@@ -436,12 +436,13 @@ class ReviewRoundOne408Test(unittest.TestCase):
                 s = r1_session(agent, drafts)
                 with self.assertRaises(acp.AcpProtocolError):
                     s.prompt("first", FAR)
+                # round 2, MED 1: the raise inside on_update closed c0 already, with no call of the driver's
+                self.assertIn(("tool.result", "c0", "cancelled"), pairs(drafts.drafts))
                 if close == "abandoned":
                     closed = drafts.abandoned(c.PROTOCOL_ERROR, "an update could not be taken")
-                    self.assertEqual(pairs(closed), [("tool.result", "c0", "cancelled"), ("result", None, None)])
+                    self.assertEqual(pairs(closed), [("result", None, None)])
                 else:
-                    closed = drafts.start_turn()
-                    self.assertEqual(pairs(closed), [("tool.result", "c0", "cancelled")])
+                    self.assertEqual(drafts.start_turn(), [])
                 mark = len(drafts.drafts)
                 out = s.prompt("second", FAR)
                 drafts.ended(out, "turn-2", "dlv-2")
@@ -514,6 +515,199 @@ class ReviewRoundOne408Test(unittest.TestCase):
     def test_abandoned_takes_a_route_contract_code(self) -> None:                         # guard
         with self.assertRaises(TypeError):
             ag.AcpDrafts().abandoned("not-a-code", "x")
+
+
+C0_OPEN = ("update", {"sessionUpdate": "tool_call", "toolCallId": "c0", "status": "in_progress", "rawInput": {"ok": 1}})
+C0_AGAIN = ("update", {"sessionUpdate": "tool_call", "toolCallId": "c0", "status": "completed", "rawInput": {"ok": 2}})
+
+
+def orphans(drafts) -> list:
+    """tool.result drafts whose call_id has no tool.call in the same stretch of drafts."""
+    called = {d["payload"]["call_id"] for d in drafts if d["type"] == "tool.call"}
+    return [d["payload"]["call_id"] for d in drafts
+            if d["type"] == "tool.result" and d["payload"]["call_id"] not in called]
+
+
+class ReviewRoundTwo408Test(unittest.TestCase):
+    """Regressions for DeepSeek's round-2 read of #408 at 890f4272 (MED 1, MED 2 and the lows). Each fails on that
+    head, except the guards and the F4 witness, marked as such."""
+
+    def session_raise_script(self, late=()):
+        # turn 1 drafts c0, then a line that is not JSON-RPC makes the session raise and abandon the turn
+        return [[C0_OPEN, ("raw", "{not json"), ("wait_cancel",), *late, ("end", "cancelled")],
+                [C0_AGAIN, ("end", "end_turn")]]
+
+    def test_r2_m1_a_turn_the_session_abandons_is_closed_through_open_acp_drafts(self) -> None:
+        agent = FakeAcpAgent(self.session_raise_script())
+        drafts = ag.AcpDrafts()
+        s = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, drafts=drafts)
+        with self.assertRaises(acp.AcpProtocolError):
+            s.prompt("first", FAR)
+        self.assertEqual(pairs(drafts.drafts), [("tool.call", "c0", None), ("tool.result", "c0", "cancelled"),
+                                                ("result", None, None)])
+        self.assertEqual(drafts.drafts[-1]["payload"]["code"], c.PROTOCOL_ERROR)
+        mark = len(drafts.drafts)
+        out = s.prompt("second", FAR)
+        drafts.ended(out, "turn-2", "dlv-2")
+        self.assertEqual(pairs(drafts.drafts[mark:]), [("tool.call", "c0", None), ("tool.result", "c0", "ok"),
+                                                       ("result", None, None)])
+
+    def test_r2_m1_a_raise_inside_on_update_closes_the_turn_without_the_drivers_help(self) -> None:
+        agent = FakeAcpAgent([[C0_OPEN, ("update", {"sessionUpdate": "tool_call", "toolCallId": "c1",
+                                                    "status": "in_progress", "rawInput": {"n": 12345.0}}),
+                               ("wait_cancel",), ("end", "cancelled")],
+                              [("update", {"sessionUpdate": "tool_call_update", "toolCallId": "c1",
+                                           "status": "completed", "rawInput": {"n": 1}}), ("end", "end_turn")]])
+        drafts = ag.AcpDrafts(redact=("12345",))
+        s = r1_session(agent, drafts)                                   # the four callbacks only, nothing else
+        with self.assertRaises(acp.AcpProtocolError):
+            s.prompt("first", FAR)
+        self.assertEqual(pairs(drafts.drafts), [("tool.call", "c0", None), ("tool.result", "c0", "cancelled")])
+        mark = len(drafts.drafts)
+        out = s.prompt("second", FAR)
+        drafts.ended(out, "turn-2", "dlv-2")
+        self.assertEqual(orphans(drafts.drafts[mark:]), [])
+        self.assertEqual(pairs(drafts.drafts[mark:]), [("tool.call", "c1", None), ("tool.result", "c1", "ok"),
+                                                       ("result", None, None)])
+
+    def test_r2_m1_a_raise_inside_on_line_ends_the_turns_open_calls(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.on_update({"sessionId": "s", "update": C0_OPEN[1]})
+        with self.assertRaises(acp.AcpProtocolError):
+            drafts.on_line('{"jsonrpc":"2.0","method":"x","params":{"t":"' + chr(0xDCFF) + '"}}')   # not UTF-8
+        self.assertEqual(pairs(drafts.drafts), [("tool.call", "c0", None), ("tool.result", "c0", "cancelled")])
+        self.assertEqual(drafts.start_turn(), [])
+
+    def test_r2_m1_start_turn_closes_what_a_session_raise_left_when_nothing_is_wired(self) -> None:   # guard
+        agent = FakeAcpAgent(self.session_raise_script())
+        drafts = ag.AcpDrafts()
+        s = r1_session(agent, drafts)
+        with self.assertRaises(acp.AcpProtocolError):
+            s.prompt("first", FAR)
+        self.assertEqual(pairs(drafts.start_turn()), [("tool.result", "c0", "cancelled")])
+        mark = len(drafts.drafts)
+        out = s.prompt("second", FAR)
+        drafts.ended(out, "turn-2", "dlv-2")
+        self.assertEqual(orphans(drafts.drafts[mark:]), [])
+
+    def test_r2_m1_an_on_abandoned_that_raises_does_not_hide_the_turns_error(self) -> None:
+        agent = FakeAcpAgent(self.session_raise_script())
+
+        def failing(code, detail):
+            raise ValueError("synthetic")
+
+        s = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, on_abandoned=failing)
+        with self.assertRaises(acp.AcpProtocolError):
+            s.prompt("first", FAR)
+        self.assertIsNone(s.prompt("second", FAR).code)
+
+    def test_r2_m1_open_acp_drafts_takes_every_callback_itself(self) -> None:
+        agent = FakeAcpAgent()
+        drafts = ag.AcpDrafts()
+        for given in ({"on_line": print}, {"on_abandoned": print}):
+            with self.subTest(given=sorted(given)), self.assertRaises(TypeError):
+                ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, drafts=drafts, **given)
+        with self.assertRaises(TypeError):
+            ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, drafts=object())
+        self.assertEqual(agent.received, [])
+
+    def test_r2_f4_a_late_call_reads_as_the_next_turns_own(self) -> None:          # the witness (passes)
+        late = ("update", {"sessionUpdate": "tool_call", "toolCallId": "late-1", "status": "in_progress",
+                           "rawInput": {"a": 2}})
+        streams = {"late from turn 1": [[R1_TOOL[1], ("wait_cancel",), ("end", "cancelled"), late],
+                                        [("chunk", "second"), ("end", "end_turn")]],
+                   "turn 2's own call": [[R1_TOOL[1], ("wait_cancel",), ("end", "cancelled")],
+                                         [late, ("chunk", "second"), ("end", "end_turn")]]}
+        seen = {}
+        for name, script in streams.items():
+            agent = FakeAcpAgent(script)
+            drafts = ag.AcpDrafts()
+            lines = []
+            holder = {}
+
+            def on_update(params, d=drafts, h=holder):
+                d.on_update(params)
+                if not h.get("cancelled"):
+                    h["cancelled"] = True
+                    h["s"].cancel()
+
+            holder["s"] = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR,
+                                      on_line=lambda line, d=drafts, ls=lines: (ls.append(line), d.on_line(line)),
+                                      on_update=on_update, on_ask=drafts.on_ask)
+            out1 = holder["s"].prompt("first", FAR)
+            drafts.ended(out1, "turn-1", "dlv-1")
+            self.assertIsNone(holder["s"].connection.abandoned_turn)   # turn 1 was answered: nothing to drain
+            mark, line_mark = len(drafts.drafts), len(lines)
+            out2 = holder["s"].prompt("second", FAR)
+            drafts.ended(out2, "turn-2", "dlv-2")
+            seen[name] = (lines[line_mark:], pairs(drafts.drafts[mark:]))
+        # the client reads the very same lines in turn 2 either way: no rule over what it reads can tell them apart
+        self.assertEqual(seen["late from turn 1"], seen["turn 2's own call"])
+        self.assertIn(("tool.call", "late-1", None), seen["turn 2's own call"][1])
+
+    def test_r2_f4_an_abandoned_turns_updates_read_while_draining_are_not_drafted(self) -> None:   # guard
+        drained = ("update", {"sessionUpdate": "tool_call", "toolCallId": "drained-1", "status": "in_progress",
+                              "rawInput": {}})
+        agent = FakeAcpAgent(self.session_raise_script(late=(drained,)))
+        drafts = ag.AcpDrafts()
+        s = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, drafts=drafts)
+        with self.assertRaises(acp.AcpProtocolError):
+            s.prompt("first", FAR)
+        out = s.prompt("second", FAR)
+        drafts.ended(out, "turn-2", "dlv-2")
+        self.assertNotIn("drained-1", [d["payload"].get("call_id") for d in drafts.drafts])
+
+    def test_r2_f7_a_turns_end_is_drafted_once(self) -> None:
+        out = acp.TurnOutcome(1, None, "end_turn", False, False, None, None, None, "", "hi")
+        drafts = ag.AcpDrafts()
+        drafts.ended(out, "turn-1", "dlv-1")
+        for second in (lambda: drafts.ended(out, "turn-1", "dlv-1"), lambda: drafts.abandoned(c.ENGINE_ERROR, "x")):
+            with self.assertRaises(TypeError):
+                second()
+        self.assertEqual([d["type"] for d in drafts.drafts], ["input.accepted", "result"])
+        drafts.on_line('{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}')     # the next turn read
+        self.assertEqual(len(drafts.ended(out, "turn-2", "dlv-2")), 2)
+        drafts.start_turn()                                                  # a turn begun by the driver
+        self.assertEqual(len(drafts.ended(out, "turn-3", "dlv-3")), 2)
+
+    def test_r2_f8_wrong_shaped_callbacks_are_refused(self) -> None:
+        drafts = ag.AcpDrafts()
+        for bad in ({}, {"sessionUpdate": "tool_call", "toolCallId": "c"}, [1], "x", None, {"update": [1]}):
+            with self.subTest(params=repr(bad)), self.assertRaises(TypeError):
+                drafts.on_update(bad)
+        for bad in ({"tool_call": {}}, None, "ask-1"):
+            with self.subTest(ask=repr(bad)), self.assertRaises(TypeError):
+                drafts.on_ask(bad)
+        self.assertEqual(drafts.drafts, [])
+
+    def test_r2_f10_a_lone_surrogate_in_a_tool_result_or_name_leaves_the_draft_writable(self) -> None:
+        line = ('{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"c1","status":"completed",'
+                '"name":"bad' + chr(92) + 'ud800name","kind":"execute","rawInput":{},'
+                '"content":[{"type":"content","content":{"type":"text","text":"a' + chr(92) + 'ud800b"}}]}}')
+        drafts = ag.AcpDrafts()
+        drafts.on_update(json.loads(line))
+        for draft in drafts.drafts:
+            json.dumps(draft, ensure_ascii=False).encode("utf-8")          # raises if a surrogate is left
+        call, result = drafts.drafts
+        self.assertEqual(call["payload"]["name"], "execute")
+        self.assertEqual(result["payload"]["text"], "a" + chr(0xFFFD) + "b")
+        bad_id = json.loads('{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"c' + chr(92)
+                            + 'ud800","status":"completed","rawInput":{}}}')
+        drafts = ag.AcpDrafts()
+        drafts.on_update(bad_id)
+        self.assertEqual(drafts.drafts, [])                                  # an id no draft could carry
+
+    def test_r2_f12_a_digest_not_of_sha256_form_is_refused(self) -> None:
+        for digest in (lambda v: "not-a-digest", lambda v: "A" * 64, lambda v: None):
+            with self.subTest(digest=digest(None)), self.assertRaises(acp.AcpInvalid):
+                acp.ToolCalls(digest).update(tool_update({}, "ok"))
+        good = acp.ToolCalls(ag.input_digest).update(tool_update({}, "ok"))                   # guard
+        self.assertEqual(good[0]["payload"]["input_digest"], ag.input_digest({}))
+
+    def test_r2_the_class_docstring_names_every_scalar_the_mask_refuses(self) -> None:
+        doc = ag.AcpDrafts.__doc__
+        self.assertIn("a number, a bool or null", doc)
+        self.assertNotIn("a float whose text spells a value is a protocol error", doc)
 
 if __name__ == "__main__":
     unittest.main()

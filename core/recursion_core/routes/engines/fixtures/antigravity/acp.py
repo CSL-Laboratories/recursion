@@ -915,6 +915,10 @@ class AcpSession:
     from it). ``on_update(params)`` gets each session/update of the turn; ``on_ask(ask)`` each new permission
     ask (it must not block: the answer comes back through ``answer_permission``, from any thread). When one
     of them raises, the error reaches the caller of ``prompt`` and the turn is abandoned (item 12).
+    ``on_abandoned(code, detail)`` is called when ``prompt`` abandons its turn because handling it raised,
+    after the agent was asked to stop it and before the error is raised: a driver closes the turn's drafts
+    there. An ``Exception`` out of it is dropped (the turn's own error is the one raised); an interruption
+    is raised.
 
     The session reads the clock with its ordering lock held, at the moment a step that starts work is
     serialized (item 11); the connection's own lock is never held while calling out.
@@ -924,7 +928,8 @@ class AcpSession:
                  permission_timeout_s: float | None = None,
                  on_line: Callable[[str], object] | None = None,
                  on_update: Callable[[dict], object] | None = None,
-                 on_ask: Callable[[PermissionAsk], object] | None = None) -> None:
+                 on_ask: Callable[[PermissionAsk], object] | None = None,
+                 on_abandoned: Callable[[str, str], object] | None = None) -> None:
         self.process = process
         self._clock = clock
         self.connection = AcpConnection(hooks=hooks, clock=clock, permission_timeout_s=permission_timeout_s)
@@ -936,6 +941,7 @@ class AcpSession:
         self._reading = threading.Lock()
         self.input_lost = False
         self._on_line, self._on_update, self._on_ask = on_line, on_update, on_ask
+        self._on_abandoned = on_abandoned
 
     # -- writing ------------------------------------------------------------------------------------------
     def _write(self, lines) -> bool:
@@ -1085,9 +1091,15 @@ class AcpSession:
         except BaseException as error:
             # The turn ends here, typed by the failure, and the agent is asked to stop it: the session can
             # take the next turn once the agent has answered this one (the next prompt reads to that answer).
-            self.connection.abandon(error.code if isinstance(error, AcpError) else c.ENGINE_ERROR,
-                                    f"handling the turn raised {type(error).__name__}", rpc_id=rpc_id)
+            code = error.code if isinstance(error, AcpError) else c.ENGINE_ERROR
+            detail = f"handling the turn raised {type(error).__name__}"
+            self.connection.abandon(code, detail, rpc_id=rpc_id)
             self.cancel()
+            if self._on_abandoned is not None:
+                try:
+                    self._on_abandoned(code, detail)
+                except Exception:   # the turn's own error is the one raised; an interruption still goes up
+                    pass
             raise
 
     def _drain(self, deadline_at: float) -> None:
@@ -1221,6 +1233,11 @@ class AcpSession:
 TOOL_TEXT_LIMIT = 64_000   # characters of a result's text; beyond it the text is cut and marked truncated
 
 
+def _lone_surrogate(text: str) -> bool:
+    """Whether ``text`` holds a surrogate code point (JSON reads a pair as one character, so any left is lone)."""
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+
+
 @dataclass
 class _ToolCall:
     call_id: str
@@ -1263,7 +1280,8 @@ class ToolCalls:
         if not isinstance(update, Mapping) or update.get("sessionUpdate") not in ("tool_call", "tool_call_update"):
             return []
         call_id = update.get("toolCallId")
-        if not isinstance(call_id, str) or not 1 <= len(call_id) <= 128 or "\n" in call_id or "\r" in call_id:
+        if (not isinstance(call_id, str) or not 1 <= len(call_id) <= 128 or "\n" in call_id or "\r" in call_id
+                or _lone_surrogate(call_id)):
             self.ignored += 1
             return []
         call = self._calls.setdefault(call_id, _ToolCall(call_id))
@@ -1293,6 +1311,8 @@ class ToolCalls:
     # -- internals ------------------------------------------------------------------------------------------
     def _name(self, call: _ToolCall) -> str:
         name = call.name if call.name and len(call.name) <= 256 and not any(c in call.name for c in "\r\n") else None
+        if name is not None and _lone_surrogate(name):   # it could not be written as UTF-8 JSON
+            name = None
         return name or call.kind or "other"
 
     def _call(self, call: _ToolCall) -> dict:
@@ -1301,6 +1321,8 @@ class ToolCalls:
             digest = self._digest(value)
         except ValueError:          # no canonical text: the agent's protocol error, never an input dropped
             raise AcpProtocolError("tool input has no RFC 8785 text") from None
+        if not (isinstance(digest, str) and len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest)):
+            raise AcpInvalid("the digest function must give a SHA-256 as 64 lowercase hex characters")
         call.called = True          # only once its draft exists: a refused call is never "drafted"
         payload = {"call_id": call.call_id, "name": self._name(call), "input_digest": digest,
                    "input": dict(value) if isinstance(value, Mapping) else None}
@@ -1320,6 +1342,8 @@ class ToolCalls:
         text = "".join(parts) if parts else (call.raw_output if isinstance(call.raw_output, str) else "")
         if self._mask is not None:
             text = self._mask(text)   # after the join: parts masked one by one could spell a value together
+        if _lone_surrogate(text):     # a JSON line may carry one escaped; a draft must be writable as UTF-8
+            text = "".join(chr(0xFFFD) if 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in text)
         truncated = len(text) > TOOL_TEXT_LIMIT
         payload = {"call_id": call.call_id, "status": status, "text": text[:TOOL_TEXT_LIMIT], "output_ref": None,
                    "truncated": truncated}

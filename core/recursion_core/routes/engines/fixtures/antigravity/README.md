@@ -107,7 +107,8 @@ adapter launches a keyed route only through an `output_boundary` (a launcher, as
 keep out, whose capture masks them before anything is persisted) and refuses it without one, before custody
 is asked (`antigravity_output_boundary_missing`). E4, E6, E7 and E9 need the same for their keyed routes.
 `AcpDrafts.ended` takes `turn_id` (`turn-...`) and `delivery_id` (`dlv-...`) of common.v1's form, both or
-neither.
+neither. `open_acp(..., drafts=d)` wires all four of its callbacks, the session's `on_abandoned` included, so a
+turn whose `prompt` raised has its open tool calls closed and its result drafted without the caller's help.
 A permission answer is decided when it claims the ask, against a clock read after the claim, so a wait for
 a lock never lets a late answer approve. The deadline of a step that starts work is checked once the step
 holds the session's ordering lock.

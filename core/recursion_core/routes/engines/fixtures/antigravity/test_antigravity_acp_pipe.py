@@ -30,11 +30,22 @@ CWD = "/var/tmp/workspace"
 WATCHDOG_S = 60.0   # only a hang reaches it
 
 
+# The fake agent's environment: only what a Python child needs, never the developer's whole shell (a real
+# credential in it would reach the child). Product code builds its children's environment in routes.launch.
+CHILD_NAMES = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "SYSTEMROOT")
+
+
+def child_environment() -> dict:
+    env = {name: os.environ[name] for name in CHILD_NAMES if name in os.environ}
+    env["PYTHONPATH"] = str(CORE)
+    return env
+
+
 class PipeProcess:
     """An ``EngineProcess`` over a child's stdin and stdout, for these tests only."""
 
     def __init__(self, scenario: dict) -> None:
-        env = dict(os.environ, PYTHONPATH=str(CORE))
+        env = child_environment()
         self.proc = subprocess.Popen([sys.executable, "-B", "-m", MODULE, json.dumps(scenario)],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      env=env, text=True, encoding="utf-8", bufsize=1)
@@ -138,6 +149,18 @@ class PipeTest(unittest.TestCase):
         session.close()
         self.assertEqual(process.proc.wait(WATCHDOG_S), 0)
 
+
+
+class ChildEnvironmentTest(unittest.TestCase):
+    """DeepSeek's round-1 F13 of #408: the fake agent's process gets an allowlisted environment, never the shell's."""
+
+    def test_the_child_gets_only_the_allowlisted_names(self) -> None:
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "made-up-for-this-test", "HOME": "/made/up"}):
+            env = child_environment()
+        self.assertLessEqual(set(env), set(CHILD_NAMES) | {"PYTHONPATH"})
+        self.assertNotIn("GEMINI_API_KEY", env)
+        self.assertNotIn("HOME", env)
 
 if __name__ == "__main__":
     unittest.main()

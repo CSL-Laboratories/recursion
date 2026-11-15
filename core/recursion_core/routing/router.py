@@ -18,8 +18,9 @@ routable but ``routes.json`` does not configure is ``route_not_configured``. ``d
 the snapshot from the loaded routes, the daemon's own refusals, the breaker and the key store.
 
 Two more answers read the same inputs: ``explain`` (the decision, and every rule's and the default's part
-in it, for ``routing show`` and QUOTA's ``route.explain``) and ``next_after_limit`` (after a limit on the
-decided route: the next route the user listed for it, or ask; never anything the user did not list).
+in it, for ``routing show``), with ``explain_answer`` (QUOTA's ``route.explain`` answer, in its published
+shape only), and ``next_after_limit`` (after a limit on the decided route: the next route the user listed
+for it, or ask; never anything the user did not list).
 
 The task carries ``task_kind`` (a string), ``tags`` (a list of strings) and ``hand_pick``
 (``{engine, model}``, model null for the one routes.json configures), the words of the control schema's
@@ -275,6 +276,47 @@ def explain(config: Config, detection: object, task: object) -> dict:
         default.update(outcome="refused", reason=skipped_of.get("default"))
     return {"decision": decision, "route_decision": route_decision(decision), "hand_pick": decision["hand_pick"],
             "rules": rules, "default": default}
+
+
+# The members of route.explain's params (methods.v1 params.route.explain, #368 at 16dea486).
+EXPLAIN_PARAMS = ("session_id", "engine", "hand_pick", "task_kind", "tags")
+
+
+def explain_answer(config: Config, detection: object, params: object) -> dict:
+    """``route.explain``'s answer in its published shape and nothing more (methods.v1 ``answer.route.explain``,
+    #368 at 16dea486): ``{"code": "ok", "decision": <route_decision>}`` for a routed task, else
+    ``{"code": "request_invalid", "detail": ...}``. The detail is routing's own code, with ``:`` and the reason
+    when there is one, as the Liaison ruled for routing's refusals at 3:11 PM, Nov 14, until SPINE's schema
+    revision gives them a code of their own. ``explain()``'s rule-by-rule outcomes are not returned (the
+    Liaison's ruling of 4:20 PM): they wait for that same revision.
+
+    The params' ``task_kind``, ``tags`` and ``hand_pick`` are the task; ``session_id`` is the caller's to
+    resolve and is not read here. A member the method does not have is refused with its name as the detail.
+    ``hand_pick`` carries both ``engine`` and ``model`` (common.v1). An ``engine`` with a ``hand_pick`` of
+    another engine is refused, ``engine_and_hand_pick_differ`` (the Liaison's ruling of 4:20 PM); with a hand
+    pick of the same engine, the hand pick decides. An ``engine`` alone is refused, ``engine_named_not_routed``:
+    a start that names its engine is not routed (it launches that engine's ``routes.json`` entry), so there
+    is no routing decision to explain (questions.md Q16).
+    """
+    if not isinstance(params, Mapping):
+        return {"code": "request_invalid", "detail": "params"}
+    for name in params:
+        if name not in EXPLAIN_PARAMS:
+            return {"code": "request_invalid", "detail": name if isinstance(name, str) and _CODE.fullmatch(name) else "params"}
+    hand = params.get("hand_pick")
+    if "hand_pick" in params and not (isinstance(hand, Mapping) and set(hand) == {"engine", "model"}):
+        return {"code": "request_invalid", "detail": "hand_pick"}
+    if "engine" in params:
+        if hand is None:
+            return {"code": "request_invalid", "detail": "engine_named_not_routed"}
+        if hand["engine"] != params["engine"]:
+            return {"code": "request_invalid", "detail": "engine_and_hand_pick_differ"}
+    task = {key: params[key] for key in ("task_kind", "tags", "hand_pick") if key in params}
+    decision = decide(config, detection, task)
+    if not decision["ok"]:
+        detail = decision["code"] if decision.get("reason") is None else f'{decision["code"]}:{decision["reason"]}'
+        return {"code": "request_invalid", "detail": detail}
+    return {"code": "ok", "decision": route_decision(decision)}
 
 
 # -- next_after_limit: what a limit on the decided route leads to ---------------------------------------------

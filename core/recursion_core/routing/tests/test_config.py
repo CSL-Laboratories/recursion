@@ -452,6 +452,20 @@ class CatalogTests(unittest.TestCase):
             rc.catalog(_with_connection(ROUTES, "codex", {"kind": "subscription", "id": "claude-main"}), KEYS)
         self.assertEqual(cm.exception.code, "catalog_conflict")
 
+    def test_a_key_of_a_provider_outside_the_vendor_list_leaves_loading_alone(self) -> None:
+        # The key store keeps and lists a key of any well-formed provider (the Liaison's ruling of 6:03 PM,
+        # Nov 14, on KEYS' K14; KEYS' draft lists nous and refuseless beside routing's six). Such a key is
+        # catalogued, no login can name its vendor yet (questions.md Q15), and the routing file still loads.
+        keys = {**KEYS, "nous-main": {"provider": "nous"}, "refuseless-1": {"provider": "refuseless"},
+                "other-1": {"provider": "acme"}}
+        self.assertEqual(rc.catalog(ROUTES, keys)["nous-main"], {"vendor": "nous", "kind": "api_key"})
+        self.assertEqual(config(keys=keys).default.engine, "claude_code")
+        raw = mutated(lambda c: c["logins"].append({"id": "nous-key", "vendor": "nous", "kind": "api_key",
+                                                     "connection_id": "nous-main", "engines": ["recursion_loop"]}))
+        with self.assertRaises(rc.ConfigError) as cm:
+            config(raw, keys=keys)
+        self.assertEqual(cm.exception.code, "unknown_vendor")
+
 
 @unittest.skipUnless(POSIX_OWNER, "the routing file's owner check needs a POSIX uid")
 class RoutingFileTests(unittest.TestCase):

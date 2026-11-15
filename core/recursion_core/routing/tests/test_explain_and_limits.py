@@ -178,5 +178,53 @@ class NextAfterLimitTests(unittest.TestCase):
         self.assertGreater(n, 500)
 
 
+class ExplainAnswerTests(unittest.TestCase):
+    """route.explain's answer, its published shape only (methods.v1 answer.route.explain, #368 at 16dea486)."""
+
+    def setUp(self) -> None:
+        self.cfg = config()
+
+    def test_a_routed_task_answers_ok_and_the_route_decision_only(self) -> None:
+        for params in ({"task_kind": "review"}, {"task_kind": "search", "tags": ["cheap"]}, {},
+                       {"task_kind": "chat", "hand_pick": {"engine": "opencode", "model": "m-1"}},
+                       {"session_id": "s-1", "task_kind": "review"}):
+            with self.subTest(params):
+                task = {k: v for k, v in params.items() if k != "session_id"}
+                answer = router.explain_answer(self.cfg, SENTRY, params)
+                self.assertEqual(answer, {"code": "ok", "decision": router.route_decision(router.decide(self.cfg, SENTRY, task))})
+                self.assertEqual(set(answer["decision"]), {"chosen", "reason", "candidates", "hand_pick"})
+
+    def test_a_refused_decision_answers_request_invalid_with_routings_code(self) -> None:
+        for params, det, detail in (
+                ({"hand_pick": {"engine": "pi", "model": None}}, SENTRY, "hand_pick_engine_unavailable:not_on_path"),
+                ({"task_kind": "chat"}, detection({"codex"}, {"claude_code": "signed_out"}), "default_engine_unavailable:signed_out"),
+                ({"tags": ["cheap", ""]}, SENTRY, "bad_task:tags")):
+            with self.subTest(params):
+                self.assertEqual(router.explain_answer(self.cfg, det, params), {"code": "request_invalid", "detail": detail})
+
+    def test_the_h33_example_is_refused_never_answered_by_the_config(self) -> None:
+        # #368's good/methods.v1/h33-route-explain-ok.json answers these params with a config decision, hand_pick
+        # null and codex skipped breaker_open. Routing never replaces a hand pick (grill Q45): it refuses.
+        det = detection({"claude_code", "opencode"}, {"codex": "breaker_open"})
+        answer = router.explain_answer(self.cfg, det, {"hand_pick": {"engine": "codex", "model": None}, "task_kind": "code_edit"})
+        self.assertEqual(answer, {"code": "request_invalid", "detail": "hand_pick_engine_unavailable:breaker_open"})
+
+    def test_an_engine_and_a_hand_pick(self) -> None:
+        hp = {"engine": "opencode", "model": None}
+        self.assertEqual(router.explain_answer(self.cfg, SENTRY, {"engine": "codex", "hand_pick": hp}),
+                         {"code": "request_invalid", "detail": "engine_and_hand_pick_differ"})
+        same = router.explain_answer(self.cfg, SENTRY, {"engine": "opencode", "hand_pick": hp})
+        self.assertEqual((same["code"], same["decision"]["reason"], same["decision"]["hand_pick"]), ("ok", "hand_pick", hp))
+        self.assertEqual(router.explain_answer(self.cfg, SENTRY, {"engine": "codex"}),
+                         {"code": "request_invalid", "detail": "engine_named_not_routed"})
+
+    def test_params_outside_the_published_ones_are_refused(self) -> None:
+        for params, detail in (({"task_kind": "review", "repo": "x"}, "repo"), (None, "params"), (["review"], "params"),
+                               ({"hand_pick": {"engine": "codex"}}, "hand_pick"), ({"hand_pick": None}, "hand_pick"),
+                               ({"hand_pick": "codex"}, "hand_pick"), ({"Task Kind": "x"}, "params")):
+            with self.subTest(params):
+                self.assertEqual(router.explain_answer(self.cfg, SENTRY, params), {"code": "request_invalid", "detail": detail})
+
+
 if __name__ == "__main__":
     unittest.main()

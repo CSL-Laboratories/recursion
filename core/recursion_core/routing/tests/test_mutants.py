@@ -147,6 +147,34 @@ MUTANTS = {
         "parsed = json.loads(text, object_pairs_hook=_no_duplicate_members)",
         "parsed = json.loads(text)",
         {"test_a_member_named_twice_is_refused"}),
+    # Slice 2, after #371 passed its reads: route.explain's published answer, and a key store that keeps keys of
+    # providers routing does not list.
+    "M25 an engine with a hand pick of another engine: the hand pick taken silently": (
+        ROUTER,
+        '        if hand["engine"] != params["engine"]:\n'
+        '            return {"code": "request_invalid", "detail": "engine_and_hand_pick_differ"}\n',
+        "",
+        {"test_an_engine_and_a_hand_pick"}),
+    "M26 explain's rule outcomes returned beside the decision": (
+        ROUTER,
+        '    return {"code": "ok", "decision": route_decision(decision)}',
+        '    return {"code": "ok", "decision": route_decision(decision), "rules": explain(config, detection, task)["rules"]}',
+        {"test_a_routed_task_answers_ok_and_the_route_decision_only"}),
+    "M27 a refused hand pick answered with the config's route": (
+        ROUTER,
+        '    if not decision["ok"]:\n        detail = ',
+        '    if not decision["ok"] and "hand_pick" in task:\n'
+        '        decision = decide(config, detection, {k: v for k, v in task.items() if k != "hand_pick"})\n'
+        '    if not decision["ok"]:\n        detail = ',
+        {"test_the_h33_example_is_refused_never_answered_by_the_config",
+         "test_a_refused_decision_answers_request_invalid_with_routings_code"}),
+    "M28 a key of a provider outside the vendor list refused": (
+        CONFIG,
+        '        put(key_id, meta["provider"], "api_key", "key store")\n',
+        '        if meta["provider"] not in VENDORS:\n'
+        '            raise ConfigError("key_metadata_invalid", key_id)\n'
+        '        put(key_id, meta["provider"], "api_key", "key store")\n',
+        {"test_a_key_of_a_provider_outside_the_vendor_list_leaves_loading_alone"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

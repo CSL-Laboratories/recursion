@@ -34,7 +34,10 @@
     {"argv": ["agent", "--disable-auto-update", "--yolo", "acp"], "detail": "full_access_not_acknowledged:--yolo"},
     {"argv": ["agent", "--disable-auto-update", "--approve-mcps", "acp"], "detail": "full_access_not_acknowledged:--approve-mcps"},
     {"argv": ["agent", "--disable-auto-update", "-pf", "--", "say hi"], "detail": "full_access_not_acknowledged:-f"},
-    {"argv": ["agent", "--disable-auto-update", "--sandbox", "disabled", "acp"], "detail": "full_access_not_acknowledged:--sandbox"}
+    {"argv": ["agent", "--disable-auto-update", "--sandbox", "disabled", "acp"], "detail": "full_access_not_acknowledged:--sandbox"},
+    {"argv": ["agent", "--disable-auto-update", "\ud800", "acp"], "detail": "argv_invalid"},
+    {"argv": ["agent", "--disable-auto-update"], "detail": "drive_missing"},
+    {"argv": ["agent", "--disable-auto-update", "--"], "detail": "drive_missing"}
   ],
   "accepted": [
     ["agent", "--disable-auto-update", "-p", "--output-format", "stream-json", "--model", "synthetic-model", "--", "--api-key=only-the-prompt"],

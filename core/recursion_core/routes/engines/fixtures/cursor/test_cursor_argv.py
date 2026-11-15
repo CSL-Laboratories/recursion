@@ -164,8 +164,72 @@ class CheckTest(unittest.TestCase):
                 cursor.check_argv(argv)
             self.assertEqual(caught.exception.detail, "argv_invalid")
 
+    def test_an_argument_with_a_lone_surrogate_is_refused(self):
+        """Break-it read 5 of #388, F5-1: UTF-8 cannot write a lone surrogate, so execve could not be given it
+        (Python raises UnicodeEncodeError). Refused wherever it stands, the escape range ``U+DC80``..``U+DCFF``
+        included, in an argument, the model or the binary."""
+        for code in (0xD800, 0xDBFF, 0xDC00, 0xDC80, 0xDFFF):
+            lone = chr(code)
+            for argv in (["agent", "--disable-auto-update", lone, "acp"],
+                         ["agent", "--disable-auto-update", "-p", "--model", "m" + lone],
+                         ["agent", "--disable-auto-update", "-p", "--", "say " + lone],
+                         ["agent" + lone, "--disable-auto-update", "acp"]):
+                with self.subTest(code=hex(code), argv=argv):
+                    with self.assertRaises(cursor.ArgvRefused) as caught:
+                        cursor.check_argv(argv)
+                    self.assertEqual(caught.exception.detail, "argv_invalid")
+            with self.assertRaises(cursor.ArgvRefused) as caught:
+                cursor.oneshot_argv("m" + lone)
+            self.assertEqual(caught.exception.detail, "model_invalid")
+            with self.assertRaises(cursor.ArgvRefused) as caught:
+                cursor.acp_argv(binary="/opt/" + lone + "/agent")
+            self.assertEqual(caught.exception.detail, "binary_not_absolute")
+        astral = chr(0x1F600)   # a character beyond the BMP is text UTF-8 writes: taken
+        cursor.check_argv(["agent", "--disable-auto-update", "-p", "--", "say " + astral])
+        self.assertEqual(cursor.oneshot_argv("m" + astral)[-1], "m" + astral)
+        self.assertEqual(cursor.acp_argv(binary="/opt/" + astral + "/agent")[0], "/opt/" + astral + "/agent")
+
+    def test_the_whole_argv_is_bounded(self):
+        """Break-it read 5 of #388, F5-2: execve also bounds the argv as a whole (ARG_MAX). Each argument is
+        counted with its NUL, exactly at MAX_ARGV_BYTES passes and one byte more is refused."""
+        self.assertEqual(cursor.MAX_ARGV_BYTES, 1024 * 1024)
+        head = ["agent", "--disable-auto-update", "-p", "--"]
+        room = cursor.MAX_ARGV_BYTES - sum(len(a.encode("utf-8")) + 1 for a in head)
+        tail = []
+        while room:
+            size = min(cursor.MAX_ARG_BYTES, room - 1)
+            tail.append("x" * size)
+            room -= size + 1
+        argv = head + tail
+        self.assertEqual(sum(len(a.encode("utf-8")) + 1 for a in argv), cursor.MAX_ARGV_BYTES)
+        self.assertTrue(all(len(a) <= cursor.MAX_ARG_BYTES for a in argv))
+        cursor.check_argv(argv)
+        for longer in (argv[:-1] + [argv[-1] + "x"], argv + ["x"], head + ["x" * cursor.MAX_ARG_BYTES] * 20):
+            with self.assertRaises(cursor.ArgvRefused) as caught:
+                cursor.check_argv(longer)
+            self.assertEqual(caught.exception.detail, "argv_invalid")
+
+    def test_the_drive_stands_right_after_the_updater_flag(self):
+        """Break-it read 5 of #388, F5-3: an argv that names no drive would start the interactive agent."""
+        self.assertEqual(cursor.DRIVES, ("-p", "acp"))
+        for argv in (["agent", "--disable-auto-update"], ["agent", "--disable-auto-update", "--"],
+                     ["agent", "--disable-auto-update", "--", "acp"], ["agent", "--disable-auto-update", "--", "-p"],
+                     ["agent", "--disable-auto-update", "--model", "m", "-p"],
+                     ["agent", "--disable-auto-update", "--print"], ["agent", "--disable-auto-update", "-pv"],
+                     ["agent", "--disable-auto-update", "ACP"], ["agent", "--disable-auto-update", "chat"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(cursor.ArgvRefused) as caught:
+                    cursor.check_argv(argv)
+                self.assertEqual(caught.exception.detail, "drive_missing")
+        with self.assertRaises(cursor.ArgvRefused) as caught:   # acknowledged full access still needs a drive
+            cursor.check_argv(["agent", "--disable-auto-update", "--force"], full_access_acknowledged=True)
+        self.assertEqual(caught.exception.detail, "drive_missing")
+        cursor.check_argv(["agent", "--disable-auto-update", "-p"])
+        cursor.check_argv(["agent", "--disable-auto-update", "acp"])
+        cursor.check_argv(("agent", "--disable-auto-update", "acp"))
+
     def test_every_refused_argv_of_the_fixture(self):
-        self.assertEqual(len(ARGV["refused"]), 21)
+        self.assertEqual(len(ARGV["refused"]), 24)
         for case in ARGV["refused"]:
             with self.subTest(argv=case["argv"]):
                 with self.assertRaises(cursor.ArgvRefused) as caught:
@@ -196,8 +260,9 @@ class CheckTest(unittest.TestCase):
                 cursor.check_argv(["agent", *extra, "--disable-auto-update", "acp"])
 
     def test_options_that_only_look_alike_are_not_refused(self):
-        cursor.check_argv(["agent", "--disable-auto-update", "--api-keys-doc", "acp"])
-        cursor.check_argv(["agent", "--disable-auto-update", "--headers-only", "acp"])
+        """The drive now stands right after the updater flag (F5-3), so these options follow it."""
+        cursor.check_argv(["agent", "--disable-auto-update", "-p", "--api-keys-doc"])
+        cursor.check_argv(["agent", "--disable-auto-update", "-p", "--headers-only"])
 
     def test_the_updater_flag_must_be_an_option_not_argv0(self):
         with self.assertRaises(cursor.ArgvRefused) as caught:

@@ -37,17 +37,21 @@ be agreed and tested with lane EVENTS before anything is wired (the lane's quest
 text (anything else is a ``TypeError``). A line that is not one strict JSON object, has a type this parser
 does not know, belongs to another conversation, has a shape this parser does not know, or repeats something
 already drafted, gives no draft and is counted in ``StreamParser.counts``. A forged event.v1 line is such a
-line: its ``type`` is none of Cursor's. The conversation's id is set by the first line that is neither of an
-unknown type nor assistant text, so neither can bind the parser to another conversation. Model text
-(assistant content, the answer) is model payload and is never inspected; the answer is only checked to be
-text.
+line: its ``type`` is none of Cursor's. The one exception is the terminal line: a result line whose outcome
+the parser cannot read still ends the turn, as a ``result`` draft with code ``protocol_error``, and is not
+counted. The conversation's id is set by the first line that is neither of an unknown type nor assistant
+text, so neither can bind the parser to another conversation. Model text (assistant content, the answer) is
+model payload and is never inspected; the answer is only checked to be text.
 
 THE RESULT IS TERMINAL. Cursor documents the result line as the stream's last: after the first one, a
-second result is counted ``result_repeated`` and any other line ``after_result``, and neither drafts
-anything. A success must carry its answer as text that UTF-8 can write; any other success line is a
-``protocol_error``, never an empty success.
+second result of this conversation is counted ``result_repeated`` and any other line of it
+``after_result``, and neither drafts anything. A later line that is not JSON, has an unknown type, or has
+no or another conversation's id is counted as that, as before the result. A success must carry its answer
+as text that UTF-8 can write; any other success line is a ``protocol_error``, never an empty success.
 
-The parser serves ONE worker and one reader of its output, in order, and holds no lock.
+The parser serves ONE worker and one reader of its output, in order, and holds no lock. ``parse`` is not
+atomic: an exception that escapes it (a ``MemoryError``, an interrupt) may leave its line half recorded,
+so a driver that catches one discards the parser with the turn.
 """
 
 from __future__ import annotations
@@ -84,6 +88,13 @@ FULL_ACCESS_OPTIONS = ("--force", "--yolo", "--approve-mcps", "--dangerously-ski
 FULL_ACCESS_SHORT_OPTIONS = ("-f",)
 # Linux takes at most 131072 bytes, its terminating NUL included, for one argument (MAX_ARG_STRLEN).
 MAX_ARG_BYTES = 128 * 1024 - 1
+# Linux also bounds argv and the environment together (ARG_MAX: a quarter of the stack limit, 2 MiB under the
+# usual 8 MiB stack). This lane holds the whole argv, each argument with its terminating NUL, to half of that,
+# leaving the rest for the child's environment (an allowlist) and the pointers. A stack limit under 4 MiB
+# lowers ARG_MAX below this bound, and execve then refuses the launch itself.
+MAX_ARGV_BYTES = 1024 * 1024
+# The two drives, as each builder writes it right after the updater flag.
+DRIVES = ("-p", "acp")
 LAUNCH_REFUSED = "launch_refused"   # routes.contract's code; the detail says which rule
 
 # The bounds of what a draft carries (this lane's choice, not a published limit). An input over the first
@@ -104,7 +115,7 @@ COUNTS = (
     "unknown_type",        # a type this parser does not read; it never sets the conversation's id
     "no_session",          # no session_id, or one that is not a string of 1 to 256 characters
     "other_session",       # a session_id other than the first a known line reported
-    "after_result",        # any line but a result after the terminal result
+    "after_result",        # any other line of this conversation after the terminal result
     "result_repeated",     # a second terminal result line
     "unknown_subtype",     # a system or tool_call line with a subtype this parser does not read
     "init_repeated",       # a second system/init
@@ -149,13 +160,14 @@ def oneshot_declaration() -> dict:
 def _executable(binary: object) -> str:
     """argv[0]: the ``binary`` option composition gave, else DEFAULT_EXECUTABLE.
 
-    The option must be a plain absolute path to a file: it starts with ``/``, and no part of it is empty,
-    ``.`` or ``..`` (so ``/``, ``/..``, ``//x`` and ``/opt/agent/`` are refused); no NUL, CR or LF.
+    The option must be a plain absolute path: it starts with ``/``, and no part of it is empty, ``.`` or
+    ``..`` (so ``/``, ``/..``, ``//x`` and ``/opt/agent/`` are refused); no NUL, CR, LF or lone surrogate.
+    Nothing here looks at the file system, so whether a file is there shows only at launch.
     """
     if binary is None:
         return DEFAULT_EXECUTABLE
     if (not isinstance(binary, str) or not binary.startswith("/") or any(ch in binary for ch in "\x00\r\n")
-            or any(part in ("", ".", "..") for part in binary.split("/")[1:])):
+            or _has_surrogate(binary) or any(part in ("", ".", "..") for part in binary.split("/")[1:])):
         raise ArgvRefused("binary_not_absolute")
     return binary
 
@@ -163,10 +175,12 @@ def _executable(binary: object) -> str:
 def oneshot_argv(model: object, *, binary: object = None) -> list[str]:
     """The one-shot drive's options, up to the prompt (the driver adds ``--`` and the prompt).
 
-    The updater flag stands first, right after argv[0], on both drives. No ``--force``, ``--api-key`` or
-    header is added.
+    The updater flag stands first, right after argv[0], on both drives, and the drive (``-p``) right after
+    it. No ``--force``, ``--api-key`` or header is added. A model that is empty, starts with a dash, or holds
+    a NUL, CR, LF or lone surrogate is ``model_invalid``.
     """
-    if not isinstance(model, str) or not model or model.startswith("-") or any(ch in model for ch in "\x00\r\n"):
+    if (not isinstance(model, str) or not model or model.startswith("-") or any(ch in model for ch in "\x00\r\n")
+            or _has_surrogate(model)):
         raise ArgvRefused("model_invalid")
     return [_executable(binary), NO_UPDATE, "-p", "--output-format", "stream-json", "--model", model]
 
@@ -184,8 +198,9 @@ def check_argv(argv: object, *, binary: object = None, full_access_acknowledged:
 
     * ``full_access_malformed``: ``full_access_acknowledged`` is not a bool; only ``True`` acknowledges, as
       in the existing launch guards (``"true"``, ``1`` and the like are not an acknowledgement).
-    * ``argv_invalid``: not a non-empty list of text; an empty argument; an argument holding a NUL or longer
-      than MAX_ARG_BYTES UTF-8 bytes (neither can be passed); an option holding a CR or LF.
+    * ``argv_invalid``: not a non-empty list of text; an empty argument; an argument holding a NUL or a lone
+      surrogate, or longer than MAX_ARG_BYTES UTF-8 bytes; an argv longer than MAX_ARGV_BYTES in all, each
+      argument counted with its NUL (none of these can be passed to execve); an option holding a CR or LF.
     * ``executable_mismatch``: argv[0] is not the vouched executable.
     * ``credential_in_argv:<option>``: an option carries a credential, in any spelling: ``--api-key K``,
       ``--api-key=K``, ``-H V``, ``-HV``, or ``H`` among bundled short options (``-vH V``).
@@ -193,12 +208,16 @@ def check_argv(argv: object, *, binary: object = None, full_access_acknowledged:
       bundled, ``--sandbox disabled``) without ``full_access_acknowledged=True``.
     * ``updater_not_disabled``: argv[1] is not the updater flag. It stands first on both drives, so it is a
       global option before any command (the break-it read's F1, in its stricter form: questions.md Q18).
+    * ``drive_missing``: argv[2] is not one of DRIVES, ``-p`` (the one-shot drive) or ``acp``, as the two
+      builders write them. An argv that names no drive would start Cursor's interactive agent (the fifth
+      break-it read of #388, F5-3).
     """
     if not isinstance(full_access_acknowledged, bool):
         raise ArgvRefused("full_access_malformed")
     if (not isinstance(argv, (list, tuple)) or not argv
-            or not all(isinstance(a, str) and a and "\x00" not in a and len(a.encode("utf-8", "surrogatepass"))
-                       <= MAX_ARG_BYTES for a in argv)):
+            or not all(isinstance(a, str) and a and "\x00" not in a and not _has_surrogate(a)
+                       and len(a.encode("utf-8")) <= MAX_ARG_BYTES for a in argv)
+            or sum(len(a.encode("utf-8")) + 1 for a in argv) > MAX_ARGV_BYTES):
         raise ArgvRefused("argv_invalid")
     if argv[0] != _executable(binary):
         raise ArgvRefused("executable_mismatch")
@@ -228,6 +247,8 @@ def check_argv(argv: object, *, binary: object = None, full_access_acknowledged:
                     raise ArgvRefused(f"full_access_not_acknowledged:{option}")
     if len(argv) < 2 or argv[1] != NO_UPDATE:
         raise ArgvRefused("updater_not_disabled")
+    if len(rest) < 2 or rest[1] not in DRIVES:
+        raise ArgvRefused("drive_missing")
 
 
 # --------------------------------------------------------------------------------- the switch, as data

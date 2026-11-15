@@ -1,0 +1,8 @@
+{
+  "tenant": "t1",
+  "prompt": "add a line to README",
+  "engine": "claude_code",
+  "workspace": {
+    "path": "/home/dev/projects/atlas"
+  }
+}

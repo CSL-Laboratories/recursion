@@ -1,0 +1,14 @@
+{
+  "seq": 1,
+  "session_id": "run:run-0f8e7d6c5b4a39281706f5e4d3c2b1a0",
+  "run_id": "run-0f8e7d6c5b4a39281706f5e4d3c2b1a0",
+  "turn_id": null,
+  "time": "2026-11-14T23:40:00.000Z",
+  "type": "workspace.grant",
+  "source": "engine",
+  "trust": "untrusted",
+  "payload": {
+    "path": "/home/dev/projects/atlas",
+    "run_id": "run-0f8e7d6c5b4a39281706f5e4d3c2b1a0"
+  }
+}

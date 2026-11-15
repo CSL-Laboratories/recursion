@@ -1,0 +1,100 @@
+{
+  "about": "Lane WORKSPACE's fixtures for SPINE: what the workspace lane sends and reads. A file under good/ must fit its schema; a file under bad/ must not, for the reason given. Written by scripts/make_fixtures.py of the lane; the schemas are lane SPINE's.",
+  "fixtures": [
+    {
+      "file": "good/workspace-request-path-only.json",
+      "schema": "methods.v1.json#/$defs/workspace_request",
+      "shows": "The folder the command line was launched from, sent as the default workspace; mode and base are the configured ones."
+    },
+    {
+      "file": "good/workspace-request-worktree-from-a-base.json",
+      "schema": "methods.v1.json#/$defs/workspace_request",
+      "shows": "A worktree asked for explicitly, cut from a named base."
+    },
+    {
+      "file": "good/run-start-with-a-workspace.json",
+      "schema": "methods.v1.json#/$defs/params.run.start",
+      "shows": "run.start carrying the workspace request, the field the workspace registrant declares."
+    },
+    {
+      "file": "good/launch-workspace-direct.json",
+      "schema": "run.record.v1.json#/$defs/launch_workspace",
+      "shows": "A folder in no git work tree: the engine works in it; nothing is cut."
+    },
+    {
+      "file": "good/launch-workspace-worktree-before-launch.json",
+      "schema": "run.record.v1.json#/$defs/launch_workspace",
+      "shows": "What the start registrant writes for a repository: the resolved folder, the base left to the worktree provider (the folder's HEAD), no worktree yet."
+    },
+    {
+      "file": "good/launch-workspace-worktree-from-a-base.json",
+      "schema": "run.record.v1.json#/$defs/launch_workspace",
+      "shows": "A folder inside a repository, with a base and steps as the request gave them."
+    },
+    {
+      "file": "good/session-workspace-worktree-made.json",
+      "schema": "common.v1.json#/$defs/workspace",
+      "shows": "The completed workspace a session view shows: source_path becomes path, the base is resolved to a commit and the worktree exists."
+    },
+    {
+      "file": "good/session-workspace-direct.json",
+      "schema": "common.v1.json#/$defs/workspace",
+      "shows": "A direct workspace in a session view."
+    },
+    {
+      "file": "good/event-workspace-grant.json",
+      "schema": "event.v1.json",
+      "shows": "The run was given its folder, at launch, in the run's own log."
+    },
+    {
+      "file": "good/event-workspace-revoke.json",
+      "schema": "event.v1.json",
+      "shows": "The run lost its folder once it ended."
+    },
+    {
+      "file": "good/event-workspace-grant-in-a-session.json",
+      "schema": "event.v1.json",
+      "shows": "A run that belongs to a session is logged in the session."
+    },
+    {
+      "file": "bad/launch-workspace-direct-with-a-worktree.json",
+      "schema": "run.record.v1.json#/$defs/launch_workspace",
+      "rule": "direct mode has no worktree"
+    },
+    {
+      "file": "bad/launch-workspace-path-not-source-path.json",
+      "schema": "run.record.v1.json#/$defs/launch_workspace",
+      "rule": "the launch record names the folder source_path, not path"
+    },
+    {
+      "file": "bad/workspace-request-with-a-worktree-path.json",
+      "schema": "methods.v1.json#/$defs/workspace_request",
+      "rule": "a request cannot name the worktree"
+    },
+    {
+      "file": "bad/workspace-request-mode-null.json",
+      "schema": "methods.v1.json#/$defs/workspace_request",
+      "rule": "mode is direct or worktree when present"
+    },
+    {
+      "file": "bad/session-workspace-worktree-not-made.json",
+      "schema": "common.v1.json#/$defs/workspace",
+      "rule": "a completed worktree workspace names its worktree"
+    },
+    {
+      "file": "bad/session-workspace-source-path.json",
+      "schema": "common.v1.json#/$defs/workspace",
+      "rule": "the session view names the folder path, not source_path"
+    },
+    {
+      "file": "bad/event-workspace-grant-from-an-engine.json",
+      "schema": "event.v1.json",
+      "rule": "only the core writes a grant"
+    },
+    {
+      "file": "bad/event-workspace-grant-without-run-id.json",
+      "schema": "event.v1.json",
+      "rule": "a grant names the run"
+    }
+  ]
+}

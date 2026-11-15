@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import errno
 import ipaddress
+import math
+import numbers
 import os
 import re
 import socket
@@ -226,6 +228,17 @@ def check_peer(sock: socket.socket, getter: PeerCredGetter, expected_uid: int) -
     return cred
 
 
+def _seconds(name: str, value: object) -> float:
+    """``value`` as float seconds, if it is a finite, positive real number (an int, a float or another
+    ``numbers.Real``, never a bool); else ``ValueError``. Zero, a negative or NaN served nothing, and NaN killed
+    a worker in ``settimeout`` (the reads of #407 by DeepSeek: round 2 F3, round 3 N3 and N4)."""
+
+    if (isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(value)
+            or not value > 0):
+        raise ValueError(f"{name} must be a finite, positive real number of seconds (an int or a float, not a bool)")
+    return float(value)
+
+
 class UnixControlServer:
     """Owner-only AF_UNIX listener that hands each frame to ``handler`` and writes its reply.
 
@@ -264,10 +277,10 @@ class UnixControlServer:
             raise ValueError("max_connections must be positive")
         if reserved_connections < 0 or (reserved_connections and priority is None):
             raise ValueError("reserved_connections needs a priority test and cannot be negative")
-        # A finite, positive number of seconds: zero, a negative or NaN served nothing, and NaN killed the worker
-        # (the round-2 read of #407 by DeepSeek, F3).
-        if type(reserved_timeout_s) not in (int, float) or not 0 < reserved_timeout_s < float("inf"):
-            raise ValueError("reserved_timeout_s must be a finite, positive number of seconds")
+        idle_timeout_s = _seconds("idle_timeout_s", idle_timeout_s)
+        # Checked only when it is used: a server with no reserved slots ignores it, as before.
+        if reserved_connections:
+            reserved_timeout_s = _seconds("reserved_timeout_s", reserved_timeout_s)
         self.directory = directory
         self._path = refuse_remote_bind(os.path.join(directory, name))
         self._handler = handler
@@ -487,15 +500,22 @@ class UnixControlServer:
             # The slot is freed before the connection is closed, so a client that has seen the close finds it
             # free: a Stop sent right after it is served, not refused busy. The worker and its socket stay in
             # the server's sets until the socket is disposed of, so a server shutting down meanwhile still finds,
-            # shuts and joins them (the round-1 reads of #407: Astra R2, Sol R1). A disposal that fails is
-            # recorded (``conn_close_failed``), and the worker still leaves the sets (the round-2 read by
-            # DeepSeek, F4). The slots bound the handlers that run; a worker that has freed its slot and not yet
-            # disposed of its socket is not counted, so for a moment there can be several such tails.
+            # shuts and joins them (the round-1 reads of #407: Astra R2, Sol R1). A release that fails is recorded
+            # (``conn_close_failed``) and the descriptor it left open, if any, is released directly, so no socket
+            # stays open untracked; then the worker leaves the sets (round 2, DeepSeek F4; round 3, N2). The slots
+            # bound the handlers that run; a worker that has freed its slot and not yet disposed of its socket is
+            # not counted, so for a moment there can be several such tails.
             slots.release()
             try:
                 conn.close()
             except OSError:
                 self._refuse("conn_close_failed")
+                try:
+                    fd = conn.detach()   # -1 once the descriptor is already gone
+                    if fd >= 0:
+                        os.close(fd)
+                except OSError:
+                    pass
             finally:
                 with self._lock:
                     self._workers.discard(threading.current_thread())

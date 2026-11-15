@@ -871,15 +871,86 @@ class ConnectionBoundTests(_TmpCase):
         self.assertFalse(os.path.exists(srv.path))
 
     def test_a_reserved_deadline_that_is_not_a_finite_positive_number_is_refused(self) -> None:
-        """The round-2 read of #407 by DeepSeek, F3: zero, a negative or NaN served nothing, and NaN killed the
-        worker with a ValueError from settimeout."""
-        for bad in (0, 0.0, -1.0, float("nan"), float("inf"), "1", True):
-            with self.subTest(reserved_timeout_s=repr(bad)):
-                with self.assertRaises(ValueError):
-                    UnixControlServer(self.sock_dir, ct.with_ping_health(_Recorder()), reserved_connections=1,
-                                      priority=lambda request: True, reserved_timeout_s=bad)
-        UnixControlServer(self.sock_dir, ct.with_ping_health(_Recorder()), reserved_connections=1,
-                          priority=lambda request: True, reserved_timeout_s=0.2)
+        """The reads of #407 by DeepSeek: round 2 F3, zero, a negative or NaN served nothing, and NaN killed the
+        worker; round 3 N3, a finite positive real was refused by type, and N4, the idle deadline had no check."""
+        from decimal import Decimal
+        from fractions import Fraction
+
+        class Seconds(float):
+            pass
+
+        def make(**kwargs):
+            return UnixControlServer(self.sock_dir, ct.with_ping_health(_Recorder()), reserved_connections=1,
+                                     priority=lambda request: True, **kwargs)
+
+        for name in ("reserved_timeout_s", "idle_timeout_s"):
+            for bad in (0, 0.0, -1.0, float("nan"), float("inf"), "1", True, None, Decimal("1")):
+                with self.subTest(name=name, value=repr(bad)):
+                    with self.assertRaises(ValueError) as caught:
+                        make(**{name: bad})
+                    self.assertIn("finite, positive real number", str(caught.exception))
+            for good in (1, 0.2, Fraction(1, 2), Seconds(0.5)):
+                with self.subTest(name=name, value=repr(good)):
+                    self.assertEqual(type(getattr(make(**{name: good}), "_" + name)), float)
+        # A server with no reserved slots does not use reserved_timeout_s, and ignores it, as before.
+        UnixControlServer(self.sock_dir, ct.with_ping_health(_Recorder()), reserved_timeout_s=None)
+
+    def test_a_handler_may_shut_the_server_down(self) -> None:
+        """The round-3 read of #407 by DeepSeek, N1: close() called from a handler joined its own thread, raised
+        RuntimeError and left the listener bound."""
+        limit = 30.0
+        holder: list = []
+
+        def handler(message, conn=None):
+            if message.get("op") == "shutdown":
+                holder[0].close()
+                return {"ok": True, "op": "shutdown"}
+            return ct.with_ping_health(_Recorder())(message, conn)
+
+        srv = self.server(handler, max_connections=1, idle_timeout_s=30.0)
+        holder.append(srv)
+        started = self._recording_workers(srv)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as raw:
+            raw.settimeout(limit)
+            raw.connect(srv.path)
+            raw.sendall(framing.encode_frame({"op": "shutdown"}))
+            try:
+                raw.recv(1 << 16)                          # the reply, or the end: the server is going away
+            except OSError:
+                pass
+        for worker in started:
+            worker.join(limit)
+        self.assertIsNone(srv._sock)
+        self.assertFalse(os.path.exists(srv.path))
+
+    def test_a_release_that_fails_before_the_descriptor_is_released_leaves_nothing_open(self) -> None:
+        """The round-3 read of #407 by DeepSeek, N2: a socket release that failed before closing the descriptor left
+        the socket open and untracked, against the comment's promise. Now its descriptor is released directly."""
+        from unittest import mock
+        limit = 30.0
+        srv = self.server(max_connections=1, idle_timeout_s=30.0)
+        started = self._recording_workers(srv)
+        failed: list = []
+        real_close = socket.socket.close
+
+        def fail_before_release(sock):
+            if threading.current_thread().name == "control-transport-conn" and not failed:
+                failed.append((sock, sock.fileno()))
+                raise OSError("injected: the release failed before the descriptor was released")
+            return real_close(sock)
+
+        with mock.patch.object(socket.socket, "close", fail_before_release):
+            with UnixControlClient(srv.path) as client:
+                self.assertEqual(client.request({"op": "ping"})["op"], "pong")
+            for worker in started:
+                worker.join(limit)
+        sock, fd = failed[0]
+        self.assertIn("conn_close_failed", srv.refused)
+        self.assertEqual(sock.fileno(), -1)
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+        with srv._lock:
+            self.assertEqual((srv._workers, srv._conns), (set(), set()))
 
     def test_a_worker_frees_its_slot_before_it_closes_its_connection(self) -> None:
         """Witness W1, recorded, not timed: the order of the slot's release and the socket's close in the worker

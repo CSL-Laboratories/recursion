@@ -1,4 +1,4 @@
-# Evaluation protocol (lane EVAL), version 3
+# Evaluation protocol (lane EVAL), version 4
 
 Written before any measured run. This file, the analysis script `eval/analyze.py` and the calculator
 `eval/passk.py` are hashed in `eval/FROZEN.sha256`; every record carries those hashes, and a test fails
@@ -28,7 +28,17 @@ to Claude Code with Claude Code's own `--effort` and `--permission-mode` flags, 
 them: extra engine arguments that would set effort, model, permission mode or settings are refused, and
 only the variables that say where the sign-in lives and how the network is reached (`CLAUDE_CONFIG_DIR`,
 proxy and certificate variables) may be passed to an engine, because an environment variable can
-override a flag. A paired comparison refuses two records that differ in these settings, the engine
+override a flag. For the same reason the direct arm runs Claude Code only with no settings file in
+effect: a settings file can set the effort, the model, the permission mode or any environment variable
+after launch, over the flags (Claude Code's documented precedence), so the record would not say what ran.
+A file that sets anything (an empty object, or one holding only `$schema`, sets nothing; a file that
+cannot be read counts as set) refuses the arm, naming it, in the engine's user configuration folder
+(`CLAUDE_CONFIG_DIR` when passed, otherwise the route home's `.claude`), in the machine's managed policy
+(`/etc/claude-code/managed-settings.json` and `managed-settings.d/`) and, before any attempt, in any
+task's start tree (`.claude/settings.json`, `.claude/settings.local.json`); the same places are checked
+again at each attempt, with the attempt's own environment and work tree, and a file found only then makes
+that attempt an infra failure (`setup_failed`) without starting the engine. Engine arguments that set a
+fallback model or a main-thread agent are refused as well. A paired comparison refuses two records that differ in these settings, the engine
 version, the runner, the evaluated commit, the protocol or the analysis; and a record is scored only by
 the protocol and analysis version it names: a record of any other version is refused, never scored by
 this one.
@@ -74,8 +84,10 @@ One command runs a pinned suite through each arm (`eval/run`). For every attempt
    (otherwise the attempt is an infra failure, `start_tree_mismatch`);
 3. the engine run in it with the prompt, at most the task's time limit, in its own process session; every
    process left in that session, whatever process group it moved to, is killed when the engine exits or
-   runs out of time, rescanning until none is left (a cleanup that cannot empty the session is
-   reported, and the attempt is not graded); variables passed to the engine can never replace the
+   runs out of time, rescanning until none is left, an empty scan confirmed by a fresh one; a cleanup
+   that cannot empty the session within 10 seconds, or that leaves the engine's output pipes held open by
+   a process outside the session, is reported at once, without waiting for the engine or its pipes, and
+   the attempt is not graded; no wait is unbounded; variables passed to the engine can never replace the
    attempt's TMPDIR, XDG_RUNTIME_DIR, HOME or PATH;
 4. the final diff taken against the start commit (new files included);
 5. the hidden tests written over the work tree (over whatever the engine left at those paths) and run;
@@ -187,7 +199,12 @@ be done and whose hidden tests did not pass.
 ## 8. Known limits
 
 - Every engine runs as the same operator: a held-out folder the operator can read, an engine can read.
-- A process an engine starts in a new session of its own is outside the session the runner kills.
+- A process an engine starts in a new session of its own is outside the session the runner kills (if it
+  still holds the engine's output, the attempt reports a cleanup failure); so is a chain of processes
+  each forking and exiting inside one scan of `/proc`.
+- Settings that are not files on this machine (server-managed settings an organization delivers, or on
+  WSL a Windows policy it inherits) are not checked; the operator runs on an account and machine with
+  none.
 - The grade is the hidden tests' exit code; tests that were wrong on the commit (grader defects) are
   caught only by the fail-on-parent, pass-on-commit check, not proven absent. A corrected grader is a new
   protocol version, and both scores are reported.
@@ -210,3 +227,8 @@ be done and whose hidden tests did not pass.
   screen needs a frozen suite too; held-out inputs are reached through no link and task folders hold
   none; session cleanup rescans and reports a failure; nothing is published by default. The analysis
   changed (`analyze.py`); the calculator did not.
+- 4 (Nov 14, 2026, answering the two third-round reads of #381; still before any measured run): the direct arm
+  runs only with no Claude Code settings file in effect (user folder, managed policy, task repository),
+  and refuses fallback-model and agent arguments; session cleanup confirms an empty scan with a fresh
+  one, reports a failure at once with no unbounded wait, and reports output pipes held open by a process
+  outside the session. Neither the analysis nor the calculator changed.

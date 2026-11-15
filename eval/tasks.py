@@ -80,6 +80,25 @@ class Task:
                     raise TaskError(f"task {self.id}: {member.name} is not a file, folder or symlink")
             archive.extractall(dest, filter="data")
 
+    def start_file(self, name: str) -> bytes | None:
+        """The bytes of the start tree's file ``name`` (a relative path), None when the start tree has no entry
+        there; TaskError when the entry is not a regular file or the start tree cannot be read."""
+        if self.start_files is not None:
+            return self.start_files.get(name)
+        if self.start_tar is None:
+            raise TaskError(f"task {self.id}: no start tree")
+        try:
+            with tarfile.open(self.start_tar) as archive:
+                for member in archive.getmembers():
+                    if os.path.normpath(member.name) != name:
+                        continue
+                    if not member.isfile():
+                        raise TaskError(f"task {self.id}: {name} in the start tree is not a regular file")
+                    return archive.extractfile(member).read()
+        except (OSError, tarfile.TarError) as exc:
+            raise TaskError(f"task {self.id}: start tree cannot be read: {exc}") from None
+        return None
+
     def write_hidden(self, work: Path) -> None:
         for name, data in self.hidden.items():
             path = work / safe_relpath(name)

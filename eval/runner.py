@@ -180,6 +180,9 @@ def run_attempt(ctx: Context, arm, task, index: int, *, planned: bool = True, re
             except arms_mod.EngineMissing as exc:
                 _set_error(trial, "engine_missing", str(exc))
                 return trial
+            except arms_mod.ArmRefused as exc:        # refused before the engine started (a settings file)
+                _set_error(trial, "setup_failed", str(exc))
+                return trial
             trial["run_id"] = outcome.run_id
             trial["engine"] = {"exit": outcome.exit, "signal": outcome.signal, "timed_out": outcome.timed_out,
                                "claimed_done": outcome.claimed_done}
@@ -373,6 +376,7 @@ def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements:
     for arm in arms:
         try:
             arm.preflight()
+            arm.check_tasks(suite.tasks)
             version = arm.engine_version()
             pinned = suite.engines.get(arm.engine)
             if suite.frozen and not (isinstance(pinned, str) and pinned):

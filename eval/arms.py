@@ -35,13 +35,27 @@ PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions", "manual", "dontA
 # is refused (PROTOCOL.md, section 1).
 ALLOWED_PASS_ENV = ("CLAUDE_CONFIG_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "SSL_CERT_FILE",
                     "NODE_EXTRA_CA_CERTS")
-# Engine arguments that would set what a named setting sets; the named setting is the only way.
+# Engine arguments that would set what a named setting sets; the named setting is the only way. A fallback
+# model or a main-thread agent can change the model the run uses.
 OVERRIDING_ARGS = ("--effort", "--model", "--permission-mode", "--settings", "--dangerously-skip-permissions",
-                   "--allow-dangerously-skip-permissions")
+                   "--allow-dangerously-skip-permissions", "--fallback-model", "--agent")
+# Settings files Claude Code loads besides its flags (its documentation, "Settings files and precedence" and
+# "Deploy managed settings"): the user file in its configuration folder, the task repository's shared and
+# local files, and the machine's managed policy. Any of them can set the effort, the model, the permission
+# mode or an environment variable over the recorded flags (an `env` entry replaces the inherited variable
+# after launch, and CLAUDE_CODE_EFFORT_LEVEL outranks --effort), so the direct arm runs Claude Code only with
+# none of them in effect (PROTOCOL.md, section 1).
+MANAGED_SETTINGS = (Path("/etc/claude-code/managed-settings.json"), Path("/etc/claude-code/managed-settings.d"))
+PROJECT_SETTINGS = (".claude/settings.json", ".claude/settings.local.json")
+# How long, after the engine's session is empty, its leader may take to be reaped and its pipes to end.
+CLEANUP_GRACE_S = 5.0
 
 
 class SessionCleanupError(RuntimeError):
-    """Processes of an engine's session were still alive when cleanup gave up."""
+    """Processes of an engine's session were still alive when cleanup gave up, or its output pipes were still
+    held open after the session was empty."""
+
+
 INFRA_RESULT_ERRORS = {
     "rate_limit": "vendor_limit",
     "authentication_failed": "auth_failed",
@@ -91,7 +105,13 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
     engine started, and on timeout the engine itself), so pipes close and nothing outlives the attempt
     inside the session. Waiting on the process rather than on end-of-output means a helper that holds
     stdout cannot turn a finished run into a timeout. A process that started a session of its own
-    (setsid) is out of reach; PROTOCOL.md names it.
+    (setsid) is out of reach (PROTOCOL.md names it); if it still holds the engine's output when the session
+    is empty, that is reported as a cleanup failure.
+
+    No wait is unbounded. A cleanup failure is raised at once: no wait for the engine, which may never
+    exit, and none for its pipes, which a survivor may hold. Each reader thread closes its own pipe at the
+    end of output (closing a pipe from here would wait for a read blocked on it); the threads are daemons,
+    and the Popen object reaps the engine whenever it does exit.
     Times are monotonic.
     """
     started = time.monotonic()
@@ -103,8 +123,14 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
     chunks: dict = {"stdout": [], "stderr": []}
 
     def read(name, pipe):
-        for block in iter(lambda: pipe.read(65536), b""):
-            chunks[name].append(block)
+        try:
+            for block in iter(lambda: pipe.read(65536), b""):
+                chunks[name].append(block)
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
 
     def feed():
         try:
@@ -118,32 +144,39 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
             except OSError:
                 pass
 
-    threads = [threading.Thread(target=read, args=("stdout", process.stdout), daemon=True),
-               threading.Thread(target=read, args=("stderr", process.stderr), daemon=True),
-               threading.Thread(target=feed, daemon=True)]
+    threads = [threading.Thread(target=read, args=("stdout", process.stdout), name="stdout", daemon=True),
+               threading.Thread(target=read, args=("stderr", process.stderr), name="stderr", daemon=True),
+               threading.Thread(target=feed, name="stdin", daemon=True)]
     for thread in threads:
         thread.start()
     timed_out = False
-    cleanup_error = None
     try:
         process.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         timed_out = True
-    finally:
+    except BaseException as exc:
+        # An interruption is what is reported; the session is emptied first, as far as it can be.
         try:
             _kill_session(process.pid)
-        except SessionCleanupError as exc:
-            cleanup_error = exc
-        process.wait()
+        except SessionCleanupError as cleanup:
+            exc.add_note(f"cleanup after the interruption: {cleanup}")
+        raise
+    _kill_session(process.pid)
+    # The session is empty, so its leader, which can leave neither its session nor its process group, has
+    # exited: this wait ends at once. It is bounded all the same.
+    try:
+        process.wait(timeout=CLEANUP_GRACE_S)
+    except subprocess.TimeoutExpired:
+        raise SessionCleanupError(f"the engine (process {process.pid}) was not reaped {CLEANUP_GRACE_S:g} s after "
+                                  "its session was emptied") from None
+    deadline = time.monotonic() + CLEANUP_GRACE_S
     for thread in threads:
-        thread.join(timeout=30)
-    for pipe in (process.stdout, process.stderr):
-        try:
-            pipe.close()
-        except OSError:
-            pass
-    if cleanup_error is not None:
-        raise cleanup_error
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    held = [thread.name for thread in threads if thread.is_alive()]
+    if held:
+        raise SessionCleanupError(f"the engine's {' and '.join(held)} still open {CLEANUP_GRACE_S:g} s after its "
+                                  "session was emptied: a process outside the session (one that started a session "
+                                  "of its own) holds it")
     code = process.returncode
     return {
         "exit": code if code is not None and code >= 0 else None,
@@ -179,9 +212,14 @@ def _session_members(sid: int) -> list:
 
 
 def _kill_session(sid: int) -> None:
-    """Kill every live process of session ``sid``, in any process group, rescanning until none is left
-    (a process forked between a scan and a kill is found by the next scan). The session is the engine's
-    own (start_new_session), never the runner's. SessionCleanupError if any is still alive after 10 s."""
+    """Kill every live process of session ``sid``, in any process group, rescanning until none is left.
+
+    A process forked between a scan and a kill is found by the next scan, and a killed one forks no more.
+    A scan that finds none is confirmed by a fresh one before returning: a process that forks and exits
+    while a scan reads /proc hides its child from that scan, never from the next (the child exists before
+    its parent exits, so before the next listing). A chain of such exits, each inside one scan, is out of
+    reach like a new session (PROTOCOL.md names both). The session is the engine's own
+    (start_new_session), never the runner's. SessionCleanupError if any is still alive after 10 s."""
     if sid == os.getsid(0):
         raise RuntimeError("refusing to kill the runner's own session")
     try:
@@ -191,10 +229,16 @@ def _kill_session(sid: int) -> None:
     if not os.path.isdir("/proc"):
         return
     deadline = time.monotonic() + 10
+    empty = 0
     while True:
         members = _session_members(sid)
         if not members:
-            return
+            empty += 1
+            if empty == 2:
+                return
+            time.sleep(0.01)
+            continue
+        empty = 0
         if time.monotonic() >= deadline:
             raise SessionCleanupError(f"processes {members} of the engine's session {sid} survived cleanup")
         for pid in members:
@@ -203,6 +247,47 @@ def _kill_session(sid: int) -> None:
             except (ProcessLookupError, PermissionError):
                 pass
         time.sleep(0.01)
+
+
+def _sets_something(data: bytes) -> bool:
+    """False only for a settings file that sets nothing: an empty object, or one holding only "$schema"."""
+    try:
+        value = json.loads(data)
+    except ValueError:
+        return True
+    return not (isinstance(value, dict) and set(value) <= {"$schema"})
+
+
+def settings_in_effect(paths) -> list:
+    """Those of ``paths`` (settings files, or folders of *.json settings files) that set something or cannot
+    be read (Claude Code may read what this cannot). An absent path is no setting."""
+    found = []
+    for path in map(Path, paths):
+        if path.is_dir():
+            try:
+                inside = sorted(item for item in path.iterdir() if item.suffix == ".json")
+            except OSError:
+                found.append(str(path))
+                continue
+            found += settings_in_effect(inside)
+            continue
+        if not os.path.lexists(path):
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            found.append(str(path))
+            continue
+        if _sets_something(data):
+            found.append(str(path))
+    return found
+
+
+def _settings_refusal(found: list) -> str:
+    return (f"direct arm (claude_code): Claude Code settings in effect: {'; '.join(found)}. A settings file can "
+            "set the effort, the model, the permission mode or an environment variable over the recorded flags, "
+            "so the direct arm runs only with none (an empty object, or one holding only \"$schema\", sets "
+            "nothing)")
 
 
 def _count(value):
@@ -286,6 +371,9 @@ class Arm:
     def preflight(self) -> None:
         raise NotImplementedError
 
+    def check_tasks(self, tasks) -> None:
+        """Before any attempt: ArmRefused if a task's start tree would change what the arm runs."""
+
     def engine_version(self) -> str | None:
         raise NotImplementedError
 
@@ -340,6 +428,40 @@ class DirectArm(Arm):
                 raise ArmRefused("direct arm (claude_code): a model is required, the same one the Recursion arm uses")
             if shutil.which(self.claude.binary) is None:
                 raise ArmRefused(f"direct arm (claude_code): {self.claude.binary!r} is not on PATH")
+            found = settings_in_effect(list(MANAGED_SETTINGS) + self._user_settings(None))
+            if found:
+                raise ArmRefused(_settings_refusal(found))
+
+    def _user_settings(self, env: dict | None) -> list:
+        """The user settings file the engine reads: in CLAUDE_CONFIG_DIR when that is passed, else in
+        HOME/.claude. Before an attempt (``env`` None) HOME is the route home; without one it is the
+        attempt's fresh scratch home, checked at the attempt."""
+        if env is not None:
+            given = env.get("CLAUDE_CONFIG_DIR")
+            return [(Path(given) if given else Path(env["HOME"]) / ".claude") / "settings.json"]
+        if "CLAUDE_CONFIG_DIR" in self.claude.pass_env and os.environ.get("CLAUDE_CONFIG_DIR"):
+            return [Path(os.environ["CLAUDE_CONFIG_DIR"]) / "settings.json"]
+        if self.claude.home:
+            return [Path(self.claude.home) / ".claude" / "settings.json"]
+        return []
+
+    def check_tasks(self, tasks) -> None:
+        """No task's start tree may hold a project settings file that sets something: Claude Code would load
+        it from the task repository over the recorded flags."""
+        if self.engine != "claude_code":
+            return
+        found = []
+        for task in tasks:
+            for name in PROJECT_SETTINGS:
+                try:
+                    data = task.start_file(name)
+                except ValueError:                 # TaskError: there, but not a regular file
+                    found.append(f"task {task.id}: {name}")
+                    continue
+                if data is not None and _sets_something(data):
+                    found.append(f"task {task.id}: {name}")
+        if found:
+            raise ArmRefused(_settings_refusal(found))
 
     def engine_version(self) -> str | None:
         if self.engine == "standin":
@@ -365,6 +487,13 @@ class DirectArm(Arm):
             home = Path(self.claude.home) if self.claude.home else None
             extra = {name: os.environ[name] for name in self.claude.pass_env if name in os.environ}
         env = scratch_mod.environment(scratch, home=home, extra=extra)
+        if self.engine == "claude_code":
+            # Again at the attempt, with the environment the engine gets and the task repository it works in:
+            # nothing it would load may have appeared since the checks before the run.
+            found = settings_in_effect(list(MANAGED_SETTINGS) + self._user_settings(env)
+                                       + [work / name for name in PROJECT_SETTINGS])
+            if found:
+                raise ArmRefused(_settings_refusal(found))
         message = json.dumps({"type": "user", "message": {"role": "user", "content": [
             {"type": "text", "text": task.prompt}]}}) + "\n"
         done = run_process(self.argv(), cwd=work, env=env, stdin=message.encode("utf-8"), timeout_s=task.timeout_s)

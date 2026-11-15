@@ -166,11 +166,14 @@ class Relay:
         return reply
 
     def handle(self, request: Message) -> Message:
-        """One frame in, one frame out. Never raises: anything unexpected is "delivery unknown"."""
+        """One frame in, one frame out. Never raises: a request that is not an object is refused unsent
+        (``bad_frame``); anything unexpected after that is "delivery unknown"."""
         return self._handle(request)[0]
 
     def _handle(self, request: Message) -> tuple[Message, bool]:
         """The answer, and whether the request may have reached the daemon (the socket was connected)."""
+        if not isinstance(request, dict):
+            return relay_error("bad_frame", delivered=False, detail="frame_not_object"), False
         try:
             op = request.get("op")
             if isinstance(op, str) and op.startswith(RELAY_OP_PREFIX):
@@ -286,7 +289,8 @@ def main(
         return EXIT_REFUSED
     try:
         relay = Relay(args.socket, environ=environ, key_label=args.key_label, connect=connect)
-    except (RemoteBindRefused, InsecureSocketPath, PlatformNotSupported, ValueError) as exc:
+    except (RemoteBindRefused, InsecureSocketPath, PlatformNotSupported, ValueError, OSError) as exc:
+        # OSError: a socket directory that cannot be looked at (its parent is a file, or not searchable).
         print(f"recursion relay: refused: {type(exc).__name__}: {exc}", file=err)
         return EXIT_REFUSED
     return relay.serve(sys.stdin.buffer if stdin is None else stdin, sys.stdout.buffer if stdout is None else stdout)

@@ -114,6 +114,13 @@ class DeviceTests(unittest.TestCase):
         self.assertEqual(self.book.check_connection([], "read").code, "connection_invalid")  # type: ignore[arg-type]
         self.book.disconnect([])  # type: ignore[arg-type]
 
+    def test_a_grant_whose_device_id_is_not_a_string_is_refused(self) -> None:
+        for device_id in ([], {}, 7, None, ""):
+            with self.subTest(device_id=device_id), self.assertRaises(PairingRefused) as caught:
+                self.book.add(grant(device_id), expires_at=self.clock.now + 60)  # type: ignore[arg-type]
+            self.assertEqual(caught.exception.code, "grant_invalid")
+        self.assertEqual([row["device_id"] for row in self.book.list()], ["dev_one"])
+
     def test_the_list_shows_state_and_no_secret(self) -> None:
         self.book.add(grant("dev_two", scopes=("read",), label="tablet"), expires_at=self.clock.now + 10)
         self.book.revoke("dev_one")

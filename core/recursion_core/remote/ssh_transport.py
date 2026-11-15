@@ -290,6 +290,10 @@ class SshRelayClient:
         timeout_s: float = DEFAULT_TIMEOUT_S,
         max_frame_bytes: int = MAX_FRAME_BYTES,
     ) -> None:
+        if not isinstance(target, SshTarget):
+            raise TypeError("target must be an SshTarget")
+        if type(max_frame_bytes) is not int or max_frame_bytes < 1:
+            raise ValueError("max_frame_bytes must be a positive integer")
         hello_timeout_s = _positive(hello_timeout_s, "hello_timeout_s")
         self._timeout_s = _positive(timeout_s, "timeout_s")
         pins = pinned_fingerprints(target.known_hosts, target.host, target.port)
@@ -568,6 +572,8 @@ class RelayAPI:
 
     def __init__(self, target: SshTarget | None = None, *, persistent: bool = False,
                  connect: Callable[[], Any] | None = None, **client_options: Any) -> None:
+        if target is not None and not isinstance(target, SshTarget):
+            raise TypeError("target must be an SshTarget")
         if connect is None:
             if target is None:
                 raise ValueError("RelayAPI needs a target or a connect function")

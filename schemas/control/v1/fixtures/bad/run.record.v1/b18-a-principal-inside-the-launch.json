@@ -1,0 +1,90 @@
+{
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "tenant": "t1",
+  "engine": "claude_code",
+  "state": "running",
+  "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/recursion-run-run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7.service",
+  "started_at": 1794555600.25,
+  "stop": null,
+  "start_key": {
+    "client_key": "k-1",
+    "engine": "claude_code",
+    "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3",
+    "intent_version": 1,
+    "intent_sha256": "c486511161020624e02e9a1000e6d675fba0aad2240ce6942398c10207b5e843"
+  },
+  "generation": 2,
+  "cgroup_marker": "cg-3c1f6f0a2b7d4e5f8a9b0c1d2e3f4a5b",
+  "members": [],
+  "stop_attestation": null,
+  "principal": {
+    "kind": "owner",
+    "id": "local"
+  },
+  "launch": {
+    "route_entry": {
+      "route": {
+        "engine": "claude_code",
+        "model": "claude-sonnet-5-5",
+        "connection": {
+          "kind": "subscription",
+          "id": "personal-max"
+        }
+      },
+      "deadline_s": 1800.0,
+      "binary": null
+    },
+    "route_decision": {
+      "chosen": {
+        "engine": "claude_code",
+        "model": "claude-sonnet-5-5",
+        "connection": {
+          "kind": "subscription",
+          "id": "personal-max"
+        }
+      },
+      "reason": "config",
+      "candidates": [
+        {
+          "engine": "codex",
+          "model": null,
+          "skipped": "breaker_open"
+        },
+        {
+          "engine": "claude_code",
+          "model": "claude-sonnet-5-5",
+          "skipped": null
+        }
+      ],
+      "hand_pick": null
+    },
+    "workspace": {
+      "mode": "worktree",
+      "source_path": "/home/dev/projects/atlas",
+      "base_ref": "refs/heads/main",
+      "worktree_path": "/home/dev/.local/state/recursion/worktrees/ses-7f3a9c2e51d04b6a"
+    },
+    "containment_level": "host_integrated",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "turn_id": "turn-000b",
+    "owner": "host",
+    "budget": {
+      "cap_usd": 5.0
+    },
+    "principal": {
+      "kind": "owner",
+      "id": "local"
+    }
+  },
+  "engine_session_id": "0d7c5a52-9a0e-4a43-9d57-5b9a1c6f2e11",
+  "continues": "run-0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+  "lease": {
+    "owner": "daemon",
+    "epoch": 3,
+    "expires_at": "2026-11-13T08:10:00.000Z"
+  },
+  "cgroup_identity": {
+    "st_dev": 27,
+    "st_ino": 18446
+  }
+}

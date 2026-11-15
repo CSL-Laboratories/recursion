@@ -1,0 +1,8 @@
+{
+  "tool": "T",
+  "cwd": null,
+  "input_text": "{\"k\": \"\\u0061\"}",
+  "expect": {
+    "call_text": "{\"cwd\":null,\"input\":{\"k\":\"a\"},\"tool\":\"T\"}"
+  }
+}

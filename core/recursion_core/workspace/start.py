@@ -14,17 +14,26 @@ the request's ``workspace`` (``methods.v1.json#/$defs/workspace_request``: ``pat
   ``request_invalid`` / ``workspace`` when the value is not a workspace request (not an object, no
   ``path``, a member the schema does not have, a ``mode`` outside ``direct`` and ``worktree``, a
   ``base_ref`` that is not a non-empty string); ``workspace_invalid`` / ``<reason>`` when the folder fails
-  a rule of ``validate.REASONS``, or ``not_a_repository`` when worktree mode is asked of a folder in no
-  git work tree, or ``base_ref_invalid`` when the base is not one this lane passes to git.
+  a rule of ``validate.REASONS``, or ``base_ref_invalid`` when the base is not one this lane passes to git,
+  or ``not_a_repository`` when worktree mode is asked of a folder in no git work tree, or ``not_unit_safe``
+  when the folder the run would WORK in could not be named in a unit (see below).
 
 THE MODE when the request gives none: ``worktree`` when the folder is inside a git work tree, ``direct``
 otherwise. That is the brief's recommended default (a), a question for Lucas that is still open; the
-normaliser takes it as ``default_mode='auto'`` and can be told ``'direct'``.
+normaliser takes it as ``default_mode='auto'`` and can be told ``'direct'`` or ``'worktree'``.
+
+THE FOLDER A RUN WORKS IN must hold only the characters the launcher can put in a unit
+(``validate.UNIT_PATH_SAFE``). In direct mode that is the folder asked for. In worktree mode it is the run's
+worktree under the state directory, ``<state_dir>/worktrees/<run_id>``, and in it the asked folder's place in
+its repository (a run asked to work in ``<top>/pkg`` works in ``<worktree>/pkg``); a run id is always a
+unit-safe word. So a repository named ``my project`` may be worked on in worktree mode, and not in direct mode,
+where the launcher would refuse it after the record exists.
 
 IT IS PURE. It creates no folder, worktree or branch, writes no file and appends no event: it reads the file
-system (``stat``, ``realpath``, and the ``.git`` marker of ``validate.git_work_tree``) and runs no git. A
-retried start never reaches it: the seam matches a retry on the client's raw request before any normaliser
-runs, so a worktree made for a failed start is found again by the provider, not here.
+system (``stat``, ``realpath``, and in a mode other than direct the ``.git`` files and folders
+``validate.git_work_tree`` reads, the way git's own discovery reads them) and runs no git. A retried start
+never reaches it: the seam matches a retry on the client's raw request before any normaliser runs, so a
+worktree made for a failed start is found again by the provider, not here.
 
 REGISTERING. ``register(hooks)`` declares the request field ``workspace`` and the snapshot key ``workspace``
 and nothing else. Nothing calls it in a running daemon yet: the composition imports a lane's
@@ -40,7 +49,7 @@ import os
 from pathlib import Path
 
 from recursion_core.control.hooks import Refusal
-from recursion_core.workspace.validate import WorkspaceInvalid, git_work_tree, valid_base_ref, validate
+from recursion_core.workspace.validate import WorkspaceInvalid, git_work_tree, unit_safe, valid_base_ref, validate
 
 NAME = 'workspace'
 FIELDS = ('workspace',)
@@ -85,11 +94,19 @@ class Normalizer:
             return Refusal('workspace_invalid', refused.reason)
         if base_ref is not None and not valid_base_ref(base_ref):
             return Refusal('workspace_invalid', 'base_ref_invalid')
-        in_git = git_work_tree(folder) is not None
-        if mode is None:
-            mode = self._default_mode if self._default_mode != 'auto' else ('worktree' if in_git else 'direct')
-        if mode == 'worktree' and not in_git:
-            return Refusal('workspace_invalid', 'not_a_repository')
+        if mode is None and self._default_mode != 'auto':
+            mode = self._default_mode
+        works_in = folder
+        if mode != 'direct':
+            top = git_work_tree(folder)
+            if top is None and mode == 'worktree':
+                return Refusal('workspace_invalid', 'not_a_repository')
+            if top is None:
+                mode = 'direct'
+            else:
+                mode, works_in = 'worktree', state_dir / 'worktrees' / folder.relative_to(top)
+        if not unit_safe(works_in):
+            return Refusal('workspace_invalid', 'not_unit_safe')
         return {'workspace': {'mode': mode, 'source_path': str(folder), 'base_ref': base_ref, 'worktree_path': None}}
 
 

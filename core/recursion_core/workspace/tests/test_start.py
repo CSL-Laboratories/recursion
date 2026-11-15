@@ -16,12 +16,13 @@ from unittest import mock
 
 from recursion_core.control import hooks as H
 from recursion_core.workspace import start as S
+from recursion_core.workspace.tests import repos
 from recursion_core.workspace.tests.published import fits
 
 POSIX = os.name == 'posix'
 
 
-@unittest.skipUnless(POSIX, 'the workspace checks are POSIX: the daemon runs on Linux')
+@unittest.skipUnless(POSIX and repos.HAVE_GIT, 'the workspace checks are POSIX, and the repository is made by git')
 class NormalizerTest(unittest.TestCase):
 
     def setUp(self) -> None:
@@ -31,13 +32,11 @@ class NormalizerTest(unittest.TestCase):
         self.state.mkdir()
         self.plain = self.root / 'plain'
         self.plain.mkdir()
-        self.repo = self.root / 'repo'
-        (self.repo / '.git').mkdir(parents=True)
-        (self.repo / '.git' / 'HEAD').write_text('ref: refs/heads/main\n')
-        (self.repo / 'pkg').mkdir()
-        self.normalize = S.Normalizer(state_dir=self.state)
         if S.git_work_tree(self.plain) is not None:
             self.skipTest('the temporary folder is itself inside a git work tree')
+        self.repo = self.root / 'repo'
+        repos.make_repo(self.repo, {'pkg/module.py': 'x = 1\n'})
+        self.normalize = S.Normalizer(state_dir=self.state)
 
     def ask(self, workspace, normalize=None, principal=H.OWNER):
         request = {'tenant': 't1', 'prompt': 'add a line', 'workspace': workspace}
@@ -82,6 +81,55 @@ class NormalizerTest(unittest.TestCase):
         link.symlink_to(self.repo)
         self.assertEqual(self.ask({'path': str(link)}), self.launch('worktree', self.repo))
         self.assertEqual(self.ask({'path': str(self.plain) + '/'}), self.launch('direct', self.plain))
+
+    def test_the_mode_follows_what_git_itself_would_find(self) -> None:
+        linked = self.root / 'linked-admin'
+        repos.make_repo(linked)
+        (linked / '.git').rename(self.root / 'admin')
+        (linked / '.git').symlink_to(self.root / 'admin', target_is_directory=True)
+        self.assertEqual(self.ask({'path': str(linked)}), self.launch('worktree', linked))
+        marker = self.root / 'marker-only'
+        (marker / '.git').mkdir(parents=True)
+        (marker / '.git' / 'HEAD').write_text('ref: refs/heads/main\n')
+        self.assertEqual(self.ask({'path': str(marker)}), self.launch('direct', marker))
+        self.assertEqual(self.ask({'path': str(marker), 'mode': 'worktree'}),
+                         H.Refusal('workspace_invalid', 'not_a_repository'))
+
+    def test_direct_mode_reads_no_git_metadata(self) -> None:
+        def no_git(folder):
+            raise AssertionError('direct mode read git metadata')
+        with mock.patch.object(S, 'git_work_tree', no_git):
+            self.assertEqual(self.ask({'path': str(self.repo), 'mode': 'direct'}), self.launch('direct', self.repo))
+            direct = S.Normalizer(state_dir=self.state, default_mode='direct')
+            self.assertEqual(self.ask({'path': str(self.repo)}, direct), self.launch('direct', self.repo))
+
+    # -- the folder a run works in --------------------------------------------------------------------
+    def test_a_worktree_source_may_hold_any_character_the_folder_a_run_works_in_may_not(self) -> None:
+        for name in ('project with spaces', 'caf\u00e9'):
+            source = self.root / name
+            repos.make_repo(source)
+            for value in ({'path': str(source)}, {'path': str(source), 'mode': 'worktree'}):
+                self.assertEqual(self.ask(value), self.launch('worktree', source), value)
+            self.assertEqual(self.ask({'path': str(source), 'mode': 'direct'}),
+                             H.Refusal('workspace_invalid', 'not_unit_safe'), name)
+        plain = self.root / 'plain folder'
+        plain.mkdir()
+        self.assertEqual(self.ask({'path': str(plain)}), H.Refusal('workspace_invalid', 'not_unit_safe'))
+
+    def test_in_worktree_mode_the_run_works_in_the_folders_place_in_its_worktree(self) -> None:
+        (self.repo / 'sub dir').mkdir()
+        self.assertEqual(self.ask({'path': str(self.repo / 'sub dir')}), H.Refusal('workspace_invalid', 'not_unit_safe'))
+        self.assertEqual(self.ask({'path': str(self.repo / 'sub dir'), 'mode': 'direct'}),
+                         H.Refusal('workspace_invalid', 'not_unit_safe'))
+        self.assertEqual(self.ask({'path': str(self.repo / 'pkg')}), self.launch('worktree', self.repo / 'pkg'))
+
+    def test_in_worktree_mode_the_state_directory_is_part_of_the_folder_a_run_works_in(self) -> None:
+        state = self.root / 'state dir'
+        state.mkdir()
+        normalize = S.Normalizer(state_dir=state)
+        self.assertEqual(self.ask({'path': str(self.repo)}, normalize), H.Refusal('workspace_invalid', 'not_unit_safe'))
+        self.assertEqual(self.ask({'path': str(self.repo), 'mode': 'direct'}, normalize), self.launch('direct', self.repo))
+        self.assertEqual(self.ask({'path': str(self.plain)}, normalize), self.launch('direct', self.plain))
 
     def test_a_base_ref_is_kept_as_given(self) -> None:
         self.assertEqual(self.ask({'path': str(self.repo), 'base_ref': 'origin/main~2'}),

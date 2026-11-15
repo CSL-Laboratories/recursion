@@ -28,13 +28,25 @@ every run runs as the operator. ``grant`` answers the id and changes nothing, an
 
 THE PER-RUN RECORD. A run's access to its folder is recorded in the event log as ``workspace.grant`` when
 the run is launched and ``workspace.revoke`` when it has ended, each ``{path, run_id}``
-(``event.v1.json#/$defs/workspace.grant``), from ``source`` core, in the run's log. ``Ledger`` writes them
-through the event store's transaction helper, in the caller's transaction, with one row per run in the
-lane's own table ``workspace_grant``: a grant recorded twice for one run (a retried launch) appends one
-event; a revoke is appended once, and only after a grant; ``unrevoked(tx)`` lists the runs whose grant has
-no revoke yet, which is what a startup reads after a crash. Nothing here opens a transaction: the caller
-owns it, passes it, and calls this outside every daemon, registry and run lock. Nothing calls the ledger in
-a running daemon yet; the provider that launches a run in its folder (seam S4) is the next pull request.
+(``event.v1.json#/$defs/workspace.grant``), from ``source`` core, in the run's log: its session's, or
+``run:<run_id>`` for a run with no session, never another run's. ``Ledger`` writes them through the event
+store's transaction helper, in the caller's transaction, with one row per run in the lane's own table
+``workspace_grant`` (``run_id`` its key; ``log_id`` and ``path``; ``granted_seq``, the seq of the grant that
+stands or stood last; ``revoked_seq``, the seq of its revoke, or null while it stands):
+
+- a grant recorded again while the run's grant stands (a launch asked twice) appends nothing;
+- a grant recorded after the run's revoke is a NEW grant: a start that failed after its grant and gave it
+  back is retried under the same run id (the seam relaunches the same run), so the grant is appended again
+  and the run counts as unrevoked again, which is what lets a startup after a crash find it;
+- a revoke ends the grant that stands, and is appended once for it; with none standing it appends nothing;
+- every grant of one run names the same folder and the same log: another path or log for a run already
+  recorded is refused (``ValueError('grant_conflict')``) before anything is written.
+
+``unrevoked(tx)`` lists the runs whose grant stands, which is what a startup reads after a crash. A revoke ends
+whichever grant of the run stands, so the caller that wires these (the next pull request) revokes an
+attempt's grant before that attempt's failure is answered; a retry's grant then always comes after it.
+Nothing here opens a transaction: the caller owns it, passes it, and calls this outside every daemon,
+registry and run lock. Nothing calls the ledger in a running daemon yet.
 """
 from __future__ import annotations
 
@@ -97,7 +109,7 @@ def _ids(run_id, log_id) -> str:
     if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
         raise ValueError('run_id_invalid')
     log = f'run:{run_id}' if log_id is None else log_id
-    if not isinstance(log, str) or not _LOG_ID.fullmatch(log):
+    if not isinstance(log, str) or not _LOG_ID.fullmatch(log) or (log.startswith('run:') and log != f'run:{run_id}'):
         raise ValueError('log_id_invalid')
     return log
 
@@ -105,7 +117,7 @@ def _ids(run_id, log_id) -> str:
 def access_event(kind: str, run_id: str, path: str, *, log_id: str | None = None) -> dict:
     """The ``workspace.grant`` or ``workspace.revoke`` event of a run, as the helper's ``append`` takes it: an
     event.v1 without ``seq`` and ``time``, which the helper assigns. ``log_id`` is the run's session, or
-    ``run:<run_id>`` for a run with no session (the default)."""
+    ``run:<run_id>`` for a run with no session (the default); another run's log raises ``ValueError``."""
     if kind not in ('workspace.grant', 'workspace.revoke'):
         raise ValueError('kind')
     log = _ids(run_id, log_id)
@@ -125,20 +137,29 @@ class Ledger:
 
     @staticmethod
     def granted(tx, run_id: str, path: str, *, log_id: str | None = None) -> int | None:
-        """Record that ``run_id`` was given ``path``, in ``tx``: the new event's seq, or None when this run's
-        grant was recorded before (nothing is appended again)."""
+        """Record that ``run_id`` was given ``path``, in ``tx``: the new event's seq, or None when the run's
+        grant stands already (nothing is appended again). After the run's revoke it is a new grant. Another path
+        or log for a run already recorded raises ``ValueError('grant_conflict')``. See the module's text."""
         event = access_event('workspace.grant', run_id, path, log_id=log_id)
-        if tx.execute('SELECT 1 FROM workspace_grant WHERE run_id = ?', (run_id,)):
+        rows = tx.execute('SELECT log_id, path, revoked_seq FROM workspace_grant WHERE run_id = ?', (run_id,))
+        if not rows:
+            seq = tx.append(event)
+            tx.execute('INSERT INTO workspace_grant (run_id, log_id, path, granted_seq, revoked_seq) '
+                       'VALUES (?, ?, ?, ?, NULL)', (run_id, event['session_id'], path, seq))
+            return seq
+        log, held, revoked = rows[0]
+        if (log, held) != (event['session_id'], path):
+            raise ValueError('grant_conflict')
+        if revoked is None:
             return None
         seq = tx.append(event)
-        tx.execute('INSERT INTO workspace_grant (run_id, log_id, path, granted_seq, revoked_seq) VALUES (?, ?, ?, ?, NULL)',
-                   (run_id, event['session_id'], path, seq))
+        tx.execute('UPDATE workspace_grant SET granted_seq = ?, revoked_seq = NULL WHERE run_id = ?', (seq, run_id))
         return seq
 
     @staticmethod
     def revoked(tx, run_id: str) -> int | None:
-        """Record that ``run_id`` lost its folder, in ``tx``: the new event's seq, or None when the run has no
-        grant, or its revoke was recorded before."""
+        """Record that ``run_id`` lost its folder, in ``tx``: the new event's seq, or None when no grant of the
+        run stands (none was recorded, or its revoke was)."""
         _ids(run_id, None)
         rows = tx.execute('SELECT log_id, path FROM workspace_grant WHERE run_id = ? AND revoked_seq IS NULL', (run_id,))
         if not rows:
@@ -150,6 +171,6 @@ class Ledger:
 
     @staticmethod
     def unrevoked(tx) -> list:
-        """``[(run_id, log_id, path), ...]`` for every run whose grant has no revoke, by run id."""
+        """``[(run_id, log_id, path), ...]`` for every run whose grant stands (no revoke after it), by run id."""
         return [tuple(row) for row in
                 tx.execute('SELECT run_id, log_id, path FROM workspace_grant WHERE revoked_seq IS NULL ORDER BY run_id')]

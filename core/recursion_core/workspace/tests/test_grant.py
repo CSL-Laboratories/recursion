@@ -10,6 +10,7 @@ import inspect
 import os
 import pathlib
 import shutil
+import sqlite3
 import tempfile
 import unittest
 
@@ -103,6 +104,11 @@ class GrantTest(unittest.TestCase):
         if self.me != 0:
             self.refused(lambda: G.grant('/usr', self.me), 'path_invalid', 'not_owned')
 
+    def test_a_folder_named_with_any_character_may_be_granted(self) -> None:
+        spaced = self.root / 'my project'
+        spaced.mkdir()
+        self.assertEqual(G.grant(str(spaced), self.me), G.grant_id_of(spaced, self.me))
+
     def test_a_worktree_under_the_state_directory_may_be_granted(self) -> None:
         tree = self.root / 'state' / 'worktrees' / 'run-1'
         tree.mkdir(parents=True)
@@ -141,11 +147,69 @@ class LedgerTest(unittest.TestCase):
             {'session_id': 'run:run-1', 'run_id': 'run-1', 'turn_id': None, 'type': 'workspace.revoke',
              'source': 'core', 'trust': 'trusted', 'payload': {'path': '/home/dev/projects/atlas', 'run_id': 'run-1'}}])
 
-    def test_a_grant_recorded_again_for_one_run_appends_nothing(self) -> None:
+    def rows(self):
+        with self.store.transaction() as tx:
+            return [tuple(row) for row in tx.execute(
+                'SELECT run_id, log_id, path, granted_seq, revoked_seq FROM workspace_grant ORDER BY run_id')]
+
+    def test_a_grant_recorded_again_while_it_stands_appends_nothing(self) -> None:
         self.assertIsNotNone(self.granted('run-1', '/p'))
         self.assertIsNone(self.granted('run-1', '/p'))
-        self.assertIsNone(self.granted('run-1', '/other'))
         self.assertEqual([event['type'] for event in self.store.events], ['workspace.grant'])
+
+    def test_the_seqs_answered_are_the_events_and_the_row_keeps_them(self) -> None:
+        self.assertEqual(self.granted('run-a', '/a'), 1)
+        self.assertEqual(self.revoked('run-a'), 2)
+        self.assertEqual(self.granted('run-b', '/b', log_id='ses-x'), 3)
+        self.assertEqual(self.rows(), [('run-a', 'run:run-a', '/a', 1, 2), ('run-b', 'ses-x', '/b', 3, None)])
+
+    def test_a_grant_after_the_revoke_is_a_new_grant_and_the_run_stands_unrevoked_again(self) -> None:
+        # A start that failed after its grant gave it back; the seam retries it under the same run id.
+        self.assertEqual(self.granted('run-1', '/p', log_id='ses-s'), 1)
+        self.assertEqual(self.revoked('run-1'), 2)
+        self.assertEqual(self.unrevoked(), [])
+        self.assertEqual(self.granted('run-1', '/p', log_id='ses-s'), 3)
+        self.assertEqual(self.unrevoked(), [('run-1', 'ses-s', '/p')])
+        self.assertEqual(self.rows(), [('run-1', 'ses-s', '/p', 3, None)])
+        self.assertIsNone(self.granted('run-1', '/p', log_id='ses-s'))
+        self.assertEqual(self.revoked('run-1'), 4)
+        self.assertIsNone(self.revoked('run-1'))
+        self.assertEqual(self.unrevoked(), [])
+        self.assertEqual(self.rows(), [('run-1', 'ses-s', '/p', 3, 4)])
+        self.assertEqual([(event['type'], event['session_id']) for event in self.store.events],
+                         [('workspace.grant', 'ses-s'), ('workspace.revoke', 'ses-s')] * 2)
+
+    def test_another_folder_or_log_for_a_recorded_run_is_refused_before_anything_is_written(self) -> None:
+        self.granted('run-1', '/p', log_id='ses-s')
+        for path, log_id in (('/q', 'ses-s'), ('/p', 'ses-t'), ('/p', None)):
+            with self.assertRaisesRegex(ValueError, 'grant_conflict'):
+                self.granted('run-1', path, log_id=log_id)
+        self.revoked('run-1')
+        with self.assertRaisesRegex(ValueError, 'grant_conflict'):
+            self.granted('run-1', '/q', log_id='ses-s')
+        self.assertEqual([event['type'] for event in self.store.events], ['workspace.grant', 'workspace.revoke'])
+        self.assertEqual(self.rows(), [('run-1', 'ses-s', '/p', 1, 2)])
+
+    def test_a_run_with_no_session_is_logged_in_its_own_log_never_another_runs(self) -> None:
+        with self.assertRaisesRegex(ValueError, 'log_id_invalid'):
+            self.granted('run-a', '/p', log_id='run:run-b')
+        with self.assertRaisesRegex(ValueError, 'log_id_invalid'):
+            G.access_event('workspace.revoke', 'run-a', '/p', log_id='run:run-ab')
+        self.assertEqual(self.store.events, [])
+        self.assertEqual(self.granted('run-a', '/p', log_id='run:run-a'), 1)
+        self.assertEqual(self.store.events[0]['session_id'], 'run:run-a')
+
+    def test_a_revoke_is_asked_with_a_run_id_the_envelope_takes(self) -> None:
+        for run_id in ('bad run', '', 'r' * 65, 5, None):
+            with self.assertRaisesRegex(ValueError, 'run_id_invalid'):
+                self.revoked(run_id)
+
+    def test_the_table_keeps_one_row_per_run(self) -> None:
+        with self.assertRaises(sqlite3.IntegrityError):
+            with self.store.transaction() as tx:
+                tx.execute('INSERT INTO workspace_grant VALUES (?, ?, ?, ?, ?)', ('run-1', 'run:run-1', '/p', 1, None))
+                tx.execute('INSERT INTO workspace_grant VALUES (?, ?, ?, ?, ?)', ('run-1', 'run:run-1', '/p', 2, None))
+        self.assertEqual(self.rows(), [])
 
     def test_a_revoke_is_appended_once_and_only_after_a_grant(self) -> None:
         self.assertIsNone(self.revoked('run-1'))
@@ -177,14 +241,21 @@ class LedgerTest(unittest.TestCase):
 
     def test_ids_and_paths_that_break_the_envelope_are_refused_before_anything_is_written(self) -> None:
         for run_id, path, log_id in (('', '/p', None), ('run 1', '/p', None), ('r' * 65, '/p', None), (5, '/p', None),
-                                     ('run-1', '', None), ('run-1', None, None), ('run-1', '/p', 'run-1'),
-                                     ('run-1', '/p', 'ses-'), ('run-1', '/p', 5)):
+                                     ('run-1\n', '/p', None), ('run-1', '', None), ('run-1', None, None),
+                                     ('run-1', '/p', 'run-1'), ('run-1', '/p', 'ses-'), ('run-1', '/p', 5),
+                                     ('run-1', '/p', 'ses-' + 'a' * 61), ('run-1', '/p', 'ses-x\n'),
+                                     ('run-1', '/p', 'run:run-1\n'), ('run-1', '/p', 'ses-x y')):
             with self.assertRaises(ValueError):
                 self.granted(run_id, path, log_id=log_id)
         with self.assertRaises(ValueError):
             G.access_event('workspace.other', 'run-1', '/p')
         self.assertEqual(self.store.events, [])
         self.assertEqual(self.store.rows, {})
+
+    def test_the_longest_ids_the_envelope_takes_are_taken(self) -> None:
+        self.assertEqual(G.access_event('workspace.grant', 'r' * 64, '/p')['session_id'], 'run:' + 'r' * 64)
+        self.assertEqual(G.access_event('workspace.grant', 'run-1', '/p', log_id='ses-' + 'a' * 60)['session_id'],
+                         'ses-' + 'a' * 60)
 
     def test_the_events_are_published_event_records(self) -> None:
         if fits is None:

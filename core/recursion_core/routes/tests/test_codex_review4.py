@@ -1,5 +1,5 @@
 """Round 4 of the reads of #402 (lane DRIVER-CX): this lane's tests for DeepSeek V4.1 Flash's findings R4-1 to R4-3,
-and for each rule of the round-4 answer (each fails when its rule is taken out).
+and for each rule of the round-4 answer (each fails when its rule is taken out); and round 5's F1 (PortWaitOptionTest).
 
 Fakes only: no real codex, no credential, no network; every key below is made up. A test that waits on another
 thread gives it STUCK seconds before it calls it stuck; a passing run never waits that long.
@@ -15,6 +15,7 @@ import time
 import unittest
 from unittest import mock
 
+from recursion_core.routes.driver import DriverInputError
 from recursion_core.routes.engines import codex as cx
 from recursion_core.routes.tests import test_codex_attended as attended
 from recursion_core.routes.tests.fakes import FakeClock
@@ -262,6 +263,44 @@ class PortWaitTest(unittest.TestCase):
         self.assertEqual(len(port.requests), 1)
         driver.send(handle, ANSWER)
         self.assertEqual(answers(server, 77), [{"id": 77, "result": {"decision": "accept"}}])
+
+
+class PortWaitOptionTest(unittest.TestCase):
+    """Round 5, DeepSeek F1: ``port_wait_s`` is a number of seconds from 0 to ``threading.TIMEOUT_MAX``; anything else
+    is refused when the driver is made (DriverInputError), not first when the input is ended."""
+
+    def test_a_wrong_wait_is_refused_when_the_driver_is_made(self):
+        for value in ("0.5", None, float("nan"), float("inf"), 1e300, -1, -0.1, True, [1]):
+            with self.subTest(value=value):
+                with self.assertRaises(DriverInputError) as cm:
+                    cx.CodexDriver(Launcher(AppServer()), FakeClock(), port_wait_s=value)
+                self.assertEqual(cm.exception.field, "port_wait_s")
+
+    def test_a_number_of_seconds_is_taken(self):
+        for value in (0, 0.0, 0.25, 2, cx.PORT_WAIT_S, threading.TIMEOUT_MAX):
+            with self.subTest(value=value):
+                cx.CodexDriver(Launcher(AppServer()), FakeClock(), port_wait_s=value)
+
+    def test_a_wait_of_zero_ends_the_input_without_waiting_for_the_port(self):
+        entered, go = threading.Event(), threading.Event()
+
+        class Port(FakeApprovals):
+            def request(inner, effect, binding):
+                entered.set()
+                go.wait(STUCK)
+                return super().request(effect, binding)
+        server, driver, handle, _ = opened(Port(), port_wait_s=0)
+        reader, reader_errors = in_thread(lambda: feed(driver, handle, ask_command()("trn-1")))
+        self.assertTrue(entered.wait(STUCK))
+        try:
+            driver.send(handle, {"kind": "close"})  # returns at once: the port is still being asked
+            self.assertTrue(server.stdin_closed)
+            self.assertTrue(reader.is_alive())
+        finally:
+            go.set()
+            reader.join(STUCK)
+        self.assertEqual(reader_errors, [])
+        self.assertEqual(handle._codex.bindings, {})
 
 
 class ToolChildEnvTest(unittest.TestCase):

@@ -87,7 +87,8 @@ interruption goes on. An approval id the gate would refuse in ``approval_answer`
 approval whose turn ended, or whose request the server settled, while the port was asked is not kept and
 nothing is written for it. ``close`` ends the input at once, and once it has returned no request is put to
 the port that was not with it already: it waits for one in flight, for at most ``port_wait_s`` seconds (an
-option of the driver, ``PORT_WAIT_S`` unless given), and nothing that call opens is kept. A request read
+option of the driver, ``PORT_WAIT_S`` unless given: a number of seconds from 0 to ``threading.TIMEOUT_MAX``,
+or the driver is not made, ``DriverInputError("port_wait_s")``), and nothing that call opens is kept. A request read
 while another is with the port waits for it as long at most, then is declined. The port must not call back
 into the driver: ``send`` or ``interrupt`` from inside its call, on the thread that is asking it, is refused
 (``DriverStateError``), and an approval request read there is declined, instead of waiting for ever on a
@@ -224,7 +225,8 @@ class _Session:
     def close(self, wait_s: float | None = None) -> None:
         """End standard input at once. Nothing is written after this, held writes included, and no request is
         put to the approvals port after this returns that was not with it already: a port call in flight is
-        waited for, for at most ``wait_s`` seconds (None: without a bound), and nothing it opens is kept (the
+        waited for, for at most ``wait_s`` seconds (None: without a bound; the driver always passes its checked
+        ``port_wait_s``), and nothing it opens is kept (the
         #402 reads, round 4, DeepSeek R4-2: a port that waits for a thread which closes the worker no longer
         holds it for good)."""
 
@@ -249,7 +251,7 @@ class CodexDriver(Driver):
                  approvals=None, port_wait_s: float = PORT_WAIT_S) -> None:
         self._launcher, self._clock, self._binary = launcher, clock, binary
         self._start_timeout_s = start_timeout_s
-        self._port_wait_s = port_wait_s
+        self._port_wait_s = _seconds(port_wait_s, "port_wait_s")  # checked here, not first when the input ends
         self._wall = wall_clock or time.time
         self._approvals = approvals
         if approvals is not None:
@@ -935,6 +937,15 @@ def _adopt(session: _Session, core_turn: str, engine_turn: str) -> bool:
     session.core_turn[engine_turn] = core_turn
     session.flushing.add(core_turn)  # a write sent from now on queues behind the held ones
     return True
+
+
+def _seconds(value: object, field: str) -> float:
+    """A number of seconds a lock wait can take, 0 to ``threading.TIMEOUT_MAX``, or ``DriverInputError(field)``
+    (the #402 reads, round 5, DeepSeek F1: a string, NaN or infinity failed only once the input had ended)."""
+
+    if type(value) not in (int, float) or not 0 <= value <= threading.TIMEOUT_MAX:
+        raise DriverInputError(field)
+    return float(value)
 
 
 @contextlib.contextmanager

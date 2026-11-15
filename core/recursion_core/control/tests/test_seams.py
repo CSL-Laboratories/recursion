@@ -476,6 +476,41 @@ CORE_PACKAGES = ('recursion_core', 'recursion_core.control', 'recursion_core.rou
 REGISTERS_NOTHING = 'def register(hooks):\n    pass\n'
 
 
+def landed(case: unittest.TestCase, text: str):
+    """A module that plays a lane's REAL ``control.scopes``, for one test, already imported. It is put before
+    whatever this tree has under that name (and before a stand-in a fixture gave that), so the test is the same
+    whether or not a lane's real module has landed; a fixture made afterwards mounts its fakes before it in turn.
+    ``(the module, a fixture of its own, the call that cleans that fixture)``. Also used by the daemon-side tests."""
+    folder = tempfile.mkdtemp(prefix='seam-real-registrant-')
+    control = importlib.import_module('recursion_core.control')
+    pathlib.Path(folder, 'scopes.py').write_text(text, encoding='utf-8')
+
+    def unmount() -> None:
+        control.__path__.remove(folder)
+        sys.modules.pop('recursion_core.control.scopes', None)
+        if hasattr(control, 'scopes'):
+            del control.scopes
+        shutil.rmtree(folder, True)
+        importlib.invalidate_caches()
+    sys.modules.pop('recursion_core.control.scopes', None)
+    control.__path__.insert(0, folder)
+    case.addCleanup(unmount)
+    importlib.invalidate_caches()
+    real = importlib.import_module('recursion_core.control.scopes')
+    case.assertTrue(real.REAL, 'the module that plays the real one is the one imported before any fake')
+    calls: list = []
+    fake = FakeLanes(mock.Mock(addCleanup=calls.append))    # cleaned by the test itself, not at its end
+
+    def clean() -> None:
+        while calls:
+            calls.pop()()
+    case.addCleanup(clean)
+    return real, fake, clean
+
+
+LANDED_WITH_AN_ENGINE = "REAL = True\n\n\ndef register(hooks):\n    hooks.engines.register('grok', lambda *a, **k: None)\n"
+
+
 class RegistrationTest(unittest.TestCase):
     """Absent is not broken, and absent is decided before the import."""
 
@@ -484,35 +519,7 @@ class RegistrationTest(unittest.TestCase):
         self.fake.stand_in_for_the_installed()      # a registrant that has landed registers nothing in these tests
 
     def landed(self, text: str):
-        """A module that plays a lane's REAL ``control.scopes``, for one test, already imported. It is put before
-        whatever this tree has under that name (and before the stand-in the fixture gave that), so the test is the
-        same whether or not a lane's real module has landed; a fixture made afterwards mounts its fakes before it
-        in turn. ``(the module, a fixture of its own, the call that cleans that fixture)``."""
-        folder = tempfile.mkdtemp(prefix='seam-real-registrant-')
-        control = importlib.import_module('recursion_core.control')
-        pathlib.Path(folder, 'scopes.py').write_text(text, encoding='utf-8')
-
-        def unmount() -> None:
-            control.__path__.remove(folder)
-            sys.modules.pop('recursion_core.control.scopes', None)
-            if hasattr(control, 'scopes'):
-                del control.scopes
-            shutil.rmtree(folder, True)
-            importlib.invalidate_caches()
-        sys.modules.pop('recursion_core.control.scopes', None)
-        control.__path__.insert(0, folder)
-        self.addCleanup(unmount)
-        importlib.invalidate_caches()
-        real = importlib.import_module('recursion_core.control.scopes')
-        self.assertTrue(real.REAL, 'the module that plays the real one is the one imported before any fake')
-        calls: list = []
-        fake = FakeLanes(mock.Mock(addCleanup=calls.append))    # cleaned by the test itself, not at its end
-
-        def clean() -> None:
-            while calls:
-                calls.pop()()
-        self.addCleanup(clean)
-        return real, fake, clean
+        return landed(self, text)
 
     def test_a_fake_registrant_stands_in_for_a_real_module_of_its_name_and_the_real_one_is_put_back(self) -> None:
         """A registrant can be a module of the core itself (``control.scopes``), and one day a lane's real one is
@@ -541,7 +548,7 @@ class RegistrationTest(unittest.TestCase):
         """These tests are about the fakes they install. A lane's real registrant, once it is in the tree, would
         register into every composition here; the fixture gives each one that is installed a stand-in that
         registers nothing, and puts the real one back afterwards."""
-        real, fake, clean = self.landed("REAL = True\n\n\ndef register(hooks):\n    hooks.engines.register('grok', lambda *a, **k: None)\n")
+        real, fake, clean = self.landed(LANDED_WITH_AN_ENGINE)
         self.assertIn('grok', H.compose().engines.names(), 'it is installed: a composition finds it')
         fake.stand_in_for_the_installed()
         self.assertEqual(H.compose().engines.names(), ('claude_code', 'codex'))
@@ -3927,10 +3934,32 @@ class AncestorDiscoveryTest(unittest.TestCase):
     """A registrant whose parent's own parent is not installed is absent, not broken (the read's note 4)."""
 
     def test_an_absent_ancestor_is_absence_and_a_broken_installed_one_fails(self) -> None:
+        """Whatever lanes this tree has, now or later. Every registrant that is really here gets a stand-in that
+        registers nothing, and the ancestor's absence is made for the test: where the composition asks whether
+        that package, or anything below it, is there, it is told no. (It used to rely on that package not being
+        in the tree, and on no lane having landed at all: a real registrant's methods made it fail.) Then the
+        ancestor is installed and broken, as a fake under its real name, and the composition fails.
+
+        So that the stand-ins are held by this test itself, a module that plays another lane's real registrant
+        is in the tree before the fixture is made: without the stand-ins its engine would be composed."""
+        ancestor = 'recursion_core.control.mcp'
+        landed(self, LANDED_WITH_AN_ENGINE)
         fake = FakeLanes(self)
-        self.assertIsNone(importlib.util.find_spec('recursion_core.control.mcp'), 'that ancestor is absent in this tree')
-        made = H.compose()
-        self.assertEqual(made.methods.registered(), ())
+        fake.stand_in_for_the_installed()
+        find_spec, asked = importlib.util.find_spec, []
+
+        def absent(name, package=None):
+            asked.append(name)
+            return None if name == ancestor or name.startswith(ancestor + '.') else find_spec(name, package)
+        before = set(sys.modules)
+        with mock.patch.object(importlib.util, 'find_spec', absent):
+            made = H.compose()
+        self.assertEqual((made.methods.registered(), made.commands.names(), made.engines.names()),
+                         ((), (), ('claude_code', 'codex')))
+        self.assertEqual([name for name in asked if name.startswith(ancestor)], [ancestor],
+                         'absent is decided at the ancestor: the module below it is not asked for')
+        self.assertEqual({name for name in set(sys.modules) - before if name.startswith(ancestor)}, set(),
+                         'and nothing of it is imported')
         fake.lane('control.mcp', init='raise RuntimeError("this package does not import")\n')
         with self.assertRaises(H.HookError):
             H.compose()

@@ -7,6 +7,7 @@ the documented arguments. With nothing registered the composition is the one it 
 """
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -22,7 +23,8 @@ import recursion_core.daemon as daemon_module
 from recursion_core.control import hooks as H, methods
 from recursion_core.control.client import SocketAPI
 from recursion_core.control.tests.test_seams import (
-    FakeStore, RegionWalk, Service, WatchedLock as OwnerLock, answered_from_another_thread, quiet, row_names_service, watch)
+    LANDED_WITH_AN_ENGINE, FakeLanes, FakeStore, RegionWalk, Service, WatchedLock as OwnerLock,
+    answered_from_another_thread, landed, quiet, row_names_service, watch)
 from recursion_core.daemon import Daemon, Registry, control_adapter as adapter, launcher
 from recursion_core.daemon.tests.test_composition import (
     BOOT, LINUX, LINUX_ONLY, STANDIN, ProcessUnitManager, Units, until,
@@ -96,9 +98,16 @@ def close_waits(case, made, store, close, entered, leave, admitted=1):
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)
 class Composed(unittest.TestCase):
-    """A composed daemon, as in ``test_composition.ComposedDaemonTest``."""
+    """A composed daemon, as in ``test_composition.ComposedDaemonTest``.
+
+    A ``boot()`` that is given no hooks composes them from the installed registrants, which is the daemon's own
+    path. These tests are about a tree in which no lane has landed, whatever this tree holds on the day they run:
+    every registrant that is really here gets a stand-in that registers nothing, for the test (the fixture of the
+    control-side tests). A test's own fake lane is installed over that. Each lane tests its own registration."""
 
     def setUp(self):
+        self.lanes = FakeLanes(self)                # made first, so it is cleaned last: after the composition has closed
+        self.lanes.stand_in_for_the_installed()
         self.tmp = Path(tempfile.mkdtemp(prefix='rc-seams-'))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         os.chmod(self.tmp, 0o700)
@@ -244,7 +253,6 @@ class NothingRegisteredTest(Composed):
     def test_a_registrant_that_is_absent_changes_nothing_and_one_that_is_broken_stops_the_composition(self):
         # The composition imports its registrants by their own names, so a lane is faked under its real name, for
         # as long as the block lasts.
-        from recursion_core.control.tests.test_seams import FakeLanes
         with contextlib.ExitStack() as installed:
             lanes = FakeLanes(mock.Mock(addCleanup=installed.callback))
             lanes.lane('keys')                                                # a lane's package with no hooks module
@@ -263,6 +271,23 @@ class NothingRegisteredTest(Composed):
                 self.assertEqual(self.open, [])
         _, composed = self.boot()  # and the next composition starts
         self.assertEqual(self.api(composed).call('run.list')['code'], 'ok')
+
+
+class LandedLaneTest(Composed):
+    """What ``Composed.setUp`` promises, held: a lane that has really landed does not change what these tests
+    compose. A module that plays a lane's real registrant is in the tree BEFORE the fixture is made."""
+
+    def setUp(self):
+        real, _, _ = landed(self, LANDED_WITH_AN_ENGINE)
+        self.assertEqual(importlib.util.find_spec('recursion_core.control.scopes').origin, real.__file__,
+                         'it is installed: a composition would find it, and its engine')
+        super().setUp()
+
+    def test_a_boot_that_is_given_no_hooks_is_the_bare_composition_whatever_has_landed(self):
+        _, composed = self.boot()
+        made = composed.hooks
+        self.assertEqual((made.gate.enabled, made.methods.registered(), made.commands.names(), tuple(made.engines.names())),
+                         (False, (), (), ('claude_code', 'codex')))
 
 
 class AuthorizeSeamTest(Composed):
@@ -1787,6 +1812,7 @@ class CompositionCloseRegionTest(RegionWalk, unittest.TestCase):
         self.by_instruction('Composition.close')
 
 
+@unittest.skipUnless(LINUX, LINUX_ONLY)
 class ChangeMarkerRegistryTest(unittest.TestCase):
     """S12 at the daemon registry: the producer's four writers, and the two reads of the source."""
 

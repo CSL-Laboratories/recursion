@@ -26,6 +26,13 @@ needs ``permission_bridge``. A call whose flag is false raises ``DriverRefused``
 call and the flag), except the mid-turn send, which raises ``DriverBusy`` (code ``busy``, the frozen brief's
 word). PROVISIONAL, both that answer and the start and resume forms above: which of the brief's wording and
 driver.v2's stands is open with Lucas (lane questions Q1 and Q7); consumers must not rely on either yet.
+PORT WITHDRAW (the Liaison's ruling of Nov 15, 7:07 PM, for #402's round 5, P2). A driver that puts a request to
+the approvals port first takes a ticket, ``admit_port(handle)``, and hands it to the port with the request; the port
+opens the approval only if ``ticket.publish()`` answers True. ``withdraw_port(handle)``, which a ``close`` input also
+runs, withdraws every ticket admitted and not yet published and admits no more. So after it returns, no approval
+opens and no request is delivered to the port for that worker, and it never waits for the port. The port's side
+(refuse a withdrawn request with a typed reason) is lane APPROVALS'.
+
 A malformed call raises ``DriverInputError``; a call the worker's state does not allow (closed input, an
 interrupt of a turn that is not in progress, a reused turn or delivery id) raises ``DriverStateError``. All
 of these are raised before the subclass is asked.
@@ -231,6 +238,8 @@ class Handle:
         self._deliveries: set[str] = set()   # every delivery id written, accepted or not
         self._pending: dict[str, tuple[str, str]] = {}  # delivery id -> (turn id, how), until accepted
         self._closed = False
+        self._port_sealed = False             # set by withdraw_port; no request is admitted to the port after it
+        self._tickets: list[PortTicket] = []  # requests admitted to the port and not yet published or withdrawn
 
     @property
     def engine_session_id(self) -> str | None:
@@ -256,6 +265,51 @@ class Handle:
     def as_record(self) -> dict:
         """driver.v2's handle record."""
         return {"run_id": self.run_id, "engine_session_id": self._engine_session_id}
+
+
+ADMITTED, PUBLISHED, WITHDRAWN = "admitted", "published", "withdrawn"
+
+
+class PortTicket:
+    """One request admitted to the approvals port. It ends in exactly one of two states, once:
+
+    - ``publish()``: the port calls it at the moment it would make the approval visible (inside its own commit).
+      True means it may open the approval; False means the request was withdrawn and the port opens nothing.
+    - ``withdraw()``: ``Driver.withdraw_port`` calls it. True means the request will never be published.
+
+    Whichever comes first wins; the other answers False. Neither ever waits for anything but the ticket's own
+    lock, which is held only to change the state.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state = ADMITTED
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def publish(self) -> bool:
+        with self._lock:
+            if self._state != ADMITTED:
+                return False
+            self._state = PUBLISHED
+            return True
+
+    def withdraw(self) -> bool:
+        with self._lock:
+            if self._state != ADMITTED:
+                return False
+            self._state = WITHDRAWN
+            return True
+
+
+def _withdraw_all(handle: Handle) -> None:
+    """Under ``handle._lock``: admit no more requests and withdraw every one not yet published."""
+    handle._port_sealed = True
+    for ticket in handle._tickets:
+        ticket.withdraw()
+    handle._tickets = []
 
 
 class Driver:
@@ -300,9 +354,37 @@ class Driver:
                     self._need("send", "permission_bridge")
                 elif kind == "close":
                     handle._closed = True  # before the write: nothing is sent after a close
+                    _withdraw_all(handle)  # and nothing admitted to the approvals port is published after it
                 else:
                     self._reserve(handle, item)
             self._send(handle, item)
+
+    # -- the approvals port (PORT WITHDRAW) ----------------------------------------------------------
+    def admit_port(self, handle: Handle) -> PortTicket:
+        """Admit one request to the approvals port for ``handle``: the ticket the port publishes with.
+
+        Raises ``DriverStateError`` once ``withdraw_port`` (or a ``close`` input) has run for the handle, so no
+        request is delivered to the port for a closed worker. The caller hands the ticket to the port with the
+        request; the port opens the approval only if ``ticket.publish()`` answers True.
+        """
+        with handle._lock:
+            if handle._port_sealed:
+                raise DriverStateError("the worker's approvals port is sealed")
+            handle._tickets = [t for t in handle._tickets if t.state == ADMITTED]
+            ticket = PortTicket()
+            handle._tickets.append(ticket)
+            return ticket
+
+    def withdraw_port(self, handle: Handle) -> None:
+        """Withdraw every request admitted to the port for ``handle`` and not yet published, and admit no more.
+
+        Bounded: it takes the handle's lock and each ticket's lock, which are held only to change a state,
+        never across a call to the port, the engine or the subclass. When it returns, each of the handle's
+        tickets is published or withdrawn, and no ``publish`` can succeed any more: no approval opens and no
+        request is delivered for this worker after it. A ``close`` input calls it too. Idempotent.
+        """
+        with handle._lock:
+            _withdraw_all(handle)
 
     def interrupt(self, handle: Handle, turn_id: object) -> None:
         self._need("interrupt", "interrupt")

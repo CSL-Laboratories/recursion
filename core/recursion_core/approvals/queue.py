@@ -10,8 +10,17 @@ and the object the method handlers and the engine drivers call:
   fail. A request that cannot be made whole is refused with ``ApprovalRefused`` and nothing is written; any
   other ``Exception`` of the insert's transaction is ``store_unavailable`` with its cause chained, a store
   that fails and a caller's own misuse alike (a request made inside another transaction); an interruption
-  passes as it is. ``ask(effect, binding)`` is the same for a driver's tool call (the brief's
+  passes as it is. ``ask(effect, binding, ticket=...)`` is the same for a driver's tool call (the brief's
   ``request(effect, binding)``).
+* THE DRIVER'S TICKET (DRIVER-CC's port withdraw, #432). Every engine request carries the ticket the driver
+  admitted it with (anything with ``publish() -> bool``; the driver's ``PortTicket``); one without is refused
+  ``ticket``, so no driver skips its withdraw, and a plugin's effect carries none. ``publish()`` is called
+  exactly once, inside the transaction that makes the approval visible, after every check and before
+  anything a surface can read; unless it answers True the request was withdrawn (its worker was closed), the
+  transaction is rolled back and the call is refused ``approval_withdrawn`` with the run id as its detail:
+  no record, no event, no binding, nothing offered, nothing a retry or a restart could open later. A ticket
+  that answered True stays published; if the commit then fails, nothing opens either and the call is
+  ``store_unavailable``.
 * A request counts as SHOWN only once a subscriber took it without raising. One that no subscriber took
   (none was subscribed, or each one failed) is offered again by the next start, once its worker runs.
 * ``wait(approval_id)`` blocks until the request is no longer pending and returns its record: approved,
@@ -88,6 +97,18 @@ def _tell(fn, *args) -> bool:
         log.error("an approval subscriber failed: %s", type(exc).__name__)
         return False
     return True
+
+
+def _publish(ticket, run_id) -> None:
+    """Inside the request's transaction: ``ticket.publish()``, once. Anything but True is a withdrawn request
+    (``approval_withdrawn``, the run as its detail); a ticket whose ``publish`` raises is refused ``ticket``.
+    Either refusal rolls the transaction back, so nothing is written."""
+    try:
+        published = ticket.publish()
+    except Exception as exc:  # noqa: BLE001 - the driver's object, not the store: typed, and nothing written
+        raise ApprovalRefused("ticket") from exc
+    if published is not True:
+        raise ApprovalRefused("approval_withdrawn", run_id)
 
 
 def timestamp_of(seconds: float) -> str:
@@ -266,9 +287,10 @@ class ApprovalQueue:
     # -- requests ----------------------------------------------------------------------------------------
 
     def request(self, source: str, effect: dict, *, session_id=None, run_id=None, turn_id=None,
-                engine_request_id: str | None = None, display: list = ()) -> str:
+                engine_request_id: str | None = None, display: list = (), ticket=None) -> str:
         """A new request; refused with ``ApprovalRefused`` (a typed code) and nothing written if it cannot be
-        made whole. An engine's request names the driver's pending request (``engine_request_id``)."""
+        made whole. An engine's request names the driver's pending request (``engine_request_id``) and carries
+        the driver's port ticket (``ticket``), published inside the commit (THE DRIVER'S TICKET, above)."""
         if self._store is None:
             raise ApprovalRefused("store_absent")
         now = self._clock()
@@ -289,11 +311,16 @@ class ApprovalQueue:
                 raise ApprovalRefused("binding_mismatch")
         elif engine_request_id is not None:
             raise ApprovalRefused("binding_mismatch")  # a plugin's effect has no engine request to bind
+        if (source == "engine_tool") != (ticket is not None) \
+                or (ticket is not None and not callable(getattr(ticket, "publish", None))):
+            raise ApprovalRefused("ticket")  # an engine's request has the driver's ticket; a plugin's has none
         with self._lock:
             self._done.setdefault(approval_id, threading.Event())
         try:
             with self._store.transaction() as tx:
                 rows.insert(tx, record, binding)
+                if ticket is not None:
+                    _publish(ticket, record["run_id"])  # last, inside the commit: nothing is visible before it
         except BaseException as exc:
             with self._lock:
                 self._done.pop(approval_id, None)
@@ -305,13 +332,15 @@ class ApprovalQueue:
         self._offer(record)
         return approval_id
 
-    def ask(self, effect: dict, binding: dict, *, turn_id=None) -> str:
-        """A driver's tool call (the brief's ``request(effect, binding)``): an engine-tool effect, and the
-        driver's side of the binding, ``{"engine_request_id": ...}``. Returns the approval id."""
+    def ask(self, effect: dict, binding: dict, *, ticket=None, turn_id=None) -> str:
+        """A driver's tool call (the brief's ``request(effect, binding)``): an engine-tool effect, the driver's
+        side of the binding, ``{"engine_request_id": ...}``, and the ticket the driver admitted it with (without
+        one it is refused ``ticket``). Returns the approval id, or ``approval_withdrawn`` if the ticket was
+        withdrawn before the commit."""
         if type(effect) is not dict or type(binding) is not dict or set(binding) != {"engine_request_id"}:
             raise ApprovalRefused("binding_mismatch")
         return self.request("engine_tool", effect, session_id=effect.get("session_id"), run_id=effect.get("run_id"),
-                            turn_id=turn_id, engine_request_id=binding["engine_request_id"])
+                            turn_id=turn_id, engine_request_id=binding["engine_request_id"], ticket=ticket)
 
     def _offer(self, record: dict, *, only=None) -> bool:
         """Tell the subscribers of a committed request (or only ``only``); remember it as shown only if one

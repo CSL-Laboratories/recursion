@@ -19,7 +19,7 @@ from recursion_core.approvals import store as rows
 from recursion_core.approvals.effects import EffectRefused
 from recursion_core.approvals.model import ApprovalRefused
 from recursion_core.approvals.queue import ApprovalQueue
-from recursion_core.approvals.tests.test_queue import V1, Clock, FakeStore, _vector_effect, needs_fakes
+from recursion_core.approvals.tests.test_queue import V1, Clock, FakeStore, Ticket, _vector_effect, needs_fakes
 
 try:
     from recursion_core.approvals.hooks import install, queue_of
@@ -53,7 +53,7 @@ class _Base(unittest.TestCase):
     def engine_request(self, request_id: str = "toolu_1", queue=None) -> str:
         return (queue or self.queue).request("engine_tool", self.engine, session_id=self.engine["session_id"],
                                              run_id=self.engine["run_id"], turn_id="turn-0001",
-                                             engine_request_id=request_id)
+                                             engine_request_id=request_id, ticket=Ticket())
 
     def plugin_request(self, queue=None, **change) -> str:
         return (queue or self.queue).request("plugin_effect", dict(self.plugin, **change), run_id=self.plugin["run_id"])
@@ -470,7 +470,8 @@ class MethodShapeTests(_ConcurrentBase):
 
     def test_drivers_reach_the_registered_queue_and_ask(self) -> None:  # Sol R8, DS F9
         self.assertIs(queue_of(self.hooks), self.queue)
-        approval_id = self.queue.ask(self.engine, {"engine_request_id": "toolu_ask"}, turn_id="turn-0002")
+        approval_id = self.queue.ask(self.engine, {"engine_request_id": "toolu_ask"}, ticket=Ticket(),
+                                     turn_id="turn-0002")
         with self.store.transaction() as tx:
             self.assertEqual(rows.binding_of(tx, approval_id)["engine_request_id"], "toolu_ask")
         for binding in ({}, {"engine_request_id": "x", "run_id": "other"}, "toolu"):

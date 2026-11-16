@@ -41,11 +41,13 @@ _NEEDS = {"approval.open": ("command_id", "approval_id", "surface"),
 
 
 class ApprovalRefused(Exception):
-    """The core's own refusal of a happening; ``code`` is one plain word. It changes nothing."""
+    """The core's own refusal of a happening; ``code`` is one plain word, and ``detail``, when there is one, names
+    what it is about (``approval_withdrawn`` names the run). It changes nothing."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, detail: str | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.detail = detail
 
 
 def _at(at: object) -> int:

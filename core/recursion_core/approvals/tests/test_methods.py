@@ -17,6 +17,7 @@ from recursion_core.approvals import model
 from recursion_core.approvals import store as rows
 from recursion_core.approvals.hooks import install
 from recursion_core.approvals.queue import ApprovalQueue
+from recursion_core.approvals.tests.test_queue import Ticket
 
 try:
     from recursion_core.control.hooks import Hooks, Principal
@@ -57,7 +58,7 @@ class MethodTests(unittest.TestCase):
         self.effect = effect["record"]["effect"]
         self.approval_id = self.queue.request("engine_tool", self.effect, session_id=self.effect["session_id"],
                                               run_id=self.effect["run_id"], turn_id="turn-0001",
-                                              engine_request_id="toolu_1")
+                                              engine_request_id="toolu_1", ticket=Ticket())
         self.count = 0
 
     def call(self, method: str, params: dict, principal=None) -> dict:

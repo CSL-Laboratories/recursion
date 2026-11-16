@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import inspect
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import sysconfig
@@ -214,6 +216,64 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         answer = json.loads(out.getvalue())
         self.assertEqual((answer["code"], answer["interpreter"], answer["unit"]), ("ok", sys.executable, self.unit))
+
+    # Review 4 of #382, Codex GPT-6.1 Sol (DeepSeek I7-2): an error opening the unit other than a link
+    # answered not_regular, a refusal for a file's type, for a regular file the command could not open, and
+    # lost the error. Sol's two regressions, and the socket case that stays a type refusal.
+    def test_descriptors_exhausted_opening_the_unit_is_a_filesystem_error(self):
+        import resource  # POSIX only, as this class is: at module level it fails the simulated-Windows import
+        self.run_action("install")
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        held = []
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
+            for _ in range(128):
+                try:
+                    held.append(os.open(os.devnull, os.O_RDONLY))
+                except OSError as exc:
+                    self.assertEqual(exc.errno, errno.EMFILE)
+                    break
+            else:
+                self.fail("the lowered descriptor limit was not reached")
+            code, answer = self.run_action("install")
+        finally:
+            for fd in held:
+                os.close(fd)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+        self.assertEqual((code, answer["code"]), (1, "filesystem_error"))
+        self.assertIn("Too many open files", answer["detail"])
+
+    def test_an_io_error_opening_the_unit_is_a_filesystem_error_for_every_command(self):
+        self.run_action("install")
+        with open(self.unit, "rb") as handle:
+            before = handle.read()
+        real_open = os.open
+
+        def opening(path, flags, *args, **kwargs):
+            if os.fspath(path) == self.unit:
+                raise OSError(errno.EIO, "Input/output error")
+            return real_open(path, flags, *args, **kwargs)
+        for action in ("install", "upgrade", "uninstall"):
+            with self.subTest(action=action):
+                with mock.patch("os.open", side_effect=opening):
+                    code, answer = self.run_action(action)
+                self.assertEqual((code, answer["code"]), (1, "filesystem_error"))
+                self.assertIn("Input/output error", answer["detail"])
+        with open(self.unit, "rb") as handle:
+            self.assertEqual(handle.read(), before)  # nothing rewritten or removed
+
+    def test_a_socket_at_the_units_name_stays_not_regular(self):
+        folder = self.home
+        for name in (".config", "systemd", "user"):
+            folder = os.path.join(folder, name)
+            os.mkdir(folder, 0o700)
+        server = socket.socket(socket.AF_UNIX)
+        self.addCleanup(server.close)
+        server.bind(self.unit)  # the non-blocking open takes a FIFO, but a socket is ENXIO
+        for action in ("install", "upgrade", "uninstall"):
+            with self.subTest(action=action):
+                code, answer = self.run_action(action)
+                self.assertEqual((code, answer["code"]), (1, "not_regular"))
 
     def test_the_default_home_is_the_password_databases_not_HOME(self):
         import pwd

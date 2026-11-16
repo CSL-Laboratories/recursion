@@ -11,6 +11,7 @@ here reads ``os.environ`` or the process's home folder; the caller passes the ro
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import secrets
 import stat
@@ -247,7 +248,12 @@ def held_regular(path: str):
     except FileNotFoundError:  # not there (a concurrent uninstall removed it since the caller looked)
         raise InstallRefused("unit_missing", f"{path} is not there; run the command again") from None
     except OSError as exc:
-        raise InstallRefused("not_regular", path) from exc
+        # A link at the name (O_NOFOLLOW) or a socket there (the non-blocking open takes a FIFO, not a
+        # socket) is the file's type; any other error (too many open files, an I/O error) is the error
+        # itself, which setup.run answers as filesystem_error with the error and the path.
+        if exc.errno in (errno.ELOOP, errno.ENXIO):
+            raise InstallRefused("not_regular", path) from exc
+        raise
     try:
         info = os.fstat(fd)
         if not _is_reg(info.st_mode):

@@ -114,6 +114,59 @@ class IsErrorTest(unittest.TestCase):
         for method, codes in mcp_tools.NOT_ERRORS.items():
             self.assertLessEqual(codes, set(rows[method]["codes"]), method)
 
+    # Round 1 of #430, Codex GPT-6 Astra and GPT-6.1 Sol. R1: a code that is not a string is an error, never a
+    # raise. R2: the refusals stay errors for every Stop and interrupt method, the lookup is exact, and is_error
+    # reads NOT_ERRORS, which call_tool reads through is_error. These run with or without the published table.
+
+    WRONG_TYPE_CODES = ([], {}, ["pending"], {"code": "pending"}, 1, 1.5, True, None)
+    MAPPED = ("run.stop", "session.stop", "session.interrupt")
+
+    def test_a_code_that_is_not_a_string_is_an_error(self) -> None:
+        for method in (*self.MAPPED, "run.status", "run.unknown"):
+            for code in self.WRONG_TYPE_CODES:
+                with self.subTest(method=method, code=repr(code)):
+                    self.assertIs(mcp_tools.is_error(method, {"code": code}), True)
+
+    def test_the_stop_tool_keeps_a_wrong_type_code_as_an_error_answer(self) -> None:
+        for code in self.WRONG_TYPE_CODES:
+            with self.subTest(code=repr(code)):
+                api = self.Answering(code)
+                res = mcp_tools.call_tool(api, "recursion_run_stop", {"run_id": "r1"})
+                self.assertIs(res["isError"], True)
+                self.assertEqual(res["structuredContent"], {"code": code, "run_id": "r1"})
+                self.assertEqual(json.loads(res["content"][0]["text"]), {"code": code, "run_id": "r1"})
+
+    def test_the_refusals_stay_errors_for_every_stop_and_interrupt_method(self) -> None:
+        refusals = ("scope_refused", "request_invalid", "unavailable", "run_unknown", "registry_unavailable",
+                    "session_unknown", "method_unknown", "conflict", "unsupported", "credentials_unavailable")
+        for method in self.MAPPED:
+            for code in refusals:
+                with self.subTest(method=method, code=code):
+                    self.assertIs(mcp_tools.is_error(method, {"code": code}), True)
+        for code in ("ok", "started"):   # run.stop answers stopped, pending or ended, never these
+            self.assertIs(mcp_tools.is_error("run.stop", {"code": code}), True, code)
+
+    def test_the_method_is_looked_up_exactly(self) -> None:
+        for method in ("RUN.STOP", "Run.Stop", " run.stop", "run.stop ", "run.stop\n", "Session.Stop",
+                       "session.interrupt ", "run_stop", "run.stop.x", "", "run.unknown"):
+            with self.subTest(method=repr(method)):
+                self.assertIs(mcp_tools.is_error(method, {"code": "pending"}), True)
+                self.assertIs(mcp_tools.is_error(method, {"code": "ended"}), True)
+                self.assertIs(mcp_tools.is_error(method, {"code": "ok"}), False)
+
+    def test_is_error_reads_the_one_mapping_and_call_tool_reads_is_error(self) -> None:
+        from unittest import mock
+        with mock.patch.dict(mcp_tools.NOT_ERRORS, {"run.stop": frozenset({"synthetic_answer"})}):
+            self.assertIs(mcp_tools.is_error("run.stop", {"code": "synthetic_answer"}), False)
+            self.assertIs(mcp_tools.is_error("run.stop", {"code": "pending"}), True)
+            res = mcp_tools.call_tool(self.Answering("synthetic_answer"), "recursion_run_stop", {"run_id": "r1"})
+            self.assertIs(res["isError"], False)
+        marker = object()
+        with mock.patch.object(mcp_tools, "is_error", return_value=marker) as seen:
+            res = mcp_tools.call_tool(self.Answering("pending"), "recursion_run_stop", {"run_id": "r1"})
+        self.assertIs(res["isError"], marker)
+        seen.assert_called_once_with("run.stop", {"code": "pending", "run_id": "r1"})
+
 
 class CodexSnippetTest(unittest.TestCase):
     def test_stop_gets_per_tool_approve_and_start_does_not(self) -> None:

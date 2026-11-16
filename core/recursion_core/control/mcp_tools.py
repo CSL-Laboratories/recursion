@@ -60,9 +60,14 @@ NOT_ERRORS: dict[str, frozenset[str]] = {
 
 def is_error(method: str, answer: object) -> bool:
     """Whether ``answer``, the control API's answer to ``method``, is an error for ``isError``. An answer that is not
-    an object, or carries no code of the method's non-error set, is an error."""
+    an object, or carries no code of the method's non-error set, is an error. A code that is not a string (a JSON
+    array or object, say) is an error before any set is asked: it could not be one of the codes, and an unhashable
+    one would raise in the lookup (round 1 of #430, Codex GPT-6 Astra and GPT-6.1 Sol, R1). ``method`` is looked
+    up exactly: no case folding or trimming; a method the mapping does not name keeps ``SUCCESS_CODES``."""
 
     code = answer.get("code") if isinstance(answer, dict) else None
+    if type(code) is not str:
+        return True
     return code not in NOT_ERRORS.get(method, SUCCESS_CODES)
 
 TOOLS = (

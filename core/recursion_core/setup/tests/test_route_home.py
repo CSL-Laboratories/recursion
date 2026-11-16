@@ -146,7 +146,9 @@ class RouteHomeTests(unittest.TestCase):
                              (OSError(22, "not a link"), "route_home_untrusted")):
             with self.subTest(raised=type(raised).__name__), mock.patch("os.readlink", side_effect=raised):
                 self.refused(code, os.path.join(link, "homes", "claude_code"), os.path.join(link, "homes"))
-        with mock.patch("pwd.getpwuid", side_effect=OSError(5, "the name service did not answer")):
+        # What CPython raises when the lookup itself fails (Devin's thread on #401): KeyError, not OSError.
+        failed = KeyError(f"getpwuid(): uid not found: {os.geteuid()}")
+        with mock.patch("pwd.getpwuid", side_effect=failed), mock.patch.dict(os.environ, {"HOME": self.base}):
             self.assertIn("password database", self.refused("route_home_untrusted", self.path).detail)
         long_name = os.path.join(self.root, "x" * 300)  # ENAMETOOLONG: a failure that is not EACCES
         self.assertIn("OSError", self.refused("route_home_untrusted", long_name).detail)
@@ -342,6 +344,21 @@ class RouteHomeTests(unittest.TestCase):
                     error = self.refused("route_home_missing", path, root)
                 self.assertEqual(len(calls), fail_at)
                 self.assertEqual(error.detail, f"{alias} was removed while it was followed")
+
+    # Devin's thread on #401 (Nov 15): CPython's pwd.getpwuid raises KeyError, never OSError, when the lookup itself
+    # fails (getpwuid_r's error from NSS or LDAP is reported as "uid not found": Modules/pwdmodule.c, 3.12.3 and
+    # 3.14.8 alike), so the OSError refusal could not run, and an outage compared the operator's home against $HOME
+    # alone. A KeyError is now refused whatever $HOME says: no entry and a failed lookup cannot be told apart.
+    def test_a_password_lookup_that_fails_as_cpython_fails_is_refused_whatever_HOME_says(self):
+        failed = KeyError(f"getpwuid(): uid not found: {os.geteuid()}")
+        for home in (os.environ.get("HOME") or "/", self.base, self.state, "/"):
+            with self.subTest(HOME=home), mock.patch.dict(os.environ, {"HOME": home}), \
+                    mock.patch("pwd.getpwuid", side_effect=failed):
+                error = self.refused("route_home_untrusted", self.path)
+            self.assertEqual(error.detail, "the operator's home is unknown: the password database gives no entry "
+                                           "for this user (none, or the lookup failed)")
+        with mock.patch.dict(os.environ, {"HOME": self.base}):
+            check(self.path, self.root)  # control: the same check passes when the lookup answers
 
     def test_with_no_operators_home_known_the_check_refuses_rather_than_passes(self):
         # DeepSeek F4: an empty set of homes would let any path through the operator's-home rule.

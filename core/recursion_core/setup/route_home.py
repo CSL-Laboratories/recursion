@@ -22,8 +22,10 @@ keeper of this file:
                                  operator's home that cannot be followed to the end (a lookup or
                                  readlink that fails other than "missing", more than 40 links, a
                                  name below something that is not a folder); or the operator's home
-                                 is unknown (no absolute $HOME and no password entry) or the
-                                 password database cannot be read
+                                 is unknown: the password database gives no entry for this user (a
+                                 failed lookup, an NSS or LDAP outage, reaches Python as no entry,
+                                 so both are refused, whatever $HOME says), or neither it nor $HOME
+                                 names an absolute home
     route_home_outside_root      path is the root itself, or not below it (a root of / has nothing below
                                  it: it is root's, never the operator's custodied root)
     route_home_is_operator_home  path, or the root, is the operator's own home (the password
@@ -229,22 +231,25 @@ def _trusted_folder(path: str, info: os.stat_result, trusted: tuple) -> None:
 def _operator_homes() -> set[str]:
     """The operator's home, as the password database and ``$HOME`` name it, links followed.
 
-    Refuses when neither names one (no absolute ``$HOME`` and no password entry for this user), or
-    when the password database cannot be read: the rule must not pass for want of a home to compare.
+    Refuses when the password database gives no entry for this user. CPython's ``pwd.getpwuid`` raises
+    ``KeyError`` both for a uid with no entry and for a lookup that failed, never ``OSError``: any error of
+    ``getpwuid_r`` (an NSS or LDAP outage) is reported as "uid not found" (``Modules/pwdmodule.c``, the
+    same in 3.12.3 and 3.14.8). The two cannot be told apart, so both are refused: comparing against
+    ``$HOME`` alone would let the rule pass on a value the operator's environment chose (Devin's thread on
+    #401). Refuses too when neither names an absolute home: the rule must not pass for want of a home to
+    compare.
     """
 
     import pwd  # Linux only, as the launcher is
 
-    homes = [os.environ.get("HOME")]
     try:
-        homes.append(pwd.getpwuid(os.geteuid()).pw_dir)
-    except KeyError:  # no entry for this user: $HOME alone names the home
-        pass
-    except OSError as exc:  # the name service (NSS, LDAP) did not answer
-        raise RouteHomeRefused("route_home_untrusted",
-                               f"the password database cannot be read: {type(exc).__name__}") from None
+        entry = pwd.getpwuid(os.geteuid()).pw_dir
+    except KeyError:  # no entry, or a lookup that failed: CPython answers both so
+        raise RouteHomeRefused("route_home_untrusted", "the operator's home is unknown: the password database "
+                               "gives no entry for this user (none, or the lookup failed)") from None
+    homes = [os.environ.get("HOME"), entry]
     found = {_resolve(home) for home in homes if isinstance(home, str) and home.startswith("/")}
     if not found:
         raise RouteHomeRefused("route_home_untrusted", "the operator's home is unknown: no absolute HOME and "
-                               "no password entry")
+                               "no absolute home in the password entry")
     return found

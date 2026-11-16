@@ -258,6 +258,7 @@ def check_request(method: str, params) -> None:
     with every required field, no field the method does not take, and every field that is present of its
     published shape (a null is a value, refused where the schema does not admit it). The first problem found
     is named: a missing field, then a field the method does not take, then a value, in the published order."""
+    _need(method in PARAMS, '', 'unknown_method')         # a method this lane does not answer (session.interrupt)
     _need(isinstance(params, dict), '', 'object')
     required, optional = PARAMS[method]
     for field in sorted(required):

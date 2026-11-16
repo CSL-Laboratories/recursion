@@ -55,7 +55,8 @@ def turn_ended(session_id: str, run_id, turn_id: str, outcome: str, result) -> d
 def interrupt(session_id: str, run_id, turn_id, requested_by: dict, outcome: str) -> dict:
     """An interrupt was asked, and what came of it: 'delivered' (the turn WAS interrupted; written only when the
     driver reported it), 'fell_back_to_stop' (the driver cannot interrupt, so a Stop was asked instead) or
-    'no_live_turn' (with no turn id)."""
+    'no_live_turn' (with no turn id). ``requested_by`` is a common.v1 principal, checked by the caller
+    (``Sessions.interrupt``) before anything is written."""
     return envelope('interrupt', session_id, run_id, turn_id,
                     {'turn_id': turn_id, 'requested_by': dict(requested_by), 'outcome': outcome})
 

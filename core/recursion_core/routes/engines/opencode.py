@@ -96,6 +96,7 @@ from __future__ import annotations
 import calendar
 import copy
 import hashlib
+import http.client
 import json
 import math
 import re
@@ -336,6 +337,16 @@ class OneShot:
         except BaseException:
             _fence(process, "driver_error")
             raise
+
+
+def _drop(items: list, item: object) -> None:
+    """Delete ``item`` (by identity) from ``items`` IN PLACE, the first time it is found. The list is never rebuilt:
+    a rebuild (read, then assign) drops whatever another thread appends between the two. An append only adds at
+    the end, so the index found stays the entry's own."""
+    for index, each in enumerate(items):
+        if each is item:
+            del items[index]
+            return
 
 
 def _refuse_what_is_not_run(request: dict) -> None:
@@ -639,7 +650,7 @@ def http_abort(url: str, session: str, *, timeout: float = 5.0) -> bool:
     try:
         with opener.open(request, timeout=timeout):
             return True   # any answer that is not 2xx raises HTTPError (urllib's HTTPErrorProcessor)
-    except OSError:   # URLError and HTTPError are OSErrors
+    except (OSError, http.client.HTTPException):   # URLError and HTTPError are OSErrors; a malformed reply is not
         return False
 
 
@@ -716,6 +727,7 @@ class ServeDriver(Driver):
 
     def _start(self, handle, request: dict, env: dict) -> None:
         route = request["route"]
+        _refuse_what_is_not_run(request)   # another engine's route, or a workspace the spawn cannot honour
         connection = f"{route['connection']['kind']}:{route['connection']['id']}"
         # The launched model, and a route the parser refuses, are refused here, before anything is started.
         model = held_to_the_guard(route["model"], None)
@@ -888,7 +900,7 @@ class ServeDriver(Driver):
             with self._lock:
                 if worker["turn"] is turn:
                     worker["turn"] = None
-                worker["live"][:] = [q for q in worker["live"] if q is not turn["process"]]   # it has exited
+                _drop(worker["live"], turn["process"])   # it has exited
                 closed = worker["closed"]
         except BaseException:
             if claimed is not None:
@@ -965,7 +977,7 @@ class ServeDriver(Driver):
                     worker["busy"].append(process); claimed = True   # noqa: E702 - one line: one step
                 process.terminate()
                 with self._lock:
-                    worker["live"][:] = [q for q in worker["live"] if q is not process]
+                    _drop(worker["live"], process)
             except Exception as error:
                 errors.append(error)
             except BaseException as error:
@@ -975,7 +987,7 @@ class ServeDriver(Driver):
             finally:
                 if claimed:
                     with self._lock:
-                        worker["busy"][:] = [q for q in worker["busy"] if q is not process]
+                        _drop(worker["busy"], process)
         with self._lock:
             key = id(worker["handle"])
             if worker["released"] and not worker["live"] and not worker["spawning"] \

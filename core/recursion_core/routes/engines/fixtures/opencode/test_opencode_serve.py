@@ -12,6 +12,7 @@ from __future__ import annotations
 import http.server
 import inspect
 import os
+import socket
 import sys
 import threading
 import unittest
@@ -1252,6 +1253,68 @@ class ServeRoundTwoTests(unittest.TestCase):
         self.assertEqual(errors, ["OSError"])
         driver.release(handle)
         self.assertEqual(([p.terminated for p in spy.processes], driver._workers), ([1, 1], {}))
+
+
+class ServeReviewThreadTests(unittest.TestCase):
+    """The Devin review threads on #421, and #414's two for the serve drive. Every wait is bounded."""
+
+    def test_a_malformed_abort_reply_is_no_abort(self):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        srv.settimeout(5)
+        self.addCleanup(srv.close)
+
+        def answer():
+            conn, _ = srv.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(b"no status line at all\r\n\r\n")
+
+        replier = threading.Thread(target=answer, daemon=True)
+        replier.start()
+        self.assertIs(oc.http_abort(f"http://127.0.0.1:{srv.getsockname()[1]}", "ses_abc"), False)
+        replier.join(5)
+
+    def test_a_process_appended_while_a_cleaner_removes_another_stays_owned(self):
+        driver = oc.ServeDriver(Spy(), port=lambda: PORT)
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        worker = driver._workers[id(handle)]
+        late = Process()
+
+        class Racing(list):   # the turn spawn's unlocked append lands after the cleaner read, before it writes
+            fired = False
+
+            def land(self):
+                if not Racing.fired:
+                    Racing.fired = True
+                    list.append(self, late)
+
+            def __setitem__(self, key, value):
+                self.land()
+                list.__setitem__(self, key, value)
+
+            def __delitem__(self, key):
+                self.land()
+                list.__delitem__(self, key)
+
+        worker["live"] = Racing(worker["live"])
+        driver.finish_turn(handle, 0)          # takes the turn's own process off the list
+        self.assertTrue(any(p is late for p in worker["live"]))
+        driver.release(handle)
+        self.assertEqual((late.terminated, driver._workers), (1, {}))
+
+    def test_a_start_the_serve_drive_would_not_run_as_asked_is_refused(self):
+        workspace = {"path": "/repo", "mode": "worktree", "base_ref": "main", "worktree_path": "/repo-wt"}
+        codex = session()
+        codex["route"] = dict(codex["route"], engine="codex")
+        for start, ws, field in ((codex, None, "route.engine"), (session(), workspace, "workspace")):
+            with self.subTest(field=field):
+                spy = Spy()
+                with self.assertRaises(DriverInputError) as caught:
+                    oc.ServeDriver(spy, port=lambda: PORT).start(start, ws, ENV)
+                self.assertEqual((caught.exception.field, spy.processes), (field, []))
 
 
 if __name__ == "__main__":

@@ -51,6 +51,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import pathlib
 import re
 import sqlite3
 import threading
@@ -123,10 +124,11 @@ class Authority:
             raise Refused("anchor_is_csl_key")
         self._anchor = anchor_public_key
         self._clock = clock
-        if not os.path.isfile(ledger_path):
-            raise Refused("ledger_missing")
-        self._path = ledger_path
-        self._db = self._connect(ledger_path)
+        # Resolved once, here: a relative path names the ledger of the working directory of now, and a
+        # reopen after a failed rollback must reach that same ledger whatever the working directory is then.
+        self._path = os.path.abspath(ledger_path)
+        self._db = self._connect(self._path)
+        self._unusable = False  # set once a failed rollback or ``close`` leaves no usable connection
         self._lock = threading.Lock()
         # Positive Ed25519 verdicts for this instance's fixed anchor, keyed by the exact
         # (signature hex, canonical bytes) pair; LRU, bounded, own lock (free-threaded safe).
@@ -211,10 +213,17 @@ class Authority:
         return profile, hashlib.sha256(raw).hexdigest()
 
     def _connect(self, ledger_path: str) -> sqlite3.Connection:
-        """The ledger, opened and checked to be this anchor's; refused, with nothing left open, if not."""
+        """The ledger, opened and checked to be this anchor's; refused, with nothing left open, if not.
+
+        The daemon never creates the ledger, here or when a failed rollback opens it again: a path with no file
+        is ``ledger_missing`` before anything is opened, and the open itself is read-write only (SQLite's
+        ``mode=rw``), so a file removed after that check is refused too and is never created empty."""
+        if not os.path.isfile(ledger_path):
+            raise Refused("ledger_missing")
         db = None
         try:
-            db = sqlite3.connect(ledger_path, isolation_level=None, check_same_thread=False, timeout=30)
+            uri = pathlib.Path(os.path.abspath(ledger_path)).as_uri() + "?mode=rw"
+            db = sqlite3.connect(uri, uri=True, isolation_level=None, check_same_thread=False, timeout=30)
             db.execute("PRAGMA synchronous=FULL")
             db.execute("PRAGMA busy_timeout=30000")
             meta = dict(db.execute("SELECT k, v FROM meta").fetchall())
@@ -234,18 +243,35 @@ class Authority:
 
     def _roll_back(self) -> None:
         """Roll a charge's write transaction back. If ROLLBACK itself raises, the connection may still hold
-        that transaction, and every later charge would fail to begin its own: so the connection is closed,
-        which discards what the transaction wrote, and the ledger is opened again with the same checks. The
-        rollback's error is raised all the same. If the ledger cannot be opened again, the closed connection
-        stays, and every later charge fails and writes nothing."""
+        that transaction, and every later charge would wait for it and fail: so the connection is closed,
+        which discards what the transaction wrote, and the ledger is opened again by ``_connect``, at the
+        absolute path resolved at construction, with every check of the first open (the ledger must still
+        exist; nothing is created). A cursor on the old connection that another owner still holds would keep
+        that transaction until it is finalized; nothing in this module hands one out.
+
+        Until that open succeeds the ledger is out of use, and every later charge is refused
+        ``ledger_invalid`` at once and writes nothing. If the close itself raises, the connection is kept,
+        since it may still hold the transaction, and nothing is opened beside it; if the ledger cannot be
+        opened again, the closed connection is kept. The rollback's error propagates from here; what the
+        caller of ``charge`` sees is said there."""
         try:
             self._db.execute("ROLLBACK")
         except BaseException:
+            self._unusable = True
+            closed = False
             with contextlib.suppress(Exception):
                 self._db.close()
-            with contextlib.suppress(Refused):
-                self._db = self._connect(self._path)
+                closed = True
+            if closed:
+                with contextlib.suppress(Refused):
+                    self._db = self._connect(self._path)
+                    self._unusable = False
             raise
+
+    def _require_usable(self) -> None:
+        """``ledger_invalid`` once a failed rollback or ``close`` has left this authority no usable ledger."""
+        if self._unusable:
+            raise Refused("ledger_invalid")
 
     def charge(self, envelope: object, *, plugin_id: str, artifact_sha256: str, scope: dict,
                kind: str, provider: str, model_version: str, currency: str, amount_minor: object,
@@ -262,9 +288,13 @@ class Authority:
         of a refusal or an error, its error reaches the caller in their place, with the refusal or
         error as its context, and nothing is written. If its exit swallows a refusal or an error,
         ``charge`` raises it all the same: a guard can refuse a charge, never turn a refusal into a
-        success. If the rollback itself raises, the connection is closed (which discards what the
-        transaction wrote) and the ledger opened again, so no later charge inherits that transaction.
-        The core passes its commit section with the halt recheck (R4-1), whose exit only
+        success. If the rollback itself raises, its error reaches the caller in place of the charge's,
+        unless the guard's exit swallows it, when the charge's own error is raised; the connection is
+        closed (which discards what the transaction wrote) and the ledger opened again, so no later charge
+        inherits that transaction. If that cannot be done (the close raises, or the ledger cannot be opened
+        again), every later charge is refused ``ledger_invalid`` at once, and so is every charge after
+        ``close``. A guard must not call ``charge``: the ledger's lock is held while it runs, so that call
+        would wait for itself. The core passes its commit section with the halt recheck (R4-1), whose exit only
         releases the fence; so signature verification never runs under it and a halt never waits
         for one.
         """
@@ -294,6 +324,7 @@ class Authority:
             raise Refused("idempotency_key_invalid")
         failure: BaseException | None = None
         with self._lock, contextlib.ExitStack() as guarded:
+            self._require_usable()
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 if commit_guard is not None:
@@ -325,4 +356,5 @@ class Authority:
 
     def close(self) -> None:
         with self._lock:
+            self._unusable = True
             self._db.close()

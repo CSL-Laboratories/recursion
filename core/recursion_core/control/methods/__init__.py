@@ -78,6 +78,9 @@ A lane registers a handler from its registrant module's ``register(hooks)``::
 WHO OWNS THE TRANSACTION. For a method keyed by ``command_id`` the dispatcher does this, in order:
 
 1. With no event store composed, it answers ``unsupported``, detail ``store_absent``, and calls nothing.
+   A ``command_id`` that is not common.v1's (8 to 128 of ``A-Z a-z 0-9 . _ : -``, matched whole) answers
+   ``request_invalid``, detail ``command_id``, before the payload digest, the tenant and the store: no
+   transaction is opened and nothing is read, kept or changed.
 2. It takes the command's slot: commands with the same ``(tenant, method, command_id)`` run one at a
    time in this process, so two identical commands sent at once run the handler once.
 3. It opens the store's transaction and looks the receipt up IN it. A receipt with the same payload
@@ -168,6 +171,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
+import re
 import threading
 from collections.abc import Callable
 from typing import NamedTuple
@@ -356,6 +360,11 @@ def canonical_text(value, depth: int = 0) -> str:
         keys = sorted(value, key=lambda key: key.encode('utf-16-be', 'surrogatepass'))
         return '{' + ','.join(_string(key) + ':' + canonical_text(value[key], depth + 1) for key in keys) + '}'
     raise NoCanonicalText('type')
+
+
+# common.v1's command_id (``$defs/command_id``; the event store checks the same grammar, events/db.py). ASCII
+# only and matched whole, so no line end, NUL or DEL passes.
+_COMMAND_ID = re.compile(r'[A-Za-z0-9._:-]{8,128}')
 
 
 def payload_digest(params: dict) -> str:
@@ -578,7 +587,7 @@ class MethodTable:
         if store is None:
             return {'code': 'unsupported', 'detail': 'store_absent'}
         command_id = params.get('command_id')
-        if not isinstance(command_id, str) or not command_id:
+        if not isinstance(command_id, str) or not _COMMAND_ID.fullmatch(command_id):
             return {'code': 'request_invalid', 'detail': 'command_id'}
         try:
             digest = payload_digest(params)

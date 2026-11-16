@@ -1066,7 +1066,7 @@ def table_with(store=None, tenant=methods.INSTALL_TENANT, **handlers):
     return table
 
 
-TURN = {'command_id': 'cmd-1', 'session_id': 'ses-1', 'expected_revision': 3, 'text': 'go on'}
+TURN = {'command_id': 'cmd-0001', 'session_id': 'ses-1', 'expected_revision': 3, 'text': 'go on'}
 
 
 class MethodTableTest(unittest.TestCase):
@@ -1165,14 +1165,14 @@ class MethodTableTest(unittest.TestCase):
         handlers, store = Handlers(), work_store()
         table = table_with(store, **{'session.turn': handlers.turn})
         answer = table.dispatch('session.turn', dict(TURN), H.OWNER, None)
-        self.assertEqual(answer, {'code': 'ok', 'turn_id': 'turn-cmd-1'})
+        self.assertEqual(answer, {'code': 'ok', 'turn_id': 'turn-cmd-0001'})
         self.assertEqual(handlers.calls, [(H.OWNER, True, TURN)])
         self.assertEqual((store.commits, store.rollbacks), (1, 0))
         digest = hashlib.sha256(b'{"expected_revision":3,"session_id":"ses-1","text":"go on"}').hexdigest()
-        self.assertEqual(store.receipts, {('install', 'session.turn', 'cmd-1'): (digest, answer)})
-        self.assertEqual(store.rows, {('work', 'cmd-1'): {'operation_id': 'op-cmd-1', 'state': 'pending'}},
+        self.assertEqual(store.receipts, {('install', 'session.turn', 'cmd-0001'): (digest, answer)})
+        self.assertEqual(store.rows, {('work', 'cmd-0001'): {'operation_id': 'op-cmd-0001', 'state': 'pending'}},
                          'the work intent is in the same commit as the receipt')
-        self.assertEqual(handlers.callbacks, [('wake', 'cmd-1')])
+        self.assertEqual(handlers.callbacks, [('wake', 'cmd-0001')])
 
     def test_the_same_command_again_returns_the_first_answer_and_runs_nothing(self) -> None:
         handlers, store = Handlers(), work_store()
@@ -1181,7 +1181,7 @@ class MethodTableTest(unittest.TestCase):
         again = table.dispatch('session.turn', dict(TURN), H.OWNER, None)
         self.assertEqual(again, first)
         self.assertEqual(len(handlers.calls), 1)
-        self.assertEqual(handlers.callbacks, [('wake', 'cmd-1')], 'a replay stages no callback')
+        self.assertEqual(handlers.callbacks, [('wake', 'cmd-0001')], 'a replay stages no callback')
         self.assertEqual(len(store.rows), 1, 'and no second work intent')
 
     def test_the_same_id_with_another_payload_is_a_conflict(self) -> None:
@@ -1203,8 +1203,8 @@ class MethodTableTest(unittest.TestCase):
         table.dispatch('session.turn', dict(TURN), H.OWNER, None)
         table.dispatch('session.queue', dict(TURN), H.OWNER, None)
         table.dispatch('session.turn', dict(TURN, session_id='ses-2'), H.DEVICE, None)
-        self.assertEqual(sorted(store.receipts), [('t1', 'session.queue', 'cmd-1'), ('t1', 'session.turn', 'cmd-1'),
-                                                  ('t2', 'session.turn', 'cmd-1')])
+        self.assertEqual(sorted(store.receipts), [('t1', 'session.queue', 'cmd-0001'), ('t1', 'session.turn', 'cmd-0001'),
+                                                  ('t2', 'session.turn', 'cmd-0001')])
         self.assertEqual(len(handlers.calls), 3)
         self.assertEqual(asked[-1], (H.DEVICE, 'ses-2'))
         # A tenant the params name is not the target's tenant: it changes the payload, never the namespace.
@@ -1212,7 +1212,7 @@ class MethodTableTest(unittest.TestCase):
                          {'code': 'conflict', 'detail': 'command_id_reused'})
         self.assertNotIn('t9', [tenant for tenant, _, _ in store.receipts])
         # The principal is not part of the key: the same command from another caller is the same command.
-        self.assertEqual(table.dispatch('session.turn', dict(TURN), H.DEVICE, None), {'code': 'ok', 'turn_id': 'turn-cmd-1'})
+        self.assertEqual(table.dispatch('session.turn', dict(TURN), H.DEVICE, None), {'code': 'ok', 'turn_id': 'turn-cmd-0001'})
         self.assertEqual(len(handlers.calls), 3)
 
     @quiet
@@ -1268,7 +1268,7 @@ class MethodTableTest(unittest.TestCase):
         threads[0].start()
         self.assertTrue(handlers.entered.wait(BOUND_S), 'the first command reached its handler')
         threads[1].start()
-        key = ('install', 'session.turn', 'cmd-1')
+        key = ('install', 'session.turn', 'cmd-0001')
         waiting = lambda: table._slots.get(key, (None, 0))[1]   # noqa: E731
         deadline = time.monotonic() + BOUND_S
         while waiting() < 2 and time.monotonic() < deadline:
@@ -1279,8 +1279,8 @@ class MethodTableTest(unittest.TestCase):
         for thread in threads:
             thread.join(BOUND_S)
         self.assertEqual(len(handlers.calls), 1)
-        self.assertEqual(answers, [{'code': 'ok', 'turn_id': 'turn-cmd-1'}] * 2)
-        self.assertEqual(handlers.callbacks, [('wake', 'cmd-1')])
+        self.assertEqual(answers, [{'code': 'ok', 'turn_id': 'turn-cmd-0001'}] * 2)
+        self.assertEqual(handlers.callbacks, [('wake', 'cmd-0001')])
         self.assertEqual(store.commits, 2, 'the second commit is the replay\'s own, with nothing in it')
         self.assertEqual(table._slots, {}, 'the slot goes when nobody waits on it')
 
@@ -1341,7 +1341,7 @@ class MethodTableTest(unittest.TestCase):
         table = table_with(store, **{'session.turn': turn})
         self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, None), {'code': 'ok'})
         self.assertEqual(ran, ['first', 'third'])
-        self.assertEqual(list(store.receipts), [('install', 'session.turn', 'cmd-1')])
+        self.assertEqual(list(store.receipts), [('install', 'session.turn', 'cmd-0001')])
 
     def test_callbacks_run_after_the_commit_and_outside_the_commands_slot(self) -> None:
         seen, store = [], work_store()
@@ -1369,12 +1369,12 @@ class MethodTableTest(unittest.TestCase):
         with self.assertRaises(Cut):
             table.dispatch('session.turn', dict(TURN), H.OWNER, None)
         self.assertEqual(woken, [], 'the callback that would have woken the worker never ran')
-        self.assertEqual(store.rows, {('work', 'cmd-1'): {'operation_id': 'op-1', 'state': 'pending'}},
+        self.assertEqual(store.rows, {('work', 'cmd-0001'): {'operation_id': 'op-1', 'state': 'pending'}},
                          'the intent is committed: a service that scans for pending work finds it')
-        self.assertIn(('install', 'session.turn', 'cmd-1'), store.receipts)
+        self.assertIn(('install', 'session.turn', 'cmd-0001'), store.receipts)
         # The client retries after the restart: the receipt answers, and the work is not staged again.
         self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, None), {'code': 'ok', 'accepted': True})
-        self.assertEqual(handlers.calls, ['cmd-1'])
+        self.assertEqual(handlers.calls, ['cmd-0001'])
         self.assertEqual(woken, [])
         self.assertEqual(len(store.rows), 1)
 
@@ -1435,6 +1435,88 @@ class MethodTableTest(unittest.TestCase):
         one = methods.payload_digest({'command_id': 'a', 'n': 1.0, 'text': 'x'})
         self.assertEqual(one, methods.payload_digest({'text': 'x', 'n': 1, 'command_id': 'another id'}))
         self.assertNotEqual(one, methods.payload_digest({'text': 'x', 'n': 2}))
+
+
+class CommandIdGrammarTest(unittest.TestCase):
+    """A command id is common.v1's ``command_id``: 8 to 128 of A-Z a-z 0-9 . _ : -, matched whole, for EVERY method
+    keyed by one. Anything else is answered request_invalid / command_id before the payload digest, the tenant and the
+    store: no transaction is opened, no receipt is read or kept, no handler or tenant function is asked. (Until
+    Nov 15, 2026 the dispatcher checked only for a non-empty string, so a short id, an illegal character, NUL or
+    DEL reached ``receipt_get``; with EVENTS' store that raised TypeError and the caller got 'unavailable', as both
+    round-5 Codex reads of lane APPROVALS's draft showed.) A valid id at either bound is kept and replayed as before.
+    """
+
+    BAD = ('short', 'cmd-001', 'z' * 129, 'cmd 0001', 'cmd-0001/x', 'cmd-0001\r', 'cmd-0001\n', 'cmd-0001\t',
+           'cmd-12' + chr(0) + 'x', 'cmd-12' + chr(0x7F) + 'x', 'cmd-0001' + chr(0xE9), 'cmd-000' + chr(0x661))
+    GOOD = ('A._:-012', 'Z' * 128)
+
+    class Store:
+        """Opens transactions and keeps receipts, and writes down every use."""
+
+        def __init__(self) -> None:
+            self.kept, self.used, self.opened = {}, [], 0
+
+        @contextlib.contextmanager
+        def transaction(self):
+            self.opened += 1
+            store = self
+
+            class Tx:
+                def receipt_get(self, tenant, method, command_id):
+                    store.used.append(('get', method, command_id))
+                    return store.kept.get((tenant, method, command_id))
+
+                def receipt_put(self, tenant, method, command_id, digest, answer):
+                    store.used.append(('put', method, command_id))
+                    store.kept[(tenant, method, command_id)] = (digest, answer)
+            yield Tx()
+
+    def keyed_tables(self):
+        """For every method keyed by command_id, a table with it registered under each tenant kind there is (a
+        function of the registrant's, and the install's constant), with what each handler and function was asked."""
+        for name, row in methods.METHODS.items():
+            if row.idempotency != 'command_id' or name in methods.MANDATORY or name.startswith('run.'):
+                continue                # the daemon's own methods are not registered by a lane
+            for kind in ('function', 'install'):
+                asked = []
+
+                def tenant_of(principal, params, asked=asked):
+                    asked.append(('tenant', params.get('command_id')))
+                    return 't1'
+
+                def handler(ctx, params, asked=asked):
+                    asked.append(('handler', params.get('command_id')))
+                    return {'code': 'ok'}
+                table = methods.MethodTable()
+                table.register(name, handler, service=row.service,
+                               tenant=tenant_of if kind == 'function' else methods.INSTALL_TENANT)
+                table.store = self.Store()
+                yield name, kind, table, asked
+
+    def test_an_id_outside_the_grammar_is_refused_before_the_receipt_for_every_command_method(self) -> None:
+        seen = 0
+        for name, kind, table, asked in self.keyed_tables():
+            for command_id in self.BAD:
+                with self.subTest(method=name, tenant=kind, command_id=command_id):
+                    answer = table.dispatch(name, {'command_id': command_id, 'text': 'x'}, H.OWNER, None)
+                    self.assertEqual(answer, {'code': 'request_invalid', 'detail': 'command_id'})
+            with self.subTest(method=name, tenant=kind):
+                self.assertEqual((table.store.opened, table.store.used, table.store.kept, asked), (0, [], {}, []),
+                                 'nothing is read, kept or asked for an id outside the grammar')
+            seen += 1
+        self.assertGreater(seen, 30, 'every keyed method, under both tenant kinds')
+
+    def test_a_valid_id_at_either_bound_is_kept_and_replayed_as_before(self) -> None:
+        for name, kind, table, asked in self.keyed_tables():
+            for command_id in self.GOOD:
+                with self.subTest(method=name, tenant=kind, command_id=command_id):
+                    params = {'command_id': command_id, 'text': 'x'}
+                    self.assertEqual(table.dispatch(name, dict(params), H.OWNER, None), {'code': 'ok'})
+                    self.assertEqual(table.dispatch(name, dict(params), H.OWNER, None), {'code': 'ok'})
+                    self.assertEqual([what for what in asked if what[1] == command_id and what[0] == 'handler'],
+                                     [('handler', command_id)], 'the replay answers from the receipt')
+                    self.assertEqual([use for use in table.store.used if use[2] == command_id],
+                                     [('get', name, command_id), ('put', name, command_id), ('get', name, command_id)])
 
 
 class CommandTableTest(unittest.TestCase):
@@ -2818,7 +2900,7 @@ class OwnedAnswerTest(unittest.TestCase):
         expected = {'code': 'ok', 'revision': 1, 'items': ['a']}
         first = table.dispatch('session.turn', dict(TURN), H.OWNER, None)
         self.assertEqual(first, expected, 'the first caller gets what was committed')
-        self.assertEqual(store.receipts[('install', 'session.turn', 'cmd-1')][1], expected)
+        self.assertEqual(store.receipts[('install', 'session.turn', 'cmd-0001')][1], expected)
         first['items'].append('changed by the first caller')
         replay = table.dispatch('session.turn', dict(TURN), H.OWNER, None)
         self.assertEqual(replay, expected)

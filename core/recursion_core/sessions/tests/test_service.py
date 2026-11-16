@@ -522,6 +522,45 @@ class FenceTest(unittest.TestCase):
 class FreshLaunchTest(unittest.TestCase):
     """A session whose launches never started has no conversation to lose: its next turn launches afresh."""
 
+    def test_a_launch_still_pending_at_a_restart_never_started_and_the_next_turn_launches_afresh(self):
+        """Round 5 (DeepSeek A1, astra R1, sol R1): recovery marks a launch that was never attempted
+        ``attempted: false``; it never reached the port, so the session's next turn, or its next queued message,
+        launches afresh. A launch ATTEMPTED before the restart is not such proof: its session's next turn is still
+        refused (the control)."""
+        for how in ('turn', 'queue', 'after_a_refusal', 'attempted'):
+            with self.subTest(how=how):
+                first = Lane()
+                if how == 'after_a_refusal':
+                    first.units.then = [UnitRefused('engine_missing')]
+                    session = first.start(prompt='first')['session']
+                    first.settle()                                  # refused: failed, nothing started
+                    idle = session_of(first, session['session_id'])
+                    self.assertEqual(turn_of(first, idle, text='second')['code'], 'ok')   # committed, not attempted
+                else:
+                    session = first.start(prompt='first')['session']
+                if how == 'attempted':
+                    first.units.then = ['cut-before']
+                    with self.assertRaises(Cut):
+                        first.settle()                              # the claim was committed; then the process ended
+                    first.units.stop_answers = [stop_answer(session['worker']['run_id'], 'ended')]
+                lane = first.restarted()
+                lane.settle()                                       # the recovery Stop settles the session
+                sid = session['session_id']
+                idle = session_of(lane, sid)
+                self.assertEqual((idle['state'], idle['worker']), ('idle', None))
+                if how == 'queue':
+                    lane.call('session.queue', {'command_id': 'cmd-queue-0001', 'session_id': sid, 'text': 'next'})
+                    lane.settle()
+                else:
+                    answer = turn_of(lane, idle, command_id='cmd-turn-0009', text='next')
+                    if how == 'attempted':
+                        self.assertEqual((answer['code'], answer['detail']), ('unsupported', 'not_implemented'))
+                        self.assertEqual(lane.units.launched, [])
+                        continue
+                    self.assertEqual(answer['code'], 'ok', answer)
+                    lane.settle()
+                self.assertEqual([(order.text, order.resume) for order in lane.units.launched], [('next', None)])
+
     def test_a_new_turn_after_a_first_launch_that_never_started_launches_afresh(self):
         lane = Lane()
         lane.units.then = [UnitRefused('engine_missing', 'no such binary'), UnitRefused('engine_missing', 'still')]

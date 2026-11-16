@@ -5290,7 +5290,7 @@ class StartPathOnTest(unittest.TestCase):
             return chosen['route']['engine'] in ('codex', 'claude_code')
         other = entry('claude_code')        # well formed, and launchable here: but it is not this record's engine
         stored = [('codex', shape) for shape in ({'route': 'codex'}, {'binary': None}, {'route': ['codex']}, 'codex',
-                                                 {'route': {}}, {'route': {'engine': ''}}, {'route': {'engine': 7}}, 7, other)]
+                                                 {'route': {}}, {'route': {'engine': ''}}, {'route': {'engine': 7}}, 7, [], other)]
         # A record whose own engine is not a name agrees with an entry that has none: that is refused all the same.
         stored += [(None, {'route': {}}), ('', {'route': {'engine': ''}}), (7, {'route': {'engine': 7}})]
         for engine, shape in stored:

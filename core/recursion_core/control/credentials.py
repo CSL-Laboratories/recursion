@@ -678,9 +678,15 @@ class CredentialStore:
     def _revoke_here(self, record: dict) -> None:
         """Refused from here on, whatever the file write does. Never dated before the grant's issue: after a wall
         clock that stepped back, the store this writes must still load (the round-2 reads of #377, Astra 1 and
-        Sol 1). A retry keeps this first time. Lock held."""
+        Sol 1). A retry keeps this first time. A wall clock that cannot be read does not undo the revocation: it
+        is dated at the grant's issue and kept pending like any other (round 9 of #377: DeepSeek F2, Codex GPT-6
+        Astra 2 and GPT-6.1 Sol 2). Lock held."""
 
-        record["revoked_at"] = max(record["issued_at"], self._now())
+        try:
+            stamp = self._now()
+        except CredentialStoreError:
+            stamp = record["issued_at"]
+        record["revoked_at"] = max(record["issued_at"], stamp)
         self._unpersisted = self._unpersisted | {record["token_id"]}
 
     def _settle(self) -> tuple[Credential, ...]:

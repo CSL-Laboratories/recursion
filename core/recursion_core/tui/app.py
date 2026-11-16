@@ -174,6 +174,7 @@ class TuiApp:
         self._output_lines = output_lines
         self.log = EventLog(log_cap)
         self._t0 = clock()
+        self._last_ms = 0  # the last event's time: a clock sample that is no number keeps it (T4)
         self.runs: list[dict] = []
         self.selected: str | None = None
         self.attached: str | None = None
@@ -181,12 +182,16 @@ class TuiApp:
         self.refresh_failed: str | None = None  # last run.list read failed
         self.status_refresh_failed: str | None = None  # last run.status read failed
         self.list_stale = False  # last successful run.list was marked stale; only a fresh list clears it
+        self.status_stale = False  # the same for run.status: an answer to another method is no fresh status (T3)
         self.last: dict | None = None
         self.last_method: str | None = None
         self._answer_keyed: list[tuple[str, str, str]] = []
         self.answer_conditions: list[tuple[str, str]] = []
         self.shown: dict[tuple[str, str], tuple[str, str]] = {}  # conditions as last logged
-        self._uncertain: dict[str, str] = {}  # per run, until the API lists that run with no unconfirmed Stop
+        # Per run (a Stop) until the API attests that Stop, or per launch (a start) until a list or status names it
+        self._uncertain: dict[str, str] = {}
+        self._asked = 0  # requests asked so far, in order: a read asked before a confirmed Stop is known by it
+        self._stopped: dict[str, int] = {}  # run id -> requests asked when its Stop was confirmed (T2)
         self.errors: list[str] = []
         self.last_error: Event | None = None  # kept here too, so a bounded log cannot drop it
         self.mode, self.line, self.stop_target = "keys", "", None
@@ -225,7 +230,10 @@ class TuiApp:
     # -- the event log --------------------------------------------------------------------------
     def _emit(self, event_type: str, source: str, text: str, speech: str | None = None,
               state: str | None = None) -> Event | None:
-        ms = int(round((self._clock() - self._t0) * 1000))
+        elapsed = (self._clock() - self._t0) * 1000
+        # A clock sample that is no number (NaN, or infinite) keeps the last event's time, so the event is still
+        # logged and no answer or error is lost to a ValueError (the triage of Nov 16, T4).
+        ms = self._last_ms = int(round(elapsed)) if elapsed - elapsed == 0 else self._last_ms
         # The final event seals the log in the same step: any later append, even one a busy thread had
         # already begun, is refused by the log itself, so the final event stays last.
         append = self.log.append_last if event_type == "close" else self.log.append
@@ -299,13 +307,15 @@ class TuiApp:
                 self._error(f"refused locally: start while watch_only ({self._stale_text()}); refresh first")
                 return
             self.in_flight[method] += 1
+            self._asked += 1
+            asked = self._asked
             self._emit("request", "operator", f"request {method} {_fmt(params)}".rstrip())
-            self.dispatch(method, params, self.on_answer)
+            self.dispatch(method, params, lambda m, pa, a: self.on_answer(m, pa, a, asked=asked))
 
     def _inline(self, method: str, params: dict, done: Callable[[str, dict, dict], None]) -> None:
         done(method, params, call_api(self._api, method, params))
 
-    def on_answer(self, method: str, params: dict, answer: dict) -> None:
+    def on_answer(self, method: str, params: dict, answer: dict, asked: int | None = None) -> None:
         if not isinstance(answer, Mapping):  # as call_api says of it (review 2 of #405, DeepSeek L1)
             answer = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
         try:
@@ -321,13 +331,14 @@ class TuiApp:
             if self.closed:  # the TUI ended while the answer was read: it changes nothing
                 return
             try:
-                self._apply_answer(method, params, answer, code, kept)
+                self._apply_answer(method, params, answer, code, kept, asked)
             except Exception as exc:  # noqa: BLE001 - one answer that cannot be read must not end the loop
                 # A Loop runs this on its only thread, and raw mode turns Ctrl-C into a key: a raise here would
                 # leave a terminal no key can reach (review 1 of #405, DeepSeek H1). Said, and not taken.
                 self._error(f"the answer to {method} could not be read ({type(exc).__name__}); it was not taken")
 
-    def _apply_answer(self, method: str, params: dict, answer: dict, code, kept: dict | None = None) -> None:
+    def _apply_answer(self, method: str, params: dict, answer: dict, code, kept: dict | None = None,
+                      asked: int | None = None) -> None:
         self.in_flight[method] = max(0, self.in_flight[method] - 1)
         self.last, self.last_method = dict(answer) if kept is None else kept, method  # a plain copy (on_answer's)
         # A Stop answer confirms only the run it was sent for (ADV2-11): one that names another run,
@@ -338,7 +349,8 @@ class TuiApp:
             pass
         elif method == "run.list":
             if code == "ok" and isinstance(answer.get("runs"), list):
-                self.runs = [r for r in answer["runs"] if isinstance(r, dict)]
+                # A list asked before a run's Stop was confirmed does not show that run running again (T2)
+                self.runs = self._after_stops([r for r in answer["runs"] if isinstance(r, dict)], asked)
                 self.snapshot_at, self.refresh_failed = self._clock(), None
                 # A stale list stays stale until a later list is not. A status answer must not clear it
                 # (bot review 4503920848).
@@ -353,13 +365,18 @@ class TuiApp:
             # not a failed read, and a successful list must not clear it (bot review 4503920903).
             if code == "ok":
                 self.status_refresh_failed = None
-                if isinstance(answer.get("run"), dict):
-                    self._merge(answer["run"])
+                # A stale status stays stale until a later status is not, as a list does: an answer to another
+                # method (a Stop) is no fresh status (the triage of Nov 16, T3).
+                self.status_stale = answer.get("stale") is True
+                if isinstance(answer.get("run"), dict) and not self._before_stop(answer["run"], asked):
+                    self._merge(answer["run"])  # a status asked before its run's Stop was confirmed is not taken (T2)
             elif code == p.UNAVAILABLE:
                 self.status_refresh_failed = f"run.status answered {field(code)}"
         elif code == "ok" and isinstance(answer.get("run"), dict):
             self._merge(answer["run"])
         elif code in ("stopped", "pending") and isinstance(answer.get("run_id"), str):
+            if code == "stopped":  # every request asked so far was asked before this confirmation (T2)
+                self._stopped[answer["run_id"]] = self._asked
             for run in self.runs:
                 if run.get("run_id") == answer["run_id"]:
                     run["state"] = "stopped" if code == "stopped" else "stop_pending"
@@ -374,6 +391,8 @@ class TuiApp:
         # write to the registry failed (recorded=false) leaves the run `running` with no stop (R2 finding
         # 6). A later answer about another run, or a run absent from the list, does not clear it either.
         attested = {f"run={r.get('run_id')}" for r in self.runs if r.get("state") == "stopped"}
+        # A start the API could not confirm stays UNCERTAIN until a list or a status names its run (T23)
+        attested |= {f"start={r.get('run_id')}" for r in self.runs}
         for subject in list(self._uncertain):
             if subject in attested:
                 del self._uncertain[subject]
@@ -555,6 +574,21 @@ class TuiApp:
         if self.pane is not None:
             return self.transcript_rows.get(self.pane)
         return self.outputs.get(self.attached or "")
+
+    def _before_stop(self, run: Mapping, asked: int | None) -> bool:
+        """True when ``run``'s Stop was confirmed after this read was asked: the read may show the run as it was
+        before the Stop, so it cannot undo it (the triage of Nov 16, T2). An answer handed to ``on_answer`` with
+        no ``asked`` (not through ``request``) is taken as it comes."""
+
+        return asked is not None and asked <= self._stopped.get(str(run.get("run_id")), 0)
+
+    def _after_stops(self, runs: list[dict], asked: int | None) -> list[dict]:
+        """``runs`` from a list, but a run whose Stop was confirmed after the list was asked stays as that Stop
+        left it (``stopped``)."""
+
+        old = {str(r.get("run_id")): r for r in self.runs}
+        return [old.get(str(r.get("run_id")), {**r, "state": "stopped"}) if self._before_stop(r, asked) else r
+                for r in runs]
 
     def _merge(self, run: dict) -> None:
         for i, known in enumerate(self.runs):
@@ -937,10 +971,12 @@ class TuiApp:
     # -- derived state --------------------------------------------------------------------------
     @property
     def stale(self) -> bool:
-        if (self.refresh_failed or self.status_refresh_failed or self.list_stale
+        if (self.refresh_failed or self.status_refresh_failed or self.list_stale or self.status_stale
                 or any(label == p.STALE for label, _ in self.answer_conditions)):
             return True
-        return self.snapshot_at is not None and self._clock() - self.snapshot_at > self.stale_after_s
+        # Fresh only while the snapshot's age is a number within the limit: a clock that gave no number (NaN), at
+        # the list or now, leaves the view stale, never fresh for ever (the triage of Nov 16, T4).
+        return self.snapshot_at is not None and not self._clock() - self.snapshot_at <= self.stale_after_s
 
     @property
     def watch_only(self) -> bool:
@@ -957,9 +993,14 @@ class TuiApp:
             reasons.append(f"refresh failed: {self.status_refresh_failed}")
         if self.list_stale:
             reasons.append("run.list answer was stale")
+        if self.status_stale:
+            reasons.append("run.status answer was stale")
         if any(label == p.STALE for label, _ in self.answer_conditions):
             reasons.append("API marked its answer stale")
-        if self.snapshot_at is not None and self._clock() - self.snapshot_at > self.stale_after_s:
+        age = self._clock() - self.snapshot_at if self.snapshot_at is not None else 0.0
+        if age != age:  # NaN: the clock gave no number (T4)
+            reasons.append("snapshot time unknown: the clock gave no number")
+        elif not age <= self.stale_after_s:
             reasons.append(f"snapshot older than {self.stale_after_s:.1f}s")
         return "; ".join(reasons)
 
@@ -1382,6 +1423,10 @@ class Loop:
             if item is None:
                 return
             method, params, done = item
+            if self.app.closed or self._halt.is_set():
+                # Closing sends nothing: a request this lane has not begun when the TUI closes is not sent, a
+                # Start or a Stop alike; one begun before may end after it (the triage of Nov 16, T1).
+                continue
             try:
                 answer = call_api(self._api, method, params)
             except BaseException as err:  # noqa: BLE001 - KeyboardInterrupt, SystemExit: an answer, so in_flight

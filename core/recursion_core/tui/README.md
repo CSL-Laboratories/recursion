@@ -13,7 +13,8 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
 - `protocol.py`: the CLI's commands (`list`, `status RUN`, `stop RUN`,
   `start --tenant --engine --prompt [--client-key]`, `conditions`) and the same `run.*` request each
   request command sends. There is no approve, deny, order or mid-run verb. `keyed_conditions` turns an
-  answer into text labels: `REFUSED`, `UNCERTAIN` (a `pending` stop), `STALE`, `UNRECONCILED` (a
+  answer into text labels: `REFUSED`, `UNCERTAIN` (a `pending` stop, or a `start_unconfirmed` launch,
+  which may be running), `STALE`, `UNRECONCILED` (a
   run with an unconfirmed Stop: `stop_pending`, or any state but `stopped` that carries a stop record,
   such as a `starting` run whose Stop the API kept as intent with `cgroup_unknown`), `UNAVAILABLE`.
 - `events.py`: the one ordered event log (requests, answers, condition edges, engine output chunks,
@@ -64,8 +65,8 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
 ## Behaviour
 
 - Opening reads `run.list`. Attaching (`a`/Enter, or `status RUN`) reads `run.status`. Neither starts
-  anything. Closing (`q`, Ctrl-C, or the terminal ending input) sends nothing and exits 0; runs keep
-  going, and reopening reattaches. An API client that cannot be built is `control_api_unavailable` on
+  anything. Closing (`q`, Ctrl-C, or the terminal ending input) sends nothing and exits 0: a request
+  still queued and not begun is not sent, a Stop included; runs keep going, and reopening reattaches. An API client that cannot be built is `control_api_unavailable` on
   stderr with exit 1, as in the CLI.
 - Keys (all from the keymap, so a binding file can change them; `?` lists the ones in force, and the
   prompt row's hints follow the keymap):
@@ -171,8 +172,10 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   screen shows the API's own answer: `status=stopped`, or `status=pending` plus an `UNCERTAIN` line.
   Stop needs no input lease and has its own request lane, so it never waits behind a slow read. Keys are
   handled before queued output each tick.
-- Stale (snapshot older than `stale_after_s`, a failed refresh, or an answer marked `stale`) forces
-  `watch_only`. Start is refused locally; reads and Stop stay available.
+- Stale (snapshot older than `stale_after_s` or taken at a time that is not a number, a failed refresh, or
+  an answer marked `stale`) forces `watch_only`. A `run.list` or `run.status` marked `stale` keeps it until
+  a later answer of the same method is not; an answer to another method (a Stop) does not end it. Start
+  is refused locally; reads and Stop stay available.
 - Every request, answer, condition edge, engine output chunk, notice and error is an event in
   `TuiApp.log` before any renderer shows it. The full-screen frame and the linear renderer both read
   that log; neither renders from the other's frame or strings. `transcript` is the log's text.
@@ -180,7 +183,9 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   `UNRECONCILED changed: ...`, `UNRECONCILED cleared, was: ...`), not again after every command. A
   usage error says only the error. `UNCERTAIN` for a run stays until the API attests the stop: it lists
   that run as `stopped`, or answers `stopped` to a Stop of it. A run listed with no stop record does not
-  clear it, since a pending Stop whose registry write failed leaves exactly that. The `conditions` command says the current set again on demand. The CLI has the same
+  clear it, since a pending Stop whose registry write failed leaves exactly that. A `run.list` or `run.status`
+  asked before a Stop was confirmed does not show that run running again. A start's `UNCERTAIN` stays
+  until a list or a status names its run. The `conditions` command says the current set again on demand. The CLI has the same
   command (`recursion-control conditions`), which reads `run.list` because it keeps no state. No control
   API method was added.
 - The latest error stays on its own row (and in the inline live region) until a newer error replaces

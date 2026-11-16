@@ -1089,11 +1089,18 @@ class DeliveryModel:
 
 # ----------------------------------------------------------------------------------------- the Task
 
-def _log_times(events: list, entity_id: str, of_turn: str | None = None) -> tuple:
-    """created_at and updated_at of the Task of one entity (a run or a turn, named by its id: the ids of
-    the two kinds never coincide), from the log as it is retained: created_at is null, because no event
-    of this version establishes a creation and its time (see below), and updated_at is the time of the
-    latest state.changed of the run or the turn, or null where the log holds none.
+def _log_times(events: list, entity: str, entity_id: str, of_turn: str | None = None) -> tuple:
+    """created_at and updated_at of the Task of one entity (a run or a turn), from the log as it is
+    retained: created_at is null, because no event of this version establishes a creation and its time
+    (see below), and updated_at is the time of the latest state.changed OF THAT run or turn, or null where
+    the log holds none.
+
+    Which entity a state.changed is of is said in its payload: ``entity`` and ``entity_id`` (event.v1.json,
+    state.changed). Where the event is filed, the ``turn_id`` beside its payload, says under which turn it
+    was logged and not what changed. Both are asked for a turn: the event is filed under that turn
+    (``of_turn``, as before) AND its payload names that turn. So a change of the run or of the session that
+    is filed under a turn is not a change of that turn and does not move its Task; and a change of a turn,
+    of a session or of another run in a run's log does not move that run's.
 
     Task created_at comes from retained creation metadata or an event that establishes creation of that
     entity. Position 1 and absence of an earlier replay.gap are retention checks, not proof of creation.
@@ -1114,7 +1121,8 @@ def _log_times(events: list, entity_id: str, of_turn: str | None = None) -> tupl
     is null for every Task here, whatever the log holds, until a later version gives one of the two.
     """
     mine = [event for event in events if of_turn is None or event.get("turn_id") == of_turn]
-    changed = [event["time"] for event in mine if event["type"] == "state.changed"]
+    changed = [event["time"] for event in mine if event["type"] == "state.changed"
+               and event["payload"]["entity"] == entity and event["payload"]["entity_id"] == entity_id]
     return None, (changed[-1] if changed else None)
 
 
@@ -1138,7 +1146,7 @@ def task_of_run(view: dict, events: list = (), pending_approval_ids: list = ()) 
     ``lost_reboot``. A Task of a run has no turn outcome and does not expire.
     """
     state, run_id, result = view["state"], view["run_id"], view.get("result")
-    created_at, updated_at = _log_times(list(events), run_id)
+    created_at, updated_at = _log_times(list(events), "run", run_id)
     task = {"task_id": run_id, "source": "run", "session_id": None, "run_id": run_id, "turn_id": None,
             "outcome": None, "cancel_requested": False, "pending_approval_ids": [], "expires_at": None,
             "created_at": created_at, "updated_at": updated_at, "result": None}
@@ -1182,7 +1190,7 @@ def task_of_turn(session: dict, turn_id: str, events: list = (), pending_approva
     turn = next((item for item in session["turns"] if item["turn_id"] == turn_id), None)
     if turn is None:
         raise Refused("turn_unknown")
-    created_at, updated_at = _log_times(list(events), turn_id, of_turn=turn_id)
+    created_at, updated_at = _log_times(list(events), "turn", turn_id, of_turn=turn_id)
     live = turn["state"] in ("queued", "running")
     status = {"queued": "working", "running": "working", "ended": "completed", "failed": "failed",
               "interrupted": "cancelled", "stopped": "cancelled"}[turn["state"]]
@@ -1615,9 +1623,20 @@ def transcript_page_problems(params: dict, raw_page: dict, page: dict) -> list:
     the raw page is not itself a right answer to that cursor (``page_problems`` finds something in it:
     an event of another log, a position skipped, a gap that does not start at the next missing position
     or carries the wrong seq), so no transcript page may be made from it. ``lines``: there is not one
-    line for each event of the raw page, in order, with the event's seq and type. ``envelope``: the
-    transcript page's cursor, ``more`` or ``epoch_advanced`` is not the raw page's. Then whatever
-    ``page_problems`` finds in the transcript page itself.
+    line for each event of the raw page, in order, with the event's seq and type. ``<line number>:<field>``
+    (the form of ``transcript_problems``): a line carries, in that field, something else than its event
+    says. ``envelope``: the transcript page's cursor, ``more`` or ``epoch_advanced`` is not the raw page's.
+    Then whatever ``page_problems`` finds in the transcript page itself.
+
+    WHAT A LINE IS HELD TO, from the page's own events (``transcript_fields``): its ``source``, its
+    ``trust``, its ``state``, and its ``text`` wherever the text is the event's own and plain. So a line of
+    engine output that is given another text, or is relabelled as the core's and trusted, is found here.
+    WHAT ONE PAGE CANNOT SAY, and is therefore not compared: ``time_rel_ms``, which counts from the time of
+    the log's FIRST event and never runs backwards over the whole log; a page that does not begin at
+    position 1 holds neither that first time nor the lines before its own, so the value is held only for a
+    page whose first event is at position 1. The text of a type whose text is a sentence of the core's
+    renderer, engine text that is not plain (the sanitizer's rule is not part of these records),
+    ``speech`` and ``focus`` are the renderer's, and no rule here gives them.
     """
     asked_raw = dict(params, projection="raw")
     if raw_page.get("projection") != "raw" or page_problems(asked_raw, raw_page):
@@ -1627,6 +1646,11 @@ def transcript_page_problems(params: dict, raw_page: dict, page: dict) -> list:
     if (not isinstance(lines, list) or len(lines) != len(events)
             or any(line.get("seq") != event["seq"] or line.get("event_type") != event["type"] for line, event in zip(lines, events))):
         problems.append("lines")
+    else:
+        # One line for each event: each is held to what its event says. The time is held only where this
+        # page holds the log's first event (position 1); see the text above for why.
+        whole = bool(events) and events[0]["seq"] == 1
+        problems += [found for found in transcript_problems(events, lines) if whole or not found.endswith(":time_rel_ms")]
     if any(page.get(member) != raw_page.get(member) for member in ("cursor", "more", "epoch_advanced")):
         problems.append("envelope")
     return problems + [found for found in page_problems(params, page) if found not in problems]

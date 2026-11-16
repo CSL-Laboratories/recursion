@@ -1,0 +1,6 @@
+{
+  "method": "budget.show",
+  "params": {
+    "connection_id": "subscription:personal-max"
+  }
+}

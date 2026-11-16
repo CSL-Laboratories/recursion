@@ -1,0 +1,8 @@
+{
+  "tool": "\u00c9crire",
+  "cwd": "C:\\Users\\dev\\Projets\\caf\u00e9",
+  "input_text": "{\"content\": \"caf\u00e9 \u2014 1.5 kg \ud83d\ude00\"}",
+  "expect": {
+    "call_text": "{\"cwd\":\"C:\\\\Users\\\\dev\\\\Projets\\\\caf\u00e9\",\"input\":{\"content\":\"caf\u00e9 \u2014 1.5 kg \ud83d\ude00\"},\"tool\":\"\u00c9crire\"}"
+  }
+}

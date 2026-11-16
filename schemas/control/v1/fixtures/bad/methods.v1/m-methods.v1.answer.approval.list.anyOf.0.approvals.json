@@ -1,0 +1,9 @@
+{
+  "method": "approval.list",
+  "params": {
+    "state": "pending"
+  },
+  "answer": {
+    "code": "ok"
+  }
+}

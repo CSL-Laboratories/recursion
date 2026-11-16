@@ -1,0 +1,8 @@
+{
+  "tool": "Bash",
+  "cwd": null,
+  "input_text": "{\"a\": 9007199254740993.0}",
+  "expect": {
+    "refused": "integer_out_of_range"
+  }
+}

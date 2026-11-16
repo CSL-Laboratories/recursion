@@ -1,8 +1,9 @@
 """The ``key`` command family of ``recursion-control`` (seam S2): add, list, remove and audit user-entered keys.
 
-Registered by ``recursion_core.keys.hooks`` into the command table once SPINE's seams land. The actions run in
-the CLI's own process against the user's own key store and make no daemon call, so ``client`` is not used: a
-key never crosses the control socket. The actions themselves are in ``recursion_core.keys.cli``.
+Registered by ``recursion_core.keys.hooks`` into the command table (S2) at composition; ``recursion-control``
+offers it once its parser reads that table, which master's does not yet. The actions run in the CLI's own
+process against the user's own key store and make no daemon call, so ``client`` is not used: a key never
+crosses the control socket. The actions themselves are in ``recursion_core.keys.cli``.
 """
 from __future__ import annotations
 

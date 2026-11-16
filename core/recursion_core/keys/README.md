@@ -4,7 +4,7 @@ Recursion keeps the model-provider API keys a user types in. It keeps them in th
 
 ## Commands
 
-The same four actions are available as `recursion-control key ...` (once SPINE's seams land) and as `python -m recursion_core.keys ...` (which needs no daemon):
+The same four actions are available as `python -m recursion_core.keys ...` (which needs no daemon) and, once `recursion-control` reads SPINE's command table (S2), as `recursion-control key ...`. SPINE's seams are on master and `hooks.py` registers the family there, but master's `recursion-control` does not read that table yet:
 
 | Command | What it does |
 |---|---|
@@ -47,7 +47,7 @@ The index, `$XDG_CONFIG_HOME/recursion/keys/index.json` (default `~/.config/recu
 
 `credentials(connection_id, env_name)`, imported as `from recursion_core.keys import credentials`, is the `Credentials` type of `routes/base.py`. It returns the value only when the id is saved under exactly that variable name and the key has a spend opt-in with a cap above 0. An unknown id, or a known one asked for under another name, raises `KeyError(connection_id)`, as the daemon's default does. A refused known id, or one whose add or removal is unfinished, raises `KeyRefused`, a `KeyError` with a typed code. Either way the route refuses before launch: `launch_refused`, "no credential for ID". It is the only way a value leaves the store for a route; `KeyStore.values()` serves `audit` alone.
 
-`hooks.py` registers it into seam S7, and the `key` command family into S2, once SPINE's seams pull request lands. Until then the daemon still passes `no_custody` and every API-key route refuses, as before.
+`hooks.py` registers it into seam S7, and the `key` command family into S2, when SPINE's `control.hooks.compose()` loads this lane. The seams are on master, but nothing outside them calls `compose()` yet: until the daemon and `recursion-control` call the composed hooks, the daemon still passes `no_custody` and every API-key route refuses, as before.
 
 ## Spend
 

@@ -1,7 +1,8 @@
 """``credentials()`` as the routes use it: passed where the daemon passes ``no_custody`` today.
 
-Until SPINE's seams land, the daemon builds both adapters with ``no_custody``; these tests build the same
-adapters through ``RouteService`` with the store's ``credential`` instead, and with ``no_custody`` for the base.
+Until the daemon calls SPINE's composed hooks, which master's does not yet, it builds both adapters with
+``no_custody``; these tests build the same adapters through ``RouteService`` with the store's ``credential``
+instead, and with ``no_custody`` for the base.
 """
 from __future__ import annotations
 

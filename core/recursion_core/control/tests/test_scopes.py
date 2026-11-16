@@ -870,6 +870,107 @@ class RoundEightScopesTest(unittest.TestCase):
         self.assertEqual(live(principal, "run.start", {}), ("scope_refused", "needs_run"))
 
 
+class RoundEightCodexScopesTest(unittest.TestCase):
+    """The round-8 reads of #377, Codex GPT-6 Astra 1 and GPT-6.1 Sol 1 (STRICT): a class that shadows its instance
+    __dict__ hid an unreadable instance declaration from getattr_static, so the plugin's identity grants were read."""
+
+    class RejectIdentity:
+        def held(self, *args):
+            raise AssertionError("unreadable context reached identity store")
+
+        def grant_scopes(self, *args):
+            raise AssertionError("unreadable context reached grant store")
+
+    def test_unreadable_instance_grant_with_shadowed_dictionary_never_consults_identity(self) -> None:
+        # Sol's test, as written in its proposed-regression-tests.diff.
+        class EmptyStore:
+            def __init__(self):
+                self.calls = []
+
+            def held(self, *args):
+                self.calls.append(args)
+                return frozenset()
+
+        class Shadowing:
+            kind, id = "plugin", "synthetic"
+
+            @property
+            def __dict__(self):
+                raise AttributeError("synthetic dictionary unavailable")
+
+            def __getattribute__(self, name):
+                if name == "grant":
+                    raise AttributeError("synthetic context unavailable")
+                return object.__getattribute__(self, name)
+
+        principal = Shadowing()
+        object.__setattr__(principal, "grant", "synthetic-context")
+        self.assertEqual(object.__getattribute__(principal, "grant"), "synthetic-context")
+        store = EmptyStore()
+        self.assertEqual(Authorizer(scope_of=lambda _: None, credentials=store).held(principal), frozenset())
+        self.assertEqual(store.calls, [])
+
+    def test_instance_declaration_with_shadowed_dictionary(self) -> None:
+        # Astra's DeclarationContracts test, directly and inherited.
+        class Base:
+            kind, id = "plugin", "synthetic"
+
+            @property
+            def __dict__(self):
+                return {}
+
+            def __getattribute__(self, name):
+                if name == "grant":
+                    raise AttributeError("synthetic unreadable field")
+                return object.__getattribute__(self, name)
+
+        class Child(Base):
+            pass
+
+        auth = Authorizer(scope_of=lambda _: None, credentials=self.RejectIdentity())
+        for cls in (Base, Child):
+            principal = cls()
+            object.__setattr__(principal, "grant", "synthetic-reference")
+            with self.subTest(inherited=cls is Child):
+                self.assertEqual(auth.held(principal), frozenset())
+
+    def test_instance_declaration_with_inherited_dictionary_shadow_and_fallback(self) -> None:
+        # Astra's second DeclarationContracts test: the shadow is inherited, and a __getattr__ would answer None.
+        class Storage:
+            pass
+
+        class Hidden(Storage):
+            kind, id = "plugin", "synthetic"
+
+            @property
+            def __dict__(self):
+                raise RuntimeError("dictionary unavailable")
+
+            def __getattribute__(self, name):
+                if name == "grant":
+                    raise AttributeError("synthetic unreadable field")
+                return object.__getattribute__(self, name)
+
+            def __getattr__(self, name):
+                if name == "grant":
+                    return None
+                raise AttributeError(name)
+
+        principal = Hidden()
+        object.__setattr__(principal, "grant", "synthetic-reference")
+        self.assertEqual(Authorizer(scope_of=lambda _: None, credentials=self.RejectIdentity()).held(principal),
+                         frozenset())
+
+    def test_an_ordinary_instance_dictionary_still_reads_absence(self) -> None:
+        # The control: Python's own __dict__ descriptor proves absence, so a host-attributed plugin keeps its grants.
+        class Ordinary:
+            kind, id, in_run_unit = "plugin", "plugin.alpha", False
+
+        auth = authorizer(credentials=Grants({("plugin", "plugin.alpha"): {"read", "run"}}))
+        self.assertEqual(auth.held(Ordinary()), frozenset({"read", "run"}))
+        self.assertEqual(auth.held(Principal("plugin", "plugin.alpha")), frozenset({"read", "run"}))
+
+
 class ConstructionTest(unittest.TestCase):
     def test_the_providers_must_be_callable(self) -> None:
         for kwargs in ({"scope_of": None}, {"scope_of": "read"}, {"scope_of": SCOPE_COLUMN.get, "in_subtree": None},

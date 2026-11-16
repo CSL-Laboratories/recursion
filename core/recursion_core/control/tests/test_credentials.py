@@ -1378,6 +1378,102 @@ class RoundEightCredentialsTest(unittest.TestCase):
         self.assertEqual(store.grants(), [])
 
 
+class RoundEightCodexCredentialsTest(unittest.TestCase):
+    """The round-8 reads of #377: Codex GPT-6 Astra 2 and 3, GPT-6.1 Sol 2 and 3. A container type compared with ``in``
+    asked the type's metaclass; mint's isinstance read the caller's __class__; and a wall clock below zero wrote an
+    issue time that made the whole store unloadable (#385's round-6 F3)."""
+
+    def setUp(self) -> None:
+        self.base = tempfile.mkdtemp(prefix="creds-r8c-")
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.path = os.path.join(self.base, "state", "synthetic-store.json")
+
+    def test_container_type_membership_does_not_use_metaclass_equality(self) -> None:
+        # Astra's ContainerContracts test.
+        class Meta(type):
+            def __eq__(cls, other):
+                return other is list
+
+            __hash__ = type.__hash__
+
+        class Container(list, metaclass=Meta):
+            def __iter__(self):
+                raise RuntimeError("synthetic container iteration")
+
+        with self.assertRaises(CredentialRefused) as caught:
+            creds.check_grant("plugin", Container(["read"]))
+        self.assertEqual(caught.exception.detail, "scopes_invalid")
+
+    @NEEDS_POSIX
+    def test_mint_refuses_a_container_without_reading_its_class(self) -> None:
+        # Sol's test.
+        class OtherCollection:
+            @property
+            def __class__(self):
+                raise RuntimeError("synthetic class reader failed")
+
+            def __iter__(self):
+                return iter(("read",))
+
+            def __len__(self):
+                return 1
+
+            def __contains__(self, item):
+                return item == "read"
+
+        store = CredentialStore(self.path)
+        with self.assertRaises(CredentialRefused) as caught:
+            store.mint("plugin", "synthetic", OtherCollection())
+        self.assertEqual(caught.exception.detail, "scopes_invalid")
+        self.assertEqual(store.grants(), [])
+
+    @NEEDS_POSIX
+    def test_mint_with_negative_clock_keeps_the_store_loadable(self) -> None:
+        # Sol's test; Astra's original_negative_clock_mint_must_reload is the same case.
+        store = CredentialStore(self.path, wall=lambda: -1.0)
+        store.mint("plugin", "synthetic", ["read"])
+        reopened = CredentialStore(self.path)
+        self.assertEqual(len(reopened.grants()), 1)
+        self.assertEqual(reopened.grants()[0].issued_at, 0)
+
+    @NEEDS_POSIX
+    def test_rollback_must_not_damage_existing_store(self) -> None:
+        # Astra's ClockContracts test: a clock that steps back below zero after a valid grant.
+        now = [1000]
+        store = CredentialStore(self.path, wall=lambda: now[0])
+        store.mint("device", "existing", ["read"])
+        now[0] = -2.5
+        store.mint("plugin", "later", ["read"])
+        self.assertEqual(len(CredentialStore(self.path).grants()), 2)
+
+    @NEEDS_POSIX
+    def test_rollback_expiry_cannot_write_negative_expiry(self) -> None:
+        # Astra's ClockContracts test.
+        store = CredentialStore(self.path, wall=lambda: -10)
+        with self.assertRaises(CredentialRefused) as caught:
+            store.mint("plugin", "synthetic", ["read"], expires_at=-1)
+        self.assertEqual(caught.exception.detail, "expiry_invalid")
+        self.assertEqual(store.grants(), [])
+
+    @NEEDS_POSIX
+    def test_a_wall_clock_that_does_not_answer_a_number_is_a_typed_store_error(self) -> None:
+        # #385's round-6 F5 (DeepSeek), owed here: a wall answering a non-number left int()'s error untyped.
+        good = CredentialStore(self.path, wall=lambda: 1000.0)
+        token, cred = good.mint("plugin", "synthetic", ["read"], expires_at=5000)
+        for answer in ("x", None, float("nan"), float("inf")):
+            with self.subTest(answer=repr(answer)):
+                bad = CredentialStore(self.path, wall=lambda a=answer: a)
+                with self.assertRaises(CredentialStoreError):
+                    bad.mint("plugin", "other", ["read"])
+                with self.assertRaises(CredentialStoreError):
+                    bad.grant_scopes(cred.token_id, "plugin", "synthetic")
+                with self.assertRaises(CredentialRefused) as caught:
+                    bad.verify(token, peer="p")
+                self.assertEqual(caught.exception.detail, "store_unavailable")
+        self.assertEqual(len(CredentialStore(self.path).grants()), 1)
+        self.assertEqual(good.verify(token, peer="p").token_id, cred.token_id)
+
+
 class PlatformTest(unittest.TestCase):
     def test_without_uids_the_store_refuses_to_open(self) -> None:
         with mock.patch.object(creds.os, "name", "nt"):

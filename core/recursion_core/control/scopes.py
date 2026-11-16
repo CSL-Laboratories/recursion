@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import types
 from collections.abc import Callable
 
 from recursion_core.control.credentials import ALL_SCOPES, PAGE_DEVICE_ID, SCOPE_REFUSED, CredentialStore, ceiling
@@ -138,6 +139,20 @@ def _special(cls: type, name: str):
     return _ABSENT
 
 
+def _instance_dictionary_shadowed(cls: type) -> bool:
+    """Whether something other than Python's own ``__dict__`` descriptor stands at ``__dict__`` for instances of
+    ``cls`` (the first class in its MRO that has one, read past any metaclass). Then nothing can show that an
+    instance declares no ``grant``, so its absence is not taken as proved (round 8 of #377, Codex GPT-6 Astra 1
+    and GPT-6.1 Sol 1: a shadowed instance dictionary hid an unreadable declaration from ``getattr_static``)."""
+
+    for base in _TYPE_MRO(cls):
+        member = _TYPE_DICT(base).get("__dict__", _ABSENT)
+        if member is not _ABSENT:
+            return not (type(member) in (types.GetSetDescriptorType, types.MemberDescriptorType)
+                        and member.__name__ == "__dict__" and member.__objclass__ is base)
+    return False
+
+
 def _read_declared_grant(principal):
     """``principal.grant`` as Python reads it with no ``__getattr__`` fallback: the ``__getattribute__`` Python
     selects for the type, bound as Python binds it. A metaclass cannot put another reader in its place (the
@@ -175,7 +190,10 @@ class Authorizer:
         try:
             # Each class's own dictionary first, read past any metaclass: a metaclass answering __dict__ hid a
             # declaration from getattr_static (round 7, Sol 1); then the instance and the metaclass as before.
-            declared = (_special(type(principal), "grant") is not _ABSENT
+            # A shadowed instance dictionary counts as a declaration: absence cannot be shown (round 8, Astra 1,
+            # Sol 1), so the grant is read with the type's reader and, if that fails, the principal holds nothing.
+            declared = (_instance_dictionary_shadowed(type(principal))
+                        or _special(type(principal), "grant") is not _ABSENT
                         or _special(type(type(principal)), "grant") is not _ABSENT
                         or inspect.getattr_static(principal, "grant", _ABSENT) is not _ABSENT
                         or inspect.getattr_static(type(principal), "grant", _ABSENT) is not _ABSENT)

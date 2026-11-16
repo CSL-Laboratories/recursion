@@ -165,7 +165,9 @@ def check_grant(kind: object, scopes: object) -> frozenset[str]:
         raise CredentialRefused("kind_not_mintable")
     # Exactly one of the four built-in containers, so none of a subclass's own __iter__, __len__ or __bool__ is
     # asked: a subclass is refused (round 8 of #377, DeepSeek 1: one that raised left mint untyped).
-    if type(scopes) not in (set, frozenset, list, tuple) or not scopes:
+    # The container's type is compared by identity: ``in`` on a tuple of types would ask the type's own metaclass
+    # for equality (round 8 of #377, Codex GPT-6 Astra 2).
+    if not any(type(scopes) is allowed for allowed in (set, frozenset, list, tuple)) or not scopes:
         raise CredentialRefused("scopes_invalid")
     if not all(isinstance(s, str) for s in scopes):   # before hashing: a list may hold an unhashable value
         raise CredentialRefused("scopes_invalid")
@@ -558,7 +560,14 @@ class CredentialStore:
                           expires_at=record["expires_at"], revoked_at=record["revoked_at"])
 
     def _now(self) -> int:
-        return int(self._wall())
+        """The wall clock in whole seconds. A clock that does not answer a finite number makes the store unusable:
+        ``CredentialStoreError``, never an untyped error out of mint, verify or a read (#385's round-6 F5, owed on
+        #377 and answered with its round-8 reads)."""
+
+        try:
+            return int(self._wall())
+        except Exception as exc:  # noqa: BLE001 - a clock that cannot be read is a store that cannot be used
+            raise CredentialStoreError(f"the wall clock did not answer a finite number ({type(exc).__name__})") from None
 
     def mint(self, kind: str, principal_id: str, scopes: Collection[str], *,
              expires_at: int | None = None) -> tuple[str, Credential]:
@@ -571,12 +580,14 @@ class CredentialStore:
         """
 
         kind, principal_id = _text(kind), _text(principal_id)   # their text (round 7 of #377, DeepSeek 1)
-        granted = check_grant(kind, scopes if isinstance(scopes, (set, frozenset, list, tuple)) else None)
+        granted = check_grant(kind, scopes)   # no isinstance first: it would read the caller's __class__ (round 8, Sol 3)
         if not isinstance(principal_id, str) or _LABEL.fullmatch(principal_id) is None:
             raise CredentialRefused("principal_id_invalid")
         if (kind, principal_id) in RESERVED:
             raise CredentialRefused("principal_id_reserved")
-        now = self._now()
+        # Never below zero: a wall clock that answered below zero wrote an issue time the loader refuses, and the
+        # whole file then failed to load for every later process (#385's round-6 F3; round 8 of #377, Astra 3, Sol 2).
+        now = max(0, self._now())
         if expires_at is not None and (type(expires_at) is not int or expires_at <= now):
             raise CredentialRefused("expiry_invalid")
         session = kind == "session"
@@ -695,10 +706,15 @@ class CredentialStore:
                     reason = "token_unknown"
                 elif record["revoked_at"] is not None:
                     reason = "token_revoked"
-                elif record["expires_at"] is not None and self._now() >= record["expires_at"]:
-                    reason = "token_expired"
                 else:
-                    return self._credential(record)
+                    try:
+                        expired = record["expires_at"] is not None and self._now() >= record["expires_at"]
+                    except CredentialStoreError as exc:   # the clock, not the peer: not counted against it
+                        log.error("credential check refused for peer %r: %s", peer, exc)
+                        raise CredentialRefused("store_unavailable") from None
+                    if not expired:
+                        return self._credential(record)
+                    reason = "token_expired"
         now_limited = self._limit.failed(peer)
         log.warning("credential check failed for peer %r: %s%s", peer, reason,
                     "; the peer is now refused for a while" if now_limited else "")

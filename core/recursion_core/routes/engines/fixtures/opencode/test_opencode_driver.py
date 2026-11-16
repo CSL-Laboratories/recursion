@@ -8,6 +8,8 @@ A spy stands in for the launch path: it records every spawn and gives back a pla
 from __future__ import annotations
 
 import inspect
+import dis
+import signal
 import sys
 import threading
 import unittest
@@ -416,6 +418,193 @@ class StartedRollbackTests(unittest.TestCase):
         self.assertFalse(p.started)
         p.feed(START)
         self.assertTrue(p.started)
+
+
+FINISH_STOP_B = FINISH_STOP.replace("ses_a", "ses_b")
+LIMIT_429 = ('{"type":"error","sessionID":"ses_a","error":{"name":"APIError","data":{"statusCode":429,'
+             '"message":"synthetic"}}}\n')
+
+
+class RoundThreeDriverTests(unittest.TestCase):
+    """#414 round 3: astra required 1 to 4, DeepSeek MEDIUM-1 and LOW-1. Every wait here is bounded."""
+
+    setUp, accepted = RoundTwoDriverTests.setUp, RoundTwoDriverTests.accepted
+
+    # astra required 1: a failed explicit close can be asked again
+    def test_a_failed_explicit_close_can_be_asked_again(self):
+        process = self.spy.processes[0]
+        process.close_errors = [OSError("synthetic: not closed")]
+        with self.assertRaises(OSError):
+            self.driver.send(self.handle, {"kind": "close"})
+        self.assertFalse(self.handle.closed)
+        self.driver.send(self.handle, {"kind": "close"})
+        self.assertEqual((process.close_attempts, process.closes, self.handle.closed), (2, 1, True))
+        with self.assertRaises(DriverStateError):
+            self.driver.send(self.handle, {"kind": "close"})
+
+    # astra required 2: only a start read by this parse call accepts the prompt
+    def test_an_empty_parse_does_not_accept_a_start_read_before_the_prompt(self):
+        self.driver.parse(self.handle, START)
+        self.driver.send(self.handle, message())
+        self.assertEqual(self.accepted(self.driver.parse(self.handle, "")), [])
+        self.assertEqual(len(self.accepted(self.driver.parse(self.handle, START))), 1)
+
+    # astra required 3: terminal transitions wait for a line being read, and a later send reserves no turn
+    def test_a_finish_waits_for_a_line_being_read_and_its_429_decides(self):
+        self.driver.send(self.handle, message())
+        parser = self.driver._worker(self.handle)["parser"]
+        real, inside, go = parser._typed, threading.Event(), threading.Event()
+
+        def slow(event):
+            inside.set()
+            go.wait(5)
+            return real(event)
+
+        parser._typed = slow
+        drafts, errors = [], []
+
+        def run(call):
+            try:
+                drafts.extend(call())
+            except BaseException as err:   # noqa: BLE001 (the kind is the answer)
+                errors.append(type(err).__name__)
+
+        reader = threading.Thread(target=run, args=(lambda: self.driver.parse(self.handle, LIMIT_429),), daemon=True)
+        reader.start()
+        self.assertTrue(inside.wait(5))
+        finisher = threading.Thread(target=run, args=(lambda: self.driver.finish(self.handle, 0),), daemon=True)
+        finisher.start()
+        finisher.join(0.1)
+        early = not finisher.is_alive()
+        go.set()
+        reader.join(5)
+        finisher.join(5)
+        self.assertFalse(reader.is_alive() or finisher.is_alive())
+        self.assertEqual((errors, early), ([], False))
+        self.assertEqual([d["payload"]["code"] for d in drafts if d["type"] == "result"], ["plan_limit"])
+
+    def test_a_release_waits_for_a_finish(self):
+        self.driver.send(self.handle, message())
+        parser = self.driver._worker(self.handle)["parser"]
+        real, inside, go, released = parser.end, threading.Event(), threading.Event(), threading.Event()
+
+        def slow_end(code):
+            inside.set()
+            go.wait(5)
+            return real(code)
+
+        parser.end = slow_end
+        finisher = threading.Thread(target=self.driver.finish, args=(self.handle, 0), daemon=True)
+        finisher.start()
+        self.assertTrue(inside.wait(5))
+        releaser = threading.Thread(target=lambda: (self.driver.release(self.handle), released.set()), daemon=True)
+        releaser.start()
+        early = released.wait(0.1)
+        go.set()
+        finisher.join(5)
+        releaser.join(5)
+        self.assertFalse(early)
+        self.assertTrue(released.is_set())
+
+    def test_a_send_refused_after_finish_or_release_leaves_no_live_turn(self):
+        for terminal in ("finish", "release"):
+            with self.subTest(terminal=terminal):
+                self.setUp()
+                if terminal == "finish":
+                    self.driver.finish(self.handle, 0)
+                else:
+                    self.driver.release(self.handle)
+                with self.assertRaises(DriverStateError):
+                    self.driver.send(self.handle, message())
+                self.assertIsNone(self.handle.live_turn)
+                self.assertEqual(self.spy.processes[0].sent, [])
+
+    # astra required 4: one SIGINT at any instruction of the terminal transitions leaves the lock free
+    def test_one_sigint_at_any_instruction_leaves_the_driver_lock_free(self):
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        broken = []
+        try:
+            for call, code in (("finish", oc.OpenCodeDriver.finish.__code__),
+                               ("release", oc.OpenCodeDriver.release.__code__),
+                               ("finish", oc.OpenCodeDriver._exclusive.__code__)):
+                for inst in dis.get_instructions(code):
+                    # NOT_TAKEN (3.14) is the marker control.hooks' OWNERSHIP note names: no signal is delivered there.
+                    if inst.opname in ("RESUME", "CACHE", "NOT_TAKEN"):
+                        continue
+                    self.setUp()
+                    self.driver.send(self.handle, message())
+                    fired = []
+
+                    def trace(frame, event, arg, code=code, offset=inst.offset, fired=fired):
+                        if frame.f_code is code:
+                            frame.f_trace_opcodes = True
+                            if event == "opcode" and frame.f_lasti == offset and not fired:
+                                fired.append(1)
+                                signal.raise_signal(signal.SIGINT)
+                            return trace
+                        return None
+
+                    sys.settrace(trace)
+                    try:
+                        getattr(self.driver, call)(self.handle, 0) if call == "finish" \
+                            else self.driver.release(self.handle)
+                    except KeyboardInterrupt:
+                        pass
+                    finally:
+                        sys.settrace(None)
+                    if not fired:
+                        continue
+                    free = []
+                    probe = threading.Thread(target=lambda free=free, lock=self.driver._ending: free.append(
+                        lock.acquire(timeout=1.0) and (lock.release() or True)))
+                    probe.start()
+                    probe.join(5)
+                    if free != [True]:
+                        broken.append((call, code.co_name, inst.offset, inst.opname, "lock held"))
+                        continue           # this driver's lock is lost: no retry on it
+                    if id(self.handle) in self.driver._workers:     # not complete: asked again, it completes
+                        getattr(self.driver, call)(self.handle, 0) if call == "finish" \
+                            else self.driver.release(self.handle)
+                    if self.handle.live_turn is not None or id(self.handle) in self.driver._workers:
+                        broken.append((call, code.co_name, inst.offset, inst.opname, "not terminal"))
+        finally:
+            sys.settrace(None)
+            signal.signal(signal.SIGINT, old)
+        self.assertEqual(broken, [])
+
+    # DeepSeek MEDIUM-1: only a step of the run's own session certifies success
+    def test_a_step_finish_of_another_session_does_not_certify_success(self):
+        nul = FINISH_STOP.replace('"ses_a"', '"ses\\u0000a"')
+        for lines in ((TEXT, START, FINISH_STOP_B), (TEXT, START, nul), (TEXT, FINISH_STOP_B)):
+            with self.subTest(lines=lines):
+                p = oc.Parser(connection_id="api_key:k1", model=None, wall=lambda: 1794614400.0,
+                              clock=lambda: 100.0)
+                for line in lines:
+                    p.feed(line)
+                p.end(None)
+                self.assertEqual(p.outcome[0], "engine_exited")
+        self.driver.send(self.handle, message())
+        for line in (TEXT, START, FINISH_STOP_B):
+            self.driver.parse(self.handle, line)
+        self.assertEqual(self.driver.finish(self.handle, None)[0]["payload"]["code"], "engine_exited")
+
+    def test_the_runs_own_stop_still_certifies_after_a_foreign_one(self):
+        p = oc.Parser(connection_id="api_key:k1", model=None, wall=lambda: 1794614400.0, clock=lambda: 100.0)
+        for line in (TEXT, START, FINISH_STOP, FINISH_STOP_B):
+            p.feed(line)
+        p.end(None)
+        self.assertIsNone(p.outcome[0])
+
+    # DeepSeek LOW-1: feed refuses a CR inside the line, as OneShot does
+    def test_feed_refuses_a_carriage_return_inside_a_line(self):
+        p = oc.Parser(connection_id="api_key:k1", model=None, wall=lambda: 1794614400.0, clock=lambda: 100.0)
+        for line in ("a\rb\n", "a\rb", "a\r", "a\r\rb\n", "a\r\r\n"):
+            with self.subTest(line=line):
+                with self.assertRaises(ValueError):
+                    p.feed(line)
+        self.assertEqual(p.lines_read, 0)
+        p.feed("a\r\n")
+        self.assertEqual(p.lines_read, 1)
 
 
 if __name__ == "__main__":

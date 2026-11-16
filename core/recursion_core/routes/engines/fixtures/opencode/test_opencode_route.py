@@ -480,6 +480,11 @@ class ReadTimeoutTests(unittest.TestCase):
                 pass
 
             def read_line(self, timeout_s):
+                # A BOUND: this fake would feed for ever, so a drive that no longer stops at the late read (the
+                # after-read check removed) fails here at once instead of growing without end (Nov 15, 2026: such
+                # a mutant passed the 6 GB ceiling five times, its Parser.anomalies growing a line a read).
+                if len(waits) >= 3:
+                    raise AssertionError("read past the test's budget of three reads")
                 waits.append(timeout_s)
                 state["now"], state["step"] = 9.0, 1.5
                 return "x\n"

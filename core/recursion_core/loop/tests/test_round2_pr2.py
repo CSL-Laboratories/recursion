@@ -93,9 +93,10 @@ class KeeperStart(unittest.TestCase):
             pass
 
         said = []
+        # create=True: os.fork does not exist on Windows (nor in the simulated-Windows run); the check holds there too
         with mock.patch.object(reaper.ctypes, "CDLL", loader), \
                 mock.patch.object(reaper.signal, "signal"), \
-                mock.patch.object(reaper.os, "fork", side_effect=ForkIntercept) as fork, \
+                mock.patch.object(reaper.os, "fork", side_effect=ForkIntercept, create=True) as fork, \
                 mock.patch.object(reaper.os, "write", side_effect=lambda fd, data: said.append((fd, data))), \
                 mock.patch.object(reaper.os, "_exit", side_effect=SystemExit) as end:
             try:

@@ -72,6 +72,10 @@ class ControlClient:
             raise
         except Exception:  # noqa: BLE001 - any transport failure is "unavailable", nothing more
             raise ControlError("control_api_unavailable") from None
+        # None, str, bool, NaN and any other non-int are not an HTTP status. %d would raise, and a
+        # float such as 503.0 is not an integer status either.
+        if type(status) is not int:
+            raise ControlError("control_api_response_invalid")
         if status != 200:
             code = data.get("error") if type(data) is dict else None
             # A typed refusal: the request arrived and the control API answered, with its own

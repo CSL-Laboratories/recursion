@@ -218,7 +218,18 @@ class Application:
 
     @staticmethod
     def _send(start_response, status: str, html: str) -> list[bytes]:
-        raw = html.encode("utf-8")
+        try:
+            raw = html.encode("utf-8")
+        except UnicodeEncodeError:
+            # Encoding sits after the handler's try. A lone surrogate in a rendered field must
+            # still leave one answer, with the same headers, and must not name the bad text.
+            status = "500 Internal Server Error"
+            html = Application._page(
+                "Not available",
+                '<p role="status">Not available: the page could not finish this request '
+                "(UnicodeEncodeError). It does not know whether anything that was sent took effect; "
+                "check the run before sending it again.</p>")
+            raw = html.encode("utf-8")
         start_response(status, [
             ("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(raw))),
             ("Cache-Control", "no-store"), ("Content-Security-Policy", _CSP),
@@ -296,7 +307,7 @@ class Application:
     @staticmethod
     def _query(env: dict) -> dict:
         try:
-            form = parse_qs(env.get("QUERY_STRING", ""), strict_parsing=True)
+            form = parse_qs(env.get("QUERY_STRING", ""), strict_parsing=True, keep_blank_values=True)
         except ValueError:
             raise _BadRequest("query") from None
         return form
@@ -317,10 +328,11 @@ class Application:
                 # "run_id=run-1234567890" cut after "run-12" would name another run.
                 raise ValueError("short body")
             raw = data.decode("utf-8")
-            form = parse_qs(raw, strict_parsing=True)
+            form = parse_qs(raw, strict_parsing=True, keep_blank_values=True)
         except (KeyError, UnicodeError, ValueError):
             raise _BadRequest("form") from None
-        if set(form) != fields or any(len(v) != 1 for v in form.values()):
+        # A blank value is a value: dropping it would hide a duplicate or an extra name.
+        if set(form) != fields or any(len(v) != 1 or v[0] == "" for v in form.values()):
             raise _BadRequest("fields")
         return {k: v[0] for k, v in form.items()}
 

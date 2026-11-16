@@ -64,33 +64,40 @@ def panel_registry(panels):
             break
         except Exception as exc:  # noqa: BLE001 - whatever the iteration raises, the refusal is the first text
             raise ValueError(_NEEDS_KEYS) from exc
-        if not isinstance(panel, Mapping) or not REQUIRED_PANEL_KEYS <= panel.keys():
-            raise ValueError(_NEEDS_KEYS)
-        if set(panel) - PANEL_KEYS:
-            raise ValueError(_ONLY_READS)
-        pid, title, reads = panel["id"], panel["title"], panel["reads"]
-        if type(pid) is not str or not re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", pid):
-            raise ValueError(_BAD_ID)
-        if pid in registered or type(title) is not str or not title.strip():
-            raise ValueError(_DUPLICATE_OR_TITLE)
-        # One copy, taken before any check: what is checked is what is kept.
-        reads = tuple(reads) if type(reads) in (list, tuple) else ()
-        if not reads or any(type(r) is not str or r not in READS for r in reads):
-            raise ValueError(_BAD_READS)
-        venue = panel.get("venue")
-        if venue is not None and (type(venue) is not str or not re.fullmatch(r"[a-z0-9_]{1,48}", venue)):
-            raise ValueError(_BAD_VENUE)
-        venue_use = panel.get("venue_use")
-        if venue_use is not None and (type(venue_use) is not str
-                                      or not re.fullmatch(r"[a-z0-9_]{1,48}:[a-z0-9_]{1,48}", venue_use)):
-            raise ValueError(_BAD_VENUE_USE)
-        if type(panel.get("withhold_venue_data", True)) is not bool:
-            raise ValueError(_BAD_WITHHOLD)
-        # Always use the shared venue-data filter, even if the plugin asks otherwise.
-        # O7 reads stay unscoped; venue_use is a label; declared venue filters data after the read.
-        # paper and stock are one book in that filter (PAPER_BOOK); the panel still declares one id.
-        registered[pid] = MappingProxyType({"title": title, "reads": tuple(dict.fromkeys(reads)),
-                                            "venue": venue, "venue_use": venue_use})
+        try:
+            if not isinstance(panel, Mapping) or not REQUIRED_PANEL_KEYS <= panel.keys():
+                raise ValueError(_NEEDS_KEYS)
+            if set(panel) - PANEL_KEYS:
+                raise ValueError(_ONLY_READS)
+            pid, title, reads = panel["id"], panel["title"], panel["reads"]
+            if type(pid) is not str or not re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", pid):
+                raise ValueError(_BAD_ID)
+            if pid in registered or type(title) is not str or not title.strip():
+                raise ValueError(_DUPLICATE_OR_TITLE)
+            # One copy, taken before any check: what is checked is what is kept.
+            reads = tuple(reads) if type(reads) in (list, tuple) else ()
+            if not reads or any(type(r) is not str or r not in READS for r in reads):
+                raise ValueError(_BAD_READS)
+            venue = panel.get("venue")
+            if venue is not None and (type(venue) is not str or not re.fullmatch(r"[a-z0-9_]{1,48}", venue)):
+                raise ValueError(_BAD_VENUE)
+            venue_use = panel.get("venue_use")
+            if venue_use is not None and (type(venue_use) is not str
+                                          or not re.fullmatch(r"[a-z0-9_]{1,48}:[a-z0-9_]{1,48}", venue_use)):
+                raise ValueError(_BAD_VENUE_USE)
+            if type(panel.get("withhold_venue_data", True)) is not bool:
+                raise ValueError(_BAD_WITHHOLD)
+            # Always use the shared venue-data filter, even if the plugin asks otherwise.
+            # O7 reads stay unscoped; venue_use is a label; declared venue filters data after the read.
+            # paper and stock are one book in that filter (PAPER_BOOK); the panel still declares one id.
+            registered[pid] = MappingProxyType({"title": title, "reads": tuple(dict.fromkeys(reads)),
+                                                "venue": venue, "venue_use": venue_use})
+        except ValueError as exc:
+            if exc.args and exc.args[0] in REFUSALS:
+                raise
+            raise ValueError(_NEEDS_KEYS) from exc
+        except Exception as exc:  # noqa: BLE001 - an unreadable declaration gets the first refusal
+            raise ValueError(_NEEDS_KEYS) from exc
     return MappingProxyType(registered)
 
 
@@ -212,14 +219,26 @@ def _venue_only(value, venue, scoped, withheld, depth=0):
                 return _DROP
             scoped = True
         out = {}
+        switch_on = False
         for key, item in value.items():
             if not isinstance(key, str):
                 withheld.append(item)
+                continue
+            # An unlabelled scalar is dropped, and withhold_venue_data then reads a missing
+            # venue_data_switch as off. Keep an exact "on" when the venue_data beside it is kept,
+            # so an on gate is not reported as off and its owned rows stay.
+            if not scoped and key == "venue_data_switch" and type(item) is str and item == "on":
+                switch_on = True
                 continue
             # What sits under a paper_* / stock_* key is the book's own, like a labelled row.
             child = _venue_only(item, venue, scoped or _paper_book_key(key, venue), withheld, depth + 1)
             if child is not _DROP:
                 out[key] = child
+        if switch_on:
+            if "venue_data" in out:
+                out["venue_data_switch"] = "on"
+            else:
+                withheld.append("on")
     elif isinstance(value, (list, tuple)):
         out = [item for item in (_venue_only(v, venue, scoped, withheld, depth + 1) for v in value)
                if item is not _DROP]

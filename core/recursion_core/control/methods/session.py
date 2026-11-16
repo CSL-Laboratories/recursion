@@ -193,11 +193,11 @@ def handlers(sessions) -> dict:
         _shape('session.steer', params)
         text, expected = params['text'], params['expected_turn_id']
         session = _load(ctx, params['session_id'])
-        _steering_offered(session, session_id=session['session_id'])
         if session['active_turn_id'] != expected:
             return {'code': 'conflict', 'detail': 'stale_turn', 'session_id': session['session_id']}
-        item = delivery.queue_item(ctx.tx, session, item_id=sessions.mint('qi-'), text=text, delivery='steer',
-                                   created_at=sessions.now())
+        _steering_offered(session, session_id=session['session_id'])
+        item = delivery.queue_item(ctx.tx, session, item_id=sessions.mint('qi-'), text=text,
+                                   delivery=sessions.steering_delivery(session), created_at=sessions.now())
         ctx.after_commit(sessions.wake.set)
         return {'code': 'ok', 'item': item}
 
@@ -224,9 +224,13 @@ def handlers(sessions) -> dict:
     def update(ctx, params):
         _shape('queue.update', params)
         facts = {key: params[key] for key in ('text', 'delivery') if key in params}
-        return _item_change('queue.update', ctx, params,
-                            lambda item, session: delivery.edit(ctx.tx, item['item_id'], facts, session),
-                            to_steer=facts.get('delivery') == 'steer')
+        to_steer = facts.get('delivery') == 'steer'
+
+        def change(item, session):
+            if to_steer:
+                facts['delivery'] = sessions.steering_delivery(session)     # the same fallback as session.steer
+            return delivery.edit(ctx.tx, item['item_id'], facts, session)
+        return _item_change('queue.update', ctx, params, change, to_steer=to_steer)
 
     def cancel(ctx, params):
         return _item_change('queue.cancel', ctx, params,

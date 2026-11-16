@@ -674,6 +674,37 @@ class DeliveryOrderTest(unittest.TestCase):
         self.assertEqual([(order.text, order.resume) for order in self.lane.units.launched[1:]],
                          [('skip the docs', 'engine-conversation-1')])
 
+    def test_a_turn_on_a_driver_without_typed_acceptance_of_mid_turn_input_runs_and_ends_like_any_other(self):
+        """Devin's read of #398, service.py 116-119, takes ``input_ack`` for the gate of every acceptance. It is
+        the declaration of an input sent INTO a turn in progress (driver.v2); the engine's acceptance of a turn's
+        first input (``input.accepted`` with ``how: new_turn``, CHANGES.md draft 4) is what starts any turn, on the
+        one-turn path too, and nothing in a declaration withholds it. Pinned, not changed: with that acceptance
+        the turn runs and ends normally."""
+        live = self.running('claude_code')
+        self.assertEqual(live['turns'][0]['state'], 'running')
+        after = self.lane.sessions.turn_finished(live['session_id'], live['active_turn_id'], outcome='done',
+                                                 result=DONE, worker_alive=False)
+        self.assertEqual((after['state'], after['active_turn_id'], after['turns'][0]['state']),
+                         ('idle', None, 'ended'))
+
+    def test_a_turn_whose_input_the_engine_never_accepted_can_end_only_failed(self):
+        """The same read's example: a turn still ``queued`` (no ``input.accepted`` yet) is refused a normal end,
+        because it never started; the engine side reports it ``failed`` (with a code), or a Stop or a restart
+        ends it. Nothing manufactures an acceptance the engine did not give. The question this leaves open (a
+        driver that never accepts even its first input) is in the lane's report, for the Liaison."""
+        session = self.lane.start(engine='claude_code', prompt='first')['session']
+        self.lane.settle()
+        turn_id = session['active_turn_id']
+        with self.assertRaises(machine.Refused) as refused:
+            self.lane.sessions.turn_finished(session['session_id'], turn_id, outcome='done', result=DONE,
+                                             worker_alive=False)
+        self.assertEqual(refused.exception.code, 'result')
+        self.assertEqual(session_of(self.lane, session['session_id'])['turns'][0]['state'], 'queued')
+        after = self.lane.sessions.turn_finished(session['session_id'], turn_id, outcome='failed',
+                                                 result={'code': 'engine_exited', 'detail': 'no acceptance',
+                                                         'result_ref': None}, worker_alive=False)
+        self.assertEqual((after['state'], after['turns'][0]['state']), ('idle', 'failed'))
+
     def test_a_steer_queued_before_its_engine_lost_typed_acceptance_is_held(self):
         live = self.running('codex')
         item = self.lane.call('session.steer', {'command_id': 'cmd-steer-0001', 'session_id': live['session_id'],

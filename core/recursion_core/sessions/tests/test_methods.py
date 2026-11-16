@@ -272,6 +272,53 @@ class MethodsTest(unittest.TestCase):
                                            'text': 'held', 'expected_turn_id': live['active_turn_id']})
         self.assertEqual(gone, {'code': 'unavailable', 'detail': 'driver_absent', 'session_id': live['session_id']})
 
+    def test_a_steer_on_a_driver_that_cannot_take_input_mid_turn_is_queued_as_the_next_turn(self):
+        """The published fallback of session.steer (the table row: mid_turn_input, then next_turn; methods.v1: the
+        message is queued for the next turn "and the item's delivery says so"), for a steer and for an edit that
+        selects one: the answer, the stored item and the event all say next_turn. Where the driver takes input
+        mid-turn, a steer stays a steer. Devin's read of #398, service.py 199-200."""
+        live = self.start(engine='opencode', prompt='first')['session']
+        steer = self.call('session.steer', {'command_id': 'cmd-steer-fb-01', 'session_id': live['session_id'],
+                                            'text': 'skip the docs', 'expected_turn_id': live['active_turn_id']})
+        self.assertEqual((steer['code'], steer['item']['delivery'], steer['item']['state']),
+                         ('ok', 'next_turn', 'queued'))
+        item = self.call('session.queue', {'command_id': 'cmd-queue-fb-01', 'session_id': live['session_id'],
+                                           'text': 'later'})['item']
+        edited = self.call('queue.update', {'command_id': 'cmd-edit-fb-001', 'item_id': item['item_id'],
+                                            'expected_revision': 1, 'delivery': 'steer'})
+        self.assertEqual((edited['code'], edited['item']['delivery'], edited['item']['revision']),
+                         ('ok', 'next_turn', 2))
+        with self.lane.store.transaction() as tx:
+            self.assertEqual([found['delivery'] for found in store.items(tx, live['session_id'])],
+                             ['next_turn', 'next_turn'])
+        queued = [event['payload']['delivery'] for event in self.lane.store.events if event['type'] == 'steer.queued']
+        self.assertEqual(queued, ['next_turn', 'next_turn', 'next_turn'])
+        mid_turn = self.start(engine='codex', prompt='first', command_id='cmd-start-fb-02')['session']
+        steer = self.call('session.steer', {'command_id': 'cmd-steer-fb-02', 'session_id': mid_turn['session_id'],
+                                            'text': 'skip the docs', 'expected_turn_id': mid_turn['active_turn_id']})
+        self.assertEqual(steer['item']['delivery'], 'steer')
+
+    def test_a_steer_aimed_at_a_stale_turn_is_a_conflict_before_the_driver_is_asked(self):
+        """The order of checks (methods.v1 README, rule 3): the receipt, then the revision or turn, then the driver's
+        flags. A client that remembers an ended turn is told so (and the answer is kept for its id), whatever the
+        driver says now. Devin's read of #398, service.py 196-198."""
+        live = self.start(engine='codex', prompt='first')['session']
+        ended_turn = live['active_turn_id']
+        self.finish(live['session_id'])
+        stale = {'code': 'conflict', 'detail': 'stale_turn', 'session_id': live['session_id']}
+        self.lane.drivers.by_engine['codex']['input_ack'] = False
+        answer = self.call('session.steer', {'command_id': 'cmd-steer-st-01', 'session_id': live['session_id'],
+                                             'text': 'too late', 'expected_turn_id': ended_turn})
+        self.assertEqual(answer, stale)
+        self.assertIn(('t1', 'session.steer', 'cmd-steer-st-01'), self.receipts())
+        self.lane.drivers.by_engine.pop('codex')
+        answer = self.call('session.steer', {'command_id': 'cmd-steer-st-02', 'session_id': live['session_id'],
+                                             'text': 'too late', 'expected_turn_id': ended_turn})
+        self.assertEqual(answer, stale)
+        self.assertIn(('t1', 'session.steer', 'cmd-steer-st-02'), self.receipts())
+        with self.lane.store.transaction() as tx:
+            self.assertEqual(store.items(tx, live['session_id']), [])
+
     def test_every_supplied_field_must_have_its_published_shape(self):
         """Every field of every method this slice answers, with every value of ``SHAPE_VALUES``: a value the
         published params refuse (a null included, where the schema does not admit null) is ``request_invalid``

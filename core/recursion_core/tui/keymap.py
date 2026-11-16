@@ -17,7 +17,8 @@ of the keymap: ``y`` alone confirms and any other key cancels.
 
 No timers. Within one context no binding may be a prefix of another, so a sequence is complete, still
 pending, or not bound, decided by the keys alone. Binding is not serialised: two threads that bind into one
-keymap at once are the caller's to order (each client binds into its own copy, ``for_client``). A pending sequence waits for the next key; Esc cancels it,
+keymap at once are the caller's to order (each client keeps its own pending sequence, ``for_client``; the
+binding tables are shared). A pending sequence waits for the next key; Esc cancels it,
 and then does what Esc does where it was pressed (leaves the line, the help or the pager).
 A key that breaks a leader sequence is consumed (the user meant a leader command); a key that breaks any
 other prefix (``ctrl+d`` then ``j``) is read again on its own.
@@ -167,6 +168,17 @@ DEFAULT_KEYS = frozenset(key for context in LEADER_CONTEXTS for seq in DEFAULTS[
                          for key in seq.split() if key != "<leader>")
 
 
+def _sendable(ch: str) -> bool:
+    """One character a terminal can send and the decoder gives as a key: UTF-8 (a lone surrogate is neither sent
+    nor read; DeepSeek's round 6 of #404, F4) and visible."""
+
+    try:
+        ch.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return visible(ch)
+
+
 def key_name(token: str) -> str | None:
     """The name ``keys.KeyDecoder`` gives the key that ``token`` names (``space`` is " ", ``ctrl+i`` is
     ``tab``), or None when no key a terminal sends is read as it (review 2 of #404, Astra 4)."""
@@ -175,7 +187,7 @@ def key_name(token: str) -> str | None:
         return None
     token = " " if token == "space" else ALIASES.get(token, token)
     if len(token) == 1:
-        return token if visible(token) else None  # what the decoder gives (Devin's thread on #404: U+034F)
+        return token if _sendable(token) else None  # what the decoder gives (Devin's thread on #404: U+034F)
     if token in _CTRL or token in _SINGLE or token in _NAMED or token == "shift+tab":
         return token
     if any(token.startswith(mods) and token[len(mods):] in _NAMED for mods in _MODIFIER_SETS):
@@ -183,7 +195,7 @@ def key_name(token: str) -> str | None:
     if token.startswith("ctrl+alt+") and "ctrl+" + token[9:] in _CTRL:
         return token
     rest = token[4:] if token.startswith("alt+") else ""
-    return token if len(rest) == 1 and visible(rest) or rest in _SINGLE[:3] else None  # DeepSeek r5 of #404, F4
+    return token if len(rest) == 1 and _sendable(rest) or rest in _SINGLE[:3] else None  # DeepSeek r5, r6 of #404
 
 
 def is_key_name(token: str) -> bool:

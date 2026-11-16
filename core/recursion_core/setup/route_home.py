@@ -36,9 +36,11 @@ keeper of this file:
 ``check`` raises nothing else for any path or root, however malformed.
 
 A route home that does not exist yet is accepted when everything above it passes: the launcher's
-``private_dir`` makes it 0700 right after the check. The root itself must already exist (a missing
-root is ``route_home_missing``): it is made once, owner-only, before the first launch (by
-``recursiond install`` or ``provision``, lane INSTALL), not by the check's caller on the way. A route home inside the operator's home is
+``private_dir`` is to make it 0700 right after the check (lane STOP's call, a later change). The root
+itself must already exist (a missing root is ``route_home_missing``): it is made once, owner-only,
+before the first launch, not by the check's caller on the way. ``recursiond install`` makes it from
+lane INSTALL's second slice on, with the daemon's stores; the installer this module stands on writes
+only the service unit, so until then nothing makes it. A route home inside the operator's home is
 accepted (the daemon's state folder is ``~/.local/state/recursion``), only the home itself is
 refused. The three identities (path, root, the operator's home) are compared after links are
 followed; a name in them that does not exist is compared as written and the names after it are

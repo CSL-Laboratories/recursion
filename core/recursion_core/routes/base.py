@@ -46,14 +46,23 @@ class RouteAdapter:
             argv, env = self.argv(request), self.env(request)
         except c.RouteError as err:
             return c.result(rid, err.code, detail=err.detail)
-        # STARTED CHILDREN ARE FENCED ON EVERY WAY OUT. Once the launcher has returned a process, any
-        # exception that leaves this method, BaseException included, fences that process first; the same
-        # exception object then leaves. The three typed exits below fence with their own reason and answer;
-        # everything else is fenced with UNEXPECTED_FENCE and raised. A fence that itself fails never
-        # replaces the exception: it is noted on it. What this method cannot cover is an asynchronous
-        # exception (a signal handler's) delivered between the launcher's return and the store into
-        # ``process``, or inside this handler before the fence has run; the process then exists only in the
-        # launcher's own record of the run (daemon/launcher.py publishes it with RunContext.launched).
+        # STARTED CHILDREN ARE FENCED ON EVERY WAY OUT OF THIS METHOD (an override of ``run`` owns its own
+        # cleanup). Once the launcher has returned a process:
+        # - A typed exit (deadline, protocol error, engine io) fences with its own reason and answers.
+        # - Any other exception, BaseException included, fences with UNEXPECTED_FENCE, and the same exception
+        #   object leaves.
+        # - If a typed exit's fence raises, the ORIGINAL typed exception leaves instead of the answer (its type
+        #   is what callers decide on); the fence is tried once more as UNEXPECTED_FENCE, and the first
+        #   failure is noted on the original.
+        # - A fence failure never replaces the exception that leaves. When no fence attempt succeeded, the
+        #   exception that leaves carries the failures in CLEANUP_FAILURES (and a note): the child may still
+        #   be running, so a caller that finds the attribute must not treat the exit as clean.
+        # What this method cannot cover is an asynchronous exception (a signal handler's) delivered between
+        # the launcher's return and the store into ``process``, or inside the outer handler before its fence
+        # has run; the process then exists only in the launcher's own record of the run (daemon/launcher.py
+        # publishes it with RunContext.launched). One delivered after a typed fence succeeded and before
+        # ``fenced`` is set fences twice, which is harmless; setting the flag first would leave a child
+        # unfenced instead.
         process = None
         fenced = False
         try:
@@ -68,19 +77,25 @@ class RouteAdapter:
             events: list[dict] = []
             try:
                 return self.drive(process, request, deadline_at, events)
-            except Deadline:
-                process.fence("deadline")  # fenced for this request only; the breaker never hears of it
+            except Deadline as err:
+                done = _typed_fence(process, "deadline", err)  # for this request only; the breaker never hears
                 fenced = True
+                if not done:
+                    raise
                 return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
             except _Protocol as err:
-                process.fence("protocol_error")
+                done = _typed_fence(process, "protocol_error", err)
                 fenced = True
+                if not done:
+                    raise
                 return c.result(rid, c.PROTOCOL_ERROR, events=events, detail=str(err))
             except OSError as err:
                 # A child that exits before the request is written raises BrokenPipeError. That stays a
                 # typed result, and the process is fenced, instead of escaping the route boundary.
-                process.fence("io_error")
+                done = _typed_fence(process, "io_error", err)
                 fenced = True
+                if not done:
+                    raise
                 return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
         except BaseException as err:
             # Inline, not a helper: a helper's entry is one more point where an interruption could land
@@ -89,10 +104,7 @@ class RouteAdapter:
                 try:
                     process.fence(UNEXPECTED_FENCE)
                 except BaseException as fence_err:  # noqa: BLE001 - the exception that reached here is the one that leaves
-                    try:
-                        err.add_note(f"fencing the child also failed: {type(fence_err).__name__}")
-                    except BaseException:  # noqa: BLE001 - an exception that takes no note still leaves unchanged
-                        pass
+                    _record_cleanup_failure(err, fence_err, still_running=True)
             raise
 
     # -- subclass hooks -----------------------------------------------------------------------
@@ -151,6 +163,48 @@ class _Protocol(Exception):
 # The fence reason for a started child whose run leaves ``RouteAdapter.run`` by an exception that none of
 # the typed exits answers (the same word lane ENGINE-E5's one-shot adapter uses for its own copy of the loop).
 UNEXPECTED_FENCE = "unexpected"
+
+# The attribute an exception leaving ``RouteAdapter.run`` carries when no fence of the started child succeeded:
+# a tuple of the fence failures, oldest first. Its presence means the child may still be running.
+CLEANUP_FAILURES = "cleanup_failures"
+RUNNING_NOTE = "no fence of the started child succeeded: it may still be running"
+
+
+def _record_cleanup_failure(err: BaseException, fence_err: BaseException, *, still_running: bool) -> None:
+    """Note ``fence_err`` on ``err``; when ``still_running``, also add it to ``err``'s CLEANUP_FAILURES. Never
+    raises: whatever the note or the attribute raises is dropped, so ``err`` leaves unchanged otherwise."""
+
+    try:
+        if still_running:
+            setattr(err, CLEANUP_FAILURES, (*getattr(err, CLEANUP_FAILURES, ()), fence_err))
+    except BaseException:  # noqa: BLE001 - an exception that takes no attribute still leaves
+        pass
+    try:
+        err.add_note(f"fencing the child also failed: {type(fence_err).__name__}")
+        if still_running and RUNNING_NOTE not in err.__notes__:
+            err.add_note(RUNNING_NOTE)
+    except BaseException:  # noqa: BLE001 - an exception that takes no note still leaves unchanged
+        pass
+
+
+def _typed_fence(process: EngineProcess, reason: str, err: BaseException) -> bool:
+    """A typed exit's fence. True when it succeeded. Otherwise the fence is tried once more as
+    UNEXPECTED_FENCE, every failure is recorded on ``err`` (``_record_cleanup_failure``), and False is
+    returned so the caller raises ``err`` itself."""
+
+    try:
+        process.fence(reason)
+        return True
+    except BaseException as first:  # noqa: BLE001 - recorded on the typed exception, which then leaves
+        failed = first
+    try:
+        process.fence(UNEXPECTED_FENCE)
+    except BaseException as second:  # noqa: BLE001 - recorded on the typed exception, which then leaves
+        _record_cleanup_failure(err, failed, still_running=True)
+        _record_cleanup_failure(err, second, still_running=True)
+        return False
+    _record_cleanup_failure(err, failed, still_running=False)
+    return False
 
 
 def scalar(value: object) -> object:

@@ -86,11 +86,18 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   short fault never hides a real limit on the same connection from that tenant.
 - Recursion's own deadline is `deadline_exceeded`: the run is fenced (`EngineProcess.fence`) for that
   request only and the breaker is not told. Other engine failures are request-local too.
-- A started child is fenced on every way out of `RouteAdapter.run`: the three typed exits (deadline,
-  protocol error, engine io) fence with their own reason and answer; any other exception, `BaseException`
-  included, fences the child with the reason `unexpected` and the same exception object leaves. A fence
-  that itself fails is noted on that exception (`add_note`) and never replaces it. A driver does not need
-  to fence for itself (`tests/test_base_fence.py`).
+- A child started by `RouteAdapter.run` is fenced on every way out of that method, once the launcher has
+  returned it. A successful return is not fenced. The three typed exits (deadline, protocol error, engine
+  io) fence with their own reason and answer. Any other exception, `BaseException` included, fences the
+  child with the reason `unexpected`, and the same exception object leaves. If a typed exit's fence raises,
+  the original typed exception leaves instead of the answer, after one more fence as `unexpected`; the
+  failure is noted on it (`add_note`). A fence failure never replaces the exception that leaves. When no
+  fence succeeded, that exception also carries `cleanup_failures` (`base.CLEANUP_FAILURES`, the failures
+  oldest first): the child may still be running, and a caller must not treat the exit as clean. A driver
+  whose adapter runs this `run` does not need to fence for itself; an adapter that overrides `run` owns its
+  own cleanup (`ProfileRouteAdapter` does: lane ENGINE-E9's #425 adds its fence). The boundary fences only a
+  process the launcher returned: a launcher that fails after starting a child must end that child itself
+  before it raises (`launch.py`). Tests: `tests/test_base_fence.py`.
 - Recovery: an open key always has a finite end (`reset_at` on the breaker clock, capped; otherwise a
   300 s cooldown doubling to 3600 s). Vendor `resetsAt` is Unix epoch and is translated onto that clock
   before it is stored, so a monotonic deadline clock does not turn one limit into an 8-day fence.

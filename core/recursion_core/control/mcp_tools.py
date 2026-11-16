@@ -44,6 +44,27 @@ START = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": Fals
 
 STOP_TOOL = "recursion_run_stop"
 
+# The ONE place that says which answer codes are not errors (``isError`` false), per control method. A Stop
+# that answers ``pending`` (a member still lives) or ``ended`` (the run had ended already), and an interrupt that
+# answers ``pending``, are truthful answers, not failed calls: a model must not read them as "it did not happen".
+# The codes are the published method table's for each method (schemas/control/v1/methods.table.v1.json, #368:
+# run.stop and session.stop answer stopped, pending or ended; session.interrupt answers ok or pending). Every
+# other method keeps the control API's SUCCESS_CODES (started, ok, stopped). Lane MCP's server reads this through
+# ``is_error`` (the Liaison's ruling on MCP's Q2, Nov 15, 4:22 PM).
+NOT_ERRORS: dict[str, frozenset[str]] = {
+    "run.stop": frozenset({"stopped", "pending", "ended"}),
+    "session.stop": frozenset({"stopped", "pending", "ended"}),
+    "session.interrupt": frozenset({"ok", "pending"}),
+}
+
+
+def is_error(method: str, answer: object) -> bool:
+    """Whether ``answer``, the control API's answer to ``method``, is an error for ``isError``. An answer that is not
+    an object, or carries no code of the method's non-error set, is an error."""
+
+    code = answer.get("code") if isinstance(answer, dict) else None
+    return code not in NOT_ERRORS.get(method, SUCCESS_CODES)
+
 TOOLS = (
     {"name": "recursion_run_list", "method": "run.list", "title": "List runs",
      "description": "List runs and their states, in run_id order. A page that is not the last carries "
@@ -71,7 +92,8 @@ def descriptors() -> list[dict]:
 
 
 def call_tool(api: ControlAPI, name: str, arguments: dict | None) -> dict:
-    """``tools/call``: forward to the control API and return its answer verbatim as structured content."""
+    """``tools/call``: forward to the control API and return its answer verbatim as structured content. ``isError``
+    is ``is_error(method, answer)``: a Stop answering ``pending`` or ``ended`` is not an error."""
 
     tool = next((t for t in TOOLS if t["name"] == name), None)
     if tool is None:
@@ -79,4 +101,4 @@ def call_tool(api: ControlAPI, name: str, arguments: dict | None) -> dict:
                 "isError": True}
     result = api.call(tool["method"], arguments or {})
     return {"content": [{"type": "text", "text": json.dumps(result, sort_keys=True)}],
-            "structuredContent": result, "isError": result.get("code") not in SUCCESS_CODES}
+            "structuredContent": result, "isError": is_error(tool["method"], result)}

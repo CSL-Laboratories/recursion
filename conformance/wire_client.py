@@ -371,6 +371,14 @@ VECTOR_RULES = ("call.profile", "approval.binding", "approval.lifecycle", "trans
                 "task.derivation", "start.intent", "event.cursor", "event.page")
 
 
+def _derived(rule, *args):
+    """The Task a rule derives, or the rule's refusal of its source (a vector can expect ``refused:<code>``)."""
+    try:
+        return rule(*args)
+    except rules.Refused as refusal:
+        return refusal
+
+
 def load_vectors(folder: Path) -> list[dict]:
     """The vectors of a folder (``vectors/index.json``), or none when the folder has no vectors.
 
@@ -619,14 +627,15 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
             return f"the task does not fit mcp.task.v1: {misfit}"
         if vector["source"] == "run":
             misfit = _misfit(schemas, "run.view.v1.json", vector["view"])
-            wanted = None if misfit else rules.task_of_run(vector["view"], vector["events"], vector["pending_approval_ids"])
+            wanted = None if misfit else _derived(rules.task_of_run, vector["view"], vector["events"], vector["pending_approval_ids"])
         else:
             misfit = _misfit(schemas, "session.v1.json", vector["session"])
-            wanted = None if misfit else rules.task_of_turn(vector["session"], vector["turn_id"], vector["events"],
+            wanted = None if misfit else _derived(rules.task_of_turn, vector["session"], vector["turn_id"], vector["events"],
                                                             vector["pending_approval_ids"])
         if misfit:
             return f"the source record does not fit its schema: {misfit}"
-        found = rules.task_problems(wanted, vector["task"])
+        found = (["refused:" + wanted.code] if isinstance(wanted, rules.Refused)   # the rule refuses the source itself
+                 else rules.task_problems(wanted, vector["task"]))
         return None if found == vector["expect"] else f"the rule finds {found}, the vector says {vector['expect']}"
     if rule == "start.intent":
         # A start request, the extensions the start path declared (null when no lane is on it), and the

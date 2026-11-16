@@ -692,6 +692,11 @@
       "shows": "The Stop is confirmed: only now is the Task cancelled."
     },
     {
+      "file": "task.derivation/x20-a-stop-whose-proof-names-another-cgroup.json",
+      "rule": "task.derivation",
+      "shows": "A stopped run whose proof names another cgroup is not a confirmed Stop: the rule refuses it (stop_unattested) and derives no cancelled Task, as the registry refuses to restore such a record."
+    },
+    {
       "file": "task.derivation/r16-run-ended-with-its-result.json",
       "rule": "task.derivation",
       "shows": "The run ended and its result says ok: completed. The Task carries the result's code and detail and names the run as where the whole result is read (run.status)."

@@ -102,7 +102,8 @@ def clear_start_environment(names=KEY_ENV) -> bool:
     """Linux: overwrite with NUL bytes the values of ``names`` in the environment block this process started
     with (the memory ``/proc/<pid>/environ`` reads, which unsetting a variable leaves as it was). Only that block
     is written, located from ``/proc/self/stat``. Returns False when it could not be done, or when a value is
-    still readable there afterwards; True otherwise, and on a system without /proc."""
+    still readable there afterwards; True otherwise, and when there is no /proc at all (a /proc that cannot be looked
+    at, or whose environ cannot be read, is False)."""
 
     if not sys.platform.startswith("linux"):
         return True
@@ -114,8 +115,12 @@ def clear_start_environment(names=KEY_ENV) -> bool:
         return any(name in wanted and value.strip(b"\0")
                    for name, _, value in (entry.partition(b"=") for entry in block.split(b"\0")))
 
-    if not os.path.exists("/proc/self/environ"):
-        return True  # no /proc: there is no such block to read, for this process or any other
+    try:
+        os.stat("/proc")
+    except FileNotFoundError:
+        return True  # no /proc at all: there is no such block to read, for this process or any other
+    except OSError:
+        return False  # /proc could not be looked at, which is not the same as there being none (sol 2)
     try:
         if not readable():
             return True  # nothing to clear
@@ -165,8 +170,9 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("recursion_loop: --max-steps and --max-output-tokens must be positive")
     if args.permissions == perm.FULL_ACCESS and not args.acknowledge_full_access:
         raise SystemExit("recursion_loop: the full-access profile needs --acknowledge-full-access for this run")
-    if args.approval_timeout <= 0:
-        raise SystemExit("recursion_loop: --approval-timeout must be positive")
+    if not 0 < args.approval_timeout <= threading.TIMEOUT_MAX:  # NaN, infinity and what no wait takes fail this
+        raise SystemExit("recursion_loop: --approval-timeout must be positive and finite "
+                         f"(at most {threading.TIMEOUT_MAX:.0f} seconds)")
     try:
         acceptance = d.Acceptance(args.acceptance, rounds=args.acceptance_rounds) if args.acceptance else None
     except ValueError as exc:

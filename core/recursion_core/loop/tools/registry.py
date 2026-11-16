@@ -352,6 +352,7 @@ class ToolRegistry:
         except ToolError as exc:
             return self._finish(call, ToolOutput(f"invalid input: {exc}", ERROR), ctx)
         ctx.max_bytes, ctx.max_lines = self.max_bytes, self.max_lines
+        outer_facts = ctx.approved_facts  # a call this one's tool dispatches gets its own, and gives these back
         if tool.needs_approval is not False:  # fails closed: anything but False (a subclass may skip the check) asks
             facts = None
             if tool.precheck is not None:
@@ -395,6 +396,9 @@ class ToolRegistry:
                     return self._finish(call, ToolOutput(f"the call could not be run: {exc}", ERROR), ctx)
                 if again != facts:
                     return self._finish(call, ToolOutput(CHANGED_SINCE_APPROVAL, ERROR), ctx)
+            if ctx.cancel.cancelled:
+                # Interrupted while the precheck ran again: nothing has run, and an interrupt is final (sol 4).
+                return self._finish(call, ToolOutput(perm.REFUSALS[perm.CANCELLED], CANCELLED), ctx)
             ctx.approved_facts = facts
         try:
             output = tool.run(args, ctx)
@@ -407,7 +411,7 @@ class ToolRegistry:
         except BaseException as exc:  # noqa: BLE001 - a tool's failure (a library's sys.exit too) is the model's to see
             output = ToolOutput(f"the tool failed: {type(exc).__name__}: {exc}", ERROR)
         finally:
-            ctx.approved_facts = UNBOUND
+            ctx.approved_facts = outer_facts
         if not isinstance(output, ToolOutput) or not isinstance(output.text, str) or output.status not in STATUSES:
             output = ToolOutput("the tool failed: it returned no text", ERROR)
         return self._finish(call, output, ctx)

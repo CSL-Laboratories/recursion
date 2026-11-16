@@ -43,7 +43,7 @@ SPEC = b.ToolSpec(
 )
 
 
-def _plan(args: Mapping[str, Any], ctx: ToolContext) -> tuple[Path, str, str, int]:
+def _plan(args: Mapping[str, Any], ctx: ToolContext) -> tuple[Path, str, str, int, int]:
     ws = ctx.workspace
     path = resolve_writable(ws, args["path"])
     shown = ws.display(path)
@@ -58,6 +58,11 @@ def _plan(args: Mapping[str, Any], ctx: ToolContext) -> tuple[Path, str, str, in
     if old == new:
         raise ToolError("old_string and new_string are the same; nothing would change")
     first = text.find(old)
+    if first < 0 and "\n" in old and "\r" not in old and "\r\n" in text:
+        # read shows a CRLF file's lines without their CR, so an anchor copied from it has bare LFs: it is met with
+        # the file's own line ends, and so is the text that replaces it
+        old, new = old.replace("\n", "\r\n"), new.replace("\r\n", "\n").replace("\n", "\r\n")
+        first = text.find(old)
     if first < 0:
         raise ToolError(f"replace_not_found: old_string does not occur in {shown}")
     replace_all = args.get("replace_all", False)
@@ -66,7 +71,7 @@ def _plan(args: Mapping[str, Any], ctx: ToolContext) -> tuple[Path, str, str, in
         raise ToolError(f"anchor_not_unique: old_string occurs {_starts(text, old)} times in {shown}; include more "
                         f"of the surrounding text, or set replace_all")
     n = text.count(old) if replace_all else 1  # replace_all replaces left to right, without overlaps
-    return path, text, text.replace(old, new, n), n
+    return path, text, text.replace(old, new, n), n, first
 
 
 def _starts(text: str, old: str) -> int:
@@ -78,23 +83,25 @@ def _starts(text: str, old: str) -> int:
 
 
 def precheck(args: Mapping[str, Any], ctx: ToolContext) -> Mapping[str, str] | None:
-    path, _, _, _ = _plan(args, ctx)
+    path, *_ = _plan(args, ctx)
     return request_facts(ctx.workspace, args["path"], path)
 
 
 def _snippet(new_text: str, at: int) -> str:
-    lines = new_text.splitlines()
+    lines = new_text.split("\n")  # the lines ``read`` numbers: by LF only, and the CR of a CRLF is not shown
+    if lines[-1] == "":
+        lines.pop()
+    lines = [line[:-1] if line.endswith("\r") else line for line in lines]
     first = new_text.count("\n", 0, at)
     lo, hi = max(0, first - CONTEXT_LINES), min(len(lines), first + CONTEXT_LINES + 1)
     return "".join(f"{i + 1:>6}\t{lines[i]}\n" for i in range(lo, hi))
 
 
 def run(args: Mapping[str, Any], ctx: ToolContext) -> ToolOutput:
-    path, text, new_text, n = _plan(args, ctx)
+    path, _, new_text, n, at = _plan(args, ctx)
     keep_approved(ctx, args["path"], path)
     ctx.cancel.raise_if_cancelled()
     atomic_write(ctx.workspace, path, new_text.encode("utf-8"))
-    at = text.find(args["old_string"])
     return ToolOutput(f"edited {ctx.workspace.display(path)}: {n} replacement{'s' if n != 1 else ''}\n"
                       + _snippet(new_text, at))
 

@@ -108,6 +108,10 @@ def main():
         shell = os.fork()
         if shell == 0:
             try:
+                # Python ignores these two signals when it starts, and an ignored signal stays ignored through
+                # execv: the command's shell gets their default action back (a closed pipe ends it, as in any shell).
+                signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+                signal.signal(signal.SIGXFSZ, signal.SIG_DFL)
                 os.execv(sys.argv[1], sys.argv[1:])
             finally:
                 os._exit(127)

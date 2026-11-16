@@ -43,9 +43,13 @@ def _reports(payload: dict[str, Any], label: str) -> dict[str, float]:
         median = row.get("median_s")
         if isinstance(median, bool) or not isinstance(median, (int, float)):
             raise CompareError(f"{label} benchmark {name} median_s is not a number")
-        if not math.isfinite(median) or median <= 0:
+        try:
+            number = float(median)
+        except (OverflowError, ValueError) as exc:
+            raise CompareError(f"{label} benchmark {name} median_s must be positive") from exc
+        if not math.isfinite(number) or number <= 0:
             raise CompareError(f"{label} benchmark {name} median_s must be positive")
-        found[name] = float(median)
+        found[name] = number
     return found
 
 
@@ -57,11 +61,21 @@ def compare_reports(
     absolute_floor_s: float = DEFAULT_ABSOLUTE_FLOOR_S,
 ) -> dict[str, Any]:
     """Return a JSON-ready report. Regressions are listed; nothing here fails CI."""
-    if not math.isfinite(ratio_limit) or ratio_limit <= 1:
+    if isinstance(ratio_limit, bool) or not isinstance(ratio_limit, (int, float)):
+        raise CompareError("ratio limit must be a finite number greater than 1")
+    try:
+        limit = float(ratio_limit)
+    except (OverflowError, ValueError) as exc:
+        raise CompareError("ratio limit must be a finite number greater than 1") from exc
+    if not math.isfinite(limit) or limit <= 1:
         raise CompareError("ratio limit must be a finite number greater than 1")
     if isinstance(absolute_floor_s, bool) or not isinstance(absolute_floor_s, (int, float)):
         raise CompareError("absolute floor must be a number of seconds")
-    if not math.isfinite(absolute_floor_s) or absolute_floor_s < 0:
+    try:
+        floor = float(absolute_floor_s)
+    except (OverflowError, ValueError) as exc:
+        raise CompareError("absolute floor must be zero or a positive finite number") from exc
+    if not math.isfinite(floor) or floor < 0:
         raise CompareError("absolute floor must be zero or a positive finite number")
     base = _reports(baseline, "baseline")
     head = _reports(candidate, "candidate")
@@ -83,11 +97,13 @@ def compare_reports(
             })
             continue
         ratio = head_s / base_s
+        if not math.isfinite(ratio):
+            raise CompareError(f"benchmark {name} ratio is not finite")
         delta_s = head_s - base_s
         delta_pct = (ratio - 1.0) * 100.0
         # Both gates are strict: equal to 10% or equal to the floor is not over it.
-        over_ratio = ratio > ratio_limit
-        over_floor = delta_s > absolute_floor_s
+        over_ratio = ratio > limit
+        over_floor = delta_s > floor
         if over_ratio and over_floor:
             status = "regression"
         elif over_ratio:
@@ -111,8 +127,8 @@ def compare_reports(
     rows.sort(key=lambda item: item["name"])
     return {
         "schema": "recursion-perf-compare/1",
-        "ratio_limit": ratio_limit,
-        "absolute_floor_s": absolute_floor_s,
+        "ratio_limit": limit,
+        "absolute_floor_s": floor,
         "flagged": bool(regressions),
         "regressions": regressions,
         "rows": rows,
@@ -122,6 +138,11 @@ def compare_reports(
 def job_exit_code(*, bench_ok: bool) -> int:
     """A slow result is a warning. Only a broken harness fails the job."""
     return 0 if bench_ok else 1
+
+
+def _plain(text: object) -> str:
+    """Keep a report field on one line so it cannot forge a workflow command."""
+    return str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def format_seconds(seconds: float) -> str:
@@ -135,6 +156,8 @@ def format_seconds(seconds: float) -> str:
 def render_markdown(report: dict[str, Any], *, baseline_label: str, candidate_label: str) -> str:
     limit_pct = (report["ratio_limit"] - 1.0) * 100.0
     floor = format_seconds(report["absolute_floor_s"])
+    baseline_label = _plain(baseline_label)
+    candidate_label = _plain(candidate_label)
     lines = [
         "## Performance vs master",
         "",
@@ -154,14 +177,14 @@ def render_markdown(report: dict[str, Any], *, baseline_label: str, candidate_la
             delta = "—"
         else:
             delta = f"{row['delta_pct']:+.1f}% ({format_seconds(abs(row['delta_s']))})"
-        lines.append(f"| `{row['name']}` | {base} | {head} | {delta} | {row['status']} |")
+        lines.append(f"| `{_plain(row['name'])}` | {base} | {head} | {delta} | {row['status']} |")
     if not report["flagged"]:
         lines.extend(["", "No benchmark was slower than the threshold."])
     else:
         lines.extend(["", "Flagged regressions (warning only):"])
         for row in report["regressions"]:
             lines.append(
-                f"- `{row['name']}` {row['delta_pct']:+.1f}% "
+                f"- `{_plain(row['name'])}` {row['delta_pct']:+.1f}% "
                 f"({format_seconds(row['baseline_s'])} -> {format_seconds(row['candidate_s'])})"
             )
     lines.append("")
@@ -172,7 +195,7 @@ def warning_lines(report: dict[str, Any]) -> list[str]:
     lines = []
     for row in report["regressions"]:
         lines.append(
-            f"{row['name']} median is {row['delta_pct']:.1f}% slower than the PR base "
+            f"{_plain(row['name'])} median is {row['delta_pct']:.1f}% slower than the PR base "
             f"({format_seconds(row['baseline_s'])} -> {format_seconds(row['candidate_s'])} per op, "
             f"{format_seconds(row['delta_s'])} absolute). "
             f"Threshold is {(report['ratio_limit'] - 1) * 100:.0f}% and "
@@ -180,5 +203,5 @@ def warning_lines(report: dict[str, Any]) -> list[str]:
         )
     for row in report["rows"]:
         if row["status"] == "removed":
-            lines.append(f"{row['name']} ran on the PR base and is missing from this branch.")
+            lines.append(f"{_plain(row['name'])} ran on the PR base and is missing from this branch.")
     return lines

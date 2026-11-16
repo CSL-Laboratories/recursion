@@ -6,6 +6,7 @@ import ast
 import gc
 import importlib.util
 import json
+import math
 import os
 import socket
 import subprocess
@@ -471,6 +472,185 @@ class SweepRegressionTests(unittest.TestCase):
         with mock.patch.object(perf_ci, "_run", return_value=failed):
             with self.assertRaises(perf_ci.PerfCIError):
                 perf_ci._remove_worktree(Path("/unused/synthetic-worktree"))
+
+    def test_f04_malformed_numeric_inputs_have_typed_refusals(self):
+        inputs = [
+            (_report({"x": 1}), _report({"x": 2}), {"ratio_limit": "1.1"}),
+            (_report({"x": 10**400}), _report({"x": 1}), {}),
+            (_report({"x": 1}), _report({"x": 1}), {"absolute_floor_s": 10**400}),
+        ]
+        for baseline, candidate, options in inputs:
+            with self.subTest(options=options, median=baseline["benchmarks"][0]["median_s"]):
+                with self.assertRaises(perf_compare.CompareError):
+                    perf_compare.compare_reports(baseline, candidate, **options)
+
+    def test_f05_finite_reports_do_not_produce_infinity_in_json(self):
+        try:
+            result = perf_compare.compare_reports(_report({"x": 5e-324}), _report({"x": 1.0}))
+        except perf_compare.CompareError:
+            return
+        json.dumps(result, allow_nan=False)
+
+    def test_f06_wrong_shape_and_bad_encoding_are_bench_errors(self):
+        for content in (b"[]", b"null", b"\xff"):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "workload.json"
+                path.write_bytes(content)
+                with mock.patch.object(perf_bench, "WORKLOAD_PATH", path):
+                    with self.assertRaises(perf_bench.BenchError):
+                        perf_bench.load_workload()
+
+    def test_f09_markdown_log_cannot_inject_workflow_commands(self):
+        import contextlib
+        import io
+        name = "ordinary\n::error::SYNTHETIC_ANNOTATION"
+        result = perf_compare.compare_reports(_report({name: 1.0}), _report({name: 2.0}))
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_STEP_SUMMARY": ""}),
+              contextlib.redirect_stdout(output)):
+            perf_ci._emit(result, baseline_label="base", candidate_label="head")
+        self.assertFalse(any(line.startswith("::error::") for line in output.getvalue().splitlines()))
+
+    def test_f09_invalid_base_refusal_cannot_inject_workflow_commands(self):
+        import contextlib
+        import io
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "missing\n::error::SYNTHETIC_REFUSAL",
+                                            "PERF_REGRESSION_RATIO": "", "PERF_ABSOLUTE_FLOOR_S": ""}),
+              mock.patch.object(perf_ci, "_run", return_value=subprocess.CompletedProcess([], 1, "", "")),
+              contextlib.redirect_stderr(output)):
+            self.assertEqual(perf_ci.main(), 1)
+        self.assertFalse(any(line.startswith("::error::") for line in output.getvalue().splitlines()))
+
+    def test_f09_numeric_env_refusal_does_not_echo_arbitrary_rejected_text(self):
+        sentinel = "SYNTHETIC_NOT_A_REAL_KEY"
+        with mock.patch.dict(os.environ, {"PERF_REGRESSION_RATIO": sentinel}):
+            with self.assertRaises(perf_ci.PerfCIError) as caught:
+                perf_ci._ratio_limit()
+        self.assertNotIn(sentinel, str(caught.exception))
+
+    def test_f10_two_droppers_do_not_raise_keyerror(self):
+        import threading
+        import types
+        marker = "scripts.sweep_s2b_drop_probe"
+        saved = {key: value for key, value in sys.modules.items() if key == "scripts" or key.startswith("scripts.")}
+        sys.modules[marker] = types.ModuleType(marker)
+        barrier = threading.Barrier(2)
+        original_list = list
+        errors = []
+
+        def snapshot(mapping):
+            keys = original_list(mapping)
+            try:
+                barrier.wait(timeout=0.25)
+            except threading.BrokenBarrierError:
+                pass
+            return keys
+
+        def drop():
+            try:
+                perf_bench._drop_imported_product()
+            except Exception as exc:
+                errors.append(exc)
+
+        try:
+            with mock.patch.object(perf_bench, "list", snapshot, create=True):
+                threads = [threading.Thread(target=drop) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=2)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+        finally:
+            sys.modules.pop(marker, None)
+            sys.modules.update(saved)
+
+    def test_f11_overlapping_samples_keep_gc_disabled(self):
+        import threading
+        first_inside = threading.Event()
+        second_inside = threading.Event()
+        first_done = threading.Event()
+        observed = []
+        errors = []
+        was_enabled = gc.isenabled()
+
+        def first_callback():
+            first_inside.set()
+            second_inside.wait(0.25)
+
+        def second_callback():
+            second_inside.set()
+            if not first_done.wait(2):
+                raise AssertionError("first timed call did not finish")
+            observed.append(gc.isenabled())
+
+        def first():
+            try:
+                perf_bench._timed_call(first_callback, 1)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                first_done.set()
+
+        def second():
+            try:
+                if not first_inside.wait(2):
+                    raise AssertionError("first timed call did not start")
+                perf_bench._timed_call(second_callback, 1)
+            except Exception as exc:
+                errors.append(exc)
+
+        try:
+            gc.enable()
+            threads = [threading.Thread(target=first), threading.Thread(target=second)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(observed, [False])
+        finally:
+            if was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+
+    @unittest.skipUnless(hasattr(socket.socket, "sendmsg"), "sendmsg is a POSIX socket API")
+    def test_f12_guard_blocks_udp_sendmsg(self):
+        original_socket = socket.socket
+        original_connect = socket.create_connection
+        installed = perf_bench._GUARD_INSTALLED
+        receiver = original_socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            receiver.bind(("127.0.0.1", 0))
+            perf_bench.install_network_guard()
+            sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                with self.assertRaises(RuntimeError):
+                    sender.sendmsg([b"x"], [], 0, receiver.getsockname())
+            finally:
+                sender.close()
+        finally:
+            receiver.close()
+            socket.socket = original_socket
+            socket.create_connection = original_connect
+            perf_bench._GUARD_INSTALLED = installed
+
+    def test_f19_git_helpers_supply_finite_deadlines(self):
+        # The evidence witness also calls frozen ci_gate and other lanes.
+        # This row is only the perf_ci helper.
+        seen = []
+
+        def run(*args, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            return subprocess.CompletedProcess(args[0] if args else [], 0, "", "")
+
+        with mock.patch.object(perf_ci.subprocess, "run", side_effect=run):
+            perf_ci._run(["git", "status"], cwd=ROOT)
+        self.assertTrue(seen)
+        self.assertTrue(all(value is not None and math.isfinite(value) for value in seen))
 
 
 if __name__ == "__main__":

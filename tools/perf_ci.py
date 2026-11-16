@@ -28,6 +28,8 @@ import perf_compare
 from perf_bench import BenchError, HARNESS_ROOT, run_paired, run_suite
 
 GIT = ["git", "-c", "core.longpaths=true", "-c", "core.quotePath=false"]
+# Each git call has its own deadline. The workflow step's outer limit is 55s.
+GIT_TIMEOUT_SECONDS = 20
 DEFAULT_RATIO = perf_compare.DEFAULT_RATIO_LIMIT
 
 
@@ -47,7 +49,7 @@ def _env_float(name: str, default: float) -> float:
     try:
         value = float(raw)
     except ValueError as exc:
-        raise PerfCIError(f"{name}={raw!r} is not a number") from exc
+        raise PerfCIError(f"{name} is not a number") from exc
     if not math.isfinite(value):
         raise PerfCIError(f"{name}={raw!r} must be a finite number")
     return value
@@ -68,6 +70,8 @@ def _absolute_floor() -> float:
 
 
 def _run(cmd: list[str], *, cwd: Path, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
+    if timeout is None:
+        timeout = GIT_TIMEOUT_SECONDS
     return subprocess.run(
         cmd,
         cwd=cwd,
@@ -84,14 +88,16 @@ def _worktree(sha: str) -> Path:
     probe = _run([*GIT, "cat-file", "-e", f"{sha}^{{commit}}"], cwd=HARNESS_ROOT)
     if probe.returncode != 0:
         raise PerfCIError(
-            f"base commit {sha} is not in this clone; use a full-history checkout"
+            f"base commit {_command_text(sha)} is not in this clone; use a full-history checkout"
         )
     path = Path(tempfile.mkdtemp(prefix="perf-base-"))
     path.rmdir()
     added = _run([*GIT, "worktree", "add", "--detach", str(path), sha], cwd=HARNESS_ROOT)
     if added.returncode != 0:
-        sys.stderr.write(added.stderr)
-        raise PerfCIError(f"git worktree add failed for {sha[:12]}")
+        detail = _command_text(added.stderr)
+        if detail:
+            sys.stderr.write(detail + "\n")
+        raise PerfCIError(f"git worktree add failed for {_command_text(sha[:12])}")
     return path
 
 
@@ -100,7 +106,7 @@ def _remove_worktree(path: Path | None) -> None:
         return
     removed = _run([*GIT, "worktree", "remove", "--force", str(path)], cwd=HARNESS_ROOT)
     if removed.returncode != 0:
-        detail = removed.stderr.strip() or f"exit {removed.returncode}"
+        detail = _command_text(removed.stderr.strip()) or f"exit {removed.returncode}"
         raise PerfCIError(f"git worktree remove failed: {detail}")
 
 
@@ -162,18 +168,18 @@ def main() -> int:
             report = perf_compare.compare_reports(
                 baseline, head, ratio_limit=limit, absolute_floor_s=floor,
             )
-            _emit(report, baseline_label=base_sha[:12], candidate_label="head")
+            _emit(report, baseline_label=_command_text(base_sha[:12]), candidate_label="head")
             print(f"PERF_CI_SECONDS={time.perf_counter() - started:.3f}", flush=True)
             print(f"PERF_REGRESSIONS={len(report['regressions'])}", flush=True)
             code = job_ok()
     except (PerfCIError, BenchError) as exc:
-        print(f"PERF_CI_FAIL: {exc}", file=sys.stderr)
+        print(f"PERF_CI_FAIL: {_command_text(str(exc))}", file=sys.stderr)
         code = perf_compare.job_exit_code(bench_ok=False)
     finally:
         try:
             _remove_worktree(tree)
         except PerfCIError as exc:
-            print(f"PERF_CI_FAIL: {exc}", file=sys.stderr)
+            print(f"PERF_CI_FAIL: {_command_text(str(exc))}", file=sys.stderr)
             code = perf_compare.job_exit_code(bench_ok=False)
     return code
 

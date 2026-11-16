@@ -1332,7 +1332,11 @@ class CommitFencePrimitiveTests(unittest.TestCase):
             with self.subTest(read=name):
                 done = threading.Event()
                 answer: list = []
-                reader = threading.Thread(target=lambda: (answer.append(read()), done.set()), daemon=True)
+                def reading(answer=answer, read=read, done=done) -> None:  # this round's, even after a join that timed out
+                    answer.append(read())
+                    done.set()
+
+                reader = threading.Thread(target=reading, daemon=True)
                 with fence._marks_lock:
                     reader.start()
                     self.assertFalse(done.wait(0.3), name + " answered while the marks lock was held")

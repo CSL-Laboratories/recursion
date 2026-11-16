@@ -121,6 +121,46 @@ class EntryTest(unittest.TestCase):
         self.assertEqual({"code": "tools_unavailable", "reason": "published_unreadable", "detail": "ValueError"},
                          stderr_lines(err)[0])
 
+    def test_every_failure_of_the_choice_is_one_tools_unavailable_line_and_status_1(self) -> None:
+        # #416, round 1 (DeepSeek F1, F2 and F9, Astra R3, Sol R2): nothing read, nothing on stdout, one line.
+        class Raising:
+            def __init__(self, exc):
+                self.exc, self.calls = exc, []
+
+            def call(self, method, params):
+                self.calls.append(method)
+                raise self.exc
+
+        for exc in (RuntimeError("boom"), KeyError("boom"), ValueError("daemon-side"), ConnectionError("reset")):
+            with self.subTest(raised=type(exc).__name__):
+                api, err = Raising(exc), io.StringIO()
+                self.assertEqual(1, entry.main([], stdin=Untouchable(), stdout=Untouchable(), stderr=err,
+                                               check=lambda environ, api=api: api, published=lambda: PUBLISHED))
+                self.assertEqual([{"code": "tools_unavailable", "reason": "listing_failed", "detail": type(exc).__name__}],
+                                 stderr_lines(err))
+                self.assertEqual(["methods.list"], api.calls)
+        for table in ([], "table", None, 17):
+            documents = dict(PUBLISHED.documents)
+            documents[projection.TABLE_FILE] = table
+            with self.subTest(table=table):
+                err = io.StringIO()
+                self.assertEqual(1, entry.main([], stdin=Untouchable(), stdout=Untouchable(), stderr=err,
+                                               check=lambda environ: ScriptedAPI(),
+                                               published=lambda documents=documents: projection.Published(documents)))
+                self.assertEqual([("tools_unavailable", "published_invalid")], [(e["code"], e["reason"]) for e in stderr_lines(err)])
+
+    def test_an_exit_or_an_interrupt_while_choosing_is_not_a_refusal(self) -> None:
+        for exc in (SystemExit, KeyboardInterrupt):
+            class Raising:
+                def call(self, method, params, exc=exc):
+                    raise exc()
+
+            api, err = Raising(), io.StringIO()
+            with self.subTest(raised=exc.__name__), self.assertRaises(exc):
+                entry.main([], stdin=Untouchable(), stdout=Untouchable(), stderr=err,
+                           check=lambda environ, api=api: api, published=lambda: PUBLISHED)
+            self.assertEqual("", err.getvalue())
+
     def test_an_interrupt_exits_130(self) -> None:
         class Interrupting(io.RawIOBase):
             def readable(self):

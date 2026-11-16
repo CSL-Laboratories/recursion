@@ -178,6 +178,30 @@ class PublishedKeywordTest(unittest.TestCase):
                 tools.ecma_pattern(pattern)
         self.assertIsNotNone(tools.ecma_pattern("^[A-Za-z0-9._:-]{1,128}$").search("a.b:c"))
 
+    def test_forms_python_reads_otherwise_are_refused(self) -> None:
+        # #416, round 1 (Sol R4): an empty class, a quantifier on nothing or on a quantifier (Python's possessive
+        # forms), and a brace that is not a whole quantifier are refused, not read Python's way.
+        for pattern in ("[]]", "[]", "[^]", "[^]]", "a++", "a*+", "a?+", "a{2}+", "a+?+", "a**", "a???", "{1}", "^*",
+                        "(*)", "a|+", "x{,3}", "x{1,2", "a{"):
+            with self.subTest(pattern=pattern), self.assertRaises(SchemaUnsupported):
+                tools.ecma_pattern(pattern)
+        for pattern in ("{1}", "^*", "(*)", "a|+", "$?"):  # refused here, whatever Python's own parser would say
+            with self.subTest(pattern=pattern), self.assertRaisesRegex(SchemaUnsupported, "nothing to repeat, or on a quantifier"):
+                tools.ecma_pattern(pattern)
+        for pattern, value in (("^a+?$", "aaa"), ("^a{2,3}?$", "aa"), ("^a{2,}$", "aaaa"), ("^x]$", "x]"),
+                               ("^[a-c]{1,2}$", "cb"), ("^(ab)*$", "abab"), ("^a??b$", "b"), ("^[{}]+$", "{}")):
+            with self.subTest(pattern=pattern):
+                self.assertIsNotNone(tools.ecma_pattern(pattern).search(value))
+        self.assertIsNone(tools.ecma_pattern("^a{2,3}$").search("a"))
+
+    def test_bounds_do_not_apply_to_a_boolean_and_a_number_is_finite(self) -> None:
+        # #416, round 1 (DeepSeek F3; the survivors of Astra's M06 and M12 and Sol's M12 and M13).
+        either = {"type": ["boolean", "number"], "minimum": 2}
+        self.assertIsNone(check_arguments(either, True))
+        self.assertEqual("arguments must be at least 2", check_arguments(either, 1))
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            self.assertEqual("arguments must be a number", check_arguments({"type": "number"}, bad), bad)
+
 
 if __name__ == "__main__":
     unittest.main()

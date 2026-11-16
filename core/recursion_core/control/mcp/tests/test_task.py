@@ -1,4 +1,5 @@
-"""The Task derivation against every vector of ``schemas/control/v1/vectors/task.derivation`` (SPINE's #368).
+"""The Task derivation against every vector of ``schemas/control/v1/vectors/task.derivation`` (SPINE's #368, at
+``998e42ce``).
 
 A vector holds a source (a run's view, or a session and one of its turns), its log, the approvals pending, a
 Task, and ``expect``: exactly the fields of that Task that are not what the source says. For the vectors whose
@@ -64,10 +65,10 @@ def shape_problems(task: dict) -> list[str]:
 class VectorTest(unittest.TestCase):
     def test_the_vectors_are_there(self) -> None:
         names = [name for name, _ in vectors()]
-        self.assertEqual(49, len(names), VECTORS)
+        self.assertEqual(57, len(names), VECTORS)  # #368 at 998e42ce added t35 to t38 and x16 to x19
         self.assertEqual(19, sum(n.startswith("r") for n in names))
-        self.assertEqual(15, sum(n.startswith("t") for n in names))
-        self.assertEqual(15, sum(n.startswith("x") for n in names))
+        self.assertEqual(19, sum(n.startswith("t") for n in names))
+        self.assertEqual(19, sum(n.startswith("x") for n in names))
 
     def test_each_vector(self) -> None:
         for name, vector in vectors():
@@ -108,7 +109,6 @@ class RunTest(unittest.TestCase):
             ({"status": "error", "code": "plan_limit", "detail": "x"}, "failed", {"code": "plan_limit", "detail": "x", "result_ref": "run-1"}),
             ({"status": "ok", "code": "engine_error", "detail": ""}, "failed", {"code": "engine_error", "detail": "", "result_ref": "run-1"}),
             ({"status": "error", "code": None, "detail": ""}, "failed", {"code": "result_invalid", "detail": "", "result_ref": "run-1"}),
-            ({"code": None, "detail": None}, "failed", {"code": "result_invalid", "detail": None, "result_ref": "run-1"}),
             (None, "failed", {"code": "result_unavailable", "detail": None, "result_ref": None}),
         ]
         for result, status, want in cases:
@@ -130,13 +130,47 @@ class RunTest(unittest.TestCase):
                 task_of_run(self.VIEW, pending_approval_ids=bad)
 
     def test_updated_at_is_the_latest_state_change_and_created_at_is_never_given(self) -> None:
-        events = [{"type": "state.changed", "time": "t1", "payload": {"reason": "snapshot"}},
+        mine = {"entity": "run", "entity_id": "run-1"}
+        events = [{"type": "state.changed", "time": "t1", "payload": dict(mine, reason="snapshot")},
                   {"type": "engine.output", "time": "t2"},
-                  {"type": "state.changed", "time": "t3", "payload": {"reason": "commit"}},
-                  {"type": "stop.result", "time": "t4"}]
+                  {"type": "state.changed", "time": "t3", "payload": dict(mine, reason="commit")},
+                  {"type": "stop.result", "time": "t4"},
+                  # #368 at 998e42ce: a change of another run, of a turn or of the session does not move it
+                  {"type": "state.changed", "time": "t5", "payload": {"entity": "run", "entity_id": "run-2"}},
+                  {"type": "state.changed", "time": "t6", "turn_id": "turn-1", "payload": {"entity": "turn", "entity_id": "turn-1"}},
+                  {"type": "state.changed", "time": "t7", "payload": {"entity": "session", "entity_id": "ses-1"}},
+                  # the rule asks the entity as well as the id (ids of two kinds never coincide in a real log)
+                  {"type": "state.changed", "time": "t7b", "payload": {"entity": "turn", "entity_id": "run-1"}}]
         task = task_of_run(self.VIEW, events)
         self.assertEqual((None, "t3"), (task["created_at"], task["updated_at"]))
         self.assertIsNone(task_of_run(self.VIEW, [{"type": "engine.output", "time": "t2"}])["updated_at"])
+        filed_under_a_turn = {"type": "state.changed", "time": "t8", "turn_id": "turn-1", "payload": mine}
+        self.assertEqual("t8", task_of_run(self.VIEW, events + [filed_under_a_turn])["updated_at"])
+
+    def test_a_member_the_rule_reads_is_never_supplied(self) -> None:
+        # #416, round 1 (Astra R2, Sol R3, DeepSeek F5 and F8): an absent member is not read as null; a null is.
+        ended = dict(self.VIEW, state="ended")
+        for view in (dict(ended, result={"status": "ok", "detail": ""}),  # no code: never completed
+                     dict(ended, result={"code": None, "detail": None}),  # code null and no status
+                     dict(ended, result={"status": "ok", "code": None}),  # no detail
+                     dict(self.VIEW, state="start_failed", start_error={"detail": "x"}),
+                     dict(self.VIEW, state="start_failed", start_error="route_not_configured")):
+            with self.subTest(view=view), self.assertRaises(TaskUnavailable) as caught:
+                task_of_run(view)
+            self.assertEqual("source", caught.exception.reason)
+        self.assertEqual("completed", task_of_run(dict(ended, result={"status": "ok", "code": None, "detail": None}))["status"])
+        for kept in (None, {}):
+            self.assertIsNone(task_of_run(dict(self.VIEW, state="start_failed", start_error=kept))["result"]["detail"])
+
+    def test_an_event_it_cannot_read_is_refused(self) -> None:
+        change = {"type": "state.changed", "time": "t", "payload": {"entity": "run", "entity_id": "run-1"}}
+        for event in ({k: v for k, v in change.items() if k != "time"}, {k: v for k, v in change.items() if k != "payload"},
+                      dict(change, payload={"entity_id": "run-1"}), dict(change, payload={"entity": "run"}),
+                      {"time": "t"}, "state.changed"):
+            with self.subTest(event=event), self.assertRaises(TaskUnavailable) as caught:
+                task_of_run(self.VIEW, [event])
+            self.assertEqual("source", caught.exception.reason)
+        self.assertIsNone(task_of_run(self.VIEW, [dict(change, time=None)])["updated_at"])  # a null time is kept as null
 
     def test_sources_it_cannot_read_are_refused(self) -> None:
         for view, reason in (({"run_id": "r", "state": "paused"}, "state"), ({"state": "running"}, "source"),
@@ -191,11 +225,42 @@ class TurnTest(unittest.TestCase):
         self.assertEqual("input_required", task_of_turn(session, "turn-b", (), ["apr-1"])["status"])
         self.assertEqual(("completed", []), tuple(task_of_turn(session, "turn-a", (), ["apr-1"])[k]
                                                    for k in ("status", "pending_approval_ids")))
-        events = [{"type": "state.changed", "turn_id": "turn-a", "time": "ta"},
-                  {"type": "state.changed", "turn_id": "turn-b", "time": "tb"},
-                  {"type": "state.changed", "turn_id": None, "time": "tsession"}]
+        events = [{"type": "state.changed", "turn_id": "turn-a", "time": "ta", "payload": {"entity": "turn", "entity_id": "turn-a"}},
+                  {"type": "state.changed", "turn_id": "turn-b", "time": "tb", "payload": {"entity": "turn", "entity_id": "turn-b"}},
+                  {"type": "state.changed", "turn_id": None, "time": "tsession", "payload": {"entity": "session", "entity_id": "ses-1"}}]
         self.assertEqual(("ta", "tb"), (task_of_turn(session, "turn-a", events)["updated_at"],
                                         task_of_turn(session, "turn-b", events)["updated_at"]))
+
+    def test_a_change_of_the_run_or_the_session_filed_under_a_turn_does_not_move_it(self) -> None:
+        # #368 at 998e42ce (vectors t35 to t38): the event must be filed under the turn AND its payload name it.
+        session = self.session()
+        events = [{"type": "state.changed", "turn_id": "turn-b", "time": "tb", "payload": {"entity": "turn", "entity_id": "turn-b"}},
+                  {"type": "state.changed", "turn_id": "turn-b", "time": "trun", "payload": {"entity": "run", "entity_id": "run-1"}},
+                  {"type": "state.changed", "turn_id": "turn-b", "time": "tses", "payload": {"entity": "session", "entity_id": "ses-1"}},
+                  {"type": "state.changed", "turn_id": "turn-b", "time": "tsame", "payload": {"entity": "session", "entity_id": "turn-b"}},
+                  {"type": "state.changed", "turn_id": None, "time": "tunfiled", "payload": {"entity": "turn", "entity_id": "turn-b"}}]
+        self.assertEqual("tb", task_of_turn(session, "turn-b", events)["updated_at"])
+        self.assertIsNone(task_of_turn(session, "turn-b", events[1:])["updated_at"])
+
+    def test_a_member_the_rule_reads_is_never_supplied(self) -> None:
+        # #416, round 1 (Astra R2, Sol R3, DeepSeek F5 and F8): an absent member is not read as null.
+        for member in ("run_id", "outcome", "expires_at", "result", "state"):
+            session = self.session()
+            del session["turns"][1][member]
+            with self.subTest(turn_without=member), self.assertRaises(TaskUnavailable) as caught:
+                task_of_turn(session, "turn-b")
+            self.assertEqual("source", caught.exception.reason)
+        for member in ("session_id", "state"):  # the session's state is read while the turn is live
+            session = self.session()
+            del session[member]
+            with self.subTest(session_without=member), self.assertRaises(TaskUnavailable) as caught:
+                task_of_turn(session, "turn-b")
+            self.assertEqual("source", caught.exception.reason)
+        unnamed = self.session()
+        del unnamed["turns"][0]["turn_id"]  # a turn read before the one asked for
+        with self.assertRaises(TaskUnavailable) as caught:
+            task_of_turn(unnamed, "turn-b")
+        self.assertEqual("source", caught.exception.reason)
 
     def test_sources_it_cannot_read_are_refused(self) -> None:
         for session, turn_id, reason in ((self.session(), "turn-z", "turn_unknown"), ({"session_id": "s"}, "turn-b", "source"),

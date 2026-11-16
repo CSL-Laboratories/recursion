@@ -7,7 +7,9 @@ self-contained (an MCP client is handed one schema per tool and resolves no refe
 cycle, a reference with sibling keywords, or a target that does not exist.
 
 WHAT THE DAEMON IMPLEMENTS comes from ``methods.list``: ``{code: "ok", table_version, methods: [{name,
-implemented, beta}]}``. ``project`` advertises, in the table's order, exactly the rows that are
+implemented, beta}]}``, the published answer's shape and no other (``answer.methods.list`` in
+``methods.v1.json``: those members exactly, ``implemented`` and ``beta`` booleans, each name once), checked
+before any table is chosen. ``project`` advertises, in the table's order, exactly the rows that are
 ``mcp.exposed`` AND that the daemon lists as implemented, under their published tool names and with their
 published annotations, only when the daemon's ``table_version`` is the published one. A row that is not
 exposed is never a tool, whatever the daemon implements: ``approval.open`` and ``approval.answer`` (no
@@ -20,13 +22,21 @@ codes it answers); the table publishes no title.
 
 * the daemon answers ``methods.list`` with ``method_unknown``: it is from before the method table, and the
   LEGACY four (``tools.tool_table``) are served, as slice 1 does;
+* it answers ``ok`` in another shape: refused (``listing_invalid``), whatever comes next;
 * it answers ``ok`` and the published files are present: the projected table; a different ``table_version``
-  or a listing that is not the published shape refuses (``ProjectionRefused``), because a schema advertised
-  for another version of the table could be wrong;
+  refuses (``table_version_mismatch``), because a schema advertised for another version of the table could
+  be wrong;
 * it answers ``ok`` and the published files are absent (a package installed without them): the legacy four,
-  and the reason is logged. Which files an installed package carries is not decided yet;
+  and the reason is logged. Until INSTALL ships ``schemas/control/v1/*.json`` as package data (the Liaison's
+  ruling of Nov 15 on the lane's Q9), only a source tree has them;
 * any other answer (``unavailable``, ``scope_refused``, the socket client's ``control_api_unavailable``)
-  refuses.
+  refuses (``listing_unavailable``), and so does a ``methods.list`` call that raises (``listing_failed``; an
+  exit or an interrupt goes on).
+
+Every refusal is a ``ProjectionRefused(reason, detail)``. Published files that are not the published shape
+(a table that is not an object, a row that is not one or whose ``mcp`` is not one, an exposed row whose
+``codes`` are not strings or whose ``scope`` is not one, a parameter schema this server cannot check) are
+``published_incomplete`` or ``published_invalid``.
 """
 
 from __future__ import annotations
@@ -61,10 +71,14 @@ class Published:
             raise ProjectionRefused("published_incomplete", f"needs {TABLE_FILE} and {PARAMS_FILE}")
         self.documents = {name: copy.deepcopy(doc) for name, doc in documents.items()}
         table = self.documents[TABLE_FILE]
+        if not isinstance(table, Mapping):
+            raise ProjectionRefused("published_invalid", f"{TABLE_FILE} is not an object")
         self.table_version = table.get("table_version")
         self.rows = table.get("methods")
         if not isinstance(self.table_version, str) or not isinstance(self.rows, list):
             raise ProjectionRefused("published_invalid", "the table needs table_version and methods")
+        if not all(isinstance(row, Mapping) for row in self.rows):
+            raise ProjectionRefused("published_invalid", "a row of the table is not an object")
 
     @classmethod
     def from_directory(cls, directory: Path) -> Published | None:
@@ -107,25 +121,35 @@ class Published:
                 for key, value in schema.items()}
 
 
-def _listing(answer: Any) -> dict[str, bool]:
-    """``methods.list``'s answer as {name: implemented}; ``ProjectionRefused`` when it is not that shape."""
+_ANSWER_MEMBERS = frozenset({"code", "table_version", "methods"})
+_ENTRY_MEMBERS = frozenset({"name", "implemented", "beta"})
 
-    methods = answer.get("methods") if isinstance(answer, Mapping) else None
-    if not isinstance(methods, list) or not isinstance(answer.get("table_version"), str):
-        raise ProjectionRefused("listing_invalid", "methods.list answered without table_version and methods")
+
+def _listing(answer: Any) -> dict[str, bool]:
+    """``methods.list``'s ``ok`` answer as {name: implemented}; ``ProjectionRefused`` when it is not the published
+    shape (``answer.methods.list``: those members exactly, each entry ``name``, ``implemented`` and ``beta``
+    exactly, the two booleans, each name once)."""
+
+    if (not isinstance(answer, Mapping) or set(answer) != _ANSWER_MEMBERS or not isinstance(answer["methods"], list)
+            or not isinstance(answer["table_version"], str)):
+        raise ProjectionRefused("listing_invalid", "methods.list answered ok, but not as code, table_version and methods")
     implemented: dict[str, bool] = {}
-    for entry in methods:
-        if (not isinstance(entry, Mapping) or not isinstance(entry.get("name"), str)
-                or not isinstance(entry.get("implemented"), bool) or entry["name"] in implemented):
+    for entry in answer["methods"]:
+        if (not isinstance(entry, Mapping) or set(entry) != _ENTRY_MEMBERS or not isinstance(entry["name"], str)
+                or not isinstance(entry["implemented"], bool) or not isinstance(entry["beta"], bool)
+                or entry["name"] in implemented):
             raise ProjectionRefused("listing_invalid", f"a method entry is not name/implemented/beta: {entry!r}")
         implemented[entry["name"]] = entry["implemented"]
     return implemented
 
 
 def _description(row: Mapping) -> str:
-    codes = row.get("codes") or []
-    return (f"The Recursion control method {row['name']} (scope: {row.get('scope')}). "
-            f"It answers one of: {', '.join(codes)}.")
+    """A tool's description, written from its row; ``ProjectionRefused`` for a row it cannot be written from."""
+
+    codes, scope = row.get("codes"), row.get("scope")
+    if not isinstance(codes, list) or not all(isinstance(c, str) for c in codes) or not isinstance(scope, str):
+        raise ProjectionRefused("published_invalid", f"row {row.get('name')!r}: codes must be strings and scope a string")
+    return f"The Recursion control method {row['name']} (scope: {scope}). It answers one of: {', '.join(codes)}."
 
 
 def project(published: Published, answer: Mapping) -> tuple[Tool, ...]:
@@ -136,9 +160,11 @@ def project(published: Published, answer: Mapping) -> tuple[Tool, ...]:
         raise ProjectionRefused("table_version_mismatch",
                                 f"the daemon's table is {answer['table_version']}, the published one {published.table_version}")
     tools, names = [], set()
-    for row in published.rows:
-        mcp = row.get("mcp") if isinstance(row, Mapping) else None
-        if not isinstance(mcp, Mapping) or mcp.get("exposed") is not True or implemented.get(row.get("name")) is not True:
+    for row in published.rows:  # each an object (Published)
+        mcp = row.get("mcp")
+        if not isinstance(mcp, Mapping):
+            raise ProjectionRefused("published_invalid", f"row {row.get('name')!r}: mcp must be an object")
+        if mcp.get("exposed") is not True or implemented.get(row.get("name")) is not True:
             continue
         name, annotations = mcp.get("tool"), mcp.get("annotations")
         if not isinstance(name, str) or not name or name in names or not isinstance(annotations, Mapping):
@@ -159,13 +185,17 @@ def project(published: Published, answer: Mapping) -> tuple[Tool, ...]:
 def choose_tools(api: Any, published: Published | None) -> tuple[tuple[Tool, ...], dict]:
     """The tools to serve, and a log entry saying which table and why."""
 
-    answer = api.call("methods.list", {})
+    try:
+        answer = api.call("methods.list", {})
+    except Exception as exc:  # noqa: BLE001 - no listing: refused, and named; an exit or an interrupt goes on
+        raise ProjectionRefused("listing_failed", type(exc).__name__) from None
     code = answer.get("code") if isinstance(answer, Mapping) else None
     if code == "method_unknown":
         return tool_table(), {"event": "tools", "table": LEGACY, "reason": "daemon_without_method_table"}
     if code != "ok":
         detail = answer.get("detail") if isinstance(answer, Mapping) else None
         raise ProjectionRefused("listing_unavailable", f"methods.list answered {code!r}" + (f" ({detail})" if detail else ""))
+    _listing(answer)  # its shape is checked whatever comes next, the fallback included
     if published is None:
         return tool_table(), {"event": "tools", "table": LEGACY, "reason": "published_table_missing"}
     tools = project(published, answer)

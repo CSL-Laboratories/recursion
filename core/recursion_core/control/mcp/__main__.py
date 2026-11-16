@@ -5,8 +5,10 @@ arguments. Before reading anything from stdin it runs the socket check (``socket
 fails it writes one JSON line to stderr, ``{"code": "socket_check_failed", "reason": ..., "detail": ...}``,
 writes nothing to stdout and exits 1. Then it chooses its tools (``projection.choose_tools``): the legacy
 four for a daemon from before the method table, else the published table's exposed rows that the daemon
-implements; a refused choice writes ``{"code": "tools_unavailable", "reason": ..., "detail": ...}`` and
-exits 1. Otherwise it serves until the client ends stdin, or until stdout fails, and exits 0. It reads fd 0
+implements; a refused choice writes ``{"code": "tools_unavailable", "reason": ..., "detail": ...}``, writes
+nothing to stdout and exits 1, whether the daemon's answer, its ``methods.list`` call or the published files
+are at fault (``projection.py`` names each reason; ``published_unreadable`` is a file JSON cannot read). An
+exit or an interrupt while choosing is not a refusal and goes on. Otherwise it serves until the client ends stdin, or until stdout fails, and exits 0. It reads fd 0
 and writes fd 1 directly (``stdio.py``), so a client that stops reading ends the process cleanly instead of
 leaving a buffered stdout for the interpreter's final flush to fail on.
 Every line it writes to stderr goes to fd 2 directly too, never through ``sys.stderr``: a client that
@@ -73,13 +75,18 @@ def main(argv: list[str] | None = None, *, environ: Mapping[str, str] | None = N
     except socket_check.SocketCheckFailed as exc:
         line({"code": "socket_check_failed", "reason": exc.reason, "detail": exc.detail})
         return EXIT_REFUSED
-    try:
-        tools, chosen = projection.choose_tools(api, published())
+    try:  # the published files first, on their own: a file that cannot be read is not a daemon's answer
+        documents = published()
     except projection.ProjectionRefused as exc:
         line({"code": "tools_unavailable", "reason": exc.reason, "detail": exc.detail})
         return EXIT_REFUSED
     except (OSError, ValueError) as exc:  # published files that cannot be read as JSON
         line({"code": "tools_unavailable", "reason": "published_unreadable", "detail": type(exc).__name__})
+        return EXIT_REFUSED
+    try:  # every refusal of the choice is a ProjectionRefused, a methods.list call that raises included
+        tools, chosen = projection.choose_tools(api, documents)
+    except projection.ProjectionRefused as exc:
+        line({"code": "tools_unavailable", "reason": exc.reason, "detail": exc.detail})
         return EXIT_REFUSED
     instream = FdReader(0) if stdin is None else stdin
     outstream = FdWriter(1) if stdout is None else stdout

@@ -83,6 +83,27 @@ class PublishedTableTest(unittest.TestCase):
         self.assertEqual("arguments.command_id is required",
                          check_arguments(session, {"session_id": "ses-1", "expected_turn_id": "turn-1"}))
 
+    def test_a_stops_pending_and_ended_read_as_errors_until_controls_mapping_changes(self) -> None:
+        # The Liaison's ruling of Nov 15 on the lane's Q2: isError follows CONTROL's mapping (SUCCESS_CODES), and this
+        # face builds none of its own. This pins TODAY's behaviour; it is to change with CONTROL's mapping.
+        by_method = {t.method: t for t in project(PUBLISHED, listing(PUBLISHED))}
+        codes = {row["name"]: row["codes"] for row in PUBLISHED.rows}
+
+        class Answering:
+            def __init__(self, code):
+                self.code = code
+
+            def call(self, method, params):
+                return {"code": self.code}
+
+        for method, code in (("run.stop", "pending"), ("run.stop", "ended"), ("session.stop", "pending"),
+                             ("session.stop", "ended"), ("session.interrupt", "pending")):
+            with self.subTest(method=method, code=code):
+                self.assertIn(code, codes[method])
+                result = tools.forward(Answering(code), by_method[method], {})
+                self.assertEqual((True, code), (result["isError"], result["structuredContent"]["code"]))
+        self.assertFalse(tools.forward(Answering("stopped"), by_method["run.stop"], {})["isError"])
+
 
 class JoinTest(unittest.TestCase):
     def test_another_table_version_is_refused(self) -> None:
@@ -104,6 +125,43 @@ class JoinTest(unittest.TestCase):
             with self.subTest(answer=str(answer)[:60]), self.assertRaises(ProjectionRefused) as caught:
                 project(PUBLISHED, answer)
             self.assertEqual("listing_invalid", caught.exception.reason)
+
+    def test_an_entry_is_exactly_name_implemented_and_beta(self) -> None:
+        # #416, round 1 (Astra R1, Sol R1): answer.methods.list is closed, and beta is a boolean like implemented.
+        good = listing(PUBLISHED)
+        first = good["methods"][0]
+        for entry in ({k: v for k, v in first.items() if k != "beta"}, dict(first, beta=None), dict(first, beta=1),
+                      dict(first, beta="false"), dict(first, beta={}), dict(first, unpublished_member=True)):
+            with self.subTest(entry=entry), self.assertRaises(ProjectionRefused) as caught:
+                project(PUBLISHED, dict(good, methods=[entry] + good["methods"][1:]))
+            self.assertEqual("listing_invalid", caught.exception.reason)
+        with self.assertRaises(ProjectionRefused) as caught:
+            project(PUBLISHED, dict(good, unpublished_member=True))
+        self.assertEqual("listing_invalid", caught.exception.reason)
+
+    def test_published_files_that_are_not_the_published_shape_are_refused(self) -> None:
+        # #416, round 1 (DeepSeek F2, Astra R3, Sol R2): published_invalid, never an AttributeError or a
+        # description written from codes that are not strings.
+        for table in ([], "table", None, 17, {"table_version": "1.0", "methods": ["run.status"]}):
+            documents = dict(PUBLISHED.documents)
+            documents[projection.TABLE_FILE] = table
+            with self.subTest(table=str(table)[:40]), self.assertRaises(ProjectionRefused) as caught:
+                Published(documents)
+            self.assertEqual("published_invalid", caught.exception.reason)
+        gone = object()
+        for key, value in (("codes", [1]), ("codes", "ok"), ("codes", None), ("codes", gone), ("scope", None), ("scope", gone),
+                           ("mcp", "exposed"), ("mcp", gone)):
+            def change(rows, documents, key=key, value=value):
+                row = next(r for r in rows if r["name"] == "run.stop")
+                if value is gone:
+                    del row[key]
+                else:
+                    row[key] = value
+
+            published = with_rows(change)
+            with self.subTest(key=key, value="absent" if value is gone else value), self.assertRaises(ProjectionRefused) as caught:
+                project(published, listing(published))
+            self.assertEqual("published_invalid", caught.exception.reason)
 
     def test_a_name_the_table_does_not_have_is_not_a_tool(self) -> None:
         answer = listing(PUBLISHED, ())
@@ -211,6 +269,34 @@ class ChooseTest(unittest.TestCase):
         tools_, entry = self.choose(listing(PUBLISHED), published=None)
         self.assertEqual(4, len(tools_))
         self.assertEqual("published_table_missing", entry["reason"])
+
+    def test_the_listing_is_read_as_the_published_shape_before_the_fallback_too(self) -> None:
+        # #416, round 1 (Sol R1): without the published files an ok answer is still read as the published shape.
+        no_beta = listing(PUBLISHED)
+        del no_beta["methods"][0]["beta"]
+        for answer in ({"code": "ok"}, {"code": "ok", "table_version": PUBLISHED.table_version, "methods": None},
+                       {"code": "ok", "table_version": 4, "methods": []}, no_beta):
+            with self.subTest(answer=str(answer)[:60]), self.assertRaises(ProjectionRefused) as caught:
+                self.choose(answer, published=None)
+            self.assertEqual("listing_invalid", caught.exception.reason)
+
+    def test_a_listing_call_that_raises_is_refused_and_named(self) -> None:
+        # #416, round 1 (DeepSeek F1, Astra R3, Sol R2): listing_failed, apart from the published files' reasons;
+        # an exit or an interrupt is not a refusal and goes on.
+        class Raising:
+            def __init__(self, exc):
+                self.exc = exc
+
+            def call(self, method, params):
+                raise self.exc
+
+        for exc in (RuntimeError("boom"), KeyError("boom"), ValueError("x"), ConnectionError("reset")):
+            with self.subTest(exc=type(exc).__name__), self.assertRaises(ProjectionRefused) as caught:
+                choose_tools(Raising(exc), PUBLISHED)
+            self.assertEqual(("listing_failed", type(exc).__name__), (caught.exception.reason, caught.exception.detail))
+        for exc in (SystemExit(), KeyboardInterrupt()):
+            with self.subTest(exc=type(exc).__name__), self.assertRaises(type(exc)):
+                choose_tools(Raising(exc), PUBLISHED)
 
     def test_any_other_answer_refuses(self) -> None:
         for answer in ({"code": "unavailable", "detail": "daemon_closing"}, {"code": "scope_refused"},

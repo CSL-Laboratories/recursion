@@ -4,15 +4,19 @@ Two tables can be served:
 
 * the LEGACY table (``tool_table``): the four run tools exactly as ``control/mcp_tools.py`` (lane CONTROL's
   file) describes them, with their names, titles, input schemas and marks by effect (decided Nov 7, "All
-  picks"; stop ``destructiveHint: true``, ``openWorldHint: false``). It is read from that file, never copied.
-  It is what a daemon from before the method table answers;
+  picks"; stop ``destructiveHint: true``, ``openWorldHint: false``). It is read from that file, not written
+  out here, and deep-copied on each call so that no caller can change the shared descriptors. It is what a
+  daemon from before the method table answers;
 * the PROJECTED table (``projection.py``): the published method table's exposed rows that the daemon says it
   implements, with their published names, annotations and parameter schemas.
 
 ``forward`` sends a call to the control API and answers as ``control/mcp_tools.call_tool`` does: the API's
 answer as ``structuredContent``, the same JSON as text, and ``isError`` unless the code is ``started``,
 ``ok`` or ``stopped`` (``control.api.SUCCESS_CODES``). The MCP face adds nothing and has no Stop path of
-its own.
+its own. ``isError`` follows CONTROL's mapping, and this face builds none of its own: today a stop's or an
+interrupt's ``pending``, and a stop's ``ended``, read as errors although they are truthful answers (a Stop
+under way, a run or session already over); the structured answer carries the code. CONTROL is to change
+the mapping in its next slice (the Liaison's ruling of Nov 15 on the lane's Q2), and a test pins today's.
 
 ``check_arguments`` checks a call's arguments against the tool's own ``inputSchema`` before anything is
 sent: 2025-06-18 answers invalid arguments as a protocol error (``-32602``), and a call that does not
@@ -23,8 +27,13 @@ is never half checked. ``description`` is an annotation and checks nothing.
 
 ``pattern`` is read as JSON Schema says, as an ECMA-262 regular expression, unanchored: outside a
 character class ``$`` matches only at the very end (Python's ``$`` also matches before a last newline) and
-``.`` matches no line terminator (``\\n``, ``\\r``, U+2028, U+2029). Escapes other than those listed in
-``_ESCAPES``, and groups that begin ``(?``, are refused rather than read differently.
+``.`` matches no line terminator (``\\n``, ``\\r``, U+2028, U+2029). What Python would read differently is
+refused, not translated: escapes other than those listed in ``_ESCAPES``; groups that begin ``(?``; an empty
+class, ``[]`` or ``[^]`` (ECMA-262 reads ``[]]`` as a class that matches nothing and then ``]``, Python as a
+class holding ``]``); a quantifier with nothing to repeat, or on another quantifier (``a++`` is Python's
+possessive quantifier and no ECMA-262 pattern; one lazy ``?`` after a quantifier is read the same); and a
+``{`` that is not a whole quantifier ``{n}``, ``{n,}`` or ``{n,m}`` after something to repeat (Python reads
+``x{,3}`` as a quantifier, ECMA-262 as text).
 """
 
 from __future__ import annotations
@@ -49,6 +58,7 @@ SUPPORTED = frozenset({"type", "properties", "required", "additionalProperties",
 TYPES = frozenset({"object", "string", "integer", "number", "boolean", "array", "null"})
 _ESCAPES = frozenset("rnt.-\\/^$()[]{}|*+?")
 _LINE_TERMINATORS = "[^\n\r\u2028\u2029]"
+_BRACED = re.compile(r"\{[0-9]+(?:,[0-9]*)?\}")
 
 
 class SchemaUnsupported(ValueError):
@@ -77,6 +87,7 @@ def ecma_pattern(pattern: str) -> re.Pattern:
     if not isinstance(pattern, str):
         raise SchemaUnsupported("a pattern must be a string")
     out, i, in_class = [], 0, False
+    last = None  # outside a class, what came before: "atom", "quantifier", "lazy", or None (nothing to repeat)
     while i < len(pattern):
         ch = pattern[i]
         if ch == "\\":
@@ -84,25 +95,54 @@ def ecma_pattern(pattern: str) -> re.Pattern:
                 raise SchemaUnsupported(f"pattern {pattern!r}: escape not read the same in Python")
             out.append(pattern[i:i + 2])
             i += 2
+            last = last if in_class else "atom"
             continue
         if in_class:
             if ch == "]":
-                in_class = False
+                in_class, last = False, "atom"
             out.append(ch)
         elif ch == "[":
+            opening = "[^" if pattern[i + 1:i + 2] == "^" else "["  # a negated class: copy the caret too
+            if pattern[i + len(opening):i + len(opening) + 1] == "]":
+                raise SchemaUnsupported(f"pattern {pattern!r}: an empty class ('[]' or '[^]') is not read the same in Python")
             in_class = True
-            out.append(ch)
-            if pattern[i + 1:i + 2] == "^":  # a negated class: copy the caret too
-                out.append("^")
+            out.append(opening)
+            i += len(opening)
+            continue
+        elif ch in "*+?{":
+            braced = _BRACED.match(pattern, i) if ch == "{" else None
+            if ch == "{" and braced is None:
+                raise SchemaUnsupported(f"pattern {pattern!r}: a '{{' that is not a whole quantifier is not read the same in Python")
+            if ch == "?" and last == "quantifier":  # lazy: read the same
+                out.append(ch)
+                last = "lazy"
                 i += 1
+                continue
+            if last != "atom":
+                raise SchemaUnsupported(f"pattern {pattern!r}: a quantifier with nothing to repeat, or on a quantifier, "
+                                        "is not read the same in Python")
+            token = braced.group(0) if braced else ch
+            out.append(token)
+            last = "quantifier"
+            i += len(token)
+            continue
         elif ch == "(" and pattern[i + 1:i + 2] == "?":
             raise SchemaUnsupported(f"pattern {pattern!r}: '(?' groups are not read the same in Python")
+        elif ch in "(|":
+            out.append(ch)
+            last = None
         elif ch == "$":
             out.append(r"\Z")
+            last = None
+        elif ch == "^":
+            out.append(ch)
+            last = None
         elif ch == ".":
             out.append(_LINE_TERMINATORS)
+            last = "atom"
         else:
             out.append(ch)
+            last = "atom"
         i += 1
     if in_class:
         raise SchemaUnsupported(f"pattern {pattern!r}: an unterminated class")
@@ -244,7 +284,10 @@ def forward(api: Any, tool: Tool, arguments: dict) -> dict:
     """Send one call to the control API; the ``tools/call`` result, as control/mcp_tools.call_tool makes it."""
 
     answer = api.call(tool.method, arguments or {})
-    # An answer that is not an object raises here (it has no .get), and the session answers that call
-    # as an outcome it does not know.
+    # An answer that is not an object, or that JSON cannot write, raises here, and the session answers that
+    # call as an outcome it does not know. isError follows CONTROL's mapping (SUCCESS_CODES, as
+    # control/mcp_tools.call_tool sets it), and this face builds none of its own: a stop's or an interrupt's
+    # pending, and a stop's ended, read as errors today although they are truthful answers, and
+    # structuredContent carries the code. To change with CONTROL's mapping (the Liaison's ruling on Q2).
     return {"content": [{"type": "text", "text": json.dumps(answer, sort_keys=True)}],
             "structuredContent": answer, "isError": answer.get("code") not in SUCCESS_CODES}

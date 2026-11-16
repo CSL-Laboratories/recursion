@@ -1,0 +1,54 @@
+Dev task 04: fix a word-frequency function (a bug fix in existing code).
+-- task.json --
+{"id": "dev-04-top-words", "cluster": "dev", "created_at": null,
+ "test_command": ["{python}", "-B", "-m", "unittest", "{hidden_modules}"],
+ "timeout_s": 900, "grading_timeout_s": 120}
+-- prompt.md --
+`top_words(text, n)` in `wordcount/count.py` gives wrong answers. Fix it so that:
+
+- words that differ only in case count as one word, reported in lower case;
+- words keep their apostrophes ("don't" is one word);
+- the result is a list of `(word, count)` pairs, most common first, and pairs with the same count are ordered alphabetically;
+- an `n` larger than the number of distinct words returns all of them.
+-- start/wordcount/__init__.py --
+"""Word counting."""
+-- start/wordcount/count.py --
+import re
+from collections import Counter
+
+
+def top_words(text, n):
+    """The n most common words, most common first; ties broken alphabetically."""
+    words = re.findall(r"[a-z']+", text)
+    counts = Counter(words)
+    return counts.most_common(n)
+-- hidden/test_count.py --
+import unittest
+
+from wordcount.count import top_words
+
+
+class TopWordsTests(unittest.TestCase):
+    def test_case_folds(self):
+        self.assertEqual(top_words("The the THE cat", 1), [("the", 3)])
+
+    def test_ties_alphabetical(self):
+        self.assertEqual(top_words("b a c b a c", 3), [("a", 2), ("b", 2), ("c", 2)])
+
+    def test_more_than_distinct(self):
+        self.assertEqual(top_words("x y", 5), [("x", 1), ("y", 1)])
+
+    def test_apostrophes(self):
+        self.assertEqual(top_words("don't stop, don't", 1), [("don't", 2)])
+-- solution/wordcount/count.py --
+import re
+from collections import Counter
+
+
+def top_words(text, n):
+    """The n most common words, most common first; ties broken alphabetically."""
+    words = re.findall(r"[a-z']+", text.lower())
+    counts = Counter(words)
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:n]
+-- standin.json --
+{"outcomes": ["idle"]}

@@ -241,7 +241,8 @@ CHILD_ENV_NAMES = ("PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPD
                    "XDG_STATE_HOME", "XDG_RUNTIME_DIR")
 _EOF = object()
 # Lines of output read at most before /stop or /quit ends the input, while the driver holds a write for the
-# turn's id (round 3 of #402, GPT-6 Astra 3).
+# turn's id (round 3 of #402, GPT-6 Astra 3), and again after /quit has ended it, before the workers are ended
+# (round 4, GPT-6 Astra 2).
 HELD_READS = 100
 
 
@@ -486,8 +487,13 @@ def session_loop(driver, commands, say, console, *, env: dict | None = None, ses
         handle = state["handle"]
         # What the worker still writes after /quit, while it has some, read like any other output: a line that
         # is not the protocol's ends the run with its message here too (the #402 reads, round 3, GPT-6.1 Sol 4).
-        while not state["eof"] and handle.closed and read_once():
-            pass
+        # At most HELD_READS lines, so a worker that never stops writing cannot keep /quit from the fence that
+        # ends it (round 4, GPT-6 Astra 2).
+        reads = 0
+        while reads < HELD_READS and not state["eof"] and handle.closed and read_once():
+            reads += 1
+        if reads == HELD_READS and not state["eof"]:
+            say(f"the worker still writes after {HELD_READS} lines since its input ended; it is ended now")
     except _OutputFailed as failed:
         say(f"the worker's output failed: {failed.args[0]}; the run ends")
     return seen
@@ -524,9 +530,9 @@ def run_mode(args: argparse.Namespace) -> int:
     seen: dict = {}
     # Every worker is ended and every capture closed however the loop ends, an exception or Ctrl-C included.
     # Each step is tried even when one before it fails or is interrupted (the drafts file, a worker), and even
-    # when its failure cannot be printed; the first failure is kept before it is said and raised afterwards
-    # unless the loop's own exception is already on its way (the #402 reads: GPT-6 Astra R7, round 2 change 4
-    # and round 3 change 4, DeepSeek F2).
+    # when its failure cannot be printed or the printing is interrupted; the first failure is kept before it is
+    # said and raised afterwards unless the loop's own exception is already on its way (the #402 reads: GPT-6
+    # Astra R7, round 2 change 4 and round 3 change 4, DeepSeek F2; round 4, GPT-6 Astra 3 and GPT-6.1 Sol 1).
     try:
         session_loop(driver, Typed(), say, console, env=child_env(dict(os.environ)), route=route, seen=seen,
                      on_draft=on_draft)
@@ -542,7 +548,7 @@ def run_mode(args: argparse.Namespace) -> int:
                 failure = failure or err
                 try:
                     print(f"[{name} could not be ended: {type(err).__name__}: {err}]")
-                except Exception:  # noqa: BLE001 - a message that cannot be printed never stops the cleanup
+                except BaseException:  # noqa: BLE001 - not printed, or interrupted: cleanup goes on (round 4)
                     pass
         if failure is not None and in_flight is None:
             raise failure

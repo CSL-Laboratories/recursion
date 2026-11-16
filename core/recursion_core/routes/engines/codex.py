@@ -86,9 +86,12 @@ hanging; a port interrupted by ``KeyboardInterrupt`` or ``SystemExit`` gets the 
 interruption goes on. An approval id the gate would refuse in ``approval_answer`` is declined at once; an
 approval whose turn ended, or whose request the server settled, while the port was asked is not kept and
 nothing is written for it. ``close`` ends the input at once, and once it has returned no request is put to
-the port that was not with it already: it waits for one in flight, for at most ``port_wait_s`` seconds (an
-option of the driver, ``PORT_WAIT_S`` unless given: a number of seconds from 0 to ``threading.TIMEOUT_MAX``,
-or the driver is not made, ``DriverInputError("port_wait_s")``), and nothing that call opens is kept. A request read
+the port that was not admitted to it already. A request is admitted in one step under the session lock, the
+last before the port is called, so a ``close`` that takes that lock first is seen there and the port is not
+asked (the #402 reads, round 4: GPT-6 Astra 1). An admitted request is in flight: ``close`` waits for it, for
+at most ``port_wait_s`` seconds (an option of the driver, ``PORT_WAIT_S`` unless given: a number of seconds
+from 0 to ``threading.TIMEOUT_MAX``, or the driver is not made, ``DriverInputError("port_wait_s")``), and
+nothing that call opens is kept. A request read
 while another is with the port waits for it as long at most, then is declined. The port must not call back
 into the driver: ``send`` or ``interrupt`` from inside its call, on the thread that is asking it, is refused
 (``DriverStateError``), and an approval request read there is declined, instead of waiting for ever on a
@@ -111,6 +114,12 @@ command and cwd, the changes, or the arguments) and ``input_digest``, the SHA-25
 ``item/completed`` is the ``tool.result``: ``ok``, ``error`` or ``denied`` from the item's status, the
 output text (cut at 64 KiB, ``truncated``); a repeated completion drafts nothing. Tool drafts are made
 only while a turn is in progress.
+
+PROVISIONAL (Lucas, Nov 15: items 36, 7, 37 and 49 are not decided: saved sessions and resume; steering on an
+engine that cannot take a message mid-turn; a second turn; the driver's answer while a turn runs). What this
+driver builds on them stays as it is and is marked so here: ``thread/resume`` for a stored thread,
+``turn/steer`` for a message sent while a turn runs, and more than one turn in one worker. Nothing more of
+them is switched on until he decides (the Liaison's reading, Nov 15).
 
 Not here yet: ``fork`` (false until SESSIONS asks), APPROVALS' real port, who owns a live handle between
 turns (DRIVER-CC's S9 drive owner, ``routes/workers.py``).
@@ -178,7 +187,8 @@ class _Session:
         self.recorded: set[str] = set()          # core turns whose id the turn/start answer recorded, not yet out
         self.retired: set[str] = set()           # core turns whose end or refusal was seen: never adopted again
         self.resolved: set[str] = set()          # server requests (JSON ids) the server settled in this turn
-        self.asking: int | None = None           # the thread that is asking the approvals port, while it asks
+        self.asking: int | None = None           # the thread asking the approvals port, from just before
+        #                                            its request is admitted until the port has answered
         self.done_calls: set[str] = set()        # tool call ids given their result in the turn in progress
         self.seen_requests: set[str] = set()     # approval requests (JSON ids) of the turn in progress
         self.next_id = 1
@@ -224,11 +234,12 @@ class _Session:
 
     def close(self, wait_s: float | None = None) -> None:
         """End standard input at once. Nothing is written after this, held writes included, and no request is
-        put to the approvals port after this returns that was not with it already: a port call in flight is
-        waited for, for at most ``wait_s`` seconds (None: without a bound; the driver always passes its checked
-        ``port_wait_s``), and nothing it opens is kept (the
-        #402 reads, round 4, DeepSeek R4-2: a port that waits for a thread which closes the worker no longer
-        holds it for good)."""
+        put to the approvals port after this returns that was not admitted to it already: ``closed`` is set
+        under the session lock, the lock under which ``_ask`` admits a request as its last step before the port
+        (the #402 reads, round 4: GPT-6 Astra 1). An admitted request is in flight and is waited for, for at
+        most ``wait_s`` seconds (None: without a bound; the driver always passes its checked ``port_wait_s``),
+        and nothing it opens is kept (round 4, DeepSeek R4-2: a port that waits for a thread which closes the
+        worker no longer holds it for good)."""
 
         with self.write_lock:
             with self.lock:
@@ -365,14 +376,15 @@ class CodexDriver(Driver):
                 session.early.append(line)
 
     def _abandon(self, session: _Session, reason: str, err: BaseException) -> None:
-        """End the worker of a start that is given up, both steps tried. A step that fails is added to ``err``
-        as a note and does not take its place, so the caller still gets the start's own refusal (the #402
-        reads, round 3, DeepSeek F3)."""
+        """End the worker of a start that is given up, both steps tried. A step that fails, or is interrupted
+        (``KeyboardInterrupt``, ``SystemExit``), is added to ``err`` as a note and does not take its place, and
+        the next step is still tried: the worker is fenced and the caller still gets the start's own refusal
+        (the #402 reads, round 3, DeepSeek F3; round 4, GPT-6 Astra 4 and GPT-6.1 Sol 2)."""
 
         for step in (lambda: session.close(self._port_wait_s), lambda: session.process.fence(reason)):
             try:
                 step()
-            except Exception as failed:  # noqa: BLE001 - noted on the refusal, never raised in its place
+            except BaseException as failed:  # noqa: BLE001 - noted on the refusal, never raised in its place
                 err.add_note(f"the worker could not be ended: {type(failed).__name__}")
 
     # -- send, interrupt ------------------------------------------------------------------------------
@@ -818,24 +830,28 @@ class CodexDriver(Driver):
             return _DECLINE_NOW  # the exact action is not known: nothing approvable is opened (#402, R1)
         binding = {"run_id": session.run_id, "engine": ENGINE, "engine_request_id": key,
                    "bound_at": _timestamp_ms(self._wall())}
-        # ``ask_lock`` spans the check of the input, the port call and the binding, and ``close`` takes it too:
-        # once ``close`` has returned, no request is put to the port, and a close that comes first is seen here
+        # ``ask_lock`` spans the check of the input, the port call and the binding, and ``close`` takes it too
         # (the #402 reads, round 2: GPT-6 Astra 2, DeepSeek R2-2). The turn and the request are checked again
         # just before the port is asked and again after it answers: an end or a settlement seen meanwhile means
         # no approval is opened, or none is kept (round 3: GPT-6.1 Sol 2, GPT-6 Astra 1). ``close`` ends the
         # input first and waits for the port at most ``port_wait_s``, and a request that finds another with the
         # port waits as long at most, then is declined (round 4, DeepSeek R4-2), so no wait here is for good.
+        # The check just before the port admits the request, under the session lock, under which ``close`` sets
+        # ``closed``, and nothing of the driver's comes between it and the port call: a close that comes first
+        # is seen there and the port is not asked, so once ``close`` has returned only a request admitted before
+        # it can still reach the port (round 4: GPT-6 Astra 1).
         with _waited(session.ask_lock, self._port_wait_s) as taken:
             if not taken:
                 return _DECLINE_NOW  # another request has been with the port longer than port_wait_s
-            with session.lock:
-                if session.closed or turn not in session.core_turn or key in session.resolved:
-                    return _ANSWERED  # input ended, the turn ended or the server settled it: nothing is opened
-            session.asking = threading.get_ident()
+            session.asking = threading.get_ident()  # first: admitting the request is the last step before the port
             try:
-                approval_id = self._approvals.request(effect, binding)
-            except Exception:  # noqa: BLE001 - any failure of the port: deny now, never leave the engine waiting
-                return _DECLINE_NOW
+                with session.lock:
+                    if session.closed or turn not in session.core_turn or key in session.resolved:
+                        return _ANSWERED  # input ended, the turn ended or the server settled it: nothing is opened
+                try:
+                    approval_id = self._approvals.request(effect, binding)
+                except Exception:  # noqa: BLE001 - any failure of the port: deny now, never leave the engine waiting
+                    return _DECLINE_NOW
             finally:
                 session.asking = None
             try:  # an id the gate would refuse in approval_answer could never be answered (round 2, R2-3)

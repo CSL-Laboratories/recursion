@@ -1,0 +1,77 @@
+Dev task 02: Roman numerals both ways, with validation.
+-- task.json --
+{"id": "dev-02-roman", "cluster": "dev", "created_at": null,
+ "test_command": ["{python}", "-B", "-m", "unittest", "{hidden_modules}"],
+ "timeout_s": 900, "grading_timeout_s": 120}
+-- prompt.md --
+Implement `to_roman(number)` and `from_roman(text)` in `numerals/roman.py`.
+
+- They cover 1 to 3999 and use the standard subtractive forms (IV, IX, XL, XC, CD, CM).
+- `to_roman` raises `ValueError` for any number outside 1 to 3999.
+- `from_roman` accepts only canonical upper-case numerals: anything else (the empty string, "IIII", "VX", "IC", "MMMM", letters that are not numerals) raises `ValueError`.
+- `from_roman(to_roman(n)) == n` for every n in range.
+-- start/numerals/__init__.py --
+"""Number formats."""
+-- start/numerals/roman.py --
+def to_roman(number):
+    raise NotImplementedError
+
+
+def from_roman(text):
+    raise NotImplementedError
+-- hidden/test_roman.py --
+import unittest
+
+from numerals.roman import from_roman, to_roman
+
+
+class RomanTests(unittest.TestCase):
+    def test_known_values(self):
+        for number, text in [(1, "I"), (4, "IV"), (9, "IX"), (14, "XIV"), (40, "XL"), (90, "XC"),
+                             (400, "CD"), (1994, "MCMXCIV"), (3999, "MMMCMXCIX")]:
+            self.assertEqual(to_roman(number), text)
+            self.assertEqual(from_roman(text), number)
+
+    def test_round_trip(self):
+        for number in range(1, 4000):
+            self.assertEqual(from_roman(to_roman(number)), number)
+
+    def test_out_of_range(self):
+        for number in (0, 4000, -1):
+            with self.assertRaises(ValueError):
+                to_roman(number)
+
+    def test_invalid_numerals(self):
+        for text in ("", "IIII", "VX", "IC", "MMMM", "ABC"):
+            with self.assertRaises(ValueError):
+                from_roman(text)
+-- solution/numerals/roman.py --
+_VALUES = [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"), (50, "L"),
+           (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]
+
+
+def to_roman(number):
+    if not isinstance(number, int) or not 1 <= number <= 3999:
+        raise ValueError(f"out of range: {number!r}")
+    out = []
+    for value, symbol in _VALUES:
+        count, number = divmod(number, value)
+        out.append(symbol * count)
+    return "".join(out)
+
+
+def from_roman(text):
+    if not isinstance(text, str) or not text:
+        raise ValueError("empty numeral")
+    total, i = 0, 0
+    for value, symbol in _VALUES:
+        while text.startswith(symbol, i):
+            total += value
+            i += len(symbol)
+    if i != len(text) or not 1 <= total <= 3999 or to_roman(total) != text:
+        raise ValueError(f"not a canonical numeral: {text!r}")
+    return total
+-- standin.json --
+{"outcomes": ["solve"],
+ "usage": {"input_tokens": 1200, "cache_creation_input_tokens": 300, "cache_read_input_tokens": 4000,
+           "output_tokens": 450, "total_cost_usd": 0.0123}}

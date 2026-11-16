@@ -519,12 +519,14 @@ class TuiApp:
         transcript.pages += 1
         try:
             self.request(s.READ, transcript.read_params())
-        except Exception as exc:  # noqa: BLE001 - the dispatch failed; the view was rebuilt all the same
+        except BaseException as exc:  # noqa: BLE001 - the dispatch failed; the view was rebuilt all the same
             self.in_flight[s.READ] = max(0, self.in_flight[s.READ] - 1)
             transcript.owed = "read_failed"
             self._error(f"transcript session={field(sid)}: the view was rebuilt (the marker is shown and the rows "
                         f"before it kept), but the read of the log from its start could not be sent "
                         f"({type(exc).__name__}): pending; the command transcript {field(sid)} reads it")
+            if not isinstance(exc, Exception):
+                raise  # an interrupt goes on to the caller once the state is said (review 7 of #405, F9)
 
     def open_transcript(self, session_id: str) -> None:
         """Show a session's transcript in the output pane, reading it from the cursor (from the start the

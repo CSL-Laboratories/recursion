@@ -199,17 +199,18 @@ What the TUI relies on from the daemon about positions, as the store and the cur
 
 - A log's positions are gapless from 1, and a line at a position never changes: the event store appends one
   row per event at the next seq and refuses every update and delete of the log in the file itself (lane
-  EVENTS, on #373's branch at `31ce13eb`, `core/recursion_core/events/db.py` lines 115-124 and 349-352; the
-  `events` package is not in this tree yet).
+  EVENTS, #373, merged: `core/recursion_core/events/db.py` lines 115-124 and 349-352, in this tree since the
+  merge of master; cited first at #373's `31ce13eb`).
 - The epoch rises by one each time the store is opened, and a cursor carries it (the same file, lines 55-56
   and 574-576). An older epoch goes on with the same persistent log; `epoch_advanced` is not a reset; a seq
   past the high-water mark is `cursor_ahead`, and a seq at it is a valid empty read; a position that
   retention skipped is a `replay.gap` line (SPINE's cursor, `schemas/control/v1/common.v1.json` line 245).
 - So, in an epoch and across the epochs of one store, the high-water mark never goes down and a position
   shown never holds another line. Lane EVENTS' #403 (`45eedbcf`) lists `events.read` and `events.follow` as
-  read rows (`core/recursion_core/control/methods/__init__.py` line 206 there; line 204 in this tree) and
-  changes none of this; its change
-  reader keeps the digest of the last image it logged for the same reason (`events/changes.py` lines 11-14).
+  read rows (`core/recursion_core/control/methods/__init__.py` line 206, there and in this tree) and
+  changes none of this; its change reader, which is not in this tree, keeps the digest of the last image it
+  logged for the same reason (`core/recursion_core/events/changes.py` lines 11-14 on #403's branch at
+  `45eedbcf`).
 
 What it checks: every read after a line was shown asks from the position before the last line shown, for
 one line more, so the answer begins with that line, and it must be the line shown (every field but its
@@ -247,7 +248,7 @@ The cases, what the user sees, and the test that holds each (in `tests/test_revi
 | Same-epoch rewrite of an earlier line | not seen (below) | `SameEpochRewriteTest` (pins the limit) |
 | An empty stream | nothing; later lines once | `EmptyStreamTest` |
 | A reconnect in the middle of a burst | each line once; a marker when the log was lost meanwhile | `BurstTest` |
-| Retention over the last line shown | the gap line when it covers more; no marker | `RetentionTest` |
+| Retention over the last line shown | the gap line when it covers more, then its gap marker row; no rebuild marker | `RetentionTest` |
 | Many gap lines after the last line shown, read again | each once | r6 `GapLinesTest` |
 | A rebuild with no read left in the open | a marker that says the command reads the log again | r6 `BudgetTest` |
 | A rebuild whose read cannot be sent | the marker, and an error that says so | r6 `RebuildReadTest` |

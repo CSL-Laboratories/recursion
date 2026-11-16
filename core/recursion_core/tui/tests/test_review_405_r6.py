@@ -259,8 +259,9 @@ class SolRound2Test(unittest.TestCase):  # GPT-6.1 Sol's round-2 read of 71c3a00
 class SentencesTest(unittest.TestCase):  # F2, F3, F7, F8, F9
     def test_the_sentences_say_what_the_code_does(self) -> None:
         readme = " ".join((Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8").split())
-        self.assertIn("line 206 there; line 204 in this tree", readme)  # F7
-        self.assertIn("the `events` package is not in this tree yet", readme)
+        self.assertIn("line 206, there and in this tree", readme)  # F7; review 7, F2
+        self.assertIn("in this tree since the merge of master", readme)  # review 7, F1
+        self.assertIn("on #403's branch at `45eedbcf`", readme)  # review 7, F3
         self.assertIn("the caller asks `broken`, rebuilds the view (`restart()`) and says so, and never iterates None",
                       readme)  # F8
         self.assertIn("| Case | What the user sees | Test |", readme)  # F9

@@ -34,6 +34,7 @@ before and after a gap is never joined as if nothing lay between (the Liaison's 
 
 from __future__ import annotations
 
+import copy
 import threading
 from collections.abc import Mapping
 
@@ -70,7 +71,8 @@ def page_problem(asked: Mapping, answer: Mapping) -> str | None:
     Rule (7) as SPINE's ``conformance/rules.py`` (``page_problems``) states it for the side that reads, after
     the shapes ``transcript.line.v1`` gives. A page in another projection than the one asked for is
     ``projection`` and nothing else of it is looked at. ``lines`` is not a list, or holds more lines than the
-    read's ``limit`` (``lines``; Sol's round 2 of #405, 3), or a line is not
+    read's ``limit`` when the read names one (``lines``; Sol's round 2 of #405, 3: SPINE's schema makes the
+    limit optional, so a read without one is still a read, and has no length to hold), or a line is not
     an object with an integer ``seq``, a text ``event_type`` and a ``text`` and ``speech`` that are each text
     or null (``line``). Each line is the next position after the one before (the asked ``seq`` first), or a
     ``replay.gap`` whose ``seq`` is the last of the positions it covers (``order``). The answer's cursor
@@ -185,6 +187,15 @@ class Transcript:
                 seq = self.last_seq - 1
             return {"epoch": self.cursor["epoch"], "session_id": self.session_id, "seq": seq}
 
+    def __deepcopy__(self, memo: dict) -> Transcript:
+        """A copy of the state with a lock of its own: the lock is not state (review 7 of #405, F8)."""
+
+        with self._lock:
+            copied = Transcript.__new__(Transcript)
+            copied._lock = threading.RLock()
+            copied.__dict__.update(copy.deepcopy(self.__dict__, memo))
+            return copied
+
     def furthest_ask(self) -> int:
         """The furthest position a read of this transcript asks from: an answer, or a refusal, to a read asked from
         past it was sent before the view began again (``restart()``), and is not taken."""
@@ -219,8 +230,12 @@ class Transcript:
         it, or an answer that ends before it; ``broken`` says which, and nothing else changes but the epoch. A
         gap line over that position is retention, which rule (7) allows: it is shown when it covers more than
         that position, and the lines after it are shown. The page is copied before the lock is taken, so a
-        caller's slow object holds no other caller up (review 6, F2)."""
+        caller's slow object holds no other caller up (review 6, F2); a line whose own methods raise raises to
+        the caller there, before anything is changed (review 7, F7). An ``asked`` that is not a position (a
+        bool) shows nothing (review 7, F10)."""
 
+        if asked is not None and not _is_int(asked):
+            return []
         cursor, lines = answer.get("cursor"), answer.get("lines")
         page = {"cursor": dict(cursor) if isinstance(cursor, Mapping) else cursor, "more": answer.get("more"),
                 "lines": [dict(line.items()) if isinstance(line, Mapping) else line for line in lines]

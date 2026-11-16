@@ -473,10 +473,14 @@ class NoOwnerCheckTests(unittest.TestCase):
             path = Path(tmp) / "routing.json"
             for content in ("null", json.dumps(CONFIG), '{"version": 1, "version": 1}'):
                 path.write_text(content, encoding="utf-8")
-                with self.subTest(content=content[:20]), mock.patch.object(rc, "os", _NoGeteuid()):
-                    with mock.patch.object(rc.json, "loads", side_effect=AssertionError("parsed")):
-                        with self.assertRaises(rc.RoutingUnreadable):
-                            rc.read_routing_file(path)
+                no_uid = _NoGeteuid()
+                with self.subTest(content=content[:20]), mock.patch.object(rc, "os", no_uid), \
+                        mock.patch.object(no_uid, "open", side_effect=AssertionError("opened"), create=True) as opened, \
+                        mock.patch.object(rc.json, "loads", side_effect=AssertionError("parsed")) as parsed:
+                    with self.assertRaises(rc.RoutingUnreadable):
+                        rc.read_routing_file(path)
+                    opened.assert_not_called()  # refused before it is opened (astra r1's later note), and so
+                    parsed.assert_not_called()  # before it is parsed
 
 
 @unittest.skipUnless(POSIX_OWNER, "the routing file's owner check needs a POSIX uid")

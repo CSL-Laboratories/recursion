@@ -20,6 +20,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import recursion_core
 from recursion_core.routing.tests import test_config  # POSIX_OWNER, RoutingFileTests: where the reader's rules run
@@ -225,15 +226,19 @@ def run_child(module: str, old: str, new: str) -> dict:
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
-# The routing file reader's mutants whose killers need the reader's owner check (test_config's RoutingFileTests,
-# which run where os.geteuid exists, on Linux). Without the check (Windows) a present routing file is refused as
-# unreadable before it is opened or parsed (test_config's NoOwnerCheckTests), so these rules cannot change an answer
-# there and no test can catch them: each is judged where the check exists, and is named here with the reason it is
-# not judged elsewhere. Every other mutant is judged on every platform.
+# The routing file reader's mutants whose killers are test_config's RoutingFileTests, which run only where
+# test_config.POSIX_OWNER holds: os.geteuid exists and the platform is Linux (as before this list existed). Where it
+# does not, these three are not judged, each with its reason; every other mutant is judged on every platform.
+# On Windows (no os.geteuid) the reader refuses a present routing file as unreadable before it opens or parses it
+# (test_config's NoOwnerCheckTests), so these rules cannot change an answer there and no test can catch them. On a
+# POSIX host that is not Linux the owner check exists, but RoutingFileTests was already skipped there.
 NEEDS_OWNER_CHECK = {
-    "M15 the routing file's owner not checked": "there is no owner to check: os.geteuid does not exist",
-    "M22 a present null routing file read as absent": "a present routing file is refused before it is parsed",
-    "M24 a member named twice read as the last one": "a present routing file is refused before it is parsed",
+    "M15 the routing file's owner not checked":
+        "its killer runs only where POSIX_OWNER holds; on Windows there is no owner check to remove",
+    "M22 a present null routing file read as absent":
+        "its killers run only where POSIX_OWNER holds; on Windows a present file is refused before it is parsed",
+    "M24 a member named twice read as the last one":
+        "its killer runs only where POSIX_OWNER holds; on Windows a present file is refused before it is parsed",
 }
 
 
@@ -260,6 +265,37 @@ class MutantTests(unittest.TestCase):
             module, _, _, killers = MUTANTS[name]
             self.assertEqual(module, CONFIG, name)
             self.assertLessEqual(killers, reader, name)  # each killer is skipped exactly where this one is not judged
+
+    @staticmethod
+    def _dispatch(posix_owner: bool) -> tuple[list, list, unittest.TestResult]:
+        """test_every_kept_mutant_is_caught run with test_config.POSIX_OWNER as given and a recording run_child,
+        under which each mutant is caught by its own killers: the mutants it dispatches, and the subtests it skips."""
+        dispatched = []
+
+        def child(module, old, new):
+            [(name, killers)] = [(n, k) for n, (m, o, w, k) in MUTANTS.items() if (m, o, w) == (module, old, new)]
+            dispatched.append(name)
+            return {"ran": 1, "failed": sorted(killers)}
+        result = unittest.TestResult()
+        with mock.patch.object(test_config, "POSIX_OWNER", posix_owner), \
+                mock.patch.object(sys.modules[__name__], "run_child", side_effect=child):
+            MutantTests("test_every_kept_mutant_is_caught").run(result)
+        return dispatched, [str(test) for test, _ in result.skipped], result
+
+    def test_with_the_owner_check_every_mutant_is_dispatched_and_none_skipped(self) -> None:  # astra r1 R1
+        dispatched, skipped, result = self._dispatch(True)
+        self.assertEqual(dispatched, list(MUTANTS))
+        self.assertEqual(skipped, [])
+        self.assertEqual(result.failures + result.errors, [])
+
+    def test_without_the_owner_check_only_the_three_reader_mutants_are_skipped(self) -> None:  # astra r1 R1
+        three = {"M15 the routing file's owner not checked", "M22 a present null routing file read as absent",
+                 "M24 a member named twice read as the last one"}  # spelled out: independent of NEEDS_OWNER_CHECK
+        dispatched, skipped, result = self._dispatch(False)
+        self.assertEqual(dispatched, [name for name in MUTANTS if name not in three])
+        self.assertEqual(len(skipped), 3)
+        self.assertEqual({name for name in three if any(name in test for test in skipped)}, three)
+        self.assertEqual(result.failures + result.errors, [])
 
     @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema not installed")
     def test_every_schema_mutant_is_caught(self) -> None:

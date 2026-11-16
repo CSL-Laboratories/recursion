@@ -19,7 +19,8 @@ The stdlib modules that pick an implementation at import time are imported first
 them. Four things run that way: test_child_env.py, each package's test_windows_refusal.py (whose
 ``WindowsRefusalTests`` otherwise run only on a real Windows host), an import of every core test
 module, and a run of every other core test file (the hosted windows job stops at the first failing
-file, so it never reached them). ``HOST_LIMITED`` names the few cases this host cannot run as
+file, so it never reached them; that run is split into parts, the files test_simulated_windows_others_*.py,
+to keep each gate file under the gate's per-file limit). ``HOST_LIMITED`` names the few cases this host cannot run as
 Windows would.
 
 Limits: path syntax, file modes, links, sockets, signals and process handling stay POSIX. This
@@ -211,6 +212,39 @@ def simulate(*args: str) -> dict:
     return json.loads(line[len(_MARK):])
 
 
+# The gate gives each test file 180 s; all the other core suites in one file took 119 to 175 s on hosted
+# runners. So they run in parts, one gate file each (OTHER_SUITE_FILE), one suite after another inside a part.
+OTHER_SUITE_PARTS = 3
+OTHER_SUITE_FILE = "test_simulated_windows_others_{part}.py"
+
+
+def other_core_suites() -> list[Path]:
+    """Every core test file outside child_env's tests, but the refusal files (run by their own test)."""
+
+    return sorted(path for path in CORE.glob("recursion_core/*/tests/test_*.py")
+                  if path.parent != HERE and path.name != "test_windows_refusal.py")
+
+
+def other_core_suites_part(part: int) -> list[Path]:
+    """Part ``part`` (1 to OTHER_SUITE_PARTS): the suites whose sorted position is ``part - 1`` modulo the parts."""
+
+    return other_core_suites()[part - 1::OTHER_SUITE_PARTS]
+
+
+def assert_other_suites_clean(case: unittest.TestCase, part: int) -> None:
+    """Run one part's suites under the simulation; each is judged by _assert_clean, HOST_LIMITED excused."""
+
+    others = other_core_suites_part(part)
+    case.assertGreater(len(others), 0)
+    for path in others:
+        suite = path.relative_to(CORE).as_posix()
+        with case.subTest(suite=suite):
+            result = simulate(str(path))
+            for kind in ("errors", "failures"):
+                result[kind] = [row for row in result[kind] if row["test"] not in HOST_LIMITED.get(suite, {})]
+            SimulatedWindowsTests._assert_clean(case, result)
+
+
 @unittest.skipIf(os.name == "nt", "simulation for POSIX hosts; a Windows host runs the suites themselves")
 class SimulatedWindowsTests(unittest.TestCase):
     maxDiff = None
@@ -249,18 +283,21 @@ class SimulatedWindowsTests(unittest.TestCase):
                 self.assertGreater(result["run"], 0)
                 self.assertEqual([], result["skipped_tests"])
 
-    def test_the_other_core_suites_have_no_error_or_failure_on_simulated_windows(self) -> None:
-        others = sorted(path for path in CORE.glob("recursion_core/*/tests/test_*.py")
-                        if path.parent != HERE and path.name != "test_windows_refusal.py")
+    def test_the_parts_hold_every_other_core_suite_exactly_once(self) -> None:
+        # The other core suites run in OTHER_SUITE_PARTS gate files (see other_core_suites_part).
+        others = other_core_suites()
         self.assertGreater(len(others), len(REFUSAL_AREAS))
         self.assertLessEqual(set(HOST_LIMITED), {path.relative_to(CORE).as_posix() for path in others})
-        for path in others:
-            suite = path.relative_to(CORE).as_posix()
-            with self.subTest(suite=suite):
-                result = simulate(str(path))
-                for kind in ("errors", "failures"):
-                    result[kind] = [row for row in result[kind] if row["test"] not in HOST_LIMITED.get(suite, {})]
-                self._assert_clean(result)
+        parts = [other_core_suites_part(part) for part in range(1, OTHER_SUITE_PARTS + 1)]
+        self.assertEqual(len(others), sum(len(paths) for paths in parts))
+        self.assertEqual(others, sorted(path for paths in parts for path in paths))
+        self.assertTrue(all(parts), [len(paths) for paths in parts])
+        files = sorted(HERE.glob(OTHER_SUITE_FILE.format(part="*")))
+        self.assertEqual([HERE / OTHER_SUITE_FILE.format(part=part) for part in range(1, OTHER_SUITE_PARTS + 1)], files)
+        for part, path in enumerate(files, start=1):
+            with self.subTest(file=path.name):
+                module = _load(str(path), f"simulated_windows_part_{part}")
+                self.assertEqual(part, module.PART)
 
     def test_every_gated_area_has_a_windows_refusal_file(self) -> None:
         found = sorted(path.parents[1].name for path in CORE.glob("recursion_core/*/tests/test_windows_refusal.py"))

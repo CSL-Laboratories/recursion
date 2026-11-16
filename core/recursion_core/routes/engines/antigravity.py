@@ -478,6 +478,15 @@ def _utf8_length(raw: str, error: type) -> int:
         raise error("stdout line is not UTF-8") from None
 
 
+def _read_length(line: str) -> int:
+    """A line's length in bytes as the reader read it: a surrogate a ``surrogateescape`` decode made is the one
+    byte it stands for; any other surrogate is counted as ``surrogatepass`` writes it."""
+    try:
+        return len(line.encode("utf-8", "surrogateescape"))
+    except UnicodeEncodeError:
+        return len(line.encode("utf-8", "surrogatepass"))
+
+
 def _count(value: object) -> bool:
     return type(value) is int and value >= 0
 
@@ -849,7 +858,14 @@ class AcpDrafts:
         if not isinstance(line, str):
             raise TypeError("on_line takes the line as a str")
         raw = mask(line, self._redact) + "\n"
-        start, self.offset = self.offset, self.offset + _utf8_length(raw, acp_module().AcpProtocolError)
+        try:
+            length = _utf8_length(raw, acp_module().AcpProtocolError)
+        except BaseException:
+            # The line was read, so its bytes count, as the reader decoded them (a lone surrogate is a byte
+            # that was not UTF-8): every later span stays at its true place in the stream. Nothing is drafted.
+            self.offset += _read_length(line) + 1
+            raise
+        start, self.offset = self.offset, self.offset + length
         self.drafts.append({"type": "engine.output", "payload": {
             "stream": "stdout", "text": raw, "offset_start": start, "offset_end": self.offset}})
 

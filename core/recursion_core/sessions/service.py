@@ -58,7 +58,8 @@ nor turned into a next turn, until he answers.
 
 A NEW TURN AFTER A FIRST LAUNCH THAT NEVER STARTED. A turn continues the conversation: a live worker that takes
 another message, or a launch that resumes the engine's session. A session whose every turn so far was a launch
-that definitely never started (refused by the launcher, or never attempted) has no conversation to continue
+that definitely never started (refused by the launcher, or never attempted, before or across a restart) has no
+conversation to continue
 or to lose, so its next turn launches afresh. One whose conversation may have begun and cannot be continued is
 refused ``unsupported`` (questions.md Q6, Lucas's).
 
@@ -165,13 +166,16 @@ class Sessions:
 
     def _never_started(self, tx, session: dict) -> bool:
         """True when no turn of ``session`` can have reached an engine: no engine reported a conversation id, and
-        every turn so far was a launch that is ``failed`` (refused by the launcher, so nothing started, or never
-        attempted). A session with no turn is the first case of it."""
+        every turn so far was a launch that definitely never started: ``failed`` (refused by the launcher, or never
+        attempted under a pending Stop), or ``outcome_unknown`` with ``attempted`` exactly False (still pending when
+        the daemon restarted: the port was never called). A session with no turn is the first case of it."""
         if session['engine_session_id'] is not None:
             return False
         never = {operation['payload']['target_turn_id']
                  for operation in store.work(tx, session_id=session['session_id'])
-                 if operation['kind'] == 'launch' and operation['state'] == 'failed'}
+                 if operation['kind'] == 'launch' and (operation['state'] == 'failed' or (
+                     operation['state'] == 'outcome_unknown'
+                     and (operation['outcome'] or {}).get('attempted') is False))}
         return all(turn['turn_id'] in never for turn in session['turns'])
 
     def steering_refusal(self, session: dict):
@@ -246,8 +250,9 @@ class Sessions:
 
         Each session is looked at in its own transaction. One that raises an ``Exception`` (a port, such as a
         driver's declaration, failing) is logged and changes nothing: its transaction is rolled back, its item stays
-        queued, and the pass goes on with the next session; a later pass tries it again. A ``BaseException`` (the
-        process ending) is not caught: it ends the pass, as it ends the process. The first read, of which sessions
+        queued, and the pass goes on with the next session; a later pass tries it again. A ``BaseException`` is not
+        caught: it ends the pass and the ``SessionsService`` loop, which keeps it in ``failure`` and is no longer
+        ``ready``, while the process goes on (a later ``start`` is a fresh start). The first read, of which sessions
         have a queue, is not guarded: a store error there ends the pass, and the service's next pass reads again."""
         with self.store.transaction() as tx:
             waiting = store.with_queued_items(tx)

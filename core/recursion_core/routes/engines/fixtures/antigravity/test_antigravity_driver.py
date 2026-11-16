@@ -1174,7 +1174,9 @@ class ReviewRoundFive408Test(unittest.TestCase):
             drafts.ended(s.prompt("four", FAR), "turn-4", "dlv-4")
         self.assertEqual(drafts._turns, {})                       # every turn's object is dropped with its result
         self.assertEqual(sorted(drafts._done.values()), [4, 4, 4])  # what outlives a turn: one number per session
-        self.assertEqual(set(vars(drafts)), {"offset", "drafts", "_redact", "_turn", "_turns", "_done"})
+        self.assertEqual(set(vars(drafts)), {"offset", "drafts", "_redact", "_turn", "_turns", "_done", "_begun",
+                                             "_outer", "_lock"})
+        self.assertEqual(drafts._outer, [])
         self.assertEqual(len([d for d in drafts.drafts if d["type"] == "result"]), 12)
         self.assertEqual(unanswered(drafts.drafts), [])
 
@@ -1263,6 +1265,448 @@ class ReviewRoundFive408Test(unittest.TestCase):
             ag.mask_forms((SubStr("k"),))
         self.assertIn("is exactly a ``str``", " ".join(ag.mask.__doc__.split()))
         self.assertIn("exactly (a subclass is refused", " ".join(ag.mask_forms.__doc__.split()))
+
+KEY6 = "review-only-made-up-secret-408"   # made up for these tests
+
+
+def u6(call_id="call-1", **extra) -> dict:
+    return {"sessionId": "fake-session-1", "update": {"sessionUpdate": "tool_call", "toolCallId": call_id,
+                                                      "status": "completed", "kind": "execute", "rawInput": {},
+                                                      **extra}}
+
+
+def texts_of(drafts, kind, field):
+    return [d["payload"][field] for d in drafts if d["type"] == kind]
+
+
+def strings_in(value) -> list:
+    """Every key and string of a decoded value, in the order it is written."""
+    out = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            out.append(k)
+            out += strings_in(v)
+    elif isinstance(value, list):
+        for v in value:
+            out += strings_in(v)
+    elif isinstance(value, str):
+        out.append(value)
+    return out
+
+
+def recoverable(pieces, key: str) -> bool:
+    """Whether a reader recovers ``key`` from ``pieces`` in order, any between skipped: inside one piece, or as
+    the end of one, whole pieces, and the start of a later one. Written apart from the product's search."""
+    if any(key in piece for piece in pieces):
+        return True
+    reached = set()                         # lengths of key's prefixes spelled so far, ending at a piece's end
+    for piece in pieces:
+        now = set()
+        for k in reached:
+            if piece.startswith(key[k:]):
+                return True
+            if piece and key[k:].startswith(piece):
+                now.add(k + len(piece))
+        now |= {k for k in range(1, len(key)) if piece.endswith(key[:k])}
+        reached |= now
+    return False
+
+
+def six_outcome(session=1, turn=1, code=None, detail=""):
+    return acp.TurnOutcome(turn, code, "end_turn", False, False, None, None, None, detail, "", session)
+
+
+class ReviewRoundSix408Test(unittest.TestCase):
+    """#408's first full round at 110fdd29: Codex astra R1-R7, Codex sol R1-R6, DeepSeek round 6 (MEDIUM 1,
+    LOW 2-5). Each fails on 110fdd29 unless marked a guard (a guard holds a rule a removal probe needs)."""
+
+    # -- astra R1 / sol R1 (HIGH): a value split over pieces, and numeric spellings, before any draft --------
+    def test_h1_a_value_split_over_content_items_is_masked_in_the_saved_line(self) -> None:
+        drafts = ag.AcpDrafts(redact=(KEY6,))
+        up = u6(content=[{"type": "content", "content": {"type": "text", "text": part}}
+                         for part in (KEY6[:12], KEY6[12:])])
+        line = json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": up})
+        drafts.on_line(line)
+        drafts.on_update(up)
+        out = drafts.drafts[0]["payload"]
+        self.assertEqual((out["offset_start"], out["offset_end"]), (0, len(line.encode()) + 1))
+        self.assertFalse(recoverable(strings_in(json.loads(out["text"])), KEY6))
+        self.assertNotIn(KEY6, texts_of(drafts.drafts, "tool.result", "text")[0])
+
+    def test_h1_a_value_split_over_input_values_or_keys_is_masked_before_the_digest(self) -> None:
+        for raw in ({"a": KEY6[:12], "b": KEY6[12:]}, {KEY6[:12]: 1, KEY6[12:]: 2}, {"a": [KEY6[:5], {KEY6[5:]: 0}]}):
+            with self.subTest(raw=raw):
+                drafts = ag.AcpDrafts(redact=(KEY6,))
+                drafts.on_update(u6(rawInput=raw, title="t"))
+                call = [d["payload"] for d in drafts.drafts if d["type"] == "tool.call"][0]
+                self.assertFalse(recoverable(strings_in(call["input"]), KEY6))
+                self.assertEqual(call["input_digest"], ag.input_digest(call["input"]))
+                self.assertNotEqual(call["input_digest"], ag.input_digest(raw))
+
+    def test_h1_a_number_that_spells_a_value_refuses_its_line_before_any_draft(self) -> None:
+        line = ('{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":'
+                '"tool_call","toolCallId":"c1","status":"in_progress","rawInput":{"n":1.2345e4}}}}')
+        for value in ("12345", "12345.0"):
+            with self.subTest(value=value):
+                drafts = ag.AcpDrafts(redact=(value,))
+                drafts.start_turn()
+                with self.assertRaises(acp.AcpProtocolError):
+                    drafts.on_line(line)
+                self.assertEqual(drafts.drafts, [])
+                self.assertEqual(drafts.offset, len(line) + 1)    # its bytes still count: later offsets stay true
+
+    def test_h1_through_the_session_the_refused_line_leaves_no_draft_and_the_turn_one_result(self) -> None:
+        drafts = ag.AcpDrafts(redact=("12345",))
+        line = ('{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session-1","update":'
+                '{"sessionUpdate":"tool_call","toolCallId":"c1","status":"in_progress","rawInput":{"n":1.2345e4}}}}')
+        agent = FakeAcpAgent([[C0_OPEN, ("raw", line), ("wait_cancel",), ("end", "cancelled")]])
+        s = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, drafts=drafts)
+        with self.assertRaises(acp.AcpProtocolError):
+            s.prompt("one", FAR)
+        for d in drafts.drafts:
+            if d["type"] == "engine.output":
+                self.assertNotIn("1.2345e4", d["payload"]["text"])
+        self.assertEqual(texts_of(drafts.drafts, "result", "code"), [c.PROTOCOL_ERROR])
+        self.assertEqual(texts_of(drafts.drafts, "tool.result", "status"), ["cancelled"])
+
+    def test_h1_what_cannot_be_masked_in_place_is_refused(self) -> None:
+        cases = {
+            "a value across a string and a number": u6(rawInput={"a": ["1234", 5]}),
+            "a value across a tool call id": {"sessionId": "s", "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "call-" + KEY6[:10], KEY6[10:]: 1, "status": "completed"}},
+            "two keys that mask alike": u6(rawInput={KEY6: 1, "*" * len(KEY6): 2}),
+        }
+        forms = {"a value across a string and a number": "12345"}
+        for name, params in cases.items():
+            with self.subTest(name):
+                drafts = ag.AcpDrafts(redact=(forms.get(name, KEY6),))
+                with self.assertRaises(acp.AcpProtocolError):
+                    drafts.on_update(params)
+                self.assertEqual(drafts.drafts, [])
+
+    def test_h1_a_line_whose_number_holds_part_of_a_value_is_refused(self) -> None:
+        drafts = ag.AcpDrafts(redact=("12345",))
+        with self.assertRaises(acp.AcpProtocolError):
+            drafts.on_line('{"a":["1234",5]}')
+        self.assertEqual(drafts.drafts, [])
+
+    def test_h1_a_surrogate_pair_split_over_two_strings_is_masked(self) -> None:
+        key = "x-review-" + chr(0x1F642)
+        drafts = ag.AcpDrafts(redact=(key,))
+        drafts.on_update(u6(rawInput={"a": "x-review-" + chr(0xD83D), "b": chr(0xDE42)}))
+        joined = "".join(strings_in([d["payload"]["input"] for d in drafts.drafts if d["type"] == "tool.call"]))
+        self.assertNotIn(key, joined.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass"))
+
+    def test_h1_a_line_masked_across_tokens_keeps_its_byte_length_and_its_json(self) -> None:
+        drafts = ag.AcpDrafts(redact=(KEY6,))
+        line = json.dumps({"a": KEY6[:3], "b": ["x\u00e9", KEY6[3:20], {KEY6[20:]: True}]})
+        drafts.on_line(line)
+        text = drafts.drafts[0]["payload"]["text"]
+        self.assertEqual(len(text.encode()), len(line.encode()) + 1)
+        self.assertFalse(recoverable(strings_in(json.loads(text)), KEY6))
+
+    def test_h1_guard_a_line_with_no_value_is_drafted_unchanged(self) -> None:
+        drafts = ag.AcpDrafts(redact=(KEY6,))
+        line = json.dumps({"jsonrpc": "2.0", "method": "x", "params": {"n": 1.5, "t": "review-only"}})
+        drafts.on_line(line)
+        self.assertEqual(drafts.drafts[0]["payload"]["text"], line + "\n")
+
+    # -- astra R2 / sol R5 (MEDIUM, STRICT): masked again after a surrogate is replaced -----------------------
+    def test_m2_a_replaced_surrogate_never_spells_a_value(self) -> None:
+        key, agent_text = "review-only-\ufffd-made-up", "review-only-" + chr(0xD800) + "-made-up"
+        drafts = ag.AcpDrafts(redact=(key,))
+        drafts.on_update(u6(rawOutput=agent_text))
+        self.assertNotIn(key, texts_of(drafts.drafts, "tool.result", "text")[0])
+        drafts.ended(six_outcome(session=7, detail=agent_text))
+        self.assertNotIn(key, texts_of(drafts.drafts, "result", "detail")[0])
+        tools = acp.ToolCalls(ag.input_digest, mask=lambda t: ag.mask(t, ag.mask_forms((key,))))
+        self.assertNotIn(key, tools.update(u6(rawOutput=agent_text))[1]["payload"]["text"])
+
+    def test_m2_guard_the_shared_client_masks_a_result_text_once_its_parts_are_joined(self) -> None:
+        # for a draft maker that hands ToolCalls its update unmasked (another engine's)
+        tools = acp.ToolCalls(ag.input_digest, mask=lambda t: ag.mask(t, ag.mask_forms((KEY6,))))
+        parts = [{"type": "content", "content": {"type": "text", "text": p}} for p in (KEY6[:9], KEY6[9:])]
+        self.assertNotIn(KEY6, tools.update(u6(content=parts))[1]["payload"]["text"])
+
+    def test_m2_through_an_error_answer_the_result_detail_is_masked_after_repair(self) -> None:
+        key = "prefix\ufffdsuffix"
+        drafts = ag.AcpDrafts(redact=(key,))
+        agent = FakeAcpAgent([[("error", -32603, "prefix" + chr(0xD800) + "suffix")]])
+        s = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, drafts=drafts)
+        drafts.ended(s.prompt("x", FAR))
+        self.assertNotIn(key, texts_of(drafts.drafts, "result", "detail")[0])
+
+    # -- astra R3 / sol R2 (MEDIUM): one identity per call across redaction ----------------------------------
+    def test_m3_a_denied_call_whose_id_holds_a_value_is_drafted_denied(self) -> None:
+        drafts = ag.AcpDrafts(redact=(KEY6,))
+        drafts.on_ask(acp.PermissionAsk("permission-1", 1, {"toolCallId": "call-" + KEY6}, (), None, answer=acp.DENY))
+        drafts.on_update(u6("call-" + KEY6, status="failed"))
+        self.assertEqual(texts_of(drafts.drafts, "tool.result", "status"), ["denied"])
+        self.assertNotIn(KEY6, json.dumps(drafts.drafts))
+
+    def test_m3_through_the_session_a_denial_keeps_its_call(self) -> None:
+        cid = "call-" + KEY6
+        drafts = ag.AcpDrafts(redact=(KEY6,))
+        agent = FakeAcpAgent([[("update", u6(cid, status="pending")["update"]),
+                               ("ask", {"toolCallId": cid, "title": "t"}, OPTIONS_ALL),
+                               ("update", u6(cid, status="failed")["update"]), ("end", "end_turn")]])
+        holder = {}
+
+        def ask(a):
+            drafts.on_ask(a)
+            holder["s"].answer_permission(a.token, acp.DENY)
+
+        holder["s"] = s = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, on_line=drafts.on_line,
+                                      on_update=drafts.on_update, on_ask=ask)
+        drafts.ended(s.prompt("x", FAR))
+        self.assertEqual(texts_of(drafts.drafts, "tool.result", "status"), ["denied"])
+
+    def test_m3_an_id_whose_mask_is_too_long_gets_a_short_safe_id(self) -> None:
+        drafts = ag.AcpDrafts(redact=("\u00e9" * 40,))
+        drafts.on_update(u6("\u00e9" * 100))
+        call_id = texts_of(drafts.drafts, "tool.call", "call_id")[0]
+        self.assertLessEqual(len(call_id), 128)
+        self.assertNotIn("\u00e9" * 40, call_id)
+
+    def test_m3_distinct_ids_stay_distinct_calls_with_distinct_safe_ids(self) -> None:
+        drafts = ag.AcpDrafts(redact=(KEY6,))
+        ids = (KEY6, "*" * len(KEY6), "a-" + KEY6, "b-" + KEY6, "redacted-call-2")
+        for cid in ids:
+            drafts.on_update(u6(cid))
+        calls = texts_of(drafts.drafts, "tool.call", "call_id")
+        self.assertEqual(len(calls), len(ids))
+        self.assertEqual(len(set(calls)), len(ids))
+        self.assertEqual(sorted(texts_of(drafts.drafts, "tool.result", "call_id")), sorted(calls))
+        self.assertNotIn(KEY6, json.dumps(drafts.drafts))
+        self.assertTrue(all(len(cid) <= 128 for cid in calls))
+
+    # -- astra R4 / sol R4 / DeepSeek r6 MEDIUM 1: overlapping sessions on one drafts object -------------------
+    def nested(self, drafts, wiring):
+        """Session A's update callback runs session B's whole turn (one thread), then A goes on."""
+        b = FakeAcpAgent([[("update", u6("B1")["update"]), ("end", "end_turn")]])
+        options = {"drafts": drafts} if wiring == "drafts=" else {
+            "on_line": drafts.on_line, "on_update": drafts.on_update, "on_ask": drafts.on_ask}
+        sb = ag.open_acp(b, b.clock, route("gemini-api-key"), CWD, FAR, **options)
+        a = FakeAcpAgent([[("update", u6("A1", status="in_progress")["update"]),
+                           ("update", u6("A2", status="in_progress")["update"]), ("update", u6("A2")["update"]),
+                           ("end", "end_turn")]])
+
+        def update(params):
+            drafts.on_update(params)
+            if params["update"]["toolCallId"] == "A1":
+                drafts.ended(sb.prompt("B", FAR))
+        sa = ag.open_acp(a, a.clock, route("gemini-api-key"), CWD, FAR, on_line=drafts.on_line, on_update=update,
+                         on_ask=drafts.on_ask)
+        drafts.ended(sa.prompt("A", FAR))
+
+    def test_m4_a_session_nested_in_anothers_turn_leaves_that_turn_untouched(self) -> None:
+        for wiring in ("drafts=", "bound"):
+            with self.subTest(wiring=wiring):
+                drafts = ag.AcpDrafts()
+                self.nested(drafts, wiring)
+                results = [(d["payload"]["call_id"], d["payload"]["status"]) for d in drafts.drafts
+                           if d["type"] == "tool.result"]
+                self.assertEqual(sorted(results), [("A1", "error"), ("A2", "ok"), ("B1", "ok")])
+                self.assertEqual(texts_of(drafts.drafts, "tool.call", "call_id"), ["A1", "B1", "A2"])
+                self.assertEqual(texts_of(drafts.drafts, "result", "code"), [None, None])
+                self.assertEqual((drafts._turns, drafts._outer), ({}, []))
+
+    def test_m4_the_drafts_api_nests_and_takes_the_first_turn_up_again(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.turn_start((1, 1))
+        drafts.on_update(u6("a1", status="in_progress"))
+        self.assertEqual(drafts.turn_start((2, 1)), [])               # A's open call is not cancelled
+        drafts.on_update(u6("b1"))
+        drafts.turn_end((2, 1), six_outcome(session=2), None, "")
+        drafts.on_update(u6("a1"))                                   # A again: its own call ends ok
+        drafts.turn_end((1, 1), six_outcome(session=1), None, "")
+        self.assertEqual([(d["payload"]["call_id"], d["payload"]["status"]) for d in drafts.drafts
+                          if d["type"] == "tool.result"], [("b1", "ok"), ("a1", "ok")])
+
+    def test_m4_another_threads_turn_is_refused_and_changes_nothing(self) -> None:
+        import threading
+        drafts = ag.AcpDrafts()
+        drafts.turn_start((1, 1))
+        drafts.on_update(u6("a1", status="in_progress"))
+        before = list(drafts.drafts)
+        errors = []
+
+        def other():
+            for call in (lambda: drafts.turn_start((2, 1)), lambda: drafts.on_update(u6("b1")),
+                         lambda: drafts.on_line("{}"), lambda: drafts.on_ask(
+                             acp.PermissionAsk("p", 1, {"toolCallId": "b1"}, (), None))):
+                try:
+                    call()
+                except acp.AcpStateError as err:
+                    errors.append(err)
+        worker = threading.Thread(target=other)
+        worker.start()
+        worker.join()
+        self.assertEqual(len(errors), 4)
+        self.assertEqual(drafts.drafts, before)
+        drafts.turn_end((1, 1), None, c.ENGINE_ERROR, "x")
+        self.assertEqual(texts_of(drafts.drafts, "tool.result", "status"), ["cancelled"])
+        # once the session has told a turn's end, answered or not, another thread may use the drafts
+        drafts.turn_start((1, 2))
+        drafts.turn_end((1, 2), six_outcome(turn=2), None, "")
+        later = threading.Thread(target=lambda: errors.append(drafts.turn_start((3, 1))))
+        later.start()
+        later.join()
+        self.assertEqual(errors[-1], [])
+
+    def test_m4_the_driver_leaves_an_announced_turn_to_its_session(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.turn_start((1, 1))
+        drafts.on_update(u6("a1", status="in_progress"))
+        self.assertEqual(drafts.abandoned(c.ENGINE_ERROR, "x"), [])
+        with self.assertRaises(acp.AcpStateError):
+            drafts.start_turn()
+        self.assertEqual(texts_of(drafts.drafts, "tool.result", "status"), [])
+
+    # -- astra R5 / sol R3 (MEDIUM): the begun turn's key kept through parsing and callback failures ----------
+    def test_m5_every_failure_after_the_prompt_is_written_ends_that_turn(self) -> None:
+        class InterruptHook(acp.EngineHooks):
+            def limit(self, method, error):
+                raise KeyboardInterrupt("made up")
+
+        open_call = ("update", u6("c1", status="in_progress")["update"])
+        cases = {
+            "a stop reason ACP does not have": ([open_call, ("end", "not-a-stop-reason")], {}, acp.AcpProtocolError),
+            "an error answer whose code is not a number": ([open_call, ("error", "bad", "bad")], {},
+                                                           acp.AcpProtocolError),
+            "on_line raises on the answer": ([open_call, ("end", "end_turn")], {"raise_on": "stopReason"}, Injected6),
+            "a hook raises an interruption on the answer": ([open_call, ("error", -32603, "x")],
+                                                            {"hooks": InterruptHook()}, KeyboardInterrupt),
+            "the prompt's write is interrupted after it was written": ([], {"interrupt_write": True},
+                                                                       KeyboardInterrupt),
+        }
+        for name, (script, how, error) in cases.items():
+            with self.subTest(name):
+                drafts = ag.AcpDrafts()
+                agent = FakeAcpAgent([script])
+
+                def line(text, raise_on=how.get("raise_on")):
+                    drafts.on_line(text)
+                    if raise_on and raise_on in text:
+                        raise Injected6("made up")
+                session = acp.AcpSession(agent, agent.clock, hooks=how.get("hooks", acp.NO_HOOKS), on_line=line,
+                                         on_update=drafts.on_update, on_ask=drafts.on_ask)
+                session.open("gemini-api-key", CWD, FAR)
+                if how.get("interrupt_write"):
+                    send = agent.send
+
+                    def interrupted(text, send=send):
+                        send(text)
+                        if json.loads(text).get("method") == "session/prompt":
+                            raise KeyboardInterrupt("made up")
+                    agent.send = interrupted
+                with self.assertRaises(error):
+                    session.prompt("x", FAR)
+                results = [d["payload"]["code"] for d in drafts.drafts if d["type"] == "result"]
+                self.assertEqual(len(results), 1)
+                self.assertEqual(unanswered(drafts.drafts), [])
+                self.assertEqual(drafts._turns, {})
+                self.assertEqual(drafts._done, {session.connection.serial: 1})
+
+    def test_m5_guard_a_prompt_refused_before_its_request_ends_no_earlier_turn(self) -> None:
+        drafts = ag.AcpDrafts()
+        agent = FakeAcpAgent([[C0_OPEN, ("end", "end_turn")]])
+        s = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, drafts=drafts)
+        one = s.prompt("one", FAR)
+        with self.assertRaises(acp.AcpError):
+            s.prompt("two", agent.clock())                 # its deadline has passed already
+        self.assertEqual(texts_of(drafts.drafts, "result", "code"), [])
+        self.assertEqual([d["type"] for d in drafts.ended(one)], ["result"])
+
+    def test_l3_guard_a_turn_the_session_ends_without_its_start_counts_as_begun(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.turn_start((1, 1))
+        drafts.turn_end((1, 1), None, c.ENGINE_ERROR, "one")
+        drafts.turn_end((1, 2), None, c.ENGINE_ERROR, "two")      # its start was never heard (it raised)
+        self.assertEqual(drafts.ended(six_outcome(turn=2)), [])
+
+    # -- astra R7 / sol M10 / DeepSeek r6 LOW 5: the turn rules no test held -----------------------------------
+    def test_l7_guard_an_update_after_a_closed_turn_takes_fresh_tools(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.turn_start((1, 1))
+        drafts.on_update(u6())
+        drafts.turn_end((1, 1), six_outcome(), None, "")
+        drafts.on_update(u6())                    # the next turn's own call under a reused id, before ended()
+        self.assertEqual(len(texts_of(drafts.drafts, "tool.call", "call_id")), 2)
+
+    def test_l7_guard_a_same_sessions_next_start_ends_the_open_call_cancelled(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.turn_start((1, 1))
+        drafts.on_update(u6(status="in_progress"))
+        tail = drafts.turn_start((1, 2))
+        self.assertEqual([(d["type"], d["payload"].get("status")) for d in tail], [("tool.result", "cancelled")])
+
+    def test_l7_guard_an_earlier_turns_end_never_lowers_the_last_turn_drafted(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.turn_start((1, 1))
+        drafts.turn_start((1, 2))
+        drafts.turn_end((1, 2), None, c.ENGINE_ERROR, "two")
+        drafts.turn_end((1, 1), None, c.ENGINE_ERROR, "one")
+        self.assertEqual(drafts.turn_end((1, 2), None, c.ENGINE_ERROR, "two again"), [])
+        self.assertEqual(texts_of(drafts.drafts, "result", "detail"), ["two", "one"])
+
+    # -- DeepSeek r6 LOW 2, 3, 4 (sol's 18 and 19, astra's follow-ups) -----------------------------------------
+    def test_l2_a_repeated_turn_start_never_gives_a_second_result(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.turn_start((1, 1))
+        drafts.ended(six_outcome())
+        self.assertEqual(drafts.turn_start((1, 1)), [])
+        self.assertEqual(drafts.ended(six_outcome()), [])
+        drafts.turn_start((1, 2))
+        self.assertEqual(drafts.turn_start((1, 2)), [])
+        self.assertEqual(len(texts_of(drafts.drafts, "result", "code")), 1)
+
+    def test_l3_ended_of_a_turn_the_session_has_not_begun_is_refused(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.turn_start((1, 1))
+        drafts.ended(six_outcome())
+        with self.assertRaises(TypeError):
+            drafts.ended(six_outcome(turn=2))
+        drafts.turn_start((1, 2))
+        self.assertEqual([d["type"] for d in drafts.ended(six_outcome(turn=2))], ["result"])
+        # a session the drafts were never told turns of keeps the documented order: guard
+        self.assertEqual([d["type"] for d in drafts.ended(six_outcome(session=9, turn=3))], ["result"])
+
+    def test_l4_turn_end_with_a_key_that_is_not_its_outcomes_is_refused_before_anything_changes(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.turn_start((1, 1))
+        drafts.on_update(u6(status="in_progress"))
+        before = list(drafts.drafts)
+        for wrong in (six_outcome(session=2), six_outcome(turn=5)):
+            with self.assertRaises(TypeError):
+                drafts.turn_end((1, 1), wrong, None, "")
+        self.assertEqual(drafts.drafts, before)
+
+    # -- astra R6 / sol R6 (LOW): the README's interface is the code's ---------------------------------------
+    def test_l6_the_readme_publishes_the_real_signatures_and_every_test_module(self) -> None:
+        import inspect
+        import re
+        text = (HERE / "README.md").read_text(encoding="utf-8")
+        documented = [x.strip() for x in re.search(r"TurnOutcome\(([^)]*)\)", text, re.S)[1].split(",")]
+        self.assertEqual(documented, list(inspect.signature(acp.TurnOutcome).parameters))
+        session = re.search(r"class AcpSession\(([^)]*)\)", text, re.S)[1]
+        for name in inspect.signature(acp.AcpSession).parameters:
+            self.assertIn(name, session)
+        for name in ("update", "asked", "turn_ended", "has_open", "ignored", "NoCanonicalText"):
+            self.assertIn(name, text)
+        command = text.split("Run the tests by module name", 1)[1].split("`unittest discover", 1)[0]
+        for path in sorted(HERE.glob("test_*.py")):
+            self.assertIn(f"antigravity.{path.stem}", command)
+
+    def test_l6_the_readmes_example_runs(self) -> None:
+        text = (HERE / "README.md").read_text(encoding="utf-8")
+        example = text.split("```python\n", 1)[1].split("```", 1)[0]
+        exec(compile(example, "README.md example", "exec"), {})
+
+
+class Injected6(RuntimeError):
+    pass
+
 
 if __name__ == "__main__":
     unittest.main()

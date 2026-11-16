@@ -596,5 +596,340 @@ class _Audit(HTMLParser):
             self.button_text[-1] += data
 
 
+def _directives(header: str) -> dict:
+    out = {}
+    for part in header.split(";"):
+        words = part.split()
+        if words:
+            out[words[0].lower()] = words[1:]
+    return out
+
+
+class StrictDoorPins(GuiHarness):
+    """Two door rules no earlier test held (first review of #384, GPT-6.1 Sol, R1)."""
+
+    ROUTES = (
+        ("GET", "/", None, ""),
+        ("GET", "/read", None, "command=operator.positions.inspect"),
+        ("GET", "/panel", None, "id=missing"),
+        ("POST", "/action", {"command": ACTIONS[0], "confirm": "explicit"}, ""),
+        ("POST", "/stop", {"run_id": "run-1", "confirm": "explicit"}, ""),
+        ("GET", "/v1/control", None, ""),
+        ("POST", "/v1/control", {"method": "run.list"}, ""),
+    )
+
+    def test_only_the_value_true_admits_a_device(self) -> None:
+        # The core adapter's answer is taken only when it is the value True: a truthy number, text,
+        # list or principal-shaped mapping is not an admission, on every path, known or not.
+        for verdict in (False, None, 0, 1, "yes", [True], {"kind": "device", "id": "page"}):
+            for method, path, form, query in self.ROUTES:
+                with self.subTest(verdict=verdict, method=method, path=path):
+                    self.door.ok = verdict
+                    status, _, body = self.request(method, path, form, query=query)
+                    self.assertEqual(status, "401 Unauthorized")
+                    self.assertIn("device_not_authenticated", body)
+        self.assertEqual(self.api.calls, [])
+        self.door.ok = True
+        self.assertEqual(self.request("GET", "/")[0], "200 OK")
+
+    def test_every_response_class_denies_scripts_and_allows_only_the_page_stylesheet(self) -> None:
+        page = self.request("GET", "/")[2]
+        style = re.search(r"<style>(.*?)</style>", page, re.S).group(1)
+        style_source = "'sha256-%s'" % base64.b64encode(hashlib.sha256(style.encode()).digest()).decode()
+        door_says_no = _Door(False)
+        cases = {
+            "200 OK": lambda: self.request("GET", "/"),
+            "400 Bad Request": lambda: self.request("GET", "/read", query="command=operator.orders.submit"),
+            "403 Forbidden": lambda: self.request("GET", "/", headers={"HTTP_HOST": "evil.example"}),
+            "404 Not Found": lambda: self.request("GET", "/nowhere"),
+            "405 Method Not Allowed": lambda: self.request("POST", "/panel", {"id": "x"}),
+        }
+        responses = {status: make() for status, make in cases.items()}
+        self.app._door = door_says_no
+        responses["401 Unauthorized"] = self.request("GET", "/")
+        for expected, (status, headers, body) in responses.items():
+            with self.subTest(status=expected):
+                self.assertEqual(status, expected)
+                policy = _directives(headers["Content-Security-Policy"])
+                self.assertEqual(policy["default-src"], ["'none'"])
+                # What a browser applies to script elements and to script attributes, fallbacks included.
+                for chain in (("script-src-elem", "script-src", "default-src"),
+                              ("script-src-attr", "script-src", "default-src")):
+                    effective = next(policy[name] for name in chain if name in policy)
+                    self.assertEqual(effective, ["'none'"], chain)
+                style_elem = next(policy[name] for name in ("style-src-elem", "style-src", "default-src") if name in policy)
+                self.assertEqual(style_elem, [style_source])
+                self.assertNotIn("style-src-attr", policy)
+                for values in policy.values():
+                    self.assertFalse({"'unsafe-inline'", "'unsafe-eval'", "'unsafe-hashes'", "*"} & set(values))
+                self.assertEqual(policy["base-uri"], ["'none'"])
+                self.assertEqual(policy["frame-ancestors"], ["'none'"])
+                self.assertNotIn("<script", body.lower())
+
+
+def _deep(levels: int, leaf):
+    value = leaf
+    for _ in range(levels):
+        value = {"next": value}
+    return value
+
+
+class BreakItPins(GuiHarness):
+    """Findings F1 to F8 of the DeepSeek break-it read of #384 (round 3)."""
+
+    TITLE = "</title><script>alert(1)</script>"
+
+    def with_panel(self):
+        self.app = Application(ControlClient(wsgi_transport(self.api)), self.door, frozenset({HOST}),
+                               frozenset({ORIGIN}), panels=[{"id": "p", "title": self.TITLE, "reads": [READS[0]],
+                                                            "venue": "paper"}])
+
+    def headers_without_length(self, headers: dict) -> dict:
+        return {k: v for k, v in headers.items() if k != "Content-Length"}
+
+    def test_f1_a_deep_answer_is_drawn_with_a_marker_never_a_crash(self) -> None:
+        deep = {"result": _deep(5000, "DEEP-LEAF"), "status_code": "ok"}
+        self.app._client.operator = lambda *_a, **_k: deep
+        status, headers, body = self.request("GET", "/read", query="command=" + READS[0])
+        self.assertEqual(status, "200 OK")
+        self.assertIn("nested too deeply to show", body)
+        self.assertNotIn("DEEP-LEAF", body)
+        self.with_panel()
+        self.app._client.operator = lambda *_a, **_k: {"result": {"venue": "paper", "rows": _deep(5000, "DEEP-LEAF")},
+                                                      "errors": [_deep(5000, "DEEP-ERROR")]}
+        status, _, body = self.request("GET", "/panel", query="id=p")
+        self.assertEqual(status, "200 OK")
+        self.assertIn("Withheld: data not in the paper book", body)
+        self.assertNotIn("DEEP-LEAF", body)
+        self.assertNotIn("DEEP-ERROR", body)
+        shallow = withhold_venue_data(_deep(60, "SHALLOW-LEAF"))
+        for _ in range(60):
+            shallow = shallow["next"]
+        self.assertEqual(shallow, "SHALLOW-LEAF")
+
+    def test_f2_a_panel_title_is_escaped_inside_the_title_element(self) -> None:
+        self.with_panel()
+        for path, query in (("/panel", "id=p"), ("/", "")):
+            with self.subTest(path=path):
+                status, _, body = self.request("GET", path, query=query)
+                self.assertEqual(status, "200 OK")
+                self.assertNotIn("<script", body.lower())
+                self.assertEqual(body.count("</title>"), 1)
+        title = re.search(r"<title>(.*?)</title>", self.request("GET", "/panel", query="id=p")[2], re.S).group(1)
+        self.assertTrue(title.startswith("&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;"), title)
+
+    def test_f3_the_read_and_panel_queries_take_exactly_one_name_once(self) -> None:
+        self.with_panel()
+        command = "command=" + READS[0]
+        for path, query in (("/read", command + "&extra=1"), ("/read", command + "&" + command),
+                            ("/read", ""), ("/panel", "id=p&extra=1"), ("/panel", "id=p&id=p"), ("/panel", "")):
+            with self.subTest(path=path, query=query):
+                self.assertEqual(self.request("GET", path, query=query)[0], "400 Bad Request")
+        self.assertEqual(self.request("GET", "/read", query=command)[0], "200 OK")
+        self.assertEqual(self.request("GET", "/panel", query="id=p")[0], "200 OK")
+
+    def test_f4_a_length_of_zero_or_less_is_refused_and_nothing_is_read(self) -> None:
+        body = b"run_id=run-1&confirm=explicit"
+        for length in ("0", "-1", "-100"):
+            with self.subTest(length=length):
+                stream = io.BytesIO(body)
+                env = {"REQUEST_METHOD": "POST", "PATH_INFO": "/stop", "QUERY_STRING": "", "HTTP_HOST": HOST,
+                       "HTTP_ORIGIN": ORIGIN, "HTTP_SEC_FETCH_SITE": "same-origin", "CONTENT_LENGTH": length,
+                       "CONTENT_TYPE": "application/x-www-form-urlencoded", "wsgi.input": stream,
+                       "wsgi.errors": sys.stderr}
+                status = []
+                self.app(env, lambda s, h: status.append(s))
+                self.assertEqual(status, ["400 Bad Request"])
+                self.assertEqual(stream.tell(), 0)
+        self.assertEqual(self.api.calls, [])
+
+    def test_f5_a_raising_door_refuses_and_a_raising_handler_answers_with_the_same_headers(self) -> None:
+        ok_headers = self.headers_without_length(self.request("GET", "/")[1])
+        for error in (TimeoutError("DOOR-SECRET"), RuntimeError("DOOR-SECRET"), RecursionError("DOOR-SECRET")):
+            with self.subTest(door=type(error).__name__):
+                def door(_env, error=error):
+                    raise error
+                self.app._door = door
+                status, headers, body = self.request("GET", "/")
+                self.assertEqual(status, "401 Unauthorized")
+                self.assertIn("device_not_authenticated", body)
+                self.assertNotIn("DOOR-SECRET", body)
+                self.assertEqual(self.headers_without_length(headers), ok_headers)
+        self.app._door = self.door
+        for error in (TimeoutError("SECRET-TEXT"), RuntimeError("SECRET-TEXT"), RecursionError("SECRET-TEXT")):
+            with self.subTest(handler=type(error).__name__):
+                def boom(*_a, error=error, **_k):
+                    raise error
+                self.app._client.operator = boom
+                self.app._client.stop_run = boom
+                for method, path, form, query in (("GET", "/read", None, "command=" + READS[0]),
+                                                  ("POST", "/stop", {"run_id": "run-1", "confirm": "explicit"}, "")):
+                    status, headers, body = self.request(method, path, form, query=query)
+                    self.assertEqual(status, "500 Internal Server Error")
+                    self.assertIn("(%s)" % type(error).__name__, body)
+                    self.assertIn("does not know whether anything that was sent took effect", body)
+                    self.assertNotIn("SECRET-TEXT", body)
+                    self.assertEqual(self.headers_without_length(headers), ok_headers)
+
+    def test_f7_a_key_that_is_not_text_is_left_out_and_the_page_still_draws(self) -> None:
+        shown = withhold_venue_data({1: "INT-KEY", (1, 2): "TUPLE-KEY", "b": 2, "nested": [{3: "x", "c": 1}]})
+        self.assertEqual(shown, {"b": 2, "nested": [{"c": 1}]})
+        self.assertEqual(json.loads(json.dumps(shown, sort_keys=True)), shown)
+        self.app._client.operator = lambda *_a, **_k: {"result": {1: "INT-KEY", "symbol": "TEXT-KEY"}}
+        status, _, body = self.request("GET", "/read", query="command=" + READS[0])
+        self.assertEqual(status, "200 OK")
+        self.assertIn("TEXT-KEY", body)
+        self.assertNotIn("INT-KEY", body)
+
+    def test_f8_a_host_or_origin_that_is_not_text_is_refused(self) -> None:
+        for headers, code in (({"HTTP_HOST": [HOST]}, "host_not_allowed"), ({"HTTP_HOST": HOST.encode()}, "host_not_allowed"),
+                              ({"HTTP_ORIGIN": [ORIGIN]}, "origin_not_allowed"),
+                              ({"HTTP_ORIGIN": ORIGIN.encode()}, "origin_not_allowed")):
+            for method in ("GET", "POST"):
+                with self.subTest(headers=headers, method=method):
+                    form = {"run_id": "run-1", "confirm": "explicit"} if method == "POST" else None
+                    status, _, body = self.request(method, "/" if method == "GET" else "/stop", form, headers=headers)
+                    self.assertEqual(status, "403 Forbidden")
+                    self.assertIn(code, body)
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(self.door.seen, 0)
+
+    def test_round4_f1_a_request_line_that_is_not_text_is_refused_with_the_page_headers(self) -> None:
+        ok_headers = self.headers_without_length(self.request("GET", "/")[1])
+        self.api.calls.clear()  # the home page above reads the routes; the refused requests below read nothing
+        for headers in ({"REQUEST_METHOD": ["GET"]}, {"PATH_INFO": ["/"]}, {"REQUEST_METHOD": ("GET",)},
+                        {"REQUEST_METHOD": 7}, {"PATH_INFO": b"/"}):
+            with self.subTest(headers=headers):
+                status, got, body = self.request("GET", "/", headers=headers)
+                self.assertEqual(status, "400 Bad Request")
+                self.assertIn("Bad request: request line", body)
+                self.assertEqual(self.headers_without_length(got), ok_headers)
+        self.assertEqual(self.api.calls, [])
+
+    def test_round4_f4_a_host_or_origin_must_be_a_str_exactly(self) -> None:
+        class Lying(str):
+            def __eq__(self, other):
+                return True
+
+            def __hash__(self):
+                return hash(HOST) if self.startswith("evil") else str.__hash__(self)
+
+        class LyingOrigin(Lying):
+            def __hash__(self):
+                return hash(ORIGIN)
+
+        for headers, code in (({"HTTP_HOST": Lying("evil.example")}, "host_not_allowed"),
+                              ({"HTTP_HOST": Lying(HOST)}, "host_not_allowed"),
+                              ({"HTTP_ORIGIN": LyingOrigin("http://evil.example")}, "origin_not_allowed")):
+            with self.subTest(headers=headers):
+                status, _, body = self.request("GET", "/", headers=headers)
+                self.assertEqual(status, "403 Forbidden")
+                self.assertIn(code, body)
+        self.assertEqual(self.door.seen, 0)
+
+    def test_round5_no_untrusted_value_is_compared_before_it_is_a_plain_str(self) -> None:
+        # DeepSeek round 5, F1, F2 and F4: the method, the path and Sec-Fetch-Site are checked to be a
+        # str exactly before anything compares them; a value that raises or lies in a comparison is
+        # refused with the page's headers and reaches nothing.
+        class EqRaises:
+            def __eq__(self, other):
+                raise RuntimeError("EQ-BOOM")
+
+            def __ne__(self, other):
+                raise RuntimeError("NE-BOOM")
+
+            def __hash__(self):
+                raise RuntimeError("HASH-BOOM")
+
+        class Lying(str):
+            claim = ""
+
+            def __eq__(self, other):
+                return other == self.claim
+
+            def __ne__(self, other):
+                return other != self.claim
+
+            def __hash__(self):
+                return hash(self.claim)
+
+        class LyingPost(Lying):
+            claim = "POST"
+
+        class LyingStop(Lying):
+            claim = "/stop"
+
+        class LyingSameOrigin(Lying):
+            claim = "same-origin"
+
+        ok_headers = self.headers_without_length(self.request("GET", "/")[1])
+        self.api.calls.clear()
+        stop_form = {"run_id": "run-1", "confirm": "explicit"}
+        allowed = {"HTTP_ORIGIN": ORIGIN, "HTTP_SEC_FETCH_SITE": "same-origin"}
+        cases = (
+            ("GET", "/", None, {"REQUEST_METHOD": EqRaises()}, "400 Bad Request", "request line"),
+            ("GET", "/", None, {"PATH_INFO": EqRaises()}, "400 Bad Request", "request line"),
+            ("GET", "/stop", stop_form, {"REQUEST_METHOD": LyingPost("GET"), **allowed}, "400 Bad Request", "request line"),
+            ("POST", "/", stop_form, {"PATH_INFO": LyingStop("/"), **allowed}, "400 Bad Request", "request line"),
+            ("GET", "/", None, {"HTTP_SEC_FETCH_SITE": EqRaises()}, "403 Forbidden", "cross_site_request"),
+            ("POST", "/stop", stop_form, {"HTTP_SEC_FETCH_SITE": LyingSameOrigin("cross-site")}, "403 Forbidden",
+             "cross_site_request"),
+        )
+        for method, path, form, headers, expected, text in cases:
+            with self.subTest(method=method, path=path, headers=sorted(headers)):
+                status, got, body = self.request(method, path, form, headers=headers)
+                self.assertEqual(status, expected)
+                self.assertIn(text, body)
+                self.assertEqual(self.headers_without_length(got), ok_headers)
+        self.assertEqual(self.api.calls, [])
+
+    def test_round6_each_request_value_is_read_once_and_the_door_alone_refuses_a_bad_method(self) -> None:
+        # DeepSeek round 6, F1: the method that was checked is the method that is compared. An environ
+        # whose second read of a key would answer with a raising object is read once per key and the
+        # request is answered normally. F3: the door function on its own refuses a method that is not
+        # a str exactly instead of admitting it.
+        class Boom:
+            def __eq__(self, other):
+                raise RuntimeError("SECOND-READ-BOOM")
+
+            __ne__ = __eq__
+            __hash__ = None
+
+        class OnceEnviron(dict):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.reads = {}
+
+            def _count(self, key):
+                self.reads[key] = self.reads.get(key, 0) + 1
+                return self.reads[key]
+
+            def get(self, key, default=None):
+                if self._count(key) > 1 and key in ("REQUEST_METHOD", "PATH_INFO", "HTTP_HOST",
+                                                    "HTTP_ORIGIN", "HTTP_SEC_FETCH_SITE"):
+                    return Boom()
+                return super().get(key, default)
+
+            def __getitem__(self, key):
+                self._count(key)
+                return super().__getitem__(key)
+
+        for method, path, body in (("GET", "/", b""), ("POST", "/stop", b"run_id=run-1&confirm=explicit")):
+            with self.subTest(method=method):
+                env = OnceEnviron({"REQUEST_METHOD": method, "PATH_INFO": path, "QUERY_STRING": "", "HTTP_HOST": HOST,
+                                   "HTTP_ORIGIN": ORIGIN, "HTTP_SEC_FETCH_SITE": "same-origin",
+                                   "CONTENT_LENGTH": str(len(body)), "CONTENT_TYPE": "application/x-www-form-urlencoded",
+                                   "wsgi.input": io.BytesIO(body), "wsgi.errors": sys.stderr})
+                status = []
+                self.app(env, lambda s, h: status.append(s))
+                self.assertEqual(status, ["200 OK"])
+                for key in ("REQUEST_METHOD", "PATH_INFO", "HTTP_HOST", "HTTP_ORIGIN", "HTTP_SEC_FETCH_SITE"):
+                    self.assertEqual(env.reads.get(key), 1, key)
+        for bad in (7, None, ["GET"], Boom()):
+            with self.subTest(standalone=type(bad).__name__):
+                env = {"HTTP_HOST": HOST, "HTTP_ORIGIN": ORIGIN, "HTTP_SEC_FETCH_SITE": "same-origin"}
+                self.assertIsNotNone(self.app._refusal(env, bad))
+
+
 if __name__ == "__main__":
     unittest.main()

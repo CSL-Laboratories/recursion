@@ -1,0 +1,9 @@
+{
+  "types": [
+    "turn.ended",
+    "usage",
+    "result"
+  ],
+  "permission": "subscribe",
+  "x-nobody-defined-this": true
+}

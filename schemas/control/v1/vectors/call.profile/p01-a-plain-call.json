@@ -1,0 +1,8 @@
+{
+  "tool": "Bash",
+  "cwd": "/home/dev/projects/atlas",
+  "input_text": "{ \"description\" : \"clean build\", \"command\" : \"rm -rf build && make\" }",
+  "expect": {
+    "call_text": "{\"cwd\":\"/home/dev/projects/atlas\",\"input\":{\"command\":\"rm -rf build && make\",\"description\":\"clean build\"},\"tool\":\"Bash\"}"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "reason": "config",
+  "candidates": [
+    {
+      "engine": "codex",
+      "model": null,
+      "skipped": "breaker_open"
+    },
+    {
+      "engine": "claude_code",
+      "model": "claude-sonnet-5-5",
+      "skipped": null
+    }
+  ],
+  "hand_pick": null
+}

@@ -892,8 +892,54 @@ class ConnectionBoundTests(_TmpCase):
             for good in (1, 0.2, Fraction(1, 2), Seconds(0.5)):
                 with self.subTest(name=name, value=repr(good)):
                     self.assertEqual(type(getattr(make(**{name: good}), "_" + name)), float)
+        # Sol R1 (round 1 of #407): the value checked must be the float kept. A float subclass whose __float__
+        # answers NaN, a real too small to be a positive float, and one too large to be a float are refused.
+        class NotANumberWhenConverted(float):
+            def __float__(self):
+                return float("nan")
+
+        for name in ("reserved_timeout_s", "idle_timeout_s"):
+            for bad in (NotANumberWhenConverted(1.0), Fraction(1, 10 ** 400), 10 ** 400):
+                with self.subTest(name=name, value=type(bad).__name__):
+                    with self.assertRaises(ValueError):
+                        make(**{name: bad})
         # A server with no reserved slots does not use reserved_timeout_s, and ignores it, as before.
         UnixControlServer(self.sock_dir, ct.with_ping_health(_Recorder()), reserved_timeout_s=None)
+
+    def test_allowed_float_subclass_cannot_reintroduce_nan_worker_crash(self) -> None:
+        """Codex GPT-6.1 Sol's R1 witness (round 1 of #407), for both timeout parameters: a float subclass that
+        passes the check but converts to NaN must be refused at construction, or else be served with no uncaught
+        worker exception. Master served it; 2122b4d2 stored NaN and the worker died in settimeout."""
+        limit = 30.0   # a watchdog only
+
+        class Seconds(float):
+            def __float__(self):
+                return float("nan")
+
+        for parameter in ("idle_timeout_s", "reserved_timeout_s"):
+            with self.subTest(parameter=parameter):
+                errors: list = []
+                previous = threading.excepthook
+                threading.excepthook = lambda args: errors.append(args.exc_type.__name__)
+                try:
+                    try:
+                        srv = self.server(max_connections=1, reserved_connections=1, priority=lambda request: True,
+                                          **{parameter: Seconds(1.0)})
+                    except ValueError:
+                        continue                                   # refused at construction: the repair
+                    started = self._recording_workers(srv)
+                    holder = None
+                    if parameter == "reserved_timeout_s":
+                        holder = UnixControlClient(srv.path)
+                        self.addCleanup(holder.close)
+                        self.assertEqual(holder.request({"op": "ping"})["op"], "pong")
+                    reply, _ = _one_frame(srv.path, {"op": "stop", "run_id": "r1"})
+                    for worker in started[1:] if holder is not None else started:
+                        worker.join(limit)
+                    self.assertEqual(errors, [])
+                    self.assertTrue(reply["ok"])
+                finally:
+                    threading.excepthook = previous
 
     def test_a_handler_may_shut_the_server_down(self) -> None:
         """The round-3 read of #407 by DeepSeek, N1: close() called from a handler joined its own thread, raised

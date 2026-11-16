@@ -233,10 +233,19 @@ def _seconds(name: str, value: object) -> float:
     ``numbers.Real``, never a bool); else ``ValueError``. Zero, a negative or NaN served nothing, and NaN killed
     a worker in ``settimeout`` (the reads of #407 by DeepSeek: round 2 F3, round 3 N3 and N4)."""
 
-    if (isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(value)
-            or not value > 0):
-        raise ValueError(f"{name} must be a finite, positive real number of seconds (an int or a float, not a bool)")
-    return float(value)
+    message = f"{name} must be a finite, positive real number of seconds (an int or a float, not a bool)"
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(message)
+    # Converted to a plain float ONCE, and that float is what is checked and kept: a subclass's own __float__ could
+    # answer NaN after its value passed, and a tiny or huge real converts to 0.0 or overflows (round 1 of #407,
+    # Codex GPT-6.1 Sol R1).
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(message) from None
+    if not math.isfinite(seconds) or not seconds > 0:
+        raise ValueError(message)
+    return seconds
 
 
 class UnixControlServer:

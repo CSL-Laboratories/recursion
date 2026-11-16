@@ -102,7 +102,8 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
   span filed under its last position;
 - every field typed as a timestamp holds a moment that exists, with seconds from 00 to 59 (the
   keyword `x-instant`, which this client adds to its validator; the check stands without the
-  pattern);
+  pattern), in every folder: a definition whose pattern takes a timestamp must carry the keyword,
+  and its pattern must refuse a second of 60;
 - in the method table, the seven mandatory built-ins are exactly the rows that cannot answer
   `unsupported`; every row can answer `unavailable`; a built-in that waits on no service answers it
   only for a closing daemon (`run.start` also for a start registrant that refused, `plugin.list` also

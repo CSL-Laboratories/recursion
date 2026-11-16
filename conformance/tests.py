@@ -137,6 +137,36 @@ class PublishedFilesTest(unittest.TestCase):
         if any("event.v1.json" in s.schemas for s in self.sets.values()):
             self.assertEqual(sorted(open_on_purpose - seen), [], "listed as open on purpose but not found: update the list")
 
+    def test_every_timestamp_in_every_folder_is_a_real_instant_with_seconds_below_sixty(self):
+        """A definition whose pattern takes a timestamp is a timestamp, in whichever folder of schemas it stands:
+        it carries ``x-instant``, so that the client's validator refuses a day that does not exist, and its
+        pattern refuses a second of 60. A pattern is taken for a timestamp's when it accepts a timestamp and
+        refuses the same shape spelt in letters. Until Nov 15, 2026 the revoked-key list's own definition had
+        neither, and a list that expired on the 31st of February fitted (a reader of the pull request showed
+        it); the client's check of the keyword was never asked there."""
+        a_time, same_shape, sixty = "2026-11-13T12:34:56.000Z", "abcd-ef-ghTij:kl:mn.opqZ", "2026-11-13T12:34:60.000Z"
+        found = set()
+
+        def walk(node, name, path):
+            if isinstance(node, dict):
+                pattern = node.get("pattern")
+                if isinstance(pattern, str) and re.search(pattern, a_time) and not re.search(pattern, same_shape):
+                    found.add((name, path))
+                    with self.subTest(schema=name, at=path):
+                        self.assertIs(node.get("x-instant"), True, "a timestamp without the real-instant keyword")
+                        self.assertIsNone(re.search(pattern, sixty), "a timestamp whose pattern takes a second of 60")
+                for key, value in node.items():
+                    walk(value, name, f"{path}/{key}")
+            elif isinstance(node, list):
+                for i, item in enumerate(node):
+                    walk(item, name, f"{path}/{i}")
+
+        for schemas in self.sets.values():
+            for name, schema in schemas.schemas.items():
+                walk(schema, name, "")
+        self.assertLessEqual({("common.v1.json", "/$defs/timestamp"), ("revoked-keys.v1.json", "/$defs/timestamp")}, found,
+                             "the walk does not see both folders' timestamps")
+
     # A rule that is only written down is not proved. The four tests below take every rule of one kind away,
     # one at a time, and require that a bad fixture notices: with the rule gone, a fixture that names that
     # keyword at that place is accepted, or is no longer refused for its own rule. So no closed object can
@@ -1409,6 +1439,35 @@ class RulesTest(unittest.TestCase):
         for text in ("2026-11-13T12:34:60.000Z", "2016-12-31T23:59:60.000Z"):
             keywords = {keyword for keyword, _, _ in client.leaf_errors(timestamp, text)}
             self.assertLessEqual({"pattern", "x-instant"}, keywords, "refused by the pattern and by the real-instant check, each on its own")
+
+    def test_a_revocation_lists_times_are_real_instants_as_every_other_timestamp(self):
+        """The plugin folder's records go through the same client and the same real-instant check: a revoked-key
+        list whose issue, expiry or revocation time names a day that does not exist, or a second of 60, does
+        not fit, by the standard-library reader (``rules.fits``) and by the client's validator, which reports
+        the real-instant keyword itself (and the pattern for a second of 60). The first case is the witness a
+        reader of the pull request gave: h01 with expires_at on the 31st of February."""
+        plugin = next(folder for folder in client.folders() if (folder / "revoked-keys.v1.json").is_file())
+        schemas = client.SchemaSet(plugin)
+        validator = schemas.validator("revoked-keys.v1.json")
+        listed = client.read_json(plugin / "fixtures" / "good" / "revoked-keys.v1" / "h01-one-revoked-key.json")
+        # The standard-library reader is handed the one document: it refuses the folder whole, because the manifest
+        # uses minProperties, a keyword it does not read (a separate matter, named in the lane's report).
+        alone = {"revoked-keys.v1.json": schemas.schemas["revoked-keys.v1.json"]}
+        self.assertTrue(self.rules.fits("revoked-keys.v1.json", listed, alone))
+        self.assertEqual(client.leaf_errors(validator, listed), [])
+        for place in (("expires_at",), ("issued_at",), ("keys", 0, "revoked_at")):
+            for text, keywords in (("2026-02-31T00:00:00.000Z", {"x-instant"}), ("2025-02-29T08:00:00.000Z", {"x-instant"}),
+                                   ("2026-11-13T07:59:60.000Z", {"pattern", "x-instant"})):
+                with self.subTest(at=place, timestamp=text):
+                    changed = copy.deepcopy(listed)
+                    holder = changed
+                    for part in place[:-1]:
+                        holder = holder[part]
+                    holder[place[-1]] = text
+                    self.assertFalse(self.rules.fits("revoked-keys.v1.json", changed, alone))
+                    at = "".join(f"/{part}" for part in place)
+                    seen = {keyword for keyword, location, _ in client.leaf_errors(validator, changed) if location == at}
+                    self.assertLessEqual(keywords, seen)
 
     # ---- the delivery of a queue item
     def test_a_refused_delivery_step_changes_nothing_and_raises_nothing_but_a_refusal(self):

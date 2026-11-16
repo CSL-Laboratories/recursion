@@ -144,10 +144,6 @@ File follow-ups to **Triage**. Keep the Linear issue current as work progresses,
 anything that comes up in a session to **Triage** instead of dropping it; Linear is the
 primary async channel, alongside Google Meet and Discord.
 
-## When Claude can't fix a review thread
-
-See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-fix-a-review-thread).
-
 ## Branch and review flow
 
 - Branch from up-to-date `master` as `csl-<N>-<slug>` (example `csl-26-short-slug`).

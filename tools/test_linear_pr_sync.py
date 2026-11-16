@@ -737,6 +737,53 @@ class WorkflowAndDocsTests(unittest.TestCase):
         for needle in ("CODEX-GATE", "@codex review", "CODEX_TRIGGER_PAT", "## Code Review Rules", "codex-gate.yml"):
             self.assertNotIn(needle, agents)
 
+    def test_document_pins_formerly_held_by_the_stuck_thread_watch_test(self) -> None:
+        # Moved from tools/test_stuck_thread_watch.py (master ff3f8071,
+        # WorkflowAndDocsTests.test_docs_point_at_the_workflow) when CSL-238 retired the
+        # watch: these pins guard the branch rule, the issue-reference rule, the roll-up
+        # rule and the pull request template, which have nothing to do with the watch.
+        for text in (AGENTS.read_text(encoding="utf-8"), CLAUDE.read_text(encoding="utf-8")):
+            self.assertIn("needs-decision", text)
+            self.assertIn("Stuck PR threads: recursion#", text)
+            self.assertRegex(text, r"do not\s+file one issue per thread")
+            self.assertIn("<!-- stuck-pr-threads:recursion#<PR> -->", text)
+            self.assertIn("csl-<N>-<slug>", text)
+            self.assertIn("Fixes CSL-N", text)
+            self.assertNotIn("Commit to `loop/work/<task-id>`", text)
+            self.assertNotIn("Branch naming is deferred to", text)
+        contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        self.assertIn("csl-<N>-<slug>", contributing)
+        self.assertIn("Fixes CSL-N", contributing)
+        self.assertNotIn("keep this convention", contributing)
+        self.assertNotIn("Branch naming is deferred to", contributing)
+        template = (ROOT / ".github" / "pull_request_template.md").read_text(encoding="utf-8")
+        self.assertIn("Stuck PR threads: recursion#<PR>", template)
+        self.assertIn("## Branch", template)
+        self.assertIn("## Test plan", template)
+        self.assertIn("Touches other repos?", template)
+
+    def test_contributing_links_into_agents_md_reach_a_heading(self) -> None:
+        # Replaces the master pin of AGENTS.md#when-claude-cant-fix-a-review-thread: that
+        # section of CONTRIBUTING.md is gone with the writer, and no link may point at a
+        # heading that does not exist.
+        contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        agents = AGENTS.read_text(encoding="utf-8")
+        slugs = {
+            "".join(c for c in line[3:].strip().lower() if c.isalnum() or c in " -").replace(" ", "-")
+            for line in agents.splitlines()
+            if line.startswith("## ")
+        }
+        parts = contributing.split("AGENTS.md#")[1:]
+        self.assertTrue(parts)
+        for part in parts:
+            anchor = ""
+            for c in part:
+                if not (c.isalnum() or c == "-"):
+                    break
+                anchor += c
+            self.assertIn(anchor, slugs)
+        self.assertNotIn("When Claude can't fix", contributing)
+
     def test_docs_require_grok_bots_to_read_pr_sync_comments(self) -> None:
         text = AGENTS.read_text(encoding="utf-8")
         self.assertIn("linear-pr-sync.yml", text)

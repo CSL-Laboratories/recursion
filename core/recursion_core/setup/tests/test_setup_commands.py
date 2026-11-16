@@ -262,9 +262,14 @@ class SetupContainmentTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         base = os.path.realpath(self._tmp.name)
         os.chmod(base, 0o700)
-        self.config = os.path.join(base, "config")
+        home = os.path.join(base, "home")  # the password database's home for this user, here (Q19)
+        os.mkdir(home, 0o700)
+        self.config = os.path.join(home, ".config")
         self.file = os.path.join(self.config, "recursion", "containment.json")
-        env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.config})
+        passwd = mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=home))
+        passwd.start()
+        self.addCleanup(passwd.stop)
+        env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": os.path.join(base, "xdg")})  # not where it is read
         env.start()
         self.addCleanup(env.stop)
 

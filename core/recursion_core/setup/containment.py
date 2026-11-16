@@ -1,8 +1,11 @@
 """The containment setting (lane INSTALL): where the daemon may give an engine its route home.
 
-The operator chooses it, and Recursion reads it from one file, ``containment.json`` in
-``$XDG_CONFIG_HOME/recursion`` (``~/.config/recursion`` when ``XDG_CONFIG_HOME`` is unset or empty,
-the folder the daemon reads ``routes.json`` from, ``daemon/control_adapter.py``):
+The operator chooses it, and Recursion reads it from one file, ``.config/recursion/containment.json``
+under the home the password database gives for this user, whatever ``HOME`` or ``XDG_CONFIG_HOME``
+say (the Liaison's ruling on Q19, Nov 15): the daemon under the user manager and the operator's shell
+can disagree about those variables, and a setting read from another folder would silently answer the
+looser default. One place only: a ``containment.json`` under ``$XDG_CONFIG_HOME/recursion`` is never
+read, and doctor names it (``doctor_checks``):
 
     {"engine_homes": "inside_operator_home", "version": 1}
 
@@ -25,16 +28,21 @@ the default, and the answer says so (``source`` ``"default"``). Every other case
 
     containment_untrusted   the file is a link, not a regular file, not the operator's, or writable by
                             group or world; the ``recursion`` folder is a link, not a folder, not the
-                            operator's, or writable by group or world; a folder above it another user
-                            could change (each root's or the operator's, not writable by group or world
-                            unless sticky; a link above it root's or the operator's, followed, at most
-                            40 links); or the config folder is not an absolute path
+                            operator's, or writable by group or world; a link at or below the operator's
+                            home (none is followed there); a link above the home that anyone but root
+                            owns or could replace (the folder holding it, or one on the way to its
+                            target, not root's alone), or more than 40 of them (the Liaison's ruling on
+                            Q21); a folder above it another user could change (each root's or the
+                            operator's, not writable by group or world unless sticky); or the password
+                            database gives no absolute home for this user
     containment_unreadable  the file, or a folder on the way to it, cannot be looked up, opened or read
     containment_invalid     not UTF-8 JSON in the shape above (a half-written file included), or larger
                             than 64 KiB; or, for ``write``, a value that is not one of ``ENGINE_HOMES``
     containment_changed     the file changed while it was being read (rewritten where it is, or another
                             file renamed over it, or removed); run the command again
     containment_needs_engine_user   ``write`` only: outside_operator_home on a machine with no engine user
+    containment_not_flushed  ``write`` only: the file holds the new value, but its folder could not be
+                            flushed after the rename; run the command again
 
 ``read`` raises nothing else. Read once, pass the value: the daemon is to read the setting once when it
 starts and pass the same ``allow_inside_operator_home`` to ``route_home.check`` (lane STOP, the
@@ -42,8 +50,11 @@ launcher) and to the subscription policy (lane ENGINE-E9), so the two never answ
 Nothing in the daemon reads it yet.
 
 ``write`` replaces the file whole: a new file, mode 0600, written, flushed, and renamed over the old one
-in the same folder, so a reader sees the old setting or the new one, never a mix. It makes a missing
-config folder and ``recursion`` folder 0700. It refuses when the file in place is refused by ``read``
+in the same folder, which is then flushed, so a reader sees the old setting or the new one, never a mix
+(or, reading while the rename happens, is refused ``containment_changed`` and runs again). Writers take
+turns: each holds an exclusive ``flock`` on the folder from its read to its answer, so its answer is the
+file's value when it answers, and it removes the temporary files a killed writer left. It makes a
+missing ``.config`` and ``recursion`` folder 0700. It refuses when the file in place is refused by ``read``
 (it never overwrites a file it could not read, one a newer Recursion wrote included): the operator
 removes such a file by hand. A file-system error while writing (a full disk) is raised as ``OSError``.
 
@@ -65,7 +76,7 @@ from dataclasses import dataclass
 __all__ = [
     "DEFAULT_ENGINE_HOMES", "ENGINE_HOMES", "FILE_NAME", "INSIDE_OPERATOR_HOME", "LEVELS", "NEEDS_ENGINE_USER",
     "OPERATOR_WORDS", "OUTSIDE_OPERATOR_HOME", "VERSION", "Containment", "ContainmentRefused", "config_folder",
-    "doctor_check", "engine_user", "read", "write",
+    "doctor_checks", "engine_user", "read", "write",
 ]
 
 INSIDE_OPERATOR_HOME = "inside_operator_home"
@@ -78,7 +89,6 @@ FOLDER_NAME = "recursion"
 FILE_NAME = "containment.json"
 MAX_BYTES = 64 * 1024
 _KEYS = frozenset({"version", "engine_homes"})
-_MAX_LINKS = 40  # Linux's MAXSYMLINKS
 
 # The one text the operator reads about the default, wherever it is shown: recursiond's answers,
 # doctor, the terminal app's and the page's settings screens, and the approval prompt for the looser
@@ -127,31 +137,27 @@ def engine_user() -> str | None:
     return None
 
 
-def config_folder(environ=None) -> str:
-    """``$XDG_CONFIG_HOME/recursion``, or ``$HOME/.config/recursion`` (the password database's home when
-    ``HOME`` is unset or empty). Refuses ``containment_untrusted`` unless the folder is absolute."""
+def config_folder() -> str:
+    """``.config/recursion`` under the home the password database gives for this user, whatever ``HOME`` or
+    ``XDG_CONFIG_HOME`` say. Refuses ``containment_untrusted`` when the database has no entry for this
+    user or cannot be read, or its home is not an absolute path."""
 
-    env = os.environ if environ is None else environ
-    base = env.get("XDG_CONFIG_HOME") or ""
-    if not base:
-        home = env.get("HOME") or ""
-        if not home:
-            import pwd  # Linux only, as the launcher is
+    import pwd  # Linux only, as the launcher is
 
-            try:
-                home = pwd.getpwuid(os.geteuid()).pw_dir
-            except (KeyError, OSError):
-                home = ""
-        base = os.path.join(home, ".config") if home else ""
-    if not isinstance(base, str) or not base.startswith("/") or "\0" in base:
-        raise ContainmentRefused("containment_untrusted", f"the config folder {base!r} is not an absolute path")
-    return os.path.join(base, FOLDER_NAME)
+    try:
+        home = pwd.getpwuid(os.geteuid()).pw_dir
+    except (KeyError, OSError) as exc:
+        raise ContainmentRefused("containment_untrusted",
+                                 f"the password database gives no home for this user: {type(exc).__name__}") from None
+    if not isinstance(home, str) or not home.startswith("/") or "\0" in home:
+        raise ContainmentRefused("containment_untrusted", f"the operator's home {home!r} is not an absolute path")
+    return os.path.normpath(os.path.join(home, ".config", FOLDER_NAME))
 
 
-def read(environ=None) -> Containment:
+def read() -> Containment:
     """The setting, or the default when there is no file. See the module docstring for the refusals."""
 
-    folder = config_folder(environ)
+    folder = config_folder()
     path = os.path.join(folder, FILE_NAME)
     fd = _open_folder(folder, create=False)
     if fd is None:
@@ -159,24 +165,29 @@ def read(environ=None) -> Containment:
     try:
         value = _read_in(fd, path)
     finally:
-        os.close(fd)
+        _close(fd)
     if value is None:
         return Containment(DEFAULT_ENGINE_HOMES, "default", path)
     return Containment(value, "file", path)
 
 
-def write(engine_homes, environ=None) -> tuple[Containment, bool]:
+def write(engine_homes) -> tuple[Containment, bool]:
     """Set the value; answers the new reading and whether the file changed. See the module docstring."""
 
     if type(engine_homes) is not str or engine_homes not in ENGINE_HOMES:
         raise ContainmentRefused("containment_invalid", f"engine_homes must be one of {', '.join(ENGINE_HOMES)}")
     if engine_homes == OUTSIDE_OPERATOR_HOME and engine_user() is None:
         raise ContainmentRefused("containment_needs_engine_user", f"{OUTSIDE_OPERATOR_HOME} {NEEDS_ENGINE_USER}")
-    folder = config_folder(environ)
+    folder = config_folder()
     path = os.path.join(folder, FILE_NAME)
+    import fcntl  # Linux only, as the launcher is: not with the module, which every system imports
+
     fd = _open_folder(folder, create=True)
     try:
+        fcntl.flock(fd, fcntl.LOCK_EX)  # writers take turns: read, compare and write alone (released at close)
+        _sweep(fd)
         if _read_in(fd, path) == engine_homes:
+            _flush_folder(fd, path, engine_homes)  # a run after containment_not_flushed makes it durable
             return Containment(engine_homes, "file", path), False
         data = (json.dumps({"engine_homes": engine_homes, "version": VERSION}, sort_keys=True) + "\n").encode()
         temp = f".{FILE_NAME}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
@@ -197,39 +208,117 @@ def write(engine_homes, environ=None) -> tuple[Containment, bool]:
             except OSError:
                 pass
             raise
-        os.fsync(fd)
+        _flush_folder(fd, path, engine_homes)
     finally:
-        os.close(fd)
+        _close(fd)
     return Containment(engine_homes, "file", path), True
 
 
-def doctor_check(environ=None) -> dict:
-    """The setting as one check of the doctor report (``doctor_report``'s ``checks`` entry, methods.v1 on
-    SPINE's #368): its value, its level, and what it means for the operator."""
+def _flush_folder(fd: int, path: str, engine_homes: str) -> None:
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        _refuse("containment_not_flushed", f"{path} holds {engine_homes} now, but its folder could not be flushed "
+                f"({type(exc).__name__}), so the change may not survive a power loss; run the command again")
 
+
+def _sweep(fd: int) -> None:
+    """Remove the temporary files a writer killed before its rename left (none is being written: the
+    caller holds the folder's lock)."""
+
+    for name in os.listdir(fd):
+        if name.startswith(f".{FILE_NAME}.") and name.endswith(".tmp"):
+            try:
+                os.unlink(name, dir_fd=fd)
+            except OSError:  # gone, or not a file: left as it is
+                pass
+
+
+def _close(fd: int) -> None:
+    """Close a descriptor opened for reading; an error there loses nothing that was read."""
+
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def doctor_checks(environ=None) -> list[dict]:
+    """The setting as checks of the doctor report (``doctor_report``'s ``checks`` entries, methods.v1 on
+    SPINE's #368): its value, its level and what it means for the operator; and, when ``XDG_CONFIG_HOME``
+    (``environ``'s, ``os.environ``'s by default) names another folder, a line that says the setting is
+    not read from there, naming a ``containment.json`` found there."""
+
+    checks = [_setting_check()]
+    other = _elsewhere(os.environ if environ is None else environ)
+    if other is not None:
+        here = checks[0]["subject"] or "the home the password database gives"
+        stray = os.path.join(other, FILE_NAME)
+        try:
+            found = os.path.lexists(stray)
+        except ValueError:  # a NUL in XDG_CONFIG_HOME: no file can be there
+            found = False
+        if found:
+            checks.append(_check("containment.config_folder", stray, "warn",
+                                 f"{stray} is not read: the containment setting is read only from {here}, "
+                                 "under the home the password database gives, whatever XDG_CONFIG_HOME says",
+                                 f"set the value with `recursiond setup containment <value>`, then remove {stray}"))
+        else:
+            checks.append(_check("containment.config_folder", other, "ok",
+                                 f"XDG_CONFIG_HOME names {other}; the containment setting is read only from "
+                                 f"{here}, under the home the password database gives", None))
+    return checks
+
+
+def _elsewhere(env) -> str | None:
+    """``$XDG_CONFIG_HOME/recursion`` when ``XDG_CONFIG_HOME`` is set and names another folder than the
+    setting's own (compared as written, then with links followed); None otherwise."""
+
+    xdg = env.get("XDG_CONFIG_HOME") or ""
+    if not isinstance(xdg, str) or not xdg:
+        return None
+    other = os.path.join(xdg, FOLDER_NAME)
+    try:
+        here = config_folder()
+    except ContainmentRefused:
+        return other
+    try:
+        if os.path.normpath(other) == os.path.normpath(here) or os.path.realpath(other) == os.path.realpath(here):
+            return None
+    except (OSError, ValueError):
+        pass
+    return other
+
+
+_SETTING = "containment.engine_homes"
+
+
+def _setting_check() -> dict:
     subject = None
     try:
-        subject = os.path.join(config_folder(environ), FILE_NAME)
-        setting = read(environ)
+        subject = os.path.join(config_folder(), FILE_NAME)
+        setting = read()
     except ContainmentRefused as exc:
-        return _check(subject, "fail", f"the containment setting cannot be read ({exc.code}: {exc.detail})",
+        return _check(_SETTING, subject, "fail", f"the containment setting cannot be read ({exc.code}: {exc.detail})",
                       "make the file yours and not writable by others, or remove it, then run "
                       "`recursiond setup containment <value>`")
     said = f"engine_homes is {setting.engine_homes}{' (the default: no file)' if setting.source == 'default' else ''}"
-    if setting.engine_homes == INSIDE_OPERATOR_HOME:
-        return _check(setting.path, "warn", f"{said}; level {setting.level}. {OPERATOR_WORDS}",
-                      "set up a separate engine user, then run "
-                      f"`recursiond setup containment {OUTSIDE_OPERATOR_HOME}`")
     user = engine_user()
+    if setting.engine_homes == INSIDE_OPERATOR_HOME:
+        if user is None:  # no step the operator can take yet: said, not offered as a fix
+            return _check(_SETTING, setting.path, "warn", f"{said}; level {setting.level}. {OPERATOR_WORDS} "
+                          f"{OUTSIDE_OPERATOR_HOME} {NEEDS_ENGINE_USER}.", None)
+        return _check(_SETTING, setting.path, "warn", f"{said}; level {setting.level}. {OPERATOR_WORDS}",
+                      f"run `recursiond setup containment {OUTSIDE_OPERATOR_HOME}` to keep engines out of your home")
     if user is None:
-        return _check(setting.path, "fail", f"{said}; level {setting.level}, which {NEEDS_ENGINE_USER}",
+        return _check(_SETTING, setting.path, "fail", f"{said}; level {setting.level}, which {NEEDS_ENGINE_USER}",
                       f"set up the engine user, or run `recursiond setup containment {INSIDE_OPERATOR_HOME}`")
-    return _check(setting.path, "ok", f"{said}; level {setting.level}: engines run as {user}, outside your home",
-                  None)
+    return _check(_SETTING, setting.path, "ok",
+                  f"{said}; level {setting.level}: engines run as {user}, outside your home", None)
 
 
-def _check(subject, state: str, detail: str, fix) -> dict:
-    return {"id": "containment.engine_homes", "subject": subject, "state": state, "detail": detail, "fix": fix}
+def _check(check_id: str, subject, state: str, detail: str, fix) -> dict:
+    return {"id": check_id, "subject": subject, "state": state, "detail": detail, "fix": fix}
 
 
 def _refuse(code: str, detail: str):
@@ -258,7 +347,10 @@ def _open_folder(folder: str, *, create: bool) -> int | None:
     except OSError as exc:
         _folder_error(path, exc)
     try:
-        info = os.fstat(fd)
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            _refuse("containment_unreadable", f"{path}: {type(exc).__name__}")
         if not stat.S_ISDIR(info.st_mode):
             _refuse("containment_untrusted", f"{path} is not a folder")
         if info.st_uid != os.geteuid():
@@ -266,7 +358,7 @@ def _open_folder(folder: str, *, create: bool) -> int | None:
         if info.st_mode & 0o022:
             _refuse("containment_untrusted", f"{path} is writable by group or world; `chmod 700` it")
     except BaseException:
-        os.close(fd)
+        _close(fd)
         raise
     return fd
 
@@ -288,18 +380,27 @@ def _folder_error(path: str, exc: OSError):
     _refuse("containment_unreadable", f"{path}: {type(exc).__name__}")
 
 
+_MAX_LINKS = 40  # Linux's MAXSYMLINKS: the links one path lookup follows before ELOOP
+
+
 def _walk_above(folder: str, *, create: bool) -> str | None:
-    """``folder`` (the config folder) with every link followed, each folder from ``/`` to it root's or
-    the operator's and not writable by group or world unless sticky, each link root's or the operator's
-    (at most ``_MAX_LINKS``). None when a name on the way does not exist and ``create`` is False; with
-    ``create``, a missing folder is made 0700."""
+    """``folder`` (``<home>/.config``, normalized) as the kernel reaches it, each folder root's or the operator's
+    and not writable by group or world unless sticky. Above the operator's home a link is followed only when
+    only root can change it (the Liaison's ruling on Q21): root owns the link, the folder holding it is root's
+    and not writable by group or others (sticky or not), and the folders on the way to its target, and on to
+    the home, are root's and not writable by group or others, links among them held to the same rule, at most
+    ``_MAX_LINKS`` in all. At or below the home no link is followed (the 3:46 PM ruling). None when a name on
+    the way does not exist and ``create`` is False; with ``create``, a missing ``.config`` is made 0700, and
+    nothing at or above the home is ever made."""
 
     trusted = (0, os.geteuid())
-    names = [name for name in folder.split("/") if name]
-    current, links = "/", 0
+    home = os.path.dirname(folder)
+    above = [name for name in os.path.dirname(home).split("/") if name]
+    below = [name for name in home.split("/") if name][len(above):] + [os.path.basename(folder)]
+    current, links, through = "/", 0, False
     _trusted_folder("/", _lstat("/"), trusted)
-    while names:
-        name = names.pop(0)
+    while above:
+        name = above.pop(0)
         if name == ".":
             continue
         if name == "..":
@@ -308,8 +409,40 @@ def _walk_above(folder: str, *, create: bool) -> str | None:
         candidate = os.path.join(current, name)
         info = _lstat(candidate)
         if info is None:
+            if create:
+                _refuse("containment_unreadable", f"{candidate} does not exist, so neither does the operator's home")
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            if info.st_uid != 0:
+                _refuse("containment_untrusted", f"{candidate} is a link above your home that root does not own")
+            _root_alone(current, _lstat(current), f"which holds the link {candidate},")
+            links += 1
+            if links > _MAX_LINKS:
+                _refuse("containment_untrusted", f"more than {_MAX_LINKS} links above your home")
+            try:
+                target = os.readlink(candidate)
+            except OSError as exc:
+                _refuse("containment_unreadable", f"{candidate}: {type(exc).__name__}")
+            if target.startswith("/"):
+                current = "/"
+            above[:0] = [part for part in target.split("/") if part]
+            through = True
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            _refuse("containment_untrusted", f"{candidate} is not a folder")
+        if through:
+            _root_alone(candidate, info, "on the way through a link above your home,")
+        else:
+            _trusted_folder(candidate, info, trusted)
+        current = candidate
+    for index, name in enumerate(below):
+        candidate = os.path.join(current, name)
+        info = _lstat(candidate)
+        if info is None:
             if not create:
                 return None
+            if index < len(below) - 1:
+                _refuse("containment_unreadable", f"{candidate}, the operator's home, does not exist")
             try:
                 os.mkdir(candidate, 0o700)
             except FileExistsError:
@@ -320,24 +453,22 @@ def _walk_above(folder: str, *, create: bool) -> str | None:
             if info is None:
                 _refuse("containment_unreadable", f"{candidate} was removed while it was made")
         if stat.S_ISLNK(info.st_mode):
-            if info.st_uid not in trusted:
-                _refuse("containment_untrusted", f"{candidate} is a link another user owns")
-            links += 1
-            if links > _MAX_LINKS:
-                _refuse("containment_untrusted", f"more than {_MAX_LINKS} links on the way to {folder}")
-            try:
-                target = os.readlink(candidate)
-            except OSError as exc:
-                _refuse("containment_unreadable", f"{candidate}: {type(exc).__name__}")
-            if target.startswith("/"):
-                current = "/"
-            names[:0] = [part for part in target.split("/") if part]
-            continue
+            _refuse("containment_untrusted", f"{candidate} is a link: the setting is not read through a link")
         if not stat.S_ISDIR(info.st_mode):
             _refuse("containment_untrusted", f"{candidate} is not a folder")
         _trusted_folder(candidate, info, trusted)
         current = candidate
     return current
+
+
+def _root_alone(path: str, info: os.stat_result | None, said: str) -> None:
+    """``path`` is root's and neither group nor others can write in it, sticky or not."""
+
+    if info is None:
+        _refuse("containment_unreadable", f"{path} does not exist")
+    if info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        _refuse("containment_untrusted",
+                f"{path}, {said} is not root's alone (another user owns it or can write in it)")
 
 
 def _lstat(path: str) -> os.stat_result | None:
@@ -384,12 +515,15 @@ def _read_in(folder_fd: int, path: str) -> str | None:
         if now is None or (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
             _refuse("containment_changed", f"{path} changed while it was read; run the command again")
     finally:
-        os.close(fd)
+        _close(fd)
     return _parse(data, path)
 
 
 def _read_held(fd: int, path: str) -> tuple[bytes, os.stat_result]:
-    info = os.fstat(fd)
+    try:
+        info = os.fstat(fd)
+    except OSError as exc:
+        _refuse("containment_unreadable", f"{path}: {type(exc).__name__}")
     if not stat.S_ISREG(info.st_mode):
         _refuse("containment_untrusted", f"{path} is not a regular file")
     if info.st_uid != os.geteuid():

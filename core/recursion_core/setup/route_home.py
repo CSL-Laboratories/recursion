@@ -132,7 +132,7 @@ def _holds(folder: str, real: str) -> bool:
 def _text(value: object, what: str) -> str:
     try:
         text = os.fspath(value)
-    except TypeError:
+    except Exception:  # not a path, or a path-like whose __fspath__ fails (DeepSeek F6 on #428)
         raise RouteHomeRefused("route_home_untrusted", f"the {what} is not a file-system path") from None
     if type(text) is not str or not text.startswith("/"):
         raise RouteHomeRefused("route_home_untrusted", f"the {what} is not absolute")

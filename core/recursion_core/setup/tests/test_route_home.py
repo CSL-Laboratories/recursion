@@ -522,6 +522,23 @@ class RouteHomeTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             check(self.path, self.root, False)  # keyword only: the frozen positional interface is unmoved
 
+    def test_a_path_like_whose_fspath_fails_is_refused(self):
+        # Review 1 of #428, DeepSeek F6: "check raises nothing else ... however malformed".
+        class Broken:
+            def __init__(self, exc):
+                self.exc = exc
+
+            def __fspath__(self):
+                raise self.exc
+        for exc in (ValueError("no"), OSError(5, "Input/output error"), RuntimeError("no")):
+            for which in ("path", "root"):
+                with self.subTest(exc=type(exc).__name__, which=which), self.assertRaises(RouteHomeRefused) as caught:
+                    if which == "path":
+                        check(Broken(exc), self.root)
+                    else:
+                        check(self.path, Broken(exc))
+                self.assertEqual(caught.exception.code, "route_home_untrusted")
+
 
 class FrozenInterfaceTests(unittest.TestCase):
     """STOP builds against these; a change is a request to lane INSTALL."""

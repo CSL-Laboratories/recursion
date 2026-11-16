@@ -89,7 +89,7 @@ def dispatch(args, client) -> int:
                package=recursion_core.__file__)
 
 
-def run_setting(setting: str, value, *, out, environ=None) -> int:
+def run_setting(setting: str, value, *, out) -> int:
     """``setup <setting> [<value>]``: show the setting, or set it. One JSON answer on ``out``."""
 
     action = f"setup {setting}"
@@ -97,16 +97,16 @@ def run_setting(setting: str, value, *, out, environ=None) -> int:
         if setting != "containment":
             raise containment.ContainmentRefused("setting_unknown", repr(setting))
         if value is None:
-            reading, changed = containment.read(environ), False
+            reading, changed = containment.read(), False
         else:
-            reading, changed = containment.write(value, environ)
+            reading, changed = containment.write(value)
     except containment.ContainmentRefused as exc:
         _print(out, {"code": exc.code, "action": action, "detail": exc.detail})
         return EXIT_REFUSED
     except OSError as exc:
         detail = f"{type(exc).__name__}: {exc}"
         if exc.filename is None:
-            detail += f" (in {containment.config_folder(environ)})"
+            detail += f" (in {containment.config_folder()})"
         _print(out, {"code": "filesystem_error", "action": action, "detail": detail})
         return EXIT_REFUSED
     answer = {"code": "ok", "action": action, "changed": changed, "engine_homes": reading.engine_homes,

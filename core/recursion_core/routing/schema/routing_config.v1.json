@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "routing_config.v1.json",
+  "title": "routing_config.v1: the routing file, routing.json",
+  "x-version": "1.0-draft.1",
+  "description": "The file '$XDG_CONFIG_HOME/recursion/routing.json', beside routes.json: a default route, ordered rules, and the logins each engine is billed through, one per engine (grill Q45: a default engine, a routing config the user writes, and a per-task hand pick that always wins; the hand pick is on the task, never in this file). It holds no secret: a login names a connection id, the route contract's route.connection.id. The file must be a regular file of the operator's that no one else can write. Rules the loader (recursion_core.routing.config.load_config) enforces that a schema cannot state: a login's vendor and kind match the credential catalog (the key store's metadata for API keys, the connections routes.json configures for sign-ins); one login per vendor and kind, per connection and per engine; the Claude subscription is bound to claude_code only (grill Q12); the login bound to an engine is the connection routes.json launches that engine with; every route's engine has a login; every fallback route is billed through the configured login of its engine; login ids and rule ids are unique.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "logins", "default", "rules"],
+  "properties": {
+    "version": {
+      "description": "Written as the integer 1. JSON Schema counts 1.0 equal to 1; the loader does not, and refuses 1.0 and true (bad_version).",
+      "const": 1
+    },
+    "logins": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/login"}
+    },
+    "default": {"$ref": "#/$defs/route"},
+    "rules": {
+      "description": "Tried in order. The first rule that matches the task and whose engine is routable is chosen.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/rule"}
+    },
+    "undetected_rule": {
+      "description": "What a matching rule whose engine is not routable does. skip: try the next rule, then the default. refuse: the task is refused. A hand pick and the default are never replaced either way.",
+      "enum": ["skip", "refuse"],
+      "default": "skip"
+    }
+  },
+  "$defs": {
+    "id": {
+      "description": "A login or rule id. The pattern's $ would also match before a final line break, so line breaks are excluded on their own.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "engine": {
+      "description": "The route contract's engine ids (recursion_core.routes.contract.ENGINES).",
+      "enum": ["claude_code", "codex", "pi", "hermes", "opencode"]
+    },
+    "vendor": {
+      "description": "Canonical vendor id, matched exactly: no case folding, no alias.",
+      "enum": ["anthropic", "openai", "xai", "google", "cursor", "opencode"]
+    },
+    "model": {
+      "description": "A model id the breaker store can record: 1 to 128 printable ASCII characters, no space, no line break.",
+      "type": "string",
+      "pattern": "^[\\x21-\\x7e]{1,128}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "connection_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "login": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "vendor", "kind", "connection_id", "engines"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "vendor": {"$ref": "#/$defs/vendor"},
+        "kind": {"enum": ["subscription", "api_key"]},
+        "connection_id": {"$ref": "#/$defs/connection_id"},
+        "engines": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/engine"}
+        }
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine"],
+      "properties": {
+        "engine": {"$ref": "#/$defs/engine"},
+        "model": {
+          "description": "Null or absent: the model routes.json configures for the engine.",
+          "anyOf": [{"type": "null"}, {"$ref": "#/$defs/model"}]
+        },
+        "limits": {"$ref": "#/$defs/limits"}
+      }
+    },
+    "limits": {
+      "description": "The user's limit behaviour and fallback order for this route, in the shape recursion_core.routes.limits validates. Absent: the limits routes.json configures for the engine.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "on_limit": {"enum": ["ask", "wait", "fallback"]},
+        "fallback": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {"$ref": "#/$defs/fallback_route"}
+        }
+      },
+      "if": {"required": ["on_limit"], "properties": {"on_limit": {"const": "fallback"}}},
+      "then": {"required": ["fallback"], "properties": {"fallback": {"minItems": 1}}}
+    },
+    "route_contract_engine": {
+      "description": "The engines the route contract itself accepts today (recursion_core.routes.contract.ENGINES): a fallback route is launched by the route service as it is written.",
+      "enum": ["claude_code", "codex", "pi", "hermes", "opencode"]
+    },
+    "fallback_route": {
+      "description": "A whole route, as the route contract takes it: every structural rule of recursion_core.routes.contract.validate_request is stated here; which login it may name is the loader's (fallback_not_a_login).",
+      "type": "object",
+      "propertyNames": {"enum": ["engine", "model", "connection", "profile", "home", "bare", "api_key_helper", "billing_ack"]},
+      "required": ["engine", "model", "connection"],
+      "properties": {
+        "engine": {"$ref": "#/$defs/route_contract_engine"},
+        "model": {"type": "string", "minLength": 1},
+        "connection": {
+          "type": "object",
+          "required": ["kind", "id"],
+          "properties": {
+            "kind": {"enum": ["subscription", "api_key", "passthrough"]},
+            "id": {"type": "string", "minLength": 1},
+            "key_source": {"enum": ["custody", "api_key_helper"], "default": "custody"}
+          }
+        }
+      },
+      "allOf": [
+        {
+          "description": "pi, hermes and opencode take a profile object.",
+          "if": {"required": ["engine"], "properties": {"engine": {"enum": ["pi", "hermes", "opencode"]}}},
+          "then": {"required": ["profile"], "properties": {"profile": {"type": "object"}}}
+        },
+        {
+          "description": "key_source api_key_helper only on an api_key connection of claude_code.",
+          "if": {"required": ["connection"], "properties": {"connection": {"required": ["key_source"], "properties": {"key_source": {"const": "api_key_helper"}}}}},
+          "then": {"properties": {"engine": {"const": "claude_code"}, "connection": {"properties": {"kind": {"const": "api_key"}}}}}
+        },
+        {
+          "description": "An api_key connection whose key comes from custody (key_source custody, or absent) names its credential_env.",
+          "if": {"required": ["connection"], "properties": {"connection": {
+            "required": ["kind"], "properties": {"kind": {"const": "api_key"}},
+            "not": {"required": ["key_source"], "properties": {"key_source": {"const": "api_key_helper"}}}}}},
+          "then": {"properties": {"connection": {"required": ["credential_env"], "properties": {"credential_env": {"type": "string", "minLength": 1}}}}}
+        },
+        {
+          "description": "A passthrough connection is claude_code's only, and names its method.",
+          "if": {"required": ["connection"], "properties": {"connection": {"required": ["kind"], "properties": {"kind": {"const": "passthrough"}}}}},
+          "then": {"properties": {"engine": {"const": "claude_code"}, "connection": {"required": ["method"], "properties": {"method": {"type": "string", "minLength": 1}}}}}
+        }
+      ]
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "when", "route"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "when": {
+          "description": "Every condition given must hold. task_kind: the task's kind is one of these. tags_all: the task carries every one of these tags.",
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "task_kind": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+            "tags_all": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+          }
+        },
+        "route": {"$ref": "#/$defs/route"}
+      }
+    }
+  }
+}

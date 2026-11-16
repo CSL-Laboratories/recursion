@@ -27,7 +27,8 @@ from collections.abc import Callable, Mapping
 
 from recursion_core.tui import protocol as p
 from recursion_core.tui.events import LOG_CAP, Event, EventLog
-from recursion_core.tui.sanitize import OutputSanitizer, cell_width, field, wrap
+from recursion_core.tui.keys import Key, Paste
+from recursion_core.tui.sanitize import OutputSanitizer, cell_width, field, printable_only, wrap
 from recursion_core.tui.view import Row, color_enabled
 
 Dispatch = Callable[[str, dict, Callable[[str, dict, dict], None]], None]
@@ -36,6 +37,7 @@ PARTIAL_CAP = 8192  # unfinished line with no newline; older cells are marked, n
 RUN_ROWS = 5
 CONDITION_ROWS = 4
 _TRUNCATED = "⟦truncated⟧"
+_CURSOR = "▏"  # where the command line's cursor is, drawn only when it is not at the end
 
 
 def _fmt(params: Mapping) -> str:
@@ -116,8 +118,15 @@ class TuiApp:
         self.errors: list[str] = []
         self.last_error: Event | None = None  # kept here too, so a bounded log cannot drop it
         self.mode, self.line, self.stop_target = "keys", "", None
+        self.cursor = 0  # the command line's insertion point, 0..len(line)
+        # Burst input seen since the line was opened, or on the s that armed a Stop (review of #372, R1):
+        # the next Enter or y does not act on it, however it arrives itself.
+        self._line_burst = self._stop_burst = False
         self.notice = ""
         self.closed = False
+        # Held while the app's state changes, and by close(); never while reading a caller's answer or
+        # logging engine output, so close() cannot wait on a stalled thread (reviews of a1f16a20, C4).
+        self._lock = threading.RLock()
         self._state = "live"
         self.skipped_events = 0  # engine output events a Loop dropped from its presentation queue
         self.outputs: dict[str, _Output] = {}
@@ -125,10 +134,13 @@ class TuiApp:
 
     # -- the event log --------------------------------------------------------------------------
     def _emit(self, event_type: str, source: str, text: str, speech: str | None = None,
-              state: str | None = None) -> Event:
+              state: str | None = None) -> Event | None:
         ms = int(round((self._clock() - self._t0) * 1000))
-        return self.log.append(ms, event_type, source, state or self._view_state(), text,
-                               text if speech is None else speech, self._focus())
+        # The final event seals the log in the same step: any later append, even one a busy thread had
+        # already begun, is refused by the log itself, so the final event stays last.
+        append = self.log.append_last if event_type == "close" else self.log.append
+        return append(ms, event_type, source, state or self._view_state(), text,
+                      text if speech is None else speech, self._focus())
 
     @property
     def transcript(self) -> list[str]:
@@ -163,27 +175,40 @@ class TuiApp:
             self.request("run.status", {"run_id": self.attached})
 
     def close(self) -> None:
-        self.closed = True
-        self._emit("close", "operator", "closed: no request sent; runs keep going and can be reattached")
+        """Closing sends nothing. After it the app takes no key, answer or output: nothing is logged,
+        sent or changed, so a thread that is still busy cannot add to the log or send a request."""
+
+        with self._lock:  # a state change already under way finishes first; none starts after this
+            self.closed = True  # a second call changes nothing: the sealed log refuses its event
+            self._emit("close", "operator", "closed: no request sent; runs keep going and can be reattached")
 
     # -- requests -------------------------------------------------------------------------------
     def request(self, method: str, params: dict) -> None:
         if method not in p.ALLOWED_METHODS:  # defensive: nothing outside the CLI's method set leaves the TUI
             raise ValueError(method)
-        if method == "run.start" and self.watch_only:
-            self._error(f"refused locally: start while watch_only ({self._stale_text()}); refresh first")
-            return
-        self.in_flight[method] += 1
-        self._emit("request", "operator", f"request {method} {_fmt(params)}".rstrip())
-        self.dispatch(method, params, self.on_answer)
+        with self._lock:
+            if self.closed:
+                return
+            if method == "run.start" and self.watch_only:
+                self._error(f"refused locally: start while watch_only ({self._stale_text()}); refresh first")
+                return
+            self.in_flight[method] += 1
+            self._emit("request", "operator", f"request {method} {_fmt(params)}".rstrip())
+            self.dispatch(method, params, self.on_answer)
 
     def _inline(self, method: str, params: dict, done: Callable[[str, dict, dict], None]) -> None:
         done(method, params, call_api(self._api, method, params))
 
     def on_answer(self, method: str, params: dict, answer: dict) -> None:
+        code = answer.get("code")  # read before taking the lock: the answer is the caller's object
+        with self._lock:
+            if self.closed:  # the TUI ended while the answer was read: it changes nothing
+                return
+            self._apply_answer(method, params, answer, code)
+
+    def _apply_answer(self, method: str, params: dict, answer: dict, code) -> None:
         self.in_flight[method] = max(0, self.in_flight[method] - 1)
         self.last, self.last_method = answer, method
-        code = answer.get("code")
         # A Stop answer confirms only the run it was sent for (ADV2-11): one that names another run,
         # or none, changes no run and is shown as a mismatch, never as this run's Stop.
         mismatch = (method == "run.stop" and code in ("stopped", "pending")
@@ -223,9 +248,13 @@ class TuiApp:
         self._answer_keyed = p.keyed_conditions(answer)
         self.answer_conditions = [(label, text) for label, _, text in self._answer_keyed]
         self._uncertain.update({subject: text for label, subject, text in self._answer_keyed if label == p.UNCERTAIN})
-        open_stop = {f"run={r.get('run_id')}": p.stop_unconfirmed(r) for r in self.runs}
-        for subject in list(self._uncertain):  # a later answer about another run does not clear it
-            if not open_stop.get(subject, True):
+        # Only an attested stop clears it: the API lists the run as `stopped`, which the registry stores
+        # only with an attestation. A listed run with no stop record is not proof: a pending Stop whose
+        # write to the registry failed (recorded=false) leaves the run `running` with no stop (R2 finding
+        # 6). A later answer about another run, or a run absent from the list, does not clear it either.
+        attested = {f"run={r.get('run_id')}" for r in self.runs if r.get("state") == "stopped"}
+        for subject in list(self._uncertain):
+            if subject in attested:
                 del self._uncertain[subject]
         # A stopped answer for a run that is not in this snapshot still confirms that Stop.
         # The cleanup above keeps it when the run is absent (bot review 4504133355).
@@ -260,34 +289,53 @@ class TuiApp:
 
     # -- engine output (no control API stream exists yet; the caller feeds events here) ----------
     def on_event(self, event: Mapping) -> None:
-        run_id = str(event.get("run_id"))
-        out = self.outputs.get(run_id)
-        if out is None:
-            out = self.outputs[run_id] = _Output(self._output_lines, run_id)
-        chunk, done = out.feed(event.get("text", ""))
-        # Logged already sanitized; the linear renderer says each finished line once, marked as output.
-        self._emit("output", "engine", chunk, speech="\n".join(out.label + line for line in done),
-                   state=self._state)
+        run_id, text = str(event.get("run_id")), event.get("text", "")  # the caller's object, read unlocked
+        with self._lock:
+            if self.closed:
+                return
+            out = self.outputs.get(run_id)
+            if out is None:
+                out = self.outputs[run_id] = _Output(self._output_lines, run_id)
+            chunk, done = out.feed(text)
+            speech, state = "\n".join(out.label + line for line in done), self._state
+        # Logged already sanitized, outside the lock; the linear renderer says each finished line once,
+        # marked as output. If the TUI ended meanwhile, the sealed log refuses it.
+        self._emit("output", "engine", chunk, speech=speech, state=state)
 
     # -- keys -----------------------------------------------------------------------------------
-    def press(self, key: str) -> None:
+    def press(self, key: Key, *, burst: bool = False) -> None:
+        """One key (a name from ``keys.KeyDecoder``, or a ``Paste``). ``burst`` means it came in one
+        read with other input: an unbracketed paste, or typing faster than the client reads. Such a
+        key cannot confirm a Stop or send the command line, because pasted text would otherwise act; nor
+        can the next key, when the Stop was armed or the line typed with burst input. This is a heuristic
+        for an unbracketed paste: input that arrives one key per read cannot be told from typing."""
+
+        with self._lock:
+            self._press(key, burst)
+
+    def _press(self, key: Key, burst: bool) -> None:
+        if self.closed:
+            return
+        if key == "ctrl+c":  # the terminal sends Ctrl-C as a key (raw mode); it closes, from any mode
+            self.close()
+            return
         if self.mode == "confirm_stop":
             target, self.mode, self.stop_target = self.stop_target, "keys", None
-            if key in ("y", "Y"):
+            armed_by_burst, self._stop_burst = self._stop_burst, False
+            if key in ("y", "Y") and not (burst or armed_by_burst):
                 self.stop(target)
+            elif key in ("y", "Y"):
+                self._notice(f"stop of {field(target)} cancelled: the s or the y came in one read with other "
+                             f"input (a paste?); nothing sent; press s and then y again")
             else:
                 self._notice(f"stop of {field(target)} cancelled; nothing sent")
             return
         if self.mode == "command":
-            if key == "enter":
-                line, self.mode, self.line = self.line, "keys", ""
-                self.command(line)
-            elif key == "esc":
-                self.mode, self.line = "keys", ""
-            elif key == "backspace":
-                self.line = self.line[:-1]
-            elif len(key) == 1 and key.isprintable():
-                self.line += key
+            self._edit(key, burst)
+            return
+        if isinstance(key, Paste):
+            self._notice("paste ignored: the run list takes keys, not text; press : to paste a command; "
+                         "nothing sent")
             return
         if key in ("j", "down", "k", "up"):
             self._move(1 if key in ("j", "down") else -1)
@@ -297,13 +345,50 @@ class TuiApp:
             self.refresh()
         elif key == "s":
             if self.selected:  # the target is fixed now; a later refresh or output cannot change it
-                self.mode, self.stop_target = "confirm_stop", self.selected
+                self.mode, self.stop_target, self._stop_burst = "confirm_stop", self.selected, burst
             else:
                 self._notice("no run selected; nothing to stop")
         elif key == ":":
-            self.mode, self.line = "command", ""
+            self.mode, self.line, self.cursor, self._line_burst = "command", "", 0, burst
         elif key == "q":
             self.close()
+
+    def _edit(self, key: Key, burst: bool) -> None:
+        """The ":" command line: left, right, Home and End move the cursor; Backspace deletes before it
+        and Delete at it; typed and pasted text goes in at it; Esc leaves the line; Enter sends it."""
+
+        line, at = self.line, self.cursor
+        if burst and key != "enter":
+            self._line_burst = True
+        if isinstance(key, Paste):
+            text = printable_only(key.text)  # a pasted line break is a space: a paste never sends the line
+            self.line, self.cursor = line[:at] + text + line[at:], at + len(text)
+            if key.dropped:
+                self._notice(f"paste cut: {key.dropped} characters past the first {len(key.text)} were not kept")
+        elif key == "enter" and (burst or self._line_burst):
+            self._line_burst = False  # said once; the next Enter, on its own, sends the line
+            self._notice("the command line was not sent: it or its Enter came in one read with other input "
+                         "(a paste?); press Enter to send it")
+        elif key == "enter":
+            self.mode, self.line, self.cursor = "keys", "", 0
+            self.command(line)
+        elif key == "esc":
+            self.mode, self.line, self.cursor = "keys", "", 0  # the next ":" starts a line with a fresh mark
+        elif key == "backspace":
+            if at:
+                self.line, self.cursor = line[:at - 1] + line[at:], at - 1
+        elif key == "delete":
+            self.line = line[:at] + line[at + 1:]
+        elif key == "left":
+            self.cursor = max(0, at - 1)
+        elif key == "right":
+            self.cursor = min(len(line), at + 1)
+        elif key == "home":
+            self.cursor = 0
+        elif key == "end":
+            self.cursor = len(line)
+        elif len(key) == 1 and key.isprintable():
+            self.line, self.cursor = line[:at] + key + line[at:], at + 1
 
     def command(self, line: str) -> None:
         """A command line in the CLI's grammar: ``list``, ``status RUN``, ``stop RUN``, ``start ...``,
@@ -388,6 +473,11 @@ class TuiApp:
     def sync_conditions(self) -> None:
         """Log each condition that appeared, changed or cleared since the last sync; nothing else."""
 
+        with self._lock:
+            if not self.closed:
+                self._sync_conditions()
+
+    def _sync_conditions(self) -> None:
         now = self._current()
         for key, (label, text) in self.shown.items():
             if key not in now:
@@ -625,7 +715,9 @@ class TuiApp:
         if self.mode == "confirm_stop":
             return f"recursion: stop run {field(self.stop_target)}? y sends run.stop, any other key cancels"
         if self.mode == "command":
-            return f"recursion: {self.line}"
+            at = self.cursor
+            shown = self.line if at >= len(self.line) else self.line[:at] + _CURSOR + self.line[at:]
+            return f"recursion: {shown}"
         return "recursion: j/k select  a attach  r refresh  s stop  : command  q close (runs keep going)"
 
     # -- notices and errors (logged; an error is never redrawn away) -----------------------------
@@ -673,6 +765,8 @@ class Loop:
         self.dropped_events = 0
         self._wake = threading.Event()
         self._halt = threading.Event()
+        self._paint_lock = threading.Lock()  # a paint and shutdown() never overlap; none starts after it
+        self.join_timeout_s = 5.0
         self._lanes = {"stop": queue.SimpleQueue(), "other": queue.SimpleQueue()}
         self._threads: list[threading.Thread] = []
         self.frame: list[Row] = []
@@ -680,8 +774,8 @@ class Loop:
         app.dispatch = self._dispatch
 
     # thread-safe inputs
-    def press(self, key: str) -> None:
-        self._keys.put(key)
+    def press(self, key: Key, *, burst: bool = False) -> None:
+        self._keys.put((key, burst))
         self._wake.set()
 
     def post_event(self, event: Mapping) -> None:
@@ -712,13 +806,18 @@ class Loop:
         t.start()
         self._threads.append(t)
 
-    def shutdown(self) -> None:
-        self._halt.set()
+    def shutdown(self) -> bool:
+        """Stop painting at once, then stop the threads. When this returns no paint is under way and
+        none will start, even if a thread is still inside a slow call; True when every thread ended."""
+
+        with self._paint_lock:
+            self._halt.set()
         self._wake.set()
         for lane in self._lanes.values():
             lane.put(None)
         for t in self._threads:
-            t.join(timeout=5)
+            t.join(timeout=self.join_timeout_s)
+        return not any(t.is_alive() for t in self._threads)
 
     def run(self) -> None:
         self.app.open()
@@ -731,9 +830,10 @@ class Loop:
         app = self.app
         while True:  # 1. keys first: Stop never waits behind output
             try:
-                app.press(self._keys.get_nowait())
+                key, burst = self._keys.get_nowait()
             except queue.Empty:
                 break
+            app.press(key, burst=burst)
         while True:  # 2. API answers
             try:
                 done, method, params, answer = self._answers.get_nowait()
@@ -757,4 +857,6 @@ class Loop:
         self.frame = self._render()
         self.frames += 1
         if self._sink is not None:
-            self._sink(self.frame)
+            with self._paint_lock:
+                if not self._halt.is_set():  # after shutdown() nothing is painted over the restored terminal
+                    self._sink(self.frame)

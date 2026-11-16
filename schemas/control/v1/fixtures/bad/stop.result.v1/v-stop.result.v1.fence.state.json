@@ -1,0 +1,10 @@
+{
+  "code": "pending",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "state": "pending",
+  "reason": "cgroup_unknown",
+  "fence": {
+    "state": "x-nobody-defined-this",
+    "incarnation": 2
+  }
+}

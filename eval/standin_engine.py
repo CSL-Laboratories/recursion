@@ -28,6 +28,7 @@ unknown (null), never 0.
 import json
 import os
 import posixpath
+import shutil
 import subprocess
 import sys
 import time
@@ -42,15 +43,45 @@ def emit(**fields):
     sys.stdout.flush()
 
 
+def _remove(name):
+    if os.path.isdir(name) and not os.path.islink(name):
+        shutil.rmtree(name)
+    else:
+        os.remove(name)
+
+
+def _plain_above(name):
+    """True when every folder above ``name`` is a real folder (no file, no link)."""
+    parts = name.split("/")
+    for i in range(1, len(parts)):
+        above = "/".join(parts[:i])
+        if os.path.islink(above) or not os.path.isdir(above):
+            return False
+    return True
+
+
 def write_files(files):
+    """Deletions first, then the files written, so a file replaced by a folder (or the reverse) is laid out
+    whatever the order of the plan; what stands in a written path's way is removed, a link never followed."""
+    good = {}
     for name, content in (files or {}).items():
         if name.startswith("/") or ".." in name.split("/") or posixpath.normpath(name) != name:
             emit(type="system", subtype="stand_in_bad_path", path=name)
             continue
+        good[name] = content
+    for name, content in good.items():
+        if content is None and _plain_above(name) and os.path.lexists(name):
+            _remove(name)
+    for name, content in good.items():
         if content is None:
-            if os.path.lexists(name):
-                os.remove(name)
             continue
+        parts = name.split("/")
+        for i in range(1, len(parts)):
+            above = "/".join(parts[:i])
+            if os.path.islink(above) or (os.path.lexists(above) and not os.path.isdir(above)):
+                _remove(above)
+        if os.path.islink(name) or os.path.isdir(name):
+            _remove(name)
         folder = os.path.dirname(name)
         if folder:
             os.makedirs(folder, exist_ok=True)

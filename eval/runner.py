@@ -536,6 +536,19 @@ def make_arms(names: list, suite, args) -> list:
     return out
 
 
+def default_label(suite, engine: str) -> str:
+    """The label a run carries when none is given: dev for the dev set; pilot for a frozen held-out suite on
+    a real engine; otherwise shakedown. Every measured label (screen, pilot, full) needs a frozen suite
+    (check_plan), so on a held-out suite not yet frozen, a fresh harvest, the one label a run may carry is
+    shakedown, which is never a measurement; a measurement still needs a frozen suite and the label given
+    or defaulted on it."""
+    if suite.split == "dev":
+        return "dev"
+    if engine in record_mod.ORACLE_ENGINES or not suite.frozen:
+        return "shakedown"
+    return "pilot"
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="eval/run", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -554,7 +567,7 @@ def main(argv=None) -> int:
     parser.add_argument("--claude-home", help="the route home Claude Code is signed in on (the founder's step)")
     parser.add_argument("--pass-env", action="append", help="name of a variable to pass to the engine")
     parser.add_argument("--label", help="dev, shakedown, screen, pilot or full (default: dev for the dev suite; "
-                                        "shakedown for a held-out suite on the stand-in engine; else pilot)")
+                                        "pilot for a frozen held-out suite on a real engine; else shakedown)")
     parser.add_argument("--seed", type=int, default=20261126)
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
@@ -565,10 +578,9 @@ def main(argv=None) -> int:
     try:
         suite = load_suite(args.suite, args.tasks)
         arms = make_arms([a.strip() for a in args.arms.split(",") if a.strip()], suite, args)
-        default = "dev" if suite.split == "dev" else ("shakedown" if args.engine == "standin" else "pilot")
         outcome = run(suite, arms, k=args.k, attempts=args.attempts, replacements=args.replacements,
-                      label=args.label or default, seed=args.seed, jobs=args.jobs, out_dir=args.out,
-                      artifacts=args.artifacts, tmp_base=args.tmp_base, xdg_base=args.xdg_base)
+                      label=args.label or default_label(suite, args.engine), seed=args.seed, jobs=args.jobs,
+                      out_dir=args.out, artifacts=args.artifacts, tmp_base=args.tmp_base, xdg_base=args.xdg_base)
     except (RunRefused, heldout.HeldOutDenied, suite_mod.SuiteError, scratch_mod.ScratchError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2

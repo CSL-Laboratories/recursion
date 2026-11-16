@@ -31,6 +31,7 @@ import json
 import re
 import shutil
 import sys
+import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -111,8 +112,19 @@ def _git(repo: Path, *args) -> bytes:
 
 
 def candidate_commits(repo: Path, branch: str, not_before: str) -> list:
-    out = _git(repo, "rev-list", "--first-parent", "--reverse", f"--since={not_before}T00:00:00Z", branch)
-    return [line for line in out.decode().split() if line]
+    """The branch's first-parent commits, oldest first, whose committer date is on or after ``not_before``
+    (00:00 UTC). The whole first-parent history is walked and each commit's own date compared:
+    ``rev-list --since`` stops walking at the first older commit, so where committer dates run backward
+    it left eligible commits out. (``--since-as-filter`` filters too, but only from git 2.37; this needs
+    no particular git.)"""
+    since = int(datetime.strptime(not_before, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+    out = _git(repo, "rev-list", "--first-parent", "--reverse", "--timestamp", branch)
+    commits = []
+    for line in out.decode().splitlines():
+        stamp, sha = line.split()
+        if int(stamp) >= since:
+            commits.append(sha)
+    return commits
 
 
 def tree_files(repo: Path, commit: str) -> dict:
@@ -251,12 +263,18 @@ def harvest(repos_path: Path, not_before: str, out: Path, *, suite_id: str, vers
                 continue
             task_id = candidate["meta"]["id"]
             folder = staging / task_id
-            write_task(folder, candidate)
-            task = task_mod.load_dir(folder)
-            task.parent_tree = candidate["parent_tree"]
-            checked = validate_mod.validate(task, reruns=reruns, tmp_base=tmp_base, xdg_base=xdg_base)
+            try:
+                write_task(folder, candidate)
+                task = task_mod.load_dir(folder)
+                task.parent_tree = candidate["parent_tree"]
+                checked = validate_mod.validate(task, reruns=reruns, tmp_base=tmp_base, xdg_base=xdg_base)
+            except (OSError, ValueError, gitutil.GitError, tarfile.TarError) as exc:
+                # One candidate that cannot be laid out or checked is that candidate's rejection, not the
+                # end of the harvest (TaskError and HarvestError are ValueErrors).
+                checked = validate_mod.Validation(
+                    ok=False, reason=f"the task could not be built or checked: {type(exc).__name__}: {exc}"[:500])
             if not checked.ok:
-                shutil.rmtree(folder)
+                shutil.rmtree(folder, ignore_errors=True)
                 rejects.append({"repo": repo_cfg["name"], "commit": commit, "reason": checked.reason})
                 log(f"rejected {repo_cfg['name']} {commit[:12]}: {checked.reason}")
                 continue

@@ -102,8 +102,7 @@ class Task:
     def write_hidden(self, work: Path) -> None:
         for name, data in self.hidden.items():
             path = work / safe_relpath(name)
-            if path.is_symlink() or path.is_dir():
-                _remove(path)
+            _clear_the_way(work, path)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
             path.chmod(self.modes.get(name, 0o644))
@@ -152,15 +151,43 @@ def _remove(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _plain_folders_above(work: Path, path: Path) -> bool:
+    """True when every folder between ``work`` and ``path`` is a real folder (no file, no link)."""
+    here = work
+    for part in path.relative_to(work).parts[:-1]:
+        here = here / part
+        if here.is_symlink() or not here.is_dir():
+            return False
+    return True
+
+
+def _clear_the_way(work: Path, path: Path) -> None:
+    """Remove what stands where ``path`` is to be written: a file or link where one of its folders must be
+    (a file replaced by a folder), and a folder or link at the path itself (a folder replaced by a file).
+    A link is removed, never followed, so nothing is written outside ``work``."""
+    here = work
+    for part in path.relative_to(work).parts[:-1]:
+        here = here / part
+        if here.is_symlink() or (here.exists() and not here.is_dir()):
+            _remove(here)
+    if path.is_symlink() or path.is_dir():
+        _remove(path)
+
+
 def apply_files(work: Path, files: dict, modes: dict | None = None) -> None:
+    """Deletions first, then the files written: a commit that replaces a file with a folder (or a folder
+    with a file) is laid out whatever the order of ``files``."""
     for name, data in files.items():
-        path = work / safe_relpath(name)
-        if data is None:
-            if path.exists() or path.is_symlink():
-                _remove(path)
+        if data is not None:
             continue
-        if path.is_symlink() or path.is_dir():
+        path = work / safe_relpath(name)
+        if _plain_folders_above(work, path) and (path.exists() or path.is_symlink()):
             _remove(path)
+    for name, data in files.items():
+        if data is None:
+            continue
+        path = work / safe_relpath(name)
+        _clear_the_way(work, path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data if isinstance(data, bytes) else data.encode("utf-8"))
         path.chmod((modes or {}).get(name, 0o644))

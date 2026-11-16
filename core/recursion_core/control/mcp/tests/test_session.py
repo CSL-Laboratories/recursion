@@ -688,6 +688,42 @@ class WorkerStartFailureTest(SessionCase):
         session.close()
         self.assertEqual(["run.start", "run.stop"], [m for m, _ in api.calls])
 
+    def test_a_failed_stop_start_gives_back_its_id_and_slot_before_an_exit_from_its_answer_goes_on(self) -> None:
+        # Round 7 of #395 (Sol's REQUIRED 1, Astra's R5): an in-process session writes the reader's own answers,
+        # and an exit or an interrupt from such a write goes on to the caller. When it comes from the "no worker"
+        # answer, the unsent call must be finished first, or its id and its slot stay taken and close waits for ever.
+        for exc in (SystemExit, KeyboardInterrupt, GeneratorExit):
+            for how in ("ordinary slot", "reserved slot", "promoted from waiting"):
+                with self.subTest(exception=exc.__name__, how=how):
+                    api = GateAPI()
+                    session, _ = self.session(api, max_in_flight=1, reserved_stop=int(how == "reserved slot"))
+                    held: list = []
+                    if how != "ordinary slot":  # a status call takes the one ordinary slot; its worker is held back
+                        with mock.patch.object(session, "_start", held.append):
+                            self.feed(session, call(2, *STATUS))
+
+                    def failing(message, exc=exc):
+                        raise exc("the failure answer's write")
+
+                    session._write = failing
+                    if how == "promoted from waiting":
+                        self.feed(session, call("stop", *STOP))  # no slot: it waits, and nothing is written
+                    try:
+                        with mock.patch.object(server.threading.Thread, "start", side_effect=RuntimeError("no thread")):
+                            with self.assertRaises(exc):
+                                if how == "promoted from waiting":
+                                    session._finish(held.pop())  # the slot goes to the waiting stop
+                                else:
+                                    self.feed(session, call("stop", *STOP))
+                        for each in held:
+                            session._finish(each)
+                        api.assert_nothing_entered(self)
+                        self.assertEqual((0, 0, 0), (session.in_flight(), session._general, session._reserved))
+                    finally:  # a call left in flight keeps close waiting: give it back, so a failure is not a hang
+                        for each in list(session._in_flight.values()):
+                            session._finish(each)
+                        session.close()
+
 
 class LogTest(SessionCase):
     def test_initialize_and_ignored_responses_are_logged(self) -> None:

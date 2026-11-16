@@ -56,7 +56,9 @@ slot waits in a queue:
 ordinary calls in one of ``max_waiting`` places, stop calls in one of ``max_waiting_stops`` places of their
 own, which are served first. A call that finds its queue full is refused at once with ``-32000`` "Server
 busy" and ``data.delivered: false``: nothing was sent, so it is safe to send again. A request whose id is
-still in flight (waiting, running or being answered) is refused.
+still in flight (waiting, running or being answered) is refused. A call whose worker thread cannot be
+started is answered ``-32603`` and never sent; its slot and its id are given back even when writing that
+answer raises (an exit or an interrupt from that write then goes on to the caller).
 
 END OF INPUT. The client ending stdin ends reading: calls already admitted are run (waiting ones as slots
 free) and answered while stdout stays open, then ``serve`` returns 0. An answer is never dropped, so a
@@ -419,8 +421,10 @@ class LegacySession:
         try:
             worker.start()
         except RuntimeError:  # no thread could be started: nothing was sent to the daemon
-            self._reply(jsonrpc.error(call.request_id, jsonrpc.INTERNAL_ERROR, "Internal error: no worker for this call"))
-            self._finish(call)
+            try:
+                self._reply(jsonrpc.error(call.request_id, jsonrpc.INTERNAL_ERROR, "Internal error: no worker for this call"))
+            finally:  # an exit or an interrupt from that write goes on, but only after the slot and the id are back
+                self._finish(call)
 
     def _run(self, call: _Call) -> None:
         try:

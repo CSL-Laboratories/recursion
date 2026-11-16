@@ -21,10 +21,11 @@ Reading (``read_frames``):
 * a last line with no newline before end of input is still read as a message.
 
 Writing (``encode``, ``FrameWriter``): compact JSON, ASCII only (every non-ASCII character escaped), so a
-message can never carry a raw newline or depend on the console's encoding; one ``write`` and one
-``flush`` per message under one lock, so concurrent answers never interleave. A write that fails (the
-client stopped reading) marks the writer broken and calls ``on_broken`` once; later messages are dropped,
-and the server stops forwarding (``server.py``, OUTPUT FAILURE).
+message can never carry a raw newline or depend on the console's encoding; each message is written whole
+(a short write is given the rest) and flushed once, under one lock, so concurrent answers never
+interleave. A write that fails (the client stopped reading) marks the writer broken and calls
+``on_broken`` once; later messages are dropped, and the server stops forwarding (``server.py``, OUTPUT
+FAILURE).
 """
 
 from __future__ import annotations

@@ -37,6 +37,11 @@ and the object the method handlers and the engine drivers call:
   later start replaced, one an interrupted launch kept. Those workers share one wake signal, and a worker that
   wakes to find the queue closing, or its generation gone, sets it again before it returns, so none takes the
   signal another is waiting on.
+* ``start`` and ``stop`` run one at a time, whoever calls them: a start that comes while a stop runs waits until
+  that stop has joined its workers, and a stop waits for a start in progress. So no worker is published or
+  launched while a stop withdraws and joins, none a stop has read is forgotten, and no start clears the wake
+  a stop's worker is still waiting on. The lock is re-entrant: a subscriber that the start's offering calls
+  may call ``stop`` on its own thread.
 * ``open_in`` / ``answer_in`` run inside the dispatcher's transaction for approval.open and approval.answer;
   ``list_page`` serves approval.list (summaries only).
 * ``consume(...)`` carries an approved effect out once, against the private binding; every refusal is a
@@ -114,6 +119,7 @@ class ApprovalQueue:
         self._closing = threading.Event()
         self._worker: threading.Thread | None = None
         self._workers: list = []       # every worker a start launched and no stop has joined yet
+        self._lifecycle = threading.RLock()  # held across all of start and all of stop: one at a time
         self._generation = None        # the running worker's token; a worker whose token is gone returns
         self._running = False          # started and not stopped: a surface that subscribes now is offered
         self._late = None              # while a start runs: (token, fn) of surfaces that subscribed during it
@@ -134,6 +140,12 @@ class ApprovalQueue:
         return self._store
 
     def start(self, context) -> None:
+        """Recover, launch the deadline worker and let the surfaces through (the module text says how a start
+        that fails or is interrupted leaves the queue). One at a time with ``stop``: under ``_lifecycle``."""
+        with self._lifecycle:
+            self._start(context)
+
+    def _start(self, context) -> None:
         if self._store is None:
             self.attach(context.store)
         elif self._store is not context.store:
@@ -191,7 +203,12 @@ class ApprovalQueue:
         and one an interrupted launch kept (a start never joins one: it only publishes its own). Interrupted,
         the workers not yet joined are kept, and a second ``stop`` joins them. A worker whose thread never
         launched (its start failed) has nothing to join and is let go; were it to launch late, its generation is
-        gone and it returns at once."""
+        gone and it returns at once. One at a time with ``start`` (under ``_lifecycle``), so no start publishes
+        or launches a worker while this withdraws and joins."""
+        with self._lifecycle:
+            self._stop()
+
+    def _stop(self) -> None:
         self._withdraw()
         while True:
             with self._lock:

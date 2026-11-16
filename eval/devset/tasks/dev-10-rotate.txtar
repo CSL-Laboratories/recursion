@@ -1,0 +1,62 @@
+Dev task 10: transpose and rotate a rectangular matrix.
+-- task.json --
+{"id": "dev-10-rotate", "cluster": "dev", "created_at": null,
+ "test_command": ["{python}", "-B", "-m", "unittest", "{hidden_modules}"],
+ "timeout_s": 900, "grading_timeout_s": 120}
+-- prompt.md --
+Implement `transpose(matrix)` and `rotate_clockwise(matrix)` in `grid/rotate.py`.
+
+A matrix is a list of rows, each a list; it may be rectangular rather than square. Both functions return a new matrix (lists of lists) and leave the input unchanged. `[]` gives `[]`. Rows of different lengths raise `ValueError`.
+-- start/grid/__init__.py --
+"""Grid helpers."""
+-- start/grid/rotate.py --
+def transpose(matrix):
+    raise NotImplementedError
+
+
+def rotate_clockwise(matrix):
+    raise NotImplementedError
+-- hidden/test_rotate.py --
+import unittest
+
+from grid.rotate import rotate_clockwise, transpose
+
+
+class RotateTests(unittest.TestCase):
+    def test_transpose_rectangular(self):
+        self.assertEqual(transpose([[1, 2, 3], [4, 5, 6]]), [[1, 4], [2, 5], [3, 6]])
+
+    def test_rotate_rectangular(self):
+        self.assertEqual(rotate_clockwise([[1, 2, 3], [4, 5, 6]]), [[4, 1], [5, 2], [6, 3]])
+
+    def test_rotate_square(self):
+        self.assertEqual(rotate_clockwise([[1, 2], [3, 4]]), [[3, 1], [4, 2]])
+
+    def test_empty(self):
+        self.assertEqual(transpose([]), [])
+        self.assertEqual(rotate_clockwise([]), [])
+
+    def test_ragged(self):
+        with self.assertRaises(ValueError):
+            transpose([[1, 2], [3]])
+
+    def test_input_untouched(self):
+        given = [[1, 2], [3, 4]]
+        rotate_clockwise(given)
+        self.assertEqual(given, [[1, 2], [3, 4]])
+-- solution/grid/rotate.py --
+def _check(matrix):
+    if matrix and len({len(row) for row in matrix}) != 1:
+        raise ValueError("rows have different lengths")
+
+
+def transpose(matrix):
+    _check(matrix)
+    return [list(column) for column in zip(*matrix)]
+
+
+def rotate_clockwise(matrix):
+    _check(matrix)
+    return [list(column) for column in zip(*reversed(matrix))]
+-- standin.json --
+{"outcomes": ["solve", "auth", "auth", "auth", "solve"]}

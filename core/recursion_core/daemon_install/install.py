@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from .errors import InstallRefused
 from .layout import (Owned, Roots, check_dirs, ensure_dir, file_untrusted, held_regular, owned_paths,
                      read_regular_and_stat, replace_regular, unlink_regular, write_exclusive)
-from .unit import MARKER, UNIT_NAME, render_unit
+from .unit import MARKER, UNIT_NAME, render_unit, state_elsewhere
 
 _UNIT_MODE = 0o644
 _DIR_MODE = 0o700
@@ -70,7 +70,11 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
 
 def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     """Rewrite the unit to what ``install`` would write now. A missing unit is refused. The same
-    bytes change nothing unless another user could change the file; then it is written again."""
+    bytes change nothing unless another user could change the file; then it is written again. A unit
+    whose daemon may keep its state in another folder (``state_elsewhere``: its own ``XDG_STATE_HOME``,
+    an ``EnvironmentFile``, the manager's value passed through) is refused ``unit_state_elsewhere``,
+    left as it is: replacing it would point the daemon at another state folder, without the revocations
+    and breaker trips kept in its own."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args).encode()
@@ -80,6 +84,15 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     current, info = read_regular_and_stat(paths.unit)  # the file read, checked against the path while open
     if current == unit and not file_untrusted(paths.unit, info):
         return _plan("upgrade", False, paths)
+    why = None if current == unit else state_elsewhere(current, paths.home)
+    if why:  # the S6 sweep's F1 on #410, reachable here too: the unit left as it is
+        state = os.path.join(paths.home, ".local", "state", "recursion")
+        raise InstallRefused(
+            "unit_state_elsewhere",
+            f"{paths.unit} {why}: the daemon it starts may keep its state (the revocation and breaker "
+            f"stores, the run registry) there, and the unit `recursiond upgrade` writes leaves it in "
+            f"{state}, the daemon's default. Stop the daemon, move that state folder to {state}, take the "
+            "line out of the unit, then run `recursiond upgrade` again")
     replace_regular(paths.unit, unit, _UNIT_MODE)
     return _plan("upgrade", True, paths)
 

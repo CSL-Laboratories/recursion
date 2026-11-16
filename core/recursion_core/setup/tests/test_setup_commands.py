@@ -33,6 +33,10 @@ def _probe(**changes):
     return lambda interpreter: dict(info)
 
 
+def _environ_without(*names):
+    return mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k not in names}, clear=True)
+
+
 def _refusing_probe(interpreter):
     raise AssertionError("uninstall must not start the interpreter")
 
@@ -47,10 +51,10 @@ class CommandTests(unittest.TestCase):
         self.roots = Roots(home=self.home)
         self.unit = os.path.join(self.home, ".config", "systemd", "user", UNIT_NAME)
 
-    def run_action(self, action, *, interpreter=PY, probe=None, package=PACKAGE):
-        out = io.StringIO()
+    def run_action(self, action, *, interpreter=PY, probe=None, package=PACKAGE, environ=None):
+        out = io.StringIO()  # an empty environment unless one is given: XDG_* of the run's own are not read
         code = setup.run(action, out=out, roots=self.roots, interpreter=interpreter, package=package,
-                         probe=probe or _probe())
+                         probe=probe or _probe(), environ={} if environ is None else environ)
         lines = out.getvalue().splitlines()
         self.assertEqual(len(lines), 1, lines)
         return code, json.loads(lines[0])
@@ -198,6 +202,7 @@ class CommandTests(unittest.TestCase):
     def test_recursiond_install_end_to_end(self):
         out = io.StringIO()
         with mock.patch.object(entry, "_linux", return_value=True), \
+                _environ_without("XDG_CONFIG_HOME", "XDG_STATE_HOME"), \
                 mock.patch.object(setup, "default_roots", return_value=self.roots), \
                 mock.patch.object(setup, "probe_interpreter", _probe()), contextlib.redirect_stdout(out):
             code = entry.main(["install"])
@@ -275,6 +280,74 @@ class CommandTests(unittest.TestCase):
                 code, answer = self.run_action(action)
                 self.assertEqual((code, answer["code"]), (1, "not_regular"))
 
+    # The S6 integration sweep, F2 on #410 (P2): with XDG_CONFIG_HOME set, the user manager reads its units from
+    # $XDG_CONFIG_HOME/systemd/user, and install wrote ~/.config/systemd/user and answered ok.
+    def test_a_config_home_elsewhere_is_refused_before_anything_is_read(self):
+        custom = os.path.join(self._tmp.name, "custom-config")
+        for value in (custom, "relative/config", os.path.join(self.home, ".config", "x")):
+            for action in ("install", "upgrade", "uninstall"):
+                with self.subTest(value=value, action=action):
+                    code, answer = self.run_action(action, probe=_refusing_probe, environ={"XDG_CONFIG_HOME": value})
+                    self.assertEqual((code, answer["code"], answer["action"]), (1, "config_home_elsewhere", action))
+                    self.assertIn(f"XDG_CONFIG_HOME is {value}", answer["detail"])
+                    self.assertIn(f"`env -u XDG_CONFIG_HOME recursiond {action}`", answer["detail"])
+                    self.assertEqual(os.listdir(self.home), [])
+        # Read from this command's own environment when none is passed (the sweep's ready test).
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": custom}):
+            out = io.StringIO()
+            code = setup.run("install", out=out, roots=self.roots, interpreter=PY, package=PACKAGE, probe=_probe())
+        self.assertEqual((code, json.loads(out.getvalue())["code"]), (1, "config_home_elsewhere"))
+        self.assertEqual(os.listdir(self.home), [])
+        # Unset, empty, or naming ~/.config itself: the default.
+        config = os.path.join(self.home, ".config")
+        for environ in ({}, {"XDG_CONFIG_HOME": ""}, {"XDG_CONFIG_HOME": config}, {"XDG_CONFIG_HOME": config + "/"}):
+            with self.subTest(environ=environ):
+                code, answer = self.run_action("install", environ=environ)
+                self.assertEqual((code, answer["code"]), (0, "ok"))
+
+    # The S6 integration sweep, F1 on #410 (P1), by this command's environment: a daemon started with
+    # XDG_STATE_HOME keeps its state there, and the unit puts it in ~/.local/state/recursion.
+    def test_a_state_home_elsewhere_is_refused_by_install_and_upgrade(self):
+        custom = os.path.join(self._tmp.name, "custom-state")
+        for value in (custom, "relative/state"):
+            for action in ("install", "upgrade"):
+                with self.subTest(value=value, action=action):
+                    code, answer = self.run_action(action, probe=_refusing_probe, environ={"XDG_STATE_HOME": value})
+                    self.assertEqual((code, answer["code"], answer["action"]), (1, "state_home_elsewhere", action))
+                    self.assertIn(f"in {value}/recursion", answer["detail"])
+                    self.assertIn(f"`env -u XDG_STATE_HOME recursiond {action}`", answer["detail"])
+                    self.assertEqual(os.listdir(self.home), [])
+        code, answer = self.run_action("uninstall", environ={"XDG_STATE_HOME": custom})  # it touches no state
+        self.assertEqual((code, answer["code"], answer["changed"]), (0, "ok", False))
+        state = os.path.join(self.home, ".local", "state")
+        for environ in ({"XDG_STATE_HOME": ""}, {"XDG_STATE_HOME": state}):
+            with self.subTest(environ=environ):
+                code, answer = self.run_action("install", environ=environ)
+                self.assertEqual((code, answer["code"]), (0, "ok"))
+
+    def test_a_unit_that_keeps_the_state_elsewhere_is_printed_as_its_refusal(self):
+        os.makedirs(os.path.dirname(self.unit), 0o700)
+        with open(self.unit, "w", encoding="utf-8") as handle:
+            handle.write("[Service]\nEnvironment=XDG_STATE_HOME=/elsewhere\nExecStart=/old\n")
+        code, answer = self.run_action("upgrade")
+        self.assertEqual((code, answer["code"], answer["action"]), (1, "unit_state_elsewhere", "upgrade"))
+        self.assertIn("sets XDG_STATE_HOME=/elsewhere", answer["detail"])
+
+    # The Liaison's item 4 (Nov 16): a password lookup that fails (CPython raises KeyError for no entry and for a
+    # failed lookup alike) ended `recursiond install` with a traceback; it is the JSON refusal home_unknown.
+    def test_a_password_lookup_that_fails_is_a_json_refusal(self):
+        failed = KeyError(f"getpwuid(): uid not found: {os.geteuid()}")
+        for action in setup.NAMES:
+            with self.subTest(action=action):
+                out = io.StringIO()
+                with mock.patch.object(setup.sys, "platform", "linux"), mock.patch("pwd.getpwuid", side_effect=failed), \
+                        mock.patch.object(setup, "run") as run:
+                    self.assertEqual(setup.dispatch(mock.Mock(command=action, out=out), None), 1)
+                answer = json.loads(out.getvalue())
+                self.assertEqual((answer["code"], answer["action"]), ("home_unknown", action))
+                self.assertIn("the password database gives no entry for this user", answer["detail"])
+                run.assert_not_called()
+
     def test_the_default_home_is_the_password_databases_not_HOME(self):
         import pwd
         with mock.patch.dict(os.environ, {"HOME": "/somewhere/else"}):
@@ -328,7 +401,8 @@ class RealProbeTests(unittest.TestCase):
     def test_install_from_a_checkout_is_refused_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as home:
             out = io.StringIO()
-            code = setup.run("install", out=out, roots=Roots(home=home), interpreter=sys.executable, package=PACKAGE)
+            code = setup.run("install", out=out, roots=Roots(home=home), interpreter=sys.executable, package=PACKAGE,
+                             environ={})
             answer = json.loads(out.getvalue())
             self.assertEqual(code, 1)
             self.assertIn(answer["code"], {"not_installed", "interpreter_not_free_threaded"})

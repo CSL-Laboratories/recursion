@@ -263,6 +263,61 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(upgrade(self.roots, EXEC).changed)
         self.assertEqual(_read(self.unit), render_unit(EXEC))
 
+    # The S6 integration sweep, F1 on #410 (P1): upgrade replaced a hand-placed unit that set the daemon's state
+    # folder elsewhere, and the daemon then opened fresh stores in ~/.local/state without the revocations kept in
+    # its own. Such a unit is refused before anything is made, and left as it is.
+    def test_upgrade_refuses_a_unit_that_keeps_the_state_elsewhere_and_changes_nothing(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        custom = os.path.join(self.case, "custom-state")
+        cases = (
+            (f"Environment=XDG_STATE_HOME={custom}\n", f"sets XDG_STATE_HOME={custom}"),
+            (f'Environment="A=1" "XDG_STATE_HOME={custom} two"\n', f"sets XDG_STATE_HOME={custom} two"),
+            (f"Environment=XDG_STATE_HOME=%h/.local/state\nEnvironment=XDG_STATE_HOME={custom}\n",
+             f"sets XDG_STATE_HOME={custom}"),
+            (f"Environment=A=1 \\\n    XDG_STATE_HOME={custom}\n", f"sets XDG_STATE_HOME={custom}"),
+            ("Environment=XDG_STATE_HOME=%h/other\n", "sets XDG_STATE_HOME=%h/other"),
+            ("Environment=XDG_STATE_HOME=relative\n", "sets XDG_STATE_HOME=relative"),
+            ("EnvironmentFile=%h/.config/recursion.env\n", "reads EnvironmentFile=%h/.config/recursion.env"),
+            ("EnvironmentFile=-/etc/recursion.env\n", "reads EnvironmentFile=-/etc/recursion.env"),
+            ("PassEnvironment=HOME XDG_STATE_HOME\n", "passes the user manager's own XDG_STATE_HOME"),
+            (f'Environment="XDG_STATE_HOME={custom}\n', "which cannot be read"),
+        )
+        for service, said in cases:
+            with self.subTest(service=service):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(f"[Unit]\nDescription=by hand\n[Service]\n{service}ExecStart=/old/python -m x\n")
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    upgrade(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
+                self.assertIn(said, caught.exception.detail)
+                self.assertIn(f"move that state folder to {self.state}", caught.exception.detail)
+                self.assertEqual(_tree(self.home), before)  # the unit as it was
+        with open(self.unit, "wb") as handle:
+            handle.write(b"[Service]\nEnvironment=XDG_STATE_HOME=\xff\nExecStart=/old\n")
+        with self.assertRaises(InstallRefused) as caught:
+            upgrade(self.roots, EXEC)
+        self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
+        self.assertIn("is not UTF-8 text", caught.exception.detail)
+
+    def test_upgrade_still_replaces_a_unit_whose_state_is_the_default(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        custom = os.path.join(self.case, "custom-state")
+        for service in ("",  # no setting: the user manager's, or the default
+                        "Environment=XDG_STATE_HOME=%h/.local/state\n",
+                        f"Environment=XDG_STATE_HOME={self.home}/.local/state/\n",
+                        f"Environment=XDG_STATE_HOME={custom}\nEnvironment=\n",  # an empty one drops those before it
+                        f"Environment=XDG_STATE_HOME={custom}\nUnsetEnvironment=XDG_STATE_HOME\n",
+                        "EnvironmentFile=/etc/recursion.env\nUnsetEnvironment=XDG_STATE_HOME\n",
+                        "PassEnvironment=XDG_STATE_HOME\nPassEnvironment=\n",
+                        "EnvironmentFile=/etc/recursion.env\nEnvironmentFile=\n",
+                        f"[Install]\nEnvironment=XDG_STATE_HOME={custom}\n"):  # not the [Service] section's
+            with self.subTest(service=service):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(f"[Service]\n{service}ExecStart=/old\n")
+                self.assertTrue(upgrade(self.roots, EXEC).changed)
+                self.assertEqual(_read(self.unit), render_unit(EXEC))
+
     def test_upgrade_without_a_unit_is_refused(self) -> None:
         with self.assertRaises(InstallRefused) as caught:
             upgrade(self.roots, EXEC)

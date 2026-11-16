@@ -1515,6 +1515,91 @@ class RoundNineCredentialsTest(unittest.TestCase):
             self.assertEqual(CredentialStore(path).grants()[0].revoked_at, first)
 
 
+class _ObservedLock:
+    """Stands in for a store's lock: says when a caller starts to wait for it, then waits on the real one."""
+
+    def __init__(self, real):
+        self.real, self.waiting = real, threading.Event()
+
+    def __enter__(self):
+        self.waiting.set()
+        self.real.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.real.release()
+        return False
+
+    def acquire(self, *args, **kwargs):
+        return self.real.acquire(*args, **kwargs)
+
+    def release(self):
+        self.real.release()
+
+
+@NEEDS_POSIX
+class ClockInsideTheLockTest(unittest.TestCase):
+    """The Devin review thread on #385: grant_scopes and held judged expiry by a clock read before they waited
+    for the lock, so a grant that expired during the wait still answered its scopes."""
+
+    def _store(self, folder, now):
+        store = CredentialStore(os.path.join(folder, "synthetic.json"), wall=lambda: now[0])
+        token, grant = store.mint("plugin", "synthetic", ["read"], expires_at=1100)
+        return store, grant
+
+    def _judged_after_a_wait(self, ask):
+        with tempfile.TemporaryDirectory() as folder:
+            now = [1000]
+            store, grant = self._store(folder, now)
+            real = store._lock
+            store._lock = _ObservedLock(real)
+            answer = []
+            real.acquire()
+            try:
+                caller = threading.Thread(target=lambda: answer.append(ask(store, grant)))
+                caller.start()
+                self.assertTrue(store._lock.waiting.wait(10))
+                now[0] = 2000   # the grant expires while the caller waits for the lock
+            finally:
+                real.release()
+            caller.join(10)
+            self.assertFalse(caller.is_alive())
+            return answer
+
+    def test_grant_scopes_judges_expiry_when_the_lock_is_taken(self):
+        self.assertEqual(self._judged_after_a_wait(
+            lambda store, grant: store.grant_scopes(grant.token_id, "plugin", "synthetic")), [frozenset()])
+
+    def test_held_judges_expiry_when_the_lock_is_taken(self):
+        self.assertEqual(self._judged_after_a_wait(lambda store, grant: store.held("plugin", "synthetic")),
+                         [frozenset()])
+
+    def test_a_clock_that_raises_inside_the_lock_leaves_it_free_and_the_store_unchanged(self):
+        with tempfile.TemporaryDirectory() as folder:
+            now = [1000]
+            store, grant = self._store(folder, now)
+            path = os.path.join(folder, "synthetic.json")
+            with open(path, "rb") as handle:
+                before = handle.read()
+            grants = store.grants()
+            now[0] = "broken"
+            for ask in (lambda: store.grant_scopes(grant.token_id, "plugin", "synthetic"),
+                        lambda: store.held("plugin", "synthetic")):
+                with self.assertRaises(CredentialStoreError):
+                    ask()
+                free = []
+                other = threading.Thread(target=lambda: free.append(store._lock.acquire(timeout=5)))
+                other.start()
+                other.join(10)
+                self.assertEqual(free, [True])
+                store._lock.release()
+            now[0] = 1000
+            self.assertEqual(store.grants(), grants)
+            with open(path, "rb") as handle:
+                self.assertEqual(handle.read(), before)
+            self.assertEqual(store.grant_scopes(grant.token_id, "plugin", "synthetic"), frozenset({"read"}))
+
+
 class PlatformTest(unittest.TestCase):
     def test_without_uids_the_store_refuses_to_open(self) -> None:
         with mock.patch.object(creds.os, "name", "nt"):

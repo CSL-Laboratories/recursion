@@ -745,8 +745,8 @@ class CredentialStore:
         token holds: another grant of the same identity never widens it."""
 
         token_id, kind, principal_id = _text(token_id), _text(kind), _text(principal_id)   # round 6, DeepSeek 2
-        now = self._now()
         with self._lock:
+            now = self._now()   # read once the lock is held, as verify does: waiting must not make it stale
             self._refresh()
             record = self._grants.get(token_id) if isinstance(token_id, str) else None
             if (record is None or record["kind"] != kind or record["id"] != principal_id
@@ -762,9 +762,9 @@ class CredentialStore:
         read); the authorizer cuts to it again."""
 
         kind, principal_id = _text(kind), _text(principal_id)   # compared as their text (round 6, DeepSeek 2)
-        now = self._now()
         out: set[str] = set()
         with self._lock:
+            now = self._now()   # read once the lock is held (the Devin review thread on #385)
             self._refresh()
             for record in self._grants.values():
                 if (record["kind"] == kind and record["id"] == principal_id and record["revoked_at"] is None

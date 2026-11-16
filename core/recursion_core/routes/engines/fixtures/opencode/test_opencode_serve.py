@@ -10,9 +10,11 @@ name:
 from __future__ import annotations
 
 import http.server
+import os
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from recursion_core.routes import contract as c
 from recursion_core.routes.driver import Declaration, DriverInputError, DriverRefused, DriverStateError
@@ -573,6 +575,413 @@ class HttpAbortTests(unittest.TestCase):
                     oc.http_abort(url, "ses_x")
         with self.assertRaises(ValueError):
             oc.http_abort("http://127.0.0.1:80", "-x")
+
+
+def step_start(sid: str, part_type: str = "step-start") -> str:
+    return ('{"type":"step_start","timestamp":1,"sessionID":"%s","part":{"type":"%s"}}\n' % (sid, part_type))
+
+
+class OnceRaisingLock:
+    """A lock whose first entry raises ``KeyboardInterrupt``: an interruption landing exactly there."""
+
+    def __init__(self) -> None:
+        self.lock, self.armed = threading.Lock(), True
+
+    def __enter__(self):
+        if self.armed:
+            self.armed = False
+            raise KeyboardInterrupt("one interruption at the first entry")
+        return self.lock.__enter__()
+
+    def __exit__(self, *exc):
+        return self.lock.__exit__(*exc)
+
+
+class HookLock:
+    """The driver's lock, counting entries: before entry ``n`` it calls ``hooks[n]`` once (a call landing there)."""
+
+    def __init__(self, lock, hooks: dict) -> None:
+        self.lock, self.hooks, self.entries = lock, dict(hooks), 0
+
+    def __enter__(self):
+        self.entries += 1
+        hook = self.hooks.pop(self.entries, None)
+        if hook is not None:
+            hook()
+        return self.lock.__enter__()
+
+    def __exit__(self, *exc):
+        return self.lock.__exit__(*exc)
+
+
+class ReleaseAndRaceTests(Base):
+    """#421's first round: release is terminal and owns what it stops; nothing is left running or reserved."""
+
+    def started_turn(self, **kwargs):
+        driver = self.make(**kwargs)
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        return driver, handle
+
+    def test_a_release_while_a_turns_spawn_runs_terminates_the_late_process_unwritten(self):
+        entered, go = threading.Event(), threading.Event()
+        spy = Spy()
+
+        def spawn(argv, env):
+            process = spy(argv, env)
+            if argv[1] == "run":
+                entered.set()
+                if not go.wait(30):   # a watchdog only: the test sets it
+                    raise AssertionError("the test never let the spawn return")
+            return process
+
+        driver = self.make(spy)
+        driver._spawn = spawn
+        handle = driver.start(session(), None, ENV)
+        errors = []
+
+        def send():
+            try:
+                driver.send(handle, message())
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=send)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(30))
+            driver.release(handle)   # does not wait for the spawn
+            self.assertEqual(spy.processes[0].terminated, 1)
+            self.assertIn(id(handle), driver._workers)   # still owed the process the spawn will give back
+        finally:
+            go.set()
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
+        server, turn = spy.processes
+        self.assertEqual((turn.terminated, turn.sent, turn.closes), (1, [], 0))
+        self.assertEqual([type(e) for e in errors], [DriverStateError])
+        self.assertEqual(driver._workers, {})
+        self.assertIsNone(handle.live_turn)
+        driver.release(handle)
+        self.assertEqual((server.terminated, turn.terminated), (1, 1))
+
+    def test_a_released_handle_refuses_every_later_call(self):
+        driver, handle = self.started_turn()
+        driver.release(handle)
+        self.assertIsNone(handle.live_turn)   # not left busy: the next message is refused as released
+        for call in (lambda: driver.send(handle, message(turn="turn-2", delivery="dlv-2")),
+                     lambda: driver.parse(handle, '{"type":"text"}\n'), lambda: driver.finish_turn(handle, 0),
+                     lambda: driver.interrupt(handle, "turn-3"), lambda: driver.send(handle, {"kind": "close"})):
+            with self.assertRaises(DriverStateError):
+                call()
+            self.assertIsNone(handle.live_turn)
+        self.assertEqual(len(self.spy.spawns), 2)
+        self.assertEqual([p.terminated for p in self.spy.processes], [1, 1])
+
+    def test_a_release_between_the_registration_and_the_write_leaves_the_prompt_unwritten(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver._lock = HookLock(driver._lock, {4: lambda: driver.release(handle)})   # the 4th entry in send
+        with self.assertRaises(DriverStateError):
+            driver.send(handle, message())
+        server, turn = self.spy.processes
+        self.assertEqual((turn.sent, turn.terminated, server.terminated), ([], 1, 1))
+        self.assertIsNone(handle.live_turn)
+        self.assertEqual(driver._workers, {})
+
+    def test_a_release_just_before_the_spawn_starts_nothing(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver._lock = HookLock(driver._lock, {2: lambda: driver.release(handle)})   # the 2nd entry in send
+        with self.assertRaises(DriverStateError):
+            driver.send(handle, message())
+        self.assertEqual(len(self.spy.spawns), 1)   # the server only
+        self.assertEqual(self.spy.processes[0].terminated, 1)
+        self.assertIsNone(handle.live_turn)
+        self.assertEqual(driver._workers, {})
+
+    def test_an_interruption_in_a_termination_keeps_every_process_not_yet_ended_owed(self):
+        driver, handle = self.started_turn()
+        server, turn = self.spy.processes
+        real, cuts = turn.terminate, [KeyboardInterrupt("cut short")]
+
+        def terminate():
+            if cuts:
+                raise cuts.pop()
+            real()
+
+        turn.terminate = terminate
+        with self.assertRaises(KeyboardInterrupt):
+            driver.release(handle)
+        self.assertEqual((turn.terminated, server.terminated), (0, 0))   # the server was not reached
+        driver.release(handle)
+        self.assertEqual((turn.terminated, server.terminated), (1, 1))
+        self.assertEqual(driver._workers, {})
+
+    def test_one_termination_that_raises_leaves_the_other_tried_and_itself_owed(self):
+        for failing in (0, 1):   # the server's, then the turn's process
+            with self.subTest(failing=failing):
+                driver, handle = self.started_turn()
+                processes = self.spy.processes
+                victim, real = processes[failing], processes[failing].terminate
+                failures = [OSError("synthetic: cannot terminate")]
+
+                def terminate(victim=victim, real=real, failures=failures):
+                    if failures:
+                        raise failures.pop()
+                    real()
+
+                victim.terminate = terminate
+                with self.assertRaises(OSError):
+                    driver.release(handle)
+                self.assertEqual([p.terminated for p in processes], [0 if p is victim else 1 for p in processes])
+                self.assertIn(id(handle), driver._workers)
+                for call, args in ((driver.send, (message(turn="turn-2", delivery="dlv-2"),)),
+                                   (driver.parse, ('{"type":"text"}\n',)), (driver.finish_turn, (0,)),
+                                   (driver.send, ({"kind": "close"},))):
+                    with self.assertRaises(DriverStateError):
+                        call(handle, *args)
+                self.assertEqual([p.terminated for p in processes], [0 if p is victim else 1 for p in processes])
+                driver.release(handle)   # tries the owed one again, and only it
+                self.assertEqual([p.terminated for p in processes], [1, 1])
+                self.assertEqual(driver._workers, {})
+
+    def test_an_interruption_at_the_handles_registration_terminates_the_server(self):
+        for resume in (False, True):
+            with self.subTest(resume=resume):
+                driver = self.make()
+                driver._lock = OnceRaisingLock()
+                with self.assertRaises(KeyboardInterrupt):
+                    if resume:
+                        driver.resume("ses_abc", session(), None, ENV)
+                    else:
+                        driver.start(session(), None, ENV)
+                self.assertEqual(self.spy.processes[0].terminated, 1)
+                self.assertEqual(driver._workers, {})
+
+    def test_a_server_whose_termination_fails_at_start_leaves_the_first_error(self):
+        spy = Spy([])
+        driver = self.make(spy)
+        failed = []
+
+        def spawn(argv, env):
+            process = spy(argv, env)
+
+            def terminate():
+                failed.append(1)
+                raise OSError("synthetic: cannot terminate")
+
+            process.terminate = terminate
+            return process
+
+        driver._spawn = spawn
+        with self.assertRaises(DriverStateError) as caught:
+            driver.start(session(), None, ENV)
+        self.assertEqual(failed, [1])
+        self.assertTrue(any("cannot terminate" in note for note in caught.exception.__notes__))
+
+    def test_a_reported_session_id_a_later_turn_cannot_pass_is_not_adopted(self):
+        for sid in ("-invalid-session", ".."):
+            with self.subTest(sid=sid):
+                driver, handle = self.started_turn()
+                drafts = driver.parse(handle, step_start(sid))
+                self.assertIsNone(handle.engine_session_id)
+                anomalies = driver._worker(handle)["turn"]["parser"].anomalies
+                unusable = [a for a in anomalies if a.endswith("session_id_unusable")]
+                self.assertEqual(unusable, ["line 1: session_id_unusable"])
+                self.assertIn("input.accepted", [d["type"] for d in drafts])   # the engine did take the message
+                driver.finish_turn(handle, 0)
+                with self.assertRaises(DriverStateError):
+                    driver.send(handle, message(turn="turn-2", delivery="dlv-2"))
+                self.assertIsNone(handle.live_turn)   # the refused turn is ended: the next call is not busy
+                with self.assertRaises(DriverStateError):
+                    driver.interrupt(handle, "turn-2")
+                self.assertEqual(len(self.spy.spawns), 2)
+
+    def test_a_turn_whose_preparation_raises_ends_and_spawns_nothing(self):
+        for raised, expected in ((KeyboardInterrupt("cut short"), KeyboardInterrupt),
+                                 (ValueError("session"), DriverStateError)):
+            with self.subTest(raised=raised):
+                driver = self.make()
+                handle = driver.start(session(), None, ENV)
+                with mock.patch.object(oc, "attach_argv", side_effect=raised):
+                    with self.assertRaises(expected):
+                        driver.send(handle, message())
+                self.assertIsNone(handle.live_turn)
+                self.assertEqual(len(self.spy.spawns), 1)
+                driver.send(handle, message(turn="turn-2", delivery="dlv-2"))   # the first turn that runs
+                self.assertEqual(self.spy.processes[1].sent, ["Run the tests."])
+
+    def test_an_abort_cut_short_still_terminates_the_turn_and_the_same_exception_leaves(self):
+        for raised in (KeyboardInterrupt("stop"), SystemExit(3), GeneratorExit()):
+            with self.subTest(raised=type(raised).__name__):
+                driver = self.make(abort_answer=raised)
+                handle = driver.resume("ses_abc", session(), None, ENV)
+                driver.send(handle, message())
+                with self.assertRaises(type(raised)) as caught:
+                    driver.interrupt(handle, "turn-1")
+                self.assertIs(caught.exception, raised)
+                self.assertEqual((len(self.aborts), self.spy.processes[1].terminated), (1, 1))
+                self.assertEqual(self.spy.processes[0].terminated, 0)
+
+    def test_an_abort_cut_short_whose_termination_also_fails_still_leaves_as_itself(self):
+        driver = self.make(abort_answer=KeyboardInterrupt("stop"))
+        handle = driver.resume("ses_abc", session(), None, ENV)
+        driver.send(handle, message())
+
+        def terminate():
+            raise OSError("synthetic: cannot terminate")
+
+        self.spy.processes[1].terminate = terminate
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            driver.interrupt(handle, "turn-1")
+        self.assertTrue(any("cannot terminate" in note for note in caught.exception.__notes__))
+
+    def test_a_finish_between_the_gate_and_the_interrupt_is_a_state_error(self):
+        driver, handle = self.started_turn()
+        entered, go = threading.Event(), threading.Event()
+        real = driver._interrupt
+        errors = []
+
+        def paused(h, turn_id):
+            entered.set()
+            if not go.wait(30):   # a watchdog only: the test sets it
+                raise AssertionError("the test never let the interrupt go on")
+            return real(h, turn_id)
+
+        driver._interrupt = paused
+
+        def interrupt():
+            try:
+                driver.interrupt(handle, "turn-1")
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=interrupt)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(30))   # past the gate's check that turn-1 is in progress
+            driver.finish_turn(handle, 0)
+        finally:
+            go.set()
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([type(e) for e in errors], [DriverStateError])
+        self.assertEqual((self.aborts, self.spy.processes[1].terminated), ([], 0))
+
+    def test_two_finishers_of_one_turn_give_one_result(self):
+        driver, handle = self.started_turn()
+        parser = driver._worker(handle)["turn"]["parser"]
+        real, entered, go = parser.end, threading.Event(), threading.Event()
+        results, errors = [], []
+
+        def end(exit_code):
+            if not entered.is_set():   # only the first finisher waits here
+                entered.set()
+                if not go.wait(30):   # a watchdog only: the test sets it
+                    raise AssertionError("the test never let the finish go on")
+            return real(exit_code)
+
+        parser.end = end
+
+        def finish():
+            try:
+                results.append(driver.finish_turn(handle, 0))
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=finish)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(30))
+            with self.assertRaises(DriverStateError):
+                driver.finish_turn(handle, 1)
+            self.assertEqual(handle.live_turn, "turn-1")
+        finally:
+            go.set()
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual((errors, [r[0]["payload"]["code"] for r in results]), ([], [None]))
+        self.assertIsNone(handle.live_turn)
+        with self.assertRaises(DriverStateError):
+            driver.finish_turn(handle, 0)
+
+    def test_a_finish_interrupted_part_way_completes_the_same_turn_when_called_again(self):
+        for after_the_outcome in (False, True):
+            with self.subTest(after_the_outcome=after_the_outcome):
+                driver, handle = self.started_turn()
+                parser = driver._worker(handle)["turn"]["parser"]
+                real_end, real_check, cuts = parser.end, oc.check_draft, [KeyboardInterrupt("cut short")]
+
+                def end(exit_code, real_end=real_end, cuts=cuts, after=after_the_outcome):
+                    if cuts and not after:
+                        raise cuts.pop()
+                    return real_end(exit_code)
+
+                def check(draft, real_check=real_check, cuts=cuts, after=after_the_outcome):
+                    if cuts and after:
+                        raise cuts.pop()
+                    return real_check(draft)
+
+                parser.end = end
+                with mock.patch.object(oc, "check_draft", check):
+                    with self.assertRaises(KeyboardInterrupt):
+                        driver.finish_turn(handle, 0)
+                    self.assertEqual(handle.live_turn, "turn-1")
+                    (result,) = driver.finish_turn(handle, 1)   # the outcome reached first stands
+                self.assertEqual(result["payload"]["code"], c.ENGINE_EXITED if not after_the_outcome else None)
+                self.assertIsNone(handle.live_turn)
+
+    def test_a_prompt_write_that_raised_is_never_accepted(self):
+        spy = Spy()
+
+        def spawn(argv, env):
+            process = spy(argv, env)
+            if argv[1] == "run":
+                def send(text):
+                    raise BrokenPipeError("synthetic: the write failed")
+                process.send = send
+            return process
+
+        driver = self.make(spy)
+        driver._spawn = spawn
+        handle = driver.start(session(), None, ENV)
+        with self.assertRaises(BrokenPipeError):
+            driver.send(handle, message())
+        drafts = driver.parse(handle, step_start("ses_x"))
+        self.assertNotIn("input.accepted", [d["type"] for d in drafts])
+        driver.release(handle)
+        self.assertEqual([p.terminated for p in spy.processes], [1, 1])
+
+    def test_only_a_well_formed_step_start_accepts_the_message(self):
+        driver, handle = self.started_turn()
+        self.assertNotIn("input.accepted", [d["type"] for d in driver.parse(handle, step_start("ses_x", "text"))])
+        self.assertIn("input.accepted", [d["type"] for d in driver.parse(handle, step_start("ses_x"))])
+
+    def test_a_session_id_of_dots_is_never_an_argv_value_or_a_path(self):
+        for sid in (".", ".."):
+            with self.subTest(sid=sid):
+                with self.assertRaises(ValueError):
+                    oc.attach_argv(URL, None, session=sid)
+                with self.assertRaises(ValueError):
+                    oc.http_abort(URL, sid)
+                with self.assertRaises(DriverInputError):
+                    self.make().resume(sid, session(), None, ENV)
+        self.assertEqual(oc.attach_argv(URL, None, session="...")[-1], "...")
+
+
+class ProxyTests(unittest.TestCase):
+    def test_the_proxy_environment_is_never_used(self):
+        target_fixture, proxy_fixture = HttpAbortTests("test_nothing_listening_is_no_abort"), \
+            HttpAbortTests("test_nothing_listening_is_no_abort")
+        target, proxy = target_fixture.serve(200), proxy_fixture.serve(200)
+        self.addCleanup(target_fixture.doCleanups)
+        self.addCleanup(proxy_fixture.doCleanups)
+        names = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+        with mock.patch.dict(os.environ, {**{n: proxy for n in names}, "no_proxy": "", "NO_PROXY": ""}):
+            self.assertTrue(oc.http_abort(target, "ses_x"))
+        self.assertEqual(target_fixture.handler.seen, [("POST", "/session/ses_x/abort", b"")])
+        self.assertEqual(proxy_fixture.handler.seen, [])
 
 
 if __name__ == "__main__":

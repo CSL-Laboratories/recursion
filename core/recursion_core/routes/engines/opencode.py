@@ -85,9 +85,10 @@ envelope's text sounds like a quota and ``engine_error`` otherwise; else ``ok`` 
 (then ``ok``). ``detail`` names the typed error only when it is one of the error
 names OpenCode's source defines (``KNOWN_ERRORS``), and says ``error`` otherwise: never the engine's own words.
 
-What is NOT here: interrupt and resume (the ``serve`` worker, a later slice), the permission bridge, and any
-registration (later slices; a registration will state ``default_executable='opencode'``). The guard and the
-child environment are other lanes' files.
+``ServeDriver`` (the third slice) drives ``opencode serve`` with one ``opencode run --attach`` per turn, against
+fakes: interrupt and resume are there. What is NOT here: the permission bridge, the 2.x drive, and any registration
+(later slices; a registration will state ``default_executable='opencode'``). The guard and the child environment
+are other lanes' files.
 """
 
 from __future__ import annotations
@@ -478,9 +479,10 @@ def _loopback_url_ok(url: object) -> bool:
 
 
 def _session_ok(session: object) -> bool:
-    """OpenCode's own session id as an argv value: what the parser keeps as one, and never read as an option."""
+    """OpenCode's own session id as an argv value and as one segment of the abort's path: what the parser keeps as
+    one, never read as an option, and never ``.`` or ``..`` (which a path would read as another place)."""
     return isinstance(session, str) and 1 <= len(session) <= MAX_SESSION_ID and not session.startswith("-") \
-        and not _CONTROL.search(session) and not _SURROGATE.search(session)
+        and session not in (".", "..") and not _CONTROL.search(session) and not _SURROGATE.search(session)
 
 
 def server_url(port: int) -> str:
@@ -498,7 +500,8 @@ def serve_argv(port: int, *, binary: str | None = None) -> list[str]:
 
 
 def listening_url(text: object, port: int) -> str | None:
-    """The server's own readiness line, when it names exactly the loopback address and ``port``; otherwise None."""
+    """The server's own readiness line, when it names exactly the loopback address and ``port``; otherwise None.
+    A ``port`` that is not a port (``server_url``'s rule) raises ``ValueError``."""
     match = _LISTENING.fullmatch(text) if isinstance(text, str) else None
     if match is None or match.group(1) != server_url(port):
         return None
@@ -563,22 +566,36 @@ class ServeDriver(Driver):
 
     ``start`` and ``resume`` start the server and read its output, on ``clock``, for up to ``ready_s`` seconds until
     its readiness line names the loopback address and that port. Otherwise the server is terminated and the call
-    raises ``DriverStateError``; nothing else was started. ``resume`` continues OpenCode's own session id: every
-    turn of that handle passes ``--session <id>``.
+    raises ``DriverStateError``; nothing else was started. The server is the call's own until the handle is
+    registered: whatever stops the call before then (a read that raises, an interruption at the registration) also
+    terminates it, and a termination that fails then is noted on the exception that leaves, not raised in its
+    place. ``resume`` continues OpenCode's own session id: every turn of that handle passes ``--session <id>``.
 
     A turn: the ``user_message`` is spawned as ``run --attach`` with its text on standard input, which is then
-    ended; ``parse`` reads that turn's stdout; the first ``step_start`` accepts the message (``new_turn``);
+    ended; ``parse`` reads that turn's stdout; the first well-formed ``step_start`` of the turn's own session
+    accepts the message (``new_turn``) once its write has returned (a write that raised is never accepted);
     ``finish_turn(handle, exit_code)`` drafts the turn's result once its process has exited, and ends the turn. A
     later turn of a handle whose conversation id is still unknown cannot reach the same conversation: it is refused
-    (``DriverStateError``), that turn is ended, and nothing is spawned. A turn whose process cannot be started
-    ends at once and the spawn's error is raised. A turn that reports another session id than
-    the conversation's is recorded in the turn parser's ``anomalies`` (``conversation_changed``).
+    (``DriverStateError``), that turn is ended, and nothing is spawned. Whatever stops a turn before its process is
+    registered (its preparation, a spawn that raises, an interruption) ends that turn at once and leaves; a process
+    the spawn gave back by then is terminated. A session id the turn reports that a later turn could not pass as
+    ``--session`` (``attach_argv``'s rule) is not adopted: it is recorded in the turn parser's ``anomalies``
+    (``session_id_unusable``). A turn that reports another session id than the conversation's is recorded there too
+    (``conversation_changed``).
 
     ``interrupt`` asks the server to abort the session's running turn (``abort(url, session_id)``, OpenCode's own
     abort); when no id is known yet, or the server does not answer 2xx, or the ask raises, the turn's process is
-    terminated instead. Either way the turn ends through ``finish_turn``. ``close`` ends the handle's input: the
-    server is stopped then, or once the turn in progress is finished. ``release(handle)`` stops both processes at
-    once and forgets the handle; who calls it on Stop and shutdown is lane STOP's and DRIVER-CC's to define.
+    terminated instead. An ask cut short by a ``BaseException`` (a Stop, an exit) also terminates the process, and
+    then the same exception leaves. Either way the turn ends through ``finish_turn``, one finisher per turn.
+    ``close`` ends the handle's input: the server is stopped then, or once the turn in progress is finished.
+
+    ``release(handle)`` is terminal: from its first call the handle refuses every later call of this driver
+    (``DriverStateError``), its turn in progress is ended, and the turn's process and the server are terminated,
+    each on its own. A turn whose process is still being spawned when ``release`` runs is terminated as soon as the
+    spawn gives it back, and nothing is written to it (its ``send`` raises ``DriverStateError``). A termination that
+    raises is raised from ``release`` after the other was tried, and that process stays owed: a later ``release``
+    tries it again, and only it. The driver keeps the handle until every process it started for it was terminated.
+    Who calls ``release`` on Stop and shutdown is lane STOP's and DRIVER-CC's to define.
     """
 
     declaration = Declaration(ENGINE, Flags(**SERVE_FLAGS), input_ack=False)
@@ -595,11 +612,14 @@ class ServeDriver(Driver):
         self._spawn, self._binary, self._port, self._abort = spawn, binary, port, abort
         self._ready_s, self._wall, self._clock = ready_s, wall, clock
         self._workers: dict[int, dict] = {}
-        self._lock = threading.Lock()   # guards the table of workers only; never held while a process is called
+        # Guards the table and every worker's fields. Never held while a process, the spawn or the abort is called.
+        self._lock = threading.Lock()
 
     def _worker(self, handle) -> dict:
         with self._lock:   # a registered worker holds its handle, so no other handle can have its id
             worker = self._workers.get(id(handle))
+            if worker is not None and worker["released"]:
+                worker = None   # kept only until its processes are terminated: closed to every call
         if worker is None:
             raise DriverStateError("this handle has no server (released, or never started)")
         return worker
@@ -614,19 +634,23 @@ class ServeDriver(Driver):
             raise DriverInputError("engine_session_id")
         port = self._port()
         argv = serve_argv(port, binary=self._binary)
+        worker = {"handle": handle, "server": None, "url": None, "env": dict(env), "model": model,
+                  "connection": connection, "turn": None, "turns": 0, "closed": False, "released": False,
+                  "spawning": False, "owed": [], "cleaning": 0}
         server = self._spawn(argv, dict(env))
-        try:
+        try:   # the server is this call's until the handle is registered
             url = self._await_ready(server, port)
-        except BaseException:
-            server.terminate()
+            if url is None:
+                raise DriverStateError("opencode serve gave no readiness line for its loopback address")
+            worker["server"], worker["url"] = server, url
+            with self._lock:
+                self._workers[id(handle)] = worker
+        except BaseException as error:
+            with self._lock:
+                if self._workers.get(id(handle)) is worker:
+                    del self._workers[id(handle)]
+            _terminate_noting(server, error)
             raise
-        if url is None:
-            server.terminate()
-            raise DriverStateError("opencode serve gave no readiness line for its loopback address")
-        with self._lock:
-            self._workers[id(handle)] = {"handle": handle, "server": server, "url": url, "env": dict(env),
-                                         "model": model, "connection": connection, "turn": None, "turns": 0,
-                                         "closed": False}
 
     def _await_ready(self, server, port: int) -> str | None:
         from recursion_core.routes.launch import ReadTimeout   # local, as in OneShot
@@ -647,29 +671,68 @@ class ServeDriver(Driver):
                 return url
 
     def _send(self, handle, item: dict) -> None:
-        worker = self._worker(handle)
         if item["kind"] == "close":
-            worker["closed"] = True
-            if worker["turn"] is None:
+            worker = self._worker(handle)
+            with self._lock:
+                worker["closed"] = True
+                idle = worker["turn"] is None
+            if idle:
                 self.release(handle)
             return
-        # A user_message: the gate reserved it as a new turn (mid_turn_input is false).
-        session = handle.engine_session_id
-        if worker["turns"] and session is None:
-            self.turn_ended(handle, item["turn_id"])
-            raise DriverStateError("no conversation id to continue: the earlier turns reported none")
-        argv = attach_argv(worker["url"], worker["model"], session=session, binary=self._binary)
-        parser = Parser(connection_id=worker["connection"], model=worker["model"], wall=self._wall,
-                        clock=self._clock)
+        # A user_message: the gate reserved it as a new turn (mid_turn_input is false). Until the turn's process is
+        # registered, whatever stops this call ends that turn, so the gate never keeps a turn that has no process.
+        turn_id = item["turn_id"]
+        worker = process = turn = None
+        late = False
         try:
+            worker = self._worker(handle)
+            session = handle.engine_session_id
+            if worker["turns"] and session is None:
+                raise DriverStateError("no conversation id to continue: the earlier turns reported none")
+            try:
+                argv = attach_argv(worker["url"], worker["model"], session=session, binary=self._binary)
+            except ValueError:
+                raise DriverStateError("the conversation id cannot be passed to a turn") from None
+            parser = Parser(connection_id=worker["connection"], model=worker["model"], wall=self._wall,
+                            clock=self._clock)
+            with self._lock:
+                if worker["released"]:
+                    raise DriverStateError("this handle has no server (released, or never started)")
+                worker["spawning"] = True   # a release from now on leaves this call the process it spawns
             process = self._spawn(argv, dict(worker["env"]))
-        except BaseException:
-            self.turn_ended(handle, item["turn_id"])   # nothing started and nothing written: the turn ends
+            with self._lock:
+                worker["spawning"] = False
+                if worker["released"]:   # released while the spawn ran: the process is owed a termination
+                    late = True
+                    worker["owed"].append(process)
+                else:
+                    turn = {"id": turn_id, "delivery": None, "process": process, "parser": parser,
+                            "accepted": False, "finishing": False}
+                    worker["turn"] = turn
+                    worker["turns"] += 1
+        except BaseException as error:
+            if worker is not None:
+                with self._lock:
+                    worker["spawning"] = False
+                    registered = turn is not None and worker["turn"] is turn
+                    if process is not None and not registered and process not in worker["owed"]:
+                        worker["owed"].append(process)
+            if turn is None:
+                self._end_turn(handle, turn_id)
+            if worker is not None:
+                self._clean(worker, noting=error)
             raise
-        worker["turn"] = {"id": item["turn_id"], "delivery": item["delivery_id"], "process": process,
-                          "parser": parser, "accepted": False}
-        worker["turns"] += 1
+        if late:
+            self._end_turn(handle, turn_id)
+            self._clean(worker)
+            raise DriverStateError("the handle was released while this turn's process was starting: the process "
+                                   "was terminated and nothing was written to it")
+        with self._lock:
+            released = worker["released"]
+        if released:   # a release since the registration has already terminated the process
+            raise DriverStateError("the handle was released before the message was written: nothing was written")
         process.send(item["text"])
+        turn["delivery"] = item["delivery_id"]   # only a write that returned can be accepted later (as #414)
         process.close_stdin()
 
     def _parse(self, handle, line: str) -> list[dict]:
@@ -680,12 +743,16 @@ class ServeDriver(Driver):
         parser = turn["parser"]
         drafts = parser.feed(line)
         reported = parser.engine_session_id
-        if reported is not None and handle.engine_session_id is None:
+        if reported is not None and not _session_ok(reported):
+            if not turn.get("unusable"):   # a later turn could not pass it as --session: never adopted
+                turn["unusable"] = True
+                parser._anomaly("session_id_unusable")
+        elif reported is not None and handle.engine_session_id is None:
             handle.set_engine_session_id(reported)
         elif reported is not None and reported != handle.engine_session_id and not turn.get("changed"):
             turn["changed"] = True
             parser._anomaly("conversation_changed")
-        if not turn["accepted"] and parser.started:
+        if not turn["accepted"] and turn["delivery"] is not None and parser.started:
             turn["accepted"] = True
             drafts.append(_draft("input.accepted", {"delivery_id": turn["delivery"], "turn_id": turn["id"],
                                                     "how": "new_turn"}))
@@ -693,24 +760,45 @@ class ServeDriver(Driver):
 
     def finish_turn(self, handle, exit_code: int | None) -> list[dict]:
         """The turn's ``result`` draft once its process has exited; the turn ends with it. An ``exit_code`` that
-        is not an int or None is ``DriverInputError`` with nothing changed."""
+        is not an int or None is ``DriverInputError`` with nothing changed. One finisher per turn: a second caller,
+        while the first runs or after it, gets ``DriverStateError``. Interrupted part-way, ``finish_turn`` can be
+        called again and completes the same turn: the parser's outcome, once reached, is kept (the first exit code
+        given decides it). When the handle's input was closed, the server is then stopped; a termination that fails
+        there stays owed to ``release``."""
         worker = self._worker(handle)
-        turn = worker["turn"]
-        if turn is None:
-            raise DriverStateError("no turn in progress")
-        if exit_code is not None and type(exit_code) is not int:
-            raise DriverInputError("exit_code")
-        drafts = [check_draft(d) for d in turn["parser"].end(exit_code)]
-        worker["turn"] = None
-        if handle.live_turn == turn["id"]:
-            self.turn_ended(handle, turn["id"])
-        if worker["closed"]:
-            self.release(handle)
+        with self._lock:
+            turn = worker["turn"]
+            if turn is None or turn["finishing"]:
+                raise DriverStateError("no turn in progress")
+            if exit_code is not None and type(exit_code) is not int:
+                raise DriverInputError("exit_code")
+            turn["finishing"] = True
+        try:
+            parser = turn["parser"]
+            if parser.outcome is None:
+                parser.end(exit_code)
+            code, detail = parser.outcome
+            drafts = [check_draft(_draft("result", {"code": code, "detail": detail}))]
+            with self._lock:
+                if worker["turn"] is turn:
+                    worker["turn"] = None
+                closed = worker["closed"]
+        except BaseException:
+            with self._lock:
+                turn["finishing"] = False
+            raise
+        self._end_turn(handle, turn["id"])
+        if closed:
+            try:
+                self.release(handle)
+            except Exception:   # the server stays owed: a later release tries it again
+                pass
         return drafts
 
     def _interrupt(self, handle, turn_id: str) -> None:
         worker = self._worker(handle)
-        turn = worker["turn"]
+        with self._lock:
+            turn = worker["turn"]
         if turn is None or turn["id"] != turn_id:
             raise DriverStateError(f"{turn_id} has no process")
         session = handle.engine_session_id
@@ -720,17 +808,80 @@ class ServeDriver(Driver):
                     return
             except Exception:   # an ask that fails is no abort: the process is ended instead
                 pass
+            except BaseException as error:   # an ask cut short: the process is ended, then the same exception
+                _terminate_noting(turn["process"], error)
+                raise
         turn["process"].terminate()
 
     def release(self, handle) -> None:
-        """Stop the turn's process and the server, and forget the handle. A second call does nothing."""
+        """Terminal: the handle refuses every later call, its turn in progress ends, and the turn's process and the
+        server are terminated, each on its own. A termination that raised is tried again by the next call, and
+        only it; a handle this driver does not hold is left as it is."""
         with self._lock:
-            worker = self._workers.pop(id(handle), None)
+            worker = self._workers.get(id(handle))
             if worker is None:
                 return
-        if worker["turn"] is not None:
-            worker["turn"]["process"].terminate()
-        worker["server"].terminate()
+            if not worker["released"]:
+                worker["released"] = worker["closed"] = True
+                turn, worker["turn"] = worker["turn"], None
+                if turn is not None:
+                    worker["owed"].append(turn["process"])
+                worker["owed"].append(worker["server"])
+        live = handle.live_turn
+        if live is not None:
+            self._end_turn(handle, live)
+        self._clean(worker)
+
+    def _end_turn(self, handle, turn_id: str) -> None:
+        """End ``turn_id`` at the gate when it is still the turn in progress (a release may have ended it)."""
+        try:
+            self.turn_ended(handle, turn_id)
+        except DriverStateError:
+            pass
+
+    def _clean(self, worker: dict, *, noting: BaseException | None = None) -> None:
+        """Terminate every process the worker is owed, each on its own: one whose termination raises stays owed and
+        the others are still tried. A released worker leaves the table once nothing is owed and no spawn is under
+        way. The first termination error is raised after all were tried; with ``noting`` (an exception already
+        leaving) each is noted on it instead."""
+        with self._lock:
+            owed, worker["owed"] = worker["owed"], []
+            worker["cleaning"] += 1
+        tried, kept, errors = 0, [], []
+        try:
+            for process in owed:
+                try:
+                    process.terminate()
+                except Exception as error:
+                    kept.append(process)
+                    errors.append(error)
+                tried += 1
+        finally:   # an interruption keeps the process it interrupted, and every one not yet tried, owed
+            with self._lock:
+                worker["owed"][:0] = kept + owed[tried:]
+                worker["cleaning"] -= 1
+                key = id(worker["handle"])
+                if worker["released"] and not worker["owed"] and not worker["spawning"] \
+                        and not worker["cleaning"] and self._workers.get(key) is worker:
+                    del self._workers[key]
+        if not errors:
+            return
+        if noting is not None:
+            for error in errors:
+                noting.add_note(f"terminating a process also failed: {error!r}")
+            return
+        for error in errors[1:]:
+            errors[0].add_note(f"terminating another process also failed: {error!r}")
+        raise errors[0]
+
+
+def _terminate_noting(process, leaving: BaseException) -> None:
+    """Terminate ``process`` while ``leaving`` is on its way out: a termination that fails is noted on ``leaving``,
+    never raised in its place."""
+    try:
+        process.terminate()
+    except Exception as error:
+        leaving.add_note(f"terminating a process also failed: {error!r}")
 
 
 class Parser:

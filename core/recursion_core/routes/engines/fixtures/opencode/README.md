@@ -20,8 +20,9 @@ the test admits for such an entry) and drop the test's no-capture-yet line.
 | `test_opencode_replay.py` | the fake run as a process: the same drafts come back through a pipe |
 | `test_opencode_route.py` | the one-shot drive on today's route path (`RouteService`, the breaker, the profile adapter and its guard), with a fake launcher |
 | `test_opencode_driver.py` | `OpenCodeDriver` on driver.v2's gate (#376), with a spy for the spawn |
+| `test_opencode_serve.py` | `ServeDriver` on driver.v2's gate, with scripted processes, a recorded abort and HTTP servers of the test's own on 127.0.0.1 |
 
-The four test modules live here only until the ownership map gives this lane a path under
+The five test modules live here only until the ownership map gives this lane a path under
 `routes/engines/tests/`. This folder has no `__init__.py` (the parent `fixtures/` is lane DRIVER-CC's), so
 `unittest discover` does not find them; the hosted gate does (its glob `core/**/test_*.py` runs each file by its
 entry point). Run them by name from the repository root:
@@ -31,6 +32,7 @@ PYTHONPATH=core python -m unittest recursion_core.routes.engines.fixtures.openco
 PYTHONPATH=core python -m unittest recursion_core.routes.engines.fixtures.opencode.test_opencode_replay
 PYTHONPATH=core python -m unittest recursion_core.routes.engines.fixtures.opencode.test_opencode_route
 PYTHONPATH=core python -m unittest recursion_core.routes.engines.fixtures.opencode.test_opencode_driver
+PYTHONPATH=core python -m unittest recursion_core.routes.engines.fixtures.opencode.test_opencode_serve
 ```
 
 ## The module's interface (`routes/engines/opencode.py`)
@@ -54,6 +56,6 @@ Nothing registers any of it and no other lane imports it yet; this is what a con
 | `OpenCodeDriver.finish(handle, exit_code) -> list[dict]` | the `result` draft once the process has exited: one terminal transition per handle (finishers serialised; one gets the result, any other `DriverStateError`; interrupted, it completes when called again, the first exit code deciding). `DriverInputError` for an `exit_code` that is not an int or None, with nothing changed. The process is the caller's: `finish` ends no process. |
 | `OpenCodeDriver.release(handle)` | forgets a handle whose `finish` will never come and ends its turn in progress; a handle it does not hold is left as it is. The process is the caller's to end (lane STOP's and DRIVER-CC's to define). |
 | `ENGINE`, `DEFAULT_EXECUTABLE`, `CHILD_ENV`, `FLAGS`, `KNOWN_ERRORS` | constants; `FLAGS` is read-only |
-| `ServeDriver(spawn, *, binary=None, port=pick_port, abort=http_abort, ready_s=30.0, wall=, clock=)` | the serve drive on driver.v2's gate (#376), built against fakes and registered nowhere: one `opencode serve` per handle on 127.0.0.1, one `opencode run --attach` per turn, `--session <id>` for every turn after OpenCode reported its conversation id and for every turn of a resumed handle. `finish_turn(handle, exit_code)` drafts a turn's result and ends the turn; `interrupt` asks the server to abort, else terminates the turn's process; `release(handle)` stops both processes. `start` raises `DriverStateError` when the server gives no readiness line for its port in `ready_s` seconds. |
-| `serve_argv(port, *, binary=None)`, `attach_argv(url, model, *, session=None, binary=None)`, `listening_url(text, port)`, `server_url(port)`, `pick_port()`, `http_abort(url, session, *, timeout=5.0)` | the serve drive's parts. Only `http://127.0.0.1:<port>` is served or attached (`ValueError` otherwise); a session id that is empty, starts with `-`, or holds a control character is refused (`ValueError`). |
+| `ServeDriver(spawn, *, binary=None, port=pick_port, abort=http_abort, ready_s=30.0, wall=, clock=)` | the serve drive on driver.v2's gate (#376), built against fakes and registered nowhere: one `opencode serve` per handle on 127.0.0.1, one `opencode run --attach` per turn, `--session <id>` for every turn after OpenCode reported its conversation id and for every turn of a resumed handle. `finish_turn(handle, exit_code)` drafts a turn's result and ends the turn; `interrupt` asks the server to abort, else terminates the turn's process (also when the ask is cut short by a `BaseException`, which then leaves as itself); `release(handle)` is terminal: every later call is `DriverStateError`, the turn in progress ends, the turn's process and the server are terminated each on its own, a process still being spawned is terminated unwritten when the spawn returns, and a termination that raised is tried again by the next `release`. A reported session id that a later turn could not pass is not adopted (`session_id_unusable` in the turn parser's `anomalies`). `start` raises `DriverStateError` when the server gives no readiness line for its port in `ready_s` seconds. |
+| `serve_argv(port, *, binary=None)`, `attach_argv(url, model, *, session=None, binary=None)`, `listening_url(text, port)`, `server_url(port)`, `pick_port()`, `http_abort(url, session, *, timeout=5.0)` | the serve drive's parts. Only `http://127.0.0.1:<port>` is served or attached (`ValueError` otherwise); a session id that is empty, starts with `-`, is `.` or `..`, or holds a control character is refused (`ValueError`). |
 | `SERVE_FLAGS`, `serve_declaration()` | the serve drive's flags (multi_turn, interrupt, resume, typed_limits, usage) and its driver.v2 root record |

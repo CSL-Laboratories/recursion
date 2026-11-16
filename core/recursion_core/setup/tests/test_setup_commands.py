@@ -257,7 +257,8 @@ class CommandTests(unittest.TestCase):
             os.mkdir(folder, 0o700)
         server = socket.socket(socket.AF_UNIX)
         self.addCleanup(server.close)
-        server.bind(self.unit)  # the non-blocking open takes a FIFO, but a socket is ENXIO
+        with contextlib.chdir(folder):  # by its short name: an absolute temporary path can pass AF_UNIX's limit
+            server.bind(UNIT_NAME)  # the non-blocking open takes a FIFO, but a socket is ENXIO
         for action in ("install", "upgrade", "uninstall"):
             with self.subTest(action=action):
                 code, answer = self.run_action(action)

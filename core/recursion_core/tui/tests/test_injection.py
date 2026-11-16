@@ -95,6 +95,25 @@ class SanitizerTest(unittest.TestCase):
                 self.assertEqual(san.feed("a") + san.feed(ch) + san.feed("b") + san.flush(), out)
 
 
+    def test_unicode_line_separators_and_truncated_utf8_never_break_jsonl_or_drop_bytes(self) -> None:
+        from recursion_core.tui.events import from_jsonl, to_jsonl
+
+        for ch in ("\u2028", "\u2029", "\u1160", "\uffa0"):
+            out = s.sanitize("a" + ch + "b")
+            self.assertNotIn(ch, out)
+            self.assertIn(f"U+{ord(ch):04X}", out)
+        self.assertEqual(s.sanitize(b"ok\xe2\x82"), "ok\ufffd")
+
+        driver = FakeDriver()
+        rid = driver.start_run()
+        app = TuiApp(driver.api, clock=Clock(), environ={"NO_COLOR": "1"})
+        app.open()
+        app.on_event({"run_id": rid, "text": "head\u2028injected\u2029tail\n"})
+        round_tripped = from_jsonl(to_jsonl(app.log))
+        self.assertEqual(len(round_tripped), len(app.log))
+        self.assertNotIn("\u2028", round_tripped[-1].text)
+
+
 class InjectionInAppTest(unittest.TestCase):
     def setUp(self) -> None:
         self.driver = FakeDriver()

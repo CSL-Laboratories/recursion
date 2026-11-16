@@ -273,6 +273,44 @@ class WriterTest(unittest.TestCase):
         from recursion_core.control_transport.framing import MAX_FRAME_BYTES
         self.assertGreater(framing.MAX_LINE_BYTES, MAX_FRAME_BYTES)
 
+    def test_a_negative_count_is_a_failed_stream(self) -> None:
+        # #395, DeepSeek r8 F1: a stream that reports an error as -1 took nothing; the writer must not loop on it.
+        class Negative(io.RawIOBase):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def writable(self):
+                return True
+
+            def write(self, data):
+                self.calls += 1
+                if self.calls > 100:  # bounds the old loop, so a red run fails instead of hanging
+                    raise RuntimeError("looped")
+                return -1
+
+        stream, seen = Negative(), []
+        writer = FrameWriter(stream, on_broken=lambda: seen.append(True))
+        self.assertFalse(writer.write({"jsonrpc": "2.0", "id": 1, "result": {}}))
+        self.assertEqual((1, True, [True]), (stream.calls, writer.broken, seen))
+
+    def test_each_message_is_flushed_once(self) -> None:
+        # #395, DeepSeek r8 F6: "flushed once" was held by no test.
+        class Counting(io.BytesIO):
+            def __init__(self):
+                super().__init__()
+                self.flushes = 0
+
+            def flush(self):
+                self.flushes += 1
+                super().flush()
+
+        stream = Counting()
+        writer = FrameWriter(stream)
+        for n in range(3):
+            self.assertTrue(writer.write({"jsonrpc": "2.0", "id": n, "result": {}}))
+        self.assertEqual(3, stream.flushes)
+
 
 class JsonRpcTest(unittest.TestCase):
     def test_valid_ids(self) -> None:

@@ -23,11 +23,11 @@ one value are both named, once per place.
 
 ITEMS NO RECORD NAMES. On a keychain it also counts the items Recursion saved (on the Secret Service those that carry
 ``application recursion``, on the macOS Keychain the generic passwords whose service is ``recursion.<store id>.<save
-id>.<provider>``) that neither a record of this store's index names by its save nor an unfinished operation by its id
-(``KeyStore.unnamed_items``): another store's, or this store's from before its index was lost, emptied or put back.
-Their values are not looked for; ``remove <id>`` deletes every item of this store under an id a record names, and the
-keychain's own tool finds the rest (``secret-tool`` by that attribute, Keychain Access by the name ``Recursion API key
-<id>``).
+id>.<provider>``, or ``recursion.<save id>``, the service #422's first head wrote) that neither a record of this store's
+index names by its save nor an unfinished operation by its id (``KeyStore.unnamed_items``): another store's, or this
+store's from before its index was lost, emptied or put back. Their values are not looked for; ``remove <id>`` deletes
+every item of this store under an id a record names, and the keychain's own tool finds the rest (``secret-tool`` by that
+attribute, Keychain Access by the name ``Recursion API key <id>``).
 
 COMPLETE OR NOT. The audit is incomplete (``key audit`` exits 4 when it found nothing) when a saved value could not be
 read (gone, or its keychain does not answer now), a file could not be read, an operation is unfinished, the journal was

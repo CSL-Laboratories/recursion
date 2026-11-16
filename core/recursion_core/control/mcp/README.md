@@ -5,12 +5,14 @@ The server speaks MCP over its stdin and stdout and forwards every tool call to 
 control socket, the same socket and client (`control/client.py`) the control CLI uses. It has no Stop
 path of its own: the stop tool forwards to `run.stop` and answers what it answered.
 
-This is the lane's first slice. What it covers and what it does not:
+This covers the lane's first two slices: the stdio server (#395), and the tool table projected from the
+published method table with the Task derivation (#416). What it covers and what it does not:
 
-| | In this slice | Not yet |
+| | Built | Not yet |
 |---|---|---|
 | Protocol | revision `2025-06-18` (the legacy era) | `2026-07-28` with `server/discover`, the `_meta` envelope and Tasks |
-| Tools | the four run tools of `control/mcp_tools.py`, unchanged | the tool table projected from the method table; session and other verbs |
+| Tools | the published method table's rows marked `mcp.exposed` that the daemon implements, projected under their published names, marks and parameter schemas (`projection.py`); the four run tools of `control/mcp_tools.py`, unchanged, for a daemon from before the method table or where the published files are missing | a tool for a row the table does not mark exposed (no `approval.open` or `approval.answer`) |
+| Tasks | the Task of a run and of a turn (`task.py`, `mcp.task.v1`), checked against every `task.derivation` vector | Tasks on the wire (`tasks/get`, `tasks/cancel`), and where a Task's log and pending approvals come from at run time |
 | Caller | the daemon's same-user rule, as for the CLI | caller tokens, scopes, a failed-auth limit (lane CONTROL's interface; how a client gets and loses its token is not decided) |
 | Entry | this module entry | a registered `recursion mcp` command |
 | Checked against | scripted clients in the tests and the fixtures below | a real MCP client product, or a conformance tool: none was run |
@@ -26,10 +28,31 @@ run unit is not admitted). It proves the socket is sound and answered, not which
 step fails it writes one JSON line to stderr, `{"code": "socket_check_failed", "reason": ..., "detail": ...}`,
 nothing to stdout, and exits 1. The folder and socket steps are repeated before every forwarded call.
 
+Then, still before it reads stdin, it chooses its tools (`projection.choose_tools`). It reads the published
+files (`schemas/control/v1/`; a source tree has them, an installed package not until lane INSTALL ships them
+as package data) and asks the daemon `methods.list`:
+
+- `method_unknown` (a daemon from before the method table): the legacy four;
+- `ok` in the published shape (`code`, `table_version` and `methods` exactly; each entry `name`,
+  `implemented` and `beta`, the two booleans) with the published `table_version`: the projected tools,
+  each parameter schema made self-contained;
+- `ok` in that shape while the published files are missing: the legacy four, with the reason logged;
+- anything else refuses: another answer, a `methods.list` call that raises, a listing of another shape,
+  another `table_version`, or published files that cannot be read or are not the published shape (a file
+  nested deeper than Python's stack included). The process writes one JSON line to stderr,
+  `{"code": "tools_unavailable", "reason": ..., "detail": ...}`, nothing to stdout, and exits 1. An exit or
+  an interrupt while choosing is not a refusal.
+
+`isError` follows CONTROL's mapping (`control.api.SUCCESS_CODES`): today a stop's or an interrupt's
+`pending`, and a stop's `ended`, read as errors though they are truthful answers; the structured answer
+carries the code, and CONTROL is to change the mapping. The published `run.start` leaves `engine` optional;
+a daemon without a routing start registrant answers a start without one `request_invalid`, and nothing runs.
+
 Exit statuses: 0 when the client ends stdin (once the answers owed have been read) or stdout fails; 1 when
-the socket check fails; 2 for an argument; 3 for an unexpected error while serving (one JSON line,
-`internal_error`); 130 when interrupted. An answer is never dropped, so a client that ends stdin and stops
-reading stdout without shutting it keeps the process until it reads again or stdout fails.
+the socket check fails or no tools can be chosen (`tools_unavailable`); 2 for an argument; 3 for an
+unexpected error while serving (one JSON line, `internal_error`); 130 when interrupted. An answer is never
+dropped, so a client that ends stdin and stops reading stdout without shutting it keeps the process until it
+reads again or stdout fails.
 Ending stdin never stops a run: admitted calls finish and are answered, and the runs go on. The process
 reads fd 0 and writes fd 1 and fd 2 directly (`stdio.py`): nothing is buffered in `sys.stdout` or
 `sys.stderr`, so a client that stops reading, or closes stderr, ends the process with its status, not

@@ -25,21 +25,31 @@ of three or more backticks or tildes, indented by at most three spaces, opens a 
 backtick fence's info string holds no backtick), and a line of the same character, at least as long
 and with nothing after it, closes it, or else the end of the file does. A line that starts, after at
 most three spaces, with `<!--` opens an HTML comment block, which ends on the first line holding
-`-->`; a `<!--` left open on that line hides the rest of the file, as a browser reads the raw HTML.
-In a paragraph (its lines run to a blank line, a fence, a comment block or a heading) and in a
-heading, a `<!--` hides the text up to the next `-->` when the paragraph holds one, and is text when
-it does not, so a comment marker there never reaches past its paragraph. Code spans and backslash
-escapes are not read: a `<!--` in one, with a `-->` after it in its paragraph, hides the text
-between, so the check may refuse such a file but never takes a hidden policy for a shown one. Block
-quotes, lists and other raw HTML are read as paragraph lines.
+`-->`; so does one that starts with block-quote or list-item markers and then `<!--`, whose comment
+ends on the first line inside that quote or item holding `-->`. A line that starts with `<script` or
+`<style` opens raw HTML no reader sees, which ends on the line holding its end tag; one that starts
+with another tag (one of CommonMark's block tags, or any tag where no paragraph is open) opens raw
+HTML that runs to the next blank line, its comments read as in a comment block. A comment or a
+script left open (at the end of its line, of its quote or item, of its raw HTML, or of the file)
+hides the rest of the file, as a browser reads the raw HTML. A paragraph runs to a blank line, a
+block that starts as above, a heading, a rule, a list item or a deeper block quote (a line without
+the quote's marker goes on in it). In a paragraph and in a heading, read left to right, a backslash
+escape is its character, a run of backticks opens a code span that the next run of the same length
+ends, and a `<!--` outside code spans hides the text up to the next `-->`, or is text where the
+paragraph holds none. A fence, a comment or raw HTML that a quote or item holds further down is read
+as plain lines.
 An e-mail address is read from each `@` outwards, as RFC 5322 writes one: its local part is the atoms
 of RFC 5322's atext and the dots that run up to the `@`, or a quoted string ending there with any
 atoms and dots before it; its domain the atoms and dots that run on from the `@`, less a final dot,
-or a bracketed literal. It is compared whole with CONTACT. In the text a reader sees (comments and
-code blocks taken out, Markdown's backslash escapes and HTML's character references read), CONTACT
-may stand in Markdown code or emphasis (`x`, *x*, **x**, _x_, ~~x~~); in a comment or a code block
-nothing is Markdown, so there it must be CONTACT exactly. The sentence that names CONTACT is held
-word for word, so there CONTACT stands bare.
+or a bracketed literal and any Markdown marks right after it; an `@` inside a quoted local part or a
+bracketed domain is that address's own. It is compared whole with CONTACT. The text a reader sees
+(comments taken out) is read as written, and, outside its code spans and the addresses so found,
+again with Markdown's backslash escapes and character references (each with its semicolon) read.
+There CONTACT may stand wrapped as Markdown wraps text: in a code span (backtick runs of one length,
+CONTACT exactly inside), in emphasis (runs of * or _ of one length on each side) or struck through
+(one or two ~ on each side), one inside another; three or more ~ are text. In a comment or a code
+block nothing is Markdown, so there it must be CONTACT exactly. The sentence that names CONTACT is
+held word for word, so there CONTACT stands bare.
 A file larger than SIZE_LIMIT bytes is named without being read, a missing file as missing, and one
 that cannot be read as such; the work the checks do grows in step with a file's size.
 The tests check the committed files, then break, in a scratch copy of the four files, each rule
@@ -55,6 +65,7 @@ offline; git is run only when the tree is a git checkout.
 from __future__ import annotations
 
 import ast
+import bisect
 import hashlib
 import html
 import json
@@ -125,12 +136,23 @@ PUBLIC_ISSUE = "Please do not report a suspected vulnerability in a public issue
 ATOM = r"[^\s\x00-\x1f\x7f()<>\[\]:;@\\,.\"]+"
 RUN = re.compile(rf"(?:{ATOM}|\.)+")  # atoms and dots, as far as they run: a local part or a domain
 LITERAL = re.compile(r"\[[^\[\]\\\r\n]*\]")  # a bracketed domain
-ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")  # a Markdown backslash escape, which a reader sees as its character
-MARKUP = "`*_~"  # Markdown's code and emphasis marks, which may stand around CONTACT in the text a reader sees
+# What a reader sees as one character: a Markdown backslash escape, or a character reference with its semicolon.
+DECODE = re.compile(r"\\([!-/:-@\[-`{-~])|&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});")
+MARKUP = "`*_~"  # Markdown's code, emphasis and strikethrough marks, which may wrap CONTACT where a reader sees it
 FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")  # a line that may open or close a fenced code block
 COMMENT_BLOCK = re.compile(r" {0,3}<!--")  # a line that opens an HTML comment block
+HIDDEN_BLOCK = re.compile(r" {0,3}<(script|style)(?=[\s>]|$)", re.I)  # raw HTML whose text no reader sees
+HTML_BLOCK = re.compile(r" {0,3}</?([A-Za-z][A-Za-z0-9-]*)(?=[\s/>]|$)")  # a line that may open other raw HTML
+BLOCK_TAGS = frozenset(  # CommonMark's HTML block tags: one ends a paragraph; another tag opens raw HTML only after one
+    "address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt "
+    "fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link "
+    "main menu menuitem nav noframes ol optgroup option p param search section summary table tbody td tfoot th thead "
+    "title tr track ul".split())
 HEADING = re.compile(r" {0,3}#{1,6}(?:[ \t]|$)")  # a heading: a block of one line, which ends a paragraph
-
+QUOTE = re.compile(r" {0,3}>[ \t]?")  # a block quote's marker
+ITEM = re.compile(r" {0,3}(?:([-+*])|([0-9]{1,9})[.)])( {1,4}|\t)(?=\S)")  # a list item's marker, before its text
+BREAK = re.compile(r" {0,3}(?:(?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,}|=+[ \t]*)$")  # a rule or an underline
+INLINE = re.compile(r"\\[!-/:-@\[-`{-~]|`+|<!--")  # in a paragraph: an escape, a code span's run, a comment
 
 def _read(root: Path, rel: str, found: list[str]) -> bytes | None:
     path = root / rel
@@ -153,22 +175,46 @@ def _text(data: bytes) -> str:
     return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("utf-8", errors="replace")
 
 
-def _comments(text: str, block: bool) -> tuple[list[tuple[str, str]], bool]:
-    """`text` cut at its HTML comments, `<!--` to the next `-->`, into (kind, piece), and whether a
-    `<!--` is left open at its end. The kind is "shown", or for a comment "hidden" in a comment block
-    and "gone" in a paragraph or a heading. In a comment block an open `<!--` hides the rest of `text`;
-    in a paragraph it is text."""
+def _comments(text: str) -> tuple[list[tuple[str, str]], bool]:
+    """A comment block's `text` cut at its HTML comments, `<!--` to the next `-->`, into (kind, piece),
+    and whether a `<!--` is left open at its end, which hides the rest of `text`."""
     pieces: list[tuple[str, str]] = []
     done = 0
     while (start := text.find("<!--", done)) >= 0:
         end = text.find("-->", start + 2)  # so <!--> and <!---> are comments too
         if end < 0:
-            if not block:
-                break
             return pieces + [("shown", text[done:start]), ("hidden", text[start:])], True
-        pieces += [("shown", text[done:start]), ("hidden" if block else "gone", text[start:end + 3])]
+        pieces += [("shown", text[done:start]), ("hidden", text[start:end + 3])]
         done = end + 3
     return pieces + [("shown", text[done:])], False
+
+
+def _inline(text: str) -> list[tuple[str, str]]:
+    """A paragraph's or a heading's `text` cut into (kind, piece), read left to right as CommonMark reads
+    it: a backslash escape is its character; a run of backticks opens a code span ("code") that the next
+    run of the same length ends, or else is text; a `<!--` opens a comment ("gone") that the next `-->`
+    ends, or else is text."""
+    runs: dict[int, list[int]] = {}
+    for run in re.finditer("`+", text):
+        runs.setdefault(len(run.group()), []).append(run.start())
+    last_end = text.rfind("-->")
+    pieces: list[tuple[str, str]] = []
+    done = at = 0
+    while mark := INLINE.search(text, at):
+        token, at = mark.group(), mark.end()
+        if token == "<!--":
+            if mark.start() + 2 <= last_end:
+                end = text.find("-->", mark.start() + 2) + 3
+                pieces += [("shown", text[done:mark.start()]), ("gone", text[mark.start():end])]
+                done = at = end
+        elif token[0] == "`":
+            starts = runs[len(token)]
+            later = bisect.bisect_left(starts, at)
+            if later < len(starts):
+                end = starts[later] + len(token)
+                pieces += [("shown", text[done:mark.start()]), ("code", text[mark.start():end])]
+                done = at = end
+    return pieces + [("shown", text[done:])]
 
 
 def _closes(line: str, fence: str) -> bool:
@@ -178,41 +224,100 @@ def _closes(line: str, fence: str) -> bool:
                 and not close.group(2).strip(" \t"))
 
 
+def _containers(line: str) -> tuple[list[int], int]:
+    """The block quotes (0) and list items (the width of their marker) that `line` starts with, and
+    where its text inside them starts."""
+    found: list[int] = []
+    at = 0
+    while (box := QUOTE.match(line, at) or ITEM.match(line, at)) and box.end() > at:
+        found.append(0 if box.re is QUOTE else box.end() - at)
+        at = box.end()
+    return found, at
+
+
+def _inside(line: str, boxes: list[int]) -> bool:
+    """Whether `line` goes on inside the block quotes and list items `boxes`: a quote's marker for each
+    quote, and, on a line that is not blank, a list item's width of spaces for each item."""
+    at = 0
+    for width in boxes:
+        if width == 0:
+            if not (quote := QUOTE.match(line, at)):
+                return False
+            at = quote.end()
+        elif line[at:].strip(" \t"):
+            if not line.startswith(" " * width, at):
+                return False
+            at += width
+    return True
+
+
 def _pieces(text: str) -> list[tuple[str, str]]:
     """`text` cut, in order, into (kind, piece): "shown", what a reader of the rendered page sees as
-    text; "hidden", a fenced code block or a comment block, whose place on its lines a reader sees
-    empty; "gone", a comment in a paragraph or a heading, which the text around it closes over. Read
-    block first, as the docstring says."""
+    text; "code", a code span, which a reader sees as written; "hidden", a fenced code block, a comment
+    or a script, whose place on its lines a reader sees empty; "gone", a comment in a paragraph or a
+    heading, which the text around it closes over. Read block first, as the docstring says."""
     rows = [row for row in re.split(r"(?<=\n)", text) if row]
     pieces: list[tuple[str, str]] = []
     paragraph: list[str] = []
+    depth = 0  # the block quotes the paragraph starts in
+    listed = False  # whether the paragraph starts as a list item
 
     def end_paragraph() -> None:
-        pieces.extend(_comments("".join(paragraph), block=False)[0])
+        pieces.extend(_inline("".join(paragraph)))
         paragraph.clear()
 
     at = 0
     while at < len(rows):
         line = rows[at].rstrip("\n")
         opening = FENCE.fullmatch(line)
+        quotes = after = 0
+        while quote := QUOTE.match(line, after):
+            quotes, after = quotes + 1, quote.end()
+        boxes, inner = _containers(line)
         if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
             end_paragraph()
             last = next((i for i in range(at + 1, len(rows)) if _closes(rows[i].rstrip("\n"), opening.group(1))),
                         len(rows) - 1)
             pieces.append(("hidden", "".join(rows[at:last + 1])))
-        elif COMMENT_BLOCK.match(line):
+        elif COMMENT_BLOCK.match(line) or (boxes and COMMENT_BLOCK.match(line, inner)):
             end_paragraph()
-            last = next((i for i in range(at, len(rows)) if "-->" in rows[i]), len(rows) - 1)
-            found, left_open = _comments("".join(rows[at:last + 1]), block=True)
-            pieces += found
-            if left_open:  # a browser reads the rest of the file into that comment
+            start = line.index("<!--")
+            last, closed = at, "-->" in line[start + 2:]
+            while not closed and last + 1 < len(rows) and (not boxes or _inside(rows[last + 1].rstrip("\n"), boxes)):
+                last += 1
+                closed = "-->" in rows[last]
+            found, left_open = _comments("".join(rows[at:last + 1])[start:])
+            pieces += [("shown", line[:start])] + found
+            if left_open:  # open at the end of its line, of its quote or item, or of the file: a browser
+                # reads the rest of the file into that comment
                 return pieces + [("hidden", "".join(rows[last + 1:]))]
-        elif not line.strip(" \t") or HEADING.match(line):
+        elif hidden := HIDDEN_BLOCK.match(line):
             end_paragraph()
-            pieces += _comments(rows[at], block=False)[0]
+            close = re.compile(rf"</{hidden.group(1)}\s*>", re.I)
+            last = next((i for i in range(at, len(rows)) if close.search(rows[i])), None)
+            if last is None:  # a browser reads the rest of the file as script or style
+                return pieces + [("hidden", "".join(rows[at:]))]
+            block = "".join(rows[at:last + 1])
+            cut = len(block) - len(rows[last]) + close.search(rows[last]).end()
+            pieces += [("hidden", block[:cut]), ("shown", block[cut:])]
+        elif (raw := HTML_BLOCK.match(line)) and (raw.group(1).lower() in BLOCK_TAGS or not paragraph):
+            end_paragraph()  # raw HTML to the next blank line: a browser reads its comments, open ones too
+            last = next((i for i in range(at + 1, len(rows)) if not rows[i].strip(" \t\n")), len(rows)) - 1
+            found, left_open = _comments("".join(rows[at:last + 1]))
+            pieces += found
+            if left_open:
+                return pieces + [("hidden", "".join(rows[last + 1:]))]
+        elif not line[inner:].strip(" \t") or HEADING.match(line, after) or BREAK.match(line, after):
+            end_paragraph()  # a blank line, a heading, a rule or an underline
+            pieces += _inline(rows[at])
             last = at
         else:
-            paragraph.append(rows[at])
+            item = ITEM.match(line, after)
+            if paragraph and (quotes > depth or item and (item.group(1) or int(item.group(2)) == 1 or listed)):
+                end_paragraph()  # a deeper block quote, or a list item, starts a paragraph of its own
+            if not paragraph:
+                listed, depth = bool(item), quotes
+            paragraph.append(rows[at])  # a line with fewer quote markers goes on, lazily, in the same paragraph
             last = at
         at = last + 1
     end_paragraph()
@@ -221,9 +326,9 @@ def _pieces(text: str) -> list[tuple[str, str]]:
 
 def _visible(text: str) -> str:
     """What a reader of the rendered page sees as text: `text` without its comments in paragraphs and
-    headings, and with each character of its fenced code blocks and comment blocks, line endings
+    headings, and with each character of its fenced code blocks, comments and scripts, line endings
     aside, blanked to a space."""
-    return "".join(piece if kind == "shown" else "" if kind == "gone" else re.sub(r"[^\n]", " ", piece)
+    return "".join(piece if kind in ("shown", "code") else "" if kind == "gone" else re.sub(r"[^\n]", " ", piece)
                    for kind, piece in _pieces(text))
 
 
@@ -247,27 +352,50 @@ def _quoted_start(text: str, close: int) -> int | None:
     return None
 
 
-def _addresses(text: str) -> list[str]:
-    """Every e-mail address in `text`, as the docstring reads one, found outwards from each `@`: so in
-    time linear in `text`'s length, as a pattern tried at every offset of it is not."""
+def _addresses(text: str) -> list[tuple[int, int]]:
+    """Where `text` holds an e-mail address, as the docstring reads one, as (start, end): found outwards
+    from each `@`, so in time linear in `text`'s length, as a pattern tried at every offset is not. An
+    `@` inside a quoted local part or a bracketed domain is that address's own."""
     runs = {match.end(): match.start() for match in RUN.finditer(text)}
-    found: list[str] = []
+    found: list[tuple[int, int, int]] = []  # (start, @, end)
     for at in (match.start() for match in re.finditer("@", text)):
+        if found and at < found[-1][2]:
+            continue  # inside the domain of the address before it
         domain = LITERAL.match(text, at + 1) or RUN.match(text, at + 1)
         end = domain.start() + len(domain.group().rstrip(".")) if domain else at + 1
+        while domain and domain.re is LITERAL and end < len(text) and text[end] in MARKUP:
+            end += 1  # Markdown's marks after a bracketed domain, as a run takes them after a dotted one
         start = runs.get(at) if at in runs else _quoted_start(text, at - 1) if text[at - 1:at] == '"' else None
         if start is None or end == at + 1:
             continue
         start = runs.get(start, start)  # atoms or dots before a quoted string: one longer local part
-        found.append(text[start:end])
-    return found
+        while found and found[-1][1] >= start:
+            found.pop()  # an @ inside this address's quoted local part
+        found.append((start, at, end))
+    return [(start, end) for start, _, end in found]
 
 
 def _is_contact(address: str) -> bool:
-    """Whether `address` is CONTACT, set or not in Markdown code or emphasis: `x`, *x*, **x**, _x_, ~~x~~."""
-    side = (len(address) - len(CONTACT)) // 2  # the marks on each side, where CONTACT stands between them
-    return address[side:len(address) - side] == CONTACT and all(
-        address[i] == address[-1 - i] and address[i] in MARKUP for i in range(side))
+    """Whether `address` is CONTACT, bare or wrapped as Markdown wraps text: in a code span (backtick runs
+    of one length, CONTACT exactly inside), in emphasis (runs of * or _ of one length on each side), or
+    struck through (one or two ~ on each side), one inside another."""
+    start, end = 0, len(address)
+    while not (end - start == len(CONTACT) and address.startswith(CONTACT, start)):
+        mark = address[start:start + 1]
+        if not mark or mark not in MARKUP:
+            return False
+        inner = start
+        while inner < end and address[inner] == mark:
+            inner += 1
+        outer = end
+        while outer > inner and address[outer - 1] == mark:
+            outer -= 1
+        if end - outer != inner - start or (mark == "~" and inner - start > 2):
+            return False  # unequal runs, or three or more tildes, are text
+        if mark == "`":
+            return outer - inner == len(CONTACT) and address.startswith(CONTACT, inner)
+        start, end = inner, outer
+    return True
 
 
 def _committed(root: Path, rel: str, found: list[str]) -> list[tuple[str, bytes]]:
@@ -360,11 +488,26 @@ def security_problems(root: Path) -> list[str]:
             found.append(f"SECURITY.md's section {part.strip()!r} is empty")
     found += [f"SECURITY.md does not say {sentence!r}"
               for sentence in (f"Report it privately to {CONTACT}.", PUBLIC_ISSUE) if sentence not in text]
-    # As a reader sees it: the comments in paragraphs taken out, escapes and character references read.
-    seen = html.unescape(ESCAPE.sub(r"\1", "".join(piece for kind, piece in pieces if kind == "shown")))
-    unseen = [piece for kind, piece in pieces if kind != "shown"]
-    if (not all(_is_contact(address) for address in _addresses(seen))
-            or any(address != CONTACT for piece in unseen for address in _addresses(piece))):
+    # As a reader sees it, the comments in paragraphs taken out: as written first, then, outside its code
+    # spans and the addresses found, with escapes and character references read.
+    seen = [(kind, piece) for kind, piece in pieces if kind in ("shown", "code")]
+    written = "".join(piece for _, piece in seen)
+    spans = _addresses(written)
+    masked, done = [], 0
+    for start, end in spans:
+        masked += [written[done:start], " " * (end - start)]
+        done = end
+    masked = "".join(masked) + written[done:]
+    read, done = [], 0
+    for kind, piece in seen:
+        segment, done = masked[done:done + len(piece)], done + len(piece)
+        read.append(segment if kind == "code" else DECODE.sub(
+            lambda one: one.group(1) if one.group(1) is not None else html.unescape(one.group()), segment))
+    read = "".join(read)
+    unseen = [piece for kind, piece in pieces if kind not in ("shown", "code")]
+    if (not all(_is_contact(written[start:end]) for start, end in spans)
+            or not all(_is_contact(read[start:end]) for start, end in _addresses(read))
+            or any(piece[start:end] != CONTACT for piece in unseen for start, end in _addresses(piece))):
         found.append("SECURITY.md holds an e-mail address that is not its contact (CONTACT)")
     return found
 
@@ -611,6 +754,8 @@ class BrokenRuleTests(unittest.TestCase):
         return stand_in
 
     def test_a_git_that_does_not_answer_is_named(self) -> None:
+        if os.environ.get("LICENCE_CHECKS_CHILD"):
+            self.skipTest("the parent runs it: it holds for any contact or holder")
         stand_in = self.stand_in_git("exec /bin/sleep 5")
         with mock.patch.dict(os.environ, {"PATH": str(stand_in)}), mock.patch.dict(globals(), {"GIT_TIMEOUT": 1}):
             self.assertNamed(r"^git did not answer within 1 s, so LICENSE in the index was not read")
@@ -899,9 +1044,12 @@ class BrokenRuleTests(unittest.TestCase):
         """F1: an address pattern tried at every offset of SIZE_LIMIT bytes of dotted atoms ran for
         minutes. Each shape here grows the work of a scan of that kind with the square of its size;
         the checks run as a child that must answer within 60 s."""
+        if os.environ.get("LICENCE_CHECKS_CHILD"):
+            self.skipTest("the parent runs it: it holds for any contact or holder")
         text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
         shapes = ("a." * 150000, '\\"@x' * 20000, "*" * 40000 + "x@example.invalid" + "*" * 40000,
-                  "@[" * 20000, "x " + "<!--" * 20000, "a@" * 20000, '"' * 40000 + "@x", "<!--" * 20000)
+                  "@[" * 20000, "x " + "<!--" * 20000, "a@" * 20000, '"' * 40000 + "@x", "`x``y" * 15000,
+                  "\\`" * 20000, "- a <!--\n" * 3000, "> <!--\n" * 2000, "<!--" * 20000)
         body = text + "\n" + "\n\n".join(shapes) + "\n"
         self.assertLess(len(body.encode("utf-8")), SIZE_LIMIT)
         (self.root / "SECURITY.md").write_text(body, encoding="utf-8", newline="\n")
@@ -956,7 +1104,8 @@ class BrokenRuleTests(unittest.TestCase):
         text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
         for block, address in (("@team, team@ and team@. are no address", False),
                                ('"open\nquote"@example.invalid', False), ('"open\\"@example.invalid', False),
-                               ('"closed\\\\"@example.invalid', True), ('x"q"@example.invalid', True)):
+                               (self.other('"closed\\\\"@example.invalid'), True),
+                               (self.other('x"q"@example.invalid'), True)):
             with self.subTest(block=block):
                 (self.root / "SECURITY.md").write_text(text + "\n```text\n" + block + "\n```\n", encoding="utf-8",
                                                        newline="\n")
@@ -1002,7 +1151,7 @@ class BrokenRuleTests(unittest.TestCase):
 
     def test_R2_special_only_local_part_is_not_missed(self) -> None:
         text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
-        for address in ("*@example.invalid", "`@example.invalid"):
+        for address in map(self.other, ("*@example.invalid", "`@example.invalid")):
             self.assertTrue(Address(addr_spec=address).domain)
             with self.subTest(address=address):
                 (self.root / "SECURITY.md").write_text(text + "\n" + address + "\n", encoding="utf-8", newline="\n")
@@ -1030,7 +1179,7 @@ class BrokenRuleTests(unittest.TestCase):
 
     def test_rfc_atom_characters_in_source_are_addresses(self) -> None:
         text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
-        for address in ("*@example.invalid", "`@example.invalid"):
+        for address in map(self.other, ("*@example.invalid", "`@example.invalid")):
             for before, after in (("\n", "\n"), ("\n<!-- ", " -->\n"), ("\n```text\n", "\n```\n")):
                 with self.subTest(address=address, before=before):
                     self.assertEqual(Address(addr_spec=address).addr_spec, address)
@@ -1047,6 +1196,210 @@ class BrokenRuleTests(unittest.TestCase):
                 (self.root / "SECURITY.md").write_text(text + "\n```text\n" + address + "\n```\n", encoding="utf-8",
                                                        newline="\n")
                 self.assertIn(self.EMAIL_PROBLEM, self.found())
+
+    # Sol's third read (1-4), with DeepSeek's fourth (F1): their tests, on this harness.
+    def test_confirming3_backslash_mailbox_is_not_lost_in_inline_code(self) -> None:
+        address = self.other('"audit' + '\\\\' + '"@example.invalid')
+        self.assertTrue(Address(addr_spec=address).domain)
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for extra in (address, "`" + address + "`"):
+            with self.subTest(extra=extra):
+                (self.root / "SECURITY.md").write_text(text + "\n" + extra + "\n", encoding="utf-8")
+                self.assertIn(self.EMAIL_PROBLEM, self.found())
+
+    def test_confirming3_at_inside_contact_is_not_a_second_address(self) -> None:
+        current = CONTACT
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for named in ('"audit@desk"@example.invalid', "audit@[desk@inbox]"):
+            self.assertTrue(Address(addr_spec=named).domain)
+            with self.subTest(named=named), mock.patch.dict(globals(), {"CONTACT": named}):
+                (self.root / "SECURITY.md").write_text(text.replace(current, named), encoding="utf-8")
+                self.assertEqual(self.found(), [])
+
+    def test_confirming3_quoted_source_cannot_become_contact(self) -> None:
+        current, named = CONTACT, '"audit"@example.invalid'
+        other = '"evil \\"audit"@example.invalid'
+        self.assertNotEqual(Address(addr_spec=other).username, Address(addr_spec=named).username)
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8").replace(current, named)
+        with mock.patch.dict(globals(), {"CONTACT": named}):
+            (self.root / "SECURITY.md").write_text(text + "\n" + other + "\n", encoding="utf-8")
+            self.assertIn(self.EMAIL_PROBLEM, self.found())
+
+    def test_confirming3_literal_tilde_runs_are_not_contact_markup(self) -> None:
+        current, named = CONTACT, "security@example.invalid"
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8").replace(current, named)
+        with mock.patch.dict(globals(), {"CONTACT": named}):
+            for marks in ("~~~", "~~~~"):
+                with self.subTest(marks=marks):
+                    (self.root / "SECURITY.md").write_text(text + "\nOr write to " + marks + named + marks + ".\n", encoding="utf-8")
+                    self.assertIn(self.EMAIL_PROBLEM, self.found())
+
+    def test_confirming3_new_negative_fixture_can_be_contact(self) -> None:
+        self.name_and_rerun("CONTACT", CONTACT, "SECURITY.md", "*@example.invalid")
+
+    def test_confirming3_literal_comment_markers_do_not_hide_sentence(self) -> None:
+        sentence = f"Report it privately to {CONTACT}."
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for replacement in ("A marker is `<!--`. " + sentence + " Its end is `-->`.",
+                            "The text \\<!-- " + sentence + " --> is literal."):
+            with self.subTest(replacement=replacement):
+                (self.root / "SECURITY.md").write_text(text.replace(sentence, replacement), encoding="utf-8")
+                self.assertEqual(self.found(), [])
+
+    def test_confirming3_unclosed_marker_does_not_hide_same_paragraph_sentence(self) -> None:
+        sentence = f"Report it privately to {CONTACT}."
+        self.edit("SECURITY.md", sentence, "A marker is `<!--`. " + sentence)
+        self.assertEqual(self.found(), [])
+
+    def test_confirming3_container_comment_cannot_expose_policy(self) -> None:
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for prefix in ("- <!--\n\n", "> <!--\n\n", "1. <!--\n\n"):
+            with self.subTest(prefix=prefix):
+                (self.root / "SECURITY.md").write_text(prefix + text, encoding="utf-8")
+                self.assertIn("SECURITY.md has no '## Scope'", self.found())
+
+    def test_a_comment_a_quote_or_a_list_item_opens_ends_inside_it(self) -> None:
+        """Its `-->` must stand on a line inside that quote or item; one after it ends nothing, and the
+        comment, left open, hides the rest of the file as a browser reads it."""
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for prefix, hidden in (("> <!--\n> a note\n> -->\n\n", False), ("- <!-- a\n  note -->\n\n", False),
+                               ("- <!-- a\n\n  note -->\n\n", False),  # a blank line inside the item
+                               ("> <!--\n-->\n", True), ("- <!--\n\n-->\n", True), ("> - <!--\n> -->\n", True)):
+            with self.subTest(prefix=prefix):
+                (self.root / "SECURITY.md").write_text(prefix + text, encoding="utf-8", newline="\n")
+                if hidden:
+                    self.assertIn("SECURITY.md has no '## Scope'", self.found())
+                else:
+                    self.assertEqual(self.found(), [])
+
+    def test_a_paragraph_ends_at_a_list_item_a_deeper_quote_or_a_rule(self) -> None:
+        """A `<!--` cannot reach past them to a `-->`: the policy after it stays in sight."""
+        sentence = f"Report it privately to {CONTACT}."
+        for new in (f"Write to us <!--\n- {sentence}\n-->", f"Write to us <!--\n> {sentence}\n> -->",
+                    f"Write to us <!--\n***\n{sentence}\n-->", f"Write to us <!--\n1. {sentence}\n-->",
+                    f"1. Write to us <!--\n2. {sentence}\n-->", f"> Write to us <!--\n>\n> {sentence}\n> -->"):
+            with self.subTest(new=new):
+                saved = (self.root / "SECURITY.md").read_bytes()
+                self.edit("SECURITY.md", sentence, new)
+                self.assertEqual(self.found(), [])
+                (self.root / "SECURITY.md").write_bytes(saved)
+
+    def test_a_lazy_line_stays_in_its_block_quote_paragraph(self) -> None:
+        """A line without the quote's marker goes on in the quote's paragraph, so the comment opened there
+        still hides it; the next line with the marker is no deeper quote."""
+        sentence = f"Report it privately to {CONTACT}."
+        self.edit("SECURITY.md", sentence, f"> Write to us. <!--\n{sentence}\n> -->")
+        self.assertNamed(r"^SECURITY\.md does not say " + re.escape(repr(sentence)))
+
+    def test_script_and_style_hide_what_they_hold(self) -> None:
+        """DeepSeek's fourth read, F1: a browser shows no text of a script or a style element."""
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for wrapped, hidden in (("<script>\n" + text + "</script>\n", True),
+                                ('<STYLE type="text/css">\n' + text, True),  # never ended: the rest of the file
+                                ("<script>var x;</script>\n" + text, False), ("<STYLE>p {}</STYLE>\n" + text, False),
+                                ("<STYLE>p {}</style>\n" + text, False),  # an end tag in another case ends it
+                                ("<scripts>\n" + text, False)):
+            with self.subTest(wrapped=wrapped[:24]):
+                (self.root / "SECURITY.md").write_text(wrapped, encoding="utf-8", newline="\n")
+                if hidden:
+                    self.assertIn("SECURITY.md has no '## Scope'", self.found())
+                else:
+                    self.assertEqual(self.found(), [])
+        sentence = f"Report it privately to {CONTACT}."
+        (self.root / "SECURITY.md").write_text(text.replace(sentence, "<script>x</script>" + sentence),
+                                               encoding="utf-8", newline="\n")
+        self.assertEqual(self.found(), [])  # text after the end tag, on its line, is in sight
+
+    def test_only_markdown_wrapping_makes_the_contact(self) -> None:
+        """Sol 2: CONTACT is exempt wrapped as Markdown wraps it, not inside code or behind unequal marks."""
+        named = "security@example.invalid"
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8").replace(CONTACT, named)
+        with mock.patch.dict(globals(), {"CONTACT": named}):
+            for line, other in ((f"Write to ***{named}***, _*{named}*_, ~{named}~ or ``{named}``.", False),
+                                (f"Or write to `*{named}*`.", True), (f"Or write to *{named}**.", True),
+                                (f"Or write to ~~~{named}~~~.", True), (f"Or write to `{named}``.", True)):
+                with self.subTest(line=line):
+                    (self.root / "SECURITY.md").write_text(text + "\n" + line + "\n", encoding="utf-8", newline="\n")
+                    if other:
+                        self.assertIn(self.EMAIL_PROBLEM, self.found())
+                    else:
+                        self.assertEqual(self.found(), [])
+
+    def test_code_spans_are_read_as_written(self) -> None:
+        """Sol 1: in a code span a reader sees escapes and character references as written."""
+        named = "security@example.invalid"
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8").replace(CONTACT, named)
+        with mock.patch.dict(globals(), {"CONTACT": named}):
+            for line, other in (("Code: `jane\\@example.org` and `jane&#64;example.org`.", False),
+                                ("Text: jane\\@example.org and jane&#64;example.org.", True)):
+                with self.subTest(line=line):
+                    (self.root / "SECURITY.md").write_text(text + "\n" + line + "\n", encoding="utf-8", newline="\n")
+                    if other:
+                        self.assertIn(self.EMAIL_PROBLEM, self.found())
+                    else:
+                        self.assertEqual(self.found(), [])
+
+    # Sol's sweep of 97f1a4ca against master (F1, F2) and Devin's threads on it: their cases, on this harness.
+    def test_sweep_quoted_contact_with_at_in_local_part(self) -> None:
+        named = '"audit@desk"@example.invalid'
+        self.assertEqual(Address(addr_spec=named).username, "audit@desk")
+        self.edit("SECURITY.md", CONTACT, named)
+        with mock.patch.dict(globals(), {"CONTACT": named}):
+            self.assertEqual(self.found(), [])
+
+    def test_sweep_contact_with_literal_ampersand_prefix(self) -> None:
+        named = "security&notices@example.invalid"
+        self.assertEqual(Address(addr_spec=named).addr_spec, named)
+        self.edit("SECURITY.md", CONTACT, named)
+        with mock.patch.dict(globals(), {"CONTACT": named}):
+            self.assertEqual(self.found(), [])
+
+    def test_a_character_reference_needs_its_semicolon(self) -> None:
+        """Sweep F2: as CommonMark reads it, `&amp;` is `&` and `&amp` stays as written."""
+        named = "jane&amp@example.org"
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8").replace(CONTACT, named)
+        with mock.patch.dict(globals(), {"CONTACT": named}):
+            for line, other in (("Or write to jane&amp&#64;example.org.", False),
+                                ("Or write to jane&amp;&#64;example.org.", True)):
+                with self.subTest(line=line):
+                    (self.root / "SECURITY.md").write_text(text + "\n" + line + "\n", encoding="utf-8", newline="\n")
+                    if other:
+                        self.assertIn(self.EMAIL_PROBLEM, self.found())
+                    else:
+                        self.assertEqual(self.found(), [])
+
+    def test_raw_html_passes_its_comments_to_the_browser(self) -> None:
+        """Devin: a line that opens raw HTML runs to a blank line, and a `<!--` left open there hides the
+        rest of the file; a tag inside a paragraph opens nothing."""
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        sentence = f"Report it privately to {CONTACT}."
+        for changed, hidden in (("<div><!--\n</div>\n\n" + text, "all"),
+                                ("<div>\n</div>\n\n```\n" + text + "```\n", "all"),  # a fence after the blank line
+                                ("<div>\nnote <!-- a -->\n</div>\n\n" + text, ""),
+                                ("<details>\n\n" + text, ""),  # a reader sees what it holds
+                                (text.replace(sentence, f"Write to us <!--\n<p>{sentence}</p>\n-->"), ""),
+                                (text.replace(sentence, f"Write to us <!--\n<b>x</b> {sentence} -->"), "sentence")):
+            with self.subTest(changed=changed[:30]):
+                (self.root / "SECURITY.md").write_text(changed, encoding="utf-8", newline="\n")
+                if hidden == "all":
+                    self.assertIn("SECURITY.md has no '## Scope'", self.found())
+                elif hidden:
+                    self.assertNamed(r"^SECURITY\.md does not say " + re.escape(repr(sentence)))
+                else:
+                    self.assertEqual(self.found(), [])
+
+    def test_a_bracketed_domain_contact_may_be_formatted(self) -> None:
+        """Devin: Markdown's marks after a bracketed domain wrap the address too."""
+        named = "security@[192.0.2.1]"
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8").replace(CONTACT, named)
+        with mock.patch.dict(globals(), {"CONTACT": named}):
+            for line, other in ((f"Write to **{named}** or `{named}`.", False), (f"Or write to *{named}**.", True)):
+                with self.subTest(line=line):
+                    (self.root / "SECURITY.md").write_text(text + "\n" + line + "\n", encoding="utf-8", newline="\n")
+                    if other:
+                        self.assertIn(self.EMAIL_PROBLEM, self.found())
+                    else:
+                        self.assertEqual(self.found(), [])
 
     def named_in(self, source: str, constant: str, old: str, new: str) -> str:
         """`source` with the one top-level assignment of `constant`, found as Python reads it however
@@ -1108,7 +1461,7 @@ class BrokenRuleTests(unittest.TestCase):
 
     def test_R3_quoted_contact_two_edits_keep_suite_green(self) -> None:
         """And a quoted contact (Astra's and Sol's), which Python spells with escapes or other quotes."""
-        for new in ('"audit desk"@example.invalid', '"audit.release"@example.invalid'):
+        for new in ('"audit desk"@example.invalid', '"audit.release"@example.invalid', '"q\\\\r"@example.invalid'):
             with self.subTest(contact=new):
                 self.name_and_rerun("CONTACT", CONTACT, "SECURITY.md", new)
 

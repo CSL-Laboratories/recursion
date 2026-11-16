@@ -185,7 +185,7 @@ MUTANTS = {
         {"test_a_named_engine_is_not_routed_and_nothing_is_read"}),
     "M30 an engine with a hand pick of another engine let through": (
         HOOKS,
-        '            if engine is not None and picked["engine"] != engine:\n'
+        '            if engine is not None and (type(engine) is not str or picked["engine"] != engine):  # plain text only\n'
         '                return _refusal("engine_and_hand_pick_differ")\n',
         "",
         {"test_an_engine_and_a_hand_pick_of_another_engine_is_refused"}),
@@ -693,7 +693,7 @@ MUTANTS = {
         '                picked = router._task({"hand_pick": hand})[2]\n'
         '            except router._Refuse as refused:\n'
         '                return _refusal(f"{refused.code}:{refused.reason}")\n'
-        '            if engine is not None and picked["engine"] != engine:\n'
+        '            if engine is not None and (type(engine) is not str or picked["engine"] != engine):  # plain text only\n'
         '                return _refusal("engine_and_hand_pick_differ")\n'
         '        engines = tuple(hooks.engines.names())\n',
         '    early = tuple(hooks.engines.names())  # the table as it stood when routing registered\n'
@@ -708,7 +708,7 @@ MUTANTS = {
         '                picked = router._task({"hand_pick": hand})[2]\n'
         '            except router._Refuse as refused:\n'
         '                return _refusal(f"{refused.code}:{refused.reason}")\n'
-        '            if engine is not None and picked["engine"] != engine:\n'
+        '            if engine is not None and (type(engine) is not str or picked["engine"] != engine):  # plain text only\n'
         '                return _refusal("engine_and_hand_pick_differ")\n'
         '        engines = early\n',
         {"test_engine_registered_after_routing_is_used"}),
@@ -754,7 +754,7 @@ MUTANTS = {
     # #419's DeepSeek round 2 (c2566d39): F1-F4.
     "H19 a failure in routing's own limits lookup laid on the operator's file": (
         HOOKS,
-        "    limits, source = router._route_limits(config, decision)  # routing's own work: a failure here is raised\n",
+        '    limits, source = router._route_limits(config, {"reason": reason, "rule": rule, "engine": engine})  # raised\n',
         "    try:\n        limits, source = router._route_limits(config, decision)\n    except Exception:\n        return None\n",
         {"test_a_failure_in_routings_own_limits_lookup_is_not_laid_on_the_file"}),
     "H20 a hand pick of an engine the request does not name dropped when routing is off": (
@@ -772,6 +772,17 @@ MUTANTS = {
         'router._plain(request.get("engine"))',
         'request.get("engine")',
         {"test_hostile_engine_is_typed_even_with_a_hand_pick"}),
+    # #419's DeepSeek round 3 (f8ff7b4b), under ruling 7: F1 and F2.
+    "H23 a request engine that is not a word compared all the same": (
+        HOOKS,
+        '(type(engine) is not str or picked["engine"] != engine)',
+        'picked["engine"] != engine',
+        {"test_a_non_str_engine_with_a_hand_pick_is_typed"}),
+    "H24 a rule decision that names no rule given an entry": (
+        HOOKS,
+        ' or (reason == "config" and type(rule) is not str)',
+        "",
+        {"test_a_rule_decision_without_its_rule_gets_no_entry"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

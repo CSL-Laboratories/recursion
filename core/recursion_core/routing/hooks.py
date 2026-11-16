@@ -10,11 +10,11 @@ never comes here):
 
 - A request that names its ``engine`` and carries no ``hand_pick`` is not routed: ``{}``, and the start
   launches that engine's ``routes.json`` entry as it does today. Nothing is read.
-- A ``hand_pick`` is read first, once, as ``decide()`` reads it (with ``router._task``, the router's own reader,
+- A ``hand_pick`` is read first, once, with the reader ``decide()`` uses (``router._task``, the router's own,
   so there is one rule for what a hand pick is: that private name and its ``_Refuse`` are part of this module's
   contract with ``router.py``, lane ROUTING's own), whether or not routing is on and whether or not the request
   names an engine. A ``hand_pick`` that is null is taken as absent, as the start path's schema has it (it gives
-  an object or nothing). One that is not a hand pick (not an object of exactly ``engine`` and ``model``,
+  an object or nothing), where ``decide()`` would refuse one; an ``engine`` that is null is taken as not named. One that is not a hand pick (not an object of exactly ``engine`` and ``model``,
   an engine routing does not know, a model that is not a model id, or one that cannot be read) is refused,
   ``request_invalid``, detail ``bad_hand_pick:<reason>``.
 - A request with an ``engine`` and a ``hand_pick`` of another engine is refused, ``request_invalid``,
@@ -88,16 +88,17 @@ def route_entry(config: rc.Config, decision: object) -> dict | None:
     limits, those limits inside the route. A profile route's own model selector (``route.profile.model``) gets
     the same model, so the profile's guard binds the model the decision chose; the config's entry is not
     changed (the entry is a copy). None for anything ``router.route_decision`` answers None for (what a routed
-    decision is, is one rule, kept there), for a decision whose engine this config has no route for, and for a
-    chosen entry nested deeper than it can be copied (the registrant then refuses
+    decision is, is one rule, kept there), for a decision whose engine this config has no route for, for a rule
+    decision that names no rule as a plain ``str`` (``route_decision`` does not need one; the limits lookup does),
+    and for a chosen entry nested deeper than it can be copied (the registrant then refuses
     ``routing_config_invalid:unreadable``). A failure in routing's own work after that, the limits lookup, is
     raised, never laid on the operator's file; a ``BaseException`` passes through."""
     try:
         if router.route_decision(decision) is None:  # not a routed decision that decide publishes: no entry either
             return None
-        engine, model = decision["engine"], decision["model"]
-        if engine not in config.routes:
-            return None
+        engine, model, reason, rule = decision["engine"], decision["model"], decision["reason"], decision.get("rule")
+        if engine not in config.routes or (reason == "config" and type(rule) is not str):
+            return None  # an engine this config has no route for, or a rule decision that names no rule
         entry = copy.deepcopy(config.routes[engine])
     except Exception:  # noqa: BLE001 - a decision that cannot be read, or an entry nested deeper than it can be copied
         return None
@@ -105,7 +106,7 @@ def route_entry(config: rc.Config, decision: object) -> dict | None:
     profile = entry["route"].get("profile")
     if isinstance(profile, dict) and "model" in profile:
         profile["model"] = model  # the profile's selector agrees with the decision (astra R2)
-    limits, source = router._route_limits(config, decision)  # routing's own work: a failure here is raised
+    limits, source = router._route_limits(config, {"reason": reason, "rule": rule, "engine": engine})  # raised
     if source == "routing":
         entry["route"]["limits"] = limits
     return entry
@@ -124,7 +125,7 @@ def make_normalize(hooks, *, environ: Mapping | None = None):
                 picked = router._task({"hand_pick": hand})[2]
             except router._Refuse as refused:
                 return _refusal(f"{refused.code}:{refused.reason}")
-            if engine is not None and picked["engine"] != engine:
+            if engine is not None and (type(engine) is not str or picked["engine"] != engine):  # plain text only
                 return _refusal("engine_and_hand_pick_differ")
         engines = tuple(hooks.engines.names())
         try:

@@ -500,6 +500,32 @@ class HookRegressions(unittest.TestCase):
         self.assertEqual((part["route_decision"]["chosen"]["engine"], part["route_decision"]["reason"]),
                          ("codex", "hand_pick"))
 
+
+    def test_a_non_str_engine_with_a_hand_pick_is_typed(self) -> None:  # ds r3 F1
+        class HostileEq:
+            def __eq__(self, other):
+                raise RuntimeError("made-up hostile engine")
+
+            def __ne__(self, other):
+                raise RuntimeError("made-up hostile engine")
+
+            __hash__ = object.__hash__
+        hand = {"engine": "codex", "model": None}
+        self.assertRefused(self.run_start(engine=HostileEq(), hand_pick=hand), "engine_and_hand_pick_differ")
+        (self.folder / "routing.json").unlink()  # and with routing off
+        self.assertRefused(self.run_start(engine=HostileEq(), hand_pick=hand), "engine_and_hand_pick_differ")
+
+    def test_a_rule_decision_without_its_rule_gets_no_entry(self) -> None:  # ds r3 F2
+        loaded = rc.load(self.folder, {})
+        decision = router.decide(loaded, detection({"claude_code", "codex"}), {"task_kind": "review"})
+        self.assertEqual(decision["reason"], "config")
+        missing = {key: value for key, value in decision.items() if key != "rule"}
+        for label, bad in (("no rule member", missing), ("a rule that is not a word", {**decision, "rule": 5})):
+            with self.subTest(case=label):
+                self.assertIsNone(rh.route_entry(loaded, bad))
+        self.assertIsNotNone(router.route_decision(missing))  # route_decision does not need the rule; route_entry does
+        self.assertEqual(rh.route_entry(loaded, decision)["route"]["engine"], "codex")  # the control
+
     def test_hostile_hand_pick_is_typed_even_with_named_engine(self) -> None:  # sol's hardening note
         class BadRead(dict):
             def get(self, *args):

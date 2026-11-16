@@ -191,6 +191,23 @@ class EveryExceptionIsFencedTest(unittest.TestCase):
                 self.assertFalse(hasattr(err, FAILURES))
                 self.assertNotIn(RUNNING, getattr(err, "__notes__", []))
 
+    def test_a_base_exception_from_the_first_typed_fence_is_retried_and_the_typed_exception_leaves(self) -> None:
+        # DeepSeek's round-2 M14 (and its F2): the first fence of a typed exit raises a BaseException. It is caught
+        # like any other fence failure: the fence is retried as unexpected, which fences the child, so the typed
+        # exception leaves with a note and no cleanup_failures.
+        for make, reason in ((Deadline, "deadline"), (lambda: _Protocol("p"), "protocol_error"),
+                             (BrokenPipeError, "io_error")):
+            for first in (KeyboardInterrupt(), SystemExit(3), _Custom("c")):
+                err = make()
+                with self.subTest(reason=reason, first=type(first).__name__):
+                    h = Harness(_raiser(err), process=Process(fence_raises=[first]))
+                    with self.assertRaises(type(err)) as caught:
+                        h.run()
+                    self.assertIs(caught.exception, err)
+                    self.assertEqual(h.process.fenced, [reason, UNEXPECTED])
+                    self.assertIn(f"fencing the child also failed: {type(first).__name__}", err.__notes__)
+                    self.assertFalse(hasattr(err, FAILURES))
+
     def test_a_typed_fence_whose_retry_fails_too_leaves_the_typed_exception_marked_not_clean(self) -> None:
         for make, reason in ((Deadline, "deadline"), (lambda: _Protocol("p"), "protocol_error"),
                              (BrokenPipeError, "io_error")):

@@ -5,6 +5,10 @@ Every launch for these engines goes through ``subscription_routes.guard_then_spa
 inside Claude Code) before the launcher is ever called. The refusal comes back through the route
 contract as ``subscription_route_refused`` with the policy's typed cause in ``detail``.
 
+``allow_inside_operator_home`` is the containment setting (``setup/containment.py``), which the daemon
+reads once and passes here and to the launcher's route-home check; False, the default, is the stricter
+rule (a route home inside the operator's home refuses ``route_home_is_operator_home``).
+
 The engines' own stdio protocols are not built here: ``driver`` is injected and owns the run once the
 guard has passed. No running core wires a driver yet.
 """
@@ -34,11 +38,12 @@ RUNNING_NOTE = "no fence of the started child succeeded: it may still be running
 
 class ProfileRouteAdapter(RouteAdapter):
     def __init__(self, engine: str, *args, argv: Callable[[dict], list[str]], driver: Driver,
-                 operator_home: str | None = None, **kwargs) -> None:
+                 operator_home: str | None = None, allow_inside_operator_home: bool = False, **kwargs) -> None:
         if engine not in c.PROFILE_ENGINES:
             raise ValueError(engine)
         super().__init__(*args, **kwargs)
         self.engine, self._argv, self._driver, self._operator_home = engine, argv, driver, operator_home
+        self._allow_inside_operator_home = allow_inside_operator_home
 
     def run(self, request: dict, deadline_at: float) -> dict:
         rid, route = request["request_id"], request["route"]
@@ -90,6 +95,7 @@ class ProfileRouteAdapter(RouteAdapter):
                     self._launcher, self._argv(request), self.engine, dict(route["profile"]), env,
                     route_home=home if isinstance(home, str) else "", parent_env=self._parent_env,
                     operator_home=self._operator_home, wrapper=route.get("wrapper"),
+                    allow_inside_operator_home=self._allow_inside_operator_home,
                 )
             except SubscriptionRouteRefused as err:
                 return c.result(rid, c.SUBSCRIPTION_ROUTE_REFUSED, detail=err.cause)
@@ -166,9 +172,11 @@ def _typed_fence(process, reason: str, err: BaseException) -> bool:
 
 def profile_adapters(launcher, clock, credentials: Callable[[str, str], str], parent_env: Mapping[str, str], *,
                      argv: Callable[[dict], list[str]], driver: Driver,
-                     operator_home: str | None = None) -> dict[str, ProfileRouteAdapter]:
+                     operator_home: str | None = None,
+                     allow_inside_operator_home: bool = False) -> dict[str, ProfileRouteAdapter]:
     return {
         engine: ProfileRouteAdapter(engine, launcher, clock, credentials, parent_env, argv=argv, driver=driver,
-                                    operator_home=operator_home)
+                                    operator_home=operator_home,
+                                    allow_inside_operator_home=allow_inside_operator_home)
         for engine in c.PROFILE_ENGINES
     }

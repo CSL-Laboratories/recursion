@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -2495,6 +2497,149 @@ class ReleaseRecordTests(unittest.TestCase):
         runs = [{"id": "run-1", "claim": U1, "started_at": ts(10), "ended_at": ts(40)}]
         self.assertEqual(self.violations(runs=runs), [("release_before_writers_stopped", U1, "run-1"),
                                                       ("release_without_record", U1, "no record")])
+
+
+class SweepRobustnessRegressionTests(unittest.TestCase):
+    def released_fixture(self, second_at=7):
+        old = claim('c1', 'CSL-1', U1)
+        old['edits'].append({'at': ts(5), 'body': old['edits'][-1]['body'] + '\nreleased'})
+        record = comment('r1', 'CSL-1', 5, '\n'.join([
+            'Agent (claude/s1, for Lucas): release v1', f'claim: {U1}',
+            'reason: done', 'done: change', 'evidence: local check',
+            'open: none', 'next: none', 'files: example.py']))
+        later = claim('c2', 'CSL-1', U2, at=second_at, session='cursor/s2')
+        return snapshot(12, [issue('CSL-1')], [old, record, later])
+
+    def invoke_bytes(self, payload):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'snapshot.json'
+            path.write_bytes(payload)
+            stderr, stdout = io.StringIO(), io.StringIO()
+            with redirect_stderr(stderr), redirect_stdout(stdout):
+                rc = sim.main(['agent_protocol_sim.py', str(path)])
+            return rc, stderr.getvalue(), stdout.getvalue()
+
+    def test_sweep_run_cannot_start_under_a_released_claim(self):
+        snap = self.released_fixture()
+        snap['runs'] = [{'id': 'delayed-ci', 'claim': U1,
+                         'started_at': ts(6), 'ended_at': None}]
+        try:
+            result = sim.evaluate(snap)
+        except sim.SnapshotError:
+            return  # Rejecting an impossible event order is also fail-closed.
+        self.assertTrue(any(v['claim'] == U1 for v in result['violations']), result)
+
+    def test_sweep_unsorted_pings_cannot_hide_a_held_write(self):
+        blocked, question = issue('CSL-1'), issue('CSL-2')
+        blocked['blocked_by'] = ['CSL-2']
+        question['decision'] = {'options': ['A', 'B'], 'pings': [ts(5), ts(1)],
+                                'options_changed_at': [], 'deadline': ts(0)}
+        snap = snapshot(10, [blocked, question], [claim('c1', 'CSL-1', U1)],
+                        writes=[{'kind': 'push', 'issue': 'CSL-1', 'claim': U1, 'at': ts(3)}])
+        try:
+            result = sim.evaluate(snap)
+        except sim.SnapshotError:
+            return  # Rejecting an unsorted history is also acceptable.
+        self.assertIn('write_while_held', [v['code'] for v in result['violations']])
+
+    def test_sweep_cli_invalid_utf8_is_a_typed_input_error(self):
+        rc, stderr, stdout = self.invoke_bytes(b'\xff')
+        self.assertEqual(rc, 2)
+        self.assertTrue(stderr.startswith('AGENT_PROTOCOL_SIM_ERROR '))
+        self.assertEqual(stdout, '')
+
+    def test_sweep_cli_integer_limit_is_a_typed_input_error(self):
+        # 4.4 KB, exceeding the standard 4,300-digit decoder limit.
+        if sys.get_int_max_str_digits() == 0 or sys.get_int_max_str_digits() > 4399:
+            self.skipTest('interpreter does not use the standard bounded integer decoder')
+        rc, stderr, stdout = self.invoke_bytes(b'{"now":' + b'1' * 4400 + b'}')
+        self.assertEqual(rc, 2)
+        self.assertTrue(stderr.startswith('AGENT_PROTOCOL_SIM_ERROR '))
+        self.assertEqual(stdout, '')
+
+    def test_sweep_refusal_does_not_echo_an_arbitrary_invalid_value(self):
+        marker = 'SYNTHETIC_TEST_VALUE_DO_NOT_USE'
+        snap = snapshot(10, [issue('CSL-1')], [])
+        snap['now'] = marker
+        rc, stderr, _ = self.invoke_bytes(json.dumps(snap).encode())
+        self.assertEqual(rc, 2)
+        self.assertIn('now', stderr)
+        self.assertNotIn(marker, stderr)
+
+    def test_sweep_refusal_escapes_identifier_controls(self):
+        bad_id = 'bad\x1b[31mID\nFORGED_LOG'
+        snap = snapshot(10, [issue('CSL-1')], [comment(bad_id, 'CSL-404', 0, 'note')])
+        rc, stderr, _ = self.invoke_bytes(json.dumps(snap).encode())
+        self.assertEqual(rc, 2)
+        self.assertNotIn('\x1b', stderr)
+        self.assertEqual(stderr.count('\n'), 1)
+
+    def test_sweep_shared_evaluation_keeps_each_call_horizon(self):
+        from threading import Event, Thread, current_thread
+        if getattr(sys, '_is_gil_enabled', lambda: True)():
+            self.skipTest('run this bounded interleaving on 3.14t with -X gil=0')
+        snap = self.released_fixture(second_at=1)
+        ev = sim.Evaluation(snap)
+        ev.run()
+        early = sim.parse_ts(ts(1), 'early')
+        self.assertIsNone(ev.winner('CSL-1', 'recursion', ev.now))
+        entered, resume = Event(), Event()
+        original = ev._live_claims
+        results, errors = [], []
+
+        def paused(iid, repo, at):
+            if current_thread().name == 'early-reader' and at == early:
+                entered.set()
+                # The late reader blocks until this call restores the horizon,
+                # and its join is what sets resume. This wait has to outlast that join.
+                if not resume.wait(15):
+                    raise TimeoutError('controlled schedule timeout')
+            return original(iid, repo, at)
+
+        def read_early():
+            try:
+                ev.live_claims('CSL-1', 'recursion', early)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def read_late():
+            try:
+                results.append(ev.winner('CSL-1', 'recursion', ev.now))
+            except BaseException as exc:
+                errors.append(exc)
+
+        ev._live_claims = paused
+        first = Thread(target=read_early, name='early-reader', daemon=True)
+        second = Thread(target=read_late, name='late-reader', daemon=True)
+        first.start()
+        ready = entered.wait(5)
+        try:
+            if ready:
+                second.start()
+                second.join(5)
+        finally:
+            resume.set()
+            first.join(5)
+            if second.ident is not None:
+                second.join(5)
+        self.assertTrue(ready, 'early reader did not pause')
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [None])
+        self.assertIsNone(ev._horizon)
+
+    def test_F14_snapshot_string_hook_is_snapshot_error(self):
+        class BombStr(str):
+            def __eq__(self, other):
+                raise RuntimeError("eq hook")
+            def __hash__(self):
+                raise RuntimeError("hash hook")
+            def __iter__(self):
+                raise RuntimeError("iter hook")
+        with self.assertRaises(sim.SnapshotError):
+            sim.evaluate({"now": "2026-11-15T00:00:00Z", "issues": [], "comments": [], "repo": BombStr("recursion")})
+
 
 if __name__ == "__main__":
     unittest.main()

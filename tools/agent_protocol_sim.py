@@ -95,6 +95,8 @@ import dataclasses
 import json
 import re
 import sys
+import threading
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -163,13 +165,13 @@ def parse_ts(value: Any, where: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
-        raise SnapshotError(f"{where}: bad timestamp {value!r}") from exc
+        raise SnapshotError(f"{where}: bad timestamp") from exc
     if parsed.tzinfo is None:
-        raise SnapshotError(f"{where}: timestamp {value!r} has no UTC offset")
+        raise SnapshotError(f"{where}: timestamp has no UTC offset")
     try:
         return parsed.astimezone(timezone.utc)
     except OverflowError as exc:
-        raise SnapshotError(f"{where}: timestamp {value!r} is out of range in UTC") from exc
+        raise SnapshotError(f"{where}: timestamp is out of range in UTC") from exc
 
 
 def require(mapping: Any, key: str, where: str) -> Any:
@@ -379,7 +381,12 @@ def present_since(comment: Comment, line: str, at: datetime) -> datetime | None:
 
 
 class Evaluation:
+    """winner, live_claims, and the loss cache serialize on one instance so one
+    call cannot publish its horizon into another; `run` still mutates the
+    violation list for a single caller."""
+
     def __init__(self, snapshot: dict[str, Any]):
+        self._call_lock = threading.RLock()
         if not isinstance(snapshot, dict):
             raise SnapshotError("snapshot must be an object")
         self.now = parse_ts(require(snapshot, "now", "snapshot"), "now")
@@ -470,7 +477,7 @@ class Evaluation:
                     raise SnapshotError(f"issue {issue_id}: decision needs options")
                 decision = {
                     "options": [str(option) for option in options],
-                    "pings": [parse_ts(t, issue_id) for t in expect_list(decision.get("pings", []), issue_id)],
+                    "pings": sorted(parse_ts(t, issue_id) for t in expect_list(decision.get("pings", []), issue_id)),
                     "options_changed_at": [
                         parse_ts(t, issue_id) for t in expect_list(decision.get("options_changed_at", []), issue_id)
                     ],
@@ -988,11 +995,12 @@ class Evaluation:
     def live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
         """The claims live on the issue at `at` that may win its race. Like
         the race, this counts only loss parts settled strictly before `at`."""
-        outer, self._horizon = self._horizon, self.horizon_at(at)
-        try:
-            return self._live_claims(issue, repo, at)
-        finally:
-            self._horizon = outer
+        with self._call_lock:
+            outer, self._horizon = self._horizon, self.horizon_at(at)
+            try:
+                return self._live_claims(issue, repo, at)
+            finally:
+                self._horizon = outer
 
     def _live_claims(self, issue: str, repo: str, at: datetime) -> list[Claim]:
         candidates = [
@@ -1046,20 +1054,21 @@ class Evaluation:
         is decided, `when` is the settlement horizon: only parts settled
         strictly before it count, in `settled_loss` and `took_effect` alike, so
         the part never reads itself and its value does not depend on who asks."""
-        key = (claim.uuid, kind)
-        if key not in self._losses:
-            outer, self._horizon = self._horizon, when
-            try:
-                if kind == "race":
-                    won = self.winner(claim.issue, claim.repo, when)
-                    beaten = won is not None and won.uuid != claim.uuid and won.uuid not in claim.takeovers
-                    self._losses[key] = won if beaten else None
-                else:
-                    blocker = self.earlier_overlap(claim, when)
-                    self._losses[key] = blocker[0] if blocker else None
-            finally:
-                self._horizon = outer
-        return self._losses[key]
+        with self._call_lock:
+            key = (claim.uuid, kind)
+            if key not in self._losses:
+                outer, self._horizon = self._horizon, when
+                try:
+                    if kind == "race":
+                        won = self.winner(claim.issue, claim.repo, when)
+                        beaten = won is not None and won.uuid != claim.uuid and won.uuid not in claim.takeovers
+                        self._losses[key] = won if beaten else None
+                    else:
+                        blocker = self.earlier_overlap(claim, when)
+                        self._losses[key] = blocker[0] if blocker else None
+                finally:
+                    self._horizon = outer
+            return self._losses[key]
 
     def settles_at(self, claim: Claim) -> datetime:
         """When the claim's race is decided: the end of the read-back window,
@@ -1069,11 +1078,12 @@ class Evaluation:
         return claim.created_at + self.readback
 
     def winner(self, issue: str, repo: str, at: datetime) -> Claim | None:
-        key = (issue, repo, at, self.horizon_at(at))
-        if key not in self._winners:
-            live = self.live_claims(issue, repo, at)
-            self._winners[key] = min(live, key=lambda c: (c.created_at, c.uuid)) if live else None
-        return self._winners[key]
+        with self._call_lock:
+            key = (issue, repo, at, self.horizon_at(at))
+            if key not in self._winners:
+                live = self.live_claims(issue, repo, at)
+                self._winners[key] = min(live, key=lambda c: (c.created_at, c.uuid)) if live else None
+            return self._winners[key]
 
     def holder(self, issue: str, repo: str, at: datetime) -> Claim | None:
         """The race winner, unless an earlier claim, from this or another
@@ -1495,9 +1505,11 @@ class Evaluation:
             released = claim.released_at()
             if released is not None:
                 for run in self.runs:
-                    if run["claim"] == claim.uuid and run["started_at"] <= released and (
-                        run.get("ended_at") is None or run["ended_at"] > released
-                    ):
+                    if run["claim"] != claim.uuid:
+                        continue
+                    if run["started_at"] > released:
+                        self.violation("run_after_release", claim.issue, claim.uuid, run["id"])
+                    elif run.get("ended_at") is None or run["ended_at"] > released:
                         self.violation("release_before_writers_stopped", claim.issue, claim.uuid, run["id"])
                 self.check_release_record(claim, released)
 
@@ -1832,8 +1844,18 @@ def evaluate(snapshot: dict[str, Any]) -> dict[str, Any]:
         return Evaluation(snapshot).run()
     except SnapshotError:
         raise
-    except (TypeError, ValueError, AttributeError, KeyError, IndexError, ArithmeticError) as exc:
+    except (TypeError, ValueError, AttributeError, KeyError, IndexError, ArithmeticError, RuntimeError) as exc:
         raise SnapshotError(f"unreadable snapshot: {type(exc).__name__}: {exc}") from exc
+
+
+def _refuse(detail: object) -> int:
+    """Print one error line. Cc and Cs characters are written as \\uXXXX."""
+    text = "".join(
+        char if unicodedata.category(char) not in {"Cc", "Cs"} else f"\\u{ord(char):04x}"
+        for char in str(detail)
+    )
+    print(f"AGENT_PROTOCOL_SIM_ERROR {text}", file=sys.stderr)
+    return 2
 
 
 def main(argv: list[str]) -> int:
@@ -1843,9 +1865,16 @@ def main(argv: list[str]) -> int:
     try:
         snapshot = json.loads(Path(argv[1]).read_text(encoding="utf-8"))
         result = evaluate(snapshot)
-    except (OSError, json.JSONDecodeError, SnapshotError) as exc:
-        print(f"AGENT_PROTOCOL_SIM_ERROR {exc}", file=sys.stderr)
-        return 2
+    except UnicodeDecodeError:
+        return _refuse("snapshot is not valid UTF-8")
+    except json.JSONDecodeError as exc:
+        return _refuse(exc)
+    except SnapshotError as exc:
+        return _refuse(exc)
+    except ValueError:
+        return _refuse("snapshot is not valid JSON")
+    except OSError as exc:
+        return _refuse(exc)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
     return 1 if result["violations"] else 0
 

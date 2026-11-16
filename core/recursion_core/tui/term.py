@@ -318,7 +318,7 @@ def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, al
             write("\x1b[?25h\x1b[?1049l")
         else:
             write(painter.end(reader.new_lines()))
-    if alt_screen and not gone[0]:
+    if alt_screen:  # also after the screen hung up: stderr may be another stream that still works (a log file)
         err = stderr or sys.stderr
         try:
             for line in app.errors:  # the error log survives leaving the alternate screen

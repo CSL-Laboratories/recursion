@@ -60,8 +60,9 @@ class _Output:
         # The display rows of each retained line at one width, kept beside the lines, so a frame need not wrap
         # the whole history to count it or show its newest rows (review 2 of #404, Astra 3). They are counted
         # again when the width changes, and whenever they may be out of step with the lines: -1 means "not
-        # counted", from the start and while a feed adds to them, so a failure part way leaves them to be
-        # counted again, never wrong (review 3 of #404, DeepSeek F1, F2). One _Output is used by one thread at
+        # counted", from the start, and from before a feed changes the lines until their counts are beside them
+        # again, so a failure part way leaves them to be counted again, never wrong (review 3 of #404, DeepSeek
+        # F1, F2; round 3, Astra's required 1). One _Output is used by one thread at
         # a time: the app calls it under its lock (review 4 of #404, DeepSeek's section 4).
         self._width = -1
         self._rows: collections.deque[int] = collections.deque(maxlen=cap)
@@ -86,9 +87,12 @@ class _Output:
         else:
             self.partial_cut = False
         self.partial = partial
+        # "Not counted" BEFORE the retained lines change, and counted again only once the counts are beside them:
+        # a failure or an interruption between the two leaves the counts to be counted again, never old counts
+        # beside as many new lines (round 3 of #404, Astra's required 1).
+        width, self._width = self._width, -1
         self.lines.extend(done)
-        if self._width >= 0:  # the counts stay beside the lines: the same maxlen drops the same oldest ones
-            width, self._width = self._width, -1  # "not counted" until they are beside the lines again
+        if width >= 0:  # the counts stay beside the lines: the same maxlen drops the same oldest ones
             self._rows.extend(len(wrap(line, width)) for line in done)
             self._width = width
         return chunk, done

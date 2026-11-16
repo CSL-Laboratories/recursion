@@ -100,7 +100,8 @@ class _Output:
 
     def extend(self, rows: list[str]) -> None:
         """Rows that are display text already (a transcript's), kept as finished lines, counted as they are;
-        ``left`` counts the ones that push older lines out of the pane."""
+        ``left`` counts the stored text lines that leave the pane (lines as kept, not their wrapped display rows:
+        Sol's round 5 of #405, 2)."""
 
         if self.lines.maxlen is not None:
             self.left += max(0, len(self.lines) + len(rows) - self.lines.maxlen)
@@ -1144,9 +1145,11 @@ class TuiApp:
                 head = "-- sessions (session.list: live, at most 20; transcript SESSION shows one; display only)"
             elif self.pane is not None:  # lines that left the pane are said, never dropped in silence (Devin, #405)
                 left = out.left if out else 0
-                head = (f"-- transcript session={field(self.pane)} (the daemon's lines; engine text untrusted, "
-                        f"display only" + (f"; {left} earlier rows are not kept in this pane, --plain prints "
-                                           f"every line" if left else "") + ")")
+                # Said first, so an 80-column row still shows it and what to do (Sol's round 5 of #405, 1).
+                lost = (f"{left} earlier text line{'' if left == 1 else 's'} not kept here, --plain shows every "
+                        f"line; " if left else "")
+                head = (f"-- transcript{': ' + lost if lost else ' '}session={field(self.pane)} (the daemon's "
+                        f"lines; engine text untrusted, display only)")
             else:
                 head = (f"-- output run={field(self.attached) if self.attached else 'none'} (untrusted engine "
                         f"text, display only)" + (f" skipped_events={self.skipped_events}"

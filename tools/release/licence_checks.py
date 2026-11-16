@@ -13,14 +13,24 @@ break:
   read alone, as outside one; a git that does not answer within GIT_TIMEOUT seconds is named.
 - NOTICE is NOTICE_TEXT, up to line endings: the copyright holder stays a placeholder until Lucas
   names one, and no other name, address or line is added.
-- CONTRIBUTING.md has one sign-off section, held word for word up to line endings (SIGN_OFF).
-  Text elsewhere in the file is not read.
-- SECURITY.md keeps its draft note and its four sections outside HTML comments and fenced blocks,
-  each section with a line of its own; says that reports go privately to CONTACT and not to a
-  public issue; and holds no e-mail address but CONTACT. What its sections say is not judged.
+- CONTRIBUTING.md has one sign-off section, its heading a line of its own outside HTML comments
+  and fenced code blocks, held word for word up to line endings (SIGN_OFF). What the rest of the
+  file says is not judged.
+- SECURITY.md keeps its draft note and its four sections, each with a line of its own, and says
+  that reports go privately to CONTACT and not to a public issue, all outside HTML comments and
+  fenced code blocks; and nowhere in its text, comments and code blocks included, does it hold an
+  e-mail address but CONTACT. What its sections say is not judged.
+A fenced code block is read as CommonMark reads one: a line of three or more backticks or tildes,
+indented by at most three spaces, opens it, and a line of the same character, at least as long and
+with nothing after it, closes it, or else the end of the file does. An HTML comment runs from
+`<!--` to the next `-->`, on one line or over several. An e-mail address is read as RFC 5322 writes
+one: a local part (atoms joined by dots, or a quoted string), `@`, and a domain (atoms joined by
+dots, or a bracketed literal); a backtick or an asterisk ends an atom, as Markdown sets them around
+an address, so `CONTACT` and **CONTACT** are CONTACT.
 A file larger than SIZE_LIMIT bytes is named without being read, and a missing file as missing.
 The tests check the committed files, then break, in a scratch copy of the four files, each rule
-that they name, and check that it is named.
+that they name, and check that it is named; and they check that naming the contact or the holder,
+each the edit of two files the comments below describe, leaves them green.
 
 The file is named *_checks.py, not test_*.py: the frozen gate (tools/ci_gate.py) fails on a
 test-named file outside its globs, and tools/release/ is not among them, so hosted CI does not run
@@ -34,8 +44,10 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+from email.headerregistry import Address
 from pathlib import Path
 from unittest import mock
 
@@ -90,8 +102,10 @@ CONTACT = "<contact: Lucas to name>"
 SECURITY_PARTS = ("> **Draft.**", "## Reporting a vulnerability\n", "## Supported versions\n", "## Scope\n",
                   "## What the code defends, and what it does not yet\n")
 PUBLIC_ISSUE = "Please do not report a suspected vulnerability in a public issue"
-EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*")
-HIDDEN = re.compile(r"<!--.*?-->|^```.*?^```[^\n]*$", re.S | re.M)  # what a reader of the page does not see as text
+# An atom: characters other than white space, controls and RFC 5322's specials, a backtick or an asterisk.
+ATOM = r"[^\s\x00-\x1f\x7f()<>\[\]:;@\\,.\"`*]+"
+EMAIL = re.compile(rf'(?:"(?:[^"\\\r\n]|\\.)*"|{ATOM}(?:\.{ATOM})*)@(?:\[[^\[\]\\\r\n]*\]|{ATOM}(?:\.{ATOM})*)')
+FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")  # a line that may open or close a fenced code block
 
 
 def _read(root: Path, rel: str, found: list[str]) -> bytes | None:
@@ -110,6 +124,41 @@ def _text(data: bytes) -> str:
     return data.replace(b"\r\n", b"\n").decode("utf-8", errors="replace")
 
 
+def _visible(text: str) -> str:
+    """What a reader of the rendered page sees as text: `text` without its HTML comments and its
+    fenced code blocks, each of their lines kept as an empty line."""
+    lines: list[str] = []
+    fence = ""  # inside a fenced code block: the run of backticks or tildes that opened it
+    comment = False  # inside an HTML comment
+    for line in text.split("\n"):
+        if fence:
+            close = FENCE.fullmatch(line)
+            if (close and close.group(1)[0] == fence[0] and len(close.group(1)) >= len(fence)
+                    and not close.group(2).strip(" \t")):
+                fence = ""
+            lines.append("")
+            continue
+        opening = None if comment else FENCE.fullmatch(line)
+        if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+            fence = opening.group(1)  # a backtick fence's info string holds no backtick
+            lines.append("")
+            continue
+        kept, rest = "", line
+        while rest:
+            if comment:
+                end = rest.find("-->")
+                if end < 0:
+                    break
+                rest, comment = rest[end + 3:], False
+            start = rest.find("<!--")
+            if start < 0:
+                kept += rest
+                break
+            kept, rest, comment = kept + rest[:start], rest[start + 4:], True
+        lines.append(kept)
+    return "\n".join(lines)
+
+
 def _committed(root: Path, rel: str, found: list[str]) -> list[tuple[str, bytes]]:
     """The file's blobs in git's index and in HEAD, as (where, bytes), when `root` itself is a git
     checkout that holds it. [] when it is not a checkout, when git cannot be run, or when neither
@@ -125,7 +174,7 @@ def _committed(root: Path, rel: str, found: list[str]) -> list[tuple[str, bytes]
                                   capture_output=True, text=True, env=env, timeout=GIT_TIMEOUT)
             if size.returncode != 0:
                 continue  # not there (an untracked file, or no commit yet)
-            if not size.stdout.strip().isdigit():
+            if not re.fullmatch(r"[0-9]{1,18}", size.stdout.strip()):
                 found.append(f"git gave no size for {rel} {where}, so it was not read")
                 continue
             if int(size.stdout) > SIZE_LIMIT:
@@ -177,6 +226,8 @@ def contributing_problems(root: Path) -> list[str]:
     if text.count(SIGN_OFF_HEADING) != 1:
         found.append("CONTRIBUTING.md does not have exactly one sign-off section")
         return found
+    if "\n" + SIGN_OFF_HEADING not in "\n" + _visible(text):
+        found.append("CONTRIBUTING.md's sign-off heading is not a line of its own outside comments and fences")
     if text.split(SIGN_OFF_HEADING, 1)[1].split("\n## ", 1)[0] != SIGN_OFF:
         found.append("CONTRIBUTING.md's sign-off section is not SIGN_OFF word for word")
     return found
@@ -187,7 +238,8 @@ def security_problems(root: Path) -> list[str]:
     data = _read(root, "SECURITY.md", found)
     if data is None:
         return found
-    text = "\n" + HIDDEN.sub("", _text(data))
+    source = _text(data)
+    text = "\n" + _visible(source)
     for part in SECURITY_PARTS:
         if "\n" + part not in text:
             found.append(f"SECURITY.md has no {part.strip()!r}")
@@ -195,7 +247,7 @@ def security_problems(root: Path) -> list[str]:
             found.append(f"SECURITY.md's section {part.strip()!r} is empty")
     found += [f"SECURITY.md does not say {sentence!r}"
               for sentence in (f"Report it privately to {CONTACT}.", PUBLIC_ISSUE) if sentence not in text]
-    if set(EMAIL.findall(text)) - {CONTACT}:
+    if set(EMAIL.findall(source)) - {CONTACT}:
         found.append("SECURITY.md holds an e-mail address that is not its contact (CONTACT)")
     return found
 
@@ -252,6 +304,10 @@ class BrokenRuleTests(unittest.TestCase):
         self.assertIn(old, text)
         path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
 
+    def wrap(self, rel: str, before: str, after: str = "") -> None:
+        path = self.root / rel
+        path.write_text(before + path.read_text(encoding="utf-8") + after, encoding="utf-8", newline="\n")
+
     def git(self, root: Path, *args: str) -> None:
         if shutil.which("git") is None:
             self.skipTest("git is not installed")
@@ -306,6 +362,64 @@ class BrokenRuleTests(unittest.TestCase):
                     self.assertNamed(rf"^{re.escape(rel)} is larger than {len(data) * 2} bytes")
                 (self.root / rel).write_bytes(data)
 
+    def test_a_file_at_the_size_limit_is_read_and_a_larger_one_is_not(self) -> None:
+        reads: list[str] = []
+        read_bytes = Path.read_bytes
+
+        def spy(path: Path) -> bytes:
+            reads.append(path.name)
+            return read_bytes(path)
+        for rel in FILES:
+            size = (self.root / rel).stat().st_size
+            with self.subTest(rel=rel), mock.patch.object(Path, "read_bytes", spy):
+                reads.clear()
+                with mock.patch.dict(globals(), {"SIZE_LIMIT": size}):
+                    self.assertEqual([p for p in self.found() if p.startswith(f"{rel} is larger")], [])
+                self.assertIn(rel, reads)
+                reads.clear()
+                with mock.patch.dict(globals(), {"SIZE_LIMIT": size - 1}):
+                    self.assertNamed(rf"^{re.escape(rel)} is larger than {size - 1} bytes")
+                self.assertNotIn(rel, reads)
+
+    def blob_reads(self, limit: int) -> tuple[list[str], list[str]]:
+        """The problems found with SIZE_LIMIT at `limit`, and the blobs git was asked to print."""
+        calls: list[list[str]] = []
+        run = subprocess.run
+
+        def spy(args, *rest, **options):  # noqa: ANN001, ANN002, ANN003 - subprocess.run's own
+            calls.append(list(args))
+            return run(args, *rest, **options)
+        with mock.patch.object(subprocess, "run", spy), mock.patch.dict(globals(), {"SIZE_LIMIT": limit}):
+            found = self.found()
+        return found, [c[-1] for c in calls if c[-2:-1] == ["blob"]]
+
+    def test_a_blob_at_the_size_limit_is_read_and_a_larger_one_is_not(self) -> None:
+        good = (self.root / "LICENSE").read_bytes()
+        self.git(self.root, "init", "-q")
+        (self.root / "LICENSE").write_bytes(good * 3)
+        self.git(self.root, "add", "LICENSE")
+        (self.root / "LICENSE").write_bytes(good)
+        found, blobs = self.blob_reads(len(good) * 3)
+        self.assertIn("LICENSE in the index is not the published Apache License 2.0 text, byte for byte", found)
+        self.assertIn(":LICENSE", blobs)
+        found, blobs = self.blob_reads(len(good) * 3 - 1)
+        self.assertIn(f"LICENSE in the index is larger than {len(good) * 3 - 1} bytes, which no licence file is", found)
+        self.assertNotIn(":LICENSE", blobs)
+
+    def test_an_oversized_license_in_head(self) -> None:
+        good = (self.root / "LICENSE").read_bytes()
+        self.git(self.root, "init", "-q")
+        (self.root / "LICENSE").write_bytes(good * 3)
+        self.git(self.root, "add", "LICENSE")
+        self.git(self.root, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
+                 "commit", "-q", "--no-verify", "-m", "t")
+        (self.root / "LICENSE").write_bytes(good)
+        self.git(self.root, "add", "LICENSE")
+        found, blobs = self.blob_reads(len(good) * 2)
+        self.assertEqual([p for p in found if p.startswith("LICENSE")],
+                         [f"LICENSE in HEAD is larger than {len(good) * 2} bytes, which no licence file is"])
+        self.assertEqual(blobs, [":LICENSE"])
+
     def test_license_one_byte_changed(self) -> None:
         path = self.root / "LICENSE"
         path.write_bytes(path.read_bytes().replace(b"Apache License", b"Apache Licence", 1))
@@ -324,6 +438,12 @@ class BrokenRuleTests(unittest.TestCase):
             self.assertEqual(self.found(), [])
         with mock.patch.dict(os.environ, {"PATH": ""}):  # no git to run: read from disk only
             self.assertNamed(r"^LICENSE is not the published")
+
+    def test_a_checkout_where_git_cannot_run_is_read_from_disk(self) -> None:
+        self.git(self.root, "init", "-q")
+        self.git(self.root, "add", "LICENSE")
+        with mock.patch.dict(os.environ, {"PATH": ""}):
+            self.assertEqual(self.found(), [])
 
     def test_a_license_committed_with_crlf(self) -> None:
         self.git(self.root, "init", "-q")
@@ -371,9 +491,11 @@ class BrokenRuleTests(unittest.TestCase):
             self.assertNamed(r"^git did not answer within 1 s, so LICENSE in the index was not read")
 
     def test_a_git_that_answers_nonsense_is_named(self) -> None:
-        stand_in = self.stand_in_git("echo 'not a size'")
-        with mock.patch.dict(os.environ, {"PATH": str(stand_in)}):
-            self.assertNamed(r"^git gave no size for LICENSE in the index, so it was not read")
+        for answer in ("not a size", "\u00b2", "7" * 4400):  # a superscript two is a digit to str.isdigit()
+            with self.subTest(answer=answer[:12]):
+                stand_in = self.stand_in_git(f"echo '{answer}'")
+                with mock.patch.dict(os.environ, {"PATH": str(stand_in)}):
+                    self.assertNamed(r"^git gave no size for LICENSE in the index, so it was not read")
 
     def test_an_untracked_license_in_a_checkout_is_read_from_disk(self) -> None:
         self.git(self.root, "init", "-q")
@@ -395,7 +517,10 @@ class BrokenRuleTests(unittest.TestCase):
                                ("the License is in the file LICENSE.", "Contact: jane.doe@example.org\n"
                                                                        "the License is in the file LICENSE.", 6),
                                ("A copy of", "Licence text", 5),
-                               (NOTICE_TEXT, "", 1)):
+                               (NOTICE_TEXT, "", 1),
+                               ("Recursion\n", " Recursion\n", 1),
+                               ("Recursion\n", "\nRecursion\n", 1),
+                               ("the License is in the file LICENSE.\n", "the License is in the file LICENSE.\n\n", 7)):
             with self.subTest(new=new):
                 saved = (self.root / "NOTICE").read_bytes()
                 self.edit("NOTICE", old, new)
@@ -405,6 +530,13 @@ class BrokenRuleTests(unittest.TestCase):
     def test_notice_that_is_not_utf_8_is_named(self) -> None:
         (self.root / "NOTICE").write_bytes(b"Recursion\n\xff\xfe\n")
         self.assertNamed(r"^NOTICE is not NOTICE_TEXT \(from line 2\)")
+        (self.root / "NOTICE").write_bytes(NOTICE_TEXT.encode("utf-8").replace(b"Recursion", b"Recur\xffsion", 1))
+        self.assertNamed(r"^NOTICE is not NOTICE_TEXT \(from line 1\)")  # not read as if the byte were not there
+
+    def test_text_files_with_windows_line_endings_hold(self) -> None:
+        for rel in ("NOTICE", "CONTRIBUTING.md", "SECURITY.md"):
+            self.crlf(rel)
+        self.assertEqual(self.found(), [])
 
     def test_the_sign_off_section_is_held_word_for_word(self) -> None:
         for old, new in (("version 1.1\n", "version 1.10\n"),
@@ -425,10 +557,24 @@ class BrokenRuleTests(unittest.TestCase):
                 self.assertNamed(r"^CONTRIBUTING\.md does not have exactly one sign-off section")
                 (self.root / "CONTRIBUTING.md").write_bytes(saved)
 
+    def test_contributing_code_sample_is_not_signoff_section(self) -> None:
+        self.wrap("CONTRIBUTING.md", "````\n", "````\n")
+        self.assertNamed(r"^CONTRIBUTING\.md's sign-off heading is not a line of its own outside comments and fences")
+
+    def test_a_sign_off_heading_in_a_comment_or_inside_a_line_is_not_the_section(self) -> None:
+        for old, new, after in ((SIGN_OFF_HEADING, "<!--\n" + SIGN_OFF_HEADING, "-->\n"),
+                                (SIGN_OFF_HEADING, "Note: " + SIGN_OFF_HEADING, "")):
+            with self.subTest(new=new[:8]):
+                saved = (self.root / "CONTRIBUTING.md").read_bytes()
+                self.edit("CONTRIBUTING.md", old, new)
+                self.wrap("CONTRIBUTING.md", "", after)
+                self.assertNamed(r"^CONTRIBUTING\.md's sign-off heading is not a line of its own")
+                (self.root / "CONTRIBUTING.md").write_bytes(saved)
+
     def test_security_without_a_part_or_a_sentence(self) -> None:
         for removed in ("> **Draft.**", "## Reporting a vulnerability\n", "## Supported versions\n", "## Scope\n",
                         "## What the code defends, and what it does not yet\n",
-                        "Report it privately to <contact: Lucas to name>.",
+                        f"Report it privately to {CONTACT}.",
                         "Please do not report a suspected vulnerability in a public issue"):
             with self.subTest(removed=removed):
                 saved = (self.root / "SECURITY.md").read_bytes()
@@ -449,12 +595,101 @@ class BrokenRuleTests(unittest.TestCase):
                              "## What the code defends, and what it does not yet"):
                     self.assertIn(f"SECURITY.md has no {part!r}", self.found())
 
+    # The first Codex reads of #409 (GPT-6 Astra R1-R3, GPT-6.1 Sol R1-R2): their tests, on this harness.
+    def assert_security_parts_absent(self) -> None:
+        found = self.found()
+        self.assertIn("SECURITY.md has no '## Supported versions'", found)
+        self.assertIn("SECURITY.md has no '## Scope'", found)
+
+    def test_security_tilde_fence_is_not_policy_sections(self) -> None:
+        self.wrap("SECURITY.md", "~~~\n", "~~~\n")
+        self.assert_security_parts_absent()
+
+    def test_security_indented_fence_is_not_policy_sections(self) -> None:
+        self.wrap("SECURITY.md", " ```\n", " ```\n")
+        self.assert_security_parts_absent()
+
+    def test_security_unclosed_fence_is_not_policy_sections(self) -> None:
+        self.wrap("SECURITY.md", "```\n")
+        self.assert_security_parts_absent()
+
+    def test_R1_fenced_policy_has_no_required_visible_parts(self) -> None:
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        variants = {
+            "tilde": "~~~markdown\n" + text + "~~~\n",
+            "indent-1": " ```markdown\n" + text + " ```\n",
+            "indent-2": "  ```markdown\n" + text + "  ```\n",
+            "indent-3": "   ```markdown\n" + text + "   ```\n",
+            "no-closing-fence": "```markdown\n" + text,
+            "shorter-inner-fence": "````markdown\n```\n" + text + "````\n",
+        }
+        for name, wrapped in variants.items():
+            with self.subTest(variant=name):
+                (self.root / "SECURITY.md").write_text(wrapped, encoding="utf-8", newline="\n")
+                self.assertIn("SECURITY.md has no '## Scope'", self.found())
+
+    def test_security_code_block_cannot_publish_another_contact(self) -> None:
+        self.wrap("SECURITY.md", "", "\n```text\nContact: contact@example.invalid\n```\n")
+        self.assertIn("SECURITY.md holds an e-mail address that is not its contact (CONTACT)", self.found())
+
+    def test_security_comment_cannot_publish_another_address_in_source(self) -> None:
+        self.wrap("SECURITY.md", "", "\n<!-- contact@example.invalid -->\n")
+        self.assertIn("SECURITY.md holds an e-mail address that is not its contact (CONTACT)", self.found())
+
+    def test_R2_quoted_and_literal_domain_addresses_are_forbidden(self) -> None:
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for address in ('"example"@example.invalid', "example@[192.0.2.1]"):
+            with self.subTest(address=address):
+                self.assertTrue(Address(addr_spec=address).domain)
+                (self.root / "SECURITY.md").write_text(text + "\nOr report to " + address + ".\n", encoding="utf-8",
+                                                       newline="\n")
+                self.assertIn("SECURITY.md holds an e-mail address that is not its contact (CONTACT)", self.found())
+
+    def test_R2_addresses_inside_comments_or_code_are_forbidden(self) -> None:
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for addition in ("\n<!-- example@example.invalid -->\n", "\n```text\nexample@example.invalid\n```\n"):
+            with self.subTest(addition=addition):
+                (self.root / "SECURITY.md").write_text(text + addition, encoding="utf-8", newline="\n")
+                self.assertIn("SECURITY.md holds an e-mail address that is not its contact (CONTACT)", self.found())
+
+    def test_what_is_and_is_not_a_fence_or_a_comment(self) -> None:
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for name, wrapped, hidden in (
+                ("a fence closed before the policy", "```\nx\n```\n" + text, False),
+                ("closed by a longer fence and a space", "~~~\nx\n~~~~~ \n" + text, False),
+                ("four spaces: indented code, not a fence", "    ```\n" + text, False),
+                ("a backtick in a backtick fence's info string: not a fence", "``` a`b\n" + text, False),
+                ("a tilde fence is not closed by backticks", "~~~\n```\n" + text + "```\n", True),
+                ("nor by a fence with text after it", "```\n``` x\n" + text + "```\n", True),
+                ("a comment closed on its line", "<!-- x -->\n" + text, False),
+                ("a fence line inside a comment opens nothing", "<!--\n```\n-->\n" + text, False),
+                ("a comment never closed", "<!--\n" + text, True)):
+            with self.subTest(case=name):
+                (self.root / "SECURITY.md").write_text(wrapped, encoding="utf-8", newline="\n")
+                if hidden:
+                    self.assertIn("SECURITY.md has no '## Scope'", self.found())
+                else:
+                    self.assertEqual(self.found(), [])
+
+    def test_a_sentence_in_a_one_line_comment_is_hidden(self) -> None:
+        sentence = f"Report it privately to {CONTACT}."
+        self.edit("SECURITY.md", sentence, f"<!-- {sentence} -->")
+        self.assertNamed(r"^SECURITY\.md does not say " + re.escape(repr(sentence)))
+
+    def test_text_beside_a_comment_on_its_line_is_read(self) -> None:
+        sentence = f"Report it privately to {CONTACT}."
+        self.edit("SECURITY.md", sentence, f"<!-- a -->{sentence}<!-- b -->")
+        self.assertEqual(self.found(), [])
+
     def test_an_empty_security_section(self) -> None:
         text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
-        emptied = re.sub(r"(## Supported versions\n).*?(## Scope\n)", r"\1\n\2", text, flags=re.S)
-        self.assertNotEqual(emptied, text)
-        (self.root / "SECURITY.md").write_text(emptied, encoding="utf-8")
-        self.assertNamed(r"^SECURITY\.md's section '## Supported versions' is empty")
+        for heading in ("## Reporting a vulnerability\n", "## Supported versions\n", "## Scope\n",
+                        "## What the code defends, and what it does not yet\n"):
+            with self.subTest(heading=heading):
+                emptied = re.sub(rf"({re.escape(heading)}).*?(\n## |\Z)", r"\1\n\2", text, count=1, flags=re.S)
+                self.assertNotEqual(emptied, text)
+                (self.root / "SECURITY.md").write_text(emptied, encoding="utf-8", newline="\n")
+                self.assertNamed(rf"^SECURITY\.md's section {re.escape(repr(heading.strip()))} is empty")
 
     def test_security_gutted_to_its_two_sentences(self) -> None:
         (self.root / "SECURITY.md").write_text(
@@ -466,7 +701,7 @@ class BrokenRuleTests(unittest.TestCase):
             self.assertIn(f"SECURITY.md has no {part!r}", found)
 
     def test_security_with_an_address(self) -> None:
-        for address in ("jane.doe@example.org", "triage@localhost"):
+        for address in ("jane.doe@example.org", "triage@localhost", "JANE.DOE@EXAMPLE.ORG"):
             with self.subTest(address=address):
                 saved = (self.root / "SECURITY.md").read_bytes()
                 with (self.root / "SECURITY.md").open("a", encoding="utf-8") as f:
@@ -475,12 +710,49 @@ class BrokenRuleTests(unittest.TestCase):
                 (self.root / "SECURITY.md").write_bytes(saved)
 
     def test_a_named_contact_may_be_the_one_address(self) -> None:
-        with mock.patch.dict(globals(), {"CONTACT": "security@example.org"}):
-            self.edit("SECURITY.md", "<contact: Lucas to name>", "security@example.org")
+        current, named = CONTACT, "security-review@example.invalid"
+        with mock.patch.dict(globals(), {"CONTACT": named}):
+            self.edit("SECURITY.md", current, named)
             self.assertEqual(self.found(), [])
-            with (self.root / "SECURITY.md").open("a", encoding="utf-8") as f:
-                f.write("\nOr write to jane.doe@example.org.\n")
-            self.assertNamed(r"^SECURITY\.md holds an e-mail address that is not its contact")
+            for line, others in ((f"Write to **{named}**, `{named}`, <{named}> or [{named}](mailto:{named}).", False),
+                                 (f"Or write to evil.{named}.", True), (f"Or write to {named}.evil.example.", True),
+                                 ('Or write to "security-review"@example.invalid.', True),
+                                 ("Or write to jane.doe@example.org.", True)):
+                with self.subTest(line=line):
+                    saved = (self.root / "SECURITY.md").read_bytes()
+                    self.wrap("SECURITY.md", "", "\n" + line + "\n")
+                    if others:
+                        self.assertNamed(r"^SECURITY\.md holds an e-mail address that is not its contact")
+                    else:
+                        self.assertEqual(self.found(), [])
+                    (self.root / "SECURITY.md").write_bytes(saved)
+
+    def test_approved_contact_two_edits_keep_suite_green(self) -> None:
+        """Naming the contact (CONTACT and SECURITY.md) or the holder (HOLDER and NOTICE), as the
+        comments above them say, keeps this file's tests green: they run again, as a child, on a copy
+        of the four files and of this file with the two edits made."""
+        if os.environ.get("LICENCE_CHECKS_CHILD"):
+            self.skipTest("this is that run")
+        source = Path(__file__).read_text(encoding="utf-8")
+        flags = [f"-X{k}" if v is True else f"-X{k}={v}" for k, v in sys._xoptions.items()]
+        for constant, old, rel, new in (("CONTACT", CONTACT, "SECURITY.md", "security@example.invalid"),
+                                        ("HOLDER", HOLDER, "NOTICE", "Example Review Entity")):
+            with self.subTest(constant=constant):
+                tree = Path(tempfile.mkdtemp(prefix="named-", dir=self.root.parent))
+                for name in FILES:
+                    (tree / name).write_bytes((self.root / name).read_bytes())
+                line = f'{constant} = "{old}"\n'
+                self.assertEqual(source.count(line), 1)
+                (tree / "tools/release").mkdir(parents=True)
+                (tree / "tools/release/licence_checks.py").write_text(source.replace(line, f'{constant} = "{new}"\n'),
+                                                                      encoding="utf-8", newline="\n")
+                text = (tree / rel).read_text(encoding="utf-8")
+                self.assertIn(old, text)
+                (tree / rel).write_text(text.replace(old, new), encoding="utf-8", newline="\n")
+                run = subprocess.run([sys.executable, *flags, "-B", str(tree / "tools/release/licence_checks.py")],
+                                     cwd=tree, capture_output=True, text=True, timeout=600,
+                                     env={**os.environ, "LICENCE_CHECKS_CHILD": "1"})
+                self.assertEqual(run.returncode, 0, run.stderr[-3000:])
 
 
 if __name__ == "__main__":

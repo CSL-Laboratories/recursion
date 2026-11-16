@@ -96,6 +96,13 @@ def _model_version_ok(value: object) -> bool:
     return ConnectionBreaker.model_recordable(value)
 
 
+def _file_identity(path: str) -> tuple:
+    """The file a path names now: its device and inode, which a link pointed elsewhere or a file put in its
+    place changes."""
+    status = os.stat(path)
+    return (status.st_dev, status.st_ino)
+
+
 def create_ledger(path: str, anchor_public_key: str) -> None:
     """Installer step: create the ledger bound to one anchor. Refuses if it exists."""
     parse_public_key(anchor_public_key)
@@ -124,10 +131,18 @@ class Authority:
             raise Refused("anchor_is_csl_key")
         self._anchor = anchor_public_key
         self._clock = clock
-        # Resolved once, here: a relative path names the ledger of the working directory of now, and a
-        # reopen after a failed rollback must reach that same ledger whatever the working directory is then.
-        self._path = os.path.abspath(ledger_path)
+        # Resolved once, here, to the file itself: a relative path names the ledger of the working directory of
+        # now, and a link names whatever it points at when it is followed. A reopen after a failed rollback must
+        # reach this same file, whatever the working directory is then and wherever a link points by then, so
+        # the resolved path and the file's identity are kept. A bytes or path-like name is taken, as
+        # ``create_ledger`` takes it.
+        self._path = os.path.realpath(os.fsdecode(ledger_path))
         self._db = self._connect(self._path)
+        try:
+            self._identity = _file_identity(self._path)
+        except OSError:
+            self._db.close()
+            raise Refused("ledger_missing") from None
         self._unusable = False  # set once a failed rollback or ``close`` leaves no usable connection
         self._lock = threading.Lock()
         # Positive Ed25519 verdicts for this instance's fixed anchor, keyed by the exact
@@ -212,12 +227,14 @@ class Authority:
             raise Refused("profile_window")
         return profile, hashlib.sha256(raw).hexdigest()
 
-    def _connect(self, ledger_path: str) -> sqlite3.Connection:
+    def _connect(self, ledger_path: str, identity: tuple | None = None) -> sqlite3.Connection:
         """The ledger, opened and checked to be this anchor's; refused, with nothing left open, if not.
 
         The daemon never creates the ledger, here or when a failed rollback opens it again: a path with no file
         is ``ledger_missing`` before anything is opened, and the open itself is read-write only (SQLite's
-        ``mode=rw``), so a file removed after that check is refused too and is never created empty."""
+        ``mode=rw``), so a file removed after that check is refused too and is never created empty. With
+        ``identity`` (the reopen's), the file must be the one the authority opened at construction: another
+        file at the path, even a ledger of the same anchor, is ``ledger_invalid``."""
         if not os.path.isfile(ledger_path):
             raise Refused("ledger_missing")
         db = None
@@ -239,21 +256,32 @@ class Authority:
         except sqlite3.Error:
             db.close()
             raise Refused("ledger_invalid") from None
+        if identity is not None:
+            try:
+                same = _file_identity(ledger_path) == identity
+            except OSError:
+                same = False
+            if not same:
+                db.close()
+                raise Refused("ledger_invalid")
         return db
 
     def _roll_back(self) -> None:
         """Roll a charge's write transaction back. If ROLLBACK itself raises, the connection may still hold
         that transaction, and every later charge would wait for it and fail: so the connection is closed,
-        which discards what the transaction wrote, and the ledger is opened again by ``_connect``, at the
-        absolute path resolved at construction, with every check of the first open (the ledger must still
-        exist; nothing is created). A cursor on the old connection that another owner still holds would keep
-        that transaction until it is finalized; nothing in this module hands one out.
+        which discards what the transaction wrote, and the ledger is opened again by ``_connect``: the same
+        file the authority opened at construction (its resolved path, and that file's identity, so a link
+        pointed elsewhere or a ledger put in its place is refused), with every check of the first open (the
+        ledger must still exist; nothing is created). This is about the module's own connection: an object
+        someone takes from the private ``_db`` (a cursor, say) is outside what the repair promises.
 
         Until that open succeeds the ledger is out of use, and every later charge is refused
         ``ledger_invalid`` at once and writes nothing. If the close itself raises, the connection is kept,
         since it may still hold the transaction, and nothing is opened beside it; if the ledger cannot be
-        opened again, the closed connection is kept. The rollback's error propagates from here; what the
-        caller of ``charge`` sees is said there."""
+        opened again, the closed connection is kept. The rollback's error propagates from here when the
+        reopen succeeds or is refused with a code; any other error of the reopen (an interruption, say)
+        propagates in its place, with the ledger out of use all the same. What the caller of ``charge`` sees
+        is said there."""
         try:
             self._db.execute("ROLLBACK")
         except BaseException:
@@ -264,7 +292,7 @@ class Authority:
                 closed = True
             if closed:
                 with contextlib.suppress(Refused):
-                    self._db = self._connect(self._path)
+                    self._db = self._connect(self._path, self._identity)
                     self._unusable = False
             raise
 
@@ -289,14 +317,15 @@ class Authority:
         error as its context, and nothing is written. If its exit swallows a refusal or an error,
         ``charge`` raises it all the same: a guard can refuse a charge, never turn a refusal into a
         success. If the rollback itself raises, its error reaches the caller in place of the charge's,
-        unless the guard's exit swallows it, when the charge's own error is raised; the connection is
+        unless the guard's exit swallows it, when the charge's own error is raised (a reopen that fails other
+        than with a refusal raises its own error instead, as ``_roll_back`` says); the connection is
         closed (which discards what the transaction wrote) and the ledger opened again, so no later charge
         inherits that transaction. If that cannot be done (the close raises, or the ledger cannot be opened
         again), every later charge is refused ``ledger_invalid`` at once, and so is every charge after
-        ``close``. A guard must not call ``charge``: the ledger's lock is held while it runs, so that call
-        would wait for itself. The core passes its commit section with the halt recheck (R4-1), whose exit only
-        releases the fence; so signature verification never runs under it and a halt never waits
-        for one.
+        ``close``. A guard must call neither ``charge`` nor ``close``: the ledger's lock is held while it runs,
+        so either call would wait for itself. The core passes its commit section with the halt recheck (R4-1),
+        whose exit only releases the fence; so signature verification never runs under it and a halt never
+        waits for one.
         """
         profile, digest = self._check_profile(envelope)
         now = self._clock()
@@ -355,6 +384,8 @@ class Authority:
                 "remaining_minor": profile["budgets"]["total_minor"] - spent - amount_minor}
 
     def close(self) -> None:
+        """Shut the ledger's connection. The authority is out of use first, so every later charge is refused
+        ``ledger_invalid``, even when the connection's own close raises (that error reaches the caller)."""
         with self._lock:
             self._unusable = True
             self._db.close()

@@ -6,6 +6,7 @@ Rust core would be driven, not through Python internals.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -19,6 +20,7 @@ from recursion_core.plugin_security import (
     PROTOCOL, ApprovalGate, Authority, ConnectionBreaker, CoreHealth, CoreService, Grant, PluginLoader, Refused,
     ReservedEffects, TrustStore, canonical, create_breaker_store, create_ledger, parse_manifest,
 )
+from recursion_core.plugin_security.authority import PROFILE_SCHEMA
 from recursion_core.plugin_security.protocol import CommitFence
 from recursion_core.plugin_security.tests.support import (
     AGENT_TOKEN, OPERATOR_TOKEN, PLUGIN_SOURCE, PLUGIN_TOKEN, Clock, FakeGilProbe, World, authenticate, effect,
@@ -1442,6 +1444,76 @@ class LedgerRepairTests(unittest.TestCase):
         self.assertEqual((_ledger_rows(self.path, "charges"), _ledger_rows(os.path.join(second, "ledger.db"),
                                                                            "charges")), (1, 0))
 
+    def test_a_bytes_or_path_like_name_opens_and_recovers_the_same_ledger(self) -> None:  # review 2, DeepSeek F8
+        for name in (os.fsencode(self.path), Path(self.path)):
+            with self.subTest(name=type(name).__name__):
+                auth = Authority(_ANCHOR, name, lambda: 0)
+                self.addCleanup(auth.close)
+                real = auth._db
+                real.execute("BEGIN IMMEDIATE")
+                auth._db = _FailingRollback(real)
+                with self.assertRaises(sqlite3.OperationalError):
+                    auth._roll_back()
+                auth._require_usable()
+                self.assertTrue(os.path.samefile(auth._db.execute("PRAGMA database_list").fetchone()[2], self.path))
+
+    @unittest.skipIf(os.name == "nt", "links are a POSIX matter here")
+    def test_recovery_stays_on_the_file_a_link_named_at_construction(self) -> None:  # review 2, DeepSeek F10
+        root = temp_dir(self)
+        one, two, current = (os.path.join(root, name) for name in ("one", "two", "current"))
+        for folder in (one, two):
+            os.mkdir(folder)
+            create_ledger(os.path.join(folder, "ledger.db"), _ANCHOR)  # the same anchor in both
+        os.symlink(one, current)
+        auth = Authority(_ANCHOR, os.path.join(current, "ledger.db"), lambda: 0)
+        self.addCleanup(auth.close)
+        auth._db.execute("INSERT INTO charges VALUES ('prior', 'prof', 1000)")
+        os.unlink(current)
+        os.symlink(two, current)  # the link now names another ledger of the same anchor
+        real = auth._db
+        real.execute("BEGIN IMMEDIATE")
+        auth._db = _FailingRollback(real)
+        with self.assertRaises(sqlite3.OperationalError):
+            auth._roll_back()
+        auth._require_usable()
+        self.assertTrue(os.path.samefile(auth._db.execute("PRAGMA database_list").fetchone()[2],
+                                         os.path.join(one, "ledger.db")))
+        self.assertEqual(auth._db.execute("SELECT COUNT(*) FROM charges").fetchone()[0], 1)  # its spend still counts
+
+    @unittest.skipIf(os.name == "nt", "a ledger open in this process cannot be replaced on Windows")
+    def test_a_ledger_of_the_same_anchor_put_in_its_place_is_refused_on_the_reopen(self) -> None:  # DeepSeek F10
+        def replace() -> None:
+            os.unlink(self.path)
+            create_ledger(self.path, _ANCHOR)  # the same anchor: only the file's identity tells it apart
+
+        self._fail_the_rollback(before=replace)
+        self._assert_out_of_use()
+        self.assertEqual(_ledger_rows(self.path, "charges"), 0)
+
+    def test_the_first_open_refuses_another_stores_magic_and_another_anchors_ledger(self) -> None:
+        # Review 2 of #426: the reopen's identity check now refuses any other file first, so the magic and anchor
+        # checks of _connect are pinned at the first open, on both interpreters.
+        other_store, other_anchor = (os.path.join(temp_dir(self), name) for name in ("store.db", "anchor.db"))
+        create_ledger(other_store, _ANCHOR)
+        with contextlib.closing(sqlite3.connect(other_store)) as db:
+            db.execute("UPDATE meta SET v = 'another-store/v0' WHERE k = 'magic'")
+            db.commit()
+        create_ledger(other_anchor, "cd" * 32)
+        for path in (other_store, other_anchor):
+            with self.subTest(path=os.path.basename(path)):
+                with self.assertRaises(Refused) as refused:
+                    Authority(_ANCHOR, path, lambda: 0)
+                self.assertEqual(refused.exception.code, "ledger_anchor_mismatch")
+
+    def test_a_reopen_that_fails_other_than_with_a_refusal_raises_its_error_and_stays_out_of_use(self) -> None:
+        real = self.auth._db  # review 2, DeepSeek F11: as the docstring now says
+        real.execute("BEGIN IMMEDIATE")
+        self.auth._db = _FailingRollback(real)
+        with mock.patch.object(self.auth, "_connect", side_effect=OSError("synthetic: the reopen could not run")):
+            with self.assertRaises(OSError):
+                self.auth._roll_back()
+        self._assert_out_of_use()
+
     def test_a_ledger_removed_after_the_check_is_not_created_by_the_open(self) -> None:  # F2: the open never creates
         missing = os.path.join(temp_dir(self), "gone.db")
         with mock.patch("recursion_core.plugin_security.authority.os.path.isfile", return_value=True):
@@ -1453,6 +1525,96 @@ class LedgerRepairTests(unittest.TestCase):
     def test_a_charge_once_the_authority_is_shut_down_is_refused_with_a_code(self) -> None:  # DeepSeek's consumer table
         self.auth.close()
         self._assert_out_of_use()
+
+
+class _FailingShutdown:
+    """The ledger's connection, whose own close raises."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+
+    def execute(self, *args):
+        return self._real.execute(*args)
+
+    def close(self) -> None:
+        raise sqlite3.OperationalError("synthetic shutdown failure")
+
+
+class ChargeBoundaryTests(unittest.TestCase):
+    """Review 2 of #426 (astra's C1, DeepSeek F13): the recovery through the public ``charge``, with only the
+    signature's verdict stubbed, so on both interpreters (taken from astra's proposed-coverage.patch)."""
+
+    def setUp(self) -> None:
+        self.path = os.path.join(temp_dir(self), "ledger.db")
+        create_ledger(self.path, _ANCHOR)
+        self.auth = self._authority()
+        scope = dict(account="paper", venue="paper", contract_family="fixture", adapter="fixture",
+                     environment="paper")
+        self.envelope = dict(signature="synthetic-test-verdict", profile=dict(
+            schema=PROFILE_SCHEMA, profile_id="profile", issuer="installer", permission="order",
+            plugin_id="fixture.plugin", artifact_sha256="0" * 64, scope=scope, provider="fixture",
+            model_version="fixture", actions=["order.submit"], not_before=0, expires_at=10,
+            budgets=dict(currency="USD", max_effect_minor=100, total_minor=300)))
+        self.args = dict(plugin_id="fixture.plugin", artifact_sha256="0" * 64, scope=scope, kind="order.submit",
+                         provider="fixture", model_version="fixture", currency="USD", amount_minor=100)
+
+    def _authority(self) -> Authority:
+        auth = Authority(_ANCHOR, self.path, lambda: 1)
+        self.addCleanup(auth.close)
+        verdict = mock.patch.object(auth, "_verify", return_value=True)  # the signature's verdict only
+        verdict.start()
+        self.addCleanup(verdict.stop)
+        return auth
+
+    def _charge(self, key: str) -> dict:
+        return self.auth.charge(self.envelope, **self.args, idempotency_key=key)
+
+    @staticmethod
+    def _deny_the_end(action, name, *_):
+        """An SQLite authorizer refusing COMMIT and ROLLBACK: the transaction cannot end."""
+        return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_TRANSACTION and name in ("COMMIT", "ROLLBACK") \
+            else sqlite3.SQLITE_OK
+
+    def test_a_failed_commit_and_rollback_through_charge_keeps_spend_and_replay(self) -> None:
+        self.assertEqual(self._charge("prior")["spent_minor"], 100)
+        real = self.auth._db
+        real.set_authorizer(self._deny_the_end)
+        with self.assertRaises(sqlite3.DatabaseError):
+            self._charge("failed")
+        with self.assertRaises(sqlite3.ProgrammingError):  # the old connection was shut by the repair
+            real.execute("SELECT 1")
+        self.assertEqual(self._charge("failed")["spent_minor"], 200)
+        with self.assertRaises(Refused) as refused:
+            self._charge("prior")
+        self.assertEqual(refused.exception.code, "effect_replayed")
+        with contextlib.closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*), SUM(amount_minor) FROM charges").fetchone(), (2, 200))
+
+    def test_charge_is_refused_after_a_failed_shutdown_a_refused_reopen_and_its_own_shutdown(self) -> None:
+        for scenario in ("a shutdown that raises", "a refused reopen", "the authority shut down"):
+            with self.subTest(scenario=scenario):
+                self.auth = self._authority()
+                real = self.auth._db
+                self.addCleanup(setattr, self.auth, "_db", real)
+                if scenario == "the authority shut down":
+                    self.auth.close()
+                else:
+                    real.set_authorizer(self._deny_the_end)
+                    if scenario == "a shutdown that raises":
+                        self.auth._db = _FailingShutdown(real)
+                        with self.assertRaises(sqlite3.DatabaseError):
+                            self._charge("failed")
+                    else:
+                        with mock.patch.object(self.auth, "_connect", side_effect=Refused("ledger_missing")):
+                            with self.assertRaises(sqlite3.DatabaseError):
+                                self._charge("failed")
+                try:
+                    with self.assertRaises(Refused) as refused:
+                        self._charge("after")
+                    self.assertEqual(refused.exception.code, "ledger_invalid")
+                finally:
+                    self.auth._db = real
+                    real.close()
 
 
 class CommitFencePrimitiveTests(unittest.TestCase):

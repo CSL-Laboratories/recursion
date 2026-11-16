@@ -161,16 +161,20 @@ def check_dirs(root: str, path: str) -> None:
         _existing_folder(cur)
 
 
-def check_private_dir(root: str, path: str) -> None:
+def check_private_dir(root: str, path: str, *, required: bool = False) -> None:
     """``check_dirs``, and ``path`` itself, if it is there, open to nobody else at all (no bit of
     0o077) and usable by its owner (read, write and search): the route homes' custody root, which
     ``setup.route_home.check`` (lane INSTALL's #401, a separate pull request) holds to the first rule
-    and the launcher's ``private_dir`` (``daemon/launcher.py``) needs the second for."""
+    and the launcher's ``private_dir`` (``daemon/launcher.py``) needs the second for. With ``required``,
+    ``path`` must be there: the check after the root was made, which a missing root must not pass."""
 
     check_dirs(root, path)
     try:
         info = os.lstat(path)
     except FileNotFoundError:
+        if required:
+            raise InstallRefused("folder_untrusted", f"{path} is not there: it was removed after it was made; "
+                                 "run the command again") from None
         return
     if info.st_mode & 0o077:
         raise InstallRefused("folder_untrusted", f"{path} is open to group or world; route homes need it owner-only: `chmod 700` it")

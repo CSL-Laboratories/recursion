@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import os
 import shutil
@@ -1144,6 +1145,109 @@ class StoreTests(unittest.TestCase):
             os.chmod(self.store_dir, 0o700)
         self.assertIn("PermissionError", error.detail)
         self.assertEqual(os.listdir(self.store_dir), [])
+        self.assertFalse(os.path.lexists(self.unit))
+
+    def test_a_store_the_helper_cannot_link_into_place_is_not_created(self) -> None:
+        # Review 1 of #410, Codex GPT-6.1 Sol R2: an I/O error at the helper's final link answered
+        # <store>_invalid, though the new store was valid and could not be put in place.
+        real_link = os.link
+        for path in (self.breaker, self.revoked):
+            for number in (errno.ENOSPC, errno.EIO, errno.EPERM):
+                with self.subTest(store=os.path.basename(path), errno=number):
+                    def link(src, dst, *args, **kwargs):
+                        if os.fspath(dst) == path:
+                            raise OSError(number, os.strerror(number), dst)
+                        return real_link(src, dst, *args, **kwargs)
+                    with mock.patch("os.link", side_effect=link):
+                        error = self.refused("store_not_created", install, self.roots, EXEC)
+                    self.assertIn(path, error.detail)
+                    self.assertIn("cannot link the new store", error.detail)
+                    self.assertFalse(os.path.lexists(path))
+                    self.assertFalse(os.path.lexists(self.unit))
+                    self.assertLessEqual(set(os.listdir(self.store_dir)), {"breaker.sqlite3"})  # no temporary file
+
+
+@unittest.skipUnless(os.name == "posix", "the installer is Linux-only")
+class CustodyRootMadeTests(unittest.TestCase):
+    """Review 1 of #410, Codex GPT-6.1 Sol R1 and GPT-6 Astra R1: the custody root ``install`` or ``upgrade``
+    makes, or finds made meanwhile by another caller, is held to the custody rule before the unit is written
+    or kept. Sol's five probes and Astra's umask test, each red before this answer."""
+
+    setUp = InstallTests.setUp
+
+    def refused(self, call, *args) -> InstallRefused:
+        with self.assertRaises(InstallRefused) as caught:
+            call(*args)
+        self.assertEqual(caught.exception.kind, "folder_untrusted", caught.exception.detail)
+        return caught.exception
+
+    def unit_bytes(self) -> bytes:
+        with open(self.unit, "rb") as handle:
+            return handle.read()
+
+    def another_caller_makes(self, mode: int):
+        """``os.mkdir`` of the custody root, won by another caller with ``mode`` between the look and the make."""
+        real_mkdir = os.mkdir
+
+        def mkdir(path, *args, **kwargs):
+            if os.fspath(path) == self.homes:
+                real_mkdir(path, mode)
+                os.chmod(path, mode)
+            return real_mkdir(path, *args, **kwargs)
+        return mock.patch("os.mkdir", side_effect=mkdir)
+
+    def test_a_root_another_caller_made_meanwhile_is_held_to_the_rule(self) -> None:
+        for mode in (0o755, 0o750, 0o701):
+            with self.subTest(command="install", mode=oct(mode)):
+                with self.another_caller_makes(mode):
+                    self.refused(install, self.roots, EXEC)
+                self.assertFalse(os.path.lexists(self.unit))
+                os.rmdir(self.homes)
+        install(self.roots, EXEC)
+        before = self.unit_bytes()
+        for mode in (0o755, 0o750, 0o701):
+            with self.subTest(command="upgrade", mode=oct(mode)):
+                os.rmdir(self.homes)
+                with self.another_caller_makes(mode):
+                    self.refused(upgrade, self.roots, EXEC_NEXT)
+                self.assertEqual(self.unit_bytes(), before)  # the old unit is not replaced
+                os.chmod(self.homes, 0o700)
+
+    def test_a_root_made_under_a_umask_that_takes_the_owners_bits_is_refused(self) -> None:
+        install(self.roots, EXEC)
+        for umask in (0o300, 0o700):
+            for command, args in (("install", EXEC), ("upgrade", EXEC), ("upgrade", EXEC_NEXT)):
+                with self.subTest(umask=oct(umask), command=command, rewrite=args is EXEC_NEXT):
+                    if command == "install":
+                        uninstall(self.roots)
+                    before = self.unit_bytes() if os.path.lexists(self.unit) else None
+                    os.rmdir(self.homes)
+                    old = os.umask(umask)
+                    try:
+                        error = self.refused(install if command == "install" else upgrade, self.roots, args)
+                    finally:
+                        os.umask(old)
+                        if os.path.lexists(self.homes):
+                            os.chmod(self.homes, 0o700)
+                    self.assertIn("readable, writable and searchable by its owner", error.detail)
+                    if before is None:
+                        self.assertFalse(os.path.lexists(self.unit))
+                        install(self.roots, EXEC)
+                    else:
+                        self.assertEqual(self.unit_bytes(), before)
+
+    def test_a_root_gone_after_another_caller_made_it_is_not_success(self) -> None:
+        real_mkdir = os.mkdir
+
+        def made_then_gone(path, *args, **kwargs):
+            if os.fspath(path) == self.homes:
+                real_mkdir(path, 0o700)
+                os.rmdir(path)
+                raise FileExistsError(17, "File exists", path)
+            return real_mkdir(path, *args, **kwargs)
+        with mock.patch("os.mkdir", side_effect=made_then_gone):
+            error = self.refused(install, self.roots, EXEC)
+        self.assertIn("is not there", error.detail)
         self.assertFalse(os.path.lexists(self.unit))
 
 

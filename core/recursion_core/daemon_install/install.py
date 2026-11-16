@@ -61,7 +61,8 @@ def ensure_stores(paths: Owned) -> tuple[tuple[str, str, bool], ...]:
     ``open_store`` and is left as it is. A refusal keeps the store's own code
     (``breaker_store_untrusted``, ``revocation_store_invalid``, ``breaker_store_exists`` for a
     leftover ``-wal`` beside a missing store, ...); a store that cannot be made at all (a full disk,
-    a umask that takes the owner's own write bit) is ``store_not_created``. Returns
+    a umask that takes the owner's own write bit, an I/O error at the final link: the helper's
+    ``<store>_invalid`` for a new store, its code kept in the detail) is ``store_not_created``. Returns
     ``(kind, path, created now)`` for each. The ledger is not made here: it is bound to the
     installer's anchor key, which this lane does not have yet (its open question for Lucas).
     """
@@ -75,17 +76,21 @@ def ensure_stores(paths: Owned) -> tuple[tuple[str, str, bool], ...]:
     done = []
     for path, magic, create in ((paths.breaker_store, stores.BREAKER_MAGIC, stores.create_breaker_store),
                                 (paths.revocation_store, stores.REVOCATION_MAGIC, stores.create_revocation_store)):
+        exists = os.path.lexists(path)
         try:
-            if os.path.lexists(path):
+            if exists:
                 stores.open_store(path, magic).close()
-                done.append((stores.KINDS[magic], path, False))
-                continue
-            create(path)
+            else:
+                create(path)
         except Refused as refusal:
+            if not exists and refusal.code.endswith("_invalid"):
+                # The helper's refusal of a new store it could not build or put in place (an I/O error at
+                # its final link included): not a store found wrong, a store not made.
+                raise InstallRefused("store_not_created", f"{path}: {refusal.code}: {refusal.detail}") from None
             raise InstallRefused(refusal.code, f"{path}: {refusal.detail}") from None
         except (OSError, sqlite3.Error) as exc:
             raise InstallRefused("store_not_created", f"{path}: {type(exc).__name__}: {exc}") from None
-        done.append((stores.KINDS[magic], path, True))
+        done.append((stores.KINDS[magic], path, not exists))
     return tuple(done)
 
 
@@ -93,7 +98,8 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     """Create the stores and the route homes' custody root, then write the unit. The same bytes
     already there change nothing; other bytes, a unit another user could change (another user's, or
     writable by group or world) and a custody root open to anyone else or unusable by its owner are
-    refused before anything is made. A unit found is held open until the answer and checked against
+    refused before anything is made; the root as made (or as another caller made it meanwhile) is held
+    to the same rule before the unit is written. A unit found is held open until the answer and checked against
     its path and its bytes last: one removed, replaced or rewritten in place meanwhile is
     ``unit_missing`` or ``unit_changed``. A refusal
     after the stores are begun (that, or a store refused after the other was made) leaves what was
@@ -115,6 +121,7 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
         check_private_dir(paths.home, paths.homes)  # before anything is made
         made = ensure_stores(paths)  # first: a unit is never left naming a daemon whose stores are missing
         homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
+        check_private_dir(paths.home, paths.homes, required=True)  # as made, or as another caller made it
         if present:
             still_names(paths.unit, info)  # the unit answered for is still the one at its path
             still_holds(paths.unit, read)  # and still holds the bytes read (not rewritten in place)
@@ -127,7 +134,8 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
 def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     """Make any missing store and the route homes' custody root, and rewrite the unit to what
     ``install`` would write now. A missing unit, and a custody root open to anyone else or unusable by
-    its owner, are refused before anything is made. The same bytes are not written again unless
+    its owner, are refused before anything is made; the root as made is held to the same rule before
+    the unit is rewritten. The same bytes are not written again unless
     another user could change the file; a unit kept is held open until the answer and checked
     against its path and its bytes last, as in ``install``, whose words on a refusal after the stores
     apply."""
@@ -143,6 +151,7 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
         check_private_dir(paths.home, paths.homes)  # before anything is made
         made = ensure_stores(paths)
         homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
+        check_private_dir(paths.home, paths.homes, required=True)  # as made, or as another caller made it
         if current:
             still_names(paths.unit, info)  # the unit kept is still the one at its path
             still_holds(paths.unit, read)  # and still holds the bytes read (not rewritten in place)

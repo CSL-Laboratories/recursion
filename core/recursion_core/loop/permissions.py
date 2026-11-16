@@ -11,7 +11,18 @@ gave it. The core mints the approval id, draws the request, and answers on stand
 only what it asked for: a bound input that is not equal to the pending one (numbers compare by value, so 1.0
 and 1 are equal) is refused and the call is denied.
 
-No answer by the deadline means denied (approval.v1: "expired ... means denied"); so does an interrupt. A
+No answer by the deadline means denied (approval.v1: "expired ... means denied"); so does an interrupt. The
+deadline is a moment, fixed when the request is written (a monotonic clock), and it is kept where the answer is
+taken: an answer that arrives after it is refused and the call stays denied, whether or not the waiting turn has
+woken yet. An interrupt is final the same way: once the turn is cancelled, a later approval does not revive the
+call (the registry also checks the turn again after an approval, before anything runs).
+
+What is asked for is an independent copy of the call's input, taken when the request is made: the request line
+shows that copy, a later change to the caller's objects (a nested list included) does not reach it, and an
+approval without a bound input runs a fresh copy of it.
+
+When the tool's precheck names facts the model's input does not show (the file a path leads to through a link),
+they are written on the request beside the input (``resolved_path``). A
 call larger than approval.v1's provisional size limit (262,144 bytes of tool, directory and input) is denied
 without asking, because the core would refuse to draw it; the model is told to send it in smaller parts.
 
@@ -24,6 +35,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -69,21 +81,37 @@ def same_input(a: Any, b_: Any) -> bool:
     return False
 
 
+def snapshot(value: Any) -> Any:
+    """An independent copy of a JSON value: objects and arrays are copied all the way down, so nothing is shared
+    with the caller. Other kinds are kept as they are (the schema check refuses what is not JSON)."""
+
+    if isinstance(value, dict):
+        return {k: snapshot(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [snapshot(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(snapshot(v) for v in value)
+    return value
+
+
 @dataclass
 class _Pending:
     request_id: str
     input: Mapping[str, Any]
+    expires: float  # on the gate's clock
     done: threading.Event = field(default_factory=threading.Event)
     decision: Decision | None = None
 
 
 class PermissionGate:
-    def __init__(self, writer, *, profile: str = ASK, deadline_s: float = DEFAULT_DEADLINE_S) -> None:
+    def __init__(self, writer, *, profile: str = ASK, deadline_s: float = DEFAULT_DEADLINE_S,
+                 clock=time.monotonic) -> None:
         if profile not in (ASK, FULL_ACCESS):
             raise ValueError("permission profile")
         self._writer = writer
         self.profile = profile
         self.deadline_s = deadline_s
+        self._clock = clock
         self._lock = threading.Lock()
         self._pending: dict[str, _Pending] = {}
         self._next = 1
@@ -94,52 +122,80 @@ class PermissionGate:
             self._next += 1
         return f"perm-{n}"
 
-    def ask(self, turn_id: str, call: b.ToolCall, cwd: str, cancel: b.CancelToken) -> Decision:
-        """Ask for one call and wait. Called on the turn's thread."""
+    def ask(self, turn_id: str, call: b.ToolCall, cwd: str, cancel: b.CancelToken,
+            facts: Mapping[str, Any] | None = None) -> Decision:
+        """Ask for one call and wait. Called on the turn's thread. ``facts`` (from the tool's precheck) are
+        written on the request beside the input."""
 
-        args = dict(call.input or {})
+        args = snapshot(dict(call.input or {}))  # this copy is the request; nothing outside holds it
         size = len(json.dumps({"tool": call.name, "cwd": cwd, "input": args}, ensure_ascii=False,
                               separators=(",", ":")).encode("utf-8"))
         if size > MAX_EFFECT_BYTES:
             return Decision(TOO_LARGE)
+        if cancel.cancelled:
+            return Decision(CANCELLED)  # nothing is asked for a turn that has been interrupted
+        extra = {k: snapshot(v) for k, v in facts.items()} if facts else {}
         request_id = self._mint()
         if self.profile == FULL_ACCESS:
             self._writer.write("permission_request", turn_id=turn_id, request_id=request_id, call_id=call.call_id,
-                               tool=call.name, cwd=cwd, input=args, profile=FULL_ACCESS)
-            return Decision(APPROVED, args)
-        pending = _Pending(request_id, args)
+                               tool=call.name, cwd=cwd, input=snapshot(args), profile=FULL_ACCESS, **extra)
+            return Decision(APPROVED, snapshot(args))
+        pending = _Pending(request_id, args, self._clock() + self.deadline_s)
         with self._lock:
             self._pending[request_id] = pending
-        unregister = cancel.on_cancel(pending.done.set)
+
+        def on_cancel() -> None:
+            # Final: an answer that comes after this finds the request decided, and is refused.
+            with self._lock:
+                if pending.decision is None:
+                    pending.decision = Decision(CANCELLED)
+            pending.done.set()
+
+        unregister = cancel.on_cancel(on_cancel)
         try:
             self._writer.write("permission_request", turn_id=turn_id, request_id=request_id, call_id=call.call_id,
-                               tool=call.name, cwd=cwd, input=args, profile=ASK, deadline_s=self.deadline_s)
-            answered = pending.done.wait(self.deadline_s)
+                               tool=call.name, cwd=cwd, input=snapshot(args), profile=ASK,
+                               deadline_s=self.deadline_s, **extra)
+            while True:
+                with self._lock:
+                    self._expire(pending)
+                    if pending.decision is not None:
+                        break
+                    remaining = pending.expires - self._clock()
+                pending.done.wait(remaining)
         finally:
             unregister()
             with self._lock:
                 self._pending.pop(request_id, None)
-        if pending.decision is not None:
-            return pending.decision
         if cancel.cancelled:
-            return Decision(CANCELLED)
-        if not answered:
+            return Decision(CANCELLED)  # an interrupt is final, whatever came before it
+        decision = pending.decision
+        if decision.outcome == EXPIRED:
             self._writer.write("permission_expired", turn_id=turn_id, request_id=request_id)
-        return Decision(EXPIRED)
+        return decision
+
+    def _expire(self, pending: _Pending) -> None:
+        """Under the lock: an undecided request whose moment has passed is decided, denied, for good."""
+
+        if pending.decision is None and self._clock() >= pending.expires:
+            pending.decision = Decision(EXPIRED)
+            pending.done.set()
 
     def answer(self, request_id: str, approval_id: str, decision: str, bound: Mapping[str, Any] | None) -> str | None:
         """Deliver an answer from the input thread. Returns an error code, or None when it was taken."""
 
         with self._lock:
             pending = self._pending.get(request_id)
+            if pending is not None:
+                self._expire(pending)  # the deadline holds here too, before the waiting turn has woken
             if pending is None or pending.decision is not None:
                 return "no_pending_request"
             if decision == "approve":
                 if bound is not None and not same_input(bound, pending.input):
                     pending.decision = Decision(MISMATCH, approval_id=approval_id)
                 else:
-                    pending.decision = Decision(APPROVED, dict(bound) if bound is not None else pending.input,
-                                                approval_id)
+                    pending.decision = Decision(APPROVED, snapshot(dict(bound)) if bound is not None
+                                                else snapshot(pending.input), approval_id)
             else:
                 pending.decision = Decision(DENIED, approval_id=approval_id)
             pending.done.set()

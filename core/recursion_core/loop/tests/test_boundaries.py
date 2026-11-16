@@ -242,7 +242,10 @@ class FailedCallUsage(unittest.TestCase):
     def test_a_provider_bug_still_leaves_one_usage_line(self) -> None:
         session, lines = _session(self, FakeProvider([RuntimeError("a bug")]))
         docs = _serve(session, lines, MSG)
-        self.assertEqual([d["type"] for d in docs], ["input_accepted", "usage", "turn_ended", "closed"])
+        # #417 round 1 (astra R5): a loop error writes the turn's total and the session's before turn_ended too.
+        self.assertEqual([(d["type"], d.get("span")) for d in docs],
+                         [("input_accepted", None), ("usage", "call"), ("usage", "turn"), ("usage", "session_total"),
+                          ("turn_ended", None), ("closed", None)])
 
     def test_a_scripted_reply_the_wire_refuses_fails_as_a_protocol_error(self) -> None:
         provider = FakeProvider([{"tool_calls": [{"id": "c" * 129, "name": "read", "input": {"path": "a"}}]}])

@@ -91,7 +91,9 @@ class Gate(unittest.TestCase):
 
     def test_a_call_too_large_to_show_is_denied_without_asking(self) -> None:
         lines = Lines()
-        gate = perm.PermissionGate(lines.writer)
+        # A short deadline: without the size rule the call is asked for and expires at once (red in moments, as
+        # DeepSeek's round-1 read asked), instead of waiting out the default fifteen minutes.
+        gate = perm.PermissionGate(lines.writer, deadline_s=0.01)
         big = b.ToolCall("toolu_big", "write", {"path": "a", "content": "x" * perm.MAX_EFFECT_BYTES}, "")
         self.assertEqual(gate.ask("turn-1", big, "/ws", b.CancelToken()).outcome, perm.TOO_LARGE)
         self.assertEqual(lines.of("permission_request"), [])

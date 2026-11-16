@@ -34,9 +34,13 @@ How a turn ends (``turn_ended``; outcomes are session.v1's):
     a refusal, a provider failure, a full    failed, with the code
     context or an unknown stop reason
 
-Before ``turn_ended`` the turn's usage (``span: "turn"``, the sum of its calls) and the session's running total
-(``span: "session_total"``, never to be added up) are written; a sum that includes a call whose count is
-unknown is a lower bound, never a guess.
+Before every ``turn_ended`` (a turn interrupted before its first call, and a loop error, included) the turn's
+usage (``span: "turn"``, the sum of its calls) and the session's running total (``span: "session_total"``, never
+to be added up) are written. A sum that includes a call whose count is unknown is a lower bound, never a guess;
+a sum over no call at all is a known 0 (no call was made), which is not the unknown of a call that measured
+nothing. A sum keeps where its numbers came from: ``observed`` only when every count in it was observed;
+otherwise ``modelled`` when some were modelled and none inferred, and ``inferred`` when any was inferred (the
+weakest source in it; event.v1 keeps the three apart).
 
 The conversation stays valid for the next call: every tool call gets a result (a cancelled or refused one if it
 did not run), the model's reply is kept as received, vendor blocks included, and the roles alternate as the
@@ -160,9 +164,14 @@ class _Live:
     cancel: b.CancelToken = field(default_factory=b.CancelToken)
 
 
+# From the strongest source to the weakest: a sum is labelled with the weakest source of the counts in it.
+PROVENANCE_ORDER = (b.OBSERVED, b.MODELLED, b.INFERRED)
+
+
 class UsageTotal:
     """Sums usage measurements. Every count known: known. Some unknown or a lower bound: a lower bound of what
-    is known. None known: unknown."""
+    is known. Calls made but none known: unknown. No call made: a known 0. The provenance is the weakest of the
+    known counts' (PROVENANCE_ORDER)."""
 
     def __init__(self) -> None:
         self.calls = 0
@@ -170,6 +179,7 @@ class UsageTotal:
         self._sum = {name: 0 for name in b.USAGE_FIELDS}
         self._known = {name: 0 for name in b.USAGE_FIELDS}
         self._exact = {name: True for name in b.USAGE_FIELDS}
+        self._source = {name: 0 for name in b.USAGE_FIELDS}  # index into PROVENANCE_ORDER
 
     def add(self, usage: b.Usage, model: str | None) -> None:
         self.calls += 1
@@ -183,15 +193,20 @@ class UsageTotal:
             self._known[name] += 1
             if m.quality != b.KNOWN:
                 self._exact[name] = False
+            rank = PROVENANCE_ORDER.index(m.provenance) if m.provenance in PROVENANCE_ORDER else len(
+                PROVENANCE_ORDER) - 1
+            self._source[name] = max(self._source[name], rank)
 
     def to_wire(self) -> dict:
         out = {}
         for name in b.USAGE_FIELDS:
-            if self._known[name] == 0:
+            if self.calls == 0:
+                out[name] = b.observed(0).to_wire()  # no call was made: nothing was used, and that is known
+            elif self._known[name] == 0:
                 out[name] = b.unknown().to_wire()
             else:
                 quality = b.KNOWN if self._exact[name] else b.LOWER_BOUND
-                out[name] = b.Measurement(self._sum[name], quality, b.OBSERVED).to_wire()
+                out[name] = b.Measurement(self._sum[name], quality, PROVENANCE_ORDER[self._source[name]]).to_wire()
         return out
 
     @property
@@ -216,6 +231,7 @@ class Session:
                                              else ""))
         self._ran: dict[str, b.ToolResult] = {}  # results of the current reply's calls that ran, for settle
         self._cancel: b.CancelToken | None = None  # the running turn's token
+        self._turn_usage: UsageTotal | None = None  # the running turn's sum, for a turn the loop fails
         # How a turn's end is written; an Engine writes it under the lock an interrupt is answered under.
         self.ending: Callable[[Callable[[], None]], None] = _now
 
@@ -224,7 +240,9 @@ class Session:
     def run_turn(self, turn_id: str, text: str, cancel: b.CancelToken) -> str:
         """Run one turn to its end and return its outcome."""
 
-        return self._turn(turn_id, text, cancel, UsageTotal())
+        usage = UsageTotal()
+        self._turn_usage = usage
+        return self._turn(turn_id, text, cancel, usage)
 
     def _turn(self, turn_id: str, text: str, cancel: b.CancelToken, usage: UsageTotal) -> str:
         self._cancel = cancel
@@ -329,8 +347,9 @@ class Session:
     def _run_tools(self, turn_id: str, calls: tuple[b.ToolCall, ...], cancel: b.CancelToken) -> None:
         results: list[b.ToolResult] = []
         cwd = str(self.workspace.root)
-        ctx = r.ToolContext(self.workspace, cancel, self.redactor.scrub,
-                            approve=lambda call: self.gate.ask(turn_id, call, cwd, cancel))
+        ctx = r.ToolContext(self.workspace, cancel, self.redactor.scrub)
+        # The request shows what the tool's precheck added (the file a link leads to), through the context.
+        ctx.approve = lambda call: self.gate.ask(turn_id, call, cwd, cancel, facts=ctx.request_facts)
         self._ran = {}
         for call in calls:
             self.writer.write("tool_call", turn_id=turn_id, call_id=call.call_id, name=call.name,
@@ -441,23 +460,41 @@ class Session:
 
     def _end(self, turn_id: str, outcome: str, result: dict | None, reason: str, usage: UsageTotal) -> str:
         self.settle(reason)
+        return self._finish(turn_id, outcome, result, reason, usage)
+
+    def _finish(self, turn_id: str, outcome: str, result: dict | None, reason: str, usage: UsageTotal,
+                keep: bool = False) -> str:
+        """Write the turn's two usage totals and its ``turn_ended``, together, where the end is written. Every
+        way a turn ends comes through here (astra R5, sol R7)."""
+
         ended = [outcome]
 
         def write() -> None:
             # Decided where the end is written (under the Engine's lock): a delivered interrupt is not lost to a
             # limit or a failure that came first, and neither is what they were (the result and reason stay).
             final = outcome
-            if final not in KEEPS_OUTCOME and self._cancel is not None and self._cancel.cancelled:
+            if not keep and final not in KEEPS_OUTCOME and self._cancel is not None and self._cancel.cancelled:
                 final = "interrupted"
             ended[0] = final
-            if usage.calls:
-                self.writer.write("usage", turn_id=turn_id, span="turn", model=usage.model, **usage.to_wire())
-                self.writer.write("usage", turn_id=turn_id, span="session_total", model=self.session_usage.model,
-                                  **self.session_usage.to_wire())
+            self.writer.write("usage", turn_id=turn_id, span="turn", model=usage.model, **usage.to_wire())
+            self.writer.write("usage", turn_id=turn_id, span="session_total", model=self.session_usage.model,
+                              **self.session_usage.to_wire())
             self.writer.write("turn_ended", turn_id=turn_id, outcome=final, result=result, reason=reason)
 
         self.ending(write)
         return ended[0]
+
+    def fail_turn(self, turn_id: str, detail: str) -> str:
+        """End the running turn as failed by a loop error: the conversation is left valid where it can be, and
+        the totals (of the calls the turn made before it failed) come before ``turn_ended``, as for any end."""
+
+        try:
+            self.settle("loop_error")
+        except Exception:  # noqa: BLE001 - the turn has failed already; its end is written regardless
+            pass
+        usage = self._turn_usage if self._turn_usage is not None else UsageTotal()
+        result = {"code": "loop_error", "detail": detail, "result_ref": None}
+        return self._finish(turn_id, "failed", result, "loop_error", usage, keep=True)
 
 
 class Engine:
@@ -551,12 +588,12 @@ class Engine:
                 self._log(self.session.redactor.scrub(
                     f"recursion_loop: turn {item.turn_id} failed inside the loop: {type(exc).__name__}: {exc}"))
                 try:
-                    self.session.settle("loop_error")
-                except Exception:  # noqa: BLE001 - the turn has failed already; its end is written regardless
-                    pass
-                self._ending(partial(self.writer.write, "turn_ended", turn_id=item.turn_id, outcome="failed",
-                                     result={"code": "loop_error", "detail": type(exc).__name__, "result_ref": None},
-                                     reason="loop_error"))
+                    self.session.fail_turn(item.turn_id, type(exc).__name__)
+                except Exception:  # noqa: BLE001 - the end is written regardless, without its totals
+                    self._ending(partial(self.writer.write, "turn_ended", turn_id=item.turn_id, outcome="failed",
+                                         result={"code": "loop_error", "detail": type(exc).__name__,
+                                                 "result_ref": None},
+                                         reason="loop_error"))
             finally:
                 with self._lock:
                     self._live = None

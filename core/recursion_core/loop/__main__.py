@@ -5,7 +5,11 @@
 
 The key and the base URL come from the environment only (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL), never from an
 argument, a file or standard input. The key is removed from this process's environment as soon as the provider
-holds it, so no child the loop starts (the search worker, a shell command, the acceptance check) inherits it.
+holds it, so no child the loop starts (the search worker, a shell command, the acceptance check) inherits it;
+and none of them gets the engine's environment anyway (each builds its own from a short list of names). On Linux
+the key's text is also cleared from the environment block the process started with, which
+``/proc/<pid>/environ`` shows to every process of the same user (DeepSeek F3): removing a name from the
+environment does not clear those bytes. If they cannot be cleared there, the loop does not start.
 
 The model has no default: it is the route's model, given by the driver. The engine home holds the spill folder;
 it must be a private folder (created 0700 if missing). The workspace is the current folder unless --workspace
@@ -48,7 +52,9 @@ def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="python -m recursion_core.loop", description=__doc__.splitlines()[0])
     ap.add_argument("--provider", choices=("anthropic", "fake"), required=True)
     ap.add_argument("--model", help="the route's model id (required for a real provider)")
-    ap.add_argument("--home", required=True, help="the engine's private home folder")
+    ap.add_argument("--home", required=True,
+                    help="the engine's private home folder (on a POSIX file system: a Windows drive mounted in WSL "
+                         "shows every folder as open to all and is refused)")
     ap.add_argument("--workspace", default=None, help="the folder the tools work in (default: the current folder)")
     ap.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     ap.add_argument("--max-output-tokens", type=int, default=64000)
@@ -92,6 +98,48 @@ def take_keys(environ) -> list[str]:
     return taken
 
 
+def clear_start_environment(names=KEY_ENV) -> bool:
+    """Linux: overwrite with NUL bytes the values of ``names`` in the environment block this process started
+    with (the memory ``/proc/<pid>/environ`` reads, which unsetting a variable leaves as it was). Only that block
+    is written, located from ``/proc/self/stat``. Returns False when it could not be done, or when a value is
+    still readable there afterwards; True otherwise, and on a system without /proc."""
+
+    if not sys.platform.startswith("linux"):
+        return True
+    wanted = {n.encode() for n in names}
+
+    def readable() -> bool:
+        with open("/proc/self/environ", "rb") as f:
+            block = f.read()
+        return any(name in wanted and value.strip(b"\0")
+                   for name, _, value in (entry.partition(b"=") for entry in block.split(b"\0")))
+
+    try:
+        if not readable():
+            return True  # nothing to clear (or no /proc to read it from)
+    except OSError:
+        return True
+    try:
+        import ctypes
+
+        with open("/proc/self/stat", "rb") as f:
+            stat = f.read()
+        fields = stat[stat.rfind(b")") + 2:].split()
+        start, end = int(fields[47]), int(fields[48])  # env_start and env_end (fields 50 and 51)
+        if not 0 < start < end:
+            return False
+        block = ctypes.string_at(start, end - start)
+        at = 0
+        for entry in block.split(b"\0"):
+            name, sep, value = entry.partition(b"=")
+            if sep and name in wanted and value:
+                ctypes.memset(start + at + len(name) + 1, 0, len(value))
+            at += len(entry) + 1
+        return not readable()
+    except (OSError, ValueError, IndexError, AttributeError):
+        return False
+
+
 def build(args: argparse.Namespace, env: dict[str, str]):
     if args.provider == "anthropic":
         if not args.model:
@@ -123,6 +171,9 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"recursion_loop: {exc}") from None
     provider, model = build(args, dict(os.environ))
     # The provider holds the key now; nothing else in this process, or any child of it, gets it.
+    if not clear_start_environment():
+        raise SystemExit("recursion_loop: the key could not be cleared from this process's start environment "
+                         "(/proc/<pid>/environ); not starting")
     secrets = [s for s in getattr(provider, "secrets", ()) if s] + take_keys(os.environ)
     home = _home(args.home)
     try:

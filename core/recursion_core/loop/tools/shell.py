@@ -1,26 +1,40 @@
 """The shell tool: run one command in the workspace. Asks first. Also the runner the acceptance check uses.
 
-The command runs under ``bash -c`` (``sh -c`` where there is no bash), in its own process group, with no
-standard input, in the workspace. Its environment is the engine's own (which the child-environment policy
-builds in a run unit) minus every key name the loop knows, with pagers and git's credential prompt turned
-off so nothing waits for a terminal. At its deadline or on an interrupt the whole group is killed; so are
-background processes it left holding the output open once it exits. Output (standard output and standard
-error together, in order) is kept up to its first and last 4 MiB; the rest is counted, and the registry's
-cap and spill take it from there. The result starts with the exit status and the time taken (as Codex
-reports them; vault record 20261028-recursion-frontier-b4-tool-output-spill-04, section 6).
+The command runs under ``bash -c`` (``sh -c`` where there is no bash), in its own process group and session, with
+no standard input, in the workspace. On Linux it runs under a keeper of its own (``reaper.py``), which is made the
+subreaper of everything the command starts, so a process that leaves the group or the session (``setsid``, a
+double fork) is still followed. Its environment is not the engine's: it is built from a short list of names
+(``ENV_PASSED``: the search path, the user, the locale, the time zone, the temporary folder), with pagers and
+git's credential prompt turned off so nothing waits for a terminal; nothing else of the engine's environment
+reaches it (no key, no proxy setting, no ``BASH_ENV`` or ``ENV`` that a shell would run at its start).
+
+One deadline, counted from the start, covers the whole call: the command, and the reading of its output after it
+ends. A command that is cancelled before it starts is not started. When the command ends, when its deadline
+passes, or on an interrupt, everything it started is stopped (the keeper kills its descendants; the process
+group is killed as well), and reading the output stops within a bounded time even if something the loop could
+not stop still holds it open. A process that made itself a subreaper of its own, or that runs as another user, is
+outside this reach; nothing here claims more.
+
+Output (standard output and standard error together, in order) is kept up to its first and last 4 MiB, exactly;
+the rest is counted, and the registry's cap and spill take it from there. The result starts with the exit status
+and the time taken (as Codex reports them; vault record 20261028-recursion-frontier-b4-tool-output-spill-04,
+section 6).
 """
 
 from __future__ import annotations
 
 import collections
 import os
+import selectors
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from recursion_core.loop.providers import base as b
@@ -30,8 +44,15 @@ DEFAULT_TIMEOUT_S = 120
 MAX_TIMEOUT_S = 600
 KEEP_HEAD = 4 * 1024 * 1024
 KEEP_TAIL = 4 * 1024 * 1024
-DRAIN_GRACE_S = 1.0
-KEY_ENV = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+DRAIN_GRACE_S = 1.0  # how long reading goes on for output already written, once everything was stopped
+STOP_GRACE_S = 2.0  # how long the keeper gets to stop the command's descendants before its group is killed
+POLL_S = 0.05
+CHUNK = 65536
+# The environment a command gets: these names when the engine has them, and nothing else (astra R2).
+ENV_PASSED = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TEMP", "TMP")
+ENV_PREFIXES = ("LC_",)
+ENV_FIXED = {"PAGER": "cat", "GIT_PAGER": "cat", "GIT_TERMINAL_PROMPT": "0", "TERM": "dumb"}
+REAPER = Path(__file__).with_name("reaper.py")
 
 SPEC = b.ToolSpec(
     name="shell",
@@ -66,41 +87,104 @@ class Ran:
     dropped_bytes: int
 
 
-def child_env() -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k not in KEY_ENV}
-    env.update({"PAGER": "cat", "GIT_PAGER": "cat", "GIT_TERMINAL_PROMPT": "0", "TERM": "dumb"})
+def child_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment a command (and the acceptance check) gets: the names in ENV_PASSED and the LC_ ones, when
+    present, and the fixed settings; nothing else."""
+
+    source = os.environ if environ is None else environ
+    env = {k: v for k, v in source.items() if k in ENV_PASSED or k.startswith(ENV_PREFIXES)}
+    env.setdefault("PATH", os.defpath)
+    env.update(ENV_FIXED)
     return env
 
 
+def _use_reaper() -> bool:
+    return sys.platform.startswith("linux") and bool(sys.executable) and REAPER.is_file()
+
+
 class _Capture:
+    """Reads a stream on a thread of its own, keeping the first KEEP_HEAD and the last KEEP_TAIL bytes. Reading
+    a pipe waits at most POLL_S at a time, so ``stop`` ends it within a bounded time even when a process the loop
+    could not stop still holds the pipe open."""
+
     def __init__(self, stream) -> None:
         self.stream = stream
         self.head = bytearray()
         self.tail: collections.deque[bytes] = collections.deque()
         self.tail_size = 0
         self.dropped = 0
+        self._stop = threading.Event()
+        self._selector = None
+        try:
+            self._fd = stream.fileno()
+            self._selector = selectors.DefaultSelector()
+            self._selector.register(self._fd, selectors.EVENT_READ)
+        except (OSError, ValueError, AttributeError):
+            self._fd = None  # not a pipe this platform can wait on: read it plainly
+            if self._selector is not None:
+                self._selector.close()
+                self._selector = None
         self.thread = threading.Thread(target=self._pump, daemon=True)
         self.thread.start()
 
+    def _read(self) -> bytes | None:
+        """The next chunk, b"" at the end, None when nothing came within POLL_S."""
+
+        if self._selector is None:
+            return self.stream.read1(CHUNK) if hasattr(self.stream, "read1") else self.stream.read(CHUNK)
+        if not self._selector.select(POLL_S):
+            return None
+        return os.read(self._fd, CHUNK)
+
     def _pump(self) -> None:
-        while True:
-            try:
-                chunk = self.stream.read1(65536) if hasattr(self.stream, "read1") else self.stream.read(65536)
-            except (OSError, ValueError):
-                return
-            if not chunk:
-                return
-            room = KEEP_HEAD - len(self.head)
-            if room > 0:
-                self.head += chunk[:room]
-                chunk = chunk[room:]
-            if chunk:
-                self.tail.append(chunk)
-                self.tail_size += len(chunk)
-                while self.tail and self.tail_size - len(self.tail[0]) >= KEEP_TAIL:
-                    gone = self.tail.popleft()
-                    self.tail_size -= len(gone)
-                    self.dropped += len(gone)
+        try:
+            while not self._stop.is_set():
+                try:
+                    chunk = self._read()
+                except (OSError, ValueError):
+                    return
+                if chunk is None:
+                    continue
+                if not chunk:
+                    return
+                self._keep(chunk)
+        finally:
+            if self._selector is not None:
+                self._selector.close()
+
+    def _keep(self, chunk: bytes) -> None:
+        room = KEEP_HEAD - len(self.head)
+        if room > 0:
+            self.head += chunk[:room]
+            chunk = chunk[room:]
+        if not chunk:
+            return
+        self.tail.append(chunk)
+        self.tail_size += len(chunk)
+        while self.tail_size > KEEP_TAIL:  # the oldest bytes go, a part of a chunk too (sol R9)
+            excess = self.tail_size - KEEP_TAIL
+            first = self.tail[0]
+            if len(first) <= excess:
+                self.tail.popleft()
+                gone = len(first)
+            else:
+                self.tail[0] = first[excess:]
+                gone = excess
+            self.tail_size -= gone
+            self.dropped += gone
+
+    def wait(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` for the end of the output; True when it was reached."""
+
+        self.thread.join(max(0.0, timeout))
+        return not self.thread.is_alive()
+
+    def stop(self) -> None:
+        """Stop reading, whatever still holds the stream; returns once the reading thread has ended (a pipe) or
+        after a bounded wait (a stream that cannot be waited on)."""
+
+        self._stop.set()
+        self.thread.join(DRAIN_GRACE_S + 2 * POLL_S)
 
     def text(self) -> str:
         tail = b"".join(self.tail)
@@ -118,27 +202,73 @@ def _kill_group(proc: subprocess.Popen) -> None:
             pass
 
 
+def _ask_stop(proc: subprocess.Popen, reaper: bool) -> None:
+    """Tell the command to stop at once: its keeper stops everything it started; without one, its group is
+    killed. Does not wait (an interrupt calls this from the input thread)."""
+
+    if not reaper:
+        _kill_group(proc)
+        return
+    try:
+        proc.send_signal(signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def _stop(proc: subprocess.Popen, reaper: bool) -> None:
+    """Stop the command and everything it started, and wait (bounded) for it to end."""
+
+    _ask_stop(proc, reaper)
+    try:
+        proc.wait(STOP_GRACE_S)
+    except subprocess.TimeoutExpired:
+        pass
+    _kill_group(proc)  # what the keeper could not stop in time, and anything left in the group
+    try:
+        proc.wait(STOP_GRACE_S)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def run_command(command: str, cwd: str, cancel: b.CancelToken, timeout_s: float) -> Ran:
-    shell = shutil.which("bash") or "/bin/sh"
     start = time.monotonic()
-    proc = subprocess.Popen([shell, "-c", command], cwd=cwd, env=child_env(), stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
-    capture = _Capture(proc.stdout)
-    unregister = cancel.on_cancel(lambda: _kill_group(proc))
+    if cancel.cancelled:
+        return Ran(None, "", 0.0, False, True, 0)  # cancelled before it started: it never starts (sol R2)
+    deadline = start + timeout_s
+    shell = shutil.which("bash") or "/bin/sh"
+    reaper = _use_reaper()
+    argv = [shell, "-c", command]
+    if reaper:
+        argv = [sys.executable, "-I", "-S", "-B", str(REAPER), *argv]
+    proc = subprocess.Popen(argv, cwd=cwd, env=child_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, start_new_session=True)
+    capture: _Capture | None = None
+    unregister = None
     timed_out = False
     try:
+        capture = _Capture(proc.stdout)
+        unregister = cancel.on_cancel(lambda: _ask_stop(proc, reaper))  # at once if cancelled since the check
         try:
-            proc.wait(timeout_s)
+            proc.wait(max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            timed_out = True
+            timed_out = not cancel.cancelled
+        if timed_out or cancel.cancelled:
+            _stop(proc, reaper)
+            capture.wait(DRAIN_GRACE_S)
+        else:
+            # It ended by itself. What it left running is stopped now (sol R1; the keeper already did), and the
+            # rest of its output is read within the same deadline.
             _kill_group(proc)
-            proc.wait()
-        capture.thread.join(DRAIN_GRACE_S)
-        if capture.thread.is_alive():  # something it started still holds the output open
-            _kill_group(proc)
-            capture.thread.join()
+            if not capture.wait(deadline - time.monotonic()):
+                timed_out = not cancel.cancelled
+                capture.wait(DRAIN_GRACE_S)
     finally:
-        unregister()
+        if unregister is not None:
+            unregister()
+        if proc.poll() is None:
+            _stop(proc, reaper)  # an exception on the way: nothing it started is left running
+        if capture is not None:
+            capture.stop()
         if proc.stdout is not None:
             proc.stdout.close()
     elapsed = time.monotonic() - start

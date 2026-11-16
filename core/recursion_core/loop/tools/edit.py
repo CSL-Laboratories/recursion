@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from recursion_core.loop.providers import base as b
-from recursion_core.loop.tools.files import atomic_write, read_fresh, resolve_writable
+from recursion_core.loop.tools.files import atomic_write, read_fresh, request_facts, resolve_writable
 from recursion_core.loop.tools.registry import Tool, ToolContext, ToolOutput
 from recursion_core.loop.tools.workspace import ToolError
 
@@ -57,18 +57,29 @@ def _plan(args: Mapping[str, Any], ctx: ToolContext) -> tuple[Path, str, str, in
     old, new = args["old_string"], args["new_string"]
     if old == new:
         raise ToolError("old_string and new_string are the same; nothing would change")
-    count = text.count(old)
-    if count == 0:
+    first = text.find(old)
+    if first < 0:
         raise ToolError(f"replace_not_found: old_string does not occur in {shown}")
-    if count > 1 and not args.get("replace_all", False):
-        raise ToolError(f"anchor_not_unique: old_string occurs {count} times in {shown}; include more of the "
-                        f"surrounding text, or set replace_all")
-    n = count if args.get("replace_all", False) else 1
+    replace_all = args.get("replace_all", False)
+    if not replace_all and text.find(old, first + 1) >= 0:
+        # Occurrences are counted where they start, overlapping ones too: "aaa" occurs twice in "aaaa" (astra R8).
+        raise ToolError(f"anchor_not_unique: old_string occurs {_starts(text, old)} times in {shown}; include more "
+                        f"of the surrounding text, or set replace_all")
+    n = text.count(old) if replace_all else 1  # replace_all replaces left to right, without overlaps
     return path, text, text.replace(old, new, n), n
 
 
-def precheck(args: Mapping[str, Any], ctx: ToolContext) -> None:
-    _plan(args, ctx)
+def _starts(text: str, old: str) -> int:
+    count, at = 0, text.find(old)
+    while at >= 0:
+        count += 1
+        at = text.find(old, at + 1)
+    return count
+
+
+def precheck(args: Mapping[str, Any], ctx: ToolContext) -> Mapping[str, str] | None:
+    path, _, _, _ = _plan(args, ctx)
+    return request_facts(ctx.workspace, args["path"], path)
 
 
 def _snippet(new_text: str, at: int) -> str:

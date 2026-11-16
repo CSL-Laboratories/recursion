@@ -2,11 +2,17 @@
 
 - A path to write resolves like a path to read (through links, inside the workspace), but a spill reference
   is refused, and so is any path with a ``.git`` folder in it: a file there (a hook, the config) runs code
-  the next time anyone uses git in the repository.
+  the next time anyone uses git in the repository. Both are refused by where the path leads, not only by how
+  it is spelt: ``.git`` in any case (a case-insensitive drive takes ``.GIT`` for ``.git``), a folder on the
+  way that is the repository's ``.git`` or the spill folder under another name, and any path inside the spill
+  folder (the engine home may lie inside the workspace; a saved output is named by its bytes and must not
+  change under its name).
 - An existing file is changed only if this session read it and it is unchanged since (vault record
   20261028-recursion-frontier-dr-tool-editing-03: read before edit; the record's typed names are used:
   ``not_read``, ``stale_snapshot``). Its size and SHA-256 must match the read ledger (a new modification
-  time alone, with the same bytes, is not a change).
+  time alone, with the same bytes, is not a change). A file this session read that is gone when it is to be
+  changed is ``stale_snapshot`` too, not a new file (sol R3); the read is forgotten then, so a later write,
+  asked for again, creates it.
 - The new bytes go to a private temporary file in the same folder, are flushed to disk, keep the old
   file's permission bits, and replace the file in one rename; the ledger then records the new bytes, so the
   next edit needs no fresh read. A reader never sees half a file.
@@ -22,16 +28,61 @@ from pathlib import Path
 from recursion_core.loop.tools.workspace import SPILL_PREFIX, ReadMark, ToolError, Workspace
 
 
+def _identity(path: Path) -> tuple[int, int] | None:
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _git_folders(ws: Workspace) -> list[Path]:
+    """The repository's ``.git`` folder (the nearest one at or above the workspace root), if there is one."""
+
+    here = ws.root
+    while True:
+        candidate = here / ".git"
+        if candidate.is_dir():
+            return [candidate]
+        if candidate.exists() or here.parent == here:
+            return []
+        here = here.parent
+
+
+def _inside(path: Path, folder: str) -> bool:
+    text = str(path)
+    return text == folder or text.startswith(folder.rstrip(os.sep) + os.sep)
+
+
 def resolve_writable(ws: Workspace, given: object) -> Path:
     if isinstance(given, str) and given.startswith(SPILL_PREFIX):
         raise ToolError("a saved output cannot be written")
     path = ws.resolve(given)
-    rel = Path(ws.display(path))
-    if ".git" in rel.parts:
-        raise ToolError(f"{ws.display(path)} is inside a .git folder; it is not written")
+    shown = ws.display(path)
+    if _inside(path, os.path.realpath(ws.spill.root)):
+        raise ToolError(f"{shown} is a saved output's folder; it is not written")
+    if ".git" in (part.casefold() for part in Path(shown).parts):
+        raise ToolError(f"{shown} is inside a .git folder; it is not written")
+    guarded = {i for i in (_identity(f) for f in [ws.spill.root, *_git_folders(ws)]) if i is not None}
+    for folder in (path, *path.parents):
+        if not ws.inside(str(folder)):
+            break
+        if _identity(folder) in guarded:
+            raise ToolError(f"{shown} is inside a .git folder or a saved output's folder; it is not written")
     if path.is_dir():
-        raise ToolError(f"{ws.display(path)} is a folder")
+        raise ToolError(f"{shown} is a folder")
     return path
+
+
+def request_facts(ws: Workspace, given: str, path: Path) -> dict[str, str] | None:
+    """What a permission request shows beside the model's input when the path leads elsewhere (a link): the file
+    that would change, relative to the workspace (DeepSeek F4). None when the path is the file itself."""
+
+    given = os.path.expanduser(given) if given.startswith("~") else given
+    lexical = Path(os.path.normpath(given if os.path.isabs(given) else ws.root / given))
+    if lexical == path:
+        return None
+    return {"resolved_path": ws.display(path)}
 
 
 def mark_of(data: bytes, info: os.stat_result) -> ReadMark:
@@ -51,7 +102,9 @@ def read_fresh(ws: Workspace, path: Path) -> bytes:
             raise ToolError(f"{shown} is not a regular file")
         data = path.read_bytes()
     except FileNotFoundError:
-        raise ToolError(f"stale_snapshot: {shown} no longer exists; read the folder again") from None
+        ws.ledger.forget(path)  # told once; a later write is a new file and is asked for again
+        raise ToolError(f"stale_snapshot: {shown} was read in this session and no longer exists; it was not "
+                        f"written (to create it again, write it again)") from None
     current = mark_of(data, info)
     if (current.sha256, current.size) != (mark.sha256, mark.size):
         raise ToolError(f"stale_snapshot: {shown} changed since it was read; read it again before changing it")

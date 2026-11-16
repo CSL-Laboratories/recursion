@@ -39,9 +39,11 @@ BETA), scopes on the socket beyond the uid check, and the Control MCP transport.
 """
 from __future__ import annotations
 
+import errno
 import hmac
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import secrets
@@ -86,11 +88,50 @@ STOP_RESERVED_CONNECTIONS = 4
 # ({"ok":true,"result":...} and next_after). The request's own "id" is counted per call (ADV1-5).
 LIST_ENVELOPE_BYTES = 4096
 LIST_REPLY_BYTES = MAX_FRAME_BYTES - LIST_ENVELOPE_BYTES
+# The most bytes the route result of a run.status answer may take. The output tail and the run record share
+# the frame with it, so a result past this is cut, never left to fail the whole answer (E18).
+RESULT_STATUS_BYTES = MAX_FRAME_BYTES // 4
 
 
 def _wire_size(value):
     """Bytes ``value`` takes in a control frame (``framing.encode_frame``'s JSON settings)."""
     return len(json.dumps(value, separators=(',', ':'), ensure_ascii=False, default=str).encode('utf-8'))
+
+
+def _status_result(result):
+    """The route result as ``run.status`` carries it: whole while it fits ``RESULT_STATUS_BYTES``.
+
+    A larger one keeps ``status``, ``code`` and ``detail`` and the longest head of its ``text`` that fits,
+    marked ``truncated``. The whole result stays in the run's ``result.json``.
+    """
+    if _wire_size(result) <= RESULT_STATUS_BYTES:
+        return result
+    short = {key: result.get(key) for key in ('status', 'code', 'detail')}
+    short['truncated'] = True
+    text = result.get('text')
+    if isinstance(text, str):
+        short['text'] = ''
+        length = len(text)
+        while length and _wire_size({**short, 'text': text[:length]}) > RESULT_STATUS_BYTES:
+            length = length * 3 // 4
+        short['text'] = text[:length]
+    return short
+
+
+def _open_regular(path):
+    """``path`` open for reading, or ``OSError`` when it is not a regular file.
+
+    Opened ``O_NONBLOCK``: the open of a FIFO that has no writer waits for one, and a status or list
+    call waited with it (E19).
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, 'not a regular file')
+        return os.fdopen(fd, 'rb')
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 # -- registry ------------------------------------------------------------------------------------
@@ -171,12 +212,18 @@ def load_routes(path):
         deadline = entry.get('deadline_s')
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or deadline <= 0:
             raise RoutesUnreadable(f'route {engine}: deadline_s')
+        try:
+            seconds = float(deadline)
+        except OverflowError:
+            raise RoutesUnreadable(f'route {engine}: deadline_s') from None
+        if not math.isfinite(seconds):  # json.loads reads NaN and Infinity; neither is a deadline
+            raise RoutesUnreadable(f'route {engine}: deadline_s')
         binary = entry.get('binary')
         if binary is not None and not (isinstance(binary, str) and os.path.isabs(binary)):
             raise RoutesUnreadable(f'route {engine}: binary must be an absolute path')
         route = {k: v for k, v in entry.items() if k not in ('deadline_s', 'binary')}
         route['engine'] = engine
-        out[engine] = {'route': route, 'deadline_s': float(deadline), 'binary': binary}
+        out[engine] = {'route': route, 'deadline_s': seconds, 'binary': binary}
     return out
 
 
@@ -340,8 +387,17 @@ class RouteStarter:
             # not reentrant. Refusing inside the block left this thread waiting on itself, and every
             # later start, every worker's cleanup and ``active()`` waiting behind it.
             raise self._refuse(run_id, 'start_in_flight', '')
-        threading.Thread(target=self._drive, args=(ctx, request), name=f'recursion-run-{run_id}',
-                         daemon=True).start()
+        try:
+            threading.Thread(target=self._drive, args=(ctx, request), name=f'recursion-run-{run_id}',
+                             daemon=True).start()
+        except BaseException as exc:
+            # No worker will ever run: nothing else would take the run out of ``_active``, and every retry
+            # would answer ``start_in_flight`` until the daemon restarted (E04).
+            with self._lock:
+                self._active.pop(run_id, None)
+            if isinstance(exc, Exception):
+                raise self._refuse(run_id, 'worker_start_failed', type(exc).__name__) from None
+            raise
         if ctx.wait_started(self._start_timeout_s):
             return {'cgroup': ctx.cgroup}
         result = ctx.result
@@ -357,12 +413,20 @@ class RouteStarter:
         return StartRefused(code, detail)
 
     def _drive(self, ctx, request):
+        interrupt = None
         try:
             with bound_run(ctx):
                 try:
                     result = self._service.handle(request)
                 except Exception as exc:  # noqa: BLE001 - a route bug must not leave the start waiting
                     log.exception('route request for %s failed', ctx.run_id)
+                    result = route_contract.result(ctx.run_id, route_contract.ENGINE_ERROR,
+                                                   detail=f'route failure: {type(exc).__name__}')
+                except BaseException as exc:  # an interrupt or SystemExit from the callback (E34)
+                    # The published child must not outlive the worker that drove it: end it and release the
+                    # start below as for any route failure, then let the interrupt go on.
+                    log.error('route request for %s was ended by %s', ctx.run_id, type(exc).__name__)
+                    interrupt = exc
                     result = route_contract.result(ctx.run_id, route_contract.ENGINE_ERROR,
                                                    detail=f'route failure: {type(exc).__name__}')
             closing = getattr(self._daemon, 'closed', False)  # shutdown: the run is left to the next daemon
@@ -374,17 +438,25 @@ class RouteStarter:
             if ctx.process is not None:
                 if closing:
                     ctx.process.close()
+                elif interrupt is not None:
+                    self._settle(ctx, grace_s=0.0, reason='route_interrupted')
                 else:
                     self._settle(ctx)
         finally:
             with self._lock:
                 self._active.pop(ctx.run_id, None)
+        if interrupt is not None:
+            raise interrupt
 
     def _record_result(self, run_id, result):
         try:
             path = self._state / 'runs' / run_id / 'result.json'
             tmp = path.with_name('result.json.tmp')
-            fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            try:
+                os.unlink(tmp)  # a stale or planted entry is replaced: opening a FIFO here would wait for a reader
+            except FileNotFoundError:
+                pass
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
                 json.dump(result, handle, sort_keys=True)
                 handle.flush()
@@ -395,11 +467,11 @@ class RouteStarter:
             with self._lock:
                 self.results[run_id] = result
 
-    def _settle(self, ctx):
+    def _settle(self, ctx, *, grace_s=None, reason='result_recorded'):
         """After the route result: give the engine a moment to exit, then end what is left of its tree."""
         process = ctx.process
         try:
-            deadline = time.monotonic() + self._exit_grace_s
+            deadline = time.monotonic() + (self._exit_grace_s if grace_s is None else grace_s)
             while time.monotonic() < deadline:
                 if getattr(self._daemon, 'closed', False):
                     return  # the daemon is shutting down; it never stops a run on its way out
@@ -410,7 +482,7 @@ class RouteStarter:
                     log.exception('observing %s after its result failed', ctx.run_id)
                     break
                 time.sleep(0.2)
-            process.fence('result_recorded')
+            process.fence(reason)
         finally:
             process.close()
 
@@ -569,7 +641,7 @@ class DaemonControl:
                 run['state'] = {'terminated': ENDED, 'lost_reboot': LOST_REBOOT}.get(row.state, 'unknown')
         result = self._result(run_id) if isinstance(run_id, str) else None
         if result is not None:
-            run['result'] = result if full else {k: result.get(k) for k in ('status', 'code', 'detail')}
+            run['result'] = _status_result(result) if full else {k: result.get(k) for k in ('status', 'code', 'detail')}
         if full and isinstance(run_id, str):
             # run.status carries the tail of the engine's stdout, so every surface that can read a
             # status can watch output arrive without a second method (the CLI and TUI share one
@@ -585,7 +657,8 @@ class DaemonControl:
         if not RUN_ID.fullmatch(run_id):
             return None
         try:
-            data = json.loads((self._state / 'runs' / run_id / 'result.json').read_text(encoding='utf-8'))
+            with _open_regular(self._state / 'runs' / run_id / 'result.json') as handle:
+                data = json.loads(handle.read().decode('utf-8'))
         except (OSError, ValueError):
             return None
         return data if isinstance(data, dict) else None
@@ -595,7 +668,7 @@ class DaemonControl:
         if not RUN_ID.fullmatch(run_id):
             return None
         try:
-            with open(self._state / 'runs' / run_id / 'stdout.jsonl', 'rb') as handle:
+            with _open_regular(self._state / 'runs' / run_id / 'stdout.jsonl') as handle:
                 size = os.fstat(handle.fileno()).st_size
                 start = max(0, size - OUTPUT_TAIL_BYTES)
                 handle.seek(start)

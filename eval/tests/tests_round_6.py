@@ -248,5 +248,78 @@ class OneBadCandidateTests(unittest.TestCase):
             self.assertFalse((folder / "held-out" / ".staging").exists())
 
 
+
+class CallerFaultTests(unittest.TestCase):
+    """Devin's thread on 7d27961c (eval/harvest.py line 275): what is refused for every candidate alike is the
+    caller's fault and ends the harvest before anything is written; it is never one candidate's rejection."""
+
+    def setUp(self):
+        outside = outside_folder()
+        self.folder = outside.__enter__()
+        self.addCleanup(outside.__exit__, None, None, None)
+        bases = scratch_bases()
+        self.tmp, self.xdg = bases.__enter__()
+        self.addCleanup(bases.__exit__, None, None, None)
+        transitions(self.folder / "upstream")
+        self.repos = self.folder / "repos.json"
+        self.repos.write_text(json.dumps({"schema": harvest.REPOS_SCHEMA, "repos": [repo_cfg(self.folder / "upstream")]}),
+                              encoding="utf-8")
+
+    def cli(self, out: Path, *extra) -> int:
+        return harvest.main(["run", "--repos", str(self.repos), "--not-before", "2026-02-01", "--suite", "h",
+                             "--out", str(out), "--tmp-base", str(self.tmp), "--xdg-base", str(self.xdg), *extra])
+
+    def test_reruns_below_one_end_the_harvest_and_write_nothing(self):
+        for value in ("0", "-1"):
+            with self.subTest(value):
+                out = self.folder / f"held-out-reruns{value}"
+                self.assertEqual(self.cli(out, "--reruns", value), 2)
+                self.assertFalse(out.exists())
+        with self.assertRaisesRegex(harvest.HarvestError, "--reruns must be an integer of at least 1"):
+            harvest.harvest(self.repos, "2026-02-01", self.folder / "x", suite_id="h", reruns=0,
+                            tmp_base=self.tmp, xdg_base=self.xdg, log=lambda _m: None)
+
+    def test_max_per_repo_below_one_ends_the_harvest(self):
+        out = self.folder / "held-out-max"
+        self.assertEqual(self.cli(out, "--max-per-repo", "0"), 2)
+        self.assertFalse(out.exists())
+
+    def test_bad_scratch_bases_end_the_harvest_and_write_nothing(self):
+        out = self.folder / "held-out-bases"
+        code = harvest.main(["run", "--repos", str(self.repos), "--not-before", "2026-02-01", "--suite", "h",
+                             "--out", str(out), "--tmp-base", "relative/tmp", "--xdg-base", str(self.xdg)])
+        self.assertEqual(code, 2)
+        self.assertFalse(out.exists())
+
+    def test_a_fault_that_is_not_the_candidates_is_not_swallowed(self):
+        for exc in (ValueError("a caller's value"), PermissionError(13, "Permission denied"),
+                    OSError(28, "No space left on device")):
+            with self.subTest(type(exc).__name__):
+                with mock.patch.object(harvest.validate_mod, "validate", side_effect=exc):
+                    with self.assertRaises(type(exc)):
+                        harvest.harvest(self.repos, "2026-02-01", self.folder / f"held-out-{exc.args[0]}",
+                                        suite_id="h", reruns=1, tmp_base=self.tmp, xdg_base=self.xdg,
+                                        log=lambda _m: None)
+
+    def test_a_candidate_that_cannot_be_laid_out_is_still_one_rejection(self):
+        for exc in (FileExistsError(17, "File exists", "tool"), NotADirectoryError(20, "Not a directory", "tool"),
+                    tasks.TaskError("tool: not a file")):
+            with self.subTest(type(exc).__name__):
+                real = validate.validate
+                calls = []
+
+                def first_fails(task, _calls=calls, _exc=exc, _real=real, **kwargs):
+                    _calls.append(task.id)
+                    if len(_calls) == 1:
+                        raise _exc
+                    return _real(task, **kwargs)
+
+                with mock.patch.object(harvest.validate_mod, "validate", side_effect=first_fails):
+                    report = harvest.harvest(self.repos, "2026-02-01", self.folder / f"held-out-one-{type(exc).__name__}",
+                                             suite_id="h", reruns=1, tmp_base=self.tmp, xdg_base=self.xdg,
+                                             log=lambda _m: None)
+                self.assertEqual((report["kept"], len(report["rejected"])), (1, 1))
+                self.assertIn(type(exc).__name__, report["rejected"][0]["reason"])
+
 if __name__ == "__main__":
     unittest.main()

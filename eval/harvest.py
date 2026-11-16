@@ -43,6 +43,14 @@ from eval import validate as validate_mod
 REPOS_SCHEMA = "recursion-eval-repos/1"
 HARVEST_FILES = ("__init__.py", "harvest.py", "validate.py", "tasks.py", "txtar.py", "gitutil.py", "scratch.py",
                  "arms.py", "record.py", "heldout.py", "suite.py")
+# What one candidate's own files can raise while its task is written, loaded and validated: its stored form
+# refused (TaskError: a bad path, a start-tree entry that is not a file), its start archive unreadable
+# (TarError), git refusing its work copy's files (GitError; git itself already ran before the first
+# candidate), and a path that cannot be laid out as its tree says (a file where a folder must be, or the
+# reverse). Not a plain ValueError, a RuntimeError or any other OSError (a full disk, a permission, a
+# missing folder): those are the caller's or the machine's and end the run.
+CANDIDATE_FAULTS = (task_mod.TaskError, tarfile.TarError, gitutil.GitError, FileExistsError, IsADirectoryError,
+                    NotADirectoryError)
 TRAILER = re.compile(r"^[A-Za-z][A-Za-z0-9-]*: .+$")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -239,6 +247,17 @@ def harvest(repos_path: Path, not_before: str, out: Path, *, suite_id: str, vers
         raise HarvestError("--not-before is a date, YYYY-MM-DD")
     if not task_mod.TASK_ID.match(suite_id):
         raise HarvestError(f"bad suite id {suite_id!r}")
+    # What would be refused for every candidate alike is the caller's, so it ends the run here, before
+    # anything is written, and never reaches the per-candidate rejection below.
+    if isinstance(reruns, bool) or not isinstance(reruns, int) or reruns < 1:
+        raise HarvestError(f"--reruns must be an integer of at least 1, got {reruns!r}")
+    if max_per_repo is not None and (isinstance(max_per_repo, bool) or not isinstance(max_per_repo, int)
+                                     or max_per_repo < 1):
+        raise HarvestError(f"--max-per-repo must be an integer of at least 1, got {max_per_repo!r}")
+    try:
+        scratch_mod.check_bases(tmp_base, xdg_base)
+    except scratch_mod.ScratchError as exc:
+        raise HarvestError(str(exc)) from None
     out = Path(out)
     heldout.check_path(out, must_exist=False)  # absolute, and never inside the repository
     if out.exists() and any(out.iterdir()):
@@ -268,9 +287,9 @@ def harvest(repos_path: Path, not_before: str, out: Path, *, suite_id: str, vers
                 task = task_mod.load_dir(folder)
                 task.parent_tree = candidate["parent_tree"]
                 checked = validate_mod.validate(task, reruns=reruns, tmp_base=tmp_base, xdg_base=xdg_base)
-            except (OSError, ValueError, gitutil.GitError, tarfile.TarError) as exc:
+            except CANDIDATE_FAULTS as exc:
                 # One candidate that cannot be laid out or checked is that candidate's rejection, not the
-                # end of the harvest (TaskError and HarvestError are ValueErrors).
+                # end of the harvest. Anything else (a caller's argument, the machine) ends the run.
                 checked = validate_mod.Validation(
                     ok=False, reason=f"the task could not be built or checked: {type(exc).__name__}: {exc}"[:500])
             if not checked.ok:

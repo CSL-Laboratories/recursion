@@ -56,7 +56,11 @@ class RouteAdapter:
         #   failure is noted on the original.
         # - A fence failure never replaces the exception that leaves. When no fence attempt succeeded, the
         #   exception that leaves carries the failures in CLEANUP_FAILURES (and a note): the child may still
-        #   be running, so a caller that finds the attribute must not treat the exit as clean.
+        #   be running, so a caller that finds the attribute must not treat the exit as clean. The attribute is
+        #   set even when the exception's own __setattr__ refuses it (BaseException's own setter is used then).
+        # - A typed exit whose fence fails gives no typed answer: its exception reaches the caller
+        #   (RouteService._run records engine_error with the breaker and re-raises). An interruption raised BY a
+        #   fence is recorded as a cleanup failure like any other, and the retry still follows.
         # What this method cannot cover is an asynchronous exception (a signal handler's) delivered between
         # the launcher's return and the store into ``process``, or inside the outer handler before its fence
         # has run; the process then exists only in the launcher's own record of the run (daemon/launcher.py
@@ -78,7 +82,9 @@ class RouteAdapter:
             try:
                 return self.drive(process, request, deadline_at, events)
             except Deadline as err:
-                done = _typed_fence(process, "deadline", err)  # for this request only; the breaker never hears
+                # For this request only: the breaker hears nothing, unless this fence fails (then the Deadline
+                # leaves and RouteService._run records engine_error).
+                done = _typed_fence(process, "deadline", err)
                 fenced = True
                 if not done:
                     raise
@@ -98,8 +104,9 @@ class RouteAdapter:
                     raise
                 return c.result(rid, c.ENGINE_ERROR, events=events, detail=f"engine io: {type(err).__name__}")
         except BaseException as err:
-            # Inline, not a helper: a helper's entry is one more point where an interruption could land
-            # before the fence.
+            # Inline here, not a helper: a helper's entry is one more point where an interruption could land
+            # before the fence. (The typed exits' _typed_fence is entered with ``fenced`` still False, so an
+            # interruption at its entry reaches this handler, which fences.)
             if process is not None and not fenced:
                 try:
                     process.fence(UNEXPECTED_FENCE)
@@ -170,20 +177,52 @@ CLEANUP_FAILURES = "cleanup_failures"
 RUNNING_NOTE = "no fence of the started child succeeded: it may still be running"
 
 
-def _record_cleanup_failure(err: BaseException, fence_err: BaseException, *, still_running: bool) -> None:
-    """Note ``fence_err`` on ``err``; when ``still_running``, also add it to ``err``'s CLEANUP_FAILURES. Never
-    raises: whatever the note or the attribute raises is dropped, so ``err`` leaves unchanged otherwise."""
+def _force_attribute(err: BaseException, name: str, value: object) -> None:
+    """Set ``name`` on ``err``; if its own ``__setattr__`` refuses (a frozen dataclass, a hook), set it the way
+    ``BaseException`` itself does. Never raises."""
 
     try:
-        if still_running:
-            setattr(err, CLEANUP_FAILURES, (*getattr(err, CLEANUP_FAILURES, ()), fence_err))
-    except BaseException:  # noqa: BLE001 - an exception that takes no attribute still leaves
+        setattr(err, name, value)
+        return
+    except BaseException:  # noqa: BLE001 - the type refused; its base can still take it
         pass
     try:
-        err.add_note(f"fencing the child also failed: {type(fence_err).__name__}")
-        if still_running and RUNNING_NOTE not in err.__notes__:
-            err.add_note(RUNNING_NOTE)
+        BaseException.__setattr__(err, name, value)
+    except BaseException:  # noqa: BLE001 - nothing more can be done; the exception still leaves unchanged
+        pass
+
+
+def _note(err: BaseException, text: str) -> None:
+    """``err.add_note(text)``; if that raises and ``err`` has no notes yet, the note list is made as
+    ``_force_attribute`` sets an attribute. Notes ``err`` already holds are never replaced. Never raises."""
+
+    try:
+        err.add_note(text)
+        return
+    except BaseException:  # noqa: BLE001 - see below
+        pass
+    try:
+        if "__notes__" not in vars(err):
+            _force_attribute(err, "__notes__", [text])
     except BaseException:  # noqa: BLE001 - an exception that takes no note still leaves unchanged
+        pass
+
+
+def _record_cleanup_failure(err: BaseException, fence_err: BaseException, *, still_running: bool) -> None:
+    """Note ``fence_err`` on ``err``; when ``still_running``, also add it to ``err``'s CLEANUP_FAILURES, even on an
+    exception whose own ``__setattr__`` refuses attributes (Astra's C1 in round 2). Never raises."""
+
+    if still_running:
+        try:
+            failures = (*getattr(err, CLEANUP_FAILURES, ()), fence_err)
+        except BaseException:  # noqa: BLE001 - an attribute that cannot be read is replaced
+            failures = (fence_err,)
+        _force_attribute(err, CLEANUP_FAILURES, failures)
+    _note(err, f"fencing the child also failed: {type(fence_err).__name__}")
+    try:
+        if still_running and RUNNING_NOTE not in getattr(err, "__notes__", ()):
+            _note(err, RUNNING_NOTE)
+    except BaseException:  # noqa: BLE001 - notes that cannot be read are left as they are
         pass
 
 

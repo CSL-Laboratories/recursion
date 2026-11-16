@@ -9,6 +9,7 @@ exception, ``BaseException`` included, and the same exception object leaves. Fak
 from __future__ import annotations
 
 import builtins
+import dataclasses
 import traceback
 import unittest
 from unittest import mock
@@ -243,6 +244,53 @@ class EveryExceptionIsFencedTest(unittest.TestCase):
                             adapter.run(REQUEST, DEADLINE)
                     self.assertIs(caught.exception, later)
                     self.assertEqual(adapter.process.fenced, [reason])
+
+    def test_a_base_exception_from_the_first_typed_fence_does_not_replace_the_typed_exception(self) -> None:
+        # Round 2 of #420: Astra's C2 and DeepSeek's F1 (the first typed fence's catch narrowed to Exception left
+        # every test green). The original leaves; the retry follows; the attribute only when the retry fails too.
+        for make, reason in ((Deadline, "deadline"), (lambda: _Protocol("p"), "protocol_error"),
+                             (BrokenPipeError, "io_error")):
+            for first_kind in (KeyboardInterrupt, SystemExit, GeneratorExit, _Custom):
+                for retry_fails in (False, True):
+                    err, first, second = make(), first_kind("first"), ValueError("second")
+                    with self.subTest(reason=reason, first=first_kind.__name__, retry_fails=retry_fails):
+                        process = Process(fence_raises=[first, second] if retry_fails else [first])
+                        adapter = Adapter(process, drive=_raiser(err))
+                        with self.assertRaises(BaseException) as caught:  # an escaping interruption fails here
+                            adapter.run(REQUEST, DEADLINE)
+                        self.assertIs(caught.exception, err)
+                        self.assertEqual(process.fenced, [reason, UNEXPECTED])
+                        self.assertIn(f"fencing the child also failed: {first_kind.__name__}", err.__notes__)
+                        if retry_fails:
+                            self.assertEqual(getattr(err, FAILURES, None), (first, second))
+                            self.assertIn(RUNNING, err.__notes__)
+                        else:
+                            self.assertFalse(hasattr(err, FAILURES))
+
+    def test_an_exception_that_refuses_attributes_still_carries_the_cleanup_failures(self) -> None:
+        # Round 2 of #420: Astra's C1 (a frozen dataclass exception lost the documented attribute and the note).
+        def frozen(parent):
+            @dataclasses.dataclass(frozen=True)
+            class Frozen(parent):
+                message: str = "drive"
+            return Frozen()
+
+        class Hooked(ValueError):
+            def __setattr__(self, name, value):
+                raise _Custom("no attributes")
+
+        cases = [(frozen(Deadline), "deadline", 2), (frozen(_Protocol), "protocol_error", 2),
+                 (frozen(OSError), "io_error", 2), (frozen(ValueError), None, 1), (Hooked("drive"), None, 1)]
+        for err, reason, fails in cases:
+            with self.subTest(kind=type(err).__mro__[1].__name__, reason=reason):
+                failures = [OSError(5, "first"), _Custom("retry")][:fails]
+                process = Process(fence_raises=list(failures))
+                with self.assertRaises(BaseException) as caught:
+                    Adapter(process, drive=_raiser(err)).run(REQUEST, DEADLINE)
+                self.assertIs(caught.exception, err)
+                self.assertEqual(process.fenced, [reason, UNEXPECTED] if reason else [UNEXPECTED])
+                self.assertEqual(getattr(err, FAILURES, None), tuple(failures))
+                self.assertIn(RUNNING, getattr(err, "__notes__", []))
 
 
 @runs_adapter

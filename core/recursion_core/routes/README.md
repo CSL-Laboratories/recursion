@@ -85,15 +85,23 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   `limit_notice` and never triggers a fallback. Open and half-open keys are checked before it, so a
   short fault never hides a real limit on the same connection from that tenant.
 - Recursion's own deadline is `deadline_exceeded`: the run is fenced (`EngineProcess.fence`) for that
-  request only and the breaker is not told. Other engine failures are request-local too.
+  request only and the breaker is not told. Other engine failures are request-local too. The exception is a
+  deadline whose fence fails (next point): then no typed answer is given, the `Deadline` itself leaves
+  `RouteAdapter.run`, and `RouteService._run` records `engine_error` with the breaker and re-raises it.
 - A child started by `RouteAdapter.run` is fenced on every way out of that method, once the launcher has
-  returned it. A successful return is not fenced. The three typed exits (deadline, protocol error, engine
+  returned it and the method holds it; an asynchronous exception (a signal handler's) delivered between the
+  launcher's return and that store, or inside the method's last handler before its fence, is not covered
+  (`base.py` names the window). A successful return is not fenced. The three typed exits (deadline, protocol error, engine
   io) fence with their own reason and answer. Any other exception, `BaseException` included, fences the
   child with the reason `unexpected`, and the same exception object leaves. If a typed exit's fence raises,
   the original typed exception leaves instead of the answer, after one more fence as `unexpected`; the
-  failure is noted on it (`add_note`). A fence failure never replaces the exception that leaves. When no
+  failure is noted on it (`add_note`). A fence failure never replaces the exception that leaves; an
+  interruption raised by a fence itself is recorded as a cleanup failure and does not stop the retry. When no
   fence succeeded, that exception also carries `cleanup_failures` (`base.CLEANUP_FAILURES`, the failures
-  oldest first): the child may still be running, and a caller must not treat the exit as clean. A driver
+  oldest first): the child may still be running (or already gone: the attribute says only that no fence
+  succeeded), and a caller must not treat the exit as clean. The attribute is set even on an exception whose
+  own `__setattr__` refuses it (a frozen dataclass, say), through `BaseException`'s own setter. The notes are
+  best effort: an exception whose `add_note` refuses gets its first note the same way only if it has none. A driver
   whose adapter runs this `run` does not need to fence for itself; an adapter that overrides `run` owns its
   own cleanup (`ProfileRouteAdapter` does: lane ENGINE-E9's #425 adds its fence). The boundary fences only a
   process the launcher returned: a launcher that fails after starting a child must end that child itself

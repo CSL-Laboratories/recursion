@@ -724,6 +724,44 @@ class WorkerStartFailureTest(SessionCase):
                             session._finish(each)
                         session.close()
 
+    def test_every_call_started_together_is_started_when_one_answer_exits(self) -> None:
+        # #395, DeepSeek r8 F5: _finish starts every call it made startable, and an exit from one call's "no worker"
+        # answer goes on only after the others are started. One reader admits one call at a time, so two calls made
+        # startable by one _finish do not arise through receive today; this forces that state (two waiting stops
+        # not yet ready while a slot frees) to hold the loop as DeepSeek reads it.
+        for exc in (SystemExit, KeyboardInterrupt):
+            with self.subTest(exception=exc.__name__):
+                api = GateAPI()
+                session, _ = self.session(api, max_in_flight=2, reserved_stop=0, max_waiting_stops=4)
+                held: list = []
+                with mock.patch.object(session, "_start", held.append):
+                    self.feed(session, call(1, *STATUS))
+                    self.feed(session, call(2, *STATUS))
+                    self.feed(session, call("b", *STOP))
+                    self.feed(session, call("c", *STOP))
+                waiting = list(session._waiting_stops)
+                self.assertEqual(["b", "c"], [w.request_id for w in waiting])
+                for w in waiting:
+                    w.ready = False
+                session._finish(held.pop(0))  # a slot frees while both wait unready: nothing starts
+                for w in waiting:
+                    w.ready = True
+
+                def failing(message, exc=exc):
+                    raise exc("the no-worker answer's write")
+
+                session._write = failing
+                try:
+                    with mock.patch.object(server.threading.Thread, "start", side_effect=RuntimeError("no thread")):
+                        with self.assertRaises(exc):
+                            session._finish(held.pop(0))  # both stops become startable at once
+                    api.assert_nothing_entered(self)
+                    self.assertEqual((0, 0, 0), (session.in_flight(), session._general, session._reserved))
+                finally:  # a call left in flight keeps close waiting: give it back, so a failure is not a hang
+                    for each in list(session._in_flight.values()):
+                        session._finish(each)
+                    session.close()
+
 
 class LogTest(SessionCase):
     def test_initialize_and_ignored_responses_are_logged(self) -> None:

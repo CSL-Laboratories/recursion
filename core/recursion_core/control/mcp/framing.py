@@ -134,8 +134,8 @@ class FrameWriter:
     def write(self, message: dict) -> bool:
         """Write one message; ``False`` when it was not written (the stream failed now or earlier).
 
-        A stream that takes part of a message is given the rest. One that takes nothing (``0``, or ``None``,
-        which a raw stream returns when it would block) has failed, and so has one that raises any
+        A stream that takes part of a message is given the rest. One that takes nothing (``0``, ``None``,
+        which a raw stream returns when it would block, or a negative count) has failed, and so has one that raises any
         ``Exception``: a pipe the client stopped reading, a stream already shut, a text stream given bytes.
         One that raises an exit or an interrupt has failed too (``broken``, ``on_broken``), and that exception
         then goes on to the caller. A message ``encode`` refuses raises before anything is written."""
@@ -162,11 +162,11 @@ class FrameWriter:
 
     def _write_all(self, data: bytes) -> bool:
         """Under the lock: every byte of ``data``, in as many writes as the stream needs; ``False`` when a
-        write takes nothing."""
+        write takes nothing or reports a negative count."""
 
         while data:
             taken = self._stream.write(data)
-            if not taken:  # 0, or None from a raw stream that would block: no progress, and none to come
+            if not taken or taken < 0:  # 0, None (a raw stream that would block) or a negative count: no progress
                 return False
             data = data[taken:]
         return True

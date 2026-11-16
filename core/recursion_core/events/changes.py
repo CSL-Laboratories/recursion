@@ -47,8 +47,9 @@ service (S13). The marker's text is the protocol; this module follows it:
   the event. The first time a run is logged with a ``launch.route_decision`` that is an object (event.v1's
   payload for ``route.decision`` is one), one ``route.decision`` event is appended from it, in the same
   transaction; a value of any other type is not logged.
-- A run whose stored record has no typed post-image (a control text that is not a JSON object, or that has
-  no RFC 8785 text: an integer past 2**53, a lone surrogate, nesting past 64), or whose event the store
+- A run whose stored record has no typed post-image (a control text that is not a JSON object, nested
+  deeper than the JSON reader can follow included, or that has no RFC 8785 text: an integer past 2**53, a lone
+  surrogate, nesting past 64), or whose event the store
   refuses, is NOT logged: event.v1 has no typed form for it (the lane's ``questions.md``, Q12). It is listed,
   with its code, in this lane's table ``events_unlogged`` (durable: a restart reads it back at its first
   scan) and in ``unlogged``, logged at ERROR, and read again at every scan. So is a run the registry refuses
@@ -131,6 +132,8 @@ def _strict_object(text: str) -> dict:
         value = json.loads(text, parse_constant=refuse)
     except BadImage:
         raise
+    except RecursionError as exc:         # nested deeper than the JSON reader itself can follow
+        raise BadImage('control_text_not_json:depth') from exc
     except ValueError as exc:
         raise BadImage('control_text_not_json') from exc
     if not isinstance(value, dict):

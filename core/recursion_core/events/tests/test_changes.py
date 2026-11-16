@@ -1197,6 +1197,23 @@ class ChangeReaderTest(unittest.TestCase):
         self.assertIn(RUN, self.reader.unlogged)
         self.assertEqual(self.notes(RUN2), ['healthy'])
 
+    def test_a_control_text_nested_past_what_the_json_reader_can_follow_is_listed_and_the_scan_goes_on(self) -> None:
+        # Devin's thread on #403 (changes.py:135): 100,000 levels made json.loads raise RecursionError, which nothing
+        # caught; every step raised, the first pass never ended and the healthy run after it was never read.
+        deep = '{"a":' * 100000 + '0' + '}' * 100000
+        self.registry.control_put(RUN, deep)
+        self.put('healthy', RUN2)
+        with self.assertLogs(C.LOG, 'ERROR'):
+            self.drain()
+        self.assertTrue(self.reader.ready, 'the first pass ended')
+        self.assertEqual(self.reader.unlogged, {RUN: 'control_text_not_json:depth'})
+        self.assertEqual(self.unlogged_table(), {RUN: 'control_text_not_json:depth'})
+        self.assertEqual(self.notes(RUN2), ['healthy'])
+        self.registry.control_put(RUN3, deep)                    # and a run read by its mark, after the first pass
+        with self.assertLogs(C.LOG, 'ERROR'):
+            self.drain()
+        self.assertEqual(self.reader.unlogged[RUN3], 'control_text_not_json:depth')
+
     def test_the_lane_tables_checks_hold(self) -> None:
         # Sol r2's coverage guard: the CHECKs on log_id and route_logged.
         for log_id, route in (('invalid-log', 0), ('run:run-check', 2)):

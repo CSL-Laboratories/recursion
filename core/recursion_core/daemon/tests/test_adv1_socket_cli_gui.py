@@ -28,6 +28,7 @@ from recursion_core.control_transport import InsecureSocketPath
 from recursion_core.control_transport.framing import encode_frame
 from recursion_core.control_transport.unix import MAX_CONNECTIONS
 from recursion_core.daemon import AlreadyRunning, Daemon, Registry, UserLock
+import recursion_core.daemon as daemon_module
 from recursion_core.daemon import control_adapter as adapter
 from recursion_core.daemon import launcher
 from recursion_core.daemon.gui import LoopbackGUI
@@ -305,28 +306,58 @@ class SocketAttackTest(ComposedBase):
         self.assertEqual(receipt['code'], 'stopped', receipt)
         self.assertEqual((again['code'], again.get('repeat')), ('stopped', True), again)
 
-    def seed_settled_runs(self, count):
-        """``count`` settled runs with systemd's real cgroup paths, as ADV1-5 measured them (~975 bytes each)."""
-        store = Registry(self.state)
+    def seed_settled_runs(self, count, *, state=None, one_by_one=False):
+        """``count`` settled runs with systemd's real cgroup paths, as ADV1-5 measured them (~975 bytes each).
+
+        The rows are the ones ``Registry.add``, ``Registry.state(run_id, 'terminated', '')`` and
+        ``Registry.control_put`` leave, written in ONE commit through the registry's own ``_write`` (copy,
+        integrity_check, fsync, rename, directory fsync). Per-run calls are 3 * count commits, each copying
+        and checking the whole file: about 190 s of this file's run for 1300 runs on a loaded host.
+        ``one_by_one`` keeps that path for the test that pins both ways to the same rows.
+        """
+        store = Registry(state or self.state)
         long_group = ('/user.slice/user-1000.slice/user@1000.service/app.slice/'
                       'recursion-run-run-%s.service')
-        ids = []
+        ids, rows = [], []
         for i in range(count):
             run_id = 'run-%032x' % i
-            store.add(run_id, BOOT)
-            store.state(run_id, 'terminated', '')
             group = long_group % ('%032x' % i)
             marker = 'cg-%032x' % i
-            store.control_put(run_id, json.dumps({
+            rows.append((run_id, json.dumps({
                 'run_id': run_id, 'tenant': 't1', 'engine': 'claude_code', 'state': 'stopped', 'cgroup': group,
                 'started_at': 1.0e9, 'stop': {'requested_at': 1.0e9, 'checks': 1, 'reason': None, 'requested': True},
                 'start_key': {'client_key': 'key-%032x' % i, 'engine': 'claude_code', 'prompt_sha256': 'f' * 64},
                 'generation': 4, 'members': [], 'cgroup_marker': marker,
                 'stop_attestation': {'proof': 'empty', 'cgroup': group, 'cgroup_marker': marker,
-                                     'member_ids': [], 'generation': 3}}, sort_keys=True))
+                                     'member_ids': [], 'generation': 3}}, sort_keys=True)))
             ids.append(run_id)
+        if one_by_one:
+            for run_id, document in rows:
+                store.add(run_id, BOOT)
+                store.state(run_id, 'terminated', '')
+                store.control_put(run_id, document)
+        else:
+            now = time.time()
+            with store._write() as db:
+                db.execute(daemon_module._CONTROL_TABLE)
+                for run_id, document in rows:
+                    db.execute('INSERT INTO runs VALUES (?, ?, 0, ?, ?, ?, ?, ?)',
+                               (run_id, f'recursion-run-{run_id}.service', 'terminated', BOOT, '', now, now))
+                    db.execute('INSERT OR REPLACE INTO control_runs VALUES (?, ?)', (run_id, document))
         store.close()
         return ids
+
+    def test_the_one_commit_seed_writes_the_rows_the_per_run_calls_write(self):
+        """The fixture above: one commit leaves what add, state and control_put leave, read back through Registry."""
+        seen = []
+        for one_by_one in (True, False):
+            state = self.tmp / ('seed-one-by-one' if one_by_one else 'seed-batched')
+            self.seed_settled_runs(5, state=state, one_by_one=one_by_one)
+            store = Registry(state)
+            seen.append((store.all(), store.control_all()))
+            store.close()
+        self.assertEqual(seen[0], seen[1])
+        self.assertEqual({run.state for run in seen[0][0]}, {'terminated'})
 
     @staticmethod
     def unpaged_list(composed):

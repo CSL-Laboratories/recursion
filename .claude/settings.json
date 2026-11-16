@@ -41,6 +41,8 @@
       "Bash(python3 -X utf8 -B tools/test_fixer_failure_watcher.py)",
       "Bash(python -X utf8 -B tools/test_agent_protocol_sim.py)",
       "Bash(python3 -X utf8 -B tools/test_agent_protocol_sim.py)",
+      "Bash(python -X utf8 -B tools/test_wire_conformance.py)",
+      "Bash(python3 -X utf8 -B tools/test_wire_conformance.py)",
       "Bash(python -m unittest)",
       "Bash(python3 -m unittest)",
       "Bash(actionlint)",

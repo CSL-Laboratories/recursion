@@ -1,0 +1,8 @@
+{
+  "method": "queue.update",
+  "params": {
+    "item_id": "qi-0002",
+    "text": "Only fix the failing test.",
+    "expected_revision": 1
+  }
+}

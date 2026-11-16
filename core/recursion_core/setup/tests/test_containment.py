@@ -12,9 +12,12 @@ import errno
 import json
 import os
 import re
+import shutil
 import socket
+import stat
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -201,9 +204,17 @@ class ContainmentTests(unittest.TestCase):
         self.addCleanup(server.close)
         # Bound through its folder's descriptor: a short name whatever the folder's path (an absolute temporary
         # path can pass AF_UNIX's limit), and the working folder left alone (an earlier test may have removed it).
+        # /proc/self/fd is Linux's; elsewhere (macOS) the file's own path is bound when it fits AF_UNIX's limit
+        # there, and the test is skipped when it does not (the Liaison's ruling on #382's like test).
         held = os.open(self.folder, os.O_RDONLY | os.O_DIRECTORY)
         self.addCleanup(os.close, held)
-        server.bind(f"/proc/self/fd/{held}/containment.json")
+        if os.path.isdir(f"/proc/self/fd/{held}"):
+            server.bind(f"/proc/self/fd/{held}/containment.json")
+        elif len(os.fsencode(self.file)) < 104:
+            server.bind(self.file)
+        else:
+            self.skipTest(f"no /proc/self/fd here, and the file's path ({len(os.fsencode(self.file))} bytes) is past "
+                          "AF_UNIX's limit")
         self.assertIn("not a regular file", self.refused("containment_untrusted").detail)
 
     def _code(self):
@@ -563,6 +574,46 @@ class ContainmentTests(unittest.TestCase):
             if not done:
                 done.append(True)
                 os.utime(self.file, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))  # the bytes stay
+            return data
+        with mock.patch("os.read", side_effect=read):
+            self.assertIn("changed while it was read", self.refused("containment_changed").detail)
+        self.assertEqual(containment.read().engine_homes, OUTSIDE)
+
+    # Review 2 of #428, DeepSeek F2: a umask that takes the owner's bits left ~/.config at 0500, and write() failed
+    # with a raw PermissionError naming the wrong folder, for good.
+    def test_folders_made_are_0700_whatever_the_umask_and_one_that_cannot_be_made_is_named(self):
+        for umask in (0o200, 0o277, 0o777):
+            with self.subTest(umask=oct(umask)):
+                old = os.umask(umask)
+                try:
+                    self.assertEqual(containment.write(INSIDE)[1], True)
+                finally:
+                    os.umask(old)
+                for folder in (self.config, self.folder):
+                    self.assertEqual(stat.S_IMODE(os.stat(folder).st_mode), 0o700, folder)
+                self.assertEqual(stat.S_IMODE(os.stat(self.file).st_mode), 0o600)
+                shutil.rmtree(self.config)
+        os.mkdir(self.config, 0o500)  # left so by hand, or by an earlier Recursion under such a umask
+        try:
+            error = self.refused("containment_unreadable", lambda: containment.write(INSIDE))
+        finally:
+            os.chmod(self.config, 0o700)
+        self.assertEqual(error.detail, f"{self.folder} cannot be made in {self.config}: PermissionError; "
+                                       f"{self.config} must be writable and searchable by its owner (`chmod 700` it)")
+        self.assertEqual(containment.write(INSIDE)[1], True)  # after the `chmod 700` it names, a write works
+
+    # Review 2 of #428, DeepSeek F3: the ctime term of the comparison had no test of its own. A chmod during the
+    # read (the bytes, the size and the mtime unchanged) moves only ctime; the pause puts it past the clock's tick.
+    def test_a_change_of_ctime_alone_while_read_is_refused(self):
+        self.put(_doc(OUTSIDE))
+        done = []
+
+        def read(fd, size):
+            data = _real_read(fd, size)
+            if not done:
+                done.append(True)
+                time.sleep(0.05)
+                os.chmod(self.file, 0o640)
             return data
         with mock.patch("os.read", side_effect=read):
             self.assertIn("changed while it was read", self.refused("containment_changed").detail)

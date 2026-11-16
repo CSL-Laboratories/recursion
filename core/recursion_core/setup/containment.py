@@ -35,7 +35,7 @@ the default, and the answer says so (``source`` ``"default"``). Every other case
                             Q21); a folder above it another user could change (each root's or the
                             operator's, not writable by group or world unless sticky); or the password
                             database gives no absolute home for this user
-    containment_unreadable  the file, or a folder on the way to it, cannot be looked up, opened or read
+    containment_unreadable  the file, or a folder on the way to it, cannot be looked up, opened, read or made
     containment_invalid     not UTF-8 JSON in the shape above (a half-written file included), or larger
                             than 64 KiB; or, for ``write``, a value that is not one of ``ENGINE_HOMES``
     containment_changed     the file changed while it was being read (rewritten where it is, or another
@@ -52,11 +52,14 @@ Nothing in the daemon reads it yet.
 ``write`` replaces the file whole: a new file, mode 0600, written, flushed, and renamed over the old one
 in the same folder, which is then flushed, so a reader sees the old setting or the new one, never a mix
 (or, reading while the rename happens, is refused ``containment_changed`` and runs again). Writers take
-turns: each holds an exclusive ``flock`` on the folder from its read to its answer, so its answer is the
-file's value when it answers, and it removes the temporary files a killed writer left. It makes a
-missing ``.config`` and ``recursion`` folder 0700. It refuses when the file in place is refused by ``read``
-(it never overwrites a file it could not read, one a newer Recursion wrote included): the operator
-removes such a file by hand. A file-system error while writing (a full disk) is raised as ``OSError``.
+turns: each holds an exclusive ``flock`` on the folder from its read to its answer, so among writers that
+take that lock (every ``write`` does) its answer is the file's value when it answers; a program that writes
+the file without the lock (a hand edit) can change it after. It removes the temporary files a killed
+writer left. A ``.config`` or ``recursion`` folder it makes is set to 0700 whatever the umask; one it
+cannot make is ``containment_unreadable``, naming the folder it was to be made in. It refuses when the
+file in place is refused by ``read`` (it never overwrites a file it could not read, one a newer Recursion
+wrote included): the operator removes such a file by hand. A file-system error while writing (a full
+disk) is raised as ``OSError``.
 
 The limit, as ``route_home.py``'s: code running as the operator, an engine under
 ``inside_operator_home`` included, can rewrite this file. The setting holds against other users and
@@ -341,8 +344,13 @@ def _open_folder(folder: str, *, create: bool) -> int | None:
             return None
         try:
             os.mkdir(path, 0o700)
+            os.chmod(path, 0o700)  # made here: 0700 whatever the umask (one can take the owner's own bits)
         except FileExistsError:  # made by another writer since: held to the same checks below
             pass
+        except OSError as exc:  # its folder not usable by its owner, a full disk: said, naming that folder
+            hint = (f"; {above} must be writable and searchable by its owner (`chmod 700` it)"
+                    if isinstance(exc, PermissionError) else "")
+            _refuse("containment_unreadable", f"{path} cannot be made in {above}: {type(exc).__name__}{hint}")
         fd = _open_existing_folder(path, flags)
     except OSError as exc:
         _folder_error(path, exc)
@@ -445,10 +453,11 @@ def _walk_above(folder: str, *, create: bool) -> str | None:
                 _refuse("containment_unreadable", f"{candidate}, the operator's home, does not exist")
             try:
                 os.mkdir(candidate, 0o700)
+                os.chmod(candidate, 0o700)  # made here: 0700 whatever the umask
             except FileExistsError:
                 pass
             except OSError as exc:
-                _refuse("containment_unreadable", f"{candidate} cannot be made: {type(exc).__name__}")
+                _refuse("containment_unreadable", f"{candidate} cannot be made in {current}: {type(exc).__name__}")
             info = _lstat(candidate)
             if info is None:
                 _refuse("containment_unreadable", f"{candidate} was removed while it was made")

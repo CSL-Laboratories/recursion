@@ -10,7 +10,9 @@ name:
 from __future__ import annotations
 
 import http.server
+import inspect
 import os
+import sys
 import threading
 import unittest
 from pathlib import Path
@@ -982,6 +984,274 @@ class ProxyTests(unittest.TestCase):
             self.assertTrue(oc.http_abort(target, "ses_x"))
         self.assertEqual(target_fixture.handler.seen, [("POST", "/session/ses_x/abort", b"")])
         self.assertEqual(proxy_fixture.handler.seen, [])
+
+
+def _cut_each_line(fn):
+    """The line numbers of ``fn``'s body after its docstring: a test interrupts once before each of them."""
+    lines, first = inspect.getsourcelines(fn)
+    # A ``try:`` line is the one instruction of a try statement that its own handler does not cover (CPython 3.12
+    # and 3.14): an interruption there is the window before the region, and is not walked.
+    body = [first + i for i, text in enumerate(lines)
+            if text.strip() and not text.strip().startswith(("#", "def ", "try:"))]
+    doc = fn.__doc__ is not None
+    if doc:   # skip the docstring's lines
+        end = next(i for i, text in enumerate(lines) if i and text.rstrip().endswith('"""'))
+        body = [n for n in body if n > first + end]
+    return body
+
+
+def _interrupt_before(fn, lineno):
+    """A tracer that raises one KeyboardInterrupt in ``fn`` just before line ``lineno`` runs (bounded: once)."""
+    fired = []
+
+    def trace(frame, event, arg):
+        if frame.f_code is fn.__code__:
+            if event == "line" and frame.f_lineno == lineno and not fired:
+                fired.append(lineno)
+                raise KeyboardInterrupt("one synthetic interruption")
+            return trace
+        return None
+
+    return trace, fired
+
+
+class ServeRoundTwoTests(unittest.TestCase):
+    """#421 round 2: astra C1-C7, sol 1-7, DeepSeek r2 N1-N3. Every wait is bounded; every process is a fake."""
+
+    def make(self, spawn=None, **kw):
+        spy = spawn or Spy()
+        return oc.ServeDriver(spy, port=lambda: PORT, **kw), spy
+
+    def begun(self, **kw):
+        driver, spy = self.make(**kw)
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        return driver, spy, handle
+
+    def run_cut(self, fn, lineno, call):
+        trace, fired = _interrupt_before(fn, lineno)
+        sys.settrace(trace)
+        try:
+            call()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            sys.settrace(None)
+        return fired
+
+    # DeepSeek N1 / astra C1 / sol 1: a release after the last check waits for the write, then terminates
+    def test_a_release_during_the_write_waits_for_it_and_then_terminates(self):
+        driver, spy = self.make()
+        handle = driver.start(session(), None, ENV)
+        lines, first = inspect.getsourcelines(oc.ServeDriver._send)
+        target = first + next(i for i, text in enumerate(lines) if 'process.send(item["text"])' in text)
+        entered, go, released, out = threading.Event(), threading.Event(), threading.Event(), []
+
+        def trace(frame, event, arg):
+            if frame.f_code is oc.ServeDriver._send.__code__:
+                if event == "line" and frame.f_lineno == target:
+                    entered.set()
+                    go.wait(5)
+                return trace
+            return None
+
+        def send():
+            sys.settrace(trace)
+            try:
+                driver.send(handle, message())
+                out.append("normal")
+            except BaseException as err:   # noqa: BLE001 (the kind is the answer)
+                out.append(type(err).__name__)
+            finally:
+                sys.settrace(None)
+
+        sender = threading.Thread(target=send, daemon=True)
+        releaser = threading.Thread(target=lambda: (driver.release(handle), released.set()), daemon=True)
+        sender.start()
+        self.assertTrue(entered.wait(5))
+        releaser.start()
+        early = released.wait(0.2)
+        go.set()
+        sender.join(5)
+        releaser.join(15)
+        self.assertFalse(sender.is_alive() or releaser.is_alive())
+        self.assertFalse(early)   # it waited for the write in progress
+        self.assertEqual((out, spy.processes[1].sent, [p.terminated for p in spy.processes]),
+                         (["normal"], ["Run the tests."], [1, 1]))
+        self.assertEqual(driver._workers, {})
+
+    # astra C2 / sol 2: an interruption anywhere in release or in its cleanup loses no process
+    def test_one_interruption_anywhere_in_release_or_its_cleanup_loses_no_process(self):
+        for fn in (oc.ServeDriver.release, oc.ServeDriver._clean):
+            for lineno in _cut_each_line(fn):
+                with self.subTest(fn=fn.__name__, line=lineno):
+                    driver, spy, handle = self.begun()
+                    fired = self.run_cut(fn, lineno, lambda d=driver, h=handle: d.release(h))
+                    driver.release(handle)
+                    if fired:
+                        self.assertTrue(all(p.terminated >= 1 for p in spy.processes))
+                        self.assertEqual(driver._workers, {})
+                        self.assertIsNone(handle.live_turn)
+
+    # astra C3 / sol 3 / DeepSeek N4: the server is owned from its spawn; a failed termination keeps an owner
+    def test_a_start_that_fails_after_the_spawn_terminates_its_server_or_keeps_it_owed(self):
+        for lineno in _cut_each_line(oc.ServeDriver._start):
+            for resume in (False, True):
+                with self.subTest(line=lineno, resume=resume):
+                    driver, spy = self.make()
+                    call = (lambda d=driver: d.resume("ses_old", session(), None, ENV)) if resume \
+                        else (lambda d=driver: d.start(session(), None, ENV))
+                    fired = self.run_cut(oc.ServeDriver._start, lineno, call)
+                    if fired and spy.processes:
+                        self.assertEqual(spy.processes[0].terminated, 1)
+                        self.assertEqual(driver._workers, {})
+        server = Process([])   # no readiness line, and a termination that fails once
+        failures = [OSError("synthetic: not terminated")]
+
+        def terminate():
+            if failures:
+                raise failures.pop()
+            server.terminated += 1
+
+        server.terminate = terminate
+        driver, _ = self.make(lambda argv, env: server)
+        with self.assertRaises(DriverStateError) as caught:
+            driver.start(session(), None, ENV)
+        self.assertTrue(caught.exception.__notes__)
+        (worker,) = driver._workers.values()   # the failed cleanup keeps a reachable owner
+        self.assertEqual(worker["live"], [server])
+        driver._clean(worker)
+        self.assertEqual((server.terminated, driver._workers), (1, {}))
+
+    def test_an_interruption_at_the_registration_leaves_nothing_started(self):
+        driver, spy = self.make()
+
+        class Cut(dict):
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                raise KeyboardInterrupt("registered, then interrupted")
+
+        driver._workers = Cut()
+        with self.assertRaises(KeyboardInterrupt):
+            driver.start(session(), None, ENV)
+        self.assertTrue(all(p.terminated == 1 for p in spy.processes))
+        self.assertEqual(dict(driver._workers), {})
+
+    # astra C4 / sol 6: a finish interrupted before the gate's transition can be asked again
+    def test_one_interruption_anywhere_in_finish_turn_leaves_it_retryable(self):
+        for lineno in _cut_each_line(oc.ServeDriver.finish_turn):
+            with self.subTest(line=lineno):
+                driver, spy, handle = self.begun()
+                fired = self.run_cut(oc.ServeDriver.finish_turn, lineno,
+                                     lambda d=driver, h=handle: d.finish_turn(h, 0))
+                if fired and handle.live_turn is not None:
+                    self.assertIsNone(driver.finish_turn(handle, 0)[0]["payload"]["code"])
+                self.assertIsNone(handle.live_turn)
+                driver.release(handle)
+
+    # astra C5 / sol 5 / DeepSeek N2: the original exception survives a cleanup that raises BaseException
+    def test_the_original_exception_survives_a_cleanup_that_raises(self):
+        for cleanup in (OSError("synthetic"), SystemExit("synthetic cleanup cancellation")):
+            with self.subTest(cleanup=type(cleanup).__name__):
+                original = KeyboardInterrupt("synthetic abort cancellation")
+
+                def abort(url, sid, original=original):
+                    raise original
+
+                driver, spy = self.make(abort=abort)
+                handle = driver.resume("ses_old", session(), None, ENV)
+                driver.send(handle, message())
+
+                def terminate(cleanup=cleanup):
+                    raise cleanup
+
+                real, spy.processes[1].terminate = spy.processes[1].terminate, terminate
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    driver.interrupt(handle, "turn-1")
+                self.assertIs(caught.exception, original)
+                self.assertTrue(original.__notes__)
+                spy.processes[1].terminate = real
+                driver.release(handle)
+                self.assertEqual(driver._workers, {})
+
+    # astra C6 / sol 5 / DeepSeek N3: a late process whose cleanup fails: DriverStateError, noted, still owed
+    def test_a_late_cleanup_failure_is_noted_on_the_state_refusal(self):
+        server, turn, holder = Process([READY]), Process(), {}
+        failures = [OSError("synthetic: not terminated")]
+
+        def terminate():
+            if failures:
+                raise failures.pop()
+            turn.terminated += 1
+
+        turn.terminate = terminate
+
+        def spawn(argv, env):
+            if argv[1] == "serve":
+                return server
+            holder["driver"].release(holder["handle"])   # released while the turn's spawn runs
+            return turn
+
+        driver, _ = self.make(spawn)
+        holder["driver"], holder["handle"] = driver, driver.start(session(), None, ENV)
+        with self.assertRaises(DriverStateError) as caught:
+            driver.send(holder["handle"], message())
+        self.assertTrue(caught.exception.__notes__)
+        self.assertEqual(turn.sent, [])
+        self.assertIn(id(holder["handle"]), driver._workers)
+        driver.release(holder["handle"])
+        self.assertEqual((server.terminated, turn.terminated, driver._workers), (1, 1, {}))
+
+    # sol 4 / astra C7: an interruption anywhere in a turn's start leaves no live turn without a process
+    def test_one_interruption_anywhere_in_send_leaves_no_turn_without_its_process(self):
+        for lineno in _cut_each_line(oc.ServeDriver._send):
+            with self.subTest(line=lineno):
+                driver, spy = self.make()
+                handle = driver.start(session(), None, ENV)
+                fired = self.run_cut(oc.ServeDriver._send, lineno, lambda d=driver, h=handle: d.send(h, message()))
+                if not fired:
+                    driver.release(handle)
+                    continue
+                if handle.live_turn is not None:
+                    self.assertIsNotNone(driver._worker(handle)["turn"]["process"])
+                driver.release(handle)
+                self.assertTrue(all(p.terminated == 1 for p in spy.processes))
+                self.assertEqual(driver._workers, {})
+
+    # astra C7 / sol 7: two cleaners at once keep a failing process reachable
+    def test_two_cleaners_keep_a_failing_process_reachable(self):
+        driver, spy, handle = self.begun()
+        entered, go, errors, calls = threading.Event(), threading.Event(), [], []
+        turn = spy.processes[1]
+        real = turn.terminate
+
+        def terminate():
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set()
+                go.wait(5)
+                raise OSError("synthetic: not terminated")
+            real()
+
+        turn.terminate = terminate
+
+        def release():
+            try:
+                driver.release(handle)
+            except BaseException as err:   # noqa: BLE001 (the kind is the answer)
+                errors.append(type(err).__name__)
+
+        first, second = threading.Thread(target=release, daemon=True), threading.Thread(target=release, daemon=True)
+        first.start()
+        self.assertTrue(entered.wait(5))
+        second.start()
+        second.join(5)
+        go.set()
+        first.join(5)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual(errors, ["OSError"])
+        driver.release(handle)
+        self.assertEqual(([p.terminated for p in spy.processes], driver._workers), ([1, 1], {}))
 
 
 if __name__ == "__main__":

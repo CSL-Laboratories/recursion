@@ -641,7 +641,14 @@ class TuiApp:
             visit = [(shown + i) % n for i in range(1, n + 1)]
         for idx in visit:
             if needle in (src[idx].lower() if fold else src[idx]):
-                self.scroll = sum(counts[idx + 1:])  # the match's last row is the pane's newest
+                rows = [row.lower() if fold else row for row in wrap(src[idx], w)]
+                at = next((k for k, row in enumerate(rows) if needle in row), None)
+                if at is None:  # the match runs over a row's end: the row it begins on
+                    at = next((k for k in range(len(rows) - 1) if needle in rows[k] + rows[k + 1]), 0)
+                below = sum(counts[idx + 1:])
+                # The match's last row is the pane's newest; when the line is taller than the pane and the match
+                # lies above what that shows, the row the match is on is the pane's oldest (Devin's thread on #404).
+                self.scroll = max(below, below + (counts[idx] - 1 - at) - (max(1, self._out_rows) - 1))
                 self._notice(f"search {field(pattern)}: line {idx + 1} of {n}")
                 return
         self._notice(f"search {field(pattern)}: not found in the {n} lines kept")

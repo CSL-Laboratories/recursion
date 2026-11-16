@@ -47,6 +47,8 @@ import tomllib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 
+from recursion_core.tui.sanitize import visible
+
 LEADER = "ctrl+x"
 CONTEXTS = ("global", "runs", "output", "command", "help")
 VIEWS = {"runs": ("runs", "global"), "output": ("output", "global"), "command": ("command",), "help": ("help",)}
@@ -170,7 +172,7 @@ def key_name(token: str) -> str | None:
         return None
     token = " " if token == "space" else ALIASES.get(token, token)
     if len(token) == 1:
-        return token if token.isprintable() else None
+        return token if visible(token) else None  # what the decoder gives (Devin's thread on #404: U+034F)
     if token in _CTRL or token in _SINGLE or token in _NAMED or token == "shift+tab":
         return token
     if any(token.startswith(mods) and token[len(mods):] in _NAMED for mods in _MODIFIER_SETS):
@@ -303,11 +305,15 @@ class Keymap:
     def _refusal(self, context: str, seq: tuple[str, ...], action: str) -> str | None:
         if seq == (self.leader,) and context in LEADER_CONTEXTS:  # alone it would shadow the leader (#404, M3)
             return "the leader is not bound alone; it starts the leader's sequences"
+        if context == "command" and len(seq[0]) == 1:  # a typed key would be lost from the line (Devin, #404)
+            return f"{show_sequence(seq[:1], self.leader)} types text on the command line; no binding there begins with it"
         if "esc" in seq and (seq != ("esc",) or ESC_CANCELS.get(context) != action):  # review 1 of #404, R1
             return ("Esc never sends a request or arms anything: it is bound only alone, to the cancel of its "
                     "context (line.cancel, help.close, focus.runs)")
         under_p = len(seq) >= 2 and seq[:2] == (self.leader, "p")
         if action.startswith(PLUGIN_PREFIX):
+            if context not in LEADER_CONTEXTS:  # the line and the keys view never see a leader sequence (Devin, #404)
+                return f"plugin actions are bound only where a leader sequence is typed ({', '.join(LEADER_CONTEXTS)})"
             if not under_p:
                 return "plugin actions are bound only under <leader> p"
             plugin_id, _, command = action[len(PLUGIN_PREFIX):].rpartition(".")

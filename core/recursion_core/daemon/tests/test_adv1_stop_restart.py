@@ -701,19 +701,16 @@ class RestartTest(ComposedBase):
         original = type(starter).__call__
         seen = []
         gate = threading.Event()
-        received, passed_on = [], []
-
-        def passed(self_, *args, **kwargs):
-            passed_on.append((args, kwargs))
-            return original(self_, *args, **kwargs)
+        received = []
+        real = mock.Mock(wraps=original)  # the real starter itself: its calls are the ones that reached it
 
         def slow(self_, *args, **kwargs):
             # The control API calls the starter as (params) on master, and as (params, record) when a lane's
             # start registrant is on the start path (SPINE's seams draft, #370). Whatever came is passed on.
-            received.append((args, kwargs))
+            received.append((self_, args, kwargs))
             gate.set()
             time.sleep(0.5)
-            return passed(self_, *args, **kwargs)
+            return real(self_, *args, **kwargs)
 
         def reconcile_in_window():
             gate.wait(10)
@@ -731,7 +728,10 @@ class RestartTest(ComposedBase):
         self.assertNotIn('start_failed', seen, 'the record flapped starting -> start_failed -> running')
         self.assertEqual(seen, ['starting'])
         self.assertEqual(len(received), 1, received)
-        self.assertEqual(passed_on, received, 'the stand-in passed on every argument the starter was called with')
+        called_on, args, kwargs = received[0]
+        self.assertIs(called_on, starter)
+        self.assertEqual(real.call_args_list, [mock.call(starter, *args, **kwargs)],
+                         'the real starter was called with every argument the stand-in was called with')
         # A start nobody is running any more (left by an earlier daemon) is still settled on the next pass.
         composed.control.registry.put({'run_id': 'run-left', 'tenant': 't1', 'engine': 'claude_code',
                                        'state': 'starting', 'cgroup': None, 'started_at': 1.0, 'stop': None,
@@ -747,7 +747,12 @@ class RestartTest(ComposedBase):
         daemon, composed = self.boot()
         control = composed.control
         original = adapter.RouteStarter._drive
-        held, counted, seen = [], [], []
+        reconcile_one = type(control)._reconcile_one
+        held, counted, seen, looked = [], [], [], []
+
+        def looking(self_, rec, row):
+            looked.append((rec['run_id'], rec.get('state'), row))
+            return reconcile_one(self_, rec, row)
 
         def reconcile_first(self_, ctx, request):
             held.append(self_.active(ctx.run_id))
@@ -757,13 +762,16 @@ class RestartTest(ComposedBase):
             seen.extend(r['state'] for r in control.registry.list())
             return original(self_, ctx, request)
 
-        with mock.patch.object(adapter.RouteStarter, '_drive', reconcile_first):
+        with mock.patch.object(adapter.RouteStarter, '_drive', reconcile_first), \
+                mock.patch.object(type(control), '_reconcile_one', looking):
             answer = control.api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0'})
         self.assertEqual(answer['code'], 'started', answer)
         run_id = answer['run']['run_id']
         self.assertEqual(held, [True], 'the starter held the run when reconcile looked')
         self.assertEqual(counted, [0], 'no start of the control was counted in flight')
         self.assertEqual(seen, ['starting'], 'the record flapped starting -> start_failed -> running')
+        self.assertEqual([entry for entry in looked if entry[0] == run_id], [(run_id, 'starting', None)],
+                         'reconcile looked at the starting record once, before the unit existed')
         self.assertEqual(self.api(composed).call('run.status', {'run_id': run_id})['run']['state'], 'running')
 
 

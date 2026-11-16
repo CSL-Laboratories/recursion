@@ -16,20 +16,23 @@ under the beta tag.
 Identity is checked positively only where the real version line is recorded and
 names the engine (``ident_required``): claude_code (``2.1.318 (Claude Code)``),
 codex (``codex-cli 0.160.0``) and opencode (``opencode v2.2.5``). For these, a line
-that does not match ``ident`` is refused (``identity_mismatch``). An engine with no
-identity rule and no pin is refused (``identity_unverified``) before its binary is
-run. For grok the real line was never read, so no format is invented: a native
-binary with the right name printing a bare version that passes the floors is granted,
-and the only identity check is that the line names no other engine. Whether grok
-needs a pinned digest or is accepted as is, is open for Lucas.
+that does not match ``ident`` is refused (``identity_mismatch``). An engine with
+neither a required identity line nor a pin is refused (``identity_unverified``)
+before its binary is run: its name and a version line prove nothing. That is grok
+today: its real line was never read, so no format is invented, and until a line is
+recorded or a pin names its binary, no file named ``grok`` is granted (#424 round 1,
+DeepSeek F1: a copy of python3 named grok was granted as Grok 3.12.3). Whether grok
+gets a recorded line, a pinned digest or is accepted as is stays open for Lucas.
 
 Pinned routes (``pin``; Lucas's owner call of 2026-11-09): pi, hermes and cursor
 (``launcher+tree``) and antigravity (``binary+launcher``) are granted only when the
 install matches a pin in ``pins.py``; the pin is their identity and their version,
 nothing is run, and the grant is beta. Any mismatch is ``pin_mismatch`` until
-re-pinned. Gemini CLI has no row (Lucas's owner call of 2026-11-09: the row is
-dropped; the Google route is Antigravity CLI, ``agy``), so ``gemini`` is
-``engine_unknown`` and a ``gemini`` binary on PATH is never looked up or granted.
+re-pinned. Gemini CLI has no row: #323 removed it on 2026-11-09 under a call it
+records as Lucas's (the Google route being Antigravity CLI, ``agy``), and whether to
+restore it is Lucas's open decision D10, so the absence is held pending D10, not
+settled. Meanwhile ``gemini`` is ``engine_unknown`` and a ``gemini`` binary on PATH
+is never looked up or granted.
 A floor change is a new ``FLOOR_TABLE_VERSION``, never an in-place edit; grants
 issued under another table version are refused (``grant_stale``).
 """
@@ -213,13 +216,27 @@ def _floor(spec: EngineSpec, floor: str) -> ParsedVersion:
 
 
 def _below(spec: EngineSpec, found: ParsedVersion, floor: str) -> bool:
-    """``found`` is below ``floor``. On the date scheme a build of the floor's own day and time is not
-    known to contain the floor unless it is the floor's commit, when the floor names one: it counts as
-    below (fail closed; #323 review of 7c15fa97, point 2)."""
+    """``found`` is below ``floor``.
+
+    On the date scheme a floor that names a commit is a statement about that build. When the floor gives
+    no time of day, its granularity is the day: any build of that day that is not the floor's commit is
+    not known to contain the floor and counts as below, whatever time it states (fail closed; #323 review
+    of 7c15fa97 point 2, and #424 round 1: a stated time must not evade it). When the floor gives a time,
+    a build at that exact time with another commit counts as below.
+    """
     f = _floor(spec, floor)
-    if found.key != f.key:
-        return found.key < f.key
-    return f.commit is not None and found.commit != f.commit
+    if f.commit is not None and found.commit != f.commit:
+        same = found.key[:3] == f.key[:3] if not _timed(floor) else found.key == f.key
+        if same:
+            return True
+    return found.key < f.key
+
+
+def _timed(floor: str) -> bool:
+    """A date floor that states a build time (``YYYY.MM.DD-HH-MM-SS``)."""
+    token = _token(floor)
+    m = _DATE.fullmatch(token) if token else None
+    return bool(m and m.group(4) is not None)
 
 
 def with_note(spec: EngineSpec, detail: str) -> str:
@@ -227,11 +244,12 @@ def with_note(spec: EngineSpec, detail: str) -> str:
 
 
 def check_identity(spec: EngineSpec) -> None:
-    """Refuse an engine with no identity rule and no pin: its name and a version line alone prove nothing."""
-    if spec.ident is None and spec.pin is None:
+    """Refuse an engine with neither a required identity line nor a pin: its name and a version line prove nothing."""
+    if spec.pin is None and not (spec.ident is not None and spec.ident_required):
         raise LaunchRefused(
             "identity_unverified", spec.engine,
-            "no identity rule or pinned digest for this engine; a name plus a version line is not enough",
+            "no recorded version line that names this engine and no pinned digest; a file name plus a version "
+            "line is not enough (open for Lucas)",
         )
 
 
@@ -286,7 +304,7 @@ def table_record() -> dict[str, object]:
                 "functional_basis": s.functional_basis,
                 "security_basis": s.security_basis,
                 "probe_name": s.probe_name,
-                "identity": "pin" if s.pin else "required" if s.ident_required else ("rule" if s.ident else "unverified"),
+                "identity": "pin" if s.pin else "required" if s.ident and s.ident_required else "unverified",
                 "pin": s.pin,
             }
             for s in _SPECS

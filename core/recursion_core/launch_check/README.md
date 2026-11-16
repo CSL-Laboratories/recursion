@@ -8,8 +8,8 @@ and untouched; its `LIVE_ADAPTERS_ENABLED` stays `False`.
 Governing spec: `contracts/PRODUCT.md` at csl-research `055cc7a5c793b7135e5d0565dc4198cf96230531`
 (SHA-256 `e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf`), section 3.3
 "R2a defined" (grill Q22), O50 ("Beta until measured") and 11.6 (grill Q43, functional floors), 34b (nine engines).
-This package ships eight of them: Lucas dropped the Gemini CLI row on 2026-11-09 (see
-[Gemini CLI is not a route](#gemini-cli-is-not-a-route)).
+This package ships eight of them: the Gemini CLI row is absent, held pending Lucas's open
+decision D10 (see [Gemini CLI is not a route](#gemini-cli-is-not-a-route)).
 Build-order item 5 (B10). Recursion hard rule 8 still applies: no live provider call until
 R2a merges and `CONTROL_PLANE.md` records each route's account and spend ceiling.
 Facts for that gate (whether merging this package counts as "R2a landed" is open for Lucas):
@@ -20,7 +20,9 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
 
 - `detect(engine, path_string)` / `detect_all(path_string)`: static detection on an
   explicit PATH string (never `os.environ`). Lists the hits for each binary name, resolves
-  symlinks and offers only a native target (ELF, Mach-O or PE magic). Nothing found is
+  symlinks and offers only a native target (ELF, Mach-O or PE magic: four bytes, so a file
+  that starts with them and is not a program is "native" here and only the kernel refuses it,
+  at exec). Nothing found is
   executed. Only the first hit of each name counts, so a native copy shadowed by a wrapper
   is not offered. Codex's npm shim (`bin/codex` -> `@openai/codex/bin/codex.js`) is followed
   to the vendored `vendor/<triple>/codex/codex` only when the layout is recognised;
@@ -151,19 +153,19 @@ When a functional floor is set, it also needs `found >= functional`. With no fun
 floor the engine still runs and the grant is tagged `beta` for route.list (O50, "Beta
 until measured"). A floor change is a new table version (grants under the old version
 become `grant_stale`). `floor_unset` remains in the closed refusal set for a table
-floor that does not parse. An engine with no identity rule (no `ident` regex and no
-pin) is refused `identity_unverified` before its binary is run; no row is in that state
-now. 1.5.0 removes the Gemini CLI row; no other row changed from 1.4.0.
+floor that does not parse. An engine with neither a required identity line nor a pin is
+refused `identity_unverified` before its binary is run; grok is in that state (below). 1.5.0 removes the Gemini CLI row; no other row changed from 1.4.0.
 
 Identity is checked positively only for the three engines whose real version line is
 recorded and names the engine: claude_code (`2.1.318 (Claude Code)`), codex
 (`codex-cli 0.160.0`) and opencode (`opencode v2.2.5`).
 For these a line that does not match the engine's identity rule is `identity_mismatch`
 (so a native `claude` printing `2.1.400` is refused). For pi, hermes, cursor and
-antigravity the pin is the identity. For grok the real line was never read, and no format
-is invented: a native binary with the right name printing a bare version that passes the
-floors is granted; the only identity check is that the line names no other engine in the
-table. Whether grok needs a pinned digest or is accepted as is, is open for Lucas.
+antigravity the pin is the identity. For grok the real line was never read and no format
+is invented, and grok has no pin, so nothing ties a file named `grok` to Grok: it is refused
+`identity_unverified` before it is run (#424 round 1, DeepSeek F1: until then a copy of
+python3 named `grok` was granted as Grok 3.12.3). Whether grok gets a recorded line, a pinned
+digest or is accepted as is, is open for Lucas; until he answers, no grok grant exists.
 
 | Engine (binaries) | Scheme | Functional floor (Q43) | Security floor (relayed) | Measured help |
 |---|---|---|---|---|
@@ -492,11 +494,13 @@ its own, apart from logic, as #336 does for its measured help.
 
 ### Gemini CLI is not a route
 
-Lucas's owner call of 2026-11-09: drop the Gemini CLI row. Background (Google sources are
-cited in the PR body): Google stopped serving Gemini CLI for Google AI Pro, Ultra and free
-individual accounts on 2026-06-18, and its replacement is Antigravity CLI (`agy`), the
-pinned beta route above. This closes the earlier open item (pin the Gemini bundle or drop
-the row).
+The row is absent, and that state is held, not settled: #323 removed it on 2026-11-09
+under a call it records as Lucas's ("drop the Gemini CLI row"), and the plan this lane works
+from lists restoring it as his open decision D10, with no words of his that settle it found.
+Nothing here builds or restores a row until he answers. Background #323 gave (Google sources
+are cited in its PR body): Google stopped serving Gemini CLI for Google AI Pro, Ultra and
+free individual accounts on 2026-06-18, and its replacement is Antigravity CLI (`agy`), the
+pinned beta route above.
 
 - Gemini CLI is not an engine here: no floor row, no pin, no API-key route. `gemini` is
   not a binary name any row looks for.
@@ -604,6 +608,26 @@ Called by nothing, like the rest of this package. What it adds:
 - One line of this README named the launch's containment with the word that master's
   `daemon/tests/test_plugins.py` (`ReadmeClaimTests`) refuses in any core README, so the merge
   of master made the gate red. The line now says "the launch's own containment".
+
+## Lane LAUNCH-CHECK, #424 round 1 (answers to three reads at `9cd220c3`)
+
+- grok: no grant without a required identity line or a pin (`identity_unverified`).
+- A date floor that names a commit and no time: every build of its day that is not its commit is
+  below it, whatever time it states.
+- Probe timeouts above `MAX_PROBE_TIMEOUT_S` (3600 s), or integers too large for a float, are
+  `version_probe_failed`, not an `OverflowError`.
+- Argv and env text that cannot be encoded (a lone surrogate) is `spawn_too_large`.
+- The probe releases its child on every exit: an interrupt, a poll error or a reader that
+  cannot start kills and reaps the child's session, ends the readers, closes the pipes and
+  re-raises.
+- The probe frames lines by LF (a CR before it included) and trims only spaces, so a tab, a
+  lone CR, a vertical tab or an escape in real output reaches `parse_version` and is refused.
+- A `path_string` that is not exactly `str` is `path_not_absolute`; `verify()` authenticates
+  first; a forged field JSON cannot hold is `grant_forged`; `absent` records carry `hits` and
+  `detection` like the other two outcomes.
+- Gemini's absence is described as held pending D10; `DECODER.md` treats the pre-exec line as
+  intent, writes the parent refusal as `start_error.code=launch_refused` with the cause in the
+  detail, and drops its FIFO-capacity assumption.
 
 ## Tests
 

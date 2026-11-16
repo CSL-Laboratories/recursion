@@ -150,7 +150,7 @@ class VersionFixtureTests(Dir):
                 self.assertEqual(fx.outcome, outcome)
 
     def test_the_table_covers_every_probed_engine(self) -> None:
-        probed = {e for e, s in FLOORS.items() if s.pin is None}
+        probed = {e for e, s in FLOORS.items() if s.pin is None and s.ident_required}
         self.assertEqual(probed, {fx.engine for fx in VERSIONS if fx.outcome == "granted"})
 
 

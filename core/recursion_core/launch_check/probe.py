@@ -34,6 +34,7 @@ from recursion_core.launch_check.floors import EngineSpec
 from recursion_core.launch_check.refusals import LaunchRefused
 
 PROBE_TIMEOUT_S = 20.0
+MAX_PROBE_TIMEOUT_S = 3600.0  # the longest probe a caller may ask for; any deadline under it is representable
 PROBE_OUTPUT_CAP = 64 * 1024
 SYSTEM_PATH = "/usr/bin:/bin"
 
@@ -74,9 +75,18 @@ def probe_env(spec: EngineSpec, home: str) -> dict[str, str]:
 
 
 def _first_line(data: bytes) -> str:
-    for line in data.decode("utf-8", "replace").splitlines():
-        if line.strip():
-            return line.strip()
+    """The first line that is not blank, stdout's before stderr's (the caller's order).
+
+    Lines are framed by LF; a CR just before the LF belongs to the framing, and only spaces around the
+    line are trimmed. Every other control character (a tab, a lone CR, a vertical tab, an escape) stays
+    in the line, so ``parse_version`` sees it and refuses the line, instead of a split or a strip
+    removing it first (#424 round 1, Codex sol R2).
+    """
+    for line in data.decode("utf-8", "replace").split("\n"):
+        if line.endswith("\r"):
+            line = line[:-1]
+        if line.strip(" "):
+            return line.strip(" ")
     return ""
 
 
@@ -138,14 +148,23 @@ _POLL_S = 0.01
 
 
 def check_timeout(spec: EngineSpec, timeout: object) -> None:
-    """A probe timeout is an ``int`` or ``float`` (not a bool), finite and above zero.
+    """A probe timeout is an ``int`` or ``float`` (not a bool), above zero and at most ``MAX_PROBE_TIMEOUT_S``.
 
     A NaN deadline is never reached and an infinite one never ends, so either would let a probe that
-    never exits hold the check for ever: both are refused before anything runs.
+    never exits hold the check for ever; an integer too large for a float would raise ``OverflowError``
+    in the deadline arithmetic (#424 round 1). All are refused before anything runs. An ``int`` is
+    compared exactly, with no conversion to float.
     """
-    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+    if type(timeout) is int:
+        ok = 0 < timeout <= MAX_PROBE_TIMEOUT_S
+    elif type(timeout) is float:
+        ok = math.isfinite(timeout) and 0 < timeout <= MAX_PROBE_TIMEOUT_S
+    else:
+        ok = False
+    if not ok:
+        shown = repr(timeout) if type(timeout) in (int, float) and len(repr(timeout)) <= 40 else f"<{type(timeout).__name__}>"
         raise LaunchRefused("version_probe_failed", spec.engine,
-                            f"probe timeout must be a finite number of seconds above 0, not {timeout!r}")
+                            f"probe timeout must be seconds above 0 and at most {MAX_PROBE_TIMEOUT_S:g}, not {shown}")
 
 
 def run_version_probe(spec: EngineSpec, realpath: str, timeout: float = PROBE_TIMEOUT_S) -> ProbeResult:
@@ -168,11 +187,16 @@ def run_version_probe(spec: EngineSpec, realpath: str, timeout: float = PROBE_TI
             )
         except OSError as e:
             raise LaunchRefused("binary_missing", spec.engine, f"spawn failed: {e.__class__.__name__}") from None
-        over = threading.Event()
-        readers = [_CappedReader(proc.stdout, over), _CappedReader(proc.stderr, over)]
-        for r in readers:
-            r.start()
+        # From here on every exit, ordinary or not (an interrupt, a poll or thread error, a reader that
+        # cannot start), passes the ``finally`` below, which releases what Popen made: the child's session
+        # is killed and reaped if it has not ended, the readers end and the pipes close (#424 round 1,
+        # Codex astra R1, DeepSeek F2). The initiating exception is re-raised unchanged.
+        readers: list[_CappedReader] = []
         try:
+            over = threading.Event()
+            for stream in (proc.stdout, proc.stderr):
+                readers.append(_CappedReader(stream, over))
+                readers[-1].start()
             deadline = t0 + timeout
             while (code := proc.poll()) is None:
                 if over.is_set():
@@ -203,9 +227,15 @@ def run_version_probe(spec: EngineSpec, realpath: str, timeout: float = PROBE_TI
                                     "--version exited but a process outside its session kept the output open")
             raw = _first_line(bytes(readers[0].data)) or _first_line(bytes(readers[1].data))
         finally:
+            if proc.returncode is None:  # not reaped: the loop was left before the child ended
+                try:
+                    _kill_group(proc)
+                except Exception:  # noqa: BLE001 - cleanup never replaces the exception that is leaving
+                    pass
             for r in readers:
                 r.stop.set()
-                r.join(1.0)
+                if r.ident is not None:  # a reader whose start failed was never running
+                    r.join(1.0)
             for stream in (proc.stdout, proc.stderr):
                 try:
                     stream.close()

@@ -23,9 +23,9 @@ def launch_check(
     for engine in FLOORS:
         found = detect(engine, path_string)
         hits = [h.path for h in found.hits]
-        if not found.hits:
+        if not found.hits:  # the same keys as the other two outcomes (#424 round 1, DeepSeek F4)
             records.append({"outcome": "absent", "engine": engine, "floor_table": FLOOR_TABLE_VERSION,
-                            "refusal_codes": REFUSAL_CODES_VERSION})
+                            "refusal_codes": REFUSAL_CODES_VERSION, "hits": hits, "detection": found.note})
             continue
         if found.candidate is None:
             rec = LaunchRefused("wrapper_refused", engine, found.note).record()

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from recursion_core.launch_check import binary, pins
 from recursion_core.launch_check.binary import PINNED_LAUNCHER_EXT, file_kind, sha256_file
 from recursion_core.launch_check.floors import FLOORS, spec_for
+from recursion_core.launch_check.refusals import LaunchRefused
 
 
 @dataclass(frozen=True)
@@ -227,6 +228,12 @@ def path_hits(name: str, path_string: str, pinned: bool = False) -> list[str]:
     return hits
 
 
+def check_path_string(engine: str, path_string: object) -> None:
+    """A PATH string is exactly ``str``; anything else is a typed refusal, never an AttributeError."""
+    if type(path_string) is not str:
+        raise LaunchRefused("path_not_absolute", engine, f"PATH string is not text: <{type(path_string).__name__}>")
+
+
 def detect(engine: str, path_string: str) -> Detection:
     """Return the engine's PATH hits and a native candidate, or None (fail closed).
 
@@ -234,8 +241,10 @@ def detect(engine: str, path_string: str) -> Detection:
     a later native copy shadowed by a wrapper is not offered. A pinned route offers
     its first hit of any kind; with several names, the first whose launcher is pinned.
     A ``hermes`` hit in the npm ``hermes-agent`` bridge is named in the note and never offered.
+    A ``path_string`` that is not exactly ``str`` is ``path_not_absolute`` (#424 round 1, DeepSeek F3).
     """
     spec = spec_for(engine)
+    check_path_string(spec.engine, path_string)
     hits: list[Hit] = []
     firsts: list[Hit] = []
     for name in spec.names:

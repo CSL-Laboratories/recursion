@@ -15,24 +15,33 @@ an acyclic decoder handoff"). Line numbers are master `fb578e31`.
 - `daemon/engine_exec.py` (standard library only, nothing from `recursion_core`) reads at most
   `MAX_ENV_BYTES = 60000` bytes, checks the shape, and calls `os.execve(executable, argv, env)`.
   Any failure exits 127 and writes only the exception's class name to the unit's stderr.
-- So the last check of the binary is the parent's (this package's `LaunchPlan.exec_argv()`), and
-  between it and `execve` the unit is created and the helper starts: the window of CX-1402. The
-  child has no grant to check against and no way to say why it refused.
+- Nothing on today's daemon path calls this package: `LaunchPlan.exec_argv()` is not called at this
+  head. Once wired, the parent's last check is the seam S10 hook, and between it and `execve` the
+  unit is created and the helper starts: the window of CX-1402. The child has no grant to check
+  against and no way to say why it refused.
 
 ## Two refusals that must stay apart
 
 | Where | What it means | How it travels |
 |---|---|---|
-| Parent, seam S10 (`launch_check(ctx, executable)`), before the run directory's files exist | **no unit started** | the hook's code: `launch_check:<code>`, as `start_failed` with `start_error.code` |
-| Child, this decoder, inside the unit, before `execve` | **no engine executed** (the unit did start: the helper is its main process) | the status channel below, then `start_failed` with the child's code |
+| Parent, seam S10 (`launch_check(ctx, executable)`), before the run directory's files exist | **no unit started** | `start_failed` with `start_error` `{"code": "launch_refused", "detail": "launch_check:binary_changed"}` (the cause in the detail) |
+| Child, this decoder, inside the unit, before `execve` | **no engine executed** (the unit did start: the helper is its main process) | the status channel below, then `start_failed` with `start_error.code` `launch_refused` and the child's code in the detail (the exact detail text is for STOP and SPINE to fix) |
 
-A test or a surface never says "no unit started" for the second row.
+A test or a surface never says "no unit started" for the second row. The `code` is a `code_word`
+(`^[a-z][a-z0-9_]{0,63}$`, #368 `common.v1.json`), so a colon never goes there: at #370 the
+launcher already wraps the S10 diagnostic as `RouteError(LAUNCH_REFUSED, detail)`. Storing
+`start_error` in the run record is STOP's work, not this lane's.
 
 ## The envelope, version `launch-envelope/1`
 
 The parent writes ONE length-prefixed JSON object to the FIFO that carries the environment today
-(the header stays an ASCII decimal length and `\n`; the body stays at most 60000 bytes, under a
-Linux FIFO's 64 KiB buffer, so the parent's write never blocks):
+(the header stays an ASCII decimal length and `\n`; the body stays at most 60000 bytes). A FIFO's
+capacity is not guaranteed to hold the frame (it can be lowered per descriptor; #424 round 1 measured
+a 4096-byte FIFO taking 4096 of 60006 bytes in one non-blocking write), so neither side assumes one
+write: the parent writes in a loop that handles partial writes and `EAGAIN`, under a deadline and
+the launch's cancellation, and refuses the launch (`launch_refused`, cause in the detail) if the
+whole frame is not written; the child reads until the header's length, end of file or its own
+deadline, and refuses a short frame (`envelope_malformed`).
 
 ```
 {"v": "launch-envelope/1",
@@ -83,14 +92,26 @@ unit's command line. The child opens it write-only with `O_CLOEXEC` and writes e
 
 - `{"v":"launch-status/1","outcome":"refused","code":"<code>"}` then exits 127, where `<code>` is
   from this package's closed refusal set plus one new code, `envelope_malformed`; or
-- `{"v":"launch-status/1","outcome":"exec"}` immediately before `execve`. `O_CLOEXEC` closes the
-  FIFO when the exec succeeds, so the parent reads the line and then end of file.
+- `{"v":"launch-status/1","outcome":"intent"}` immediately before `execve`: an intent, not a proof.
+  `O_CLOEXEC` closes the FIFO when the exec succeeds; if `execve` returns, the helper still holds
+  the FIFO and writes `{"v":"launch-status/1","outcome":"exec_failed","errno":<n>}`, then exits 127.
 
-The parent reads with a bound: "exec" then end of file means the engine was executed; "refused"
-means no engine executed, with the code; end of file with no line, or a malformed line, means the
-helper died before deciding, which is recorded as outcome unknown and refused
-(`launch_check_failed`), never as a launch. A failed `execve` after the "exec" line exits 127 and
-the parent sees the unit end without the engine's first output: STOP's existing start-failure path.
+What the parent may conclude, read with a bound:
+
+| Read | Conclusion |
+|---|---|
+| "refused" | no engine executed; the code is the cause |
+| "intent", then "exec_failed" | no engine executed; the errno is the cause |
+| "intent", then end of file | **outcome unknown**: the exec succeeded, or the helper died between the line and the exec |
+| end of file with no line, or a malformed line | outcome unknown: the helper died before deciding; the launch is refused (`launch_check_failed`) |
+
+"Intent" followed by end of file does not prove execution, and neither the engine's first output
+nor its exit status settles it (an engine may print nothing, or exit 127 on its own). An
+affirmative observation is needed to record "executed": while the unit's main process is alive,
+`/proc/<MainPID>/exe` names the checked file (same device and inode as the descriptor the child
+hashed). When that cannot be read in time (an engine that exits at once), the run records the
+outcome as unknown, never as a launch that happened. Which observation STOP's launcher takes is
+STOP's to settle.
 
 ## Who changes what
 
@@ -114,7 +135,10 @@ version string. Re-check: a same-size replacement between the parent's check and
 removed, a binary replaced between the child's hash and its exec (option (b) must execute the
 hashed bytes; option (a) must at least refuse on `ETXTBSY`). Channel: the "exec" line followed by
 end of file, the "refused" line, end of file with no line, a malformed line, a status FIFO the
-parent never opens (the child must not block for ever: it opens with a bound). Every binary is a
+parent never opens (the child must not block for ever: it opens with a bound); the helper dying
+after "intent"; a failed `execve` after "intent"; a silent engine that exits 0 at once; an engine
+that exits 127 on its own; a FIFO lowered to 4096 bytes and a reader that makes no progress (the
+parent's bounded write must refuse, not hang). Every binary is a
 fake (`tests/fixtures.py`, `tests/fake_binaries.py`); no real engine runs.
 
 ## Open, for the Liaison

@@ -83,9 +83,12 @@ class Base(unittest.TestCase):
 
         Pi, Hermes, Cursor and Antigravity are pinned routes since 2026-11-09 (test_pins.py).
         The probed-path rules they used to exercise (date scheme, sibling probe binary) stay
-        covered here on a patched row.
+        covered here on a patched row. Since #424 round 1 a probed row needs a required identity
+        line, so the patched row gets one that every line meets: the cells reach the parser.
         """
         table = dict(floors_mod.FLOORS)
+        if "ident_required" not in changes:  # a caller that names its own identity rule keeps it
+            changes = {"ident": r".", "ident_required": True, **changes}
         table[engine] = dataclasses.replace(table[engine], pin=None, **changes)
         return mock.patch.object(floors_mod, "FLOORS", table)
 
@@ -154,7 +157,7 @@ class GrantTests(Base):
             ("opencode", "opencode2", "opencode v2.2.5", None),
             ("opencode", "opencode", "opencode 1.18.32", "version_refused"),
             ("opencode", "opencode", "opencode 1.18.33", None),
-            ("grok", "grok", "grok 1.0.0", None),
+            ("grok", "grok", "grok 1.0.0", "identity_unverified"),  # #424 round 1: no recorded line, no pin
             # Pinned routes: a native file with the right name and a good version line is not a pin.
             ("cursor", "agent", "2026.10.22", "pin_mismatch"),
             ("cursor", "cursor-agent", "2026.10.01-e373342", "pin_mismatch"),
@@ -398,22 +401,28 @@ class GrantRefusalTests(Base):
         with self.probed_hermes():
             self.assertEqual("0.9.1", self.g("hermes", self._hermes("hermes-acp 0.9.1")).version)
 
-    def test_bare_line_engines_have_no_positive_identity_check(self) -> None:
-        # Grok: the real line was never read, so no format is invented. A bare line passing the
-        # floors grants. Cursor and Antigravity were here until Lucas's 2026-11-09 call made them
-        # pinned routes (test_pins.py); the Gemini CLI row was dropped the same day.
-        for engine, name, line in (("grok", "grok", "1.0.0"),):
-            with self.subTest(engine=engine):
+    def test_bare_line_engines_are_identity_unverified(self) -> None:
+        # Grok: the real line was never read, so no format is invented, and it has no pin. Until #424
+        # round 1 a bare line passing the floors granted (DeepSeek F1: any native file named grok); now
+        # nothing ties the file to Grok, so it is refused before it is run. Which of a recorded line, a
+        # pin or acceptance as is applies stays Lucas's. Cursor and Antigravity were here until the
+        # 2026-11-09 call #323 records made them pinned routes (test_pins.py).
+        for engine, name, line in (("grok", "grok", "1.0.0"), ("grok", "grok", "grok 1.0.0")):
+            with self.subTest(engine=engine, line=line):
                 self.assertFalse(FLOORS[engine].ident_required)
                 self.assertIsNone(FLOORS[engine].pin)
-                self.assertEqual(engine, self.g(engine, F.make(name, line)).engine)
+                self.refused("identity_unverified", self.g, engine, F.make(name, line))
         self.assertEqual(["grok"], sorted(e for e, s in FLOORS.items() if not s.ident_required and s.pin is None))
 
     def test_self_naming_rechecked_at_launch_plan(self) -> None:
-        g = self.g("grok", F.make("grok", "1.0.0"))
+        # Granted under a table that requires the line to name grok, planned under one whose rule it fails.
         table = dict(floors_mod.FLOORS)
         table["grok"] = dataclasses.replace(table["grok"], ident_required=True)
         with mock.patch.object(floors_mod, "FLOORS", table):
+            g = self.g("grok", F.make("grok", "grok 1.0.0"))
+        stricter = dict(table)
+        stricter["grok"] = dataclasses.replace(table["grok"], ident=r"\bxai-grok\b")
+        with mock.patch.object(floors_mod, "FLOORS", stricter):
             self.refused("identity_mismatch", launch_plan, g, ["grok"])
 
     def test_every_engine_without_an_identity_rule_is_refused(self) -> None:
@@ -426,7 +435,10 @@ class GrantRefusalTests(Base):
             self.refused("identity_unverified", self.g, "grok", F.make("grok", "grok 1.0.0"))
 
     def test_identity_rechecked_at_launch_plan(self) -> None:
-        g = self.g("grok", F.make("grok", "grok 1.0.0"))
+        table = dict(floors_mod.FLOORS)
+        table["grok"] = dataclasses.replace(table["grok"], ident_required=True)
+        with mock.patch.object(floors_mod, "FLOORS", table):
+            g = self.g("grok", F.make("grok", "grok 1.0.0"))
         table = dict(floors_mod.FLOORS)
         table["grok"] = dataclasses.replace(table["grok"], ident=None)
         with mock.patch.object(floors_mod, "FLOORS", table):
@@ -598,9 +610,9 @@ class LaunchPlanTests(Base):
             self.refused("version_refused", launch_plan, g, ["claude"])
 
     def test_unset_functional_floor_grants_as_beta_and_reaches_a_plan(self) -> None:
-        g = self.g("grok", F.make("grok", "grok 1.0.0"))
+        g = self.g("codex", F.make("codex", "codex-cli 0.160.0"))  # codex: security floor only
         self.assertTrue(g.record()["beta"])
-        plan = launch_plan(g, ["grok"])
+        plan = launch_plan(g, ["codex"])
         self.assertEqual(g.realpath, plan.exec_argv()[0])
 
 

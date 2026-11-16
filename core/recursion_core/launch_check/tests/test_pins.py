@@ -1888,11 +1888,11 @@ class GeminiDroppedTests(Base):
         self.assertEqual({"absent"}, {r["outcome"] for r in records})
 
     def test_a_grant_cannot_be_planned_as_gemini(self) -> None:
-        g = grant("grok", F.make("grok", "grok 1.0.0"), probe=F.probe)
+        g = grant("codex", F.make("codex", "codex-cli 0.160.0"), probe=F.probe)
         self.refused("argv0_mismatch", launch_plan, g, ["gemini", "-p", "hi"])
         self.refused("grant_forged", launch_plan, dataclasses.replace(g, engine="gemini"), ["gemini"])
         with self.assertRaises(TypeError):  # the auth statement went with the row
-            launch_plan(g, ["grok"], auth="api_key")  # type: ignore[call-arg]
+            launch_plan(g, ["codex"], auth="api_key")  # type: ignore[call-arg]
 
     def test_a_pin_cannot_make_gemini_a_route(self) -> None:
         script = self.gemini_bundle()

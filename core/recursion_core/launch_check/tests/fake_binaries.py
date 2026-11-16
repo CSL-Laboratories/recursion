@@ -112,7 +112,7 @@ VERSIONS: tuple[VersionFixture, ...] = (
     VersionFixture("claude_code", "2.1.318 (Claude Code)", (2, 1, 318), None, "granted"),
     VersionFixture("codex", "codex-cli 0.160.0", (0, 160, 0), None, "granted"),
     VersionFixture("opencode", "opencode v2.2.5", (2, 2, 5), None, "granted"),
-    VersionFixture("grok", "grok 1.0.0", (1, 0, 0), None, "granted"),
+    VersionFixture("grok", "grok 1.0.0", (1, 0, 0), None, "identity_unverified"),  # no recorded line, no pin
     # Floors.
     VersionFixture("claude_code", "2.1.311 (Claude Code)", (2, 1, 311), None, "version_refused"),
     VersionFixture("claude_code", "2.1.314 (Claude Code)", (2, 1, 314), None, "granted"),
@@ -122,7 +122,7 @@ VERSIONS: tuple[VersionFixture, ...] = (
     # Identity.
     VersionFixture("claude_code", "2.1.318", (2, 1, 318), None, "identity_mismatch"),
     VersionFixture("claude_code", "codex-cli 2.1.318", (2, 1, 318), None, "engine_mismatch"),
-    VersionFixture("grok", "2.1.318 (Claude Code)", (2, 1, 318), None, "engine_mismatch"),
+    VersionFixture("grok", "2.1.318 (Claude Code)", (2, 1, 318), None, "identity_unverified"),
     # Broken lines.
     VersionFixture("claude_code", "", None, None, "identity_mismatch"),
     VersionFixture("claude_code", "2.1. (Claude Code)", None, None, "version_unparsed"),
@@ -132,5 +132,5 @@ VERSIONS: tuple[VersionFixture, ...] = (
     VersionFixture("claude_code", "2.1.318 (Claude\ufffd Code)", None, None, "version_unparsed"),
     VersionFixture("claude_code", "2.1.318 (Claude Code)\x1b[0m", None, None, "version_unparsed"),
     VersionFixture("claude_code", "2.1.318 (Claude Code)\x00", None, None, "version_unparsed"),
-    VersionFixture("grok", "grok\t1.0.0", None, None, "version_unparsed"),
+    VersionFixture("opencode", "opencode\tv2.2.5", None, None, "version_unparsed"),
 )

@@ -99,8 +99,8 @@ class FloorTableTests(unittest.TestCase):
             self.assertEqual("required", engines[engine]["identity"], engine)
         for engine in pinned:
             self.assertEqual("pin", engines[engine]["identity"], engine)
-        for engine in set(FLOORS) - required - pinned:
-            self.assertEqual("rule", engines[engine]["identity"], engine)
+        for engine in set(FLOORS) - required - pinned:  # #424 round 1: no required line, no pin
+            self.assertEqual("unverified", engines[engine]["identity"], engine)
         self.assertEqual({"grok"}, set(FLOORS) - required - pinned)
 
     def test_table_is_read_only(self) -> None:

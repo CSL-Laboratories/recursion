@@ -136,7 +136,7 @@ class DateFloorCommitTests(Base):
 
     def test_the_floor_commit_itself_and_later_days_pass(self) -> None:
         spec = FLOORS["cursor"]
-        for line in ("2025.09.17-25b418f", "2025.09.18-aaaaaa", "2025.09.17-00-00-01-aaaaaa", "2026.11.05-86047df"):
+        for line in ("2025.09.17-25b418f", "2025.09.18-aaaaaa", "2025.09.17-00-00-01-25b418f", "2026.11.05-86047df"):
             with self.subTest(line=line):
                 check_floors(spec, parse_version("date", line))
 

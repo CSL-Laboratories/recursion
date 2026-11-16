@@ -340,12 +340,18 @@ def authenticate(g: object) -> EngineSpec:
         raise LaunchRefused("grant_forged", "?", f"not a Grant: {type(g).__name__}")
     values = asdict(g)
     mac = values.pop("mac")
-    engine = g.engine if isinstance(g.engine, str) else "?"
-    if not isinstance(mac, str) or not hmac.compare_digest(mac, _mac(values)):
+    engine = g.engine if type(g.engine) is str else "?"
+    try:  # a forged field JSON cannot hold (bytes, a set) is a forged grant, not a TypeError (DeepSeek F3)
+        expected = _mac(values)
+    except (TypeError, ValueError, RecursionError):
+        raise LaunchRefused("grant_forged", engine, "a field is not plain data: not issued by grant()") from None
+    if not isinstance(mac, str) or not hmac.compare_digest(mac, expected):
         raise LaunchRefused("grant_forged", engine, "MAC missing or invalid: not issued by grant()")
     if g.floor_table != floors.FLOOR_TABLE_VERSION or g.refusal_codes != REFUSAL_CODES_VERSION:
         raise LaunchRefused("grant_stale", engine, f"issued under {g.floor_table}; table is now {floors.FLOOR_TABLE_VERSION}")
     spec = spec_for(engine)
+    if (spec.pin or "") != g.pin_kind:  # before the identity rule, which reads the pin column
+        raise LaunchRefused("grant_forged", engine, "pin kind does not match the floor table")
     check_identity(spec)
     if not HEX64.fullmatch(g.sha256) or not HEX64.fullmatch(g.probe_sha256):
         raise LaunchRefused("grant_forged", engine, "digest is not a full 64-hex SHA-256")
@@ -354,8 +360,6 @@ def authenticate(g: object) -> EngineSpec:
         raise LaunchRefused("grant_forged", engine, "version fields do not re-parse")
     check_self_named(spec, g.version_raw)  # re-checked at the trusted boundary
     check_floors(spec, parsed)  # re-checked at the trusted boundary
-    if (spec.pin or "") != g.pin_kind:
-        raise LaunchRefused("grant_forged", engine, "pin kind does not match the floor table")
     if type(g.entry) is not tuple or not all(isinstance(e, str) for e in g.entry):
         raise LaunchRefused("grant_forged", engine, "entry is not a tuple of paths")
     if type(g.check_only) is not bool or type(g.interpreter) is not str:
@@ -384,7 +388,7 @@ def verify(g: Grant) -> None:
     A check-only ``binary+launcher`` grant's entry must be exactly ``(pin_target,)`` (``grant_forged``);
     that binary must still resolve to itself, be native and hash to ``pin_sha256`` (``binary_changed``).
     """
-    spec = spec_for(g.engine)
+    spec = authenticate(g)  # before any field of g is read (#424 round 1, DeepSeek F3)
     pairs = [(g.path, g.realpath, g.sha256)]
     if g.probe_path != g.path:
         pairs.append((g.probe_path, g.probe_realpath, g.probe_sha256))
@@ -420,20 +424,28 @@ def verify(g: Grant) -> None:
             raise LaunchRefused("binary_changed", spec.engine, f"entry {e} now resolves elsewhere")
 
 
+def _encoded_len(spec: EngineSpec, text: str, what: str) -> int:
+    """Bytes ``text`` takes in the spawn; text that cannot be encoded (a lone surrogate) is a typed refusal."""
+    try:
+        return len(text.encode("utf-8", "surrogateescape"))
+    except UnicodeEncodeError:
+        raise LaunchRefused("spawn_too_large", spec.engine, f"{what} cannot be encoded for the spawn") from None
+
+
 def _spawn_bytes(spec: EngineSpec, argv: Sequence[str], env: Mapping[str, str]) -> int:
     total = 0
     # Exactly str, never a subclass: a subclass can lie about its own bytes (``encode``) or its NULs.
     for a in argv:
         if type(a) is not str or "\x00" in a:
             raise LaunchRefused("spawn_too_large", spec.engine, "argv item is not NUL-free text")
-        n = len(a.encode("utf-8", "surrogateescape")) + 1
+        n = _encoded_len(spec, a, "argv item") + 1
         if n > MAX_ARG_BYTES:
             raise LaunchRefused("spawn_too_large", spec.engine, f"one argv item is {n} bytes > {MAX_ARG_BYTES}")
         total += n
     for k, v in env.items():
         if type(k) is not str or type(v) is not str or "\x00" in k + v or "=" in k or not k:
             raise LaunchRefused("spawn_too_large", spec.engine, "env item is not NUL-free text")
-        n = len(f"{k}={v}".encode("utf-8", "surrogateescape")) + 1
+        n = _encoded_len(spec, f"{k}={v}", "env item") + 1
         if n > MAX_ARG_BYTES:
             raise LaunchRefused("spawn_too_large", spec.engine, f"env item {k} is {n} bytes > {MAX_ARG_BYTES}")
         total += n

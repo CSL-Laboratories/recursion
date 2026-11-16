@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -41,8 +42,28 @@ def _unsafe_text(text: str) -> bool:
 
 
 def _printable(text: object) -> str:
-    """Escape whatever print() could not encode (a lone surrogate) and any NUL."""
-    return str(text).encode("utf-8", "backslashreplace").decode("utf-8").replace("\0", "\\x00")
+    """One diagnostic line: lone surrogates, NULs and other controls are escaped.
+
+    A key or a path must not be able to forge a second line or a raw terminal control.
+    """
+    raw = str(text).encode("utf-8", "backslashreplace").decode("utf-8")
+    parts: list[str] = []
+    for char in raw:
+        if char == "\0":
+            parts.append("\\x00")
+        elif unicodedata.category(char) in ("Cc", "Cs"):
+            parts.append(f"\\u{ord(char):04x}")
+        else:
+            parts.append(char)
+    return "".join(parts)
+
+
+def _git_env() -> dict[str, str]:
+    """Child git must not lazy-fetch a missing blob from a promisor remote."""
+    env = os.environ.copy()
+    env["GIT_NO_LAZY_FETCH"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
 
 
 def errors(pin: object) -> list[str]:
@@ -97,11 +118,23 @@ def vault_errors(pin: dict, vault: Path) -> list[str]:
         return []
     spec = f"{pin['commit']}:{pin['path']}"
     try:
-        blob = subprocess.run(
-            ["git", "-C", str(vault), "show", spec],
+        # cat-file, not show: show renders a tree listing, and that listing is not the
+        # pinned blob. GIT_NO_LAZY_FETCH keeps a partial clone from calling the promisor.
+        kind = subprocess.run(
+            ["git", "-c", "credential.helper=", "-C", str(vault), "cat-file", "-t", spec],
             check=True,
             capture_output=True,
             timeout=GIT_TIMEOUT_SECONDS,
+            env=_git_env(),
+        ).stdout.decode("ascii", "replace").strip()
+        if kind != "blob":
+            return [f"{spec} is a {kind or 'unknown object'}, not a pinned blob"]
+        blob = subprocess.run(
+            ["git", "-c", "credential.helper=", "-C", str(vault), "cat-file", "blob", spec],
+            check=True,
+            capture_output=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+            env=_git_env(),
         ).stdout
     except subprocess.TimeoutExpired:
         return [f"cannot read {spec!a} from {str(vault)!a}: git timed out after {GIT_TIMEOUT_SECONDS} seconds"]

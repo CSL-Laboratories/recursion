@@ -54,6 +54,7 @@ class _Output:
         self.sanitizer = OutputSanitizer()
         self.events = 0
         self.dropped = 0
+        self.finished = 0  # lines finished since the output began: a line's place, which retention does not move
         self.label = f"output run={field(run_id)}: "
         # The display rows of each retained line at one width, kept beside the lines, so a frame need not wrap
         # the whole history to count it or show its newest rows (review 2 of #404, Astra 3). They are counted
@@ -90,6 +91,7 @@ class _Output:
         # beside as many new lines (round 3 of #404, Astra's required 1).
         width, self._width = self._width, -1
         self.lines.extend(done)
+        self.finished += len(done)
         if width >= 0:  # the counts stay beside the lines: the same maxlen drops the same oldest ones
             self._rows.extend(len(wrap(line, width)) for line in done)
             self._width = width
@@ -181,6 +183,7 @@ class TuiApp:
         self.help_scroll = 0  # the first help row shown in full screen
         self._keys_row = True  # the last frame had a row for the open keys (review 3 of #404, DeepSeek F6)
         self._out_rows = 10  # rows the output pane had in the last frame (a half page is half of it)
+        self._landing: tuple | None = None  # the last search's match until a frame lands it (Sol's r5 of #404, 2)
         # Burst input seen since the line was opened, or on any key of the sequence that armed a Stop
         # (review of #372, R1): the next Enter or y does not act on it, however it arrives itself.
         self._line_burst = self._stop_burst = False
@@ -596,6 +599,7 @@ class TuiApp:
     def _page(self, action: str, burst: bool = False) -> None:
         """Pager steps in display rows (a long line's rows are each reachable; review 1 of #404, R2)."""
 
+        self._landing = None  # a pager key moves the view itself (a search sets its own again)
         half = max(1, self._out_rows // 2)
         step = {"pager.down": -1, "pager.up": 1, "pager.half_down": -half, "pager.half_up": half}.get(action)
         if step is not None:
@@ -615,10 +619,13 @@ class TuiApp:
     def _search(self, pattern: str, step: int) -> None:
         """Find ``pattern`` (case-insensitive when it has no capital letter) in the attached run's output.
         A new search starts at the newest line shown and goes to older lines; ``n`` goes on to older ones,
-        ``N`` back to newer ones, both wrapping around. The match's last display row becomes the pager's
-        newest row."""
+        ``N`` back to newer ones, both wrapping around. The match is landed (``_land``): its line's
+        last display row becomes the pager's newest row; when the line is taller than the pane and the match
+        begins above what that shows, the row the match begins on becomes the pane's oldest. The frame that next
+        draws the pane lands it again at its own width and height (Devin's thread on #404; DeepSeek's round 5,
+        F1, F3, F5; Sol's round 5, required 1 and 2)."""
 
-        self.search = pattern
+        self.search, self._landing = pattern, None
         out = self.outputs.get(self.attached or "")
         src = out.source() if out else []
         if not pattern or not src:
@@ -640,18 +647,41 @@ class TuiApp:
         else:  # N: back to newer lines
             visit = [(shown + i) % n for i in range(1, n + 1)]
         for idx in visit:
-            if needle in (src[idx].lower() if fold else src[idx]):
-                rows = [row.lower() if fold else row for row in wrap(src[idx], w)]
-                at = next((k for k, row in enumerate(rows) if needle in row), None)
-                if at is None:  # the match runs over a row's end: the row it begins on
-                    at = next((k for k in range(len(rows) - 1) if needle in rows[k] + rows[k + 1]), 0)
-                below = sum(counts[idx + 1:])
-                # The match's last row is the pane's newest; when the line is taller than the pane and the match
-                # lies above what that shows, the row the match is on is the pane's oldest (Devin's thread on #404).
-                self.scroll = max(below, below + (counts[idx] - 1 - at) - (max(1, self._out_rows) - 1))
+            pos = (src[idx].lower() if fold else src[idx]).find(needle)
+            if pos >= 0:
+                # The line by its place since the output began, so output that arrives before the frame (retention
+                # dropping older lines included) does not move it (Sol's round 5 of #404, required 2).
+                self._landing = (out, out.finished - len(out.lines) + idx, pos, needle, fold)
+                self._land()
                 self._notice(f"search {field(pattern)}: line {idx + 1} of {n}")
                 return
         self._notice(f"search {field(pattern)}: not found in the {n} lines kept")
+
+    def _land(self) -> None:
+        """Put the last search's match in the pane, at this width and the pane's rows of the last frame; the frame
+        that next draws the pane calls it again at its own (Sol's round 5 of #404, required 2). The line's last
+        display row is the pane's newest; when the line is taller than the pane and the match begins above what
+        that shows, the row the match begins on is the pane's oldest (Devin's thread on #404). That row is found
+        from the match's offset in the line as searched, lowered when the search is: lowering a row gives as many
+        characters as its part of the lowered line (only a final sigma looks at its neighbours, and it stays one
+        character), so a match over a row's end, over three rows, or after characters that lower to two is found
+        on the row it begins on (Sol's round 5 of #404, required 1; DeepSeek's, F1). A line not kept as it was
+        found is not landed: the pager stays where it is."""
+
+        out, line, pos, needle, fold = self._landing
+        src = out.source() if out is self.outputs.get(self.attached or "") else []
+        idx = line - (out.finished - len(out.lines))
+        if not 0 <= idx < len(src) or (src[idx].lower() if fold else src[idx])[pos:pos + len(needle)] != needle:
+            return
+        w = self._pane_width()
+        counts, at, end = out.counts(w), 0, 0
+        for k, row in enumerate(wrap(src[idx], w)):  # wrap drops no character
+            end += len(row.lower() if fold else row)
+            if pos < end:  # the first row reaching past the match's offset: the row it begins on
+                at = k
+                break
+        below = sum(counts[idx + 1:])
+        self.scroll = max(below, below + (counts[idx] - 1 - at) - (max(1, self._out_rows) - 1))
 
     # -- help -------------------------------------------------------------------------------------
     def show_help(self) -> None:
@@ -925,6 +955,11 @@ class TuiApp:
             rows.extend((6, "│", None) for _ in range(rem - 1 - len(lines)))
         elif rem:
             self._out_rows = rem - 1
+            # The frame that draws the pane lands the last search's match at its own width and rows: a resize (in
+            # Loop.tick, after the keys) or a condition row since the search moved them (Sol's round 5 of #404, 2).
+            if self._landing is not None:
+                self._land()
+                self._landing = None
             out = self.outputs.get(self.attached or "")
             self.scroll = min(self.scroll, self._top_scroll())  # retention may have dropped the rows it was on
             pager = ""

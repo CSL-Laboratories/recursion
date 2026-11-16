@@ -16,13 +16,15 @@ global ``<leader> p`` plugin binding does not reach the command line. The Stop c
 of the keymap: ``y`` alone confirms and any other key cancels.
 
 No timers. Within one context no binding may be a prefix of another, so a sequence is complete, still
-pending, or not bound, decided by the keys alone. A pending sequence waits for the next key; Esc cancels it,
+pending, or not bound, decided by the keys alone. Binding is not serialised: two threads that bind into one
+keymap at once are the caller's to order (each client binds into its own copy, ``for_client``). A pending sequence waits for the next key; Esc cancels it,
 and then does what Esc does where it was pressed (leaves the line, the help or the pager).
 A key that breaks a leader sequence is consumed (the user meant a leader command); a key that breaks any
 other prefix (``ctrl+d`` then ``j``) is read again on its own.
 
-The binding file (TOML, ``version = 1``) overrides the defaults per sequence; the value ``"none"`` removes a
-default. A ``[safety]`` table states rules that a binding file can only make stricter: it may add keys to
+The binding file (TOML, ``version = 1``) overrides the defaults per sequence; the value ``"none"`` removes
+that context's binding, a default or a file's own (in ``runs`` and ``output`` a global binding of the same keys
+then applies). A ``[safety]`` table states rules that a binding file can only make stricter: it may add keys to
 ``never_bind``, and may restate the fixed rules as ``true``, never ``false``. The fixed rules:
 
 - ``ctrl+y`` is bound nowhere and ``ctrl+p`` nowhere globally (no YOLO key, no global palette over
@@ -32,7 +34,8 @@ default. A ``[safety]`` table states rules that a binding file can only make str
 - no action approves anything: approvals are answered by number and Enter, never by a key binding;
 - ``esc`` is bound to nothing that sends a request; Esc cancels local UI and never stops or interrupts a run,
   and no binding file takes that cancel away (``[safety] never_bind`` cannot hold Esc);
-- plugin actions (``plugin.<plugin>.<command>``) are bound only under ``<leader> p``, and only they are;
+- plugin actions (``plugin.<plugin>.<command>``) are bound only under ``<leader> p``, and only where a leader
+  sequence is typed (``global``, ``runs``, ``output``); only they are bound under ``<leader> p``;
 - the Stop action opens the confirmation; no binding sends ``run.stop`` by itself.
 
 A binding file that cannot be read, or whose ``[safety]`` loosens a rule, is not used at all; one bad binding
@@ -180,7 +183,7 @@ def key_name(token: str) -> str | None:
     if token.startswith("ctrl+alt+") and "ctrl+" + token[9:] in _CTRL:
         return token
     rest = token[4:] if token.startswith("alt+") else ""
-    return token if len(rest) == 1 and rest.isprintable() or rest in _SINGLE[:3] else None
+    return token if len(rest) == 1 and visible(rest) or rest in _SINGLE[:3] else None  # DeepSeek r5 of #404, F4
 
 
 def is_key_name(token: str) -> bool:

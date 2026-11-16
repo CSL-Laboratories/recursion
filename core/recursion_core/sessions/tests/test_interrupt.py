@@ -7,6 +7,7 @@ There is no ``session.interrupt`` handler yet (questions.md, Q4): these tests ca
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from recursion_core.sessions import machine, records, store
 from recursion_core.sessions.tests.support import Cut, Lane, UnitRefused, published_rules, stop_answer
@@ -307,6 +308,33 @@ class InterruptAnswersTest(unittest.TestCase):
         self.assertEqual([event['payload']['requested_by'] for event in found], [{'kind': 'device', 'id': 'phone-1'}])
         self.assertTrue(rules.fits('event.v1.json#/$defs/interrupt', found[0]['payload']))
 
+    def test_a_requester_changed_after_it_was_checked_is_never_committed_as_changed(self):
+        """Round 2 of #415 (Codex GPT-6 Astra and GPT-6.1 Sol, required change 1): the caller's dict was checked and
+        only then copied, so another thread that changed it between the two committed what had not been checked."""
+        real = records.check_principal
+        for path in ('native', 'fallback', 'no_live_turn'):
+            with self.subTest(path=path):
+                self.lane = Lane()
+                if path == 'no_live_turn':
+                    sid, turn_id = self.lane.start(engine='codex')['session']['session_id'], 'turn-whatever'
+                else:
+                    live = self.running('codex' if path == 'native' else 'opencode')
+                    sid, turn_id = live['session_id'], live['active_turn_id']
+                requested_by = {'kind': 'device', 'id': 'phone-1'}
+
+                def check_then_change(value, where='/principal', requested_by=requested_by):
+                    real(value, where)
+                    requested_by['id'] = ''                 # the caller's dict, changed once the check has passed
+
+                with mock.patch.object(records, 'check_principal', check_then_change):
+                    self.lane.sessions.interrupt(sid, turn_id, requested_by)
+                with self.lane.store.transaction() as tx:
+                    committed = [operation['payload']['requested_by'] for operation in store.work(tx)
+                                 if operation['kind'] == 'interrupt']
+                committed += [event['payload']['requested_by'] for event in self.events_of('interrupt')]
+                self.assertTrue(committed, 'the request left a record')
+                self.assertEqual(committed, [{'kind': 'device', 'id': 'phone-1'}] * len(committed))
+
     # ---------------------------------------------------------------- one cancel per turn (R2, F2, O1)
     def test_a_second_request_while_a_cancel_is_pending_or_sent_sends_no_second_cancel(self):
         live = self.running()
@@ -387,6 +415,65 @@ class InterruptAnswersTest(unittest.TestCase):
                     self.assertEqual(self.lane.units.stops, [])
                 self.lane.sessions.run_pending()
                 self.assertEqual(len(self.lane.units.interrupts), 1, 'the cancel is never sent again')
+
+    def test_an_unknown_cancel_whose_settlement_fails_to_commit_is_kept_and_never_sent_again(self):
+        """Round 2 of #415 (Codex GPT-6 Astra and GPT-6.1 Sol, required change 2, STRICT): with the ``_settle`` of an
+        unknown cancel removed, every other lane test stayed green."""
+        live = self.running()
+        sid, turn_id = live['session_id'], live['active_turn_id']
+        self.lane.sessions.interrupt(sid, turn_id, OWNER)
+        helper = FakeCommitFailure(self.lane.store)
+        self.lane.sessions.store = helper
+        real = self.lane.units.interrupt
+
+        def interrupt(order):
+            real(order)
+            helper.armed = True                             # the commit after the outside call fails, once
+            raise RuntimeError('the pipe broke')
+
+        self.lane.units.interrupt = interrupt
+        with self.assertLogs('recursion_core.sessions.service', 'ERROR'):
+            self.assertEqual(self.lane.sessions.run_pending(), 1)
+        self.assertEqual(self.work_of('interrupt'), [('attempting', None)])
+        self.assertEqual(session_of(self.lane, sid)['state'], 'live')
+        self.lane.settle()                                  # healthy passes commit what was kept
+        self.assertEqual(self.work_of('interrupt'), [('outcome_unknown', {'error': 'RuntimeError'})])
+        self.assertEqual([state for state, _ in self.work_of('stop')], ['done'], 'the fallback Stop is asked')
+        self.assertEqual(session_of(self.lane, sid)['turns'][0]['state'], 'stopped')
+        self.assertEqual(len(self.lane.units.interrupts), 1, 'the cancel is never sent again')
+
+    def test_a_stop_whose_settlement_fails_to_commit_is_kept_and_committed_by_a_later_pass(self):
+        """The integration read of Nov 15 (Codex GPT-6.1 Sol, P2): one storage failure after a Stop's answer left its
+        intent ``attempting`` and its session ``stop_pending``, and nothing asked again before a restart."""
+        for first_answer in ('pending', 'stopped'):
+            with self.subTest(first_answer=first_answer):
+                self.lane = Lane()
+                live = self.running()
+                sid, run_id = live['session_id'], live['worker']['run_id']
+                self.lane.sessions.request_stop(sid)
+                helper = FakeCommitFailure(self.lane.store)
+                self.lane.sessions.store = helper
+                if first_answer == 'pending':
+                    self.lane.units.stop_answers = [stop_answer(run_id, 'pending')]
+                real = self.lane.units.stop
+
+                def stop(asked, helper=helper, real=real):
+                    answer = real(asked)
+                    if len(self.lane.units.stops) == 1:
+                        helper.armed = True                 # the commit after the first answer fails, once
+                    return answer
+
+                self.lane.units.stop = stop
+                with self.assertLogs('recursion_core.sessions.service', 'ERROR'):
+                    self.assertEqual(self.lane.sessions.run_pending(), 1)
+                self.assertEqual(self.work_of('stop'), [('attempting', None)])
+                self.assertEqual(session_of(self.lane, sid)['state'], 'stop_pending')
+                self.lane.sessions.run_pending()            # a healthy pass commits what was kept
+                after = session_of(self.lane, sid)
+                self.assertEqual((after['state'], after['worker']), ('idle', None))
+                self.assertEqual([state for state, _ in self.work_of('stop')], ['done'])
+                self.assertEqual(self.lane.units.stops, [run_id] * (2 if first_answer == 'pending' else 1),
+                                 'a confirmed Stop is not asked again; one recorded as pending is')
 
     # ------------------------------------------------------------ rules no test held (astra R4, sol R2)
     def test_a_report_under_a_pending_stop_keeps_it_pending_and_records_the_worker_s_life(self):

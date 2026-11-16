@@ -78,8 +78,9 @@ common.v1 principal; its kind and id are kept, nothing else. ONE CANCEL PER TURN
 first reads, Nov 15; Lucas may change it): while a cancel for the session's turn is pending, attempting or sent and
 not yet reported, a second request sends no second cancel and gets the first's answer (``requested``); the
 delivered event names the first asker. Whether asking again should ever escalate to a Stop is a product choice
-not built here. When the commit of what a finished cancel came to fails, that outcome is kept and committed by a
-later pass (``_settle``); the cancel itself is never sent again.
+not built here. When the commit of what a finished cancel, or a Stop that answered, came to fails, that outcome is
+kept and committed by a later pass (``_settle``); the cancel is never sent again, and a Stop is asked again only as
+the committed state says (one recorded as ``pending`` is; one confirmed is not).
 
 ``Sessions`` holds what the handlers and the service share; ``SessionsService`` is the S13 service object.
 Nothing in this module is registered anywhere (``hooks.py``).
@@ -433,12 +434,14 @@ class Sessions:
     @staticmethod
     def _requester(requested_by) -> dict:
         """``requested_by`` as a common.v1 principal of its own (its kind and id, nothing else), or
-        ``machine.Refused('request_invalid', 'requested_by')``."""
+        ``machine.Refused('request_invalid', 'requested_by')``. A dict is copied first and the copy is the one
+        checked and used: the caller's dict may be changed by another thread once the check has passed."""
+        snapshot = dict(requested_by) if isinstance(requested_by, dict) else requested_by
         try:
-            records.check_principal(requested_by, '/requested_by')
+            records.check_principal(snapshot, '/requested_by')
         except records.RecordError:
             raise machine.Refused('request_invalid', 'requested_by') from None
-        return {'kind': requested_by['kind'], 'id': requested_by['id']}
+        return {'kind': snapshot['kind'], 'id': snapshot['id']}
 
     def interrupt(self, session_id: str, expected_turn_id: str, requested_by: dict) -> tuple:
         """Ask the interruption of the turn in progress, which must be ``expected_turn_id``. Commits what it asks and
@@ -551,6 +554,9 @@ class Sessions:
             code = 'pending' if operation['may_register'] else 'ended'
         else:
             code = records.stop_confirmed(answer, run_id) or 'pending'
+        self._settle(lambda: self._stop_answered(operation, run_id, code))
+
+    def _stop_answered(self, operation: dict, run_id: str, code: str) -> None:
         with self.store.transaction() as tx:
             if code == 'pending':
                 store.move_work(tx, operation['operation_id'], 'attempting', 'pending', {'answer': 'pending'})

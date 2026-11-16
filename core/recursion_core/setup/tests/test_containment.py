@@ -399,6 +399,34 @@ class ContainmentTests(unittest.TestCase):
             error = self.refused("containment_untrusted")
         self.assertIn("on the way through a link above your home, is not root's alone", error.detail)
 
+    def test_an_absolute_link_checks_slash_even_when_it_is_sticky_and_writable(self):
+        home, link, owned = self.silverblue()
+        os.unlink(link)
+        os.symlink(owned[3], link)  # the same var/home, by an absolute target
+        root_paths = set(owned)
+        prefix = self.base
+        while prefix != "/":
+            root_paths.add(prefix)
+            prefix = os.path.dirname(prefix)
+        root_paths.add("/")
+
+        def lstat(path, *args, **kwargs):
+            info = _real_lstat(path, *args, **kwargs)
+            name = os.fspath(path)
+            if name in root_paths:
+                fields = list(info[:10])
+                fields[4] = 0
+                if stat.S_ISDIR(info.st_mode):
+                    fields[0] = ((info.st_mode & ~0o7777) | 0o1777 if name == "/"
+                                 else info.st_mode & ~0o022)
+                return os.stat_result(fields)
+            return info
+
+        with mock.patch("os.lstat", side_effect=lstat), self.passwd(home):
+            error = self.refused("containment_untrusted")
+        self.assertTrue(error.detail.startswith("/, on the way through a link above your home, is not root's alone"),
+                        error.detail)
+
     def test_a_chain_longer_than_the_bound_or_a_loop_is_refused_with_its_reason(self):
         home, link, owned = self.silverblue()
         sysdir = owned[0]

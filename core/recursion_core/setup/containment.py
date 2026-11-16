@@ -52,9 +52,10 @@ Nothing in the daemon reads it yet.
 ``write`` replaces the file whole: a new file, mode 0600, written, flushed, and renamed over the old one
 in the same folder, which is then flushed, so a reader sees the old setting or the new one, never a mix
 (or, reading while the rename happens, is refused ``containment_changed`` and runs again). Writers take
-turns: each holds an exclusive ``flock`` on the folder from its read to its answer, so among writers that
-take that lock (every ``write`` does) its answer is the file's value when it answers; a program that writes
-the file without the lock (a hand edit) can change it after. It removes the temporary files a killed
+turns: each holds an exclusive ``flock`` on the folder while reading, comparing, publishing and flushing.
+Its answer reports the value observed or published while that lock was held. Another writer can change
+it after the lock is released, before the caller receives the answer. A program that writes without the
+lock is outside this guarantee. It removes the temporary files a killed
 writer left. A ``.config`` or ``recursion`` folder it makes is set to 0700 whatever the umask; one it
 cannot make is ``containment_unreadable``, naming the folder it was to be made in. It refuses when the
 file in place is refused by ``read`` (it never overwrites a file it could not read, one a newer Recursion

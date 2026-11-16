@@ -1,0 +1,66 @@
+Dev task 06: a small INI-style configuration parser.
+-- task.json --
+{"id": "dev-06-config", "cluster": "dev", "created_at": null,
+ "test_command": ["{python}", "-B", "-m", "unittest", "{hidden_modules}"],
+ "timeout_s": 900, "grading_timeout_s": 120}
+-- prompt.md --
+Implement `parse_config(text)` in `conf/parse.py`. It returns a dict of sections, each a dict of string keys to string values.
+
+- `[name]` starts a section; keys before any section go into the section `""` (the empty string), which appears in the result only if it has keys.
+- `key = value` sets a key; spaces around the key and around the value are stripped. A value may contain `=`; only the first `=` separates.
+- Lines whose first non-space character is `#` or `;` are comments. Blank lines are ignored.
+- If a key repeats inside a section, the last value wins.
+- Any other line raises `ValueError` whose message contains `line N`, N being the 1-based line number.
+
+Do not use `configparser`.
+-- start/conf/__init__.py --
+"""Configuration files."""
+-- start/conf/parse.py --
+def parse_config(text):
+    raise NotImplementedError
+-- hidden/test_parse.py --
+import unittest
+
+from conf.parse import parse_config
+
+
+class ParseTests(unittest.TestCase):
+    def test_sections(self):
+        text = "[server]\nhost = example.test\nport=8080\n\n[client]\nretries = 3\n"
+        self.assertEqual(parse_config(text), {"server": {"host": "example.test", "port": "8080"},
+                                              "client": {"retries": "3"}})
+
+    def test_top_level_keys(self):
+        self.assertEqual(parse_config("name = x\n[a]\nb = c\n"), {"": {"name": "x"}, "a": {"b": "c"}})
+
+    def test_comments_and_equals(self):
+        text = "# comment\n  ; another\n[s]\nurl = a=b=c\n"
+        self.assertEqual(parse_config(text), {"s": {"url": "a=b=c"}})
+
+    def test_last_wins(self):
+        self.assertEqual(parse_config("[s]\nk = 1\nk = 2\n"), {"s": {"k": "2"}})
+
+    def test_bad_line(self):
+        with self.assertRaises(ValueError) as caught:
+            parse_config("[s]\nk = 1\nnot a setting\n")
+        self.assertIn("line 3", str(caught.exception))
+-- solution/conf/parse.py --
+def parse_config(text):
+    sections = {}
+    current = ""
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1].strip()
+            sections.setdefault(current, {})
+            continue
+        if "=" in line:
+            key, value = line.split("=", 1)
+            sections.setdefault(current, {})[key.strip()] = value.strip()
+            continue
+        raise ValueError(f"line {number}: not a section, setting or comment: {raw!r}")
+    return sections
+-- standin.json --
+{"outcomes": ["solve", "solve", "limit", "solve", "solve"]}

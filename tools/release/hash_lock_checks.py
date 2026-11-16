@@ -975,6 +975,53 @@ class WorkflowScanTests(TreeCase):
             with self.subTest(script=script):
                 self.assertEqual(self.nested(script), [])
 
+    # Round-7 reads (GPT-6 Astra changes 1-2): the supplied cases, as written.
+    def test_delayed_shell_paths_after_dynamic_commands_are_refused(self):
+        self.add_workflow('|\n          WRAP=/usr/bin/env; "$WRAP" -u UNUSED /bin/bash -c "printf boundary"')
+        self.assertProblem('a command named at run time, followed by')
+
+    def test_delayed_wrapper_paths_after_dynamic_commands_are_refused(self):
+        self.add_workflow('|\n          WRAP=/usr/bin/env; "$WRAP" -u UNUSED /usr/bin/nice printf boundary')
+        self.assertProblem('a command named at run time, followed by')
+
+    def test_supported_wrapper_diagnostics_and_option_aliases_are_accepted(self):
+        # Literal public option spellings, not a list generated from the parser's table.
+        # Only parse these strings: sudo/doas and all other wrappers are never executed here.
+        for prefix in (
+            'env --help', 'env --version', 'nice --help', 'nice --version',
+            'nohup --help', 'nohup --version', 'setsid --help', 'setsid --version',
+            'setsid -h', 'setsid -V', 'stdbuf --help', 'stdbuf --version', 'stdbuf --input=0',
+            'sudo -e', 'sudo -l', 'sudo -V', 'sudo -v', 'sudo --help', 'sudo --version',
+            'sudo --askpass', 'sudo --auth-type style', 'sudo --background', 'sudo --bell',
+            'sudo --chdir /tmp', 'sudo --chroot /srv', 'sudo --close-from 3',
+            'sudo --command-timeout 5', 'sudo --edit', 'sudo --group wheel', 'sudo --list',
+            'sudo --no-update', 'sudo --non-interactive', 'sudo --other-user root',
+            'sudo --preserve-groups', 'sudo --prompt prompt', 'sudo --remove-timestamp',
+            'sudo --reset-timestamp', 'sudo --role role', 'sudo --set-home', 'sudo --shell',
+            'sudo --stdin', 'sudo --type type', 'sudo --validate',
+            '/usr/bin/time -V', '/usr/bin/time --help', '/usr/bin/time --version',
+            '/usr/bin/time --portability', 'timeout --help', 'timeout --version',
+            'xargs --help', 'xargs --version',
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.nested(prefix+' true'), [])
+
+    # Round-7 reads (GPT-6.1 Sol changes 1-2): the supplied cases, as written.
+    def test_dynamic_wrapper_options_before_an_absolute_shell_are_refused(self) -> None:
+        self.add_workflow('|\n          WRAP=/usr/bin/env; "$WRAP" -u UNUSED /bin/bash -c \'source ./inert-fixture.sh\'')
+        self.assertProblem('a command named at run time')
+
+    def test_dynamic_wrapper_before_an_absolute_wrapper_is_refused(self) -> None:
+        self.add_workflow('|\n          WRAP=/usr/bin/env; "$WRAP" /usr/bin/env -S "bash -c \'source ./inert-fixture.sh\'"')
+        self.assertProblem('a command named at run time')
+
+    def test_known_wrapper_help_and_version_diagnostics_are_allowed(self) -> None:
+        for script in ('env --version', 'nice --help', 'nohup --version', 'setsid --help',
+                       'stdbuf --version', '/usr/bin/time --help', 'timeout --version', 'xargs --help'):
+            with self.subTest(script=script):
+                self.add_workflow('|\n          ' + script)
+                self.assertEqual(self.tree.problems(), [])
+
 
 class YamlReadingTests(unittest.TestCase):
     """The values the reader decodes. Each expected value is PyYAML 6.0.1's reading of the same

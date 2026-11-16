@@ -8,7 +8,7 @@ any other script, shim or non-native target is reported and left without a candi
 so ``grant()`` is never offered a wrapper. The exception is a pinned route (pi, hermes,
 cursor, antigravity): its first PATH hit is offered whatever its kind, because ``grant()``
 decides it against the pin table and runs nothing. On Windows a pinned route's name is also
-searched as ``.cmd`` and ``.ps1`` (after ``.exe``; the bare name comes last); other engines are not.
+searched as ``.cmd`` and ``.ps1`` (after ``.exe``; the bare name comes after every such hit); other engines are not.
 A ``hermes`` hit in the unofficial npm ``hermes-agent`` bridge is named and never offered,
 pinned route or not (B27, CSL-772).
 """
@@ -208,23 +208,25 @@ def _launcher_pinned(engine: str, realpath: str) -> bool:
 def path_hits(name: str, path_string: str, pinned: bool = False) -> list[str]:
     """Executable files named ``name`` on the PATH string, in search order.
 
-    Windows tries ``.exe``, for a pinned route (``pinned``) ``.cmd`` then ``.ps1``, and the bare name
-    last: Windows resolves a command through PATHEXT and never runs an extensionless file found on
-    PATH, so npm's extensionless sh shim must not hide the ``.exe`` or ``.cmd`` beside it (#323, Devin
-    r4521280830). Elsewhere only the bare name is tried.
+    Windows tries ``.exe``, for a pinned route (``pinned``) ``.cmd`` then ``.ps1``, directory by
+    directory, and the bare name only after every such hit in every directory: Windows resolves a
+    command through PATHEXT and never runs an extensionless file found on PATH, so npm's extensionless
+    sh shim must not hide the ``.exe`` or ``.cmd`` beside it (#323, Devin r4521280830) nor one in a later
+    directory (#424 Devin thread on detect.py:228). Elsewhere only the bare name is tried.
     """
-    exts: tuple[str, ...] = ("",)
+    passes: tuple[tuple[str, ...], ...] = (("",),)
     if binary.is_windows():
-        exts = (".exe", *PINNED_LAUNCHER_EXT, "") if pinned else (".exe", "")
+        passes = (((".exe", *PINNED_LAUNCHER_EXT) if pinned else (".exe",)), ("",))
     hits: list[str] = []
-    for d in path_string.split(os.pathsep):
-        if not d or not os.path.isabs(d):  # empty or relative PATH entries are never searched
-            continue
-        for ext in exts:
-            p = os.path.join(d, name + ext)
-            # A shell skips a file it cannot execute, so such a file never shadows a later hit.
-            if os.path.isfile(p) and os.access(p, os.X_OK) and p not in hits:
-                hits.append(p)
+    for exts in passes:
+        for d in path_string.split(os.pathsep):
+            if not d or not os.path.isabs(d):  # empty or relative PATH entries are never searched
+                continue
+            for ext in exts:
+                p = os.path.join(d, name + ext)
+                # A shell skips a file it cannot execute, so such a file never shadows a later hit.
+                if os.path.isfile(p) and os.access(p, os.X_OK) and p not in hits:
+                    hits.append(p)
     return hits
 
 

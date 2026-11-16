@@ -8,7 +8,9 @@ tests rely on.
 
 Without a compiler, fixtures are copies of a system native ELF (``/bin/true``) with a
 unique trailer, and ``Factory.probe`` is a test-only seam returning the configured line;
-tests that need a real child process are skipped.
+tests that need a real child process are skipped. Where there is no ``/bin/true`` (native
+Windows) the running interpreter's own executable is copied instead, so module setup never
+fails for want of it.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 
 from recursion_core.launch_check.probe import ProbeResult
@@ -95,7 +98,7 @@ class Factory:
             r = subprocess.run([cc, "-O0", "-o", base, src], capture_output=True, timeout=60)
             self.compiled = r.returncode == 0
         if not self.compiled:
-            shutil.copyfile("/bin/true", base)
+            shutil.copyfile("/bin/true" if os.path.isfile("/bin/true") else sys.executable, base)
             os.chmod(base, 0o755)
         with open(base, "rb") as f:
             self.base = f.read()

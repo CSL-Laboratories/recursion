@@ -63,8 +63,9 @@ import hmac
 import json
 import os
 import secrets
+import subprocess
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, fields
+from dataclasses import dataclass, fields
 
 from recursion_core.launch_check import binary, floors, pins
 from recursion_core.launch_check.binary import (
@@ -82,6 +83,8 @@ from recursion_core.launch_check.refusals import REFUSAL_CODES_VERSION, LaunchRe
 # argv plus env well under ARG_MAX on every supported platform.
 MAX_ARG_BYTES = 128 * 1024 - 1
 MAX_SPAWN_BYTES = 256 * 1024
+# Windows: CreateProcessW takes a command line of at most 32767 UTF-16 code units, its terminator included.
+MAX_WINDOWS_COMMAND_LINE = 32767
 
 _GRANT_KEY = secrets.token_bytes(32)
 
@@ -338,14 +341,19 @@ def authenticate(g: object) -> EngineSpec:
     """Refuse anything ``grant()`` did not issue in this process, or issued under another table."""
     if type(g) is not Grant:
         raise LaunchRefused("grant_forged", "?", f"not a Grant: {type(g).__name__}")
-    values = asdict(g)
+    # The fields are read as they are, never copied: ``dataclasses.asdict`` deep-copies each one, so a forged
+    # field whose copy raises, or one nested past the recursion limit, escaped untyped before the guard
+    # (#424 round 2, DeepSeek r2 F1, Codex astra C4, Codex sol 4). Whatever encoding a field raises, a field
+    # JSON cannot hold (bytes, a set, a cycle) is a forged grant, not an exception of its own (DeepSeek F3).
+    values = {f.name: getattr(g, f.name) for f in fields(Grant)}
     mac = values.pop("mac")
     engine = g.engine if type(g.engine) is str else "?"
-    try:  # a forged field JSON cannot hold (bytes, a set) is a forged grant, not a TypeError (DeepSeek F3)
+    try:
         expected = _mac(values)
-    except (TypeError, ValueError, RecursionError):
+    except Exception:  # noqa: BLE001 - every failure to encode a field is the same refusal
         raise LaunchRefused("grant_forged", engine, "a field is not plain data: not issued by grant()") from None
-    if not isinstance(mac, str) or not hmac.compare_digest(mac, expected):
+    # compare_digest raises on text that is not ASCII, so the MAC is checked to be ASCII text first.
+    if type(mac) is not str or not mac.isascii() or not hmac.compare_digest(mac, expected):
         raise LaunchRefused("grant_forged", engine, "MAC missing or invalid: not issued by grant()")
     if g.floor_table != floors.FLOOR_TABLE_VERSION or g.refusal_codes != REFUSAL_CODES_VERSION:
         raise LaunchRefused("grant_stale", engine, f"issued under {g.floor_table}; table is now {floors.FLOOR_TABLE_VERSION}")
@@ -383,7 +391,9 @@ def authenticate(g: object) -> EngineSpec:
 
 
 def verify(g: Grant) -> None:
-    """Re-verify the pinned binary (and probe binary, package tree, entry): resolution, then a full re-hash.
+    """Authenticate the grant (``authenticate``: anything ``grant()`` did not issue in this process is
+    ``grant_forged``), then re-verify the pinned binary (and probe binary, package tree, entry): resolution,
+    then a full re-hash.
 
     A check-only ``binary+launcher`` grant's entry must be exactly ``(pin_target,)`` (``grant_forged``);
     that binary must still resolve to itself, be native and hash to ``pin_sha256`` (``binary_changed``).
@@ -454,6 +464,18 @@ def _spawn_bytes(spec: EngineSpec, argv: Sequence[str], env: Mapping[str, str]) 
     return total
 
 
+def _windows_command_line(spec: EngineSpec, vector: Sequence[str]) -> None:
+    """On Windows the executed vector becomes one command line (quoted as ``subprocess`` quotes it), and
+    ``CreateProcessW`` refuses one over ``MAX_WINDOWS_COMMAND_LINE`` UTF-16 code units with its terminator.
+    The byte caps above do not bound it: a 40000-character prompt is under them (#424 Devin thread on
+    grant.py, the Windows command line). Counted on what is executed, after the engine name is replaced.
+    """
+    units = len(subprocess.list2cmdline(vector).encode("utf-16-le", "surrogatepass")) // 2 + 1
+    if units > MAX_WINDOWS_COMMAND_LINE:
+        raise LaunchRefused("spawn_too_large", spec.engine,
+                            f"the Windows command line is {units} UTF-16 units > {MAX_WINDOWS_COMMAND_LINE}")
+
+
 @dataclass(frozen=True)
 class LaunchPlan:
     grant: Grant
@@ -502,7 +524,11 @@ def launch_plan(g: object, argv: Sequence[str], env: Mapping[str, str] | None = 
     Only ``env`` reaches the plan; with none, the plan's environment is empty. Nothing ambient is inherited.
     """
     argv = tuple(argv) if argv is not None else ()
-    env = dict(env or {})
+    try:
+        env = dict(env or {})
+    except (TypeError, ValueError):  # not a mapping, nor pairs: typed, after the grant is authenticated
+        spec = authenticate(g)
+        raise LaunchRefused("spawn_too_large", spec.engine, "env is not a mapping of names to values") from None
     size = _checked_launch(g, argv, env)
     return LaunchPlan(g, argv, tuple(sorted(env.items())), size)
 
@@ -521,6 +547,8 @@ def _checked_launch(g: object, argv: Sequence[str], env: dict[str, str]) -> int:
     if a0 not in spec.names:
         raise LaunchRefused("argv0_mismatch", spec.engine, f"argv[0] {a0!r} must be the bare engine name")
     size = _spawn_bytes(spec, argv, env)
+    if binary.is_windows():
+        _windows_command_line(spec, [*(g.entry if _check_only_launcher(g) else (g.realpath,)), *argv[1:]])
     if g.interpreter:  # the more specific cause, whatever the launcher kind
         raise LaunchRefused(
             "interpreter_unpinned", spec.engine,

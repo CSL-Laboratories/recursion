@@ -32,7 +32,7 @@ REFUSAL_CODES = frozenset(
         "binary_changed",  # digest or resolution differs from the grant
         "engine_mismatch",  # version line names another engine
         "identity_mismatch",  # version line does not name an engine whose real line names it
-        "identity_unverified",  # engine has no identity rule or pinned digest (refused before probing)
+        "identity_unverified",  # neither a required identity line nor a pinned digest (refused before probing)
         # pinned route: launcher (on Windows also <name>.cmd/.ps1), package files or binary match no
         # recorded pin (until re-pinned); an archive-sourced pin or a bad pin entry is never matched
         "pin_mismatch",

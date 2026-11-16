@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 import os
-import select
+import selectors
 import shutil
 import signal
 import subprocess
@@ -77,13 +77,15 @@ def probe_env(spec: EngineSpec, home: str) -> dict[str, str]:
 def _first_line(data: bytes) -> str:
     """The first line that is not blank, stdout's before stderr's (the caller's order).
 
-    Lines are framed by LF; a CR just before the LF belongs to the framing, and only spaces around the
+    Lines are framed by LF; a CR just before an LF belongs to the framing, and only spaces around the
     line are trimmed. Every other control character (a tab, a lone CR, a vertical tab, an escape) stays
     in the line, so ``parse_version`` sees it and refuses the line, instead of a split or a strip
-    removing it first (#424 round 1, Codex sol R2).
+    removing it first (#424 round 1, Codex sol R2). A CR at the very end of the output has no LF after
+    it, so it is not framing and stays in the line too (#424 round 2, Codex astra C3, Codex sol 1).
     """
-    for line in data.decode("utf-8", "replace").split("\n"):
-        if line.endswith("\r"):
+    lines = data.decode("utf-8", "replace").split("\n")
+    for i, line in enumerate(lines):
+        if i < len(lines) - 1 and line.endswith("\r"):  # only a CR that an LF follows
             line = line[:-1]
         if line.strip(" "):
             return line.strip(" ")
@@ -101,9 +103,12 @@ def _kill_group(proc: subprocess.Popen) -> None:
 class _CappedReader(threading.Thread):
     """Read one pipe into memory, keeping at most ``PROBE_OUTPUT_CAP + 1`` bytes; flag when over.
 
-    On POSIX the pipe is polled with ``select`` so ``stop`` always ends the thread, even when a
-    process that left the probe's session still holds the write end open. The stream is closed
-    only after the thread has ended, so closing never waits on a blocked read.
+    On POSIX the pipe is polled with a ``selectors`` selector (no limit on the descriptor's number,
+    unlike ``select.select``, which cannot take one above 1023; #424 Devin thread on probe.py:134) so
+    ``stop`` always ends the thread, even when a process that left the probe's session still holds
+    the write end open. On Windows the read blocks and ``stop`` cannot end it; the probe then leaves
+    that stream open rather than close it under a blocked read (#424 Devin thread on probe.py:129).
+    A read that fails sets ``failed``, and the probe refuses instead of parsing what it has.
     """
 
     def __init__(self, stream, over: threading.Event) -> None:
@@ -111,6 +116,7 @@ class _CappedReader(threading.Thread):
         self.stream, self.over, self.data = stream, over, bytearray()
         self.stop = threading.Event()
         self.eof = False
+        self.failed = False
 
     def _keep(self, chunk: bytes) -> bool:
         room = PROBE_OUTPUT_CAP + 1 - len(self.data)
@@ -123,28 +129,45 @@ class _CappedReader(threading.Thread):
 
     def run(self) -> None:
         try:
-            if os.name == "nt":
+            if not _SELECT_READS:
                 while chunk := self.stream.read1(65536):
                     if not self._keep(chunk):
                         return
                 self.eof = True
                 return
             fd = self.stream.fileno()
-            while not self.stop.is_set():
-                ready, _, _ = select.select([fd], [], [], _POLL_S)
-                if not ready:
-                    continue
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    self.eof = True
-                    return
-                if not self._keep(chunk):
-                    return
+            with selectors.DefaultSelector() as sel:
+                sel.register(fd, selectors.EVENT_READ)
+                while not self.stop.is_set():
+                    if not sel.select(_POLL_S):
+                        continue
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        self.eof = True
+                        return
+                    if not self._keep(chunk):
+                        return
         except (OSError, ValueError):
-            pass
+            self.failed = True
 
 
 _POLL_S = 0.01
+_SELECT_READS = os.name != "nt"  # Windows pipes cannot be polled; there the read blocks
+
+
+def _release(proc: subprocess.Popen) -> None:
+    """Kill and reap what the probe started, whether or not its leader was already reaped.
+
+    The leader can be reaped (``returncode`` set) while a descendant in its session still runs; the
+    session is killed in every case (#424 round 2, Codex astra C1, Codex sol 3).
+    """
+    if proc.returncode is None:
+        _kill_group(proc)  # the session, then the leader, reaped
+    elif os.name != "nt":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def check_timeout(spec: EngineSpec, timeout: object) -> None:
@@ -162,7 +185,10 @@ def check_timeout(spec: EngineSpec, timeout: object) -> None:
     else:
         ok = False
     if not ok:
-        shown = repr(timeout) if type(timeout) in (int, float) and len(repr(timeout)) <= 40 else f"<{type(timeout).__name__}>"
+        # An int is compared before it is printed: one past the interpreter's digit limit cannot be
+        # printed at all (#424 round 2, Codex astra C2, Codex sol 2). A float always prints.
+        small = type(timeout) is float or (type(timeout) is int and -(10**40) < timeout < 10**40)
+        shown = repr(timeout) if small else f"<{type(timeout).__name__}>"
         raise LaunchRefused("version_probe_failed", spec.engine,
                             f"probe timeout must be seconds above 0 and at most {MAX_PROBE_TIMEOUT_S:g}, not {shown}")
 
@@ -225,18 +251,24 @@ def run_version_probe(spec: EngineSpec, realpath: str, timeout: float = PROBE_TI
             if held:
                 raise LaunchRefused("version_probe_failed", spec.engine,
                                     "--version exited but a process outside its session kept the output open")
+            if any(r.failed for r in readers):
+                raise LaunchRefused("version_probe_failed", spec.engine, "reading --version output failed")
             raw = _first_line(bytes(readers[0].data)) or _first_line(bytes(readers[1].data))
         finally:
-            if proc.returncode is None:  # not reaped: the loop was left before the child ended
-                try:
-                    _kill_group(proc)
-                except Exception:  # noqa: BLE001 - cleanup never replaces the exception that is leaving
-                    pass
+            try:  # the session, even when the leader was reaped before the exit (astra C1, sol 3)
+                _release(proc)
+            except Exception:  # noqa: BLE001 - cleanup never replaces the exception that is leaving
+                pass
             for r in readers:
                 r.stop.set()
                 if r.ident is not None:  # a reader whose start failed was never running
                     r.join(1.0)
+            # A stream whose reader is still blocked (only on Windows, where ``stop`` cannot end a read) is
+            # left open: closing it would wait on that read for as long as a descendant holds the pipe.
+            busy = {id(r.stream) for r in readers if r.is_alive()}
             for stream in (proc.stdout, proc.stderr):
+                if id(stream) in busy:
+                    continue
                 try:
                     stream.close()
                 except OSError:

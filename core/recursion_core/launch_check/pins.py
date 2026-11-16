@@ -212,7 +212,8 @@ PINS: tuple[Pin, ...] = (
     ),
     # Pi 1.5.2, windows_amd64: the bare `pi` launcher (390 bytes); same tree, entry and chain as
     # the pi.cmd pin. For a pinned route on Windows detect.path_hits tries the bare name ("")
-    # first, before .exe, .cmd and .ps1, so this is the file a PATH search offers when present.
+    # after every .exe, .cmd and .ps1 hit on PATH, so a PATH search offers this file only where
+    # none of those exists.
     Pin(
         engine="pi",
         version="1.5.2",

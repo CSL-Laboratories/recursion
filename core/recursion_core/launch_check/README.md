@@ -30,8 +30,9 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   antigravity) is the exception: its first PATH hit is offered whatever its kind, because
   `grant` decides it against the pin table and runs nothing. On Windows each PATH directory
   is searched for `.exe`, for a pinned route only also `.cmd` then `.ps1`, and the bare name
-  last (Windows resolves a command through PATHEXT, so npm's extensionless sh shim must not
-  hide the launcher beside it); elsewhere only the bare name is searched. One Codex install
+  only after every such hit in every directory (Windows resolves a command through PATHEXT,
+  so npm's extensionless sh shim must not hide the launcher beside it or in a later
+  directory); elsewhere only the bare name is searched. One Codex install
   seen from two bases (a symlinked optional-dependency folder) is one candidate; two
   different native files stay ambiguous and fail closed.
 - `grant(engine, path)`: the only issuer of a `Grant`. In order: engine in the table
@@ -41,8 +42,8 @@ window between `exec_argv()` and the exec itself is still open (CX-1402, see Lim
   wrapper name (`wrapper_refused`: shebang scripts, links to scripts, `.cmd`/`.ps1`/`.js`/
   `.sh`, text). The one exception: on Windows, a pinned route's `<name>.cmd` or
   `<name>.ps1` (the name exact, the extension in any case) goes to the pin check below
-  instead of `wrapper_refused`. An engine with no identity rule and no pin is then refused
-  (`identity_unverified`) without being run. It hashes the realpath (full SHA-256 and size), runs the zero-egress version
+  instead of `wrapper_refused`. An engine with neither a required identity line nor a pin is then
+  refused (`identity_unverified`) without being run. It hashes the realpath (full SHA-256 and size), runs the zero-egress version
   probe, re-hashes (`binary_changed` if it changed while probing), and refuses a non-zero
   exit or timeout (`version_probe_failed`), a line naming another engine (`engine_mismatch`),
   for claude_code, codex and opencode a line that does not name the engine
@@ -357,8 +358,9 @@ Sources: Cursor from `https://cursor.com/install?win32=true`; Antigravity CLI fr
 
 Lucas's owner call of 2026-11-09: "Yes, accept pinned .cmd and
 .ps1 launchers on Windows, bound to the pin." So on Windows, for pinned routes only,
-`detect.path_hits` tries `.exe`, `.cmd`, `.ps1` and then the bare name, in that order, in
-each PATH directory (the first hit of each name still counts). The bare name was tried first
+`detect.path_hits` tries `.exe`, `.cmd` and `.ps1`, in that order, in each PATH directory, and
+the bare name in each directory only after all of those (the first hit of each name still
+counts; #424 round 2 moved the bare name behind the later directories' hits too). The bare name was tried first
 until lane LAUNCH-CHECK's first slice (#323, Devin r4521280830: npm's extensionless sh shim
 beside a pinned `pi.cmd` was offered, and refused, instead of the launcher Windows runs). The
 order is why Cursor has a `.cmd` row (`.cmd` is tried before `.ps1`); Pi's bare `pi` row,
@@ -521,6 +523,14 @@ this package ships.
 - The MAC key is per process; same-process code can read it. The boundary is the core's
   process and IPC edge; the MAC stops forged or edited grant objects reaching a plan.
 - A swap between `exec_argv()` and the exec itself is still possible (ledger CX-1402).
+- A checker killed with SIGKILL (`kill -9`) runs no cleanup: the probe child it started (one
+  `<engine> --version`, in its own session) keeps running and its `r2a-probe-*` directory stays in
+  the temp folder. The package cannot reap either; a sweep of that prefix belongs to the launcher.
+  Every exit the process lives through (an interrupt, an error, a timeout) kills the probe's
+  session, even when the probe's own process has already been reaped.
+- On Windows a read of the probe's output blocks, and a descendant that keeps the pipe open keeps
+  that read waiting: the probe still returns `version_probe_failed`, and leaves that pipe open to
+  its reader rather than wait on it. Nothing here kills a Windows process tree.
   Holding the file open across the spawn (#1087 section 6.4, Windows spike) or `fexecve`
   on Linux is follow-up work; `DECODER.md` designs the child-side re-check that narrows it.
 - The grant hashes a binary of any size, and a whole tree on every plan use. A huge or
@@ -628,6 +638,28 @@ Called by nothing, like the rest of this package. What it adds:
 - Gemini's absence is described as held pending D10; `DECODER.md` treats the pre-exec line as
   intent, writes the parent refusal as `start_error.code=launch_refused` with the cause in the
   detail, and drops its FIFO-capacity assumption.
+
+## Lane LAUNCH-CHECK, #424 round 2 (answers to three reads at `4524333d`, and the review threads)
+
+- A date floor that names a commit asks for that commit all day, whether or not it also states a
+  time: another build of that day is below it at any second.
+- A CR at the very end of the probe's output (no LF after it) stays in the line and is refused;
+  only a CR that an LF follows is framing.
+- A probe timeout that is an integer too long to print is `version_probe_failed` (the message
+  shows `<int>`), and `launch_check()` still keeps a record per engine.
+- The probe kills its session on every exit it lives through, also when its own process was
+  reaped just before; a failed read of its output is `version_probe_failed`; output pipes are
+  polled with `selectors`, so a descriptor above 1023 is read; on Windows a pipe a descendant
+  holds is left open instead of closed under a blocked read.
+- `authenticate()` reads the grant's fields without copying them, so a field whose copy raises,
+  one nested past the recursion limit, a cycle, or a field whose encoding raises is
+  `grant_forged`; so is a MAC that is not ASCII text. `verify()` says it authenticates first.
+- `launch_plan()` refuses an `env` that is not a mapping (`spawn_too_large`, after the grant is
+  authenticated). `MAX_PROBE_TIMEOUT_S` is exported.
+- On Windows the executed command line (as `subprocess` quotes it) is at most 32767 UTF-16 code
+  units with its terminator (`spawn_too_large`); and a bare name ranks after every `.exe`, `.cmd`
+  or `.ps1` hit in any PATH directory.
+- The test fixtures copy the interpreter's executable where `/bin/true` does not exist.
 
 ## Tests
 

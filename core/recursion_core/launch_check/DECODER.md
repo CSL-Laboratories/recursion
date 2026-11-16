@@ -88,7 +88,8 @@ In this order, all with the standard library:
 
 Exit codes cannot carry the refusal: the engine's own exit codes overlap them once it runs. The
 parent creates a second FIFO, `launch.status`, beside the environment FIFO, and passes it on the
-unit's command line. The child opens it write-only with `O_CLOEXEC` and writes exactly one line:
+unit's command line. The child opens it write-only with `O_CLOEXEC` and writes one line, and a
+second line only when `execve` returns:
 
 - `{"v":"launch-status/1","outcome":"refused","code":"<code>"}` then exits 127, where `<code>` is
   from this package's closed refusal set plus one new code, `envelope_malformed`; or
@@ -133,8 +134,9 @@ of the wrong JSON type, `size` as a float or a bool, an uppercase or 63-characte
 version string. Re-check: a same-size replacement between the parent's check and the child's
 (mtime restored), a truncated binary, a deleted one, a path that became a symlink, an execute bit
 removed, a binary replaced between the child's hash and its exec (option (b) must execute the
-hashed bytes; option (a) must at least refuse on `ETXTBSY`). Channel: the "exec" line followed by
-end of file, the "refused" line, end of file with no line, a malformed line, a status FIFO the
+hashed bytes; option (a) must at least refuse on `ETXTBSY`). Channel: the "intent" line followed by
+end of file (outcome unknown), "intent" then "exec_failed", the "refused" line, end of file with no
+line, a malformed line, a status FIFO the
 parent never opens (the child must not block for ever: it opens with a bound); the helper dying
 after "intent"; a failed `execve` after "intent"; a silent engine that exits 0 at once; an engine
 that exits 127 on its own; a FIFO lowered to 4096 bytes and a reader that makes no progress (the

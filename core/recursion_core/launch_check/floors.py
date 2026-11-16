@@ -218,25 +218,16 @@ def _floor(spec: EngineSpec, floor: str) -> ParsedVersion:
 def _below(spec: EngineSpec, found: ParsedVersion, floor: str) -> bool:
     """``found`` is below ``floor``.
 
-    On the date scheme a floor that names a commit is a statement about that build. When the floor gives
-    no time of day, its granularity is the day: any build of that day that is not the floor's commit is
-    not known to contain the floor and counts as below, whatever time it states (fail closed; #323 review
-    of 7c15fa97 point 2, and #424 round 1: a stated time must not evade it). When the floor gives a time,
-    a build at that exact time with another commit counts as below.
+    On the date scheme a floor that names a commit is a statement about that build, and its granularity
+    is the day, whether or not the floor also states a time: any build of that day that is not the
+    floor's commit is not known to contain the floor and counts as below, whatever time it states (fail
+    closed; #323 review of 7c15fa97 point 2; #424 round 1: a stated time must not evade it; #424 round 2,
+    Codex astra C5 and DeepSeek r2 F4: nor may a later second of a floor that states its own time).
     """
     f = _floor(spec, floor)
-    if f.commit is not None and found.commit != f.commit:
-        same = found.key[:3] == f.key[:3] if not _timed(floor) else found.key == f.key
-        if same:
-            return True
+    if f.commit is not None and found.commit != f.commit and found.key[:3] == f.key[:3]:
+        return True
     return found.key < f.key
-
-
-def _timed(floor: str) -> bool:
-    """A date floor that states a build time (``YYYY.MM.DD-HH-MM-SS``)."""
-    token = _token(floor)
-    m = _DATE.fullmatch(token) if token else None
-    return bool(m and m.group(4) is not None)
 
 
 def with_note(spec: EngineSpec, detail: str) -> str:

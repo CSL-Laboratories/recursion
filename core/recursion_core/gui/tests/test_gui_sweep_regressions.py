@@ -67,6 +67,22 @@ class GuiSweepRegressions(unittest.TestCase):
                 else:
                     self.assertNotIn("ORDINARY-ROW", body)
 
+    def test_f3_stop_daemon_refusal_is_not_called_a_missing_answer(self):
+        app = self.make_app((409, b'{"error":"run_not_found"}'))
+        _, _, body = self.request(app, "/stop", form={"run_id": "run-1", "confirm": "explicit"})
+        self.assertEqual(self.calls, ["/v1/runs/stop"])
+        self.assertIn("run_not_found", body)
+        self.assertNotIn("The control API did not answer", body)
+        self.assertIn("refused", body.lower())
+
+    def test_f3_local_stop_validation_is_reported_before_sending(self):
+        app = self.make_app((200, b'{}'))
+        _, _, body = self.request(app, "/stop", form={"run_id": "bad id", "confirm": "explicit"})
+        self.assertEqual(self.calls, [])
+        self.assertIn("run_id_invalid", body)
+        self.assertNotIn("The control API did not answer", body)
+        self.assertNotIn("Stop state: unknown", body)
+
     def test_f4_unreadable_panel_mapping_has_a_contract_refusal(self):
         class UnreadablePanel(Mapping):
             def __iter__(self):
@@ -81,6 +97,17 @@ class GuiSweepRegressions(unittest.TestCase):
             panel_registry([UnreadablePanel()])
         self.assertIs(type(caught.exception), ValueError)
         self.assertEqual(caught.exception.args, (REFUSALS[0],))
+
+    def test_f5_installed_requirements_are_isolated_from_the_callers_mutations(self):
+        required = {"venue_use": ["paper:own_trading"]}
+        app = self.make_app((200, b'{"routes":[]}'), required=required)
+        required["venue_use"].append("paper:model_fed_read")
+        required["engine"] = ["plugin_engine"]
+        status, _, body = self.request(app)
+        self.assertEqual(status, "200 OK")
+        self.assertIn("gap:venue_use:paper:own_trading", body)
+        self.assertNotIn("gap:venue_use:paper:model_fed_read", body)
+        self.assertNotIn("gap:engine:plugin_engine", body)
 
     def test_f6_malformed_transport_status_is_a_control_error(self):
         for status in (None, "503"):

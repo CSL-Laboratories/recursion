@@ -129,6 +129,33 @@ class SweepGuiRegressions(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "control_api_response_invalid")
                 self.assertIsNone(caught.exception.refused)
 
+    def test_f6_constructor_requirements_are_a_snapshot_of_caller_configuration(self):
+        required = {"engine": ["plugin_engine"]}
+        app, _ = make_app({"routes": []}, required=required)
+        required["engine"][:] = ["replacement_engine"]
+        required["venue_use"] = ["paper:own_trading"]
+        statuses, _, page = request(app, path="/", query="")
+        self.assertEqual(statuses, ["200 OK"])
+        self.assertTrue("gap:engine:plugin_engine" in page, "the original requirements were not retained")
+        self.assertNotIn("gap:engine:replacement_engine", page)
+        self.assertNotIn("gap:venue_use:paper:own_trading", page)
+
+    def test_f7_local_stop_validation_is_reported_as_not_sent(self):
+        app, calls = make_app({"state": "pending"})
+        statuses, _, page = request(app, "POST", "/stop", body=b"run_id=bad+id&confirm=explicit")
+        self.assertEqual(calls, [])
+        self.assertTrue("not sent" in page.lower(), "local validation was labelled as no API reply")
+        self.assertIn("run_id_invalid", page)
+        self.assertNotIn("The control API did not answer", page)
+
+    def test_f7_typed_stop_refusal_is_distinguished_from_no_reply(self):
+        app, calls = make_app({"error": "run_not_found"}, status=404)
+        statuses, _, page = request(app, "POST", "/stop", body=b"run_id=run-1&confirm=explicit")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue("refused" in page.lower(), "a typed API refusal was labelled as no reply")
+        self.assertIn("run_not_found", page)
+        self.assertNotIn("The control API did not answer", page)
+
 
 if __name__ == "__main__":
     unittest.main()

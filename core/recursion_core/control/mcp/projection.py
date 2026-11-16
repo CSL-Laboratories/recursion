@@ -132,8 +132,15 @@ class Published:
             if key in _seen:
                 raise SchemaUnsupported(f"reference cycle through {ref!r}")
             return self.inline(target, name, _seen + (key,))
-        return {key: (value if key in ("enum", "required", "description") else self.inline(value, current, _seen))
-                for key, value in schema.items()}
+        inlined = {}
+        for key, value in schema.items():
+            if key == "properties" and isinstance(value, Mapping):  # its keys are parameter names, not keywords
+                inlined[key] = {name: self.inline(sub, current, _seen) for name, sub in value.items()}
+            elif key in ("enum", "required", "description"):  # data, not schemas
+                inlined[key] = value
+            else:
+                inlined[key] = self.inline(value, current, _seen)
+        return inlined
 
 
 _ANSWER_MEMBERS = frozenset({"code", "table_version", "methods"})

@@ -309,6 +309,24 @@ class InlineTest(unittest.TestCase):
         self.assertEqual({"enum": [{"$ref": "#/$defs/nothing"}], "required": ["$ref"]},
                          published.inline({"$ref": "methods.v1.json#/$defs/p"}))
 
+    def test_a_parameter_named_like_a_keyword_is_inlined(self) -> None:
+        # #416, Devin's review thread 2 (the Liaison's ruling on Q17): a properties map's keys are parameter names,
+        # not keywords, so a parameter named description, enum or required has its reference inlined too.
+        def change(rows, documents):
+            properties = documents[projection.PARAMS_FILE]["$defs"]["params.run.stop"]["properties"]
+            for name in ("description", "enum", "required"):
+                properties[name] = {"$ref": "common.v1.json#/$defs/run_id"}
+
+        published = with_rows(change)
+        stop = next(t for t in project(published, listing(published)) if t.method == "run.stop")
+        run_id = published.inline({"$ref": "common.v1.json#/$defs/run_id"})
+        for name in ("description", "enum", "required"):
+            with self.subTest(parameter=name):
+                self.assertEqual(run_id, stop.input_schema["properties"][name])
+        self.assertNotIn("$ref", json.dumps(stop.input_schema))
+        self.assertIsNone(check_arguments(stop.input_schema, {"run_id": "run-1", "description": "run-2", "enum": "run-3"}))
+        self.assertIsNotNone(check_arguments(stop.input_schema, {"run_id": "run-1", "required": "run 4"}))
+
     def test_the_published_documents_are_copied(self) -> None:
         documents = {projection.TABLE_FILE: {"table_version": "1.0", "methods": []}, projection.PARAMS_FILE: {"$defs": {}}}
         published = Published(documents)

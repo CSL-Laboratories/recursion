@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "driver.v2.json",
+  "title": "driver.v2: what an engine driver declares, takes and gives back",
+  "x-version": "1.0-draft.4",
+  "description": "The engine driver contract, version 2. A driver is the core's own code for one engine; this file freezes the data that crosses between a driver and the rest of the core, so that every engine lane builds the same thing. It freezes shapes only: who owns a live handle between turns, how Stop and shutdown see it, and when it is released are for the driver lane to define with the lane that owns Stop. The record at the root is the driver's DECLARATION: the engine's name and one true-or-false flag for each thing the engine can do. The calls are: start(session, workspace, env) -> handle; send(input); interrupt(turn_id); resume(engine_session_id) -> handle; fork(engine_session_id, at) -> engine_session_id; parse(line) -> event drafts. A call whose flag is false is refused 'unsupported' BEFORE any side effect: no process is started, no byte is written to the engine, no record is made. Which flag each call needs: a second send of a user_message to the same worker needs multi_turn; a send of a user_message while a turn is in progress needs mid_turn_input; a send of an approval_answer needs permission_bridge; interrupt needs interrupt; resume needs resume; fork needs fork. typed_limits says the driver reads limits from typed fields of the engine's stream (never from text); usage says it reads token counts. start, the first send, close and parse need no flag. The one-turn path that exists today (one prompt, standard input closed, read until the result) is a driver whose flags are all false.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["engine", "driver", "flags", "input_ack"],
+  "properties": {
+    "engine": {"$ref": "common.v1.json#/$defs/engine_name"},
+    "driver": {"description": "The contract version the driver implements.", "const": 2},
+    "flags": {"$ref": "#/$defs/flags"},
+    "input_ack": {
+      "description": "Whether the engine gives a typed acceptance of an input sent into a turn in progress, which the driver's parse can turn into an input.accepted draft. It records a fact about the engine and nothing else. Where it is false, a message sent mid-turn can never be shown as taken: its queue item ends outcome_unknown. Whether steering is offered at all on such an engine is not decided here.",
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "flags": {
+      "description": "Every flag is always present. mid_turn_input is true only when multi_turn is true: input in the middle of a turn needs a worker that keeps its input open.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge", "typed_limits", "usage"],
+      "properties": {
+        "multi_turn": {"type": "boolean"},
+        "mid_turn_input": {"type": "boolean"},
+        "interrupt": {"type": "boolean"},
+        "resume": {"type": "boolean"},
+        "fork": {"type": "boolean"},
+        "permission_bridge": {"type": "boolean"},
+        "typed_limits": {"type": "boolean"},
+        "usage": {"type": "boolean"}
+      },
+      "if": {"required": ["mid_turn_input"], "properties": {"mid_turn_input": {"const": true}}},
+      "then": {"properties": {"multi_turn": {"const": true}}}
+    },
+    "start": {
+      "description": "What start is given. The environment is not in this record: it is built by the child-environment policy and handed over separately, and it never appears in a record.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "run_id", "workspace", "route", "engine_session_id"],
+      "properties": {
+        "session_id": {"$ref": "common.v1.json#/$defs/log_id"},
+        "run_id": {"$ref": "common.v1.json#/$defs/run_id"},
+        "workspace": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/workspace"}]},
+        "route": {"$ref": "common.v1.json#/$defs/route"},
+        "engine_session_id": {
+          "description": "null for a new conversation. A string resumes that conversation, and needs the resume flag.",
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "handle": {
+      "description": "What start and resume give back: the run the worker lives in, and the engine's own id for the conversation once the engine has reported one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "engine_session_id"],
+      "properties": {
+        "run_id": {"$ref": "common.v1.json#/$defs/run_id"},
+        "engine_session_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 256}
+      }
+    },
+    "input": {
+      "description": "What send takes. user_message: one input of a turn. approval_answer: the core's answer to the engine's own permission request, sent only by the approval queue through its private binding. close: end the worker's input; the engine finishes and exits.",
+      "type": "object",
+      "required": ["kind"],
+      "properties": {"kind": {"enum": ["user_message", "approval_answer", "close"]}},
+      "allOf": [
+        {
+          "if": {"required": ["kind"], "properties": {"kind": {"const": "user_message"}}},
+          "then": {
+            "additionalProperties": false,
+            "required": ["turn_id", "text", "delivery_id"],
+            "properties": {
+              "kind": true,
+              "turn_id": {"$ref": "common.v1.json#/$defs/turn_id"},
+              "text": {"type": "string", "minLength": 1},
+              "delivery_id": {"$ref": "common.v1.json#/$defs/delivery_id"}
+            }
+          }
+        },
+        {
+          "if": {"required": ["kind"], "properties": {"kind": {"const": "approval_answer"}}},
+          "then": {
+            "additionalProperties": false,
+            "required": ["approval_id", "decision"],
+            "properties": {
+              "kind": true,
+              "approval_id": {"$ref": "common.v1.json#/$defs/approval_id"},
+              "decision": {"enum": ["approve", "deny"]}
+            }
+          }
+        },
+        {
+          "if": {"required": ["kind"], "properties": {"kind": {"const": "close"}}},
+          "then": {"additionalProperties": false, "properties": {"kind": true}}
+        }
+      ]
+    },
+    "interrupt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["turn_id"],
+      "properties": {"turn_id": {"$ref": "common.v1.json#/$defs/turn_id"}}
+    },
+    "fork": {
+      "description": "What fork takes: the conversation to copy, and 'at', a turn of that session, which means the state after that turn ended. It gives back the new conversation's engine_session_id. A driver that cannot fork at that turn answers 'unsupported'. A checkpoint id is turned into a turn by the workspace lane before the driver is asked.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine_session_id", "at"],
+      "properties": {
+        "engine_session_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "at": {"$ref": "common.v1.json#/$defs/turn_id"}
+      }
+    },
+    "refusal": {
+      "description": "How a call whose flag is false is refused. Nothing happened before this answer.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "call", "flag"],
+      "properties": {
+        "code": {"const": "unsupported"},
+        "call": {"enum": ["send", "interrupt", "resume", "fork"]},
+        "flag": {"enum": ["multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge"]}
+      }
+    },
+    "event_draft": {
+      "description": "What parse gives back for one line of the engine's output: zero or more of these. A draft is an event before the core has numbered and timed it; its payload is exactly the payload of that type in event.v1. A driver may draft only these types. An input.accepted draft is made only from the engine's own typed signal that it took an input (its protocol's acknowledgement, or its replay of the user message), and names the delivery_id the input was sent with; it is never read out of free text. The driver correlates acceptance with its own pending request/protocol token and worker incarnation, not an arbitrary ID read from engine output. It never drafts an approval request: it asks the approval queue, and the core writes the event.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "payload"],
+      "properties": {
+        "type": {"enum": ["engine.output", "tool.call", "tool.result", "usage", "limit", "result", "input.accepted"]},
+        "payload": {"type": "object"}
+      },
+      "allOf": [
+        {"if": {"required": ["type"], "properties": {"type": {"const": "engine.output"}}}, "then": {"properties": {"payload": {"$ref": "event.v1.json#/$defs/engine.output"}}}},
+        {"if": {"required": ["type"], "properties": {"type": {"const": "tool.call"}}}, "then": {"properties": {"payload": {"$ref": "event.v1.json#/$defs/tool.call"}}}},
+        {"if": {"required": ["type"], "properties": {"type": {"const": "tool.result"}}}, "then": {"properties": {"payload": {"$ref": "event.v1.json#/$defs/tool.result"}}}},
+        {"if": {"required": ["type"], "properties": {"type": {"const": "usage"}}}, "then": {"properties": {"payload": {"$ref": "event.v1.json#/$defs/usage"}}}},
+        {"if": {"required": ["type"], "properties": {"type": {"const": "limit"}}}, "then": {"properties": {"payload": {"$ref": "event.v1.json#/$defs/limit"}}}},
+        {"if": {"required": ["type"], "properties": {"type": {"const": "result"}}}, "then": {"properties": {"payload": {"$ref": "event.v1.json#/$defs/result"}}}},
+        {"if": {"required": ["type"], "properties": {"type": {"const": "input.accepted"}}}, "then": {"properties": {"payload": {"$ref": "event.v1.json#/$defs/input.accepted"}}}}
+      ]
+    }
+  }
+}

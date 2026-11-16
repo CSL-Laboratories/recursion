@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""eval/run: lane EVAL's runner (eval/runner.py). Run from anywhere: it finds the repository itself.
+
+    eval/run --suite dev --arms direct,recursion --k 5 --engine standin
+"""
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from eval.runner import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

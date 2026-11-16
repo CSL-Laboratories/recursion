@@ -19,13 +19,26 @@ Nothing is frozen yet.
 | `stop.result.v1.json` | 1.0-draft.2 |
 | `session.v1.json` | 1.0-draft.3 |
 | `queue.item.v1.json` | 1.0-draft.7 |
-| `event.v1.json` | 1.0-draft.7 |
+| `event.v1.json` | 1.0-draft.8 |
 | `approval.v1.json` | 1.0-draft.9 |
 | `driver.v2.json` | 1.0-draft.4 |
 | `mcp.task.v1.json` | 1.0-draft.6 |
 | `transcript.line.v1.json` | 1.0-draft.3 |
 | `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.10 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## A run's change carries a record (Nov 15, 2026)
+
+`event` draft 8; every other schema keeps its draft. A reader of the pull request showed that a run's
+`state.changed` whose post-image had neither half (`{"daemon_row": null, "control_record": null}`)
+fitted, and that `transcript_fields` then raised `TypeError` reading its state. The run's post-image is
+the only definition of that shape: a session's and a turn's post-image are one record each, never null.
+
+| What changed | What it breaks |
+|---|---|
+| A run's post-image has at least one non-null half (`not` both null). Either half may still be null while it does not exist yet | A producer that writes a run's change with neither record |
+| `conformance/rules.py`, `transcript_fields`: such an event is refused `post_image` (so `transcript_problems` answers `refused:post_image`) instead of raising | |
+| Bad fixture `b41`; one test in `conformance/tests.py` | |
 
 ## After two reads of the fifth read's answer (Nov 14, 2026)
 

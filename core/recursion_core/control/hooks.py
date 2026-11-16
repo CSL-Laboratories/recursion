@@ -169,7 +169,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from recursion_core.control.commands import CommandTable
-from recursion_core.control.methods import MethodTable, canonical_text
+from recursion_core.control.methods import MethodTable, Signal, canonical_text
 
 log = logging.getLogger(__name__)
 
@@ -421,7 +421,8 @@ class ServiceContext:
     store's transaction helper, or None when no event store is composed; its tables are registered
     and it is initialised before any handler can use it, and its first reconciliation may still be
     running. ``state_dir``: the daemon's state directory. ``clock``: the composition's clock.
-    ``closing``: a ``threading.Event`` set when the daemon begins to close.
+    ``closing``: the closing signal, set when the daemon begins to close and never cleared. It is read as a
+    ``threading.Event`` is, with ``is_set()`` and ``wait(timeout)``; it is a ``control.methods.Signal``.
 
     A SERVICE is an object with a ``name``, ``start(context)``, ``stop(context)`` and ``ready``.
     ``start`` returns promptly, after starting its thread; ``ready`` becomes true only when the
@@ -441,12 +442,13 @@ class ServiceContext:
     store: object = None
     state_dir: Path | None = None
     clock: Callable[[], float] = time.monotonic
-    closing: threading.Event | None = None
+    closing: Signal | None = None
 
 
 # OWNERSHIP. Four methods below take a lock for a piece of work that has to be finished and must not leave the lock
 # held, whatever interrupts them: Admission.close and Admission.drain, Hooks.stop_services and Hooks.finish_close.
-# (The composition's own close, in the daemon, has the same form.) Each is ONE protected region, written out in each:
+# (The composition's own close, in the daemon, has the same form; so have the gate's enter and leave, whose work is
+# the count of admitted calls.) Each is ONE protected region, written out in each:
 #
 #     done = False
 #     while True:
@@ -474,6 +476,21 @@ class ServiceContext:
 # exception tables). A loop's jump back is also one of the few places where a real signal is delivered. So a piece of
 # work that loops or has a try of its own is a function, called from the region: the call is covered. A test holds
 # that the four regions are written so.
+#
+# NO LOCK IS TAKEN IN PYTHON CODE on these paths: not with ``threading.Event`` or ``threading.Condition`` (their
+# ``set``, ``__enter__`` and ``__exit__`` are Python functions around a lock), and not with a ``with`` statement on
+# the lock. One real SIGINT, with no tracing, leaves such a lock held: it is delivered as the Python function returns
+# with the lock taken, or as the function that would release it is entered. Measured on Nov 14, 2026 with an outside
+# process sending SIGINT to a loop of each form, 4,000 deliveries each: a ``with`` on a Condition was left held 1,712
+# times on 3.12.3 and 1,570 on free-threaded 3.14.8, ``Event.set`` 1,056 and 1,059 times; a ``with`` on the lock
+# itself never on 3.12.3 and 1,793 times on 3.14.8. A close that was interrupted so and asked again waited for ever
+# on the closing signal's lock. So the closing signal is ``control.methods.Signal``, whose ``set`` holds nothing, and
+# the gate's ``enter`` and ``leave`` are regions of this form too: a lock is taken by ``take_once``, which asks who
+# owns it, and released inside the region. (The gate's drain still WAITS on its condition: ``Condition.wait`` gives
+# the lock up and takes it back, and the region asks who owns it each time round, so either way is right.)
+# STARTING is not one of these paths: ``open_store`` and ``start_services`` take the lifecycle with a ``with``
+# statement, which an interruption can leave owned on 3.14; a close on that thread is then refused as a call from
+# inside a lifecycle method. The daemon's own main thread is not interrupted so: its SIGINT and SIGTERM set a flag.
 #
 # What this form cannot cover, and does not claim:
 # (1) the instructions before the region is entered and after it is left. An interruption there is raised at once and
@@ -548,21 +565,74 @@ class Admission:
         self.stall_log_s = 30.0
 
     def enter(self) -> bool:
+        """Admit the calling thread's call: True, and it is in the count until ``leave()``; or False, once the
+        gate is closed. If this RAISES (whatever interrupted it, once the condition is free again), the call is
+        NOT in the count: the caller never learned that it was admitted, so it would never leave.
+
+        One protected region, in the form of ``close`` (OWNERSHIP). It is not ``with self._changed``: that takes
+        the condition in Python code, and one interruption on the way into it or out of it leaves the condition
+        owned by this thread, with the count as it happened to stand (measured with real signals on 3.12 and on
+        free-threaded 3.14; on 3.14 a plain ``with`` on the lock itself is left held too). The count is written
+        from what was read when the condition was taken, so going round again changes nothing twice."""
         if not self.enabled:
             return True
-        with self._changed:
-            if self._closed:
-                return False
-            self._admitted += 1
-            return True
+        kept: list = []
+        found = back = None     # the count as this call found it; and as it found it again to step back out
+        inside = None           # None until it is decided; then whether this call is in the count
+        while True:
+            try:
+                if inside is None or (inside and kept):         # to decide; or admitted, and about to raise
+                    if not self._lock._is_owned():
+                        take_once(self._lock, kept)
+                    if inside is None:
+                        if found is None:
+                            found = self._admitted
+                        self._admitted = found if self._closed else found + 1
+                        inside = self._admitted != found
+                    if inside and kept:
+                        if back is None:
+                            back = self._admitted
+                        self._admitted = back - 1
+                        if back <= 1:
+                            self._changed.notify_all()
+                        inside = False
+                if self._lock._is_owned():
+                    self._lock.release()
+                if not kept:
+                    return inside           # the answer leaves from INSIDE the region: nothing comes after it
+                if not inside:
+                    break
+            except BaseException as exc:  # noqa: BLE001 - kept; the region is gone round again
+                kept.append(exc)
+        raise_kept(kept)
 
     def leave(self) -> None:
+        """Take the calling thread's admitted call out of the count, exactly once, and wake a drain when none is
+        left. Like ``close`` it is complete before it raises what interrupted it: a call that was admitted has
+        left when this returns OR raises. One protected region (OWNERSHIP), for the reason given in ``enter``."""
         if not self.enabled:
             return
-        with self._changed:
-            self._admitted -= 1
-            if self._admitted <= 0:
-                self._changed.notify_all()
+        kept: list = []
+        found = None            # the count as this call found it, once it owns the condition
+        done = False
+        while True:
+            try:
+                if not done:
+                    if not self._lock._is_owned():
+                        take_once(self._lock, kept)
+                    if found is None:
+                        found = self._admitted
+                    self._admitted = found - 1
+                    if found <= 1:
+                        self._changed.notify_all()
+                    done = True
+                if self._lock._is_owned():
+                    self._lock.release()
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the region is gone round again
+                kept.append(exc)
+        if kept:
+            raise_kept(kept)
 
     def close(self) -> None:
         """No call is admitted from here on. An interruption while the condition is being taken is kept: the gate

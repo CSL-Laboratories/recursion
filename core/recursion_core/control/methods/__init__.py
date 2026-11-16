@@ -70,8 +70,10 @@ A lane registers a handler from its registrant module's ``register(hooks)``::
     cannot register through the context of its own dispatch. A callback that was handed the context of
     another handler which is still running registers there, as that handler itself could.
 ``ctx.closing``
-    A ``threading.Event`` that is set when the daemon begins to close. A handler that waits (a long
-    poll) waits on this and returns when it is set.
+    The closing signal: it is set when the daemon begins to close, once, and never cleared. A handler
+    that waits (a long poll) waits on this and returns when it is set. It is read as a
+    ``threading.Event`` is, with ``is_set()`` and ``wait(timeout)``; it is a ``Signal`` (below), not a
+    ``threading.Event``, and has no ``clear``.
 
 WHO OWNS THE TRANSACTION. For a method keyed by ``command_id`` the dispatcher does this, in order:
 
@@ -367,6 +369,61 @@ def _always_ready(name) -> bool:
     return True
 
 
+class Signal:
+    """A signal that is set once and never cleared: the closing signal. To its readers it is what a
+    ``threading.Event`` is, ``is_set()`` and ``wait(timeout)``.
+
+    It is not a ``threading.Event``, because ``Event.set`` takes a lock in Python code. One interruption on the
+    way into that code or out of it (a real SIGINT is enough, no tracing) leaves the lock held, and every later
+    ``set`` and ``wait`` then blocks for ever: a close that was interrupted there and asked again hung, with its
+    services and its store open.
+
+    Here ``set`` holds nothing. It stores the flag, then releases each waiter's own lock: single calls that
+    happen or do not. Interrupted at any point it can be called again, any number of times, and finishes what
+    it began: a waiter it had not reached is reached then. A waiter holds a lock of its own and nothing else,
+    so a waiter that is interrupted takes nothing from anybody. A waiter that leaves, woken or not, takes its
+    lock off the list in one call."""
+
+    __slots__ = ('_flag', '_waiters')
+
+    def __init__(self) -> None:
+        self._flag = False
+        self._waiters: list = []        # one lock for each thread that waits: taken by that thread, released by set
+
+    def is_set(self) -> bool:
+        return self._flag
+
+    def set(self) -> None:
+        self._flag = True               # first: a waiter that comes after this sees it and does not wait
+        for waiter in tuple(self._waiters):
+            try:
+                waiter.release()
+            except RuntimeError:        # released already, by a set that was interrupted after it and is asked again
+                pass
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """True when the signal is set: at once if it is set already, otherwise when a ``set`` wakes this wait.
+        False when ``timeout`` seconds pass first, and that answer stands even if the signal is set a moment
+        later: it says whether the wait was woken, as ``threading.Event.wait`` does, and ``is_set()`` says what
+        the signal is now. With no timeout it waits."""
+        mine = threading.Lock()
+        mine.acquire()                  # nobody else has it yet: it is taken at once
+        try:
+            self._waiters.append(mine)
+            if self._flag:              # looked at again, now that a set can find this lock
+                return True
+            if timeout is None:
+                return mine.acquire()
+            if timeout > 0:
+                return mine.acquire(True, timeout)      # False: the time passed and no set had let this lock go
+            return False
+        finally:
+            try:
+                self._waiters.remove(mine)      # ONE call finds it and takes it off. Looking first can miss it:
+            except ValueError:                  # a look walks the list while other waiters shorten it
+                pass                            # not there: this wait was interrupted before it was put on
+
+
 class MethodTable:
     """The handlers of one composition, and the dispatcher that runs them."""
 
@@ -377,7 +434,7 @@ class MethodTable:
         self._frozen = False
         self.store = None                            # the event store's transaction helper, or None
         self.service_ready: Callable[[str], bool] = _always_ready
-        self.closing = threading.Event()
+        self.closing = Signal()
         self._slots_lock = threading.Lock()
         self._slots: dict[tuple, list] = {}          # (tenant, method, command_id) -> [lock, waiters]
         self._active = threading.local()             # .scope: the dispatch running on this thread, or None

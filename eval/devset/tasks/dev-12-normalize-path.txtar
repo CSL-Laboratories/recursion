@@ -1,0 +1,62 @@
+Dev task 12: normalise a POSIX path string without the file system.
+-- task.json --
+{"id": "dev-12-normalize-path", "cluster": "dev", "created_at": null,
+ "test_command": ["{python}", "-B", "-m", "unittest", "{hidden_modules}"],
+ "timeout_s": 900, "grading_timeout_s": 120}
+-- prompt.md --
+Implement `normalize(path)` in `pathkit/norm.py`. It normalises a POSIX path string without looking at the file system:
+
+- repeated slashes become one (a leading `//` too: `//a` becomes `/a`);
+- `.` parts are dropped;
+- `..` removes the part before it; at the root of an absolute path it is dropped (`/../x` is `/x`); in a relative path, leading `..` parts that cannot be removed are kept (`a/../../b` is `../b`);
+- a trailing slash is dropped, except for the root `/`;
+- an empty result is `.`.
+-- start/pathkit/__init__.py --
+"""Path helpers."""
+-- start/pathkit/norm.py --
+def normalize(path):
+    raise NotImplementedError
+-- hidden/test_norm.py --
+import unittest
+
+from pathkit.norm import normalize
+
+
+class NormalizeTests(unittest.TestCase):
+    def test_absolute(self):
+        self.assertEqual(normalize("/a//b/./c/../d/"), "/a/b/d")
+
+    def test_relative_parents_kept(self):
+        self.assertEqual(normalize("a/../../b"), "../b")
+
+    def test_root_parent(self):
+        self.assertEqual(normalize("/../x"), "/x")
+        self.assertEqual(normalize("/.."), "/")
+
+    def test_empty_and_dot(self):
+        self.assertEqual(normalize(""), ".")
+        self.assertEqual(normalize("./"), ".")
+        self.assertEqual(normalize("a/.."), ".")
+
+    def test_double_slash_root(self):
+        self.assertEqual(normalize("//a"), "/a")
+-- solution/pathkit/norm.py --
+def normalize(path):
+    absolute = path.startswith("/")
+    parts = []
+    for part in path.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts and parts[-1] != "..":
+                parts.pop()
+            elif not absolute:
+                parts.append("..")
+            continue
+        parts.append(part)
+    joined = "/".join(parts)
+    if absolute:
+        return "/" + joined
+    return joined or "."
+-- standin.json --
+{"outcomes": ["give_up", "solve"]}

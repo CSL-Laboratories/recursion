@@ -329,7 +329,7 @@ class AfterTheLaunchTests(unittest.TestCase):
         self.assertEqual((res["code"], res["detail"]), (c.ENGINE_EXITED, "no exit status and no finished step"))
         res = self.run_fixture([whole[0][:10], whole[0][10:]])       # one line split in two: two bad lines
         self.assertEqual(res["code"], c.ENGINE_EXITED)
-        self.assertEqual(sum(len(p.fenced) for p in self.launcher.processes), 0)
+        self.assertEqual([p.fenced for p in self.launcher.processes], [["stdout_ended"]] * 3)
 
 
 class OneShotTests(unittest.TestCase):
@@ -403,6 +403,95 @@ class OneShotTests(unittest.TestCase):
             with self.subTest(args=args, kwargs=kwargs):
                 with self.assertRaises(ValueError):
                     oc.OneShot(*args, **kwargs)
+
+
+@unittest.skipIf(os.name == "nt", "the guard's route-home checks are POSIX")
+class RoundTwoRouteTests(unittest.TestCase):
+    """#414 round 2: astra R1 (the end of stdout is not the end of the process), R6 (an internal CR)."""
+
+    setUp, req, run_fixture = RouteTests.setUp, RouteTests.req, RouteTests.run_fixture   # the same route path
+
+    def test_the_end_of_stdout_hands_the_process_to_cleanup_on_success_and_failure(self):
+        for name, code in (("synthetic-v1-success.jsonl", None),
+                           ("synthetic-v1-exit-1-no-output.jsonl", c.ENGINE_EXITED),
+                           ("synthetic-v1-limit-429.jsonl", c.PLAN_LIMIT)):
+            with self.subTest(name):
+                self.setUp()
+                self.assertEqual(self.run_fixture(name)["code"], code)
+                self.assertEqual(self.launcher.processes[0].fenced, ["stdout_ended"])
+
+    def test_a_carriage_return_inside_a_chunk_is_a_protocol_error(self):
+        whole = (HERE / "synthetic-v1-success.jsonl").read_text("utf-8").splitlines()
+        for chunk in (whole[0] + "\r" + whole[1], "a\rb\r\n", "a\r\rb\n", "a\r\nb\n", "x\r"):
+            with self.subTest(chunk=chunk):
+                self.setUp()
+                self.launcher.next.append([chunk])
+                res = self.service.handle(self.req())
+                self.assertEqual(res["code"], c.PROTOCOL_ERROR)
+                self.assertEqual(self.launcher.processes[0].fenced, ["protocol_error"])
+
+    def test_a_terminal_crlf_is_one_ordinary_line(self):
+        whole = (HERE / "synthetic-v1-success.jsonl").read_text("utf-8").splitlines()
+        res = self.run_fixture([line + "\r\n" for line in whole])
+        self.assertEqual((res["code"], res["text"]), (None, "The tests pass."))
+
+    def test_a_profile_that_is_not_a_mapping_counts_as_empty(self):
+        for profile in ("not a mapping", 5, ["openai"]):
+            with self.subTest(profile=profile):
+                with self.assertRaises(SubscriptionRouteRefused) as caught:
+                    oc.held_to_the_guard("openai/x", profile)
+                self.assertEqual(caught.exception.cause, "model_provider_mismatch")
+
+
+class RoundTwoDeadlineTests(unittest.TestCase):
+    """#414 round 2: astra R2, the deadline is checked again after every read, the end of output included."""
+
+    STOP, Chatty, drive = OneShotTests.STOP, OneShotTests.Chatty, OneShotTests.drive
+
+    def test_a_read_that_returns_the_end_late_is_past_the_deadline(self):
+        with self.assertRaises(Deadline):
+            self.drive([self.STOP], step=3.0, deadline=5.0)        # the stop at 3 s, the end of output at 6 s
+        with self.assertRaises(Deadline):
+            self.drive([self.STOP, self.STOP], step=3.0, deadline=5.0)   # a line, not the end, read at 6 s
+        result, _, _ = self.drive([self.STOP], step=2.0, deadline=5.0)    # the end at 4 s: inside it
+        self.assertIsNone(result["code"])
+        self.assertEqual(self.process.fenced, ["stdout_ended"])
+
+
+class ReadTimeoutTests(unittest.TestCase):
+    """A read is never asked to wait for a time that is already gone (the check before every read)."""
+
+    def test_a_clock_that_moved_between_reads_stops_before_the_next_read(self):
+        state = {"now": 0.0, "step": 0.0}   # still until the first read returns; then 9 s, moving 1.5 s a reading
+        waits = []
+
+        def clock():
+            value = state["now"]
+            state["now"] += state["step"]
+            return value
+
+        class Process:
+            sent, fenced = [], []
+
+            def send(self, text):
+                self.sent.append(text)
+
+            def close_stdin(self):
+                pass
+
+            def read_line(self, timeout_s):
+                waits.append(timeout_s)
+                state["now"], state["step"] = 9.0, 1.5
+                return "x\n"
+
+            def fence(self, reason):
+                self.fenced.append(reason)
+
+        req = request(engine="opencode", model=MODEL, kind="api_key", conn_id="k1", credential_env="OPENAI_API_KEY",
+                      profile=dict(PROFILE), home="/var/lib/recursion/homes/opencode")
+        with self.assertRaises(Deadline):
+            oc.OneShot(clock, wall=lambda: 1794614400.0)(Process(), req, 10.0, [])
+        self.assertEqual(waits, [10.0])
 
 
 if __name__ == "__main__":

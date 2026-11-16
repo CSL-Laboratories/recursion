@@ -269,7 +269,19 @@ class CommandTests(unittest.TestCase):
             os.mkdir(folder, 0o700)
         server = socket.socket(socket.AF_UNIX)
         self.addCleanup(server.close)
-        server.bind(self.unit)  # the non-blocking open takes a FIFO, but a socket is ENXIO
+        # Bound through its folder's descriptor: a short name whatever the folder's path (an absolute temporary
+        # path can pass AF_UNIX's limit), and the working folder left alone (contextlib.chdir's os.getcwd()
+        # raises where the process's working folder was removed). /proc/self/fd is Linux's; elsewhere (macOS)
+        # the unit's own path is bound when it fits AF_UNIX's limit there, and the test is skipped when not.
+        held = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, held)
+        if os.path.isdir(f"/proc/self/fd/{held}"):
+            server.bind(f"/proc/self/fd/{held}/{UNIT_NAME}")  # the non-blocking open takes a FIFO, but a socket is ENXIO
+        elif len(os.fsencode(self.unit)) < 104:
+            server.bind(self.unit)
+        else:
+            self.skipTest(f"no /proc/self/fd here, and the unit's path ({len(os.fsencode(self.unit))} bytes) is past "
+                          "AF_UNIX's limit")
         for action in ("install", "upgrade", "uninstall"):
             with self.subTest(action=action):
                 code, answer = self.run_action(action)

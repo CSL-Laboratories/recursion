@@ -389,5 +389,89 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("blacksmith", recent)
 
 
+class SweepRegressionTests(unittest.TestCase):
+    def test_f01_even_samples_use_the_statistical_median(self):
+        base = [0.001] * 4 + [0.003] * 4
+        head = [0.0025] * 8
+        result = perf_compare.compare_reports(
+            _report({"sample": perf_bench._positive_median(base)}),
+            _report({"sample": perf_bench._positive_median(head)}),
+        )
+        self.assertEqual(result["rows"][0]["status"], "regression")
+        self.assertAlmostEqual(perf_bench._positive_median(base), 0.002)
+
+    def test_f02_nonfinite_durations_are_refused_before_work(self):
+        for option in ("round_s", "warmup_s"):
+            for value in (float("inf"), float("-inf"), float("nan")):
+                for paired in (False, True):
+                    with self.subTest(option=option, value=value, paired=paired):
+                        fn = mock.Mock(side_effect=AssertionError("callback ran before refusal"))
+                        options = dict(rounds=2, round_s=0.001, warmup_s=0.0)
+                        options[option] = value
+                        with self.assertRaises(perf_bench.BenchError):
+                            if paired:
+                                perf_bench.measure_pair(fn, fn, repeats=1, **options)
+                            else:
+                                perf_bench.measure(fn, **options)
+                        fn.assert_not_called()
+
+    def test_f02_cli_rejects_infinite_warmup_before_suite(self):
+        import contextlib
+        import io
+        with (mock.patch.object(perf_bench, "run_suite", return_value={"benchmarks": []}) as suite,
+              contextlib.redirect_stdout(io.StringIO())):
+            try:
+                code = perf_bench.main(["--warmup-ms", "inf"])
+            except SystemExit as exc:
+                code = exc.code
+        self.assertNotEqual(code, 0)
+        suite.assert_not_called()
+
+    def test_f03_final_case_cannot_return_success_after_deadline(self):
+        clock = [0.0]
+
+        def finish_late(*args, **kwargs):
+            clock[0] += 2.0
+            return {"median_s": 1.0}, {"median_s": 1.0}
+
+        with (mock.patch.object(perf_bench, "install_network_guard"),
+              mock.patch.object(perf_bench, "load_workload", return_value={}),
+              mock.patch.object(perf_bench, "load_product", return_value=object()),
+              mock.patch.object(perf_bench, "build_cases", side_effect=lambda *a: [("last", lambda: None)]),
+              mock.patch.object(perf_bench, "measure_pair", side_effect=finish_late),
+              mock.patch.object(perf_bench.time, "perf_counter", side_effect=lambda: clock[0])):
+            with self.assertRaises(perf_bench.BenchError):
+                perf_bench.run_paired(ROOT, ROOT, deadline_s=1.0)
+
+    def test_f07_incomplete_root_does_not_reuse_previous_tree(self):
+        saved_path = sys.path[:]
+        saved_modules = {
+            key: value for key, value in sys.modules.items()
+            if key == "scripts" or key.startswith("scripts.")
+        }
+        try:
+            perf_bench.load_product(ROOT)
+            with tempfile.TemporaryDirectory() as tmp:
+                candidate = Path(tmp)
+                canonical = candidate / "scripts/v3/planning/validation/canonical.py"
+                canonical.parent.mkdir(parents=True)
+                canonical.write_text('raise AssertionError("candidate must load")\n', encoding="utf-8")
+                try:
+                    product = perf_bench.load_product(candidate)
+                except perf_bench.BenchError:
+                    return
+                self.assertTrue(Path(product.digest.__code__.co_filename).is_relative_to(candidate))
+        finally:
+            perf_bench._drop_imported_product()
+            sys.modules.update(saved_modules)
+            sys.path[:] = saved_path
+
+    def test_f08_worktree_removal_failure_is_reported(self):
+        failed = subprocess.CompletedProcess([], 128, "", "fatal: worktree is locked")
+        with mock.patch.object(perf_ci, "_run", return_value=failed):
+            with self.assertRaises(perf_ci.PerfCIError):
+                perf_ci._remove_worktree(Path("/unused/synthetic-worktree"))
+
+
 if __name__ == "__main__":
     unittest.main()

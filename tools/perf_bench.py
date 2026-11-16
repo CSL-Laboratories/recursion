@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import socket
 import sys
 import time
@@ -92,7 +93,10 @@ def _drop_imported_product() -> None:
 def load_product(root: Path):
     """Import the planning kernel from ``root``, not from a previously imported tree."""
     sys.dont_write_bytecode = True
-    root_s = str(root.resolve())
+    root = root.resolve()
+    if not (root / "scripts" / "__init__.py").is_file():
+        raise BenchError(f"{root} has no scripts package")
+    root_s = str(root)
     sys.path = [path for path in sys.path if path != root_s]
     sys.path.insert(0, root_s)
     _drop_imported_product()
@@ -101,6 +105,10 @@ def load_product(root: Path):
         decode, digest, seal, validate_policy_fixture,
     )
     from scripts.v3.planning.validation.contracts import validate_dag  # noqa: WPS433
+
+    loaded = Path(digest.__code__.co_filename).resolve()
+    if not loaded.is_relative_to(root):
+        raise BenchError(f"planning kernel loaded from {loaded}, not {root}")
 
     return SimpleNamespace(
         decode=decode,
@@ -282,10 +290,25 @@ def _warmup(fn, warmup_s: float) -> None:
 
 def _positive_median(samples: list[float]) -> float:
     ordered = sorted(samples)
-    median = ordered[len(ordered) // 2]
+    count = len(ordered)
+    if count % 2:
+        median = ordered[count // 2]
+    else:
+        median = (ordered[count // 2 - 1] + ordered[count // 2]) / 2.0
     if median <= 0:
         raise BenchError("median sample was not positive")
     return median
+
+
+def _require_finite_duration(name: str, value: float, *, allow_zero: bool) -> None:
+    """Refuse a duration that is not a finite number of seconds before any timed call."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise BenchError(f"{name} must be a finite number of seconds")
+    if allow_zero:
+        if value < 0:
+            raise BenchError(f"{name} must be >= 0")
+    elif value <= 0:
+        raise BenchError(f"{name} must be positive")
 
 
 def _calibrate_iterations(fn, round_s: float) -> int:
@@ -319,6 +342,8 @@ def measure(fn, *, rounds: int, round_s: float, warmup_s: float) -> dict:
     """Median seconds per call. Warmup and GC pauses sit outside the samples."""
     if rounds < 1:
         raise BenchError("rounds must be >= 1")
+    _require_finite_duration("round_s", round_s, allow_zero=False)
+    _require_finite_duration("warmup_s", warmup_s, allow_zero=True)
     _warmup(fn, warmup_s)
     iterations = _calibrate_iterations(fn, round_s)
     samples: list[float] = []
@@ -360,6 +385,8 @@ def measure_pair(
         raise BenchError("paired rounds must be an even number >= 2")
     if repeats < 1:
         raise BenchError("repeats must be >= 1")
+    _require_finite_duration("round_s", round_s, allow_zero=False)
+    _require_finite_duration("warmup_s", warmup_s, allow_zero=True)
     for fn in (base_fn, head_fn):
         _warmup(fn, warmup_s)
     for _ in range(8):
@@ -464,6 +491,8 @@ def run_paired(
             raise
         except Exception as exc:  # noqa: BLE001
             raise BenchError(f"{name} failed during timing: {exc}") from exc
+        if time.perf_counter() - started > deadline_s:
+            raise BenchError(f"paired benchmark exceeded {deadline_s:.0f}s")
         base_rows.append({"name": name, "unit": "s/op", **base_sample})
         head_rows.append({"name": name, "unit": "s/op", **head_sample})
     return _report(baseline_root, base_rows), _report(candidate_root, head_rows)
@@ -504,8 +533,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--round-ms", type=float, default=DEFAULT_ROUND_MS)
     parser.add_argument("--warmup-ms", type=float, default=DEFAULT_WARMUP_MS)
     args = parser.parse_args(argv)
-    if args.round_ms <= 0 or args.warmup_ms < 0:
-        raise SystemExit("round-ms must be positive and warmup-ms must be >= 0")
+    if (
+        not math.isfinite(args.round_ms)
+        or not math.isfinite(args.warmup_ms)
+        or args.round_ms <= 0
+        or args.warmup_ms < 0
+    ):
+        raise SystemExit(
+            "round-ms must be a positive finite number and warmup-ms must be a finite number >= 0"
+        )
     try:
         report = run_suite(
             args.root,

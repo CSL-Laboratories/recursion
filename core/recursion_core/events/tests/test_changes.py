@@ -1322,18 +1322,49 @@ class ChangeReaderTest(unittest.TestCase):
         second.stop(context)
         first.bind(self.registry, self.store)                  # free again after second's stop
 
-    def test_stop_gives_up_the_claim_its_start_took_after_a_bind_to_another_store(self) -> None:
-        # DeepSeek r4, LOW-2: stop gave up the store bound last, and the store its start claimed stayed claimed.
-        first, second = C.ChangeReader(self.marker), C.ChangeReader(H.ChangeMarker())
-        first._run = second._run = lambda stopping=None: None
-        context, other = self.context(), D.FakeStore()
+    def other_store(self) -> D.FakeStore:
+        other = D.FakeStore()
         other.register_tables(C.LANE, C.LANE_VERSION, C.LANE_DDL)
         self.addCleanup(other.close)
+        return other
+
+    def test_a_started_reader_refuses_a_bind_to_another_registry_or_store(self) -> None:
+        # Sol, round 3 at 45eedbcf, required 1: a bind while started moved the reader's writes to a store whose claim
+        # it did not hold, so a second reader could start there too; both logged, and the log ended B, A while the
+        # registry held B. It replaces the case that accepted that bind (DeepSeek r4, LOW-2), whose release check
+        # stays below.
+        first, second = C.ChangeReader(self.marker), C.ChangeReader(H.ChangeMarker())
+        first._run = second._run = lambda stopping=None: None
+        context, other, other_registry = self.context(), self.other_store(), mock.Mock(spec=[])
         first.start(context)
-        first.bind(self.registry, other)
+        for registry, store in ((self.registry, other), (other_registry, self.store), (other_registry, other)):
+            with self.subTest(registry=registry, store=store):
+                with self.assertRaisesRegex(RuntimeError, 'bind cannot change its registry or store until stop'):
+                    first.bind(registry, store)
+                self.assertIs(first._registry, self.registry)
+                self.assertIs(first._store, self.store)
+        first.bind(self.registry, self.store)                   # the same two: nothing changes
+        with self.assertRaisesRegex(RuntimeError, 'another change reader'):
+            second.start(context)                               # first's claim stays on the store it started with
         first.stop(context)
-        second.start(context)                                  # the store first's start claimed is free again
+        second.start(context)                                   # given up by the stop
         second.stop(context)
+        first.bind(self.registry, other)                        # stopped: bind may change both again
+
+    def test_a_start_whose_thread_never_started_refuses_a_rebind_until_its_stop(self) -> None:
+        # Sol, round 3, required 1: the refusal holds from start to stop, a start that raised included.
+        context, service, other = self.context(), C.ChangeReader(self.marker), self.other_store()
+        with mock.patch.object(threading.Thread, 'start', side_effect=RuntimeError("can't start new thread")):
+            with self.assertRaisesRegex(RuntimeError, "can't start new thread"):
+                service.start(context)
+        with self.assertRaisesRegex(RuntimeError, 'bind cannot change its registry or store until stop'):
+            service.bind(self.registry, other)
+        service.stop(context)
+        later = C.ChangeReader(H.ChangeMarker())
+        later._run = lambda stopping=None: None
+        later.start(context)                                    # the failed start's claim was given up
+        later.stop(context)
+        service.bind(self.registry, other)
 
     def test_log_id_of_and_image_digest_refuse_what_is_not_a_post_image(self) -> None:
         # DeepSeek r3, L4.

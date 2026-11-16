@@ -62,7 +62,8 @@ service (S13). The marker's text is the protocol; this module follows it:
 What this gives, and what it does not. Replay of the log reaches the registry's durable state for every
 run not listed in ``unlogged``: the last image logged for a run equals what the registry holds once the
 reader has caught up, with one reader per store. ``start`` holds to that: another reader's ``start`` or ``bind`` on
-a started reader's store is refused. ``bind`` alone takes no claim (it is the tests' stand-in for a restart), so two
+a started reader's store is refused, and a started reader's own ``bind`` cannot move it to another registry or store.
+``bind`` alone takes no claim (it is the tests' stand-in for a restart), so two
 readers that are only bound to one store can leave a run's last image behind the registry's until its next read.
 Changes between two reads appear as the last image: the log does NOT claim every
 intermediate transition (a transition-exact log would need a write inside Stop's durable path, which is
@@ -285,7 +286,12 @@ class ChangeReader:
     def bind(self, registry, store) -> None:
         """The two things the reader reads and writes. ``start`` binds them from the service context. A store
         another reader's ``start`` holds (until its ``stop``) is refused. ``bind`` alone takes no claim: the tests
-        bind a second reader on one store to stand for a restart."""
+        bind a second reader on one store to stand for a restart. A started reader (from its ``start`` until its
+        ``stop``, a start that raised included) cannot be bound to another registry or store: that is refused, and
+        binding the same two changes nothing. So its thread reads and writes only what it was started with, on the
+        store its claim holds."""
+        if self._thread is not None and (registry is not self._registry or store is not self._store):
+            raise RuntimeError('the change reader is started: bind cannot change its registry or store until stop')
         _claim(store, self, take=False)
         self._registry, self._store = registry, store
 
@@ -309,7 +315,7 @@ class ChangeReader:
 
     def stop(self, context) -> None:
         """Ends the current start's thread, joins it, and gives up the claim that start took, on the store it was
-        started with (a later ``bind`` to another store does not move the claim). A thread whose start raised
+        started with (while it is started, ``bind`` cannot move it to another). A thread whose start raised
         before it began is not joined: when it runs, it reads its own stop signal, set here, before anything else,
         and does nothing."""
         self._stopping.set()

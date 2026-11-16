@@ -114,6 +114,10 @@ class CrashCellTest(unittest.TestCase):
         self.assertEqual(work_states(self.lane), [('launch', 'attempting')])
         after = self.lane.restarted()
         self.assertEqual(work_states(after), [('launch', 'outcome_unknown'), ('stop', 'pending')])
+        # The claim was committed, so nobody can say the port was not called: an absence settles nothing.
+        self.assertEqual(after.sessions.run_pending(), 1)
+        self.assertEqual(session_of(after, session['session_id'])['state'], 'stop_pending')
+        self.lane.units.stop_answers = [stop_answer(session['worker']['run_id'], 'ended')]     # its own word
         after.settle()
         self.assertEqual(self.lane.units.launched, [])
         self.assertEqual(only_delivery(after, session['session_id'])['state'], 'outcome_unknown')
@@ -434,13 +438,47 @@ class FenceTest(unittest.TestCase):
         self.assertEqual(lane.units.stops, [run_id, run_id])
         self.assertEqual([order.run_id for order in lane.units.launched], [run_id])
 
-    def test_an_open_launch_of_another_run_does_not_hold_this_run_s_stop(self):
-        """DeepSeek round 3, F7 (m08): only a launch of the Stop's own run is read in its claim."""
+    def test_an_absence_after_a_launch_that_raised_settles_nothing(self):
+        """DeepSeek round 4, F1r (Codex astra B1, sol R4 on #415): a launch hands its input over, so its unit runs,
+        then raises before its run is registered. Nobody can vouch for that outcome, so a Stop that finds no run
+        settles nothing: the session stays stop_pending, no replacement turn opens beside the unit, and the Stop
+        is asked until the run is there and stopped."""
         lane = Lane()
-        lane.units.then = [RuntimeError('the pipe broke')]
-        first = lane.start(prompt='first')['session']
+        session = lane.start(engine='opencode', prompt='first')['session']
+        sid, run_id = session['session_id'], session['worker']['run_id']
+        lane.sessions.engine_session_reported(sid, 'engine-conversation-1')     # a replacement could resume
+        late, real_launch = [], lane.units.launch
+
+        def launch(order):
+            real_launch(order)                                 # handed over: the unit runs
+            lane.units.registered.discard(order.run_id)        # its registry write lands later
+            late.append(order.run_id)
+            raise OSError('the pipe broke after the hand-over')
+
+        lane.units.launch = launch
         with self.assertLogs('recursion_core.sessions.service', 'ERROR'):
-            self.assertEqual(lane.sessions.run_pending(), 1)      # the launch: outcome unknown, a Stop asked
+            self.assertEqual(lane.sessions.run_pending(), 1)  # the launch: outcome unknown, a Stop asked
+        self.assertEqual(work_states(lane), [('launch', 'outcome_unknown'), ('stop', 'pending')])
+        self.assertEqual(lane.sessions.run_pending(), 1)      # the Stop: no run registered yet
+        held = session_of(lane, sid)
+        self.assertEqual(held['state'], 'stop_pending', 'an absence after an unknown launch is not an end')
+        self.assertEqual(held['worker']['run_id'], run_id)
+        replacement = turn_of(lane, held, text='replacement')
+        self.assertEqual((replacement['code'], replacement['detail']), ('busy', 'stop_pending'))
+        lane.units.registered.update(late)                    # the run is registered now
+        self.assertEqual(lane.sessions.run_pending(), 1)      # asked again: there, and stopped
+        settled = session_of(lane, sid)
+        self.assertEqual((settled['state'], settled['worker']), ('idle', None))
+        self.assertEqual(lane.units.stops, [run_id, run_id])
+        self.assertEqual([order.run_id for order in lane.units.launched], [run_id], 'one unit, ever')
+
+    def test_an_open_launch_of_another_run_does_not_hold_this_run_s_stop(self):
+        """DeepSeek round 3, F7 (m08): only a launch of the Stop's own run is read in its claim. The first session's
+        launch was still pending when the daemon restarted, so it definitely never started and its Stop may settle
+        on an absence."""
+        first_lane = Lane()
+        first = first_lane.start(prompt='first')['session']
+        lane = first_lane.restarted()                             # the launch never attempted; a recovery Stop
         second = lane.start(prompt='second', command_id='cmd-start-0002')['session']
         self.assertEqual(work_states(lane), [('launch', 'outcome_unknown'), ('stop', 'pending'), ('launch', 'pending')])
         seen = []
@@ -506,6 +544,8 @@ class FreshLaunchTest(unittest.TestCase):
         lane = Lane()
         lane.units.then = [RuntimeError('the pipe broke')]
         session = lane.start(prompt='first')['session']
+        # the Stop's own word that the run ended: after an attempt nobody can vouch for, an absence proves nothing
+        lane.units.stop_answers = [stop_answer(session['worker']['run_id'], 'ended')]
         with self.assertLogs('recursion_core.sessions.service', 'ERROR'):
             lane.settle()
         idle = session_of(lane, session['session_id'])
@@ -520,6 +560,8 @@ class FreshLaunchTest(unittest.TestCase):
         session = lane.start(prompt='first')['session']
         lane.settle()
         self.assertEqual(turn_of(lane, session_of(lane, session['session_id']), text='again')['code'], 'ok')
+        # the Stop's own word that the run ended: after an attempt nobody can vouch for, an absence proves nothing
+        lane.units.stop_answers = [stop_answer(session_of(lane, session['session_id'])['worker']['run_id'], 'ended')]
         with self.assertLogs('recursion_core.sessions.service', 'ERROR'):
             lane.settle()
         idle = session_of(lane, session['session_id'])
@@ -651,6 +693,14 @@ class DeliveryOrderTest(unittest.TestCase):
                              ['queued', 'delivering'])
         self.assertEqual(session_of(self.lane, first['session_id'])['turns'], [], 'the failed one wrote nothing')
 
+    def test_a_steer_put_into_the_turn_in_progress_counts_as_started(self):
+        """DeepSeek round 4, N2: dispatch_queued counts a mid-turn steer it started, and only once."""
+        live = self.running('codex')
+        self.lane.call('session.steer', {'command_id': 'cmd-steer-0001', 'session_id': live['session_id'],
+                                         'text': 'skip the docs', 'expected_turn_id': live['active_turn_id']})
+        self.assertEqual(self.lane.sessions.dispatch_queued(), 1)
+        self.assertEqual(self.lane.sessions.dispatch_queued(), 0, 'one delivery in flight at a time')
+
     def test_a_launch_order_carries_the_tenant_the_principal_and_the_budget(self):
         answer = self.lane.call('session.start', {'command_id': 'cmd-start-0001', 'tenant': 't9',
                                                   'engine': 'claude_code', 'prompt': 'first',
@@ -675,6 +725,8 @@ class DeliveryOrderTest(unittest.TestCase):
     def test_a_launch_whose_outcome_is_unknown_is_never_retried_and_its_unit_is_stopped(self):
         self.lane.units.then = [RuntimeError('the pipe broke')]
         session = self.lane.start(prompt='first')['session']
+        # the Stop's own word that the run ended: after an attempt nobody can vouch for, an absence proves nothing
+        self.lane.units.stop_answers = [stop_answer(session['worker']['run_id'], 'ended')]
         with self.assertLogs('recursion_core.sessions.service', 'ERROR'):
             self.lane.settle()
         self.assertEqual(work_states(self.lane), [('launch', 'outcome_unknown'), ('stop', 'done')])
@@ -839,6 +891,17 @@ class GuardTest(unittest.TestCase):
         answer = turn_of(self.lane, ended)
         self.assertEqual((answer['code'], answer['detail']), ('conflict', 'stale_revision'))
 
+
+    def test_a_binding_that_is_not_an_object_is_refused_as_one(self):
+        """DeepSeek round 4, N3."""
+        for binding in (None, 'dlv-a', ['dlv-a']):
+            with self.subTest(binding=binding):
+                def write(binding=binding):
+                    with self.lane.store.transaction() as tx:
+                        store.insert_delivery(tx, binding, None)
+                with self.assertRaises(records.RecordError) as caught:
+                    write()
+                self.assertEqual((caught.exception.path, caught.exception.rule), ('', 'object'))
 
     def test_a_binding_the_schema_refuses_is_never_written(self):
         """DeepSeek round 3, F2: the store checks a binding before it writes it, as store.py says of every record."""

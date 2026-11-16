@@ -27,15 +27,21 @@ THE FENCE BETWEEN A LAUNCH AND A STOP. Two passes may run at once (nothing here 
   returned (``done``). A launch still open may register its run after the Stop looked, even if it ends before
   the Stop's answer is read. A launch that returned handed its input over, so its run exists: the port may
   register it after the call returned (``ports.py``), and once registered it is answered (``stopped``,
-  ``ended`` or ``pending``), never None again. So for such a run None means "not registered YET". Only a
-  launch that definitely never started (``failed``) or whose outcome nobody can vouch for
-  (``outcome_unknown``) leaves None meaning "nothing runs". Until then the Stop is asked again and the session
-  stays ``stop_pending``, so no replacement turn can open beside a unit that may still appear.
+  ``ended`` or ``pending``), never None again. So for such a run None means "not registered YET". The same
+  holds for a launch that was ATTEMPTED and whose outcome nobody can vouch for (``outcome_unknown``: the port
+  raised, or the daemon ended while it was attempting): its unit may run, and its run may be registered late or
+  not be found at all. Only a launch that definitely never started leaves None meaning "nothing runs": one the
+  launcher refused (``failed``), or one still ``pending`` when the daemon restarted (``outcome_unknown`` with
+  ``attempted`` false: the port was never called). Otherwise the Stop is asked again and the session stays
+  ``stop_pending`` until a Stop answers ``stopped`` or ``ended``, so no replacement turn can open beside a unit
+  that may still appear. That wait has no bound in this slice: the session holds rather than risk a second unit.
 
 THE RESTART (``recover``), in one transaction:
 1. every delivery still ``delivering`` becomes ``outcome_unknown``, with its event (queue.item.v1);
 2. every launch, send or interrupt not done becomes ``outcome_unknown``: a delivery was quarantined, so it is
-   never written, even when the crash came before the write, and an interrupt is overtaken by step 3;
+   never written, even when the crash came before the write, and an interrupt is overtaken by step 3. Its outcome
+   says whether it was ``attempted`` (the claim was committed, so the port may have been called) or was still
+   pending (the port was never called);
 3. every session that has, or may have, a unit (a worker, live or waiting) is given a recovery Stop and goes
    ``stop_pending``: nothing here can reattach to a unit that outlived the daemon, so no new unit starts for
    that session until the old one is confirmed stopped. A session already ``stop_pending`` keeps waiting, and
@@ -212,7 +218,7 @@ class Sessions:
             for operation in store.work(tx, state='pending') + store.work(tx, state='attempting'):
                 if operation['kind'] != 'stop':
                     store.move_work(tx, operation['operation_id'], operation['state'], 'outcome_unknown',
-                                    {'why': 'daemon_restart'})
+                                    {'why': 'daemon_restart', 'attempted': operation['state'] == 'attempting'})
                 elif operation['state'] == 'attempting':
                     store.move_work(tx, operation['operation_id'], 'attempting', 'pending', {'why': 'daemon_restart'})
             stops = {(operation['session_id'], operation['payload']['run_id'])
@@ -229,9 +235,11 @@ class Sessions:
     def dispatch_queued(self) -> int:
         """Start the delivery of each session's first queued message where it can go now. Returns how many.
 
-        Each session is looked at in its own transaction. One that raises (a port, such as a driver's declaration,
-        failing) is logged and changes nothing: its transaction is rolled back, its item stays queued, and the
-        pass goes on with the next session; a later pass tries it again."""
+        Each session is looked at in its own transaction. One that raises an ``Exception`` (a port, such as a
+        driver's declaration, failing) is logged and changes nothing: its transaction is rolled back, its item stays
+        queued, and the pass goes on with the next session; a later pass tries it again. A ``BaseException`` (the
+        process ending) is not caught: it ends the pass, as it ends the process. The first read, of which sessions
+        have a queue, is not guarded: a store error there ends the pass, and the service's next pass reads again."""
         with self.store.transaction() as tx:
             waiting = store.with_queued_items(tx)
         started = 0
@@ -503,12 +511,19 @@ class Sessions:
         self.wake.set()
 
     def _launch_may_register(self, tx, run_id: str) -> bool:
-        """Whether a launch of ``run_id`` is pending or attempting (it may still register that run), or returned
-        (``done``: its run exists, and the port may register it after the call returned). A launch of a run is
-        committed with the turn that binds the run, before any Stop of it can be asked, so a launch that is
-        ``failed`` or ``outcome_unknown`` when a Stop is claimed never opens again."""
-        return any(operation['kind'] == 'launch' and operation['payload']['run_id'] == run_id
-                   for state in ('pending', 'attempting', 'done') for operation in store.work(tx, state=state))
+        """Whether a launch of ``run_id`` may have started that run, or may still: pending or attempting (it may
+        register the run after the Stop looked), returned (``done``: the port may register it late), or attempted
+        with an outcome nobody can vouch for (``outcome_unknown``: the unit may run, registered late or never). Only
+        a launch that definitely never started is ruled out: ``failed`` (refused by the launcher), or
+        ``outcome_unknown`` with ``attempted`` false (still pending at a restart: the port was never called). A
+        launch of a run is committed with the turn that binds the run, before any Stop of it can be asked."""
+        for state in ('pending', 'attempting', 'done', 'outcome_unknown'):
+            for operation in store.work(tx, state=state):
+                if operation['kind'] != 'launch' or operation['payload']['run_id'] != run_id:
+                    continue
+                if (operation['outcome'] or {}).get('attempted', True) is not False:
+                    return True
+        return False
 
     # --------------------------------------------------------------- what the engine side reports back
     def accepted(self, facts: dict) -> str:

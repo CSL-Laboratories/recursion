@@ -1,0 +1,71 @@
+Dev task 08: fix a CSV column total (a bug fix in existing code).
+-- task.json --
+{"id": "dev-08-column-total", "cluster": "dev", "created_at": null,
+ "test_command": ["{python}", "-B", "-m", "unittest", "{hidden_modules}"],
+ "timeout_s": 900, "grading_timeout_s": 120}
+-- prompt.md --
+`column_total(text, column)` in `sheets/total.py` fails on every input. Fix it so that it:
+
+- sums the numeric column named `column` of the CSV text, whose first row is the header (the header row is not summed);
+- skips empty cells in that column;
+- handles quoted fields, including commas inside quotes in other columns;
+- raises `KeyError` with the column name when the header has no such column.
+-- start/sheets/__init__.py --
+"""Spreadsheet-like helpers."""
+-- start/sheets/total.py --
+import csv
+import io
+
+
+def column_total(text, column):
+    """Sum a numeric column of CSV text, by header name."""
+    rows = list(csv.reader(io.StringIO(text)))
+    index = rows[0].index(column)
+    return sum(float(row[index]) for row in rows)
+-- hidden/test_total.py --
+import unittest
+
+from sheets.total import column_total
+
+
+class TotalTests(unittest.TestCase):
+    def test_sum(self):
+        self.assertEqual(column_total("name,amount\na,1.5\nb,2\n", "amount"), 3.5)
+
+    def test_empty_cells_skipped(self):
+        self.assertEqual(column_total("name,amount\na,\nb,4\n", "amount"), 4.0)
+
+    def test_quoted_commas(self):
+        self.assertEqual(column_total('name,amount\n"Smith, J",2\n"Doe, A",3\n', "amount"), 5.0)
+
+    def test_missing_column(self):
+        with self.assertRaises(KeyError):
+            column_total("name,amount\na,1\n", "price")
+-- solution/sheets/total.py --
+import csv
+import io
+
+
+def column_total(text, column):
+    """Sum a numeric column of CSV text, by header name."""
+    reader = csv.DictReader(io.StringIO(text))
+    if reader.fieldnames is None or column not in reader.fieldnames:
+        raise KeyError(column)
+    total = 0.0
+    for row in reader:
+        cell = (row.get(column) or "").strip()
+        if cell:
+            total += float(cell)
+    return total
+-- wrong/sheets/total.py --
+import csv
+import io
+
+
+def column_total(text, column):
+    """Sum a numeric column of CSV text, by header name."""
+    rows = list(csv.reader(io.StringIO(text)))
+    index = rows[0].index(column)
+    return sum(float(row[index]) for row in rows[1:])
+-- standin.json --
+{"outcomes": ["wrong"]}

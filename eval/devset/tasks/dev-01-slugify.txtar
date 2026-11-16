@@ -1,0 +1,54 @@
+Dev task 01: implement a slug function (new behaviour in an empty stub).
+-- task.json --
+{"id": "dev-01-slugify", "cluster": "dev", "created_at": null,
+ "test_command": ["{python}", "-B", "-m", "unittest", "{hidden_modules}"],
+ "timeout_s": 900, "grading_timeout_s": 120}
+-- prompt.md --
+Implement `slugify(text)` in `textkit/slug.py`. It turns a title into a URL slug:
+
+- lowercase the text;
+- reduce accented Latin letters to their base letter (for example "é" becomes "e"), using the standard library's `unicodedata`;
+- keep ASCII letters and digits; every run of any other characters becomes a single hyphen;
+- no leading or trailing hyphen;
+- if nothing is left, return the empty string.
+
+Use only the standard library.
+-- start/textkit/__init__.py --
+"""Small text helpers."""
+-- start/textkit/slug.py --
+def slugify(text):
+    """Turn a title into a URL slug."""
+    raise NotImplementedError
+-- hidden/test_slug.py --
+import unittest
+
+from textkit.slug import slugify
+
+
+class SlugTests(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(slugify("Hello, World!"), "hello-world")
+
+    def test_runs_collapse(self):
+        self.assertEqual(slugify("  a -- b__c  "), "a-b-c")
+
+    def test_accents(self):
+        self.assertEqual(slugify("Crème Brûlée"), "creme-brulee")
+
+    def test_nothing_left(self):
+        self.assertEqual(slugify("!!!"), "")
+
+    def test_digits(self):
+        self.assertEqual(slugify("Top 10 Tips"), "top-10-tips")
+-- solution/textkit/slug.py --
+import re
+import unicodedata
+
+
+def slugify(text):
+    """Turn a title into a URL slug."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    ascii_text = decomposed.encode("ascii", "ignore").decode("ascii").lower()
+    return re.sub(r"[^a-z0-9]+", "-", ascii_text).strip("-")
+-- standin.json --
+{"outcomes": ["solve"]}

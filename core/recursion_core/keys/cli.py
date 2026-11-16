@@ -10,7 +10,8 @@
     With no opt-in the cap is 0, and every run on the key is refused before launch until it is removed and
     added again with one. An id that looks like a key is refused before any prompt shows it, and so is everything
     else it can refuse without the key (``KeyStore.check_add``): a provider, variable name or cap it does not take,
-    a folder, index or host it cannot save in, and an id already saved.
+    a folder, index or host it cannot save in (an index already too full for one more key among them), and an id
+    already saved.
 ``list [--json]``
     Ids, providers, variable names, when each was saved, the store, the spend opt-in and any unfinished
     operation. Never a value.
@@ -309,7 +310,8 @@ def _add(args, out, err, store, terminal, stdin) -> int:
     if cap and not allow:
         raise KeyStoreError('cap_invalid', '--cap-usd above 0 needs --allow-metered-spend')
     # Everything it can refuse without the key, before the key is read: no prompt for a key it would refuse anyway.
-    store.check_add(args.key_id, args.key_provider, args.key_env)
+    store.check_add(args.key_id, args.key_provider, args.key_env, metered_spend_allowed=bool(allow),
+                    cap_usd=cap if allow else 0)
     stdin = stdin if stdin is not None else sys.stdin
     opened = None
     try:

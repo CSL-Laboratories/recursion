@@ -44,6 +44,7 @@ LOGIN = '/Users/someone/Library/Keychains/login.keychain-db'
 ELSEWHERE = '/Users/someone/Library/Keychains/elsewhere.keychain-db'
 TOOL = '/usr/bin/security'
 NOT_FOUND = b'security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\n'
+OPEN_FAILED = b'security: SecKeychainOpen: The specified keychain could not be found.\n'
 
 
 class FakeSecurity:
@@ -54,6 +55,7 @@ class FakeSecurity:
         # no_login | locks_after_add | bad_value
         self.mode = 'ok'
         self.after_dump = None      # called once after the next listing: another process acting between two
+        self.login = LOGIN          # what login-keychain answers (another keychain can become the login one)
         self.dumps: list = []       # every dump-keychain command line
         self.lines: list = []       # every line -i was given, as it was split by the 4095-byte reader
 
@@ -73,8 +75,11 @@ class FakeSecurity:
         return options, rest
 
     def _keychains(self, rest, *, adding=False):
-        if rest:
-            return [rest[0]] if rest[0] in (LOGIN, ELSEWHERE) else None
+        """The keychains a command acts on. A named one it cannot open: the search list instead, as Apple's
+        ``keychain_create_array`` gives; the command then writes the open error on standard error."""
+        if rest and rest[0] in (LOGIN, ELSEWHERE):
+            return [rest[0]]
+        self.fell_back = self.fell_back or bool(rest)
         if self.mode == 'elsewhere':
             return [ELSEWHERE]
         return [LOGIN]
@@ -88,6 +93,14 @@ class FakeSecurity:
                 and all(item[name] == value for name, value in wanted.items())]
 
     def __call__(self, argv, input):
+        """A command, and the keychain-open error on standard error when it fell back to the search list."""
+        self.fell_back = False
+        done = self._answer(argv, input)
+        if self.fell_back:
+            return Completed(done.returncode, done.stdout, OPEN_FAILED + done.stderr)
+        return done
+
+    def _answer(self, argv, input):
         if self.mode == 'locked':
             return Completed(36, b'', b'security: SecKeychainItemCopyContent: User interaction is not allowed.\n')
         if self.mode == 'fails':
@@ -97,14 +110,14 @@ class FakeSecurity:
             if self.mode == 'no_login' or len(argv) != 2:
                 return Completed(50, b'', b'security: SecKeychainCopyLogin: The specified keychain could not be '
                                           b'found.\n')
-            return Completed(0, f'    "{LOGIN}"\n'.encode(), b'')
+            return Completed(0, f'    "{self.login}"\n'.encode(), b'')
         if command == '-i':
             return self._interactive(input)
         options, rest = self._parse(argv[2:])
         if command == 'dump-keychain':
             self.dumps.append(list(argv))
             keychains = self._keychains(rest)
-            if '-d' in options or keychains is None:
+            if '-d' in options:
                 return Completed(2, b'', b'usage\n')
             if self.mode == 'dump_error':
                 return Completed(0, b'', b'security: SecKeychainItemCopyAttributesAndData: CSSM error\n')
@@ -114,8 +127,6 @@ class FakeSecurity:
                 hook()
             return Completed(0, listing, b'')
         keychains = self._keychains(rest)
-        if keychains is None:
-            return Completed(50, b'', b'security: The specified keychain could not be found.\n')
         found = self._matches(options, keychains)
         if self.mode in ('ambiguous', 'writes_then_fails'):   # a search that failed answers "not found" too
             return Completed(44, b'', b'security: SecKeychainSearchCopyNext: CSSM_ERRCODE_INTERNAL_ERROR\n' + NOT_FOUND)
@@ -152,8 +163,6 @@ class FakeSecurity:
                 continue                                      # -i goes on whatever a line does
             options, rest = self._parse(words[1:])
             keychains = self._keychains(rest)
-            if keychains is None:
-                continue
             try:
                 password = bytes.fromhex(options['-X'])
             except (KeyError, ValueError):

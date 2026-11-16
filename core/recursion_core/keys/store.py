@@ -29,9 +29,11 @@ record names (questions.md K18); on the owner-only file the copy has a file of i
 first write. A removal deletes every value saved for the id in the store, whichever save stored it.
 
 THE INDEX FORMAT, version 1: ``{"version": 1, "store_id": <32 hex>, "backend": <store or null>, "keys": {<id>:
-{"provider", "env_name", "created_at", "store", "metered_spend_allowed", "cap_usd", "save_id"}}, "pending":
-{<id>: {"op": "add" | "remove", "started_at"}}}``, at most 1 MiB. Anything else is refused ``index_invalid``. A
-listing says what the index holds; it does not say that a keychain is reachable or unlocked now.
+{"provider", "env_name", "created_at", "store", "metered_spend_allowed", "cap_usd", "save_id"}}, "pending": {<id>:
+{"op": "add" | "remove", "started_at"}}}``, at most 1 MiB. A store pinned to the macOS Keychain also records
+``"keychain": <its path>``, the login keychain it saved in (only beside a live ``macos_keychain`` pin; an older index
+without it records it at its next save). Anything else is refused ``index_invalid``. A listing says what the index
+holds; it does not say that a keychain is reachable or unlocked now.
 
 PINNING. The first save records the backend the host offered then (``system.detect``) in the index. Every later
 operation that touches a value asks again and refuses when the answer differs: ``keychain_unavailable`` when a keychain
@@ -193,6 +195,7 @@ class Index:
     keys: dict                                     # key id -> KeyRecord
     pending: dict = field(default_factory=dict)    # key id -> Pending
     store_id: str | None = None                    # the store's random id; None only before the first save
+    keychain: str | None = None                    # the macOS Keychain a store pinned there saves in (its path)
 
     def live(self) -> bool:
         return bool(self.keys or self.pending)
@@ -217,9 +220,11 @@ def index_bytes(index: Index) -> bytes:
     """The index file exactly as it is written. Every write carries the store's id (``add`` makes it first)."""
     keys ={kid: {name: getattr(record, name) for name in FIELDS} for kid, record in sorted(index.keys.items())}
     pending = {kid: {'op': p.op, 'started_at': p.started_at} for kid, p in sorted(index.pending.items())}
-    body = json.dumps({'version': INDEX_VERSION, 'store_id': index.store_id,
-                       'backend': index.backend if index.live() else None, 'keys': keys, 'pending': pending},
-                      indent=1, ensure_ascii=True)
+    doc = {'version': INDEX_VERSION, 'store_id': index.store_id, 'backend': index.backend if index.live() else None,
+           'keys': keys, 'pending': pending}
+    if index.live() and index.keychain is not None:
+        doc['keychain'] = index.keychain
+    body = json.dumps(doc, indent=1, ensure_ascii=True)
     return (body + '\n').encode('ascii')
 
 
@@ -268,10 +273,10 @@ class KeyStore:
     def _write_index(cls, folder: Folder, index: Index) -> None:
         folder.write(INDEX_NAME, cls._sized(index))
 
-    def _backend(self, pinned: str | None, store_id: str | None):
+    def _backend(self, pinned: str | None, store_id: str | None, keychain: str | None = None):
         """The backend object to use now, for the store named ``store_id``. With a pin, the host must still offer
-        the pinned backend."""
-        return self._made(self._backend_name(pinned), store_id)
+        the pinned backend. ``keychain`` is the macOS Keychain the index records, if any."""
+        return self._made(self._backend_name(pinned), store_id, keychain)
 
     def _backend_name(self, pinned: str | None) -> str:
         """The backend to use now: the pinned one, which the host must still offer, or the one the host offers."""
@@ -286,20 +291,20 @@ class KeyStore:
                                 'they are removed only where that keychain answers, then added again here')
         return pinned or offered
 
-    def _made(self, name: str, store_id: str | None):
+    def _made(self, name: str, store_id: str | None, keychain: str | None = None):
         if name == 'owner_file':
             return OwnerFile(store_id)
         if name == 'secret_service':
             return SecretService(self.system, store_id)
         if name == 'macos_keychain':
-            return MacKeychain(self.system, store_id)
+            return MacKeychain(self.system, store_id, keychain)
         raise KeyStoreError('backend_not_built',
                             f'the {STORE_TEXT[name]} backend is not built yet; no key is written to a file on a host '
                             'that has a keychain')
 
-    def _removal_backend(self, pinned: str | None, store_id: str | None):
+    def _removal_backend(self, pinned: str | None, store_id: str | None, keychain: str | None = None):
         """The backend a removal uses: the owner-only file is in the store's folder, whatever the host offers now."""
-        return OwnerFile(store_id) if pinned == 'owner_file' else self._backend(pinned, store_id)
+        return OwnerFile(store_id) if pinned == 'owner_file' else self._backend(pinned, store_id, keychain)
 
     @staticmethod
     def _identity(folder: Folder, index: Index, name: str) -> Index:
@@ -377,7 +382,7 @@ class KeyStore:
             index = self._read_index(folder)
             name = self._backend_name(index.backend)     # no pin while the index is empty: a first save pins
             index = self._identity(folder, index, name)
-            backend = self._made(name, index.store_id)
+            backend = self._made(name, index.store_id, index.keychain)
             index = self._recover(folder, index, backend)
             if key_id in index.keys:
                 raise KeyStoreError('key_exists', f'{key_id} is already saved; remove it first')
@@ -392,10 +397,13 @@ class KeyStore:
             keys = {**index.keys, key_id: record}
             intent = replace(index, backend=backend.name, pending={**index.pending, key_id: Pending(key_id, 'add', now)})
             done = replace(index, backend=backend.name, keys=keys)
-            self._sized(replace(intent, keys=keys))                     # both states fit, before anything changes
             admit = getattr(backend, 'admit', None)
             if admit is not None:
                 admit(key_id, value, record)                            # a key the backend cannot carry whole
+            target = getattr(backend, 'target', None)                   # the keychain it saves in, recorded
+            if target is not None:
+                intent, done = replace(intent, keychain=target()), replace(done, keychain=target())
+            self._sized(replace(intent, keys=keys))                     # both states fit, before anything changes
             self._write_index(folder, intent)                           # 1. the intent, before the outside effect
             try:
                 backend.put(key_id, value, folder, record=record)     # 2. the value, bound to its record, and no other
@@ -418,10 +426,12 @@ class KeyStore:
                 raise
             return record
 
-    def check_add(self, key_id: str, provider: str, env_name: str) -> None:
+    def check_add(self, key_id: str, provider: str, env_name: str, *, metered_spend_allowed: bool = False,
+                  cap_usd: float = 0) -> None:
         """Raise what ``add`` would refuse before it has a value, with the same code: an id, provider or variable
-        name it does not take; a folder, index or host it cannot save in; an id already saved, or held in the store's
-        own file with no saved key naming it. ``key add`` calls it before it reads the key, so a command that cannot
+        name it does not take; a folder, index or host it cannot save in (an index already too full for the smallest
+        record among them); an id already saved, or held in the store's own file with no saved key naming it.
+        ``key add`` calls it before it reads the key, so a command that cannot
         succeed for one of these reasons never asks for one. It changes nothing and holds the folder's lock shared;
         ``add`` checks all of it again under the exclusive lock. Left to ``add``: an id with an unfinished operation
         (the save's own recovery may finish it), a keychain that does not answer, the cap and the value."""
@@ -433,13 +443,20 @@ class KeyStore:
         with folder, folder.locked(shared=True):
             index = self._read_index(folder)
             name = self._backend_name(index.backend)
-            backend = self._made(name, self._identity(folder, index, name).store_id)
+            backend = self._made(name, self._identity(folder, index, name).store_id, index.keychain)
             if key_id in index.pending:
                 return
             if key_id in index.keys:
                 raise KeyStoreError('key_exists', f'{key_id} is already saved; remove it first')
             if name == 'owner_file' and key_id in backend.ids(folder):
                 raise _unbound_exists(key_id)
+            # An index already too full for this record (with the opt-in and cap given, else the smallest one) is
+            # refused store_full, as add refuses it.
+            given = metered_spend_allowed is True and v.valid_cap(cap_usd) and cap_usd > 0
+            smallest = KeyRecord(key_id, provider, env_name, _now(self._clock), name, given, cap_usd if given else 0,
+                                 '0' * 32)
+            self._sized(replace(index, backend=name, keys={**index.keys, key_id: smallest},
+                                pending={**index.pending, key_id: Pending(key_id, 'add', smallest.created_at)}))
 
     def remove(self, key_id: str) -> KeyRecord | None:
         """Delete a key's value from its backend, then its entry from the index.
@@ -461,7 +478,7 @@ class KeyStore:
             if record is None and key_id not in index.pending:
                 self._unnamed(folder, index, key_id)     # a value only the store's own file holds, or key_unknown
                 return None
-            backend = self._removal_backend(index.backend, index.store_id)
+            backend = self._removal_backend(index.backend, index.store_id, index.keychain)
             index = self._recover(folder, index, backend, but=key_id)
             keys = {kid: rec for kid, rec in index.keys.items() if kid != key_id}
             others = {kid: p for kid, p in index.pending.items() if kid != key_id}
@@ -521,7 +538,7 @@ class KeyStore:
         if not index.live():
             return {}, {}
         try:
-            backend = self._backend(index.backend, index.store_id)
+            backend = self._backend(index.backend, index.store_id, index.keychain)
         except KeyStoreError as exc:
             return {}, dict.fromkeys(index.keys, exc.code)
         found, missing = {}, {}
@@ -557,7 +574,7 @@ class KeyStore:
         name = self._backend_name(index.backend)
         if name not in ('secret_service', 'macos_keychain'):
             return None
-        backend = self._made(name, index.store_id)
+        backend = self._made(name, index.store_id, index.keychain)
         unnamed = getattr(backend, 'unnamed', None)
         if unnamed is not None:
             return unnamed(index)           # one listing for named and unnamed alike (the macOS Keychain)
@@ -600,7 +617,8 @@ class KeyStore:
                                         'this key has no metered-spend opt-in and cap; remove it and add it again '
                                         'with one')
                 # The value of this record's own save, and no other: see IDENTITY.
-                return self._backend(index.backend, index.store_id).get(connection_id, folder, record)
+                return self._backend(index.backend, index.store_id, index.keychain).get(connection_id, folder,
+                                                                                         record)
         except KeyRefused:
             raise
         except KeyError:
@@ -692,7 +710,7 @@ def _parse_index(raw: bytes) -> Index | None:
         doc = json.loads(raw.decode('ascii'), object_pairs_hook=_pairs, parse_constant=_constant)
     except (ValueError, _Duplicate):
         doc = None
-    if not isinstance(doc, dict) or set(doc) != {'version', 'store_id', 'backend', 'keys', 'pending'}:
+    if not isinstance(doc, dict) or set(doc) - {'keychain'} != {'version', 'store_id', 'backend', 'keys', 'pending'}:
         return None
     if type(doc['version']) is not int or doc['version'] != INDEX_VERSION or not _valid_random_id(doc['store_id']):
         return None
@@ -701,6 +719,8 @@ def _parse_index(raw: bytes) -> Index | None:
     live = bool(doc['keys'] or doc['pending'])
     backend = doc['backend']
     if (backend not in STORES) if live else (backend is not None):
+        return None
+    if 'keychain' in doc and not (live and backend == 'macos_keychain' and _valid_keychain(doc['keychain'])):
         return None
     keys = {}
     for key_id, entry in doc['keys'].items():
@@ -723,7 +743,14 @@ def _parse_index(raw: bytes) -> Index | None:
         if entry['op'] not in OPS or not v.valid_timestamp(entry['started_at']):
             return None
         pending[key_id] = Pending(key_id, entry['op'], entry['started_at'])
-    return Index(backend if live else None, keys, pending, doc['store_id'])
+    return Index(backend if live else None, keys, pending, doc['store_id'], doc.get('keychain'))
+
+
+def _valid_keychain(text: object) -> bool:
+    """A keychain's path as the index records it: absolute, at most 4096 characters, no quote, backslash or
+    control character (it is quoted on ``security``'s interactive line)."""
+    return (isinstance(text, str) and text.startswith('/') and len(text) <= 4096
+            and not any(c in '"\\' or ord(c) < 32 or ord(c) == 127 for c in text))
 
 
 class _Duplicate(Exception):

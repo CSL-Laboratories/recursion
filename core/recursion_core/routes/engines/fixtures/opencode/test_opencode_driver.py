@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -23,12 +24,20 @@ class Process:
     def __init__(self) -> None:
         self.sent: list[str] = []
         self.closes = 0
+        self.close_attempts = 0
+        self.send_error: BaseException | None = None   # raised by the next send, nothing written
+        self.close_errors: list[BaseException] = []    # raised by the next closes, in order, nothing closed
 
     def send(self, text: str) -> None:
         assert self.closes == 0, "send after close_stdin"
+        if self.send_error is not None:
+            raise self.send_error
         self.sent.append(text)
 
     def close_stdin(self) -> None:
+        self.close_attempts += 1
+        if self.close_errors:
+            raise self.close_errors.pop(0)
         self.closes += 1
 
 
@@ -231,6 +240,182 @@ class DriverLifecycleTests(unittest.TestCase):
         self.driver.send(self.handle, message())                # the step_start above came before the prompt
         drafts = self.driver.parse(self.handle, "not json\n")
         self.assertNotIn("input.accepted", [d["type"] for d in drafts])
+
+
+START = '{"type":"step_start","timestamp":1,"sessionID":"ses_a","part":{"type":"step-start"}}\n'
+TEXT = '{"type":"text","timestamp":1,"sessionID":"ses_a","part":{"type":"text","text":"hi"}}\n'
+FINISH_STOP = ('{"type":"step_finish","sessionID":"ses_a","part":{"type":"step-finish","reason":"stop",'
+               '"tokens":{"input":1}}}\n')
+
+
+class RoundTwoDriverTests(unittest.TestCase):
+    """#414 round 2: astra R3 and R5, sol R1 to R3, DeepSeek LOW-2 and NIT-3."""
+
+    def setUp(self):
+        self.spy = Spy()
+        self.driver = oc.OpenCodeDriver(self.spy, wall=lambda: 1794614400.0, clock=lambda: 100.0)
+        self.handle = self.driver.start(session(), None, ENV)
+
+    def accepted(self, drafts):
+        return [d for d in drafts if d["type"] == "input.accepted"]
+
+    # astra R3: dispatch state only after the I/O succeeded
+    def test_a_prompt_write_that_raised_is_never_accepted(self):
+        self.spy.processes[0].send_error = BrokenPipeError()
+        with self.assertRaises(BrokenPipeError):
+            self.driver.send(self.handle, message())
+        self.assertEqual(self.accepted(self.driver.parse(self.handle, START)), [])
+        self.assertEqual(self.handle.ignored_acceptances, 0)
+        self.assertEqual(self.spy.processes[0].sent, [])
+
+    def test_a_close_that_raised_is_tried_again(self):
+        process = self.spy.processes[0]
+        process.close_errors = [OSError("busy")]
+        with self.assertRaises(OSError):
+            self.driver.send(self.handle, message())
+        self.driver.send(self.handle, {"kind": "close"})
+        self.assertEqual((process.close_attempts, process.closes, process.sent), (2, 1, ["Run the tests."]))
+
+    # sol R2: only a well-formed step_start of the run's own session accepts the prompt
+    def test_a_malformed_step_start_does_not_accept_the_prompt(self):
+        self.driver.send(self.handle, message())
+        self.driver.parse(self.handle, TEXT)
+        for line in ('{"type":"step_start","timestamp":1,"sessionID":"ses_a","part":"x"}\n',
+                     '{"type":"step_start","timestamp":1,"sessionID":"ses_a","part":{"type":"text"}}\n',
+                     '{"type":"step_start","timestamp":1,"sessionID":"ses_a"}\n',
+                     '{"type":"step_start","timestamp":1,"part":{"type":"step-start"}}\n'):
+            with self.subTest(line=line):
+                self.assertEqual(self.accepted(self.driver.parse(self.handle, line)), [])
+        self.assertEqual(len(self.accepted(self.driver.parse(self.handle, START))), 1)
+
+    def test_a_step_start_of_another_session_does_not_accept_the_prompt(self):
+        self.driver.send(self.handle, message())
+        self.driver.parse(self.handle, TEXT)                      # the run's session is ses_a
+        other = START.replace("ses_a", "ses_b")
+        self.assertEqual(self.accepted(self.driver.parse(self.handle, other)), [])
+        self.assertEqual(len(self.accepted(self.driver.parse(self.handle, START))), 1)
+
+    # astra R4 / sol R1: a later step invalidates an earlier stop
+    def test_an_unfinished_later_step_is_not_a_finished_run(self):
+        self.driver.send(self.handle, message())
+        for line in (START, FINISH_STOP, START):
+            self.driver.parse(self.handle, line)
+        self.assertEqual(self.driver.finish(self.handle, None)[0]["payload"]["code"], "engine_exited")
+
+    def test_a_later_step_that_stops_again_is_a_finished_run(self):
+        self.driver.send(self.handle, message())
+        for line in (START, FINISH_STOP, START, FINISH_STOP):
+            self.driver.parse(self.handle, line)
+        self.assertEqual(self.driver.finish(self.handle, None)[0]["payload"]["code"], None)
+
+    # astra R5 / sol R3 / DeepSeek LOW-2: one terminal transition per handle
+    def test_two_finishers_give_one_result_and_one_state_error(self):
+        self.driver.send(self.handle, message())
+        parser = self.driver._worker(self.handle)["parser"]
+        real_end, inside, go = parser.end, threading.Event(), threading.Event()
+
+        def slow_end(exit_code):
+            inside.set()
+            go.wait()
+            return real_end(exit_code)
+
+        parser.end = slow_end
+        results = []
+
+        def finisher():
+            try:
+                results.append(("ok", self.driver.finish(self.handle, 0)[0]["payload"]["code"]))
+            except Exception as err:   # noqa: BLE001 (the kind is the answer)
+                results.append((type(err).__name__, None))
+
+        first = threading.Thread(target=finisher)
+        first.start()
+        inside.wait()
+        second = threading.Thread(target=finisher)
+        second.start()
+        second.join(0.2)              # time only to see that the second has not finished yet
+        go.set()
+        first.join()
+        second.join()
+        self.assertEqual(sorted(results, key=str), [("DriverStateError", None), ("ok", None)])
+        self.assertIsNone(self.handle.live_turn)
+
+    def test_an_interrupted_finish_completes_when_called_again(self):
+        for where in ("turn_ended", "check_draft"):
+            with self.subTest(where=where):
+                self.setUp()
+                self.driver.send(self.handle, message())
+                fired = []
+                if where == "turn_ended":
+                    real = self.driver.turn_ended
+
+                    def once(handle, turn_id, fired=fired, real=real):
+                        if not fired:
+                            fired.append(1)
+                            raise KeyboardInterrupt
+                        return real(handle, turn_id)
+
+                    self.driver.turn_ended = once
+                    target = None
+                else:
+                    target = oc.check_draft
+
+                    def once_draft(draft, fired=fired, target=target):
+                        if not fired:
+                            fired.append(1)
+                            raise KeyboardInterrupt
+                        return target(draft)
+
+                    oc.check_draft = once_draft
+                try:
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.driver.finish(self.handle, 0)
+                    self.assertEqual(self.handle.live_turn, "turn-1")     # a live turn keeps its worker
+                    self.assertEqual(self.driver.finish(self.handle, 1)[0]["payload"]["code"], None)  # first code
+                finally:
+                    if target is not None:
+                        oc.check_draft = target
+                self.assertIsNone(self.handle.live_turn)
+                with self.assertRaises(DriverStateError):
+                    self.driver.finish(self.handle, 0)
+
+    # DeepSeek NIT-3: release ends the turn in progress
+    def test_release_ends_the_turn_in_progress_and_ignores_handles_it_does_not_hold(self):
+        self.driver.send(self.handle, message())
+        self.driver.release(None)
+        self.driver.release(type(self.handle)("run-x", None))
+        self.assertEqual(self.handle.live_turn, "turn-1")
+        self.driver.release(self.handle)
+        self.assertIsNone(self.handle.live_turn)
+        with self.assertRaises(DriverStateError):
+            self.driver.parse(self.handle, START)
+
+
+class StartedRollbackTests(unittest.TestCase):
+    """A step_start line interrupted on its return leaves ``started`` as it was (feed's rollback)."""
+
+    def test_an_interrupted_step_start_is_not_a_start(self):
+        p = oc.Parser(connection_id="api_key:k1", model=None, wall=lambda: 1794614400.0, clock=lambda: 100.0)
+        p.feed(TEXT)                                              # the run's session is ses_a
+        lines, first = inspect.getsourcelines(oc.Parser.feed)
+        target = first + next(i for i, text in enumerate(lines) if text.strip() == "return drafts")
+
+        def tracer(frame, event, arg):
+            if frame.f_code is oc.Parser.feed.__code__:
+                if event == "line" and frame.f_lineno == target:
+                    raise KeyboardInterrupt
+                return tracer
+            return None
+
+        sys.settrace(tracer)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                p.feed(START)
+        finally:
+            sys.settrace(None)
+        self.assertFalse(p.started)
+        p.feed(START)
+        self.assertTrue(p.started)
 
 
 if __name__ == "__main__":

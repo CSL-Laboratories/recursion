@@ -40,8 +40,13 @@ and the object the method handlers and the engine drivers call:
 * ``start`` and ``stop`` run one at a time, whoever calls them: a start that comes while a stop runs waits until
   that stop has joined its workers, and a stop waits for a start in progress. So no worker is published or
   launched while a stop withdraws and joins, none a stop has read is forgotten, and no start clears the wake
-  a stop's worker is still waiting on. The lock is re-entrant: a subscriber that the start's offering calls
-  may call ``stop`` on its own thread.
+  a stop's worker is still waiting on. Two kinds of call are never made to wait, since each would wait for ever:
+  a subscriber that a start calls on its own thread (recovery tells the answered ones, the start's offering the
+  requested ones) may call ``stop`` there, and that stop runs at once, joins every worker and stands: the start
+  publishes no worker after it and leaves the queue stopped (``start`` called there is refused). ``start`` and
+  ``stop`` called on a deadline worker's own thread (its sweep tells the answered subscribers) are refused with
+  ``RuntimeError`` at once and change nothing: no thread can join itself, and a worker that waited there could
+  be waiting on a stop that is joining that very worker.
 * ``open_in`` / ``answer_in`` run inside the dispatcher's transaction for approval.open and approval.answer;
   ``list_page`` serves approval.list (summaries only).
 * ``consume(...)`` carries an approved effect out once, against the private binding; every refusal is a
@@ -119,7 +124,10 @@ class ApprovalQueue:
         self._closing = threading.Event()
         self._worker: threading.Thread | None = None
         self._workers: list = []       # every worker a start launched and no stop has joined yet
-        self._lifecycle = threading.RLock()  # held across all of start and all of stop: one at a time
+        self._lifecycle = threading.Lock()  # held across all of start and all of stop: one at a time
+        self._lifecycle_owner = None   # the thread inside start or stop (a subscriber it calls runs on it)
+        self._stops = 0                # stops so far: a start that one ran inside publishes nothing after it
+        self._on_a_worker = threading.local()  # marked on each deadline worker's own thread
         self._generation = None        # the running worker's token; a worker whose token is gone returns
         self._running = False          # started and not stopped: a surface that subscribes now is offered
         self._late = None              # while a start runs: (token, fn) of surfaces that subscribed during it
@@ -141,9 +149,18 @@ class ApprovalQueue:
 
     def start(self, context) -> None:
         """Recover, launch the deadline worker and let the surfaces through (the module text says how a start
-        that fails or is interrupted leaves the queue). One at a time with ``stop``: under ``_lifecycle``."""
+        that fails or is interrupted leaves the queue). One at a time with ``stop``: under ``_lifecycle``.
+        Refused with ``RuntimeError``, nothing changed, inside a start or stop on this thread (a subscriber it
+        calls) and on a deadline worker's thread."""
+        if self._lifecycle_owner == threading.get_ident():
+            raise RuntimeError("the approval queue cannot be started inside its own start or stop")
+        self._refuse_on_a_worker("started")
         with self._lifecycle:
-            self._start(context)
+            try:
+                self._lifecycle_owner = threading.get_ident()
+                self._start(context)
+            finally:
+                self._lifecycle_owner = None
 
     def _start(self, context) -> None:
         if self._store is None:
@@ -157,10 +174,17 @@ class ApprovalQueue:
                 # this start runs (subscribe_requested adds it), so no surface is offered anything during the
                 # start. Inside the guarded region, so a start interrupted even as this is taken lets them go.
                 self._late = list(self._requested)
+                stops = self._stops
             self.recover()
             worker = threading.Thread(target=self._run, args=(generation,), name="approvals-deadlines",
                                       daemon=True)
             with self._lock:
+                if self._stops != stops:
+                    # A stop ran inside this start: a subscriber that recovery told called it, on this thread. It
+                    # stands: no worker is published or launched, the surfaces are let through, and the queue is
+                    # left stopped.
+                    self._late = None
+                    return
                 # Ready before the worker runs, in one step with its generation: from here only this worker
                 # withdraws ready (on a failure) and restores it (after a sweep), so start never overwrites a
                 # failure the worker has already reported, and a worker whose generation has ended changes
@@ -204,9 +228,27 @@ class ApprovalQueue:
         the workers not yet joined are kept, and a second ``stop`` joins them. A worker whose thread never
         launched (its start failed) has nothing to join and is let go; were it to launch late, its generation is
         gone and it returns at once. One at a time with ``start`` (under ``_lifecycle``), so no start publishes
-        or launches a worker while this withdraws and joins."""
+        or launches a worker while this withdraws and joins. Called by a subscriber of a start on that start's own
+        thread, which holds ``_lifecycle`` already, it runs at once, and the start publishes nothing after it.
+        Called on a deadline worker's thread it is refused with ``RuntimeError`` and changes nothing: no thread
+        can join itself, and one waiting there for ``_lifecycle`` could be waiting on a stop joining it."""
+        if self._lifecycle_owner == threading.get_ident():
+            self._stop()  # a subscriber of this thread's own start: the lock is held here already
+            return
+        self._refuse_on_a_worker("stopped")
         with self._lifecycle:
-            self._stop()
+            try:
+                self._lifecycle_owner = threading.get_ident()
+                self._stop()
+            finally:
+                self._lifecycle_owner = None
+
+    def _refuse_on_a_worker(self, what: str) -> None:
+        """A deadline worker's own thread (its sweep tells the answered subscribers) neither starts nor stops
+        the queue: it is refused at once, before it could wait for ``_lifecycle``. The thread's own mark is read,
+        so no lock is taken."""
+        if getattr(self._on_a_worker, "marked", False):
+            raise RuntimeError("the approval queue cannot be %s on its own deadline worker's thread" % what)
 
     def _stop(self) -> None:
         self._withdraw()
@@ -236,6 +278,7 @@ class ApprovalQueue:
             self._running = False
             self._closing.set()
             self._generation = None
+            self._stops += 1
         self._wake.set()
 
     def subscribe_requested(self, fn: Callable[[dict], None]) -> Callable[[], None]:
@@ -446,6 +489,7 @@ class ApprovalQueue:
         other worker still alive (one a later start replaced, or one an interrupted launch kept): a worker that
         wakes to find the queue closing, or its generation gone, sets it again before it returns, so its own
         clear never takes the wake another worker waits on, a stop's above all."""
+        self._on_a_worker.marked = True  # its start or stop calls are refused (see ``stop``)
         while not self._closing.is_set() and self._generation is generation:
             try:
                 with self._store.transaction() as tx:

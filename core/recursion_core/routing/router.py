@@ -325,7 +325,8 @@ def explain(config: Config, detection: object, task: object) -> dict:
     Outcomes: ``chosen``; ``skipped`` (it matched, its engine is not routable, the next was tried; the
     reason is detection's); ``refused`` (it matched, its engine is not routable, and the config refuses);
     ``no_match`` (the reason names the condition that failed: ``task_kind`` or ``tags_all``);
-    ``not_reached`` (a route was chosen or refused before it, or the task itself was refused); ``hand_pick``
+    ``not_reached`` (a route was chosen or refused before it, whatever its own conditions, or the task itself
+    was refused); ``hand_pick``
     (the task carries a hand pick, so no rule and no default is considered). The decision is ``decide``'s:
     the task is read once, and the rows and the decision are both made from that one reading.
     """
@@ -349,12 +350,12 @@ def explain(config: Config, detection: object, task: object) -> dict:
             row.update(outcome="hand_pick", reason=None)
         elif bad_task:
             row.update(outcome="not_reached", reason=decision["code"])
+        elif done:  # the route was chosen or refused before this rule: routing never looked at its conditions
+            row.update(outcome="not_reached", reason=None)
         elif rule.task_kind is not None and kind not in rule.task_kind:
             row.update(outcome="no_match", reason="task_kind")
         elif rule.tags_all is not None and not rule.tags_all <= tags:
             row.update(outcome="no_match", reason="tags_all")
-        elif done:
-            row.update(outcome="not_reached", reason=None)
         elif source in skipped_of and skipped_of[source] is None:
             row.update(outcome="chosen", reason=None)
             done = True

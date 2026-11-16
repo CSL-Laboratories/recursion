@@ -783,6 +783,14 @@ MUTANTS = {
         ' or (reason == "config" and type(rule) is not str)',
         "",
         {"test_a_rule_decision_without_its_rule_gets_no_entry"}),
+    # The Nov 15 integration sweep against master (gpt-6.1-sol): its F2.
+    "M112 rules after the chosen or refused route explained by their own conditions": (
+        ROUTER,
+        "        elif done:  # the route was chosen or refused before this rule: routing never looked at its conditions\n"
+        '            row.update(outcome="not_reached", reason=None)\n',
+        "",
+        {"test_f2_rules_after_a_chosen_rule_are_not_reached",
+         "test_rules_after_a_refused_rule_are_not_reached_whatever_their_conditions"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

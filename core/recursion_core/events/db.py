@@ -6,6 +6,8 @@ THE PROTOCOL (the lanes' preamble, version 3.3, "Shared state"; these are the pu
                                       commit; anyone else takes part only by being passed tx. A normal exit
                                       commits; an exception rolls back and is raised again. A second
                                       transaction() in the same thread raises ``nested_transaction``.
+                                      Only the opening thread ends it: an exit from another thread is
+                                      refused (``transaction_not_active_for_caller``) and changes nothing.
         tx.append(event)              one event.v1 without ``seq`` and ``time``; both are assigned here.
                                       Returns the event's seq in its log.
         tx.receipt_get(tenant, method, command_id)
@@ -65,7 +67,11 @@ mode. An I/O error, corruption or a failed rollback marks the store FAILED: ever
 raises ``store_failed`` until the store is opened again (after a failed sync the page cache cannot be
 trusted). A COMMIT that raises is ``CommitUnknown`` (``commit_outcome_unknown``): the transaction may or
 may not be durable, the store is failed, and the caller must not treat it as rolled back; after a reopen
-a retry with the same command_id finds the receipt if it committed.
+a retry with the same command_id finds the receipt if it committed. An interruption (KeyboardInterrupt or
+SystemExit, an exception that is not an ``Exception``) is never turned into another error. One that arrives
+after ``BEGIN`` rolls that transaction back and gives up the helper's lock before it is raised again, so the next
+owner finds no transaction left open in the connection. One at a COMMIT fails the store the same way
+(``commit_outcome_unknown``: the commit may have happened) and is raised as itself.
 
 WHAT THIS DOES NOT GIVE. Subscribers are callbacks of this process: one that has not run when the process
 dies does not run; a consumer that must not miss an event reads the log from a stored position (lane
@@ -410,7 +416,11 @@ class _Opening:
         return self._tx
 
     def __exit__(self, kind, exc, tb) -> bool:
-        tx, self._tx = self._tx, None
+        tx = self._tx
+        if tx is not None and threading.get_ident() != tx._owner:
+            # Only the opening thread ends it (Transaction's own rule); the transaction stays its owner's.
+            raise StoreError('transaction_not_active_for_caller')
+        self._tx = None
         if tx is not None:
             self._store._end(tx, exc)
         return False
@@ -624,11 +634,15 @@ class EventStore:
                 self._statement('BEGIN IMMEDIATE')
                 tx = Transaction(self)
                 _HELD.store = self
+                return tx
             except BaseException:
+                # Whatever ended the opening after BEGIN, an interruption included: roll back what the connection
+                # holds open, so that the next owner does not find this transaction still in it.
+                _HELD.store = None
+                self._rollback(counted=False)
                 with self._guard:
                     self._open_count -= 1
                 raise
-            return tx
         except BaseException:
             self._lock.release()
             raise
@@ -670,6 +684,8 @@ class EventStore:
             with contextlib.suppress(Exception):
                 if self._conn.in_transaction:
                     self._conn.execute('ROLLBACK')
+            if not isinstance(exc, Exception):
+                raise                           # an interruption stays itself; the store is failed all the same
             raise CommitUnknown('commit_outcome_unknown') from exc
         self._commits += 1
         if tx._events:
@@ -718,8 +734,10 @@ class EventStore:
     def subscribe(self, fn: Callable[[tuple], object]) -> Callable[[], None]:
         """Call ``fn(events)`` with the events of each commit that appended any, after the commit, outside every
         lock of the helper, in commit order, one commit at a time. Each call gets its own copies. A subscriber
-        that raises is logged and does not affect the commit, the caller or another subscriber. Returns a
-        function that unsubscribes."""
+        that raises is logged and does not affect the commit, the caller or another subscriber, whatever it
+        raises (``asyncio.CancelledError`` included) except an interruption (KeyboardInterrupt, SystemExit). An
+        interruption is raised to the thread that delivers; the rest of that batch is not delivered, and the
+        batches still queued go out with the next commit. Returns a function that unsubscribes."""
         if not callable(fn):
             raise TypeError('a subscriber is a function of one argument')
         entry = (object(), fn)       # a registration of its own: the same function may subscribe twice
@@ -751,7 +769,9 @@ class EventStore:
                 for fn in subscribers:
                     try:
                         fn(tuple(json.loads(text) for text in batch))
-                    except Exception:    # noqa: BLE001 - a subscriber's failure is its own
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except BaseException:    # noqa: BLE001 - a subscriber's failure is its own, CancelledError too
                         LOG.exception('an event-store subscriber failed')
         except BaseException:
             with self._publish_guard:
@@ -839,6 +859,8 @@ class EventStore:
             with contextlib.suppress(Exception):
                 if conn.in_transaction:
                     conn.execute('ROLLBACK')
+            if not isinstance(exc, Exception):
+                raise                           # an interruption stays itself; the store is failed all the same
             raise CommitUnknown('commit_outcome_unknown') from exc
         return frozenset(added)
 

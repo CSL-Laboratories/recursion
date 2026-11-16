@@ -12,9 +12,9 @@ issues and PRs.
   comment on the matching CSL Linear issue, so the Linear bot notifies them. A GitHub
   mention alone is not enough. Current Linear handles (check Linear if ownership has
   changed): Chaandan = @chaandansaini101, Samir = @samirshahahmed, Lucas =
-  @lucassalvador987. This applies to interactive agents and Grok Bot. The GitHub-only
-  Claude Code Action fixer has no Linear tooling; it replies on the PR threads, and the
-  PR author relays anything it cannot fix to the Linear issue.
+  @lucassalvador987. This applies to interactive agents and Grok Bot. The Devin
+  reviewer (a GitHub App) has no Linear tooling; the PR author relays any of its findings
+  that need a decision to the Linear issue.
 - **Formal GitHub review requests.** Every review ask also needs a formal GitHub
   review request, not only the Linear @mention above. Use
   `gh pr edit <n> --add-reviewer samir-shah-ahmed,CDanTheMan` (whichever
@@ -181,8 +181,8 @@ See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-
 
 ## Review loop
 
-See [AGENTS.md#review-loop](AGENTS.md#review-loop). The stuck-thread author
-fallback lives in [When Claude can't fix a review thread](AGENTS.md#when-claude-cant-fix-a-review-thread).
+See [AGENTS.md#review-loop](AGENTS.md#review-loop) and
+[When a review thread stays open](AGENTS.md#when-a-review-thread-stays-open).
 
 ## Run a gate
 

@@ -351,3 +351,95 @@ test("a Stop the daemon answered with null is shown as that answer, not as a Sto
   assert.equal(entry.children[0].textContent, `Stop of session ${sessionId}, answer code None`);
   assert.match(entry.textContent, /REFUSED the answer is not an object/);
 });
+
+// The GitHub Codex reviewer's thread on #390 (app.js line 42): a local refusal is the outcome of one call. A
+// newer call of the same action makes it obsolete and takes it off the status line; a call never clears or
+// shows another action's refusal, and an older call's refusal that arrives after a newer call began is not
+// shown. A started run is acknowledged where the start was asked.
+function startWindowWith(extra = [], held = null) {
+  const replay = replayTransport([
+    { method: "run.list", params: {}, answer: { code: "ok", runs: [] } },
+    { method: "route.list", params: {}, answer: { code: "ok", routes: [] } },
+    { method: "run.start", params: { tenant: "t1", engine: "codex", prompt: "hi" }, answer: recorded("c01-run-start-started.json") },
+    ...extra,
+  ]);
+  if (held === null) return replay;
+  return {
+    calls: replay.calls,
+    async call(method, params) {
+      if (method === "run.start") await held;
+      return replay.call(method, params);
+    },
+  };
+}
+
+function fillStart(doc, tenant) {
+  byId(doc, "start-tenant").value = tenant;
+  byId(doc, "start-engine").value = "codex";
+  byId(doc, "start-prompt").value = "hi";
+}
+
+test("a refused start is no longer shown once a corrected start is sent, and the started run is acknowledged", async () => {
+  const started = recorded("c01-run-start-started.json");
+  const doc = windowDocument();
+  await startWindow(doc, startWindowWith());
+  await press(doc, nav(doc, "start"));
+  await press(doc, byId(doc, "start-run"));
+  assert.match(text(doc, "status-line"), /^Not sent: tenant must be non-empty text\.$/);
+  fillStart(doc, "t1");
+  await press(doc, byId(doc, "start-run"));
+  assert.equal(text(doc, "status-line"), "", "the obsolete refusal is taken off the status line");
+  assert.match(text(doc, "start-conditions"), new RegExp(`STARTED run=${started.run.run_id} started duplicate=False`));
+});
+
+test("another action's success leaves a start's refusal on the status line", async () => {
+  const doc = windowDocument();
+  await startWindow(doc, startWindowWith());
+  await press(doc, nav(doc, "start"));
+  await press(doc, byId(doc, "start-run"));
+  await press(doc, nav(doc, "runs"));
+  await press(doc, byId(doc, "runs-refresh"));
+  assert.match(text(doc, "status-line"), /^Not sent: tenant must be non-empty text\.$/);
+});
+
+test("an older start refused after a newer start was sent is not shown, and the newer start is acknowledged", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const doc = windowDocument();
+  await startWindow(doc, startWindowWith([], gate));
+  await press(doc, nav(doc, "start"));
+  fillStart(doc, "t-unrecorded");
+  const older = press(doc, byId(doc, "start-run"));
+  fillStart(doc, "t1");
+  const newer = press(doc, byId(doc, "start-run"));
+  release();
+  await Promise.all([older, newer]);
+  assert.equal(text(doc, "status-line"), "", "the older call's refusal is obsolete");
+  assert.match(text(doc, "start-conditions"), /STARTED run=/);
+});
+
+test("a newer start that is refused shows its own refusal, whatever an older start answers", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const doc = windowDocument();
+  await startWindow(doc, startWindowWith([], gate));
+  await press(doc, nav(doc, "start"));
+  fillStart(doc, "t1");
+  const older = press(doc, byId(doc, "start-run"));
+  fillStart(doc, "t-unrecorded");
+  const newer = press(doc, byId(doc, "start-run"));
+  release();
+  await Promise.all([older, newer]);
+  assert.equal(text(doc, "status-line"), "Not sent: no recorded exchange for run.start.");
+});
+
+test("a start that is refused by the daemon is not acknowledged as started", async () => {
+  const doc = windowDocument();
+  await startWindow(doc, startWindowWith([{ method: "run.start", params: { tenant: "t2", engine: "codex", prompt: "hi" },
+    answer: { code: "start_failed", start_error: { code: "launch_refused", detail: "breaker_admission_missing" } } }]));
+  await press(doc, nav(doc, "start"));
+  fillStart(doc, "t2");
+  await press(doc, byId(doc, "start-run"));
+  assert.match(text(doc, "start-conditions"), /start error: launch_refused breaker_admission_missing/);
+  assert.doesNotMatch(text(doc, "start-conditions"), /STARTED/);
+});

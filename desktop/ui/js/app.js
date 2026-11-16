@@ -17,17 +17,29 @@ import {
 export function startWindow(doc, transport, actions = makeActions()) {
   const $ = (id) => doc.getElementById(id);
 
-  function say(text) {
+  // The status line shows the local refusal ("Not sent: ...") of one call of one action. Each call is
+  // numbered. A newer call of the same action makes that refusal obsolete and takes it off the line when it
+  // begins, and an older call's refusal that arrives after a newer call of its action began is not shown. A
+  // call never clears or shows another action's refusal.
+  let callCount = 0;
+  const latestCall = new Map();
+  let shownAction = null;
+
+  function say(text, action) {
     $("status-line").textContent = text;
+    shownAction = action;
   }
 
   // A call that is not sent answers null and says why in the status line. `refused`, when given, receives
   // that reason for this call alone ({ text }): the status line is shared, so a caller with several calls in
   // flight must not read it back.
   async function ask(action, input = {}, refused = null) {
+    const call = ++callCount;
+    latestCall.set(action, call);
+    if (shownAction === action) say("", null);
     const notSent = (err) => {
       const text = `Not sent: ${err.message}.`;
-      say(text);
+      if (latestCall.get(action) === call) say(text, action);
       if (refused !== null) refused.text = text;
       return null;
     };
@@ -137,7 +149,26 @@ export function startWindow(doc, transport, actions = makeActions()) {
       client_key: $("start-client-key").value || undefined,
     };
     const answer = await ask("run.start", input);
-    if (answer) renderConditions(doc, $("start-conditions"), answer, "run.start");
+    if (answer) {
+      renderConditions(doc, $("start-conditions"), answer, "run.start");
+      acknowledgeStart(answer);
+    }
+  }
+
+  // A started run says so where the start was asked: its answer has no condition to show, and an operator who
+  // sees nothing may start it again.
+  function acknowledgeStart(answer) {
+    if (answer.code !== "started") return;
+    const run = answer.run !== null && typeof answer.run === "object" ? answer.run : {};
+    const item = doc.createElement("li");
+    item.setAttribute("data-label", "STARTED");
+    const label = doc.createElement("strong");
+    label.textContent = "STARTED";
+    item.appendChild(label);
+    let words = ` run=${field(run.run_id)} started`;
+    if (Object.prototype.hasOwnProperty.call(answer, "duplicate")) words += ` duplicate=${field(answer.duplicate)}`;
+    item.appendChild(doc.createTextNode(words));
+    $("start-conditions").children[0].appendChild(item);
   }
 
   async function refreshStart() {

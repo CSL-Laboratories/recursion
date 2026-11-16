@@ -5,7 +5,8 @@ descendant even when it leaves the command's process group or session (``setsid`
 process's parent ends, it is handed to this keeper, not to init. When the command's shell ends, or when the
 keeper is told to stop (SIGTERM, which the loop sends at the deadline or on an interrupt), it kills every
 descendant it still has, reaps them, and ends the way the shell ended (its exit status, or the same signal), so
-the loop sees the command's own status. What it cannot stop, it does not claim to: a process that made itself a
+the loop sees the command's own status. If it cannot make itself the subreaper (checked by reading the setting
+back), it does not start the command: it says so on standard error and exits with status 125. What it cannot stop, it does not claim to: a process that made itself a
 subreaper of its own, or one that runs as another user, is outside its reach.
 
 Standard library only, and nothing from the loop: it runs in a fresh interpreter started with ``-I -S``.
@@ -18,6 +19,8 @@ import sys
 import time
 
 PR_SET_CHILD_SUBREAPER = 36
+PR_GET_CHILD_SUBREAPER = 37
+REFUSED = 125  # the exit status when the command was not started
 KILL_ROUNDS_S = 2.0  # how long it keeps killing what is left (a process that forks while it is being killed)
 
 
@@ -80,12 +83,26 @@ def _kill_all():
     _reap()
 
 
+def _become_subreaper():
+    """True when this process is now the subreaper of what it starts, read back from the kernel."""
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            return False
+        flag = ctypes.c_int(0)
+        return libc.prctl(PR_GET_CHILD_SUBREAPER, ctypes.byref(flag), 0, 0, 0) == 0 and flag.value == 1
+    except (OSError, AttributeError, TypeError, ValueError):
+        return False
+
+
 def main():
     signal.signal(signal.SIGTERM, _on_term)
-    try:
-        ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
-    except (OSError, AttributeError):
-        pass  # no subreaper: what leaves the chain of parents is not followed
+    if not _become_subreaper():
+        # Without it, what leaves the chain of parents would not be followed: the command is not started (astra C2).
+        os.write(2, b"the command was not run: its keeper could not make itself the subreaper of what it starts\n")
+        os._exit(REFUSED)
+        return
     status = None
     try:
         shell = os.fork()

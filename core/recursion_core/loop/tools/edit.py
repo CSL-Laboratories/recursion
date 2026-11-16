@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from recursion_core.loop.providers import base as b
-from recursion_core.loop.tools.files import atomic_write, read_fresh, request_facts, resolve_writable
+from recursion_core.loop.tools.files import atomic_write, keep_approved, read_fresh, request_facts, resolve_writable
 from recursion_core.loop.tools.registry import Tool, ToolContext, ToolOutput
 from recursion_core.loop.tools.workspace import ToolError
 
@@ -91,6 +91,7 @@ def _snippet(new_text: str, at: int) -> str:
 
 def run(args: Mapping[str, Any], ctx: ToolContext) -> ToolOutput:
     path, text, new_text, n = _plan(args, ctx)
+    keep_approved(ctx, args["path"], path)
     ctx.cancel.raise_if_cancelled()
     atomic_write(ctx.workspace, path, new_text.encode("utf-8"))
     at = text.find(args["old_string"])

@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from recursion_core.loop.providers import base as b
-from recursion_core.loop.tools.files import atomic_write, read_fresh, request_facts, resolve_writable
+from recursion_core.loop.tools.files import atomic_write, keep_approved, read_fresh, request_facts, resolve_writable
 from recursion_core.loop.tools.registry import Tool, ToolContext, ToolOutput
 
 SPEC = b.ToolSpec(
@@ -45,6 +45,7 @@ def precheck(args: Mapping[str, Any], ctx: ToolContext) -> Mapping[str, str] | N
 def run(args: Mapping[str, Any], ctx: ToolContext) -> ToolOutput:
     ws = ctx.workspace
     path = resolve_writable(ws, args["path"])
+    keep_approved(ctx, args["path"], path)
     shown = ws.display(path)
     before = read_fresh(ws, path) if _existing(ws, path) else None
     ctx.cancel.raise_if_cancelled()

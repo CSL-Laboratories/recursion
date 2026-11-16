@@ -22,7 +22,9 @@ shows that copy, a later change to the caller's objects (a nested list included)
 approval without a bound input runs a fresh copy of it.
 
 When the tool's precheck names facts the model's input does not show (the file a path leads to through a link),
-they are written on the request beside the input (``resolved_path``). A
+they are written on the request beside the input (``resolved_path``). Only the names in ``REQUEST_FACTS`` are
+written, and only as JSON values: any other name (one that would collide with a field of the request, such as
+``input`` or ``tool``) or a value that is not JSON is refused before anything is asked (``check_facts``). A
 call larger than approval.v1's provisional size limit (262,144 bytes of tool, directory and input) is denied
 without asking, because the core would refuse to draw it; the model is told to send it in smaller parts.
 
@@ -46,6 +48,7 @@ DEFAULT_DEADLINE_S = 900.0  # approval.v1's examples expire after fifteen minute
 MAX_EFFECT_BYTES = 262_144  # approval.v1, PROVISIONAL
 ASK, FULL_ACCESS = "ask", "full_access"
 REQUEST_ID_MAX = 256  # approval.v1 binding: engine_request_id
+REQUEST_FACTS = frozenset({"resolved_path"})  # the facts a request may show beside the input
 
 APPROVED, DENIED, EXPIRED, TOO_LARGE, MISMATCH, CANCELLED = (
     "approved", "denied", "expired", "too_large", "bound_input_differs", "cancelled")
@@ -94,6 +97,26 @@ def snapshot(value: Any) -> Any:
     return value
 
 
+def check_facts(facts: Any) -> dict[str, Any] | None:
+    """The facts a precheck named, as a request may show them: None when there are none (or the precheck returned
+    something that is not a mapping, which is ignored), else an independent copy. Raises ValueError for a name
+    outside ``REQUEST_FACTS`` or a value that is not JSON (DeepSeek N2): the call is then refused, never asked."""
+
+    if not isinstance(facts, Mapping) or not facts:
+        return None
+    checked = {}
+    for name, value in facts.items():
+        if name not in REQUEST_FACTS:
+            raise ValueError(f"a permission request cannot show a fact named {name!r}")
+        value = snapshot(value)
+        try:
+            json.dumps(value, allow_nan=False)
+        except (TypeError, ValueError):
+            raise ValueError(f"the fact {name!r} is not a JSON value") from None
+        checked[name] = value
+    return checked
+
+
 @dataclass
 class _Pending:
     request_id: str
@@ -125,7 +148,8 @@ class PermissionGate:
     def ask(self, turn_id: str, call: b.ToolCall, cwd: str, cancel: b.CancelToken,
             facts: Mapping[str, Any] | None = None) -> Decision:
         """Ask for one call and wait. Called on the turn's thread. ``facts`` (from the tool's precheck) are
-        written on the request beside the input."""
+        written on the request beside the input; facts ``check_facts`` refuses raise ValueError before anything is
+        asked."""
 
         args = snapshot(dict(call.input or {}))  # this copy is the request; nothing outside holds it
         size = len(json.dumps({"tool": call.name, "cwd": cwd, "input": args}, ensure_ascii=False,
@@ -134,7 +158,7 @@ class PermissionGate:
             return Decision(TOO_LARGE)
         if cancel.cancelled:
             return Decision(CANCELLED)  # nothing is asked for a turn that has been interrupted
-        extra = {k: snapshot(v) for k, v in facts.items()} if facts else {}
+        extra = check_facts(facts) or {}
         request_id = self._mint()
         if self.profile == FULL_ACCESS:
             self._writer.write("permission_request", turn_id=turn_id, request_id=request_id, call_id=call.call_id,
@@ -153,9 +177,14 @@ class PermissionGate:
 
         unregister = cancel.on_cancel(on_cancel)
         try:
-            self._writer.write("permission_request", turn_id=turn_id, request_id=request_id, call_id=call.call_id,
-                               tool=call.name, cwd=cwd, input=snapshot(args), profile=ASK,
-                               deadline_s=self.deadline_s, **extra)
+            with self._lock:
+                # Cancelled after the check above, before the callback was in place: the callback has already
+                # decided it, and nothing is asked (astra C5, DeepSeek N3).
+                decided = pending.decision is not None
+            if not decided:
+                self._writer.write("permission_request", turn_id=turn_id, request_id=request_id,
+                                   call_id=call.call_id, tool=call.name, cwd=cwd, input=snapshot(args), profile=ASK,
+                                   deadline_s=self.deadline_s, **extra)
             while True:
                 with self._lock:
                     self._expire(pending)

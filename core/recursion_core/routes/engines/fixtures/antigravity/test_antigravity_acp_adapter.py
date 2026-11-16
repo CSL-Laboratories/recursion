@@ -490,5 +490,117 @@ class ReviewRoundThree411Test(unittest.TestCase):
         req["tenant"], req["prompt"] = LyingStr(req["tenant"]), LyingStr(req["prompt"])
         self.assertEqual(rig.run(req)["detail"], "tenant")
 
+
+class CodexRoundOne411Test(unittest.TestCase):
+    """#411's first Codex reads at 15b4b2ee (astra R1-R3, sol R1-R5). Each fails on 15b4b2ee unless marked a
+    guard (a guard holds a rule a removal probe needs)."""
+
+    SPLIT_KEY = "synthetic-a\ufffdb"              # made up; custody's contract admits any non-empty str
+    AGENT_SPELLING = "synthetic-a" + chr(0xD800) + "b"
+
+    def refused_authenticate(self, rig, message):
+        rig.agent._accept = set()
+        read = rig.agent.read_line
+
+        def read_line(timeout_s):
+            line = read(timeout_s)
+            if line is not None and '"error"' in line:
+                parsed = json.loads(line)
+                parsed["error"]["message"] = message
+                line = json.dumps(parsed)
+            return line
+        rig.agent.read_line = read_line
+
+    def test_r1_a_replaced_surrogate_never_spells_the_key_on_any_branch(self) -> None:
+        branches = {
+            "a turn's text": ([[("chunk", self.AGENT_SPELLING), ("end", "end_turn")]], "text"),
+            "a failed turn's detail": ([[("error", -32603, self.AGENT_SPELLING)]], "detail"),
+            "a client failure's detail": ([[("chunk", "hi"), ("end", "end_turn")]], "detail"),
+        }
+        for name, (scripts, field) in branches.items():
+            with self.subTest(name):
+                rig = Rig(scripts, key=self.SPLIT_KEY, methods=("gemini-api-key",))
+                if name == "a client failure's detail":
+                    self.refused_authenticate(rig, self.AGENT_SPELLING)
+                res = rig.run(request())
+                self.assertNotIn(self.SPLIT_KEY, res[field] or "")
+                json.dumps(res, ensure_ascii=False).encode("utf-8")
+
+    def test_r2_a_deadline_crossed_while_the_text_is_finished_is_deadline_exceeded_and_fenced(self) -> None:
+        rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+        deadline = rig.agent.clock() + 60
+        close = rig.agent.close_stdin
+
+        def slow_close():                             # the input's closing takes the run past its deadline
+            close()
+            rig.agent.clock.advance(61)
+        rig.agent.close_stdin = slow_close
+        res = rig.run(request(), deadline)
+        self.assertEqual(res["code"], c.DEADLINE_EXCEEDED)
+        self.assertEqual(rig.agent.fenced, ["deadline"])
+        self.assertNotIn("text", {k for k, v in res.items() if v})
+
+    def test_r2_guard_a_turn_finished_in_time_succeeds(self) -> None:
+        rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+        res = rig.run(request())
+        self.assertEqual((res["code"], res["text"], rig.agent.fenced), (None, "hi", []))
+
+    def test_r3_the_shared_request_checks_come_before_the_acp_preconditions(self) -> None:
+        bad = {
+            "an empty model": (("route", "model"), "", "route.model"),
+            "a wrong contract": (("contract",), "route.v0-not", "contract"),
+            "an empty tenant": (("tenant",), "", "tenant"),
+            "an empty prompt": (("prompt",), "", "prompt"),
+            "a bad deadline_s": (("deadline_s",), 0, "deadline_s"),
+            "no connection id": (("route", "connection", "id"), "", "route.connection"),
+        }
+        for home in (prepared, None):
+            for name, (path, value, detail) in bad.items():
+                with self.subTest(name, home=home is not None):
+                    rig = Rig([[("chunk", "hi"), ("end", "end_turn")]], home=home)
+                    req = request(cwd=...)                        # no cwd either: the shared check comes first
+                    holder = req
+                    for key in path[:-1]:
+                        holder = holder[key]
+                    holder[path[-1]] = value
+                    res = rig.run(req)
+                    self.assertEqual((res["code"], res["detail"]), (c.REQUEST_INVALID, detail))
+                    self.assertEqual((rig.launches, rig.custody), ([], []))
+        with self.subTest("a bad deadline_at"):
+            rig = Rig([[("chunk", "hi"), ("end", "end_turn")]], home=None)
+            res = rig.run(request(), float("nan"))
+            self.assertEqual((res["code"], res["detail"]), (c.REQUEST_INVALID, "deadline_at"))
+
+    def test_r3_a_request_id_that_is_not_a_str_is_refused_and_never_echoed(self) -> None:
+        for rid in (5, True, {"id": "r1"}, ["r1"], None):
+            for home, cwd in ((prepared, ...), (None, CWD), (prepared, CWD)):
+                with self.subTest(rid=rid, home=home is not None, cwd=cwd is not ...):
+                    rig = Rig([[("chunk", "hi"), ("end", "end_turn")]], home=home)
+                    req = request(cwd=cwd)
+                    req["request_id"] = rid
+                    res = rig.run(req)
+                    self.assertEqual((res["code"], res["detail"], res["request_id"]),
+                                     (c.REQUEST_INVALID, "request_id", ""))
+                    self.assertEqual(rig.launches, [])
+
+    def test_r3_guard_a_well_formed_run_built_by_the_engine_table_keeps_its_precondition(self) -> None:
+        for method, kind, cred in (("gemini-api-key", "api_key", "GEMINI_API_KEY"),
+                                   ("oauth-business", "subscription", None)):
+            with self.subTest(method=method):
+                rig = Rig([[("chunk", "hi"), ("end", "end_turn")]], home=None)
+                res = rig.run(request(method, kind, cred))
+                self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, ag.NO_RUN_FOLDER))
+
+    def test_r4_the_connections_kind_and_credential_name_are_read_as_exactly_a_str(self) -> None:
+        for name in ("kind", "credential_env"):
+            with self.subTest(field=name):
+                rig = Rig([[("chunk", "hi"), ("end", "end_turn")]])
+                req = request()
+                req["route"]["connection"][name] = LyingStr(req["route"]["connection"][name])
+                res = rig.run(req)
+                self.assertEqual((res["code"], res["detail"]), (c.REQUEST_INVALID, "route.connection." + name))
+                self.assertEqual((rig.launches, rig.custody), ([], []))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -620,6 +620,18 @@ class AntigravityOneShotAdapter(RouteAdapter):
         (``engine_unknown``), not this adapter's. ``deadline_at`` must be a finite number of the clock's
         seconds, or the request is refused the same way: no child starts with a deadline that cannot end it.
         Whatever escapes once a child has started fences it first."""
+        refused = self._refused(request, deadline_at)
+        if refused is not None:
+            return refused
+        rid = request["request_id"]
+        # The base class's loop, with one difference: the key selected for this run decides the launcher (the
+        # output boundary) and what the parser and the result mask, and it never leaves this call.
+        return self._launched(rid, request, deadline_at)
+
+    def _refused(self, request, deadline_at) -> dict | None:
+        """The request's shape and ``deadline_at``, as ``run`` describes them: the refusal, or None. A
+        ``request_id`` that is not a non-empty str is never echoed (the refusal carries ``""``). Every adapter
+        of this module calls it before anything of its own."""
         rid = request.get("request_id") if isinstance(request, Mapping) else None
         rid = rid if isinstance(rid, str) and rid else ""
         if not isinstance(request, Mapping) or not rid:
@@ -644,10 +656,11 @@ class AntigravityOneShotAdapter(RouteAdapter):
         if (not isinstance(route.get("connection"), Mapping) or not isinstance(route["connection"].get("id"), str)
                 or not route["connection"]["id"]):
             return c.result(rid, c.REQUEST_INVALID, detail="route.connection")
-        if not isinstance(route.get("model"), str):
+        if not isinstance(route.get("model"), str) or not route["model"]:
             return c.result(rid, c.REQUEST_INVALID, detail="route.model")
-        # The base class's loop, with one difference: the key selected for this run decides the launcher (the
-        # output boundary) and what the parser and the result mask, and it never leaves this call.
+        return None
+
+    def _launched(self, rid, request, deadline_at) -> dict:
         try:
             argv = self.argv(request)
             env, secret = self._prepare(request)
@@ -1439,7 +1452,9 @@ class AntigravityAcpAdapter(AntigravityOneShotAdapter):
     ``contract``, ``route.model``, ``route.auth_method``, ``route.connection`` ``kind``, ``id`` and
     ``credential_env``) must be exactly a ``str``.
 
-    The turn's text and a failure's detail are masked (``mask``) and never keep a lone surrogate. Nothing is
+    The turn's text and a failure's detail are masked (``mask``), never keep a lone surrogate, and are masked
+    again once a lone surrogate is replaced (``_final_text``). A run whose input closing or text finishing
+    ends at or after its deadline is ``deadline_exceeded``, its child fenced, never a success. Nothing is
     drafted: this adapter returns the turn's text only (``AcpDrafts`` is a driver's, for a drive that
     publishes events).
 
@@ -1454,13 +1469,16 @@ class AntigravityAcpAdapter(AntigravityOneShotAdapter):
                 request = _request_once(request)
             except _RequestRefused as err:
                 return c.result(err.request_id, err.code, detail=err.detail)
-            rid, cwd = request.get("request_id"), request.get("cwd")
-            # _request_once has refused a str subclass: a str here is exactly one
-            if rid and not (isinstance(cwd, str) and cwd.startswith("/") and "\x00" not in cwd):
-                return c.result(rid, c.REQUEST_INVALID, detail=NO_CWD)
-            if rid and self._prepared_home is None:     # as the engine table builds it: the precondition refuses
-                return c.result(rid, c.LAUNCH_REFUSED, detail=NO_RUN_FOLDER)
-        return super().run(request, deadline_at)
+        refused = self._refused(request, deadline_at)   # the shared shape and deadline checks come first
+        if refused is not None:
+            return refused
+        rid, cwd = request["request_id"], request.get("cwd")
+        # _request_once has refused a str subclass: a str here is exactly one
+        if not (isinstance(cwd, str) and cwd.startswith("/") and "\x00" not in cwd):
+            return c.result(rid, c.REQUEST_INVALID, detail=NO_CWD)
+        if self._prepared_home is None:     # as the engine table builds it: the precondition refuses
+            return c.result(rid, c.LAUNCH_REFUSED, detail=NO_RUN_FOLDER)
+        return self._launched(rid, request, deadline_at)
 
     def argv(self, request: dict) -> list[str]:
         route_method(request["route"])
@@ -1477,13 +1495,22 @@ class AntigravityAcpAdapter(AntigravityOneShotAdapter):
         except acp.AcpError as err:
             code = err.code if err.code in c.CODES else c.ENGINE_ERROR
             process.fence(code)
-            return c.result(rid, code, events=events, detail=_writable(mask(err.detail, forms)))
+            return c.result(rid, code, events=events, detail=_final_text(err.detail, forms))
         if outcome.code is None:
             session.close()
-            return c.result(rid, None, text=_writable(mask(outcome.text, forms)), events=events)
+            text = _final_text(outcome.text, forms)
+            if self._clock() >= deadline_at:     # closing the input or finishing the text ran past the deadline
+                raise Deadline()
+            return c.result(rid, None, text=text, events=events)
         code = c.ENGINE_ERROR if outcome.code == CANCELLED or outcome.code not in c.CODES else outcome.code
         process.fence(code)
-        return c.result(rid, code, events=events, detail=_writable(mask(outcome.detail, forms)))
+        return c.result(rid, code, events=events, detail=_final_text(outcome.detail, forms))
+
+
+def _final_text(text: str, forms) -> str:
+    """A result's text as returned: masked, made writable (a lone surrogate as U+FFFD), then masked again as it
+    now stands, since the replacement can spell a value the first mask did not see."""
+    return mask(_writable(mask(text, forms)), forms)
 
 
 _EXACT_STR = ("request_id", "tenant", "prompt", "cwd", "contract")

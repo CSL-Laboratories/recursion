@@ -56,6 +56,7 @@ class _Output:
         self.sanitizer = OutputSanitizer()
         self.events = 0
         self.dropped = 0
+        self.left = 0  # finished lines the deque no longer keeps (a transcript pane says so; Devin's thread on #405)
         self.label = f"output run={field(run_id)}: "
         # The display rows of each retained line at one width, kept beside the lines, so a frame need not wrap
         # the whole history to count it or show its newest rows (review 2 of #404, Astra 3). They are counted
@@ -98,8 +99,11 @@ class _Output:
         return chunk, done
 
     def extend(self, rows: list[str]) -> None:
-        """Rows that are display text already (a transcript's), kept as finished lines, counted as they are."""
+        """Rows that are display text already (a transcript's), kept as finished lines, counted as they are;
+        ``left`` counts the ones that push older lines out of the pane."""
 
+        if self.lines.maxlen is not None:
+            self.left += max(0, len(self.lines) + len(rows) - self.lines.maxlen)
         # As feed does: "not counted" BEFORE the lines change, and counted again only once the counts are beside
         # them (#404's round 3, Astra's required 1, for feed; the same order here).
         width, self._width = self._width, -1
@@ -464,7 +468,10 @@ class TuiApp:
             self._error(f"transcript session={field(sid)}: the answer was not taken ({problem}): nothing shown, "
                         f"the cursor stays at seq {transcript.cursor['seq']}; transcript {field(sid)} reads again")
             return
-        lines = transcript.apply(answer, params["cursor"]["seq"])
+        asked = params["cursor"]["seq"]
+        if type(asked) is int and asked > transcript.furthest_ask():
+            return  # asked before the view began again: dropped whole, with its more and its epoch (Devin, #405)
+        lines = transcript.apply(answer, asked)
         if lines is None:  # the log no longer holds the last line shown as it was shown
             self._rebuild(sid, transcript, transcript.broken)
             return
@@ -1135,9 +1142,11 @@ class TuiApp:
                 pager = (f" [pager: {self.scroll} rows up, G follows]" if self.scroll else " [pager: following]")
             if self.pane is SESSION_LIST:
                 head = "-- sessions (session.list: live, at most 20; transcript SESSION shows one; display only)"
-            elif self.pane is not None:
+            elif self.pane is not None:  # lines that left the pane are said, never dropped in silence (Devin, #405)
+                left = out.left if out else 0
                 head = (f"-- transcript session={field(self.pane)} (the daemon's lines; engine text untrusted, "
-                        f"display only)")
+                        f"display only" + (f"; {left} earlier rows are not kept in this pane, --plain prints "
+                                           f"every line" if left else "") + ")")
             else:
                 head = (f"-- output run={field(self.attached) if self.attached else 'none'} (untrusted engine "
                         f"text, display only)" + (f" skipped_events={self.skipped_events}"

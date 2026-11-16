@@ -55,7 +55,10 @@ checks that both settings took effect, that the file, its WAL and shared-memory 
 regular files of this user that nobody else can read or write (one that is open to others is refused, not
 narrowed), that the file is this store's (``application_id``) and passes ``quick_check``, takes an
 exclusive ``flock`` on ``<path>.lock`` for the life of the store (one writer process), and raises the epoch
-by one. The kill -9, full file system and file-size-limit tests in ``events/tests/test_durability.py`` are
+by one. A store is made only in a file this opening created. A file that exists and holds nothing (emptied, or
+its first opening did not finish) is refused (``store_empty``) and never made again over, which would lose its
+receipts and events without a word: remove it to start a new store. A store without its epoch is refused
+(``store_epoch_missing``). The kill -9, full file system and file-size-limit tests in ``events/tests/test_durability.py`` are
 the evidence; a power cut was not emulated.
 
 FAILURES. A statement that fails inside a transaction raises to the block; the transaction is rolled back
@@ -161,6 +164,17 @@ class Receipt(NamedTuple):
 # ------------------------------------------------------------------------- which thread holds what
 
 _HELD = threading.local()
+
+
+def _where(tb) -> str:
+    """Where an exception was raised, as ``file:line in function`` for each frame, oldest first: no value and no
+    exception text, which can carry what an event held."""
+    out = []
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        out.append(f'{code.co_filename}:{tb.tb_lineno} in {code.co_name}')
+        tb = tb.tb_next
+    return '; '.join(out) or 'an unknown place'
 
 
 def in_transaction() -> bool:
@@ -442,8 +456,8 @@ class EventStore:
         self._setup(os.fspath(path), clock)
         self._lock_fd = self._take_file_lock(self._path + '.lock')
         try:
-            self._make_file(self._path)
-            self._open()
+            created = self._make_file(self._path)
+            self._open(may_make=created)
         except BaseException:
             os.close(self._lock_fd)
             self._lock_fd = None
@@ -496,8 +510,8 @@ class EventStore:
         return fd
 
     @staticmethod
-    def _make_file(path: str) -> None:
-        """The database file: made here, 0600, with its directory synced; or one that exists, that is a regular
+    def _make_file(path: str) -> bool:
+        """Whether the database file was made here. Made here: 0600, with its directory synced; or one that exists, a regular
         file of this user, not a link, and open to nobody else, and so are the WAL and shared-memory files
         beside it if they exist (SQLite gives those the database file's mode). A file open to others is
         refused, never quietly narrowed: what it held may already have been read. The sidecars are checked
@@ -512,15 +526,18 @@ class EventStore:
             fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         except FileExistsError:
             EventStore._private(os.lstat(path), 'store_path')
-            return
+            return False
         os.close(fd)
         folder = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(folder)
         finally:
             os.close(folder)
+        return True
 
-    def _open(self) -> None:
+    def _open(self, may_make: bool = True) -> None:
+        """Open the connection. ``may_make``: the file is new to this opening, so a store may be made in it (the
+        fake's file is always new; the real store says what ``_make_file`` found)."""
         conn = sqlite3.connect(self._path, isolation_level=None, check_same_thread=False, timeout=0)
         try:
             # First, read only: a file that is not this store is refused before anything in it is changed (its
@@ -534,6 +551,8 @@ class EventStore:
             version = conn.execute('PRAGMA user_version').fetchone()[0]
             names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
             fresh = application == 0 and version == 0 and not names
+            if fresh and not may_make:
+                raise StoreError('store_empty')     # a store that existed and holds nothing now is not made again
             if not fresh:
                 if application != APPLICATION_ID:
                     raise StoreError('not_an_event_store')
@@ -566,8 +585,12 @@ class EventStore:
                 raise StoreError('store_corrupt')
             conn.execute('BEGIN IMMEDIATE')
             try:
+                # Read before it is raised: SQLite would add 1 to a text value and store a number.
+                row = conn.execute("SELECT value FROM store_meta WHERE key = 'epoch'").fetchone()
+                if row is None or type(row[0]) is not int or row[0] < 0:
+                    raise StoreError('store_epoch_missing')
                 conn.execute("UPDATE store_meta SET value = value + 1 WHERE key = 'epoch'")
-                self._epoch = conn.execute("SELECT value FROM store_meta WHERE key = 'epoch'").fetchone()[0]
+                self._epoch = row[0] + 1
                 conn.execute('COMMIT')
             except BaseException:
                 if conn.in_transaction:
@@ -734,7 +757,8 @@ class EventStore:
     def subscribe(self, fn: Callable[[tuple], object]) -> Callable[[], None]:
         """Call ``fn(events)`` with the events of each commit that appended any, after the commit, outside every
         lock of the helper, in commit order, one commit at a time. Each call gets its own copies. A subscriber
-        that raises is logged and does not affect the commit, the caller or another subscriber, whatever it
+        that raises is logged, by its exception's type and where it was raised, never by its text (which an
+        event's payload may have made), and does not affect the commit, the caller or another subscriber, whatever it
         raises (``asyncio.CancelledError`` included) except an interruption (KeyboardInterrupt, SystemExit). An
         interruption is raised to the thread that delivers; the rest of that batch is not delivered, and the
         batches still queued go out with the next commit. Returns a function that unsubscribes."""
@@ -771,8 +795,9 @@ class EventStore:
                         fn(tuple(json.loads(text) for text in batch))
                     except (KeyboardInterrupt, SystemExit):
                         raise
-                    except BaseException:    # noqa: BLE001 - a subscriber's failure is its own, CancelledError too
-                        LOG.exception('an event-store subscriber failed')
+                    except BaseException as exc:    # noqa: BLE001 - a subscriber's failure is its own, CancelledError too
+                        LOG.error('an event-store subscriber failed: %s at %s', type(exc).__name__,
+                                  _where(exc.__traceback__))
         except BaseException:
             with self._publish_guard:
                 self._publishing = False
@@ -1044,8 +1069,9 @@ class FakeStore(EventStore):
         out = {}
         with self._reader() as conn:
             for table in sorted(self._lane_tables):
-                cursor = conn.execute(f'SELECT * FROM "{table}"')
+                quoted = '"' + table.replace('"', '""') + '"'      # a name may hold a quote: SQL doubles it
+                cursor = conn.execute(f'SELECT * FROM {quoted}')
                 names = [column[0] for column in cursor.description]
                 for row in cursor.fetchall():
-                    out[(table, row[0])] = dict(zip(names[1:], row[1:]))
+                    out[(table, row[0])] = dict(zip(names[1:], row[1:], strict=True))
         return out

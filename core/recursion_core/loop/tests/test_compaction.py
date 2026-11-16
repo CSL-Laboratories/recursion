@@ -156,9 +156,11 @@ class InTheLoop(unittest.TestCase):
         last = provider.requests[-1]
         flat = "\n".join(p.text for m in last.messages for p in m.parts if isinstance(p, b.TextPart))
         self.assertIn("Late rule: never touch tests/.", flat)
+        # The instruction is the last part of the summary request's last user message (#423 round 1: it joins a
+        # last user message, so the roles alternate).
         summary_calls = [r for r in provider.requests if r.messages[-1].parts
-                         and isinstance(r.messages[-1].parts[0], b.TextPart)
-                         and r.messages[-1].parts[0].text == c.SUMMARY_PROMPT]
+                         and isinstance(r.messages[-1].parts[-1], b.TextPart)
+                         and r.messages[-1].parts[-1].text == c.SUMMARY_PROMPT]
         self.assertEqual(len(summary_calls), len(comps))
         self.assertEqual([d["outcome"] for d in docs if d["type"] == "turn_ended"], ["candidate_done"] * 3)
 

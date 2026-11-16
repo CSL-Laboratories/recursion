@@ -21,7 +21,9 @@ from recursion_core.loop.tests.support import Lines, registry, workspace
 
 BS = chr(92)
 SEED = ['{"k":"message","role":"user","parts":[{"t":"text","text":"go"}]}',
-        '{"k":"message","role":"assistant","parts":[{"t":"call","id":"c1","name":"read","input":{"path":"a"}}]}']
+        # The whole shape store.py writes (#423 round 1: a part missing a field is refused, astra R7, sol R6).
+        '{"k":"message","role":"assistant","parts":[{"t":"call","id":"c1","name":"read","input":{"path":"a"},'
+        '"raw":"","error":null}]}']
 
 
 def _home(case) -> Path:
@@ -31,12 +33,12 @@ def _home(case) -> Path:
     return folder
 
 
-def _journal(case, lines: list[str]) -> st.ConversationStore:
+def _journal(case, lines: list[str], end: str = "\n") -> st.ConversationStore:
     home = _home(case)
     s = st.ConversationStore(home, "j")
     s.message(b.Message("user", (b.TextPart("seed"),)))
     s.close()
-    s.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    s.path.write_text("\n".join(lines) + end, encoding="utf-8")
     return st.ConversationStore(home, "j")
 
 
@@ -82,7 +84,7 @@ class DamagedJournalsRefuseTheResume(unittest.TestCase):
             "not an object": "5",
             "user text a number": '{"k":"user","turn":"t","text":5}',
             "call input a list": ('{"k":"message","role":"assistant","parts":[{"t":"call","id":"c2","name":"read",'
-                                  '"input":[1]}]}'),
+                                  '"input":[1],"raw":"","error":null}]}'),
             "role invalid": '{"k":"message","role":"system","parts":[]}',
             "totals of the wrong shape": '{"k":"totals","state":{"calls":"many"}}',
         }
@@ -91,7 +93,8 @@ class DamagedJournalsRefuseTheResume(unittest.TestCase):
                 _journal(self, SEED + [bad, '{"k":"user","turn":"t","text":"after"}']).load()
 
     def test_a_line_cut_at_the_end_is_ignored_and_the_call_gets_an_unknown_outcome(self) -> None:
-        loaded = _journal(self, SEED + ['{"k":"result","part":{"t":"result","id":"c1","te']).load()
+        # Cut off: no line end after it (#423 round 1: a complete line that is damaged refuses, astra R7, sol R5).
+        loaded = _journal(self, SEED + ['{"k":"result","part":{"t":"result","id":"c1","te'], end="").load()
         self.assertEqual([m.role for m in loaded.messages], ["user", "assistant", "user"])
         self.assertEqual(loaded.repaired, ["c1"])
 

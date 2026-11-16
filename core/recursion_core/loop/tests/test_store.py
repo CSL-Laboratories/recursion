@@ -31,9 +31,9 @@ class RoundTrip(unittest.TestCase):
                                         b.TextPart("on it"), CALL_A,
                                         b.ToolCall("toolu_x", "read", None, '{"pa', "input is not valid JSON"))),
                 b.Message("user", (b.ToolResult("toolu_a", "created", False), b.ToolResult("toolu_x", "bad", True)))]
-        for m in msgs:
+        s.user("turn-1", "hi")  # the user's text: its message and its ledger entry, one record (#423 round 1)
+        for m in msgs[1:]:
             s.message(m)
-        s.user("turn-1", "hi")
         total = UsageTotal()
         total.add(b.Usage(input_tokens=b.observed(5)), "m1")
         s.totals(total.to_state())
@@ -146,7 +146,8 @@ class Journal(unittest.TestCase):
             "turn-1", "read both", b.CancelToken())
         s.close()
         kinds = [json.loads(x)["k"] for x in s.path.read_text().splitlines()]
-        self.assertEqual(kinds, ["message", "user", "message", "result", "result", "message", "message", "totals"])
+        # The user's text is one record, its message and its ledger entry together (#423 round 1, astra R3).
+        self.assertEqual(kinds, ["user", "message", "result", "result", "message", "message", "totals"])
 
     def test_a_repaired_conversation_stays_valid_after_the_next_turn(self) -> None:
         ws = workspace(self)

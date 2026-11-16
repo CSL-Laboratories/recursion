@@ -194,18 +194,21 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"recursion_loop: {exc}") from None
     text, found = ("", []) if args.no_project_instructions else ins.discover(workspace.root)
     redactor = p.Redactor(secrets)
-    try:
-        store = st.ConversationStore(home, args.resume or st.new_id(), redactor.scrub_obj)
-        loaded = store.load() if args.resume else None
-    except (st.StoreError, ToolError) as exc:
-        raise SystemExit(f"recursion_loop: {exc}") from None
     out = open(sys.stdout.fileno(), "w", encoding="utf-8", newline="\n", closefd=False, buffering=1)
     writer = p.Writer(out, redactor, seal_after="closed")  # nothing follows closed on standard output
     gate = perm.PermissionGate(writer, profile=args.permissions, deadline_s=args.approval_timeout)
-    session = Session(provider, registry, workspace, writer, redactor,
-                      Config(model=model, max_output_tokens=args.max_output_tokens, max_steps=args.max_steps,
-                             effort=args.effort, acceptance=acceptance, instructions=text,
-                             context_window=args.context_window), gate=gate, store=store, loaded=loaded)
+    try:
+        store = st.ConversationStore(home, args.resume or st.new_id(), redactor.scrub_obj)
+        loaded = store.load() if args.resume else None
+        if loaded is None:
+            store.create()  # the id the ready line names can be resumed from now on (astra R11, sol R10)
+        # A resumed conversation passes this run's secret policy here, or is refused (astra R8).
+        session = Session(provider, registry, workspace, writer, redactor,
+                          Config(model=model, max_output_tokens=args.max_output_tokens, max_steps=args.max_steps,
+                                 effort=args.effort, acceptance=acceptance, instructions=text,
+                                 context_window=args.context_window), gate=gate, store=store, loaded=loaded)
+    except (st.StoreError, ToolError, OSError) as exc:
+        raise SystemExit(f"recursion_loop: {exc}") from None
     engine = Engine(session, writer)
     writer.write("ready", protocol=p.PROTOCOL_VERSION, engine="recursion_loop", provider=provider.name, model=model,
                  tools=list(registry.names()), permissions=args.permissions,

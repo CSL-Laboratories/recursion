@@ -85,6 +85,19 @@ def request_facts(ws: Workspace, given: str, path: Path) -> dict[str, str] | Non
     return {"resolved_path": ws.display(path)}
 
 
+def keep_approved(ctx, given: str, path: Path) -> None:
+    """In the run of an approved call: the file the path leads to now must be the one the request showed (the same
+    ``resolved_path``, or none when the path was the file itself); otherwise nothing is changed (sol 1)."""
+
+    from recursion_core.loop.tools.registry import CHANGED_SINCE_APPROVAL, UNBOUND
+
+    approved = getattr(ctx, "approved_facts", UNBOUND)
+    if approved is UNBOUND:
+        return
+    if request_facts(ctx.workspace, given, path) != (approved or None):
+        raise ToolError(CHANGED_SINCE_APPROVAL)
+
+
 def mark_of(data: bytes, info: os.stat_result) -> ReadMark:
     return ReadMark(hashlib.sha256(data).hexdigest(), len(data), info.st_mtime_ns)
 

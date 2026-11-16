@@ -114,11 +114,13 @@ def clear_start_environment(names=KEY_ENV) -> bool:
         return any(name in wanted and value.strip(b"\0")
                    for name, _, value in (entry.partition(b"=") for entry in block.split(b"\0")))
 
+    if not os.path.exists("/proc/self/environ"):
+        return True  # no /proc: there is no such block to read, for this process or any other
     try:
         if not readable():
-            return True  # nothing to clear (or no /proc to read it from)
+            return True  # nothing to clear
     except OSError:
-        return True
+        return False  # it could not be checked, so it is not reported as done (astra C3, DeepSeek N4)
     try:
         import ctypes
 

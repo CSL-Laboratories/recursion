@@ -54,6 +54,9 @@ OK, ERROR, DENIED, CANCELLED = "ok", "error", "denied", "cancelled"
 STATUSES = (OK, ERROR, DENIED, CANCELLED)
 MARKER_OPEN = "[output truncated:"
 QUOTED_OPEN = "(output truncated:"  # what the tool's own text shows instead: the same length, so sizes hold
+UNBOUND = object()  # ToolContext.approved_facts outside the run of an approved call
+CHANGED_SINCE_APPROVAL = ("not run: what the call would change is no longer what the permission request showed "
+                          "(a path now leads to a different file); make the call again to ask again")
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,9 @@ class ToolContext:
     # What the tool's precheck said the request should show beside the input (``resolved_path``); dispatch sets
     # it for the one approve call and clears it after. An approve function may pass it on to the request.
     request_facts: Mapping[str, Any] | None = None
+    # The facts the approved request showed (None: none), set by dispatch for the run of an approved call and
+    # UNBOUND otherwise; a tool that resolves its target again refuses to change anything else (sol 1).
+    approved_facts: Any = UNBOUND
 
 
 ToolFn = Callable[[Mapping[str, Any], ToolContext], ToolOutput]
@@ -93,7 +99,9 @@ class Tool:
     needs_approval: bool = False
     # Run before a permission request, without side effects; raises ToolError so that a call that would fail
     # (a stale edit, an anchor that is not unique) is refused without asking anyone. ``run`` checks again. It may
-    # return a mapping of facts for the request (``resolved_path``); anything else it returns is ignored.
+    # return a mapping of facts for the request (``resolved_path``; permissions.check_facts refuses other names
+    # and values that are not JSON, and the call is not asked for); anything else it returns is ignored. After an
+    # approval it runs again on the approved input, and facts that differ from the approved ones stop the call.
     precheck: CheckFn | None = None
 
     def __post_init__(self) -> None:
@@ -355,8 +363,12 @@ class ToolRegistry:
                 # Never run without an answer: with no way to ask, such a tool is refused.
                 return self._finish(call, ToolOutput("refused: this tool needs an approval and none can be asked",
                                                      DENIED), ctx)
+            try:
+                facts = perm.check_facts(facts)  # before anything is asked (DeepSeek N2)
+            except ValueError as exc:
+                return self._finish(call, ToolOutput(f"the call could not be asked for: {exc}", ERROR), ctx)
             asked = b.ToolCall(call.call_id, call.name, perm.snapshot(args), call.raw_input, call.input_error)
-            ctx.request_facts = dict(facts) if isinstance(facts, Mapping) and facts else None
+            ctx.request_facts = facts
             try:
                 decision = ctx.approve(asked)
             finally:
@@ -372,6 +384,18 @@ class ToolRegistry:
                 validate(tool.spec.input_schema, args)  # what runs is the bound input; it is checked as well
             except ToolError as exc:
                 return self._finish(call, ToolOutput(f"invalid approved input: {exc}", ERROR), ctx)
+            if tool.precheck is not None:
+                # What was approved is what changes (sol 1): the precheck runs again on the approved input, and
+                # facts that are no longer the ones the request showed (a link that now leads elsewhere) stop it.
+                try:
+                    again = perm.check_facts(tool.precheck(perm.snapshot(args), ctx))
+                except ToolError as exc:
+                    return self._finish(call, ToolOutput(str(exc), ERROR), ctx)
+                except ValueError as exc:
+                    return self._finish(call, ToolOutput(f"the call could not be run: {exc}", ERROR), ctx)
+                if again != facts:
+                    return self._finish(call, ToolOutput(CHANGED_SINCE_APPROVAL, ERROR), ctx)
+            ctx.approved_facts = facts
         try:
             output = tool.run(args, ctx)
         except b.Cancelled:
@@ -382,6 +406,8 @@ class ToolRegistry:
             raise  # the process is being interrupted (SIGINT): that stops the loop, not one call
         except BaseException as exc:  # noqa: BLE001 - a tool's failure (a library's sys.exit too) is the model's to see
             output = ToolOutput(f"the tool failed: {type(exc).__name__}: {exc}", ERROR)
+        finally:
+            ctx.approved_facts = UNBOUND
         if not isinstance(output, ToolOutput) or not isinstance(output.text, str) or output.status not in STATUSES:
             output = ToolOutput("the tool failed: it returned no text", ERROR)
         return self._finish(call, output, ctx)

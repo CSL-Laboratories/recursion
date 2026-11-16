@@ -3,7 +3,8 @@
 The command runs under ``bash -c`` (``sh -c`` where there is no bash), in its own process group and session, with
 no standard input, in the workspace. On Linux it runs under a keeper of its own (``reaper.py``), which is made the
 subreaper of everything the command starts, so a process that leaves the group or the session (``setsid``, a
-double fork) is still followed. Its environment is not the engine's: it is built from a short list of names
+double fork) is still followed; a keeper that cannot make itself the subreaper does not start the command (exit
+status 125, with a line saying why). Its environment is not the engine's: it is built from a short list of names
 (``ENV_PASSED``: the search path, the user, the locale, the time zone, the temporary folder), with pagers and
 git's credential prompt turned off so nothing waits for a terminal; nothing else of the engine's environment
 reaches it (no key, no proxy setting, no ``BASH_ENV`` or ``ENV`` that a shell would run at its start).
@@ -105,7 +106,9 @@ def _use_reaper() -> bool:
 class _Capture:
     """Reads a stream on a thread of its own, keeping the first KEEP_HEAD and the last KEEP_TAIL bytes. Reading
     a pipe waits at most POLL_S at a time, so ``stop`` ends it within a bounded time even when a process the loop
-    could not stop still holds the pipe open."""
+    could not stop still holds the pipe open. A pipe the selector cannot wait on is made non-blocking and polled
+    (the read never waits, so neither does closing the stream); one that can be neither is refused, and the
+    command is stopped (astra C1). A stream with no descriptor at all (in memory) is read plainly."""
 
     def __init__(self, stream) -> None:
         self.stream = stream
@@ -117,21 +120,31 @@ class _Capture:
         self._selector = None
         try:
             self._fd = stream.fileno()
-            self._selector = selectors.DefaultSelector()
-            self._selector.register(self._fd, selectors.EVENT_READ)
         except (OSError, ValueError, AttributeError):
-            self._fd = None  # not a pipe this platform can wait on: read it plainly
-            if self._selector is not None:
-                self._selector.close()
-                self._selector = None
+            self._fd = None  # no descriptor (an in-memory stream): it is read plainly, and never waits
+        if self._fd is not None:
+            try:
+                self._selector = selectors.DefaultSelector()
+                self._selector.register(self._fd, selectors.EVENT_READ)
+            except (OSError, ValueError):
+                if self._selector is not None:
+                    self._selector.close()
+                    self._selector = None
+                os.set_blocking(self._fd, False)  # an OSError here refuses the pipe: run_command stops the command
         self.thread = threading.Thread(target=self._pump, daemon=True)
         self.thread.start()
 
     def _read(self) -> bytes | None:
         """The next chunk, b"" at the end, None when nothing came within POLL_S."""
 
-        if self._selector is None:
+        if self._fd is None:
             return self.stream.read1(CHUNK) if hasattr(self.stream, "read1") else self.stream.read(CHUNK)
+        if self._selector is None:
+            try:
+                return os.read(self._fd, CHUNK)  # non-blocking
+            except BlockingIOError:
+                self._stop.wait(POLL_S)
+                return None
         if not self._selector.select(POLL_S):
             return None
         return os.read(self._fd, CHUNK)

@@ -1504,7 +1504,7 @@ class CommandIdGrammarTest(unittest.TestCase):
                 self.assertEqual((table.store.opened, table.store.used, table.store.kept, asked), (0, [], {}, []),
                                  'nothing is read, kept or asked for an id outside the grammar')
             seen += 1
-        self.assertGreater(seen, 30, 'every keyed method, under both tenant kinds')
+        self.assertEqual(seen, 34, 'the 17 keyed rows, each under both tenant kinds')
 
     def test_a_valid_id_at_either_bound_is_kept_and_replayed_as_before(self) -> None:
         for name, kind, table, asked in self.keyed_tables():
@@ -1517,6 +1517,104 @@ class CommandIdGrammarTest(unittest.TestCase):
                                      [('handler', command_id)], 'the replay answers from the receipt')
                     self.assertEqual([use for use in table.store.used if use[2] == command_id],
                                      [('get', name, command_id), ('put', name, command_id), ('get', name, command_id)])
+
+    def one_table(self, store=None):
+        """One keyed method (session.turn, the install's tenant) on a counting store, and the ids its handler saw."""
+        asked = []
+
+        def handler(ctx, params):
+            asked.append(params.get('command_id'))
+            return {'code': 'ok'}
+        table = methods.MethodTable()
+        table.register('session.turn', handler, service=methods.METHODS['session.turn'].service, tenant=methods.INSTALL_TENANT)
+        table.store = self.Store() if store is None else store
+        return table, asked
+
+    def test_exactly_the_grammars_characters_are_taken_at_every_place_in_an_id(self) -> None:
+        """Every ASCII character and some lookalikes, at the end, the start and the middle of an 8-character id:
+        the 66 of A-Z a-z 0-9 . _ : - are kept, every other one is refused before the store. A class widened by
+        one character (DeepSeek's round-1 MEDIUM 1) turns this red."""
+        allowed = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-')
+        self.assertEqual(len(allowed), 66)
+        others = (0x85, 0xA0, 0xE9, 0x130, 0x212A, 0x660, 0x2028, 0xFEFF, 0xFF10, 0xFF41)
+        for code in (*range(0x80), *others):
+            ch = chr(code)
+            for command_id in ('cmd-000' + ch, ch + 'cmd-000', 'cmd' + ch + '0000'):
+                with self.subTest(code=hex(code), command_id=command_id):
+                    table, asked = self.one_table()
+                    answer = table.dispatch('session.turn', {'command_id': command_id, 'text': 'x'}, H.OWNER, None)
+                    if ch in allowed:
+                        self.assertEqual((answer, asked), ({'code': 'ok'}, [command_id]))
+                    else:
+                        self.assertEqual((answer, table.store.opened, asked),
+                                         ({'code': 'request_invalid', 'detail': 'command_id'}, 0, []))
+
+    def test_the_dispatcher_and_the_event_store_keep_one_grammar(self) -> None:
+        """The event store refuses a receipt key outside the same grammar by raising; if the two copies drifted, an
+        id the dispatcher took would come back unavailable / store:TypeError, the failure this check exists to end."""
+        try:
+            from recursion_core.events import db as event_db
+        except ImportError as exc:
+            self.skipTest(f'the event store cannot be imported here: {exc}')
+        self.assertEqual(methods._COMMAND_ID.pattern, event_db._COMMAND_ID.pattern)
+
+    def test_a_bad_id_is_answered_before_the_payload_digest_and_a_good_one_reaches_it(self) -> None:
+        """With the digest made to refuse, a bad id is still answered for its id and the digest is never computed;
+        a good id reaches the digest (and is answered for its params). DeepSeek's round-1 MEDIUM 2."""
+        for command_id, wanted, digests in (('short', {'code': 'request_invalid', 'detail': 'command_id'}, 0),
+                                            ('cmd-0001\n', {'code': 'request_invalid', 'detail': 'command_id'}, 0),
+                                            ('cmd-0001', {'code': 'request_invalid', 'detail': 'params'}, 1)):
+            with self.subTest(command_id=command_id):
+                table, asked = self.one_table()
+                with mock.patch.object(methods, 'payload_digest', side_effect=ValueError('stand-in')) as digest:
+                    answer = table.dispatch('session.turn', {'command_id': command_id, 'text': 'x'}, H.OWNER, None)
+                self.assertEqual((answer, digest.call_count, table.store.opened, asked), (wanted, digests, 0, []))
+
+    def test_with_no_store_the_answer_is_store_absent_whatever_the_id_or_the_params(self) -> None:
+        """The store-absent answer comes first (DeepSeek's round-1 LOW 3)."""
+        for params in ({'command_id': 'short'}, {'command_id': 'cmd-0001'}, {}, None, []):
+            with self.subTest(params=params):
+                table, asked = self.one_table()
+                table.store = None
+                self.assertEqual(table.dispatch('session.turn', params, H.OWNER, None),
+                                 {'code': 'unsupported', 'detail': 'store_absent'})
+                self.assertEqual(asked, [])
+
+    def test_params_that_are_not_an_object_are_refused_and_never_raise(self) -> None:
+        """A command's params that are not an object answered nothing: ``params.get`` raised out of the dispatch
+        (DeepSeek's round-1 LOW 5). Now they are request_invalid / params, before the id and the store."""
+        for params in (None, [], ['command_id'], 'cmd-0001', 7, ('command_id', 'cmd-0001')):
+            with self.subTest(params=params):
+                table, asked = self.one_table()
+                self.assertEqual(table.dispatch('session.turn', params, H.OWNER, None),
+                                 {'code': 'request_invalid', 'detail': 'params'})
+                self.assertEqual((table.store.opened, table.store.used, asked), (0, [], []))
+
+    def test_the_event_stores_own_file_keeps_no_receipt_for_an_id_outside_the_grammar(self) -> None:
+        """The same promise measured a second way, on EVENTS' real store and its file: the bad ids keep nothing and
+        a good one keeps exactly its receipt (DeepSeek's round-1 LOW 4)."""
+        if os.name != 'posix':
+            self.skipTest('the event store is POSIX only')
+        try:
+            from recursion_core.events import db as event_db
+        except ImportError as exc:
+            self.skipTest(f'the event store cannot be imported here: {exc}')
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, 'events.sqlite3')
+        store = event_db.EventStore(path)
+        try:
+            table, asked = self.one_table(store)
+            for command_id in self.BAD:
+                with self.subTest(command_id=command_id):
+                    self.assertEqual(table.dispatch('session.turn', {'command_id': command_id, 'text': 'x'}, H.OWNER, None),
+                                     {'code': 'request_invalid', 'detail': 'command_id'})
+            self.assertEqual(table.dispatch('session.turn', {'command_id': 'cmd-0001', 'text': 'x'}, H.OWNER, None), {'code': 'ok'})
+        finally:
+            store.close()
+        with contextlib.closing(sqlite3.connect(path)) as db:
+            kept = db.execute('SELECT tenant, method, command_id FROM receipts').fetchall()
+        self.assertEqual((kept, asked), ([(methods.INSTALL_TENANT, 'session.turn', 'cmd-0001')], ['cmd-0001']))
 
 
 class CommandTableTest(unittest.TestCase):

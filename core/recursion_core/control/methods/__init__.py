@@ -80,7 +80,9 @@ WHO OWNS THE TRANSACTION. For a method keyed by ``command_id`` the dispatcher do
 1. With no event store composed, it answers ``unsupported``, detail ``store_absent``, and calls nothing.
    A ``command_id`` that is not common.v1's (8 to 128 of ``A-Z a-z 0-9 . _ : -``, matched whole) answers
    ``request_invalid``, detail ``command_id``, before the payload digest, the tenant and the store: no
-   transaction is opened and nothing is read, kept or changed.
+   transaction is opened and nothing is read, kept or changed. So an id shorter than 8 characters is
+   refused: an id made from a counter is padded (``cmd-0001``, never ``cmd-1``). Params that are not an
+   object answer ``request_invalid``, detail ``params``, after the store-absent answer and before the id.
 2. It takes the command's slot: commands with the same ``(tenant, method, command_id)`` run one at a
    time in this process, so two identical commands sent at once run the handler once.
 3. It opens the store's transaction and looks the receipt up IN it. A receipt with the same payload
@@ -362,8 +364,9 @@ def canonical_text(value, depth: int = 0) -> str:
     raise NoCanonicalText('type')
 
 
-# common.v1's command_id (``$defs/command_id``; the event store checks the same grammar, events/db.py). ASCII
-# only and matched whole, so no line end, NUL or DEL passes.
+# The command_id of SPINE's control records (``common.v1.json``, ``$defs/command_id``, in the schema drafts that
+# are not on master yet), and the grammar the event store checks for a receipt key (events/db.py): a test holds
+# the two copies equal. ASCII only and matched whole, so no line end, NUL or DEL passes.
 _COMMAND_ID = re.compile(r'[A-Za-z0-9._:-]{8,128}')
 
 
@@ -586,6 +589,8 @@ class MethodTable:
         store = self.store
         if store is None:
             return {'code': 'unsupported', 'detail': 'store_absent'}
+        if not isinstance(params, dict):
+            return {'code': 'request_invalid', 'detail': 'params'}
         command_id = params.get('command_id')
         if not isinstance(command_id, str) or not _COMMAND_ID.fullmatch(command_id):
             return {'code': 'request_invalid', 'detail': 'command_id'}

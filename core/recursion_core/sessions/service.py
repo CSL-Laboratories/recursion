@@ -169,6 +169,12 @@ class Sessions:
             return 'unsupported', 'not_implemented'
         return None
 
+    def steering_delivery(self, session: dict) -> str:
+        """The delivery a steer gets on this session's engine: ``steer`` where the driver declares ``mid_turn_input``,
+        else ``next_turn``, the table's published fallback of ``session.steer`` (the item's delivery says so)."""
+        found = self.declaration(session['route']['engine'])
+        return 'steer' if found is not None and found['flags'].get('mid_turn_input') else 'next_turn'
+
     def _steer_now(self, tx, session: dict, item: dict) -> bool:
         """Put a queued steer into the turn in progress, if the driver can take it there now."""
         found = self.declaration(session['route']['engine'])
@@ -498,7 +504,8 @@ class SessionsService:
     whenever it is woken (after a commit) and at least every ``interval_s``. ``start`` returns at once, after
     starting the thread; it does nothing while a loop it started is still running, and after a loop that has
     left (a crash, kept in ``failure``) it is a fresh start: a new thread, recovery again, and ``failure`` cleared.
-    ``ready`` is true once recovery committed; ``stop`` returns only when the thread has joined. Not registered
+    ``ready`` is true once recovery committed; ``stop`` returns only when the thread has joined, and a stop whose
+    join was cut short (an interrupt) leaves the thread in place for the next stop to join. Not registered
     anywhere in this slice."""
 
     name = 'sessions'
@@ -526,9 +533,9 @@ class SessionsService:
         with self._lock:
             self._stopping.set()
             self.sessions.wake.set()
-            thread, self._thread = self._thread, None
-            if thread is not None:
-                thread.join()
+            if self._thread is not None:
+                self._thread.join()
+                self._thread = None     # only once joined: a join cut short is repeated by the next stop
 
     def _loop(self) -> None:
         """Recovery, then the passes. ``ready`` is true from the end of recovery until the loop leaves, for

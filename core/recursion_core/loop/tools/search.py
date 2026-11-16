@@ -73,8 +73,10 @@ def run_worker(request: dict, cancel: b.CancelToken, deadline_s: float = DEADLIN
     # The worker also bounds its own life (see search_worker.bound_own_life): this process kills it at the
     # deadline, but if this process dies first nothing else would.
     request = dict(request, alarm_s=math.ceil(deadline_s) + WORKER_GRACE_S, parent_pid=os.getpid())
-    proc = subprocess.Popen([sys.executable, "-I", str(WORKER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, env=_child_env(), cwd=request["root"])
+    # UTF-8 mode ("-X utf8"; "-I" ignores PYTHONUTF8): the worker's pipes speak the UTF-8 this side decodes, not the
+    # code page Windows would give them.
+    proc = subprocess.Popen([sys.executable, "-X", "utf8", "-I", str(WORKER)], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_child_env(), cwd=request["root"])
     unregister = cancel.on_cancel(proc.kill)
     try:
         try:

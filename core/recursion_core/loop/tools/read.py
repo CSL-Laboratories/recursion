@@ -57,16 +57,21 @@ SPEC = b.ToolSpec(
 )
 
 
+def _damaged(sample: bytes) -> int:
+    """The places in ``sample`` that are not UTF-8: one U+FFFD each in the replaced decode, less the U+FFFDs the
+    text itself holds (the bytes EF BF BD, which no other sequence can swallow because EF starts a character)."""
+
+    text = codecs.getincrementaldecoder("utf-8")("replace").decode(sample, final=False)
+    return text.count("\ufffd") - sample.count(b"\xef\xbf\xbd")
+
+
 def is_binary(head: bytes) -> bool:
     if b"\x00" in head[:SNIFF_NUL]:
         return True
     sample = head[:SNIFF_UTF8]
     if not sample:
         return False
-    decoder = codecs.getincrementaldecoder("utf-8")("replace")
-    text = decoder.decode(sample, final=False)
-    bad = text.count("\ufffd")
-    return bad * 100 > len(sample)
+    return _damaged(sample) * 100 > len(sample)
 
 
 def _list_dir(path: os.PathLike, shown: str) -> ToolOutput:

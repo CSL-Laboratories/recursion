@@ -62,6 +62,7 @@ import json
 import math
 import posixpath
 import re
+import threading
 import unicodedata
 from array import array
 from collections.abc import Callable, Mapping
@@ -846,7 +847,7 @@ def open_acp(process: EngineProcess, clock, route: Mapping, cwd: str, deadline_a
     return session
 
 
-@dataclass
+@dataclass(eq=False)
 class _DraftTurn:
     """ONE turn's state in ``AcpDrafts``: made when the turn starts, dropped once its result is drafted. Nothing
     of a turn lives anywhere else."""
@@ -855,6 +856,8 @@ class _DraftTurn:
     tools: object               # its tool calls (the shared client's ToolCalls)
     closed: bool = False        # its open calls are ended
     resulted: bool = False      # its result is drafted
+    announced: bool = False     # the session told its start and has not told its end yet
+    thread: int | None = None   # the thread whose session announced it
 
 
 class AcpDrafts:
@@ -871,12 +874,23 @@ class AcpDrafts:
 
     A TURN'S STATE IS ONE OBJECT (``_DraftTurn``), made when the turn starts (the session's ``turn_start``, the
     driver's ``start_turn``, or the first update or ask of a turn nobody announced) and held under its key
-    ``(session, turn)`` (``TurnOutcome.session`` is its connection's serial, so one ``AcpDrafts`` serves any
-    number of sessions). Its tool calls, whether they are ended and whether its result is drafted live in it
-    and nowhere else, and it is dropped once its result is drafted. EVERY TURN THAT ENDS GETS EXACTLY ONE
-    RESULT, whether or not a line of it was read. ONE THING OUTLIVES A TURN: for each session, the highest
-    turn number whose result is drafted, so that an end of a turn already gone (``ended`` twice, ``ended`` of
-    an earlier turn, ``turn_end`` again) drafts nothing and raises nothing.
+    ``(session, turn)`` (``TurnOutcome.session`` is its connection's serial). Its tool calls, whether they are
+    ended and whether its result is drafted live in it and nowhere else, and it is dropped once its result is
+    drafted. EVERY TURN THE SESSION OR THE DRIVER ENDS GETS EXACTLY ONE RESULT, whether or not a line of it was
+    read. Per session, two numbers outlive a turn: the highest turn number whose result is drafted, so that an
+    end of a turn already gone (``ended`` twice, ``ended`` of an earlier turn, ``turn_end`` again, a repeated
+    ``turn_start``) drafts nothing and raises nothing; and the highest turn number the session announced, so
+    that ``ended`` of a later turn, which has not begun, is refused (``TypeError``) instead of taking that
+    turn's result.
+
+    SESSIONS: one ``AcpDrafts`` serves any number of sessions ONE THREAD AT A TIME. A session whose turn starts
+    while another session's announced turn is in progress on the same thread (a callback of the first runs
+    the second's turn) is NESTED: the first turn is put aside untouched, every callback until the second's
+    end belongs to the second (it is the one reading lines on this thread), and the first is taken up again
+    at that end. A start, update, ask or line from another thread while an announced turn is in progress is
+    refused (``AcpStateError``) and changes nothing: sessions pumped at once on several threads take one
+    ``AcpDrafts`` each. Callbacks wrapped so that the session cannot see this object announce nothing, so
+    such a caller keeps to one session at a time itself. A lock makes each call one step.
 
     ONE PLACE ENDS A TURN'S OPEN TOOL CALLS: ``_close``, on the turn's own object, so a second close is
     harmless. A call left open ends ``cancelled`` when the turn was stopped (the caller's cancel, Recursion's
@@ -885,15 +899,24 @@ class AcpDrafts:
     turn ended, so a stray or repeated response line ends nothing. Callbacks wrapped so that the session
     cannot see this object get a turn's start and end only from the driver: ``start_turn`` before each prompt,
     ``abandoned`` in its ``except`` and ``ended`` after it; a turn the driver did not start reaches this
-    object only through its updates. A driver that ends a turn with a code outside the route contract's, or a
+    object only through its updates. ``abandoned`` and ``start_turn`` leave a turn the session announced and
+    has not ended to the session. A driver that ends a turn with a code outside the route contract's, or a
     detail that is not exactly a str, is refused (``TypeError``) before anything is drafted.
 
-    Not thread-safe: the pumping thread calls the callbacks. ``redact`` names the values no draft may carry
-    (the route's selected credential): each line (exactly a str) is masked as ``mask`` does, and each
-    update's params are masked string by string (keys included) before a tool call's input, its digest or its
-    result text is taken from them; a number, a bool or null whose text spells a value, or a number equal to
-    one, is a protocol error (the turn is abandoned, as above). A result's text and detail never keep a lone
-    surrogate.
+    ``redact`` names the values no draft may carry (the route's selected credential). A value is looked for
+    in every spelling ``mask`` reads, AND ACROSS PIECES: in the strings, keys and other scalars of a decoded
+    line or update, in the order they are written and with any pieces between skipped (a reader may join
+    values only, keys only, or a list's texts), a value spelled by the end of one piece, whole pieces and the
+    start of a later one is masked in each piece it touches, so a value split over two content items, two
+    input values or two keys reaches no draft. A line (exactly a str)
+    is masked in place, so its byte length and every offset stay; an update is masked before a tool call's
+    input, its digest, its name or its result text is taken from it. What cannot be masked in place is the
+    agent's protocol error, refused before anything of it is drafted (an ``engine.output`` included; the
+    refused line's bytes still count in the offset): a number, a bool or null whose text (as JSON or Python
+    writes it) spells a value, or a number equal to one (``1.2345e4`` is ``12345``), or such a scalar that
+    holds a part of a value spelled across pieces; a tool call id that holds such a part; two keys of one
+    object that mask alike. A result's text and detail never keep a lone surrogate, and are masked again after one
+    is replaced. A value split over two LINES is not looked for: no draft joins lines.
 
     A tool_call the agent writes AFTER its answer to a stopped turn is drafted in the next turn: no line on
     the wire names a turn (ACP updates carry only the session), so it reads exactly as the next turn's own
@@ -909,6 +932,9 @@ class AcpDrafts:
         self._turn: _DraftTurn | None = None   # the turn in progress: where lines' and updates' drafts go
         self._turns: dict = {}                 # (session, turn) -> its _DraftTurn, until its result is drafted
         self._done: dict = {}                  # session -> the highest turn number whose result is drafted
+        self._begun: dict = {}                 # session -> the highest turn number the session announced
+        self._outer: list = []                 # turns put aside by a nested session's turn, innermost last
+        self._lock = threading.RLock()
 
     # -- a turn's state -----------------------------------------------------------------------------------
     def _new_turn(self, key) -> _DraftTurn:
@@ -926,6 +952,12 @@ class AcpDrafts:
         if turn is None or turn.closed or turn.resulted:
             turn = self._turn = self._new_turn(None)
         return turn
+
+    def _owned(self) -> None:
+        """Refuses a call from another thread while an announced turn is in progress: it changes nothing."""
+        turn = self._turn
+        if turn is not None and turn.announced and turn.thread != threading.get_ident():
+            raise acp_module().AcpStateError("these drafts serve a turn in progress on another thread")
 
     def _turn_for(self, key) -> _DraftTurn | None:
         """Turn ``key``'s state: its object while it is held; the turn in progress when that one is not named
@@ -958,98 +990,151 @@ class AcpDrafts:
         return out
 
     def _result(self, turn: _DraftTurn, code, detail: str) -> dict:
-        draft = {"type": "result", "payload": {"code": code, "detail": _writable(mask(detail, self._redact))}}
+        text = _writable(mask(detail, self._redact))
+        if self._redact and text != detail:
+            text = mask(text, self._redact)     # a replaced surrogate can spell a value: masked as it now stands
+        draft = {"type": "result", "payload": {"code": code, "detail": text}}
         self.drafts.append(draft)
         turn.resulted = True
+        turn.announced = False
         if turn.key is not None:
             self._record(turn.key)
+        self._leave(turn)
         return draft
+
+    def _leave(self, turn: _DraftTurn) -> None:
+        """A turn's end: a turn a nested session's turn put aside is taken up again."""
+        if turn in self._outer:
+            self._outer.remove(turn)
+        elif turn is self._turn and self._outer:
+            self._turn = self._outer.pop()
 
     # -- the session's callbacks ------------------------------------------------------------------------
     def turn_start(self, key) -> list[dict]:
         """The session's ``on_turn_start``: turn ``key`` began (its prompt is written, nothing of it is read).
-        Its state is made here. A turn still in progress with calls open, which nothing ended, has them ended
-        ``cancelled``; those drafts are returned."""
+        Its state is made here. A turn of the same session still in progress with calls open, which nothing
+        ended, has them ended ``cancelled``; those drafts are returned. Another session's announced turn in
+        progress is put aside (nested, above). A key already held or already resulted changes nothing."""
         _check_key(key, "turn_start", none=False)
-        turn = self._turn
-        out = self._close(turn, True) if turn is not None and not turn.closed and not turn.resulted else []
-        self._turn = self._new_turn(key)
-        return out
+        with self._lock:
+            self._owned()
+            if key in self._turns or key[1] <= self._done.get(key[0], 0):
+                return []
+            turn = self._turn
+            out = []
+            if turn is not None and not turn.closed and not turn.resulted:
+                if turn.announced and turn.key[0] != key[0]:
+                    self._outer.append(turn)
+                else:
+                    out = self._close(turn, True)
+            self._turn = self._new_turn(key)
+            self._turn.announced, self._turn.thread = True, threading.get_ident()
+            self._begin(key)
+            return out
+
+    def _begin(self, key) -> None:
+        if key[1] > self._begun.get(key[0], 0):
+            self._begun[key[0]] = key[1]
 
     def turn_end(self, key, outcome, code: str, detail: str) -> list[dict]:
         """The session's ``on_turn_end``: every exit of ``prompt`` comes here. ``outcome`` is the turn's
         ``TurnOutcome``, or None when ``prompt`` raised: then the turn's open calls end ``cancelled`` and its
-        result is drafted here (none when no turn began, ``key`` None). Again for one turn, it drafts nothing."""
+        result is drafted here (none when no turn began, ``key`` None). Again for one turn, it drafts nothing.
+        A ``key`` that is not the outcome's own turn is refused (``TypeError``) before anything changes."""
         _check_key(key, "turn_end", none=True)
         if outcome is not None:
             if not isinstance(outcome, acp_module().TurnOutcome):
                 raise TypeError("turn_end takes the TurnOutcome the session gave, or None")
+            if key != (outcome.session, outcome.turn):
+                raise TypeError("turn_end takes the key of its outcome's own turn")
         else:
             _check_end(code, detail)
-        turn = None if key is None else self._turn_for(key)
-        if turn is None:
-            return []
-        if outcome is not None:
-            return self._close(turn, _stopped(outcome))
-        out = self._close(turn, True)
-        out.append(self._result(turn, code, detail))
-        return out
+        with self._lock:
+            if key is None:
+                return []
+            self._begin(key)
+            turn = self._turn_for(key)
+            if turn is None:
+                return []
+            turn.announced = False
+            if outcome is not None:
+                out = self._close(turn, _stopped(outcome))
+                self._leave(turn)
+                return out
+            out = self._close(turn, True)
+            out.append(self._result(turn, code, detail))
+            return out
 
     def on_line(self, line: str) -> None:
         if type(line) is not str:
             raise TypeError("on_line takes the line as a str")
-        raw = mask(line, self._redact) + "\n"
-        try:
-            length = _utf8_length(raw, acp_module().AcpProtocolError)
-        except BaseException:
-            turn = self._turn           # the turn is abandoned: its open calls end here, not in the next turn
-            if turn is not None and not turn.closed and not turn.resulted:
-                self._close(turn, True)
-            raise
-        start, self.offset = self.offset, self.offset + length
-        self.drafts.append({"type": "engine.output", "payload": {
-            "stream": "stdout", "text": raw, "offset_start": start, "offset_end": self.offset}})
+        with self._lock:
+            self._owned()
+            try:
+                raw, refused = _masked_line(line, self._redact)
+                raw += "\n"
+                length = _utf8_length(raw, acp_module().AcpProtocolError)
+                if refused is not None:
+                    self.offset += length     # its bytes were read: later offsets stay those of the stream
+                    raise acp_module().AcpProtocolError(refused)
+            except BaseException:
+                turn = self._turn           # the turn is abandoned: its open calls end here, not in the next turn
+                if turn is not None and not turn.closed and not turn.resulted:
+                    self._close(turn, True)
+                raise
+            start, self.offset = self.offset, self.offset + length
+            self.drafts.append({"type": "engine.output", "payload": {
+                "stream": "stdout", "text": raw, "offset_start": start, "offset_end": self.offset}})
 
     def on_update(self, params) -> None:
         if not isinstance(params, Mapping) or not isinstance(params.get("update"), Mapping):
             raise TypeError("on_update takes a session/update's params: a mapping whose update is a mapping")
-        turn = self._current()
-        try:
+        with self._lock:
+            self._owned()
+            turn = self._current()
             try:
-                masked = _masked(params, self._redact)
-            except RecursionError:      # nested too deeply to read: the agent's protocol error, never a crash
-                raise acp_module().AcpProtocolError("an update nested too deeply to read") from None
-            drafts = turn.tools.update(masked)
-        except BaseException:
-            self._close(turn, True)     # the turn is abandoned: its open calls end here, not in the next turn
-            raise
-        self.drafts += drafts
+                try:
+                    masked = _masked_update(params, self._redact)
+                except RecursionError:      # nested too deeply to read: the agent's protocol error, never a crash
+                    raise acp_module().AcpProtocolError("an update nested too deeply to read") from None
+                drafts = turn.tools.update(masked)
+            except BaseException:
+                self._close(turn, True)     # the turn is abandoned: its open calls end here, not in the next turn
+                raise
+            self.drafts += drafts
 
     def on_ask(self, ask) -> None:
         if not isinstance(ask, acp_module().PermissionAsk):
             raise TypeError("on_ask takes the PermissionAsk the session gave")
-        self._current().tools.asked(ask)
+        with self._lock:
+            self._owned()
+            self._current().tools.asked(ask)
 
     # -- the driver's calls ---------------------------------------------------------------------------------
     def start_turn(self) -> list[dict]:
         """Before a prompt: a new turn begins (for callbacks the session cannot see). A turn still in progress
-        with calls open has them ended ``cancelled`` first; those drafts are returned."""
-        turn = self._turn
-        out = self._close(turn, True) if turn is not None and not turn.closed and not turn.resulted else []
-        self._turn = self._new_turn(None)
-        return out
+        with calls open has them ended ``cancelled`` first; those drafts are returned. While a turn the session
+        announced is in progress it is refused (``AcpStateError``) and changes nothing."""
+        with self._lock:
+            turn = self._turn
+            if turn is not None and turn.announced:
+                raise acp_module().AcpStateError("a turn the session announced is in progress on these drafts")
+            out = self._close(turn, True) if turn is not None and not turn.closed and not turn.resulted else []
+            self._turn = self._new_turn(None)
+            return out
 
     def abandoned(self, code: str, detail: str) -> list[dict]:
         """The turn in progress, whose ``prompt`` raised: its open calls end ``cancelled``, then its result draft
-        with ``code`` (a route contract code). Nothing when its result is drafted already, or no turn is in
-        progress."""
+        with ``code`` (a route contract code). Nothing when its result is drafted already, no turn is in
+        progress, or the turn in progress is one the session announced and will end itself."""
         _check_end(code, detail)
-        turn = self._turn
-        if turn is None or turn.resulted:
-            return []
-        out = self._close(turn, True)
-        out.append(self._result(turn, code, detail))
-        return out
+        with self._lock:
+            turn = self._turn
+            if turn is None or turn.resulted or turn.announced:
+                return []
+            out = self._close(turn, True)
+            out.append(self._result(turn, code, detail))
+            return out
 
     def ended(self, outcome, turn_id: str | None = None, delivery_id: str | None = None) -> list[dict]:
         if not isinstance(outcome, acp_module().TurnOutcome):
@@ -1061,17 +1146,21 @@ class AcpDrafts:
         if turn_id is not None and not (type(turn_id) is str and TURN_ID.fullmatch(turn_id)
                                         and type(delivery_id) is str and DELIVERY_ID.fullmatch(delivery_id)):
             raise TypeError("ended takes a turn_id of the form turn-<id> and a delivery_id of the form dlv-<id>")
-        turn = self._turn_for((outcome.session, outcome.turn))
-        if turn is None:
-            return []
-        out = self._close(turn, _stopped(outcome))
-        if outcome.stop_reason is not None and turn_id is not None:
-            accepted = {"type": "input.accepted",
-                        "payload": {"delivery_id": delivery_id, "turn_id": turn_id, "how": "new_turn"}}
-            self.drafts.append(accepted)
-            out.append(accepted)
-        out.append(self._result(turn, outcome.code, outcome.detail))
-        return out
+        with self._lock:
+            if outcome.turn > self._begun.get(outcome.session, outcome.turn):
+                raise TypeError("ended takes the outcome of a turn that began: its session announced no such turn")
+            turn = self._turn_for((outcome.session, outcome.turn))
+            if turn is None:
+                return []
+            turn.announced = False
+            out = self._close(turn, _stopped(outcome))
+            if outcome.stop_reason is not None and turn_id is not None:
+                accepted = {"type": "input.accepted",
+                            "payload": {"delivery_id": delivery_id, "turn_id": turn_id, "how": "new_turn"}}
+                self.drafts.append(accepted)
+                out.append(accepted)
+            out.append(self._result(turn, outcome.code, outcome.detail))
+            return out
 
 
 def _check_key(key, name: str, *, none: bool) -> None:
@@ -1100,22 +1189,197 @@ def _writable(text: str) -> str:
     return text
 
 
-def _masked(value, forms):
-    """A decoded ACP value with every string in it (keys included) masked as ``mask`` does. A number, a bool
-    or null whose text (as JSON writes it, or as Python does) spells a value, or a number equal to a value
-    written as a number, is the agent's protocol error: it cannot be masked in place."""
+# -- masking across pieces ----------------------------------------------------------------------------------
+# One JSON token of a line that json.loads reads: a string (with its quotes), a number or a literal. Outside
+# strings a JSON text holds only these and structure, so a left-to-right scan finds every token.
+_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|-?Infinity|NaN|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?'
+                    r"|true|false|null", re.S)
+_SCALAR_SPELLS = "a value to keep out is still in an update once it is read"
+_ACROSS_ROUNDS = 64
+
+
+def _units(text: str) -> tuple[str, list]:
+    """``text`` as UTF-16 code units (a character beyond the BMP as its two surrogates), and for each unit the
+    index of its character in ``text``: so a pair split over two pieces (two lone surrogates) reads as the
+    character it spells."""
+    units, where = [], []
+    for i, ch in enumerate(text):
+        point = ord(ch)
+        if point > 0xFFFF:
+            point -= 0x10000
+            units += [chr(0xD800 + (point >> 10)), chr(0xDC00 + (point & 0x3FF))]
+            where += [i, i]
+        else:
+            units.append(ch)
+            where.append(i)
+    return "".join(units), where
+
+
+def _chain(pieces: list[str], forms) -> list | None:
+    """One value spelled ACROSS pieces, in order, any pieces between them skipped (a reader may join values
+    only, keys only, or a list's texts): its parts as (piece, start, end) character ranges, or None. A part
+    is the end of one piece, whole pieces, then the start of a later piece; a value inside one piece is
+    ``mask``'s to find."""
+    expanded = [_units(piece) for piece in pieces]
+    for form in forms:
+        whole = _units(form)[0]
+        n = len(whole)
+        if n < 2:
+            continue
+        states: dict = {}       # k -> the parts that spell whole[:k], each ending at the end of its piece
+        for i, (units, where) in enumerate(expanded):
+            size = len(units)
+            new: dict = {}
+            for k, parts in states.items():
+                rest = whole[k:]
+                if units.startswith(rest):
+                    parts = parts + [(i, 0, len(rest))]
+                    return [(j, expanded[j][1][a], expanded[j][1][b - 1] + 1) for j, a, b in parts]
+                if 0 < size < len(rest) and rest.startswith(units):
+                    new.setdefault(k + size, parts + [(i, 0, size)])
+            for k in range(1, min(n, size + 1)):
+                if units.endswith(whole[:k]):
+                    new.setdefault(k, [(i, size - k, size)])
+            for k, parts in new.items():
+                states.setdefault(k, parts)
+    return None
+
+
+def _across(pieces: list[str], forms) -> list:
+    """Every part of every value spelled across ``pieces`` (above), found round by round: each round's parts
+    are taken out before the next round looks, until none is left. More than ``_ACROSS_ROUNDS`` rounds is the
+    agent's protocol error (fail closed)."""
+    work, found = list(pieces), []
+    fill = _fill(forms)
+    for _round in range(_ACROSS_ROUNDS):
+        parts = _chain(work, forms)
+        if parts is None:
+            return found
+        for i, a, b in parts:
+            work[i] = work[i][:a] + fill * (b - a) + work[i][b:]
+            found.append((i, a, b))
+    raise acp_module().AcpProtocolError("a value to keep out is spelled across too many pieces to mask")
+
+
+def _filled(text: str, ranges, fill: str) -> str:
+    """``text`` with each character range replaced by ``fill`` of the same UTF-8 length."""
+    for a, b in sorted(ranges, reverse=True):
+        text = text[:a] + fill * _bytes(text[a:b]) + text[b:]
+    return text
+
+
+def _scalar_spells(value, forms) -> bool:
+    """Whether a number, a bool or null spells a value (as JSON writes it, or as Python does) or equals one."""
+    return any(form in text for form in forms for text in (json.dumps(value), repr(value))) or _number_is(value, forms)
+
+
+def _masked_line(line: str, forms) -> tuple[str, str | None]:
+    """A stdout line masked in place (same UTF-8 length), and why it is refused, or None. In a line json reads,
+    each part of a value spelled across its tokens (strings read with their escapes, numbers and literals as
+    written) is masked where it is written; then the whole line is masked as ``mask`` does. A number or
+    literal that spells a value, or that holds a part of one, refuses it. A line json cannot read is masked
+    as text: nothing in it is decoded by anyone."""
     if not forms:
-        return value
-    if isinstance(value, dict):
-        return {_masked(k, forms): _masked(v, forms) for k, v in value.items()}
+        return line, None
+    try:
+        json.loads(line)
+    except (ValueError, RecursionError):
+        return mask(line, forms), None
+    tokens = list(_TOKEN.finditer(line))
+    pieces, starts = [], []
+    for token in tokens:
+        text = token.group()
+        if text.startswith('"'):
+            decoded, at = _decode(text[1:-1]) if "\\" in text else (text[1:-1], None)
+            pieces.append(decoded)
+            starts.append(at)
+        else:
+            if _scalar_spells(json.loads(text), forms):
+                return mask(line, forms), "a value to keep out is spelled by a number or literal of a line"
+            pieces.append(text)
+            starts.append(None)
+    raw_cuts: dict = {}
+    for i, a, b in _across(pieces, forms):
+        token = tokens[i]
+        if not token.group().startswith('"'):
+            return mask(line, forms), "a value to keep out is spelled across a number or literal of a line"
+        at, inner = starts[i], len(token.group()) - 2
+        a, b = (a, b) if at is None else (at[a], at[b] if b < len(at) else inner)
+        raw_cuts.setdefault(i, []).append((token.start() + 1 + a, token.start() + 1 + b))
+    cuts = [cut for i in sorted(raw_cuts) for cut in raw_cuts[i]]
+    return mask(_filled(line, cuts, _fill(forms)), forms), None
+
+
+def _masked_update(params, forms):
+    """A decoded session/update's params masked for ``ToolCalls``: each part of a value spelled across its keys,
+    strings and other scalars (in the order they are written, any between skipped) is masked, then each
+    string as ``mask`` does. The update's ``toolCallId`` stays the agent's own (ToolCalls knows a call by it
+    and masks the id it drafts). Refused (``AcpProtocolError``): a scalar that spells a value or holds a part
+    of one, a tool call id that holds a part of one, and two keys of one object that mask alike."""
+    if not forms:
+        return params
+    pieces: list = []
+    _collect(params, pieces)
+    texts = [text for text, _scalar in pieces]
+    fill, ranges = _fill(forms), {}
+    for i, a, b in _across(texts, forms):
+        if pieces[i][1] is not _NOT_SCALAR:
+            raise acp_module().AcpProtocolError(_SCALAR_SPELLS)
+        ranges.setdefault(i, []).append((a, b))
+    masked = []
+    for i, (text, scalar) in enumerate(pieces):
+        if scalar is not _NOT_SCALAR:
+            if _scalar_spells(scalar, forms):
+                raise acp_module().AcpProtocolError(_SCALAR_SPELLS)
+            masked.append(text)
+        else:
+            masked.append(mask(_filled(text, ranges.get(i, ()), fill), forms))
+    rebuilt = _rebuild(params, iter(masked))
+    update = params.get("update")
+    call_id = update.get("toolCallId") if isinstance(update, Mapping) else None
+    new_update = rebuilt.get("update") if isinstance(rebuilt, dict) else None
+    if type(call_id) is str and isinstance(new_update, dict) and "toolCallId" in new_update:
+        if new_update["toolCallId"] != mask(call_id, forms):
+            raise acp_module().AcpProtocolError("a value to keep out is spelled across a tool call id")
+        new_update["toolCallId"] = call_id
+    return rebuilt
+
+
+_NOT_SCALAR = object()
+
+
+def _collect(value, out: list) -> None:
+    """Every key, string and other scalar of a decoded value, in the order it is written: (text, scalar)."""
+    if isinstance(value, Mapping):
+        for k, v in value.items():
+            if type(k) is not str:
+                raise TypeError("an update's keys are exactly str")
+            out.append((k, _NOT_SCALAR))
+            _collect(v, out)
+    elif isinstance(value, list):
+        for v in value:
+            _collect(v, out)
+    elif isinstance(value, str):
+        if type(value) is not str:
+            raise TypeError("mask takes exactly a str")
+        out.append((value, _NOT_SCALAR))
+    else:
+        out.append((json.dumps(value), value))
+
+
+def _rebuild(value, masked):
+    if isinstance(value, Mapping):
+        rebuilt = {}
+        for _k, v in value.items():
+            key = next(masked)
+            if key in rebuilt:
+                raise acp_module().AcpProtocolError("two keys of one object mask alike")
+            rebuilt[key] = _rebuild(v, masked)
+        return rebuilt
     if isinstance(value, list):
-        return [_masked(v, forms) for v in value]
-    if isinstance(value, str):
-        return mask(value, forms)
-    texts = (json.dumps(value), repr(value))
-    if any(form in text for form in forms for text in texts) or _number_is(value, forms):
-        raise acp_module().AcpProtocolError("a value to keep out is still in an update once it is read")
-    return value
+        return [_rebuild(v, masked) for v in value]
+    text = next(masked)
+    return text if isinstance(value, str) else value
 
 
 def _number_is(value, forms) -> bool:

@@ -13,8 +13,12 @@ serves every session of a run. After every turn, the drafts that turn added must
 The exits: the answer (with a call ended or left open), the agent answering cancelled, the caller's cancel,
 the deadline with and without a line read, the agent going away with and without a line read, a protocol
 error, a line it cannot parse, a stray response line, ``on_line`` and ``on_update`` raising, ``on_ask``
-raising (the wrapped wiring), a raise injected in each wrapped callback, and the driver's closes
-(``ended``, ``abandoned``, ``start_turn``) called again and out of order. Three wirings: ``open_acp(drafts=)``,
+raising (the wrapped wiring), a raise injected in each wrapped callback, an answer the client refuses (a
+stop reason ACP does not have, an error whose code is not a number), a line that spells the value, a value
+split over a call's input (masked, and no draft may carry it, pieces joined), ANOTHER SESSION'S WHOLE TURN
+NESTED inside a turn (on the same thread, the drafts= and bound wirings; each nested turn is checked as its
+own), and the driver's closes (``ended``, ``abandoned``, ``start_turn``) called again and out of order.
+Three wirings: ``open_acp(drafts=)``,
 the drafts' own bound callbacks, and callbacks wrapped so that the session cannot see the drafts (the
 driver then calls ``start_turn`` before each prompt). It uses only the drafts' documented calls, so it runs
 unchanged on every earlier head of this slice.
@@ -25,6 +29,7 @@ Run: PYTHONPATH=core <python> -m unittest recursion_core.routes.engines.fixtures
 from __future__ import annotations
 
 import collections
+import json
 import random
 import re
 import unittest
@@ -61,6 +66,16 @@ def done(cid: str):
                        "content": [{"type": "content", "content": {"type": "text", "text": "out"}}]})
 
 
+def huge_input(cid: str):
+    return ("update", {"sessionUpdate": "tool_call", "toolCallId": cid, "status": "in_progress",
+                       "rawInput": {"n": 2**60}})          # no RFC 8785 text: on_update raises
+
+
+def split_value(cid: str):
+    return ("update", {"sessionUpdate": "tool_call", "toolCallId": cid, "status": "in_progress",
+                       "rawInput": {"a": [VALUE[:2], VALUE[2:]]}})
+
+
 def spells_value(cid: str):
     return ("update", {"sessionUpdate": "tool_call", "toolCallId": cid, "status": "in_progress",
                        "rawInput": {"n": 12345.0}})
@@ -81,7 +96,18 @@ EXITS = {
     "a stray response line": (lambda p: [opened(p + "a"), STRAY, ("stale_response",), done(p + "a"),
                                          ("end", "end_turn")], None, False, None),
     "on_line raises": (lambda p: [opened(p + "a"), NOT_UTF8, *STOPPED], None, False, None),
-    "on_update raises": (lambda p: [opened(p + "a"), spells_value(p + "b"), *STOPPED], None, False, None),
+    "on_update raises": (lambda p: [opened(p + "a"), huge_input(p + "b"), *STOPPED], None, False, None),
+    "a line that spells the value": (lambda p: [opened(p + "a"), spells_value(p + "b"), *STOPPED], None, False, None),
+    "a value split over a call's input": (lambda p: [split_value(p + "a"), done(p + "a"), ("end", "end_turn")], None,
+                                          False, None),
+    "a stop reason ACP does not have": (lambda p: [opened(p + "a"), ("end", "not-a-stop-reason")], None, False, None),
+    "an error answer whose code is not a number": (lambda p: [opened(p + "a"), ("error", "bad", "bad")], None, False,
+                                                   None),
+    "a raise injected in on_line on the answer": (lambda p: [opened(p + "a"), ("end", "max_tokens")], None, False,
+                                                  ("wrapped",)),
+    "another session's turn nested in this one": (lambda p: [opened(p + "a"), ("chunk", "nest-here"), done(p + "a"),
+                                                             opened(p + "b"), ("end", "end_turn")], None, False,
+                                                  ("drafts=", "bound")),
     "on_ask raises": (lambda p: [opened(p + "a"), ("ask", {"toolCallId": p + "a", "title": "run", "kind": "execute",
                                                            "status": "pending"}, OPTIONS_ALL), ("end", "cancelled")],
                       None, False, ("wrapped",)),
@@ -91,6 +117,14 @@ EXITS = {
 }
 # The driver's closes, called again and out of order after the turn's own close.
 EXTRAS = ("ended again", "abandoned again", "start_turn again", "ended of the turn before", "nothing")
+
+
+def strings_of(value) -> list:
+    if isinstance(value, dict):
+        return [x for k, v in value.items() for x in (k, *strings_of(v))]
+    if isinstance(value, list):
+        return [x for v in value for x in strings_of(v)]
+    return [value] if isinstance(value, str) else []
 
 
 def code_of(err: BaseException) -> str:
@@ -111,6 +145,8 @@ class Run:
         self.failures: list = []
         self.exits = [name for name, (_s, _d, _e, only) in EXITS.items() if only is None or wiring in only]
         self.label = f"seed {seed} {wiring}"
+        self.nested: list = []          # (start, end) of the drafts of each nested turn, checked as its own
+        self.nests = 0
 
     def session(self, index: int, names: list[str]):
         scripts, holder = [], []
@@ -123,6 +159,8 @@ class Run:
             line = read(timeout_s)
             if line is not None and "-cancel" in line and holder:
                 holder[0].cancel()
+            if line is not None and "nest-here" in line:
+                self.nest(index)
             return line
 
         agent.read_line = read_line
@@ -134,7 +172,7 @@ class Run:
                             on_ask=d.on_ask)
         else:
             def on_line(line):
-                if "inject-a-raise" in line:
+                if "inject-a-raise" in line or '"stopReason":"max_tokens"' in line:
                     raise Injected("on_line")
                 d.on_line(line)
 
@@ -151,6 +189,16 @@ class Run:
         holder.append(s)
         return agent, s
 
+    def nest(self, index) -> None:
+        """Another session's whole turn, run while this session's turn reads a line (the same thread)."""
+        self.nests += 1
+        sub = f"{index}n{self.nests}"
+        name = self.rng.choice([n for n in self.exits if n != "another session's turn nested in this one"])
+        agent, s = self.session(sub, [name])
+        start = len(self.drafts.drafts)
+        self.turn(sub, agent, s, 1, name, None, nested=True)
+        self.nested.append((start, len(self.drafts.drafts)))
+
     def close(self, where, what, fn, *args) -> None:
         """One of the driver's closes; a close that raises is a broken turn, recorded, and the run goes on."""
         try:
@@ -158,7 +206,7 @@ class Run:
         except Exception as error:
             self.failures.append((*where, f"the driver's {what} raised {type(error).__name__}"))
 
-    def turn(self, index, agent, s, number, name, previous):
+    def turn(self, index, agent, s, number, name, previous, nested=False):
         d = self.drafts
         where = (self.label, f"session {index}", f"turn {number}", name)
         deadline_in = EXITS[name][1]
@@ -179,7 +227,8 @@ class Run:
                 self.close(where, "abandoned", d.abandoned, code_of(error), "the driver's except")
         else:
             self.close(where, "ended", d.ended, out, *ids)
-        extra = self.rng.choice(EXTRAS)
+        # inside another session's turn, the driver's start_turn is refused (that turn is announced): not drawn
+        extra = self.rng.choice([e for e in EXTRAS if not (nested and e == "start_turn again")])
         if extra == "ended again" and out is not None:
             self.close(where, "second ended", d.ended, out, *ids)
         elif extra == "abandoned again" and hasattr(d, "abandoned"):
@@ -188,7 +237,9 @@ class Run:
             self.close(where, "second start_turn", start_turn)
         elif extra == "ended of the turn before" and previous is not None:
             self.close(where, "ended of the turn before", d.ended, previous)
-        self.check(where + (extra,), index, number, d.drafts[before:], out, err)
+        window = [w for i, w in enumerate(d.drafts[before:], before)
+                  if not any(a <= i < b for a, b in self.nested)]
+        self.check(where + (extra,), index, number, window, out, err)
         return out
 
     def check(self, where, index, number, window, out, err) -> None:
@@ -217,6 +268,17 @@ class Run:
         for cid in ends:
             if cid not in calls:
                 self.failures.append((*where, f"call {cid} ended in a turn that did not begin it"))
+        for w in window:                    # no draft carries the value, its pieces joined in order
+            payload = w["payload"]
+            if w["type"] == "engine.output":
+                try:
+                    pieces = strings_of(json.loads(payload["text"]))
+                except ValueError:
+                    pieces = [payload["text"]]
+            else:                           # (a digest is hex, not text a reader joins)
+                pieces = strings_of({k: v for k, v in payload.items() if k != "input_digest"})
+            if VALUE in "".join(pieces):
+                self.failures.append((*where, f"a {w['type']} draft carries the value"))
 
     def go(self) -> None:
         count, index = 0, 0

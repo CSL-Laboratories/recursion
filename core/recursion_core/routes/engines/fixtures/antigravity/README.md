@@ -18,6 +18,7 @@ paths the brief names for the ACP client (`routes/acp.py`, `routes/tests/test_ac
 | `test_antigravity_acp_pipe.py` | the client over a real pipe, the fake running as its own process | `routes/tests/` |
 | `test_antigravity_one_shot.py` | the one-shot parser over the fixtures below, and the one-shot adapter | `routes/engines/tests/` |
 | `test_antigravity_driver.py` | methods, driver.v2 declarations, the ACP glue, nothing registered | `routes/engines/tests/` |
+| `test_antigravity_turns.py` | the turn invariant of `AcpDrafts` over thousands of seeded turns, the real session path | `routes/engines/tests/` |
 | `one_shot/*.jsonl` | one-shot stdout streams (SYNTHETIC) | stays |
 
 There is no `__init__.py` here or in `routes/engines/fixtures/` (that one would be lane DRIVER-CC's): the
@@ -28,7 +29,7 @@ root:
         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_acp \
         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_acp_pipe \
         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_one_shot \
-        recursion_core.routes.engines.fixtures.antigravity.test_antigravity_driver
+        recursion_core.routes.engines.fixtures.antigravity.test_antigravity_driver         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_turns
 
 `unittest discover -s core` does not find them (it needs an `__init__.py` in every folder on the way); the
 hosted gate does (it runs every `core/**/test_*.py` by path).
@@ -62,7 +63,14 @@ class AcpConnection(*, hooks=NO_HOOKS, clock=None, permission_timeout_s=None)   
     abandoned_turn; next_deadline(); ask(token); pending_result(rpc_id); turn_in_progress
     counters: stray_responses, stray_updates, late_answers, hook_failures
 
-class AcpSession(process, clock, *, hooks, permission_timeout_s, on_line, on_update, on_ask)
+class AcpSession(process, clock, *, hooks=NO_HOOKS, permission_timeout_s=None, on_line=None, on_update=None,
+                 on_ask=None, on_turn_end=None, on_turn_start=None)
+    on_turn_start(key)                        the turn whose prompt is written, before any line of it is read
+    on_turn_end(key, outcome, code, detail)   every exit of prompt, once; outcome None when prompt raised;
+        key = (connection.serial, turn number), None only when no turn began (a prompt refused before its
+        request); it is kept through any failure after the request (a bad answer, on_line raising, an
+        interrupted write). An Exception out of it is counted (turn_end_failures), never raised. Callbacks
+        bound to one object with turn_end / turn_start methods bring those along (two such objects: refused)
     open(method_id, cwd, deadline_at, *, load_session_id=None) -> session id
     prompt(text, deadline_at) -> TurnOutcome; cancel(); close()
     answer_permission(token, decision) -> bool    True only when the agent was sent the option the decision
@@ -72,8 +80,16 @@ class AcpSession(process, clock, *, hooks, permission_timeout_s, on_line, on_upd
     One caller reads the output at a time: open or prompt while another runs raises AcpStateError at once.
 
 TurnOutcome(turn, code, stop_reason, cancel_requested, cancel_confirmed, late_stop_reason, error, limit,
-            detail, text)
+            detail, text, session)                      session (required): the connection's serial
 PermissionAsk(token, turn, tool_call, options, deadline_at, answer, answered_by, option_id)
+ToolCalls(digest, mask=None)       one turn's tool_call / tool_call_update updates as driver.v2 drafts
+    update(params) -> [drafts]; asked(PermissionAsk); turn_ended(stopped) -> [drafts]; has_open; ignored
+    digest(value) -> 64 lowercase hex (RFC 8785 text, then SHA-256): raises NoCanonicalText (or returns None)
+        for a value with no canonical text (the agent's: AcpProtocolError); anything else it raises, or a
+        bad digest, is the caller's (AcpInvalid). mask(text) -> text: result texts, after the join and again
+        after a lone surrogate is replaced, and the call id a draft carries (a call is known by the agent's
+        own id; two calls never share a draft id)
+NoCanonicalText(ValueError)
 AcpError(code, detail) > AcpRefused > AcpUnsupported, AcpInvalid (also ValueError), AcpStateError (also
     RuntimeError); AcpError > AcpProtocolError; RpcError(code, message, data)
 ```
@@ -107,8 +123,11 @@ adapter launches a keyed route only through an `output_boundary` (a launcher, as
 keep out, whose capture masks them before anything is persisted) and refuses it without one, before custody
 is asked (`antigravity_output_boundary_missing`). E4, E6, E7 and E9 need the same for their keyed routes.
 `AcpDrafts.ended` takes `turn_id` (`turn-...`) and `delivery_id` (`dlv-...`) of common.v1's form, both or
-neither. `open_acp(..., drafts=d)` wires all four of its callbacks, the session's `on_turn_end` included (and wiring
-`d`'s own callbacks brings `d.turn_end` along). The session tells `on_turn_end` every end of a turn `prompt`
+neither. `open_acp(..., drafts=d)` wires all five of its callbacks, the session's `on_turn_start` and
+`on_turn_end` included (and wiring `d`'s own callbacks brings `d.turn_start` and `d.turn_end` along). One
+`AcpDrafts` serves sessions one thread at a time; a session run inside another's callback is nested, and a
+call from another thread during an announced turn is refused (`AcpStateError`). `AcpDrafts(redact=...)`
+also masks a value split across a line's or an update's pieces, and refuses what cannot be masked in place. The session tells `on_turn_end` every end of a turn `prompt`
 began, once, so one place in the drafts owns a turn's open tool calls whatever ends the turn; a second end
 drafts nothing and raises nothing.
 A permission answer is decided when it claims the ask, against a clock read after the claim, so a wait for
@@ -124,6 +143,31 @@ route contract code, or `cancelled`, which the route contract does not have: a c
 `unsupported` here is not driver.v2's refusal record (that needs `call` and `flag`): a driver wraps it.
 `PermissionAsk.token` is the client's own id, not an approval.v1 id; the approval queue's binding is not
 here. `close()` only ends the agent's input: no fencing, joining or restarting of a worker is offered.
+
+A consumer, end to end (runnable as it stands; a test runs it):
+
+```python
+from recursion_core.routes.engines import antigravity as ag
+from recursion_core.routes.engines.fixtures.antigravity import acp
+from recursion_core.routes.engines.fixtures.antigravity.fake_acp_agent import FakeAcpAgent
+
+agent = FakeAcpAgent([[("update", {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "run",
+                                   "kind": "execute", "status": "completed", "rawInput": {"n": 1}}),
+                       ("end", "end_turn")]])
+route = {"engine": "antigravity", "model": "made-up", "auth_method": "gemini-api-key",
+         "connection": {"kind": "api_key", "id": "conn-A", "credential_env": "GEMINI_API_KEY"}}
+drafts = ag.AcpDrafts(redact=("made-up-key",))
+session = ag.open_acp(agent, agent.clock, route, "/var/tmp/workspace", agent.clock() + 60, drafts=drafts)
+outcome = session.prompt("hello", agent.clock() + 60)
+assert (outcome.session, outcome.turn) == (session.connection.serial, 1)
+drafts.ended(outcome, "turn-1", "dlv-1")
+kinds = [d["type"] for d in drafts.drafts if d["type"] != "engine.output"]
+assert kinds == ["tool.call", "tool.result", "input.accepted", "result"], kinds
+
+tools = acp.ToolCalls(ag.input_digest)          # the client alone, under another engine's draft maker
+assert [d["type"] for d in tools.update({"update": {"sessionUpdate": "tool_call", "toolCallId": "x",
+                                                    "status": "completed"}})] == ["tool.call", "tool.result"]
+```
 
 ## The ACP pin
 

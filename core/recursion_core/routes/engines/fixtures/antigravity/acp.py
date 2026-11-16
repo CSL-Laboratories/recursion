@@ -981,6 +981,10 @@ class AcpSession:
         self._on_turn_end = on_turn_end
         self._on_turn_start = on_turn_start
         self.turn_end_failures = 0
+        # The number of the turn the running prompt began, kept from the moment its request is made (under the
+        # ordering lock) until its end is told: cleanup of the connection never erases it. None while no turn
+        # began (a prompt refused before its request was made).
+        self._started: int | None = None
 
     # -- writing ------------------------------------------------------------------------------------------
     def _write(self, lines) -> bool:
@@ -1108,6 +1112,7 @@ class AcpSession:
             return self._prompt(text, deadline_at)
 
     def _prompt(self, text: str, deadline_at: float) -> TurnOutcome:
+        self._started = None
         self._drain(deadline_at)
         try:
             outcome = self._turn(text, deadline_at)
@@ -1124,7 +1129,9 @@ class AcpSession:
         if outcome is not None:
             key, code, detail = (outcome.session, outcome.turn), outcome.code, outcome.detail
         else:
-            number = self.connection.abandoned_turn
+            # The key of the turn this prompt began, whatever cleared the connection's turn since (a bad
+            # answer, a line on_line raised on, an interrupted write): None only when no turn began.
+            number = self._started
             key = None if number is None else (self.connection.serial, number)
             code = error.code if isinstance(error, AcpError) else c.ENGINE_ERROR
             detail = f"handling the turn raised {type(error).__name__}"
@@ -1135,9 +1142,15 @@ class AcpSession:
 
     def _turn_started(self) -> None:
         """Tells ``on_turn_start`` the turn whose prompt was just written, before any line of it is read."""
-        number = self.connection.turn_in_progress
+        number = self._started
         if self._on_turn_start is not None and number is not None:
             self._on_turn_start((self.connection.serial, number))
+
+    def _request_prompt(self, text: str, deadline_at: float):
+        """The prompt's request; the turn it begins is kept as this prompt's own (``_started``)."""
+        made = self.connection.prompt(text, deadline_at)
+        self._started = self.connection.turn_in_progress
+        return made
 
     def _turn(self, text: str, deadline_at: float) -> TurnOutcome:
         # A prompt that could not be written is seen by the pump's first round (the input is lost): the turn
@@ -1146,7 +1159,7 @@ class AcpSession:
         # progress with nothing to end it.
         try:
             rpc_id, _written = self._step(self._starting(deadline_at, "before the prompt was sent",
-                                                         lambda: self.connection.prompt(text, deadline_at)))
+                                                         lambda: self._request_prompt(text, deadline_at)))
         except BaseException:
             if self.input_lost:
                 self.connection.input_closed()
@@ -1316,6 +1329,7 @@ class _ToolCall:
     content: list = field(default_factory=list)
     called: bool = False
     resulted: bool = False
+    public_id: str = ""     # the id its drafts carry (masked, distinct); call_id stays the agent's own
 
 
 class NoCanonicalText(ValueError):
@@ -1334,7 +1348,11 @@ class ToolCalls:
     ``asked(ask)`` tells it of a permission ask (its final answer is read when the call fails);
     ``turn_ended(stopped)`` gives a result for every call drafted without one: ``cancelled`` when the turn was
     stopped, ``error`` otherwise. ``mask(text) -> text``, when given, is applied to each result text once its
-    parts are joined. Not thread-safe: one turn's updates arrive on one thread.
+    parts are joined, and again after any lone surrogate is replaced (a replacement can spell a value).
+    CALLS ARE KNOWN BY THE AGENT'S OWN ``toolCallId`` (updates and permission asks alike); a draft carries a
+    public id instead: the id masked, and, when that is taken by another call already (two ids that mask
+    alike, or an id equal to another's mask), ``redacted-call-<n>`` masked, so two calls never share a draft
+    id and no draft id carries a masked value. Not thread-safe: one turn's updates arrive on one thread.
     """
 
     def __init__(self, digest: Callable[[object], str], mask: Callable[[str], str] | None = None) -> None:
@@ -1344,6 +1362,7 @@ class ToolCalls:
         self._mask = mask
         self._calls: dict[str, _ToolCall] = {}
         self._asks: dict[str, list] = {}
+        self._used: set = set()   # the public ids given so far
         self.ignored = 0   # updates with no usable tool call id
 
     def asked(self, ask: PermissionAsk) -> None:
@@ -1360,7 +1379,9 @@ class ToolCalls:
                 or _lone_surrogate(call_id)):
             self.ignored += 1
             return []
-        call = self._calls.setdefault(call_id, _ToolCall(call_id))
+        call = self._calls.get(call_id)
+        if call is None:
+            call = self._calls[call_id] = _ToolCall(call_id, public_id=self._public_id(call_id))
         if isinstance(update.get("name"), str) and update["name"]:
             call.name = update["name"]
         if update.get("kind") in TOOL_KINDS:
@@ -1390,6 +1411,15 @@ class ToolCalls:
         return [self._result(call, status) for call in self._calls.values() if call.called and not call.resulted]
 
     # -- internals ------------------------------------------------------------------------------------------
+    def _public_id(self, call_id: str) -> str:
+        """A draft id for a new call: distinct from every one given, and masked when a mask is given."""
+        public, n = (call_id if self._mask is None else self._mask(call_id)), 1
+        while public in self._used or len(public) > 128:
+            n += 1
+            public = f"redacted-call-{n}" if self._mask is None else self._mask(f"redacted-call-{n}")
+        self._used.add(public)
+        return public
+
     def _name(self, call: _ToolCall) -> str:
         name = call.name if call.name and len(call.name) <= 256 and not any(c in call.name for c in "\r\n") else None
         if name is not None and _lone_surrogate(name):   # it could not be written as UTF-8 JSON
@@ -1412,7 +1442,7 @@ class ToolCalls:
         if not (isinstance(digest, str) and len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest)):
             raise AcpInvalid("the digest function must give a SHA-256 as 64 lowercase hex characters")
         call.called = True          # only once its draft exists: a refused call is never "drafted"
-        payload = {"call_id": call.call_id, "name": self._name(call), "input_digest": digest,
+        payload = {"call_id": call.public_id, "name": self._name(call), "input_digest": digest,
                    "input": dict(value) if isinstance(value, Mapping) else None}
         return {"type": "tool.call", "payload": payload}
 
@@ -1432,7 +1462,9 @@ class ToolCalls:
             text = self._mask(text)   # after the join: parts masked one by one could spell a value together
         if _lone_surrogate(text):     # a JSON line may carry one escaped; a draft must be writable as UTF-8
             text = "".join(chr(0xFFFD) if 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in text)
+            if self._mask is not None:
+                text = self._mask(text)   # the replacement can spell a value: masked again, as it now stands
         truncated = len(text) > TOOL_TEXT_LIMIT
-        payload = {"call_id": call.call_id, "status": status, "text": text[:TOOL_TEXT_LIMIT], "output_ref": None,
+        payload = {"call_id": call.public_id, "status": status, "text": text[:TOOL_TEXT_LIMIT], "output_ref": None,
                    "truncated": truncated}
         return {"type": "tool.result", "payload": payload}

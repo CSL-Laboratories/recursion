@@ -308,9 +308,15 @@ class CredentialStore:
         # Refused here, not later as an untyped error out of verify or mint (round 5 of #385, DeepSeek F4).
         if not callable(wall) or (emit is not None and not callable(emit)):
             raise CredentialStoreError("wall and emit must be callable")
-        if limit is not None and not (callable(getattr(limit, "blocked", None))
-                                      and callable(getattr(limit, "failed", None))):
-            raise CredentialStoreError("limit must have blocked and failed, like FailedAuthLimit")
+        if limit is not None:
+            # Each method is required, and one that raises when it is read is refused here too, typed (round 6 of
+            # #385: Codex GPT-6 Astra 1 pins each check; DeepSeek F5, a raising property escaped untyped).
+            try:
+                usable = callable(getattr(limit, "blocked", None)) and callable(getattr(limit, "failed", None))
+            except Exception:  # noqa: BLE001 - a limiter that cannot be read cannot count failed checks
+                usable = False
+            if not usable:
+                raise CredentialStoreError("limit must have blocked and failed, like FailedAuthLimit")
         self._path, self._emit, self._wall = path, emit, wall
         self._lock_path = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.lock")
         self._lock_timeout_s = float(lock_timeout_s)

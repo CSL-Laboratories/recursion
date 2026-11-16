@@ -618,6 +618,34 @@ class RoundFiveSeamsTest(unittest.TestCase):
         token, _ = store.mint("plugin", "p1", ["read"])
         self.assertEqual(store.verify(token, peer="p").id, "p1")
 
+    @NEEDS_POSIX
+    def test_each_limiter_method_is_required_at_construction(self) -> None:
+        # The round-6 read of #385 by Codex GPT-6 Astra, 1 (its required-coverage.patch): removing either check
+        # left every test green. And DeepSeek's round-6 F5: a limiter whose method raises when read.
+        from types import SimpleNamespace
+        from recursion_core.control.credentials import CredentialStoreError
+
+        class Raising:
+            def __init__(self, broken):
+                self.broken = broken
+
+            def __getattr__(self, name):
+                if name == self.broken:
+                    raise RuntimeError(f"the {name} attribute cannot be read")
+                return lambda peer: False
+
+        base = tempfile.mkdtemp(prefix="scopes-limit-interface-")
+        self.addCleanup(shutil.rmtree, base, True)
+        path = os.path.join(base, "state", "credentials.json")
+        for limit in (SimpleNamespace(blocked=lambda peer: False),
+                      SimpleNamespace(failed=lambda peer: None),
+                      SimpleNamespace(blocked=lambda peer: False, failed=0),
+                      SimpleNamespace(blocked=0, failed=lambda peer: None),
+                      Raising("blocked"), Raising("failed")):
+            with self.subTest(limit=repr(limit)):
+                with self.assertRaises(CredentialStoreError):
+                    CredentialStore(path, limit=limit)
+
 
 class RoundSixSeamsTest(unittest.TestCase):
     """The round-6 read of #385 by DeepSeek V4.1 Flash. F1 (STRICT): one call read the principal's kind and id

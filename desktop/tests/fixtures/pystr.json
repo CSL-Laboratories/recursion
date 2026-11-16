@@ -183,6 +183,30 @@
       "field": "{\"it's\": 1}"
     },
     {
+      "name": "a negative fraction",
+      "json": "-0.5",
+      "str": "-0.5",
+      "field": "-0.5"
+    },
+    {
+      "name": "a negative fraction with digits",
+      "json": "-987.3125",
+      "str": "-987.3125",
+      "field": "-987.3125"
+    },
+    {
+      "name": "a negative small fraction inside an object",
+      "json": "{\"value\": -0.0001}",
+      "str": "{'value': -0.0001}",
+      "field": "{'value': -0.0001}"
+    },
+    {
+      "name": "a negative fraction in exponent form inside a list",
+      "json": "[-1.5e-07]",
+      "str": "[-1.5e-07]",
+      "field": "[-1.5e-07]"
+    },
+    {
       "name": "nested lists and objects",
       "json": "{\"a\": [1, \"b\", {\"c\": null}], \"d\": 2.5}",
       "str": "{'a': [1, 'b', {'c': None}], 'd': 2.5}",

@@ -269,3 +269,85 @@ test("a start sends the CLI's request from the form, and input the schema refuse
   await press(doc, byId(doc, "start-run"));
   assert.deepEqual(sent(transport, "run.start"), [{ method: "run.start", params: { tenant: "t1", engine: "codex", prompt: "hi" } }]);
 });
+
+// Round 4 of #390 (GPT-6.1 Sol, P2): each Stop keeps the reason its own call was refused, even when two Stops
+// are refused while both are in flight; the shared status line holds only the last one.
+test("two Stops refused while both are in flight each keep their own reason", async () => {
+  const run = recorded("c09-run-list-one-page.json").runs[0];
+  const sessions = recorded("h27-session-list-ok.json");
+  const sessionId = sessions.sessions[0].session_id;
+  // No recorded answer for either Stop: each call is refused here, after both were confirmed.
+  const replay = replayTransport([
+    { method: "run.list", params: {}, answer: { code: "ok", runs: [run] } },
+    { method: "session.list", params: { state: "live" }, answer: sessions },
+  ]);
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const held = {
+    calls: replay.calls,
+    async call(method, params) {
+      if (method === "run.stop" || method === "session.stop") await gate;
+      return replay.call(method, params);
+    },
+  };
+  const doc = windowDocument();
+  await startWindow(doc, held, makeActions(() => "desktop-check.1"));
+  await press(doc, button(doc, "runs-table", "Stop"));
+  const runStop = press(doc, byId(doc, "stop-confirm-yes"));
+  await press(doc, nav(doc, "sessions"));
+  await press(doc, button(doc, "sessions-list", "Stop"));
+  const sessionStop = press(doc, byId(doc, "stop-confirm-yes"));
+  release();
+  await Promise.all([runStop, sessionStop]);
+  const heads = byId(doc, "stop-answers-list").children.map((entry) => entry.children[0].textContent);
+  assert.equal(heads.length, 2);
+  assert.ok(heads.includes(`Stop of run ${run.run_id}: Not sent: no recorded exchange for run.stop.`), heads.join(" | "));
+  assert.ok(heads.includes(`Stop of session ${sessionId}: Not sent: no recorded exchange for session.stop.`), heads.join(" | "));
+});
+
+// Round 4 of #390 (GPT-6 Astra, P2): the heading names the selected session for an answer with no condition
+// (ok) and for a Stop refused here, so the session is never known only from a pending condition's text.
+test("a session Stop's success or local refusal names the session without needing a pending condition", async () => {
+  const sessions = recorded("h27-session-list-ok.json");
+  const sessionId = sessions.sessions[0].session_id;
+  for (const answered of [true, false]) {
+    const exchanges = [
+      { method: "run.list", params: {}, answer: { code: "ok", runs: [] } },
+      { method: "session.list", params: { state: "live" }, answer: sessions },
+    ];
+    if (answered) {
+      exchanges.push({
+        method: "session.stop",
+        params: { command_id: "desktop-check.1", session_id: sessionId, scope: "self" },
+        answer: { code: "ok", session_id: sessionId },
+      });
+    }
+    const doc = windowDocument();
+    await startWindow(doc, replayTransport(exchanges), makeActions(() => "desktop-check.1"));
+    await press(doc, nav(doc, "sessions"));
+    await press(doc, button(doc, "sessions-list", "Stop"));
+    await press(doc, byId(doc, "stop-confirm-yes"));
+    const heading = byId(doc, "stop-answers-list").children[0].children[0].textContent;
+    assert.equal(heading, answered
+      ? `Stop of session ${sessionId}, answer code ok`
+      : `Stop of session ${sessionId}: Not sent: no recorded exchange for session.stop.`);
+  }
+});
+
+test("a Stop the daemon answered with null is shown as that answer, not as a Stop that was not sent", async () => {
+  const sessions = recorded("h27-session-list-ok.json");
+  const sessionId = sessions.sessions[0].session_id;
+  const transport = replayTransport([
+    { method: "run.list", params: {}, answer: { code: "ok", runs: [] } },
+    { method: "session.list", params: { state: "live" }, answer: sessions },
+    { method: "session.stop", params: { command_id: "desktop-check.1", session_id: sessionId, scope: "self" }, answer: null },
+  ]);
+  const doc = windowDocument();
+  await startWindow(doc, transport, makeActions(() => "desktop-check.1"));
+  await press(doc, nav(doc, "sessions"));
+  await press(doc, button(doc, "sessions-list", "Stop"));
+  await press(doc, byId(doc, "stop-confirm-yes"));
+  const entry = byId(doc, "stop-answers-list").children[0];
+  assert.equal(entry.children[0].textContent, `Stop of session ${sessionId}, answer code None`);
+  assert.match(entry.textContent, /REFUSED the answer is not an object/);
+});

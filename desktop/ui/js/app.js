@@ -21,24 +21,27 @@ export function startWindow(doc, transport, actions = makeActions()) {
     $("status-line").textContent = text;
   }
 
-  async function ask(action, input = {}) {
+  // A call that is not sent answers null and says why in the status line. `refused`, when given, receives
+  // that reason for this call alone ({ text }): the status line is shared, so a caller with several calls in
+  // flight must not read it back.
+  async function ask(action, input = {}, refused = null) {
+    const notSent = (err) => {
+      const text = `Not sent: ${err.message}.`;
+      say(text);
+      if (refused !== null) refused.text = text;
+      return null;
+    };
     let built;
     try {
       built = actions[action](input);
     } catch (err) {
-      if (err instanceof ActionError) {
-        say(`Not sent: ${err.message}.`);
-        return null;
-      }
+      if (err instanceof ActionError) return notSent(err);
       throw err;
     }
     try {
       return await send(transport, action, built);
     } catch (err) {
-      if (err instanceof RefusedHere) {
-        say(`Not sent: ${err.message}.`);
-        return null;
-      }
+      if (err instanceof RefusedHere) return notSent(err);
       throw err;
     }
   }
@@ -87,15 +90,15 @@ export function startWindow(doc, transport, actions = makeActions()) {
   // shown; a view's box would then be hidden, and the view's next refresh would replace it. Each answer stays,
   // newest first, until the operator clears them, and a Stop that was not sent says why there as well, so no
   // Stop's outcome is dropped without a word.
-  function showStopAnswer(asked, answer) {
+  function showStopAnswer(asked, answer, refusal) {
     const what = asked.action === "run.stop" ? `run ${field(asked.input.run_id)}` : `session ${field(asked.input.session_id)}`;
     const entry = doc.createElement("div");
     entry.setAttribute("class", "stop-answer");
     const head = doc.createElement("p");
     const box = doc.createElement("div");
-    if (answer === null) head.textContent = `Stop of ${what}: ${$("status-line").textContent}`;
+    if (refusal !== undefined) head.textContent = `Stop of ${what}: ${refusal}`;
     else {
-      const code = typeof answer === "object" && !Array.isArray(answer) ? answer.code : null;
+      const code = answer !== null && typeof answer === "object" && !Array.isArray(answer) ? answer.code : null;
       head.textContent = `Stop of ${what}, answer code ${field(code)}`;
       renderConditions(doc, box, answer, asked.action);
     }
@@ -116,7 +119,9 @@ export function startWindow(doc, transport, actions = makeActions()) {
     pendingStop = null;
     $("stop-confirm").hidden = true;
     if (asked === null) return;
-    showStopAnswer(asked, await ask(asked.action, asked.input));
+    const refused = {};
+    const answer = await ask(asked.action, asked.input, refused);
+    showStopAnswer(asked, answer, refused.text);
   }
 
   function cancelStop() {

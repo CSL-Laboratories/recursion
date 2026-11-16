@@ -177,11 +177,13 @@ export function sanitize(text) {
 // What Python's str() gives for a JSON value, so a row reads exactly as the CLI's and the TUI's do. Held to
 // desktop/tests/fixtures/pystr.json, which is written by Python and checked against str() and the TUI's field().
 //
-// What JSON.parse has already dropped cannot be given back, and is not guessed at. A number written 2.0 or
-// 1e15 in the answer parses to the same value as 2 or 1000000000000000, so a whole number within 2**53 reads
-// as an integer, as Python reads the plain form, and Python's "2.0" is not shown; -0.0 reads as "0". An
-// integer past 2**53 has already lost digits and reads as Python's float of the same value. An object lists
-// integer-like keys first, where Python keeps the text's order. The fixture's "lost" list names each of these.
+// What JSON.parse has already dropped cannot be given back, and is not guessed at. A whole-valued number is
+// shown as its integer digits, whatever its size (through BigInt, so never with ".0" or an exponent), as
+// Python shows an integer: the control answers' revisions, positions and counts are integers. So a float
+// written 2.0 reads "2", -0.0 reads "0", and one written 1e21 reads as its integer digits, where Python
+// prints 2.0, -0.0 and 1e+21; and an integer past 2**53 may differ in its last digits from the wire's,
+// because JSON.parse has already rounded it. An object lists integer-like keys first, where Python keeps the
+// text's order. The fixture's "lost" list names each of these. Only a number with a fraction is a float here.
 export function pyStr(value) {
   if (typeof value === "string") return value;
   return pyRepr(value);
@@ -191,27 +193,26 @@ function pyRepr(value) {
   if (value === null || value === undefined) return "None";
   if (value === true) return "True";
   if (value === false) return "False";
-  if (typeof value === "number") return Number.isSafeInteger(value) ? String(value) : pyFloat(value);
+  if (typeof value === "number") return Number.isInteger(value) ? BigInt(value).toString() : pyFloat(value);
   if (typeof value === "string") return pyText(value);
   if (Array.isArray(value)) return "[" + value.map(pyRepr).join(", ") + "]";
   return "{" + Object.entries(value).map(([k, v]) => pyRepr(k) + ": " + pyRepr(v)).join(", ") + "}";
 }
 
-// Python's repr() of a float: the shortest digits that read back as the same value (as JavaScript's own), in
-// fixed form from 1e-4 up to 1e16 with ".0" on a whole value, and otherwise as d.ddde-XX with a sign and at
-// least two exponent digits.
+// Python's repr() of a float with a fraction (every whole value is shown as an integer above, so x here is
+// below 2**53 in size): the shortest digits that read back as the same value (as JavaScript's own), plain
+// from 1e-4 up, and below that as d.ddde-XX with at least two exponent digits.
 function pyFloat(x) {
   if (Number.isNaN(x)) return "nan";
   if (x === Infinity) return "inf";
   if (x === -Infinity) return "-inf";
   const [mantissa, power] = x.toExponential().split("e");
   const exp = Number(power);
-  if (exp < -4 || exp >= 16) return mantissa + "e" + (exp < 0 ? "-" : "+") + String(Math.abs(exp)).padStart(2, "0");
+  if (exp < -4) return mantissa + "e-" + String(-exp).padStart(2, "0");
   const sign = mantissa.startsWith("-") ? "-" : "";
   const digits = mantissa.replace("-", "").replace(".", "");
   if (exp < 0) return sign + "0." + "0".repeat(-exp - 1) + digits;
-  if (digits.length > exp + 1) return sign + digits.slice(0, exp + 1) + "." + digits.slice(exp + 1);
-  return sign + digits + "0".repeat(exp + 1 - digits.length) + ".0";
+  return sign + digits.slice(0, exp + 1) + "." + digits.slice(exp + 1);
 }
 
 // Python's repr() of a str: double quotes only when the text holds a single quote and no double quote; a

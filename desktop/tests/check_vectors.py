@@ -84,16 +84,24 @@ class PyStrTest(unittest.TestCase):
 
     def test_the_vectors_cover_what_python_writes_differently(self) -> None:
         shown = "".join(v["str"] for v in load("pystr.json")["vectors"])
-        for piece in ["e-07", "e+16", "1e-05", "\\n", "\\t", "\\r", "\\\\", "\\x07", "\\x85", "\\u200b", "\\U000f0000",
+        for piece in ["e-07", "1e-05", "\\n", "\\t", "\\r", "\\\\", "\\x07", "\\x85", "\\u200b", "\\U000f0000",
                       "[\"it's\"]", "\\'", "None", "True", "False"]:
             with self.subTest(piece):
                 self.assertIn(piece, shown)
+
+    def test_exact_integers_past_2_53_read_as_integers(self) -> None:
+        # Devin's second thread on #390: an integer JavaScript still holds exactly is shown as its digits, as
+        # Python shows it, never with a float's ".0" or an exponent.
+        shown = {v["json"]: v["str"] for v in load("pystr.json")["vectors"]}
+        for text in ("9007199254740992", "9007199254740994", "-1180591620717411303424"):
+            with self.subTest(text):
+                self.assertEqual(shown[text], text)
 
     def test_what_json_parse_has_dropped_is_named_not_hidden(self) -> None:
         # The desktop reads the answer with JSON.parse, which keeps no difference between 2 and 2.0 (and the rest
         # below). Each such value is listed with what Python shows and what the desktop shows instead.
         lost = load("pystr.json")["lost"]
-        self.assertLessEqual({"2.0", "-0.0"}, {v["json"] for v in lost})
+        self.assertLessEqual({"2.0", "-0.0", "1e21", "9007199254740993"}, {v["json"] for v in lost})
         for vector in lost:
             with self.subTest(vector["name"]):
                 self.assertEqual(str(json.loads(vector["json"])), vector["python"])

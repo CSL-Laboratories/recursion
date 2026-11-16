@@ -45,22 +45,22 @@
       "field": "1e-07"
     },
     {
-      "name": "a large float in exponent form",
-      "json": "1e16",
-      "str": "1e+16",
-      "field": "1e+16"
+      "name": "an exact integer at 2**53 (Devin's value)",
+      "json": "9007199254740992",
+      "str": "9007199254740992",
+      "field": "9007199254740992"
     },
     {
-      "name": "a whole float past 2**53",
-      "json": "12345678901234567.0",
-      "str": "1.2345678901234568e+16",
-      "field": "1.2345678901234568e+16"
+      "name": "an exact integer at 2**53 + 2",
+      "json": "9007199254740994",
+      "str": "9007199254740994",
+      "field": "9007199254740994"
     },
     {
-      "name": "a large float with digits",
-      "json": "1.5e300",
-      "str": "1.5e+300",
-      "field": "1.5e+300"
+      "name": "an exact integer past 1e21 (-2**70), with no exponent form",
+      "json": "-1180591620717411303424",
+      "str": "-1180591620717411303424",
+      "field": "-1180591620717411303424"
     },
     {
       "name": "a negative small float",
@@ -205,18 +205,32 @@
       "why": "JSON.parse gives -0 for both -0 and -0.0; Python reads -0 as the integer 0 and -0.0 as a float"
     },
     {
-      "name": "a whole float in exponent form below 2**53 reads as an integer",
+      "name": "a whole float in exponent form reads as integer digits",
       "json": "1e15",
       "python": "1000000000000000.0",
       "desktop": "1000000000000000",
       "why": "JSON.parse gives the same number for 1e15 and 1000000000000000"
     },
     {
-      "name": "an integer past 2**53 has lost digits",
+      "name": "a whole float past 2**53 reads as integer digits",
+      "json": "1e16",
+      "python": "1e+16",
+      "desktop": "10000000000000000",
+      "why": "JSON.parse gives the same number for 1e16 and 10000000000000000; Python keeps 1e16 a float"
+    },
+    {
+      "name": "a float written 1e21 reads as integer digits",
+      "json": "1e21",
+      "python": "1e+21",
+      "desktop": "1000000000000000000000",
+      "why": "JSON.parse gives the same number for 1e21 and 1000000000000000000000; Python keeps 1e21 a float"
+    },
+    {
+      "name": "an integer past 2**53 may differ in its last digits",
       "json": "9007199254740993",
       "python": "9007199254740993",
-      "desktop": "9007199254740992.0",
-      "why": "a JavaScript number holds no integer past 2**53 exactly; Python's int does"
+      "desktop": "9007199254740992",
+      "why": "JSON.parse rounds 9007199254740993 to the nearest number it holds, 9007199254740992; Python's int keeps it"
     },
     {
       "name": "an integer-like key moves to the front",

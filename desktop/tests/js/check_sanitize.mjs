@@ -53,6 +53,15 @@ test("where JSON.parse has dropped what Python reads, the desktop shows what the
   }
 });
 
+test("a whole number reads as its integer digits whatever its size: no float suffix, no exponent", () => {
+  // Devin's second thread on #390: 9007199254740992 is held exactly and must not read "9007199254740992.0".
+  assert.equal(pyStr(JSON.parse("9007199254740992")), "9007199254740992");
+  assert.equal(pyStr(2 ** 53 + 2), "9007199254740994");
+  assert.equal(pyStr(JSON.parse("1e21")), "1000000000000000000000");
+  assert.equal(pyStr(-(2 ** 70)), "-1180591620717411303424");
+  assert.equal(field({ revision: 2 ** 53 }), "{'revision': 9007199254740992}");
+});
+
 test("numbers no JSON text can carry still read as Python writes them", () => {
   assert.equal(pyStr(NaN), "nan");
   assert.equal(pyStr(Infinity), "inf");

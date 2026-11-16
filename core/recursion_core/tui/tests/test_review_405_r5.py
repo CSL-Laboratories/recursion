@@ -97,7 +97,8 @@ class CursorAheadTest(unittest.TestCase):
         # 7239b049 lost and doubled nothing here; it said "from seq 0, the last line shown" (S3): red for that.
         self.assertIn(f"no position seq {FAR}; no line has been shown", app.notice)
         app.command(f"transcript {SID}")
-        self.assertEqual(shown(app), [f"events 1 to {FAR} are not available (retention)", *texts(daemon.lines)])
+        self.assertEqual(shown(app), [f"events 1 to {FAR} are not available (retention)", s.GAP_MARK,
+                                      *texts(daemon.lines)])  # the marker row after each gap line (review 6, F1)
         self.assertEqual(marks(app), [])
 
 
@@ -266,7 +267,7 @@ class RetentionTest(unittest.TestCase):  # rule (7): retention skips positions, 
         daemon.forget(7, 8)  # retention took the last line shown and the one after it
         app.command(f"transcript {SID}")
         self.assertEqual(shown(app)[len(first):][-1], "after")
-        self.assertEqual(len(shown(app)), len(first) + 2, "one gap line, then the line after it")
+        self.assertEqual(len(shown(app)), len(first) + 3, "one gap line, its marker row, then the line after it")
         self.assertIn("not available", shown(app)[len(first)])
         self.assertEqual(marks(app), [])
 

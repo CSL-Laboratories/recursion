@@ -100,9 +100,11 @@ class _Output:
     def extend(self, rows: list[str]) -> None:
         """Rows that are display text already (a transcript's), kept as finished lines, counted as they are."""
 
+        # As feed does: "not counted" BEFORE the lines change, and counted again only once the counts are beside
+        # them (#404's round 3, Astra's required 1, for feed; the same order here).
+        width, self._width = self._width, -1
         self.lines.extend(rows)
-        if self._width >= 0:  # as feed does: "not counted" until the counts are beside the lines again
-            width, self._width = self._width, -1
+        if width >= 0:
             self._rows.extend(len(wrap(row, width)) for row in rows)
             self._width = width
 
@@ -441,7 +443,7 @@ class TuiApp:
             # position past the log): the next read goes back to the start, and a gap line shown is not shown
             # again (review 2, M1; review 3, F3). A refusal of the start itself is an error (review 4, R3).
             refused = params["cursor"]["seq"]
-            if type(refused) is int and refused > transcript.read_cursor()["seq"]:
+            if type(refused) is int and refused > transcript.furthest_ask():
                 return  # a read sent before the view began again: the read from the start is on its way
             if transcript.last_line is not None:
                 self._rebuild(sid, transcript, f"the daemon has no position seq {refused}, so it no longer holds "
@@ -475,6 +477,11 @@ class TuiApp:
             source = "engine" if line.get("trust") == "untrusted" else "recursion"
             self._emit("transcript", source, "\n".join(rows),
                        speech="\n".join(f"transcript session={field(sid)}: {row}" for row in rows))
+            if line.get("event_type") == "replay.gap":  # where its gap starts is not said: a marker row (F1)
+                out.extend([s.GAP_MARK])
+                added += len(wrap(s.GAP_MARK, self._pane_width()))
+                self._emit("transcript", "recursion", s.GAP_MARK,
+                           speech=f"transcript session={field(sid)}: {s.GAP_MARK}")
         if self.scroll and self.pane == sid:  # a scrolled pager stays on the rows it shows; the frame clamps it
             self.scroll += added
         if answer.get("epoch_advanced") is True:
@@ -482,7 +489,7 @@ class TuiApp:
                          f"{transcript.cursor['seq']} (epoch {transcript.cursor['epoch']})")
         if answer.get("more") is True and transcript.pages < s.MAX_PAGES:
             transcript.pages += 1
-            self.request(s.READ, transcript.read_params())
+            self.request(s.READ, transcript.read_params(continuing=True))  # the next page of this open (Sol 2)
         elif answer.get("more") is True:
             self._notice(f"transcript session={field(sid)}: more lines after seq {transcript.cursor['seq']}; "
                          f"the command transcript {field(sid)} reads on")
@@ -490,21 +497,34 @@ class TuiApp:
     def _rebuild(self, sid: str, transcript: s.Transcript, why: str) -> None:
         """The daemon's log no longer holds the last line shown as it was shown: a marker line says so, in the
         pane and in every renderer as a transcript row, and the log is read again from its start, shown below
-        it. What was shown stays above the marker (the Liaison's ruling on review 5 of #405)."""
+        it. What was shown stays above the marker (the Liaison's ruling on review 5 of #405). When the open has
+        no read left (``MAX_PAGES``), the marker says that the command reads the log again (review 6, F3); a
+        read that cannot be sent is said as that, not as an answer not taken (review 6, F4)."""
 
-        marker = f"-- view rebuilt: {why}; the log is shown again from its start --"
+        reading = transcript.pages < s.MAX_PAGES
+        then = ("the log is read again from its start, below" if reading else
+                f"reading the log again is pending: the command transcript {field(sid)} reads it from its start")
+        # The TUI's own words, seqs and epochs, and the session id through field(): nothing of a line's text, so
+        # it does not go through the sanitizer the daemon's lines do (review 6 of #405, F10).
+        marker = f"-- view rebuilt: {why}; {then} --"
         out = self.transcript_rows.setdefault(sid, _Output(self._output_lines, sid))
         out.extend([marker])
         if self.scroll and self.pane == sid:
             self.scroll += len(wrap(marker, self._pane_width()))
         self._emit("transcript", "recursion", marker, speech=f"transcript session={field(sid)}: {marker}")
         transcript.restart()
-        if transcript.pages < s.MAX_PAGES:
-            transcript.pages += 1
+        if not reading:
+            transcript.owed = "pending"  # said in the marker (Sol's round 2 of #405, 4)
+            return
+        transcript.pages += 1
+        try:
             self.request(s.READ, transcript.read_params())
-        else:
-            self._notice(f"transcript session={field(sid)}: the command transcript {field(sid)} reads the log "
-                         f"from its start")
+        except Exception as exc:  # noqa: BLE001 - the dispatch failed; the view was rebuilt all the same
+            self.in_flight[s.READ] = max(0, self.in_flight[s.READ] - 1)
+            transcript.owed = "read_failed"
+            self._error(f"transcript session={field(sid)}: the view was rebuilt (the marker is shown and the rows "
+                        f"before it kept), but the read of the log from its start could not be sent "
+                        f"({type(exc).__name__}): pending; the command transcript {field(sid)} reads it")
 
     def open_transcript(self, session_id: str) -> None:
         """Show a session's transcript in the output pane, reading it from the cursor (from the start the

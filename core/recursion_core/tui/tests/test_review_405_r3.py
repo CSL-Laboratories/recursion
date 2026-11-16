@@ -100,7 +100,7 @@ class GapShownOnceTest(unittest.TestCase):  # F3
         app, _ = new_app(FarGap())
         for _ in range(3):  # the gap; cursor_ahead and the cursor put back; the same gap again
             app.command(f"transcript {SID}")
-        self.assertEqual(shown(app), [f"events 1 to {far} are not available (retention)"])
+        self.assertEqual(shown(app), [f"events 1 to {far} are not available (retention)", s.GAP_MARK])  # r6 F1
 
 
 class SentencesTest(unittest.TestCase):  # F4

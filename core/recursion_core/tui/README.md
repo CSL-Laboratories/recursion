@@ -199,24 +199,60 @@ What the TUI relies on from the daemon about positions, as the store and the cur
 
 - A log's positions are gapless from 1, and a line at a position never changes: the event store appends one
   row per event at the next seq and refuses every update and delete of the log in the file itself (lane
-  EVENTS, #373 at `31ce13eb`, `core/recursion_core/events/db.py` lines 115-124 and 349-352).
+  EVENTS, on #373's branch at `31ce13eb`, `core/recursion_core/events/db.py` lines 115-124 and 349-352; the
+  `events` package is not in this tree yet).
 - The epoch rises by one each time the store is opened, and a cursor carries it (the same file, lines 55-56
   and 574-576). An older epoch goes on with the same persistent log; `epoch_advanced` is not a reset; a seq
   past the high-water mark is `cursor_ahead`, and a seq at it is a valid empty read; a position that
   retention skipped is a `replay.gap` line (SPINE's cursor, `schemas/control/v1/common.v1.json` line 245).
 - So, in an epoch and across the epochs of one store, the high-water mark never goes down and a position
   shown never holds another line. Lane EVENTS' #403 (`45eedbcf`) lists `events.read` and `events.follow` as
-  read rows (`core/recursion_core/control/methods/__init__.py` line 206) and changes none of this; its change
+  read rows (`core/recursion_core/control/methods/__init__.py` line 206 there; line 204 in this tree) and
+  changes none of this; its change
   reader keeps the digest of the last image it logged for the same reason (`events/changes.py` lines 11-14).
 
 What it checks: every read after a line was shown asks from the position before the last line shown, for
 one line more, so the answer begins with that line, and it must be the line shown (every field but its
 position). A `transcript.line.v1` line has no id, so the line itself is what is compared. When it is
 another line, the answer goes past it or ends before it, or the daemon has no position there any more
-(`cursor_ahead`), the promise above was broken: a marker line, `-- view rebuilt: <why>; the log is shown
-again from its start --`, is printed as a transcript row in every renderer, and the log is read again from
-its start and shown below it. What was shown stays above the marker. A gap line over the last line shown is
-retention: it is shown when it covers more than that line, and the lines after it are shown.
+(`cursor_ahead`), the promise above was broken: a marker line, `-- view rebuilt: <why>; the log is read
+again from its start, below --`, is printed as a transcript row in every renderer, and the log is read again from
+its start and shown below it. What was shown stays above the marker. When the open has no read left (50
+reads), the marker says that reading the log again is pending and that the command reads it; a read that
+cannot be sent is said as an error, and it too is pending (the transcript's `owed`). A gap line over the last line shown is
+retention: it is shown when it covers more than that line, and the lines after it are shown. A gap line over
+positions already shown or said since the last line shown is not shown again, and the next page of the
+same open reads on after gap lines instead of checking again, so what comes after them is reached. A page
+with more lines than the read asked for is refused before anything of it is taken. A gap line says where its gap
+ends, not where it starts (SPINE's transcript line leaves out the raw event's `from`), so every gap line shown
+is taken to cover everything from the last line shown up to it, and a marker row follows it: `-- lines may be
+missing before this point: a gap line says where its gap ends, not where it starts --`. The text before and
+after a gap is never joined as if nothing lay between. One transcript may be driven
+by two threads: it takes its own lock. For a lane that calls it: `Transcript.apply` returns None when the log
+no longer holds the last line shown; the caller asks `broken`, rebuilds the view (`restart()`) and says so,
+and never iterates None.
+
+The cases, what the user sees, and the test that holds each (in `tests/test_review_405_r5.py`, or
+`tests/test_review_405_r6.py` where named):
+
+| Case | What the user sees | Test |
+|---|---|---|
+| Cursor ahead before any line was shown (a gap line past the log) | the gap line once; the next read goes from the start; each line once | `CursorAheadTest` |
+| Cursor ahead after lines were shown | a marker, then the log from its start | `SameEpochTruncationTest` |
+| Cursor behind: two reads in flight, a cursor put back, a read or refusal sent before a rebuild | each line once; a stale answer is not taken | `CursorBehindTest`, `InFlightAcrossARebuildTest` |
+| Epoch changed: a restart over the same log | the new lines once | `EpochChangedTest` |
+| Epoch changed: a log that did not persist, or an epoch that went back | a marker, then the new log | `EpochChangedTest` |
+| Same-epoch truncation: nothing new, the daemon goes on, grown past, only the last line | a marker, then the log from its start | `SameEpochTruncationTest` |
+| Same-epoch rewrite of the last line shown | a marker, then the log | `SameEpochRewriteTest` |
+| Same-epoch rewrite of an earlier line | not seen (below) | `SameEpochRewriteTest` (pins the limit) |
+| An empty stream | nothing; later lines once | `EmptyStreamTest` |
+| A reconnect in the middle of a burst | each line once; a marker when the log was lost meanwhile | `BurstTest` |
+| Retention over the last line shown | the gap line when it covers more; no marker | `RetentionTest` |
+| Many gap lines after the last line shown, read again | each once | r6 `GapLinesTest` |
+| A rebuild with no read left in the open | a marker that says the command reads the log again | r6 `BudgetTest` |
+| A rebuild whose read cannot be sent | the marker, and an error that says so | r6 `RebuildReadTest` |
+| Two threads on one transcript | each line once | r6 `TwoCallersTest` |
+| Any gap line, one that starts late included | the gap line, then a marker that lines may be missing before it | r6 `GapStartTest` |
 
 What it cannot see: a line rewritten in place before the last line shown, with the last line left as it
 was. A reader that resumes after a position sees nothing of what lies before it; the store refuses such a

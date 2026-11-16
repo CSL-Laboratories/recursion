@@ -54,7 +54,8 @@ class NewLogGapTest(unittest.TestCase):  # R2
         daemon.forget(2, 3)
         app.command(f"transcript {SID}")  # refused at the far position: back to the last line shown, seq 0
         app.command(f"transcript {SID}")
-        self.assertEqual(shown(app)[-3:], ["new 0", "events 2 to 3 are not available (retention)", "new 3"])
+        self.assertEqual(shown(app)[-4:], ["new 0", "events 2 to 3 are not available (retention)", s.GAP_MARK,
+                                           "new 3"])  # the marker row after each gap line (review 6, F1)
 
 
 class StartRefusedTest(unittest.TestCase):  # R3

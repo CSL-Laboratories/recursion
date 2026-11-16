@@ -25,12 +25,16 @@ ends before it, or the daemon has no position there any more (``cursor_ahead``),
 promise: a marker line says so, and the log is shown again from its start below it. ``cursor_epoch_ahead``
 sets the epoch back to 1 and the check decides (review 2 of #405, DeepSeek L1). A ``cursor_ahead`` when no
 line has been shown (only gap lines) sends the next read back to the start. A refusal of the start itself is
-said as an error (review 4, R3). A replay.gap line already shown is not shown again when the same gap line
-comes again after the last line shown (review 3, F3).
+said as an error (review 4, R3). A replay.gap line already shown is not shown again, nor one over positions
+already shown or said since the last line shown (review 3, F3; review 6, F5). A transcript gap line does not say
+where its gap starts (SPINE's transcript line leaves out the raw event's ``from``), so every gap line shown is
+taken to cover everything from the last line shown up to it: ``GAP_MARK`` is shown after it, and the text
+before and after a gap is never joined as if nothing lay between (the Liaison's ruling on review 6 of #405, F1).
 """
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping
 
 from recursion_core.tui.sanitize import OutputSanitizer, field
@@ -40,6 +44,9 @@ SESSION_METHODS = frozenset({LIST, READ, FOLLOW})  # reads only; the session ver
 LIST_PARAMS = {"state": "live", "limit": 20}  # h27-session-list-ok
 READ_LIMIT = 200  # h11-events-read-as-a-transcript
 MAX_PAGES = 50  # reads one open makes in a row, the first included; then it stops and says how to read on
+# Shown after every replay.gap line: a transcript gap line says where its gap ends, not where it starts (review 6
+# of #405, F1; the Liaison's ruling).
+GAP_MARK = "-- lines may be missing before this point: a gap line says where its gap ends, not where it starts --"
 
 
 def first_cursor(session_id: str) -> dict:
@@ -62,7 +69,8 @@ def page_problem(asked: Mapping, answer: Mapping) -> str | None:
 
     Rule (7) as SPINE's ``conformance/rules.py`` (``page_problems``) states it for the side that reads, after
     the shapes ``transcript.line.v1`` gives. A page in another projection than the one asked for is
-    ``projection`` and nothing else of it is looked at. ``lines`` is not a list (``lines``), or a line is not
+    ``projection`` and nothing else of it is looked at. ``lines`` is not a list, or holds more lines than the
+    read's ``limit`` (``lines``; Sol's round 2 of #405, 3), or a line is not
     an object with an integer ``seq``, a text ``event_type`` and a ``text`` and ``speech`` that are each text
     or null (``line``). Each line is the next position after the one before (the asked ``seq`` first), or a
     ``replay.gap`` whose ``seq`` is the last of the positions it covers (``order``). The answer's cursor
@@ -82,6 +90,8 @@ def page_problem(asked: Mapping, answer: Mapping) -> str | None:
     lines = answer.get("lines")
     if not isinstance(lines, list):
         return "lines"
+    if _is_int(asked.get("limit")) and len(lines) > asked["limit"]:
+        return "lines"  # more lines than the read asked for: refused before anything of it is taken
     position = cursor["seq"]
     for line in lines:
         if not (isinstance(line, Mapping) and _is_int(line.get("seq")) and isinstance(line.get("event_type"), str)
@@ -139,62 +149,100 @@ class Transcript:
     """One session's transcript as read so far. ``cursor`` is the last position the daemon's answers
     represented, in the latest epoch one named. ``last_seq`` and ``last_line`` are the last line shown that is
     not a replay.gap line (its position, and the line without its position; ``last_line`` is None until one
-    is shown), and ``after`` the gap lines shown since. ``read_params()`` asks from the position before
-    ``last_seq``, for one line more than ``READ_LIMIT``, so the answer begins with that line again; ``apply``
-    checks it, and returns None, with the reason in ``broken``, when the log no longer holds that line as it
-    was shown. ``restart()`` begins the view again from the start of the log. Until a line is shown, a read
-    asks from ``cursor``."""
+    is shown), and ``gap_top`` the last position the gap lines shown since then cover (0 for none): every
+    position from the last line shown to it has been shown or said. ``read_params()``, an open's first read,
+    asks from the position before ``last_seq``, for one line more than ``READ_LIMIT``, so the answer begins
+    with that line again; ``apply`` checks it. ``read_params(continuing=True)``, the next page of the same
+    open, does the same when the last position represented is that line, and reads on from ``cursor`` when
+    gap lines came after it, which carry nothing to compare: so gap-only pages never ask for the same page
+    twice, and what comes after them is reached (Sol's round 2 of #405, 2). When the log no longer holds the
+    last line shown as it was shown, ``apply`` returns None and says why in ``broken``: a caller must not
+    iterate None, but rebuild the view (``restart()``) and say so, as the TUI's ``_rebuild`` does (review 6,
+    F8). ``owed`` is ``"pending"`` while a rebuilt view's read from the start is not sent (no read left in the
+    open) and ``"read_failed"`` when it could not be sent; it is None again once a page is taken (Sol's round
+    2, 4). A caller shows ``GAP_MARK`` after every gap line ``apply`` returns (F1). Until a line is shown, a
+    read asks from ``cursor``. ``apply`` copies the page before it takes the transcript's own lock, and
+    ``read_cursor``, ``read_params`` and ``restart`` take it too, so two threads may drive one transcript and
+    each line is still shown once (review 6, F2)."""
+
+    __slots__ = ("_lock", "__dict__", "__weakref__")  # the lock is not state: ``__dict__`` holds the state only
 
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
         self.cursor = first_cursor(session_id)
         self.pages = 0  # reads made in a row by the current open, the first included
-        self.last_seq, self.last_line, self.after, self.broken = 0, None, [], None
+        self.last_seq, self.last_line, self.gap_top, self.broken, self.owed = 0, None, 0, None, None
+        self._lock = threading.RLock()
 
-    def read_cursor(self) -> dict:
-        """The cursor the next read sends: the position before the last line shown, or ``cursor`` before one."""
+    def read_cursor(self, continuing: bool = False) -> dict:
+        """The cursor the next read sends: from the position before the last line shown (the check), or, before a
+        line is shown or on a page of the same open that gap lines ended, from ``cursor``."""
 
-        seq = self.last_seq - 1 if self.last_line is not None else self.cursor["seq"]
-        return {"epoch": self.cursor["epoch"], "session_id": self.session_id, "seq": seq}
+        with self._lock:
+            if self.last_line is None or (continuing and self.cursor["seq"] > self.last_seq):
+                seq = self.cursor["seq"]
+            else:
+                seq = self.last_seq - 1
+            return {"epoch": self.cursor["epoch"], "session_id": self.session_id, "seq": seq}
 
-    def read_params(self) -> dict:
-        """The next read's params: the last line shown comes again, so the page asks for one line more."""
+    def furthest_ask(self) -> int:
+        """The furthest position a read of this transcript asks from: an answer, or a refusal, to a read asked from
+        past it was sent before the view began again (``restart()``), and is not taken."""
 
-        params = read_params(self.read_cursor())
-        if self.last_line is not None:
-            params["limit"] = READ_LIMIT + 1
-        return params
+        with self._lock:
+            return max(self.cursor["seq"], self.read_cursor()["seq"])
+
+    def read_params(self, continuing: bool = False) -> dict:
+        """The next read's params: a read that checks the last line shown asks for one line more."""
+
+        with self._lock:
+            cursor = self.read_cursor(continuing)
+            params = read_params(cursor)
+            if self.last_line is not None and cursor["seq"] < self.last_seq:
+                params["limit"] = READ_LIMIT + 1
+            return params
 
     def restart(self) -> None:
         """The view begins again: the next read asks from the start of the log, in the epoch held."""
 
-        self.cursor = {"epoch": self.cursor["epoch"], "session_id": self.session_id, "seq": 0}
-        self.last_seq, self.last_line, self.after, self.broken = 0, None, [], None
+        with self._lock:
+            self.cursor = {"epoch": self.cursor["epoch"], "session_id": self.session_id, "seq": 0}
+            self.last_seq, self.last_line, self.gap_top, self.broken = 0, None, 0, None
 
     def apply(self, answer: Mapping, asked: int | None = None) -> list[dict] | None:
         """One ``ok`` answer that ``page_problem`` found right, to the read that asked from seq ``asked``: the
         lines to show, in order, each once. An answer whose cursor does not name this log, or one asked for
-        from past the position the next read asks from (a read sent before ``restart()``), shows nothing and
-        changes nothing. None when the answer shows that the log no longer holds the last line shown as it was
-        shown: another line at its position, a line past it with no gap line over it, or an answer that ends
-        before it; ``broken`` says which, and nothing else changes but the epoch. A gap line over that position
-        is retention, which rule (7) allows: it is shown when it covers more than that position, and the lines
-        after it are shown."""
+        from past every position represented (a read sent before ``restart()``), shows nothing and changes
+        nothing; so does a line at a position below 1 (review 6 of #405, F11). A page asked from the last line
+        shown or after it has nothing to check. None when the answer shows that the log no longer holds the
+        last line shown as it was shown: another line at its position, a line past it with no gap line over
+        it, or an answer that ends before it; ``broken`` says which, and nothing else changes but the epoch. A
+        gap line over that position is retention, which rule (7) allows: it is shown when it covers more than
+        that position, and the lines after it are shown. The page is copied before the lock is taken, so a
+        caller's slow object holds no other caller up (review 6, F2)."""
 
+        cursor, lines = answer.get("cursor"), answer.get("lines")
+        page = {"cursor": dict(cursor) if isinstance(cursor, Mapping) else cursor, "more": answer.get("more"),
+                "lines": [dict(line.items()) if isinstance(line, Mapping) else line for line in lines]
+                if isinstance(lines, list) else lines}
+        with self._lock:
+            return self._apply(page, asked)
+
+    def _apply(self, answer: dict, asked: int | None) -> list[dict] | None:
         cursor = answer.get("cursor")
         if not (isinstance(cursor, Mapping) and cursor.get("session_id") == self.session_id):
             return []  # not an answer about this log
-        if _is_int(asked) and asked > self.read_cursor()["seq"]:
+        if _is_int(asked) and asked > self.furthest_ask():
             return []  # asked for before the view began again: the read from the start gives these lines
         epoch = self.cursor["epoch"]
         if _is_int(cursor.get("epoch")):
             epoch = max(epoch, cursor["epoch"])  # an older epoch goes on with the same log (rule (7))
-        checked = self.last_line is None
+        checked = self.last_line is None or (_is_int(asked) and asked >= self.last_seq)
         new: list[dict] = []
         lines = answer.get("lines")
         for line in lines if isinstance(lines, list) else []:
-            if not (isinstance(line, Mapping) and _is_int(line.get("seq"))):
-                continue
+            if not (isinstance(line, Mapping) and _is_int(line.get("seq")) and line["seq"] >= 1):
+                continue  # a position is 1 or more
             seq, gap = line["seq"], line.get("event_type") == "replay.gap"
             if not checked:
                 if seq < self.last_seq:
@@ -211,11 +259,11 @@ class Transcript:
                 if seq == self.last_seq:
                     continue  # it covers only the last line shown, which the user has seen
             if gap:
-                if dict(line) in self.after:
-                    continue  # this gap line was shown after the last line shown
-                self.after = [*self.after[-READ_LIMIT:], dict(line)]
+                if seq <= self.gap_top:
+                    continue  # every position it covers was shown or said since the last line shown
+                self.gap_top = seq
             else:
-                self.last_seq, self.last_line, self.after = seq, _as_shown(line), []
+                self.last_seq, self.last_line, self.gap_top = seq, _as_shown(line), 0
             new.append(dict(line))
         if not checked and answer.get("more") is not True:
             return self._broke(epoch, f"the log ends before seq {self.last_seq}, the last line shown")
@@ -223,6 +271,7 @@ class Transcript:
         if _is_int(cursor.get("seq")):
             seq = max(seq, cursor["seq"])  # the last position represented; never back
         self.cursor = {"epoch": epoch, "session_id": self.session_id, "seq": seq}
+        self.owed = None  # a page is taken: nothing of a rebuilt view's read is owed any more
         return new
 
     def _broke(self, epoch: int, why: str) -> None:

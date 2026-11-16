@@ -208,9 +208,14 @@ class Expression:
         return bool(eval(self.code, {"__builtins__": {}}, names))
 
 
-def context(event, action, draft, label, pre, settle, dep, run_full, paid) -> dict:
+REPOSITORY = "CSL-Laboratories/recursion"
+
+
+def context(event, action, draft, label, pre, settle, dep, run_full, paid, fork=False) -> dict:
     pr = event == "pull_request"
     return {
+        "github.repository": REPOSITORY,
+        "github.event.pull_request.head.repo.full_name": ("someone/fork" if fork else REPOSITORY) if pr else None,
         "github.event_name": event,
         "github.event.action": action if pr else None,
         "github.event.pull_request.draft": draft if pr else None,
@@ -233,7 +238,7 @@ def expected_settle(event, action) -> str:
     return "success" if pr_sync(event, action) else "skipped"
 
 
-def oracle(job, event, action, draft, label, cancelled, pre, settle, dep, run_full, paid) -> bool:
+def oracle(job, event, action, draft, label, cancelled, pre, settle, dep, run_full, paid, fork=False) -> bool:
     pr = event == "pull_request"
     if job == "linux":
         return True  # always runs; the shell fails closed
@@ -245,11 +250,12 @@ def oracle(job, event, action, draft, label, cancelled, pre, settle, dep, run_fu
                and settle == expected_settle(event, action))
     if job == "linux-tests":
         return paid_ok
-    labelled = pr and draft is False and label
+    # CSL-238: a non-draft same-repository PR needs no label; a fork PR needs a person's `ci:full`.
+    requested = pr and draft is False and (not fork or label)
     if job == "windows":
-        return paid_ok and dep == "success" and (event in ("push", "workflow_dispatch") or labelled)
+        return paid_ok and dep == "success" and (event in ("push", "workflow_dispatch") or requested)
     if job == "macos":
-        return paid_ok and dep == "success" and (event == "workflow_dispatch" or labelled)
+        return paid_ok and dep == "success" and (event == "workflow_dispatch" or requested)
     raise AssertionError(job)
 
 
@@ -423,22 +429,22 @@ class ExpressionTests(unittest.TestCase):
             cls.exprs[job] = (expr, needs)
 
     def runs(self, job, event, action=None, draft=None, label=False, cancelled=False, pre="success",
-             settle=None, dep="success", run_full="true", paid="true") -> bool:
+             settle=None, dep="success", run_full="true", paid="true", fork=False) -> bool:
         settle = expected_settle(event, action) if settle is None else settle
         expr, needs = self.exprs[job]
-        return expr.runs(context(event, action, draft, label, pre, settle, dep, run_full, paid), needs, cancelled)
+        return expr.runs(context(event, action, draft, label, pre, settle, dep, run_full, paid, fork), needs, cancelled)
 
     def test_if_expressions_match_oracle(self) -> None:
         mismatches, seen = [], {job: set() for job in self.JOBS}
         grid = itertools.product(STATES, (False, True), (False, True), RESULTS, RESULTS, RESULTS,
-                                 ("true", "false", ""), ("true", "false", ""))
-        for (event, action, draft), label, cancelled, pre, settle, dep, run_full, paid in grid:
-            ctx = context(event, action, draft, label, pre, settle, dep, run_full, paid)
+                                 ("true", "false", ""), ("true", "false", ""), (False, True))
+        for (event, action, draft), label, cancelled, pre, settle, dep, run_full, paid, fork in grid:
+            ctx = context(event, action, draft, label, pre, settle, dep, run_full, paid, fork)
             for job, (expr, needs) in self.exprs.items():
-                want = oracle(job, event, action, draft, label, cancelled, pre, settle, dep, run_full, paid)
+                want = oracle(job, event, action, draft, label, cancelled, pre, settle, dep, run_full, paid, fork)
                 seen[job].add(want)
                 if expr.runs(ctx, needs, cancelled) != want:
-                    mismatches.append((job, event, action, draft, label, cancelled, pre, settle, dep, run_full, paid))
+                    mismatches.append((job, event, action, draft, label, cancelled, pre, settle, dep, run_full, paid, fork))
         self.assertEqual(mismatches[:5], [], f"{len(mismatches)} mismatches")
         for job, outcomes in seen.items():
             self.assertEqual(outcomes, {True} if job == "linux" else {True, False}, job)
@@ -448,7 +454,12 @@ class ExpressionTests(unittest.TestCase):
         self.assertEqual([self.runs(j, "push") for j in paid], [True, True, False])
         self.assertEqual([self.runs(j, "workflow_dispatch") for j in paid], [True, True, True])
         self.assertEqual([self.runs(j, "pull_request", "opened", False, label=True) for j in paid], [True, True, True])
-        self.assertEqual([self.runs(j, "pull_request", "opened", False) for j in paid], [True, False, False])
+        # CSL-238: no label or reviewer verdict on a same-repository PR; a fork PR still needs `ci:full`.
+        self.assertEqual([self.runs(j, "pull_request", "opened", False) for j in paid], [True, True, True])
+        self.assertEqual([self.runs(j, "pull_request", "opened", False, fork=True) for j in paid], [True, False, False])
+        self.assertEqual([self.runs(j, "pull_request", "opened", False, label=True, fork=True) for j in paid], [True] * 3)
+        self.assertEqual([self.runs(j, "pull_request", a, True, label=True) for j in ("windows", "macos")
+                          for a in PR_ACTIONS], [False] * 2 * len(PR_ACTIONS))
         self.assertEqual([self.runs(j, "pull_request", "synchronize", False, label=True) for j in paid], [True] * 3)
         docs = dict(run_full="false", paid="false")
         self.assertEqual([self.runs(j, "pull_request", "opened", False, label=True, **docs) for j in paid], [False] * 3)

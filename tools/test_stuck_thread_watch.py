@@ -2798,24 +2798,23 @@ class WorkflowAndDocsTests(unittest.TestCase):
     def test_docs_point_at_the_workflow(self) -> None:
         for text in (self.agents, self.claude):
             self.assertIn("stuck-thread-watch.yml", text)
-            self.assertIn("Codex reviews", text)
-            self.assertIn("@codex review", text)
+            # CSL-238: the Codex mediation is retired; a person starts the watch.
+            self.assertNotIn("@codex review", text)
+            self.assertIn("runs only when a person dispatches it", " ".join(text.split()))
             self.assertIn("needs-decision", text)
             self.assertIn("Stuck PR threads: recursion#", text)
             self.assertRegex(text, r"do not\s+file one issue per thread")
-            self.assertIn("one watcher cycle", text)
+            self.assertNotIn("one watcher cycle", text)
             self.assertIn("the PR author files it", text)
             self.assertIn("<!-- stuck-pr-threads:recursion#<PR> -->", text)
             self.assertIn("csl-<N>-<slug>", text)
             self.assertIn("Fixes CSL-N", text)
             self.assertNotIn("Commit to `loop/work/<task-id>`", text)
             self.assertNotIn("Branch naming is deferred to", text)
-            self.assertIn("CODEX-THREAD", text)
-            self.assertIn("CODEX_TRIGGER_PAT", text)
+            self.assertNotIn("CODEX-THREAD", text)
+            self.assertNotIn("CODEX_TRIGGER_PAT", text)
         self.assertIn(".github/workflows/stuck-thread-watch.yml", self.agents)
-        self.assertIn("resolveReviewThread", self.agents)
-        self.assertIn("github-actions[bot]", self.agents)
-        self.assertIn("never resolved unless Codex was explicitly asked", self.agents)
+        self.assertIn("never resolves one", " ".join(self.agents.split()))
         self.assertIn(
             "AGENTS.md#when-claude-cant-fix-a-review-thread", self.contributing
         )
@@ -2833,28 +2832,33 @@ class WorkflowAndDocsTests(unittest.TestCase):
         text = self.workflow
         self.assertIn("runs-on: ubuntu-latest", text)
         self.assertNotIn("runs-on: blacksmith", text.lower())
-        self.assertIn("cron: \"23 */2 * * *\"", text)
+        self.assertNotIn("schedule:", text)
         self.assertIn("workflow_dispatch", text)
         self.assertIn("STUCK_AFTER_HOURS", text)
-        self.assertIn("MAX_MEDIATIONS_PER_PR_PER_DAY", text)
-        self.assertIn("MAX_RESOLVES_PER_PR_PER_DAY", text)
-        self.assertIn("CODEX_TRIGGER_PAT", text)
+        # CSL-238: no Codex token, so no mediation or resolve caps to tune.
+        self.assertNotIn("MAX_MEDIATIONS_PER_PR_PER_DAY", text)
+        self.assertNotIn("MAX_RESOLVES_PER_PR_PER_DAY", text)
+        self.assertNotIn("CODEX_TRIGGER_PAT", text)
         self.assertIn("LINEAR_API_KEY", text)
         self.assertIn("stuck_thread_watch.py", text)
         self.assertIn("github.event.repository.default_branch", text)
         self.assertIn("not on the default branch yet; skip", text)
         self.assertIn("pull-requests: read", text)
-        self.assertIn("github-actions[bot]", text)
+        self.assertIn("issues: read", text)
+        self.assertNotIn("write", text.split("\npermissions:\n", 1)[1].split("\njobs:\n", 1)[0])
         self.assertIn("resolveReviewThread", text)
         self.assertNotIn("pytest", text)
         self.assertNotIn("ci_gate", text)
         self.assertNotRegex(text, r"git push|--force|mergePullRequest")
 
-    def test_comment_triggers_include_claude_and_codex(self) -> None:
-        self.assertIn("github.event.comment.user.login == 'claude[bot]'", self.workflow)
-        self.assertIn("chatgpt-codex-connector[bot]", self.workflow)
-        self.assertIn("github.event.issue.pull_request", self.workflow)
-        self.assertIn("pull_request_review", self.workflow)
+    def test_only_a_person_starts_the_watch(self) -> None:
+        # CSL-238: no schedule and no comment or review trigger; workflow_dispatch only.
+        on = self.workflow.split("\non:\n", 1)[1].split("\nenv:\n", 1)[0]
+        self.assertEqual([line[2:-1] for line in on.splitlines() if line.startswith("  ") and not line.startswith("   ")],
+                         ["workflow_dispatch"])
+        self.assertNotIn("chatgpt-codex-connector", self.workflow)
+        self.assertNotIn("secrets.CODEX", self.workflow)
+        self.assertNotIn("github.event.comment", self.workflow)
 
     def test_script_never_pushes_or_merges(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")

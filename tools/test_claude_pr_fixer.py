@@ -403,9 +403,9 @@ def validate_shared_writer_queues(text: str, expected_groups: list[str]) -> None
 
 
 class SharedQueuePolicyTests(unittest.TestCase):
-    def test_all_three_shared_writers_use_bounded_fifo_queue(self) -> None:
-        # CSL-645: the @claude writer, the conflict writer and the Codex journal writer are the
-        # only jobs that take the claude-<PR> group; the Devin writer is gone.
+    def test_both_shared_writers_use_bounded_fifo_queue(self) -> None:
+        # CSL-645: the @claude writer and the conflict writer are the only jobs that take the
+        # claude-<PR> group; the Devin writer is gone, and CSL-238 removed the Codex journal writer.
         claude = WORKFLOW_PATH.read_text()
         validate_shared_writer_queues(claude, [PR_LOCK] * len(WRITER_STAGES))
         locked = sorted(name for name in CLAUDE_JOBS if "group: claude-${{" in job_block(claude, name))
@@ -414,7 +414,7 @@ class SharedQueuePolicyTests(unittest.TestCase):
         # prepare, model and publish each take the shared per-PR lock.
         validate_shared_writer_queues(SCAN_WORKFLOW_PATH.read_text(), [])
         validate_shared_writer_queues(WRITER_WORKFLOW_PATH.read_text(), [WRITER_LOCK] * len(CONFLICT_STAGES))
-        validate_shared_writer_queues((ROOT / ".github/workflows/codex-gate.yml").read_text(), ["claude-${{ github.event.pull_request.number }}"])
+        self.assertFalse((ROOT / ".github/workflows/codex-gate.yml").exists())
 
     def test_mutations_cannot_hide_behind_actionlint_compatibility_exception(self) -> None:
         original = WORKFLOW_PATH.read_text()
@@ -453,28 +453,15 @@ class SharedQueuePolicyTests(unittest.TestCase):
                 validate_shared_writer_queues(bad, [WRITER_LOCK] * len(CONFLICT_STAGES))
         self.assertNotIn("concurrency:", job_block(SCAN_WORKFLOW_PATH.read_text(), "conflict-resolve"))
 
-    def test_codex_journal_writer_lock_rejects_queue_and_group_drift(self):
-        workflow = (ROOT / ".github/workflows/codex-gate.yml").read_text()
-        group = "claude-${{ github.event.pull_request.number }}"
-        for bad in (workflow.replace("queue: max", "queue: min"),
-                    workflow.replace("cancel-in-progress: false", "cancel-in-progress: true"),
-                    workflow.replace(group, "codex-independent")):
-            with self.assertRaises(ValueError):
-                validate_shared_writer_queues(bad, [group])
-        verdict = workflow.split("  verdict:", 1)[1]
-        self.assertIn("github.event_name == 'pull_request_review'", verdict)
-        self.assertNotIn("gh run watch", verdict)
-        self.assertNotIn("workflow_run", verdict)
-
     def test_actionlint_exception_is_exact_and_path_scoped(self) -> None:
         config = (ROOT / ".github/actionlint.yaml").read_text()
         pattern = '^unexpected key "queue" for "concurrency" section\\. expected one of "cancel-in-progress", "group"$'
-        self.assertEqual(config.count("      - '" + pattern + "'"), 4)
-        self.assertEqual(config.count("    ignore:"), 4)
+        self.assertEqual(config.count("      - '" + pattern + "'"), 3)
+        self.assertEqual(config.count("    ignore:"), 3)
         self.assertIn("  .github/workflows/claude.yml:", config)
         self.assertIn("  .github/workflows/conflict-scan.yml:", config)
         self.assertIn("  .github/workflows/claude-conflict-writer.yml:", config)
-        self.assertIn("  .github/workflows/codex-gate.yml:", config)
+        self.assertNotIn("codex-gate.yml", config)
         # CSL-408: every job is GitHub-hosted, so no custom runner labels are declared.
         self.assertNotIn("self-hosted-runner", config)
         self.assertNotIn("blacksmith", config)
@@ -529,6 +516,12 @@ class WorkflowStructureTests(unittest.TestCase):
             header = self._job(publish).split("    steps:", 1)[0]
             self.assertIn("!cancelled()", header)
             self.assertIn(f"needs.{model}.result != 'skipped'", header)
+
+    def test_human_mention_job_is_not_daily_capped(self) -> None:
+        # Moved from tools/test_codex_gate.py when CSL-238 removed the Codex gate.
+        job = self._job("claude-mention")
+        self.assertNotIn("codex-fixer-run", job)
+        self.assertIn("needs.resolve-pr.outputs.mention == 'true'", job)
 
     def test_resolve_pr_job_if_skips_bots(self) -> None:
         resolve = self._job("resolve-pr")
@@ -1596,7 +1589,6 @@ class ActionlintTests(unittest.TestCase):
                 str(WORKFLOW_PATH),
                 str(SCAN_WORKFLOW_PATH),
                 str(WRITER_WORKFLOW_PATH),
-                str(ROOT / ".github" / "workflows" / "codex-gate.yml"),
             ],
             cwd=ROOT,
             check=False,

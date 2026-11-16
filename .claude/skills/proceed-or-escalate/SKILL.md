@@ -15,7 +15,7 @@ and make each one quick to answer. Everything else, do yourself.
 
 **Scope.** These rules govern agents acting through a developer's account or
 session: interactive sessions, scheduled loops and Grok Bots. Repository workflows
-(the `claude.yml` fixer, the Codex gate, stuck-thread-watch, conflict-scan,
+(the `claude.yml` fixer, stuck-thread-watch, conflict-scan,
 linear-pr-sync and other repository workflows) and Devin automations keep the roles
 in AGENTS.md "Review roles" and "Automations". Their documented markers, receipts
 and audit comments are unchanged.
@@ -50,8 +50,7 @@ and audit comments are unchanged.
   (`claude-fixer-paused`, its 8-commit loop cap, or a pause label or marker the
   repo documents); a fix receipt cannot be verified (short SHA, commit
   not reachable from the PR head, fingerprint mismatch, no push); a branch with
-  fixer receipts was rebased or force-pushed; or `ci:full` label ownership is
-  uncertain. Never remove a pause yourself, never dispatch the fixer to get
+  fixer receipts was rebased or force-pushed. Never remove a pause yourself, never dispatch the fixer to get
   around its budget, and never report an unverified fix as fixed.
 
 If anything on this list holds, escalate; the proceed list never overrides it.

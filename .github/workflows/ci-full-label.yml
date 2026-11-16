@@ -1,4 +1,5 @@
-# Extra OS coverage when someone (or Codex READY) adds `ci:full`.
+# Extra OS coverage when a person adds `ci:full` (a fork PR's only route to
+# windows/macos; same-repository PRs get them from ci.yml with no label).
 # Must not define a job named `linux`, `windows`, or `macos`: a skipped
 # check is treated as success and would overlay a failed check of the
 # same name (CSL-202). Unrelated labels skip this caller only; the

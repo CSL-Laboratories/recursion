@@ -10,7 +10,6 @@ on:
       - ".github/workflows/claude.yml"
       - ".github/workflows/conflict-scan.yml"
       - ".github/workflows/claude-conflict-writer.yml"
-      - ".github/workflows/codex-gate.yml"
       - ".github/actionlint.yaml"
       - "scripts/ci/claude_pr_fixer_gate.py"
       - "scripts/ci/claude_fixer_receipts.py"
@@ -26,10 +25,7 @@ on:
       - "tools/test_fixer_failure_watcher.py"
       - ".github/scripts/stuck_thread_watch.py"
       - "scripts/ci/claude_conflict_scan.py"
-      - "scripts/ci/codex_gate.py"
       - "tools/test_claude_pr_fixer.py"
-      - "tools/test_codex_gate.py"
-      - "tools/test_codex_gate_identity.py"
 
 # Job-level concurrency only. Workflow-level concurrency would admit skipped
 # comments and cancel a queued fixer run.
@@ -41,7 +37,7 @@ permissions:
 jobs:
   resolve-pr:
     # Job-level filter so skipped events never allocate a runner (CSL-102).
-    # Only human @claude comments start the fixer; Codex only routes READY/MEDIATE.
+    # Only human @claude comments start the fixer.
     # Bot events never enter this job. The Devin review path was removed (CSL-645).
     if: >-
       (
@@ -340,17 +336,13 @@ jobs:
           python3 -X utf8 -B tools/test_claude_fixer_publish.py
           python3 -X utf8 -B tools/test_fixer_failure_escalation.py
           python3 -X utf8 -B tools/test_fixer_failure_watcher.py
-      - name: Codex gate tests
-        run: |
-          python3 -X utf8 -B tools/test_codex_gate.py
-          python3 -X utf8 -B tools/test_codex_gate_identity.py
       - name: actionlint
         env:
           ACTIONLINT_VERSION: "1.7.7"
         run: |
           set -euo pipefail
           bash <(curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "$ACTIONLINT_VERSION"
-          ./actionlint -color .github/workflows/claude.yml .github/workflows/conflict-scan.yml .github/workflows/claude-conflict-writer.yml .github/workflows/codex-gate.yml
+          ./actionlint -color .github/workflows/claude.yml .github/workflows/conflict-scan.yml .github/workflows/claude-conflict-writer.yml
 
   mention-prepare:
     needs: resolve-pr

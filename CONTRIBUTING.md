@@ -27,9 +27,8 @@ issues and PRs.
   eligible code owner can be requested and that the founders' reviews are
   independent review, not code-owner review. Both (a) the Linear @mention
   and (b) this GitHub request are required. This is mandatory for agents too.
-- **Wait for jobs before human sign-off.** Order: the Codex review that the Codex gate
-  requests on each non-draft head runs first, then required CI. No human approves or
-  requests changes on a PR until both have finished on the current head commit. A review on a stale head does not
+- **Wait for jobs before human sign-off.** Required CI runs first. No human approves or
+  requests changes on a PR until it has finished on the current head commit. A review on a stale head does not
   count. After new pushes, the reviewer reviews again. Review requests and their status
   are posted as @mention comments on the CSL Linear issue, and a watcher posts there when
   a PR is ready for review.

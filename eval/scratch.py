@@ -103,21 +103,36 @@ def attempt(attempt_id: str, tmp_base: Path = DEFAULT_TMP_BASE, xdg_base: Path =
     tmpdir = tmp_base / attempt_id
     xdg = xdg_base / attempt_id
     created = []
+    scratch = None
+    # A removal error must not replace the attempt's own exception (a KeyboardInterrupt in particular),
+    # and a failure removing the first folder must not skip the second.
+    body_error = False
     try:
-        for folder in (tmpdir, xdg):
-            try:
-                folder.mkdir(mode=0o700)
-            except FileExistsError:
-                raise ScratchError(f"{folder} already exists: an attempt folder is never reused") from None
-            created.append(folder)
-        scratch = Scratch(attempt_id, tmpdir, xdg)
-        scratch.home.mkdir(mode=0o700)
-        yield scratch
+        try:
+            for folder in (tmpdir, xdg):
+                try:
+                    folder.mkdir(mode=0o700)
+                except FileExistsError:
+                    raise ScratchError(f"{folder} already exists: an attempt folder is never reused") from None
+                created.append(folder)
+            scratch = Scratch(attempt_id, tmpdir, xdg)
+            scratch.home.mkdir(mode=0o700)
+            yield scratch
+        except BaseException:
+            body_error = True
+            raise
     finally:
+        cleanup_error = None
         for folder in created:
-            _rmtree(folder)
-        if len(created) == 2:
+            try:
+                _rmtree(folder)
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if scratch is not None:
             scratch.removed = not tmpdir.exists() and not xdg.exists()
+        if cleanup_error is not None and not body_error:
+            raise cleanup_error
 
 
 def environment(scratch: Scratch, *, home: Path | None = None, extra: dict | None = None) -> dict:

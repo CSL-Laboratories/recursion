@@ -11,6 +11,7 @@ test file or a changed mode cannot leave the graded tree different from the comm
 """
 from __future__ import annotations
 
+import re
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,25 @@ from eval import gitutil
 from eval import scratch as scratch_mod
 
 NO_TESTS_RAN = 5
+# unittest exits 0 and prints this when it collected tests and skipped every one.
+_RAN_TESTS = re.compile(rb"\bRan (\d+) tests?\b")
+_OK_SKIPPED = re.compile(rb"\bOK \(skipped=(\d+)\)")
+
+
+def collected_tests_all_skipped(log: bytes) -> bool:
+    """True when the hidden-test log shows every collected test was skipped.
+
+    That command exits 0, the same code as a pass. A pass on the parent would say there is nothing to
+    solve, and a pass when grading would count the task done. Neither is true: no test ran.
+    """
+    if not log:
+        return False
+    ran = _RAN_TESTS.search(log)
+    skipped = _OK_SKIPPED.search(log)
+    if ran is None or skipped is None:
+        return False
+    count = int(ran.group(1))
+    return count > 0 and count == int(skipped.group(1))
 
 
 @dataclass
@@ -66,11 +86,11 @@ def validate(task, *, reruns: int = 2, tmp_base: Path = scratch_mod.DEFAULT_TMP_
         if timed_out:
             result.reason = prefix + "hidden tests ran past their limit on the parent"
             return result
+        if code == NO_TESTS_RAN or collected_tests_all_skipped(log):
+            result.reason = prefix + "the hidden-test command ran no test on the parent"
+            return result
         if code == 0:
             result.reason = prefix + "hidden tests pass on the parent: nothing to solve"
-            return result
-        if code == NO_TESTS_RAN:
-            result.reason = prefix + "the hidden-test command ran no test on the parent"
             return result
         commit_tree, code, timed_out, log = _run(task, "commit", tmp_base, xdg_base)
         result.runs.append(("commit", code, timed_out))
@@ -78,7 +98,7 @@ def validate(task, *, reruns: int = 2, tmp_base: Path = scratch_mod.DEFAULT_TMP_
             result.reason = (f"the start tree with the reference solution and hidden tests is {commit_tree}, "
                              f"not the pinned commit tree {task.commit_tree}")
             return result
-        if code == NO_TESTS_RAN:
+        if code == NO_TESTS_RAN or collected_tests_all_skipped(log):
             result.reason = prefix + "the hidden-test command ran no test on the commit"
             return result
         if timed_out or code != 0:

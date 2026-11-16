@@ -16,8 +16,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import os
 import re
+import stat
 import sys
 import tarfile
 from dataclasses import dataclass, field
@@ -104,6 +106,7 @@ class Task:
             path = work / safe_relpath(name)
             _clear_the_way(work, path)
             path.parent.mkdir(parents=True, exist_ok=True)
+            _release_shared_name(path)
             path.write_bytes(data)
             path.chmod(self.modes.get(name, 0o644))
 
@@ -189,8 +192,47 @@ def apply_files(work: Path, files: dict, modes: dict | None = None) -> None:
         path = work / safe_relpath(name)
         _clear_the_way(work, path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        _release_shared_name(path)
         path.write_bytes(data if isinstance(data, bytes) else data.encode("utf-8"))
         path.chmod((modes or {}).get(name, 0o644))
+
+
+def _release_shared_name(path: Path) -> None:
+    """Unlink a name that must not be opened for writing, then the caller creates a new file.
+
+    Opening a FIFO or a socket for write waits for another process, and that wait is not the grading
+    deadline. A hard-linked regular file shares its inode with another name, which may lie outside the
+    work tree; writing it in place would change that other file. A private regular file is left to be
+    replaced in place, as before.
+    """
+    try:
+        info = path.lstat()
+    except OSError:
+        return
+    if stat.S_ISLNK(info.st_mode) or stat.S_ISDIR(info.st_mode):
+        return
+    if stat.S_ISREG(info.st_mode) and info.st_nlink <= 1:
+        return
+    path.unlink()
+
+
+def _positive_limit(task_id: str, key: str, value) -> None:
+    """Refuse a time limit that is not a finite positive number of seconds.
+
+    NaN and Infinity pass a ``<= 0`` check (NaN compares false; Infinity is not ``<= 0``) and then
+    ``process.wait`` has no deadline. An integer that does not fit in a float (``10**400``) would raise
+    OverflowError while the task is built.
+    """
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TaskError(f"{task_id}: {key} must be a positive number")
+    try:
+        number = float(value)
+    except OverflowError:
+        raise TaskError(f"{task_id}: {key} must be a finite positive number") from None
+    if not math.isfinite(number) or number <= 0:
+        raise TaskError(f"{task_id}: {key} must be a finite positive number")
 
 
 def _modes(task_id: str, meta: dict) -> dict:
@@ -215,9 +257,7 @@ def _meta(task_id_hint: str, meta: dict) -> dict:
     if not isinstance(command, list) or not command or not all(isinstance(p, str) and p for p in command):
         raise TaskError(f"{task_id}: test_command must be a non-empty list of strings")
     for key in ("timeout_s", "grading_timeout_s"):
-        value = meta.get(key)
-        if value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0):
-            raise TaskError(f"{task_id}: {key} must be a positive number")
+        _positive_limit(task_id, key, meta.get(key))
     return meta
 
 

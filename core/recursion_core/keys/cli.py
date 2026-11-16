@@ -422,8 +422,12 @@ def _audit(args, out, err, store) -> int:
     for key_id, code in sorted(report.missing.items()):
         print(f'not searched for {key_id}: its value could not be read ({code})', file=out)
     for key_id, op in sorted(report.pending.items()):
-        print(f'unfinished {op} of {key_id}: its value may still be in the store; "key remove {key_id}" clears it',
-              file=out)
+        if report.unnamed_refused == 'keychain_unavailable':     # the store's keychain is refused, and so a removal
+            print(f'unfinished {op} of {key_id}: its value may still be in the store; its keychain is refused '
+                  f'(keychain_unavailable), so "key remove {key_id}" cannot clear it now', file=out)
+        else:
+            print(f'unfinished {op} of {key_id}: its value may still be in the store; "key remove {key_id}" clears '
+                  'it', file=out)
     for key_id in report.unbound:
         print(f'not named: the owner-only file holds a value of {key_id} that no saved key names; '
               f'"key remove {key_id}" deletes it', file=out)

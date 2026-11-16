@@ -6,12 +6,10 @@ import io
 import json
 
 from recursion_core.keys import __main__ as entry
-from recursion_core.keys import audit as audit_mod
 from recursion_core.keys.errors import KeyRefused, KeyStoreError
 from recursion_core.keys.store import KeyStore
 from recursion_core.keys.system import Completed
 from recursion_core.keys.tests.support import (
-    MARKER,
     OTHER,
     FakeSystem,
     TempStoreCase,
@@ -19,7 +17,6 @@ from recursion_core.keys.tests.support import (
 )
 from recursion_core.keys.tests.test_macos import (
     ELSEWHERE,
-    LOGIN,
     FakeSecurity,
     fixed_clock,
 )
@@ -41,69 +38,6 @@ class MacCase(TempStoreCase):
         doc = json.loads(path.read_text())
         del doc['keychain']
         path.write_text(json.dumps(doc, indent=1, ensure_ascii=True) + '\n')
-
-
-@needs_posix
-class UnrecordedIndexTest(MacCase):
-    """DeepSeek r3 F1 (MEDIUM): an index that records no keychain is used only where the login keychain holds one of
-    the store's items; elsewhere nothing is looked for or removed, and nothing is dropped."""
-
-    def test_after_the_login_keychain_moved_a_removal_is_refused_and_keeps_the_record(self) -> None:
-        store, _, security = self.mac()
-        self.add(store)
-        self.unrecord(store)
-        security.login = ELSEWHERE
-        with self.assertRaises(KeyStoreError) as caught:
-            store.remove('codex-key')
-        self.assertEqual(caught.exception.code, 'keychain_unavailable')
-        self.assertIn('codex-key', store.list().keys)
-        self.assertEqual(store.list().pending['codex-key'].op, 'remove')
-        self.assertEqual([item['keychain'] for item in security.items], [LOGIN])
-        with self.assertRaises(KeyStoreError) as counted:
-            store.unnamed_items()
-        self.assertEqual(counted.exception.code, 'keychain_unavailable')
-        self.assertFalse(audit_mod.run(store, journal=False).complete())
-        security.login = LOGIN                                           # the keychain that holds them, again
-        store.remove('codex-key')
-        self.assertEqual((security.items, store.list().keys, store.list().pending), ([], {}, {}))
-
-    def test_beside_its_own_keychain_it_works_and_the_next_save_records_it(self) -> None:
-        store, _, _ = self.mac()
-        self.add(store)
-        self.unrecord(store)
-        self.assertIsNone(store.list().keychain)
-        self.assertEqual(store.credential('codex-key', 'CODEX_API_KEY'), MARKER)
-        self.assertEqual(store.unnamed_items(), 0)
-        self.add(store, key_id='beta', value=OTHER, env='ANTHROPIC_API_KEY', provider='anthropic')
-        self.assertEqual(store.list().keychain, LOGIN)
-
-    def test_a_removal_that_leaves_keys_records_it(self) -> None:
-        store, _, _ = self.mac()
-        self.add(store)
-        self.add(store, key_id='beta', value=OTHER, env='ANTHROPIC_API_KEY', provider='anthropic')
-        self.unrecord(store)
-        store.remove('codex-key')
-        self.assertEqual(store.list().keychain, LOGIN)
-
-    def test_a_keychain_holding_only_another_stores_items_is_not_adopted(self) -> None:
-        store, _, security = self.mac()
-        self.add(store)
-        self.unrecord(store)
-        security.items.append(dict(security.items[0], keychain=ELSEWHERE, gena='f' * 32, password=OTHER.encode()))
-        security.login = ELSEWHERE
-        with self.assertRaises(KeyStoreError) as caught:
-            self.add(store, key_id='second', value=OTHER)
-        self.assertEqual(caught.exception.code, 'keychain_unavailable')
-        self.assertIsNone(store.list().keychain)
-
-    def test_a_credential_beside_a_keychain_that_holds_none_of_the_stores_items_is_refused(self) -> None:
-        store, _, security = self.mac()
-        self.add(store)
-        self.unrecord(store)
-        security.login = ELSEWHERE
-        with self.assertRaises(KeyRefused) as refused:
-            store.credential('codex-key', 'CODEX_API_KEY')
-        self.assertEqual(refused.exception.code, 'keychain_unavailable')
 
 
 @needs_posix

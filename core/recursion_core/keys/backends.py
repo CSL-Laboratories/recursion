@@ -41,24 +41,25 @@ its intent only then.
 MACOS KEYCHAIN. Apple's ``/usr/bin/security``, at that fixed path and never one found on PATH, and the login keychain,
 which ``security login-keychain`` names once per operation and which every command then names: a save, a lookup, a
 removal and a count all go to it, never to the default keychain or the search list (lane KEYS' questions.md K21, default
-(d)). The index records that keychain at the store's first save; an index pinned here that records none (written before
-it was recorded) is used only where the login keychain holds one of the store's own items, and records it at its next
-write; an operation on a store whose login keychain is now another is refused (``keychain_unavailable``) and keeps its
-record or intent: nothing of the store's is looked for or removed in another keychain. Each save is its own generic
-password: account ``<key id>``, service ``recursion.<store id>.<save id>.<provider>``, generic attribute (``-G``)
-``<store id>``, comment (``-j``) ``<provider>``, label ``Recursion API key <id>``. Account and service are the item's
-primary key, and given both, ``security`` searches by those two alone (it then ignores ``-G`` and ``-j``; Apple's
-keychain_find.c), so the service carries the whole binding: a value is returned only to the record of the save that
-stored it, in this store, for that provider. ``delete`` and ``holds`` search by account and generic attribute, with no
-service, which ``security`` does match, so a removal reaches every save of the id in this store, one item per call. No
-save meets another's item, so none replaces a value it was not given. The value is written with ``security -i``, which
-reads its command from standard input: one ``add-generic-password`` line, the value as hexadecimal (``-X``), nothing of
-it in the arguments or the environment. ``security -i`` keeps at most 4095 bytes of a line and reads the rest as the
-next command (security.c, readline.c), so a key whose line would be longer is refused (``value_invalid``, with the
-limit) before the store writes anything; with the longest id, provider and login-keychain path that is about 1,800
-characters. The exit status of ``-i`` is not documented to report one command's failure, so every save is read back by
-its record and compared; one not kept exactly is taken out again (its own item, no other) and refused
-``keychain_failed``; a read-back the keychain does not answer keeps its own refusal (a locked keychain stays
+(d)). The index records that keychain at the store's first save; an operation on a store whose login keychain is now
+another is refused (``keychain_unavailable``) and keeps its record or intent: nothing of the store's is looked for or
+removed in another keychain. An index pinned here that records none (only unreleased drafts of this backend wrote one,
+before the keychain was recorded) is refused the same way beside any keychain, before ``security`` is asked anything: no
+listing shows which keychain it saved in, since a copy of an item in another keychain lists as the original does. Each
+save is its own generic password: account ``<key id>``, service ``recursion.<store id>.<save id>.<provider>``, generic
+attribute (``-G``) ``<store id>``, comment (``-j``) ``<provider>``, label ``Recursion API key <id>``. Account and
+service are the item's primary key, and given both, ``security`` searches by those two alone (it then ignores ``-G`` and
+``-j``; Apple's keychain_find.c), so the service carries the whole binding: a value is returned only to the record of
+the save that stored it, in this store, for that provider. ``delete`` and ``holds`` search by account and generic
+attribute, with no service, which ``security`` does match, so a removal reaches every save of the id in this store, one
+item per call. No save meets another's item, so none replaces a value it was not given. The value is written with
+``security -i``, which reads its command from standard input: one ``add-generic-password`` line, the value as
+hexadecimal (``-X``), nothing of it in the arguments or the environment. ``security -i`` keeps at most 4095 bytes of a
+line and reads the rest as the next command (security.c, readline.c), so a key whose line would be longer is refused
+(``value_invalid``, with the limit) before the store writes anything; with the longest id, provider and login-keychain
+path that is about 1,800 characters. The exit status of ``-i`` is not documented to report one command's failure, so
+every save is read back by its record and compared; one not kept exactly is taken out again (its own item, no other) and
+refused ``keychain_failed``; a read-back the keychain does not answer keeps its own refusal (a locked keychain stays
 ``keychain_locked``) and the save's intent stays. Exit 44 ("item not found") is a hint and never proof: ``security``
 also answers it when its search failed, so absence is established only by a complete listing of the login keychain
 (``count``) that shows no generic password of the id in this store, whatever its service (every item ``delete``
@@ -234,7 +235,7 @@ class MacKeychain:
         self._system = system
         self._store_id = store_id
         # The keychain the store's index records it saved in; None before a save; UNRECORDED for an index pinned here
-        # that records none (written before the keychain was recorded).
+        # that records none, which is refused (see MACOS KEYCHAIN).
         self._pinned = keychain
         self._keychain = None       # the login keychain's path: resolved once, then named by every command
 
@@ -263,6 +264,10 @@ class MacKeychain:
         store operation), so every command of it names the same keychain. Anything but one absolute, quoted path is
         refused, never guessed at."""
         if self._keychain is None:
+            if self._pinned == UNRECORDED:
+                raise KeyStoreError('keychain_unavailable', "this store's index records no keychain (only unreleased "
+                                    'drafts of this backend wrote such an index), so which keychain holds its keys '
+                                    'cannot be shown; nothing is looked for, read or removed in any keychain')
             done = self._run([self._tool(), 'login-keychain'])
             if done.returncode != 0:
                 raise _mac_failure('login-keychain', done)
@@ -271,27 +276,12 @@ class MacKeychain:
             if path is None:
                 raise KeyStoreError('keychain_failed', 'security login-keychain named no login keychain this store '
                                     'can use')
-            if self._pinned == UNRECORDED and not self._holds_store_items(path):
-                raise KeyStoreError('keychain_unavailable', "this store's index records no keychain, and the login "
-                                    "keychain holds none of the store's items; nothing is looked for or removed in it "
-                                    '(make the keychain that holds them the login keychain again)')
-            if self._pinned not in (None, UNRECORDED) and path != self._pinned:
+            if self._pinned is not None and path != self._pinned:
                 raise KeyStoreError('keychain_unavailable', 'the login keychain is not the one this store saved its '
                                     'keys in; nothing is looked for or removed in another keychain (make that one the '
                                     'login keychain again)')
             self._keychain = path
         return self._keychain
-
-    def _holds_store_items(self, path: str) -> bool:
-        """Whether a complete listing of ``path`` shows a generic password of this store (its generic attribute):
-        how an index that records no keychain is matched to one, by what it holds."""
-        done = self._run([self._tool(), 'dump-keychain', path])
-        if done.returncode != 0:
-            raise _mac_failure('dump-keychain', done)
-        if done.stderr.strip():
-            raise KeyStoreError('keychain_failed', 'security dump-keychain reported an error beside its listing, which '
-                                'may therefore be incomplete')
-        return any(item.get('gena') == self._store_id for item in _dumped(done.stdout))
 
     def target(self) -> str:
         """The keychain this backend saves in, which the store's index records at a save (see MACOS KEYCHAIN)."""

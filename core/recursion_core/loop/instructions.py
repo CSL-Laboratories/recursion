@@ -4,7 +4,9 @@ As Codex walks them (the plan's competitor notes, row 26): from the workspace up
 ``.git`` (or only the workspace when there is none), then read from the root down, so the nearer file comes
 later and can refine the farther one. In each folder AGENTS.md is read, then CLAUDE.md. All of them together
 are capped at 32 KiB, Codex's shared limit; a file that would pass the cap is cut at a UTF-8 boundary and the
-cut is said in the text and in the list. A file that is a link leading outside the repository is skipped.
+cut is said in the text and in the list. The cap bounds the reading too: a file is read only up to the room
+that is left (its size comes from its metadata), and once the room is used up no file is read at all. A file
+that is a link leading outside the repository is skipped.
 The list (path, bytes, whether cut or skipped) goes on the ``ready`` line, so what the model was told is on
 the record.
 
@@ -64,19 +66,31 @@ def discover(workspace: Path, max_bytes: int = MAX_BYTES) -> tuple[str, list[Fou
             if not (real == str(top) or real.startswith(str(top).rstrip(os.sep) + os.sep)):
                 found.append(Found(rel, 0, skipped="links outside the repository"))
                 continue
+            room = max_bytes - used
             try:
-                data = Path(real).read_bytes()
+                # Never more than the room left (and one byte to tell that there is more); nothing at all once
+                # the room is used up (astra R7, sol R6). The size comes from the file's metadata.
+                data, size = _read_at_most(real, room + 1 if room > 0 else 0)
             except OSError as exc:
                 found.append(Found(rel, 0, skipped=f"unreadable: {exc.strerror or exc}"))
                 continue
-            room = max_bytes - used
+            size = max(size, len(data))
             if room <= 0:
-                found.append(Found(rel, len(data), skipped="over the size limit for instruction files"))
+                found.append(Found(rel, size, skipped="over the size limit for instruction files"))
                 continue
-            cut = len(data) > room
+            cut = len(data) > room or size > room
             shown = data[:room].decode("utf-8", errors="ignore") if cut else data.decode("utf-8", errors="replace")
             used += len(shown.encode("utf-8"))
             note = f"\n[{rel} was cut at the {max_bytes // 1024} KiB limit for instruction files]" if cut else ""
             parts.append(f"## {rel}\n{shown}{note}")
-            found.append(Found(rel, len(data), cut=cut))
+            found.append(Found(rel, size, cut=cut))
     return "\n\n".join(parts), found
+
+
+def _read_at_most(path: str, limit: int) -> tuple[bytes, int]:
+    """At most ``limit`` bytes from the start of the file, and its size; with ``limit`` 0 the file is opened
+    for its size only and nothing is read."""
+
+    with open(path, "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        return (f.read(limit) if limit > 0 else b""), size

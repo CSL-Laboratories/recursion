@@ -21,12 +21,18 @@ Out (one object per line; standard output carries nothing else, diagnostics go t
     tool_call       {turn_id, call_id, name, input}
     tool_result     {turn_id, call_id, status, text, output_ref, truncated, spill}
     usage           {turn_id, span: "call", model, input_tokens, ...}: one per model call, a failed or
-                    interrupted one included (what it had measured; unknown, never 0, where nothing was)
+                    interrupted one included (what it had measured; unknown, never 0, where nothing was);
+                    then, before every turn_ended, span "turn" (the turn's sum; a known 0 when it made no
+                    call) and span "session_total" (the running total, never added up); a sum keeps the
+                    weakest provenance of its counts (engine.py)
     limit           {turn_id, scope, kind, model, bucket, reset_at, retry_after_s}
-    permission_request  {turn_id, request_id, call_id, tool, cwd, input, profile, deadline_s}: write, edit and
-                    shell ask before they run (permissions.py); permission_expired {turn_id, request_id} when the
-                    deadline passes unanswered (the call is denied)
-    acceptance      {turn_id, command, exit_code, passed, text}: the harness's acceptance check (done.py)
+    permission_request  {turn_id, request_id, call_id, tool, cwd, input, profile, deadline_s, resolved_path?}:
+                    write, edit and shell ask before they run (permissions.py); resolved_path, only when the
+                    path leads elsewhere through a link, names the file that would change; deadline_s is absent
+                    under full_access; permission_expired {turn_id, request_id} when the deadline passes
+                    unanswered (the call is denied, and an answer after it is refused)
+    acceptance      {turn_id, command, exit_code, passed, timed_out, text}: the harness's acceptance check
+                    (done.py)
     compaction      {turn_id, before_tokens, replaced, kept, summary: "model" | "fallback", reason, ...}
     retry           {turn_id, attempt, code, delay_s, detail}: a failed call is tried again after delay_s
     turn_ended      {turn_id, outcome, result, reason}

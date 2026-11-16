@@ -125,6 +125,10 @@ class ReadLedger:
         with self._lock:
             return self._marks.get(str(path))
 
+    def forget(self, path: Path) -> None:
+        with self._lock:
+            self._marks.pop(str(path), None)
+
 
 class Workspace:
     def __init__(self, root: Path, spill: SpillStore) -> None:

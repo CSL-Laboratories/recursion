@@ -77,10 +77,13 @@ class ToolContext:
     max_lines: int = DEFAULT_MAX_LINES
     # approve(call) -> permissions.Decision; None when nothing can be asked (then such tools are refused).
     approve: Callable[[b.ToolCall], Any] | None = None
+    # What the tool's precheck said the request should show beside the input (``resolved_path``); dispatch sets
+    # it for the one approve call and clears it after. An approve function may pass it on to the request.
+    request_facts: Mapping[str, Any] | None = None
 
 
 ToolFn = Callable[[Mapping[str, Any], ToolContext], ToolOutput]
-CheckFn = Callable[[Mapping[str, Any], ToolContext], None]
+CheckFn = Callable[[Mapping[str, Any], ToolContext], Any]
 
 
 @dataclass(frozen=True)
@@ -89,7 +92,8 @@ class Tool:
     run: ToolFn
     needs_approval: bool = False
     # Run before a permission request, without side effects; raises ToolError so that a call that would fail
-    # (a stale edit, an anchor that is not unique) is refused without asking anyone. ``run`` checks again.
+    # (a stale edit, an anchor that is not unique) is refused without asking anyone. ``run`` checks again. It may
+    # return a mapping of facts for the request (``resolved_path``); anything else it returns is ignored.
     precheck: CheckFn | None = None
 
     def __post_init__(self) -> None:
@@ -332,27 +336,38 @@ class ToolRegistry:
             return self._finish(call, ToolOutput(json.dumps(answer, ensure_ascii=False), ERROR), ctx)
         if not isinstance(call.input, Mapping):
             return self._finish(call, ToolOutput("invalid input: the input must be a JSON object", ERROR), ctx)
-        args = dict(call.input)  # one copy: what is checked is what runs
+        # One copy, all the way down and shared with nobody: what is checked is what is asked for, and what runs
+        # (sol R5). The precheck and the request each get a copy of it, so neither can change it.
+        args = perm.snapshot(dict(call.input))
         try:
             validate(tool.spec.input_schema, args)
         except ToolError as exc:
             return self._finish(call, ToolOutput(f"invalid input: {exc}", ERROR), ctx)
         ctx.max_bytes, ctx.max_lines = self.max_bytes, self.max_lines
         if tool.needs_approval is not False:  # fails closed: anything but False (a subclass may skip the check) asks
+            facts = None
             if tool.precheck is not None:
                 try:
-                    tool.precheck(args, ctx)
+                    facts = tool.precheck(perm.snapshot(args), ctx)
                 except ToolError as exc:
                     return self._finish(call, ToolOutput(str(exc), ERROR), ctx)
             if ctx.approve is None:
                 # Never run without an answer: with no way to ask, such a tool is refused.
                 return self._finish(call, ToolOutput("refused: this tool needs an approval and none can be asked",
                                                      DENIED), ctx)
-            decision = ctx.approve(call)
+            asked = b.ToolCall(call.call_id, call.name, perm.snapshot(args), call.raw_input, call.input_error)
+            ctx.request_facts = dict(facts) if isinstance(facts, Mapping) and facts else None
+            try:
+                decision = ctx.approve(asked)
+            finally:
+                ctx.request_facts = None
             if not decision.approved:
                 status = CANCELLED if decision.outcome == perm.CANCELLED else DENIED
                 return self._finish(call, ToolOutput(perm.REFUSALS.get(decision.outcome, "denied"), status), ctx)
-            args = dict(decision.input)
+            if ctx.cancel.cancelled:
+                # Approved, but the turn was interrupted meanwhile: an interrupt is final (sol R2).
+                return self._finish(call, ToolOutput(perm.REFUSALS[perm.CANCELLED], CANCELLED), ctx)
+            args = perm.snapshot(dict(decision.input))
             try:
                 validate(tool.spec.input_schema, args)  # what runs is the bound input; it is checked as well
             except ToolError as exc:

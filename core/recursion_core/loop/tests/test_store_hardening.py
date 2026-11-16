@@ -6,6 +6,7 @@ context window the loop cannot use is refused."""
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
@@ -13,7 +14,7 @@ import unittest
 from pathlib import Path
 
 from recursion_core.loop import store as st
-from recursion_core.loop.engine import Config, Session
+from recursion_core.loop.engine import Config, Session, UsageTotal
 from recursion_core.loop.providers import base as b
 from recursion_core.loop.providers.fake import FakeProvider
 from recursion_core.loop.tests.support import Lines, registry, workspace
@@ -101,6 +102,24 @@ class DamagedJournalsRefuseTheResume(unittest.TestCase):
         s.totals(session.session_usage.to_state())
         s.close()
         self.assertEqual(s.load().totals["calls"], 1)
+
+    def test_a_totals_provenance_reads_back_and_a_bad_one_is_refused(self) -> None:
+        # #417's round 1 (astra R6, sol R7) taken into PR 3 by its merge: a resumed session keeps where its
+        # totals' numbers came from; a journal written before that has no provenance and reads as observed.
+        total = UsageTotal()
+        total.add(b.Usage(cost_usd=b.Measurement(0.25, b.KNOWN, b.MODELLED)), "m")
+        s = _journal(self, SEED[:1])
+        s.totals(total.to_state())
+        s.close()
+        back = UsageTotal.from_state(s.load().totals)
+        self.assertEqual(back.to_wire()["cost_usd"], {"value": 0.25, "quality": "known", "provenance": "modelled"})
+        older = total.to_state()
+        del older["source"]
+        self.assertEqual(UsageTotal.from_state(older).to_wire()["cost_usd"]["provenance"], "observed")
+        bad = total.to_state()
+        bad["source"]["cost_usd"] = "guessed"
+        with self.assertRaises(st.StoreError):
+            _journal(self, SEED + ['{"k":"totals","state":' + json.dumps(bad) + '}']).load()
 
 
 class SummaryIsAReply(unittest.TestCase):

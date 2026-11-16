@@ -13,7 +13,8 @@ python -m recursion_core.loop --provider anthropic --model <the route's model id
 
 - `ANTHROPIC_API_KEY` and, optionally, `ANTHROPIC_BASE_URL` come from the environment. The key is removed
   from the process environment once the provider holds it, so no child of the loop inherits it, and it is
-  removed from every line the loop writes.
+  removed from every line the loop writes. On Linux its text is also cleared from the environment block the
+  process started with (`/proc/<pid>/environ`); the loop does not start if that cannot be done.
 - `--home` is the engine's private folder (created with mode 0700 if missing; refused if other users can
   open it). Outputs too large to show are saved in `<home>/spill/`.
 - The tools work in the current folder, or in `--workspace`.
@@ -36,7 +37,8 @@ payload its fields are that payload's as far as the loop knows them; `protocol.p
 (the connection id, the bucket, the input digest, the stream offsets of text, the envelope; `retry_after_s`
 and `spill` dropped; `turn_ended` is not a driver draft). Text is written when its model call ends, not while
 it streams. Every model call has one `usage` line, a failed or interrupted one included, with what it had
-measured (unknown, never 0, where nothing was).
+measured (unknown, never 0, where nothing was), and every `turn_ended` follows the turn's total and the
+session's running total (a known 0 for a turn that made no call; a loop error included).
 
 `input_accepted` is written the moment the loop takes a message, before the model sees it, and never for a
 message it did not take. A turn the model finishes ends `candidate_done`, or `done` once the task's
@@ -56,7 +58,7 @@ already finished the turn or the loop failed. Standard input is read on its own 
 | `tools/registry.py` | Input checks and the one output cap, with spill, that every tool passes through |
 | `tools/read.py`, `tools/search.py` | Reading files and folders; searching contents (in a child process). A tool runs only through `ToolRegistry.dispatch`, which checks its input, the approval rule and cancellation, scrubs and caps its output; the registry hands out a tool's spec, never its `run`, and a `run` called directly skips all of that |
 | `tools/write.py`, `tools/edit.py`, `tools/files.py` | Changing files: read first, unchanged since, atomic |
-| `tools/shell.py` | One command in its own process group, stopped at its timeout or on an interrupt |
+| `tools/shell.py`, `tools/reaper.py` | One command in its own process group and session, with an environment built from a short list of names; on Linux under a keeper that is the subreaper of all it starts. One deadline covers the command and the reading of its output; when it ends, times out or is interrupted, everything it started is stopped |
 | `tools/workspace.py` | Path confinement, the spill store, and the record of what was read |
 | `permissions.py` | Asking before a change, and the deadline that denies |
 | `done.py`, `instructions.py` | The acceptance step; the instruction files |

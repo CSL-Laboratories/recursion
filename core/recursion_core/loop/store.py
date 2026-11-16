@@ -209,6 +209,10 @@ def _check_totals(state: Any) -> None:
         table = state.get(key)
         if not isinstance(table, dict) or set(table) != set(b.USAGE_FIELDS) or not all(ok(v) for v in table.values()):
             raise TypeError(f"a totals record's {key} has one value per usage field")
+    source = state.get("source")  # absent in a journal written before #417's round 1
+    if source is not None and (not isinstance(source, dict) or set(source) != set(b.USAGE_FIELDS)
+                               or not all(v in (b.OBSERVED, b.MODELLED, b.INFERRED) for v in source.values())):
+        raise TypeError("a totals record's source has one provenance per usage field")
 
 
 def _read_record(out: Loaded, pending: dict[str, b.ToolResult], rec: Any, n: int) -> None:

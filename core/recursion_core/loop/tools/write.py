@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from recursion_core.loop.providers import base as b
-from recursion_core.loop.tools.files import atomic_write, read_fresh, resolve_writable
+from recursion_core.loop.tools.files import atomic_write, read_fresh, request_facts, resolve_writable
 from recursion_core.loop.tools.registry import Tool, ToolContext, ToolOutput
 
 SPEC = b.ToolSpec(
@@ -28,17 +28,25 @@ SPEC = b.ToolSpec(
 )
 
 
-def precheck(args: Mapping[str, Any], ctx: ToolContext) -> None:
+def _existing(ws, path) -> bool:
+    """Whether the path is an existing file to replace: it exists, or this session read it (then it must still
+    be there: a read file that is gone is ``stale_snapshot``, not a new file)."""
+
+    return path.exists() or ws.ledger.get(path) is not None
+
+
+def precheck(args: Mapping[str, Any], ctx: ToolContext) -> Mapping[str, str] | None:
     path = resolve_writable(ctx.workspace, args["path"])
-    if path.exists():
+    if _existing(ctx.workspace, path):
         read_fresh(ctx.workspace, path)
+    return request_facts(ctx.workspace, args["path"], path)
 
 
 def run(args: Mapping[str, Any], ctx: ToolContext) -> ToolOutput:
     ws = ctx.workspace
     path = resolve_writable(ws, args["path"])
     shown = ws.display(path)
-    before = read_fresh(ws, path) if path.exists() else None
+    before = read_fresh(ws, path) if _existing(ws, path) else None
     ctx.cancel.raise_if_cancelled()
     path.parent.mkdir(parents=True, exist_ok=True)
     data = args["content"].encode("utf-8")

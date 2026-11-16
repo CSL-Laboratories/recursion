@@ -157,7 +157,7 @@ class RegistrantTests(unittest.TestCase):
     def test_no_routing_file_is_todays_start(self) -> None:
         (self.folder / "routing.json").unlink()
         self.write("routes.json", "not json")  # with no routing file, routes.json is not read either
-        for params in ({}, {"hand_pick": {"engine": "codex", "model": None}}):
+        for params in ({}, {"engine": "codex"}):  # requests that carry no hand pick (the Liaison's reading)
             launch, refusal = self.start(**params)
             self.assertIsNone(refusal)
             self.assertEqual((launch["route_entry"], launch["route_decision"]), (None, None))
@@ -206,10 +206,10 @@ class RegistrantTests(unittest.TestCase):
             self.refused("bad_hand_pick:hand_pick", engine="codex", hand_pick=hand)
         self.refused("hand_pick_without_routing", engine="codex", hand_pick=model)
         self.refused("hand_pick_without_routing", hand_pick=model)
-        for params in ({"engine": "codex", "hand_pick": codex}, {"hand_pick": codex}):
-            launch, refusal = self.start(**params)  # a null model asks for nothing beyond the engine: today's start
-            self.assertIsNone(refusal, params)
-            self.assertEqual((launch["route_entry"], launch["route_decision"]), (None, None))
+        self.refused("hand_pick_without_routing", hand_pick=codex)  # ds r2 F3: no engine named, it asks for one
+        launch, refusal = self.start(engine="codex", hand_pick=codex)  # a null model of the named engine: today's start
+        self.assertIsNone(refusal)
+        self.assertEqual((launch["route_entry"], launch["route_decision"]), (None, None))
 
     def test_a_file_nested_deeper_than_the_parser_goes_is_unreadable(self) -> None:  # ds R3
         deep = "[" * 100000 + "]" * 100000
@@ -301,6 +301,59 @@ class RegistrantTests(unittest.TestCase):
         second = rh.route_entry(config, decision)
         self.assertEqual(second["route"]["connection"]["id"], "chatgpt-main")
         self.assertEqual(dict(config.routes), before)
+
+
+    # The second astra read of #419 (c2566d39): a routing.json limits value nested deeper than load's copy goes.
+    def install(self, depth: int):
+        """The third-engine composition, with a fallback profile carrying a value nested ``depth`` deep."""
+        hooks = self.third_engine()
+        raw = json.loads((self.folder / "routing.json").read_text(encoding="utf-8"))
+        fallback = {"engine": "opencode", "model": "chatgpt/configured",
+                    "connection": {"kind": "subscription", "id": "chatgpt-main"},
+                    "profile": {"provider": "chatgpt", "auth": "subscription", "method": "sign_in_with_chatgpt",
+                                "model": "chatgpt/configured", "extra": "__nested__"}}
+        raw["default"]["limits"] = {"on_limit": "ask", "fallback": [fallback]}
+        self.write("routing.json", json.dumps(raw).replace('"__nested__"', "[" * depth + "0" + "]" * depth))
+        return hooks
+
+    def test_shallow_fallback_profile_still_routes(self) -> None:  # astra r2 1, the control
+        launch, refusal = self.install(3).launch_snapshot(H.OWNER, dict(START))
+        self.assertIsNone(refusal)
+        self.assertEqual(launch["route_entry"]["route"]["engine"], "opencode")
+
+    def test_nested_fallback_profile_load_is_typed(self) -> None:  # astra r2 1, sol r2 1
+        hooks = self.install(600)  # a 1,201-byte value that parses, and that load_config's copy cannot take
+        with self.assertRaises(rc.RoutingUnreadable):
+            rc.load(self.folder, {}, engines=hooks.engines.names())
+
+    def test_nested_fallback_profile_start_is_typed(self) -> None:  # astra r2 1, sol r2 1
+        self.assertEqual(self.install(600).launch_snapshot(H.OWNER, dict(START)),
+                         (None, {"code": "request_invalid", "detail": "routing_config_invalid:unreadable"}))
+
+
+    def test_a_profile_without_a_model_selector_is_given_none(self) -> None:  # ds r2 F4
+        files = routes_file("claude_code")
+        files["routes"]["opencode"] = {"model": "xai/model-d", "connection": {"kind": "subscription", "id": "grok-sign-in"},
+                                       "profile": {"provider": "grok"}, "deadline_s": 600}
+        self.write("routes.json", files)
+        raw = routing_file()
+        raw["logins"] = [raw["logins"][0], {"id": "xai-sub", "vendor": "xai", "kind": "subscription",
+                                            "connection_id": "grok-sign-in", "engines": ["opencode"]}]
+        raw["default"], raw["rules"] = {"engine": "opencode", "model": None}, []
+        self.write("routing.json", raw)
+        hooks = H.Hooks()
+        rh.register(hooks)
+        hooks.engines.register("opencode", lambda *args, **kwargs: None)
+        hooks.freeze()
+        launch, refusal = hooks.launch_snapshot(H.OWNER, {**START, "hand_pick": {"engine": "opencode",
+                                                                                   "model": "xai/model-e"}})
+        self.assertIsNone(refusal)
+        self.assertEqual(launch["route_entry"]["route"]["model"], "xai/model-e")
+        self.assertEqual(launch["route_entry"]["route"]["profile"], {"provider": "grok"})  # no selector is added
+
+    def test_a_failure_in_routings_own_limits_lookup_is_not_laid_on_the_file(self) -> None:  # ds r2 F2
+        with mock.patch.object(rh.router, "_route_limits", side_effect=RuntimeError("routing's own bug")):
+            self.assertEqual(self.start(), (None, {"code": "unavailable", "detail": "start_registrant_failed"}))
 
     def test_a_route_that_cannot_be_described_is_never_launched(self) -> None:  # ds R7, sol R3
         with mock.patch.object(rh, "route_entry", return_value=None):  # an entry that cannot be copied: unusable config
@@ -409,6 +462,43 @@ class HookRegressions(unittest.TestCase):
         self.assertIsInstance(part, H.Refusal)
         self.assertEqual(part.answer()["code"], "request_invalid")
         self.assertTrue(part.answer()["detail"].startswith("routing_config_invalid:"), part.answer())
+
+
+    # The second sol read of #419 (c2566d39): its 1 and 2, by its names.
+    def test_R7_incomplete_routed_decision_must_not_get_an_entry(self) -> None:  # sol r2 2
+        loaded = rc.load(self.folder, {})
+        decision = router.decide(loaded, detection({"claude_code", "codex"}), {})
+        missing = {key: value for key, value in decision.items() if key != "connection"}
+        for label, bad in (("null-model", {**decision, "model": None}), ("missing-connection", missing),
+                           ("unknown-reason", {**decision, "reason": "invented"})):
+            with self.subTest(case=label):
+                self.assertIsNone(router.route_decision(bad))
+                self.assertIsNone(rh.route_entry(loaded, bad))
+        self.assertEqual(rh.route_entry(loaded, decision)["route"]["engine"], "claude_code")  # the control
+
+    def test_R3_routing_limits_copy_depth_has_a_typed_refusal(self) -> None:  # sol r2 1
+        fallback = {"engine": "claude_code", "model": "claude-model-a",
+                    "connection": {"kind": "subscription", "id": "claude-main"}, "profile": {"extra": "DEPTH_MARK"}}
+        self.raw["default"]["limits"] = {"on_limit": "fallback", "fallback": [fallback]}
+        self.write("routing.json", json.dumps(self.raw).replace('"DEPTH_MARK"', "[" * 600 + "0" + "]" * 600))
+        self.assertIsInstance(rc.read_routing_file(self.folder / "routing.json"), dict)  # it parses; the copy fails
+        self.assertRefused(self.run_start(), "routing_config_invalid:unreadable")
+
+
+    def test_hostile_engine_is_typed_even_with_a_hand_pick(self) -> None:  # ds r2 F1
+        class Hostile(str):
+            def __eq__(self, other):
+                raise RuntimeError("made-up hostile engine")
+
+            def __ne__(self, other):
+                raise RuntimeError("made-up hostile engine")
+
+            __hash__ = str.__hash__
+        self.assertRefused(self.run_start(engine=Hostile("codex"), hand_pick={"engine": "claude_code", "model": None}),
+                           "engine_and_hand_pick_differ")
+        part = self.run_start(engine=Hostile("codex"), hand_pick={"engine": "codex", "model": None})
+        self.assertEqual((part["route_decision"]["chosen"]["engine"], part["route_decision"]["reason"]),
+                         ("codex", "hand_pick"))
 
     def test_hostile_hand_pick_is_typed_even_with_named_engine(self) -> None:  # sol's hardening note
         class BadRead(dict):

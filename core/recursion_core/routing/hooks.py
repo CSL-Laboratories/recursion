@@ -10,18 +10,22 @@ never comes here):
 
 - A request that names its ``engine`` and carries no ``hand_pick`` is not routed: ``{}``, and the start
   launches that engine's ``routes.json`` entry as it does today. Nothing is read.
-- A ``hand_pick`` is read first, once, as ``decide()`` reads it, whether or not routing is on and whether or not
-  the request names an engine. One that is not a hand pick (not an object of exactly ``engine`` and ``model``,
+- A ``hand_pick`` is read first, once, as ``decide()`` reads it (with ``router._task``, the router's own reader,
+  so there is one rule for what a hand pick is: that private name and its ``_Refuse`` are part of this module's
+  contract with ``router.py``, lane ROUTING's own), whether or not routing is on and whether or not the request
+  names an engine. A ``hand_pick`` that is null is taken as absent, as the start path's schema has it (it gives
+  an object or nothing). One that is not a hand pick (not an object of exactly ``engine`` and ``model``,
   an engine routing does not know, a model that is not a model id, or one that cannot be read) is refused,
   ``request_invalid``, detail ``bad_hand_pick:<reason>``.
 - A request with an ``engine`` and a ``hand_pick`` of another engine is refused, ``request_invalid``,
   detail ``engine_and_hand_pick_differ`` (the Liaison's ruling of 4:20 PM, Nov 14, 2026), whether or not
   routing is on (its ruling of 4:53 PM, Nov 15, 2026): such a start contradicts itself, and no launch can honor it.
 - With no ``routing.json`` routing is off: ``{}``, and the start is today's (a request that names no engine
-  answers ``request_invalid``, detail ``engine``, from the start path). The one exception is a hand pick that
-  names a model: today's start launches ``routes.json``'s model, so that hand pick is refused,
-  ``request_invalid``, detail ``hand_pick_without_routing``, and never dropped silently. A hand pick whose
-  model is null asks for nothing beyond its engine (questions.md Q21).
+  answers ``request_invalid``, detail ``engine``, from the start path). The exception is a hand pick that asks
+  for more than the request's own engine: one that names a model (today's start launches ``routes.json``'s
+  model), or one whose engine the request does not name (today's start has no engine to launch). It is refused,
+  ``request_invalid``, detail ``hand_pick_without_routing``, and never dropped silently. A hand pick of the named
+  engine whose model is null asks for nothing beyond that engine (questions.md Q21).
 - Otherwise ``routing.json`` and ``routes.json`` are read from the daemon's config folder
   (``$XDG_CONFIG_HOME/recursion``, as ``compose_control`` reads ``routes.json``), detection is made, and
   ``decide()`` chooses: a hand pick wins, then a rule, then the default. A refusal is ``request_invalid``
@@ -41,7 +45,8 @@ What the registrant cannot see (questions.md Q14, Q18 and Q22). It is called wit
 request only. So detection here reads the loaded routes, the daemon's own pre-launch refusals and the engines
 the composition has, and leaves the breaker to the starter: an open breaker, and a route whose model or
 connection the breaker store cannot record (``route_unbindable``, which answers nothing without a breaker),
-refuse the launch there (``launch_refused``). Nor is it given the composition's environment: it reads the
+refuse the launch there (``launch_refused``), as a profile route's own guard refuses a picked model of
+another provider than the profile's (``model_provider_mismatch``). Nor is it given the composition's environment: it reads the
 config folder from the process's own environment at each start (``config_dir``), which is where
 ``compose_control`` reads ``routes.json`` when it is given no ``environ``, as the daemon gives none. A
 composition made with another ``environ`` would read ``routes.json`` from there and ``routing.json`` from
@@ -82,22 +87,25 @@ def route_entry(config: rc.Config, decision: object) -> dict | None:
     model and, when the decision came from a rule or the default and the routing file gives that route
     limits, those limits inside the route. A profile route's own model selector (``route.profile.model``) gets
     the same model, so the profile's guard binds the model the decision chose; the config's entry is not
-    changed (the entry is a copy). None for anything that is not a routed decision of this config (as
-    ``router.route_decision`` answers None), never a raise."""
+    changed (the entry is a copy). None for anything ``router.route_decision`` answers None for (what a routed
+    decision is, is one rule, kept there), for a decision whose engine this config has no route for, and for a
+    chosen entry nested deeper than it can be copied (the registrant then refuses
+    ``routing_config_invalid:unreadable``). A failure in routing's own work after that, the limits lookup, is
+    raised, never laid on the operator's file; a ``BaseException`` passes through."""
     try:
-        if not isinstance(decision, Mapping) or decision.get("ok") is not True:
+        if router.route_decision(decision) is None:  # not a routed decision that decide publishes: no entry either
             return None
         engine, model = decision["engine"], decision["model"]
-        if type(engine) is not str or engine not in config.routes or not (model is None or type(model) is str):
+        if engine not in config.routes:
             return None
         entry = copy.deepcopy(config.routes[engine])
-        entry["route"]["model"] = model
-        profile = entry["route"].get("profile")
-        if model is not None and isinstance(profile, dict) and "model" in profile:
-            profile["model"] = model  # the profile's selector agrees with the decision (astra R2)
-        limits, source = router._route_limits(config, decision)
-    except Exception:  # noqa: BLE001 - not a routed decision of this config: None, as route_decision answers
+    except Exception:  # noqa: BLE001 - a decision that cannot be read, or an entry nested deeper than it can be copied
         return None
+    entry["route"]["model"] = model
+    profile = entry["route"].get("profile")
+    if isinstance(profile, dict) and "model" in profile:
+        profile["model"] = model  # the profile's selector agrees with the decision (astra R2)
+    limits, source = router._route_limits(config, decision)  # routing's own work: a failure here is raised
     if source == "routing":
         entry["route"]["limits"] = limits
     return entry
@@ -107,7 +115,7 @@ def make_normalize(hooks, *, environ: Mapping | None = None):
     """The registrant for ``hooks``: it reads the engine table's names when a start asks, after composition."""
 
     def normalize(principal, request):
-        engine, hand = request.get("engine"), request.get("hand_pick")
+        engine, hand = router._plain(request.get("engine")), request.get("hand_pick")  # the engine as its plain text
         if engine is not None and hand is None:
             return {}
         picked = None
@@ -126,7 +134,7 @@ def make_normalize(hooks, *, environ: Mapping | None = None):
         except rc.RoutingUnreadable:
             return _refusal("routing_config_invalid:unreadable")
         if config is None:
-            if picked is not None and picked["model"] is not None:  # a model asked for is never dropped silently
+            if picked is not None and (picked["model"] is not None or engine is None):  # nothing asked for is dropped
                 return _refusal("hand_pick_without_routing")
             return {}
         detection = rd.detect(config, route_refusal=rd.daemon_route_refusal(None), active=engines)
@@ -134,11 +142,12 @@ def make_normalize(hooks, *, environ: Mapping | None = None):
         if not decision["ok"]:
             reason = decision.get("reason")
             return _refusal(decision["code"] if reason is None else f'{decision["code"]}:{reason}')
-        entry, record = route_entry(config, decision), router.route_decision(decision)
-        if entry is None:  # the chosen routes.json entry cannot be copied (a value nested too deep): unusable config
-            return _refusal("routing_config_invalid:unreadable")
+        record = router.route_decision(decision)  # first: route_entry answers None whenever this does
         if record is None:  # never for decide's own routed answers: no start launches half told
             raise RuntimeError("routing chose a route it cannot describe")
+        entry = route_entry(config, decision)
+        if entry is None:  # the chosen routes.json entry cannot be copied (a value nested too deep): unusable config
+            return _refusal("routing_config_invalid:unreadable")
         return {"route_entry": entry, "route_decision": record}
 
     return normalize

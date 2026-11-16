@@ -425,9 +425,9 @@ def load(config_dir: os.PathLike | str, keys: object, *, engines=None) -> Config
     None only when there is no routing file; then ``routes.json`` is not read at all. ``engines``: the engines a
     ``routes.json`` entry may name, as the daemon passes them to ``load_routes`` (its engine table's names);
     None keeps ``load_routes``' own default, and a single string is refused (``TypeError``), as ``detect`` refuses
-    one for ``active``. Raises ``RoutingUnreadable`` (either file, one nested deeper than the JSON parser goes
-    too) or ``ConfigError`` (a routing file that is present but holds null or anything else that is not a valid
-    config).
+    one for ``active``; any other iterable is taken as the names it yields (a mapping as its keys). Raises ``RoutingUnreadable`` (either file, one nested deeper than it can be parsed or
+    copied too) or ``ConfigError`` (a routing file that is present but holds null or anything else that is not a
+    valid config).
     """
     if isinstance(engines, (str, bytes)):
         raise TypeError("engines is a collection of engine names, not one string")
@@ -443,4 +443,7 @@ def load(config_dir: os.PathLike | str, keys: object, *, engines=None) -> Config
         raise RoutingUnreadable(f"routes.json: {exc}") from None
     except RecursionError:  # load_routes' own json.loads, on a routes.json nested deeper than the parser goes
         raise RoutingUnreadable("routes.json: nested deeper than the JSON parser goes") from None
-    return load_config(raw, routes, keys)
+    try:
+        return load_config(raw, routes, keys)
+    except RecursionError:  # a routing.json value that parses but is nested deeper than validation's copy goes
+        raise RoutingUnreadable("routing.json: nested deeper than it can be copied") from None

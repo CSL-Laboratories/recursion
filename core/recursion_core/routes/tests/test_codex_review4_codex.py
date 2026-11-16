@@ -79,7 +79,9 @@ class AdmissionTest(unittest.TestCase):
         self.assertEqual(self.close_while_held(ASKING).requests, [])
 
     def test_a_request_admitted_before_the_close_is_in_flight_and_nothing_it_opens_is_kept(self):
-        # GPT-6.1 Sol's witness of the same boundary: past its admission the request is with the port.
+        # GPT-6.1 Sol's witness of the same boundary: past its admission the request is with the port. It pins
+        # an OPEN defect (round 5, Astra 1 and Sol 1; round 6, DeepSeek F1 and N1): turn it over, with
+        # test_codex_review6.PortWithdrawPendingTest, when the port gains a withdraw (lane question Q10).
         self.assertEqual(len(self.close_while_held(PORT_CALL).requests), 1)
 
 

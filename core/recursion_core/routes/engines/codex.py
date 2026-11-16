@@ -91,7 +91,11 @@ last before the port is called, so a ``close`` that takes that lock first is see
 asked (the #402 reads, round 4: GPT-6 Astra 1). An admitted request is in flight: ``close`` waits for it, for
 at most ``port_wait_s`` seconds (an option of the driver, ``PORT_WAIT_S`` unless given: a number of seconds
 from 0 to ``threading.TIMEOUT_MAX``, or the driver is not made, ``DriverInputError("port_wait_s")``), and
-nothing that call opens is kept. A request read
+nothing that call opens is kept. Under the present port contract, which has no cancellation, a request already
+past its admission may still be delivered just after ``close`` returns; nothing of it is kept, but the approval
+opens. That is an OPEN defect, not an accepted limit: the #402 reads (round 5, GPT-6 Astra 1 and GPT-6.1 Sol 1;
+round 6, DeepSeek F1) require that no approval opens after ``close`` returns, which needs a withdraw in the port's
+contract; its keeper is lane DRIVER-CC (lane question Q10). A request read
 while another is with the port waits for it as long at most, then is declined. The port must not call back
 into the driver: ``send`` or ``interrupt`` from inside its call, on the thread that is asking it, is refused
 (``DriverStateError``), and an approval request read there is declined, instead of waiting for ever on a
@@ -239,7 +243,9 @@ class _Session:
         (the #402 reads, round 4: GPT-6 Astra 1). An admitted request is in flight and is waited for, for at
         most ``wait_s`` seconds (None: without a bound; the driver always passes its checked ``port_wait_s``),
         and nothing it opens is kept (round 4, DeepSeek R4-2: a port that waits for a thread which closes the
-        worker no longer holds it for good)."""
+        worker no longer holds it for good). Under the present port contract, which has no cancellation, an
+        admitted request may still be delivered just after this returns: an OPEN defect until the port can
+        withdraw (round 5, GPT-6 Astra 1 and GPT-6.1 Sol 1; round 6, DeepSeek F1; lane question Q10)."""
 
         with self.write_lock:
             with self.lock:
@@ -378,8 +384,9 @@ class CodexDriver(Driver):
     def _abandon(self, session: _Session, reason: str, err: BaseException) -> None:
         """End the worker of a start that is given up, both steps tried. A step that fails, or is interrupted
         (``KeyboardInterrupt``, ``SystemExit``), is added to ``err`` as a note and does not take its place, and
-        the next step is still tried: the worker is fenced and the caller still gets the start's own refusal
-        (the #402 reads, round 3, DeepSeek F3; round 4, GPT-6 Astra 4 and GPT-6.1 Sol 2)."""
+        the next step is still tried: the fence is tried even when ending the input failed, the worker is fenced
+        unless the fence itself fails (a note too), and the caller still gets the start's own refusal (the #402
+        reads, round 3, DeepSeek F3; round 4, GPT-6 Astra 4 and GPT-6.1 Sol 2; round 6, DeepSeek F3)."""
 
         for step in (lambda: session.close(self._port_wait_s), lambda: session.process.fence(reason)):
             try:
@@ -839,7 +846,12 @@ class CodexDriver(Driver):
         # The check just before the port admits the request, under the session lock, under which ``close`` sets
         # ``closed``, and nothing of the driver's comes between it and the port call: a close that comes first
         # is seen there and the port is not asked, so once ``close`` has returned only a request admitted before
-        # it can still reach the port (round 4: GPT-6 Astra 1).
+        # it can still reach the port (round 4: GPT-6 Astra 1). The lock orders the admission against ``close``'s
+        # record of the end: while a request is being admitted, ``close`` waits for that step (round 5, GPT-6.1
+        # Sol 2; round 6, DeepSeek F2; tested). Under the present port contract, which has no cancellation, a
+        # request already past its admission may still be delivered just after ``close`` returns, and its approval
+        # opens though nothing of it is kept here: an OPEN defect, not an accepted limit, until the port can
+        # withdraw (round 5, GPT-6 Astra 1 and GPT-6.1 Sol 1; round 6, DeepSeek F1; lane question Q10).
         with _waited(session.ask_lock, self._port_wait_s) as taken:
             if not taken:
                 return _DECLINE_NOW  # another request has been with the port longer than port_wait_s

@@ -22,8 +22,9 @@ followed, and so is a folder there that another user owns or that group or world
 link above the home (`/home` -> `/var/home`) is resolved. Every write goes to a fresh
 temporary name, is fsynced, and is linked (new file) or renamed (replacement) into place; the
 folder is fsynced after it. The unit is read with a non-blocking open of at most 1 MiB, so a FIFO
-or a device in its place is refused (`not_regular`) instead of holding the command. A file-system
-error on the way (a folder the user cannot write, a full disk) is the command's refusal
+or a device in its place is refused (`not_regular`) instead of holding the command, and so is a socket. A
+file-system error on the way (a folder the user cannot write, a full disk, a unit that cannot be
+opened for want of a descriptor or for an I/O error) is the command's refusal
 `filesystem_error`, naming the error and the path (the unit's folder when the failing call, an
 `fsync` or a `read` on an open file, names none).
 

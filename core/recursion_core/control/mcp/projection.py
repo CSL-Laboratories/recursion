@@ -36,8 +36,8 @@ codes it answers); the table publishes no title.
 Every refusal is a ``ProjectionRefused(reason, detail)``. Published files that are not the published shape
 (a table that is not an object, a row that is not one, a row whose ``name`` is not a non-empty string or
 whose ``mcp`` is not an object, an exposed row whose ``codes`` are not strings or whose ``scope`` is not one,
-a ``$ref`` that is not a string, a parameter schema or pattern this server cannot check) are
-``published_incomplete`` or ``published_invalid``.
+a ``$ref`` that is not a string, a parameter schema or pattern this server cannot check, a file or a chain
+of references nested deeper than Python's stack) are ``published_incomplete`` or ``published_invalid``.
 """
 
 from __future__ import annotations
@@ -70,7 +70,10 @@ class Published:
     def __init__(self, documents: Mapping[str, dict]) -> None:
         if TABLE_FILE not in documents or PARAMS_FILE not in documents:
             raise ProjectionRefused("published_incomplete", f"needs {TABLE_FILE} and {PARAMS_FILE}")
-        self.documents = {name: copy.deepcopy(doc) for name, doc in documents.items()}
+        try:
+            self.documents = {name: copy.deepcopy(doc) for name, doc in documents.items()}
+        except RecursionError:  # an exit or an interrupt goes on
+            raise ProjectionRefused("published_invalid", "a published file is nested deeper than this server reads") from None
         table = self.documents[TABLE_FILE]
         if not isinstance(table, Mapping):
             raise ProjectionRefused("published_invalid", f"{TABLE_FILE} is not an object")
@@ -90,7 +93,13 @@ class Published:
         directory = Path(directory)
         if not (directory / TABLE_FILE).is_file():
             return None
-        return cls({path.name: json.loads(path.read_text(encoding="utf-8")) for path in sorted(directory.glob("*.json"))})
+        documents = {}
+        for path in sorted(directory.glob("*.json")):
+            try:  # OSError and ValueError go on to the caller, which reads them as published_unreadable
+                documents[path.name] = json.loads(path.read_text(encoding="utf-8"))
+            except RecursionError:  # valid JSON nested past the parser's stack
+                raise ProjectionRefused("published_invalid", f"{path.name} is nested deeper than this server reads") from None
+        return cls(documents)
 
     def _target(self, ref: str, current: str) -> tuple[Any, str]:
         name, hash_mark, fragment = ref.partition("#")
@@ -178,8 +187,9 @@ def project(published: Published, answer: Mapping) -> tuple[Tool, ...]:
         try:
             schema = published.inline({"$ref": f"{PARAMS_FILE}{row['params']}"})
             require_supported(schema, name)
-        except (SchemaUnsupported, KeyError, TypeError) as exc:
-            raise ProjectionRefused("published_invalid", f"row {row.get('name')!r}: {exc}") from None
+        except (SchemaUnsupported, KeyError, TypeError, RecursionError) as exc:  # an exit or an interrupt goes on
+            reason = "nested deeper than this server reads" if isinstance(exc, RecursionError) else str(exc)
+            raise ProjectionRefused("published_invalid", f"row {row.get('name')!r}: {reason}") from None
         if schema.get("type") != "object":
             raise ProjectionRefused("published_invalid", f"row {row.get('name')!r}: parameters must be an object")
         names.add(name)

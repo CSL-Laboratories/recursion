@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 from recursion_core.control.mcp import projection, tools
 from recursion_core.control.mcp.projection import Published, ProjectionRefused, choose_tools, project
@@ -191,6 +194,46 @@ class JoinTest(unittest.TestCase):
             self.assertEqual("published_invalid", caught.exception.reason)
             with self.subTest(ref=value, inline=True), self.assertRaises(SchemaUnsupported):
                 published.inline({"$ref": "methods.v1.json#/$defs/params.run.stop"})
+
+    def test_a_publication_nested_past_pythons_stack_is_refused(self) -> None:
+        # #416, round 3 (Astra's and Sol's required change 1, DeepSeek R3 F1): published_invalid, wherever it shows.
+        deep = {"type": "string"}
+        for _ in range(3000):
+            deep = {"anyOf": [deep]}
+        documents = copy.deepcopy(PUBLISHED.documents)
+        documents[projection.PARAMS_FILE]["$defs"]["params.run.stop"]["properties"]["run_id"] = deep
+        with self.subTest(where="the copy"), self.assertRaises(ProjectionRefused) as caught:
+            Published(documents)
+        self.assertEqual("published_invalid", caught.exception.reason)
+
+        def chain(rows, documents):  # each schema shallow, the chain of references long
+            defs = documents[projection.PARAMS_FILE]["$defs"]
+            for n in range(1200):
+                defs[f"chain{n}"] = {"$ref": f"#/$defs/chain{n + 1}"}
+            defs["chain1200"] = {"type": "string"}
+            defs["params.run.stop"]["properties"]["run_id"] = {"$ref": "#/$defs/chain0"}
+
+        published = with_rows(chain)
+        with self.subTest(where="the walk"), self.assertRaises(ProjectionRefused) as caught:
+            project(published, listing(published))
+        self.assertEqual("published_invalid", caught.exception.reason)
+
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as folder:
+            for name, document in PUBLISHED.documents.items():
+                Path(folder, name).write_text(json.dumps(document), encoding="utf-8")
+            Path(folder, projection.PARAMS_FILE).write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+            with self.subTest(where="the file"), self.assertRaises(ProjectionRefused) as caught:
+                Published.from_directory(Path(folder))
+            self.assertEqual("published_invalid", caught.exception.reason)
+
+    def test_a_hidden_row_must_name_its_method_too(self) -> None:
+        # #416, round 3 (Astra's later coverage): the name check is for every row, not only the exposed ones.
+        def change(rows, documents):
+            next(r for r in rows if r["name"] == "approval.answer")["name"] = None
+
+        with self.assertRaises(ProjectionRefused) as caught:
+            with_rows(change)
+        self.assertEqual("published_invalid", caught.exception.reason)
 
     def test_a_name_the_table_does_not_have_is_not_a_tool(self) -> None:
         answer = listing(PUBLISHED, ())

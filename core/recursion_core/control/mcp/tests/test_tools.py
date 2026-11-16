@@ -210,6 +210,15 @@ class PublishedKeywordTest(unittest.TestCase):
                 with self.assertRaises(exc):
                     tools.ecma_pattern("a")
 
+    def test_an_ordinary_compile_error_is_refused_with_a_bounded_detail(self) -> None:
+        # #416, round 3 (Astra's and Sol's later coverage): re.error is turned too, and the pattern named in 80 characters.
+        for pattern in ("a{3,2}", "(", "a)"):
+            with self.subTest(pattern=pattern), self.assertRaises(SchemaUnsupported):
+                tools.ecma_pattern(pattern)
+        with self.assertRaises(SchemaUnsupported) as caught:
+            tools.ecma_pattern("a{3,2}" + "b" * 10000)
+        self.assertLess(len(str(caught.exception)), 300)
+
     def test_bounds_do_not_apply_to_a_boolean_and_a_number_is_finite(self) -> None:
         # #416, round 1 (DeepSeek F3; the survivors of Astra's M06 and M12 and Sol's M12 and M13).
         either = {"type": ["boolean", "number"], "minimum": 2}

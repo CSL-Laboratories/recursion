@@ -7,7 +7,9 @@ import copy
 import io
 import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 
 from recursion_core.control.mcp import __main__ as entry
 from recursion_core.control.mcp import projection
@@ -179,6 +181,27 @@ class EntryTest(unittest.TestCase):
                                     check=lambda environ, api=api: api, published=published_with(change))
                 self.assertEqual((1, [("tools_unavailable", "published_invalid")]),
                                  (status, [(e["code"], e["reason"]) for e in stderr_lines(err)]))
+
+    def test_a_publication_nested_past_pythons_stack_refuses_to_start(self) -> None:
+        # #416, round 3 (Astra's and Sol's required change 1, DeepSeek R3 F1): one line, status 1, nothing read.
+        def start(published):
+            err = io.StringIO()
+            status = entry.main([], stdin=Untouchable(), stdout=Untouchable(), stderr=err,
+                                check=lambda environ: ScriptedAPI(), published=published)
+            return status, [(e["code"], e["reason"]) for e in stderr_lines(err)]
+
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as folder:
+            for name, document in PUBLISHED.documents.items():
+                Path(folder, name).write_text(json.dumps(document), encoding="utf-8")
+            Path(folder, projection.PARAMS_FILE).write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+            self.assertEqual((1, [("tools_unavailable", "published_invalid")]),
+                             start(lambda: projection.Published.from_directory(Path(folder))))
+        deep = {"type": "string"}
+        for _ in range(3000):
+            deep = {"anyOf": [deep]}
+        documents = copy.deepcopy(PUBLISHED.documents)
+        documents[projection.PARAMS_FILE]["$defs"]["params.run.stop"]["properties"]["run_id"] = deep
+        self.assertEqual((1, [("tools_unavailable", "published_invalid")]), start(lambda: projection.Published(documents)))
 
     def test_an_exit_or_an_interrupt_while_choosing_is_not_a_refusal(self) -> None:
         for exc in (SystemExit, KeyboardInterrupt):

@@ -1,34 +1,91 @@
-"""Plain plugin declarations, validated before any read can be sent."""
+"""Plain plugin declarations, validated before any read can be sent.
+
+Frozen interface, ``gui.panels/1`` (lane PAGE, slice 1, Nov 14 2026). The plugin host
+(``daemon/plugins.py``) imports ``panel_registry``; the page imports ``filter_venue_rows`` and
+``PAPER_BOOK``. ``gui/tests/test_panels_interface.py`` pins what follows, and changing any of it
+is an interface change for every importer, not an edit:
+
+* the names in ``__all__`` and the two signatures ``panel_registry(panels)`` and
+  ``filter_venue_rows(value, venue)``;
+* the accepted keys: ``REQUIRED_PANEL_KEYS`` and the optional ``venue``, ``venue_use`` and
+  ``withhold_venue_data`` (together ``PANEL_KEYS``);
+* the refusals: ``panel_registry`` raises ``ValueError`` whose text is one of ``REFUSALS``,
+  checked in that order, so a declaration with several defects is refused with the first (a
+  ``panels`` that cannot be iterated, or that raises while it is iterated, gets the first);
+* the answer: a read-only mapping from panel id, in declaration order, to a read-only mapping of
+  exactly ``title``, ``reads`` (a tuple, duplicates dropped, order kept), ``venue`` and
+  ``venue_use``. ``withhold_venue_data`` is accepted and never kept: the page always filters.
+
+Plain data means the built-in types themselves: a declaration is any mapping, its id, title,
+venue, venue_use and every read are ``str`` exactly, ``reads`` is a ``list`` or ``tuple``
+exactly, and ``withhold_venue_data`` is ``bool`` exactly. A subclass is refused, because the
+page later compares, hashes and sends these values. ``reads`` is copied once and the copy is
+what is checked and kept.
+"""
 from collections.abc import Mapping
 import re
 from types import MappingProxyType
 
 from .client import READS
 
+__all__ = ["PANEL_KEYS", "PAPER_BOOK", "REFUSALS", "REQUIRED_PANEL_KEYS", "filter_venue_rows",
+           "panel_registry"]
+
+REQUIRED_PANEL_KEYS = frozenset({"id", "title", "reads"})
+PANEL_KEYS = REQUIRED_PANEL_KEYS | frozenset({"venue", "venue_use", "withhold_venue_data"})
+# In the order panel_registry checks them.
+REFUSALS = (
+    "panel needs id, title and reads",
+    "panel only declares reads",
+    "invalid panel id",
+    "duplicate panel id or empty title",
+    "panel reads must be O7 reads",
+    "venue must be a venue id",
+    "venue_use must be venue:use",
+    "withhold_venue_data must be a boolean",
+)
+(_NEEDS_KEYS, _ONLY_READS, _BAD_ID, _DUPLICATE_OR_TITLE, _BAD_READS, _BAD_VENUE, _BAD_VENUE_USE,
+ _BAD_WITHHOLD) = REFUSALS
+
 
 def panel_registry(panels):
     registered = {}
-    for panel in panels:
-        if not isinstance(panel, Mapping) or not {"id", "title", "reads"} <= panel.keys():
-            raise ValueError("panel needs id, title and reads")
-        if set(panel) - {"id", "title", "reads", "venue", "venue_use", "withhold_venue_data"}:
-            raise ValueError("panel only declares reads")
+    # Each declaration is checked as it is read, so the first defect is refused at once, however long
+    # the collection. A value that cannot be iterated, or that raises while it is iterated, is not a
+    # collection of declarations: it gets the first text, with what it raised kept as the cause.
+    try:
+        declarations = iter(panels)
+    except Exception as exc:  # noqa: BLE001 - whatever iter() raises, the refusal is the first text
+        raise ValueError(_NEEDS_KEYS) from exc
+    while True:
+        try:
+            panel = next(declarations)
+        except StopIteration:
+            break
+        except Exception as exc:  # noqa: BLE001 - whatever the iteration raises, the refusal is the first text
+            raise ValueError(_NEEDS_KEYS) from exc
+        if not isinstance(panel, Mapping) or not REQUIRED_PANEL_KEYS <= panel.keys():
+            raise ValueError(_NEEDS_KEYS)
+        if set(panel) - PANEL_KEYS:
+            raise ValueError(_ONLY_READS)
         pid, title, reads = panel["id"], panel["title"], panel["reads"]
-        if not isinstance(pid, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", pid):
-            raise ValueError("invalid panel id")
-        if pid in registered or not isinstance(title, str) or not title.strip():
-            raise ValueError("duplicate panel id or empty title")
-        if not isinstance(reads, (list, tuple)) or not reads or any(r not in READS for r in reads):
-            raise ValueError("panel reads must be O7 reads")
+        if type(pid) is not str or not re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", pid):
+            raise ValueError(_BAD_ID)
+        if pid in registered or type(title) is not str or not title.strip():
+            raise ValueError(_DUPLICATE_OR_TITLE)
+        # One copy, taken before any check: what is checked is what is kept.
+        reads = tuple(reads) if type(reads) in (list, tuple) else ()
+        if not reads or any(type(r) is not str or r not in READS for r in reads):
+            raise ValueError(_BAD_READS)
         venue = panel.get("venue")
-        if venue is not None and (not isinstance(venue, str) or not re.fullmatch(r"[a-z0-9_]{1,48}", venue)):
-            raise ValueError("venue must be a venue id")
+        if venue is not None and (type(venue) is not str or not re.fullmatch(r"[a-z0-9_]{1,48}", venue)):
+            raise ValueError(_BAD_VENUE)
         venue_use = panel.get("venue_use")
-        if venue_use is not None and (not isinstance(venue_use, str)
+        if venue_use is not None and (type(venue_use) is not str
                                       or not re.fullmatch(r"[a-z0-9_]{1,48}:[a-z0-9_]{1,48}", venue_use)):
-            raise ValueError("venue_use must be venue:use")
+            raise ValueError(_BAD_VENUE_USE)
         if type(panel.get("withhold_venue_data", True)) is not bool:
-            raise ValueError("withhold_venue_data must be a boolean")
+            raise ValueError(_BAD_WITHHOLD)
         # Always use the shared venue-data filter, even if the plugin asks otherwise.
         # O7 reads stay unscoped; venue_use is a label; declared venue filters data after the read.
         # paper and stock are one book in that filter (PAPER_BOOK); the panel still declares one id.
@@ -39,6 +96,9 @@ def panel_registry(panels):
 
 _DROP = object()
 _RESPONSE_LEVEL = ("errors", "provenance")
+_MAX_DEPTH = 64  # containers below the response; deeper is withheld (the same bound as gui/surface.py)
+# The scalars json.loads gives (bool is an int; a float may be NaN or infinite). Anything else is withheld.
+_JSON_SCALARS = (str, int, float, type(None))
 # One paper book. O7 v0 labels positions ``stock``; the paper gateway labels orders ``paper``.
 # A panel declaring either id keeps both row labels and both key prefixes. Any other venue
 # matches one id exactly. Display only.
@@ -64,7 +124,12 @@ def _paper_book_key(key, venue):
 def filter_venue_rows(value, venue):
     """Keep read data for a declared panel venue, without mutating the response.
 
-    Returns ``(kept, withheld)``. A panel whose venue is ``paper`` or ``stock`` keeps both
+    ``value`` is one control-API response, a mapping; anything else is withheld whole.
+    Returns ``(kept, withheld)``: ``kept`` is a new dict; ``withheld`` is true when the
+    filter dropped a dict labelled with another venue, a value outside a dict labelled with
+    an owned venue, or a value JSON cannot carry. An unlabelled container that is empty, or
+    left empty, is left out too, and on its own does not set ``withheld`` (what was dropped
+    from it does). A panel whose venue is ``paper`` or ``stock`` keeps both
     labels, and ``paper_*`` / ``stock_*`` keys, as one book. Any other venue keeps only
     that id. Fails closed: a dict labelled with a venue the panel does not own, and any
     value outside a dict labelled with an owned venue (unlabelled nested dicts, totals,
@@ -76,14 +141,30 @@ def filter_venue_rows(value, venue):
     whatever in them is unlabelled or labelled with an owned venue; a dict in them
     labelled with another venue, at any depth, is withheld. Nested keys with those names
     get no exception. This is a display filter, not order authorization or an API scope.
+
+    Containers (C7 finding 4): any mapping is read as a dict and any list or tuple as a
+    list, and they come back as a dict and a list, so a tuple of rows or a mapping proxy is
+    filtered like the JSON it stands for. Any other value that is not a str, an int (bool
+    included), a float or None (a set, a deque, any other object) is withheld wherever it is,
+    even inside a kept row. A float is kept whatever its value, NaN and the infinities
+    included, as ``json.loads`` gives them; this filter is not a strict-JSON sanitiser. An
+    entry whose key is not a str (JSON gives only str keys) is withheld, and so is any
+    container nested deeper than ``_MAX_DEPTH`` containers below the response, so a deep
+    answer is filtered, never a crash.
+
+    ``venue`` is the panel's declared venue id, as ``panel_registry`` checked it; any other
+    value owns nothing, so every labelled row is withheld.
     """
+    if not isinstance(value, Mapping):
+        return {}, True
     withheld = []
     passed = {}
-    if isinstance(value, dict) and "venue" not in value:
+    if "venue" not in value:
         owned = _owned_labels(venue)
         for key in _RESPONSE_LEVEL:
             if key in value:
-                shown = _without_other_venues(value[key], owned, withheld)
+                # value[key] is one container below the response, as the rest of the answer counts.
+                shown = _without_other_venues(value[key], owned, withheld, 1)
                 if shown is not _DROP:
                     passed[key] = shown
         value = {key: item for key, item in value.items() if key not in _RESPONSE_LEVEL}
@@ -91,23 +172,39 @@ def filter_venue_rows(value, venue):
     return {**({} if kept is _DROP else kept), **passed}, bool(withheld)
 
 
-def _without_other_venues(value, owned, withheld):
+def _without_other_venues(value, owned, withheld, depth=0):
     """Response-level errors and provenance: drop only dicts labelled with a venue not owned."""
-    if isinstance(value, dict):
+    if depth > _MAX_DEPTH and isinstance(value, (Mapping, list, tuple)):
+        withheld.append(value)
+        return _DROP
+    if isinstance(value, Mapping):
         if "venue" in value and not (isinstance(value["venue"], str) and value["venue"] in owned):
             withheld.append(value)
             return _DROP
-        shown = ((key, _without_other_venues(item, owned, withheld)) for key, item in value.items())
-        return {key: item for key, item in shown if item is not _DROP}
-    if isinstance(value, list):
-        shown = (_without_other_venues(item, owned, withheld) for item in value)
+        out = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                withheld.append(item)
+                continue
+            shown = _without_other_venues(item, owned, withheld, depth + 1)
+            if shown is not _DROP:
+                out[key] = shown
+        return out
+    if isinstance(value, (list, tuple)):
+        shown = (_without_other_venues(item, owned, withheld, depth + 1) for item in value)
         return [item for item in shown if item is not _DROP]
-    return value
+    if isinstance(value, _JSON_SCALARS):
+        return value
+    withheld.append(value)
+    return _DROP
 
 
-def _venue_only(value, venue, scoped, withheld):
+def _venue_only(value, venue, scoped, withheld, depth=0):
     owned = _owned_labels(venue)
-    if isinstance(value, dict):
+    if depth > _MAX_DEPTH and isinstance(value, (Mapping, list, tuple)):
+        withheld.append(value)
+        return _DROP
+    if isinstance(value, Mapping):
         if "venue" in value:
             label = value["venue"]
             if not (isinstance(label, str) and label in owned):
@@ -116,13 +213,17 @@ def _venue_only(value, venue, scoped, withheld):
             scoped = True
         out = {}
         for key, item in value.items():
+            if not isinstance(key, str):
+                withheld.append(item)
+                continue
             # What sits under a paper_* / stock_* key is the book's own, like a labelled row.
-            child = _venue_only(item, venue, scoped or _paper_book_key(key, venue), withheld)
+            child = _venue_only(item, venue, scoped or _paper_book_key(key, venue), withheld, depth + 1)
             if child is not _DROP:
                 out[key] = child
-    elif isinstance(value, list):
-        out = [item for item in (_venue_only(v, venue, scoped, withheld) for v in value) if item is not _DROP]
-    elif scoped:
+    elif isinstance(value, (list, tuple)):
+        out = [item for item in (_venue_only(v, venue, scoped, withheld, depth + 1) for v in value)
+               if item is not _DROP]
+    elif scoped and isinstance(value, _JSON_SCALARS):
         return value
     else:
         withheld.append(value)

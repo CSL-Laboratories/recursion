@@ -8,7 +8,9 @@
     key may spend money billed to it, and the cap in US dollars (answers typed ahead are kept);
     ``--allow-metered-spend --cap-usd N`` answers both up front, and is the only way to opt in with ``--stdin``.
     With no opt-in the cap is 0, and every run on the key is refused before launch until it is removed and
-    added again with one. An id that looks like a key is refused before any prompt shows it.
+    added again with one. An id that looks like a key is refused before any prompt shows it, and so is everything
+    else it can refuse without the key (``KeyStore.check_add``): a provider, variable name or cap it does not take,
+    a folder, index or host it cannot save in, and an id already saved.
 ``list [--json]``
     Ids, providers, variable names, when each was saved, the store, the spend opt-in and any unfinished
     operation. Never a value.
@@ -306,6 +308,8 @@ def _add(args, out, err, store, terminal, stdin) -> int:
         raise KeyStoreError('cap_invalid', '--allow-metered-spend needs --cap-usd above 0')
     if cap and not allow:
         raise KeyStoreError('cap_invalid', '--cap-usd above 0 needs --allow-metered-spend')
+    # Everything it can refuse without the key, before the key is read: no prompt for a key it would refuse anyway.
+    store.check_add(args.key_id, args.key_provider, args.key_env)
     stdin = stdin if stdin is not None else sys.stdin
     opened = None
     try:
@@ -401,7 +405,7 @@ UNNAMED_TEXT = {      # the audit's line on the keychain items no saved key name
                        'the keychain\'s own tool finds the rest by the attribute "application recursion"'),
     'macos_keychain': ('the macOS Keychain',
                        ('Keychain Access finds the rest by the name "Recursion API key <id>" (service '
-                        '"recursion.<save id>")')),
+                        '"recursion.<store id>.<save id>.<provider>")')),
 }
 
 

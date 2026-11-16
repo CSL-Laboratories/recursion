@@ -20,8 +20,9 @@ from recursion_core.keys.store import default_store
 def key_list(ctx, params) -> dict:
     if not isinstance(params, dict):
         return {'code': 'request_invalid', 'detail': 'params'}
-    if params:
-        return {'code': 'request_invalid', 'detail': min(params)}
+    if params:              # the first parameter name, or "params" when a name is not text (no name compares)
+        names = [name for name in params if isinstance(name, str)]
+        return {'code': 'request_invalid', 'detail': min(names) if len(names) == len(params) else 'params'}
     try:
         index = default_store().list()
     except KeyStoreError as exc:

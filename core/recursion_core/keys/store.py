@@ -94,10 +94,10 @@ same folder is the same store). A store on a keychain never takes it, and never 
 release a key, nor to remove one while its index pins it there (only the audit reads it, for values to look for). On a
 keychain an item is named by the store's id, which only the index records: an index LOST leaves the store's items with
 no name this store knows, so it can neither release nor remove them (the keychain's own tool can: on the Secret Service
-they carry ``application recursion``, on the macOS Keychain their service is ``recursion.<save id>``). ``remove <id>``
-of an id a record names deletes every item of the id in the store, whichever save stored it. The audit counts every
-Recursion item in the keychain that neither a record names by its save nor an unfinished operation by its id
-(``unnamed_items``), and is incomplete while there is one.
+they carry ``application recursion``, on the macOS Keychain their service is ``recursion.<store id>.<save
+id>.<provider>``). ``remove <id>`` of an id a record names deletes every item of the id in the store, whichever save
+stored it. The audit counts every Recursion item in the keychain that neither a record names by its save nor an
+unfinished operation by its id (``unnamed_items``), and is incomplete while there is one.
 """
 from __future__ import annotations
 
@@ -162,6 +162,8 @@ class KeyRecord:
     save_id: str
 
     def spend_allowed(self) -> bool:
+        """The opt-in and a cap above 0. ``add`` and the index's parser both refuse an opt-in with a cap of 0, so the
+        second test cannot be false for a record this store reads; it stays so the rule reads whole here."""
         return self.metered_spend_allowed is True and self.cap_usd > 0
 
     def published(self) -> dict:
@@ -358,14 +360,7 @@ class KeyStore:
     def add(self, key_id: str, provider: str, env_name: str, value: str, *, metered_spend_allowed: bool = False,
             cap_usd: float = 0) -> KeyRecord:
         """Save a new key. An id that is already saved is refused (``key_exists``); remove it first."""
-        problem = v.id_problem(key_id)
-        if problem is not None:
-            raise KeyStoreError('id_invalid', problem)
-        if not v.valid_provider(provider):
-            raise KeyStoreError('provider_invalid', 'a provider is a lower-case vendor id: a-z 0-9 . _ -, starting with '
-                                f'a letter or digit (published ids: {", ".join(v.PROVIDER_IDS)})')
-        if not v.valid_env_name(env_name):
-            raise KeyStoreError('env_name_invalid', 'a variable name is A-Z 0-9 _, not starting with a digit')
+        _check_names(key_id, provider, env_name)
         if not v.valid_value(value):
             raise KeyStoreError('value_invalid', f'a key is {v.VALUE_MIN} to {v.VALUE_MAX} visible ASCII characters, '
                                 'with no space')
@@ -390,9 +385,7 @@ class KeyStore:
                 raise KeyStoreError('operation_pending', f'an earlier operation on {key_id} is not finished and its '
                                     'backend could not be reached; remove the key to clear it')
             if name == 'owner_file' and key_id in backend.ids(folder):
-                raise KeyStoreError('key_exists', f'the owner-only file still holds a value of {key_id} that no saved '
-                                    f'key names (its index was lost, emptied or put back); "remove {key_id}" deletes '
-                                    'it, then add the key again')
+                raise _unbound_exists(key_id)
             now = _now(self._clock)
             record = KeyRecord(key_id, provider, env_name, now, backend.name, metered_spend_allowed, cap_usd,
                                _random_id())
@@ -400,6 +393,9 @@ class KeyStore:
             intent = replace(index, backend=backend.name, pending={**index.pending, key_id: Pending(key_id, 'add', now)})
             done = replace(index, backend=backend.name, keys=keys)
             self._sized(replace(intent, keys=keys))                     # both states fit, before anything changes
+            admit = getattr(backend, 'admit', None)
+            if admit is not None:
+                admit(key_id, value, record)                            # a key the backend cannot carry whole
             self._write_index(folder, intent)                           # 1. the intent, before the outside effect
             try:
                 backend.put(key_id, value, folder, record=record)     # 2. the value, bound to its record, and no other
@@ -421,6 +417,29 @@ class KeyStore:
                         self._write_index(folder, index)
                 raise
             return record
+
+    def check_add(self, key_id: str, provider: str, env_name: str) -> None:
+        """Raise what ``add`` would refuse before it has a value, with the same code: an id, provider or variable
+        name it does not take; a folder, index or host it cannot save in; an id already saved, or held in the store's
+        own file with no saved key naming it. ``key add`` calls it before it reads the key, so a command that cannot
+        succeed for one of these reasons never asks for one. It changes nothing and holds the folder's lock shared;
+        ``add`` checks all of it again under the exclusive lock. Left to ``add``: an id with an unfinished operation
+        (the save's own recovery may finish it), a keychain that does not answer, the cap and the value."""
+        _check_names(key_id, provider, env_name)
+        folder = self._folder(create=False)
+        if folder is None:
+            self._backend(None, None)       # a host this store cannot save on, as add refuses it
+            return
+        with folder, folder.locked(shared=True):
+            index = self._read_index(folder)
+            name = self._backend_name(index.backend)
+            backend = self._made(name, self._identity(folder, index, name).store_id)
+            if key_id in index.pending:
+                return
+            if key_id in index.keys:
+                raise KeyStoreError('key_exists', f'{key_id} is already saved; remove it first')
+            if name == 'owner_file' and key_id in backend.ids(folder):
+                raise _unbound_exists(key_id)
 
     def remove(self, key_id: str) -> KeyRecord | None:
         """Delete a key's value from its backend, then its entry from the index.
@@ -517,11 +536,12 @@ class KeyStore:
 
     def unnamed_items(self) -> int | None:
         """For ``audit`` only: how many items Recursion saved in the keychain (on the Secret Service those that carry
-        ``application recursion``, on the macOS Keychain the generic passwords whose service is ``recursion.<save
-        id>``) are named neither by a record of this index (by its save) nor by an unfinished operation (by its id):
-        another store's, or this store's from before its index was lost, emptied or put back (see VALUES NO RECORD
-        NAMES). None when the store keeps its keys in the owner-only file, or on a keychain whose backend is not
-        built. A pin the host no longer offers, or a keychain that cannot be asked, is refused with its code."""
+        ``application recursion``, on the macOS Keychain the generic passwords whose service is ``recursion.<store
+        id>.<save id>.<provider>``) are named neither by a record of this index (by its save) nor by an unfinished
+        operation (by its id): another store's, or this store's from before its index was lost, emptied or put back (see
+        VALUES NO RECORD NAMES). None when the store keeps its keys in the owner-only file, or on a keychain whose
+        backend is not built. A pin the host no longer offers, or a keychain that cannot be asked, is refused with its
+        code."""
         folder = self._folder(create=False)
         if folder is None:
             return self._unnamed_items(Index(None, {}))
@@ -538,6 +558,9 @@ class KeyStore:
         if name not in ('secret_service', 'macos_keychain'):
             return None
         backend = self._made(name, index.store_id)
+        unnamed = getattr(backend, 'unnamed', None)
+        if unnamed is not None:
+            return unnamed(index)           # one listing for named and unnamed alike (the macOS Keychain)
         named = sum(backend.count(kid, None if kid in index.pending else index.keys[kid])   # a record names its save,
                     for kid in sorted(set(index.keys) | set(index.pending)))                  # an intent every save
         return max(backend.count() - named, 0)
@@ -598,7 +621,8 @@ class KeyStore:
         """``{"metered_spend_allowed": bool, "cap_usd": number}`` as typed at ``add``; with no opt-in, the cap is 0.
 
         Reads the index only (no backend, no keychain prompt). An unknown id raises ``KeyError(connection_id)``;
-        an index the store cannot read raises ``KeyRefused`` with its code, as ``credential`` does.
+        an index the store cannot read raises ``KeyRefused`` with its code, as ``credential`` does, and an ordinary
+        I/O failure underneath it ``KeyRefused`` with ``store_failed`` (no error text).
         """
         if not v.valid_key_id(connection_id):
             raise KeyError(connection_id)
@@ -607,6 +631,8 @@ class KeyStore:
             index = self.list()
         except KeyStoreError as exc:
             code = exc.code
+        except OSError:                      # an I/O failure underneath the store: typed, and no text of it
+            code = 'store_failed'
         if code is not None:
             raise KeyRefused(connection_id, code)         # outside the handler: no __context__
         record = index.keys.get(connection_id)
@@ -627,15 +653,37 @@ class KeyStore:
             index = self.list()
         except KeyStoreError as exc:
             out['refusal'] = {'code': exc.code, 'detail': exc.detail}
+        except OSError as exc:               # an I/O failure underneath the store: its type and errno only
+            out['refusal'] = {'code': 'store_failed', 'detail': f'{type(exc).__name__} errno {exc.errno}'}
         else:
             out['store'], out['keys'] = index.backend, len(index.keys)
         try:
             out['offered'] = detect(self.system)
         except KeyStoreError as exc:
             out['offered_refusal'] = {'code': exc.code, 'detail': exc.detail}
+        except OSError as exc:
+            out['offered_refusal'] = {'code': 'store_failed', 'detail': f'{type(exc).__name__} errno {exc.errno}'}
         if 'owner_file' in (out['store'], out['offered']):
             out['owner_file'] = str(self.owner_file())
         return out
+
+
+def _check_names(key_id, provider, env_name) -> None:
+    """The refusals of ``add`` that need nothing but its words (``check_add`` and ``add``)."""
+    problem = v.id_problem(key_id)
+    if problem is not None:
+        raise KeyStoreError('id_invalid', problem)
+    if not v.valid_provider(provider):
+        raise KeyStoreError('provider_invalid', 'a provider is a lower-case vendor id: a-z 0-9 . _ -, starting with '
+                            f'a letter or digit (published ids: {", ".join(v.PROVIDER_IDS)})')
+    if not v.valid_env_name(env_name):
+        raise KeyStoreError('env_name_invalid', 'a variable name is A-Z 0-9 _, not starting with a digit')
+
+
+def _unbound_exists(key_id: str) -> KeyStoreError:
+    return KeyStoreError('key_exists', f'the owner-only file still holds a value of {key_id} that no saved key names '
+                         f'(its index was lost, emptied or put back); "remove {key_id}" deletes it, then add the key '
+                         'again')
 
 
 def _parse_index(raw: bytes) -> Index | None:

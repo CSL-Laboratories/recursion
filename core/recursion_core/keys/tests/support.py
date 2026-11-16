@@ -45,6 +45,9 @@ class FakeSystem(System):
     def which(self, name):
         return f'/fake/bin/{name}' if name in self.tools else None
 
+    def is_executable(self, path):
+        return os.path.basename(path) in self.tools
+
     def run(self, argv, *, input=None, timeout):
         self.calls.append((list(argv), input))
         name = os.path.basename(argv[0])

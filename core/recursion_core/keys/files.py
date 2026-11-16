@@ -178,6 +178,8 @@ def open_folder(path: Path, *, create: bool) -> Folder | None:
     path = Path(path)
     if not path.is_absolute():
         raise KeyStoreError('folder_invalid', f'{path}: not an absolute path')
+    if '\0' in str(path):              # os.open raises ValueError for it, not OSError: refused here, typed
+        raise KeyStoreError('folder_invalid', 'the folder path holds a NUL byte, which no file system takes')
     if create:
         _make(path)
     try:

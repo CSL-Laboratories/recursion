@@ -22,19 +22,19 @@ the search). The report names files and key ids only: no value, no part of one, 
 one value are both named, once per place.
 
 ITEMS NO RECORD NAMES. On a keychain it also counts the items Recursion saved (on the Secret Service those that carry
-``application recursion``, on the macOS Keychain the generic passwords whose service is ``recursion.<save id>``) that
-neither a record of this store's index names by its save nor an unfinished operation by its id
+``application recursion``, on the macOS Keychain the generic passwords whose service is ``recursion.<store id>.<save
+id>.<provider>``) that neither a record of this store's index names by its save nor an unfinished operation by its id
 (``KeyStore.unnamed_items``): another store's, or this store's from before its index was lost, emptied or put back.
 Their values are not looked for; ``remove <id>`` deletes every item of this store under an id a record names, and the
 keychain's own tool finds the rest (``secret-tool`` by that attribute, Keychain Access by the name ``Recursion API key
 <id>``).
 
-COMPLETE OR NOT. The audit is incomplete (``key audit`` exits 4 when it found nothing) when a saved value could
-not be read (gone, or its keychain does not answer now), a file could not be read, an operation is unfinished,
-the journal was asked for and not searched to the end (no ``journalctl``, one that cannot start, or one that
-exits with a failure), or the keychain holds an item no record names, or its items could not be counted.
-Only ``--no-journal`` leaves the journal out without making the audit incomplete. The last line counts the saved
-keys (the index's records) and, apart from them, the values looked for.
+COMPLETE OR NOT. The audit is incomplete (``key audit`` exits 4 when it found nothing) when a saved value could not be
+read (gone, or its keychain does not answer now), a file could not be read, an operation is unfinished, the journal was
+asked for and not searched to the end (no ``journalctl``, one that cannot start, or one that exits with a failure), or
+the keychain holds an item no record names, or its items could not be counted. Only ``--no-journal``, and a store with
+no value to look for (there is nothing to find in the journal), leave the journal out without making the audit
+incomplete. The last line counts the saved keys (the index's records) and, apart from them, the values looked for.
 """
 from __future__ import annotations
 

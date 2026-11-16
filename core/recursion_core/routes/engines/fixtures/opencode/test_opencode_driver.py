@@ -607,5 +607,26 @@ class RoundThreeDriverTests(unittest.TestCase):
         self.assertEqual(p.lines_read, 1)
 
 
+class ReviewThreadTests(unittest.TestCase):
+    """The Devin review threads on #414: a start the driver would not run as asked is refused, nothing spawned."""
+
+    def test_a_route_of_another_engine_is_refused_before_any_spawn(self):
+        spy = Spy()
+        start = session()
+        start["route"] = dict(start["route"], engine="codex")
+        with self.assertRaises(DriverInputError) as caught:
+            oc.OpenCodeDriver(spy).start(start, None, ENV)
+        self.assertEqual((caught.exception.field, spy.spawns), ("route.engine", []))
+
+    def test_a_workspace_is_refused_rather_than_ignored(self):
+        for workspace in ({"path": "/repo", "mode": "worktree", "base_ref": "main", "worktree_path": "/repo-wt"},
+                          {"path": "/repo", "mode": "direct", "base_ref": None, "worktree_path": None}):
+            with self.subTest(mode=workspace["mode"]):
+                spy = Spy()
+                with self.assertRaises(DriverInputError):
+                    oc.OpenCodeDriver(spy).start(session(), workspace, ENV)
+                self.assertEqual(spy.spawns, [])
+
+
 if __name__ == "__main__":
     unittest.main()

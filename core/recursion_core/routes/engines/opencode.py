@@ -338,6 +338,17 @@ class OneShot:
             raise
 
 
+def _refuse_what_is_not_run(request: dict) -> None:
+    """A start this driver would not run as asked is refused before anything is spawned (``DriverInputError``): a
+    route naming another engine (``route.engine``; the gate checks only its shape), and a workspace
+    (``workspace``): ``spawn(argv, env)`` takes no directory, so a run would start in the spawn's own directory, not
+    the one asked for. Running in a workspace waits for the launch path to carry it (lane DRIVER-CC's and LAUNCH's)."""
+    if request["route"]["engine"] != ENGINE:
+        raise DriverInputError("route.engine")
+    if request["workspace"] is not None:
+        raise DriverInputError("workspace")
+
+
 def _fence(process, reason: str) -> None:
     """Ask the cleanup layer to end the process's tree. A fence that fails does not hide the error being raised."""
     try:
@@ -396,6 +407,7 @@ class OpenCodeDriver(Driver):
 
     def _start(self, handle, request: dict, env: dict) -> None:
         route = request["route"]
+        _refuse_what_is_not_run(request)
         model = held_to_the_guard(route["model"], None)
         parser = Parser(connection_id=f"{route['connection']['kind']}:{route['connection']['id']}",
                         model=model, wall=self._wall, clock=self._clock)

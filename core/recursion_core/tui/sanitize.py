@@ -4,11 +4,15 @@ Engine output is data. ``OutputSanitizer`` is a streaming parser: ESC, CSI, OSC 
 clipboard and OSC 0/2 titles), DCS, SOS, PM, APC, their C1 forms, other C0/C1 controls, bidi controls,
 and other invisible characters never reach the terminal. Each is replaced by a visible marker such as
 ``⟦OSC 52⟧`` so nothing is hidden either. Invisible characters are every Unicode format (``Cf``),
-private-use (``Co``) and unassigned (``Cn``) character, plus variation selectors and the blank Hangul
-fillers, which are not in those categories but render as nothing. Parser state carries across chunks,
-so splitting the same bytes at any point gives the same text. A control string longer than ``MAX_SEQ``
-is cut, marked ``overlong`` and the parser returns to text, so a missing terminator cannot swallow
-later output.
+private-use (``Co``) and unassigned (``Cn``) character, the line and paragraph separators (``Zl``,
+``Zp``: U+2028 and U+2029 end a line for some readers, so they could forge one), plus variation
+selectors and the blank Hangul fillers, which are not in those categories but render as nothing. Parser
+state carries across chunks, so splitting the same bytes at any point gives the same text; bytes that
+end inside a UTF-8 sequence are shown as U+FFFD at ``flush``, not dropped. A control string longer than
+``MAX_SEQ`` is cut, marked ``overlong`` and the parser returns to text, so a missing terminator cannot
+swallow later output.
+
+``visible`` and ``printable_only`` apply the same rule to what the user types or pastes (``keys.py``).
 """
 
 from __future__ import annotations
@@ -20,8 +24,11 @@ MAX_SEQ = 4096
 
 # Not Cf/Co/Cn, but blank or invisible. U+034F and U+FE0F are the code points measured in the
 # t1435u review; the rest of each variation-selector block is the same mechanism. U+115F and
-# U+3164 are the blank Hangul fillers (t1435u and bot review 4503921323).
-_EXTRA = frozenset("\u034f\u115f\u3164")
+# U+3164 are the blank Hangul fillers (t1435u and bot review 4503921323); U+1160 and U+FFA0 are the
+# other two (R2 finding 11).
+_EXTRA = frozenset("\u034f\u115f\u1160\u3164\uffa0")
+# U+2028 and U+2029 (Zl, Zp) break a line for str.splitlines and for JavaScript (R2 finding 11).
+_SEPARATORS = ("Zl", "Zp")
 _STRING_INTRO = {"]": "OSC", "P": "DCS", "X": "SOS", "^": "PM", "_": "APC"}
 _C1_STRING = {"\x9d": "OSC", "\x90": "DCS", "\x98": "SOS", "\x9e": "PM", "\x9f": "APC"}
 _NAMED = {"\x07": "BEL", "\x08": "BS", "\x7f": "DEL", "\x0b": "VT", "\x0c": "FF", "\x18": "CAN", "\x1a": "SUB"}
@@ -48,7 +55,22 @@ def _marked(ch: str) -> bool:
         return False
     if ch in _EXTRA:
         return True
-    return unicodedata.category(ch) in ("Cf", "Co", "Cn")
+    return unicodedata.category(ch) in ("Cf", "Co", "Cn", *_SEPARATORS)
+
+
+def visible(ch: str) -> bool:
+    """True when ``ch`` reaches the display as itself (the sanitizer leaves it alone)."""
+
+    return not _marked(ch)
+
+
+def printable_only(text: str) -> str:
+    """Pasted text for a one-line field: each line break or tab becomes a space, and every other
+    character the sanitizer would mark (controls, ESC, bidi and invisible characters) is dropped, so
+    nothing in a paste can act as a key or hide part of the line."""
+
+    text = text.replace("\r\n", "\n")
+    return "".join(" " if ch in "\r\n\t" else ch for ch in text if ch in "\r\n\t" or not _marked(ch))
 
 
 def _next_marked(text: str, start: int) -> int:
@@ -96,9 +118,13 @@ class OutputSanitizer:
         return "".join(out)
 
     def flush(self) -> str:
-        """End of stream: an unfinished sequence or a trailing CR is shown, not dropped."""
+        """End of stream: an unfinished sequence, a trailing CR, or bytes that end inside a UTF-8
+        character (shown as U+FFFD; R2 finding 11) are shown, not dropped."""
 
         out: list[str] = []
+        tail = self._decoder.decode(b"", final=True)
+        if tail:
+            out.append(self.feed(tail))
         if self._cr:
             out.append(_marker("CR"))
             self._cr = False

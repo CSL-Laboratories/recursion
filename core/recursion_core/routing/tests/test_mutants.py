@@ -22,6 +22,7 @@ import unittest
 from pathlib import Path
 
 import recursion_core
+from recursion_core.routing.tests import test_config  # POSIX_OWNER, RoutingFileTests: where the reader's rules run
 
 CORE = Path(recursion_core.__file__).resolve().parents[1]
 TEST_MODULES = ("recursion_core.routing.tests.test_config", "recursion_core.routing.tests.test_router")
@@ -224,6 +225,18 @@ def run_child(module: str, old: str, new: str) -> dict:
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
+# The routing file reader's mutants whose killers need the reader's owner check (test_config's RoutingFileTests,
+# which run where os.geteuid exists, on Linux). Without the check (Windows) a present routing file is refused as
+# unreadable before it is opened or parsed (test_config's NoOwnerCheckTests), so these rules cannot change an answer
+# there and no test can catch them: each is judged where the check exists, and is named here with the reason it is
+# not judged elsewhere. Every other mutant is judged on every platform.
+NEEDS_OWNER_CHECK = {
+    "M15 the routing file's owner not checked": "there is no owner to check: os.geteuid does not exist",
+    "M22 a present null routing file read as absent": "a present routing file is refused before it is parsed",
+    "M24 a member named twice read as the last one": "a present routing file is refused before it is parsed",
+}
+
+
 class MutantTests(unittest.TestCase):
     def test_control_run_with_no_patch_passes(self) -> None:
         anchor = MUTANTS["M1 rules evaluated before the hand pick"][1]
@@ -234,9 +247,19 @@ class MutantTests(unittest.TestCase):
     def test_every_kept_mutant_is_caught(self) -> None:
         for name, (module, old, new, killers) in MUTANTS.items():
             with self.subTest(name):
+                if name in NEEDS_OWNER_CHECK and not test_config.POSIX_OWNER:
+                    self.skipTest(f"{name}: not judged on this platform: {NEEDS_OWNER_CHECK[name]}")
                 out = run_child(module, old, new)
                 self.assertTrue(out["failed"], f"{name}: no test failed")
                 self.assertTrue(killers <= set(out["failed"]), f"{name}: failed {out['failed']}, expected {sorted(killers)}")
+
+    def test_only_the_reader_mutants_that_need_the_owner_check_are_ever_left_unjudged(self) -> None:
+        self.assertLessEqual(set(NEEDS_OWNER_CHECK), set(MUTANTS))  # a renamed mutant cannot slip out of judgment
+        reader = {name for name in dir(test_config.RoutingFileTests) if name.startswith("test_")}
+        for name in NEEDS_OWNER_CHECK:
+            module, _, _, killers = MUTANTS[name]
+            self.assertEqual(module, CONFIG, name)
+            self.assertLessEqual(killers, reader, name)  # each killer is skipped exactly where this one is not judged
 
     @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema not installed")
     def test_every_schema_mutant_is_caught(self) -> None:

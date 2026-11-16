@@ -96,6 +96,28 @@ class HandPickThroughTheDaemonTest(Composed):
         self.assertEqual(answer, {"code": "request_invalid", "detail": "engine_and_hand_pick_differ"})
         self.assertEqual(composed.control.registry.list(), [])
 
+    def test_model_hand_pick_without_routing_never_launches_another_model(self) -> None:  # astra R1, Q21 (a)
+        (self.tmp / "config" / "recursion" / "routing.json").unlink()
+        _, composed = self.boot(hooks_of(rh.register))
+        answer = composed.control.call("run.start", {"tenant": "t1", "prompt": LIVE, "engine": "claude_code",
+                                                     "hand_pick": {"engine": "claude_code", "model": "picked-model"}})
+        self.assertEqual(answer, {"code": "request_invalid", "detail": "hand_pick_without_routing"})
+        self.assertEqual(composed.control.registry.list(), [])
+        self.assertEqual(self.units.procs, {})
+
+    def test_no_routing_file_picked_model_is_not_silently_launched_as_another(self) -> None:  # sol R1, Q21 (a)
+        (self.tmp / "config" / "recursion" / "routing.json").unlink()
+        seen = []
+
+        def register(hooks):
+            rh.register(hooks)
+            hooks.set("drive_owner", lambda ctx, request: seen.append(request))
+        _, composed = self.boot(hooks_of(register))
+        answer = composed.control.call("run.start", {"tenant": "t1", "prompt": LIVE, "engine": "claude_code",
+                                                     "hand_pick": {"engine": "claude_code", "model": "review-picked-model"}})
+        self.assertEqual(answer, {"code": "request_invalid", "detail": "hand_pick_without_routing"})
+        self.assertEqual(seen, [])
+
 
 if __name__ == "__main__":
     unittest.main()

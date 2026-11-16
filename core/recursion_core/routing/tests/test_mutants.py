@@ -185,8 +185,8 @@ MUTANTS = {
         {"test_a_named_engine_is_not_routed_and_nothing_is_read"}),
     "M30 an engine with a hand pick of another engine let through": (
         HOOKS,
-        '        if engine is not None and isinstance(hand, Mapping) and hand.get("engine") != engine:\n'
-        '            return _refusal("engine_and_hand_pick_differ")\n',
+        '            if engine is not None and picked["engine"] != engine:\n'
+        '                return _refusal("engine_and_hand_pick_differ")\n',
         "",
         {"test_an_engine_and_a_hand_pick_of_another_engine_is_refused"}),
     "M31 a refused decision let the start go on as today's": (
@@ -201,7 +201,7 @@ MUTANTS = {
         {"test_no_engine_named_runs_the_default"}),
     "M33 the decision's model left out of the chosen entry": (
         HOOKS,
-        '    entry["route"]["model"] = decision["model"]\n',
+        '        entry["route"]["model"] = model\n',
         "",
         {"test_a_hand_pick_wins_over_the_default"}),
     # The first reads of #399 (05a5d13d): each guard they found unprotected or missing.
@@ -623,6 +623,125 @@ MUTANTS = {
         '(type(read["reason"]) is not str or read["reason"] not in REASONS)',
         '(type(read["reason"]) is not str)',
         {"test_next_after_limit_refuses_unknown_reason"}),
+    # #419's first DeepSeek read (f30bc965), slice 3's own (H for routing's hooks, apart from #399's M numbers).
+    "H1 a hand pick's model dropped when routing is off": (
+        HOOKS,
+        '            if picked is not None and picked["model"] is not None:  # a model asked for is never dropped silently\n'
+        '                return _refusal("hand_pick_without_routing")\n',
+        "",
+        {"test_with_no_routing_file_a_hand_pick_is_never_dropped"}),
+    "H2 a hand pick read by the registrant's own reads, not as decide() reads it": (
+        HOOKS,
+        '                picked = router._task({"hand_pick": hand})[2]\n',
+        '                picked = {"engine": hand.get("engine"), "model": hand.get("model")}\n',
+        {"test_a_hand_pick_that_is_not_one_is_refused_alike_with_or_without_an_engine"}),
+    "H3 the engines not taken from the composition's table": (
+        HOOKS,
+        "        engines = tuple(hooks.engines.names())\n",
+        "        engines = None\n",
+        {"test_engine_registered_after_routing_is_used"}),
+    "H4 the table's names not handed to the loader": (
+        HOOKS,
+        "config = rc.load(config_dir(environ), {}, engines=engines)",
+        "config = rc.load(config_dir(environ), {})",
+        {"test_engine_registered_after_routing_is_used"}),
+    "H5 the caller's engine table not handed to load_routes": (
+        CONFIG,
+        "load_routes(folder / ROUTES_FILE) if engines is None else load_routes(folder / ROUTES_FILE, tuple(engines))",
+        "load_routes(folder / ROUTES_FILE)",
+        {"test_engine_registered_after_routing_is_used"}),
+    "H6 a routing.json nested too deep escaping the loader": (
+        CONFIG,
+        "    except (OSError, ValueError, RecursionError) as exc:  # RecursionError: nested deeper than the parser goes\n",
+        "    except (OSError, ValueError) as exc:\n",
+        {"test_a_file_nested_deeper_than_the_parser_goes_is_unreadable"}),
+    "H7 a routes.json nested too deep escaping the loader": (
+        CONFIG,
+        "    except RecursionError:  # load_routes' own json.loads, on a routes.json nested deeper than the parser goes\n"
+        '        raise RoutingUnreadable("routes.json: nested deeper than the JSON parser goes") from None\n',
+        "",
+        {"test_a_file_nested_deeper_than_the_parser_goes_is_unreadable"}),
+    "H8 one string taken for an engine table": (
+        CONFIG,
+        "    if isinstance(engines, (str, bytes)):\n"
+        '        raise TypeError("engines is a collection of engine names, not one string")\n',
+        "",
+        {"test_load_refuses_one_string_for_its_engines"}),
+    "H9 a decision that is not routed given an entry": (
+        HOOKS,
+        '        if not isinstance(decision, Mapping) or decision.get("ok") is not True:\n            return None\n',
+        "",
+        {"test_route_entry_answers_none_for_anything_not_a_routed_decision"}),
+    "H10 a route that cannot be described launched all the same": (
+        HOOKS,
+        "        if record is None:  # never for decide's own routed answers: no start launches half told\n"
+        '            raise RuntimeError("routing chose a route it cannot describe")\n',
+        "",
+        {"test_a_route_that_cannot_be_described_is_never_launched"}),
+    # #419's first astra read (f30bc965): R2 and R3's survivors (its A5, A6, A7).
+    "H11 the engine table taken as it stood when routing registered": (
+        HOOKS,
+        '    def normalize(principal, request):\n'
+        '        engine, hand = request.get("engine"), request.get("hand_pick")\n'
+        '        if engine is not None and hand is None:\n'
+        '            return {}\n'
+        '        picked = None\n'
+        '        if hand is not None:  # read once, as decide() reads it, and refused as it refuses, routing on or off\n'
+        '            try:\n'
+        '                picked = router._task({"hand_pick": hand})[2]\n'
+        '            except router._Refuse as refused:\n'
+        '                return _refusal(f"{refused.code}:{refused.reason}")\n'
+        '            if engine is not None and picked["engine"] != engine:\n'
+        '                return _refusal("engine_and_hand_pick_differ")\n'
+        '        engines = tuple(hooks.engines.names())\n',
+        '    early = tuple(hooks.engines.names())  # the table as it stood when routing registered\n'
+        '\n'
+        '    def normalize(principal, request):\n'
+        '        engine, hand = request.get("engine"), request.get("hand_pick")\n'
+        '        if engine is not None and hand is None:\n'
+        '            return {}\n'
+        '        picked = None\n'
+        '        if hand is not None:  # read once, as decide() reads it, and refused as it refuses, routing on or off\n'
+        '            try:\n'
+        '                picked = router._task({"hand_pick": hand})[2]\n'
+        '            except router._Refuse as refused:\n'
+        '                return _refusal(f"{refused.code}:{refused.reason}")\n'
+        '            if engine is not None and picked["engine"] != engine:\n'
+        '                return _refusal("engine_and_hand_pick_differ")\n'
+        '        engines = early\n',
+        {"test_engine_registered_after_routing_is_used"}),
+    "H12 the daemon's pre-launch refusals left out of detection": (
+        HOOKS,
+        "route_refusal=rd.daemon_route_refusal(None)",
+        "route_refusal=None",
+        {"test_daemon_prelaunch_refusal_remains_a_routing_refusal"}),
+    "H13 the entry sharing the config's own dictionaries": (
+        HOOKS,
+        "        entry = copy.deepcopy(config.routes[engine])\n",
+        "        entry = config.routes[engine]\n",
+        {"test_entry_is_detached_from_configuration_and_other_entries"}),
+    "H14 a profile route's model selector left as configured": (
+        HOOKS,
+        '            profile["model"] = model  # the profile\'s selector agrees with the decision (astra R2)\n',
+        "            pass\n",
+        {"test_selected_model_reaches_profile_as_well_as_outer_route"}),
+    # #419's first sol read (f30bc965): its A9 and A12, and R3's registrant side.
+    "H15 detection not told which engines the composition has": (
+        HOOKS,
+        "active=engines)",
+        "active=None)",
+        {"test_normalizer_enforces_active_composition_engines"}),
+    "H16 a rule's own limits left out of the chosen entry": (
+        HOOKS,
+        '    if source == "routing":\n',
+        '    if source == "routing" and decision.get("reason") == "default":\n',
+        {"test_route_entry_carries_rule_limits"}),
+    "H17 an entry that cannot be copied launched without one": (
+        HOOKS,
+        "        if entry is None:  # the chosen routes.json entry cannot be copied (a value nested too deep): unusable config\n"
+        '            return _refusal("routing_config_invalid:unreadable")\n',
+        "",
+        {"test_a_route_that_cannot_be_described_is_never_launched"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

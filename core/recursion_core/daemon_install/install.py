@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from .errors import InstallRefused
 from .layout import (Owned, Roots, check_dirs, check_private_dir, ensure_dir, file_untrusted, held_regular,
                      owned_paths, replace_regular, still_holds, still_names, unlink_regular, write_exclusive)
-from .unit import MARKER, UNIT_NAME, render_unit
+from .unit import MARKER, UNIT_NAME, render_unit, state_elsewhere
 
 _UNIT_MODE = 0o644
 _DIR_MODE = 0o700
@@ -135,7 +135,11 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     """Make any missing store and the route homes' custody root, and rewrite the unit to what
     ``install`` would write now. A missing unit, and a custody root open to anyone else or unusable by
     its owner, are refused before anything is made; the root as made is held to the same rule before
-    the unit is rewritten. The same bytes are not written again unless
+    the unit is rewritten. A unit whose daemon may keep its state in another folder (``state_elsewhere``:
+    its own ``XDG_STATE_HOME``, an ``EnvironmentFile``, the manager's value passed through) is refused
+    ``unit_state_elsewhere`` before anything is made: replacing it would point the daemon at another
+    state folder, without the revocations and breaker trips kept in its own. The same bytes are not
+    written again unless
     another user could change the file; a unit kept is held open until the answer and checked
     against its path and its bytes last, as in ``install``, whose words on a refusal after the stores
     apply."""
@@ -148,6 +152,14 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     with held_regular(paths.unit) as read:  # held open until the answer: its inode is not reused
         data, info = read
         current = data == unit and not file_untrusted(paths.unit, info)
+        why = None if data == unit else state_elsewhere(data, paths.home)
+        if why:  # the S6 sweep's F1 on #410: before anything is made, the unit left as it is
+            raise InstallRefused(
+                "unit_state_elsewhere",
+                f"{paths.unit} {why}: the daemon it starts may keep its state (the revocation and breaker "
+                f"stores, the run registry) there, and the unit `recursiond upgrade` writes puts it in "
+                f"{paths.state}. Stop the daemon, move that state folder to {paths.state}, take the line out "
+                "of the unit, then run `recursiond upgrade` again")
         check_private_dir(paths.home, paths.homes)  # before anything is made
         made = ensure_stores(paths)
         homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)

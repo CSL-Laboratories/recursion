@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 
 from .errors import InstallRefused
 
@@ -97,6 +98,83 @@ def render_unit(exec_args: tuple[str, ...]) -> str:
         "WantedBy=default.target\n"
     )
     return text
+
+
+def state_elsewhere(unit: bytes, home: str) -> str | None:
+    """Why the daemon a unit starts may keep its state in another folder than the one ``render_unit``
+    names, or ``None``: what ``upgrade`` checks in a unit before it replaces it (the S6 sweep's F1 on
+    #410: a hand-placed unit's own ``XDG_STATE_HOME`` was dropped, and the daemon's revocations with it).
+
+    Its ``[Service]`` section is read as systemd reads it, near enough: an ``Environment=`` line is a
+    list of assignments, each in double or single quotes or none, an empty one drops those before it,
+    and the last ``XDG_STATE_HOME`` counts; a value naming ``home``'s ``.local/state`` (``%h`` is
+    ``home``) is this unit's own. ``EnvironmentFile=`` can set it (its file is not read here), and
+    ``PassEnvironment=XDG_STATE_HOME`` gives the daemon the user manager's own value; ``UnsetEnvironment``
+    naming it leaves the default, which is ours. A unit that cannot be read so is answered too: then
+    where it keeps the state cannot be told. A value only in the user manager's own environment
+    (``environment.d``, ``systemctl --user set-environment``) is not seen: this package starts no
+    process to ask it.
+    """
+
+    try:
+        text = unit.decode("utf-8")
+    except UnicodeDecodeError:
+        return "is not UTF-8 text, so where it keeps the daemon's state cannot be told"
+    section = ""
+    assigned: dict[str, str] = {}
+    files: list[str] = []
+    passed = unset = False
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        while line.endswith("\\") and i < len(lines):  # a continued line
+            line = line[:-1] + " " + lines[i].strip()
+            i += 1
+        if not line or line[0] in "#;":
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if section != "Service" or key not in ("Environment", "EnvironmentFile", "PassEnvironment",
+                                                "UnsetEnvironment"):
+            continue
+        if key == "EnvironmentFile":
+            files = files + [value] if value else []
+            continue
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            return f"has {key}={value}, which cannot be read, so where it keeps the daemon's state cannot be told"
+        if key == "Environment":
+            if not words:
+                assigned = {}
+            for word in words:
+                name, has, setting = word.partition("=")
+                if has:
+                    assigned[name] = setting
+        elif key == "PassEnvironment":
+            passed = False if not words else passed or "XDG_STATE_HOME" in words
+        else:  # UnsetEnvironment; an empty one drops those before it
+            named = [word.partition("=")[0] for word in words]
+            unset = False if not words else unset or "XDG_STATE_HOME" in named
+    if unset:  # applied after Environment, EnvironmentFile and PassEnvironment: the default, ours
+        return None
+    if files:
+        return f"reads EnvironmentFile={files[0]}, which can set XDG_STATE_HOME"
+    if passed:
+        return "passes the user manager's own XDG_STATE_HOME to the daemon (PassEnvironment)"
+    value = assigned.get("XDG_STATE_HOME")
+    if value is None:
+        return None
+    named = home + value[2:] if value.startswith("%h") else value
+    ours = os.path.join(home, *STATE_HOME.split("/"))
+    if os.path.isabs(named) and os.path.realpath(named) == os.path.realpath(ours):
+        return None
+    return f"sets XDG_STATE_HOME={value}"
 
 
 def service_fields(unit: str) -> dict[str, str]:

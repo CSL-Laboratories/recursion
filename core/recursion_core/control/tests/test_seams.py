@@ -719,19 +719,25 @@ class RegistrationTest(unittest.TestCase):
             self.assertIn(sentence, text)
 
     def test_a_registrant_whose_parent_package_is_absent_is_skipped(self) -> None:
-        """Whatever lanes this tree has, now or later. The keys package's absence is made for the test: where
-        anything asks whether that package, or anything below it, is there, it is told no, and whatever of it
-        is already imported is set aside for the test and put back after it. (It used to rely on no keys lane
-        being in the tree: the keys lane's own package made it fail.)"""
+        """Whatever lanes this tree has, now or later. The keys package's absence is made for the test, as the
+        real finder shows it: asked for the package, it says None; asked for anything below it, it raises
+        ModuleNotFoundError naming the package. Whatever of the package is already imported is set aside for the
+        test and put back after it. The names asked are kept: the loader decides absence at the package, so the
+        package is the only name under it that is ever asked for. (It used to rely on no keys lane being in the
+        tree: the keys lane's own package made it fail.)"""
         package = 'recursion_core.keys'
         self.fake._set_aside(package)
-        find_spec = importlib.util.find_spec
+        find_spec, asked = importlib.util.find_spec, []
 
         def absent(name, parent=None):
-            return None if name == package or name.startswith(package + '.') else find_spec(name, parent)
+            asked.append(name)
+            if name.startswith(package + '.'):  # what the real find_spec does below a package that is absent
+                raise ModuleNotFoundError(f'No module named {package!r}', name=package)
+            return None if name == package else find_spec(name, parent)
         with mock.patch.object(importlib.util, 'find_spec', absent):
-            self.assertIsNone(importlib.util.find_spec('recursion_core.keys'), 'the keys package is absent for this test')
             composed = H.compose()
+        self.assertEqual([name for name in asked if name.startswith(package)], [package],
+                         'absent is decided at the package: the module below it is not asked for, and the package is asked once')
         self.assertEqual(composed.methods.registered(), ())
         self.assertNotIn('recursion_core.keys', sys.modules)
 

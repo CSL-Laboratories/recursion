@@ -83,7 +83,10 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   POLLHUP (a `q` already read, then the hangup); any other error is raised. Ending takes the app's state
   lock, so a state change already under way finishes first and none starts after it; the event log
   appends the final event and seals itself in one step, so an append another thread had already begun
-  is refused; and once `Loop.shutdown()` returns no frame is painted. The final event is the last.
+  is refused; and once `Loop.shutdown()` returns no frame is painted. The final event is the last. The
+  error lines go to stderr when the TUI leaves the alternate screen, also after the screen hung up, since
+  stderr may be another stream that still works (a log file); an EIO on stderr itself is the same hangup
+  and is taken quietly, and any other error on it is raised.
 - Stop: `s` fixes the target, and `y` sends `run.stop`. `stop RUN` on the command line also works. The
   screen shows the API's own answer: `status=stopped`, or `status=pending` plus an `UNCERTAIN` line.
   Stop needs no input lease and has its own request lane, so it never waits behind a slow read. Keys are

@@ -143,12 +143,16 @@ def _instance_dictionary_shadowed(cls: type) -> bool:
     """Whether something other than Python's own ``__dict__`` descriptor stands at ``__dict__`` for instances of
     ``cls`` (the first class in its MRO that has one, read past any metaclass). Then nothing can show that an
     instance declares no ``grant``, so its absence is not taken as proved (round 8 of #377, Codex GPT-6 Astra 1
-    and GPT-6.1 Sol 1: a shadowed instance dictionary hid an unreadable declaration from ``getattr_static``)."""
+    and GPT-6.1 Sol 1: a shadowed instance dictionary hid an unreadable declaration from ``getattr_static``).
+    The two native descriptor types are recognised by identity: ``in`` on a tuple of types asks the member
+    type's metaclass for equality, and a metaclass ``__eq__`` answering true passed a shadow as Python's own
+    (round 9: DeepSeek F1, Codex GPT-6 Astra 1 and GPT-6.1 Sol 1)."""
 
     for base in _TYPE_MRO(cls):
         member = _TYPE_DICT(base).get("__dict__", _ABSENT)
         if member is not _ABSENT:
-            return not (type(member) in (types.GetSetDescriptorType, types.MemberDescriptorType)
+            kind = type(member)
+            return not ((kind is types.GetSetDescriptorType or kind is types.MemberDescriptorType)
                         and member.__name__ == "__dict__" and member.__objclass__ is base)
     return False
 

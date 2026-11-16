@@ -1474,6 +1474,47 @@ class RoundEightCodexCredentialsTest(unittest.TestCase):
         self.assertEqual(good.verify(token, peer="p").token_id, cred.token_id)
 
 
+@NEEDS_POSIX
+class RoundNineCredentialsTest(unittest.TestCase):
+    """Round 9 of #377: DeepSeek F2, Codex GPT-6 Astra 2 and GPT-6.1 Sol 2 (P3): a revocation asked for while the
+    wall clock cannot be read is kept, dated at the grant's issue, and still persisted and noticed once."""
+
+    def test_a_failed_clock_does_not_leave_a_requested_revocation_live(self):
+        with tempfile.TemporaryDirectory() as folder:
+            now = [1000]
+            store = CredentialStore(os.path.join(folder, "synthetic.json"), wall=lambda: now[0])
+            _, grant = store.mint("plugin", "synthetic", ["read"])
+            now[0] = "broken"
+            try:
+                store.revoke(grant.token_id)
+            except CredentialStoreError:
+                pass
+            now[0] = 1000
+            self.assertEqual(store.grant_scopes(grant.token_id, "plugin", "synthetic"), frozenset())
+
+    def test_a_failed_clock_and_a_failed_write_keep_the_revocation_for_a_retry(self):
+        def unavailable():
+            raise OSError("synthetic clock unavailable")
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "state", "synthetic.json")
+            notices = []
+            store = CredentialStore(path, wall=lambda: 1000, emit=lambda name, value: notices.append(name))
+            _, grant = store.mint("device", "synthetic", ["read"])
+            with mock.patch.object(store, "_wall", side_effect=unavailable), \
+                    mock.patch.object(store, "_write", side_effect=CredentialStoreError("synthetic write failure")):
+                with self.assertRaises(CredentialStoreError):
+                    store.revoke(grant.token_id)
+            self.assertIn(grant.token_id, store._unpersisted)
+            first = store._grants[grant.token_id]["revoked_at"]
+            self.assertEqual(first, grant.issued_at)
+            self.assertNotIn("credential.revoked", notices)
+            self.assertEqual(store.grant_scopes(grant.token_id, "device", "synthetic"), frozenset())
+            with mock.patch.object(store, "_wall", return_value=1300):
+                self.assertEqual(store.revoke(grant.token_id).revoked_at, first)
+            self.assertEqual(notices.count("credential.revoked"), 1)
+            self.assertEqual(CredentialStore(path).grants()[0].revoked_at, first)
+
+
 class PlatformTest(unittest.TestCase):
     def test_without_uids_the_store_refuses_to_open(self) -> None:
         with mock.patch.object(creds.os, "name", "nt"):

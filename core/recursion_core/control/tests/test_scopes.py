@@ -971,6 +971,125 @@ class RoundEightCodexScopesTest(unittest.TestCase):
         self.assertEqual(auth.held(Principal("plugin", "plugin.alpha")), frozenset({"read", "run"}))
 
 
+class _RecordingStore:
+    """A credential store that holds nothing and records every question it is asked."""
+
+    def __init__(self):
+        self.calls = []
+
+    def held(self, *args):
+        self.calls.append(("held", args))
+        return frozenset()
+
+    def grant_scopes(self, *args):
+        self.calls.append(("grant_scopes", args))
+        return frozenset()
+
+
+def _shadowed_principal(meta=None, inherited=False, fallback=False, descriptor=None):
+    """A principal whose class shadows its instance ``__dict__`` and whose ``grant`` cannot be read (made up)."""
+
+    if descriptor is None:
+        if meta is None:
+            class Marker:
+                pass
+        else:
+            class Marker(metaclass=meta):
+                pass
+        descriptor = Marker()
+
+    class P:
+        kind, id = "plugin", "synthetic"
+        __dict__ = descriptor
+
+        def __getattribute__(self, name):
+            if name == "grant":
+                raise AttributeError("synthetic unavailable context")
+            return object.__getattribute__(self, name)
+    if not isinstance(descriptor, type(type.__dict__["__dict__"])):
+        descriptor.__name__, descriptor.__objclass__ = "__dict__", P
+    if fallback:
+        def missing(self, name):
+            if name == "grant":
+                return None
+            raise AttributeError(name)
+        P.__getattr__ = missing
+    if inherited:
+        class Child(P):
+            pass
+        P = Child
+    principal = P()
+    object.__setattr__(principal, "grant", "synthetic-reference")
+    return principal
+
+
+class RoundNineScopesTest(unittest.TestCase):
+    """Round 9 of #377: DeepSeek F1, F3 and F4; Codex GPT-6 Astra 1 and GPT-6.1 Sol 1 (STRICT)."""
+
+    def assert_no_store(self, principal):
+        store = _RecordingStore()
+        self.assertEqual(Authorizer(scope_of=lambda _: None, credentials=store).held(principal), frozenset())
+        self.assertEqual(store.calls, [], "an unreadable declaration reached the identity's grants")
+
+    def test_a_metaclass_equal_to_every_type_does_not_hide_the_shadow(self):
+        # DeepSeek F1 and Sol 1: the shadow's type says it equals GetSetDescriptorType.
+        class Equal(type):
+            def __eq__(cls, other):
+                return True
+
+            __hash__ = type.__hash__
+        self.assert_no_store(_shadowed_principal(Equal))
+
+    def test_a_truthy_equality_with_inheritance_and_a_fallback_does_not_hide_it(self):
+        class Truth:
+            def __bool__(self):
+                return True
+
+        class Equal(type):
+            def __eq__(cls, other):
+                return Truth()
+
+            __hash__ = type.__hash__
+        self.assert_no_store(_shadowed_principal(Equal, inherited=True, fallback=True))
+
+    def test_a_plain_marker_named_like_the_descriptor_is_a_shadow(self):
+        # DeepSeek F3: the descriptor-type conjunct is what refuses this one.
+        self.assert_no_store(_shadowed_principal())
+
+    def test_another_class_s_real_descriptor_is_not_proof_of_absence(self):
+        class Donor:
+            pass
+        self.assert_no_store(_shadowed_principal(descriptor=vars(Donor)["__dict__"]))
+
+    def test_a_slots_only_class_still_shows_absence(self):
+        # DeepSeek F4: no __dict__ anywhere is absence proved, so the identity's grants are read.
+        class Slots:
+            __slots__ = ()
+            kind, id = "plugin", "synthetic"
+
+        class Child(Slots):
+            __slots__ = ()
+        for cls in (Slots, Child):
+            with self.subTest(shape=cls.__name__):
+                store = _RecordingStore()
+                self.assertEqual(Authorizer(scope_of=lambda _: None, credentials=store).held(cls()), frozenset())
+                self.assertEqual(store.calls, [("held", ("plugin", "synthetic"))])
+
+    def test_descriptor_types_are_compared_by_identity(self):
+        # Astra 1: a structural check of the guard, not a bypass reproduction.
+        import ast
+        import inspect
+        import textwrap
+        tree = ast.parse(textwrap.dedent(inspect.getsource(scopes._instance_dictionary_shadowed)))
+        memberships = [n for n in ast.walk(tree) if isinstance(n, ast.Compare)
+                       and any(isinstance(op, (ast.In, ast.NotIn)) for op in n.ops)]
+        self.assertEqual(memberships, [], "descriptor types must be compared by identity, not membership")
+        checked = {right.attr for node in ast.walk(tree) if isinstance(node, ast.Compare)
+                   for op, right in zip(node.ops, node.comparators)
+                   if isinstance(op, ast.Is) and isinstance(right, ast.Attribute)}
+        self.assertEqual(checked, {"GetSetDescriptorType", "MemberDescriptorType"})
+
+
 class ConstructionTest(unittest.TestCase):
     def test_the_providers_must_be_callable(self) -> None:
         for kwargs in ({"scope_of": None}, {"scope_of": "read"}, {"scope_of": SCOPE_COLUMN.get, "in_subtree": None},

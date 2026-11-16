@@ -1121,5 +1121,21 @@ class RequiredRegressionTests(unittest.TestCase):
                          {"action": "none", "reason": "no_decision"})
 
 
+class SweepRegressionTests(unittest.TestCase):
+    """The Nov 15 integration sweep of #399 against master (gpt-6.1-sol, s6-int-399): its F2, by its name."""
+
+    def test_f2_rules_after_a_chosen_rule_are_not_reached(self) -> None:
+        out = router.explain(config(), SENTRY, {"task_kind": "review"})
+        self.assertEqual(out["decision"]["engine"], "codex")
+        self.assertEqual([row["outcome"] for row in out["rules"]], ["chosen", "not_reached", "not_reached"])
+
+    def test_rules_after_a_refused_rule_are_not_reached_whatever_their_conditions(self) -> None:  # the same, refused
+        raw = copy.deepcopy(CONFIG)
+        raw["undetected_rule"] = "refuse"
+        out = router.explain(config(raw), SENTRY, {"task_kind": "search"})  # no tags: cheap-to-opencode's would fail
+        self.assertEqual([(row["id"], row["outcome"]) for row in out["rules"]],
+                         [("review-to-codex", "no_match"), ("search-to-pi", "refused"), ("cheap-to-opencode", "not_reached")])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -45,12 +45,13 @@ HARVEST_FILES = ("__init__.py", "harvest.py", "validate.py", "tasks.py", "txtar.
                  "arms.py", "record.py", "heldout.py", "suite.py")
 # What one candidate's own files can raise while its task is written, loaded and validated: its stored form
 # refused (TaskError: a bad path, a start-tree entry that is not a file), its start archive unreadable
-# (TarError), git refusing its work copy's files (GitError; git itself already ran before the first
-# candidate), and a path that cannot be laid out as its tree says (a file where a folder must be, or the
-# reverse). Not a plain ValueError, a RuntimeError or any other OSError (a full disk, a permission, a
-# missing folder): those are the caller's or the machine's and end the run.
-CANDIDATE_FAULTS = (task_mod.TaskError, tarfile.TarError, gitutil.GitError, FileExistsError, IsADirectoryError,
-                    NotADirectoryError)
+# (TarError), and a path that cannot be laid out as its tree says (a file where a folder must be, or the
+# reverse). Not a GitError (git failing on a fresh scratch copy is the machine's: a permission, a full disk,
+# a broken object store), not a plain ValueError, a RuntimeError or any other OSError: those are the
+# caller's or the machine's and end the run. A candidate's paths that git or the task form cannot hold are
+# refused before this point, in build_candidate (tree_files), as that candidate's rejection.
+CANDIDATE_FAULTS = (task_mod.TaskError, tarfile.TarError, FileExistsError, IsADirectoryError, NotADirectoryError)
+GRADING_FIELDS = ("test_command", "timeout_s", "grading_timeout_s")
 TRAILER = re.compile(r"^[A-Za-z][A-Za-z0-9-]*: .+$")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -102,6 +103,10 @@ def load_repos(path: Path) -> tuple:
         if not task_mod.TASK_ID.match(repo["name"]) or repo["name"] in names:
             raise HarvestError(f"{path}: bad or duplicate repository name {repo['name']!r}")
         names.add(repo["name"])
+        try:   # the same rules a task's own task.json is held to (eval/tasks.py), checked once, here
+            task_mod._meta(repo["name"], {"id": repo["name"], **{k: repo[k] for k in GRADING_FIELDS if k in repo}})
+        except task_mod.TaskError as exc:
+            raise HarvestError(f"{path}: repository {repo['name']!r}: {exc}") from None
         if not Path(repo["path"]).is_absolute():
             raise HarvestError(f"{path}: repository path must be absolute: {repo['path']!r}")
     return repos, hashlib.sha256(raw).hexdigest()
@@ -146,7 +151,12 @@ def tree_files(repo: Path, commit: str) -> dict:
         mode, kind, sha = meta.decode().split()
         if kind != "blob" or mode not in ("100644", "100755"):
             raise HarvestError(f"{commit[:12]}: {path.decode('utf-8', 'replace')} is a {kind} with mode {mode}")
-        entries.append((path.decode("utf-8", "surrogateescape"), sha, int(mode[-3:], 8)))
+        try:
+            name = path.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HarvestError(f"{commit[:12]}: the path {path.decode('utf-8', 'replace')!r} is not UTF-8; "
+                               "a task's paths are UTF-8 text") from None
+        entries.append((name, sha, int(mode[-3:], 8)))
     blobs = _cat_blobs(repo, [sha for _, sha, _ in entries])
     return {path: (blobs[sha], mode) for path, sha, mode in entries}
 
@@ -262,9 +272,9 @@ def harvest(repos_path: Path, not_before: str, out: Path, *, suite_id: str, vers
     heldout.check_path(out, must_exist=False)  # absolute, and never inside the repository
     if out.exists() and any(out.iterdir()):
         raise HarvestError(f"{out} is not empty: a harvest writes a new folder")
+    repos, repos_sha = load_repos(repos_path)   # every repository's settings, before anything is written
     out.mkdir(parents=True, exist_ok=True)
     heldout.check_path(out)
-    repos, repos_sha = load_repos(repos_path)
     issues = json.loads(Path(issues_path).read_text(encoding="utf-8")) if issues_path else {}
     staging = out / ".staging"
     entries, rejects, heads = [], [], []

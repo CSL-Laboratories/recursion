@@ -461,13 +461,18 @@ class ContainmentTests(unittest.TestCase):
 
 
 class OperatorWordsTests(unittest.TestCase):
-    def test_the_words_name_the_danger_and_the_way_out(self):
+    def test_the_words_name_the_danger_and_claim_no_protection(self):
+        # The Liaison, Nov 15 4:36 PM: a private home separates configuration and state and is not
+        # isolation; the words must say exactly that and must not suggest protection.
         words = containment.OPERATOR_WORDS
-        for part in ("~/.local/state/recursion/homes/<engine>", "They run as you",
-                     "your files, your SSH keys, your browser and other app logins",
-                     "cannot stop a program running as you from reaching the rest of your home",
-                     "set up a separate engine user"):
+        for part in ("Engines run as your user", "~/.local/state/recursion/homes/<engine>",
+                     "keeps its settings and sign-ins separate, but does not prevent access to your other "
+                     "files, credentials or local services",
+                     "an engine can read or change anything your user account can",
+                     "your SSH keys and your browser and other app logins", "separate engine user"):
             self.assertIn(part, words)
+        for claim in ("protect", "safe", "secure", "isolat", "never", "keeps you", "private to you"):
+            self.assertNotIn(claim, words.lower())
         self.assertTrue(words.isascii())
         self.assertIsNone(re.search(r"\s{2}", words))
 

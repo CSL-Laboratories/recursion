@@ -82,14 +82,14 @@ _MAX_LINKS = 40  # Linux's MAXSYMLINKS
 
 # The one text the operator reads about the default, wherever it is shown: recursiond's answers,
 # doctor, the terminal app's and the page's settings screens, and the approval prompt for the looser
-# value (Lucas, Nov 15: "make sure that the dangers are made clear to the operator").
+# value (Lucas, Nov 15: "make sure that the dangers are made clear to the operator"). A private folder
+# separates an engine's settings; it is not isolation, and the text claims no protection beyond that.
 OPERATOR_WORDS = (
-    "Engines keep their sign-ins in a private folder inside your home "
-    "(~/.local/state/recursion/homes/<engine>). They run as you, so an engine can read and change anything "
-    "your user account can: your files, your SSH keys, your browser and other app logins. Recursion keeps "
-    "each engine's folder private to you and never gives an engine your home folder as its own, but it "
-    "cannot stop a program running as you from reaching the rest of your home. To keep engines out of your "
-    "home, set up a separate engine user and choose \"outside my home\"."
+    "Engines run as your user. Each engine's private folder inside your home "
+    "(~/.local/state/recursion/homes/<engine>) keeps its settings and sign-ins separate, but does not "
+    "prevent access to your other files, credentials or local services: an engine can read or change "
+    "anything your user account can, your SSH keys and your browser and other app logins included. "
+    "Choosing \"outside my home\" needs a separate engine user, so that engines do not run as you."
 )
 NEEDS_ENGINE_USER = "needs the engine user, which this machine does not have"
 

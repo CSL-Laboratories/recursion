@@ -238,10 +238,11 @@ def _seconds(name: str, value: object) -> float:
         raise ValueError(message)
     # Converted to a plain float ONCE, and that float is what is checked and kept: a subclass's own __float__ could
     # answer NaN after its value passed, and a tiny or huge real converts to 0.0 or overflows (round 1 of #407,
-    # Codex GPT-6.1 Sol R1).
+    # Codex GPT-6.1 Sol R1). Whatever that conversion raises is a ValueError (round 4: DeepSeek F2, Sol 1); an
+    # interrupt is not an Exception and still propagates.
     try:
         seconds = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except Exception:  # noqa: BLE001 - a real number that cannot be converted is not a number of seconds
         raise ValueError(message) from None
     if not math.isfinite(seconds) or not seconds > 0:
         raise ValueError(message)

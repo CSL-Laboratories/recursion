@@ -906,6 +906,42 @@ class ConnectionBoundTests(_TmpCase):
         # A server with no reserved slots does not use reserved_timeout_s, and ignores it, as before.
         UnixControlServer(self.sock_dir, ct.with_ping_health(_Recorder()), reserved_timeout_s=None)
 
+    def test_each_timeout_is_converted_once_and_that_float_is_kept(self) -> None:
+        """Round 4 of #407, Codex GPT-6.1 Sol required 2: a second conversion would read NaN here."""
+
+        class Stateful(float):
+            def __new__(cls):
+                value = super().__new__(cls, 1.0)
+                value.calls = 0
+                return value
+
+            def __float__(self):
+                self.calls += 1
+                return 0.375 if self.calls == 1 else float("nan")
+
+        for parameter in ("idle_timeout_s", "reserved_timeout_s"):
+            with self.subTest(parameter=parameter):
+                value = Stateful()
+                srv = UnixControlServer(self.sock_dir, ct.with_ping_health(_Recorder()), reserved_connections=1,
+                                        priority=lambda request: True, **{parameter: value})
+                self.assertEqual(value.calls, 1)
+                self.assertIs(type(getattr(srv, "_" + parameter)), float)
+                self.assertEqual(getattr(srv, "_" + parameter), 0.375)
+
+    def test_any_conversion_error_of_a_timeout_is_a_value_error(self) -> None:
+        """Round 4 of #407, DeepSeek F2 and Codex GPT-6.1 Sol required 1."""
+
+        for error in (RuntimeError, ZeroDivisionError):
+            class Broken(float):
+                def __float__(self):
+                    raise error("synthetic conversion failure")
+
+            for parameter in ("idle_timeout_s", "reserved_timeout_s"):
+                with self.subTest(parameter=parameter, error=error.__name__):
+                    with self.assertRaisesRegex(ValueError, parameter):
+                        UnixControlServer(self.sock_dir, ct.with_ping_health(_Recorder()), reserved_connections=1,
+                                          priority=lambda request: True, **{parameter: Broken(1.0)})
+
     def test_allowed_float_subclass_cannot_reintroduce_nan_worker_crash(self) -> None:
         """Codex GPT-6.1 Sol's R1 witness (round 1 of #407), for both timeout parameters: a float subclass that
         passes the check but converts to NaN must be refused at construction, or else be served with no uncaught

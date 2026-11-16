@@ -1,6 +1,8 @@
 """The ``recursiond`` console script (distribution ``csl-recursion``). Standard library only.
 
     recursiond install | upgrade | uninstall    the per-user systemd unit (control/commands/setup.py)
+    recursiond setup containment [<value>]      show or choose where engines keep their sign-ins
+                                                (setup/containment.py)
     recursiond serve [daemon options]           run the daemon in the foreground
 
 Linux only: on any other system every command refuses with ``platform_unsupported`` (exit 1)

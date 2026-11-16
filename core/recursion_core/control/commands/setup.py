@@ -18,6 +18,12 @@ first; this holds the same once the family is registered in the control CLI).
 that interpreter, started as the unit will start it (``-I``, from ``/``), what it is: it must be
 free-threaded CPython 3.14 (``interpreter_not_free_threaded``), and it must import this same
 ``recursion_core`` with no ``PYTHONPATH`` (``not_installed``), or the daemon could not start.
+
+``setup containment [<value>]`` shows or sets the containment setting (``setup/containment.py``):
+where engines keep their sign-ins, ``inside_operator_home`` (the default) or ``outside_operator_home``
+(refused while the machine has no engine user). Its answer has ``engine_homes``, ``source`` (``file``
+or ``default``), ``level``, ``file``, ``changed`` and ``notice``, the words that tell the operator what
+the default lets an engine do (with that value only); a refusal is ``"code": <containment code>`` with ``detail``.
 """
 
 from __future__ import annotations
@@ -28,13 +34,18 @@ import subprocess
 import sys
 
 from recursion_core.daemon_install import InstallRefused, Roots, daemon_exec_args, install, uninstall, upgrade
+from recursion_core.setup import containment
 
-NAMES = ("install", "upgrade", "uninstall")
+NAMES = ("install", "upgrade", "uninstall", "setup")
+SETTINGS = ("containment",)
 EXIT_OK, EXIT_REFUSED = 0, 1
 _HELP = {
     "install": "write the per-user systemd unit for the daemon (twice changes nothing)",
     "upgrade": "rewrite the unit for this interpreter and this version",
     "uninstall": "remove the unit `install` wrote; the daemon's state folder stays",
+    "setup": "show or choose a setting: containment (where engines keep their sign-ins)",
+    "containment": (f"show the containment setting, or set it to {' or '.join(containment.ENGINE_HOMES)} "
+                    f"({containment.OUTSIDE_OPERATOR_HOME} is refused while this machine has no engine user)"),
 }
 
 # Run by the interpreter the unit will run, as the unit runs it. Standard library only.
@@ -53,7 +64,13 @@ print(json.dumps(info))
 
 def parser(family) -> None:
     for name in NAMES:
-        family.add_parser(name, help=_HELP[name], description=_HELP[name])
+        command = family.add_parser(name, help=_HELP[name], description=_HELP[name])
+        if name == "setup":
+            settings = command.add_subparsers(dest="setting", metavar="setting", required=True)
+            for setting in SETTINGS:
+                one = settings.add_parser(setting, help=_HELP[setting], description=_HELP[setting])
+                one.add_argument("value", nargs="?", choices=containment.ENGINE_HOMES,
+                                 help="the value to set; without it, the setting is shown")
 
 
 def dispatch(args, client) -> int:
@@ -66,8 +83,38 @@ def dispatch(args, client) -> int:
         _print(out, {"code": "platform_unsupported", "action": args.command,
                      "detail": f"the per-user service needs Linux with systemd; this system is {sys.platform}"})
         return EXIT_REFUSED
+    if args.command == "setup":
+        return run_setting(args.setting, getattr(args, "value", None), out=out)
     return run(args.command, out=out, roots=default_roots(), interpreter=sys.executable,
                package=recursion_core.__file__)
+
+
+def run_setting(setting: str, value, *, out, environ=None) -> int:
+    """``setup <setting> [<value>]``: show the setting, or set it. One JSON answer on ``out``."""
+
+    action = f"setup {setting}"
+    try:
+        if setting != "containment":
+            raise containment.ContainmentRefused("setting_unknown", repr(setting))
+        if value is None:
+            reading, changed = containment.read(environ), False
+        else:
+            reading, changed = containment.write(value, environ)
+    except containment.ContainmentRefused as exc:
+        _print(out, {"code": exc.code, "action": action, "detail": exc.detail})
+        return EXIT_REFUSED
+    except OSError as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        if exc.filename is None:
+            detail += f" (in {containment.config_folder(environ)})"
+        _print(out, {"code": "filesystem_error", "action": action, "detail": detail})
+        return EXIT_REFUSED
+    answer = {"code": "ok", "action": action, "changed": changed, "engine_homes": reading.engine_homes,
+              "source": reading.source, "level": reading.level, "file": reading.path}
+    if reading.engine_homes == containment.INSIDE_OPERATOR_HOME:  # the words describe this value only
+        answer["notice"] = containment.OPERATOR_WORDS
+    _print(out, answer)
+    return EXIT_OK
 
 
 def default_roots() -> Roots:

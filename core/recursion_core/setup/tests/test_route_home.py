@@ -7,6 +7,7 @@ Brief, "Done when": route_home.check refuses a path outside the root, a link and
 from __future__ import annotations
 
 import builtins
+import contextlib
 import inspect
 import os
 import tempfile
@@ -453,16 +454,87 @@ class RouteHomeTests(unittest.TestCase):
         self.assertEqual(error.detail, f"{a_file} is not a folder")
 
 
+    # Nov 15 (Q14 answered by Lucas, Q17 ruled): the containment setting's keyword. Under False
+    # (``outside_operator_home``) a route home inside the operator's home, or one holding it, is
+    # refused; the default answers as before.
+    def _homes(self, home: str):
+        """$HOME and the password database's home, both ``home``."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.dict(os.environ, {"HOME": home}))
+        stack.enter_context(mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=home)))
+        return stack
+
+    def refused_strict(self, path, root=None) -> RouteHomeRefused:
+        with self.assertRaises(RouteHomeRefused) as caught:
+            check(path, self.root if root is None else root, allow_inside_operator_home=False)
+        self.assertEqual(caught.exception.code, "route_home_is_operator_home", caught.exception.detail)
+        return caught.exception
+
+    def test_under_containment_a_route_home_inside_the_operators_home_is_refused(self):
+        os.mkdir(self.path, 0o700)
+        for home in (self.state, self.base):
+            with self.subTest(home=home), self._homes(home):
+                check(self.path, self.root)  # the default: inside the home is accepted, as before
+                check(self.path, self.root, allow_inside_operator_home=True)
+                self.assertEqual(self.refused_strict(self.path).detail, "the root is inside the operator's home")
+        with self._homes(self.root):  # the root is the home itself: refused whichever the setting
+            for allow in (True, False):
+                with self.subTest(allow=allow), self.assertRaises(RouteHomeRefused) as caught:
+                    check(self.path, self.root, allow_inside_operator_home=allow)
+                self.assertEqual((caught.exception.code, caught.exception.detail),
+                                 ("route_home_is_operator_home", "the root is the operator's home"))
+        with self._homes(os.path.join(self.base, "operator")):  # a home beside the state folder
+            check(self.path, self.root, allow_inside_operator_home=False)
+
+    def test_under_containment_the_homes_are_compared_after_links_and_both_ways(self):
+        nest = os.path.join(self.root, "nest")
+        os.mkdir(nest, 0o700)
+        inner = os.path.join(nest, "claude_code")
+        with self._homes(nest):  # the home below the root, the route home below the home
+            check(inner, self.root)
+            self.assertEqual(self.refused_strict(inner).detail, f"{inner} is inside the operator's home")
+        with self._homes(os.path.join(self.path, "deeper")):  # the home below the route home (not made yet)
+            check(self.path, self.root)
+            self.assertEqual(self.refused_strict(self.path).detail, f"{self.path} holds the operator's home")
+        alias = os.path.join(self.base, "state-alias")
+        os.symlink(self.state, alias)
+        with self._homes(alias):  # the home named through a link
+            check(self.path, self.root)
+            self.assertEqual(self.refused_strict(self.path).detail, "the root is inside the operator's home")
+        operator = os.path.join(self.base, "operator")
+        for env_home, passwd_home in ((self.state, operator), (operator, self.state)):  # either names it
+            with self.subTest(env_home=env_home), mock.patch.dict(os.environ, {"HOME": env_home}), \
+                    mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=passwd_home)):
+                self.assertEqual(self.refused_strict(self.path).detail, "the root is inside the operator's home")
+        # A name that only begins with the home's (or the route home's) is not inside it.
+        for home in (self.root[:-1], self.path[:-1], self.path + "x"):
+            with self.subTest(home=home), self._homes(home):
+                check(self.path, self.root, allow_inside_operator_home=False)
+        with self._homes("/"):  # a container whose home is /: it holds only /, as the policy reads it
+            check(self.path, self.root, allow_inside_operator_home=False)
+
+    def test_the_keyword_takes_true_or_false_only(self):
+        for value in ("false", "", 0, 1, None, [], 0.0):
+            with self.subTest(value=value), self.assertRaises(RouteHomeRefused) as caught:
+                check(self.path, self.root, allow_inside_operator_home=value)
+            self.assertEqual((caught.exception.code, caught.exception.detail),
+                             ("route_home_untrusted", "allow_inside_operator_home is not True or False"))
+        with self.assertRaises(TypeError):
+            check(self.path, self.root, False)  # keyword only: the frozen positional interface is unmoved
+
+
 class FrozenInterfaceTests(unittest.TestCase):
     """STOP builds against these; a change is a request to lane INSTALL."""
 
     def test_the_frozen_names_signature_and_refusal(self):
         self.assertEqual(route_home.__all__, ["RouteHomeRefused", "check"])
         parameters = inspect.signature(check).parameters
-        self.assertEqual(list(parameters), ["path", "root"])
-        for parameter in parameters.values():
-            self.assertEqual((parameter.kind, parameter.default),
+        self.assertEqual(list(parameters), ["path", "root", "allow_inside_operator_home"])
+        for name in ("path", "root"):  # unmoved since Nov 14
+            self.assertEqual((parameters[name].kind, parameters[name].default),
                              (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty))
+        keyword = parameters["allow_inside_operator_home"]  # Nov 15: the containment setting; today's rule by default
+        self.assertEqual((keyword.kind, keyword.default), (inspect.Parameter.KEYWORD_ONLY, True))
         refusal = RouteHomeRefused("route_home_untrusted", "detail")
         self.assertEqual((refusal.code, refusal.detail), ("route_home_untrusted", "detail"))
         self.assertIsInstance(refusal, Exception)

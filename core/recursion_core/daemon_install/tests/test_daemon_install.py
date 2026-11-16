@@ -29,8 +29,14 @@ from recursion_core.daemon_install import (
 
 PY = "/opt/recursion/venv/bin/python3.14t"
 PY_NEXT = "/opt/recursion/venv-2/bin/python3.14t"
-EXEC = daemon_exec_args(PY)
-EXEC_NEXT = daemon_exec_args(PY_NEXT)
+# The unit is Linux's, and daemon_exec_args() reads its interpreter path by this host's rules. Windows CPython
+# 3.13 and later does not take a path with one leading slash as absolute: building the vectors there raised while
+# this module was imported, before any skip could apply (the S6 sweep's P3 on #382). So they are built only where
+# the path is absolute, and the classes that use them are skipped elsewhere; Windows CPython 3.12 takes the path,
+# and RenderTests run there as before.
+POSIX_PATHS = os.path.isabs(PY)
+EXEC = daemon_exec_args(PY) if POSIX_PATHS else ()
+EXEC_NEXT = daemon_exec_args(PY_NEXT) if POSIX_PATHS else ()
 
 
 def _read(path: str) -> str:
@@ -56,6 +62,8 @@ def _tree(root: str) -> dict[str, tuple]:
     return found
 
 
+@unittest.skipUnless(POSIX_PATHS, "this host does not take the unit's interpreter path as absolute (Windows "
+                     "CPython 3.13 and later); the unit is Linux's")
 class RenderTests(unittest.TestCase):
     def test_the_unit_restarts_on_failure_starts_with_the_user_manager_and_has_a_finite_stop(self) -> None:
         text = render_unit(EXEC)
@@ -168,6 +176,20 @@ class CommandTests(unittest.TestCase):
                     for needle in banned:
                         self.assertNotIn(f"import {needle}", text)
                         self.assertNotIn(f"from {needle}", text)
+
+
+class ImportTests(unittest.TestCase):
+    def test_the_module_imports_where_the_interpreter_path_is_not_absolute(self) -> None:
+        # The S6 sweep's P3 on #382: on a host whose path rules refuse the unit's POSIX interpreter path
+        # (Windows CPython 3.13 and later), importing this module raised InstallRefused before any skip applied.
+        # Its source is run again here with every path read as not absolute.
+        with open(__file__, "rb") as handle:
+            code = compile(handle.read(), __file__, "exec")
+        names = {"__name__": "_imported_where_paths_are_not_absolute", "__file__": __file__}
+        with mock.patch("os.path.isabs", return_value=False):
+            exec(code, names)
+        self.assertEqual((names["POSIX_PATHS"], names["EXEC"], names["EXEC_NEXT"]), (False, (), ()))
+        self.assertTrue(getattr(names["RenderTests"], "__unittest_skip__", False))
 
 
 @unittest.skipUnless(os.name == "posix", "the installer is Linux-only")

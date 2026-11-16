@@ -231,6 +231,13 @@ class TurnTest(unittest.TestCase):
         self.assertEqual(("ta", "tb"), (task_of_turn(session, "turn-a", events)["updated_at"],
                                         task_of_turn(session, "turn-b", events)["updated_at"]))
 
+    def test_an_event_it_cannot_read_is_refused(self) -> None:
+        # #416, round 2 (Astra's later note, its mutant 15): a turn's log reads each event as an object too.
+        for event in ("state.changed", None, ["turn-b"]):
+            with self.subTest(event=event), self.assertRaises(TaskUnavailable) as caught:
+                task_of_turn(self.session(), "turn-b", [event])
+            self.assertEqual("source", caught.exception.reason)
+
     def test_a_change_of_the_run_or_the_session_filed_under_a_turn_does_not_move_it(self) -> None:
         # #368 at 998e42ce (vectors t35 to t38): the event must be filed under the turn AND its payload name it.
         session = self.session()

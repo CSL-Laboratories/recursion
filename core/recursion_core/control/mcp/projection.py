@@ -34,8 +34,9 @@ codes it answers); the table publishes no title.
   exit or an interrupt goes on).
 
 Every refusal is a ``ProjectionRefused(reason, detail)``. Published files that are not the published shape
-(a table that is not an object, a row that is not one or whose ``mcp`` is not one, an exposed row whose
-``codes`` are not strings or whose ``scope`` is not one, a parameter schema this server cannot check) are
+(a table that is not an object, a row that is not one, a row whose ``name`` is not a non-empty string or
+whose ``mcp`` is not an object, an exposed row whose ``codes`` are not strings or whose ``scope`` is not one,
+a ``$ref`` that is not a string, a parameter schema or pattern this server cannot check) are
 ``published_incomplete`` or ``published_invalid``.
 """
 
@@ -79,6 +80,8 @@ class Published:
             raise ProjectionRefused("published_invalid", "the table needs table_version and methods")
         if not all(isinstance(row, Mapping) for row in self.rows):
             raise ProjectionRefused("published_invalid", "a row of the table is not an object")
+        if not all(isinstance(row.get("name"), str) and row["name"] for row in self.rows):
+            raise ProjectionRefused("published_invalid", "a row of the table has no name, or one that is not a string")
 
     @classmethod
     def from_directory(cls, directory: Path) -> Published | None:
@@ -110,12 +113,15 @@ class Published:
         if not isinstance(schema, Mapping):
             return schema
         if "$ref" in schema:
+            ref = schema["$ref"]
+            if not isinstance(ref, str):
+                raise SchemaUnsupported(f"a reference must be a string, not {ref!r} (in {current})")
             if set(schema) != {"$ref"}:
-                raise SchemaUnsupported(f"reference {schema['$ref']!r} has sibling keywords {sorted(set(schema) - {'$ref'})}")
-            target, name = self._target(schema["$ref"], current)
-            key = (name, schema["$ref"].partition("#")[2])
+                raise SchemaUnsupported(f"reference {ref!r} has sibling keywords {sorted(set(schema) - {'$ref'})}")
+            target, name = self._target(ref, current)
+            key = (name, ref.partition("#")[2])
             if key in _seen:
-                raise SchemaUnsupported(f"reference cycle through {schema['$ref']!r}")
+                raise SchemaUnsupported(f"reference cycle through {ref!r}")
             return self.inline(target, name, _seen + (key,))
         return {key: (value if key in ("enum", "required", "description") else self.inline(value, current, _seen))
                 for key, value in schema.items()}

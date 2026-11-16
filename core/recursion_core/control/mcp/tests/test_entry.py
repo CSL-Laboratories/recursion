@@ -3,6 +3,7 @@ read, nothing on stdout), serving, and an interrupt."""
 
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
@@ -148,6 +149,36 @@ class EntryTest(unittest.TestCase):
                                                check=lambda environ: ScriptedAPI(),
                                                published=lambda documents=documents: projection.Published(documents)))
                 self.assertEqual([("tools_unavailable", "published_invalid")], [(e["code"], e["reason"]) for e in stderr_lines(err)])
+
+    def test_a_nameless_row_or_a_pattern_python_cannot_compile_refuses_to_start(self) -> None:
+        # #416, round 2 (Astra's and Sol's required changes 1 and 2, DeepSeek R2 F1 to F3): one line, status 1.
+        def published_with(change):
+            documents = copy.deepcopy(PUBLISHED.documents)
+            change(documents)
+            return lambda: projection.Published(documents)
+
+        def stop_row(documents):
+            return next(r for r in documents[projection.TABLE_FILE]["methods"] if r["name"] == "run.stop")
+
+        listing = {"code": "ok", "table_version": PUBLISHED.table_version,
+                   "methods": [{"name": r["name"], "implemented": True, "beta": r["beta"]} for r in PUBLISHED.rows]}
+        params = PUBLISHED.documents[projection.PARAMS_FILE]["$defs"]["params.run.stop"]["properties"]
+        cases = {
+            "name a list": lambda d: stop_row(d).update(name=["run.stop"]),
+            "name absent": lambda d: stop_row(d).pop("name"),
+            "pattern too large": lambda d: d[projection.PARAMS_FILE]["$defs"]["params.run.stop"]["properties"].update(
+                run_id={"type": "string", "pattern": "a{4294967296}"}),
+            "groups too deep": lambda d: d[projection.PARAMS_FILE]["$defs"]["params.run.stop"]["properties"].update(
+                run_id={"type": "string", "pattern": "(" * 1000 + "a" + ")" * 1000}),
+        }
+        self.assertIn("run_id", params)
+        for label, change in cases.items():
+            with self.subTest(case=label):
+                api, err = ScriptedAPI([{"method": "methods.list", "params": {}, "answer": listing}]), io.StringIO()
+                status = entry.main([], stdin=Untouchable(), stdout=Untouchable(), stderr=err,
+                                    check=lambda environ, api=api: api, published=published_with(change))
+                self.assertEqual((1, [("tools_unavailable", "published_invalid")]),
+                                 (status, [(e["code"], e["reason"]) for e in stderr_lines(err)]))
 
     def test_an_exit_or_an_interrupt_while_choosing_is_not_a_refusal(self) -> None:
         for exc in (SystemExit, KeyboardInterrupt):

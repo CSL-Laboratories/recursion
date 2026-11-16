@@ -33,7 +33,8 @@ class, ``[]`` or ``[^]`` (ECMA-262 reads ``[]]`` as a class that matches nothing
 class holding ``]``); a quantifier with nothing to repeat, or on another quantifier (``a++`` is Python's
 possessive quantifier and no ECMA-262 pattern; one lazy ``?`` after a quantifier is read the same); and a
 ``{`` that is not a whole quantifier ``{n}``, ``{n,}`` or ``{n,m}`` after something to repeat (Python reads
-``x{,3}`` as a quantifier, ECMA-262 as text).
+``x{,3}`` as a quantifier, ECMA-262 as text). A pattern Python cannot compile at all (a bound past what it
+can count, groups nested past its stack) is refused too; an exit or an interrupt goes on.
 """
 
 from __future__ import annotations
@@ -148,8 +149,8 @@ def ecma_pattern(pattern: str) -> re.Pattern:
         raise SchemaUnsupported(f"pattern {pattern!r}: an unterminated class")
     try:
         return re.compile("".join(out))
-    except re.error as exc:
-        raise SchemaUnsupported(f"pattern {pattern!r}: {exc}") from None
+    except (re.error, OverflowError, RecursionError) as exc:  # not BaseException: an exit or an interrupt goes on
+        raise SchemaUnsupported(f"pattern {pattern[:80]!r}: {type(exc).__name__}: {exc}") from None
 
 
 # -- schemas --------------------------------------------------------------------------------------------

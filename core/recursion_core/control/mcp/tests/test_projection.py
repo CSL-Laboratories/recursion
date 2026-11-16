@@ -163,6 +163,35 @@ class JoinTest(unittest.TestCase):
                 project(published, listing(published))
             self.assertEqual("published_invalid", caught.exception.reason)
 
+    def test_every_row_names_its_method(self) -> None:
+        # #416, round 2 (Astra's and Sol's required change 1, DeepSeek R2 F1 and F3): an unhashable name no longer
+        # raises a TypeError, and a missing, empty or numeric one no longer drops the row (the stop tool among them).
+        gone = object()
+        for value in ([], {}, ["run.stop"], None, 7, "", gone):
+            def change(rows, documents, value=value):
+                row = next(r for r in rows if r["name"] == "run.stop")
+                if value is gone:
+                    del row["name"]
+                else:
+                    row["name"] = value
+
+            with self.subTest(name="absent" if value is gone else value), self.assertRaises(ProjectionRefused) as caught:
+                with_rows(change)
+            self.assertEqual("published_invalid", caught.exception.reason)
+
+    def test_a_reference_that_is_not_a_string_is_refused(self) -> None:
+        # #416, round 2 (Astra's and Sol's required change 1): no AttributeError from .partition.
+        for value in (17, None, [], {"$ref": "#/$defs/x"}):
+            def change(rows, documents, value=value):
+                documents[projection.PARAMS_FILE]["$defs"]["params.run.stop"]["properties"]["run_id"] = {"$ref": value}
+
+            published = with_rows(change)
+            with self.subTest(ref=value), self.assertRaises(ProjectionRefused) as caught:
+                project(published, listing(published))
+            self.assertEqual("published_invalid", caught.exception.reason)
+            with self.subTest(ref=value, inline=True), self.assertRaises(SchemaUnsupported):
+                published.inline({"$ref": "methods.v1.json#/$defs/params.run.stop"})
+
     def test_a_name_the_table_does_not_have_is_not_a_tool(self) -> None:
         answer = listing(PUBLISHED, ())
         answer["methods"].append({"name": "widget.spin", "implemented": True, "beta": True})

@@ -194,6 +194,22 @@ class PublishedKeywordTest(unittest.TestCase):
                 self.assertIsNotNone(tools.ecma_pattern(pattern).search(value))
         self.assertIsNone(tools.ecma_pattern("^a{2,3}$").search("a"))
 
+    def test_a_pattern_python_cannot_compile_is_refused_and_an_interrupt_goes_on(self) -> None:
+        # #416, round 2 (Astra's and Sol's required change 2, DeepSeek R2 F2): SchemaUnsupported, through every door.
+        deep = "(" * 1000 + "a" + ")" * 1000
+        for pattern in ("a{4294967296}", "a{99999999999999999999}", "a{2,4294967296}", deep):
+            with self.subTest(pattern=pattern[:20]):
+                with self.assertRaises(SchemaUnsupported):
+                    tools.ecma_pattern(pattern)
+                with self.assertRaises(SchemaUnsupported):
+                    tools.require_supported({"type": "string", "pattern": pattern}, "x")
+                with self.assertRaises(SchemaUnsupported):
+                    check_arguments({"type": "string", "pattern": pattern}, "a")
+        for exc in (KeyboardInterrupt, SystemExit):
+            with self.subTest(raised=exc.__name__), mock.patch.object(tools.re, "compile", side_effect=exc):
+                with self.assertRaises(exc):
+                    tools.ecma_pattern("a")
+
     def test_bounds_do_not_apply_to_a_boolean_and_a_number_is_finite(self) -> None:
         # #416, round 1 (DeepSeek F3; the survivors of Astra's M06 and M12 and Sol's M12 and M13).
         either = {"type": ["boolean", "number"], "minimum": 2}

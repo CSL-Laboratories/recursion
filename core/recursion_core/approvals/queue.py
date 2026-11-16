@@ -27,10 +27,16 @@ and the object the method handlers and the engine drivers call:
   binding, so nothing can carry it out through the dead driver; deadlines that passed while the daemon was
   down are written. While a start runs no surface is offered anything: the start offers what no surface
   took to every surface subscribed then, once its worker runs, and nothing at all if it fails. A start that
-  raises before it lets the surfaces through (a failure, or an interruption anywhere up to that step) leaves
-  the queue not started: ``ready`` withdrawn, a worker it launched told to return and kept for ``stop`` to
-  join, and each new request offered to every surface at once, as before any start. One interrupted while it
-  offers the backlog leaves the queue started; what it had not offered stays unshown.
+  raises before it lets the surfaces through (a failure, or an interruption anywhere from the moment it holds
+  the surfaces back) lets them through all the same, so each new request is offered to every surface at once.
+  If it had published its own worker, that worker is withdrawn (``ready`` too) and kept for ``stop`` to join,
+  and the queue is left not started; if not, a worker an earlier start left running is left as it was, and so
+  is ``ready``. One interrupted while it offers the backlog leaves the queue started; what it had not offered
+  stays unshown. (A second interruption that lands inside that withdrawal itself is not covered.)
+* ``stop`` wakes and joins every worker a start launched and no stop has joined yet: the current one, one a
+  later start replaced, one an interrupted launch kept. Those workers share one wake signal, and a worker that
+  wakes to find the queue closing, or its generation gone, sets it again before it returns, so none takes the
+  signal another is waiting on.
 * ``open_in`` / ``answer_in`` run inside the dispatcher's transaction for approval.open and approval.answer;
   ``list_page`` serves approval.list (summaries only).
 * ``consume(...)`` carries an approved effect out once, against the private binding; every refusal is a
@@ -107,6 +113,7 @@ class ApprovalQueue:
         self._wake = threading.Event()
         self._closing = threading.Event()
         self._worker: threading.Thread | None = None
+        self._workers: list = []       # every worker a start launched and no stop has joined yet
         self._generation = None        # the running worker's token; a worker whose token is gone returns
         self._running = False          # started and not stopped: a surface that subscribes now is offered
         self._late = None              # while a start runs: (token, fn) of surfaces that subscribed during it
@@ -132,11 +139,12 @@ class ApprovalQueue:
         elif self._store is not context.store:
             raise RuntimeError("the approval queue is attached to another store")
         generation = object()
-        with self._lock:
-            # Held back until the worker runs: every surface subscribed now, and each one that subscribes while
-            # this start runs (subscribe_requested adds it), so no surface is offered anything during the start.
-            self._late = list(self._requested)
         try:
+            with self._lock:
+                # Held back until the worker runs: every surface subscribed now, and each one that subscribes while
+                # this start runs (subscribe_requested adds it), so no surface is offered anything during the
+                # start. Inside the guarded region, so a start interrupted even as this is taken lets them go.
+                self._late = list(self._requested)
             self.recover()
             worker = threading.Thread(target=self._run, args=(generation,), name="approvals-deadlines",
                                       daemon=True)
@@ -148,6 +156,7 @@ class ApprovalQueue:
                 self._closing.clear()
                 self._generation = generation
                 self._worker = worker
+                self._workers.append(worker)  # stop joins it, whatever start comes after
                 self.ready = True
             worker.start()
             # Recovery has retired what a dead driver left, and the worker runs: the surfaces are let through here,
@@ -157,10 +166,12 @@ class ApprovalQueue:
                 self._late = None
                 self._running = True
         except BaseException:
-            # Failed or interrupted anywhere above: nothing is offered to anybody, and this start's worker (the
-            # thread may have launched all the same, by an interruption that lands once it has) is withdrawn as
-            # stop withdraws it, in the same step: it can never publish ready, and it is kept for stop to join.
-            # The queue is left not started, so a request after this is offered to every surface at once.
+            # Failed or interrupted anywhere above: the surfaces are let through, so a request after this is
+            # offered to every surface at once. If this start published its worker (the thread may have launched
+            # all the same, by an interruption that lands once it has), that worker is withdrawn as stop withdraws
+            # it, in the same step: it can never publish ready, and it is kept for stop to join, and the queue is
+            # left not started. If it had not, a worker of an earlier start that still runs is not this start's
+            # to withdraw: it and ``ready`` are left as they were.
             with self._lock:
                 self._late = None
                 if self._generation is generation:
@@ -176,15 +187,26 @@ class ApprovalQueue:
         self._offer_backlog()
 
     def stop(self, context=None) -> None:
-        """Signal the worker and return only once it has joined. Interrupted, the worker is kept, and a
-        second ``stop`` joins it again. A worker whose thread never launched (its start failed) has nothing
-        to join and is let go; were it to launch late, its generation is gone and it returns at once."""
+        """Signal every worker and return only once each has joined: the current one, one a later start replaced
+        and one an interrupted launch kept (a start never joins one: it only publishes its own). Interrupted,
+        the workers not yet joined are kept, and a second ``stop`` joins them. A worker whose thread never
+        launched (its start failed) has nothing to join and is let go; were it to launch late, its generation is
+        gone and it returns at once."""
         self._withdraw()
-        worker = self._worker
-        if worker is not None:
+        while True:
+            with self._lock:
+                pending = list(self._workers)
+                if self._worker is not None and self._worker not in pending:
+                    pending.append(self._worker)
+            if not pending:
+                return
+            worker = pending[0]
             if worker.ident is not None or worker.is_alive():
                 worker.join()
-            self._worker = None
+            with self._lock:
+                self._workers = [kept for kept in self._workers if kept is not worker]
+                if self._worker is worker:
+                    self._worker = None
 
     def _withdraw(self) -> None:
         """Withdraw ``ready`` and signal the worker to return. ``ready`` and the closing signal change together
@@ -403,7 +425,10 @@ class ApprovalQueue:
     def _run(self, generation=None) -> None:
         """The deadline worker: sweep at each deadline; on a failure, withdraw ``ready``, pause, try again.
         It returns once the queue closes or its generation is no longer the queue's; a sweep it is in when that
-        happens is finished, and from then on it changes ``ready`` no more."""
+        happens is finished, and from then on it changes ``ready`` no more. The wake signal is shared with any
+        other worker still alive (one a later start replaced, or one an interrupted launch kept): a worker that
+        wakes to find the queue closing, or its generation gone, sets it again before it returns, so its own
+        clear never takes the wake another worker waits on, a stop's above all."""
         while not self._closing.is_set() and self._generation is generation:
             try:
                 with self._store.transaction() as tx:
@@ -411,7 +436,8 @@ class ApprovalQueue:
                 wait = None if deadline is None else max(0.0, deadline / 1000 - self._clock())
                 self._wake.wait(wait)
                 self._wake.clear()
-                if self._closing.is_set():
+                if self._closing.is_set() or self._generation is not generation:
+                    self._wake.set()  # passed on: the clear above may have taken another worker's wake
                     break
                 self.sweep()
                 with self._lock:

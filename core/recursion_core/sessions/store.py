@@ -180,6 +180,8 @@ def insert_delivery(tx, binding: dict, item_id) -> None:
     ``item_id`` is the item's id, or None for a turn's own input; a binding that names an item names this one.
     The binding is checked whole first (a turn's own input is checked with the placeholder item id that
     ``delivery.begin_input`` uses)."""
+    if not isinstance(binding, dict):
+        raise records.RecordError('', 'object')
     if 'item_id' in binding and binding['item_id'] != item_id:
         raise records.RecordError('/item_id', 'this_item')
     records.check_binding({**binding, 'item_id': 'qi-none' if item_id is None else item_id})

@@ -31,7 +31,8 @@ stands on lane DRIVER-CC's handle service, lane STOP's Stop and lane ROUTING's c
     ``tenant``, the ``principal`` that started it and its ``budget`` (lane QUOTA's admission). Returns when
     the input was handed to the engine; the run may be registered after that (the Stop below allows for it).
     Raises ``UnitRefused`` when the unit DEFINITELY did not start and nothing was written; any other exception
-    is an outcome nobody can vouch for.
+    is an outcome nobody can vouch for: the unit may run, and its run may be registered late or not at all, so
+    the session holds its Stop until a Stop answers ``stopped`` or ``ended`` (``service.py``).
 
     ``send(order: SendOrder)``: write ``order.text`` under ``order.delivery_id`` to the live worker of
     ``order.run_id``, incarnation ``order.worker_incarnation``, as a new turn or into the turn in progress
@@ -41,9 +42,10 @@ stands on lane DRIVER-CC's handle service, lane STOP's Stop and lane ROUTING's c
     is registered. A run that was registered once is answered (``stopped``, ``ended`` or ``pending``) from then
     on, never None. A Stop is safe to ask again (an emergency Stop never needs fresh state). Only a well-formed
     answer that confirms the Stop settles a session (``records.stop_confirmed``). None is taken as "nothing of
-    that run runs" only when, at the Stop's claim, no launch of the run was pending, in flight or returned: a
-    launch inside ``launch`` may register its run after the Stop looked, and one that returned may register it
-    late, so then the Stop is asked again (``service.py``).
+    that run runs" only when, at the Stop's claim, no launch of the run was pending, in flight, returned or
+    attempted with an unknown outcome: a launch inside ``launch`` may register its run after the Stop looked, and
+    one that returned or raised may have started a unit whose run is registered late, so then the Stop is asked
+    again (``service.py``).
 
 The engine side reports back through the service (``Sessions.accepted``, ``turn_finished``,
 ``engine_session_reported``); in this slice the tests make those calls.

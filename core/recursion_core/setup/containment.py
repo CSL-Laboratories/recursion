@@ -395,8 +395,9 @@ def _walk_above(folder: str, *, create: bool) -> str | None:
     """``folder`` (``<home>/.config``, normalized) as the kernel reaches it, each folder root's or the operator's
     and not writable by group or world unless sticky. Above the operator's home a link is followed only when
     only root can change it (the Liaison's ruling on Q21): root owns the link, the folder holding it is root's
-    and not writable by group or others (sticky or not), and the folders on the way to its target, and on to
-    the home, are root's and not writable by group or others, links among them held to the same rule, at most
+    and not writable by group or others (sticky or not), and the folders on the way to its target (a parent
+    its ``..`` climbs to, and ``/`` for an absolute one, included), and on to the home, are root's and not
+    writable by group or others, links among them held to the same rule, at most
     ``_MAX_LINKS`` in all. At or below the home no link is followed (the 3:46 PM ruling). None when a name on
     the way does not exist and ``create`` is False; with ``create``, a missing ``.config`` is made 0700, and
     nothing at or above the home is ever made."""
@@ -413,6 +414,8 @@ def _walk_above(folder: str, *, create: bool) -> str | None:
             continue
         if name == "..":
             current = os.path.dirname(current)  # current holds no link, so this is its parent
+            if through:  # a parent a link's target climbs to is on the way too (Sol's C1 on #428)
+                _root_alone(current, _lstat(current), "on the way through a link above your home,")
             continue
         candidate = os.path.join(current, name)
         info = _lstat(candidate)
@@ -433,6 +436,7 @@ def _walk_above(folder: str, *, create: bool) -> str | None:
                 _refuse("containment_unreadable", f"{candidate}: {type(exc).__name__}")
             if target.startswith("/"):
                 current = "/"
+                _root_alone("/", _lstat("/"), "on the way through a link above your home,")
             above[:0] = [part for part in target.split("/") if part]
             through = True
             continue

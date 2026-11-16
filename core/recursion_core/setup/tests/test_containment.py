@@ -204,18 +204,41 @@ class ContainmentTests(unittest.TestCase):
         self.addCleanup(server.close)
         # Bound through its folder's descriptor: a short name whatever the folder's path (an absolute temporary
         # path can pass AF_UNIX's limit), and the working folder left alone (an earlier test may have removed it).
-        # /proc/self/fd is Linux's; elsewhere (macOS) the file's own path is bound when it fits AF_UNIX's limit
-        # there, and the test is skipped when it does not (the Liaison's ruling on #382's like test).
-        held = os.open(self.folder, os.O_RDONLY | os.O_DIRECTORY)
+        self.bind_socket(server, self.folder, self.file)
+        self.assertIn("not a regular file", self.refused("containment_untrusted").detail)
+
+    def bind_socket(self, server, folder, path):
+        """Bind ``server`` at ``path`` (in ``folder``) through the folder's descriptor: a short name whatever the
+        folder's path (an absolute temporary path can pass AF_UNIX's limit), the working folder left alone.
+        /proc/self/fd is Linux's; elsewhere (macOS) ``path`` itself is bound when it fits AF_UNIX's limit there,
+        and the test is skipped when it does not (the Liaison's ruling on #382's like test)."""
+        held = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
         self.addCleanup(os.close, held)
         if os.path.isdir(f"/proc/self/fd/{held}"):
-            server.bind(f"/proc/self/fd/{held}/containment.json")
-        elif len(os.fsencode(self.file)) < 104:
-            server.bind(self.file)
+            server.bind(f"/proc/self/fd/{held}/{os.path.basename(path)}")
+        elif len(os.fsencode(path)) < 104:
+            server.bind(path)
         else:
-            self.skipTest(f"no /proc/self/fd here, and the file's path ({len(os.fsencode(self.file))} bytes) is past "
+            self.skipTest(f"no /proc/self/fd here, and the path ({len(os.fsencode(path))} bytes) is past "
                           "AF_UNIX's limit")
-        self.assertIn("not a regular file", self.refused("containment_untrusted").detail)
+
+    def test_the_socket_fixture_without_proc_self_fd_binds_the_path_or_skips(self):
+        # Sol's C2 on #428: the fixture's branch for a system without /proc/self/fd (macOS), never an error.
+        os.makedirs(self.folder, 0o700)
+        real_isdir = os.path.isdir
+        no_proc = mock.patch("os.path.isdir", side_effect=lambda p: not str(p).startswith("/proc/") and real_isdir(p))
+        server = socket.socket(socket.AF_UNIX)
+        self.addCleanup(server.close)
+        with no_proc, self.assertRaises(unittest.SkipTest):  # a path past the limit: skipped, with its reason
+            self.bind_socket(server, self.folder, os.path.join("/", "x" * 200, "containment.json"))
+        if len(os.fsencode(self.file)) >= 104:
+            self.skipTest("this run's folder is too long to bind by its own path")
+        with no_proc:
+            try:
+                self.bind_socket(server, self.folder, self.file)
+            except unittest.SkipTest as skipped:  # a short path must be bound, not skipped
+                self.fail(f"a short path was not bound by its own path: {skipped}")
+        self.assertTrue(stat.S_ISSOCK(os.lstat(self.file).st_mode))  # bound by its own path
 
     def _code(self):
         try:
@@ -297,11 +320,13 @@ class ContainmentTests(unittest.TestCase):
         return self.owners({path: 0 for path in paths})
 
     def silverblue(self):
-        """``sys`` (root's, 0755) holds ``home``, root's link to ``../var/home`` (root's, 0755), which holds the
-        operator's home ``u`` with the setting in it: Silverblue's ``/home`` -> ``var/home``."""
-        sysdir, var = os.path.join(self.base, "sys"), os.path.join(self.base, "var")
+        """``top`` (root's, 0755, as ``/`` is) holds ``sys`` and ``var`` (root's, 0755); ``sys`` holds ``home``, root's
+        link to ``../var/home`` (root's, 0755), which holds the operator's home ``u`` with the setting in it:
+        Silverblue's ``/home`` -> ``var/home``. The link's ``..`` climbs to ``top``, which must be root's alone too."""
+        top = os.path.join(self.base, "top")
+        sysdir, var = os.path.join(top, "sys"), os.path.join(top, "var")
         varhome = os.path.join(var, "home")
-        for folder in (sysdir, var, varhome):
+        for folder in (top, sysdir, var, varhome):
             os.mkdir(folder)
             os.chmod(folder, 0o755)
         user = os.path.join(varhome, "u")
@@ -312,7 +337,7 @@ class ContainmentTests(unittest.TestCase):
             handle.write(_doc(OUTSIDE))
         link = os.path.join(sysdir, "home")
         os.symlink("../var/home", link)
-        return os.path.join(link, "u"), link, [sysdir, link, var, varhome]
+        return os.path.join(link, "u"), link, [sysdir, link, var, varhome, top]
 
     def test_a_link_only_root_can_change_above_the_home_is_followed(self):
         home, link, owned = self.silverblue()
@@ -326,16 +351,19 @@ class ContainmentTests(unittest.TestCase):
 
     def test_a_link_above_the_home_that_anyone_but_root_could_change_is_refused(self):
         home, link, owned = self.silverblue()
-        sysdir, var, varhome = owned[0], owned[2], owned[3]
+        sysdir, var, varhome, top = owned[0], owned[2], owned[3], owned[4]
         cases = [
-            ("the operator's link", [sysdir, var, varhome], {},
+            ("the operator's link", [sysdir, var, varhome, top], {},
              f"{link} is a link above your home that root does not own"),
-            ("another user's link", [sysdir, var, varhome], {link: os.geteuid() + 1},
+            ("another user's link", [sysdir, var, varhome, top], {link: os.geteuid() + 1},
              f"{link} is a link above your home that root does not own"),
-            ("in the operator's folder", [link, var, varhome], {},
+            ("in the operator's folder", [link, var, varhome, top], {},
              f"{sysdir}, which holds the link {link}, is not root's"),
-            ("a target folder the operator owns", [sysdir, link, var], {},
+            ("a target folder the operator owns", [sysdir, link, var, top], {},
              f"{varhome}, on the way through a link above your home, is not root's"),
+            # Sol's C1 on #428: the parent the target's ".." climbs to is on the way, held to the same rule.
+            ("the parent the target climbs to, the operator's", [sysdir, link, var, varhome], {},
+             f"{top}, on the way through a link above your home, is not root's"),
         ]
         for name, as_root, others, said in cases:
             with self.subTest(case=name), self.owners({**{path: 0 for path in as_root}, **others}), self.passwd(home):
@@ -349,7 +377,9 @@ class ContainmentTests(unittest.TestCase):
                                    (var, 0o777,
                                     f"{var}, on the way through a link above your home, is not root's alone"),
                                    (varhome, 0o1777, f"{varhome}, on the way through a link above your home, is not "
-                                                     "root's alone")):
+                                                     "root's alone"),
+                                   (top, 0o1777, f"{top}, on the way through a link above your home, is not "
+                                                 "root's alone")):
             with self.subTest(folder=folder, mode=oct(mode)), self.roots(*owned), self.passwd(home):
                 os.chmod(folder, mode)
                 try:
@@ -357,7 +387,7 @@ class ContainmentTests(unittest.TestCase):
                 finally:
                     os.chmod(folder, 0o755)
                 self.assertTrue(error.detail.startswith(said), error.detail)
-        a_file = os.path.join(self.base, "a-file")
+        a_file = os.path.join(top, "a-file")
         with open(a_file, "wb"):
             pass
         os.symlink("../a-file", os.path.join(sysdir, "to-a-file"))
@@ -623,8 +653,9 @@ class ContainmentTests(unittest.TestCase):
         calls = []
         real_fsync, real_rename = os.fsync, os.rename
 
-        def fsync(fd):
-            calls.append(("fsync", os.readlink(f"/proc/self/fd/{fd}")))
+        def fsync(fd):  # named by fstat, not /proc/self/fd (Sol's C2 on #428: not every system has it)
+            info = os.fstat(fd)
+            calls.append(("fsync", "folder" if stat.S_ISDIR(info.st_mode) else "file", (info.st_dev, info.st_ino)))
             return real_fsync(fd)
 
         def rename(*args, **kwargs):
@@ -632,9 +663,10 @@ class ContainmentTests(unittest.TestCase):
             return real_rename(*args, **kwargs)
         with mock.patch("os.fsync", side_effect=fsync), mock.patch("os.rename", side_effect=rename):
             containment.write(INSIDE)
-        self.assertEqual([call[0] for call in calls], ["fsync", "rename", "fsync"])
-        self.assertTrue(os.path.basename(calls[0][1]).startswith(".containment.json."))
-        self.assertEqual((calls[1][1], calls[2][1]), ("containment.json", self.folder))
+        self.assertEqual([call[:2] for call in calls], [("fsync", "file"), ("rename", "containment.json"),
+                                                        ("fsync", "folder")])
+        written, folder = os.stat(self.file), os.stat(self.folder)
+        self.assertEqual((calls[0][2], calls[2][2]), ((written.st_dev, written.st_ino), (folder.st_dev, folder.st_ino)))
 
     # DeepSeek F3: a failed flush of the folder after the rename was a filesystem_error for a change that had
     # happened; it is a typed refusal that says so, and running the command again makes it durable.
@@ -642,7 +674,7 @@ class ContainmentTests(unittest.TestCase):
         real_fsync = os.fsync
 
         def fsync(fd):
-            if os.readlink(f"/proc/self/fd/{fd}") == self.folder:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):  # the folder
                 raise OSError(errno.EIO, "Input/output error")
             return real_fsync(fd)
         with mock.patch("os.fsync", side_effect=fsync):
@@ -652,11 +684,13 @@ class ContainmentTests(unittest.TestCase):
         flushed = []
 
         def record(fd):
-            flushed.append(os.readlink(f"/proc/self/fd/{fd}"))
+            info = os.fstat(fd)
+            flushed.append((info.st_dev, info.st_ino))
             return real_fsync(fd)
         with mock.patch("os.fsync", side_effect=record):
             self.assertEqual(containment.write(INSIDE), (containment.Containment(INSIDE, "file", self.file), False))
-        self.assertEqual(flushed, [self.folder])  # running it again flushes the folder, nothing else is written
+        folder = os.stat(self.folder)
+        self.assertEqual(flushed, [(folder.st_dev, folder.st_ino)])  # it flushes the folder, and writes nothing else
 
     # DeepSeek F1 (Medium): two writers at once both answered changed with their own value, one of them
     # untrue. Writers take turns on the folder's lock; the second reads what the first wrote.
@@ -761,7 +795,7 @@ class ContainmentTests(unittest.TestCase):
         real_fsync = os.fsync
 
         def fsync(fd):
-            if os.path.basename(os.readlink(f"/proc/self/fd/{fd}")).startswith(".containment.json."):
+            if stat.S_ISREG(os.fstat(fd).st_mode):  # the new file, the only regular file write() flushes
                 raise OSError(errno.ENOSPC, "No space left on device")
             return real_fsync(fd)
         with mock.patch("os.fsync", side_effect=fsync), \

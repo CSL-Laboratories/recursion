@@ -719,8 +719,19 @@ class RegistrationTest(unittest.TestCase):
             self.assertIn(sentence, text)
 
     def test_a_registrant_whose_parent_package_is_absent_is_skipped(self) -> None:
-        self.assertIsNone(importlib.util.find_spec('recursion_core.keys'), 'no keys lane is installed in this tree')
-        composed = H.compose()
+        """Whatever lanes this tree has, now or later. The keys package's absence is made for the test: where
+        anything asks whether that package, or anything below it, is there, it is told no, and whatever of it
+        is already imported is set aside for the test and put back after it. (It used to rely on no keys lane
+        being in the tree: the keys lane's own package made it fail.)"""
+        package = 'recursion_core.keys'
+        self.fake._set_aside(package)
+        find_spec = importlib.util.find_spec
+
+        def absent(name, parent=None):
+            return None if name == package or name.startswith(package + '.') else find_spec(name, parent)
+        with mock.patch.object(importlib.util, 'find_spec', absent):
+            self.assertIsNone(importlib.util.find_spec('recursion_core.keys'), 'the keys package is absent for this test')
+            composed = H.compose()
         self.assertEqual(composed.methods.registered(), ())
         self.assertNotIn('recursion_core.keys', sys.modules)
 

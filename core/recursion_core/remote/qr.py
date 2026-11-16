@@ -13,8 +13,9 @@ bytes. Longer input is refused (``QrTooLong``); nothing here falls back to a wea
 correction level. Level M restores about 15 per cent of damaged codewords.
 
 Text is encoded as UTF-8 with no ECI segment, so a reader takes bytes outside ASCII as ISO-8859-1; the
-pairing link is ASCII. A wrong argument (data that is not bytes or text, a mask, version, border or matrix
-out of range) is a ``ValueError`` or ``TypeError`` at once, never a symbol of something else.
+pairing link is ASCII. A wrong argument (data that is not bytes or text, a mask, version, degree, border or
+matrix out of range, a drawing of anything but a ``QrCode``) is a ``ValueError`` or ``TypeError`` at once,
+never a symbol of something else.
 
 ``encode(data)`` returns a ``QrCode``; ``render_text`` draws it with half-block characters for a terminal,
 ``render_svg`` as an SVG document for a page. Both are pure functions of the code.
@@ -82,9 +83,12 @@ def _gf_mul(a: int, b: int) -> int:
 
 
 def rs_generator(degree: int) -> list[int]:
-    """The generator polynomial (x - a^0)(x - a^1)...(x - a^(degree-1)), highest power first."""
-    if type(degree) is not int or degree < 1:
-        raise ValueError("a degree is a positive integer")
+    """The generator polynomial (x - a^0)(x - a^1)...(x - a^(degree-1)), highest power first.
+
+    ``degree`` is an integer from 1 to 255: GF(256) has 255 distinct roots, so a larger degree would repeat one.
+    """
+    if type(degree) is not int or not 1 <= degree <= 255:
+        raise ValueError("a degree is an integer from 1 to 255")
     poly = [1]
     for i in range(degree):
         product = [0] * (len(poly) + 1)
@@ -305,7 +309,8 @@ _FINDER_LIKE = ((True, False, True, True, True, False, True, False, False, False
 
 
 def penalty(modules: list[list[bool]] | tuple[tuple[bool, ...], ...]) -> int:
-    """The four penalty rules: runs of five or more, 2x2 blocks, finder-like patterns, dark balance.
+    """The four penalty rules: runs of five or more, 2x2 blocks, finder-like patterns, dark balance (10 for each
+    whole 5 per cent of the exact distance of the dark share from 50 per cent).
 
     ``modules`` is a square matrix of booleans, at least 2 by 2; anything else is a ``ValueError``.
     """
@@ -332,7 +337,8 @@ def penalty(modules: list[list[bool]] | tuple[tuple[bool, ...], ...]) -> int:
             if modules[r][c] == modules[r][c + 1] == modules[r + 1][c] == modules[r + 1][c + 1]:
                 score += 3
     dark = sum(sum(row) for row in modules)
-    score += 10 * (abs(dark * 100 // (size * size) - 50) // 5)
+    total = size * size
+    score += 10 * (abs(20 * dark - 10 * total) // total)  # whole 5-point steps of the exact distance from 50%
     return score
 
 
@@ -385,6 +391,8 @@ def render_text(code: QrCode, *, border: int = QUIET_ZONE, terminal_background: 
     Shown on the other background, a drawing is an inverted symbol, which not every reader accepts, so the
     caller names the terminal's background. ``border`` is an integer of 0 or more.
     """
+    if not isinstance(code, QrCode):
+        raise TypeError("render_text() draws a QrCode")
     if terminal_background not in ("dark", "light"):
         raise ValueError("terminal_background is 'dark' or 'light'")
     if type(border) is not int or border < 0:
@@ -408,6 +416,8 @@ def render_text(code: QrCode, *, border: int = QUIET_ZONE, terminal_background: 
 
 def render_svg(code: QrCode, *, border: int = QUIET_ZONE, module_px: int = 8) -> str:
     """The code as a small SVG document: a white square and one black square per dark module."""
+    if not isinstance(code, QrCode):
+        raise TypeError("render_svg() draws a QrCode")
     if type(border) is not int or border < 0 or type(module_px) is not int or module_px < 1:
         raise ValueError("border is an integer of 0 or more and module_px an integer of 1 or more")
     side = (code.size + 2 * border) * module_px

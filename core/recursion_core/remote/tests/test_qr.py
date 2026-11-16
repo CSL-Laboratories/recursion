@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 import string
 import unittest
+import xml.etree.ElementTree as ET
 
 from recursion_core.remote import pairing, qr
 from recursion_core.remote.pairing import pairing_link
@@ -185,7 +186,7 @@ def reference_penalty(modules) -> int:
     score += 3 * sum(1 for r in range(size - 1) for c in range(size - 1)
                      if rows[r][c] == rows[r][c + 1] == rows[r + 1][c] == rows[r + 1][c + 1])
     dark = sum(row.count("1") for row in rows)
-    return score + 10 * (abs(100 * dark // (size * size) - 50) // 5)
+    return score + 10 * (abs(20 * dark - 10 * size * size) // (size * size))
 
 
 class ReferenceValueTests(unittest.TestCase):
@@ -450,6 +451,114 @@ class DrawingTests(unittest.TestCase):
             qr.render_svg(code, module_px=1.5)  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
             qr.encode("x", mask=8)
+
+
+class PenaltyRegressionTests(unittest.TestCase):
+    """N4 counts whole 5-point steps of the EXACT distance from 50 per cent dark (Codex r1 R1 on #413, both reads;
+    the cases are the reviewers': Astra's stripe, its complement and a real symbol, Sol's 37/81 and 44/81)."""
+
+    STRIPE = [[r * 21 + c < 200 for c in range(21)] for r in range(21)]  # 200/441 dark: 45.35 per cent
+
+    def test_dark_balance_does_not_round_the_percentage_before_the_distance(self) -> None:
+        # No finder-like pattern here: N1 754, N2 1137, and N4 0 (under one whole step from half).
+        self.assertEqual(qr.penalty(self.STRIPE), 1891)
+
+    def test_dark_balance_is_the_same_for_a_matrix_and_its_complement(self) -> None:
+        self.assertEqual(qr.penalty(self.STRIPE), qr.penalty([[not v for v in row] for row in self.STRIPE]))
+
+    def test_dark_balance_of_a_real_symbol(self) -> None:
+        code = qr.encode(bytes.fromhex("3c31406963cbc28c1d3c3b696d6b"), mask=4)
+        self.assertEqual(sum(map(sum, code.modules)), 180)  # 40.8 per cent: one whole step from half, not two
+        self.assertEqual(qr.penalty(code.modules), 675)
+
+    def test_dark_balance_is_zero_within_one_step_on_both_sides_of_half(self) -> None:
+        # 37/81 and 44/81 dark; no run of five, no 2x2 block, and a 9-cell line holds no 11-cell pattern.
+        matrix = [[(r + c) % 2 == 0 for c in range(9)] for r in range(9)]
+        for k in (0, 2, 4, 6):
+            matrix[k][k] = False
+        self.assertEqual(sum(map(sum, matrix)), 37)
+        self.assertEqual(qr.penalty(matrix), 0)
+        self.assertEqual(qr.penalty([[not v for v in row] for row in matrix]), 0)
+
+
+class ReedSolomonDegreeTests(unittest.TestCase):
+    def test_a_degree_is_bounded_by_the_field(self) -> None:
+        # GF(256) has 255 distinct roots: degree 256 repeats one, 513 ran off the table with an IndexError
+        # (Codex Sol r1 R2; DeepSeek r2 N1).
+        self.assertEqual(len(qr.rs_generator(255)), 256)
+        for degree in (256, 513):
+            for name, call in (("generator", qr.rs_generator), ("remainder", lambda d: qr.rs_remainder([1], d))):
+                with self.subTest(degree=degree, function=name), self.assertRaises(ValueError):
+                    call(degree)
+
+
+class RenderingCoverageTests(unittest.TestCase):
+    """What a drawing must paint and say (Codex r1 on #413: Astra R2, Sol R3). Each test here fails on a single
+    change the earlier suite let pass: a black canvas, white modules, zero-width squares or image, a wrong
+    namespace, a boolean scale, set remainder bits, swapped Q and H format words."""
+
+    def svg(self, code: qr.QrCode, module_px: int = 3):
+        return ET.fromstring(qr.render_svg(code, module_px=module_px))
+
+    def test_svg_namespace_and_viewport(self) -> None:
+        code = qr.encode("pair me")
+        doc, side = self.svg(code), str((code.size + 8) * 3)
+        self.assertEqual(doc.tag, "{http://www.w3.org/2000/svg}svg")
+        self.assertEqual((doc.attrib["width"], doc.attrib["height"]), (side, side))
+        self.assertEqual(doc.attrib["viewBox"], f"0 0 {side} {side}")
+
+    def test_svg_has_a_white_canvas_and_black_modules_that_nothing_overrides(self) -> None:
+        for data in ("pair me", "x" * 415):
+            with self.subTest(length=len(data)):
+                code = qr.encode(data)
+                doc, side = self.svg(code), str((code.size + 8) * 3)
+                self.assertEqual(doc[0].tag, "{http://www.w3.org/2000/svg}rect")
+                self.assertEqual(doc[0].attrib, {"width": side, "height": side, "fill": "#fff"})
+                self.assertEqual(doc[1].tag, "{http://www.w3.org/2000/svg}g")
+                self.assertEqual(doc[1].attrib, {"fill": "#000"})
+                self.assertTrue(all("fill" not in square.attrib for square in doc[1]))
+
+    def test_svg_squares_have_the_requested_extent(self) -> None:
+        code = qr.encode("pair me")
+        squares = list(self.svg(code)[1])
+        self.assertEqual(len(squares), sum(map(sum, code.modules)))
+        for square in squares:
+            self.assertEqual((square.attrib["width"], square.attrib["height"]), ("3", "3"))
+
+    def test_svg_module_px_true_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            qr.render_svg(qr.encode(b"x"), module_px=True)
+
+    def test_remainder_bits_are_zero_before_masking(self) -> None:
+        for version in (2, 3, 4, 5, 6, 14, 15, 16):  # 7 remainder bits at 2 to 6, 3 at 14 to 16
+            with self.subTest(version=version):
+                code = qr.encode(b"x" * qr.byte_capacity(version), mask=0)
+                functions, bits, upward, col = function_map(version), [], True, code.size - 1
+                while col > 0:
+                    if col == 6:
+                        col -= 1
+                    for r in (range(code.size - 1, -1, -1) if upward else range(code.size)):
+                        for c in (col, col - 1):
+                            if not functions[r][c]:
+                                bits.append(code.modules[r][c] ^ ((r + c) % 2 == 0))  # mask 0 taken off
+                    col -= 2
+                    upward = not upward
+                count = len(bits) % 8
+                self.assertIn(count, (3, 7))
+                self.assertFalse(any(bits[-count:]), "the remainder bits are not zero")
+
+    def test_format_levels_q_and_h_have_their_published_bits(self) -> None:
+        self.assertEqual(f"{qr.format_bits('Q', 0):015b}", "011010101011111")
+        self.assertEqual(f"{qr.format_bits('H', 0):015b}", "001011010001001")
+
+    def test_a_drawing_of_anything_but_a_code_is_refused(self) -> None:
+        # DeepSeek r2 N3: these were an AttributeError from inside the renderer.
+        for bad in (None, "x", qr.encode("x").modules):
+            with self.subTest(code=type(bad).__name__):
+                with self.assertRaises(TypeError):
+                    qr.render_text(bad)  # type: ignore[arg-type]
+                with self.assertRaises(TypeError):
+                    qr.render_svg(bad)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

@@ -1,0 +1,229 @@
+{
+  "about": "What Python's str() gives for a JSON value (json.loads, then str), and the TUI's field() of it, at master_head. desktop/ui/js/sanitize.js pyStr and field give the same for every vector. 'lost' lists values whose difference JSON.parse has already dropped, so the desktop cannot show what Python shows; each names what the desktop shows and why.",
+  "master_head": "51d4ac2e8387bb7566620824ce7e6bdb6aaf9355",
+  "vectors": [
+    {
+      "name": "an integer",
+      "json": "2",
+      "str": "2",
+      "field": "2"
+    },
+    {
+      "name": "a negative integer",
+      "json": "-17",
+      "str": "-17",
+      "field": "-17"
+    },
+    {
+      "name": "a float with a fraction",
+      "json": "2.5",
+      "str": "2.5",
+      "field": "2.5"
+    },
+    {
+      "name": "a tenth",
+      "json": "0.1",
+      "str": "0.1",
+      "field": "0.1"
+    },
+    {
+      "name": "a small float in fixed form",
+      "json": "0.0001",
+      "str": "0.0001",
+      "field": "0.0001"
+    },
+    {
+      "name": "a smaller float in exponent form",
+      "json": "0.00001",
+      "str": "1e-05",
+      "field": "1e-05"
+    },
+    {
+      "name": "an exponent below ten, written by Python with two digits",
+      "json": "1e-7",
+      "str": "1e-07",
+      "field": "1e-07"
+    },
+    {
+      "name": "a large float in exponent form",
+      "json": "1e16",
+      "str": "1e+16",
+      "field": "1e+16"
+    },
+    {
+      "name": "a whole float past 2**53",
+      "json": "12345678901234567.0",
+      "str": "1.2345678901234568e+16",
+      "field": "1.2345678901234568e+16"
+    },
+    {
+      "name": "a large float with digits",
+      "json": "1.5e300",
+      "str": "1.5e+300",
+      "field": "1.5e+300"
+    },
+    {
+      "name": "a negative small float",
+      "json": "-2.5e-10",
+      "str": "-2.5e-10",
+      "field": "-2.5e-10"
+    },
+    {
+      "name": "a float in fixed form with many digits",
+      "json": "123456.789",
+      "str": "123456.789",
+      "field": "123456.789"
+    },
+    {
+      "name": "a float just under 1e16",
+      "json": "1234567890123456.7",
+      "str": "1234567890123456.8",
+      "field": "1234567890123456.8"
+    },
+    {
+      "name": "null, true and false inside a list",
+      "json": "[null, true, false]",
+      "str": "[None, True, False]",
+      "field": "[None, True, False]"
+    },
+    {
+      "name": "an empty list and an empty object",
+      "json": "[[], {}]",
+      "str": "[[], {}]",
+      "field": "[[], {}]"
+    },
+    {
+      "name": "a top-level text is itself",
+      "json": "\"plain text\"",
+      "str": "plain text",
+      "field": "plain text"
+    },
+    {
+      "name": "a newline inside a nested text (Devin's example)",
+      "json": "{\"why\": \"a\\nb\"}",
+      "str": "{'why': 'a\\nb'}",
+      "field": "{'why': 'a\\nb'}"
+    },
+    {
+      "name": "a single quote picks double quotes",
+      "json": "[\"it's\"]",
+      "str": "[\"it's\"]",
+      "field": "[\"it's\"]"
+    },
+    {
+      "name": "both quotes keep single quotes and escape the single",
+      "json": "[\"both ' and \\\"\"]",
+      "str": "['both \\' and \"']",
+      "field": "['both \\' and \"']"
+    },
+    {
+      "name": "a backslash is doubled",
+      "json": "[\"a\\\\b\"]",
+      "str": "['a\\\\b']",
+      "field": "['a\\\\b']"
+    },
+    {
+      "name": "tab and carriage return",
+      "json": "[\"t\\tc\\r\"]",
+      "str": "['t\\tc\\r']",
+      "field": "['t\\tc\\r']"
+    },
+    {
+      "name": "a control character as \\x",
+      "json": "[\"bell\\u0007 esc\\u001b del\\u007f\"]",
+      "str": "['bell\\x07 esc\\x1b del\\x7f']",
+      "field": "['bell\\x07 esc\\x1b del\\x7f']"
+    },
+    {
+      "name": "a C1 control and a no-break space",
+      "json": "[\"c1\\u0085 nbsp\\u00a0 shy\\u00ad\"]",
+      "str": "['c1\\x85 nbsp\\xa0 shy\\xad']",
+      "field": "['c1\\x85 nbsp\\xa0 shy\\xad']"
+    },
+    {
+      "name": "format and separator characters as \\u",
+      "json": "[\"zw\\u200b rlo\\u202e ls\\u2028 ps\\u2029\"]",
+      "str": "['zw\\u200b rlo\\u202e ls\\u2028 ps\\u2029']",
+      "field": "['zw\\u200b rlo\\u202e ls\\u2028 ps\\u2029']"
+    },
+    {
+      "name": "an unassigned code point as \\u",
+      "json": "[\"\\u0378\"]",
+      "str": "['\\u0378']",
+      "field": "['\\u0378']"
+    },
+    {
+      "name": "a private-use character as \\u",
+      "json": "[\"\\ue000\"]",
+      "str": "['\\ue000']",
+      "field": "['\\ue000']"
+    },
+    {
+      "name": "an astral private-use character as \\U",
+      "json": "[\"\\udb80\\udc00\"]",
+      "str": "['\\U000f0000']",
+      "field": "['\\U000f0000']"
+    },
+    {
+      "name": "a lone surrogate as \\u",
+      "json": "[\"\\ud800\"]",
+      "str": "['\\ud800']",
+      "field": "['\\ud800']"
+    },
+    {
+      "name": "printable text beyond ASCII is kept",
+      "json": "[\"caf\\u00e9 \\u4e2d \\ud83d\\ude00\"]",
+      "str": "['caf\u00e9 \u4e2d \ud83d\ude00']",
+      "field": "['caf\u00e9 \u4e2d \ud83d\ude00']"
+    },
+    {
+      "name": "a key with a single quote",
+      "json": "{\"it's\": 1}",
+      "str": "{\"it's\": 1}",
+      "field": "{\"it's\": 1}"
+    },
+    {
+      "name": "nested lists and objects",
+      "json": "{\"a\": [1, \"b\", {\"c\": null}], \"d\": 2.5}",
+      "str": "{'a': [1, 'b', {'c': None}], 'd': 2.5}",
+      "field": "{'a': [1, 'b', {'c': None}], 'd': 2.5}"
+    }
+  ],
+  "lost": [
+    {
+      "name": "a whole float reads as an integer",
+      "json": "2.0",
+      "python": "2.0",
+      "desktop": "2",
+      "why": "JSON.parse gives the number 2 for both 2 and 2.0; Python keeps 2.0 a float"
+    },
+    {
+      "name": "negative zero reads as zero",
+      "json": "-0.0",
+      "python": "-0.0",
+      "desktop": "0",
+      "why": "JSON.parse gives -0 for both -0 and -0.0; Python reads -0 as the integer 0 and -0.0 as a float"
+    },
+    {
+      "name": "a whole float in exponent form below 2**53 reads as an integer",
+      "json": "1e15",
+      "python": "1000000000000000.0",
+      "desktop": "1000000000000000",
+      "why": "JSON.parse gives the same number for 1e15 and 1000000000000000"
+    },
+    {
+      "name": "an integer past 2**53 has lost digits",
+      "json": "9007199254740993",
+      "python": "9007199254740993",
+      "desktop": "9007199254740992.0",
+      "why": "a JavaScript number holds no integer past 2**53 exactly; Python's int does"
+    },
+    {
+      "name": "an integer-like key moves to the front",
+      "json": "{\"b\": 1, \"1\": 2}",
+      "python": "{'b': 1, '1': 2}",
+      "desktop": "{'1': 2, 'b': 1}",
+      "why": "a JavaScript object lists integer-like keys first; Python's dict keeps the order of the text"
+    }
+  ]
+}

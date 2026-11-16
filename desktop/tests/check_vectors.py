@@ -1,7 +1,7 @@
 """The parity vectors the desktop's frontend is held to are true to the CLI's and the TUI's own code.
 
-fixtures/conditions.json, walks.json and sanitize.json are read here against ``tui.protocol`` and
-``tui.sanitize``; desktop/tests/js holds the desktop's JavaScript to the same files.
+fixtures/conditions.json, walks.json, sanitize.json and pystr.json are read here against ``tui.protocol``,
+``tui.sanitize`` and Python's own ``str()``; desktop/tests/js holds the desktop's JavaScript to the same files.
 """
 
 from __future__ import annotations
@@ -69,6 +69,36 @@ class SanitizeTest(unittest.TestCase):
             for shown in (vector["sanitize"], vector["field"]):
                 with self.subTest(vector["name"]):
                     self.assertFalse(any(sanitize._marked(ch) and ch != "\n" for ch in shown))
+
+
+class PyStrTest(unittest.TestCase):
+    """fixtures/pystr.json: what Python's str() and the TUI's field() give for a parsed JSON value.
+    desktop/tests/js/check_sanitize.mjs holds the desktop's pyStr and field to the same file."""
+
+    def test_each_value_reads_as_pythons_str_of_it(self) -> None:
+        for vector in load("pystr.json")["vectors"]:
+            with self.subTest(vector["name"]):
+                value = json.loads(vector["json"])
+                self.assertEqual(str(value), vector["str"])
+                self.assertEqual(sanitize.field(value), vector["field"])
+
+    def test_the_vectors_cover_what_python_writes_differently(self) -> None:
+        shown = "".join(v["str"] for v in load("pystr.json")["vectors"])
+        for piece in ["e-07", "e+16", "1e-05", "\\n", "\\t", "\\r", "\\\\", "\\x07", "\\x85", "\\u200b", "\\U000f0000",
+                      "[\"it's\"]", "\\'", "None", "True", "False"]:
+            with self.subTest(piece):
+                self.assertIn(piece, shown)
+
+    def test_what_json_parse_has_dropped_is_named_not_hidden(self) -> None:
+        # The desktop reads the answer with JSON.parse, which keeps no difference between 2 and 2.0 (and the rest
+        # below). Each such value is listed with what Python shows and what the desktop shows instead.
+        lost = load("pystr.json")["lost"]
+        self.assertLessEqual({"2.0", "-0.0"}, {v["json"] for v in lost})
+        for vector in lost:
+            with self.subTest(vector["name"]):
+                self.assertEqual(str(json.loads(vector["json"])), vector["python"])
+                self.assertNotEqual(vector["python"], vector["desktop"])
+                self.assertTrue(vector["why"])
 
 
 if __name__ == "__main__":

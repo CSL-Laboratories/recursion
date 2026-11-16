@@ -1,6 +1,7 @@
 // The window itself: ui/js/app.js run against a stand-in of ui/index.html. Loading the page starts the window
 // on the inert transport; a Stop is sent only after the operator confirms it, the confirmation shows in
-// whichever view asked, and a cancelled Stop is never sent; a start sends the CLI's request, and refused input
+// whichever view asked, its answer shows in the core bar whichever view is shown and stays until cleared,
+// and a cancelled Stop is never sent; a start sends the CLI's request, and refused input
 // sends nothing; Open, refresh and the Start view draw what the daemon answered. No browser: the stand-in
 // document is support.mjs's, and the transport records what would have gone to the proxy. Every control is
 // pressed only when it and everything around it is shown.
@@ -101,8 +102,10 @@ test("a run's Stop asks first, in view, and sends nothing; cancelling sends noth
   await press(doc, byId(doc, "stop-confirm-yes"));
   assert.equal(confirm.hidden, true);
   assert.deepEqual(sent(transport, "run.stop"), [{ method: "run.stop", params: { run_id: runId } }]);
-  // The answer was pending: shown as not confirmed, never as stopped.
-  assert.match(text(doc, "runs-conditions"), /UNCERTAIN stop not confirmed for run=/);
+  // The answer was pending: shown as not confirmed, never as stopped, in the core bar's Stop answers.
+  assert.ok(doc.isShown(byId(doc, "stop-answers")));
+  assert.match(text(doc, "stop-answers"), new RegExp(`Stop of run ${runId}, answer code pending`));
+  assert.match(text(doc, "stop-answers"), /UNCERTAIN stop not confirmed for run=/);
   await byId(doc, "stop-confirm-yes").click();
   assert.equal(sent(transport, "run.stop").length, 1, "a second confirm sends nothing more");
 });
@@ -136,8 +139,88 @@ test("a session's Stop asks first, in the sessions view, and sends that session'
   await press(doc, button(doc, "sessions-list", "Stop"));
   await press(doc, byId(doc, "stop-confirm-yes"));
   assert.equal(sent(transport, "session.stop").length, 1);
-  assert.match(text(doc, "sessions-conditions"), /UNCERTAIN session\.stop for session=ses-7f3a9c2e51d04b6a not confirmed/);
-  assert.match(text(doc, "sessions-conditions"), /reason=cgroup_populated: stop requested, not confirmed/);
+  assert.match(text(doc, "stop-answers"), /UNCERTAIN session\.stop for session=ses-7f3a9c2e51d04b6a not confirmed/);
+  assert.match(text(doc, "stop-answers"), /reason=cgroup_populated: stop requested, not confirmed/);
+});
+
+// Devin's thread on #390 (app.js confirmStop): the confirmation is shared by every view, so a Stop can be
+// confirmed, or its answer can arrive, while another view is shown. Its answer must show there and stay.
+const SESSION_STOP_ANSWER = /UNCERTAIN session\.stop for session=ses-7f3a9c2e51d04b6a not confirmed/;
+
+function shownAnswers(doc, pattern) {
+  return doc.root.find((n) => n.tagName === "LI" && pattern.test(n.textContent) && doc.isShown(n));
+}
+
+async function visitEveryView(doc, pattern) {
+  for (const view of ["sessions", "runs", "start", "approvals", "plugins", "sessions", "runs"]) {
+    await press(doc, nav(doc, view));
+    assert.equal(shownAnswers(doc, pattern).length, 1, `the Stop's answer is still shown in the ${view} view`);
+  }
+}
+
+test("a Stop confirmed from another view shows its answer in the view that is shown, and no view switch loses it", async () => {
+  const { doc, transport } = sessionsWindow();
+  await startWindow(doc, transport, makeActions(() => "desktop-check.1"));
+  await press(doc, nav(doc, "sessions"));
+  await press(doc, button(doc, "sessions-list", "Stop"));
+  await press(doc, nav(doc, "runs"));
+  assert.deepEqual(views(doc), ["runs"]);
+  await press(doc, byId(doc, "stop-confirm-yes"));
+  assert.equal(sent(transport, "session.stop").length, 1);
+  assert.equal(shownAnswers(doc, SESSION_STOP_ANSWER).length, 1, "the answer is shown in the runs view, where it arrived");
+  await visitEveryView(doc, SESSION_STOP_ANSWER);
+});
+
+test("a Stop whose answer arrives after the operator moved to another view still shows it", async () => {
+  const { doc, transport } = sessionsWindow();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const held = {
+    calls: transport.calls,
+    async call(method, params) {
+      if (method === "session.stop") await gate;
+      return transport.call(method, params);
+    },
+  };
+  await startWindow(doc, held, makeActions(() => "desktop-check.1"));
+  await press(doc, nav(doc, "sessions"));
+  await press(doc, button(doc, "sessions-list", "Stop"));
+  const confirming = press(doc, byId(doc, "stop-confirm-yes"));
+  await press(doc, nav(doc, "plugins"));
+  release();
+  await confirming;
+  assert.deepEqual(views(doc), ["plugins"]);
+  assert.equal(shownAnswers(doc, SESSION_STOP_ANSWER).length, 1, "the answer is shown in the plugins view");
+  await visitEveryView(doc, SESSION_STOP_ANSWER);
+});
+
+test("every Stop's answer is kept, newest first, until the operator clears them; a Stop not sent says so", async () => {
+  const list = recorded("c09-run-list-one-page.json");
+  const runId = list.runs[0].run_id;
+  const sessions = recorded("h27-session-list-ok.json");
+  // No recorded answer for this run's Stop: the call is refused here, so it was not sent.
+  const transport = replayTransport([
+    { method: "run.list", params: {}, answer: { code: "ok", runs: [list.runs[0]] } },
+    { method: "session.list", params: { state: "live" }, answer: sessions },
+    { method: "session.stop", params: { command_id: "desktop-check.1", session_id: sessions.sessions[0].session_id, scope: "self" },
+      answer: recorded("h13-session-stop-of-a-subtree-still-pending.json") },
+  ]);
+  const doc = windowDocument();
+  await startWindow(doc, transport, makeActions(() => "desktop-check.1"));
+  await press(doc, nav(doc, "sessions"));
+  await press(doc, button(doc, "sessions-list", "Stop"));
+  await press(doc, byId(doc, "stop-confirm-yes"));
+  await press(doc, nav(doc, "runs"));
+  await press(doc, button(doc, "runs-table", "Stop"));
+  await press(doc, byId(doc, "stop-confirm-yes"));
+  const entries = byId(doc, "stop-answers-list").children;
+  assert.equal(entries.length, 2);
+  assert.match(entries[0].textContent, new RegExp(`^Stop of run ${runId}: Not sent: no recorded exchange for run\\.stop\\.`));
+  assert.match(entries[1].textContent, SESSION_STOP_ANSWER);
+  await visitEveryView(doc, SESSION_STOP_ANSWER);
+  await press(doc, byId(doc, "stop-answers-clear"));
+  assert.equal(byId(doc, "stop-answers-list").children.length, 0);
+  assert.equal(byId(doc, "stop-answers").hidden, true);
 });
 
 test("opening a session draws what session.status answered, and a refresh of the view clears it", async () => {

@@ -174,7 +174,14 @@ export function sanitize(text) {
   return s.feed(text) + s.flush();
 }
 
-// What Python's str() gives for a JSON value, so a row reads exactly as the CLI's and the TUI's do.
+// What Python's str() gives for a JSON value, so a row reads exactly as the CLI's and the TUI's do. Held to
+// desktop/tests/fixtures/pystr.json, which is written by Python and checked against str() and the TUI's field().
+//
+// What JSON.parse has already dropped cannot be given back, and is not guessed at. A number written 2.0 or
+// 1e15 in the answer parses to the same value as 2 or 1000000000000000, so a whole number within 2**53 reads
+// as an integer, as Python reads the plain form, and Python's "2.0" is not shown; -0.0 reads as "0". An
+// integer past 2**53 has already lost digits and reads as Python's float of the same value. An object lists
+// integer-like keys first, where Python keeps the text's order. The fixture's "lost" list names each of these.
 export function pyStr(value) {
   if (typeof value === "string") return value;
   return pyRepr(value);
@@ -184,10 +191,49 @@ function pyRepr(value) {
   if (value === null || value === undefined) return "None";
   if (value === true) return "True";
   if (value === false) return "False";
-  if (typeof value === "number") return Number.isInteger(value) ? String(value) : String(value);
-  if (typeof value === "string") return "'" + value.replaceAll("\\", "\\\\").replaceAll("'", "\\'") + "'";
+  if (typeof value === "number") return Number.isSafeInteger(value) ? String(value) : pyFloat(value);
+  if (typeof value === "string") return pyText(value);
   if (Array.isArray(value)) return "[" + value.map(pyRepr).join(", ") + "]";
   return "{" + Object.entries(value).map(([k, v]) => pyRepr(k) + ": " + pyRepr(v)).join(", ") + "}";
+}
+
+// Python's repr() of a float: the shortest digits that read back as the same value (as JavaScript's own), in
+// fixed form from 1e-4 up to 1e16 with ".0" on a whole value, and otherwise as d.ddde-XX with a sign and at
+// least two exponent digits.
+function pyFloat(x) {
+  if (Number.isNaN(x)) return "nan";
+  if (x === Infinity) return "inf";
+  if (x === -Infinity) return "-inf";
+  const [mantissa, power] = x.toExponential().split("e");
+  const exp = Number(power);
+  if (exp < -4 || exp >= 16) return mantissa + "e" + (exp < 0 ? "-" : "+") + String(Math.abs(exp)).padStart(2, "0");
+  const sign = mantissa.startsWith("-") ? "-" : "";
+  const digits = mantissa.replace("-", "").replace(".", "");
+  if (exp < 0) return sign + "0." + "0".repeat(-exp - 1) + digits;
+  if (digits.length > exp + 1) return sign + digits.slice(0, exp + 1) + "." + digits.slice(exp + 1);
+  return sign + digits + "0".repeat(exp + 1 - digits.length) + ".0";
+}
+
+// Python's repr() of a str: double quotes only when the text holds a single quote and no double quote; a
+// backslash and the chosen quote escaped; tab, newline and carriage return by name; any other character
+// Python does not print (controls, format and private-use characters, surrogates, unassigned code points,
+// separators other than the space) as \xhh, \uhhhh or \Uhhhhhhhh.
+const PY_UNPRINTABLE = /^[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]$/u;
+const PY_NAMED = new Map([["\t", "\\t"], ["\n", "\\n"], ["\r", "\\r"]]);
+
+function pyText(text) {
+  const quote = text.includes("'") && !text.includes('"') ? '"' : "'";
+  let out = quote;
+  for (const ch of text) {
+    const o = ch.codePointAt(0);
+    if (ch === quote || ch === "\\") out += "\\" + ch;
+    else if (PY_NAMED.has(ch)) out += PY_NAMED.get(ch);
+    else if (ch === " " || !PY_UNPRINTABLE.test(ch)) out += ch;
+    else if (o <= 0xff) out += "\\x" + o.toString(16).padStart(2, "0");
+    else if (o <= 0xffff) out += "\\u" + o.toString(16).padStart(4, "0");
+    else out += "\\U" + o.toString(16).padStart(8, "0");
+  }
+  return out + quote;
 }
 
 // A value shown on one row: sanitized, and a newline shown as a marker.

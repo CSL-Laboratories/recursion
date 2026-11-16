@@ -47,6 +47,13 @@ body {
   margin: 0.4rem 0;
 }
 
+/* A Stop's answer stays in the same bar, whichever view is shown, until the operator clears it. */
+#stop-answers {
+  border: 1px solid var(--core-accent);
+  padding: 0.3rem 0.6rem;
+  margin: 0.4rem 0;
+}
+
 .beta {
   color: var(--core-warn);
   border: 1px solid var(--core-warn);

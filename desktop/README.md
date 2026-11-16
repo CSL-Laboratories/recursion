@@ -32,15 +32,19 @@ which builds nothing. Nothing here is a desktop build, and nothing claims to be 
   words (`ui/js/model.js` `conditionsFor`): a pending session Stop or interrupt names its session, why, and
   every run whose Stop result is not settled, with that run's state and reason.
 - **A Stop is confirmed first.** The window sends a run's or a session's Stop only after the operator
-  confirms it, in the core bar every view shares, and never one that was cancelled (`tests/js/check_app.mjs`
-  runs `ui/js/app.js` itself against a stand-in of `ui/index.html` and presses only what is shown).
+  confirms it, in the core bar every view shares, and never one that was cancelled. The Stop's answer, or
+  why it was not sent, is drawn in the same bar whichever view is shown when it arrives, and stays there,
+  newest first, until the operator clears it (`tests/js/check_app.mjs` runs `ui/js/app.js` itself against a
+  stand-in of `ui/index.html` and presses only what is shown).
 - **SPINE's answers.** `tests/fixtures/answers.json` holds the answers of SPINE's fixtures, copied unedited by
   `sync_spine.py`, and every view is checked drawing them.
 - **The core draws approvals.** The approval region is outside the themed workspace, uses only the core's
   styles, sits above everything, and draws only the `rendered` lines of the request `approval.open`
   answered. An answer is built only from that record's digest and revision, never from a summary.
 - **Engine text is text.** Every value is set as text, after the TUI's sanitizer rules, so escapes, bidi
-  controls and invisible characters show as markers.
+  controls and invisible characters show as markers. A value that is not text reads as Python's `str()` of
+  it (`tests/fixtures/pystr.json`, written by Python), except where `JSON.parse` has already dropped the
+  difference: a whole float such as `2.0` reads `2`, and the fixture's `lost` list names each such case.
 - **Closing stops nothing.** The window registers nothing to run when it closes, and its page policy allows
   no connection at all: in this build every call answers `control_api_unavailable`, not delivered.
 

@@ -147,6 +147,20 @@ class PageTest(unittest.TestCase):
         self.assertNotIn("section", parents)
         self.assertIn("hidden", attrs)
 
+    def test_the_stop_answers_are_the_cores_and_outside_every_view(self) -> None:
+        # A Stop's answer is drawn in the same bar, so a view's refresh cannot replace it and no view hides it.
+        tags = page().tags
+        found = [(a, parents) for t, a, parents in tags if a.get("id") == "stop-answers"]
+        self.assertEqual(len(found), 1)
+        attrs, parents = found[0]
+        self.assertIn("header", parents)
+        self.assertNotIn("main", parents)
+        self.assertNotIn("section", parents)
+        self.assertEqual(attrs.get("role"), "status")
+        for inner in ("stop-answers-list", "stop-answers-clear"):
+            with self.subTest(inner):
+                self.assertEqual([p for t, a, p in tags if a.get("id") == inner], [[*parents, "div"]])
+
     def test_the_window_says_it_is_beta_and_that_closing_stops_nothing(self) -> None:
         self.assertIn('class="beta"', HTML)
         self.assertIn("Closing this window stops nothing", HTML)

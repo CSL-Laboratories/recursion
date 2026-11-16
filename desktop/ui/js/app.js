@@ -7,6 +7,7 @@
 
 import { ActionError, HELD, makeActions } from "./actions.js";
 import { listAllRuns } from "./model.js";
+import { field } from "./sanitize.js";
 import { inertTransport, RefusedHere, send } from "./transport.js";
 import {
   renderApproval, renderApprovalList, renderConditions, renderPlugins, renderRoutes, renderRuns, renderSession,
@@ -53,8 +54,8 @@ export function startWindow(doc, transport, actions = makeActions()) {
   // sits in the core bar every view shares (index.html), so it shows whichever view asked.
   let pendingStop = null;
 
-  function askToStop(action, input, text, label, conditionsBox) {
-    pendingStop = { action, input, conditionsBox };
+  function askToStop(action, input, text, label) {
+    pendingStop = { action, input };
     $("stop-confirm-text").textContent = text;
     $("stop-confirm-yes").textContent = label;
     $("stop-confirm").hidden = false;
@@ -62,8 +63,7 @@ export function startWindow(doc, transport, actions = makeActions()) {
 
   function onRunAction(action, input) {
     if (action === "run.stop") {
-      askToStop(action, input, `Stop run ${input.run_id}? The run is asked to stop through the control API.`, "Stop the run",
-        "runs-conditions");
+      askToStop(action, input, `Stop run ${input.run_id}? The run is asked to stop through the control API.`, "Stop the run");
       return;
     }
     return ask(action, input).then((answer) => answer && renderConditions(doc, $("runs-conditions"), answer, "run.status"));
@@ -71,8 +71,8 @@ export function startWindow(doc, transport, actions = makeActions()) {
 
   function onSessionAction(action, input) {
     if (action === "session.stop") {
-      askToStop(action, input, `Stop session ${input.session_id}? It is asked to stop through the control API.`, "Stop the session",
-        "sessions-conditions");
+      askToStop(action, input, `Stop session ${input.session_id}? It is asked to stop through the control API.`,
+        "Stop the session");
       return;
     }
     return ask(action, input).then((answer) => {
@@ -82,14 +82,41 @@ export function startWindow(doc, transport, actions = makeActions()) {
     });
   }
 
+  // A Stop's answer is drawn in the bar its confirmation is in (#stop-answers), never in a view's own box. The confirmation
+  // is shared by every view, so a Stop can be confirmed, or its answer can arrive, while another view is
+  // shown; a view's box would then be hidden, and the view's next refresh would replace it. Each answer stays,
+  // newest first, until the operator clears them, and a Stop that was not sent says why there as well, so no
+  // Stop's outcome is dropped without a word.
+  function showStopAnswer(asked, answer) {
+    const what = asked.action === "run.stop" ? `run ${field(asked.input.run_id)}` : `session ${field(asked.input.session_id)}`;
+    const entry = doc.createElement("div");
+    entry.setAttribute("class", "stop-answer");
+    const head = doc.createElement("p");
+    const box = doc.createElement("div");
+    if (answer === null) head.textContent = `Stop of ${what}: ${$("status-line").textContent}`;
+    else {
+      const code = typeof answer === "object" && !Array.isArray(answer) ? answer.code : null;
+      head.textContent = `Stop of ${what}, answer code ${field(code)}`;
+      renderConditions(doc, box, answer, asked.action);
+    }
+    entry.appendChild(head);
+    entry.appendChild(box);
+    const list = $("stop-answers-list");
+    list.replaceChildren(entry, ...list.childNodes);
+    $("stop-answers").hidden = false;
+  }
+
+  function clearStopAnswers() {
+    $("stop-answers-list").replaceChildren();
+    $("stop-answers").hidden = true;
+  }
+
   async function confirmStop() {
     const asked = pendingStop;
     pendingStop = null;
     $("stop-confirm").hidden = true;
     if (asked === null) return;
-    const answer = await ask(asked.action, asked.input);
-    const method = asked.action === "run.stop" ? "run.stop" : "session.stop";
-    if (answer) renderConditions(doc, $(asked.conditionsBox), answer, method);
+    showStopAnswer(asked, await ask(asked.action, asked.input));
   }
 
   function cancelStop() {
@@ -159,6 +186,7 @@ export function startWindow(doc, transport, actions = makeActions()) {
   $("runs-refresh").addEventListener("click", refreshRuns);
   $("stop-confirm-yes").addEventListener("click", confirmStop);
   $("stop-confirm-no").addEventListener("click", cancelStop);
+  $("stop-answers-clear").addEventListener("click", clearStopAnswers);
   $("start-run").addEventListener("click", startRun);
   renderApproval(doc, $("core-approval"), null, { held: HELD["approval.answer"] });
   return show("runs");

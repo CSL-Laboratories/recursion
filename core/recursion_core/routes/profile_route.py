@@ -5,9 +5,11 @@ Every launch for these engines goes through ``subscription_routes.guard_then_spa
 inside Claude Code) before the launcher is ever called. The refusal comes back through the route
 contract as ``subscription_route_refused`` with the policy's typed cause in ``detail``.
 
-``allow_inside_operator_home`` is the containment setting (``setup/containment.py``), which the daemon
-reads once and passes here and to the launcher's route-home check; False, the default, is the stricter
-rule (a route home inside the operator's home refuses ``route_home_is_operator_home``).
+``allow_inside_operator_home`` carries lane INSTALL's containment setting as a bool (True for its value
+``inside_operator_home``). Nothing in this tree reads that setting, and the launcher keeps its own home: the
+caller that builds this adapter passes the bool. False, the default, refuses a route home inside the
+operator's home (``route_home_is_operator_home``); True accepts there only the engine's own home where the
+launcher keeps it (``subscription_routes.check_route``).
 
 The engines' own stdio protocols are not built here: ``driver`` is injected and owns the run once the
 guard has passed. No running core wires a driver yet.

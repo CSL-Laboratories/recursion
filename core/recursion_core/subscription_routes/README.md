@@ -41,9 +41,12 @@ What refuses:
   one selected API-key variable. Proxy and certificate names refuse here until the
   owners decide which ones these engines need;
 - stored-credential adoption: the child's HOME must be the route home, private, not the
-  operator's home nor, unless `allow_inside_operator_home` is True (the containment setting
-  `inside_operator_home`, `setup/containment.py`, which the daemon reads once), a folder inside
-  it, and must hold no Claude Code store entry (`.claude`, `.claude.json`,
+  operator's home, and not a folder inside it unless `allow_inside_operator_home` is True; then
+  only the engine's own home where the launcher keeps it, `<state>/recursion/homes/<engine>`
+  (`<state>` is the parent's `XDG_STATE_HOME`, else `~/.local/state`; no link below it). The
+  bool carries lane INSTALL's containment setting (`inside_operator_home` is True); nothing in
+  this tree reads that setting yet, so a caller passes the bool. The route home
+  must hold no Claude Code store entry (`.claude`, `.claude.json`,
   `.config/claude`) and no Pi, Hermes or OpenCode state or login entry (`.pi`, `.hermes`,
   `.local/share/opencode`, `.config/opencode`, `.codex/auth.json`). So the route home must
   hold none of these at spawn. Checked with `lstat` only; no credential file is opened.

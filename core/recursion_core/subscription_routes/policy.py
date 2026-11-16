@@ -292,9 +292,15 @@ def check_route(
     launcher script and installed package files must match that pin, and the decision is then beta.
     ``requirements`` and ``full_access_acknowledged`` are the configured inputs (``RouteRequirements``);
     full access lets a package link leave the install root and relaxes nothing else here.
-    ``allow_inside_operator_home`` is the containment setting (``setup/containment.py``, read once by the
-    daemon): True refuses only the operator's home itself as the route home, as ``setup.route_home.check``
-    does by default; False, the default here, also a route home inside it (``route_home_is_operator_home``).
+    ``allow_inside_operator_home`` carries lane INSTALL's containment setting as a bool (its value
+    ``inside_operator_home`` is True, ``outside_operator_home`` False). Nothing in this tree reads the setting
+    or translates it, and the launcher keeps its own home: a caller passes the bool. False, the default here,
+    refuses a route home inside the operator's home (``route_home_is_operator_home``, detail
+    ``inside_operator_home``). True accepts there only the engine's own home where the launcher keeps it,
+    ``<state>/recursion/homes/<engine>`` with ``<state>`` the parent's ``XDG_STATE_HOME`` when set, else
+    ``<operator home>/.local/state``, and no link below ``<state>``; any other folder inside the operator's
+    home refuses (detail ``not_the_engine_home``). The operator's home itself refuses whatever the setting
+    (detail ``operator_home``).
     """
 
     spec = ENGINES.get(engine) if isinstance(engine, str) else None
@@ -577,19 +583,23 @@ def _check_home(
         raise SubscriptionRouteRefused(engine, "route_home_missing")
     if env.get("HOME") != route_home:
         raise SubscriptionRouteRefused(engine, "child_home_not_route_home")
-    real = os.path.realpath(route_home)
+    try:
+        real = os.path.realpath(route_home)
+    except OSError:  # a real path that cannot be read is a home that cannot be checked
+        raise SubscriptionRouteRefused(engine, "route_home_missing") from None
     operator = {os.path.realpath(path) for path in _operator_homes(parent_env, operator_home)}
+    if real in operator:  # the operator's home itself, whatever the containment setting
+        raise SubscriptionRouteRefused(engine, "route_home_is_operator_home", "operator_home")
     # A home of "/" must not use the prefix "/": that matches every absolute path, so a
     # container whose passwd home is missing (HOME=/) could launch no route.
-    # The containment setting (setup/containment.py, read once by the daemon): True, inside_operator_home,
-    # refuses only the operator's home itself, as setup.route_home.check does by default; anything else
-    # (outside_operator_home, and the default here) also a route home inside it.
-    if allow_inside_operator_home is True:
-        refused = any(real == home for home in operator)
-    else:
-        refused = any(_operator_contains(real, home) for home in operator)
-    if refused:
-        raise SubscriptionRouteRefused(engine, "route_home_is_operator_home")
+    # Inside the operator's home the containment setting decides: anything but True refuses; True accepts
+    # only the engine's own home where the launcher keeps it, never another folder (the operator's .ssh, a
+    # login store), since the route home becomes the child's HOME.
+    if any(_operator_contains(real, home) for home in operator):
+        if allow_inside_operator_home is not True:
+            raise SubscriptionRouteRefused(engine, "route_home_is_operator_home", "inside_operator_home")
+        if real not in _engine_homes(engine, parent_env, operator):
+            raise SubscriptionRouteRefused(engine, "route_home_is_operator_home", "not_the_engine_home")
     try:
         st = os.lstat(route_home)
     except OSError:
@@ -690,6 +700,17 @@ def _operator_contains(real: str, home: str) -> bool:
         return real == "/"
     base = home.rstrip("/")
     return real == base or real.startswith(base + "/")
+
+
+def _engine_homes(engine: str, parent_env: Mapping[str, str] | None, operator: set[str]) -> set[str]:
+    """Where the launcher keeps ``engine``'s home: ``<state>/recursion/homes/<engine>``, ``<state>`` being the
+    parent's ``XDG_STATE_HOME`` when it is a non-empty string, else each operator home's ``.local/state``, as
+    ``daemon/__main__.py`` and ``daemon/launcher.py`` derive it. Only ``<state>`` is resolved, so a link at
+    ``recursion``, ``homes`` or the engine's folder gives the route home another real path, which refuses."""
+
+    state = (parent_env or {}).get("XDG_STATE_HOME")
+    bases = [state] if isinstance(state, str) and state else [os.path.join(home, ".local", "state") for home in operator]
+    return {os.path.join(os.path.realpath(base), "recursion", "homes", engine) for base in bases}
 
 
 def _within(real: str, root: str) -> bool:

@@ -909,9 +909,11 @@ class Hooks:
         except KeyError:
             raise KeyError(connection_id) from None
         except Exception:  # noqa: BLE001 - a source that fails has no credential to give
-            log.exception('the credential source failed for a connection; it is treated as having none')
+            # The source chooses the type name, and a newline in that name writes a second log line.
+            # The log therefore names neither the type nor the text.
+            log.error('the credential source failed for a connection; it is treated as having none')
             raise KeyError(connection_id) from None
-        if not isinstance(secret, str) or not secret:
+        if not isinstance(secret, str) or str.__len__(secret) == 0:
             raise KeyError(connection_id)
         return secret
 
@@ -931,13 +933,20 @@ class Hooks:
         chooser = self._single.get('drive_owner')
         if chooser is None:
             return None
+
+        def label():
+            try:
+                return getattr(ctx, 'run_id', '?')
+            except Exception:  # noqa: BLE001 - a label that raises is not the failure being logged
+                return '?'
+
         try:
             owner = chooser(ctx, request)
+            if owner is not None and not callable(getattr(owner, 'run', None)):
+                log.error('the drive owner answered something with no run(); today\'s path drives %s', label())
+                return None
         except Exception:  # noqa: BLE001
-            log.exception('the drive owner failed before accepting %s; today\'s path drives it', getattr(ctx, 'run_id', '?'))
-            return None
-        if owner is not None and not callable(getattr(owner, 'run', None)):
-            log.error('the drive owner answered something with no run(); today\'s path drives %s', getattr(ctx, 'run_id', '?'))
+            log.exception('the drive owner failed before accepting %s; today\'s path drives it', label())
             return None
         return owner
 
@@ -950,10 +959,16 @@ class Hooks:
         except Exception:  # noqa: BLE001
             log.exception('page_methods failed; the page may call nothing')
             return frozenset()
-        if not isinstance(listed, (set, frozenset)) or not all(isinstance(name, str) for name in listed):
-            log.error('page_methods answered %r; the page may call nothing', type(listed).__name__)
+        try:
+            # The genexpr is what a trace pauses on. Any failure while reading the names, including a
+            # set that changes during the walk, answers the empty set. The log does not repeat the text.
+            if not isinstance(listed, (set, frozenset)) or not all(type(name) is str for name in listed):
+                log.error('page_methods answered %r; the page may call nothing', type(listed).__name__)
+                return frozenset()
+            return frozenset(listed)
+        except Exception:  # noqa: BLE001 - a walk that fails lets the page call nothing
+            log.error('page_methods failed while reading the names; the page may call nothing')
             return frozenset()
-        return frozenset(listed)
 
     # -- S12 --------------------------------------------------------------------------------------
     def mark_changed(self, run_id) -> None:

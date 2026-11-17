@@ -359,6 +359,33 @@ class InstallTests(unittest.TestCase):
                 self.assertTrue(upgrade(self.roots, EXEC).changed)
                 self.assertEqual(_read(self.unit), render_unit(EXEC))
 
+    # DeepSeek's round 10 on #382 (23f76e4a), F10-1: UnsetEnvironment=NAME=value was read as dropping NAME whatever its
+    # value; systemd drops only that exact assignment, so Environment=HOME=/srv/other stays in force.
+    def test_an_unset_of_another_value_leaves_the_assignment_in_force(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        elsewhere = os.path.join(self.case, "elsewhere")
+        for service, said in ((f"Environment=HOME={elsewhere}\nUnsetEnvironment=HOME=/not-it\n", f"sets HOME={elsewhere}"),
+                              (f"Environment=XDG_STATE_HOME={elsewhere}\nUnsetEnvironment=XDG_STATE_HOME=/not-it\n",
+                               f"sets XDG_STATE_HOME={elsewhere}"),
+                              ("EnvironmentFile=/etc/recursion.env\nUnsetEnvironment=XDG_STATE_HOME=/x HOME=/y\n",
+                               "reads EnvironmentFile=/etc/recursion.env, which can set XDG_STATE_HOME")):
+            with self.subTest(service=service):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(f"[Service]\n{service}ExecStart=/old\n")
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    upgrade(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
+                self.assertIn(said, caught.exception.detail)
+                self.assertEqual(_tree(self.home), before)  # the unit as it was
+        for service in (f"Environment=HOME={elsewhere}\nUnsetEnvironment=HOME={elsewhere}\n",  # the exact assignment
+                        f"Environment=XDG_STATE_HOME={elsewhere}\nUnsetEnvironment=XDG_STATE_HOME={elsewhere}\n"):
+            with self.subTest(service=service):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(f"[Service]\n{service}ExecStart=/old\n")
+                self.assertTrue(upgrade(self.roots, EXEC).changed)
+                self.assertEqual(_read(self.unit), render_unit(EXEC))
+
     def test_upgrade_without_a_unit_is_refused(self) -> None:
         with self.assertRaises(InstallRefused) as caught:
             upgrade(self.roots, EXEC)

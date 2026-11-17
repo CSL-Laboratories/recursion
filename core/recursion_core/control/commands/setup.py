@@ -92,7 +92,9 @@ def default_roots() -> Roots:
 
     try:
         home = pwd.getpwuid(os.geteuid()).pw_dir
-    except KeyError:  # CPython raises KeyError for no entry and for a lookup that failed (NSS, LDAP) alike
+    # CPython 3.12 and 3.14 raise KeyError for no entry and for a lookup that failed (NSS, LDAP) alike
+    # (Modules/pwdmodule.c); an OSError, from another implementation, is held to the same refusal (DeepSeek F10-2).
+    except (KeyError, OSError):
         raise InstallRefused("home_unknown", "the password database gives no entry for this user (none, or "
                              "the lookup failed), so the user manager's %h is not known") from None
     return Roots(home=home)

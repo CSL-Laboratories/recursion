@@ -342,9 +342,10 @@ class CommandTests(unittest.TestCase):
     # The Liaison's item 4 (Nov 16): a password lookup that fails (CPython raises KeyError for no entry and for a
     # failed lookup alike) ended `recursiond install` with a traceback; it is the JSON refusal home_unknown.
     def test_a_password_lookup_that_fails_is_a_json_refusal(self):
-        failed = KeyError(f"getpwuid(): uid not found: {os.geteuid()}")
-        for action in setup.NAMES:
-            with self.subTest(action=action):
+        # DeepSeek F10-2 on #382: an OSError from the lookup is held to the same refusal (CPython raises KeyError).
+        failures = (KeyError(f"getpwuid(): uid not found: {os.geteuid()}"), OSError(5, "Input/output error"))
+        for failed, action in ((failed, action) for failed in failures for action in setup.NAMES):
+            with self.subTest(action=action, failed=type(failed).__name__):
                 out = io.StringIO()
                 with mock.patch.object(setup.sys, "platform", "linux"), mock.patch("pwd.getpwuid", side_effect=failed), \
                         mock.patch.object(setup, "run") as run:

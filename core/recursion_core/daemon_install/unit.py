@@ -104,7 +104,8 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
     and the last ``XDG_STATE_HOME`` counts; a value naming ``home``'s ``.local/state`` (``%h`` is
     ``home``) is this unit's own. ``EnvironmentFile=`` can set it (its file is not read here), and
     ``PassEnvironment=XDG_STATE_HOME`` gives the daemon the user manager's own value; ``UnsetEnvironment``
-    naming it leaves the default, under ``$HOME``: the daemon's default is ``Path.home()``, which reads
+    naming it leaves the default (a ``NAME=value`` there drops only that exact assignment, as systemd
+    drops it), under ``$HOME``: the daemon's default is ``Path.home()``, which reads
     ``HOME``, so a unit's own ``HOME`` (or an ``EnvironmentFile``, which can set it) moves the state too,
     unless it names ``home`` or ``UnsetEnvironment`` drops it. A byte order mark before the first line is
     skipped, as systemd skips it, and a value with a NUL byte names no folder. A unit that cannot be read
@@ -122,7 +123,8 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
     assigned: dict[str, str] = {}
     files: list[str] = []
     passed: set[str] = set()
-    unset: set[str] = set()
+    unset: set[str] = set()  # names UnsetEnvironment drops whatever their value
+    unset_pairs: set[str] = set()  # NAME=value assignments it drops, only those exactly
     lines = text.splitlines()
     i = 0
     while i < len(lines):
@@ -157,8 +159,10 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
                     assigned[name] = setting
         elif key == "PassEnvironment":  # an empty one drops those before it
             passed = passed | set(words) if words else set()
-        else:  # UnsetEnvironment; an empty one drops those before it
-            unset = unset | {word.partition("=")[0] for word in words} if words else set()
+        else:  # UnsetEnvironment: a name drops the variable, NAME=value only that exact assignment (systemd.exec(5);
+            # DeepSeek F10-1 on #382); an empty one drops those before it
+            unset = unset | {word for word in words if "=" not in word} if words else set()
+            unset_pairs = unset_pairs | {word for word in words if "=" in word} if words else set()
     # UnsetEnvironment is applied after Environment, EnvironmentFile and PassEnvironment.
     if "XDG_STATE_HOME" not in unset:
         if files:
@@ -166,7 +170,7 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
         if "XDG_STATE_HOME" in passed:
             return "passes the user manager's own XDG_STATE_HOME to the daemon (PassEnvironment)"
         value = assigned.get("XDG_STATE_HOME")
-        if value is not None:
+        if value is not None and f"XDG_STATE_HOME={value}" not in unset_pairs:
             if _names(value, os.path.join(home, ".local", "state"), home):
                 return None
             return f"sets XDG_STATE_HOME={value}"
@@ -176,7 +180,7 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
         if files:
             return f"reads EnvironmentFile={files[0]}, which can set HOME"
         value = assigned.get("HOME")
-        if value is not None and not _names(value, home, home):
+        if value is not None and f"HOME={value}" not in unset_pairs and not _names(value, home, home):
             return f"sets HOME={value}, so the daemon's default state folder is under it"
     return None
 

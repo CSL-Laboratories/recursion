@@ -187,7 +187,7 @@ _CARRIED_ONLY_NAMES = frozenset({"CLAUDE_CODE_CLIENT_CERT"})
 _PERSPECTIVE = re.compile(r"^/(?:proc|dev/fd|dev/std(?:in|out|err))(?:/|$)")
 _PROXY_URL = re.compile(
     r"^(?:(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*)://)?(?P<userinfo>[^@/]*@)?"
-    r"(?P<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::(?P<port>[0-9]{1,5}))?/?$"
+    r"(?P<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::(?P<port>[0-9]{1,5}))?/?\Z"
 )
 # A route base URL: http(s)://host[:port][/path]. No user name or password, no query, no fragment.
 _BASE_URL = re.compile(
@@ -401,7 +401,8 @@ def build_child_env(
             name, value = pair
         except (TypeError, ValueError):
             raise EnvRefused(None, "override_malformed") from None
-        if not isinstance(name, str) or not isinstance(value, str) or not name or "=" in name or "\0" in name + value:
+        if (not isinstance(name, str) or not isinstance(value, str) or not name or "=" in name
+                or "\0" in name + value or not name.isprintable()):
             raise EnvRefused(None, "override_malformed")
         if (_DENIED.search(name) or name in _OVERRIDE_DENIED_NAMES or name in profile.scrub
                 or name in profile.passthrough or name in ("HOME", "PATH")):
@@ -425,7 +426,12 @@ def build_child_env(
         if name not in TEMP_NAMES and (not isinstance(value, str) or (name not in NO_PROXY_NAMES and "\0" in value)):
             raise EnvRefused(name, "value_malformed")
     for name in [name for name in env if name not in ("PATH", *TEMP_NAMES, *NO_PROXY_NAMES)]:
-        cause = _unsafe_value(name, env[name]) if env[name] else None  # empty: no path or URL to check
+        # An empty value has no path or URL to check, except CLAUDE_CODE_CERT_STORE: the contract is
+        # a comma list of bundled or system, so an explicit empty selector is cert_store_malformed.
+        if env[name] or name == "CLAUDE_CODE_CERT_STORE":
+            cause = _unsafe_value(name, env[name])
+        else:
+            cause = None
         if cause is not None:
             raise EnvRefused(name, cause)
     if "PATH" in env and (cause := _unsafe_path(env["PATH"])) is not None:
@@ -703,7 +709,10 @@ def _resolve(path: str) -> tuple[str | None, bool, str | None]:
             return None, False, "value_link_loop"
         if st.st_uid not in (0, euid) or not _owned_chain(current):
             return None, False, "value_chain_unsafe"
-        target = os.readlink(candidate)
+        try:
+            target = os.readlink(candidate)
+        except OSError:
+            return None, False, "value_unreadable"
         if os.path.isabs(target):
             if _PERSPECTIVE.match(target):
                 return None, False, "value_perspective"
@@ -718,7 +727,12 @@ def _unsafe_file(path: str) -> str | None:
         return cause
     if missing:  # harmless only where no one else can create it
         return None if _owned_chain(_existing_ancestor(real)) else "value_missing"
-    st = os.stat(real)
+    try:
+        st = os.stat(real)
+    except OSError:
+        # The file was removed or became unreadable after resolution. The refusal names the
+        # variable, never the path the OSError would have carried.
+        return "value_unreadable"
     euid = _posix_euid()
     if euid is None:
         return "owner_check_unsupported"
@@ -735,7 +749,11 @@ def _unsafe_dir(path: str) -> str | None:
         return cause
     if missing:
         return None if _owned_chain(_existing_ancestor(real)) else "value_missing"
-    if not stat.S_ISDIR(os.stat(real).st_mode):
+    try:
+        is_dir = stat.S_ISDIR(os.stat(real).st_mode)
+    except OSError:
+        return "value_unreadable"
+    if not is_dir:
         return "value_dir_unsafe"
     return None if _owned_chain(real) else "value_chain_unsafe"
 
@@ -754,7 +772,10 @@ def _unsafe_path(value: str) -> str | None:
             return cause
     names = PATH_TOOLS
     if names is None:
-        names = sorted({item for entry in entries if os.path.isdir(entry) for item in os.listdir(entry)})
+        try:
+            names = sorted({item for entry in entries if os.path.isdir(entry) for item in os.listdir(entry)})
+        except OSError:
+            return "value_unreadable"
     for name in names:
         located = shutil.which(name, path=value)
         if located is not None and (cause := _unsafe_file(located)) is not None:

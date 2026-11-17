@@ -211,7 +211,8 @@ class ChildRoute:
     Anthropic-compatible base, if it has one. ``provider_switches`` are the cloud-provider switches the user
     picked, by name.
 
-    The next two matter on a ``subscription`` route with a ``base_url`` and nowhere else. ``trusted_base_urls``
+    The next two change trust only on a ``subscription`` route with a ``base_url``; a malformed
+    value refuses in every mode. ``trusted_base_urls``
     are the origins (``scheme://host[:port]``) the user already agreed to send their subscription sign-in to;
     the driver keeps that list and fills it in, this module only compares. ``full_access_acknowledged`` says
     this run uses the named full-access profile and the user acknowledged it for this run (PRODUCT.md 055cc7a5

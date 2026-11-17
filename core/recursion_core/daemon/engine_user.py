@@ -85,8 +85,9 @@ def _runtime_path_present(path: Path) -> bool:
 
 
 def refuse_session_launch(argv):
-    """Refuse argv that would open a PAM/logind session (e.g. `su -`, `runuser -l`).
+    """Refuse argv whose executable is a known session launcher (su, runuser -l, ...) or systemd-run with a PAM property.
 
+    Wrappers such as env are not inspected: the check uses the base name of argv[0] only, so ``env su -`` is not a session launcher here.
     For the later cross-uid engine spawn (B7, CSL-734), not for same-uid operator runs.
     """
     if not argv or not all(isinstance(a, str) for a in argv):
@@ -179,7 +180,7 @@ SESSION_BUS_NAMES = ('DBUS_SESSION_BUS_ADDRESS', 'DBUS_STARTER_ADDRESS', 'DBUS_S
 
 
 def signin_without_session_bus(engine_env, uid, runtime_root=Path('/run/user')):
-    """Offline B9 check: the engine env reaches no session bus and no user manager.
+    """Offline B9 check: the engine env names no session bus and no bus socket exists; the user-manager check is check_engine_no_user_manager.
 
     It never opens a credential store and never reports sign-in success: the verdict
     is at best `pending`, because only a founder-attended signed-in run of each engine

@@ -361,6 +361,21 @@ def _collect(submitted: list, done: dict) -> None:
             continue
 
 
+def _publish(path: Path, text: str) -> None:
+    """Write ``text`` to a temporary name, then rename it onto ``path``.
+
+    A short write stays on the temporary name. The final name appears only with the full text. The
+    temporary name does not end in ``.json``.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
 def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements: int = 2, label: str = "dev",
         seed: int = 20261126, jobs: int = 1, out_dir: Path = DEFAULT_OUT, artifacts: Path | None = None,
         tmp_base: Path = scratch_mod.DEFAULT_TMP_BASE, xdg_base: Path = scratch_mod.DEFAULT_XDG_BASE,
@@ -368,6 +383,9 @@ def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements:
     attempts = attempts if attempts is not None else k
     check_plan(suite, arms, k=k, attempts=attempts, replacements=replacements, label=label, artifacts=artifacts,
                seed=seed)
+    names = [arm.name for arm in arms]
+    if len(names) != len(set(names)):
+        raise RunRefused(f"arm names must be unique, got {names}")
     if suite.split == "held_out" and artifacts is not None:
         heldout.check_path(artifacts, must_exist=False)  # held-out diffs and logs stay out of the repository too
     runner = {"version": __version__, "sha256": runner_sha256()}
@@ -435,10 +453,18 @@ def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements:
     planned_jobs = schedule(task_ids, [arm.name for arm, _ in ready], attempts, seed)
     done: dict = {}
     submitted: list = []
+
+    def attempt_and_keep(ctx, arm, task, index, **kwargs):
+        # The next attempt can kill this process as soon as this function returns, so the trial is
+        # on disk before then. The journal name is not ``.json``; the final record is published later.
+        trial = run_attempt(ctx, arm, task, index, **kwargs)
+        _publish(Path(out_dir) / suite.id / f"{trial['trial_id']}.journal", record_mod.dumps(trial))
+        return trial
+
     executor = ThreadPoolExecutor(max_workers=max(1, jobs))
     try:
         for job in planned_jobs:
-            submitted.append((job, executor.submit(run_attempt, contexts[job[0]], by_arm[job[0]],
+            submitted.append((job, executor.submit(attempt_and_keep, contexts[job[0]], by_arm[job[0]],
                                                    suite.task(job[1]), job[2])))
         for job, future in submitted:
             done[job] = future.result()
@@ -455,8 +481,8 @@ def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements:
                 index = next_index[key]
                 next_index[key] += 1
                 job = (arm_name, task_id, index)
-                future = executor.submit(run_attempt, contexts[arm_name], by_arm[arm_name], suite.task(task_id), index,
-                                         planned=False, replacement_for=failed["trial_id"])
+                future = executor.submit(attempt_and_keep, contexts[arm_name], by_arm[arm_name], suite.task(task_id),
+                                         index, planned=False, replacement_for=failed["trial_id"])
                 batch.append((job, future))
                 submitted.append((job, future))
             pending = []
@@ -485,7 +511,7 @@ def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements:
         target = Path(out_dir) / suite.id
         target.mkdir(parents=True, exist_ok=True)
         path = target / f"{record['record_id']}.json"
-        path.write_text(record_mod.dumps(record), encoding="utf-8")
+        _publish(path, record_mod.dumps(record))
         result.records[arm_name] = path
         log(f"record: {path}")
     return result
@@ -590,6 +616,8 @@ def main(argv=None) -> int:
         return 2
     if outcome.interrupted:
         return 130
+    if outcome.refused and not outcome.records:
+        return 2
     return 3 if outcome.refused else 0
 
 

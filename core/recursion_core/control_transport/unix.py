@@ -45,6 +45,9 @@ PeerCredGetter = Callable[[socket.socket], PeerCred]
 
 DEFAULT_SOCKET_NAME = "control.sock"
 MAX_CONNECTIONS = 16
+# How many of the latest refusal reasons ``UnixControlServer.refused`` keeps (sweep s7 D09: every refused peer
+# was appended and nothing was ever dropped). A diagnostic, not a count of refusals.
+REFUSED_KEPT = 128
 # Whole-frame deadline: each request must arrive complete within this long of the server
 # being ready for it (connect or previous reply), however the bytes are spaced.
 IDLE_TIMEOUT_S = 30.0
@@ -264,8 +267,12 @@ class UnixControlServer:
             # A cap that cannot carry the server's own fallback reply is refused before startup (sweep s7 D19:
             # at a cap of 32 the 50-byte fallback was written anyway).
             raise ValueError(f"max_frame_bytes must be an int of at least {_MIN_FRAME_BYTES}")
-        if max_connections < 1:
-            raise ValueError("max_connections must be positive")
+        # Counts are exact ints (sweep s7 D08: 1.5, NaN and infinity passed, and a 1.5 semaphore granted eight
+        # slots); a bool is not a count.
+        if type(max_connections) is not int or max_connections < 1:
+            raise ValueError("max_connections must be a positive int")
+        if type(reserved_connections) is not int:
+            raise ValueError("reserved_connections must be an int")
         if reserved_connections < 0 or (reserved_connections and priority is None):
             raise ValueError("reserved_connections needs a priority test and cannot be negative")
         self.directory = directory
@@ -379,6 +386,8 @@ class UnixControlServer:
     def _refuse(self, reason: str) -> None:
         with self._lock:
             self.refused.append(reason)
+            if len(self.refused) > REFUSED_KEPT:
+                del self.refused[:-REFUSED_KEPT]   # the oldest go; the list stays a list for its readers
 
     def _accept_loop(self) -> None:
         sock = self._sock

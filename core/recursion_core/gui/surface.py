@@ -32,16 +32,27 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import stat
 from collections.abc import Mapping
 from html import escape
+from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, quote
 
 from .client import ACTIONS, READS, ControlClient, ControlError
 from .inventory import BARS, SIGN_IN_REJECTED, assess, coverage_gaps, project
-from .layouts import load_user_layout
+from .layouts import (
+    MAX_BYTES as _LAYOUT_MAX_BYTES,
+    LayoutRefused,
+    load_user_layout,
+    read_layout,
+    user_layout_path,
+)
 from .panels import PAPER_BOOK, filter_venue_rows, panel_registry
-from .themes import active_theme_css
+from .themes import (
+    MAX_THEME_FILES, _FILENAME, _load_theme, _trusted_dir, active_theme_css, gui_config_dir,
+)
 
 __all__ = ["Application", "withhold_venue_data"]
 
@@ -51,6 +62,7 @@ __all__ = ["Application", "withhold_venue_data"]
 # sheet still has one min-width: (the shared 24px target on a, button and input).
 # Theme variables have no fallback, so an unset token leaves that declaration unused.
 # Visibility, interventions, and the core chrome name canvas colours, never --theme-*.
+# The appearance picker is core chrome as well: canvas, outside the themed workspace.
 _CSS = ("body{font:16px/1.5 system-ui,sans-serif;margin:0 auto;max-width:72rem;padding:0 1rem}"
         ".skip{position:absolute;left:-999px}.skip:focus{left:1rem;top:1rem;background:#fff;padding:.5rem}"
         "a,button,input{min-height:24px;min-width:24px}button{padding:.25rem .75rem}"
@@ -81,7 +93,8 @@ _CSS = ("body{font:16px/1.5 system-ui,sans-serif;margin:0 auto;max-width:72rem;p
         '[data-theme-scope] section[aria-labelledby="actions-h"] *'
         "{color:canvastext;background:canvas}"
         'header,footer,nav,#core-approval,section[aria-labelledby="stop-h"]'
-        "{color:canvastext;background:canvas}")
+        "{color:canvastext;background:canvas}"
+        "#core-appearance{color:canvastext;background:canvas}")
 _CSS_HASH = base64.b64encode(hashlib.sha256(_CSS.encode()).digest()).decode()
 
 
@@ -104,6 +117,20 @@ _STOP = ('<section aria-labelledby="stop-h"><h2 id="stop-h">Stop a run</h2>'
          '<p><input type="checkbox" id="confirm-stop" name="confirm" value="explicit" required>'
          '<label for="confirm-stop">I confirm stopping this run</label></p>'
          '<button type="submit">Request stop</button></form></section>')
+# Fixed markup, outside <main data-theme-scope>. A loaded theme or layout cannot add, drop
+# or restyle it, and the core-region bytes stay the same whichever names are loaded.
+# Empty fields mean the core default. A name is accepted only when that theme or layout is loaded.
+_APPEARANCE = (
+    '<section id="core-appearance" aria-labelledby="appearance-h"><h2 id="appearance-h">Appearance</h2>'
+    '<form method="post" action="/appearance"><p><label for="appearance-theme">Theme</label> '
+    '<input id="appearance-theme" name="theme" maxlength="64" autocomplete="off"></p>'
+    '<p><label for="appearance-layout">Layout</label> '
+    '<input id="appearance-layout" name="layout" maxlength="64" autocomplete="off"></p>'
+    '<button type="submit">Apply appearance</button></form>'
+    '<form method="post" action="/appearance"><p><button type="submit" id="appearance-reset" '
+    'name="reset" value="default">Reset appearance</button></p></form></section>')
+# A catalog larger than the theme directory cap is not offered. One active layout file still is.
+_LAYOUT_CATALOG_CAP = MAX_THEME_FILES
 _MAX_BODY = 4096
 # O7 operator-response.schema.json: the visibility object is closed to these four keys and values
 # (the downstream plugin draft #318, docs/replacement/outcomes/O7). The GUI renders only these fixed strings.
@@ -198,6 +225,153 @@ def _withheld_note(venue: str) -> str:
     return '<p role="note">Withheld: data not labelled <code>%s</code>.</p>' % escape(venue)
 
 
+def _canonical_layout(layout: Mapping) -> bytes:
+    """JSON bytes ``read_layout`` will accept again. No author text is copied through."""
+
+    def plain(value):
+        if isinstance(value, Mapping):
+            return {key: plain(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return [plain(item) for item in value]
+        return value
+
+    return json.dumps(plain(layout), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _read_nofollow(path: Path, size: int) -> bytes | None:
+    """Bytes of a regular file, or None. A symlink is not opened."""
+    if size < 0 or size > _LAYOUT_MAX_BYTES or not hasattr(os, "O_NOFOLLOW"):
+        return None
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(os.fspath(path), flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+            return None
+        view = bytearray()
+        while len(view) < size:
+            chunk = os.read(fd, size - len(view))
+            if not chunk:
+                return None
+            view.extend(chunk)
+        return bytes(view)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _dest_replaceable(path: Path) -> bool:
+    """True when ``path`` is absent or a regular file. A symlink is left untouched."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode)
+
+
+def _snapshot(path: Path) -> tuple[str, bytes]:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return ("absent", b"")
+    except OSError:
+        return ("blocked", b"")
+    if not stat.S_ISREG(info.st_mode):
+        return ("blocked", b"")
+    raw = _read_nofollow(path, info.st_size)
+    if raw is None:
+        return ("blocked", b"")
+    return ("file", raw)
+
+
+def _replace_owned(path: Path, data: bytes) -> None:
+    """Replace ``path`` with owner-only bytes. Never follow a symlink, never truncate first.
+
+    The new bytes land in a temporary file in the same directory, then one rename. A failure
+    before that rename leaves the previous file as it was.
+    """
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "fchmod"):
+        raise OSError("nofollow")
+    parent = path.parent
+    if not _trusted_dir(parent):
+        raise OSError("untrusted")
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+             | getattr(os, "O_CLOEXEC", 0))
+    fd = None
+    tmp_path = None
+    for _ in range(3):
+        candidate = parent / (".%s.tmp-%d-%s" % (path.name, os.getpid(), os.urandom(4).hex()))
+        try:
+            fd = os.open(os.fspath(candidate), flags, 0o600)
+            tmp_path = candidate
+            break
+        except FileExistsError:
+            continue
+    if fd is None or tmp_path is None:
+        raise OSError("temp")
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            wrote = os.write(fd, view)
+            if wrote <= 0:
+                raise OSError("short write")
+            view = view[wrote:]
+        os.fsync(fd)
+    except OSError:
+        os.close(fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    os.close(fd)
+    try:
+        os.rename(tmp_path, path)
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise OSError("mode")
+
+
+def _restore(path: Path, snap: tuple[str, bytes]) -> None:
+    kind, raw = snap
+    if kind == "absent":
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("not a file")
+        os.unlink(path)
+        return
+    if kind != "file":
+        raise OSError("blocked")
+    _replace_owned(path, raw)
+
+
+def _remove_regular(path: Path) -> None:
+    """Unlink a regular file. A symlink is not removed and not followed."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("symlink")
+    os.unlink(path)
+
+
 class Application:
     def __init__(self, client: ControlClient, door: Callable[[dict], bool], hosts: frozenset,
                  origins: frozenset, required: dict | None = None, panels=(), *, theme_root=None) -> None:
@@ -253,7 +427,8 @@ class Application:
             return self._send(start_response, status,
                               self._page("Refused", "<p>Refused: %s</p>" % escape(refusal), theme_css), theme_css)
         routes = {("GET", "/"): self._home, ("GET", "/read"): self._read, ("GET", "/panel"): self._panel,
-                  ("POST", "/action"): self._action, ("POST", "/stop"): self._stop}
+                  ("POST", "/action"): self._action, ("POST", "/stop"): self._stop,
+                  ("POST", "/appearance"): self._appearance}
         handler = routes.get((method, path))
         if handler is None:
             known = path in {p for _, p in routes}
@@ -312,6 +487,7 @@ class Application:
                 '<li><a href="/#actions-h">Interventions</a></li><li><a href="/#stop-h">Stop a run</a></li>'
                 '</ul></nav><main id="main" data-theme-scope tabindex="-1">' + main + "</main>"
                 '<aside id="core-approval" aria-label="Approval request, drawn by the core"></aside>'
+                + _APPEARANCE
                 + _STOP
                 + "<footer><p>Results are shown as the control API returned them. A stop that is not "
                 "confirmed shows as pending.</p></footer></body></html>")
@@ -418,6 +594,180 @@ class Application:
         if set(form) != fields or any(len(v) != 1 for v in form.values()):
             raise _BadRequest("fields")
         return {k: v[0] for k, v in form.items()}
+
+    def _posted(self, env: dict) -> dict:
+        """One value per field, blank values kept. The appearance form uses blanks as default."""
+        try:
+            length = int(env.get("CONTENT_LENGTH") or "0")
+        except ValueError:
+            raise _BadRequest("length") from None
+        if not 0 < length <= _MAX_BODY:
+            raise _BadRequest("length")
+        if (env.get("CONTENT_TYPE") or "").split(";")[0].strip() != "application/x-www-form-urlencoded":
+            raise _BadRequest("content type")
+        try:
+            data = env["wsgi.input"].read(length)
+            if len(data) != length:
+                raise ValueError("short body")
+            raw = data.decode("utf-8")
+            form = parse_qs(raw, strict_parsing=True, keep_blank_values=True)
+        except (KeyError, UnicodeError, ValueError):
+            raise _BadRequest("form") from None
+        if any(len(v) != 1 for v in form.values()):
+            raise _BadRequest("fields")
+        return {k: v[0] for k, v in form.items()}
+
+    def _theme_dir(self) -> Path | None:
+        """The directory whose ``selection.json`` the theme loader reads."""
+        if self._theme_root is not None:
+            try:
+                root = Path(self._theme_root)
+            except TypeError:
+                return None
+        else:
+            root = gui_config_dir()
+        if root is None or not root.is_absolute():
+            return None
+        return root
+
+    def _loaded_theme_names(self) -> set[str]:
+        """Theme names ``active_theme_css`` could apply. A duplicate name is not selectable."""
+        root = self._theme_dir()
+        if root is None or not _trusted_dir(root):
+            return set()
+        folder = root / "themes"
+        if not _trusted_dir(folder):
+            return set()
+        try:
+            names = [name for name in os.listdir(folder) if _FILENAME.fullmatch(name)]
+        except OSError:
+            return set()
+        if len(names) > MAX_THEME_FILES:
+            return set()
+        found: dict[str, object] = {}
+        blocked: set[str] = set()
+        for filename in sorted(names):
+            theme = _load_theme(folder / filename)
+            if theme is None:
+                continue
+            if theme.name in found or theme.name in blocked:
+                blocked.add(theme.name)
+                found.pop(theme.name, None)
+                continue
+            found[theme.name] = theme
+        return set(found)
+
+    def _consider_layout(self, path: Path, found: dict[str, bytes], blocked: set[str], *,
+                         same_bytes_ok: bool) -> None:
+        try:
+            parsed = read_layout(path, known_panels=self._panels)
+        except (FileNotFoundError, LayoutRefused, OSError):
+            return
+        name = parsed["name"]
+        if type(name) is not str or name in blocked:
+            return
+        raw = _canonical_layout(parsed)
+        if len(raw) > _LAYOUT_MAX_BYTES:
+            return
+        if name in found:
+            if same_bytes_ok and found[name] == raw:
+                return
+            blocked.add(name)
+            found.pop(name, None)
+            return
+        found[name] = raw
+
+    def _loaded_layouts(self) -> dict[str, bytes]:
+        """Layout name to the bytes the layout loader will read from ``layout.json``.
+
+        Candidates are ``layouts/*.json`` beside that file, plus the active file when it names
+        the same bytes as one candidate. Two different documents with one name are not selectable.
+        """
+        found: dict[str, bytes] = {}
+        blocked: set[str] = set()
+        folder = user_layout_path().parent / "layouts"
+        names: list[str] = []
+        try:
+            if folder.is_absolute() and _trusted_dir(folder):
+                names = [name for name in os.listdir(folder) if _FILENAME.fullmatch(name)]
+        except OSError:
+            names = []
+        if len(names) > _LAYOUT_CATALOG_CAP:
+            names = []
+        for filename in sorted(names):
+            self._consider_layout(folder / filename, found, blocked, same_bytes_ok=False)
+        self._consider_layout(user_layout_path(), found, blocked, same_bytes_ok=True)
+        return found
+
+    def _keep_appearance(self, theme_name: str | None, layout_bytes: bytes | None) -> None:
+        """Write the theme selection and the layout file the loaders already read.
+
+        ``theme_name`` None is the theme loader's default (``{"theme": null}``). ``layout_bytes``
+        None removes ``layout.json`` when it is a regular file. A symlink is not followed and
+        not replaced. A failure leaves the previous files.
+        """
+        root = self._theme_dir()
+        if root is None or not _trusted_dir(root):
+            raise _BadRequest("appearance directory")
+        selection_path = root / "selection.json"
+        if _snapshot(selection_path)[0] == "blocked" or not _dest_replaceable(selection_path):
+            raise _BadRequest("appearance not kept")
+        layout_path = user_layout_path()
+        writing_layout = layout_bytes is not None
+        removing_layout = False
+        if writing_layout:
+            home = layout_path.parent
+            if (not layout_path.is_absolute() or not home.is_absolute() or not _trusted_dir(home)
+                    or not _dest_replaceable(layout_path)):
+                raise _BadRequest("appearance not kept")
+        else:
+            try:
+                os.lstat(layout_path)
+            except FileNotFoundError:
+                removing_layout = False
+            except OSError:
+                raise _BadRequest("appearance not kept") from None
+            else:
+                if not _dest_replaceable(layout_path):
+                    raise _BadRequest("appearance not kept")
+                removing_layout = True
+        selection_bytes = json.dumps({"theme": theme_name}, separators=(",", ":")).encode("utf-8")
+        sel_snap = _snapshot(selection_path)
+        lay_snap = _snapshot(layout_path) if writing_layout or removing_layout else None
+        if sel_snap[0] == "blocked" or (lay_snap is not None and lay_snap[0] == "blocked"):
+            raise _BadRequest("appearance not kept")
+        try:
+            _replace_owned(selection_path, selection_bytes)
+            if writing_layout:
+                _replace_owned(layout_path, layout_bytes)
+            elif removing_layout:
+                _remove_regular(layout_path)
+        except OSError:
+            try:
+                _restore(selection_path, sel_snap)
+                if lay_snap is not None and writing_layout:
+                    _restore(layout_path, lay_snap)
+            except OSError:
+                pass
+            raise _BadRequest("appearance not kept") from None
+
+    def _appearance(self, env: dict) -> tuple[str, str]:
+        """Choose a loaded theme and layout, or reset both. Local files only, no control call."""
+        form = self._posted(env)
+        if set(form) == {"reset"} and form["reset"] == "default":
+            self._keep_appearance(None, None)
+            return "Appearance", '<p role="status">Appearance reset.</p>'
+        if set(form) != {"theme", "layout"}:
+            raise _BadRequest("fields")
+        theme_name = form["theme"] if form["theme"] != "" else None
+        layout_name = form["layout"] if form["layout"] != "" else None
+        if theme_name is not None and theme_name not in self._loaded_theme_names():
+            raise _BadRequest("unknown theme")
+        layouts = self._loaded_layouts()
+        if layout_name is not None and layout_name not in layouts:
+            raise _BadRequest("unknown layout")
+        self._keep_appearance(theme_name, None if layout_name is None else layouts[layout_name])
+        return "Appearance", '<p role="status">Appearance kept.</p>'
 
     @staticmethod
     def _response_view(data: object) -> str:

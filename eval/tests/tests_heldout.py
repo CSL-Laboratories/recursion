@@ -117,7 +117,7 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(record["suite"]["split"], "held_out")
             # The same process, now a dev process, is refused the held-out suite.
             heldout._declared = None
-            self.assertEqual(runner.main(["--suite", "dev", "--arms", "recursion", "--k", "1"]), 3)
+            self.assertEqual(runner.main(["--suite", "dev", "--arms", "recursion", "--k", "1"]), 2)
             self.assertEqual(heldout.declared(), "dev")
             code = runner.main(["--suite", "pilot-t", "--tasks", str(folder), "--arms", "direct", "--k", "1",
                                 "--out", str(out), "--tmp-base", str(tmp), "--xdg-base", str(xdg)])

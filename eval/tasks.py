@@ -258,6 +258,12 @@ def _meta(task_id_hint: str, meta: dict) -> dict:
         raise TaskError(f"{task_id}: test_command must be a non-empty list of strings")
     for key in ("timeout_s", "grading_timeout_s"):
         _positive_limit(task_id, key, meta.get(key))
+    for key in ("cluster", "created_at"):
+        if key not in meta or meta[key] is None:
+            continue
+        value = meta[key]
+        if not isinstance(value, str) or not value:
+            raise TaskError(f"{task_id}: {key} must be a non-empty string or be absent")
     return meta
 
 

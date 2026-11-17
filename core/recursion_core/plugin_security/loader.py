@@ -67,6 +67,7 @@ NOT_GRANTED = "plugin_not_granted"
 # or ``__format__``, an object's ``__getattr__``. These read the interpreter's own slots and walk
 # dictionaries' tables instead, so they call none of it and raise nothing a plugin chose.
 _CLASS_NAME = type.__dict__["__name__"].__get__               # a type's own name slot
+_ABSENT = object()  # no entry of that name in sys.modules before a plugin ran
 _MODULE_DICT = types.ModuleType.__dict__["__dict__"].__get__  # a module's own namespace dict
 
 
@@ -324,14 +325,34 @@ class PluginLoader:
     def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings,
                   developer: str, generation: int | None) -> LoadedPlugin:
         before = set(plain_modules())
-        module = types.ModuleType("csl_plugin_" + manifest.plugin_id.replace(".", "_").replace("-", "_"))
+        name = "csl_plugin_" + manifest.plugin_id.replace(".", "_").replace("-", "_")
+        module = types.ModuleType(name)
         failure: BaseException | None = None
+        # The module is in ``sys.modules`` under its own name while its code runs, as an import puts
+        # it, so code that looks its module up there (``dataclasses`` with postponed annotations,
+        # ``typing.get_type_hints``) works (PS6). Only while it runs: the entry that was there before,
+        # if any, is put back after, through ``dict``'s own methods and only while ``sys.modules`` is
+        # still the plain dict it was, so no plugin code runs for it and nothing raised there skips
+        # the GIL read below.
+        modules = sys.modules
+        registered = type(modules) is dict
+        previous = dict.get(modules, name, _ABSENT) if registered else _ABSENT
+        if registered:
+            dict.__setitem__(modules, name, module)
         try:
             exec(code, module.__dict__)  # plugin code: _load_lock is held, _lock is not
         except BaseException as exc:  # noqa: BLE001 - the GIL check must follow any outcome
             failure = exc
         finally:
             try:
+                if registered and sys.modules is modules and type(modules) is dict:
+                    try:
+                        if previous is _ABSENT:
+                            dict.pop(modules, name, None)
+                        else:
+                            dict.__setitem__(modules, name, previous)
+                    except Exception:  # noqa: BLE001 - a colliding key's __eq__ is plugin code
+                        pass
                 # Plain data only: nothing a plugin put in sys.modules runs here, and nothing raised
                 # here skips the GIL read below (review 3 of #380: an object in sys.modules whose
                 # __getattr__ raised ended the load here, with the GIL never read).

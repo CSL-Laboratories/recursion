@@ -34,6 +34,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -69,6 +70,39 @@ class ToolOutput:
         return self.status != OK
 
 
+class _ApprovedSlot:
+    """``approved_facts`` for one context, kept per thread.
+
+    A field on the shared context lets a second dispatch save the unbound marker and write it back while the
+    first dispatch is still inside its tool (DeepSeek R4-2). Each context holds one ``threading.local``, so
+    each thread has its own value and a restore stays on the thread that saved it. A read before this thread
+    has set the value is ``UNBOUND``. The local lives on the instance, not in a table keyed by the context:
+    a context compares equal to another and is not a dict key.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def _local(self, obj: object) -> threading.local:
+        local = obj.__dict__.get("_approved_local")
+        if local is not None:
+            return local
+        with self._lock:
+            local = obj.__dict__.get("_approved_local")
+            if local is None:
+                local = threading.local()
+                obj.__dict__["_approved_local"] = local
+            return local
+
+    def __get__(self, obj: object | None, owner: type | None = None) -> Any:
+        if obj is None:
+            return self
+        return getattr(self._local(obj), "value", UNBOUND)
+
+    def __set__(self, obj: object, value: Any) -> None:
+        self._local(obj).value = value
+
+
 @dataclass
 class ToolContext:
     workspace: Workspace
@@ -83,9 +117,8 @@ class ToolContext:
     # What the tool's precheck said the request should show beside the input (``resolved_path``); dispatch sets
     # it for the one approve call and clears it after. An approve function may pass it on to the request.
     request_facts: Mapping[str, Any] | None = None
-    # The facts the approved request showed (None: none), set by dispatch for the run of an approved call and
-    # UNBOUND otherwise; a tool that resolves its target again refuses to change anything else (sol 1).
-    approved_facts: Any = UNBOUND
+    # Not a dataclass field: the descriptor below stores it per thread. See _ApprovedSlot.
+    approved_facts = _ApprovedSlot()
 
 
 ToolFn = Callable[[Mapping[str, Any], ToolContext], ToolOutput]
@@ -352,6 +385,9 @@ class ToolRegistry:
         except ToolError as exc:
             return self._finish(call, ToolOutput(f"invalid input: {exc}", ERROR), ctx)
         ctx.max_bytes, ctx.max_lines = self.max_bytes, self.max_lines
+        # This thread's binding. A nested call on this same thread saves it and gives it back. Another thread
+        # has its own slot, so its restore cannot clear this one (DeepSeek R4-2).
+        outer_facts = ctx.approved_facts
         if tool.needs_approval is not False:  # fails closed: anything but False (a subclass may skip the check) asks
             facts = None
             if tool.precheck is not None:
@@ -395,6 +431,9 @@ class ToolRegistry:
                     return self._finish(call, ToolOutput(f"the call could not be run: {exc}", ERROR), ctx)
                 if again != facts:
                     return self._finish(call, ToolOutput(CHANGED_SINCE_APPROVAL, ERROR), ctx)
+            if ctx.cancel.cancelled:
+                # Interrupted while the precheck ran again: nothing has run, and an interrupt is final (sol 4).
+                return self._finish(call, ToolOutput(perm.REFUSALS[perm.CANCELLED], CANCELLED), ctx)
             ctx.approved_facts = facts
         try:
             output = tool.run(args, ctx)
@@ -407,7 +446,7 @@ class ToolRegistry:
         except BaseException as exc:  # noqa: BLE001 - a tool's failure (a library's sys.exit too) is the model's to see
             output = ToolOutput(f"the tool failed: {type(exc).__name__}: {exc}", ERROR)
         finally:
-            ctx.approved_facts = UNBOUND
+            ctx.approved_facts = outer_facts
         if not isinstance(output, ToolOutput) or not isinstance(output.text, str) or output.status not in STATUSES:
             output = ToolOutput("the tool failed: it returned no text", ERROR)
         return self._finish(call, output, ctx)

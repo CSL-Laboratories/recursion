@@ -87,11 +87,18 @@ def request_facts(ws: Workspace, given: str, path: Path) -> dict[str, str] | Non
 
 def keep_approved(ctx, given: str, path: Path) -> None:
     """In the run of an approved call: the file the path leads to now must be the one the request showed (the same
-    ``resolved_path``, or none when the path was the file itself); otherwise nothing is changed (sol 1)."""
+    ``resolved_path``, or none when the path was the file itself); otherwise nothing is changed (sol 1).
+
+    A context that has no approved-facts record at all is refused: there is nothing to check it against, so
+    nothing is changed. ``UNBOUND`` (a tool run outside dispatch, which the registry documents as skipping
+    these rules) still changes nothing here and does not raise."""
 
     from recursion_core.loop.tools.registry import CHANGED_SINCE_APPROVAL, UNBOUND
 
-    approved = getattr(ctx, "approved_facts", UNBOUND)
+    try:
+        approved = ctx.approved_facts
+    except AttributeError:
+        raise ToolError("refused: this call has no record of what was approved") from None
     if approved is UNBOUND:
         return
     if request_facts(ctx.workspace, given, path) != (approved or None):

@@ -21,6 +21,8 @@ from recursion_core.loop.tools import registry as r
 
 class ReadGuards(unittest.TestCase):
     def test_the_file_is_opened_without_blocking(self) -> None:
+        if not hasattr(os, "O_NONBLOCK"):
+            self.skipTest("this system has no O_NONBLOCK, and read asks for none there")
         ws = workspace(self, {"file.txt": "safe\n"})
         real = os.open
         flags: list[int] = []

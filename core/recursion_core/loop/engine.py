@@ -35,7 +35,7 @@ How a turn ends (``turn_ended``; outcomes are session.v1's):
                                              have had (a failure's code, a limit's detail); result null and
                                              reason ``interrupted`` when the interrupt itself ended it
     a typed limit                            paused, after a ``limit`` line (its retry_after_s null when the
-                                             provider's is not a finite number of seconds)
+                                             provider's is not a finite integer or a finite float)
     the reply hit the output limit           paused
     the step budget ran out                  paused (budget exhaustion is never done)
     a refusal, a provider failure, a full    failed, with the code
@@ -43,7 +43,9 @@ How a turn ends (``turn_ended``; outcomes are session.v1's):
 
 Before every ``turn_ended`` (a turn interrupted before its first call, and a loop error, included) the turn's
 usage (``span: "turn"``, the sum of its calls) and the session's running total (``span: "session_total"``, never
-to be added up) are written. A sum that includes a call whose count is unknown is a lower bound, never a guess;
+to be added up) are written. If the turn's own finaliser raises, those two spans are written from the sums
+already held, or as unknown when that write itself fails; the end line is written after them. A sum that
+includes a call whose count is unknown is a lower bound, never a guess;
 a sum over no call at all is a known 0 (no call was made), which is not the unknown of a call that measured
 nothing. A sum keeps where its numbers came from: ``observed`` only when every count in it was observed;
 otherwise ``modelled`` when some were modelled and none inferred, and ``inferred`` when any was inferred (the
@@ -141,6 +143,44 @@ def _writable(value: object) -> bool:
     except (ValueError, TypeError, RecursionError):
         return False
     return True
+
+
+def _plain(value: object, seen: set[int] | None = None) -> object:
+    """A copy whose mappings are plain dicts, nested, so a UserDict or a mapping proxy can be written as JSON.
+    A container already being copied is an empty stand-in, so a cycle cannot grow the copy. A value reached by
+    two paths is copied at each path."""
+
+    if seen is None:
+        seen = set()
+    if isinstance(value, Mapping):
+        ident = id(value)
+        if ident in seen:
+            return {}
+        seen.add(ident)
+        try:
+            return {(key if isinstance(key, str) else _plain(key, seen)): _plain(item, seen)
+                    for key, item in value.items()}
+        finally:
+            seen.discard(ident)
+    if isinstance(value, list):
+        ident = id(value)
+        if ident in seen:
+            return []
+        seen.add(ident)
+        try:
+            return [_plain(item, seen) for item in value]
+        finally:
+            seen.discard(ident)
+    if isinstance(value, tuple):
+        ident = id(value)
+        if ident in seen:
+            return ()
+        seen.add(ident)
+        try:
+            return tuple(_plain(item, seen) for item in value)
+        finally:
+            seen.discard(ident)
+    return value
 
 
 def _texts(part: b.Part) -> object:
@@ -342,7 +382,10 @@ class Session:
     # -- one turn ----------------------------------------------------------------------------------------
 
     def run_turn(self, turn_id: str, text: str, cancel: b.CancelToken) -> str:
-        """Run one turn to its end and return its outcome."""
+        """Run one turn to its end and return its outcome.
+
+        Raises ValueError, changing nothing, when the text is not UTF-8 encodable.
+        """
 
         usage = UsageTotal()
         self._turn_usage = usage
@@ -439,8 +482,13 @@ class Session:
     def _limit(self, turn_id: str, exc: b.LimitError, usage: UsageTotal) -> str:
         # A value JSON cannot write (NaN, an infinity) or that is not what the field holds would make the line
         # unwritable: the line says the time is unknown instead, and the turn still pauses.
+        # An int is not passed to math.isfinite. That conversion raises OverflowError for an int past the
+        # float range, and a finite integer (however large) is a legal retry time the line can carry.
+        # The call's usage line was already written by _call before this ran.
         retry = exc.retry_after_s
-        if isinstance(retry, bool) or not isinstance(retry, (int, float)) or not math.isfinite(retry):
+        if isinstance(retry, bool) or not isinstance(retry, (int, float)):
+            retry = None
+        elif not isinstance(retry, int) and not math.isfinite(retry):
             retry = None
         reset_at = exc.reset_at if isinstance(exc.reset_at, str) else None
         self.writer.write("limit", turn_id=turn_id, scope="connection", kind="plan_limit", model=None,
@@ -611,6 +659,18 @@ class Session:
         for part in parts:
             if not isinstance(part, (b.TextPart, b.ToolCall, b.OpaquePart)):
                 raise _NotKept(f"the reply holds a {type(part).__name__} part, which a reply cannot carry")
+            # A mapping that is not a dict (a proxy, a UserDict, and the same nested) is what ToolCall accepts.
+            # JSON only writes a plain dict, so normalise before the checks. A value nested too deep, a cycle
+            # included, is refused here, before the Unicode walk, so that walk never follows it.
+            if isinstance(part, b.ToolCall) and isinstance(part.input, Mapping):
+                if b.nests_deeper(part.input, b.MAX_INPUT_DEPTH):
+                    part = b.ToolCall(part.call_id, part.name, None, "", b.INPUT_TOO_DEEP)
+                else:
+                    part = b.ToolCall(part.call_id, part.name, _plain(part.input), part.raw_input,
+                                      part.input_error)
+            elif isinstance(part, b.OpaquePart) and isinstance(part.data, Mapping):
+                if not b.nests_deeper(part.data, b.MAX_INPUT_DEPTH):
+                    part = b.OpaquePart(part.vendor, _plain(part.data))
             if b.holds_unencodable(_texts(part)):
                 # A lone surrogate: no line could carry it and no request send it, and it cannot be changed.
                 raise _NotKept("the reply holds text that is not valid Unicode (a lone surrogate)")
@@ -817,11 +877,33 @@ class Engine:
                     f"recursion_loop: turn {item.turn_id} failed inside the loop: {type(exc).__name__}: {exc}"))
                 try:
                     self.session.fail_turn(item.turn_id, type(exc).__name__)
-                except Exception:  # noqa: BLE001 - the end is written regardless, without its totals
-                    self._ending(partial(self.writer.write, "turn_ended", turn_id=item.turn_id, outcome="failed",
-                                         result={"code": "loop_error", "detail": type(exc).__name__,
-                                                 "result_ref": None},
-                                         reason="loop_error"))
+                except Exception:  # noqa: BLE001 - the end is written regardless; the totals already summed go first
+                    turn_id = item.turn_id
+                    detail = type(exc).__name__
+
+                    def write_end() -> None:
+                        # The call's usage was counted before fail_turn ran. Write those sums, then the end.
+                        # If that write fails, write unknown totals. If that fails too, the end line still goes out.
+                        try:
+                            turn_usage = self.session._turn_usage or UsageTotal()
+                            self.writer.write("usage", turn_id=turn_id, span="turn", model=turn_usage.model,
+                                              **turn_usage.to_wire())
+                            session_usage = self.session.session_usage
+                            self.writer.write("usage", turn_id=turn_id, span="session_total",
+                                              model=session_usage.model, **session_usage.to_wire())
+                        except Exception:  # noqa: BLE001 - unknown totals, then the end line, still
+                            try:
+                                blank = b.Usage().to_wire()
+                                self.writer.write("usage", turn_id=turn_id, span="turn", model=None, **blank)
+                                self.writer.write("usage", turn_id=turn_id, span="session_total", model=None,
+                                                  **blank)
+                            except Exception:  # noqa: BLE001 - the end line below is the one that must be written
+                                pass
+                        self.writer.write("turn_ended", turn_id=turn_id, outcome="failed",
+                                          result={"code": "loop_error", "detail": detail, "result_ref": None},
+                                          reason="loop_error")
+
+                    self._ending(write_end)
             finally:
                 with self._lock:
                     self._live = None

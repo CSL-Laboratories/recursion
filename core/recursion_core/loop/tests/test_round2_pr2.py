@@ -135,7 +135,7 @@ class StartEnvironment(unittest.TestCase):
             self.assertFalse(cli.clear_start_environment())
 
     def test_guard_no_proc_at_all_is_nothing_to_clear(self) -> None:
-        with mock.patch.object(cli.os.path, "exists", return_value=False), \
+        with mock.patch.object(cli.os, "stat", side_effect=FileNotFoundError(errno.ENOENT, "synthetic: no /proc")), \
                 mock.patch("builtins.open", side_effect=AssertionError("nothing is read without /proc")):
             self.assertTrue(cli.clear_start_environment())
 

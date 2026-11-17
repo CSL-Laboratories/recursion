@@ -23,8 +23,10 @@ approval without a bound input runs a fresh copy of it.
 
 When the tool's precheck names facts the model's input does not show (the file a path leads to through a link),
 they are written on the request beside the input (``resolved_path``). Only the names in ``REQUEST_FACTS`` are
-written, and only as JSON values: any other name (one that would collide with a field of the request, such as
-``input`` or ``tool``) or a value that is not JSON is refused before anything is asked (``check_facts``). A
+written, each as the type ``FACT_TYPES`` gives it (``resolved_path`` is a string), and only if the line can carry
+it as the writer writes it (JSON, UTF-8): any other name (one that would collide with a field of the request, such
+as ``input`` or ``tool``), a value of another type, or one that cannot be written that way (a file name that is not
+UTF-8) is refused before anything is asked (``check_facts``). A
 call larger than approval.v1's provisional size limit (262,144 bytes of tool, directory and input) is denied
 without asking, because the core would refuse to draw it; the model is told to send it in smaller parts.
 
@@ -48,7 +50,8 @@ DEFAULT_DEADLINE_S = 900.0  # approval.v1's examples expire after fifteen minute
 MAX_EFFECT_BYTES = 262_144  # approval.v1, PROVISIONAL
 ASK, FULL_ACCESS = "ask", "full_access"
 REQUEST_ID_MAX = 256  # approval.v1 binding: engine_request_id
-REQUEST_FACTS = frozenset({"resolved_path"})  # the facts a request may show beside the input
+FACT_TYPES = {"resolved_path": str}  # the facts a request may show beside the input, and the type of each
+REQUEST_FACTS = frozenset(FACT_TYPES)
 
 APPROVED, DENIED, EXPIRED, TOO_LARGE, MISMATCH, CANCELLED = (
     "approved", "denied", "expired", "too_large", "bound_input_differs", "cancelled")
@@ -100,7 +103,8 @@ def snapshot(value: Any) -> Any:
 def check_facts(facts: Any) -> dict[str, Any] | None:
     """The facts a precheck named, as a request may show them: None when there are none (or the precheck returned
     something that is not a mapping, which is ignored), else an independent copy. Raises ValueError for a name
-    outside ``REQUEST_FACTS`` or a value that is not JSON (DeepSeek N2): the call is then refused, never asked."""
+    outside ``REQUEST_FACTS``, a value of the wrong type, or one the request line cannot carry as the writer
+    writes it (DeepSeek N2, R3-2; sol 1): the call is then refused, never asked."""
 
     if not isinstance(facts, Mapping) or not facts:
         return None
@@ -109,10 +113,12 @@ def check_facts(facts: Any) -> dict[str, Any] | None:
         if name not in REQUEST_FACTS:
             raise ValueError(f"a permission request cannot show a fact named {name!r}")
         value = snapshot(value)
+        if not isinstance(value, FACT_TYPES[name]):
+            raise ValueError(f"the fact {name!r} must be a {FACT_TYPES[name].__name__}")
         try:
-            json.dumps(value, allow_nan=False)
-        except (TypeError, ValueError):
-            raise ValueError(f"the fact {name!r} is not a JSON value") from None
+            json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")  # the way the writer writes it
+        except (TypeError, ValueError):  # UnicodeEncodeError is a ValueError: a lone surrogate, a name that is not UTF-8
+            raise ValueError(f"the fact {name!r} is not a JSON value the request line can carry") from None
         checked[name] = value
     return checked
 
@@ -148,8 +154,9 @@ class PermissionGate:
     def ask(self, turn_id: str, call: b.ToolCall, cwd: str, cancel: b.CancelToken,
             facts: Mapping[str, Any] | None = None) -> Decision:
         """Ask for one call and wait. Called on the turn's thread. ``facts`` (from the tool's precheck) are
-        written on the request beside the input; facts ``check_facts`` refuses raise ValueError before anything is
-        asked."""
+        written on the request beside the input. None, or a precheck value that is not a mapping, means no
+        facts. A non-mapping passed here (not via that precheck path) raises ValueError before anything is
+        asked, as do facts ``check_facts`` refuses."""
 
         args = snapshot(dict(call.input or {}))  # this copy is the request; nothing outside holds it
         size = len(json.dumps({"tool": call.name, "cwd": cwd, "input": args}, ensure_ascii=False,
@@ -157,12 +164,18 @@ class PermissionGate:
         if size > MAX_EFFECT_BYTES:
             return Decision(TOO_LARGE)
         if cancel.cancelled:
-            return Decision(CANCELLED)  # nothing is asked for a turn that has been interrupted
+            return Decision(CANCELLED)  # nothing is asked for a turn already interrupted (a later one is caught below)
+        # A precheck may return a non-mapping, and check_facts ignores that. ask itself was given facts to
+        # write: anything that is not a mapping (or None) is refused before a request exists.
+        if facts is not None and not isinstance(facts, Mapping):
+            raise ValueError("facts must be a mapping of names the request may show")
         extra = check_facts(facts) or {}
         request_id = self._mint()
         if self.profile == FULL_ACCESS:
             self._writer.write("permission_request", turn_id=turn_id, request_id=request_id, call_id=call.call_id,
                                tool=call.name, cwd=cwd, input=snapshot(args), profile=FULL_ACCESS, **extra)
+            if cancel.cancelled:
+                return Decision(CANCELLED)  # interrupted while the line was written: an interrupt is final
             return Decision(APPROVED, snapshot(args))
         pending = _Pending(request_id, args, self._clock() + self.deadline_s)
         with self._lock:
@@ -175,8 +188,9 @@ class PermissionGate:
                     pending.decision = Decision(CANCELLED)
             pending.done.set()
 
-        unregister = cancel.on_cancel(on_cancel)
+        unregister = None
         try:
+            unregister = cancel.on_cancel(on_cancel)
             with self._lock:
                 # Cancelled after the check above, before the callback was in place: the callback has already
                 # decided it, and nothing is asked (astra C5, DeepSeek N3).
@@ -193,9 +207,16 @@ class PermissionGate:
                     remaining = pending.expires - self._clock()
                 pending.done.wait(remaining)
         finally:
-            unregister()
+            # Pop first. The remover runs after the request is gone, and a remover that raises must not
+            # leave it waiting or replace the decision already made (DeepSeek R4-1). A real token's remover
+            # only drops its callback; it does not raise.
             with self._lock:
                 self._pending.pop(request_id, None)
+            if unregister is not None:
+                try:
+                    unregister()
+                except Exception:  # noqa: BLE001 - the request is already gone; bookkeeping must not undo that
+                    pass
         if cancel.cancelled:
             return Decision(CANCELLED)  # an interrupt is final, whatever came before it
         decision = pending.decision

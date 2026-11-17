@@ -23,7 +23,9 @@ Out (one object per line; standard output carries nothing else, diagnostics go t
     usage           {turn_id, span: "call", model, input_tokens, ...}: one per model call, a failed or
                     interrupted one included (what it had measured; unknown, never 0, where nothing was);
                     then, before every turn_ended, span "turn" (the turn's sum; a known 0 when it made no
-                    call) and span "session_total" (the running total, never added up); a sum keeps the
+                    call) and span "session_total" (the running total, never added up). If the turn's own
+                    finaliser raises, those two spans are still written from the sums already held, or as
+                    unknown when that write itself fails, and the end line follows. A sum keeps the
                     weakest provenance of its counts (engine.py)
     limit           {turn_id, scope, kind, model, bucket, reset_at, retry_after_s}
     permission_request  {turn_id, request_id, call_id, tool, cwd, input, profile, deadline_s, resolved_path?}:

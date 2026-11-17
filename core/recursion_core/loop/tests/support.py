@@ -43,7 +43,7 @@ def workspace(case, files: dict[str, str | bytes] | None = None) -> Workspace:
         if isinstance(content, bytes):
             target.write_bytes(content)
         else:
-            target.write_text(content, encoding="utf-8")
+            target.write_bytes(content.encode("utf-8"))  # not text mode: Windows would turn each LF into CRLF
     return Workspace(root, SpillStore(home))
 
 

@@ -28,6 +28,8 @@ log = logging.getLogger(__name__)
 
 RUN_ID = re.compile(r'[a-zA-Z0-9_-]{1,64}')
 UNIT = re.compile(r'recursion-run-[a-zA-Z0-9_-]{1,64}\.service')
+# systemd-run --user with no Slice= property places the unit in app.slice.
+_SUPERVISED_SLICE = 'app.slice'
 # Terminal states are sticky: once recorded they are never re-observed or re-adopted.
 # terminated: the run's process is attested gone in this boot. A scripted "ended"
 # observation is not enough while a listener is still alive. Attested ends are: the
@@ -727,6 +729,25 @@ class Registry:
         """
         return self.control_identity(run_id)[1]
 
+    def control_document(self, run_id):
+        """The stored control record as a dict, or None when this run has none.
+
+        A value that is not a JSON object raises ValueError. That is not "no record".
+        """
+        with self.lock:
+            self._ensure_open()
+            table = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                    "AND name='control_runs'").fetchone()
+            if table is None:
+                return None
+            row = self.db.execute('SELECT record FROM control_runs WHERE run_id=?', (run_id,)).fetchone()
+        if row is None:
+            return None
+        record = json.loads(row[0])
+        if not isinstance(record, dict):
+            raise ValueError('control record is not an object')
+        return record
+
     def close(self):
         with self.lock:
             if not self.closed:
@@ -851,7 +872,18 @@ class Daemon:
             if not run.stop_requested:
                 return 'empty'
             try:
-                return remove(run.unit, cgroup)
+                document = self.registry.control_document(run_id)
+            except (OSError, ValueError, TypeError):
+                log.exception('control record of %s could not be read; its cgroup stays', run_id)
+                return 'empty'
+            if not isinstance(document, dict) or document.get('cgroup') != cgroup:
+                return 'empty'
+            marker = document.get('cgroup_marker')
+            if not isinstance(marker, str) or not marker:
+                return 'empty'
+            try:
+                return remove(run.unit, cgroup, marker=marker,
+                              identity=document.get('cgroup_identity'))
             except Exception:
                 log.exception('removal of the cgroup of %s failed', run_id)
                 return 'empty'
@@ -1237,36 +1269,107 @@ class SystemdUserManager:
                 return None if live is None else False
             time.sleep(0.05)
 
-    def remove_cleared_cgroup(self, unit, group):
+    def _identity_matches(self, info, identity):
+        """True when no inode was recorded, or ``info`` is that inode. A bad identity is doubt."""
+        if identity is None:
+            return True
+        if not isinstance(identity, dict):
+            return False
+        dev, ino = identity.get('st_dev'), identity.get('st_ino')
+        if type(dev) is not int or type(ino) is not int or dev < 0 or ino < 0:
+            return False
+        return info.st_dev == dev and info.st_ino == ino
+
+    def _removal_directory(self, unit, group):
+        """The leaf Path, ``absent`` when a proved parent is already gone, or None on doubt.
+
+        The path must sit under this cgroup root, inside the supervised slice, and be this
+        unit. A symlink at any component is doubt. ``..`` is doubt. The leaf itself is
+        stat'd by the caller so a missing leaf can be told from a refused path.
+        """
+        root = self.cgroup_root
+        if not isinstance(root, Path):
+            try:
+                root = Path(root)
+            except TypeError:
+                return None
+        if not root.is_absolute():
+            return None
+        try:
+            root_info = root.lstat()
+        except OSError:
+            return None
+        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+            return None
+        if (not isinstance(group, str) or not group.startswith('/') or '\x00' in group
+                or '..' in Path(group).parts or not UNIT.fullmatch(unit)
+                or Path(group).name != unit):
+            return None
+        parts = [part for part in group.split('/') if part]
+        if not parts or any(part in ('.', '..') for part in parts):
+            return None
+        if _SUPERVISED_SLICE not in parts[:-1]:
+            return None
+        directory = root
+        try:
+            for part in parts[:-1]:
+                directory = directory / part
+                info = directory.lstat()
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    return None
+            directory = directory / parts[-1]
+            directory.relative_to(root)
+        except OSError as exc:
+            return 'absent' if exc.errno == errno.ENOENT else None
+        except ValueError:
+            return None
+        return directory
+
+    def remove_cleared_cgroup(self, unit, group, *, marker=None, identity=None):
         """Remove the recorded cgroup directory after a walk found it empty.
 
-        ``removed``: this call removed the directory, or it vanished as the call removed it.
-        ``populated``: the kernel refused because the directory is in use, or a live process
-        is in it. ``empty``: the directory is still there. ``absent``: there was no directory.
+        ``removed`` only when this call's ``rmdir`` succeeded.
+        ``absent`` when the proved directory was already gone. This call did not remove it.
+        ``populated`` when a re-read shows a live process, or the re-read failed.
+        ``empty`` when the directory stays, including every doubt and an ``EBUSY`` from
+        empty child cgroups after a clear re-read.
         A symlink is not followed and is not removed. Entries inside the directory are not unlinked.
         """
-        if (not isinstance(group, str) or not group.startswith('/') or '..' in Path(group).parts
-                or not UNIT.fullmatch(unit) or Path(group).name != unit):
+        if not isinstance(marker, str) or not marker:
             return 'empty'
-        directory = self.cgroup_root / group.lstrip('/')
+        found = self._removal_directory(unit, group)
+        if found is None:
+            return 'empty'
+        if found == 'absent':
+            return 'absent'
+        directory = found
         try:
             info = directory.lstat()
         except OSError as exc:
             return 'absent' if exc.errno == errno.ENOENT else 'empty'
+        except (ValueError, TypeError):
+            return 'empty'
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return 'empty'
+        if not self._identity_matches(info, identity):
             return 'empty'
         try:
             os.rmdir(directory)
         except OSError as exc:
             if exc.errno == errno.ENOENT:
-                return 'removed'
+                return 'absent'
             if exc.errno == errno.EBUSY:
+                live = self._recorded_cgroup_live(directory, group)
+                if live is False:
+                    return 'empty'
                 return 'populated'
             if exc.errno == errno.ENOTEMPTY:
                 live = self._recorded_cgroup_live(directory, group)
                 if live is True:
                     return 'populated'
                 return 'empty'
+            return 'empty'
+        except (ValueError, TypeError):
             return 'empty'
         return 'removed'
 

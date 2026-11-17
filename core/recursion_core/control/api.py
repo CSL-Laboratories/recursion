@@ -82,6 +82,7 @@ import errno
 import hashlib
 import os
 from pathlib import Path
+import re
 import stat
 import threading
 import uuid
@@ -105,6 +106,11 @@ LIST_LIMIT_MAX = 1000  # the most runs one run.list page may ask for
 # How many times a Stop decision whose write came back stale is applied to a fresh read of the record.
 # An empty result that has not landed after the last one answers pending, never stopped.
 STALE_RETRIES = 3
+# A user service launched with no Slice= property lands in app.slice. A removal that
+# cannot show that parent is not this run's supervised cgroup.
+_RUN_ID = re.compile(r"[a-zA-Z0-9_-]{1,64}")
+_UNIT = re.compile(r"recursion-run-[a-zA-Z0-9_-]{1,64}\.service")
+_SUPERVISED_SLICE = "app.slice"
 
 # starter(params) -> {"cgroup"}: the daemon's launch path (route service + cgroup leaf), injected. params
 # carries the API-chosen "run_id", which the starter must launch under.
@@ -454,31 +460,199 @@ class ControlAPI:
                 "member_ids": sorted(member["member_id"] for member in members),
                 "generation": rec["generation"]}
 
-    def _remove_recorded_cgroup(self, rec: dict) -> str:
-        """Remove the cgroup directory named on ``rec``, when that path is itself the directory.
+    def _known_cgroup_root(self) -> Path | None:
+        """The cgroup root the cleanup layer names, or None when this Stop cannot prove one."""
+        kill = self._kill
+        root = getattr(kill, "cgroup_root", None)
+        if root is None:
+            daemon = getattr(kill, "_daemon", None)
+            manager = getattr(daemon, "manager", None) if daemon is not None else None
+            root = getattr(manager, "cgroup_root", None)
+        if isinstance(root, Path):
+            return root
+        if isinstance(root, str) and root:
+            return Path(root)
+        return None
 
-        ``removed``: this Stop removed it, or it vanished as this Stop removed it.
-        ``populated``: the kernel refused because the directory is in use.
-        ``empty``: there was nothing to remove, or the directory is still there.
+    def _identity_matches(self, info: os.stat_result, identity: object) -> bool:
+        """True when no inode was recorded, or the directory is that inode.
+
+        A recorded identity that is not this directory is doubt. An absent identity is
+        the record shape this tree stores today (a minted ``cgroup_marker`` and no
+        ``cgroup_identity``); the marker string is required separately.
+        """
+        if identity is None:
+            return True
+        if not isinstance(identity, dict):
+            return False
+        dev, ino = identity.get("st_dev"), identity.get("st_ino")
+        if type(dev) is not int or type(ino) is not int or dev < 0 or ino < 0:
+            return False
+        return info.st_dev == dev and info.st_ino == ino
+
+    def _level_populated(self, directory: Path) -> bool | None:
+        """True when this directory lists a pid or says populated. False when it was read clear.
+
+        A missing ``cgroup.procs`` or ``cgroup.events`` is an empty level. Any other read
+        error is doubt.
+        """
+        try:
+            text = (directory / "cgroup.procs").read_text()
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT, errno.ESRCH):
+                return None
+            text = ""
+        except (ValueError, TypeError):
+            return None
+        for token in text.split():
+            if not token.isdigit() or int(token) <= 0:
+                return None
+            return True
+        try:
+            events = (directory / "cgroup.events").read_text()
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT, errno.ESRCH):
+                return None
+            events = ""
+        except (ValueError, TypeError):
+            return None
+        try:
+            fields = dict(line.split() for line in events.splitlines() if line.strip())
+        except ValueError:
+            return None
+        populated = fields.get("populated")
+        if populated == "1":
+            return True
+        if populated not in (None, "0"):
+            return None
+        return False
+
+    def _subtree_populated(self, directory: Path) -> bool | None:
+        """True when a re-read shows a process, False when the subtree was read clear, None on doubt."""
+        stack = [(directory, 0)]
+        seen: set[tuple[int, int]] = set()
+        nodes = 0
+        while stack:
+            current, depth = stack.pop()
+            nodes += 1
+            if depth > 8 or nodes > 64:
+                return None
+            try:
+                info = current.lstat()
+            except OSError:
+                return None
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                return None
+            ident = (info.st_dev, info.st_ino)
+            if ident in seen:
+                return None
+            seen.add(ident)
+            level = self._level_populated(current)
+            if level is None:
+                return None
+            if level:
+                return True
+            try:
+                entries = list(current.iterdir())
+            except OSError:
+                return None
+            for entry in entries:
+                try:
+                    child = entry.lstat()
+                except OSError:
+                    return None
+                if stat.S_ISLNK(child.st_mode):
+                    return None
+                if stat.S_ISDIR(child.st_mode) and entry.name not in (".", ".."):
+                    stack.append((entry, depth + 1))
+        return False
+
+    def _proved_cgroup_directory(self, rec: dict) -> Path | str | None:
+        """The leaf to remove, ``absent`` when that leaf is already gone, or None on any doubt.
+
+        Doubt includes: no known cgroup root, a path that is not under that root, a path
+        outside the supervised slice, a leaf that is not this run's unit, a missing marker,
+        a symlink at any component, or a path that climbs out of the root.
+        """
+        root = self._known_cgroup_root()
+        group = rec.get("cgroup")
+        run_id = rec.get("run_id")
+        marker = rec.get("cgroup_marker")
+        if root is None or not isinstance(marker, str) or not marker:
+            return None
+        if not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None:
+            return None
+        unit = f"recursion-run-{run_id}.service"
+        if not root.is_absolute():
+            return None
+        try:
+            root_info = root.lstat()
+        except OSError:
+            return None
+        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+            return None
+        if (not isinstance(group, str) or not group.startswith("/") or "\x00" in group
+                or ".." in Path(group).parts or not _UNIT.fullmatch(unit)
+                or Path(group).name != unit):
+            return None
+        parts = [part for part in group.split("/") if part]
+        if not parts or any(part in (".", "..") for part in parts):
+            return None
+        if _SUPERVISED_SLICE not in parts[:-1]:
+            return None
+        directory = root
+        try:
+            for part in parts[:-1]:
+                directory = directory / part
+                info = directory.lstat()
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    return None
+            directory = directory / parts[-1]
+            directory.relative_to(root)
+        except OSError as exc:
+            return "absent" if exc.errno == errno.ENOENT else None
+        except ValueError:
+            return None
+        return directory
+
+    def _remove_recorded_cgroup(self, rec: dict) -> str:
+        """Remove this run's cgroup directory only when the path is proved.
+
+        ``removed``: this call's ``rmdir`` succeeded.
+        ``absent``: the proved directory was already gone. This call did not remove it.
+        ``populated``: a re-read shows a process, or the re-read itself failed.
+        ``empty``: the directory stays. Every doubt is this word, and so is an empty
+        child cgroup that makes ``rmdir`` answer ``EBUSY``.
         A symlink is not followed and is not removed. Entries inside the directory are not unlinked.
         """
-        path = rec.get("cgroup")
-        if not isinstance(path, str) or not path.startswith("/") or ".." in Path(path).parts:
+        found = self._proved_cgroup_directory(rec)
+        if found is None:
             return "empty"
-        directory = Path(path)
+        if found == "absent":
+            return "absent"
+        directory = found
         try:
             info = directory.lstat()
-        except OSError:
+        except OSError as exc:
+            return "absent" if exc.errno == errno.ENOENT else "empty"
+        except (ValueError, TypeError):
             return "empty"
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return "empty"
+        if not self._identity_matches(info, rec.get("cgroup_identity")):
             return "empty"
         try:
             os.rmdir(directory)
         except OSError as exc:
             if exc.errno == errno.ENOENT:
-                return "removed"
+                return "absent"
             if exc.errno == errno.EBUSY:
+                live = self._subtree_populated(directory)
+                if live is False:
+                    return "empty"
                 return "populated"
+            return "empty"
+        except (ValueError, TypeError):
             return "empty"
         return "removed"
 
@@ -631,9 +805,10 @@ class ControlAPI:
         if answer == REMOVED:
             proof_name = "removed"
         else:
-            # The kill tree reported an empty cgroup and did not remove it. When the stored path is
-            # the directory itself, this Stop removes that leaf. A logical path that is not a
-            # directory on disk stays proof empty; the manager removes the directory under its root.
+            # The kill tree reported an empty cgroup and did not remove it. This Stop removes the
+            # leaf only when the path is under the known cgroup root, inside the supervised slice,
+            # named for this run and carrying this run's marker. Any doubt leaves the directory
+            # and stores proof empty. ``absent`` is the word for a directory already gone.
             removed = self._remove_recorded_cgroup(rec)
             if removed == "populated":
                 return self._pending(rec, "cgroup_populated")
@@ -760,7 +935,13 @@ class ControlAPI:
                         res = self._held(fresh, reason)
                     else:
                         fresh["state"] = "stopped"
-                        fresh["stop_attestation"] = self._attestation(fresh)
+                        # Keep the proof this Stop already earned. Rebuilding from the default
+                        # would drop ``removed`` on the stale-write retry.
+                        prior = confirmed.get("stop_attestation")
+                        proof_name = prior.get("proof") if isinstance(prior, dict) else "empty"
+                        if proof_name not in ("empty", "removed"):
+                            proof_name = "empty"
+                        fresh["stop_attestation"] = self._attestation(fresh, proof=proof_name)
                 try:
                     outcome = self._commit(fresh)
                 except _RegistryError:

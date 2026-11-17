@@ -158,11 +158,11 @@ class RunRegistry(Protocol):
 class KillTree(Protocol):
     """cgroup + pidfd cleanup. ``request_stop`` runs the #916 procedure (SIGINT to the run, drain, SIGKILL
     whatever is left after the grace period, via ``cgroup.kill`` and pidfds); ``confirm`` reports whether
-    the run's cgroup is empty. Never ``PR_SET_PDEATHSIG`` or ``preexec_fn``."""
+    the run's cgroup is empty, or whether this Stop removed it. Never ``PR_SET_PDEATHSIG`` or ``preexec_fn``."""
 
     def request_stop(self, cgroup: str) -> None: ...
 
-    def confirm(self, cgroup: str, timeout_s: float) -> str: ...  # EMPTY | POPULATED | TIMEOUT | UNKNOWN
+    def confirm(self, cgroup: str, timeout_s: float) -> str: ...  # EMPTY | REMOVED | POPULATED | TIMEOUT | UNKNOWN
 
 
 class InMemoryRunRegistry:

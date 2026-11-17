@@ -9,13 +9,23 @@ pass unnoticed.
 
 Nothing is frozen yet.
 
+## Stop removal receipt
+
+`run.record` and `run.view` are `1.0-draft.5`. Draft 4 already listed proof `removed` beside proof `empty` and left the top description saying a stored proof of removed was reserved. This draft records that change: `launch_manifest` stays reserved, and proof `removed` means this Stop removed the cgroup directory after the empty walk. Proof `empty` remains the proof when this Stop did not remove the directory.
+
+This draft number belongs to the removal receipt. The schema change that shares these two files takes `1.0-draft.6` when it lands after this one. If that change lands first, the removal receipt takes `1.0-draft.6` and rewrites the same sentence on that draft.
+
+| What changed | What it breaks |
+|---|---|
+| `x-version` of `run.record.v1.json` and `run.view.v1.json` is `1.0-draft.5`. The top description of `run.record` no longer calls proof `removed` reserved | A reader that treated the description's reserved sentence as a refusal of a stored proof `removed` |
+
 ## Where each schema stands
 
 | Schema | Version |
 |---|---|
 | `common.v1.json` | 1.0-draft.5 |
-| `run.record.v1.json` | 1.0-draft.4 |
-| `run.view.v1.json` | 1.0-draft.4 |
+| `run.record.v1.json` | 1.0-draft.5 |
+| `run.view.v1.json` | 1.0-draft.5 |
 | `stop.result.v1.json` | 1.0-draft.2 |
 | `session.v1.json` | 1.0-draft.3 |
 | `queue.item.v1.json` | 1.0-draft.7 |

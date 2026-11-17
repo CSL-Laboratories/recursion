@@ -310,6 +310,31 @@ class WithdrawTest(unittest.TestCase):
         self.assertEqual(len(admitted), 1000)
         self.assertEqual({id(t) for t in h._tickets}, {id(t) for t in admitted})
 
+    def test_admit_racing_withdraw_publishes_nothing(self) -> None:
+        """One thread admits while another withdraws. After the withdraw returns, nothing the admitter holds can publish."""
+        for _ in range(RACE_ROUNDS):
+            drv, h = _Driver(), _handle()
+            started = threading.Event()
+            held: list[d.PortTicket] = [drv.admit_port(h)]
+
+            def admit(started=started, held=held, drv=drv, h=h) -> None:
+                started.set()
+                while True:
+                    try:
+                        held.append(drv.admit_port(h))
+                    except d.DriverStateError:
+                        return
+
+            t = _thread(self, admit)
+            self.assertTrue(started.wait(GUARD_S))
+            drv.withdraw_port(h)
+            t.join(GUARD_S)
+            self.assertFalse(t.is_alive())
+            self.assertTrue(h.port_sealed)
+            self.assertGreaterEqual(len(held), 1)
+            for ticket in held:
+                self.assertFalse(ticket.publish(lambda: None))
+
     def test_a_ticket_ends_once(self) -> None:
         ran = []
         t = d.PortTicket()

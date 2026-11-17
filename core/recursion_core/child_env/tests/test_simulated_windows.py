@@ -30,6 +30,9 @@ it is not a Windows run. Every value is fake; no engine, provider or network is 
 
 from __future__ import annotations
 
+import ast
+import importlib
+import io
 import json
 import os
 import re
@@ -39,6 +42,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _FLAG = "--simulate-windows"
 _MARK = "SIMULATED_WINDOWS_RESULT "
@@ -216,6 +220,22 @@ def simulate(*args: str) -> dict:
 # runners. So they run in parts, one gate file each (OTHER_SUITE_FILE), one suite after another inside a part.
 OTHER_SUITE_PARTS = 3
 OTHER_SUITE_FILE = "test_simulated_windows_others_{part}.py"
+# Every core test module (recursion_core/<package>/tests/test_*.py) the parts do NOT run, with the reason. The cover
+# test lists the modules from the file system and requires: parts + this table = every module, each named once.
+_BY_REFUSAL = "run per area by test_windows_refusal_tests_pass_and_skip_nothing_on_simulated_windows"
+_CHILD_ENV_OWN = ("child_env's own test file: outside the other-suites run since the single-file version "
+                  "(its folder is HERE); imported by the import-all test, not simulated")
+OTHER_SUITES_EXCLUDED = {
+    **{f"recursion_core/{area}/tests/test_windows_refusal.py": _BY_REFUSAL for area in REFUSAL_AREAS},
+    "recursion_core/child_env/tests/test_child_env.py":
+        "TARGET: run by test_child_env_suite_has_no_error_or_failure_on_simulated_windows",
+    "recursion_core/child_env/tests/test_simulated_windows.py": "this harness: a part run must not start itself",
+    **{f"recursion_core/child_env/tests/{OTHER_SUITE_FILE.format(part=part)}":
+       "a part file: a part run must not start a part" for part in range(1, OTHER_SUITE_PARTS + 1)},
+    **{f"recursion_core/child_env/tests/{name}": _CHILD_ENV_OWN for name in (
+        "test_c146_cite.py", "test_no_proxy_glob.py", "test_no_proxy_readings.py", "test_r3_finding_1.py",
+        "test_r3_finding_12.py", "test_redteam_rt343.py")},
+}
 
 
 def other_core_suites() -> list[Path]:
@@ -228,7 +248,26 @@ def other_core_suites() -> list[Path]:
 def other_core_suites_part(part: int) -> list[Path]:
     """Part ``part`` (1 to OTHER_SUITE_PARTS): the suites whose sorted position is ``part - 1`` modulo the parts."""
 
+    if isinstance(part, bool) or not isinstance(part, int) or not 1 <= part <= OTHER_SUITE_PARTS:
+        raise ValueError(f"part must be an int from 1 to {OTHER_SUITE_PARTS}, not {part!r}")
     return other_core_suites()[part - 1::OTHER_SUITE_PARTS]
+
+
+def _suites_on_disk() -> list[str]:
+    """The cover test's oracle: every recursion_core/<package>/tests/test_*.py, as a posix path relative to CORE.
+
+    Listed with os.listdir, not with Path.glob and not through other_core_suites, so a shortened selector
+    or stride in the helpers above cannot move it. Sorted by path parts, as the helpers sort their Paths.
+    """
+
+    root = os.path.join(str(CORE), "recursion_core")
+    found = []
+    for package in os.listdir(root):
+        folder = os.path.join(root, package, "tests")
+        if os.path.isdir(folder):
+            found.extend(f"recursion_core/{package}/tests/{name}" for name in os.listdir(folder)
+                         if name.startswith("test_") and name.endswith(".py") and os.path.isfile(os.path.join(folder, name)))
+    return sorted(found, key=lambda rel: rel.split("/"))
 
 
 def assert_other_suites_clean(case: unittest.TestCase, part: int) -> None:
@@ -285,6 +324,21 @@ class SimulatedWindowsTests(unittest.TestCase):
 
     def test_the_parts_hold_every_other_core_suite_exactly_once(self) -> None:
         # The other core suites run in OTHER_SUITE_PARTS gate files (see other_core_suites_part).
+        # The oracle is the file system plus OTHER_SUITES_EXCLUDED, not the helpers it judges (Grok read, R1).
+        disk = _suites_on_disk()
+        self.assertTrue(all(isinstance(why, str) and why.strip() for why in OTHER_SUITES_EXCLUDED.values()))
+        self.assertEqual([], sorted(set(OTHER_SUITES_EXCLUDED) - set(disk)), "an exclusion names no module on disk")
+        expected = [rel for rel in disk if rel not in OTHER_SUITES_EXCLUDED]
+        self.assertEqual(expected, [path.relative_to(CORE).as_posix() for path in other_core_suites()])
+        for part in range(1, OTHER_SUITE_PARTS + 1):
+            self.assertEqual(expected[part - 1::OTHER_SUITE_PARTS],
+                             [path.relative_to(CORE).as_posix() for path in other_core_suites_part(part)], part)
+        sizes = [len(other_core_suites_part(part)) for part in range(1, OTHER_SUITE_PARTS + 1)]
+        self.assertEqual(len(expected), sum(sizes))
+        self.assertLessEqual(max(sizes) - min(sizes), 1, sizes)
+        for bad in (0, OTHER_SUITE_PARTS + 1, -1, True, 1.5, None, "1"):
+            with self.subTest(part=bad), self.assertRaises(ValueError):
+                other_core_suites_part(bad)
         others = other_core_suites()
         self.assertGreater(len(others), len(REFUSAL_AREAS))
         self.assertLessEqual(set(HOST_LIMITED), {path.relative_to(CORE).as_posix() for path in others})
@@ -298,6 +352,35 @@ class SimulatedWindowsTests(unittest.TestCase):
             with self.subTest(file=path.name):
                 module = _load(str(path), f"simulated_windows_part_{part}")
                 self.assertEqual(part, module.PART)
+
+    def test_each_part_file_runs_its_own_part_and_nothing_else(self) -> None:
+        # Grok read, R2: load each part file, run its one test against a stand-in for simulate (no suite starts)
+        # and require that it asked for exactly its own slice of the independent list, in order.
+        shared = importlib.import_module("recursion_core.child_env.tests.test_simulated_windows")
+        expected = [rel for rel in _suites_on_disk() if rel not in OTHER_SUITES_EXCLUDED]
+        clean = {"run": 1, "errors": [], "failures": [], "skipped": 0, "skipped_tests": [], "skip_reasons": [],
+                 "package": ""}
+        for part in range(1, OTHER_SUITE_PARTS + 1):
+            path = HERE / OTHER_SUITE_FILE.format(part=part)
+            with self.subTest(file=path.name):
+                module = _load(str(path), f"simulated_windows_part_run_{part}")
+                self.assertIs(shared, module.simulated)  # else the stand-in below would not be the one it calls
+                calls: list = []
+
+                def stand_in(*args: str, calls: list = calls) -> dict:
+                    calls.append(args)
+                    return dict(clean)
+
+                suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+                with mock.patch.object(shared, "simulate", stand_in):
+                    outcome = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
+                self.assertEqual((1, [], [], []), (outcome.testsRun, outcome.errors, outcome.failures, outcome.skipped))
+                self.assertEqual([(str(CORE / rel),) for rel in expected[part - 1::OTHER_SUITE_PARTS]], calls)
+                # the part class keeps the POSIX-host skip (its decorator is False here, so read the source)
+                guards = [ast.unparse(dec.args[0]) for node in ast.parse(path.read_text(encoding="utf-8")).body
+                          if isinstance(node, ast.ClassDef) for dec in node.decorator_list
+                          if isinstance(dec, ast.Call) and ast.unparse(dec.func) == "unittest.skipIf" and dec.args]
+                self.assertEqual(["os.name == 'nt'"], guards)
 
     def test_every_gated_area_has_a_windows_refusal_file(self) -> None:
         found = sorted(path.parents[1].name for path in CORE.glob("recursion_core/*/tests/test_windows_refusal.py"))

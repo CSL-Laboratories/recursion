@@ -1671,3 +1671,44 @@ def input_digest(tool_input) -> str:
     """``input_digest`` of a tool.call event: the same form, over the tool's input."""
     check_value(tool_input)
     return hashlib.sha256(text_of(tool_input).encode("utf-8")).hexdigest()
+
+
+def session_stop_problems(exchange) -> list:
+    """What does not agree in a ``session.stop`` answer. Empty when it agrees, or when this is not one.
+
+    A Stop is ``stopped`` only when every run in it is stopped and ``pending`` is empty. One pending run
+    makes the answer ``pending``, and ``pending`` names those runs and no others. ``fits`` stays true:
+    the published schema does not say this.
+    """
+    if not isinstance(exchange, dict) or exchange.get("method") != "session.stop":
+        return []
+    answer = exchange.get("answer")
+    if not isinstance(answer, dict):
+        return []
+    code = answer.get("code")
+    if code not in ("stopped", "pending", "ended"):
+        return []
+    runs, named = answer.get("runs"), answer.get("pending")
+    if not isinstance(runs, list) or not isinstance(named, list):
+        return ["shape"]
+    problems = []
+    pending_ids = []
+    every_run_stopped = True
+    for run in runs:
+        if not isinstance(run, dict) or not isinstance(run.get("run_id"), str):
+            problems.append("run")
+            every_run_stopped = False
+            continue
+        if run.get("code") == "pending" or run.get("state") == "pending":
+            pending_ids.append(run["run_id"])
+        if run.get("code") != "stopped":
+            every_run_stopped = False
+    if code == "stopped" and (pending_ids or named):
+        problems.append("stopped_while_pending")
+    if code == "ended" and (pending_ids or named):
+        problems.append("ended_while_pending")
+    if code == "stopped" and not every_run_stopped:
+        problems.append("not_every_run_stopped")
+    if any(not isinstance(item, str) for item in named) or sorted(named) != sorted(pending_ids):
+        problems.append("pending_names")
+    return problems

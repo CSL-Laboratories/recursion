@@ -40,11 +40,17 @@ def _profile_of_length(nbytes: int) -> dict:
 
 
 class _ScriptedSocket:
-    """In-memory recv stream. Honours ``recv(n)`` and sends nothing."""
+    """In-memory recv stream. Honours ``recv(n)`` and sends nothing.
 
-    def __init__(self, payload: bytes):
+    ``chunks`` limits each read to that many bytes, in order, even when the caller asks for more.
+    ``asked`` records every ``recv`` size the client requested.
+    """
+
+    def __init__(self, payload: bytes, chunks: list[int] | None = None):
         self._payload = payload
         self.offset = 0
+        self._chunks = list(chunks) if chunks is not None else None
+        self.asked: list[int] = []
 
     def settimeout(self, value):
         pass
@@ -56,7 +62,13 @@ class _ScriptedSocket:
         pass
 
     def recv(self, maximum):
-        chunk = self._payload[self.offset:self.offset + maximum]
+        self.asked.append(maximum)
+        take = maximum
+        if self._chunks is not None:
+            if not self._chunks:
+                return b""
+            take = min(maximum, self._chunks.pop(0))
+        chunk = self._payload[self.offset:self.offset + take]
         self.offset += len(chunk)
         return chunk
 
@@ -64,11 +76,42 @@ class _ScriptedSocket:
         pass
 
 
-def _client_reply(payload: bytes) -> dict:
-    scripted = _ScriptedSocket(payload)
+class _StallAfterSocket(_ScriptedSocket):
+    """Returns the payload, then raises ``TimeoutError`` instead of ending the stream."""
+
+    def __init__(self, payload: bytes):
+        super().__init__(payload)
+        self.stalls = 0
+
+    def recv(self, maximum):
+        if self.offset >= len(self._payload):
+            self.stalls += 1
+            self.asked.append(maximum)
+            raise TimeoutError("stall")
+        return super().recv(maximum)
+
+
+def _call_with(scripted: _ScriptedSocket) -> dict:
     with mock.patch.object(transport.socket, "socket", return_value=scripted), \
             mock.patch.object(transport, "_peer_uid", return_value=os.getuid()):
         return transport.OperatorReadsClient("unused.sock").call(METHOD)
+
+
+def _client_reply(payload: bytes) -> dict:
+    return _call_with(_ScriptedSocket(payload))
+
+
+def _chunks_then_tail(body: int, tail: int) -> list[int]:
+    """Chunk sizes that sum to ``body + tail``. The last chunk is ``tail`` bytes."""
+
+    chunks: list[int] = []
+    left = body
+    while left > 65536:
+        chunks.append(65536)
+        left -= 65536
+    chunks.append(left)
+    chunks.append(tail)
+    return chunks
 
 
 def _json_line(total: int) -> bytes:
@@ -137,6 +180,41 @@ class ReplyCapTests(unittest.TestCase):
         reply = transport.OperatorReadsClient("unused.sock", timeout_s=1e20).call(METHOD)
         self.assertEqual(reply["code"], "control_api_unavailable")
         self.assertIs(reply["delivered"], False)
+
+    @unittest.skipUnless(CAN_SERVE, "Linux client required")
+    def test_newline_crossing_the_cap_in_one_chunk_is_too_large(self):
+        """A chunk that starts under the cap and finishes on a newline past it is refused.
+
+        Cap-aligned reads hit the earlier length check before this measured check. Here the
+        buffer is five bytes short of the cap, and the next six bytes end on the newline.
+        """
+        payload = _json_line(CAP + 1)
+        self.assertEqual(payload.rfind(b"\n"), CAP)
+        scripted = _ScriptedSocket(payload, chunks=_chunks_then_tail(CAP - 5, 6))
+        reply = _call_with(scripted)
+        self.assertEqual(reply.get("code"), "control_api_unavailable")
+        self.assertEqual((reply.get("delivered"), reply.get("detail")), ("unknown", "reply_too_large"))
+        self.assertEqual(scripted.offset, CAP + 1)
+
+    @unittest.skipUnless(CAN_SERVE, "Linux client required")
+    def test_recv_near_the_cap_asks_only_for_the_remaining_room(self):
+        """The read that can cross the cap asks for the bytes still allowed, not a full buffer."""
+        payload = _json_line(CAP + 1)
+        scripted = _ScriptedSocket(payload, chunks=_chunks_then_tail(CAP - 5, 6))
+        _call_with(scripted)
+        self.assertGreaterEqual(len(scripted.asked), 2, scripted.asked)
+        self.assertEqual(scripted.asked[-1], (CAP + 1) - (CAP - 5), scripted.asked)
+
+    @unittest.skipUnless(CAN_SERVE, "Linux client required")
+    def test_exact_cap_with_no_newline_is_too_large_before_a_stall(self):
+        """Exactly the cap and no newline, then a stall, is reply_too_large rather than reply_timeout."""
+        payload = b"x" * CAP
+        self.assertNotIn(b"\n", payload)
+        scripted = _StallAfterSocket(payload)
+        reply = _call_with(scripted)
+        self.assertEqual(reply.get("code"), "control_api_unavailable")
+        self.assertEqual((reply.get("delivered"), reply.get("detail")), ("unknown", "reply_too_large"))
+        self.assertEqual(scripted.stalls, 0)
 
 
 if __name__ == "__main__":

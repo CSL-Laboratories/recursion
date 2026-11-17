@@ -94,11 +94,26 @@ class Fixture(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertTrue(fired)
 
+@unittest.skipIf(os.name == "nt", "POSIX rules")
 class Defects(Fixture):
     def test_D10_refusal_newline(self):
-            with self.assertRaises(EnvRefused) as cm:
-                self.build(overrides={'BAD\nFORGED: accepted':'fixture'})
-            self.assertNotIn('\n',str(cm.exception),'caller-controlled name creates a second refusal line')
+            names = (
+                'BAD\nFORGED: accepted',
+                'BAD\rFORGED: accepted',
+                'BAD\x0bFORGED: accepted',
+                'BAD\x0cFORGED',
+                'BAD\u2028FORGED: accepted',
+                'BAD\u0085FORGED: accepted',
+                'BAD\x1b[2JFORGED: accepted',
+            )
+            for name in names:
+                with self.subTest(name=repr(name)):
+                    with self.assertRaises(EnvRefused) as cm:
+                        self.build(overrides={name: 'fixture'})
+                    self.assertIsNone(cm.exception.name)
+                    self.assertEqual('override_malformed', cm.exception.cause)
+                    self.assertNotIn(name, str(cm.exception))
+                    self.assertNotIn('\n', str(cm.exception))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

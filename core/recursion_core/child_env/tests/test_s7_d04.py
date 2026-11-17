@@ -94,6 +94,7 @@ class Fixture(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertTrue(fired)
 
+@unittest.skipIf(os.name == "nt", "POSIX rules")
 class Defects(Fixture):
     def test_D04_filesystem_errors(self):
             ca = self.root / 'synthetic-private-ca'
@@ -105,17 +106,19 @@ class Defects(Fixture):
                     ca.unlink()
                 return result
             with self.subTest(window='final-stat'):
-                try:
-                    with mock.patch.object(policy, '_resolve', resolved_then_removed):
+                with mock.patch.object(policy, '_resolve', resolved_then_removed):
+                    with self.assertRaises(EnvRefused) as caught:
                         self.build(parent={'SSL_CERT_FILE':str(ca)})
-                except EnvRefused as exc:
-                    self.assertNotIn(str(ca), str(exc))
+                self.assertEqual('value_unreadable', caught.exception.cause)
+                self.assertNotIn(str(ca), str(caught.exception))
             link = self.root / 'link'
             link.symlink_to(self.home)
             with self.subTest(window='readlink'):
                 with mock.patch.object(policy.os, 'readlink', side_effect=OSError(errno.EIO, 'synthetic EIO', str(link))):
-                    with self.assertRaises(EnvRefused):
+                    with self.assertRaises(EnvRefused) as caught:
                         self.build(parent={'SSL_CERT_FILE':str(link)})
+                self.assertEqual('value_unreadable', caught.exception.cause)
+                self.assertNotIn(str(link), str(caught.exception))
             # Master line 703 is the same hole on a directory value: the final stat can raise a
             # path-bearing OSError after resolution. The patch covers the file and the link.
             dire = self.root / 'synthetic-private-dir'
@@ -126,11 +129,11 @@ class Defects(Fixture):
                     dire.rmdir()
                 return result
             with self.subTest(window='dir-stat'):
-                try:
-                    with mock.patch.object(policy, '_resolve', resolved_dir_then_removed):
+                with mock.patch.object(policy, '_resolve', resolved_dir_then_removed):
+                    with self.assertRaises(EnvRefused) as caught:
                         self.build(parent={'SSL_CERT_DIR':str(dire)})
-                except EnvRefused as exc:
-                    self.assertNotIn(str(dire), str(exc))
+                self.assertEqual('value_unreadable', caught.exception.cause)
+                self.assertNotIn(str(dire), str(caught.exception))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

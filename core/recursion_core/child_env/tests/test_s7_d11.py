@@ -94,6 +94,7 @@ class Fixture(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertTrue(fired)
 
+@unittest.skipIf(os.name == "nt", "POSIX rules")
 class Defects(Fixture):
     def test_D11_proxy_final_newline(self):
             for name in policy.VALUE_URLS+policy.VALUE_ALL_PROXY:

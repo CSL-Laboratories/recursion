@@ -1,38 +1,13 @@
-import ast
-
-from collections.abc import Mapping
-
-import dataclasses
-
-import errno
-
-import importlib
-
 import inspect
-
 import os
-
-from pathlib import Path
-
-import signal
-
-import stat
-
 import sys
-
 import tempfile
-
 import threading
-
-import time
-
-from types import SimpleNamespace
-
 import unittest
-
+from pathlib import Path
 from unittest import mock
 
-from recursion_core.child_env import ChildRoute, EnvRefused, build_child_env, policy, spawn
+from recursion_core.child_env import EnvRefused, build_child_env, policy
 
 
 class Fixture(unittest.TestCase):
@@ -42,9 +17,6 @@ class Fixture(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.home = self.root / 'home'
         self.home.mkdir(mode=0o700)
-        self.binary = self.root / 'engine'
-        self.binary.write_text('#!/bin/sh\nexit 0\n', encoding='ascii')
-        self.binary.chmod(0o700)
         self.bases = mock.patch.object(policy, '_tmp_bases', return_value=[str(self.root)])
         self.bases.start()
         self.addCleanup(self.bases.stop)
@@ -59,9 +31,10 @@ class Fixture(unittest.TestCase):
     def interleave(self, function, source_line, mutate, call):
         """Select one ordinary-container interleaving; no scheduling sleeps."""
         lines, first = inspect.getsourcelines(function)
-        target = next(first+i for i,s in enumerate(lines) if s.strip() == source_line)
+        target = next(first + i for i, s in enumerate(lines) if s.strip() == source_line)
         entered, done = threading.Event(), threading.Event()
         errors = []
+
         def worker():
             try:
                 if not entered.wait(3):
@@ -71,9 +44,11 @@ class Fixture(unittest.TestCase):
                 errors.append(e)
             finally:
                 done.set()
+
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
         fired = False
+
         def trace(frame, event, arg):
             nonlocal fired
             if not fired and event == 'line' and frame.f_code is function.__code__ and frame.f_lineno == target:
@@ -82,6 +57,7 @@ class Fixture(unittest.TestCase):
                 if not done.wait(3):
                     raise AssertionError('mutator missed bounded deadline')
             return trace
+
         previous = sys.gettrace()
         try:
             sys.settrace(trace)
@@ -94,15 +70,17 @@ class Fixture(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertTrue(fired)
 
+
+@unittest.skipIf(os.name == "nt", "POSIX rules")
 class Defects(Fixture):
     def test_D06_overrides_snapshot(self):
-            overrides = {'LANG':'C'}
-            try:
-                env = self.interleave(policy.build_child_env, 'env[name] = value',
-                                      lambda:overrides.update(LC_ALL='C'), lambda:self.build(overrides=overrides))
-            except EnvRefused:
-                return
-            self.assertEqual(env['LANG'], 'C')
+        overrides = {'LANG': 'C'}
+        with self.assertRaises(EnvRefused) as caught:
+            self.interleave(policy.build_child_env, 'env[name] = value',
+                            lambda: overrides.update(LC_ALL='C'), lambda: self.build(overrides=overrides))
+        self.assertIsNone(caught.exception.name)
+        self.assertEqual('override_malformed', caught.exception.cause)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

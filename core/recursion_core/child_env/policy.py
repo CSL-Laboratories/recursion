@@ -381,10 +381,12 @@ def build_child_env(
 
     # Overrides are merged first and then checked by exactly the rules below, like any inherited value.
     # They may only set a name this engine's allowlist already carries: never HOME, PATH or a credential.
-    # Taken once. None is no overrides. A value that is not a mapping, including a falsy list or bool,
-    # is override_malformed rather than treated as empty or left as AttributeError. A mapping that
-    # changes while these pairs are applied is the same refusal: the child must not see a torn set,
-    # and the caller must not see RuntimeError from a live view.
+    # Taken once for application, then read once more when the overrides are a dict, to detect a
+    # change. A mapping that is not a dict is applied from that one copy: a one-shot or reordered
+    # items() is not treated as a change. None is no overrides. A value that is not a mapping,
+    # including a falsy list or bool, is override_malformed rather than treated as empty or left as
+    # AttributeError. A dict that changes while these pairs are applied is the same refusal: the child
+    # must not see a torn set, and the caller must not see an exception from a live view.
     if overrides is None:
         override_items: tuple[tuple[object, object], ...] = ()
     elif not isinstance(overrides, Mapping):
@@ -392,11 +394,15 @@ def build_child_env(
     else:
         try:
             override_items = tuple(overrides.items())
-        except (AttributeError, RuntimeError, TypeError, ValueError):
+        except Exception:
             raise EnvRefused(None, "override_malformed") from None
-    for name, value in override_items:
+    for pair in override_items:
+        try:
+            name, value = pair
+        except (TypeError, ValueError):
+            raise EnvRefused(None, "override_malformed") from None
         if (not isinstance(name, str) or not isinstance(value, str) or not name or "=" in name
-                or "\0" in name + value or "\n" in name or "\r" in name):
+                or "\0" in name + value or not name.isprintable()):
             raise EnvRefused(None, "override_malformed")
         if (_DENIED.search(name) or name in _OVERRIDE_DENIED_NAMES or name in profile.scrub
                 or name in profile.passthrough or name in ("HOME", "PATH")):
@@ -406,10 +412,10 @@ def build_child_env(
         if name in _CARRIED_ONLY_NAMES:
             raise EnvRefused(name, "override_denied")
         env[name] = value
-    if overrides is not None:
+    if isinstance(overrides, dict):
         try:
             current_items = tuple(overrides.items())
-        except (AttributeError, RuntimeError, TypeError, ValueError):
+        except Exception:
             raise EnvRefused(None, "override_malformed") from None
         if current_items != override_items:
             raise EnvRefused(None, "override_malformed")
@@ -485,7 +491,7 @@ def _route_env(profile: EngineProfile, auth_mode: str, route: ChildRoute | None)
         raise EnvRefused(None, "route_malformed")
     try:
         switches = tuple(raw_switches)
-    except RuntimeError:
+    except Exception:
         raise EnvRefused(None, "route_malformed") from None
     if not all(isinstance(name, str) for name in switches):
         raise EnvRefused(None, "route_malformed")
@@ -766,7 +772,10 @@ def _unsafe_path(value: str) -> str | None:
             return cause
     names = PATH_TOOLS
     if names is None:
-        names = sorted({item for entry in entries if os.path.isdir(entry) for item in os.listdir(entry)})
+        try:
+            names = sorted({item for entry in entries if os.path.isdir(entry) for item in os.listdir(entry)})
+        except OSError:
+            return "value_unreadable"
     for name in names:
         located = shutil.which(name, path=value)
         if located is not None and (cause := _unsafe_file(located)) is not None:

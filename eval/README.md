@@ -9,7 +9,7 @@ how a result may be worded.
 | `PROTOCOL.md` | the protocol, frozen with `analyze.py` and `passk.py` by `FROZEN.sha256` |
 | `run` | the runner's command (`eval/run --help`) |
 | `runner.py` | one suite run per arm: scratch runtime, fresh copy, engine, diff, hidden tests, record |
-| `arms.py` | the direct arm (stand-in engine, Claude Code) and the Recursion arm (refuses until WORKSPACE and EVENTS land) |
+| `arms.py` | the direct arm (stand-in engine, Claude Code) and the Recursion arm (not built yet: REFUSAL when seams are missing, NOT_BUILT when they are present) |
 | `standin_engine.py` | a scripted stand-in engine that edits the work tree, for offline runs; not a measurement |
 | `record.py`, `schema/recursion-eval-run-1.json` | the `recursion-eval-run/1` record and its checks |
 | `passk.py` | pass^k and pass@1 from per-task counts; task-level bootstrap, paired and clustered intervals |

@@ -1,10 +1,8 @@
 """The two arms: an engine run as its own CLI (direct), and the same engine under Recursion.
 
 Same model, route and effort in both (PROTOCOL.md, "Arms"). The direct arm reads tokens and cost
-from the engine's own output; it is not a Recursion surface. The Recursion arm drives the engine
-through the control socket, gives it the task repository through WORKSPACE's ``workspace`` field
-(seam S6) and reads usage from EVENTS' usage events, never from parsing output. Until both are on
-the evaluated base it refuses with REFUSAL and the rest of the run goes on.
+from the engine's own output; it is not a Recursion surface. The Recursion arm is not built yet:
+preflight refuses with REFUSAL when seams are missing and NOT_BUILT when they are present.
 """
 from __future__ import annotations
 
@@ -12,6 +10,7 @@ import errno
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -240,6 +239,9 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
     does exit.
     Times are monotonic.
     """
+    # Session cleanup calls getsid. Without it, do not start a process this function cannot reap.
+    if not hasattr(os, "getuid") or not hasattr(os, "getsid"):
+        raise ArmRefused("platform_unsupported")
     if not isinstance(argv, (list, tuple)) or not argv or any(not isinstance(part, str) for part in argv):
         raise EngineMissing("the command must be a non-empty list of strings")
     if stdin is not None and not isinstance(stdin, bytes):
@@ -575,6 +577,192 @@ def _count(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+# A credential name, as a suffix, so a prefix (ANTHROPIC_API_KEY, AWS_SECRET_ACCESS_KEY)
+# still matches. The whole identifier is kept; only the value is dropped. ``token`` does
+# not match ``tokens``, and ``session`` does not match ``sessions``.
+_CREDENTIAL_NAME = re.compile(
+    r"(?i)(?:access_token|refresh_token|authorization|password|passwd|"
+    r"secret_access_key|secret_key|private_key|access_key|"
+    r"secret|api[_-]?key|cookie|session|token)$"
+)
+
+
+def _next_cut(text, start):
+    """The next ``=``, ``:`` or ``--`` at or after ``start``.
+
+    One forward read of the gap. Searching the remainder from every separator is quadratic
+    on engine text that is full of ``:`` or ``=`` and has no ``--``. Returns
+    ``(sep_index or -1, flag_index or -1)`` with only the earlier mark set.
+    """
+    index = start
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == "=" or char == ":":
+            return index, -1
+        if char == "-" and index + 1 < length and text[index + 1] == "-":
+            return -1, index
+        index += 1
+    return -1, -1
+
+
+def _scheme_value_start(text, start):
+    """Index of the token after a Bearer or Basic scheme, or None when the text has no scheme there."""
+    for word in ("bearer", "basic"):
+        end = start + len(word)
+        if end < len(text) and text[start:end].lower() == word and text[end].isspace():
+            index = end + 1
+            while index < len(text) and text[index].isspace():
+                index += 1
+            return index
+    return None
+
+
+def _credential_value_end(text, start, whole_line=False):
+    """End index of one credential value, or None when there is no value.
+
+    A quoted value runs to its closing quote (a backslash keeps the next character). A value
+    whose opening quote is itself escaped (``\\"abc def\\"``) is the same span, so the part
+    after a space is not left behind. An unquoted value is one token. A Bearer or Basic scheme
+    in front of that token is part of the value, so ``authorization=Bearer <value>`` does not
+    keep the value after the scheme word. An Authorization value is the rest of the line: the
+    scheme word and every parameter after it, through the line end.
+    """
+    length = len(text)
+    if start >= length or text[start].isspace():
+        return None
+    if whole_line:
+        index = start
+        while index < length and text[index] not in "\r\n":
+            index += 1
+        return index if index > start else None
+    if text[start] == "\\" and start + 1 < length and text[start + 1] in "\"'":
+        quote = text[start + 1]
+        index = start + 2
+        while index < length:
+            if text[index] == "\\" and index + 1 < length:
+                if text[index + 1] == quote:
+                    return index + 2
+                index += 2
+                continue
+            index += 1
+        return length
+    if text[start] in "\"'":
+        quote = text[start]
+        index = start + 1
+        while index < length:
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == quote:
+                return index + 1
+            index += 1
+        return length
+    scheme = _scheme_value_start(text, start)
+    index = start
+    if scheme is not None and scheme < length and not text[scheme].isspace():
+        index = scheme
+    while index < length and not text[index].isspace():
+        index += 1
+    return index if index > start else None
+
+
+def _name_ending_at(text, sep):
+    """The identifier immediately before a separator, skipping spaces and one quote. Or None."""
+    index = sep
+    while index > 0 and text[index - 1].isspace():
+        index -= 1
+    if index > 0 and text[index - 1] in "\"'":
+        index -= 1
+    end = index
+    while index > 0 and (text[index - 1].isalnum() or text[index - 1] in "_.-"):
+        index -= 1
+    if index == end:
+        return None
+    return index, text[index:end]
+
+
+def _flag_at(text, start):
+    """A ``--name value`` or ``--name=value`` flag when the name carries a credential. Or None."""
+    if not text.startswith("--", start):
+        return None
+    length = len(text)
+    index = start + 2
+    name_at = index
+    while index < length and (text[index].isalnum() or text[index] in "_.-"):
+        index += 1
+    name = text[name_at:index]
+    if not name or _CREDENTIAL_NAME.search(name) is None:
+        return None
+    if index < length and text[index] == "=":
+        value_at = index + 1
+    elif index < length and text[index].isspace():
+        value_at = index
+    else:
+        return None
+    while value_at < length and text[value_at].isspace():
+        value_at += 1
+    value_end = _credential_value_end(
+        text, value_at, whole_line=name.lower().endswith("authorization"))
+    if value_end is None:
+        return None
+    return "--" + name, value_end
+
+
+def redact_detail(text):
+    """Drop values for names that carry a credential.
+
+    The engine's own error text is copied into the record. A value after one of these names is
+    replaced so the record keeps the failure and not the value. The separator may be ``=`` or
+    ``:``, the name may carry a prefix, the value may be quoted, and a Bearer or Basic scheme is
+    part of the value. An Authorization value runs to the end of its line, so a scheme other than
+    Bearer or Basic does not leave the rest of that line in the record. A flag of the form
+    ``--api-key <value>`` is the same. Each character is read a constant number of times, with no
+    shared state, so a second caller cannot see this caller's text and a long engine error cannot
+    stall the recording step.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    parts = []
+    index = 0
+    length = len(text)
+    while index < length:
+        sep, flag = _next_cut(text, index)
+        if sep < 0 and flag < 0:
+            parts.append(text[index:])
+            break
+        if flag >= 0 and (sep < 0 or flag <= sep):
+            found = _flag_at(text, flag)
+            if found is None:
+                parts.append(text[index:flag + 2])
+                index = flag + 2
+                continue
+            shown, value_end = found
+            parts.append(text[index:flag])
+            parts.append(shown + "=[redacted]")
+            index = value_end
+            continue
+        named = _name_ending_at(text, sep)
+        if named is None or _CREDENTIAL_NAME.search(named[1]) is None:
+            parts.append(text[index:sep + 1])
+            index = sep + 1
+            continue
+        name_at, name = named
+        value_at = sep + 1
+        while value_at < length and text[value_at].isspace():
+            value_at += 1
+        value_end = _credential_value_end(
+            text, value_at, whole_line=name.lower().endswith("authorization"))
+        if value_end is None:
+            parts.append(text[index:sep + 1])
+            index = sep + 1
+            continue
+        parts.append(text[index:name_at])
+        parts.append(name + "=[redacted]")
+        index = value_end
+    return "".join(parts)
+
+
 def _json_loads(line: bytes):
     """Parse one stream line. An integer past the platform digit limit stays text, not an error."""
     def parse_int(text):
@@ -639,8 +827,10 @@ def parse_stream_json(stdout: bytes, *, cost_basis: str) -> dict:
     if failure is None and result.get("api_error_status") == 401:
         failure = "auth_failed"
     detail = error if isinstance(error, str) else result.get("subtype")
+    if detail is not None:
+        detail = redact_detail(str(detail))
     return {"has_result": True, "claimed_done": False, "failure": failure or "engine_error",
-            "detail": str(detail) if detail is not None else None, "usage": usage}
+            "detail": detail, "usage": usage}
 
 
 class Arm:

@@ -43,6 +43,9 @@ def _real_runtime_dir() -> Path:
 
 
 def check_bases(tmp_base: Path, xdg_base: Path) -> None:
+    # getuid names the real runtime directory. Without it this platform cannot keep that promise.
+    if not hasattr(os, "getuid"):
+        raise ScratchError("platform_unsupported")
     tmp_base, xdg_base = Path(tmp_base), Path(xdg_base)
     if not tmp_base.is_absolute() or not xdg_base.is_absolute():
         raise ScratchError("scratch bases must be absolute paths")

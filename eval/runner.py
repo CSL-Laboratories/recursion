@@ -120,7 +120,7 @@ def not_run_trial(trial_id: str, task_id: str, index: int) -> dict:
 
 
 def _set_error(trial: dict, cls: str, detail: str | None) -> None:
-    trial["error"] = {"class": cls, "tier": record_mod.CLASS_TIER[cls], "detail": detail}
+    trial["error"] = {"class": cls, "tier": record_mod.CLASS_TIER[cls], "detail": arms_mod.redact_detail(detail)}
 
 
 def grade(task, work: Path, scratch) -> dict:
@@ -291,6 +291,8 @@ def check_plan(suite, arms: list, *, k, attempts, replacements, label: str, arti
         raise RunRefused(f"attempts ({attempts}) below k ({k}): pass^{k} would be not estimable for every task")
     if not (_is_int(replacements) and replacements >= 0):
         raise RunRefused(f"replacements must be a non-negative integer, got {replacements!r}")
+    if replacements > 2:
+        raise RunRefused(f"replacements are at most 2 per task and arm, got {replacements}")
     if label not in record_mod.LABELS:
         raise RunRefused(f"label must be one of {record_mod.LABELS}")
     if (label == "dev") != (suite.split == "dev"):

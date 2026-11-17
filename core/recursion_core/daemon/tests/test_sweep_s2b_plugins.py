@@ -1,4 +1,4 @@
-"""E21: a symlinked revocation store is not opened.
+"""E21, and a plugin directory name that must not forge a log record.
 
 ``test_a_symlinked_revocation_store_must_not_be_opened`` pins a symlink whose target is mode 0666.
 The mode check alone refuses that target, so it does not tell ``lstat`` from ``stat``.
@@ -7,6 +7,8 @@ the link and loads, and the check must not.
 ``test_a_swap_to_a_symlink_between_the_check_and_the_open_does_not_load`` pins that the open uses
 the inode that was checked. Bounded rounds, run on the free-threaded interpreter with the GIL off.
 ``test_two_hosts_creating_the_store_together_both_load`` pins two creators of one new store.
+``test_plugin_paths_must_not_inject_log_records`` pins that a newline in a plugin directory name
+cannot forge a second log record.
 Fixture bytes are generated here.
 """
 import os
@@ -167,6 +169,16 @@ class PluginRegressions(unittest.TestCase):
             if done.get('state') == 'loaded' and 'elsewhere.sqlite3' in str(opened):
                 leaks += 1
         self.assertEqual(leaks, 0, f'{leaks} of {rounds} rounds loaded through a symlinked store')
+
+    def test_plugin_paths_must_not_inject_log_records(self):
+        source = self.root / 'fixture\nSYNTHETIC-FORGED-LOG-LINE'
+        source.mkdir(mode=0o700)
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR') as captured:
+            host = plugins.PluginHost(self.root / 'config', self.root / 'state',
+                                      plugin_dirs=(source,), gil_probe=GilOff(), verification_available=lambda: True)
+        self.addCleanup(host.close)
+        self.assertEqual(host.records[0]['code'], 'plugin_file_missing')
+        self.assertNotIn('\nSYNTHETIC-FORGED-LOG-LINE', '\n'.join(captured.output))
 
 
 if __name__ == '__main__':

@@ -7,6 +7,7 @@ Run: PYTHONPATH=core <python> -m unittest recursion_core.routes.engines.fixtures
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -1804,6 +1805,97 @@ class DevinThreads396Test(unittest.TestCase):
         self.assertEqual(len(spans), len(lines) - 1)
         for span in spans:
             self.assertEqual(span["offset_start"], true[span["text"][:-1]])
+
+
+def _json_unescape(text: str) -> str:
+    """What a reader gets by reading ``text`` as JSON string escapes, a few layers deep. The attack, written
+    apart from the product: a piece that still holds backslash-u spellings is not masked."""
+    level = text
+    for _layer in range(9):
+        if "\\" not in level:
+            return level
+        try:
+            decoded = json.loads('"' + level + '"')
+        except ValueError:
+            return level
+        if not isinstance(decoded, str) or decoded == level:
+            return level
+        level = decoded
+    return level
+
+
+class ReviewRoundSeven408Test(unittest.TestCase):
+    """DeepSeek's round-7 read of #408 at c140f90b. HIGH 1 and LOW 2 fail on that head. LOW 3 and LOW 5 are the
+    docstring the read asked for once the behavior stays the one the driver's tests pin. LOW 4 guards the
+    put-aside drop."""
+
+    def test_h1_escaped_halves_of_a_value_reach_no_draft_and_not_the_digest(self) -> None:
+        halves = ("".join("\\u%04x" % ord(ch) for ch in KEY6[:12]),
+                  "".join("\\u%04x" % ord(ch) for ch in KEY6[12:]))
+        drafts = ag.AcpDrafts(redact=(KEY6,))
+        raw = {"a": halves[0], "b": halves[1]}
+        drafts.on_update(u6(rawInput=raw))
+        call = [d["payload"] for d in drafts.drafts if d["type"] == "tool.call"][0]
+        peeled = [_json_unescape(piece) for piece in strings_in(call["input"])]
+        self.assertFalse(recoverable(peeled, KEY6))
+        self.assertNotIn(KEY6, json.dumps(call["input"]))
+        self.assertEqual(call["input_digest"], ag.input_digest(call["input"]))
+        self.assertNotEqual(call["input_digest"], ag.input_digest(raw))
+        drafts = ag.AcpDrafts(redact=(KEY6,))
+        up = u6(content=[{"type": "content", "content": {"type": "text", "text": part}} for part in halves])
+        line = json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": up})
+        drafts.on_line(line)
+        saved = json.loads(drafts.drafts[0]["payload"]["text"])
+        peeled = [_json_unescape(piece) for piece in strings_in(saved)]
+        self.assertFalse(recoverable(peeled, KEY6))
+        self.assertNotIn(KEY6, drafts.drafts[0]["payload"]["text"])
+
+    def test_h1_a_value_split_over_two_strings_of_a_line_json_cannot_read_is_masked(self) -> None:
+        line = '{"text": "%s"} {"text": "%s"}' % (KEY6[:12], KEY6[12:])
+        with self.assertRaises(ValueError):
+            json.loads(line)
+        drafts = ag.AcpDrafts(redact=(KEY6,))
+        drafts.on_line(line)
+        saved = drafts.drafts[0]["payload"]["text"]
+        parts = re.findall(r'"([^"\\]*)"', saved)
+        self.assertFalse(recoverable(parts, KEY6))
+        self.assertNotIn(KEY6, saved)
+        escaped = '{"text": "%s"} {"text": "%s"}' % (
+            "".join("\\u%04x" % ord(ch) for ch in KEY6[:12]),
+            "".join("\\u%04x" % ord(ch) for ch in KEY6[12:]))
+        with self.assertRaises(ValueError):
+            json.loads(escaped)
+        drafts = ag.AcpDrafts(redact=(KEY6,))
+        drafts.on_line(escaped)
+        saved = drafts.drafts[0]["payload"]["text"]
+        parts = [_json_unescape(piece) for piece in re.findall(r'"((?:[^"\\]|\\.)*)"', saved)]
+        self.assertFalse(recoverable(parts, KEY6))
+
+    def test_low2_two_keys_that_mask_alike_refuse_the_line_before_its_draft(self) -> None:
+        drafts = ag.AcpDrafts(redact=(KEY6,))
+        params = u6(rawInput={KEY6: 1, "*" * len(KEY6): 2})
+        line = json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": params}, sort_keys=False)
+        with self.assertRaises(acp.AcpProtocolError) as caught:
+            drafts.on_line(line)
+        self.assertIn("two keys of one object mask alike", str(caught.exception))
+        self.assertEqual(drafts.drafts, [])
+        self.assertEqual(drafts.offset, len(line.encode()) + 1)
+
+    def test_low3_the_docstring_says_an_unannounced_end_is_accepted(self) -> None:
+        doc = " ".join(ag.AcpDrafts.__doc__.split())
+        self.assertIn("only when that session has already announced an earlier one", doc)
+        self.assertIn("must feed only the turn in progress", doc)
+
+    def test_low4_ending_a_put_aside_turn_drops_it_from_the_outer_stack(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.turn_start((1, 1))
+        drafts.turn_start((2, 1))
+        self.assertEqual(len(drafts._outer), 1)
+        drafts.ended(six_outcome(session=1, turn=1))
+        self.assertEqual(drafts._outer, [])
+        drafts.ended(six_outcome(session=2, turn=1))
+        drafts.on_update(u6(call_id="fresh-after"))
+        self.assertEqual(texts_of(drafts.drafts, "tool.call", "call_id"), ["fresh-after"])
 
 
 if __name__ == "__main__":

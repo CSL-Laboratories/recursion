@@ -191,21 +191,27 @@ class DurableRouteBreaker:
             # as tripped; the next request reads the store again (ADV2-1).
             return {'admitted': False, 'code': c.BREAKER_OPEN, 'probe': None, 'retry_at': None, 'key': connection}
         answer = self._inner.admit(connection, model, tenant, deadline_s=deadline_s)
-        if answer.get('admitted'):
-            ctx = getattr(_current, 'ctx', None)
-            if ctx is not None:
-                ctx.admitted = (connection, str(model))
         probe = answer.get('probe')
-        if answer.get('admitted') and probe is not None and self.tripped(connection):
+        # A store that cannot say whether it holds a trip (None) goes the leased way too, and fails there.
+        if answer.get('admitted') and probe is not None and self.tripped(connection) is not False:
             try:
                 with self._trip_lock:
                     generation = self._trips.get(connection, 0)
                     lease = self._stored.begin_probe(connection)
             except (Refused, sqlite3.Error) as exc:
-                log.error('no probe lease from the breaker store: %s', _code(exc))
-            else:
-                with self._lock:
-                    self._leases[probe] = (lease, generation)
+                # E24: no store lease (another holder's lease is live, or the store failed). A probe
+                # admitted without one could never clear the stored trip, and two probes would run on
+                # one trip: the route's probe is given back unused and this request is refused.
+                log.error('no probe lease from the breaker store (%s): the route probe is refused', _code(exc))
+                self._inner.record(connection, model, tenant, {'code': c.BREAKER_OPEN}, probe)
+                return {'admitted': False, 'code': c.BREAKER_OPEN, 'probe': None, 'retry_at': None,
+                        'key': connection}
+            with self._lock:
+                self._leases[probe] = (lease, generation)
+        if answer.get('admitted'):
+            ctx = getattr(_current, 'ctx', None)
+            if ctx is not None:
+                ctx.admitted = (connection, str(model))
         return answer
 
     def record(self, connection, model, tenant, outcome, probe=None):

@@ -115,6 +115,10 @@ def _last_charge(db) -> tuple | None:
     return db.execute(_LAST_CHARGE).fetchone()
 
 
+# A last-charge read that raised. Not a row, and not "the ledger held no charge": a reopen must not trust either.
+_WITNESS_UNKNOWN = object()
+
+
 def create_ledger(path: str, anchor_public_key: str) -> None:
     """Installer step: create the ledger bound to one anchor. Refuses if it exists."""
     parse_public_key(anchor_public_key)
@@ -160,7 +164,7 @@ class Authority:
             before = _file_identity(self._path)
         except OSError:
             raise Refused("ledger_missing") from None
-        self._db = self._connect(self._path)
+        self._db = self._connect(self._path, before=before)
         try:
             self._identity = _file_identity(self._path)
         except OSError:
@@ -259,7 +263,7 @@ class Authority:
         return profile, hashlib.sha256(raw).hexdigest()
 
     def _connect(self, ledger_path: str, identity: tuple | None = None,
-                 witness: tuple | None = None) -> sqlite3.Connection:
+                 witness: tuple | None = None, *, before: tuple | None = None) -> sqlite3.Connection:
         """The ledger, opened and checked to be this anchor's; refused, with nothing left open, if not.
 
         The daemon never creates the ledger, here or when a failed rollback opens it again: a path with no file
@@ -268,6 +272,9 @@ class Authority:
 
         With ``identity`` (the reopen's), the ledger opened must be the one the authority holds, and nothing is
         written to it before that is known (the first open adds the charges index; the reopen adds nothing).
+        The first open is passed the identity stat'ed before it and compares the path again after the meta check
+        and before that index: a different file is ``ledger_invalid``, the connection is shut, and the index is
+        not written onto it.
         Two checks, each ``ledger_invalid`` with the connection shut: the path must still name the file of
         ``identity`` (its device and inode), and the opened connection itself must hold ``witness``, the last
         charge the authority saw, unchanged (charges are only ever added). The second check reads the
@@ -295,6 +302,17 @@ class Authority:
             db.close()
             raise Refused("ledger_anchor_mismatch")
         if identity is None:
+            # ``before`` is the path's identity just before this open. Compare again before the index write: that
+            # write commits at once, so a file put in the place before connect would otherwise keep the index.
+            if before is not None:
+                try:
+                    current = _file_identity(ledger_path)
+                except OSError:
+                    db.close()
+                    raise Refused("ledger_missing") from None
+                if current != before:
+                    db.close()
+                    raise Refused("ledger_invalid")
             try:
                 db.execute(_CHARGES_INDEX)  # ledgers created before the index gain it here
             except sqlite3.Error:
@@ -319,7 +337,8 @@ class Authority:
         ledger the authority opened at construction (its resolved path, that file's identity, and the last
         charge the authority saw, found on the connection opened, so a link pointed elsewhere or a ledger put in
         its place is refused, as ``_connect`` says), with every check of the first open (the ledger must still
-        exist; nothing is created). This is about the module's own connection: an object
+        exist; nothing is created). A last-charge read that did not return leaves the witness unknown, and this
+        open is then not attempted: the ledger stays out of use. This is about the module's own connection: an object
         someone takes from the private ``_db`` (a cursor, say) is outside what the repair promises.
 
         Until that open succeeds the ledger is out of use, and every later charge is refused
@@ -337,7 +356,7 @@ class Authority:
             with contextlib.suppress(Exception):
                 self._db.close()
                 closed = True
-            if closed:
+            if closed and self._witness is not _WITNESS_UNKNOWN:
                 with contextlib.suppress(Refused):
                     self._db = self._connect(self._path, self._identity, self._witness)
                     self._unusable = False
@@ -367,7 +386,8 @@ class Authority:
         unless the guard's exit swallows it, when the charge's own error is raised (a reopen that fails other
         than with a refusal raises its own error instead, as ``_roll_back`` says); the connection is
         closed (which discards what the transaction wrote) and the ledger opened again, so no later charge
-        inherits that transaction. If that cannot be done (the close raises, or the ledger cannot be opened
+        inherits that transaction. If the last-charge read did not return, the ledger is not opened again.
+        If that cannot be done (the close raises, the witness is unknown, or the ledger cannot be opened
         again), every later charge is refused ``ledger_invalid`` at once, and so is every charge after
         ``close``. A guard must call neither ``charge`` nor ``close``: the ledger's lock is held while it runs,
         so either call would wait for itself. The core passes its commit section with the halt recheck (R4-1),
@@ -405,6 +425,8 @@ class Authority:
             try:
                 # First, under the write lock and before the guard (whose entry may refuse): every charge committed
                 # until now is at or before this one, and a reopen after a failure from here on must find it.
+                # Unknown until the read returns, so a read that raises cannot reopen on an older witness.
+                self._witness = _WITNESS_UNKNOWN
                 self._witness = _last_charge(self._db)
                 if commit_guard is not None:
                     guarded.enter_context(commit_guard)

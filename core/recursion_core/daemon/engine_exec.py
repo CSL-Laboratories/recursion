@@ -35,7 +35,7 @@ def _read(fd, size, deadline):
         except BlockingIOError:
             left = deadline - time.monotonic()
             if left <= 0:
-                raise TimeoutError('environment not written')
+                raise TimeoutError('environment not written') from None
             select.select([fd], [], [], left)
 
 

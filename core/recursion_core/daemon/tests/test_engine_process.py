@@ -51,60 +51,61 @@ class EngineProcessTest(unittest.TestCase):
 
     # -- E06: two closers close one descriptor once --------------------------------------------------
     def test_two_closers_do_not_close_a_reused_descriptor(self):
-        damaged = 0
-        for _ in range(10):
-            out = self.root / 'stdout.jsonl'
-            out.write_bytes(b'')
-            sentinel = self.root / 'sentinel'
-            sentinel.write_bytes(b'ordinary content')
-            process = launcher.UnitEngineProcess(Mock(), 'run-one', None, out, None)
-            old_fd = process._out
-            gate = threading.Barrier(2)
-            lock = threading.Lock()
-            replacement = []
-            failures = []
-            real_close, real_open = os.close, os.open
-
-            def capture(obj, name, *default):
-                value = builtins.getattr(obj, name, *default)
-                if obj is process and name == '_out' and value is not None:
-                    # Make the gap between the read of the number and its clearing as wide as a closer can have it.
-                    try:
-                        gate.wait(timeout=0.25)
-                    except threading.BrokenBarrierError:
-                        pass
-                return value
-
-            def close_and_reuse(fd):
-                if fd != old_fd:
-                    return real_close(fd)
-                with lock:
-                    real_close(fd)
-                    if not replacement:
-                        replacement.append(real_open(sentinel, os.O_RDONLY))
-
-            def closer():
-                try:
-                    process.close()
-                except BaseException as exc:
-                    failures.append(type(exc).__name__)
-
-            with patch.object(launcher, 'getattr', capture, create=True), patch.object(os, 'close', close_and_reuse):
-                threads = [threading.Thread(target=closer) for _ in range(2)]
-                for thread in threads:
-                    thread.start()
-                for thread in threads:
-                    thread.join(2)
-                self.assertFalse(any(thread.is_alive() for thread in threads))
-            self.assertFalse(failures)
-            self.assertEqual(replacement, [old_fd], 'the process reused the released descriptor')
-            try:
-                os.fstat(replacement[0])
-            except OSError:
-                damaged += 1
-            else:
-                real_close(replacement[0])
+        damaged = sum(self._two_closers_round() for _ in range(10))
         self.assertEqual(damaged, 0, f'{damaged} of 10 rounds closed the descriptor that replaced the first one')
+
+    def _two_closers_round(self):
+        out = self.root / 'stdout.jsonl'
+        out.write_bytes(b'')
+        sentinel = self.root / 'sentinel'
+        sentinel.write_bytes(b'ordinary content')
+        process = launcher.UnitEngineProcess(Mock(), 'run-one', None, out, None)
+        old_fd = process._out
+        gate = threading.Barrier(2)
+        lock = threading.Lock()
+        replacement = []
+        failures = []
+        real_close, real_open = os.close, os.open
+
+        def capture(obj, name, *default):
+            value = builtins.getattr(obj, name, *default)
+            if obj is process and name == '_out' and value is not None:
+                # Make the gap between the read of the number and its clearing as wide as a closer can have it.
+                try:
+                    gate.wait(timeout=0.25)
+                except threading.BrokenBarrierError:
+                    pass
+            return value
+
+        def close_and_reuse(fd):
+            if fd != old_fd:
+                return real_close(fd)
+            with lock:
+                real_close(fd)
+                if not replacement:
+                    replacement.append(real_open(sentinel, os.O_RDONLY))
+
+        def closer():
+            try:
+                process.close()
+            except BaseException as exc:
+                failures.append(type(exc).__name__)
+
+        with patch.object(launcher, 'getattr', capture, create=True), patch.object(os, 'close', close_and_reuse):
+            threads = [threading.Thread(target=closer) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertFalse(failures)
+        self.assertEqual(replacement, [old_fd], 'the process reused the released descriptor')
+        try:
+            os.fstat(replacement[0])
+        except OSError:
+            return 1
+        real_close(replacement[0])
+        return 0
 
     def test_a_second_close_is_still_quiet(self):
         out = self.root / 'stdout.jsonl'

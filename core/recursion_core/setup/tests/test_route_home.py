@@ -360,6 +360,25 @@ class RouteHomeTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HOME": self.base}):
             check(self.path, self.root)  # control: the same check passes when the lookup answers
 
+    # Review 5 of #401 (Claude Fable 5.2), R1: since 3905b856 a KeyError is refused one step earlier, so the test below no
+    # longer reached the refusal for no absolute home; removing it, changing its code or dropping the startswith("/")
+    # filter left every test green. The lookup that answers with no absolute home reaches it (the read's test_r1.py).
+    def test_an_entry_that_names_no_absolute_home_is_refused_unless_HOME_names_one(self):
+        for pw_dir in ("", "relative/home"):
+            entry = mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=pw_dir))
+            with self.subTest(pw_dir=pw_dir), entry:
+                with mock.patch.dict(os.environ):
+                    os.environ.pop("HOME", None)
+                    error = self.refused("route_home_untrusted", self.path)
+                    self.assertEqual(error.detail, "the operator's home is unknown: no absolute HOME and "
+                                                   "no absolute home in the password entry")
+                with mock.patch.dict(os.environ, {"HOME": "relative/home"}):
+                    self.refused("route_home_untrusted", self.path)  # a relative HOME names no home
+                with mock.patch.dict(os.environ, {"HOME": self.root}):
+                    self.refused("route_home_is_operator_home", self.path)  # HOME alone still names the home
+                with mock.patch.dict(os.environ, {"HOME": self.base}):
+                    check(self.path, self.root)  # control
+
     def test_with_no_operators_home_known_the_check_refuses_rather_than_passes(self):
         # DeepSeek F4: an empty set of homes would let any path through the operator's-home rule.
         no_entry = mock.patch("pwd.getpwuid", side_effect=KeyError(os.geteuid()))

@@ -116,7 +116,13 @@ _live_lock = threading.Lock()
 _live: set = set()
 
 
-def _track(process) -> None:
+def _track(process, *, cancel: bool = True) -> None:
+    """Remember a process this run started.
+
+    ``cancel`` is false for the grading command. An interrupt stops engines, not the hidden tests:
+    killing those tests and recording the signal as the model failing them is the runner's own act.
+    """
+    process._csl_cancel_on_interrupt = bool(cancel)
     with _live_lock:
         _live.add(process)
 
@@ -127,9 +133,12 @@ def _untrack(process) -> None:
 
 
 def cancel_running() -> None:
-    """Stop every engine still being waited on, each in the session this process started."""
+    """Stop every engine still being waited on, each in the session this process started.
+
+    A process tracked with cancel false (the grader) is left to finish.
+    """
     with _live_lock:
-        processes = list(_live)
+        processes = [process for process in _live if getattr(process, "_csl_cancel_on_interrupt", False)]
     for process in processes:
         if process.poll() is not None:
             continue
@@ -167,8 +176,35 @@ def _reap(process, *, timeout: float) -> None:
             pass
 
 
-def _abandon_unwatched(process, started_threads: list) -> None:
-    """Popen succeeded and a reader never started, so the child and its pipes are still ours."""
+def _held_pipes_sentence(held: list) -> str:
+    """The same sentence the ordinary path raises when a survivor still holds a pipe."""
+    return (f"the engine's {' and '.join(held)} still open {CLEANUP_GRACE_S:g} s after its "
+            "session was emptied: a process outside the session (one that started a session "
+            "of its own) holds it")
+
+
+def _join_readers(threads) -> list:
+    """Wait up to the cleanup grace for readers that already started. Names still blocked come back."""
+    deadline = time.monotonic() + CLEANUP_GRACE_S
+    held = []
+    for thread in threads:
+        if thread.ident is None and not thread.is_alive():
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            thread.join(timeout=remaining)
+        if thread.is_alive():
+            held.append(thread.name)
+    return held
+
+
+def _abandon_unwatched(process, started_threads: list) -> list:
+    """Popen succeeded and a reader never started, so the child and its pipes are still ours.
+
+    Readers that did start are joined for the cleanup grace. A name that is still blocked is
+    returned so the caller can note it; the pipe is not closed from here, because that close
+    waits on the blocked read.
+    """
     try:
         _kill_session(process.pid)
     except (SessionCleanupError, OSError, RuntimeError):
@@ -181,9 +217,11 @@ def _abandon_unwatched(process, started_threads: list) -> None:
     owned = set(streams) - {thread.name for thread in started_threads}
     for name in owned:
         _close_stream(streams[name])
+    return _join_readers(started_threads)
 
 
-def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeout_s: float) -> dict:
+def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeout_s: float,
+                cancel_on_interrupt: bool = True) -> dict:
     """Run argv in its own session and wait for THAT process, at most ``timeout_s``.
 
     Then every process left in the session is killed, whatever process group it moved to (helpers the
@@ -193,15 +231,20 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
     (setsid) is out of reach (PROTOCOL.md names it); if it still holds the engine's output when the session
     is empty, that is reported as a cleanup failure.
 
-    No wait is unbounded. A cleanup failure is raised at once: no wait for the engine, which may never
-    exit, and none for its pipes, which a survivor may hold. Each reader thread closes its own pipe at the
-    end of output (closing a pipe from here would wait for a read blocked on it); the threads are daemons,
-    and the Popen object reaps the engine whenever it does exit.
+    No wait is unbounded. A cleanup failure is reported after the cleanup grace (``CLEANUP_GRACE_S``),
+    including when a helper that started its own session still holds a pipe: that grace is the wait.
+    Each reader thread closes its own pipe at the end of output (closing a pipe from here would wait for
+    a read blocked on it); the threads are daemons, and the Popen object reaps the engine whenever it
+    does exit.
     Times are monotonic.
     """
     # Session cleanup calls getsid. Without it, do not start a process this function cannot reap.
     if not hasattr(os, "getuid") or not hasattr(os, "getsid"):
         raise ArmRefused("platform_unsupported")
+    if not isinstance(argv, (list, tuple)) or not argv or any(not isinstance(part, str) for part in argv):
+        raise EngineMissing("the command must be a non-empty list of strings")
+    if stdin is not None and not isinstance(stdin, bytes):
+        raise ValueError("stdin must be bytes")
     timeout_s = _finite_seconds(timeout_s)
     started = time.monotonic()
     try:
@@ -209,7 +252,6 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
                                    stderr=subprocess.PIPE, start_new_session=True)
     except FileNotFoundError as exc:
         raise EngineMissing(f"{argv[0]}: {exc}") from None
-    _track(process)
     chunks: dict = {"stdout": [], "stderr": []}
 
     def read(name, pipe):
@@ -238,14 +280,18 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
                threading.Thread(target=read, args=("stderr", process.stderr), name="stderr", daemon=True),
                threading.Thread(target=feed, name="stdin", daemon=True)]
     try:
+        _track(process, cancel=cancel_on_interrupt)
         started_threads: list = []
         try:
             for thread in threads:
                 thread.start()
                 started_threads.append(thread)
-        except BaseException:
+        except BaseException as exc:
             # No reader is blocked on a pipe that never started, so closing it cannot wait.
-            _abandon_unwatched(process, started_threads)
+            # A reader that did start may still be blocked on a helper outside the session.
+            held = _abandon_unwatched(process, started_threads)
+            if held:
+                exc.add_note(_held_pipes_sentence(held))
             raise
         timed_out = False
         try:
@@ -265,6 +311,9 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
                              "its session was emptied")
             except BaseException:
                 pass
+            held = _join_readers(threads)
+            if held:
+                exc.add_note(_held_pipes_sentence(held))
             raise
         _kill_session(process.pid)
         # The session is empty, so its leader, which can leave neither its session nor its process group, has
@@ -274,14 +323,9 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
         except subprocess.TimeoutExpired:
             raise SessionCleanupError(f"the engine (process {process.pid}) was not reaped {CLEANUP_GRACE_S:g} s after "
                                       "its session was emptied") from None
-        deadline = time.monotonic() + CLEANUP_GRACE_S
-        for thread in threads:
-            thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        held = [thread.name for thread in threads if thread.is_alive()]
+        held = _join_readers(threads)
         if held:
-            raise SessionCleanupError(f"the engine's {' and '.join(held)} still open {CLEANUP_GRACE_S:g} s after its "
-                                      "session was emptied: a process outside the session (one that started a session "
-                                      "of its own) holds it")
+            raise SessionCleanupError(_held_pipes_sentence(held))
         code = process.returncode
         return {
             "exit": code if code is not None and code >= 0 else None,

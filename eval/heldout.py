@@ -57,12 +57,15 @@ def _inside(path: Path, root: Path) -> bool:
 
 def check_path(path, *, must_exist: bool = True) -> Path:
     """The resolved held-out folder, or HeldOutDenied."""
-    raw = Path(path)
+    try:
+        raw = Path(path)
+    except (TypeError, ValueError) as exc:
+        raise HeldOutDenied(f"held-out path {path!r} is not a filesystem path: {exc}") from None
     if not raw.is_absolute():
         raise HeldOutDenied(f"held-out path must be absolute, got {str(path)!r}")
     try:
         resolved = raw.resolve(strict=must_exist)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise HeldOutDenied(f"held-out path {str(path)!r} cannot be opened: {exc}") from None
     repo = REPO_ROOT.resolve()
     if _inside(resolved, repo) or _inside(raw.absolute(), repo):

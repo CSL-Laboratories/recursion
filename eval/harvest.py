@@ -34,6 +34,7 @@ import re
 import shutil
 import sys
 import tarfile
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -172,9 +173,27 @@ def glob_regex(pattern: str) -> re.Pattern:
     return re.compile("^" + "".join(out) + "$")
 
 
+def _read_json(path: Path):
+    """The caller's JSON file, or a HarvestError. A missing file, a directory, bad UTF-8 and
+    broken JSON are the same refusal, not a traceback."""
+    try:
+        raw = Path(path).read_bytes()
+        return raw, json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise HarvestError(f"{path}: {exc}") from None
+
+
+def _load_issues(path: Path | None) -> dict:
+    if path is None:
+        return {}
+    _, data = _read_json(path)
+    if not isinstance(data, dict):
+        raise HarvestError(f"{path}: issues must be a JSON object, got {type(data).__name__}")
+    return data
+
+
 def load_repos(path: Path) -> tuple:
-    raw = Path(path).read_bytes()
-    data = json.loads(raw)
+    raw, data = _read_json(path)
     if not isinstance(data, dict) or data.get("schema") != REPOS_SCHEMA:
         raise HarvestError(f"{path}: not a {REPOS_SCHEMA} file")
     repos = data.get("repos")
@@ -188,9 +207,10 @@ def load_repos(path: Path) -> tuple:
             if key not in repo:
                 raise HarvestError(f"{path}: a repository entry lacks {key!r}")
         _refuse_repository_shape(path, repo)
-        if not task_mod.TASK_ID.match(repo["name"]) or repo["name"] in names:
-            raise HarvestError(f"{path}: bad or duplicate repository name {repo['name']!r}")
-        names.add(repo["name"])
+        name = repo["name"]
+        if not task_mod.TASK_ID.match(name) or name in names:
+            raise HarvestError(f"{path}: bad or duplicate repository name {name!r}")
+        names.add(name)
         try:   # the same rules a task's own task.json is held to (eval/tasks.py), checked once, here
             task_mod._meta(repo["name"], {"id": repo["name"], **{k: repo[k] for k in GRADING_FIELDS if k in repo}})
         except task_mod.TaskError as exc:
@@ -219,7 +239,11 @@ def candidate_commits(repo: Path, branch: str, not_before: str) -> list:
     ``rev-list --since`` stops walking at the first older commit, so where committer dates run backward
     it left eligible commits out. (``--since-as-filter`` filters too, but only from git 2.37; this needs
     no particular git.)"""
-    since = int(datetime.strptime(not_before, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+    try:
+        parsed = datetime.strptime(not_before, "%Y-%m-%d")
+    except ValueError:
+        raise HarvestError("--not-before is a date, YYYY-MM-DD") from None
+    since = int(parsed.replace(tzinfo=timezone.utc).timestamp())
     out = _git(repo, "rev-list", "--first-parent", "--reverse", "--timestamp", branch)
     commits = []
     for line in out.decode().splitlines():
@@ -347,6 +371,10 @@ def harvest(repos_path: Path, not_before: str, out: Path, *, suite_id: str, vers
             log=print) -> dict:
     if not DATE.match(not_before):
         raise HarvestError("--not-before is a date, YYYY-MM-DD")
+    try:  # 2026-02-30 matches the shape and is not a calendar day; refuse it before any folder is created
+        datetime.strptime(not_before, "%Y-%m-%d")
+    except ValueError:
+        raise HarvestError("--not-before is a date, YYYY-MM-DD") from None
     if not task_mod.TASK_ID.match(suite_id):
         raise HarvestError(f"bad suite id {suite_id!r}")
     # What would be refused for every candidate alike is the caller's, so it ends the run here, before
@@ -362,13 +390,18 @@ def harvest(repos_path: Path, not_before: str, out: Path, *, suite_id: str, vers
         raise HarvestError(str(exc)) from None
     out = Path(out)
     heldout.check_path(out, must_exist=False)  # absolute, and never inside the repository
-    if out.exists() and any(out.iterdir()):
-        raise HarvestError(f"{out} is not empty: a harvest writes a new folder")
     repos, repos_sha = load_repos(repos_path)   # every repository's settings, before anything is written
-    out.mkdir(parents=True, exist_ok=True)
+    issues = _load_issues(issues_path)          # before the output folder exists
+    # An existing folder, even an empty one, is already someone's output. mkdir without exist_ok
+    # catches the race between this check and the create. Staging is private to this call.
+    if out.exists():
+        raise HarvestError(f"{out} is not empty: a harvest writes a new folder")
+    try:
+        out.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        raise HarvestError(f"{out} is not empty: a harvest writes a new folder") from None
     heldout.check_path(out)
-    issues = json.loads(Path(issues_path).read_text(encoding="utf-8")) if issues_path else {}
-    staging = out / ".staging"
+    staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=out))
     entries, rejects, heads = [], [], []
     for repo_cfg in repos:
         repo = Path(repo_cfg["path"])

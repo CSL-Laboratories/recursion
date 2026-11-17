@@ -1,0 +1,8 @@
+{
+  "tool": "Bash",
+  "cwd": null,
+  "input_text": "[1, 2]",
+  "expect": {
+    "refused": "input_not_an_object"
+  }
+}

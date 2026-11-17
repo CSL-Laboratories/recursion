@@ -1,0 +1,7 @@
+{
+  "model": "claude-sonnet-5-5",
+  "connection": {
+    "kind": "subscription",
+    "id": "personal-max"
+  }
+}

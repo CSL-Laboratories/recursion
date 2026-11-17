@@ -1,0 +1,12 @@
+{
+  "token_id": "stk-00a8",
+  "token_sha256": "2b515d66a6b532556851dd17b31760335e61644e7cdc230ecdfdcc4ee3bfa960",
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "verbs": [
+    "session.status",
+    "events.read",
+    "events.follow"
+  ],
+  "issued_at": "2026-11-13T07:30:01.000Z",
+  "expires_at": null
+}

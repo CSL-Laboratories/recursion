@@ -1,0 +1,154 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "framing/08-request-ids",
+  "protocol": "2025-06-18",
+  "summary": "A string or integer id is echoed exactly (0 is a request); null, a fraction, a boolean, an object or an array is refused with id null.",
+  "source": "MCP 2025-06-18 basic/index (Messages) and basic/transports (stdio); JSON-RPC 2.0 sections 4-5 (MCP 2025-06-18: the id is a string or an integer and MUST NOT be null)",
+  "api": [],
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": "abc",
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": "abc",
+          "result": {}
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 0,
+          "result": {}
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": -5,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": -5,
+          "result": {}
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 1.5,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: id must be a string or an integer, never null"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": "",
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": "",
+          "result": {}
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": null,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: id must be a string or an integer, never null"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": true,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: id must be a string or an integer, never null"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": {},
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: id must be a string or an integer, never null"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": [
+          1
+        ],
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: id must be a string or an integer, never null"
+          }
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

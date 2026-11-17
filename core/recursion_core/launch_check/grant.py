@@ -345,7 +345,16 @@ def authenticate(g: object) -> EngineSpec:
     # field whose copy raises, or one nested past the recursion limit, escaped untyped before the guard
     # (#424 round 2, DeepSeek r2 F1, Codex astra C4, Codex sol 4). Whatever encoding a field raises, a field
     # JSON cannot hold (bytes, a set, a cycle) is a forged grant, not an exception of its own (DeepSeek F3).
-    values = {f.name: getattr(g, f.name) for f in fields(Grant)}
+    # The read sits inside the guard too: a required field that is absent (deleted, or missing from a
+    # record restored across the process boundary) is the same refusal, not an AttributeError
+    # (#424 round 3, DeepSeek r3 F1).
+    try:
+        values = {f.name: getattr(g, f.name) for f in fields(Grant)}
+    except Exception:  # noqa: BLE001 - a missing field is a forged grant
+        engine = getattr(g, "engine", "?")
+        if type(engine) is not str:
+            engine = "?"
+        raise LaunchRefused("grant_forged", engine, "a field is missing: not issued by grant()") from None
     mac = values.pop("mac")
     engine = g.engine if type(g.engine) is str else "?"
     try:

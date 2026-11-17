@@ -652,8 +652,9 @@ Called by nothing, like the rest of this package. What it adds:
   polled with `selectors`, so a descriptor above 1023 is read; on Windows a pipe a descendant
   holds is left open instead of closed under a blocked read.
 - `authenticate()` reads the grant's fields without copying them, so a field whose copy raises,
-  one nested past the recursion limit, a cycle, or a field whose encoding raises is
-  `grant_forged`; so is a MAC that is not ASCII text. `verify()` says it authenticates first.
+  one nested past the recursion limit, a cycle, a field whose encoding raises, or a required
+  field that is absent is `grant_forged`; so is a MAC that is not ASCII text. `verify()` says it
+  authenticates first.
 - `launch_plan()` refuses an `env` that is not a mapping (`spawn_too_large`, after the grant is
   authenticated). `MAX_PROBE_TIMEOUT_S` is exported.
 - On Windows the executed command line (as `subprocess` quotes it) is at most 32767 UTF-16 code

@@ -1,5 +1,8 @@
 {
   "code": "stopped",
   "repeat": true,
-  "state": "stopped"
+  "state": "stopped",
+  "admission_closed": true,
+  "local_scope_empty": true,
+  "external_effects": "none_known"
 }

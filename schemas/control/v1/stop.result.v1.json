@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "stop.result.v1.json",
   "title": "stop.result.v1: what a Stop answers",
-  "x-version": "1.0-draft.2",
-  "description": "The answer of run.stop when the run exists. THE LEGACY ANSWER is exactly what the daemon answers today and stays valid: code 'stopped' or 'pending', 'state' with the same word, 'repeat' on a stopped answer, 'reason' on a pending one, and 'recorded' only when it is false. THE ADDITIONS are optional, and each is added to the daemon's answers by the lane that owns Stop, in a versioned step of its own, never by the lane that wrote this schema: the code 'ended', and the fields 'attestation', 'containment_level', 'claim' and 'fence'. Until then no answer carries them, and the answer for a run id that was never registered stays today's. MEANINGS, frozen: 'stopped' means the run's removal was attested (today by proof 'empty'; by 'removed' once that is added). 'ended' means the run had already ended before this Stop, and this call stopped nothing; it never implies a verified removal. 'pending' means neither is established. A client that meets a code or a proof it does not know treats the run as NOT stopped. A client that meets a 'claim' it does not know shows nothing stronger than the weakest claim it does know.",
+  "x-version": "1.0-draft.3",
+  "description": "The answer of run.stop when the run exists. THE LEGACY ANSWER is exactly what the daemon answers today and stays valid: code 'stopped' or 'pending', 'state' with the same word, 'repeat' on a stopped answer, 'reason' on a pending one, and 'recorded' only when it is false. A stopped answer also carries admission_closed, local_scope_empty and external_effects. external_effects is none_known or unresolved and no other word: unresolved when an effect.outcome_unknown is recorded for the run or that log cannot be read, none_known otherwise. local_scope_empty is the cleanup that was seen, separate from admission_closed. workspace.revoke is present only when that event was appended for the run. THE OTHER ADDITIONS stay optional, each added by the lane that owns Stop in a versioned step of its own: the code 'ended', and the fields 'attestation', 'containment_level', 'claim' and 'fence'. The answer for a run id that was never registered stays today's. MEANINGS, frozen: 'stopped' means the run's removal was attested (today by proof 'empty'; by 'removed' once that is added). 'ended' means the run had already ended before this Stop, and this call stopped nothing; it never implies a verified removal. 'pending' means neither is established. A client that meets a code or a proof it does not know treats the run as NOT stopped. A client that meets a 'claim' it does not know shows nothing stronger than the weakest claim it does know.",
   "type": "object",
   "additionalProperties": false,
   "required": ["code", "run_id", "state"],
@@ -26,15 +26,51 @@
     "attestation": {"$ref": "#/$defs/attestation"},
     "containment_level": {"$ref": "#/$defs/containment_level"},
     "claim": {"$ref": "#/$defs/claim"},
-    "fence": {"$ref": "#/$defs/fence"}
+    "fence": {"$ref": "#/$defs/fence"},
+    "admission_closed": {
+      "description": "True once this Stop was accepted for the run, so a later dispatch of the run is refused.",
+      "type": "boolean"
+    },
+    "local_scope_empty": {
+      "description": "The cleanup that was seen, separate from admission. True only when this Stop's confirm read the cgroup empty.",
+      "type": "boolean"
+    },
+    "external_effects": {
+      "description": "none_known, or unresolved when an effect.outcome_unknown is recorded for the run or the log cannot be read. No other word.",
+      "type": "string"
+    },
+    "workspace.revoke": {
+      "description": "Present and true only when a workspace.revoke event was appended for this run.",
+      "type": "boolean"
+    }
   },
   "allOf": [
     {
       "if": {"required": ["code"], "properties": {"code": {"const": "stopped"}}},
       "then": {
-        "required": ["repeat"],
-        "properties": {"state": {"const": "stopped"}},
-        "not": {"required": ["reason"]}
+        "required": ["repeat", "admission_closed", "local_scope_empty", "external_effects"],
+        "properties": {
+          "state": {"const": "stopped"},
+          "external_effects": {"enum": ["none_known", "unresolved"]}
+        },
+        "not": {
+          "anyOf": [
+            {"required": ["reason"]},
+            {
+              "required": ["attestation"],
+              "properties": {
+                "attestation": {
+                  "anyOf": [
+                    {"not": {"required": ["admission_closed"]}},
+                    {"not": {"required": ["local_scope_empty"]}},
+                    {"not": {"required": ["external_effects"]}},
+                    {"properties": {"external_effects": {"not": {"enum": ["none_known", "unresolved"]}}}}
+                  ]
+                }
+              }
+            }
+          ]
+        }
       }
     },
     {
@@ -73,7 +109,10 @@
         "proof": {"enum": ["empty", "removed"]},
         "cgroup": {"type": "string", "minLength": 1},
         "cgroup_identity": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/cgroup_identity"}]},
-        "time": {"$ref": "common.v1.json#/$defs/timestamp"}
+        "time": {"$ref": "common.v1.json#/$defs/timestamp"},
+        "admission_closed": {"type": "boolean"},
+        "local_scope_empty": {"type": "boolean"},
+        "external_effects": {"type": "string"}
       },
       "if": {"required": ["proof"], "properties": {"proof": {"const": "removed"}}},
       "then": {"properties": {"cgroup_identity": {"type": "object"}}}

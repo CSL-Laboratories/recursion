@@ -13359,6 +13359,42 @@
       }
     },
     {
+      "file": "bad/stop.result.v1/b15-stopped-without-admission-fact.json",
+      "schema": "stop.result.v1.json",
+      "rule": "A stopped answer carries admission_closed.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/stop.result.v1/b16-stopped-without-local-scope.json",
+      "schema": "stop.result.v1.json",
+      "rule": "A stopped answer carries local_scope_empty.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/stop.result.v1/b17-stopped-without-external-effects.json",
+      "schema": "stop.result.v1.json",
+      "rule": "A stopped answer carries external_effects.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/stop.result.v1/b18-stopped-with-an-effects-word-nobody-records.json",
+      "schema": "stop.result.v1.json",
+      "rule": "The value at /external_effects must be one of the values listed at stop.result.v1.json#/allOf/0/then/properties/external_effects.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/external_effects"
+      }
+    },
+    {
       "file": "bad/stop.result.v1/b11-ended-with-an-attestation.json",
       "schema": "stop.result.v1.json",
       "rule": "'ended' never implies a verified removal: it attests nothing.",

@@ -113,10 +113,19 @@ def _new_run_id() -> str:
 
 class ControlAPI:
     def __init__(self, registry: RunRegistry, kill_tree: KillTree, starter: Starter, clock: Callable[[], float],
-                 *, confirm_timeout_s: float = 5.0, new_run_id: Callable[[], str] = _new_run_id) -> None:
+                 *, confirm_timeout_s: float = 5.0, new_run_id: Callable[[], str] = _new_run_id,
+                 events=None) -> None:
         self._registry, self._kill, self._starter, self._clock = registry, kill_tree, starter, clock
         self._new_run_id = new_run_id
         self._confirm_timeout_s = confirm_timeout_s
+        # Optional event store the workspace ledger writes through. The daemon composition does not
+        # pass one yet: with none, admission still shuts and the answer does not name workspace.revoke.
+        self._events = events
+        self._admission_lock = threading.Lock()
+        self._admission: set[str] = set()
+        self._effects: dict[str, str] = {}
+        self._revoked: set[str] = set()
+        self._ledger_declared = False
         self._locks_lock = threading.Lock()
         # Exclusion is the registry's owner lock table when it has one, so two ControlAPIs over the same
         # registry take the same locks. The owner is a token minted for the in-flight call, not a thread
@@ -153,7 +162,7 @@ class ControlAPI:
             return self.list_runs(params)
         if method == "run.start":
             return self.start(params)
-        handler = {"run.status": self.status, "run.stop": self.stop}.get(method)
+        handler = {"run.status": self.status, "run.stop": self.stop, "run.dispatch": self.dispatch}.get(method)
         if handler is None:
             return {"code": METHOD_UNKNOWN, "detail": str(method)}
         run_id = params.get("run_id")
@@ -432,7 +441,8 @@ class ControlAPI:
         members = rec.get("members") or []
         return {"proof": "empty", "cgroup": rec.get("cgroup"), "cgroup_marker": rec.get("cgroup_marker"),
                 "member_ids": sorted(member["member_id"] for member in members),
-                "generation": rec["generation"]}
+                "generation": rec["generation"], "admission_closed": True, "local_scope_empty": True,
+                "external_effects": self._effects_for(rec["run_id"])}
 
     def _enter_owner(self) -> None:
         depth = getattr(self._local, "depth", 0)
@@ -461,6 +471,8 @@ class ControlAPI:
         try:
             if self._stop_target(run_id) is None:  # no lock is kept for ids that name no run
                 return {"code": RUN_UNKNOWN, "run_id": run_id}
+            # Admission and the workspace revoke happen before the run lock and before the kill.
+            self._accept_stop(run_id)
             with self._run_lock(run_id):
                 rec = self._stop_target(run_id)
                 if rec is None:
@@ -468,6 +480,127 @@ class ControlAPI:
                 return self._stop(rec)
         finally:
             self._exit_owner()
+
+    def dispatch(self, run_id: str) -> dict:
+        """A later dispatch of a run whose Stop was accepted is refused. An unknown run stays unknown."""
+        rec = self._stop_target(run_id)
+        if rec is None:
+            return {"code": RUN_UNKNOWN, "run_id": run_id}
+        if self._dispatch_refused(run_id, rec):
+            return {"code": "refused", "run_id": run_id, "detail": "admission_closed"}
+        return {"code": OK, "run_id": run_id}
+
+    def _dispatch_refused(self, run_id: str, rec: dict) -> bool:
+        with self._admission_lock:
+            if run_id in self._admission:
+                return True
+        if rec.get("state") in ("stopped", "stop_pending"):
+            return True
+        return isinstance(rec.get("stop"), dict)
+
+    def _accept_stop(self, run_id: str) -> None:
+        """Shut admission and append workspace.revoke while no run lock is held. A ledger error does not skip the kill."""
+        with self._admission_lock:
+            self._admission.add(run_id)
+        self._remember_effects(run_id, self._read_effects(run_id))
+        self._record_revoke(run_id)
+
+    def _remember_effects(self, run_id: str, value: str) -> None:
+        with self._admission_lock:
+            self._effects[run_id] = value
+
+    def _effects_for(self, run_id: str) -> str:
+        with self._admission_lock:
+            cached = self._effects.get(run_id)
+        if cached is not None:
+            return cached
+        value = self._read_effects(run_id)
+        with self._admission_lock:
+            return self._effects.setdefault(run_id, value)
+
+    def _mark_revoked(self, run_id: str) -> None:
+        with self._admission_lock:
+            self._revoked.add(run_id)
+
+    def _revoke_named(self, run_id: str) -> bool:
+        with self._admission_lock:
+            if run_id in self._revoked:
+                return True
+        store = self._events
+        if store is None:
+            return False
+        try:
+            found = self._log_has_revoke(store, run_id)
+        except Exception:
+            return False
+        if found:
+            self._mark_revoked(run_id)
+        return found
+
+    def _read_effects(self, run_id: str) -> str:
+        """none_known when no effect.outcome_unknown is recorded for the run. Unreadable log: unresolved."""
+        store = self._events
+        if store is None:
+            return "none_known"
+        try:
+            events = store.events
+        except Exception:
+            return "unresolved"
+        for event in events:
+            if (isinstance(event, dict) and event.get("type") == "effect.outcome_unknown"
+                    and event.get("run_id") == run_id):
+                return "unresolved"
+        return "none_known"
+
+    def _log_has_revoke(self, store, run_id: str) -> bool:
+        return any(isinstance(event, dict) and event.get("type") == "workspace.revoke"
+                   and event.get("run_id") == run_id for event in store.events)
+
+    def _ledger(self):
+        try:
+            from recursion_core.workspace.grant import Ledger
+        except ImportError:
+            return None
+        return Ledger
+
+    def _record_revoke(self, run_id: str) -> None:
+        store = self._events
+        if store is None:
+            return
+        try:
+            if self._log_has_revoke(store, run_id):
+                self._mark_revoked(run_id)
+                return
+            ledger = self._ledger()
+            if ledger is None:
+                return
+            if not self._ledger_declared:
+                try:
+                    ledger.declare(store)
+                except RuntimeError:
+                    pass
+                self._ledger_declared = True
+            with store.transaction() as tx:
+                seq = ledger.revoked(tx, run_id)
+            if seq is not None or self._log_has_revoke(store, run_id):
+                self._mark_revoked(run_id)
+        except Exception:
+            try:
+                if self._log_has_revoke(store, run_id):
+                    self._mark_revoked(run_id)
+            except Exception:
+                return
+
+    def _stamp(self, answer: dict, run_id: str) -> dict:
+        """Put the admission fact, the cleanup fact and the effects word on a Stop answer. Name workspace.revoke only when that event is in the log."""
+        if not isinstance(answer, dict) or answer.get("code") == RUN_UNKNOWN:
+            return answer
+        answer["admission_closed"] = True
+        answer["local_scope_empty"] = answer.get("code") == STOPPED
+        answer["external_effects"] = self._effects_for(run_id)
+        if self._revoke_named(run_id):
+            answer["workspace.revoke"] = True
+        return answer
 
     def _stop_target(self, run_id: str) -> dict | None:
         """The registry's record, or, when the registry cannot be read, the record this process kept for a
@@ -535,19 +668,21 @@ class ControlAPI:
         while True:
             adopted = self._adopt_unrecorded_launch(rec)
             if adopted is not None:
-                return adopted
+                return self._stamp(adopted, rec["run_id"])
             run_id = rec["run_id"]
             if rec["state"] == "stopped":
                 res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": True}
                 # A stopped launch this process still holds was never written: try again now.
-                return self._recorded(res, rec) if run_id in self._launched else res
+                if run_id in self._launched:
+                    res = self._recorded(res, rec)
+                return self._stamp(res, run_id)
             result = self._stop_attempt(rec, reconfirm=reconfirms_left > 0)
             if not result.pop("_reconfirm", False):
-                return result
+                return self._stamp(result, run_id)
             reconfirms_left -= 1
             if reconfirms_left < 0:  # the attempt above already consumed the one reconfirm
-                return {"code": PENDING, "run_id": run_id, "state": "pending", "reason": "cgroup_changed",
-                        "recorded": False}
+                return self._stamp({"code": PENDING, "run_id": run_id, "state": "pending",
+                                    "reason": "cgroup_changed", "recorded": False}, run_id)
 
     def _stop_attempt(self, rec: dict, *, reconfirm: bool) -> dict:
         """Request and confirm the cgroup on ``rec``, then record that decision. No recursion."""

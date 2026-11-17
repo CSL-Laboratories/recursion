@@ -14,9 +14,9 @@ Nothing is frozen yet.
 | Schema | Version |
 |---|---|
 | `common.v1.json` | 1.0-draft.5 |
-| `run.record.v1.json` | 1.0-draft.4 |
+| `run.record.v1.json` | 1.0-draft.5 |
 | `run.view.v1.json` | 1.0-draft.4 |
-| `stop.result.v1.json` | 1.0-draft.2 |
+| `stop.result.v1.json` | 1.0-draft.3 |
 | `session.v1.json` | 1.0-draft.3 |
 | `queue.item.v1.json` | 1.0-draft.7 |
 | `event.v1.json` | 1.0-draft.7 |
@@ -26,6 +26,18 @@ Nothing is frozen yet.
 | `transcript.line.v1.json` | 1.0-draft.3 |
 | `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.10 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## Stop answer facts (Nov 17, 2026)
+
+`stop.result` draft 3. `run.record` draft 5. A stopped answer carries three facts beside `repeat`:
+`admission_closed`, `local_scope_empty` and `external_effects`. `external_effects` is `none_known` or
+`unresolved`. When a stopped answer carries `attestation`, that object carries the same three facts.
+The stored `stop_attestation` may carry them and still loads a row that does not.
+
+| What changed | What it breaks |
+|---|---|
+| A stopped `stop.result` without `admission_closed`, `local_scope_empty` or `external_effects`, or with any other effects word, is refused. A stopped answer whose `attestation` lacks those facts is refused | A captured stopped answer that had only `repeat` |
+| `run.record` `stop_attestation` may carry the same three facts. They are not required on a stored row | A reader that refused a stored proof with a field it had not listed |
 
 ## After two reads of the fifth read's answer (Nov 14, 2026)
 

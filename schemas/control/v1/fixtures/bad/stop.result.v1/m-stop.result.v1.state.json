@@ -1,5 +1,8 @@
 {
   "code": "stopped",
   "repeat": true,
-  "run_id": "run-17d4a69723244aa087c0942d2be267d4"
+  "run_id": "run-17d4a69723244aa087c0942d2be267d4",
+  "admission_closed": true,
+  "local_scope_empty": true,
+  "external_effects": "none_known"
 }

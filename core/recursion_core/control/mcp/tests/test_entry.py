@@ -100,6 +100,15 @@ class EntryTest(unittest.TestCase):
         self.assertEqual(130, entry.main([], stdin=Interrupting(), stdout=io.BytesIO(), stderr=io.StringIO(),
                                          check=lambda environ: ScriptedAPI()))
 
+    def test_an_interrupt_during_the_socket_check_exits_130_and_nothing_is_read_or_written(self) -> None:
+        def interrupted(environ):
+            raise KeyboardInterrupt
+
+        err = io.StringIO()
+        self.assertEqual(130, entry.main([], environ={}, stdin=Untouchable(), stdout=Untouchable(), stderr=err,
+                                         check=interrupted))
+        self.assertEqual("", err.getvalue())
+
     def test_an_unexpected_error_while_serving_exits_3_with_one_json_line(self) -> None:
         class Failing(io.RawIOBase):
             def readable(self):

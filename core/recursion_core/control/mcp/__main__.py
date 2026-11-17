@@ -16,7 +16,8 @@ does not end, or that aborts after an interrupt.
 
 Exit statuses: 0 end of input or stdout failed; 1 the socket check failed; 2 usage (an argument was given);
 3 an unexpected error while serving (one JSON line on stderr, ``{"code": "internal_error", ...}``); 130
-interrupted. This is a client entry, not a kernel one: it registers nothing and starts no daemon service.
+interrupted, at any point after the usage check (the socket check's read too), with no traceback. This is a
+client entry, not a kernel one: it registers nothing and starts no daemon service.
 """
 
 from __future__ import annotations
@@ -64,6 +65,13 @@ def main(argv: list[str] | None = None, *, environ: Mapping[str, str] | None = N
     if argv:
         line({"code": "usage", "detail": "python -m recursion_core.control.mcp takes no arguments"})
         return EXIT_USAGE
+    try:  # an interrupt anywhere after the usage check, the socket check's read included, is status 130
+        return _run(environ, stdin, stdout, check, line)
+    except KeyboardInterrupt:  # the client interrupted us: calls already sent to the daemon go on there
+        return EXIT_INTERRUPTED
+
+
+def _run(environ: Mapping[str, str] | None, stdin: Any, stdout: Any, check, line: Callable[[dict], None]) -> int:
     try:
         api = check(environ)
     except socket_check.SocketCheckFailed as exc:
@@ -74,8 +82,6 @@ def main(argv: list[str] | None = None, *, environ: Mapping[str, str] | None = N
     line({"event": "serving", "protocol": server.LEGACY_PROTOCOL})
     try:
         return server.serve(api, instream, outstream, log=line)
-    except KeyboardInterrupt:  # the client interrupted us: calls already sent to the daemon go on there
-        return EXIT_INTERRUPTED
     except Exception as exc:  # noqa: BLE001 - one diagnostic line, an exit status of its own
         line({"code": "internal_error", "detail": f"{type(exc).__name__}: {exc}"})
         return EXIT_INTERNAL

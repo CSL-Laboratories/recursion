@@ -1,0 +1,9 @@
+{
+  "schema": "gui.layout/1",
+  "name": "badstop",
+  "title": "Names stop",
+  "columns": 1,
+  "slots": [
+    {"panel": "stop", "column": 1, "span": 1, "order": 0, "collapsed": false}
+  ]
+}

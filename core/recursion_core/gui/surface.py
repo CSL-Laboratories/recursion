@@ -39,6 +39,7 @@ from urllib.parse import parse_qs, quote
 
 from .client import ACTIONS, READS, ControlClient, ControlError
 from .inventory import BARS, SIGN_IN_REJECTED, assess, coverage_gaps, project
+from .layouts import load_user_layout
 from .panels import PAPER_BOOK, filter_venue_rows, panel_registry
 
 __all__ = ["Application", "withhold_venue_data"]
@@ -48,7 +49,20 @@ _CSS = ("body{font:16px/1.5 system-ui,sans-serif;margin:0 auto;max-width:72rem;p
         "a,button,input{min-height:24px;min-width:24px}button{padding:.25rem .75rem}"
         ":focus{outline:3px solid #1a5fb4;outline-offset:2px}table{border-collapse:collapse}"
         "th,td{border:1px solid #666;padding:.25rem .5rem;text-align:left}"
-        ".badge{font-weight:700;border:2px solid currentColor;padding:0 .25rem}")
+        ".badge{font-weight:700;border:2px solid currentColor;padding:0 .25rem}"
+        "body{box-sizing:border-box}"
+        "input,button,pre,table,.layout,.slot{max-width:100%;box-sizing:border-box}"
+        "pre{white-space:pre-wrap;overflow-wrap:anywhere}"
+        "table{display:block;overflow-x:auto}"
+        "summary{min-height:24px;min-width:24px}"
+        ".layout{display:grid;grid-template-columns:minmax(0,1fr)}"
+        ".cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}"
+        ".cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}"
+        ".slot{min-width:0;padding:.5rem}"
+        ".slot-1-1{grid-column:1}.slot-2-1{grid-column:2}.slot-3-1{grid-column:3}"
+        ".slot-1-2{grid-column:1/span 2}.slot-2-2{grid-column:2/span 2}.slot-1-3{grid-column:1/span 3}"
+        "@media (max-width:767px){.layout,.cols-2,.cols-3{grid-template-columns:minmax(0,1fr)}"
+        ".slot-1-1,.slot-2-1,.slot-3-1,.slot-1-2,.slot-2-2,.slot-1-3{grid-column:auto}}")
 _CSS_HASH = base64.b64encode(hashlib.sha256(_CSS.encode()).digest()).decode()
 _CSP = ("default-src 'none'; style-src 'sha256-%s'; form-action 'self'; frame-ancestors 'none'; "
         "base-uri 'none'" % _CSS_HASH)
@@ -285,6 +299,10 @@ class Application:
                 '<p><input type="checkbox" id="confirm-stop" name="confirm" value="explicit" required>'
                 '<label for="confirm-stop">I confirm stopping this run</label></p>'
                 '<button type="submit">Request stop</button></form></section>')
+        layout = load_user_layout(self._panels)
+        if layout is not None:
+            slots = "".join(self._layout_slot(slot, reads, actions) for slot in layout["slots"])
+            return layout["title"], '<div class="layout cols-%d">%s</div>%s' % (layout["columns"], slots, stop)
         panels = ('<section aria-labelledby="panels-h"><h2 id="panels-h">Plugin panels</h2><ul>'
                   + "".join('<li><a href="/panel?id=%s">%s</a></li>' % (quote(pid), escape(p["title"]))
                             for pid, p in self._panels.items()) + "</ul></section>")
@@ -292,6 +310,28 @@ class Application:
                 + reads + '</ul></section><section aria-labelledby="actions-h"><h2 id="actions-h">'
                 "Interventions</h2>" + actions + "</section>" + stop)
         return "Overview", main
+
+    def _layout_slot(self, slot, reads: str, actions: str) -> str:
+        panel_id = slot["panel"]
+        title, inner = self._view_body(panel_id, reads, actions)
+        kind = "details" if slot["collapsed"] else "section"
+        tag = ('<%s class="slot slot-%d-%d" data-column="%d" data-panel="%s" data-collapsed="%s">'
+               % (kind, slot["column"], slot["span"], slot["column"], escape(panel_id, quote=True),
+                  "true" if slot["collapsed"] else "false"))
+        if slot["collapsed"]:
+            return tag + "<summary>%s</summary>%s</details>" % (escape(title), inner)
+        return tag + inner + "</section>"
+
+    def _view_body(self, panel_id: str, reads: str, actions: str) -> tuple[str, str]:
+        if panel_id == "routes":
+            return "Routes", self._routes_table()
+        if panel_id == "reads":
+            return "Reads", ('<section aria-labelledby="reads-h"><h2 id="reads-h">Reads</h2><ul>'
+                             + reads + "</ul></section>")
+        if panel_id == "interventions":
+            return "Interventions", ('<section aria-labelledby="actions-h"><h2 id="actions-h">'
+                                     "Interventions</h2>" + actions + "</section>")
+        return self._panels[panel_id]["title"], self._panel_body(self._panels[panel_id])
 
     @staticmethod
     def _query(env: dict) -> dict:
@@ -391,6 +431,9 @@ class Application:
         if set(form) != {"id"} or len(form["id"]) != 1 or form["id"][0] not in self._panels:
             raise _BadRequest("panel_not_registered")
         panel = self._panels[form["id"][0]]
+        return panel["title"], self._panel_body(panel)
+
+    def _panel_body(self, panel) -> str:
         body = "<h2>%s</h2><p>Read-only plugin panel.</p>" % escape(panel["title"])
         if panel["venue_use"] is not None:
             body += ('<p role="note">Declared venue use: <code>%s</code> (a label). '
@@ -423,7 +466,7 @@ class Application:
             except ControlError as exc:
                 body += '<p role="status">Unavailable: %s</p>' % escape(exc.code)
             body += "</section>"
-        return panel["title"], body
+        return body
 
     def _action(self, env: dict) -> tuple[str, str]:
         form = self._form(env, {"command", "confirm"})

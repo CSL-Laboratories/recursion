@@ -211,7 +211,7 @@ class CeilingAtCallTest(unittest.TestCase):
         auth = authorizer(credentials=None)
         self.assertEqual(auth.held(Principal("plugin", "plugin.alpha")), frozenset())
         self.assertEqual(auth.held(Principal("device", "phone-1")), frozenset())
-        self.assertEqual(auth.held(Principal("owner", "local")), frozenset({"read", "run", "approve", "manage"}))
+        self.assertEqual(auth.held(Principal("owner", "local")), scopes.ALL_SCOPES)
 
         class Odd:
             kind, id, in_run_unit = "operator_ui", "x", False

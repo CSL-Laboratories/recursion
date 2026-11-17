@@ -258,3 +258,12 @@ From the repository root:
 PYTHONPATH=core python3 -B -m unittest discover -s core/recursion_core/control/tests -t core -v
 PYTHONPATH=core python3.14t -X gil=0 -B -m unittest discover -s core/recursion_core/control/tests -t core -v
 ```
+
+## Device credential
+
+The owner-only socket still treats a peer with the daemon's uid, and no `auth` on the frame, as the
+owner. A same-uid copy of an old relay is that peer: it remains the owner. A frame that carries
+`auth` is a device credential. The daemon checks it and, when it verifies, the caller is that
+device and may watch and Stop. A token that does not verify is refused. A peer whose credentials
+cannot be read is refused and is never the owner. `device.pair` and `device.revoke` are how the
+owner mints and revokes that credential. They are not rows of the frozen method table.

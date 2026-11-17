@@ -39,9 +39,11 @@ THE MAPPING (what each line becomes):
                   truncated when the output is longer than the 5000 characters the emitter keeps
     result        a usage draft (when any count is known), then a result draft (once)
     anything else engine.output (stdout) of the raw line, untrusted, so nothing read is lost: a line
-                  that is not one JSON object, holds NaN, Infinity, a number too large for a double, a
-                  key twice, or a lone UTF-16 surrogate anywhere, has an unknown type, does not have
-                  its type's shape, or comes after the result
+                  that is not one JSON object, holds NaN, Infinity, a number too large for a double
+                  (a non-finite float, or a whole number outside ±(2**53 - 1)), a key twice, or a lone
+                  UTF-16 surrogate anywhere, has an unknown type, does not have its type's shape, or
+                  comes after the result. A line that is empty or only spaces or tabs gives no draft;
+                  a vertical tab or a form feed is kept
 
 NO LIMIT IS TYPED. The stream carries no typed limit field: the result record has an exit code and an
 error string only. On this path the exit code is 0 (completed), 1 (failed, unfinished, or the start
@@ -58,16 +60,25 @@ break). Hermes names a call when the agent gave it an id. A valid engine id is u
 id that is not a valid call id is replaced by ``e9h-`` and 32 hex digits of its SHA-256, so its result
 still pairs. A call with no id gets ``e9n-<n>`` from this parser's own counter. A result with no id
 pairs with the open id-less call of its name only when that call is the ONLY one open under that name
-and no result of that name has arrived while several were open. Otherwise the result gets an id of its
-own and pairs with nothing, because a guess would pair the wrong output with a call: once a result
-arrives while several calls of a name are open, which call it ended is unknown, so every result of that
-name pairs with nothing until all the calls open then, and any started meanwhile, have ended. Then
-pairing starts afresh. An id-less call whose line stayed raw is counted as open too, so that its result
-is never paired with another call.
+(a call that carries an engine id counts as open under that name too) and no result of that name has
+arrived while several were open. Otherwise the result gets an id of its own and pairs with nothing,
+because a guess would pair the wrong output with a call: once a result arrives while several calls of
+a name are open, which call it ended is unknown, so every id-less result of that name pairs with
+nothing until all the calls open then, and any started meanwhile, have ended. Then pairing starts
+afresh. An id-less call whose line stayed raw is counted as open too, so that its result is never
+paired with another call. A line that is not a sound record is counted the same way when it is still
+one JSON object of type ``tool_use``, with a name of 1 to 256 characters and no line break, and with
+no ``tool_call_id`` (the key absent, or null): it is open under that name with no id, and the name is
+uncertain at once. A ``tool_use`` that carries an id is open under that name too, even when its line
+stayed raw. The line itself stays raw and mints no id. A line that is not JSON is not counted, and
+nothing after the result record is counted.
 
 OFFSETS. ``parse`` takes each line exactly as it was read, newline included; ``offset_start`` and
-``offset_end`` are byte offsets (UTF-8) into that stream, the end exclusive. stdout and stderr are
-counted separately.
+``offset_end`` are byte offsets (UTF-8) into that stream, the end exclusive. A byte that is not
+UTF-8, kept by a reader as a surrogate in U+DC80..U+DCFF, counts as that one byte; any other lone
+surrogate counts as the three bytes of its UTF-8 form. A draft's text replaces a lone surrogate with
+U+FFFD, so the draft can be stored as UTF-8; the offsets stay those of the stream. stdout and stderr
+are counted separately.
 
 THE ARGV. ``one_shot_argv`` gives what a registration with ``default_executable='hermes'`` promises:
 argv[0] is the binary the route entry names when composition gave one, else ``hermes``, and nothing
@@ -118,6 +129,9 @@ INPUT_CARRY_LIMIT = 65536         # bytes of RFC 8785 text above which a tool's 
 # taken, up to RFC 8785's own depth.
 INPUT_CARRY_DEPTH = 62
 ENGINE_SESSION_ID_LIMIT = 256     # driver.v2 handle.engine_session_id
+# The last whole number ``canonical_text`` accepts (control/methods MAX_INT). 2**53 itself is a finite
+# float and still has no RFC 8785 text, so an int outside this range keeps the line raw.
+_MAX_EXACT_INT = 2**53 - 1
 _CALL_ID = re.compile(r'[^\r\n]{1,128}')
 _NAME = re.compile(r'[^\r\n]{1,256}')
 _MODEL = re.compile(r'[^\r\n]{1,256}')
@@ -172,14 +186,17 @@ def _load_object(text: str):
 
 def _scalar_values_are_sound(value) -> bool:
     """Every string and key a sequence of Unicode scalar values (``json`` decodes an escaped lone
-    surrogate into one, which no UTF-8 store can hold), and every float finite (``json`` decodes
-    ``NaN``, ``Infinity`` and an overflowing ``1e999`` into floats that are not). Walked without
-    recursion."""
+    surrogate into one, which no UTF-8 store can hold), every whole number inside ±(2**53 - 1), and
+    every float finite (``json`` decodes ``NaN``, ``Infinity`` and an overflowing ``1e999`` into
+    floats that are not). Walked without recursion."""
     stack = [value]
     while stack:
         item = stack.pop()
         if isinstance(item, str):
             if _SURROGATE.search(item):
+                return False
+        elif type(item) is int:
+            if item > _MAX_EXACT_INT or item < -_MAX_EXACT_INT:
                 return False
         elif isinstance(item, float):
             if not math.isfinite(item):
@@ -245,7 +262,9 @@ class HermesStreamParser:
         self._minted = 0
         # tool name -> the open calls with no engine id: our id, or None for a call whose line stayed raw
         self._open_unnamed: dict[str, list[str | None]] = {}
-        # names whose open id-less calls can no longer be told apart (a result came while several were open)
+        # tool name -> how many calls that carry an engine id are still open
+        self._open_named: dict[str, int] = {}
+        # names whose id-less results must not be paired until the open calls of that name have ended
         self._ambiguous: set[str] = set()
 
     # -- the calls ----------------------------------------------------------------------------------
@@ -253,12 +272,14 @@ class HermesStreamParser:
         """The drafts for one stdout line, read exactly as written (newline included)."""
         start, end = self._advance('stdout', line)
         text = line.rstrip('\r\n')
-        if not text.strip():
+        if not text.strip(' \t'):
             return []
         record = _load_object(text)
         drafts = None if record is None or self._result_seen else self._typed(record, start, end)
         if drafts is None:
             self.raw_lines += 1
+            if record is None and not self._result_seen:
+                self._note_rejected_call(text)
             return [_output('stdout', line, start, end)]
         return drafts
 
@@ -268,7 +289,13 @@ class HermesStreamParser:
         return [_output('stderr', line, start, end)] if line else []
 
     def finish(self, exit_status: int | None) -> list[dict]:
-        """At the end of the stream. A run whose stream had no result record gets ``engine_exited``."""
+        """At the end of the stream. A run whose stream had no result record gets ``engine_exited``.
+
+        ``exit_status`` is an ``int``, or ``None`` when the process gave none. Any other type is a
+        caller error and changes nothing.
+        """
+        if exit_status is not None and type(exit_status) is not int:
+            raise HermesParseError('exit_status')
         if self._result_seen:
             return []
         self._result_seen = True
@@ -281,7 +308,12 @@ class HermesStreamParser:
         return self._result_seen
 
     def exit_agrees(self, exit_status: int) -> bool | None:
-        """Whether the process's exit status is the one the result record reported; None before a record."""
+        """Whether the process's exit status is the one the result record reported; None before a record.
+
+        ``exit_status`` must be an ``int``. A bool or a float is a caller error.
+        """
+        if type(exit_status) is not int:
+            raise HermesParseError('exit_status')
         return None if self.exit_code is None else self.exit_code == exit_status
 
     # -- one typed record ---------------------------------------------------------------------------
@@ -322,17 +354,20 @@ class HermesStreamParser:
         text = None
         tool_input = record.get('input')
         if isinstance(tool_input, dict):
-            canonical_text, no_text = _canonical()
             try:
-                text = canonical_text(tool_input)
-            except (no_text, RecursionError):
-                text = None
+                canonical_text, _ = _canonical()
+                written = canonical_text(tool_input)
+            except Exception:
+                written = None
+            text = written if isinstance(written, str) else None
         if text is None:
-            # No truthful digest: the input is absent, not an object, or has no RFC 8785 text. The line
-            # stays raw. An id-less call is still open under its name, so its result is never paired with
-            # another call of that name.
+            # No truthful digest: the input is absent, not an object, or has no RFC 8785 text, or the
+            # canonical writer failed. The line stays raw. An id-less call is still open under its name,
+            # and a call that carries an id is open too, so a later id-less result is not paired by guess.
             if engine_id is None:
                 self._open_unnamed.setdefault(name, []).append(None)
+            else:
+                self._hold_named(name)
             return None
         data = text.encode('utf-8')
         carried = tool_input if len(data) <= INPUT_CARRY_LIMIT and _depth(tool_input) <= INPUT_CARRY_DEPTH else None
@@ -343,6 +378,7 @@ class HermesStreamParser:
             self._open_unnamed.setdefault(name, []).append(call_id)
         else:
             call_id = _call_id(engine_id)
+            self._hold_named(name)
         return [{'type': 'tool.call', 'payload': {
             'call_id': call_id, 'name': name, 'input_digest': hashlib.sha256(data).hexdigest(), 'input': carried}}]
 
@@ -356,6 +392,7 @@ class HermesStreamParser:
             return None
         if engine_id is not None:
             call_id = _call_id(engine_id)
+            self._release_named(name)
         else:
             call_id = self._end_unnamed(name)
         return [{'type': 'tool.result', 'payload': {
@@ -404,7 +441,7 @@ class HermesStreamParser:
         if not isinstance(line, str):
             raise HermesParseError('line: text, as read')
         start = self._offsets[stream]
-        end = start + len(line.encode('utf-8', 'surrogatepass'))
+        end = start + _utf8_span(line)
         self._offsets[stream] = end
         return start, end
 
@@ -416,14 +453,48 @@ class HermesStreamParser:
         self._minted += 1
         return f'e9n-{self._minted}'
 
+    def _note_rejected_call(self, text: str) -> None:
+        """A tool_use refused before it was a sound record: still open, so its result is not guessed."""
+        try:
+            value = json.loads(text)
+        except (ValueError, RecursionError):
+            return
+        if not isinstance(value, dict) or value.get('type') != 'tool_use':
+            return
+        name = value.get('name')
+        if not isinstance(name, str) or not _NAME.fullmatch(name):
+            return
+        engine_id = value.get('tool_call_id')
+        if engine_id is None:
+            self._open_unnamed.setdefault(name, []).append(None)
+            self._ambiguous.add(name)
+            return
+        if isinstance(engine_id, str) and engine_id:
+            self._hold_named(name)
+
+    def _hold_named(self, name: str) -> None:
+        """One open call of ``name`` that carries an engine id."""
+        self._open_named[name] = self._open_named.get(name, 0) + 1
+
+    def _release_named(self, name: str) -> None:
+        """That call's result carried the id, so the call is no longer open."""
+        count = self._open_named.get(name, 0)
+        if count > 1:
+            self._open_named[name] = count - 1
+        else:
+            self._open_named.pop(name, None)
+        if not self._open_unnamed.get(name) and name not in self._open_named:
+            self._ambiguous.discard(name)
+
     def _end_unnamed(self, name: str) -> str:
         """The call id for an id-less result of ``name``: its call's, only when that call is beyond doubt."""
         open_calls = self._open_unnamed.get(name, [])
-        if len(open_calls) == 1 and name not in self._ambiguous:
+        named_open = name in self._open_named
+        if len(open_calls) == 1 and not named_open and name not in self._ambiguous:
             ended = open_calls.pop()
             call_id = ended if ended is not None else self._mint()   # a raw call has no tool.call to pair
-        elif open_calls:
-            # Several open (or a group already in doubt): one of them ended, which one is unknown.
+        elif open_calls and (len(open_calls) > 1 or named_open or name in self._ambiguous):
+            # Several open, or a group already in doubt: one of them ended, which one is unknown.
             self._ambiguous.add(name)
             open_calls.pop()
             call_id = self._mint()
@@ -431,7 +502,8 @@ class HermesStreamParser:
             call_id = self._mint()
         if not open_calls:
             self._open_unnamed.pop(name, None)
-            self._ambiguous.discard(name)
+            if not named_open:
+                self._ambiguous.discard(name)
         return call_id
 
 
@@ -441,9 +513,35 @@ def _call_id(engine_id: str) -> str:
     return 'e9h-' + hashlib.sha256(engine_id.encode('utf-8', 'surrogatepass')).hexdigest()[:32]
 
 
+def _utf8_span(line: str) -> int:
+    """Bytes of ``line`` as the stream held them.
+
+    A scalar encodes as UTF-8. A surrogate in U+DC80..U+DCFF is one byte that was not UTF-8. Any
+    other lone surrogate counts as the three bytes of its UTF-8 form, so the length is always defined.
+    """
+    try:
+        return len(line.encode('utf-8'))
+    except UnicodeEncodeError:
+        total = 0
+        for ch in line:
+            point = ord(ch)
+            if 0xDC80 <= point <= 0xDCFF:
+                total += 1
+            else:
+                total += len(ch.encode('utf-8', 'surrogatepass'))
+        return total
+
+
+def _storable(text: str) -> str:
+    """``text`` with each lone surrogate replaced by U+FFFD, so a UTF-8 store can hold the draft."""
+    if _SURROGATE.search(text) is None:
+        return text
+    return _SURROGATE.sub('\ufffd', text)
+
+
 def _output(stream: str, text: str, start: int, end: int) -> dict:
     return {'type': 'engine.output', 'payload': {
-        'stream': stream, 'text': text, 'offset_start': start, 'offset_end': end}}
+        'stream': stream, 'text': _storable(text), 'offset_start': start, 'offset_end': end}}
 
 
 def declaration() -> dict:

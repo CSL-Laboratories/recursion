@@ -1,0 +1,8 @@
+{
+  "tool": "T",
+  "cwd": "/srv",
+  "input_text": "{\"z\": [3, 1, 2], \"a\": {\"y\": null, \"x\": [true, false, {\"b\": 1, \"a\": 2}]}}",
+  "expect": {
+    "call_text": "{\"cwd\":\"/srv\",\"input\":{\"a\":{\"x\":[true,false,{\"a\":2,\"b\":1}],\"y\":null},\"z\":[3,1,2]},\"tool\":\"T\"}"
+  }
+}

@@ -1,0 +1,288 @@
+{
+  "about": "Answers and the conditions the CLI and the TUI show for them (tui/protocol.py keyed_conditions at master_head): label, subject and text. The desktop shows the same labels and words; desktop/tests/check_vectors.py checks these against the TUI's function and desktop/tests/js checks the desktop's.",
+  "master_head": "fb578e31a2c0469457a23dbcaa4030bdd24cef64",
+  "labels": [
+    "UNAVAILABLE",
+    "UNRECONCILED",
+    "STALE",
+    "REFUSED",
+    "UNCERTAIN"
+  ],
+  "vectors": [
+    {
+      "name": "unavailable with a detail",
+      "answer": {
+        "code": "control_api_unavailable",
+        "delivered": false,
+        "detail": "busy"
+      },
+      "conditions": [
+        [
+          "UNAVAILABLE",
+          "api",
+          "control API unavailable: busy"
+        ]
+      ]
+    },
+    {
+      "name": "unavailable with no detail",
+      "answer": {
+        "code": "control_api_unavailable"
+      },
+      "conditions": [
+        [
+          "UNAVAILABLE",
+          "api",
+          "control API unavailable: no answer"
+        ]
+      ]
+    },
+    {
+      "name": "unavailable, delivery unknown",
+      "answer": {
+        "code": "control_api_unavailable",
+        "delivered": "unknown",
+        "detail": "request:ConnectionError"
+      },
+      "conditions": [
+        [
+          "UNAVAILABLE",
+          "api",
+          "control API unavailable: request:ConnectionError"
+        ]
+      ]
+    },
+    {
+      "name": "stop pending with a reason",
+      "answer": {
+        "code": "pending",
+        "run_id": "run-1",
+        "reason": "cgroup_not_empty"
+      },
+      "conditions": [
+        [
+          "UNCERTAIN",
+          "run=run-1",
+          "stop not confirmed for run=run-1: reason=cgroup_not_empty; run may still be running"
+        ]
+      ]
+    },
+    {
+      "name": "stop pending with no reason",
+      "answer": {
+        "code": "pending",
+        "run_id": "run-1"
+      },
+      "conditions": [
+        [
+          "UNCERTAIN",
+          "run=run-1",
+          "stop not confirmed for run=run-1: reason=unknown; run may still be running"
+        ]
+      ]
+    },
+    {
+      "name": "an unknown run",
+      "answer": {
+        "code": "run_unknown",
+        "run_id": "run-9"
+      },
+      "conditions": [
+        [
+          "REFUSED",
+          "answer",
+          "run_unknown run-9"
+        ]
+      ]
+    },
+    {
+      "name": "a start that failed",
+      "answer": {
+        "code": "start_failed",
+        "detail": "route_not_configured"
+      },
+      "conditions": [
+        [
+          "REFUSED",
+          "answer",
+          "start_failed route_not_configured"
+        ]
+      ]
+    },
+    {
+      "name": "a code that is not text",
+      "answer": {
+        "code": 5
+      },
+      "conditions": [
+        [
+          "REFUSED",
+          "answer",
+          "5"
+        ]
+      ]
+    },
+    {
+      "name": "no code at all",
+      "answer": {},
+      "conditions": [
+        [
+          "REFUSED",
+          "answer",
+          "None"
+        ]
+      ]
+    },
+    {
+      "name": "a stale list",
+      "answer": {
+        "code": "ok",
+        "stale": true,
+        "runs": []
+      },
+      "conditions": [
+        [
+          "STALE",
+          "answer",
+          "API marked this answer stale"
+        ]
+      ]
+    },
+    {
+      "name": "a stop asked and not confirmed",
+      "answer": {
+        "code": "ok",
+        "runs": [
+          {
+            "run_id": "run-1",
+            "state": "stop_pending",
+            "stop": {
+              "reason": "cgroup_not_empty"
+            }
+          },
+          {
+            "run_id": "run-2",
+            "state": "starting",
+            "stop": {
+              "reason": "cgroup_unknown"
+            }
+          },
+          {
+            "run_id": "run-3",
+            "state": "stopped",
+            "stop": {
+              "reason": "signalled"
+            }
+          },
+          {
+            "run_id": "run-4",
+            "state": "running"
+          }
+        ]
+      },
+      "conditions": [
+        [
+          "UNRECONCILED",
+          "run=run-1",
+          "run=run-1 state=stop_pending reason=cgroup_not_empty: stop requested, cleanup not confirmed"
+        ],
+        [
+          "UNRECONCILED",
+          "run=run-2",
+          "run=run-2 state=starting reason=cgroup_unknown: stop requested, cleanup not confirmed"
+        ]
+      ]
+    },
+    {
+      "name": "stop_pending with no stop record",
+      "answer": {
+        "code": "ok",
+        "run": {
+          "run_id": "run-5",
+          "state": "stop_pending"
+        }
+      },
+      "conditions": [
+        [
+          "UNRECONCILED",
+          "run=run-5",
+          "run=run-5 state=stop_pending reason=None: stop requested, cleanup not confirmed"
+        ]
+      ]
+    },
+    {
+      "name": "unreconciled state",
+      "answer": {
+        "code": "ok",
+        "reconciliation": "unreconciled"
+      },
+      "conditions": [
+        [
+          "UNRECONCILED",
+          "api",
+          "API reports unreconciled state"
+        ]
+      ]
+    },
+    {
+      "name": "everything at once",
+      "answer": {
+        "code": "pending",
+        "run_id": "run-1",
+        "stale": true,
+        "reconciliation": "unreconciled",
+        "run": {
+          "run_id": "run-1",
+          "state": "stop_pending",
+          "stop": {
+            "reason": "x"
+          }
+        }
+      },
+      "conditions": [
+        [
+          "UNCERTAIN",
+          "run=run-1",
+          "stop not confirmed for run=run-1: reason=unknown; run may still be running"
+        ],
+        [
+          "STALE",
+          "answer",
+          "API marked this answer stale"
+        ],
+        [
+          "UNRECONCILED",
+          "run=run-1",
+          "run=run-1 state=stop_pending reason=x: stop requested, cleanup not confirmed"
+        ],
+        [
+          "UNRECONCILED",
+          "api",
+          "API reports unreconciled state"
+        ]
+      ]
+    },
+    {
+      "name": "engine text in a detail",
+      "answer": {
+        "code": "start_failed",
+        "detail": "bad\u001b[31mred\nline\u0007"
+      },
+      "conditions": [
+        [
+          "REFUSED",
+          "answer",
+          "start_failed bad\u27e6CSI\u27e7red\u27e6LF\u27e7line\u27e6BEL\u27e7"
+        ]
+      ]
+    },
+    {
+      "name": "success says nothing",
+      "answer": {
+        "code": "stopped",
+        "run_id": "run-1"
+      },
+      "conditions": []
+    }
+  ]
+}

@@ -1,0 +1,1362 @@
+{
+  "record": {
+    "approval_id": "apr-00c4",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "turn_id": "turn-000c",
+    "source": "engine_tool",
+    "effect": {
+      "kind": "engine_tool",
+      "engine": "claude_code",
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "tool": "Bash",
+      "cwd": "/home/dev/projects/atlas",
+      "input": {
+        "command": "rm -rf build && make",
+        "description": "clean build"
+      }
+    },
+    "digest_form": "rfc8785/v1",
+    "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+    "display": [],
+    "rendered_form": "csl-approval-lines/v0",
+    "rendered": [
+      {
+        "text": "Tool call waiting for an answer",
+        "trust": "trusted"
+      },
+      {
+        "text": "engine: claude_code",
+        "trust": "trusted"
+      },
+      {
+        "text": "session: ses-7f3a9c2e51d04b6a",
+        "trust": "trusted"
+      },
+      {
+        "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "trust": "trusted"
+      },
+      {
+        "text": "tool: \"Bash\"",
+        "trust": "untrusted"
+      },
+      {
+        "text": "directory: \"/home/dev/projects/atlas\"",
+        "trust": "untrusted"
+      },
+      {
+        "text": "input fields: 2",
+        "trust": "trusted"
+      },
+      {
+        "text": "\"command\": \"rm -rf build && make\"",
+        "trust": "untrusted"
+      },
+      {
+        "text": "\"description\": \"clean build\"",
+        "trust": "untrusted"
+      }
+    ],
+    "requested_at": "2026-11-13T07:34:30.000Z",
+    "expires_at": "2026-11-13T07:49:30.000Z",
+    "state": "pending",
+    "opened_by": [],
+    "answered_by": null,
+    "answer": null,
+    "answered_at": null,
+    "revision": 1
+  },
+  "steps": [
+    {
+      "what": "The terminal shows it at revision 1.",
+      "principal": {
+        "kind": "owner",
+        "id": "local"
+      },
+      "at": "2026-11-13T07:34:32.000Z",
+      "request": {
+        "method": "approval.open",
+        "params": {
+          "command_id": "tui-7c1e.0110",
+          "approval_id": "apr-00c4",
+          "surface": "tui"
+        }
+      },
+      "answer": {
+        "code": "ok",
+        "approval": {
+          "approval_id": "apr-00c4",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "turn_id": "turn-000c",
+          "source": "engine_tool",
+          "effect": {
+            "kind": "engine_tool",
+            "engine": "claude_code",
+            "session_id": "ses-7f3a9c2e51d04b6a",
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "tool": "Bash",
+            "cwd": "/home/dev/projects/atlas",
+            "input": {
+              "command": "rm -rf build && make",
+              "description": "clean build"
+            }
+          },
+          "digest_form": "rfc8785/v1",
+          "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+          "display": [],
+          "rendered_form": "csl-approval-lines/v0",
+          "rendered": [
+            {
+              "text": "Tool call waiting for an answer",
+              "trust": "trusted"
+            },
+            {
+              "text": "engine: claude_code",
+              "trust": "trusted"
+            },
+            {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
+              "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+              "trust": "trusted"
+            },
+            {
+              "text": "tool: \"Bash\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "directory: \"/home/dev/projects/atlas\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "input fields: 2",
+              "trust": "trusted"
+            },
+            {
+              "text": "\"command\": \"rm -rf build && make\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"description\": \"clean build\"",
+              "trust": "untrusted"
+            }
+          ],
+          "requested_at": "2026-11-13T07:34:30.000Z",
+          "expires_at": "2026-11-13T07:49:30.000Z",
+          "state": "pending",
+          "opened_by": [
+            {
+              "principal": {
+                "kind": "owner",
+                "id": "local"
+              },
+              "surface": "tui",
+              "revision": 1,
+              "at": "2026-11-13T07:34:32.000Z"
+            }
+          ],
+          "answered_by": null,
+          "answer": null,
+          "answered_at": null,
+          "revision": 1
+        }
+      },
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build"
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 2",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "pending",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          }
+        ],
+        "answered_by": null,
+        "answer": null,
+        "answered_at": null,
+        "revision": 1
+      }
+    },
+    {
+      "what": "A replacement effect bound to another run. (Until the third read the model wrote it into the record first, raised the revision, and left the envelope on the old run.)",
+      "core": {
+        "happening": "change",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+          "tool": "Write",
+          "cwd": "/home/dev/projets/caf\u00e9",
+          "input": {
+            "file_path": "notes/men\u00fa.txt",
+            "content": "caf\u00e9 \u2014 1.5 kg",
+            "weight_kg": 1.5
+          }
+        }
+      },
+      "result": "target",
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build"
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 2",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "pending",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          }
+        ],
+        "answered_by": null,
+        "answer": null,
+        "answered_at": null,
+        "revision": 1
+      }
+    },
+    {
+      "what": "A replacement effect bound to another session.",
+      "core": {
+        "happening": "change",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-2c4e6a8b0d1f3a5c",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Write",
+          "cwd": "/home/dev/projets/caf\u00e9",
+          "input": {
+            "file_path": "notes/men\u00fa.txt",
+            "content": "caf\u00e9 \u2014 1.5 kg",
+            "weight_kg": 1.5
+          }
+        }
+      },
+      "result": "target",
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build"
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 2",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "pending",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          }
+        ],
+        "answered_by": null,
+        "answer": null,
+        "answered_at": null,
+        "revision": 1
+      }
+    },
+    {
+      "what": "A replacement effect of another engine.",
+      "core": {
+        "happening": "change",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "codex",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Write",
+          "cwd": "/home/dev/projets/caf\u00e9",
+          "input": {
+            "file_path": "notes/men\u00fa.txt",
+            "content": "caf\u00e9 \u2014 1.5 kg",
+            "weight_kg": 1.5
+          }
+        }
+      },
+      "result": "target",
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build"
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 2",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "pending",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          }
+        ],
+        "answered_by": null,
+        "answer": null,
+        "answered_at": null,
+        "revision": 1
+      }
+    },
+    {
+      "what": "A deadline on a day that does not exist.",
+      "core": {
+        "happening": "change",
+        "expires_at": "2026-02-31T07:49:30.000Z"
+      },
+      "result": "timestamp",
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build"
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 2",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "pending",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          }
+        ],
+        "answered_by": null,
+        "answer": null,
+        "answered_at": null,
+        "revision": 1
+      }
+    },
+    {
+      "what": "A change that names nothing to change.",
+      "core": {
+        "happening": "change"
+      },
+      "result": "nothing_to_change",
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Bash",
+          "cwd": "/home/dev/projects/atlas",
+          "input": {
+            "command": "rm -rf build && make",
+            "description": "clean build"
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "39f84aee4acb31972adc920f7acfa0fcc4f4df94e3c178c7f60f425ae12eda77",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Bash\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projects/atlas\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 2",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"command\": \"rm -rf build && make\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"description\": \"clean build\"",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "pending",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          }
+        ],
+        "answered_by": null,
+        "answer": null,
+        "answered_at": null,
+        "revision": 1
+      }
+    },
+    {
+      "what": "A replacement effect for the same run, session and engine: taken. Revision 2.",
+      "core": {
+        "happening": "change",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Write",
+          "cwd": "/home/dev/projets/caf\u00e9",
+          "input": {
+            "file_path": "notes/men\u00fa.txt",
+            "content": "caf\u00e9 \u2014 1.5 kg",
+            "weight_kg": 1.5
+          }
+        }
+      },
+      "result": "ok",
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Write",
+          "cwd": "/home/dev/projets/caf\u00e9",
+          "input": {
+            "file_path": "notes/men\u00fa.txt",
+            "content": "caf\u00e9 \u2014 1.5 kg",
+            "weight_kg": 1.5
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "3836d0feae567113f9d05139a418df1692f3851846c340d3b0d4f3b3e385172d",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Write\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projets/caf\u00e9\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 3",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"content\": \"caf\u00e9 \u2014 1.5 kg\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"file_path\": \"notes/men\u00fa.txt\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"weight_kg\": 1.5",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "pending",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          }
+        ],
+        "answered_by": null,
+        "answer": null,
+        "answered_at": null,
+        "revision": 2
+      }
+    },
+    {
+      "what": "The terminal shows revision 2.",
+      "principal": {
+        "kind": "owner",
+        "id": "local"
+      },
+      "at": "2026-11-13T07:34:50.000Z",
+      "request": {
+        "method": "approval.open",
+        "params": {
+          "command_id": "tui-7c1e.0111",
+          "approval_id": "apr-00c4",
+          "surface": "tui"
+        }
+      },
+      "answer": {
+        "code": "ok",
+        "approval": {
+          "approval_id": "apr-00c4",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "turn_id": "turn-000c",
+          "source": "engine_tool",
+          "effect": {
+            "kind": "engine_tool",
+            "engine": "claude_code",
+            "session_id": "ses-7f3a9c2e51d04b6a",
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "tool": "Write",
+            "cwd": "/home/dev/projets/caf\u00e9",
+            "input": {
+              "file_path": "notes/men\u00fa.txt",
+              "content": "caf\u00e9 \u2014 1.5 kg",
+              "weight_kg": 1.5
+            }
+          },
+          "digest_form": "rfc8785/v1",
+          "digest": "3836d0feae567113f9d05139a418df1692f3851846c340d3b0d4f3b3e385172d",
+          "display": [],
+          "rendered_form": "csl-approval-lines/v0",
+          "rendered": [
+            {
+              "text": "Tool call waiting for an answer",
+              "trust": "trusted"
+            },
+            {
+              "text": "engine: claude_code",
+              "trust": "trusted"
+            },
+            {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
+              "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+              "trust": "trusted"
+            },
+            {
+              "text": "tool: \"Write\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "directory: \"/home/dev/projets/caf\u00e9\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "input fields: 3",
+              "trust": "trusted"
+            },
+            {
+              "text": "\"content\": \"caf\u00e9 \u2014 1.5 kg\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"file_path\": \"notes/men\u00fa.txt\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"weight_kg\": 1.5",
+              "trust": "untrusted"
+            }
+          ],
+          "requested_at": "2026-11-13T07:34:30.000Z",
+          "expires_at": "2026-11-13T07:49:30.000Z",
+          "state": "pending",
+          "opened_by": [
+            {
+              "principal": {
+                "kind": "owner",
+                "id": "local"
+              },
+              "surface": "tui",
+              "revision": 1,
+              "at": "2026-11-13T07:34:32.000Z"
+            },
+            {
+              "principal": {
+                "kind": "owner",
+                "id": "local"
+              },
+              "surface": "tui",
+              "revision": 2,
+              "at": "2026-11-13T07:34:50.000Z"
+            }
+          ],
+          "answered_by": null,
+          "answer": null,
+          "answered_at": null,
+          "revision": 2
+        }
+      },
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Write",
+          "cwd": "/home/dev/projets/caf\u00e9",
+          "input": {
+            "file_path": "notes/men\u00fa.txt",
+            "content": "caf\u00e9 \u2014 1.5 kg",
+            "weight_kg": 1.5
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "3836d0feae567113f9d05139a418df1692f3851846c340d3b0d4f3b3e385172d",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Write\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projets/caf\u00e9\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 3",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"content\": \"caf\u00e9 \u2014 1.5 kg\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"file_path\": \"notes/men\u00fa.txt\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"weight_kg\": 1.5",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "pending",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          },
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 2,
+            "at": "2026-11-13T07:34:50.000Z"
+          }
+        ],
+        "answered_by": null,
+        "answer": null,
+        "answered_at": null,
+        "revision": 2
+      }
+    },
+    {
+      "what": "The owner approves revision 2.",
+      "principal": {
+        "kind": "owner",
+        "id": "local"
+      },
+      "at": "2026-11-13T07:34:52.000Z",
+      "request": {
+        "method": "approval.answer",
+        "params": {
+          "command_id": "tui-7c1e.0112",
+          "approval_id": "apr-00c4",
+          "digest": "3836d0feae567113f9d05139a418df1692f3851846c340d3b0d4f3b3e385172d",
+          "answer": "approve",
+          "expected_revision": 2,
+          "surface": "tui"
+        }
+      },
+      "answer": {
+        "code": "ok",
+        "approval": {
+          "approval_id": "apr-00c4",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "turn_id": "turn-000c",
+          "source": "engine_tool",
+          "effect": {
+            "kind": "engine_tool",
+            "engine": "claude_code",
+            "session_id": "ses-7f3a9c2e51d04b6a",
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "tool": "Write",
+            "cwd": "/home/dev/projets/caf\u00e9",
+            "input": {
+              "file_path": "notes/men\u00fa.txt",
+              "content": "caf\u00e9 \u2014 1.5 kg",
+              "weight_kg": 1.5
+            }
+          },
+          "digest_form": "rfc8785/v1",
+          "digest": "3836d0feae567113f9d05139a418df1692f3851846c340d3b0d4f3b3e385172d",
+          "display": [],
+          "rendered_form": "csl-approval-lines/v0",
+          "rendered": [
+            {
+              "text": "Tool call waiting for an answer",
+              "trust": "trusted"
+            },
+            {
+              "text": "engine: claude_code",
+              "trust": "trusted"
+            },
+            {
+              "text": "session: ses-7f3a9c2e51d04b6a",
+              "trust": "trusted"
+            },
+            {
+              "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+              "trust": "trusted"
+            },
+            {
+              "text": "tool: \"Write\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "directory: \"/home/dev/projets/caf\u00e9\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "input fields: 3",
+              "trust": "trusted"
+            },
+            {
+              "text": "\"content\": \"caf\u00e9 \u2014 1.5 kg\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"file_path\": \"notes/men\u00fa.txt\"",
+              "trust": "untrusted"
+            },
+            {
+              "text": "\"weight_kg\": 1.5",
+              "trust": "untrusted"
+            }
+          ],
+          "requested_at": "2026-11-13T07:34:30.000Z",
+          "expires_at": "2026-11-13T07:49:30.000Z",
+          "state": "approved",
+          "opened_by": [
+            {
+              "principal": {
+                "kind": "owner",
+                "id": "local"
+              },
+              "surface": "tui",
+              "revision": 1,
+              "at": "2026-11-13T07:34:32.000Z"
+            },
+            {
+              "principal": {
+                "kind": "owner",
+                "id": "local"
+              },
+              "surface": "tui",
+              "revision": 2,
+              "at": "2026-11-13T07:34:50.000Z"
+            }
+          ],
+          "answered_by": {
+            "kind": "owner",
+            "id": "local"
+          },
+          "answer": "approve",
+          "answered_at": "2026-11-13T07:34:52.000Z",
+          "revision": 2
+        }
+      },
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Write",
+          "cwd": "/home/dev/projets/caf\u00e9",
+          "input": {
+            "file_path": "notes/men\u00fa.txt",
+            "content": "caf\u00e9 \u2014 1.5 kg",
+            "weight_kg": 1.5
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "3836d0feae567113f9d05139a418df1692f3851846c340d3b0d4f3b3e385172d",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Write\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projets/caf\u00e9\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 3",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"content\": \"caf\u00e9 \u2014 1.5 kg\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"file_path\": \"notes/men\u00fa.txt\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"weight_kg\": 1.5",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "approved",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          },
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 2,
+            "at": "2026-11-13T07:34:50.000Z"
+          }
+        ],
+        "answered_by": {
+          "kind": "owner",
+          "id": "local"
+        },
+        "answer": "approve",
+        "answered_at": "2026-11-13T07:34:52.000Z",
+        "revision": 2
+      }
+    },
+    {
+      "what": "The core carries it out.",
+      "core": {
+        "happening": "consume",
+        "revision": 2,
+        "digest": "3836d0feae567113f9d05139a418df1692f3851846c340d3b0d4f3b3e385172d",
+        "binding": {
+          "approval_id": "apr-00c4",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "engine": "claude_code",
+          "engine_request_id": "req_01HV8",
+          "bound_at": "2026-11-13T07:34:30.000Z"
+        }
+      },
+      "result": "ok",
+      "record": {
+        "approval_id": "apr-00c4",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "turn_id": "turn-000c",
+        "source": "engine_tool",
+        "effect": {
+          "kind": "engine_tool",
+          "engine": "claude_code",
+          "session_id": "ses-7f3a9c2e51d04b6a",
+          "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+          "tool": "Write",
+          "cwd": "/home/dev/projets/caf\u00e9",
+          "input": {
+            "file_path": "notes/men\u00fa.txt",
+            "content": "caf\u00e9 \u2014 1.5 kg",
+            "weight_kg": 1.5
+          }
+        },
+        "digest_form": "rfc8785/v1",
+        "digest": "3836d0feae567113f9d05139a418df1692f3851846c340d3b0d4f3b3e385172d",
+        "display": [],
+        "rendered_form": "csl-approval-lines/v0",
+        "rendered": [
+          {
+            "text": "Tool call waiting for an answer",
+            "trust": "trusted"
+          },
+          {
+            "text": "engine: claude_code",
+            "trust": "trusted"
+          },
+          {
+            "text": "session: ses-7f3a9c2e51d04b6a",
+            "trust": "trusted"
+          },
+          {
+            "text": "run: run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "trust": "trusted"
+          },
+          {
+            "text": "tool: \"Write\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "directory: \"/home/dev/projets/caf\u00e9\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "input fields: 3",
+            "trust": "trusted"
+          },
+          {
+            "text": "\"content\": \"caf\u00e9 \u2014 1.5 kg\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"file_path\": \"notes/men\u00fa.txt\"",
+            "trust": "untrusted"
+          },
+          {
+            "text": "\"weight_kg\": 1.5",
+            "trust": "untrusted"
+          }
+        ],
+        "requested_at": "2026-11-13T07:34:30.000Z",
+        "expires_at": "2026-11-13T07:49:30.000Z",
+        "state": "consumed",
+        "opened_by": [
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 1,
+            "at": "2026-11-13T07:34:32.000Z"
+          },
+          {
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "surface": "tui",
+            "revision": 2,
+            "at": "2026-11-13T07:34:50.000Z"
+          }
+        ],
+        "answered_by": {
+          "kind": "owner",
+          "id": "local"
+        },
+        "answer": "approve",
+        "answered_at": "2026-11-13T07:34:52.000Z",
+        "revision": 2
+      }
+    }
+  ],
+  "binding": {
+    "approval_id": "apr-00c4",
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "engine": "claude_code",
+    "engine_request_id": "req_01HV8",
+    "bound_at": "2026-11-13T07:34:30.000Z"
+  }
+}

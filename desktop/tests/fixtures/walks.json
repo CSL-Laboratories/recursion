@@ -1,0 +1,375 @@
+{
+  "about": "How the CLI and the TUI read every run (tui/protocol.py list_all_runs at master_head): the answers run.list gives page by page, the calls made, and the list shown. The desktop reads the list the same way.",
+  "master_head": "fb578e31a2c0469457a23dbcaa4030bdd24cef64",
+  "vectors": [
+    {
+      "name": "one page",
+      "pages": [
+        {
+          "code": "ok",
+          "runs": [
+            {
+              "run_id": "run-1",
+              "state": "running"
+            }
+          ]
+        }
+      ],
+      "calls": [
+        [
+          "run.list",
+          {}
+        ]
+      ],
+      "result": {
+        "code": "ok",
+        "runs": [
+          {
+            "run_id": "run-1",
+            "state": "running"
+          }
+        ]
+      }
+    },
+    {
+      "name": "two pages joined",
+      "pages": [
+        {
+          "code": "ok",
+          "runs": [
+            {
+              "run_id": "run-1",
+              "state": "running"
+            }
+          ],
+          "next_after": "run-1"
+        },
+        {
+          "code": "ok",
+          "runs": [
+            {
+              "run_id": "run-2",
+              "state": "running"
+            }
+          ]
+        }
+      ],
+      "calls": [
+        [
+          "run.list",
+          {}
+        ],
+        [
+          "run.list",
+          {
+            "after": "run-1"
+          }
+        ]
+      ],
+      "result": {
+        "code": "ok",
+        "runs": [
+          {
+            "run_id": "run-1",
+            "state": "running"
+          },
+          {
+            "run_id": "run-2",
+            "state": "running"
+          }
+        ]
+      }
+    },
+    {
+      "name": "a stale page marks the list stale",
+      "pages": [
+        {
+          "code": "ok",
+          "runs": [
+            {
+              "run_id": "run-1",
+              "state": "running"
+            }
+          ],
+          "next_after": "run-1"
+        },
+        {
+          "code": "ok",
+          "runs": [
+            {
+              "run_id": "run-2",
+              "state": "running"
+            }
+          ],
+          "stale": true
+        }
+      ],
+      "calls": [
+        [
+          "run.list",
+          {}
+        ],
+        [
+          "run.list",
+          {
+            "after": "run-1"
+          }
+        ]
+      ],
+      "result": {
+        "code": "ok",
+        "runs": [
+          {
+            "run_id": "run-1",
+            "state": "running"
+          },
+          {
+            "run_id": "run-2",
+            "state": "running"
+          }
+        ],
+        "stale": true
+      }
+    },
+    {
+      "name": "a later page that is not ok is returned as it came",
+      "pages": [
+        {
+          "code": "ok",
+          "runs": [
+            {
+              "run_id": "run-1",
+              "state": "running"
+            }
+          ],
+          "next_after": "run-1"
+        },
+        {
+          "code": "control_api_unavailable",
+          "delivered": false,
+          "detail": "busy"
+        }
+      ],
+      "calls": [
+        [
+          "run.list",
+          {}
+        ],
+        [
+          "run.list",
+          {
+            "after": "run-1"
+          }
+        ]
+      ],
+      "result": {
+        "code": "control_api_unavailable",
+        "delivered": false,
+        "detail": "busy"
+      }
+    },
+    {
+      "name": "a cursor that is not the last run",
+      "pages": [
+        {
+          "code": "ok",
+          "runs": [
+            {
+              "run_id": "run-1",
+              "state": "running"
+            },
+            {
+              "run_id": "run-2",
+              "state": "running"
+            }
+          ],
+          "next_after": "run-1"
+        }
+      ],
+      "calls": [
+        [
+          "run.list",
+          {}
+        ]
+      ],
+      "result": {
+        "code": "list_incomplete",
+        "detail": "cursor_not_advancing:run-1",
+        "pages": 1
+      }
+    },
+    {
+      "name": "a cursor that does not move forward",
+      "pages": [
+        {
+          "code": "ok",
+          "runs": [
+            {
+              "run_id": "run-2",
+              "state": "running"
+            }
+          ],
+          "next_after": "run-2"
+        },
+        {
+          "code": "ok",
+          "runs": [
+            {
+              "run_id": "run-1",
+              "state": "running"
+            }
+          ],
+          "next_after": "run-1"
+        }
+      ],
+      "calls": [
+        [
+          "run.list",
+          {}
+        ],
+        [
+          "run.list",
+          {
+            "after": "run-2"
+          }
+        ]
+      ],
+      "result": {
+        "code": "list_incomplete",
+        "detail": "cursor_not_advancing:run-1",
+        "pages": 2
+      }
+    },
+    {
+      "name": "a run listed twice",
+      "pages": [
+        {
+          "code": "ok",
+          "runs": [
+            {
+              "run_id": "run-1",
+              "state": "running"
+            }
+          ],
+          "next_after": "run-1"
+        },
+        {
+          "code": "ok",
+          "runs": [
+            {
+              "run_id": "run-1",
+              "state": "running"
+            }
+          ]
+        }
+      ],
+      "calls": [
+        [
+          "run.list",
+          {}
+        ],
+        [
+          "run.list",
+          {
+            "after": "run-1"
+          }
+        ]
+      ],
+      "result": {
+        "code": "list_incomplete",
+        "detail": "run_listed_twice:run-1",
+        "pages": 2
+      }
+    },
+    {
+      "name": "runs that are not a list",
+      "pages": [
+        {
+          "code": "ok",
+          "runs": {
+            "run-1": {}
+          },
+          "next_after": "run-1"
+        }
+      ],
+      "calls": [
+        [
+          "run.list",
+          {}
+        ]
+      ],
+      "result": {
+        "code": "list_incomplete",
+        "detail": "runs_not_a_list",
+        "pages": 1
+      }
+    },
+    {
+      "name": "a run with no id",
+      "pages": [
+        {
+          "code": "ok",
+          "runs": [
+            {
+              "state": "running"
+            }
+          ],
+          "next_after": "x"
+        }
+      ],
+      "calls": [
+        [
+          "run.list",
+          {}
+        ]
+      ],
+      "result": {
+        "code": "list_incomplete",
+        "detail": "run_without_id",
+        "pages": 1
+      }
+    },
+    {
+      "name": "the first answer unavailable",
+      "pages": [
+        {
+          "code": "control_api_unavailable",
+          "delivered": false,
+          "detail": "connect:FileNotFoundError"
+        }
+      ],
+      "calls": [
+        [
+          "run.list",
+          {}
+        ]
+      ],
+      "result": {
+        "code": "control_api_unavailable",
+        "delivered": false,
+        "detail": "connect:FileNotFoundError"
+      }
+    },
+    {
+      "name": "an empty page with a cursor",
+      "pages": [
+        {
+          "code": "ok",
+          "runs": [],
+          "next_after": "run-1"
+        }
+      ],
+      "calls": [
+        [
+          "run.list",
+          {}
+        ]
+      ],
+      "result": {
+        "code": "list_incomplete",
+        "detail": "cursor_not_advancing:run-1",
+        "pages": 1
+      }
+    }
+  ]
+}

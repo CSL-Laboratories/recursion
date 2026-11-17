@@ -1,0 +1,8 @@
+{
+  "method": "doctor",
+  "params": {},
+  "answer": {
+    "code": "method_unknown",
+    "detail": "not_implemented"
+  }
+}

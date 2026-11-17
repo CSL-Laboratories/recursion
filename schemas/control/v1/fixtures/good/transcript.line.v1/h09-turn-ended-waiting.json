@@ -1,0 +1,11 @@
+{
+  "seq": 18,
+  "time_rel_ms": 17629,
+  "event_type": "turn.ended",
+  "source": "core",
+  "trust": "trusted",
+  "state": "waiting",
+  "text": "turn ended: waiting for you",
+  "speech": "waiting for you",
+  "focus": "composer"
+}

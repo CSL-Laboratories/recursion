@@ -386,6 +386,39 @@ class InstallTests(unittest.TestCase):
                 self.assertTrue(upgrade(self.roots, EXEC).changed)
                 self.assertEqual(_read(self.unit), render_unit(EXEC))
 
+    # Grok's round 10 on #382 (23f76e4a). R2: an empty XDG_STATE_HOME= was refused, but the daemon reads an empty value as
+    # the default (daemon/__main__.py: XDG_STATE_HOME or Path.home()); the unit's HOME then decides. R3: str.splitlines
+    # ended lines at \v, \f, \x1c-\x1e, \x85, \u2028 and \u2029, which systemd reads within a line, so the check could
+    # read a section systemd never sees, and miss an Environment line systemd applies.
+    def test_lines_end_where_systemd_ends_them_and_an_empty_state_home_is_the_default(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        elsewhere = os.path.join(self.case, "elsewhere")
+        refused = [(f"Environment=XDG_STATE_HOME= HOME={elsewhere}\n", f"sets HOME={elsewhere}"),
+                   ("Environment=HOME=\n", "sets HOME=, so the daemon's default state folder is under it")]
+        replaced = ["Environment=XDG_STATE_HOME=\n", "Environment=XDG_STATE_HOME=\nEnvironment=HOME=%h\n"]
+        for end in ("\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"):
+            # systemd reads "A=1<end>[Unit]" as one assignment, so the next line is still [Service]'s
+            refused.append((f"Environment=A=1{end}[Unit]\nEnvironment=XDG_STATE_HOME={elsewhere}\n",
+                            f"sets XDG_STATE_HOME={elsewhere}"))
+            # and "A=1<end>Environment=..." as one assignment too: no XDG_STATE_HOME is set
+            replaced.append(f"Environment=A=1{end}Environment=XDG_STATE_HOME={elsewhere}\n")
+        for service, said in refused:
+            with self.subTest(service=service):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(f"[Service]\n{service}ExecStart=/old\n")
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    upgrade(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
+                self.assertIn(said, caught.exception.detail)
+                self.assertEqual(_tree(self.home), before)  # the unit as it was
+        for service in replaced:
+            with self.subTest(service=service):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(f"[Service]\n{service}ExecStart=/old\n")
+                self.assertTrue(upgrade(self.roots, EXEC).changed)
+                self.assertEqual(_read(self.unit), render_unit(EXEC))
+
     def test_upgrade_without_a_unit_is_refused(self) -> None:
         with self.assertRaises(InstallRefused) as caught:
             upgrade(self.roots, EXEC)

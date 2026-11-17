@@ -29,6 +29,8 @@ STOP_TIMEOUT_S = 90  # systemd's own default, stated: finite, and long enough fo
 MAX_ARGS = 16
 MAX_ARG_LEN = 256
 _ARG = re.compile(r"[A-Za-z0-9_./:%@=+-]+")
+_LINE_END = re.compile(r"\r\n|\r|\n")  # systemd's; str.splitlines also ends lines at \v, \f, \x1c-\x1e, \x85, \u2028, \u2029
+_BLANKS = " \t\r\n"  # what systemd strips around a line, a key and a value
 
 
 def daemon_exec_args(interpreter: str) -> tuple[str, ...]:
@@ -108,7 +110,9 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
     drops it), under ``$HOME``: the daemon's default is ``Path.home()``, which reads
     ``HOME``, so a unit's own ``HOME`` (or an ``EnvironmentFile``, which can set it) moves the state too,
     unless it names ``home`` or ``UnsetEnvironment`` drops it. A byte order mark before the first line is
-    skipped, as systemd skips it, and a value with a NUL byte names no folder. A unit that cannot be read
+    skipped, as systemd skips it, and a value with a NUL byte names no folder. Lines end where systemd ends
+    them, at ``\\r\\n``, ``\\r`` or ``\\n`` only, and an empty ``XDG_STATE_HOME`` is the daemon's default, as the
+    daemon reads it (``os.environ.get('XDG_STATE_HOME') or ...``). A unit that cannot be read
     so is answered too: then where it keeps the state cannot be told. A value only in the user manager's own
     environment
     (``environment.d``, ``systemctl --user set-environment``) is not seen: this package starts no
@@ -125,13 +129,13 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
     passed: set[str] = set()
     unset: set[str] = set()  # names UnsetEnvironment drops whatever their value
     unset_pairs: set[str] = set()  # NAME=value assignments it drops, only those exactly
-    lines = text.splitlines()
+    lines = _LINE_END.split(text)  # not str.splitlines, whose other line ends systemd reads within a line (Grok R3)
     i = 0
     while i < len(lines):
-        line = lines[i].strip()
+        line = lines[i].strip(_BLANKS)
         i += 1
         while line.endswith("\\") and i < len(lines):  # a continued line
-            line = line[:-1] + " " + lines[i].strip()
+            line = line[:-1] + " " + lines[i].strip(_BLANKS)
             i += 1
         if not line or line[0] in "#;":
             continue
@@ -139,7 +143,7 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
             section = line[1:-1]
             continue
         key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip()
+        key, value = key.strip(_BLANKS), value.strip(_BLANKS)
         if section != "Service" or key not in ("Environment", "EnvironmentFile", "PassEnvironment",
                                                 "UnsetEnvironment"):
             continue
@@ -170,7 +174,7 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
         if "XDG_STATE_HOME" in passed:
             return "passes the user manager's own XDG_STATE_HOME to the daemon (PassEnvironment)"
         value = assigned.get("XDG_STATE_HOME")
-        if value is not None and f"XDG_STATE_HOME={value}" not in unset_pairs:
+        if value and f"XDG_STATE_HOME={value}" not in unset_pairs:  # empty: the default, as the daemon reads it (Grok R2)
             if _names(value, os.path.join(home, ".local", "state"), home):
                 return None
             return f"sets XDG_STATE_HOME={value}"

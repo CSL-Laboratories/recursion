@@ -176,6 +176,7 @@ class TrustStore:
             keys[key_id(hex_key)] = (label, hex_key)
         self._keys = MappingProxyType(keys)
         self._lock = threading.Lock()
+        self._store_path = revocation_store
         self._db = None if revocation_store is None else self._open_store(revocation_store)
         generations = {}
         if self._db is not None:
@@ -274,7 +275,9 @@ class TrustStore:
 
         The row is read and written inside ``BEGIN IMMEDIATE``: no other connection
         writes the store between the read and the write. ``None`` when nothing was
-        written (see ``revoke``); a ``sqlite3`` error rolls back and propagates.
+        written (see ``revoke``). A ``sqlite3`` error rolls back and propagates.
+        When that roll-back itself fails, the connection is dropped and the store is
+        opened again, then the original error propagates.
         """
         db = self._db
         db.execute("BEGIN IMMEDIATE")
@@ -306,9 +309,28 @@ class TrustStore:
                 try:
                     db.execute("ROLLBACK")
                 except sqlite3.Error:
-                    pass
+                    self._replace_store_connection(db)
             raise
         return generation
+
+    def _replace_store_connection(self, db) -> None:
+        """A roll-back that itself fails leaves the connection inside a transaction.
+
+        Drop that connection and open the store again so a later revoke can write.
+        """
+        try:
+            db.close()
+        except sqlite3.Error:
+            pass
+        if self._db is db:
+            self._db = None
+        path = self._store_path
+        if not path:
+            return
+        try:
+            self._db = self._open_store(path)
+        except Refused:
+            self._db = None
 
     def close(self) -> None:
         with self._lock:

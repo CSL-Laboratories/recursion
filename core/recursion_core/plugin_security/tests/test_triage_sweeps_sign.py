@@ -339,5 +339,32 @@ class GenerationRuleTests(unittest.TestCase):
             (caught.exception.code, caught.exception.detail),
             ("revocation_not_durable", KID))
 
+    def test_a_roll_back_that_itself_fails_does_not_leave_the_handle_unable_to_revoke(self):
+        # A write that fails, and a roll-back that also fails, must not leave this handle
+        # inside a transaction. The next revoke on the same handle still writes.
+        path = _store(self)
+        trust = self._open(path)
+        real = trust._db
+
+        class _Poison:
+            def execute(self, sql, *args, **kwargs):
+                word = sql.lstrip().split(None, 1)[0].upper()
+                if word == "INSERT":
+                    raise sqlite3.OperationalError("insert refused by the test")
+                if word == "ROLLBACK":
+                    raise sqlite3.OperationalError("roll-back refused by the test")
+                return real.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        trust._db = _Poison()
+        with self.assertRaises(Refused) as caught:
+            trust.revoke(KID)
+        self.assertEqual(caught.exception.code, "revocation_not_durable")
+        self.assertFalse(trust._db.in_transaction)
+        self.assertEqual(trust.revoke(KID), 2)
+        self.assertEqual(self._open(path).generation(KID), 2)
+
 if __name__ == "__main__":
     unittest.main()

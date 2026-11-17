@@ -14,6 +14,7 @@ import threading
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest import mock
 
 from recursion_core.gui.surface import Application
 from recursion_core.gui.tests.test_surface import HOST, ORIGIN, GuiHarness
@@ -218,7 +219,14 @@ class ThemeParserTests(unittest.TestCase):
                 self.assertRegex(parsed.css, r"^\[data-theme-scope\]\{(?:(?:%s);)+\}$" % _DECL.pattern)
                 if schema_errors is not None:
                     self.assertEqual(schema_errors(document), [], path.name)
-        contrast_only = {"b10-fg-contrast.json", "b11-muted-contrast.json", "b12-accent-contrast.json"}
+        # Contrast floors, and radius 4.0, which a schema checker treats as the integer 4.
+        parser_only = {
+            "b10-fg-contrast.json",
+            "b11-muted-contrast.json",
+            "b12-accent-contrast.json",
+            "b20-radius-float.json",
+        }
+        self.assertIn("b20-radius-float.json", parser_only)
         for path in bad:
             with self.subTest(path=path.name):
                 raw = path.read_bytes()
@@ -229,7 +237,7 @@ class ThemeParserTests(unittest.TestCase):
                 document = json.loads(raw.decode("utf-8"))
                 with self.assertRaises(themes.ThemeError):
                     themes.parse_theme(document)
-                if schema_errors is not None and path.name in contrast_only:
+                if schema_errors is not None and path.name in parser_only:
                     self.assertEqual(schema_errors(document), [], path.name)
 
     def test_other_whole_document_defects_are_refused(self) -> None:
@@ -250,6 +258,55 @@ class ThemeParserTests(unittest.TestCase):
             with self.subTest(defect=label):
                 with self.assertRaises(themes.ThemeError):
                     themes.parse_theme(document)
+
+    def test_a_trailing_newline_is_refused_by_the_schema_and_the_parser(self) -> None:
+        # Draft 2020-12 searches the pattern, and ``$`` matches before a final newline.
+        # The page uses ``fullmatch``, which does not. Both must refuse the document.
+        themes = self.themes()
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        samples = {
+            "name": (
+                schema["properties"]["name"]["pattern"],
+                {**DUSK, "name": "dusk\n"},
+                "dusk\n",
+                "theme_name",
+            ),
+            "title": (
+                schema["properties"]["title"]["pattern"],
+                {**DUSK, "title": "Dusk\n"},
+                "Dusk\n",
+                "theme_title",
+            ),
+            "colour": (
+                schema["$defs"]["colour"]["pattern"],
+                _paper_with(fg="#1a1a1a\n"),
+                "#1a1a1a\n",
+                "theme_colour",
+            ),
+        }
+        schema_errors = _schema_errors_or_none()
+        for label, (pattern, document, value, code) in samples.items():
+            with self.subTest(field=label):
+                self.assertIsNone(
+                    re.search(pattern, value),
+                    "%s pattern still matches a trailing newline" % label)
+                with self.assertRaises(themes.ThemeError) as caught:
+                    themes.parse_theme(document)
+                self.assertEqual(caught.exception.code, code)
+                if schema_errors is not None:
+                    self.assertTrue(schema_errors(document), label)
+
+    def test_radius_float_is_parser_only_and_the_schema_names_it(self) -> None:
+        themes = self.themes()
+        document = json.loads((FIXTURES / "bad" / "b20-radius-float.json").read_text(encoding="utf-8"))
+        with self.assertRaises(themes.ThemeError) as caught:
+            themes.parse_theme(document)
+        self.assertEqual(caught.exception.code, "theme_radius")
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self.assertIn("4.0", schema["description"])
+        schema_errors = _schema_errors_or_none()
+        if schema_errors is not None:
+            self.assertEqual(schema_errors(document), [], "b20-radius-float.json")
 
     def test_config_dir_refuses_a_relative_base(self) -> None:
         themes = self.themes()
@@ -546,6 +603,119 @@ class ThemePageTests(GuiHarness):
         self.assertEqual(found[0], found[1])
         self.assertIn(DUSK_CSS, found[0][1])
         self.assertNotIn("deep", found[0][1])
+
+    def test_pinned_safety_text_uses_an_opaque_canvas_background(self) -> None:
+        sheet = _styles(self.request("GET", "/")[2])[0]
+        self._assert_pinned_safety_background(sheet)
+
+    def _assert_pinned_safety_background(self, sheet: str) -> None:
+        # Visibility and intervention text sit on canvas, the same pair as Stop
+        # and the approval region. A transparent background lets --theme-bg through.
+        match = re.search(
+            r'section\[aria-label="Visibility"\].*?'
+            r'section\[aria-labelledby="actions-h"\] \*'
+            r'\{color:canvastext;background:([^;}]+)\}',
+            sheet,
+        )
+        self.assertIsNotNone(match, sheet)
+        self.assertEqual(match.group(1), "canvas")
+        self.assertNotIn("background:transparent", match.group(0))
+        self.assertIn(
+            'header,footer,nav,#core-approval,section[aria-labelledby="stop-h"]'
+            "{color:canvastext;background:canvas}",
+            sheet,
+        )
+
+    def test_the_daemon_path_reads_the_operator_directory(self) -> None:
+        xdg = Path(self._tmp.name) / "xdg-daemon"
+        _write_gui(xdg / "recursion" / "gui", {"dusk.json": DUSK}, {"theme": "dusk"})
+        saved = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(xdg)
+        try:
+            app = Application(
+                self.app._client, self.door, frozenset({HOST}), frozenset({ORIGIN}))
+            status, headers, body = self._render(app)
+        finally:
+            if saved is None:
+                os.environ.pop("XDG_CONFIG_HOME", None)
+            else:
+                os.environ["XDG_CONFIG_HOME"] = saved
+        self.assertEqual(status, "200 OK")
+        self.assertIn('<style id="theme">', body)
+        self.assertIn(DUSK_CSS, body)
+        self.assertEqual(len(_directives(headers["Content-Security-Policy"])["style-src"]), 2)
+
+    def test_a_selected_symlink_is_not_applied(self) -> None:
+        root = self._gui({}, {"theme": "dusk"})
+        outside = Path(self._tmp.name) / "real-dusk.json"
+        outside.write_text(json.dumps(DUSK), encoding="utf-8")
+        _own(outside, 0o600)
+        os.symlink(outside, root / "themes" / "dusk.json")
+        body = self._render(self._app(root))[2]
+        self.assertNotIn('<style id="theme">', body)
+        self.assertNotIn(DUSK_CSS, body)
+
+    def test_a_repeated_member_applies_nothing(self) -> None:
+        selected = self._gui({"dusk.json": DUSK}, None)
+        choice = selected / "selection.json"
+        choice.write_bytes(b'{"theme": null, "theme": "dusk"}')
+        _own(choice, 0o600)
+        self.assertNotIn('<style id="theme">', self._render(self._app(selected))[2])
+        # Last-wins would keep the dusk bg. The repeated member must refuse the file.
+        raw = (
+            b'{"schema":"gui.theme/1","name":"dusk","title":"Dusk","tokens":{'
+            b'"bg":"#ffffff","fg":"#f2f4f7","muted":"#b8c0cc","accent":"#7cc4ff","border":"#3a4450",'
+            b'"bg":"#101418"}}'
+        )
+        doubled = self._gui({}, {"theme": "dusk"})
+        path = doubled / "themes" / "dusk.json"
+        path.write_bytes(raw)
+        _own(path, 0o600)
+        body = self._render(self._app(doubled))[2]
+        self.assertNotIn('<style id="theme">', body)
+        self.assertNotIn(DUSK_CSS, body)
+
+    def test_a_valid_theme_over_the_byte_cap_is_not_applied(self) -> None:
+        # 8193 is one byte over the cap. Sizing from the constant would hide a raised cap.
+        body = json.dumps(DUSK, separators=(",", ":")).encode("utf-8")
+        pad = 8193 - len(body)
+        self.assertGreater(pad, 0)
+        over = b"{" + b" " * pad + body[1:]
+        under = b"{" + b" " * 20 + body[1:]
+        self.assertEqual(len(over), 8193)
+        self.assertLess(len(under), 8192)
+        huge = self._gui({}, {"theme": "dusk"})
+        huge_path = huge / "themes" / "dusk.json"
+        huge_path.write_bytes(over)
+        _own(huge_path, 0o600)
+        self.assertNotIn('<style id="theme">', self._render(self._app(huge))[2])
+        small = self._gui({}, {"theme": "dusk"})
+        small_path = small / "themes" / "dusk.json"
+        small_path.write_bytes(under)
+        _own(small_path, 0o600)
+        rendered = self._render(self._app(small))[2]
+        self.assertIn('<style id="theme">', rendered)
+        self.assertIn(DUSK_CSS, rendered)
+
+    def test_another_owners_theme_is_not_applied(self) -> None:
+        themes = _parser()
+        root = self._gui({"dusk.json": DUSK}, {"theme": "dusk"})
+        real_lstat = themes.os.lstat
+        real_fstat = themes.os.fstat
+
+        def other_uid(info):
+            return os.stat_result((*info[:4], info.st_uid + 1, *info[5:]))
+
+        def other_lstat(path):
+            return other_uid(real_lstat(path))
+
+        def other_fstat(fd):
+            return other_uid(real_fstat(fd))
+
+        with mock.patch.object(themes.os, "lstat", side_effect=other_lstat):
+            self.assertNotIn('<style id="theme">', self._render(self._app(root))[2])
+        with mock.patch.object(themes.os, "fstat", side_effect=other_fstat):
+            self.assertNotIn('<style id="theme">', self._render(self._app(root))[2])
 
     def test_a_missing_theme_directory_does_not_fail_the_page(self) -> None:
         status, _headers, body = self._render(self._app(Path(self._tmp.name) / "absent"))

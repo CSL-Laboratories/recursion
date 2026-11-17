@@ -59,7 +59,21 @@ def launch_env(
     in the parent process is not in ``child_env`` and is not read from ``os.environ``.
     """
 
-    checked = dict(child_env)
+    # A decision stores the child env as pairs, which ``dict`` accepts and ``Mapping`` does not.
+    if isinstance(child_env, Mapping):
+        pairs = child_env.items()
+    elif isinstance(child_env, (str, bytes)) or not isinstance(child_env, Sequence):
+        raise EnvRefused(None, "child_env_malformed")
+    else:
+        pairs = child_env
+    checked: dict[str, str] = {}
+    for item in pairs:
+        if not (isinstance(item, tuple) and len(item) == 2):
+            raise EnvRefused(None, "child_env_malformed")
+        name, value = item
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise EnvRefused(name if isinstance(name, str) else None, "child_env_malformed")
+        checked[name] = value
     if not isinstance(credential_env, str) or credential_env not in ("", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
         raise EnvRefused(None, "route_key_malformed")
     credential = credential_env

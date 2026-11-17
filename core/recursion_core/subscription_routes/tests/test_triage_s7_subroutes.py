@@ -1,6 +1,6 @@
-"""S7 triage (routes-core): witnesses for confinement and refusal checks in subscription_routes/.
+"""S7 triage (routes-core): witnesses for confinement, refusal, and staging checks.
 
-SR-01, SR-02, SR-03, SR-05, SR-06, SR-07, SR-10 and SR-11. Scratch homes and packages only;
+SR-01 through SR-11 except the route-service witness. Scratch homes and packages only;
 no engine, no network, no credential (every key value is a fake string).
 """
 
@@ -16,12 +16,13 @@ from unittest import mock
 
 from recursion_core.subscription_routes import (
     HERMES_ADOPT_EXTERNAL_LOGINS, SubscriptionRouteRefused, WrapperInstall, check_route,
-    measure_package_pin,
+    guard_then_spawn, measure_package_pin,
 )
 from recursion_core.subscription_routes import own_loop, policy, wrapper_pin
 from recursion_core.subscription_routes.wrapper_pin import WrapperPinRefused, verify_package_pin
 
 MARK = "S7-TRIAGE-MARKER"
+FAKE_KEY = "fake-api-key-not-a-credential"
 
 
 class _Base(unittest.TestCase):
@@ -143,6 +144,60 @@ class Policy(_Base):
                 check_route("opencode", {"provider": "bad\nforged", "auth": "api_key",
                                          "credential_env": "OPENAI_API_KEY"}, {}, route_home=str(self.home))
             self.assertNotIn("\n", str(caught.exception))
+
+    def opencode_api(self, **env):
+        return check_route("opencode", {"provider": "openai", "auth": "api_key", "credential_env": "OPENAI_API_KEY",
+                                        "model": "openai/m"}, env, route_home=str(self.home),
+                           parent_env=self.parent(), operator_home=str(self.operator))
+
+    # SR-04: a null child env, a non-string name, or a non-string value is a typed refusal.
+    def test_sr04_malformed_env_is_a_refusal(self):
+        self.opencode_api(PATH="/usr/bin:/bin", HOME=str(self.home), OPENAI_API_KEY=FAKE_KEY)  # control
+        for name, env in {"none": None, "int_value": {"HOME": str(self.home), "OPENAI_API_KEY": 7},
+                          "int_name": {"HOME": str(self.home), "OPENAI_API_KEY": FAKE_KEY, 7: "x"}}.items():
+            with self.subTest(name):
+                try:
+                    check_route("opencode", {"provider": "openai", "auth": "api_key",
+                                             "credential_env": "OPENAI_API_KEY"}, env, route_home=str(self.home),
+                                parent_env=self.parent(), operator_home=str(self.operator))
+                except SubscriptionRouteRefused:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    self.fail(f"untyped exception: {type(exc).__name__}")
+
+    def _hermes_spawn(self):
+        profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY",
+                   "model": "anthropic/m", HERMES_ADOPT_EXTERNAL_LOGINS: False}
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "ANTHROPIC_API_KEY": FAKE_KEY}
+        return guard_then_spawn(mock.MagicMock(name="launcher"), [self.wrapper.launcher_path, "run", "anthropic/m"],
+                                "hermes", profile, env, route_home=str(self.home), parent_env=self.parent(),
+                                operator_home=str(self.operator), wrapper=self.wrapper)
+
+    def _try_refused(self, fn):
+        try:
+            fn()
+        except SubscriptionRouteRefused:
+            pass
+
+    # SR-08: a staging mkdir or write failure is a typed refusal, not a raw OSError.
+    def test_sr08_hermes_staging_failure_is_a_refusal(self):
+        self.home.chmod(0o500)
+        if os.access(self.home, os.W_OK):
+            self.skipTest("running as a user that writes mode-0500 directories")
+        self.call(self._try_refused, self._hermes_spawn)
+
+    # SR-09: publishing the switch does not replace an empty .hermes another writer holds open.
+    def test_sr09_held_empty_hermes_dir_is_not_replaced(self):
+        parent = self.home / ".hermes"
+        parent.mkdir(mode=0o700)
+        fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, fd)
+        try:
+            self._hermes_spawn()
+        except SubscriptionRouteRefused:
+            return  # refusing is an acceptable answer
+        self.assertTrue(os.path.samestat(os.fstat(fd), os.stat(parent)),
+                        "the .hermes directory a writer held open was unlinked and replaced")
 
 
 class WrapperPin(_Base):

@@ -421,7 +421,7 @@ class HermesHomeReuseTests(_Calls):
     def test_empty_hermes_dir_counts_as_absent_on_an_api_key_hermes_route(self) -> None:
         (self.home / ".hermes").mkdir(mode=0o755)
         self.launch("hermes")
-        self.assert_switch_written()  # the staged directory replaced the empty one, 0700
+        self.assert_switch_written()  # the empty directory stays, is made 0700, and receives the switch
         self.assertEqual(1, self.launcher.call_count)
 
     def test_empty_hermes_dir_still_refuses_on_other_engines(self) -> None:
@@ -447,18 +447,17 @@ class HermesHomeReuseTests(_Calls):
         self.launcher.assert_not_called()
 
     def test_rename_that_finds_the_hermes_dir_filled_refuses(self) -> None:
+        # An empty directory is kept and the switch is linked in, so this race is the absent
+        # directory only: that path still renames a staged directory into place.
         for code in (errno.EEXIST, errno.ENOTEMPTY):
-            for start in ("absent", "empty"):
-                with self.subTest(code=errno.errorcode[code], start=start):
-                    shutil.rmtree(self.home / ".hermes", ignore_errors=True)
-                    if start == "empty":
-                        (self.home / ".hermes").mkdir(mode=0o700)
-                    with mock.patch.object(policy.os, "rename", side_effect=OSError(code, os.strerror(code))) as rename:
-                        exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
-                    self.assertEqual(".hermes", exc.detail)
-                    self.assertEqual(1, rename.call_count)
-                    self.assertEqual([], self.stray())  # the staging directory is removed
-                    self.assertFalse(self.config().exists())
+            with self.subTest(code=errno.errorcode[code]):
+                shutil.rmtree(self.home / ".hermes", ignore_errors=True)
+                with mock.patch.object(policy.os, "rename", side_effect=OSError(code, os.strerror(code))) as rename:
+                    exc = self.refused("hermes_config_blocks_adopt_override", self.launch, "hermes")
+                self.assertEqual(".hermes", exc.detail)
+                self.assertEqual(1, rename.call_count)
+                self.assertEqual([], self.stray())  # the staging directory is removed
+                self.assertFalse(self.config().exists())
         self.launcher.assert_not_called()
 
     def test_hermes_dir_with_entries_and_no_config_gets_the_switch_by_link(self) -> None:

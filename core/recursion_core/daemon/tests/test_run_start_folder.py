@@ -1,7 +1,8 @@
 """D-19: run.start names a folder, and the run's unit works in that folder.
 
 A start that carries ``workspace`` is checked before a record exists. In direct mode the unit's
-working directory is that folder. HOME stays the engine's private home. A worktree is not made here.
+working directory is that folder. HOME stays the engine's private home. In worktree mode the unit's
+working directory is the worktree made outside the repository.
 """
 from __future__ import annotations
 
@@ -300,20 +301,27 @@ class ComposedFolderTest(unittest.TestCase):
         self.assertEqual(len(self.units.started), before)
 
     @unittest.skipUnless(repos.HAVE_GIT, 'the repository is made by git')
-    def test_a_worktree_is_not_made_and_the_run_does_not_start_in_the_checkout_or_the_home(self):
+    def test_a_worktree_is_the_units_directory_and_not_the_checkout_or_the_home(self):
         repo = self.tmp / 'repo'
         repos.make_repo(repo, {'README.md': 'hello\n'})
         composed = self.boot()
         before = len(self.units.started)
         answer = self._start(composed, {'path': str(repo), 'mode': 'worktree'})
-        self.assertEqual(answer.get('code'), 'start_failed', answer)
-        self.assertEqual(answer.get('start_error', {}).get('detail'), 'working_directory_failed')
-        self.assertEqual(len(self.units.started), before)
-        rec = composed.control.registry.get(answer['run_id'])
-        self.assertEqual(rec['launch']['workspace']['mode'], 'worktree')
-        self.assertIsNone(rec['launch']['workspace']['worktree_path'])
-        self.assertEqual(rec['launch']['workspace']['source_path'], _real(repo))
+        self.assertEqual(answer.get('code'), 'started', answer)
+        self.assertEqual(len(self.units.started), before + 1)
+        recorded = answer['run']['launch']['workspace']['worktree_path']
+        self.assertEqual(_real(self.units.started[-1]['cwd']), _real(recorded))
+        self.assertNotEqual(_real(recorded), _real(repo))
+        self.assertNotEqual(_real(recorded), _real(self.state / 'homes' / 'claude_code'))
+        self.assertEqual((Path(recorded) / 'README.md').read_text(), 'hello\n')
+        self.assertFalse((repo / '.git' / 'worktrees').exists())
         self.assertFalse((self.state / 'worktrees' / 'unbuilt').exists())
+        init = self._init_line(answer['run']['run_id'])
+        self.assertEqual(init.get('home'), str(self.state / 'homes' / 'claude_code'))
+        rec = composed.control.registry.get(answer['run']['run_id'])
+        self.assertEqual(rec['launch']['workspace']['mode'], 'worktree')
+        self.assertEqual(rec['launch']['workspace']['worktree_path'], recorded)
+        self.assertEqual(rec['launch']['workspace']['source_path'], _real(repo))
 
 
 def signal_kill():

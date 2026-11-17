@@ -1,4 +1,4 @@
-"""The workspace registrant: the provider returns a direct folder, and does not make a worktree."""
+"""The workspace registrant: the provider returns a direct folder, and makes a worktree outside the repository."""
 from __future__ import annotations
 
 import os
@@ -68,7 +68,7 @@ class ProviderTest(unittest.TestCase):
         ctx = _Ctx('run-none', LaunchContext(principal=OWNER, **launch))
         self.assertIsNone(self.hooks.working_directory(ctx))
 
-    def test_a_worktree_place_is_chosen_and_not_made(self):
+    def test_a_worktree_place_is_chosen_once_and_made_outside_the_repository(self):
         launch, refusal = self.hooks.launch_snapshot(OWNER, {
             'tenant': 't1', 'prompt': 'x', 'workspace': {'path': str(self.repo), 'mode': 'worktree'}})
         self.assertIsNone(refusal)
@@ -84,20 +84,20 @@ class ProviderTest(unittest.TestCase):
 
         raw = WH.Provider(state_dir=self.state)
         with mock.patch('recursion_core.workspace.hooks.choose', side_effect=_spy):
-            with self.assertRaises(RuntimeError):
-                raw(ctx)
+            folder = raw(ctx)
         self.assertEqual(len(seen), 1)
         chosen = seen[0]
         self.assertIsNotNone(chosen)
-        self.assertFalse(Path(chosen.path).exists(), 'the chosen place was not created')
+        self.assertEqual(os.path.realpath(folder), os.path.realpath(chosen.path))
+        self.assertTrue(Path(folder).is_dir())
         self.assertNotEqual(os.path.realpath(chosen.path), os.path.realpath(self.repo))
+        self.assertFalse(chosen.writes_git_common_dir)
+        self.assertFalse(chosen.engine_worktree_switching)
         with mock.patch('recursion_core.workspace.hooks.choose') as picked:
-            with self.assertRaises(RuntimeError):
-                raw(ctx)
+            self.assertEqual(raw(ctx), folder)
             picked.assert_not_called()
         self.assertFalse((self.state / 'worktrees' / 'unbuilt').exists())
-        with self.assertRaises(Exception):
-            self.hooks.working_directory(ctx)
+        self.assertEqual(self.hooks.working_directory(ctx), folder)
 
 
 if __name__ == '__main__':

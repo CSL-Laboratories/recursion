@@ -271,6 +271,40 @@ class ControlAPI:
         from recursion_core.daemon.launcher import drop_launch
         drop_launch(run_id)
 
+    def _carry_worktree(self, rec, current) -> None:
+        """Copy a worktree path the provider wrote onto the launch the starter saw.
+
+        The registry copy still has null until the write that follows. A direct folder, and a
+        worktree that was not made, leave the stored null in place.
+        """
+        if not isinstance(rec, dict) or not isinstance(current, dict):
+            return
+        live = rec.get("launch")
+        workspace = live.get("workspace") if isinstance(live, dict) else None
+        if not isinstance(workspace, dict) or workspace.get("mode") != "worktree":
+            return
+        path = workspace.get("worktree_path")
+        if not isinstance(path, str) or not path:
+            return
+        stored = current.get("launch")
+        target = stored.get("workspace") if isinstance(stored, dict) else None
+        if isinstance(target, dict) and target.get("mode") == "worktree":
+            target["worktree_path"] = path
+
+    def _persist_worktree(self, rec) -> None:
+        """Write the provider's path when this start will not otherwise store the record again."""
+        try:
+            current = self._reg("get", rec["run_id"])
+        except _RegistryError:
+            return
+        if current is None:
+            return
+        before = ((current.get("launch") or {}).get("workspace") or {}).get("worktree_path")
+        self._carry_worktree(rec, current)
+        after = ((current.get("launch") or {}).get("workspace") or {}).get("worktree_path")
+        if after != before:
+            self._try_put(current)
+
     def _start(self, params: Mapping) -> dict:
         key = params.get("client_key")
         digest = hashlib.sha256(params["prompt"].encode("utf-8")).hexdigest()
@@ -343,6 +377,7 @@ class ControlAPI:
                     current = None
                 recorded = False
                 if current is not None:
+                    self._carry_worktree(rec, current)
                     current["state"] = "start_failed"
                     recorded = self._try_put(current)
                 if not recorded:  # the record still says starting; a same-key retry must still relaunch
@@ -350,11 +385,13 @@ class ControlAPI:
             return {"code": START_FAILED, "run_id": run_id, "detail": type(err).__name__, "recorded": recorded}
         cgroup = handle.get("cgroup") if isinstance(handle, Mapping) else None
         if not isinstance(cgroup, str) or not cgroup:
+            self._persist_worktree(rec)
             return {"code": START_UNCONFIRMED, "run": rec, "detail": "starter_handle_invalid"}
         with self._run_lock(run_id):
             # Known to this process even if the write below fails, so Stop and a retry can still aim at it
             # (red-team r3 finding 1).
             current = self._current(rec)  # re-read: keeps a stop intent written while the starter ran
+            self._carry_worktree(rec, current)
             current.update(state="running", cgroup=cgroup)
             self._launched[run_id] = dict(current)
             if current.get("stop") is not None or run_id in self._stop_wanted:
@@ -462,6 +499,8 @@ class ControlAPI:
         fresh = self._reread(rec)
         if fresh is None:
             return False
+        # The write that lost the race did not land, so the fresh row still needs the path this start made.
+        self._carry_worktree(rec, fresh)
         if fresh.get("state") == "stopped" or fresh.get("stop") is not None or rec["run_id"] in self._stop_wanted:
             fresh["cgroup"] = fresh.get("cgroup") or cgroup
             self._launched[rec["run_id"]] = dict(fresh)

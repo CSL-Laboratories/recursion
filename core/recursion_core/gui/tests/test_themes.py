@@ -20,7 +20,7 @@ from recursion_core.gui.surface import Application
 from recursion_core.gui.tests.test_surface import HOST, ORIGIN, GuiHarness
 
 ROOT = Path(__file__).resolve().parents[4]
-FIXTURES = ROOT / "schemas" / "gui" / "v1" / "fixtures"
+FIXTURES = ROOT / "schemas" / "gui" / "v1" / "fixtures" / "theme"
 SCHEMA_PATH = ROOT / "schemas" / "gui" / "v1" / "theme.v1.json"
 
 # The core stylesheet as it stood before a theme floor was appended. Phone layout
@@ -211,6 +211,8 @@ class ThemeParserTests(unittest.TestCase):
         bad = sorted((FIXTURES / "bad").glob("*.json"))
         self.assertGreaterEqual(len(good), 6)
         self.assertGreaterEqual(len(bad), 9)
+        for path in good + bad:
+            self.assertNotIn("gui.layout/1", path.read_text(encoding="utf-8"), path.name)
         schema_errors = _schema_errors_or_none()
         for path in good:
             with self.subTest(path=path.name):

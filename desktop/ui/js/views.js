@@ -695,12 +695,12 @@ export function applyLayout(workspace, document, options = undefined) {
   const restore = () => {
     try {
       restoreAttrs(workspace, previousWorkspaceAttrs);
-      restoreProps(workspace.style, previousWorkspaceProps);
       for (const row of previousSections) {
         restoreAttrs(row.section, row.attrs);
         if (canStyle(row.section)) restoreProps(row.section.style, row.props);
       }
       if (previousOrder && typeof workspace.replaceChildren === "function") workspace.replaceChildren(...previousOrder);
+      restoreProps(workspace.style, previousWorkspaceProps);
     } catch {
       // The original failure is reported by the caller.
     }
@@ -719,6 +719,13 @@ export function applyLayout(workspace, document, options = undefined) {
       section.setAttribute("data-collapsed", slot.collapsed ? "true" : "false");
       if (canStyle(section)) {
         section.style.setProperty("grid-column", narrow ? "auto" : `${slot.column} / span ${slot.span}`);
+      }
+    }
+    const desktopPlaced = parsed.slots.some((slot) => WORKSPACE_VIEWS.includes(slot.panel) && byId.has(slot.panel));
+    if (!desktopPlaced) {
+      for (const section of sections) {
+        if (section.hidden === true || !canStyle(section)) continue;
+        section.style.setProperty("grid-column", `1 / span ${drawColumns}`);
       }
     }
     workspace.setAttribute("data-columns", String(parsed.columns));

@@ -216,7 +216,18 @@ export function startWindow(doc, transport, actions = makeActions(), appearance 
   };
 
   function show(view) {
-    for (const section of doc.querySelectorAll("main > section")) section.hidden = section.dataset.view !== view;
+    const workspace = $("workspace");
+    const laidOut = workspace !== null && workspace.getAttribute("data-layout") !== null;
+    for (const section of doc.querySelectorAll("main > section")) {
+      const placed = laidOut
+        && section.getAttribute("data-column") !== null
+        && section.getAttribute("data-collapsed") !== "true";
+      if (placed) {
+        section.hidden = false;
+        continue;
+      }
+      section.hidden = section.dataset.view !== view;
+    }
     for (const button of doc.querySelectorAll("nav button")) {
       if (button.dataset.view === view) button.setAttribute("aria-current", "page");
       else button.removeAttribute("aria-current");

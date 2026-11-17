@@ -27,12 +27,20 @@ const THEME_PROP = /^--theme-(?:bg|fg|muted|accent|border|density|radius)$/;
 const THEME_VALUE = /^(?:#[0-9a-f]{6}|compact|normal|roomy|(?:0|2|4|8)px)$/;
 const CORE_IDS = ["core-approval", "stop-confirm", "stop-answers", "link-state", "stop-confirm-yes", "stop-confirm-no"];
 
-function listGui(dir) {
-  return readdirSync(new URL(`${dir}/`, GUI_FIXTURES)).filter((name) => name.endsWith(".json")).sort();
+function listGui(dir, kind) {
+  return readdirSync(new URL(`${kind}/${dir}/`, GUI_FIXTURES)).filter((name) => name.endsWith(".json")).sort();
 }
 
-function readGui(dir, name) {
-  return readFileSync(new URL(`${dir}/${name}`, GUI_FIXTURES), "utf8");
+function readGui(dir, name, kind) {
+  if (kind) return readFileSync(new URL(`${kind}/${dir}/${name}`, GUI_FIXTURES), "utf8");
+  for (const candidate of ["theme", "layout"]) {
+    try {
+      return readFileSync(new URL(`${candidate}/${dir}/${name}`, GUI_FIXTURES), "utf8");
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err;
+    }
+  }
+  throw new Error(`no fixture ${dir}/${name}`);
 }
 
 function schemaOf(raw) {
@@ -49,7 +57,7 @@ function schemaOf(raw) {
 
 function guiFiles(dir, kind) {
   const prefix = kind === "theme" ? "gui.theme/" : "gui.layout/";
-  return listGui(dir).filter((name) => schemaOf(readGui(dir, name)).startsWith(prefix));
+  return listGui(dir, kind).filter((name) => schemaOf(readGui(dir, name, kind)).startsWith(prefix));
 }
 
 function applyLayout(workspace, document, options) {
@@ -528,4 +536,95 @@ test("a refused layout leaves an applied layout in place, and a narrow width doe
   assert.deepEqual(coreSnapshot(win), before);
   assert.equal(applyLayout(workspace, null).applied, false);
   assert.equal(workspace.getAttribute("data-columns"), kept);
+});
+
+test("each fixture directory holds one schema", () => {
+  for (const kind of ["theme", "layout"]) {
+    const other = kind === "theme" ? "gui.layout/1" : "gui.theme/1";
+    for (const dir of ["good", "bad"]) {
+      const names = listGui(dir, kind);
+      assert.ok(names.length > 0, `${kind}/${dir}`);
+      for (const name of names) {
+        const raw = readGui(dir, name, kind);
+        const prefix = kind === "theme" ? "gui.theme/" : "gui.layout/";
+        assert.equal(raw.includes(other), false, `${kind}/${dir}/${name}`);
+        assert.equal(schemaOf(raw).startsWith(prefix), true, `${kind}/${dir}/${name}`);
+      }
+    }
+  }
+});
+
+test("h01 spans the one shown section when it places no desktop section", () => {
+  const win = windowDocument();
+  const workspace = win.getElementById("workspace");
+  assert.equal(applyLayout(workspace, readGui("good", "h01-two-columns.json")).applied, true);
+  const shown = win.querySelectorAll("main > section").filter((section) => section.hidden !== true);
+  assert.equal(shown.length, 1);
+  assert.equal(shown[0].getAttribute("data-view"), "runs");
+  assert.equal(shown[0].style.props.get("grid-column"), "1 / span 2");
+  assert.equal(workspace.style.props.get("grid-template-columns"), "repeat(2, minmax(0, 1fr))");
+});
+
+test("a second layout throw still restores every section", () => {
+  const win = windowDocument();
+  const workspace = win.getElementById("workspace");
+  const first = {
+    schema: "gui.layout/1", name: "desk", title: "Desktop sections", columns: 2,
+    slots: [
+      { panel: "runs", column: 1, span: 1, order: 0, collapsed: false },
+      { panel: "sessions", column: 2, span: 1, order: 0, collapsed: false },
+    ],
+  };
+  assert.equal(applyLayout(workspace, first).applied, true);
+  const real = workspace.style.setProperty.bind(workspace.style);
+  workspace.style.setProperty = (name, value) => {
+    if (name === "grid-template-columns") throw new Error("interrupted");
+    return real(name, value);
+  };
+  const second = {
+    schema: "gui.layout/1", name: "next", title: "Plugins", columns: 1,
+    slots: [{ panel: "plugins", column: 1, span: 1, order: 0, collapsed: false }],
+  };
+  assert.throws(() => applyLayout(workspace, second), /interrupted/);
+  const byView = Object.fromEntries(win.querySelectorAll("main > section").map((section) => [section.dataset.view, section]));
+  assert.equal(byView.runs.getAttribute("data-column"), "1");
+  assert.equal(byView.sessions.getAttribute("data-column"), "2");
+  assert.equal(byView.plugins.getAttribute("data-column"), null);
+  assert.equal(byView.plugins.style.props.get("grid-column"), undefined);
+  assert.equal(workspace.getAttribute("data-layout"), "desk");
+  assert.equal(workspace.getAttribute("data-columns"), "2");
+});
+
+test("core region names are refused when the caller lists them", () => {
+  for (const name of ["stop", "approval", "header", "footer"]) {
+    const workspace = doc.createElement("main");
+    const document = {
+      schema: "gui.layout/1", name: "core", title: "Core", columns: 1,
+      slots: [{ panel: name, column: 1, span: 1, order: 0, collapsed: false }],
+    };
+    const result = applyLayout(workspace, document, { knownPanels: [name] });
+    assert.equal(result.applied, false, name);
+    assert.equal(result.reason, "panel", name);
+    assert.equal(workspace.getAttribute("data-columns"), null, name);
+  }
+});
+
+test("columns above three are refused and a slot writes layout span and order", () => {
+  const empty = doc.createElement("main");
+  const wide = { schema: "gui.layout/1", name: "wide", title: "Wide", columns: 4, slots: [] };
+  const refused = applyLayout(empty, wide);
+  assert.equal(refused.applied, false);
+  assert.equal(refused.reason, "columns");
+  assert.equal(empty.getAttribute("data-columns"), null);
+  const win = windowDocument();
+  const workspace = win.getElementById("workspace");
+  const document = {
+    schema: "gui.layout/1", name: "span", title: "Span", columns: 2,
+    slots: [{ panel: "runs", column: 1, span: 2, order: 4, collapsed: false }],
+  };
+  assert.equal(applyLayout(workspace, document).applied, true);
+  const runs = win.querySelectorAll("main > section").find((section) => section.dataset.view === "runs");
+  assert.equal(workspace.getAttribute("data-layout"), "span");
+  assert.equal(runs.getAttribute("data-span"), "2");
+  assert.equal(runs.getAttribute("data-order"), "4");
 });

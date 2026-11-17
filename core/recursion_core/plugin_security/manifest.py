@@ -67,8 +67,8 @@ MANIFEST_SCHEMA = "csl-plugin-manifest/vNext"
 # The form that names every file of the package (SPINE's manifest.v1.json, a draft).
 MANIFEST_SCHEMA_V1 = "csl-plugin-manifest/1"
 # Canonical permission order. Requests must list permissions in this order, so the
-# signed bytes for one permission set are unique. These seven are also what a grant in
-# install.json may name today (daemon/plugins.py, read_install).
+# signed bytes for one permission set are unique. A vNext manifest requests only these
+# seven. install.json may name PERMISSIONS_V1 (daemon/plugins.py, read_install).
 PERMISSIONS = ("read", "propose", "panel", "network", "credential", "process", "order")
 # Version 1 only appends: an existing name never changes its place, so the signed bytes
 # for an existing set never change. The five new names and their order are PROVISIONAL
@@ -121,6 +121,17 @@ _PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)
 # with any extension ("CON.txt"): CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9 (Microsoft, "Naming
 # Files, Paths, and Namespaces"; its superscript-digit forms cannot occur in this ASCII grammar).
 _WINDOWS_DEVICE = re.compile(r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?")
+# The install schema's key_id (schemas/plugin/v1/install.v1.json): ed25519: and 32 lower-case hex.
+_KEY_ID = re.compile(r"ed25519:[0-9a-f]{32}")
+# The daemon reads a manifest only up to this many bytes. The same bound sits beside
+# package verification: verify_package is the next slice, and a manifest the daemon
+# will not read is not parsed.
+MAX_MANIFEST_BYTES = 64 * 1024
+
+
+def developer_key_id_ok(value: object) -> bool:
+    """True for null or a key id. Any other shape is not a developer key id."""
+    return value is None or (type(value) is str and _KEY_ID.fullmatch(value) is not None)
 
 
 @dataclass(frozen=True)
@@ -224,7 +235,13 @@ def parse_manifest(raw: bytes) -> Manifest:
     now follow ``_HOST`` (D0 and Lucas's B44): a raw IP address, a port outside 1 to 65535 or
     with a leading zero, a label of 64 characters or more and a host of more than 253 are
     refused, as ``manifest_network_destinations``, where the earlier parser accepted them.
+
+    Bytes longer than ``MAX_MANIFEST_BYTES`` (64 KiB, the daemon's manifest bound) are
+    refused ``plugin_file_too_large`` before they are parsed. That bound sits beside
+    ``verify_package``: parsing ``files`` does not verify the package.
     """
+    if type(raw) is bytes and len(raw) > MAX_MANIFEST_BYTES:
+        raise Refused("plugin_file_too_large", "manifest.json")
     data = parse(raw)
     v1 = type(data) is dict and data.get("schema") == MANIFEST_SCHEMA_V1
     if type(data) is not dict or set(data) != (_FIELDS_V1 if v1 else _FIELDS):
@@ -441,7 +458,12 @@ class Grant:
     # key here may still be bound by ``order_after_revoked_key``, which names the key the
     # user turned order back on for; with neither it is unbound and grants nothing, in
     # either manifest form: the user grants again, for the key the manifest names now.
+    # Null, or a key id (``ed25519:`` and 32 lower-case hex). Anything else is refused.
     developer_key_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not developer_key_id_ok(self.developer_key_id):
+            raise Refused("grant_invalid", "developer_key_id")
 
 
 def _bound_developer_key(grant: Grant) -> str | None:

@@ -270,10 +270,40 @@ class FilesTests(unittest.TestCase):
         self.assertRefused({}, "manifest_files")
         self.assertRefused([[ENTRY_FILE, sha(PLUGIN_SOURCE)]], "manifest_files")
         self.assertRefused(None, "manifest_files")
+        # The count ceiling is the map check. A canonical manifest of 4096 files is over
+        # the 64 KiB bound, so parse_manifest refuses it before the map is read.
+        from recursion_core.plugin_security.manifest import _parse_files
         many = self.files(**{"m/f%04d.py" % i: sha(b"") for i in range(4095)})
-        self.assertEqual(len(parse_manifest(v1(files=many)).files), 4096)
-        many["m/f4095.py"] = sha(b"")
-        self.assertRefused(many, "manifest_files")
+        self.assertEqual(len(_parse_files(many, sha(PLUGIN_SOURCE))), 4096)
+        extra = dict(many)
+        extra["m/f4095.py"] = sha(b"")
+        with self.assertRaises(Refused) as caught:
+            _parse_files(extra, sha(PLUGIN_SOURCE))
+        self.assertEqual(caught.exception.code, "manifest_files")
+
+    def test_a_manifest_over_the_daemon_byte_bound_is_refused_before_the_file_map(self) -> None:
+        """The daemon refuses a manifest above 64 KiB. The same bound sits on the parser,
+        beside package verification, so a legal file map that does not fit is not parsed."""
+        from recursion_core.daemon.plugins import MAX_MANIFEST_BYTES
+        files = self.files()
+        raw = v1(files=files)
+        i = 0
+        while len(raw) <= MAX_MANIFEST_BYTES:
+            files["m/f%04d.py" % i] = sha(b"")
+            i += 1
+            raw = v1(files=files)
+            if i > 4096:
+                self.fail("a 4096-file manifest still fit the daemon bound")
+        self.assertGreater(len(raw), MAX_MANIFEST_BYTES)
+        self.assertLess(i, 4096)
+        with self.assertRaises(Refused) as caught:
+            parse_manifest(raw)
+        self.assertEqual((caught.exception.code, caught.exception.detail),
+                         ("plugin_file_too_large", "manifest.json"))
+        del files["m/f%04d.py" % (i - 1)]
+        smaller = v1(files=files)
+        self.assertLessEqual(len(smaller), MAX_MANIFEST_BYTES)
+        self.assertEqual(len(parse_manifest(smaller).files), len(files))
 
 
 @needs_crypto

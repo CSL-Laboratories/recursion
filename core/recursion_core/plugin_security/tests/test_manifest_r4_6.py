@@ -17,6 +17,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import socket
 import string
 import unittest
@@ -447,6 +448,105 @@ class InstallReaderBindingTests(unittest.TestCase):
                         "permissions": ["read"], "developer_key_id": 5})
         self.assertEqual((caught.exception.code, caught.exception.detail),
                          ("plugin_install_config_invalid", "grant value"))
+
+    def test_the_install_reader_takes_null_or_a_key_id_and_refuses_other_shapes(self) -> None:
+        """Every path of developer_key_id: absent, null and a key id are kept; malformed text
+        and a non-text value are plugin_install_config_invalid / grant value."""
+        from recursion_core.daemon.plugins import PluginRefused
+        good = "ed25519:" + "ab" * 16
+        base = {"plugin_id": "demo.plugin", "artifact_sha256": "0" * 64, "signer_key_id": None,
+                "permissions": ["read"]}
+        absent = self._read(dict(base))["demo.plugin"]
+        self.assertIsNone(absent.developer_key_id)
+        null = self._read(dict(base, developer_key_id=None))["demo.plugin"]
+        self.assertIsNone(null.developer_key_id)
+        kept = self._read(dict(base, developer_key_id=good))["demo.plugin"]
+        self.assertEqual(kept.developer_key_id, good)
+        malformed = (
+            "", "ed25519:", "ed25519:" + "a" * 31, "ed25519:" + "a" * 33,
+            "ed25519:" + "AB" * 16, "ed25519:" + "ab" * 16 + "\n", "ed25519:" + "zz" * 16,
+            "not-a-key", " " + good, good + " ", "ed25519:" + "ab" * 16 + "\x00",
+        )
+        for value in malformed:
+            with self.subTest(value=value):
+                with self.assertRaises(PluginRefused) as caught:
+                    self._read(dict(base, developer_key_id=value))
+                self.assertEqual((caught.exception.code, caught.exception.detail),
+                                 ("plugin_install_config_invalid", "grant value"))
+        for value in (5, 0, True, False, 1.5, [], {}):
+            with self.subTest(value=value):
+                with self.assertRaises(PluginRefused) as caught:
+                    self._read(dict(base, developer_key_id=value))
+                self.assertEqual((caught.exception.code, caught.exception.detail),
+                                 ("plugin_install_config_invalid", "grant value"))
+
+    def test_grant_accepts_null_or_a_key_id_and_refuses_other_text(self) -> None:
+        good = "ed25519:" + "ab" * 16
+        self.assertEqual(
+            Grant("demo.plugin", "0" * 64, None, ("read",), developer_key_id=good).developer_key_id, good)
+        self.assertIsNone(
+            Grant("demo.plugin", "0" * 64, None, ("read",), developer_key_id=None).developer_key_id)
+        with self.assertRaises(Refused) as caught:
+            Grant("demo.plugin", "0" * 64, None, ("read",), developer_key_id="")
+        self.assertEqual((caught.exception.code, caught.exception.detail), ("grant_invalid", "developer_key_id"))
+
+    def test_a_grant_may_name_the_five_version_1_permission_names(self) -> None:
+        from recursion_core.daemon.plugins import PluginRefused
+        five = ["surface", "command", "subscribe", "tool", "run"]
+        base = {"plugin_id": "demo.plugin", "artifact_sha256": "0" * 64, "signer_key_id": None,
+                "developer_key_id": "ed25519:" + "ab" * 16}
+        grant = self._read(dict(base, permissions=five))["demo.plugin"]
+        self.assertEqual(grant.permissions, tuple(five))
+        with self.assertRaises(PluginRefused) as caught:
+            self._read(dict(base, permissions=five + ["admin"]))
+        self.assertEqual((caught.exception.code, caught.exception.detail),
+                         ("plugin_install_config_invalid", "grant value"))
+
+    def test_the_reader_and_the_schema_member_agree_once_both_are_in(self) -> None:
+        """The schema file is master's (this branch does not edit it). The member is added
+        in memory, the way the schema draft adds it. Reader and member then agree."""
+        schema_path = Path(__file__).resolve().parents[4] / "schemas" / "plugin" / "v1" / "install.v1.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertNotIn("developer_key_id", schema["$defs"]["grant"]["properties"])
+        key_def = schema["$defs"]["key_id"]
+        self.assertEqual(key_def["pattern"], r"^ed25519:[0-9a-f]{32}$")
+        schema["$defs"]["grant"]["properties"]["developer_key_id"] = {
+            "anyOf": [{"type": "null"}, {"$ref": "#/$defs/key_id"}]}
+        schema["$defs"]["grant"]["description"] = schema["$defs"]["grant"]["description"] + (
+            " developer_key_id is the developer key a manual grant is bound to, or null when the grant names none.")
+        pattern = re.compile(key_def["pattern"])
+        banned = key_def["not"]["pattern"]
+        samples = [None, "ed25519:" + "ab" * 16, "", "ed25519:", "ed25519:" + "a" * 31,
+                   "ed25519:" + "a" * 33, "ed25519:" + "AB" * 16, "ed25519:" + "zz" * 16,
+                   "ed25519:" + "ab" * 16 + "\n", 5, True, False, [], {}]
+        try:
+            import jsonschema
+        except ImportError:
+            jsonschema = None
+        validator = jsonschema.Draft202012Validator(schema) if jsonschema is not None else None
+        for value in samples:
+            with self.subTest(value=value):
+                if value is None or (type(value) is str and pattern.fullmatch(value)
+                                      and re.search(banned, value) is None):
+                    member_ok = True
+                else:
+                    member_ok = False
+                reader_ok = self._reader_keeps(value)
+                self.assertEqual(reader_ok, member_ok)
+                if validator is not None:
+                    grant = {"plugin_id": "demo.plugin", "artifact_sha256": "0" * 64,
+                             "permissions": ["read"], "developer_key_id": value}
+                    self.assertEqual(validator.is_valid({"grants": [grant]}), member_ok)
+
+    def _reader_keeps(self, value) -> bool:
+        from recursion_core.daemon.plugins import PluginRefused
+        try:
+            grant = self._read({"plugin_id": "demo.plugin", "artifact_sha256": "0" * 64,
+                                "signer_key_id": None, "permissions": ["read"],
+                                "developer_key_id": value})["demo.plugin"]
+        except PluginRefused:
+            return False
+        return grant.developer_key_id == value or (value is None and grant.developer_key_id is None)
 
 
 if __name__ == "__main__":

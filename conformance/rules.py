@@ -950,8 +950,12 @@ def transcript_fields(events: list) -> list:
                 "trust": event["trust"], "state": state}
         if kind == "approval.requested":
             line["text"] = "\n".join(item["text"] for item in payload["rendered"])
-        elif kind in _TEXT_FROM and _plain(payload[_TEXT_FROM[kind]]):
-            line["text"] = payload[_TEXT_FROM[kind]]
+        elif kind in _TEXT_FROM:
+            text = payload[_TEXT_FROM[kind]]
+            # Engine text and untrusted text stay behind the plain-ASCII rule. Trusted core text is the
+            # core's own, so a character outside ASCII is still compared.
+            if _plain(text) or (event.get("source") == "core" and event.get("trust") == "trusted"):
+                line["text"] = text
         lines.append(line)
     return lines
 
@@ -1057,6 +1061,8 @@ class DeliveryModel:
         elif happening == "written":
             if state != "delivering":
                 raise Refused("not_delivering")
+            if binding is None:
+                raise Refused("binding")
             if (facts.get("delivery_id") != binding["delivery_id"] or facts.get("item_id", binding["item_id"]) != binding["item_id"]
                     or facts.get("session_id", binding["session_id"]) != binding["session_id"]
                     or facts.get("run_id", binding["run_id"]) != binding["run_id"]
@@ -1070,6 +1076,8 @@ class DeliveryModel:
                 if state == "outcome_unknown":
                     self.evidence.append(dict(facts))      # kept for reconciliation; never dropped
                 raise Refused("not_delivering")
+            if binding is None:
+                raise Refused("binding")
             if any(facts.get(theirs) != binding[ours] for theirs, ours in (
                     ("delivery_id", "delivery_id"), ("session_id", "session_id"), ("run_id", "run_id"),
                     ("turn_id", "target_turn_id"), ("how", "how"))):
@@ -1082,6 +1090,8 @@ class DeliveryModel:
             ended = facts.get("turn_id")
             if not isinstance(ended, str) or not ended:
                 raise Refused("turn")
+            if state == "delivering" and binding is None:
+                raise Refused("binding")
             if state == "delivering" and ended == binding["target_turn_id"]:      # whichever 'how' the binding says
                 item.update(state="outcome_unknown")
         elif happening in ("edit", "cancel"):
@@ -1532,6 +1542,10 @@ def start_key_of(request: dict, declared) -> dict | None:
     key = request.get("client_key")
     if not isinstance(key, str):
         return None
+    # A null engine is stored only with an intent. With no declared extensions there is no intent, so
+    # there is no legacy key to store. A named engine keeps the three legacy members.
+    if declared is None and request.get("engine") is None:
+        raise Refused("engine")
     start_key = {"client_key": key, "engine": request.get("engine"),
                  "prompt_sha256": _prompt_sha256(request)}
     if declared is not None:
@@ -1575,7 +1589,12 @@ def cursor_answer(cursor: dict, log: dict | None, epoch: int) -> dict:
     from zero.
     """
     if log is None:
-        return {"code": "session_unknown", "session_id": cursor["session_id"]}
+        answer = {"code": "session_unknown"}
+        # A refusal's session_id is a ses- id. A run log id is not one, so it is not copied in.
+        session_id = cursor.get("session_id")
+        if isinstance(session_id, str) and re.fullmatch(r"ses-[A-Za-z0-9_-]{1,60}", session_id):
+            answer["session_id"] = session_id
+        return answer
     if cursor["epoch"] > epoch:
         return {"code": "request_invalid", "detail": "cursor_epoch_ahead"}
     if cursor["seq"] > log["high_water"]:
@@ -1690,6 +1709,19 @@ def transcript_page_problems(params: dict, raw_page: dict, page: dict) -> list:
         # page holds the log's first event (position 1); see the text above for why.
         whole = bool(events) and events[0]["seq"] == 1
         problems += [found for found in transcript_problems(events, lines) if whole or not found.endswith(":time_rel_ms")]
+        # A later page has no origin to compare with. It can still say that its own lines run backwards.
+        if not whole and isinstance(lines, list):
+            previous = None
+            for number, line in enumerate(lines, 1):
+                current = line.get("time_rel_ms") if isinstance(line, dict) else None
+                if (isinstance(previous, (int, float)) and not isinstance(previous, bool)
+                        and isinstance(current, (int, float)) and not isinstance(current, bool)
+                        and current < previous):
+                    name = f"{number}:time_rel_ms"
+                    if name not in problems:
+                        problems.append(name)
+                if isinstance(current, (int, float)) and not isinstance(current, bool):
+                    previous = current
     if any(page.get(member) != raw_page.get(member) for member in ("cursor", "more", "epoch_advanced")):
         problems.append("envelope")
     return problems + [found for found in page_problems(params, page) if found not in problems]

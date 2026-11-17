@@ -197,7 +197,14 @@ class DelegatedRoot:
             raise ValueError('Empty launch')
         leaf = self.leaf(name)
         kill_timeout = _kill_timeout(kill_timeout)  # before the leaf exists
-        self.fs.make_leaf(leaf)
+        existed = os.path.lexists(leaf)
+        try:
+            self.fs.make_leaf(leaf)
+        except BaseException as exc:
+            # make_leaf can create the directory and then be interrupted, before a LeafRun exists to clean it up.
+            # Drop only a directory this call created. A removal failure must not take the place of exc.
+            self._drop_leaf_this_call_created(leaf, existed, exc)
+            raise
         if leaf.is_symlink() or os.lstat(leaf).st_uid != os.getuid():
             raise PermissionError('Leaf is not an operator-owned directory')
         run = LeafRun(self.fs, leaf, kill_timeout)
@@ -207,6 +214,15 @@ class DelegatedRoot:
             run._cleanup_after(exc)
             raise
         return run
+
+    def _drop_leaf_this_call_created(self, leaf, existed, exc):
+        """Remove a leaf make_leaf created before it raised. Never replaces ``exc``."""
+        if existed or isinstance(exc, FileExistsError) or not os.path.lexists(leaf):
+            return
+        try:
+            self.fs.remove(leaf)
+        except BaseException as cleanup:
+            exc.add_note(f'leaf removal raised: {cleanup!r}')
 
     def adopt(self, name, kill_timeout=5.0):
         """Re-adopt a registered leaf after a restart: a handle that can kill it later.
@@ -337,6 +353,7 @@ class LeafRun:
         with self.lock:
             if self.outcome is None or not self.removed:
                 self.outcome = self._terminate()
+            self._release_captured_stdio()
             return self.outcome
 
     def _terminate(self):
@@ -404,6 +421,20 @@ class LeafRun:
         if state not in ('leaf_empty', 'empty') or errors:
             log.error('leaf %s: %s', self.leaf, outcome)
         return outcome
+
+    def _release_captured_stdio(self):
+        """Shut pipes this launcher opened. Only PIPE is stored on the Popen; a caller's own file is not.
+        A failure here must not replace the outcome already booked by ``_terminate``."""
+        proc = self.proc
+        if proc is None:
+            return
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is None or stream.closed:
+                continue
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     def _close_retrying(self):
         """close(), retried when an interrupt lands inside it (C2-10: finally can be

@@ -34,6 +34,7 @@ import re
 import shutil
 import sys
 import tarfile
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -172,9 +173,27 @@ def glob_regex(pattern: str) -> re.Pattern:
     return re.compile("^" + "".join(out) + "$")
 
 
+def _read_json(path: Path):
+    """The caller's JSON file, or a HarvestError. A missing file, a directory, bad UTF-8 and
+    broken JSON are the same refusal, not a traceback."""
+    try:
+        raw = Path(path).read_bytes()
+        return raw, json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise HarvestError(f"{path}: {exc}") from None
+
+
+def _load_issues(path: Path | None) -> dict:
+    if path is None:
+        return {}
+    _, data = _read_json(path)
+    if not isinstance(data, dict):
+        raise HarvestError(f"{path}: issues must be a JSON object, got {type(data).__name__}")
+    return data
+
+
 def load_repos(path: Path) -> tuple:
-    raw = Path(path).read_bytes()
-    data = json.loads(raw)
+    raw, data = _read_json(path)
     if not isinstance(data, dict) or data.get("schema") != REPOS_SCHEMA:
         raise HarvestError(f"{path}: not a {REPOS_SCHEMA} file")
     repos = data.get("repos")
@@ -371,13 +390,18 @@ def harvest(repos_path: Path, not_before: str, out: Path, *, suite_id: str, vers
         raise HarvestError(str(exc)) from None
     out = Path(out)
     heldout.check_path(out, must_exist=False)  # absolute, and never inside the repository
-    if out.exists() and any(out.iterdir()):
-        raise HarvestError(f"{out} is not empty: a harvest writes a new folder")
     repos, repos_sha = load_repos(repos_path)   # every repository's settings, before anything is written
-    out.mkdir(parents=True, exist_ok=True)
+    issues = _load_issues(issues_path)          # before the output folder exists
+    # An existing folder, even an empty one, is already someone's output. mkdir without exist_ok
+    # catches the race between this check and the create. Staging is private to this call.
+    if out.exists():
+        raise HarvestError(f"{out} is not empty: a harvest writes a new folder")
+    try:
+        out.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        raise HarvestError(f"{out} is not empty: a harvest writes a new folder") from None
     heldout.check_path(out)
-    issues = json.loads(Path(issues_path).read_text(encoding="utf-8")) if issues_path else {}
-    staging = out / ".staging"
+    staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=out))
     entries, rejects, heads = [], [], []
     for repo_cfg in repos:
         repo = Path(repo_cfg["path"])

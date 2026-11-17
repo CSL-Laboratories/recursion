@@ -46,6 +46,7 @@ import json
 import os
 import re
 import stat
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -156,6 +157,44 @@ def _connection(route: object) -> tuple[str, str] | None:
     return kind, ident
 
 
+def _sign_in_label(label: str) -> str:
+    """The route guard's folding of a sign-in provider: "ChatGPT" and "chatgpt" are one label.
+
+    The same rule as ``subscription_routes``: case, spaces, hyphens and underscores are spelling.
+    """
+    return "_".join(label.strip().lower().replace("-", " ").replace("_", " ").split())
+
+
+def _mappings_nested_past(value: object, limit: int) -> bool:
+    """True when mappings under ``value`` are nested deeper than ``limit``.
+
+    Lists and tuples are walked and not counted, and a cycle is walked once. Used only after a
+    copy has already run out of stack, to tell a deep mapping from a deep list.
+    """
+    seen: set[int] = set()
+    stack: list[tuple[object, int]] = [(value, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > limit:
+            return True
+        if not isinstance(node, (Mapping, list, tuple)):
+            continue
+        ident = id(node)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        if isinstance(node, Mapping):
+            stack.extend((child, depth + 1) for child in node.values())
+        else:
+            stack.extend((child, depth) for child in node)
+    return False
+
+
+def _owned_routes(routes: Mapping) -> dict:
+    """A JSON copy of the caller's routes. The loaded config stores this object, not the caller's."""
+    return {eng: json.loads(json.dumps(entry)) for eng, entry in routes.items()}
+
+
 def catalog(routes: object, keys: object) -> dict:
     """The credential catalog: connection id -> ``{"vendor", "kind"}``. Metadata only, never a secret.
 
@@ -163,10 +202,10 @@ def catalog(routes: object, keys: object) -> dict:
     is an ``api_key`` connection of that provider. ``routes`` is ``load_routes``' answer; a sign-in
     (``subscription``) connection it configures, on an engine's own route or in that route's
     ``limits.fallback`` list, gets its vendor from the engine (``SIGN_IN_VENDOR``) or, on a harness,
-    from its profile's sign-in label (``PROFILE_SIGN_IN_VENDOR``). A sign-in whose vendor cannot be read
-    is left out, so no login can name it, and an ``api_key`` connection in routes.json is not
-    catalogued from there: only the key store says what a key is. One connection id with two different
-    (vendor, kind) readings is refused whole.
+    from its profile's sign-in label (``PROFILE_SIGN_IN_VENDOR``), folded the way the route guard
+    folds that label. A sign-in whose vendor cannot be read is left out, so no login can name it, and
+    an ``api_key`` connection in routes.json is not catalogued from there: only the key store says what
+    a key is. One connection id with two different (vendor, kind) readings is refused whole.
     """
     if not isinstance(keys, Mapping):
         raise ConfigError("no_key_catalog", "the key store's metadata is required (an empty mapping when none)")
@@ -200,7 +239,7 @@ def catalog(routes: object, keys: object) -> dict:
             if vendor is None:
                 profile = candidate.get("profile")
                 label = profile.get("provider") if isinstance(profile, Mapping) else None
-                vendor = PROFILE_SIGN_IN_VENDOR.get(label) if isinstance(label, str) else None
+                vendor = PROFILE_SIGN_IN_VENDOR.get(_sign_in_label(label)) if isinstance(label, str) else None
             if vendor is not None:
                 put(conn[1], vendor, "subscription", f"routes.json {engine}")
     return out
@@ -225,6 +264,13 @@ def _route(raw: object, where: str) -> Route:
             raise ConfigError("bad_limits", f"{where}.limits: {err.detail}") from None
         except (TypeError, ValueError, AttributeError):  # a value the limits validator could not read
             raise ConfigError("bad_limits", f"{where}.limits") from None
+        except RecursionError:
+            # Nested mappings in a fallback profile run this copy out of stack: a limits value,
+            # refused by type. A value whose depth is lists, not mappings, still raises, and load()
+            # answers RoutingUnreadable for that.
+            if _mappings_nested_past(raw["limits"], max(32, sys.getrecursionlimit() // 3)):
+                raise ConfigError("bad_limits", f"{where}.limits") from None
+            raise
     return Route(engine, model, limits)
 
 
@@ -318,6 +364,9 @@ def load_config(raw: object, routes: object, keys: object) -> Config:
         logins[lg.id] = lg
     if not logins:
         raise ConfigError("no_logins", "at least one login is required")
+    # One copy, before the checks the stored routes must agree with. A caller that changes
+    # ``routes`` while this runs cannot make the stored connection differ from the decision's.
+    routes = _owned_routes(routes)
     # The login bound to an engine is the connection routes.json launches that engine with.
     for eng, login_id in engine_login.items():
         entry = routes.get(eng)
@@ -343,9 +392,8 @@ def load_config(raw: object, routes: object, keys: object) -> Config:
     policy = raw.get("undetected_rule", "skip")
     if policy not in UNDETECTED_RULES:
         raise ConfigError("bad_undetected_rule", "undetected_rule")
-    copied = {eng: json.loads(json.dumps(entry)) for eng, entry in routes.items()}
     return Config(MappingProxyType(logins), MappingProxyType(engine_login), default, tuple(rules), policy,
-                  MappingProxyType(copied))
+                  MappingProxyType(routes))
 
 
 def _fallbacks_are_logins(default: Route, rules: list, routes: Mapping, logins: Mapping, engine_login: Mapping) -> None:
@@ -391,7 +439,7 @@ def read_routing_file(path: os.PathLike | str) -> object | None:
         fd = os.open(os.fspath(path), flags)
     except FileNotFoundError:
         return None
-    except OSError as exc:
+    except (OSError, ValueError) as exc:  # ValueError: a path that holds a NUL, which OSError does not cover
         raise RoutingUnreadable(f"routing file unreadable: {type(exc).__name__}") from None
     try:
         info = os.fstat(fd)

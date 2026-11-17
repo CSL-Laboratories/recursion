@@ -78,8 +78,8 @@ removal and a recovery change the values of the id they name and of no other, so
 unrelated write. The store's OWN owner-only file (``_own_file``) is the one in its folder, except while its index pins
 the store to a keychain (then it has none) or has records on the file (then only a file that names the index's store
 id). With no record, the file in the folder is the store's own whichever store it names, whatever the host offers, even
-beside an index that kept its id: the same folder is the same store, as a save takes that file's id (below). A value in
-its own file that no record reaches stays there: the audit searches for it (``UNBOUND``) and names its id; ``remove
+beside an index that kept its id: the same folder is the same store (a save into the file takes its id, below). A value
+in its own file that no record reaches stays there: the audit searches for it (``UNBOUND``) and names its id; ``remove
 <id>``, for an id no record or intent names, deletes it whatever the host offers now, in one write of the file and with
 no intent (nothing outside the folder changes), and changes nothing else, the index's store id included; and ``add
 <id>`` on the file is refused (``key_exists``) until it is removed, so no save replaces a value it was not given. A file

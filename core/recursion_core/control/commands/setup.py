@@ -38,6 +38,10 @@ or a failed lookup: CPython raises ``KeyError`` for both) is ``home_unknown``, b
 that interpreter, started as the unit will start it (``-I``, from ``/``), what it is: it must be
 free-threaded CPython 3.14 (``interpreter_not_free_threaded``), and it must import this same
 ``recursion_core`` with no ``PYTHONPATH`` (``not_installed``), or the daemon could not start.
+
+``provision`` is that same ``install``: the unit, the stores and the route homes' custody root,
+as one JSON object. It runs no ``systemctl``. A second call, when those are already what
+``install`` would write, changes nothing.
 """
 
 from __future__ import annotations
@@ -47,7 +51,8 @@ import os
 import subprocess
 import sys
 
-from recursion_core.daemon_install import InstallRefused, Roots, daemon_exec_args, install, uninstall, upgrade
+from recursion_core.daemon_install import (InstallRefused, Roots, daemon_exec_args, install, owned_paths, uninstall,
+                                           upgrade)
 
 NAMES = ("install", "upgrade", "uninstall")
 EXIT_OK, EXIT_REFUSED = 0, 1
@@ -139,12 +144,12 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
 
 
 def refuse_elsewhere(action: str, environ, roots: Roots) -> None:
-    """Refuse an ``XDG_CONFIG_HOME`` (every command) or ``XDG_STATE_HOME`` (``install``, ``upgrade``) that
-    names another folder than the default under the home. Unset or empty is the default; a relative value
-    names no folder for sure, so it is refused too."""
+    """Refuse an ``XDG_CONFIG_HOME`` (every command) or ``XDG_STATE_HOME`` (``install``, ``upgrade``,
+    ``provision``) that names another folder than the default under the home. Unset or empty is the
+    default; a relative value names no folder for sure, so it is refused too."""
 
     checks = [("XDG_CONFIG_HOME", ".config", "config_home_elsewhere")]
-    if action in ("install", "upgrade"):
+    if action in ("install", "upgrade", "provision"):
         checks.append(("XDG_STATE_HOME", ".local/state", "state_home_elsewhere"))
     for name, default, code in checks:
         value = environ.get(name) or ""
@@ -222,3 +227,58 @@ def require_daemon_interpreter(info: dict, interpreter: str, package: str) -> No
 
 def _print(out, answer: dict) -> None:
     print(json.dumps(answer, sort_keys=True), file=out)
+
+
+def provision_command(out=None) -> int:
+    """``recursiond provision``: this user's roots, this interpreter, one JSON object on stdout."""
+
+    import recursion_core
+
+    out = sys.stdout if out is None else out
+    if not sys.platform.startswith("linux"):
+        _print(out, {"code": "platform_unsupported", "action": "provision",
+                     "detail": f"the per-user service needs Linux with systemd; this system is {sys.platform}"})
+        return EXIT_REFUSED
+    try:
+        roots = default_roots()
+    except InstallRefused as exc:
+        _print(out, {"code": exc.kind, "action": "provision", "detail": exc.detail})
+        return EXIT_REFUSED
+    return provision(out, roots=roots, interpreter=sys.executable, package=recursion_core.__file__)
+
+
+def provision(out, *, roots: Roots, interpreter: str, package: str, probe=None, environ=None) -> int:
+    """Write the unit, the stores and the route homes' custody root. A second call changes nothing.
+
+    This is ``install`` (``daemon_install.install``): on this branch that creates the breaker
+    store, the revocation store and ``<state>/homes``, then the unit. The printed ``next``
+    commands are the ones ``install`` returns; none is run here. ``KeyboardInterrupt`` and
+    ``SystemExit`` propagate. A second caller, with its own roots, gets its own answer.
+    """
+
+    probe = probe_interpreter if probe is None else probe
+    environ = os.environ if environ is None else environ
+    try:
+        refuse_elsewhere("provision", environ, roots)
+        require_daemon_interpreter(probe(interpreter), interpreter, package)
+        paths = owned_paths(roots)
+        homes_before = os.path.lexists(paths.homes)
+        plan = install(roots, daemon_exec_args(interpreter))
+    except InstallRefused as exc:
+        _print(out, {"code": exc.kind, "action": "provision", "detail": exc.detail})
+        return EXIT_REFUSED
+    except OSError as exc:
+        _print(out, {"code": "filesystem_error", "action": "provision", "detail": _filesystem_detail(exc, roots)})
+        return EXIT_REFUSED
+    answer = {
+        "code": "ok",
+        "action": "provision",
+        "changed": bool(plan.changed),
+        "unit": plan.unit,
+        "interpreter": interpreter,
+        "stores": [{"kind": kind, "path": path, "created": created} for kind, path, created in plan.stores],
+        "homes": {"root": paths.homes, "created": (not homes_before) and os.path.lexists(paths.homes)},
+        "next": [list(command) for command in plan.commands],
+    }
+    _print(out, answer)
+    return EXIT_OK

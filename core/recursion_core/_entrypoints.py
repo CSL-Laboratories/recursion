@@ -1,13 +1,16 @@
 """The ``recursiond`` console script (distribution ``csl-recursion``). Standard library only.
 
     recursiond install | upgrade | uninstall    the per-user systemd unit (control/commands/setup.py)
+    recursiond provision                        unit, stores and the route homes' custody root
     recursiond doctor [--json]                  report this machine; no daemon is required
+    recursiond up                               start the user unit and print the GUI address
     recursiond serve [daemon options]           run the daemon in the foreground
 
 Linux only: on any other system every command refuses with ``platform_unsupported`` (exit 1)
-before anything else is imported; ``--help`` still prints. install, upgrade and uninstall print
-one JSON object. ``doctor --json`` prints one report; without ``--json`` it prints one line per
-check. 0 is ok, 1 a refusal or a report that has a fail, 2 a usage error.
+before anything else is imported; ``--help`` still prints. install, upgrade, uninstall and
+provision each print one JSON object. ``doctor --json`` prints one report; without ``--json``
+it prints one line per check. ``up`` prints one JSON object. 0 is ok, 1 a refusal, a report
+that has a fail, or a socket that did not answer, 2 a usage error.
 
 ``serve`` checks the build before it imports anything of the daemon's: the daemon needs
 free-threaded CPython 3.14 (``build_not_free_threaded`` otherwise). It then replaces this process
@@ -30,8 +33,8 @@ PROG = "recursiond"
 DAEMON_MODULE = "recursion_core.daemon"
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
 _DESCRIPTION = ("Recursion's per-user daemon and its installer. Linux only. "
-                "install, upgrade and uninstall each print one JSON object. "
-                "doctor prints a report.")
+                "install, upgrade, uninstall and provision each print one JSON object. "
+                "doctor prints a report. up prints one JSON object.")
 
 
 def _configure_doctor(parser) -> None:
@@ -50,10 +53,30 @@ def _handle_doctor(args) -> int:
     return doctor.exit_code(report)
 
 
+def _configure_plain(parser) -> None:
+    """A subcommand with no options. The table's shape stays (name, help, configure, handle)."""
+
+
+def _handle_provision(_args) -> int:
+    import recursion_core.control.commands.setup as setup_commands
+
+    return setup_commands.provision_command()
+
+
+def _handle_up(_args) -> int:
+    import recursion_core.setup.up as up
+
+    return up.command()
+
+
 # Later cogs append a row: (name, help, configure, handle). configure adds that command's options.
 SUBCOMMANDS = (
     ("doctor", "report what is ok, warn, fail or unknown on this machine",
      _configure_doctor, _handle_doctor),
+    ("provision", "create the stores, the route homes' custody root and the per-user unit",
+     _configure_plain, _handle_provision),
+    ("up", "start the per-user unit and print the GUI address when the socket answers",
+     _configure_plain, _handle_up),
 )
 
 

@@ -117,8 +117,10 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
     ``HOME``, so a unit's own ``HOME`` (or an ``EnvironmentFile``, which can set it) moves the state too,
     unless it names ``home`` or ``UnsetEnvironment`` drops it. The first column-0 byte order mark in the
     file is skipped and that line is read (one at byte 0 already counts); a later column-0 mark stays on
-    the key. A backslash then a space or a tab ends the line and that assignment is left unused. A ``\\u``
-    or ``\\U`` escape of a noncharacter is not followed. Lines end where systemd ends
+    the key. On a syntax error in one of these settings (a backslash then a space or a tab, an unknown
+    escape), the words already accepted stay and that line stops. A ``\\u`` noncharacter skips that word
+    and the line continues; a ``\\U`` noncharacter stops the line. What remains is applied, and a unit
+    whose applied state is the default is rewritten. Lines end where systemd ends
     them, at ``\\r\\n``, ``\\r``, ``\\n`` or a NUL byte only, and words are split and C escapes decoded by systemd's
     table (``_words``), and an empty ``XDG_STATE_HOME`` is the daemon's default, as the
     daemon reads it (``os.environ.get('XDG_STATE_HOME') or ...``). A unit that cannot be read
@@ -177,11 +179,15 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
             continue
         words = _words(value)
         if words is None:
-            # A backslash then a space or a tab ends the line. systemd ignores that assignment and keeps reading
-            # (Grok R2 of review 13). Any other value this check cannot read refuses the unit.
-            if _ends_backslash_blank(raw):
+            # A syntax error keeps every word already accepted and stops the line. A \u noncharacter skips
+            # that word; a \U noncharacter stops the line. A line that stored nothing leaves earlier lines
+            # (Grok r14 R1, R2). Any other value this check cannot read refuses the unit.
+            kept = _kept_words(value)
+            if kept is None:
+                return f"has {key}={value}, which cannot be read, so where it keeps the daemon's state cannot be told"
+            if not kept:
                 continue
-            return f"has {key}={value}, which cannot be read, so where it keeps the daemon's state cannot be told"
+            words = kept
         if key == "Environment":
             if not words:
                 assigned = {}
@@ -223,7 +229,8 @@ def _words(value: str) -> list[str] | None:
     taken away wherever they stand, and C escapes decoded by systemd's table, inside quotes too (Grok R3 on #382:
     ``shlex.split`` made ``\\s`` an ``s`` and ``\\x45`` an ``x45``). ``None`` when systemd would not read it, or when an
     escape gives a character this check does not follow: an unknown escape, a NUL, a byte above 0x7f, a noncharacter,
-    a quote left open or a backslash at the end. Then where the unit keeps the state cannot be told, and it is refused."""
+    a quote left open or a backslash at the end. ``_kept_words`` then keeps what was already accepted; a value
+    that stored nothing and still cannot be read is refused."""
 
     words: list[str] = []
     word: list[str] = []
@@ -279,6 +286,8 @@ def _escape(value: str, i: int) -> tuple[str | None, int]:
             return None, i + 2
         code = int(digits, 16)
         limit = 0x7F if e == "x" else 0x10FFFF
+        # A noncharacter is not stored here. Deleting the rejection lets /.. name the default folder over an
+        # earlier one; _kept_words then skips a \u word or stops the line on \U (Grok r14 R2).
         if code == 0 or code > limit or 0xD800 <= code <= 0xDFFF or _noncharacter(code):
             return None, i + 2
         return chr(code), i + 2 + size
@@ -301,21 +310,113 @@ def _one_mark(raw: str, skipped: bool) -> tuple[str, bool]:
     return raw, skipped
 
 
-def _ends_backslash_blank(raw: str) -> bool:
-    """Whether ``raw`` ends in a backslash and then a space or a tab. systemd ends the line there and ignores
-    the assignment; once the blank is stripped the value still ends in a backslash."""
-
-    i = len(raw)
-    while i and raw[i - 1] in " \t":
-        i -= 1
-    return i < len(raw) and i > 0 and raw[i - 1] == "\\"
-
-
 def _noncharacter(code: int) -> bool:
-    """Whether ``code`` is a Unicode noncharacter. systemd's ``unichar_is_valid`` rejects these, so the
-    assignment is ignored and an earlier folder stays."""
+    """Whether ``code`` is a Unicode noncharacter. systemd's ``unichar_is_valid`` rejects these.
+    A ``\\u`` one skips that word; a ``\\U`` one stops the line."""
 
     return 0xFDD0 <= code <= 0xFDEF or (code & 0xFFFF) in (0xFFFE, 0xFFFF)
+
+
+def _unicode_noncharacter(value: str, i: int) -> str:
+    """``'u'`` or ``'U'`` when the escape at ``value[i]`` is a noncharacter, else ``''``."""
+
+    if i + 1 >= len(value) or value[i] != "\\":
+        return ""
+    letter = value[i + 1]
+    if letter not in ("u", "U"):
+        return ""
+    size = 4 if letter == "u" else 8
+    digits = value[i + 2:i + 2 + size]
+    if len(digits) != size or any(d not in _HEX_DIGITS for d in digits):
+        return ""
+    code = int(digits, 16)
+    if code == 0 or code > 0x10FFFF or 0xD800 <= code <= 0xDFFF or not _noncharacter(code):
+        return ""
+    return letter
+
+
+def _past_word(value: str, i: int, quote: str) -> int:
+    """Index of the blank after the word that holds the ``\\u`` noncharacter at ``i``, or the end."""
+
+    size = 4 if value[i + 1] == "u" else 8
+    i += 2 + size
+    while i < len(value):
+        c = value[i]
+        if c == "\\":
+            _decoded, nxt = _escape(value, i)
+            i = nxt if nxt > i else i + 1
+            continue
+        if quote:
+            if c == quote:
+                quote = ""
+            i += 1
+            continue
+        if c in "\"'":
+            quote = c
+            i += 1
+            continue
+        if c in _BLANKS:
+            return i
+        i += 1
+    return i
+
+
+def _kept_words(value: str) -> list[str] | None:
+    """Words systemd keeps when ``_words`` cannot read ``value``.
+
+    ``None``: nothing was stored and the value still cannot be read, so the unit is refused.
+    An empty list: this line stores nothing, and assignments already read stay.
+    Otherwise: the words accepted before a syntax error or a ``\\U`` stop, or the words left after a
+    ``\\u`` noncharacter was skipped.
+    """
+
+    words: list[str] = []
+    word: list[str] = []
+    quote = ""
+    started = False
+    i = 0
+    while i < len(value):
+        c = value[i]
+        if c == "\\":
+            mark = _unicode_noncharacter(value, i)
+            if mark == "u":
+                word, started = [], False
+                i = _past_word(value, i, quote)
+                quote = ""
+                continue
+            if mark == "U":
+                return words
+            decoded, i = _escape(value, i)
+            if decoded is None:
+                return words if words else None
+            word.append(decoded)
+            started = True
+            continue
+        if quote:
+            if c == quote:
+                quote = ""
+            else:
+                word.append(c)
+            i += 1
+            continue
+        if c in "\"'":
+            quote, started = c, True
+            i += 1
+            continue
+        if c in _BLANKS:
+            if started:
+                words.append("".join(word))
+                word, started = [], False
+            i += 1
+            continue
+        word.append(c)
+        started = True
+        i += 1
+    if quote:
+        return None
+    if started:
+        words.append("".join(word))
+    return words
 
 
 def _continues(line: str) -> bool:

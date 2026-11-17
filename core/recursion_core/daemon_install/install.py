@@ -2,6 +2,8 @@
 
 ``install`` creates the breaker store and the revocation store where the daemon opens them, then
 writes the unit; run again, it finds both stores and the same unit bytes and changes nothing.
+The ledger step takes ``anchor_public_key``. This command cannot fill that parameter, so the step
+reports ``needs the anchor key (Lucas)`` and does not create the ledger.
 ``upgrade`` does the same for an existing unit and rewrites it (a new interpreter, or a hand-placed
 unit from before the installer). ``uninstall`` removes the unit it wrote and nothing else: not the
 folders around it, which other units share, and not the daemon's state folder with the run
@@ -25,6 +27,8 @@ from .unit import MARKER, UNIT_NAME, render_unit, state_elsewhere
 
 _UNIT_MODE = 0o644
 _DIR_MODE = 0o700
+# The whole detail of a ledger step that has no anchor to bind. The installer does not choose one.
+NEEDS_ANCHOR = "needs the anchor key (Lucas)"
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,9 @@ class Plan:
     unit: str
     commands: tuple[tuple[str, ...], ...]
     stores: tuple[tuple[str, str, bool], ...] = ()  # (kind, path, created now), install and upgrade
+    # (path, created now, detail). Detail is ``needs the anchor key (Lucas)`` when the step had no key
+    # and the ledger was not there. None on uninstall, which does not touch the ledger.
+    ledger: tuple[str, bool, str] | None = None
 
 
 def plan_commands(action: str) -> tuple[tuple[str, ...], ...]:
@@ -63,8 +70,8 @@ def ensure_stores(paths: Owned) -> tuple[tuple[str, str, bool], ...]:
     leftover ``-wal`` beside a missing store, ...); a store that cannot be made at all (a full disk,
     a umask that takes the owner's own write bit, an I/O error at the final link: the helper's
     ``<store>_invalid`` for a new store, its code kept in the detail) is ``store_not_created``. Returns
-    ``(kind, path, created now)`` for each. The ledger is not made here: it is bound to the
-    installer's anchor key, which this lane does not have yet (its open question for Lucas).
+    ``(kind, path, created now)`` for each. The ledger is not one of these: ``ensure_ledger`` is the
+    step that would create it, and it has no anchor key unless the caller passes one.
     """
 
     # Imported here, not with this module: ``recursiond --help`` builds its parser from this package.
@@ -94,7 +101,58 @@ def ensure_stores(paths: Owned) -> tuple[tuple[str, str, bool], ...]:
     return tuple(done)
 
 
-def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
+def ensure_ledger(paths: Owned, anchor_public_key: str | None) -> tuple[str, bool, str]:
+    """The ledger step. Returns ``(path, created now, detail)``.
+
+    ``anchor_public_key`` is the key ``authority.create_ledger`` binds the new ledger to.
+    ``install`` and ``upgrade`` pass None: nothing in this command has that key, and
+    ``install.json``'s ``authority_anchor`` is not read. None, or an empty string, reports
+    ``needs the anchor key (Lucas)`` when the ledger is not there and creates nothing. A
+    caller that has the key creates a missing ledger through ``plugin_security.stores.create_ledger``
+    (that calls ``authority.create_ledger``). A ledger already there is checked with
+    ``open_store`` and left as it is, whether or not a key was passed.
+    """
+
+    from recursion_core.plugin_security import Refused, stores
+
+    if type(paths) is not Owned:
+        raise InstallRefused("paths", "ensure_ledger takes owned_paths(roots)")
+    if anchor_public_key is not None and type(anchor_public_key) is not str:
+        raise InstallRefused("anchor_public_key", "the anchor is the installer's public key, or absent")
+    ensure_dir(paths.home, paths.store_dir, mode=_DIR_MODE)
+    path = paths.ledger
+    exists = os.path.lexists(path)
+    if not anchor_public_key:
+        if not exists:
+            return (path, False, NEEDS_ANCHOR)
+        _open_ledger(path)
+        return (path, False, "")
+    if exists:
+        _open_ledger(path)
+        return (path, False, "")
+    try:
+        stores.create_ledger(path, anchor_public_key)
+    except Refused as refusal:
+        if not exists and refusal.code.endswith("_invalid"):
+            raise InstallRefused("store_not_created", f"{path}: {refusal.code}: {refusal.detail}") from None
+        raise InstallRefused(refusal.code, f"{path}: {refusal.detail}") from None
+    except (OSError, sqlite3.Error) as exc:
+        raise InstallRefused("store_not_created", f"{path}: {type(exc).__name__}: {exc}") from None
+    return (path, True, "")
+
+
+def _open_ledger(path: str) -> None:
+    from recursion_core.plugin_security import Refused, stores
+
+    try:
+        stores.open_store(path, stores.LEDGER_MAGIC).close()
+    except Refused as refusal:
+        raise InstallRefused(refusal.code, f"{path}: {refusal.detail}") from None
+    except (OSError, sqlite3.Error) as exc:
+        raise InstallRefused("store_not_created", f"{path}: {type(exc).__name__}: {exc}") from None
+
+
+def install(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str | None = None) -> Plan:
     """Create the stores and the route homes' custody root, then write the unit. The same bytes
     already there change nothing; other bytes, a unit another user could change (another user's, or
     writable by group or world) and a custody root open to anyone else or unusable by its owner are
@@ -103,7 +161,8 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     its bytes and then its path last (``still_holds``, then ``still_names``): one removed, replaced or rewritten
     in place meanwhile is ``unit_missing`` or ``unit_changed``. A refusal
     after the stores are begun (that, or a store refused after the other was made) leaves what was
-    made; each store made is a whole, valid store, and the command run again finds it."""
+    made; each store made is a whole, valid store, and the command run again finds it. ``anchor_public_key``
+    is passed to ``ensure_ledger``; the default None is the command, which has no key."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args).encode()
@@ -120,6 +179,7 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
                 raise InstallRefused("unit_untrusted", f"{why}; `recursiond upgrade` writes it again, ours and 0644")
         check_private_dir(paths.home, paths.homes)  # before anything is made
         made = ensure_stores(paths)  # first: a unit is never left naming a daemon whose stores are missing
+        ledger = ensure_ledger(paths, anchor_public_key)
         homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
         check_private_dir(paths.home, paths.homes, required=True)  # as made, or as another caller made it
         if present:
@@ -128,10 +188,10 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
         else:
             ensure_dir(paths.home, paths.unit_dir, mode=_DIR_MODE)
             write_exclusive(paths.unit, unit, _UNIT_MODE)
-        return _plan("install", not present or _any_created(made) or homes, paths, made)
+        return _plan("install", not present or _any_created(made) or homes or ledger[1], paths, made, ledger)
 
 
-def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
+def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str | None = None) -> Plan:
     """Make any missing store and the route homes' custody root, and rewrite the unit to what
     ``install`` would write now. A missing unit, and a custody root open to anyone else or unusable by
     its owner, are refused before anything is made; the root as made is held to the same rule before
@@ -162,6 +222,7 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
                 "of the unit, then run `recursiond upgrade` again")
         check_private_dir(paths.home, paths.homes)  # before anything is made
         made = ensure_stores(paths)
+        ledger = ensure_ledger(paths, anchor_public_key)
         homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
         check_private_dir(paths.home, paths.homes, required=True)  # as made, or as another caller made it
         if current:
@@ -169,7 +230,7 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
             still_names(paths.unit, info)  # last: the path still names the file that was read
         else:
             replace_regular(paths.unit, unit, _UNIT_MODE)
-        return _plan("upgrade", not current or _any_created(made) or homes, paths, made)
+        return _plan("upgrade", not current or _any_created(made) or homes or ledger[1], paths, made, ledger)
 
 
 def uninstall(roots: Roots) -> Plan:
@@ -204,5 +265,7 @@ def _any_created(made: tuple[tuple[str, str, bool], ...]) -> bool:
     return any(created for _, _, created in made)
 
 
-def _plan(action: str, changed: bool, paths: Owned, stores: tuple[tuple[str, str, bool], ...] = ()) -> Plan:
-    return Plan(action=action, changed=changed, unit=paths.unit, commands=plan_commands(action), stores=stores)
+def _plan(action: str, changed: bool, paths: Owned, stores: tuple[tuple[str, str, bool], ...] = (),
+          ledger: tuple[str, bool, str] | None = None) -> Plan:
+    return Plan(action=action, changed=changed, unit=paths.unit, commands=plan_commands(action),
+                stores=stores, ledger=ledger)

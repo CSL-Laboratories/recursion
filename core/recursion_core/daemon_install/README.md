@@ -29,8 +29,10 @@ the user manager's own environment says. A daemon that kept its state elsewhere 
 only where it says so: in the unit `upgrade` would replace (`unit_state_elsewhere`) or in this
 command's environment (`state_home_elsewhere`); a value only in the user manager's own environment
 (`environment.d`, `systemctl --user set-environment`) is not seen, since this package starts no
-process to ask it. The ledger is not made yet: it is bound to the installer's
-anchor key, which is the open question for Lucas in the lane brief.
+process to ask it. The ledger step runs in the same `install` and `upgrade`, behind
+`anchor_public_key`. The command cannot fill that parameter, so the step reports
+`needs the anchor key (Lucas)` and does not create `ledger.sqlite3`. A caller that
+passes the key creates it through `plugin_security.stores.create_ledger`.
 
 A link at any folder or file under the home is refused (`symlink_refused`, `not_regular`), never
 followed, and so is a folder there that another user owns or that group or world can write

@@ -62,10 +62,10 @@ from recursion_core.routes import ClaudeCodeAdapter, CodexAdapter, ConnectionBre
 from recursion_core.routes import contract as route_contract
 
 from . import RUN_ID, TERMINAL
-from .breaker import DurableRouteBreaker, open_breaker_store, store_probe_lease_s
+from .breaker import DurableRouteBreaker, open_breaker_store, store_path, store_probe_lease_s
 from .launcher import (EngineUnitManager, ProductionLauncher, RunContext, UnitKillTree, bound_run,
                        private_dir, require_launcher_platform)
-from .plugins import PluginHost
+from .plugins import LEDGER_FILE, PluginHost
 
 log = logging.getLogger(__name__)
 
@@ -820,6 +820,69 @@ class DeviceDoor:
             pass
 
 
+# The installer's unit is a short regular file. A larger file at that name is not treated as one.
+_UNIT_MARKER_MAX = 16384
+
+
+def _installed_profile_store_refusal(state_dir):
+    """One line when an installed profile is missing the breaker store or the authority ledger.
+
+    Installed means this folder is ``<home>/.local/state/recursion`` and the user unit
+    ``<home>/.config/systemd/user/recursion-daemon.service`` is a regular file whose first line
+    is the installer's marker. The unit is opened with ``O_NOFOLLOW`` and only that first line
+    is read. A symlink, an unreadable file, a file larger than ``_UNIT_MARKER_MAX`` or any other
+    first line is not an installed profile, and the caller creates a missing breaker store as
+    it always has. A store that is present, including as a symlink, is not missing.
+    """
+
+    from recursion_core.daemon_install.unit import MARKER, UNIT_NAME
+
+    state = Path(state_dir)
+    if (state.name != 'recursion' or state.parent.name != 'state'
+            or state.parent.parent.name != '.local'):
+        return None
+    home = state.parent.parent.parent
+    if home == state.parent.parent:  # ``.local`` has no parent folder above it
+        return None
+    unit = home / '.config' / 'systemd' / 'user' / UNIT_NAME
+    if not _unit_first_line_is(unit, MARKER):
+        return None
+    breaker = store_path(state)
+    ledger = breaker.parent / LEDGER_FILE
+    missing = []
+    tails = []
+    if not os.path.lexists(breaker):
+        missing.append(f'the breaker store is missing ({breaker})')
+        tails.append('`recursiond install` creates the breaker store')
+    if not os.path.lexists(ledger):
+        missing.append(f'the authority ledger is missing ({ledger})')
+        tails.append('the ledger needs the anchor key (Lucas)')
+    if not missing:
+        return None
+    return (f"recursion daemon refused to start: {' and '.join(missing)}. "
+            f"An installed profile does not create them. {' and '.join(tails)}.")
+
+
+def _unit_first_line_is(path, marker):
+    nofollow = getattr(os, 'O_NOFOLLOW', None)
+    if nofollow is None:
+        return False  # without it a symlink could be followed; that is not this unit
+    try:
+        fd = os.open(path, os.O_RDONLY | nofollow | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _UNIT_MARKER_MAX or info.st_size < 0:
+            return False
+        data = os.read(fd, len(marker.encode()) + 1)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return data.split(b'\n', 1)[0] == marker.encode()
+
+
 class Composition:
     """What ``compose_control`` built, and how to stop it. Closing never stops a run."""
 
@@ -847,7 +910,10 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
     ``daemon.manager`` must be an ``EngineUnitManager``. ``routes`` overrides the operator's
     route file (tests). A route file that cannot be trusted leaves every start refused
     (``route_not_configured``) and is logged; reads and Stop still work. The same holds for a
-    breaker store that exists and cannot be opened (``breaker_store_unavailable``). A loaded route
+    breaker store that exists and cannot be opened (``breaker_store_unavailable``). An installed
+    profile (the installer's unit is present for this state folder) refuses to start, one line of
+    text and no traceback, when the breaker store or the authority ledger is missing, and does not
+    create either. Any other state folder still opens a missing breaker store by creating it. A loaded route
     the daemon has no credential custody for (``route_unsupported``) is logged here and refused
     ``launch_refused`` at each start; the other routes are not affected.
 
@@ -875,6 +941,11 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
             log.error('route %s cannot start (%s): %s', engine, route_contract.LAUNCH_REFUSED, unsupported)
     config_dir = Path(environ.get('XDG_CONFIG_HOME') or str(Path.home() / '.config')) / 'recursion'
     registry = DurableRunRegistry(daemon.registry, processes=pid_alive(manager))
+    # Before any store is opened. SystemExit is not an Exception, so the open below does not catch it,
+    # and nothing in this function creates the missing file.
+    refusal = _installed_profile_store_refusal(state_dir)
+    if refusal:
+        raise SystemExit(refusal)
     stored = breaker = breaker_unavailable = None
     route_breaker = ConnectionBreaker(clock)
     try:

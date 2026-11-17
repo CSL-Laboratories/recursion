@@ -22,11 +22,12 @@ from .unit import STATE_HOME, UNIT_NAME
 
 # Where the daemon opens its stores, under its state folder (tests/test_daemon_install.py holds these
 # to the daemon's own names): daemon/__main__.py's "recursion", daemon/breaker.py's STORE_DIR and
-# STORE_FILE, daemon/plugins.py's REVOCATION_FILE.
+# STORE_FILE, daemon/plugins.py's REVOCATION_FILE and LEDGER_FILE.
 STATE_FOLDER = "recursion"
 STORE_FOLDER = "plugin-security"
 BREAKER_FILE = "breaker.sqlite3"
 REVOCATION_FILE = "revoked.sqlite3"
+LEDGER_FILE = "ledger.sqlite3"  # daemon/plugins.py LEDGER_FILE; created only once the anchor key is known
 # The route homes' custody root: daemon/launcher.py makes each route home at <state>/homes/<engine>
 # (its private_dir), and setup.route_home.check refuses a root that is missing or not owner-only, so
 # install makes it, 0700, before the first launch (lane INSTALL's question 15).
@@ -50,6 +51,7 @@ class Owned:
     store_dir: str         # <state>/plugin-security
     breaker_store: str     # <store_dir>/breaker.sqlite3
     revocation_store: str  # <store_dir>/revoked.sqlite3
+    ledger: str            # <store_dir>/ledger.sqlite3, the authority ledger (not created until the anchor key is passed)
     homes: str             # <state>/homes, the route homes' custody root (route_home.check's root)
 
 
@@ -69,6 +71,7 @@ def owned_paths(roots: Roots) -> Owned:
         store_dir=store_dir,
         breaker_store=os.path.join(store_dir, BREAKER_FILE),
         revocation_store=os.path.join(store_dir, REVOCATION_FILE),
+        ledger=os.path.join(store_dir, LEDGER_FILE),
         homes=os.path.join(state, HOMES_FOLDER),
     )
 

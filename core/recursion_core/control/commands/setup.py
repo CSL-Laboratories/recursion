@@ -9,7 +9,9 @@ Each command prints one JSON object on stdout. Success is ``"code": "ok"`` (exit
 ``changed`` (whether a file was written or removed), ``unit`` (its path) and ``next`` (the
 ``systemctl --user`` commands that apply the change; none is run here); ``install`` and
 ``upgrade`` add ``stores``, one ``{"kind", "path", "created"}`` for the breaker store and one for
-the revocation store. A refusal is ``"code": <kind>`` with ``detail`` (exit 1). A file-system error
+the revocation store, and ``ledger`` (``kind``, ``path``, ``created``, ``detail``). With no anchor
+key, ``detail`` is ``needs the anchor key (Lucas)`` and the ledger file is not created. A refusal
+is ``"code": <kind>`` with ``detail`` (exit 1). A file-system error
 on the way (a folder the user cannot write, a full disk) is the refusal ``filesystem_error``, its
 detail naming the error and the path; files written before it stay written, so the answer does not
 say that nothing changed. ``XDG_CONFIG_HOME`` naming another folder than ``~/.config`` is refused
@@ -134,6 +136,9 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
     if action != "uninstall":
         answer["interpreter"] = interpreter
         answer["stores"] = [{"kind": kind, "path": path, "created": created} for kind, path, created in plan.stores]
+        if plan.ledger is not None:
+            path, created, detail = plan.ledger
+            answer["ledger"] = {"kind": "ledger", "path": path, "created": created, "detail": detail}
     _print(out, answer)
     return EXIT_OK
 

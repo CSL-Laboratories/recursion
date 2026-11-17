@@ -40,6 +40,11 @@ turn ends that turn with a ``protocol_error`` result. A ``turn/completed`` that 
 to our ``turn/start`` waits for it, so the acceptance always comes before the turn's end.
 
 INTERRUPT is the protocol's own ``turn/interrupt`` (held, like a steer, until the turn's id is known).
+A repeat interrupt of that same turn is a no-op: nothing is written again, and the deadline is not moved.
+If ``turn/completed`` has not arrived within ``INTERRUPT_DEADLINE_S`` on the driver's clock, the worker's
+input is ended and the run is handed to Stop's fence (``EngineProcess.fence``, reason ``interrupt_deadline``).
+The turn stays the turn in progress: the engine did not end it, and this driver does not invent a
+``turn/completed``.
 
 A TURN ENDS at ``turn/completed``: the driver calls ``turn_ended`` and drafts, in this order, one
 ``usage`` (the thread's running total from the last ``thread/tokenUsage/updated`` of that turn, span
@@ -172,6 +177,10 @@ _UNKNOWN = {"value": None, "quality": "unknown", "provenance": "unavailable"}
 TOOL_ITEMS = ("commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall")
 CARRY_LIMIT = 64 * 1024  # bytes of a tool's input or output a draft carries
 PORT_WAIT_S = 30.0  # seconds close, or another request, waits for a port call in flight (#402 round 4, R4-2)
+# How long an interrupt waits for turn/completed before the worker is ended and the run handed to Stop's
+# fence (finding B3-8.5, PRODUCT.md S6). The driver's clock measures it. Five seconds leaves a living
+# app-server time to send the end, and does not hold a silent one for the longer start bound.
+INTERRUPT_DEADLINE_S = 5.0
 _UNNAMED_ENDS = 8   # turn ends kept while their turn's id is not named yet (#402 round 4, DeepSeek R4-1)
 _TOOL_STATUS = {"completed": "ok", "failed": "error", "declined": "denied"}
 # event.v1 usage field <- ThreadTokenUsage breakdown field (0.160.0). cacheWriteInputTokens is optional there.
@@ -211,6 +220,9 @@ class _Session:
         self.engine_turn: dict[str, str] = {}    # core turn id -> the engine's turn id
         self.core_turn: dict[str, str] = {}      # the engine's turn id -> core turn id
         self.held: dict[str, list] = {}          # core turn id -> writes waiting for the engine's turn id
+        self.interrupts: set[str] = set()        # core turns already given interrupt(); a repeat is a no-op
+        self.interrupt_fired: set[str] = set()   # those whose deadline already ended the worker
+        self.interrupt_stops: dict[str, threading.Event] = {}  # set when that deadline must stop
         self.usage: dict[str, dict] = {}         # the engine's turn id -> its last ThreadTokenUsage
         self.bucket_limit: dict | None = None    # the last exhausted window seen: {"bucket", "reset_at"}
         self.model: str | None = None            # the served model, only as the protocol reports it
@@ -443,8 +455,68 @@ class CodexDriver(Driver):
 
     def _interrupt(self, handle: Handle, turn_id: str) -> None:
         session = self._session(handle)
-        params = {"threadId": session.thread_id}
-        self._write_for_turn(session, turn_id, ("turn/interrupt", turn_id), "turn/interrupt", params, "turnId")
+        with session.lock:
+            if turn_id in session.interrupts:
+                return  # a repeat of the same turn: no second turn/interrupt, and the deadline stays
+            session.interrupts.add(turn_id)
+        try:
+            params = {"threadId": session.thread_id}
+            self._write_for_turn(session, turn_id, ("turn/interrupt", turn_id), "turn/interrupt", params, "turnId")
+        except BaseException:
+            with session.lock:
+                _drop_interrupt(session, turn_id)
+            raise
+        self._arm_interrupt_deadline(session, turn_id)
+
+    def _arm_interrupt_deadline(self, session: _Session, turn_id: str) -> None:
+        """Watch ``INTERRUPT_DEADLINE_S`` on the driver's clock. A clock that does not move is not the bound:
+        a test clock stands still until the test advances it, and a head that never reaches the bound does
+        not end the worker on wall time alone."""
+
+        seconds = INTERRUPT_DEADLINE_S
+        deadline = self._clock() + seconds
+        wall_end = time.monotonic() + seconds
+        stop = threading.Event()
+
+        def watch() -> None:
+            while not stop.is_set():
+                if self._clock() >= deadline:
+                    self._interrupt_unanswered(session, turn_id)
+                    return
+                if time.monotonic() >= wall_end and self._clock() < deadline:
+                    return
+                stop.wait(0.02)
+
+        with session.lock:
+            if turn_id not in session.interrupts or turn_id in session.retired:
+                return
+            session.interrupt_stops[turn_id] = stop
+        threading.Thread(target=watch, name="codex-interrupt-deadline", daemon=True).start()
+
+    def _interrupt_unanswered(self, session: _Session, turn_id: str) -> None:
+        """No ``turn/completed`` within the deadline. End the worker, then hand the run to Stop's fence.
+
+        Both steps are tried; a step that fails, or is interrupted, is noted and does not take the place of
+        the other (the same rule as a start that is given up). A turn the engine managed to end in between is
+        not fenced: Stop is for the run whose turn never ended. The turn is left in progress, because the
+        engine sent no end and this method does not invent one."""
+
+        with session.lock:
+            if turn_id not in session.interrupts or turn_id in session.retired or turn_id in session.interrupt_fired:
+                return
+            session.interrupt_fired.add(turn_id)
+        noted = c.RouteError(c.DEADLINE_EXCEEDED, "no turn/completed within INTERRUPT_DEADLINE_S")
+        try:
+            session.close(self._port_wait_s)
+        except BaseException as failed:  # noqa: BLE001 - noted, and the fence is still asked for
+            noted.add_note(f"the worker could not be ended: {type(failed).__name__}")
+        with session.lock:
+            if turn_id in session.retired:
+                return
+        try:
+            session.process.fence("interrupt_deadline")
+        except BaseException as failed:  # noqa: BLE001 - the input was already ended; nothing else is waiting
+            noted.add_note(f"the worker could not be ended: {type(failed).__name__}")
 
     def _write_for_turn(self, session: _Session, turn: str, record: tuple, method: str, params: dict,
                         key: str) -> None:
@@ -954,6 +1026,16 @@ def _not_from_the_port(session: _Session) -> None:
         raise DriverStateError("the approvals port must not call back into the driver")
 
 
+def _drop_interrupt(session: _Session, turn: str) -> None:
+    """Forget an interrupt of ``turn``. The caller holds ``session.lock``. Its deadline must not fire."""
+
+    session.interrupts.discard(turn)
+    session.interrupt_fired.discard(turn)
+    stop = session.interrupt_stops.pop(turn, None)
+    if stop is not None:
+        stop.set()
+
+
 def _not_retired(session: _Session, turn: str) -> None:
     """Refuse input for a core turn whose end or refusal was seen. The caller holds ``session.lock``."""
 
@@ -966,6 +1048,7 @@ def _retire(session: _Session, core_turn: str, engine_turn: object) -> tuple:
     ``session.lock`` alone for a turn whose id was never named (no approval can be bound for it; round 4)."""
 
     session.retired.add(core_turn)
+    _drop_interrupt(session, core_turn)  # its end arrived: the deadline must not end the worker as well
     if isinstance(engine_turn, str):
         session.core_turn.pop(engine_turn, None)
         for approval_id, bound in list(session.bindings.items()):

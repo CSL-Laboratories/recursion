@@ -1,0 +1,22 @@
+{
+  "code": "stopped",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "state": "stopped",
+  "repeat": false,
+  "attestation": {
+    "proof": "removed",
+    "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/recursion-run-run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7.service",
+    "cgroup_identity": {
+      "st_dev": 27,
+      "st_ino": 18446
+    },
+    "time": "2026-11-13T07:41:02.118Z"
+  },
+  "containment_level": "host_integrated",
+  "claim": "cgroup_removed_whole_run_unverified",
+  "fence": {
+    "state": "fenced",
+    "incarnation": 1,
+    "x-nobody-defined-this": true
+  }
+}

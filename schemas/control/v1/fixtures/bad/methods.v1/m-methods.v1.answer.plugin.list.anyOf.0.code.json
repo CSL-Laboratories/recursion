@@ -1,0 +1,13 @@
+{
+  "answer": {
+    "approval_surface": "none: no surface can approve or veto yet, so no effect is authorized",
+    "approvals_drawn": 0,
+    "authority_profile": "not configured",
+    "containment": "none: plugins run in the daemon process and uid",
+    "core_poisoned": null,
+    "plugins": [],
+    "verification": "available"
+  },
+  "method": "plugin.list",
+  "params": {}
+}

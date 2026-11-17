@@ -1,0 +1,34 @@
+{
+  "declared": [
+    "hand_pick",
+    "workspace",
+    "containment_level",
+    "session_id",
+    "turn_id"
+  ],
+  "request": {
+    "tenant": "t1",
+    "engine": "codex",
+    "prompt": "Fix the failing test in tests/test_io.py.",
+    "client_key": "k-1",
+    "workspace": {
+      "path": "/home/dev/projects/atlas"
+    }
+  },
+  "expect": {
+    "preimage": "{\"engine\":\"codex\",\"prompt_sha256\":\"aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3\",\"workspace\":{\"path\":\"/home/dev/projects/atlas\"}}",
+    "start_key": {
+      "client_key": "k-1",
+      "engine": "codex",
+      "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3",
+      "intent_version": 1,
+      "intent_sha256": "b038070399fbd7af45837484a9b589e6240b8769e83f6437d5630066a0ec3ba4"
+    },
+    "retry": "client_key_reused"
+  },
+  "stored": {
+    "client_key": "k-1",
+    "engine": "codex",
+    "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
+  }
+}

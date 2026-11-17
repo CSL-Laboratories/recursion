@@ -219,9 +219,10 @@ runs as beta until measured (O50). `rust-v0.145.0` (first tag with all 15 `--dis
 keys, 11.6) is an **unmeasured candidate** and is not applied; measuring it is F17 work.
 Claude Code keeps its 2.1.314 functional floor and 2.1.260 security floor.
 
-Version parsing is strict. Semver: the first word holding `digit.digit` must be
+Version parsing is strict. Semver: the first word holding ASCII `digit.digit` must be
 `[v]MAJOR.MINOR.PATCH[-prerelease]` with no leading zeros; a prerelease is `version_refused`
-(floors name releases); a fourth part, glued letters or `+build` is `version_unparsed`.
+(floors name releases); a fourth part, glued letters, a digit outside ASCII 0-9, or
+`+build` is `version_unparsed`.
 Cursor: `[v]YYYY.M.D[-HH-MM-SS][-<hex commit>]`, compared numerically as
 (year, month, day, build time); the commit does not order. Lines over 256 characters are
 unparsed. Real-shape lines covered: `2.1.318 (Claude Code)`, `codex-cli 0.160.0`,
@@ -656,7 +657,8 @@ Called by nothing, like the rest of this package. What it adds:
   field that is absent is `grant_forged`; so is a MAC that is not ASCII text. `verify()` says it
   authenticates first.
 - `launch_plan()` refuses an `env` that is not a mapping (`spawn_too_large`, after the grant is
-  authenticated). `MAX_PROBE_TIMEOUT_S` is exported.
+  authenticated), including a falsy non-mapping. Only `None` is an empty environment.
+  `MAX_PROBE_TIMEOUT_S` is exported.
 - On Windows the executed command line (as `subprocess` quotes it) is at most 32767 UTF-16 code
   units with its terminator (`spawn_too_large`); and a bare name ranks after every `.exe`, `.cmd`
   or `.ps1` hit in any PATH directory.

@@ -132,15 +132,20 @@ _SPECS = (
 FLOORS: MappingProxyType[str, EngineSpec] = MappingProxyType({s.engine: s for s in _SPECS})
 
 MAX_VERSION_LINE = 256
+# ASCII digits only. In Python 3, ``\d`` without this flag also matches decimal digits
+# outside 0-9, and ``int()`` then folds them into a larger number (U+0660 after 259
+# becomes 2590). A token that contains such a digit is unparsed.
 _NUM = r"(0|[1-9]\d{0,8})"
 _SEMVER = re.compile(
-    rf"v?{_NUM}\.{_NUM}\.{_NUM}(?:-([0-9A-Za-z][0-9A-Za-z.-]*))?(\+[0-9A-Za-z.-]+)?"
+    rf"v?{_NUM}\.{_NUM}\.{_NUM}(?:-([0-9A-Za-z][0-9A-Za-z.-]*))?(\+[0-9A-Za-z.-]+)?",
+    re.ASCII,
 )
 # Cursor: YYYY.MM.DD, optional -HH-MM-SS build time, optional -<hex commit>.
 _DATE = re.compile(
-    r"v?(\d{4})\.(\d{1,2})\.(\d{1,2})(?:-(\d{2})-(\d{2})-(\d{2}))?(?:-([0-9a-f]{6,40}))?"
+    r"v?(\d{4})\.(\d{1,2})\.(\d{1,2})(?:-(\d{2})-(\d{2})-(\d{2}))?(?:-([0-9a-f]{6,40}))?",
+    re.ASCII,
 )
-_VERSIONISH = re.compile(r"\d+\.\d+")
+_VERSIONISH = re.compile(r"\d+\.\d+", re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -171,8 +176,9 @@ def _token(raw: str) -> str | None:
 def parse_version(scheme: str, raw: str) -> ParsedVersion | None:
     """Strict parse. ``None`` means unparsed (extra parts, glued letters, ``+build``, bad date).
 
-    The version token is the first whitespace-separated word holding ``digit.digit``;
-    it must match the engine's whole format. A prerelease is returned, not accepted:
+    The version token is the first whitespace-separated word holding ASCII ``digit.digit``;
+    it must match the engine's whole format. A digit outside ASCII 0-9 is unparsed, not
+    folded into a larger number. A prerelease is returned, not accepted:
     callers refuse it (floors name releases). The whole line must be printable text: a control
     character (a terminal escape, a tab, a carriage return, NUL, a bidirectional override) or
     U+FFFD, which is how the probe reads a byte that is not UTF-8, makes it unparsed, so such a

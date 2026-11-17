@@ -530,11 +530,17 @@ class LaunchPlan:
 def launch_plan(g: object, argv: Sequence[str], env: Mapping[str, str] | None = None) -> LaunchPlan:
     """Check a launch against a grant. ``env`` is the already-built child env (child_env), not os.environ.
 
-    Only ``env`` reaches the plan; with none, the plan's environment is empty. Nothing ambient is inherited.
+    Only ``env`` reaches the plan. Only ``None`` means an empty environment: a falsy
+    non-mapping (``0``, ``""``, ``[]``) is refused, not stored as empty. Nothing ambient is inherited.
     """
     argv = tuple(argv) if argv is not None else ()
     try:
-        env = dict(env or {})
+        if env is None:
+            env = {}
+        elif not isinstance(env, Mapping):
+            raise TypeError
+        else:
+            env = dict(env)
     except (TypeError, ValueError):  # not a mapping, nor pairs: typed, after the grant is authenticated
         spec = authenticate(g)
         raise LaunchRefused("spawn_too_large", spec.engine, "env is not a mapping of names to values") from None

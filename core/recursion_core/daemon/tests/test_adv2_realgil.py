@@ -75,6 +75,7 @@ class Adv2RealGilTests(unittest.TestCase):
     def run_host(self, source):
         fx.write_install(self.config, grants=[fx.grant_for(source)])
         fx.write_plugin(self.config / 'plugins' / 'gil', source)
+        fx.ensure_revocation_store(self.tmp / 'state')
         env = {'PYTHONPATH': str(CORE), 'PATH': '/usr/bin:/bin'}  # no PYTHON_GIL, and no -X gil=0 below
         done = subprocess.run([sys.executable, '-B', '-c', HOST, str(self.config), str(self.tmp / 'state'), str(self.ext)],
                               capture_output=True, text=True, timeout=120, env=env, check=False)

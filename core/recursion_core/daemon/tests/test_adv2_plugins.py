@@ -58,6 +58,7 @@ class Adv2HostCase(unittest.TestCase):
     def host(self, **options):
         options.setdefault('gil_probe', FakeGilProbe())
         options.setdefault('verification_available', lambda: True)
+        fx.ensure_revocation_store(self.state)
         host = plugins.PluginHost(self.config, self.state, **options)
         self.addCleanup(host.close)
         return host
@@ -317,8 +318,15 @@ class Adv2FilesystemTests(Adv2HostCase):
                     else:
                         sec.unlink()
                 record = host.records[0]
-                self.assertEqual((record['state'], record['code'], record['detail']),
-                                 ('refused', 'revocation_store_invalid', 'PermissionError'))
+                # A folder that can be listed and is not writable used to fail while the
+                # daemon created the store file. The file is not created now, so a missing
+                # file in that folder is revocation_store_missing. A folder that cannot be
+                # stated still refuses revocation_store_invalid from the operating system.
+                if shape.__name__ == 'a_folder_that_cannot_be_written_to':
+                    expected = ('refused', 'revocation_store_missing', '')
+                else:
+                    expected = ('refused', 'revocation_store_invalid', 'PermissionError')
+                self.assertEqual((record['state'], record['code'], record['detail']), expected)
                 self.assertFalse(self.marker.exists())
 
     def test_a_grant_for_another_digest_gives_no_permission(self):

@@ -44,6 +44,7 @@ class HostCase(unittest.TestCase):
         # builds, where the real probe would poison the core at the first load. The real probe is
         # covered by plugin_security/tests/test_runtime.py and by the daemon evidence run on 3.14t.
         options.setdefault('gil_probe', FakeGilProbe())
+        fx.ensure_revocation_store(self.state)
         host = plugins.PluginHost(self.config, self.state, **options)
         self.addCleanup(host.close)
         return host

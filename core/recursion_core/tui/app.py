@@ -1368,7 +1368,7 @@ class TuiApp:
         closers = [show_sequence(s, leader) for s, a in view.items() if a == "help.close"]
         closes = ", ".join(closers[:-1]) + " or " + closers[-1] if len(closers) > 1 else "".join(closers)
         steps = [self._first_key(a, "help") for a in ("help.down", "help.up")]
-        scroll = ["/".join(k for k in steps if k)] if all(steps) else []
+        scroll = ["/".join(k for k in steps if k)] if any(steps) else []  # one alone is named too (Grok r8 of #404)
         if view.get(("pagedown",)) == "help.page_down" and view.get(("pageup",)) == "help.page_up":
             scroll.append("Page Up/Down")
         return " and ".join(scroll), (f"{closes} closes" if closes else "no key closes it")

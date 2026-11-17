@@ -922,15 +922,17 @@ class AcpDrafts:
     drafted. EVERY TURN THE SESSION OR THE DRIVER ENDS GETS EXACTLY ONE RESULT, whether or not a line of it was
     read. Per session, two numbers outlive a turn: the highest turn number whose result is drafted, so that an
     end of a turn already gone (``ended`` twice, ``ended`` of an earlier turn, ``turn_end`` again, a repeated
-    ``turn_start``) drafts nothing and raises nothing; and the highest turn number the session announced, so
-    that ``ended`` of a later turn, which has not begun, is refused (``TypeError``) instead of taking that
-    turn's result.
+    ``turn_start``) drafts nothing and raises nothing; and the highest turn number the session announced.
+    ``ended`` refuses a later turn (``TypeError``) only when that session has already announced an earlier
+    one. An end of a turn the session never announced, which is how the driver finishes a turn (``ended``,
+    and ``turn_end`` of a key above that number), is accepted and drafts that turn's result.
 
     SESSIONS: one ``AcpDrafts`` serves any number of sessions ONE THREAD AT A TIME. A session whose turn starts
     while another session's announced turn is in progress on the same thread (a callback of the first runs
     the second's turn) is NESTED: the first turn is put aside untouched, every callback until the second's
     end belongs to the second (it is the one reading lines on this thread), and the first is taken up again
-    at that end. A start, update, ask or line from another thread while an announced turn is in progress is
+    at that end. A caller that feeds ``on_update`` itself must feed only the turn in progress: an update's
+    ``sessionId`` is not read, so a later update of a put-aside session is drafted into the nested turn. A start, update, ask or line from another thread while an announced turn is in progress is
     refused (``AcpStateError``) and changes nothing: sessions pumped at once on several threads take one
     ``AcpDrafts`` each. Callbacks wrapped so that the session cannot see this object announce nothing, so
     such a caller keeps to one session at a time itself. A lock makes each call one step.
@@ -950,8 +952,11 @@ class AcpDrafts:
     in every spelling ``mask`` reads, AND ACROSS PIECES: in the strings, keys and other scalars of a decoded
     line or update, in the order they are written and with any pieces between skipped (a reader may join
     values only, keys only, or a list's texts), a value spelled by the end of one piece, whole pieces and the
-    start of a later one is masked in each piece it touches, so a value split over two content items, two
-    input values or two keys reaches no draft. A line (exactly a str)
+    start of a later one is masked in each piece it touches, escapes included (each piece is read to the same
+    depth ``mask`` reads, and the cuts are mapped back onto the spelling that was written), so a value split
+    over two content items, two input values or two keys reaches no draft. A line ``json`` cannot read is
+    masked the same way across its quoted strings: a reader can join those strings even when the line is not
+    one JSON value. A line (exactly a str)
     is masked in place, so its byte length and every offset stay; an update is masked before a tool call's
     input, its digest, its name or its result text is taken from it. What cannot be masked in place is the
     agent's protocol error, refused before anything of it is drafted (an ``engine.output`` included; the
@@ -1295,11 +1300,38 @@ def _chain(pieces: list[str], forms) -> list | None:
     return None
 
 
+def _peel(text: str) -> tuple[str, array | None, bool]:
+    """``text`` read the way ``mask`` reads it: up to ``MASK_DEPTH`` layers of JSON escapes, where each decoded
+    character begins in ``text`` (None when nothing was decoded), and whether a further layer remains. A
+    further layer means the piece keeps nothing (``mask`` fills a text it cannot finish reading)."""
+    level, starts = text, None
+    for _layer in range(MASK_DEPTH + 1):
+        if "\\" not in level:
+            return level, starts, False
+        decoded, inner = _decode(level)
+        if len(decoded) == len(level):
+            return level, starts, False
+        starts = inner if starts is None else array("q", map(starts.__getitem__, inner))
+        level = decoded
+    return "", None, True
+
+
 def _across(pieces: list[str], forms) -> list:
     """Every part of every value spelled across ``pieces`` (above), found round by round: each round's parts
-    are taken out before the next round looks, until none is left. More than ``_ACROSS_ROUNDS`` rounds is the
-    agent's protocol error (fail closed)."""
-    work, found = list(pieces), []
+    are taken out before the next round looks, until none is left. Each piece is peeled first (``_peel``), and
+    a range is returned in the piece as it was given, so the escapes ``mask`` would read are the ones that get
+    masked. A piece with escapes deeper than ``MASK_DEPTH`` is masked whole. More than ``_ACROSS_ROUNDS``
+    rounds is the agent's protocol error (fail closed)."""
+    work, maps, found = [], [], []
+    for piece in pieces:
+        level, starts, too_deep = _peel(piece)
+        if too_deep:
+            found.append((len(work), 0, len(piece)))
+            work.append("")
+            maps.append(None)
+        else:
+            work.append(level)
+            maps.append(starts)
     fill = _fill(forms)
     for _round in range(_ACROSS_ROUNDS):
         parts = _chain(work, forms)
@@ -1307,7 +1339,12 @@ def _across(pieces: list[str], forms) -> list:
             return found
         for i, a, b in parts:
             work[i] = work[i][:a] + fill * (b - a) + work[i][b:]
-            found.append((i, a, b))
+            starts = maps[i]
+            if starts is None:
+                found.append((i, a, b))
+            else:
+                end = int(starts[b]) if b < len(starts) else len(pieces[i])
+                found.append((i, int(starts[a]), end))
     raise acp_module().AcpProtocolError("a value to keep out is spelled across too many pieces to mask")
 
 
@@ -1323,18 +1360,59 @@ def _scalar_spells(value, forms) -> bool:
     return any(form in text for form in forms for text in (json.dumps(value), repr(value))) or _number_is(value, forms)
 
 
+def _quoted_cuts(line: str, forms) -> list:
+    """Character ranges of a value spelled across the quoted strings of ``line`` (a line json cannot read, or
+    any line whose strings a reader can still join). Ranges sit in ``line`` itself."""
+    tokens = [token for token in _TOKEN.finditer(line) if token.group().startswith('"')]
+    pieces, where = [], []
+    for token in tokens:
+        inner = token.group()[1:-1]
+        decoded, at = _decode(inner) if "\\" in inner else (inner, None)
+        pieces.append(decoded)
+        where.append((token.start() + 1, at, len(inner)))
+    cuts = []
+    for i, a, b in _across(pieces, forms):
+        origin, at, inner = where[i]
+        if at is not None:
+            a, b = at[a], (at[b] if b < len(at) else inner)
+        cuts.append((origin + a, origin + b))
+    return cuts
+
+
+def _keys_collide(value, forms) -> bool:
+    """Whether one object has two keys that ``mask`` writes as the same text."""
+    if isinstance(value, dict):
+        seen = set()
+        for key, child in value.items():
+            if type(key) is not str:
+                continue
+            masked = mask(key, forms)
+            if masked in seen:
+                return True
+            seen.add(masked)
+            if _keys_collide(child, forms):
+                return True
+    elif isinstance(value, list):
+        return any(_keys_collide(child, forms) for child in value)
+    return False
+
+
 def _masked_line(line: str, forms) -> tuple[str, str | None]:
     """A stdout line masked in place (same UTF-8 length), and why it is refused, or None. In a line json reads,
-    each part of a value spelled across its tokens (strings read with their escapes, numbers and literals as
-    written) is masked where it is written; then the whole line is masked as ``mask`` does. A number or
-    literal that spells a value, or that holds a part of one, refuses it. A line json cannot read is masked
-    as text: nothing in it is decoded by anyone."""
+    each part of a value spelled across its tokens (strings read with their escapes, to the depth ``mask``
+    reads, numbers and literals as written) is masked where it is written; then the whole line is masked as
+    ``mask`` does. A number or literal that spells a value, or that holds a part of one, refuses it, and so do
+    two keys of one object that mask alike: both are refused before the line is drafted. A line json cannot
+    read is masked as text and across its quoted strings, escapes included, because a reader can join those
+    strings even though the line is not one JSON value."""
     if not forms:
         return line, None
     try:
-        json.loads(line)
+        loaded = json.loads(line)
     except (ValueError, RecursionError):
-        return mask(line, forms), None
+        return mask(_filled(line, _quoted_cuts(line, forms), _fill(forms)), forms), None
+    if _keys_collide(loaded, forms):
+        return mask(line, forms), "two keys of one object mask alike"
     tokens = list(_TOKEN.finditer(line))
     pieces, starts = [], []
     for token in tokens:

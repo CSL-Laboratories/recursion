@@ -695,9 +695,10 @@ class RestartTest(ComposedBase):
         registering the run wrote start_failed for a start that then succeeded (the record flapped).
         The window here opens before the real starter has the run, so ``starter.active`` is False in it and the
         control's count of starts in flight is what holds the record; the next test holds the other half.
-        The stand-in opens the window and waits for the racer to reconcile before the real starter runs, so a
-        prompt racer reads ``starting``. A racer that runs only after ``run.start`` returns reads ``running``.
-        Either reading is the product; ``start_failed`` in the window is not."""
+        The stand-in opens the window and waits for the racer to reconcile before the real starter runs.
+        When that wait returns because the racer released the stand-in, the racer read the record in the
+        window and the only product reading is ``starting``. ``running`` is a product reading only when
+        the wait's backstop expired and the real starter had already run. ``start_failed`` is neither."""
         daemon, composed = self.boot()
         api = self.api(composed)
         starter = composed.control.starter
@@ -705,6 +706,7 @@ class RestartTest(ComposedBase):
         seen = []
         gate = threading.Event()
         release = threading.Event()
+        in_time = []
         received = []
         real = mock.Mock(wraps=original)  # the real starter itself: its calls are the ones that reached it
 
@@ -715,7 +717,8 @@ class RestartTest(ComposedBase):
             gate.set()  # the window is open: the launch intent is written, the real starter has not run
             # The racer reconciles, records, then releases. Two seconds is only a backstop so a witness
             # that delays the racer until after run.start returns cannot deadlock this stand-in.
-            release.wait(2)
+            # True: the racer released the stand-in. False: the backstop expired.
+            in_time.append(release.wait(2))
             return real(self_, *args, **kwargs)
 
         def reconcile_in_window():
@@ -736,8 +739,12 @@ class RestartTest(ComposedBase):
         run_id = answer['run']['run_id']
         self.assertEqual(api.call('run.status', {'run_id': run_id})['run']['state'], 'running')
         self.assertNotIn('start_failed', seen, 'the record flapped starting -> start_failed -> running')
-        self.assertTrue(seen, 'reconcile did not run')
-        self.assertTrue(all(state in ('starting', 'running') for state in seen), seen)
+        self.assertEqual(len(in_time), 1, in_time)
+        if in_time[0]:
+            self.assertEqual(seen, ['starting'])
+        else:
+            self.assertTrue(seen, 'reconcile did not run')
+            self.assertTrue(all(state in ('starting', 'running') for state in seen), seen)
         self.assertEqual(len(received), 1, received)
         called_on, args, kwargs = received[0]
         self.assertIs(called_on, starter)

@@ -104,20 +104,25 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
     and the last ``XDG_STATE_HOME`` counts; a value naming ``home``'s ``.local/state`` (``%h`` is
     ``home``) is this unit's own. ``EnvironmentFile=`` can set it (its file is not read here), and
     ``PassEnvironment=XDG_STATE_HOME`` gives the daemon the user manager's own value; ``UnsetEnvironment``
-    naming it leaves the default, which is ours. A unit that cannot be read so is answered too: then
-    where it keeps the state cannot be told. A value only in the user manager's own environment
+    naming it leaves the default, under ``$HOME``: the daemon's default is ``Path.home()``, which reads
+    ``HOME``, so a unit's own ``HOME`` (or an ``EnvironmentFile``, which can set it) moves the state too,
+    unless it names ``home`` or ``UnsetEnvironment`` drops it. A byte order mark before the first line is
+    skipped, as systemd skips it, and a value with a NUL byte names no folder. A unit that cannot be read
+    so is answered too: then where it keeps the state cannot be told. A value only in the user manager's own
+    environment
     (``environment.d``, ``systemctl --user set-environment``) is not seen: this package starts no
     process to ask it.
     """
 
     try:
-        text = unit.decode("utf-8")
+        text = unit.decode("utf-8-sig")  # a byte order mark first is skipped, as systemd skips it (DeepSeek H9-3)
     except UnicodeDecodeError:
         return "is not UTF-8 text, so where it keeps the daemon's state cannot be told"
     section = ""
     assigned: dict[str, str] = {}
     files: list[str] = []
-    passed = unset = False
+    passed: set[str] = set()
+    unset: set[str] = set()
     lines = text.splitlines()
     i = 0
     while i < len(lines):
@@ -150,25 +155,40 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
                 name, has, setting = word.partition("=")
                 if has:
                     assigned[name] = setting
-        elif key == "PassEnvironment":
-            passed = False if not words else passed or "XDG_STATE_HOME" in words
+        elif key == "PassEnvironment":  # an empty one drops those before it
+            passed = passed | set(words) if words else set()
         else:  # UnsetEnvironment; an empty one drops those before it
-            named = [word.partition("=")[0] for word in words]
-            unset = False if not words else unset or "XDG_STATE_HOME" in named
-    if unset:  # applied after Environment, EnvironmentFile and PassEnvironment: the default, ours
-        return None
-    if files:
-        return f"reads EnvironmentFile={files[0]}, which can set XDG_STATE_HOME"
-    if passed:
-        return "passes the user manager's own XDG_STATE_HOME to the daemon (PassEnvironment)"
-    value = assigned.get("XDG_STATE_HOME")
-    if value is None:
-        return None
+            unset = unset | {word.partition("=")[0] for word in words} if words else set()
+    # UnsetEnvironment is applied after Environment, EnvironmentFile and PassEnvironment.
+    if "XDG_STATE_HOME" not in unset:
+        if files:
+            return f"reads EnvironmentFile={files[0]}, which can set XDG_STATE_HOME"
+        if "XDG_STATE_HOME" in passed:
+            return "passes the user manager's own XDG_STATE_HOME to the daemon (PassEnvironment)"
+        value = assigned.get("XDG_STATE_HOME")
+        if value is not None:
+            if _names(value, os.path.join(home, ".local", "state"), home):
+                return None
+            return f"sets XDG_STATE_HOME={value}"
+    # No XDG_STATE_HOME: the state is under Path.home(), which reads HOME, so the unit's own HOME moves it too
+    # (DeepSeek H9-2 on #382). The user manager's own HOME is the home's.
+    if "HOME" not in unset:
+        if files:
+            return f"reads EnvironmentFile={files[0]}, which can set HOME"
+        value = assigned.get("HOME")
+        if value is not None and not _names(value, home, home):
+            return f"sets HOME={value}, so the daemon's default state folder is under it"
+    return None
+
+
+def _names(value: str, folder: str, home: str) -> bool:
+    """Whether a unit's ``value`` (``%h`` is ``home``) names ``folder``, links followed."""
+
     named = home + value[2:] if value.startswith("%h") else value
-    ours = os.path.join(home, ".local", "state")
-    if os.path.isabs(named) and os.path.realpath(named) == os.path.realpath(ours):
-        return None
-    return f"sets XDG_STATE_HOME={value}"
+    try:
+        return os.path.isabs(named) and os.path.realpath(named) == os.path.realpath(folder)
+    except ValueError:  # a NUL byte, which realpath refuses: no folder (DeepSeek H9-1)
+        return False
 
 
 def service_fields(unit: str) -> dict[str, str]:

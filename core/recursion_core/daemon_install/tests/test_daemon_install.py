@@ -277,8 +277,9 @@ class InstallTests(unittest.TestCase):
             (f"Environment=A=1 \\\n    XDG_STATE_HOME={custom}\n", f"sets XDG_STATE_HOME={custom}"),
             ("Environment=XDG_STATE_HOME=%h/other\n", "sets XDG_STATE_HOME=%h/other"),
             ("Environment=XDG_STATE_HOME=relative\n", "sets XDG_STATE_HOME=relative"),
-            ("EnvironmentFile=%h/.config/recursion.env\n", "reads EnvironmentFile=%h/.config/recursion.env"),
-            ("EnvironmentFile=-/etc/recursion.env\n", "reads EnvironmentFile=-/etc/recursion.env"),
+            ("EnvironmentFile=%h/.config/recursion.env\n",
+             "reads EnvironmentFile=%h/.config/recursion.env, which can set XDG_STATE_HOME"),
+            ("EnvironmentFile=-/etc/recursion.env\n", "reads EnvironmentFile=-/etc/recursion.env, which can set XDG_STATE_HOME"),
             ("PassEnvironment=HOME XDG_STATE_HOME\n", "passes the user manager's own XDG_STATE_HOME"),
             (f'Environment="XDG_STATE_HOME={custom}\n', "which cannot be read"),
         )
@@ -308,13 +309,53 @@ class InstallTests(unittest.TestCase):
                         f"Environment=XDG_STATE_HOME={self.home}/.local/state/\n",
                         f"Environment=XDG_STATE_HOME={custom}\nEnvironment=\n",  # an empty one drops those before it
                         f"Environment=XDG_STATE_HOME={custom}\nUnsetEnvironment=XDG_STATE_HOME\n",
-                        "EnvironmentFile=/etc/recursion.env\nUnsetEnvironment=XDG_STATE_HOME\n",
+                        "EnvironmentFile=/etc/recursion.env\nUnsetEnvironment=XDG_STATE_HOME HOME\n",
                         "PassEnvironment=XDG_STATE_HOME\nPassEnvironment=\n",
                         "EnvironmentFile=/etc/recursion.env\nEnvironmentFile=\n",
                         f"[Install]\nEnvironment=XDG_STATE_HOME={custom}\n"):  # not the [Service] section's
             with self.subTest(service=service):
                 with open(self.unit, "w", encoding="utf-8") as handle:
                     handle.write(f"[Service]\n{service}ExecStart=/old\n")
+                self.assertTrue(upgrade(self.roots, EXEC).changed)
+                self.assertEqual(_read(self.unit), render_unit(EXEC))
+
+    # DeepSeek's round 9 on #382 (6ba00157): three spellings of a unit got past the check. H9-1: a NUL byte in a value
+    # raised ValueError out of upgrade, a traceback for the command. H9-2: the unit's own HOME moves the daemon's
+    # default state folder (Path.home() reads it), and it was not read. H9-3: a byte order mark before [Service] hid
+    # the section, which systemd still reads.
+    def test_upgrade_refuses_a_nul_byte_a_home_of_its_own_and_a_section_behind_a_byte_order_mark(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        elsewhere = os.path.join(self.case, "elsewhere")
+        cases = (
+            ("[Service]\nEnvironment=XDG_STATE_HOME=/a\0b\nExecStart=/old\n", "sets XDG_STATE_HOME=/a\0b"),
+            ("[Service]\nEnvironment=HOME=/a\0b\nExecStart=/old\n", "sets HOME=/a\0b"),
+            (f"[Service]\nEnvironment=HOME={elsewhere}\nExecStart=/old\n",
+             f"sets HOME={elsewhere}, so the daemon's default state folder is under it"),
+            (f"[Service]\nEnvironment=XDG_STATE_HOME=%h/x HOME={elsewhere}\nUnsetEnvironment=XDG_STATE_HOME\nExecStart=/old\n",
+             f"sets HOME={elsewhere}"),
+            ("[Service]\nEnvironmentFile=/etc/recursion.env\nUnsetEnvironment=XDG_STATE_HOME\nExecStart=/old\n",
+             "reads EnvironmentFile=/etc/recursion.env, which can set HOME"),
+            (f"\ufeff[Service]\nEnvironment=XDG_STATE_HOME={elsewhere}\nExecStart=/old\n", f"sets XDG_STATE_HOME={elsewhere}"),
+            (f"\ufeff[Service]\nEnvironment=HOME={elsewhere}\nExecStart=/old\n", f"sets HOME={elsewhere}"),
+        )
+        for text, said in cases:
+            with self.subTest(text=text):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    upgrade(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
+                self.assertIn(said, caught.exception.detail)
+                self.assertEqual(_tree(self.home), before)  # the unit as it was
+        for service in ("Environment=HOME=%h\n", f"Environment=HOME={self.home}/\n",
+                        f"Environment=HOME={elsewhere} XDG_STATE_HOME=%h/.local/state\n",  # XDG_STATE_HOME decides
+                        f"Environment=HOME={elsewhere}\nUnsetEnvironment=HOME\n",
+                        "EnvironmentFile=/etc/recursion.env\nUnsetEnvironment=XDG_STATE_HOME HOME\n",
+                        "PassEnvironment=HOME\n"):  # the user manager's own HOME is the home's
+            with self.subTest(service=service):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(f"\ufeff[Service]\n{service}ExecStart=/old\n")
                 self.assertTrue(upgrade(self.roots, EXEC).changed)
                 self.assertEqual(_read(self.unit), render_unit(EXEC))
 

@@ -332,6 +332,12 @@ class CommandTests(unittest.TestCase):
         code, answer = self.run_action("upgrade")
         self.assertEqual((code, answer["code"], answer["action"]), (1, "unit_state_elsewhere", "upgrade"))
         self.assertIn("sets XDG_STATE_HOME=/elsewhere", answer["detail"])
+        # DeepSeek H9-1 on #382: a NUL byte in the value was a ValueError traceback; it is one JSON refusal.
+        with open(self.unit, "w", encoding="utf-8") as handle:
+            handle.write("[Service]\nEnvironment=XDG_STATE_HOME=/a\0b\nExecStart=/old\n")
+        code, answer = self.run_action("upgrade")
+        self.assertEqual((code, answer["code"]), (1, "unit_state_elsewhere"))
+        self.assertIn("sets XDG_STATE_HOME=/a\0b", answer["detail"])
 
     # The Liaison's item 4 (Nov 16): a password lookup that fails (CPython raises KeyError for no entry and for a
     # failed lookup alike) ended `recursiond install` with a traceback; it is the JSON refusal home_unknown.

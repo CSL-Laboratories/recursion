@@ -8,6 +8,7 @@ import io
 import logging
 import sys
 import threading
+import traceback
 import unittest
 
 from recursion_core.control import hooks as H
@@ -85,6 +86,96 @@ class HooksBoundaryTest(unittest.TestCase):
 
         hooks = configured('drive_owner', lambda context, request: Owner())
         self.assertIsNone(hooks.drive_owner(object(), {}))
+
+    def test_a_page_walk_that_raises_answers_the_empty_set(self):
+        """A walk that raises something other than RuntimeError still answers the empty set, and says so."""
+        marker = 'SYNTHETIC_WALK_MARKER_71'
+
+        class Raising(set):
+            def __iter__(self):
+                raise ValueError('walk diagnostic: ' + marker)
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        H.log.addHandler(handler)
+        try:
+            answer = configured('page_methods', lambda: Raising({'session.turn'})).page_methods()
+        finally:
+            H.log.removeHandler(handler)
+        self.assertEqual(answer, frozenset())
+        self.assertIn('page_methods failed while reading the names', stream.getvalue())
+        self.assertNotIn(marker, stream.getvalue())
+
+    def test_a_credential_failure_omits_the_type_name_and_the_caller_traceback(self):
+        """The log does not carry the source's type name, and the caller's traceback does not carry the text."""
+        marker = 'SYNTHETIC_DIAGNOSTIC_MARKER_71'
+        type_marker = 'SYNTHETIC_TYPE_MARKER_71'
+        boom = type(type_marker, (Exception,), {})
+
+        def source(connection, env_name):
+            raise boom('decoding diagnostic: ' + marker)
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        H.log.addHandler(handler)
+        try:
+            with self.assertRaises(KeyError) as caught:
+                configured('credentials', source).credentials('connection-label', 'ENV_LABEL')
+        finally:
+            H.log.removeHandler(handler)
+        self.assertEqual(caught.exception.args, ('connection-label',))
+        logged = stream.getvalue()
+        self.assertTrue(logged, 'the failure must still be logged')
+        self.assertNotIn(marker, logged)
+        self.assertNotIn(type_marker, logged)
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertIsNone(caught.exception.__cause__)
+        formatted = ''.join(traceback.format_exception(caught.exception))
+        self.assertNotIn(marker, formatted)
+        self.assertNotIn(type_marker, formatted)
+
+    def test_a_page_name_whose_type_is_not_str_is_left_out(self):
+        """A name that is a str subclass is not a str. It must not make another method look allowed."""
+
+        class Tricky(str):
+            def __eq__(self, other):
+                return other == 'run.stop' or other == 'session.turn' or str.__eq__(self, other)
+
+            def __hash__(self):
+                return hash('run.stop')
+
+        answer = configured('page_methods', lambda: {Tricky('session.turn')}).page_methods()
+        self.assertEqual(answer, frozenset())
+        self.assertNotIn('run.stop', answer)
+
+    def test_an_empty_credential_is_refused_even_when_it_claims_to_be_present(self):
+        """Empty text is not a credential, including a subclass that says it is present."""
+
+        class Blank(str):
+            def __new__(cls):
+                return str.__new__(cls, '')
+
+            def __bool__(self):
+                return True
+
+        hooks = configured('credentials', lambda connection, env_name: Blank())
+        with self.assertRaises(KeyError) as caught:
+            hooks.credentials('connection-label', 'ENV_LABEL')
+        self.assertEqual(caught.exception.args, ('connection-label',))
+
+    def test_a_drive_label_that_raises_still_declines_the_owner(self):
+        """Reading the run label must not replace the decline. The caller still gets no owner."""
+
+        class Ctx:
+            @property
+            def run_id(self):
+                raise RuntimeError('label failed')
+
+        class Owner:
+            run = None
+
+        hooks = configured('drive_owner', lambda context, request: Owner())
+        self.assertIsNone(hooks.drive_owner(Ctx(), {}))
 
 
 if __name__ == '__main__':

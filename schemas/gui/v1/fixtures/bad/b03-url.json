@@ -1,0 +1,12 @@
+{
+  "schema": "gui.theme/1",
+  "name": "bad",
+  "title": "Bad",
+  "tokens": {
+    "bg": "#ffffff",
+    "fg": "url(http://127.0.0.1/a)",
+    "muted": "#595959",
+    "accent": "#1a5fb4",
+    "border": "#666666"
+  }
+}

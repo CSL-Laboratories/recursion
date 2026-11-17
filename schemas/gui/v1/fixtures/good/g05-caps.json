@@ -1,0 +1,12 @@
+{
+  "schema": "gui.theme/1",
+  "name": "caps",
+  "title": "Caps",
+  "tokens": {
+    "bg": "#FFFFFF",
+    "fg": "#1A1A1A",
+    "muted": "#595959",
+    "accent": "#1A5FB4",
+    "border": "#666666"
+  }
+}

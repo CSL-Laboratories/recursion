@@ -5,7 +5,8 @@ The TUI has exactly the item 8 CLI's commands (``list``, ``status RUN``, ``stop 
 into the same ``(method, params)`` the CLI sends. ``conditions`` reads the current conditions again on
 demand: the TUI answers it from what it already knows and sends nothing; the one-shot CLI keeps no
 state, so it reads ``run.list`` first. There is no approve, deny, order or mid-run verb: the control
-API has none, and the TUI never gets a command the CLI lacks.
+API has none, and the TUI never gets a run command the CLI lacks. The session reads (``sessions``,
+``transcript SESSION``; ``sessions.py``) come first in the TUI: their CLI twins belong to the verb lanes.
 
 ``list_all_runs`` is how both surfaces read the run list: it follows ``run.list``'s ``next_after`` until
 the last page (ADV1-5), so the CLI's ``list`` / ``conditions`` and the TUI's list see every run.

@@ -1,0 +1,23 @@
+{
+  "chosen": {
+    "engine": "claude_code",
+    "model": "claude-sonnet-5-5",
+    "connection": {
+      "kind": "subscription",
+      "id": "personal-max"
+    }
+  },
+  "reason": "config",
+  "candidates": [
+    {
+      "model": null,
+      "skipped": "breaker_open"
+    },
+    {
+      "engine": "claude_code",
+      "model": "claude-sonnet-5-5",
+      "skipped": null
+    }
+  ],
+  "hand_pick": null
+}

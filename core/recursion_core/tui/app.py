@@ -26,6 +26,7 @@ import time
 from collections.abc import Callable, Mapping
 
 from recursion_core.tui import protocol as p
+from recursion_core.tui import sessions as s
 from recursion_core.tui.events import LOG_CAP, Event, EventLog
 from recursion_core.tui.keymap import BY_ID, PLUGIN_PREFIX, Keymap, Pending, Unbound, show_sequence
 from recursion_core.tui.keys import Key, Paste
@@ -40,6 +41,7 @@ HELP_ROWS = 3  # entries the open keys show at least; they take rows from the ru
 CONDITION_ROWS = 4
 _TRUNCATED = "⟦truncated⟧"
 _CURSOR = "▏"  # where the command line's cursor is, drawn only when it is not at the end
+SESSION_LIST = object()  # ``TuiApp.pane`` when the output pane shows the session list (review 1 of #405, Sol R1)
 
 
 def _fmt(params: Mapping) -> str:
@@ -55,6 +57,7 @@ class _Output:
         self.events = 0
         self.dropped = 0
         self.finished = 0  # lines finished since the output began: a line's place, which retention does not move
+        self.left = 0  # finished lines the deque no longer keeps (a transcript pane says so; Devin's thread on #405)
         self.label = f"output run={field(run_id)}: "
         # The display rows of each retained line at one width, kept beside the lines, so a frame need not wrap
         # the whole history to count it or show its newest rows (review 2 of #404, Astra 3). They are counted
@@ -96,6 +99,22 @@ class _Output:
             self._rows.extend(len(wrap(line, width)) for line in done)
             self._width = width
         return chunk, done
+
+    def extend(self, rows: list[str]) -> None:
+        """Rows that are display text already (a transcript's), kept as finished lines, counted as they are;
+        ``left`` counts the stored text lines that leave the pane (lines as kept, not their wrapped display rows:
+        Sol's round 5 of #405, 2)."""
+
+        if self.lines.maxlen is not None:
+            self.left += max(0, len(self.lines) + len(rows) - self.lines.maxlen)
+        # As feed does: "not counted" BEFORE the lines change, and counted again only once the counts are beside
+        # them (#404's round 3, Astra's required 1, for feed; the same order here).
+        width, self._width = self._width, -1
+        self.lines.extend(rows)
+        self.finished += len(rows)  # a line's place, as feed counts it (the Grok read of #404's round 8, R1)
+        if width >= 0:
+            self._rows.extend(len(wrap(row, width)) for row in rows)
+            self._width = width
 
     def source(self) -> list[str]:
         """Every line kept, the unfinished one last."""
@@ -199,6 +218,13 @@ class TuiApp:
         self.skipped_events = 0  # engine output events a Loop dropped from its presentation queue
         self.outputs: dict[str, _Output] = {}
         self.in_flight: dict[str, int] = collections.defaultdict(int)
+        # Sessions (slice 2, part 2): the last session.list, and each opened transcript with its rows. The
+        # output pane shows a transcript while ``pane`` names its session, else the attached run's output.
+        self.sessions: list[dict] = []
+        self.transcripts: dict[str, s.Transcript] = {}
+        self.transcript_rows: dict[str, _Output] = {}
+        self.session_view: _Output | None = None  # the last session list's rows, for the output pane
+        self.pane: str | object | None = None  # a session id, SESSION_LIST, or None for the run's output
 
     # -- the event log --------------------------------------------------------------------------
     def _emit(self, event_type: str, source: str, text: str, speech: str | None = None,
@@ -248,9 +274,10 @@ class TuiApp:
         a search, or its landing, kept from the last run would show rows that are not there (reviews 1 of #404, M2
         and R4; DeepSeek's round 6, F2)."""
 
-        if run_id != self.attached:
+        if run_id != self.attached or self.pane is not None:  # a transcript's view is not the run's
             self.scroll, self.search, self._landing = 0, "", None
         self.attached = self.selected = run_id
+        self.pane = None  # the output pane goes back to the run's output
 
     def refresh(self) -> None:
         self.request("run.list", {})
@@ -267,7 +294,8 @@ class TuiApp:
 
     # -- requests -------------------------------------------------------------------------------
     def request(self, method: str, params: dict) -> None:
-        if method not in p.ALLOWED_METHODS:  # defensive: nothing outside the CLI's method set leaves the TUI
+        # Defensive: nothing outside the CLI's method set, and the session reads, leaves the TUI.
+        if method not in p.ALLOWED_METHODS and method not in s.SESSION_METHODS:
             raise ValueError(method)
         with self._lock:
             if self.closed:
@@ -283,15 +311,30 @@ class TuiApp:
         done(method, params, call_api(self._api, method, params))
 
     def on_answer(self, method: str, params: dict, answer: dict) -> None:
-        code = answer.get("code")  # read before taking the lock: the answer is the caller's object
+        if not isinstance(answer, Mapping):  # as call_api says of it (review 2 of #405, DeepSeek L1)
+            answer = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
+        try:
+            code = answer.get("code")  # read before taking the lock: the answer is the caller's object
+        except Exception:  # noqa: BLE001 - one that cannot be read is answered as call_api answers it (#405 r3, F2)
+            answer = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
+            code = answer["code"]
+        try:  # what every frame reads again: a plain copy, made before the lock is taken (#405 r3 F2, r4 R4)
+            kept = dict(answer)
+        except Exception:  # noqa: BLE001
+            kept = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
         with self._lock:
             if self.closed:  # the TUI ended while the answer was read: it changes nothing
                 return
-            self._apply_answer(method, params, answer, code)
+            try:
+                self._apply_answer(method, params, answer, code, kept)
+            except Exception as exc:  # noqa: BLE001 - one answer that cannot be read must not end the loop
+                # A Loop runs this on its only thread, and raw mode turns Ctrl-C into a key: a raise here would
+                # leave a terminal no key can reach (review 1 of #405, DeepSeek H1). Said, and not taken.
+                self._error(f"the answer to {method} could not be read ({type(exc).__name__}); it was not taken")
 
-    def _apply_answer(self, method: str, params: dict, answer: dict, code) -> None:
+    def _apply_answer(self, method: str, params: dict, answer: dict, code, kept: dict | None = None) -> None:
         self.in_flight[method] = max(0, self.in_flight[method] - 1)
-        self.last, self.last_method = answer, method
+        self.last, self.last_method = dict(answer) if kept is None else kept, method  # a plain copy (on_answer's)
         # A Stop answer confirms only the run it was sent for (ADV2-11): one that names another run,
         # or none, changes no run and is shown as a mismatch, never as this run's Stop.
         mismatch = (method == "run.stop" and code in ("stopped", "pending")
@@ -357,6 +400,166 @@ class TuiApp:
         elif method == "run.stop":  # the answer line above already said it
             self._notice(f"stop run={field(params.get('run_id'))}: control API answered {field(code)}", speech="")
         self.sync_conditions()
+        if method == s.LIST:
+            self._session_list(answer, code)
+        elif method == s.READ:
+            self._transcript_page(params, answer, code)
+
+    def _session_list(self, answer: dict, code) -> None:
+        """The session list, logged (so every renderer says it) and shown in the output pane in full screen:
+        its rows, "no sessions listed", or what the daemon answered instead (review 1 of #405, Sol R1). Only
+        an ``ok`` answer that holds a list is taken (DeepSeek L3, L5)."""
+
+        if code == "ok" and isinstance(answer.get("sessions"), list):
+            self.sessions = [x for x in answer["sessions"] if isinstance(x, dict)]
+            rows = [s.session_row(x) for x in self.sessions] or ["no sessions listed"]
+            self._emit("sessions", "recursion", "\n".join([f"sessions: {len(self.sessions)}", *rows]))
+        elif code == "ok":
+            self._error(f"session.list answered ok without a list (its sessions is a "
+                        f"{type(answer.get('sessions')).__name__}); nothing listed")
+            rows = ["nothing listed: the answer held no list of sessions (the error row says so)"]
+        else:
+            rows = [f"nothing listed: session.list answered {field(code)} (the error row says why)"]
+        if self.pane is not SESSION_LIST:  # another pane: start at its newest rows with no search
+            self.scroll, self.search = 0, ""
+        self.session_view = _Output(self._output_lines, "sessions")
+        self.session_view.extend(rows)
+        self.pane = SESSION_LIST
+
+    def _transcript_page(self, params: dict, answer: dict, code) -> None:
+        """One answer to a transcript read. A page is checked first (``sessions.page_problem``): one that is not
+        the answer to the read asked is said, changes nothing, rows or cursor, and is not asked for again
+        (review 1 of #405, Sol R2; DeepSeek H1, L2). A right page: each new line logged once (so every
+        renderer prints the same rows), its rows kept for the output pane, and the next page asked for while
+        the answer says there is more. A page, or a ``cursor_ahead``, that shows the log no longer holds the
+        last line shown as it was shown rebuilds the view (``_rebuild``)."""
+
+        sid = (params.get("cursor") or {}).get("session_id")
+        transcript = self.transcripts.get(sid)
+        if transcript is None:  # not a transcript this TUI opened
+            return
+        if code == "request_invalid" and answer.get("detail") == "cursor_epoch_ahead":
+            # The epoch held is ahead of the daemon's (an answer once named a later one). Rule (7) lets epoch 1
+            # read on by its seq, so the next read starts there (DeepSeek L1).
+            transcript.cursor = {**transcript.cursor, "epoch": 1}
+            self._notice(f"transcript session={field(sid)}: the daemon's epoch is behind the one held; the next "
+                         f"read goes on from seq {transcript.cursor['seq']} with epoch 1, and checks the last line "
+                         f"shown first")
+            return
+        if code == "request_invalid" and answer.get("detail") == "cursor_ahead":
+            # The daemon has no position where the read asked from. After a line was shown that position is the
+            # one before it, so the log lost a position it had: a broken promise, and the view is rebuilt (the
+            # Liaison's ruling on review 5 of #405). Before any line, only gap lines were shown (one may name a
+            # position past the log): the next read goes back to the start, and a gap line shown is not shown
+            # again (review 2, M1; review 3, F3). A refusal of the start itself is an error (review 4, R3).
+            refused = params["cursor"]["seq"]
+            if type(refused) is int and refused > transcript.furthest_ask():
+                return  # a read sent before the view began again: the read from the start is on its way
+            if transcript.last_line is not None:
+                self._rebuild(sid, transcript, f"the daemon has no position seq {refused}, so it no longer holds "
+                                               f"seq {transcript.last_seq}, the last line shown (epoch "
+                                               f"{transcript.cursor['epoch']})")
+            elif refused:
+                transcript.cursor = {**transcript.cursor, "seq": 0}
+                self._notice(f"transcript session={field(sid)}: the daemon has no position seq {refused}; no line "
+                             f"has been shown, so the next read goes on from the start of its log")
+            else:
+                self._error(f"transcript session={field(sid)}: the daemon refuses even the start of its log (seq 0); "
+                            f"nothing can be read from it until it serves that")
+            return
+        if code != "ok":
+            return
+        problem = s.page_problem(params, answer)
+        if problem is not None:
+            self._error(f"transcript session={field(sid)}: the answer was not taken ({problem}): nothing shown, "
+                        f"the cursor stays at seq {transcript.cursor['seq']}; transcript {field(sid)} reads again")
+            return
+        asked = params["cursor"]["seq"]
+        if type(asked) is int and asked > transcript.furthest_ask():
+            return  # asked before the view began again: dropped whole, with its more and its epoch (Devin, #405)
+        lines = transcript.apply(answer, asked)
+        if lines is None:  # the log no longer holds the last line shown as it was shown
+            self._rebuild(sid, transcript, transcript.broken)
+            return
+        out = self.transcript_rows.setdefault(sid, _Output(self._output_lines, sid))
+        added = 0
+        for line in lines:
+            rows = s.rows(line)
+            out.extend(rows)
+            added += sum(len(wrap(row, self._pane_width())) for row in rows)
+            source = "engine" if line.get("trust") == "untrusted" else "recursion"
+            self._emit("transcript", source, "\n".join(rows),
+                       speech="\n".join(f"transcript session={field(sid)}: {row}" for row in rows))
+            if line.get("event_type") == "replay.gap":  # where its gap starts is not said: a marker row (F1)
+                out.extend([s.GAP_MARK])
+                added += len(wrap(s.GAP_MARK, self._pane_width()))
+                self._emit("transcript", "recursion", s.GAP_MARK,
+                           speech=f"transcript session={field(sid)}: {s.GAP_MARK}")
+        if self.scroll and self.pane == sid:  # a scrolled pager stays on the rows it shows; the frame clamps it
+            self.scroll += added
+        if answer.get("epoch_advanced") is True:
+            self._notice(f"transcript session={field(sid)}: the daemon restarted; read on from seq "
+                         f"{transcript.cursor['seq']} (epoch {transcript.cursor['epoch']})")
+        if answer.get("more") is True and transcript.pages < s.MAX_PAGES:
+            transcript.pages += 1
+            self.request(s.READ, transcript.read_params(continuing=True))  # the next page of this open (Sol 2)
+        elif answer.get("more") is True:
+            self._notice(f"transcript session={field(sid)}: more lines after seq {transcript.cursor['seq']}; "
+                         f"the command transcript {field(sid)} reads on")
+
+    def _rebuild(self, sid: str, transcript: s.Transcript, why: str) -> None:
+        """The daemon's log no longer holds the last line shown as it was shown: a marker line says so, in the
+        pane and in every renderer as a transcript row, and the log is read again from its start, shown below
+        it. What was shown stays above the marker (the Liaison's ruling on review 5 of #405). When the open has
+        no read left (``MAX_PAGES``), the marker says that the command reads the log again (review 6, F3); a
+        read that cannot be sent is said as that, not as an answer not taken (review 6, F4)."""
+
+        reading = transcript.pages < s.MAX_PAGES
+        then = ("the log is read again from its start, below" if reading else
+                f"reading the log again is pending: the command transcript {field(sid)} reads it from its start")
+        # The TUI's own words, seqs and epochs, and the session id through field(): nothing of a line's text, so
+        # it does not go through the sanitizer the daemon's lines do (review 6 of #405, F10).
+        marker = f"-- view rebuilt: {why}; {then} --"
+        out = self.transcript_rows.setdefault(sid, _Output(self._output_lines, sid))
+        out.extend([marker])
+        if self.scroll and self.pane == sid:
+            self.scroll += len(wrap(marker, self._pane_width()))
+        self._emit("transcript", "recursion", marker, speech=f"transcript session={field(sid)}: {marker}")
+        transcript.restart()
+        if not reading:
+            transcript.owed = "pending"  # said in the marker (Sol's round 2 of #405, 4)
+            return
+        transcript.pages += 1
+        try:
+            self.request(s.READ, transcript.read_params())
+        except BaseException as exc:  # noqa: BLE001 - the dispatch failed; the view was rebuilt all the same
+            self.in_flight[s.READ] = max(0, self.in_flight[s.READ] - 1)
+            transcript.owed = "read_failed"
+            self._error(f"transcript session={field(sid)}: the view was rebuilt (the marker is shown and the rows "
+                        f"before it kept), but the read of the log from its start could not be sent "
+                        f"({type(exc).__name__}): pending; the command transcript {field(sid)} reads it")
+            if not isinstance(exc, Exception):
+                raise  # an interrupt goes on to the caller once the state is said (review 7 of #405, F9)
+
+    def open_transcript(self, session_id: str) -> None:
+        """Show a session's transcript in the output pane, reading it from the cursor (from the start the
+        first time; on again from where the last read ended)."""
+
+        transcript = self.transcripts.setdefault(session_id, s.Transcript(session_id))
+        transcript.pages = 1  # this read is the first of at most MAX_PAGES (DeepSeek L5)
+        if self.pane != session_id:  # another pane: start at its newest rows; reading on keeps the view
+            self.pane, self.scroll = session_id, 0
+        self.transcript_rows.setdefault(session_id, _Output(self._output_lines, session_id))
+        self.request(s.READ, transcript.read_params())
+
+    def _pane_output(self) -> _Output | None:
+        """What the output pane and its pager show: the open transcript, else the attached run's output."""
+
+        if self.pane is SESSION_LIST:
+            return self.session_view
+        if self.pane is not None:
+            return self.transcript_rows.get(self.pane)
+        return self.outputs.get(self.attached or "")
 
     def _merge(self, run: dict) -> None:
         for i, known in enumerate(self.runs):
@@ -384,7 +587,7 @@ class TuiApp:
                 out = self.outputs[run_id] = _Output(self._output_lines, run_id)
             before = out.partial
             chunk, done = out.feed(text)
-            if self.scroll and run_id == self.attached:
+            if self.scroll and self.pane is None and run_id == self.attached:
                 # A scrolled pager stays on the rows it shows: it moves up by the display rows this chunk
                 # added at the end, a partial line begun, grown or finished included (review 1 of #404, R3).
                 # The frame and the pager keep it within the rows retained.
@@ -523,6 +726,8 @@ class TuiApp:
                 self._notice("no run selected; nothing to stop")
         elif action == "conditions.show":
             self.show_conditions()
+        elif action == "sessions.show":
+            self.request(s.LIST, dict(s.LIST_PARAMS))
         elif action == "focus.output":
             self.focus = "output"
         elif action == "focus.runs":
@@ -594,7 +799,7 @@ class TuiApp:
         """The pager's largest offset: the oldest retained display row is the pane's newest (as before, in
         rows instead of lines, so a long line's first row is reachable too)."""
 
-        out = self.outputs.get(self.attached or "")
+        out = self._pane_output()
         # ``width``: the frame's own, given as it is (0 too); None reads the pane's (DeepSeek r7 of #404, F4)
         return max(0, out.total_rows(self._pane_width() if width is None else width) - 1) if out else 0
 
@@ -619,7 +824,8 @@ class TuiApp:
                 self._notice("no search yet: press / in the output pager")
 
     def _search(self, pattern: str, step: int) -> None:
-        """Find ``pattern`` (case-insensitive when it has no capital letter) in the attached run's output.
+        """Find ``pattern`` (case-insensitive when it has no capital letter) in what the output pane shows (the
+        attached run's output, a transcript or the session list).
         A new search starts at the newest line shown and goes to older lines; ``n`` goes on to older ones,
         ``N`` back to newer ones, both wrapping around. The match is landed (``_land``): its line's
         last display row becomes the pager's newest row; when the line is taller than the pane and the match
@@ -628,7 +834,7 @@ class TuiApp:
         F1, F3, F5; Sol's round 5, required 1 and 2)."""
 
         self.search, self._landing = pattern, None
-        out = self.outputs.get(self.attached or "")
+        out = self._pane_output()
         src = out.source() if out else []
         if not pattern or not src:
             self._notice(f"search {field(pattern)}: no output to search")
@@ -673,7 +879,7 @@ class TuiApp:
         found is not landed: the pager stays where it is."""
 
         out, line, pos, needle, fold = self._landing
-        src = out.source() if out is self.outputs.get(self.attached or "") else []
+        src = out.source() if out is self._pane_output() else []  # the pane's own: a run's, a transcript, the sessions
         idx = line - (out.finished - len(out.lines))
         if not 0 <= idx < len(src) or (src[idx].lower() if fold else src[idx])[pos:pos + len(needle)] != needle:
             return
@@ -703,7 +909,8 @@ class TuiApp:
                 lines.append(f"  {keys}: {BY_ID[action].help if action in BY_ID else action}")
         lines += ["stop always asks: y sends run.stop, any other key cancels",
                   "commands (: or /, and --plain): list (or runs), status RUN, stop RUN, "
-                  "start --tenant T --engine E --prompt P [--client-key K], conditions, help (or keys), quit",
+                  "start --tenant T --engine E --prompt P [--client-key K], conditions, sessions, "
+                  "transcript SESSION, help (or keys), quit",
                   "Ctrl+C closes the TUI from any mode; closing the TUI never stops a run; Esc never sends anything"]
         self.help_lines, self.help_scroll = lines, 0
         self.mode = "help"
@@ -712,7 +919,8 @@ class TuiApp:
     def command(self, line: str) -> None:
         """A command line in the CLI's grammar: ``list``, ``status RUN``, ``stop RUN``, ``start ...``,
         ``conditions``, and the TUI's own ``help`` (``keys``) and ``quit``, which send nothing. A leading
-        ``/`` is accepted (slash commands), and ``runs`` is another name for ``list``."""
+        ``/`` is accepted (slash commands), and ``runs`` is another name for ``list``. ``sessions`` reads
+        ``session.list`` and ``transcript SESSION`` reads that session's transcript (``events.read``)."""
 
         line = line.strip()
         if line.startswith("/"):
@@ -723,6 +931,18 @@ class TuiApp:
             return
         if word in ("quit", "q") and not rest.strip():
             self.close()
+            return
+        if word == "sessions":
+            if rest.strip():
+                self._error("usage error: sessions takes no arguments; nothing sent")
+            else:
+                self.request(s.LIST, dict(s.LIST_PARAMS))
+            return
+        if word == "transcript":
+            if len(rest.split()) != 1:
+                self._error("usage error: transcript SESSION; nothing sent")
+            else:
+                self.open_transcript(rest.strip())
             return
         if word == "runs":
             line = "list" + (" " + rest if rest else "")
@@ -964,15 +1184,26 @@ class TuiApp:
             if self._landing is not None:
                 self._land(max(1, w - 2), rem - 1)  # the width and rows this frame draws the pane at
                 self._landing = None
-            out = self.outputs.get(self.attached or "")
+            out = self._pane_output()
             # retention may have dropped the rows it was on; counted at this frame's width (DeepSeek r6 of #404, F3)
             self.scroll = min(self.scroll, self._top_scroll(max(1, w - 2)))
             pager = ""
             if self.focus == "output" or self.scroll:
                 pager = (f" [pager: {self.scroll} rows up, G follows]" if self.scroll else " [pager: following]")
-            rows.append((6, f"-- output run={field(self.attached) if self.attached else 'none'} (untrusted engine "
-                            f"text, display only)" + (f" skipped_events={self.skipped_events}"
-                                                      if self.skipped_events else "") + pager + " --", None))
+            if self.pane is SESSION_LIST:
+                head = "-- sessions (session.list: live, at most 20; transcript SESSION shows one; display only)"
+            elif self.pane is not None:  # lines that left the pane are said, never dropped in silence (Devin, #405)
+                left = out.left if out else 0
+                # Said first, so an 80-column row still shows it and what to do (Sol's round 5 of #405, 1).
+                lost = (f"{left} earlier text line{'' if left == 1 else 's'} not kept here, --plain shows every "
+                        f"line; " if left else "")
+                head = (f"-- transcript{': ' + lost if lost else ' '}session={field(self.pane)} (the daemon's "
+                        f"lines; engine text untrusted, display only)")
+            else:
+                head = (f"-- output run={field(self.attached) if self.attached else 'none'} (untrusted engine "
+                        f"text, display only)" + (f" skipped_events={self.skipped_events}"
+                                                  if self.skipped_events else ""))
+            rows.append((6, head + pager + " --", None))
             lines = out.tail(rem - 1, max(1, w - 2), self.scroll) if out else []
             rows.extend((6, "│ " + line, None) for line in lines)
             rows.extend((6, "│", None) for _ in range(rem - 1 - len(lines)))
@@ -1216,7 +1447,11 @@ class Loop:
             if item is None:
                 return
             method, params, done = item
-            self._answers.put((done, method, params, call_api(self._api, method, params)))
+            try:
+                answer = call_api(self._api, method, params)
+            except BaseException as err:  # noqa: BLE001 - KeyboardInterrupt, SystemExit: an answer, so in_flight
+                answer = {"code": p.UNAVAILABLE, "detail": type(err).__name__}  # stays true (#405 r2, DeepSeek L3)
+            self._answers.put((done, method, params, answer))
             self._wake.set()
 
     def start(self) -> None:

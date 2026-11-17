@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass
 
 FIELDS = ("seq", "time_rel_ms", "event_type", "source", "trust", "state", "text", "speech", "focus")
 EVENT_TYPES = ("open", "attach", "close", "request", "answer", "condition", "conditions", "notice", "error", "output",
-               "help")
+               "help", "sessions", "transcript")
 SOURCES = ("operator", "recursion", "engine")
 LOG_CAP = 20_000  # events kept for renderers that fall behind; seq keeps counting past it
 

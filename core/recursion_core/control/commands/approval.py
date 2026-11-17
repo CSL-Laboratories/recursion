@@ -1,6 +1,7 @@
 """``recursion-control approval list|open|answer``: the approval queue from the command line (lane APPROVALS).
 
-* ``approval list [--session LOG] [--state STATE]``: summaries, as JSON. This shows no prompt.
+* ``approval list [--session LOG] [--state STATE] [--after ID]``: summaries, as JSON, 100 to a page. This shows
+  no prompt. An answer with more after it carries ``next_after``: the ``--after`` of the next page.
 * ``approval open APPROVAL_ID``: prints the request's rendered lines, in full and in order, as the core drew
   them (``trusted`` lines as they are, ``untrusted`` ones after a marker), then its revision and digest; this
   is what records that the command line showed it.
@@ -28,6 +29,7 @@ def parser(family) -> None:
     listing.add_argument("--session", default=None, help="only this log (a session id, or run:<run_id>)")
     listing.add_argument("--state", default=None,
                          choices=("pending", "approved", "denied", "expired", "consumed", "vetoed"))
+    listing.add_argument("--after", default=None, help="the next_after a list printed: the page after it")
     opening = actions.add_parser("open", help="show one request's lines (records that it was shown)")
     opening.add_argument("approval_id")
     answering = actions.add_parser("answer", help="answer a request that 'open' showed")
@@ -50,7 +52,8 @@ def _print_lines(out, approval: dict) -> None:
 def dispatch(args, client) -> int:
     action = args.approval_action
     if action == "list":
-        params = {key: value for key, value in (("session_id", args.session), ("state", args.state)) if value is not None}
+        params = {key: value for key, value in (("session_id", args.session), ("state", args.state),
+                                                ("after", getattr(args, "after", None))) if value is not None}
         answer = client.call("approval.list", params)
         args.out.write(json.dumps(answer, sort_keys=True) + "\n")
         return 0 if answer.get("code") == "ok" else 1

@@ -49,13 +49,19 @@ and the object the method handlers and the engine drivers call:
 * ``start`` and ``stop`` run one at a time, whoever calls them: a start that comes while a stop runs waits until
   that stop has joined its workers, and a stop waits for a start in progress. So no worker is published or
   launched while a stop withdraws and joins, none a stop has read is forgotten, and no start clears the wake
-  a stop's worker is still waiting on. Two kinds of call are never made to wait, since each would wait for ever:
-  a subscriber that a start calls on its own thread (recovery tells the answered ones, the start's offering the
-  requested ones) may call ``stop`` there, and that stop runs at once, joins every worker and stands: the start
-  publishes no worker after it and leaves the queue stopped (``start`` called there is refused). ``start`` and
-  ``stop`` called on a deadline worker's own thread (its sweep tells the answered subscribers) are refused with
-  ``RuntimeError`` at once and change nothing: no thread can join itself, and a worker that waited there could
-  be waiting on a stop that is joining that very worker.
+  a stop's worker is still waiting on. The lock is re-entrant, so a call on the thread that is inside a start or
+  a stop never waits for itself, wherever it lands: a subscriber the start calls (recovery tells the answered
+  ones, the start's offering the requested ones), or a signal handler.
+  - A ``stop`` there runs at once, joins every worker and stands: a start counts the stops its own thread makes
+    from the moment it is called, and one that sees a stop publishes no worker after it (one that had published
+    ends stopped). A stop another thread made while this start waited for it is not this start's to undo.
+  - A ``start`` inside a start or a stop on its thread is refused with ``RuntimeError`` and changes nothing. One
+    that lands before the outer call has recorded its thread runs whole first, as if called just before it.
+  - ``start`` and ``stop`` on a deadline worker's own thread (its sweep tells the answered subscribers) are
+    refused with ``RuntimeError`` at once and change nothing: a worker cannot join itself, and one that waited
+    there could be waiting on a stop that is joining it. The refusal is this queue's own: a worker of one queue
+    may start or stop another queue, waiting for it as any caller does, so two queues whose workers stop each
+    other would join each other for ever (the daemon runs one queue).
 * ``open_in`` / ``answer_in`` run inside the dispatcher's transaction for approval.open and approval.answer;
   ``list_page`` serves approval.list (summaries only).
 * ``consume(...)`` carries an approved effect out once, against the private binding; every refusal is a
@@ -139,9 +145,9 @@ class ApprovalQueue:
         self._closing = threading.Event()
         self._worker: threading.Thread | None = None
         self._workers: list = []       # every worker a start launched and no stop has joined yet
-        self._lifecycle = threading.Lock()  # held across all of start and all of stop: one at a time
-        self._lifecycle_owner = None   # the thread inside start or stop (a subscriber it calls runs on it)
-        self._stops = 0                # stops so far: a start that one ran inside publishes nothing after it
+        self._lifecycle = threading.RLock()  # held across all of start and all of stop: one at a time
+        self._lifecycle_owner = None   # the thread inside start or stop, once recorded: a start it calls is refused
+        self._stopped_here = threading.local()  # each thread's count of its stops, which a start reads first
         self._on_a_worker = threading.local()  # marked on each deadline worker's own thread
         self._generation = None        # the running worker's token; a worker whose token is gone returns
         self._running = False          # started and not stopped: a surface that subscribes now is offered
@@ -166,18 +172,23 @@ class ApprovalQueue:
         """Recover, launch the deadline worker and let the surfaces through (the module text says how a start
         that fails or is interrupted leaves the queue). One at a time with ``stop``: under ``_lifecycle``.
         Refused with ``RuntimeError``, nothing changed, inside a start or stop on this thread (a subscriber it
-        calls) and on a deadline worker's thread."""
-        if self._lifecycle_owner == threading.get_ident():
-            raise RuntimeError("the approval queue cannot be started inside its own start or stop")
+        calls) and on a deadline worker's thread. A stop this thread makes from the moment of the call stands."""
+        stops = self._stops_here()  # first: a stop on this thread from here on is one this start must not undo
         self._refuse_on_a_worker("started")
         with self._lifecycle:
+            if self._lifecycle_owner == threading.get_ident():
+                raise RuntimeError("the approval queue cannot be started inside its own start or stop")
+            self._lifecycle_owner = threading.get_ident()
             try:
-                self._lifecycle_owner = threading.get_ident()
-                self._start(context)
+                self._start(context, stops)
             finally:
                 self._lifecycle_owner = None
 
-    def _start(self, context) -> None:
+    def _stops_here(self) -> int:
+        """How many stops this thread has made on this queue."""
+        return getattr(self._stopped_here, "count", 0)
+
+    def _start(self, context, stops: int) -> None:
         if self._store is None:
             if context.store is None:
                 return  # no event store is composed: nothing to recover or run, and the queue stays not ready
@@ -191,15 +202,14 @@ class ApprovalQueue:
                 # this start runs (subscribe_requested adds it), so no surface is offered anything during the
                 # start. Inside the guarded region, so a start interrupted even as this is taken lets them go.
                 self._late = list(self._requested)
-                stops = self._stops
             self.recover()
             worker = threading.Thread(target=self._run, args=(generation,), name="approvals-deadlines",
                                       daemon=True)
             with self._lock:
-                if self._stops != stops:
-                    # A stop ran inside this start: a subscriber that recovery told called it, on this thread. It
-                    # stands: no worker is published or launched, the surfaces are let through, and the queue is
-                    # left stopped.
+                if self._stops_here() != stops:
+                    # A stop ran on this thread since this start was called (a subscriber that recovery told, or a
+                    # signal handler). It stands: no worker is published or launched, the surfaces are let
+                    # through, and the queue is left stopped.
                     self._late = None
                     return
                 # Ready before the worker runs, in one step with its generation: from here only this worker
@@ -217,7 +227,7 @@ class ApprovalQueue:
             # left running with every surface held back.
             with self._lock:
                 self._late = None
-                self._running = True
+                self._running = self._stops_here() == stops  # a stop since the publication left it stopped
         except BaseException:
             # Failed or interrupted anywhere above: the surfaces are let through, so a request after this is
             # offered to every surface at once. If this start published its worker (the thread may have launched
@@ -237,7 +247,9 @@ class ApprovalQueue:
         # Every surface subscribed now (before the start or during it, unless it unsubscribed) is offered what no
         # surface took, once, here; from here a surface that subscribes is offered it when it subscribes. The queue
         # has started: an interruption while this offers leaves it started, and what was not offered stays unshown.
-        self._offer_backlog()
+        # After a stop on this thread since the publication, nothing is offered: the queue is stopped.
+        if self._stops_here() == stops:
+            self._offer_backlog()
 
     def stop(self, context=None) -> None:
         """Signal every worker and return only once each has joined: the current one, one a later start replaced
@@ -245,20 +257,19 @@ class ApprovalQueue:
         the workers not yet joined are kept, and a second ``stop`` joins them. A worker whose thread never
         launched (its start failed) has nothing to join and is let go; were it to launch late, its generation is
         gone and it returns at once. One at a time with ``start`` (under ``_lifecycle``), so no start publishes
-        or launches a worker while this withdraws and joins. Called by a subscriber of a start on that start's own
-        thread, which holds ``_lifecycle`` already, it runs at once, and the start publishes nothing after it.
-        Called on a deadline worker's thread it is refused with ``RuntimeError`` and changes nothing: no thread
-        can join itself, and one waiting there for ``_lifecycle`` could be waiting on a stop joining it."""
-        if self._lifecycle_owner == threading.get_ident():
-            self._stop()  # a subscriber of this thread's own start: the lock is held here already
-            return
+        or launches a worker while this withdraws and joins. Called on a thread already inside a start or stop (a
+        subscriber, a signal handler), which holds the re-entrant ``_lifecycle``, it runs at once, and a start it
+        ran inside publishes nothing after it. Called on a deadline worker's thread it is refused with
+        ``RuntimeError`` and changes nothing: a worker cannot join itself, and one waiting there for
+        ``_lifecycle`` could be waiting on a stop joining it."""
         self._refuse_on_a_worker("stopped")
         with self._lifecycle:
+            outer = self._lifecycle_owner  # this thread's own start or stop, if this call is inside one
+            self._lifecycle_owner = threading.get_ident()
             try:
-                self._lifecycle_owner = threading.get_ident()
                 self._stop()
             finally:
-                self._lifecycle_owner = None
+                self._lifecycle_owner = outer  # a start the outer call makes after this is still refused
 
     def _refuse_on_a_worker(self, what: str) -> None:
         """A deadline worker's own thread (its sweep tells the answered subscribers) neither starts nor stops
@@ -295,7 +306,7 @@ class ApprovalQueue:
             self._running = False
             self._closing.set()
             self._generation = None
-            self._stops += 1
+        self._stopped_here.count = self._stops_here() + 1
         self._wake.set()
 
     def subscribe_requested(self, fn: Callable[[dict], None]) -> Callable[[], None]:
@@ -501,28 +512,35 @@ class ApprovalQueue:
         return expired
 
     def _run(self, generation=None) -> None:
-        """The deadline worker: sweep at each deadline; on a failure, withdraw ``ready``, pause, try again.
+        """The deadline worker: sweep at each deadline; on a failure, withdraw ``ready``, pause, and sweep again
+        at once (not at the next deadline, which an empty queue does not have): ``ready`` comes back with the
+        first sweep that succeeds.
         It returns once the queue closes or its generation is no longer the queue's; a sweep it is in when that
         happens is finished, and from then on it changes ``ready`` no more. The wake signal is shared with any
         other worker still alive (one a later start replaced, or one an interrupted launch kept): a worker that
         wakes to find the queue closing, or its generation gone, sets it again before it returns, so its own
         clear never takes the wake another worker waits on, a stop's above all."""
         self._on_a_worker.marked = True  # its start or stop calls are refused (see ``stop``)
+        failed = False
         while not self._closing.is_set() and self._generation is generation:
             try:
                 with self._store.transaction() as tx:
                     deadline = rows.next_deadline(tx)
                 wait = None if deadline is None else max(0.0, deadline / 1000 - self._clock())
+                if failed:
+                    wait = 0.0  # after a failure, sweep at once: only a sweep that succeeds restores ready
                 self._wake.wait(wait)
                 self._wake.clear()
                 if self._closing.is_set() or self._generation is not generation:
                     self._wake.set()  # passed on: the clear above may have taken another worker's wake
                     break
                 self.sweep()
+                failed = False
                 with self._lock:
                     if not self._closing.is_set() and self._generation is generation:
                         self.ready = True
             except Exception as exc:  # noqa: BLE001 - the worker must outlive a failed transaction
+                failed = True
                 with self._lock:
                     if self._generation is generation:  # a worker whose generation has ended changes nothing
                         self.ready = False

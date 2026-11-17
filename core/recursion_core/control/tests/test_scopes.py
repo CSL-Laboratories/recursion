@@ -860,6 +860,7 @@ class ExactStrPrincipalTest(unittest.TestCase):
         self.assertEqual(auth.held(kind_liar), frozenset())
         self.assertEqual(auth(kind_liar, "run.stop", {"run_id": "run-host"}), ("scope_refused", "needs_run"))
         self.assertEqual(auth.held(Principal("device", Liar("evil"))), frozenset())
+        self.assertEqual(auth(Principal("device", Liar("evil")), "approval.answer", {}), ("scope_refused", "needs_approve"))
         plugin = Principal("plugin", "plugin.alpha")   # a {read, run} grant still stops only its own run
         self.assertIsNone(auth(plugin, "run.stop", {"run_id": "run-alpha"}))
         for run_id in ("run-host", "run-beta", "run-noowner", "run-emptyowner", "run-legacy", "run-not-recorded"):

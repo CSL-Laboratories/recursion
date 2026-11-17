@@ -30,7 +30,9 @@ root:
         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_acp_pipe \
         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_one_shot \
         recursion_core.routes.engines.fixtures.antigravity.test_s7_antigravity \
-        recursion_core.routes.engines.fixtures.antigravity.test_antigravity_driver         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_turns
+        recursion_core.routes.engines.fixtures.antigravity.test_antigravity_driver \
+        recursion_core.routes.engines.fixtures.antigravity.test_antigravity_turns \
+        recursion_core.routes.engines.fixtures.antigravity.test_antigravity_acp_adapter
 
 `unittest discover -s core` does not find them (it needs an `__init__.py` in every folder on the way); the
 hosted gate does (it runs every `core/**/test_*.py` by path).
@@ -134,6 +136,8 @@ drafts nothing and raises nothing.
 A permission answer is decided when it claims the ask, against a clock read after the claim, so a wait for
 a lock never lets a late answer approve. The deadline of a step that starts work is checked once the step
 holds the session's ordering lock.
+
+The ACP drive as a route adapter: `AntigravityAcpAdapter` (and `acp_factory`, `binary` only) runs one turn of `agy acp` per run, with the one-shot adapter's STRICT environment path shared and unchanged. A run needs an absolute `cwd` in the request (`request_invalid` otherwise), and that folder, with no fallback, is what the agent is told (`session/new`); the run's folder is the workspace lane's to decide. The adapter does not decide where the process starts: it hands the launcher no working directory (the launcher contract has none), so once the daemon can launch this engine (its launcher has no `antigravity` profile yet) the child starts in the engine's home under the daemon's state folder. It must not be registered until the launch boundary starts the child in the run's folder, and `acp_factory` refuses until then. The class itself is registrable (the engine table checks only that a factory is callable), and an adapter built that way refuses every run before any launch (`launch_refused`, `antigravity_acp_launch_has_no_run_folder`) until the launch boundary and the agent's folder are one folder. Nothing registers it. Its tests: `test_antigravity_acp_adapter.py`.
 
 Codes: every `AcpError` carries a route contract code (`launch_refused`, `auth_failed`, `engine_error`,
 `engine_exited`, `deadline_exceeded`, `protocol_error`, `request_invalid`). `TurnOutcome.code` is None, a

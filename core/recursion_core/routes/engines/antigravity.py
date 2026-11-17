@@ -631,7 +631,26 @@ class AntigravityOneShotAdapter(RouteAdapter):
         ``contract.validate_request`` has them. Which engine a route names is the dispatcher's check
         (``engine_unknown``), not this adapter's. ``deadline_at`` must be a finite number of the clock's
         seconds, or the request is refused the same way: no child starts with a deadline that cannot end it.
-        Whatever escapes once a child has started fences it first."""
+        The request is copied once before those checks, so a Mapping cannot answer the check one way and the
+        use another. Whatever escapes once a child has started fences it first."""
+        if isinstance(request, Mapping):
+            try:
+                request = _request_once(request)
+            except _RequestRefused as err:
+                return c.result(err.request_id, err.code, detail=err.detail)
+        refused = self._refused(request, deadline_at)
+        if refused is not None:
+            return refused
+        rid = request["request_id"]
+        # The base class's loop, with one difference: the key selected for this run decides the launcher (the
+        # output boundary) and what the parser and the result mask, and it never leaves this call.
+        return self._launched(rid, request, deadline_at)
+
+    def _refused(self, request, deadline_at) -> dict | None:
+        """The request's shape and ``deadline_at``, as ``run`` describes them: the refusal, or None. A
+        ``request_id`` that is not a non-empty str is never echoed (the refusal carries ``""``). Every adapter
+        of this module reads the request once first, and that read is a shape check too, then calls this
+        before any check of its own."""
         rid = request.get("request_id") if isinstance(request, Mapping) else None
         rid = rid if isinstance(rid, str) and rid else ""
         if not isinstance(request, Mapping) or not rid:
@@ -659,15 +678,16 @@ class AntigravityOneShotAdapter(RouteAdapter):
         if (not isinstance(route.get("connection"), Mapping) or not isinstance(route["connection"].get("id"), str)
                 or not route["connection"]["id"]):
             return c.result(rid, c.REQUEST_INVALID, detail="route.connection")
-        if not isinstance(route.get("model"), str):
+        if not isinstance(route.get("model"), str) or not route["model"]:
             return c.result(rid, c.REQUEST_INVALID, detail="route.model")
-        # The base class's loop, with one difference: the key selected for this run decides the launcher (the
-        # output boundary) and what the parser and the result mask, and it never leaves this call.
+        return None
+
+    def _launched(self, rid, request, deadline_at) -> dict:
         try:
             argv = self.argv(request)
             env, secret = self._prepare(request)
         except c.RouteError as err:
-            return c.result(rid, err.code, detail=err.detail)
+            return c.result(rid, err.code, detail=_final_text(err.detail, ()))
         secrets = () if secret is None else (secret,)
         forms = mask_forms(secrets)
         launcher = self._launcher
@@ -675,7 +695,7 @@ class AntigravityOneShotAdapter(RouteAdapter):
             try:
                 launcher = self._output_boundary(secrets)
             except c.RouteError as err:
-                return c.result(rid, err.code, detail=mask(err.detail, forms))
+                return c.result(rid, err.code, detail=_final_text(err.detail, forms))
             except OSError:      # the boundary could not set its capture up: nothing is launched
                 return c.result(rid, c.LAUNCH_REFUSED, detail=OUTPUT_UNPROTECTED)
         if self._deadline_passed(deadline_at):
@@ -684,7 +704,7 @@ class AntigravityOneShotAdapter(RouteAdapter):
         try:
             process = launcher(argv, env=env, shell=False)
         except c.RouteError as err:
-            return c.result(rid, err.code, detail=mask(err.detail, forms))
+            return c.result(rid, err.code, detail=_final_text(err.detail, forms))
         except OSError as err:
             return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
         events: list[dict] = []
@@ -1513,3 +1533,169 @@ def _number_is(value, forms) -> bool:
 # common.v1 $defs/turn_id and $defs/delivery_id.
 TURN_ID = re.compile(r"turn-[A-Za-z0-9_-]{1,59}")
 DELIVERY_ID = re.compile(r"dlv-[A-Za-z0-9_-]{1,60}")
+
+
+
+# -- the ACP drive as a route adapter (one turn per run; inert) -------------------------------------------------
+NO_CWD = "cwd"
+
+
+class AntigravityAcpAdapter(AntigravityOneShotAdapter):
+    """One turn of ``agy acp`` per run, through the shared client. NOTHING HERE IS REGISTERED OR LOADED.
+
+    It is the one-shot adapter in every STRICT part, unchanged and shared, not copied: the request's shape and
+    ``deadline_at`` checks, the prepared route home, the daemon-HOME refusal, the output boundary for a keyed
+    route, custody's typed refusals, the updater switch and exactly the method's one key (``_prepare``).
+    What differs is the argv (``agy acp``), the drive (initialize, authenticate with the route's one method,
+    session/new in the request's ``cwd``, one prompt), and the request's ``cwd``.
+
+    WHAT THE AGENT IS TOLD IS THE CALLER'S FOLDER. A run is refused ``request_invalid`` (``cwd``) unless the
+    request names a ``cwd`` that is exactly a ``str`` (not a subclass), absolute and holding no NUL, and that
+    folder, with no fallback, is the one the agent is told (``session/new``). Nothing here decides what a
+    run's folder is: that is the workspace lane's (#392). The field is read from ``request["cwd"]`` until
+    SPINE names it in the route contract (the Liaison's ruling, Nov 15).
+
+    WHERE THE PROCESS STARTS IS NOT THIS ADAPTER'S. It hands the launch boundary ``argv``, ``env`` and
+    ``shell`` and no working directory: the launcher contract (``launcher(argv, *, env, shell=False)``) has no
+    field for one, and the daemon's launcher refuses any other option (``launch_option_denied``,
+    ``daemon/launcher.py`` ``ProductionLauncher.__call__``). At this head no launcher for this engine can be
+    built (``ENGINE_PROFILES`` has no ``antigravity``), and the daemon's launcher starts every unit in the
+    engine's home under its state folder (``<state>/homes/<engine>``), not in the run's folder. Once #370
+    lands, its S4 ``working_directory`` provider will choose the folder from the run's workspace (the engine's
+    home when it answers None).
+    THIS ADAPTER MUST NOT BE REGISTERED UNTIL THE LAUNCH BOUNDARY STARTS THE CHILD IN THE RUN'S FOLDER, and
+    ``acp_factory`` refuses until then. The class itself is registrable (the engine table checks only that a
+    factory is callable), and what the table builds from it has no prepared home: it refuses every run, before
+    anything starts, with the precondition's own refusal (``launch_refused``, ``NO_RUN_FOLDER``).
+
+    THE REQUEST IS READ ONCE. ``run`` copies it, its route and its connection into plain dicts (each key read
+    once), and every check and every use after that reads the copy: one Mapping cannot answer the check one
+    way and the use another. A str field it reads (``request_id``, ``tenant``, ``prompt``, ``cwd``,
+    ``contract``, ``route.model``, ``route.auth_method``, ``route.connection`` ``kind``, ``id`` and
+    ``credential_env``) must be exactly a ``str``.
+
+    The turn's text and a failure's detail are masked (``mask``), never keep a lone surrogate, and are masked
+    again once a lone surrogate is replaced (``_final_text``). A run whose input closing or text finishing
+    ends at or after its deadline is ``deadline_exceeded``, its child fenced, never a success. Nothing is
+    drafted: this adapter returns the turn's text only (``AcpDrafts`` is a driver's, for a drive that
+    publishes events).
+
+    Every failure path fences the child: a refusal or failure of the client (``AcpError``) and a turn that
+    did not succeed are fenced with their code, and anything else that escapes is fenced by ``_launched``,
+    which both adapters' ``run`` calls, before it is raised. The turn's text is the agent's message chunks joined, masked
+    once joined (``mask``), so a selected value split across chunks never reaches the result."""
+
+    def run(self, request: dict, deadline_at: float) -> dict:
+        if isinstance(request, Mapping):
+            try:
+                request = _request_once(request)
+            except _RequestRefused as err:
+                return c.result(err.request_id, err.code, detail=err.detail)
+        refused = self._refused(request, deadline_at)   # the shared shape and deadline checks come first
+        if refused is not None:
+            return refused
+        rid, cwd = request["request_id"], request.get("cwd")
+        # _request_once has refused a str subclass: a str here is exactly one
+        if not (isinstance(cwd, str) and cwd.startswith("/") and "\x00" not in cwd):
+            return c.result(rid, c.REQUEST_INVALID, detail=NO_CWD)
+        if self._prepared_home is None:     # as the engine table builds it: the precondition refuses
+            return c.result(rid, c.LAUNCH_REFUSED, detail=NO_RUN_FOLDER)
+        return self._launched(rid, request, deadline_at)
+
+    def argv(self, request: dict) -> list[str]:
+        route_method(request["route"])
+        return acp_argv(self.executable)
+
+    def drive(self, process: EngineProcess, request: dict, deadline_at: float, events: list[dict], *,
+              redact=()) -> dict:
+        rid = request["request_id"]
+        forms = mask_forms(redact)
+        acp = acp_module()
+        try:
+            session = open_acp(process, self._clock, request["route"], request["cwd"], deadline_at)
+            outcome = session.prompt(request["prompt"], deadline_at)
+        except acp.AcpError as err:
+            code = err.code if err.code in c.CODES else c.ENGINE_ERROR
+            process.fence(code)
+            return c.result(rid, code, events=events, detail=_final_text(err.detail, forms))
+        if outcome.code is None:
+            session.close()
+            text = _final_text(outcome.text, forms)
+            if self._clock() >= deadline_at:     # closing the input or finishing the text ran past the deadline
+                raise Deadline()
+            return c.result(rid, None, text=text, events=events)
+        code = c.ENGINE_ERROR if outcome.code == CANCELLED or outcome.code not in c.CODES else outcome.code
+        process.fence(code)
+        return c.result(rid, code, events=events, detail=_final_text(outcome.detail, forms))
+
+
+def _final_text(text: str, forms) -> str:
+    """A result's text as returned: masked, made writable (a lone surrogate as U+FFFD), then masked again as it
+    now stands, since the replacement can spell a value the first mask did not see."""
+    return mask(_writable(mask(text, forms)), forms)
+
+
+_EXACT_STR = ("request_id", "tenant", "prompt", "cwd", "contract")
+_EXACT_STR_ROUTE = ("model", "auth_method")
+_EXACT_STR_CONNECTION = ("kind", "id", "credential_env")
+
+
+class _RequestRefused(c.RouteError):
+    """A refusal of ``_request_once``: ``request_invalid``, the field named, and the caller's ``request_id``
+    when the copy holds one that is exactly a str and can be written as UTF-8 (else ``""``), so the caller can
+    match the refusal."""
+
+    def __init__(self, request_id: str, detail: str) -> None:
+        super().__init__(c.REQUEST_INVALID, detail)
+        self.request_id = request_id
+
+
+def _request_once(request: Mapping) -> dict:
+    """The request, its route and its connection copied into plain dicts, each key read once; a str field this
+    adapter reads that is a str subclass is refused ``request_invalid``, named (``_RequestRefused``). The
+    ``request_id`` is read first: one holding a surrogate code point cannot be written as UTF-8, so it is
+    refused (``request_id``) and never echoed."""
+    def copy(mapping, exact, prefix):
+        out = dict(mapping.items())
+        return out, [prefix + name for name in exact
+                     if isinstance(out.get(name), str) and type(out.get(name)) is not str]
+
+    rid, bad = "", []
+    try:
+        snapshot, bad = copy(request, _EXACT_STR, "")
+        value = snapshot.get("request_id")
+        if type(value) is str and any(0xD800 <= ord(ch) <= 0xDFFF for ch in value):
+            raise _RequestRefused("", "request_id")
+        if type(value) is str:
+            rid = value
+        route = snapshot.get("route")
+        if not bad and isinstance(route, Mapping):
+            route, bad = copy(route, _EXACT_STR_ROUTE, "route.")
+            snapshot["route"] = route
+            connection = route.get("connection")
+            if not bad and isinstance(connection, Mapping):
+                route["connection"], bad = copy(connection, _EXACT_STR_CONNECTION, "route.connection.")
+    except _RequestRefused:
+        raise
+    except Exception:   # a Mapping that cannot be read as one
+        raise _RequestRefused(rid, "request") from None
+    if bad:
+        raise _RequestRefused(rid, bad[0])
+    return snapshot
+
+
+NO_RUN_FOLDER = "antigravity_acp_launch_has_no_run_folder"
+
+
+def acp_factory(launcher, clock, credentials, environ, **options) -> AntigravityAcpAdapter:
+    """S3's ``factory(launcher, clock, credentials, environ, **options)``; ``options`` is at most ``binary``.
+
+    IT REFUSES (``RouteError``, ``launch_refused``, ``NO_RUN_FOLDER``), so a composition that registers it
+    fails: this adapter must not be registered until the launch boundary starts the child in the run's
+    folder. Nothing given to a factory can say that yet (the launcher contract has no working directory, and
+    the daemon's launcher refuses any option it does not know), so the refusal is unconditional. It goes in
+    the change that gives the launcher contract a working directory and has ``run`` pass the run's folder."""
+    unknown = set(options) - {"binary"}
+    if unknown:
+        raise TypeError(f"unknown options: {sorted(unknown)}")
+    raise c.RouteError(c.LAUNCH_REFUSED, NO_RUN_FOLDER)

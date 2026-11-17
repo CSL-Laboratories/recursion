@@ -1207,5 +1207,56 @@ class ReviewRoundEight396Test(unittest.TestCase):
         readme = (here / "README.md").read_text(encoding="utf-8")
         self.assertIn("never its compatibility spellings (NFKC, NFKD)", " ".join(readme.split()))
 
+
+class _TwoFaced(dict):
+    """``get`` answers the check; the stored value is what ``__getitem__`` and ``items`` return."""
+
+    def get(self, key, default=None):
+        if key == "request_id":
+            return "r-checked"
+        if key == "prompt":
+            return "prompt-the-check-is-shown"
+        return super().get(key, default)
+
+
+class ReviewRoundFour411OneShotTest(unittest.TestCase):
+    """DeepSeek's round-4 F1 and F2 on the one-shot adapter. A refusal detail must stay writable, and the
+    request is read once so the id that is echoed is the id that was checked."""
+
+    def test_f1_a_surrogate_in_the_connection_id_never_makes_a_refusal_unwritable(self) -> None:
+        bad = "conn-" + chr(0xD800)
+        for key in ("", "made-up\x00key"):
+            with self.subTest(key=repr(key)):
+                clock = Clock()
+                launcher = Launcher([], clock)
+
+                def custody(_conn_id, _name, key=key):
+                    return key
+
+                made = ag.AntigravityOneShotAdapter(launcher, clock, custody, PARENT, prepared_home=prepared,
+                                                    output_boundary=FakeBoundary(launcher))
+                req = request()
+                req["route"]["connection"]["id"] = bad
+                res = made.run(req, clock() + 60)
+                json.dumps(res, ensure_ascii=False).encode("utf-8")
+                self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+                self.assertNotIn(chr(0xD800), res["detail"])
+                self.assertEqual(launcher.calls, [])
+
+    def test_f2_the_one_shot_request_is_read_once(self) -> None:
+        clock = Clock()
+        launcher = Launcher(lines("synthetic-ok.jsonl"), clock)
+        made = adapter(launcher, clock)
+        stored = request()
+        stored["request_id"] = "r-stored-" + chr(0xD800)
+        stored["prompt"] = "a prompt the check never saw"
+        res = made.run(_TwoFaced(stored), clock() + 60)
+        json.dumps(res, ensure_ascii=False).encode("utf-8")
+        self.assertEqual(res["request_id"], "")
+        self.assertEqual(res["detail"], "request_id")
+        self.assertEqual(launcher.calls, [])
+        self.assertNotIn("a prompt the check never saw", json.dumps(res))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -791,6 +791,17 @@ MUTANTS = {
         "",
         {"test_f2_rules_after_a_chosen_rule_are_not_reached",
          "test_rules_after_a_refused_rule_are_not_reached_whatever_their_conditions"}),
+    # #419's Grok read, round 4 (870a7e10): its R1 and its advisable note.
+    "H25 the limits lookup handed the caller's decision, not route_entry's copy": (
+        HOOKS,
+        'router._route_limits(config, {"reason": reason, "rule": rule, "engine": engine})',
+        "router._route_limits(config, decision)",
+        {"test_the_limits_lookup_reads_route_entrys_own_copy_of_the_decision"}),
+    "H26 a rule that is a str subclass taken as a word": (
+        HOOKS,
+        '(reason == "config" and type(rule) is not str)',
+        '(reason == "config" and not isinstance(rule, str))',
+        {"test_a_rule_that_is_a_str_subclass_gets_no_entry"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

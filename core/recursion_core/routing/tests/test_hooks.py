@@ -526,6 +526,33 @@ class HookRegressions(unittest.TestCase):
         self.assertIsNotNone(router.route_decision(missing))  # route_decision does not need the rule; route_entry does
         self.assertEqual(rh.route_entry(loaded, decision)["route"]["engine"], "codex")  # the control
 
+
+    def test_the_limits_lookup_reads_route_entrys_own_copy_of_the_decision(self) -> None:  # grok r4 R1, ds r4 F1
+        class ReadOnce(dict):
+            """A rule decision whose rule is read once (``get``) and raises if it is read again (``[]``)."""
+
+            def __getitem__(self, key):
+                if key == "rule":
+                    raise RuntimeError("the decision's rule read a second time")
+                return super().__getitem__(key)
+        self.raw["rules"][0]["route"]["limits"] = {"on_limit": "wait"}
+        self.write("routing.json", self.raw)
+        loaded = rc.load(self.folder, {})
+        decision = router.decide(loaded, detection({"claude_code", "codex"}), {"task_kind": "review"})
+        self.assertEqual(decision["reason"], "config")
+        entry = rh.route_entry(loaded, ReadOnce(decision))  # the lookup gets route_entry's copy, never this object
+        self.assertEqual((entry["route"]["engine"], entry["route"]["limits"]["on_limit"]), ("codex", "wait"))
+
+    def test_a_rule_that_is_a_str_subclass_gets_no_entry(self) -> None:  # grok r4, its advisable note beside R1
+        class ComparingRaises(str):
+            def __eq__(self, other):
+                raise RuntimeError("made-up rule compare")
+
+            __hash__ = str.__hash__
+        loaded = rc.load(self.folder, {})
+        decision = router.decide(loaded, detection({"claude_code", "codex"}), {"task_kind": "review"})
+        self.assertIsNone(rh.route_entry(loaded, {**decision, "rule": ComparingRaises(decision["rule"])}))
+
     def test_hostile_hand_pick_is_typed_even_with_named_engine(self) -> None:  # sol's hardening note
         class BadRead(dict):
             def get(self, *args):

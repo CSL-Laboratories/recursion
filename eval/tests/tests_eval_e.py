@@ -144,7 +144,10 @@ class ReplacementLimitTests(unittest.TestCase):
                 trial("t", 3, "vendor_limit", planned=False, replacement_for="r.t.2"),
                 trial("t", 4, "pass", planned=False, replacement_for="r.t.3")]
         candidate = build_record(rows, k=1, attempts=1, replacements=3)
-        self.assertTrue(record.validate(candidate))
+        errors = record.validate(candidate)
+        self.assertTrue(
+            any(line.startswith("record.plan.replacements_per_task:") for line in errors),
+            errors)
 
 
 class GitDeadlineTests(unittest.TestCase):

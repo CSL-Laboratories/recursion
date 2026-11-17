@@ -577,22 +577,33 @@ def _count(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
-# A credential name, as a suffix, so a prefix (ANTHROPIC_API_KEY) still matches. The whole
-# identifier is kept; only the value is dropped. ``token`` does not match ``tokens``.
+# A credential name, as a suffix, so a prefix (ANTHROPIC_API_KEY, AWS_SECRET_ACCESS_KEY)
+# still matches. The whole identifier is kept; only the value is dropped. ``token`` does
+# not match ``tokens``, and ``session`` does not match ``sessions``.
 _CREDENTIAL_NAME = re.compile(
-    r"(?i)(?:access_token|refresh_token|authorization|password|passwd|secret|api[_-]?key|token)$"
+    r"(?i)(?:access_token|refresh_token|authorization|password|passwd|"
+    r"secret_access_key|secret_key|private_key|access_key|"
+    r"secret|api[_-]?key|cookie|session|token)$"
 )
 
 
-def _next_sep(text, start):
-    """Index of the next ``=`` or ``:``, or -1."""
-    equals = text.find("=", start)
-    colon = text.find(":", start)
-    if equals < 0:
-        return colon
-    if colon < 0:
-        return equals
-    return equals if equals < colon else colon
+def _next_cut(text, start):
+    """The next ``=``, ``:`` or ``--`` at or after ``start``.
+
+    One forward read of the gap. Searching the remainder from every separator is quadratic
+    on engine text that is full of ``:`` or ``=`` and has no ``--``. Returns
+    ``(sep_index or -1, flag_index or -1)`` with only the earlier mark set.
+    """
+    index = start
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == "=" or char == ":":
+            return index, -1
+        if char == "-" and index + 1 < length and text[index + 1] == "-":
+            return -1, index
+        index += 1
+    return -1, -1
 
 
 def _scheme_value_start(text, start):
@@ -607,16 +618,35 @@ def _scheme_value_start(text, start):
     return None
 
 
-def _credential_value_end(text, start):
+def _credential_value_end(text, start, whole_line=False):
     """End index of one credential value, or None when there is no value.
 
-    A quoted value runs to its closing quote (a backslash keeps the next character). An unquoted
-    value is one token. A Bearer or Basic scheme in front of that token is part of the value, so
-    ``authorization=Bearer <value>`` does not keep the value after the scheme word.
+    A quoted value runs to its closing quote (a backslash keeps the next character). A value
+    whose opening quote is itself escaped (``\\"abc def\\"``) is the same span, so the part
+    after a space is not left behind. An unquoted value is one token. A Bearer or Basic scheme
+    in front of that token is part of the value, so ``authorization=Bearer <value>`` does not
+    keep the value after the scheme word. An Authorization value is the rest of the line: the
+    scheme word and every parameter after it, through the line end.
     """
     length = len(text)
     if start >= length or text[start].isspace():
         return None
+    if whole_line:
+        index = start
+        while index < length and text[index] not in "\r\n":
+            index += 1
+        return index if index > start else None
+    if text[start] == "\\" and start + 1 < length and text[start + 1] in "\"'":
+        quote = text[start + 1]
+        index = start + 2
+        while index < length:
+            if text[index] == "\\" and index + 1 < length:
+                if text[index + 1] == quote:
+                    return index + 2
+                index += 2
+                continue
+            index += 1
+        return length
     if text[start] in "\"'":
         quote = text[start]
         index = start + 1
@@ -672,7 +702,8 @@ def _flag_at(text, start):
         return None
     while value_at < length and text[value_at].isspace():
         value_at += 1
-    value_end = _credential_value_end(text, value_at)
+    value_end = _credential_value_end(
+        text, value_at, whole_line=name.lower().endswith("authorization"))
     if value_end is None:
         return None
     return "--" + name, value_end
@@ -684,8 +715,11 @@ def redact_detail(text):
     The engine's own error text is copied into the record. A value after one of these names is
     replaced so the record keeps the failure and not the value. The separator may be ``=`` or
     ``:``, the name may carry a prefix, the value may be quoted, and a Bearer or Basic scheme is
-    part of the value. A flag of the form ``--api-key <value>`` is the same. One pass, with no
-    shared state, so a second caller cannot see this caller's text.
+    part of the value. An Authorization value runs to the end of its line, so a scheme other than
+    Bearer or Basic does not leave the rest of that line in the record. A flag of the form
+    ``--api-key <value>`` is the same. Each character is read a constant number of times, with no
+    shared state, so a second caller cannot see this caller's text and a long engine error cannot
+    stall the recording step.
     """
     if not isinstance(text, str) or not text:
         return text
@@ -693,8 +727,7 @@ def redact_detail(text):
     index = 0
     length = len(text)
     while index < length:
-        sep = _next_sep(text, index)
-        flag = text.find("--", index)
+        sep, flag = _next_cut(text, index)
         if sep < 0 and flag < 0:
             parts.append(text[index:])
             break
@@ -718,7 +751,8 @@ def redact_detail(text):
         value_at = sep + 1
         while value_at < length and text[value_at].isspace():
             value_at += 1
-        value_end = _credential_value_end(text, value_at)
+        value_end = _credential_value_end(
+            text, value_at, whole_line=name.lower().endswith("authorization"))
         if value_end is None:
             parts.append(text[index:sep + 1])
             index = sep + 1

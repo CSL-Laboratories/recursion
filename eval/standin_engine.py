@@ -107,13 +107,8 @@ def write_files(files):
     for name, content in good.items():
         if content is None:
             continue
-        parts = name.split("/")
-        for i in range(1, len(parts)):
-            above = "/".join(parts[:i])
-            if os.path.islink(above) or (os.path.lexists(above) and not os.path.isdir(above)):
-                _remove(above)
-        if os.path.islink(name) or os.path.isdir(name):
-            _remove(name)
+        # Refuse a bad entry before any removal. A folder, a link, or a file standing where a
+        # parent folder must be, used to be removed first, and the bad entry then wrote nothing.
         try:
             raw, mode = _material(content)
         except (ValueError, binascii.Error, TypeError):
@@ -121,6 +116,13 @@ def write_files(files):
         if raw is None:
             emit(type="system", subtype="stand_in_bad_file", path=name)
             continue
+        parts = name.split("/")
+        for i in range(1, len(parts)):
+            above = "/".join(parts[:i])
+            if os.path.islink(above) or (os.path.lexists(above) and not os.path.isdir(above)):
+                _remove(above)
+        if os.path.islink(name) or os.path.isdir(name):
+            _remove(name)
         folder = os.path.dirname(name)
         if folder:
             os.makedirs(folder, exist_ok=True)

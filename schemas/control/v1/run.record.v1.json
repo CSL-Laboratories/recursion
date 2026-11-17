@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "run.record.v1.json",
+  "title": "run.record.v1: the run record as the registry stores it",
+  "x-version": "1.0-draft.4",
+  "description": "STORAGE record. This is the JSON document the daemon's registry keeps for one run (core/recursion_core/control/registry.py). The twelve required fields are exactly what is stored today and none of them changes in version 1, including 'start_key' and 'stop_attestation' in today's shapes. The other fields are optional additions: each is either absent or carries a value, and null is not used for them. 'principal' and 'launch' are written together by the start path once a lane has registered on it, and this schema refuses one without the other; 'launch' is the ONE typed launch snapshot (route entry, route decision, workspace, containment level, session and turn, owner, budget) and the principal is its trusted sibling, never inside it. NONE of this is ever copied from a request's params. 'start_error' is reserved for the lane that owns Stop and is absent until it writes it. RESERVED, and refused by this schema until the lane that owns Stop defines them: a 'launch_manifest' field, and a stored attestation whose proof is 'removed'. What a client reads from run.status and run.list is a different record, run.view.v1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "tenant", "engine", "state", "cgroup", "started_at", "stop", "start_key", "generation", "cgroup_marker", "members", "stop_attestation"],
+  "properties": {
+    "run_id": {"$ref": "common.v1.json#/$defs/run_id"},
+    "tenant": {"$ref": "common.v1.json#/$defs/tenant"},
+    "engine": {"$ref": "#/$defs/engine_as_given"},
+    "state": {"$ref": "#/$defs/stored_state"},
+    "cgroup": {"$ref": "#/$defs/cgroup"},
+    "started_at": {"$ref": "common.v1.json#/$defs/epoch_seconds"},
+    "stop": {"$ref": "#/$defs/stop"},
+    "start_key": {"$ref": "#/$defs/start_key"},
+    "generation": {"$ref": "#/$defs/generation"},
+    "cgroup_marker": {"$ref": "#/$defs/cgroup_marker"},
+    "members": {"$ref": "#/$defs/members"},
+    "stop_attestation": {"$ref": "#/$defs/stop_attestation"},
+    "launch": {"$ref": "#/$defs/launch"},
+    "start_error": {"$ref": "#/$defs/start_error"},
+    "engine_session_id": {"$ref": "#/$defs/engine_session_id"},
+    "continues": {"$ref": "#/$defs/continues"},
+    "principal": {"$ref": "common.v1.json#/$defs/principal"},
+    "lease": {"$ref": "common.v1.json#/$defs/lease"},
+    "cgroup_identity": {"$ref": "common.v1.json#/$defs/cgroup_identity"}
+  },
+  "allOf": [{"$ref": "#/$defs/stopped_rules"}],
+  "dependentRequired": {"principal": ["launch"], "launch": ["principal"]},
+  "$defs": {
+    "engine_as_given": {
+      "description": "The engine name the start asked for, as given: run.start accepts any non-empty string and a start that names an engine with no route is recorded as start_failed with that name.",
+      "type": "string",
+      "minLength": 1
+    },
+    "stored_state": {
+      "description": "starting: the launch intent is written and no cgroup is recorded yet. start_failed: the launch path refused or failed. running: the unit's cgroup is recorded. stop_pending: a Stop was asked and is not confirmed. stopped: terminal, and stored only with an attestation.",
+      "enum": ["starting", "start_failed", "running", "stop_pending", "stopped"]
+    },
+    "cgroup": {
+      "description": "The unit's cgroup path, or null until the launch is recorded.",
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "cgroup_marker": {
+      "description": "An identity for that cgroup which a new path never inherits, or null while there is no cgroup.",
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "generation": {
+      "description": "Rises by one with every stored write. A write names the generation it read; one that names an older generation is refused.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["member_id", "pid"],
+        "properties": {
+          "member_id": {"type": "string", "minLength": 1},
+          "pid": {"type": "integer"}
+        }
+      }
+    },
+    "stop": {
+      "description": "null until a Stop is asked. requested is true only once the cleanup request was sent to the cgroup named by this object's own cgroup and cgroup_marker, which are written at that moment (control/api.py, _stop_attempt) and are absent on a Stop kept as an intent.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["requested_at", "checks", "reason", "requested"],
+      "properties": {
+        "requested_at": {"$ref": "common.v1.json#/$defs/epoch_seconds"},
+        "checks": {"type": "integer", "minimum": 0},
+        "reason": {"anyOf": [{"type": "null"}, {"$ref": "stop.result.v1.json#/$defs/pending_reason"}]},
+        "requested": {"type": "boolean"},
+        "cgroup": {"type": ["string", "null"], "minLength": 1},
+        "cgroup_marker": {"type": ["string", "null"], "minLength": 1}
+      }
+    },
+    "start_key": {
+      "description": "null for a start with no client_key. Otherwise what a retried start is compared with. The three required fields are today's: the key, the engine, and the SHA-256 of the prompt's UTF-8 bytes (the prompt itself is not stored). engine is the engine as the request named it; it is null only for a request that named none and asked the router to choose, which exists only on the versioned path, so a null engine always comes with an intent. intent_version and intent_sha256 are new in version 1, optional, and always come together: they are the only place the identity of a request is kept. The daemon computes the INTENT from what the client sent, never from a digest the client supplies. The start intent contains engine as supplied (or null) and the prompt hash, plus only the start-path registry's declared extensions that are present and non-null in the validated request. session_id and turn_id are declared internal extensions. Undeclared and absent/null extensions are omitted. Compute intent before registrants normalize or route it; do not hash their output. With the extension system off, retain the legacy three-member identity exactly. Publish the exact preimage and encoding with a version and byte-level vectors; do not substitute a fixed list of optional null fields. Version 1: the preimage is the UTF-8 bytes of that one object as RFC 8785 writes it (conformance/rules.py, start_intent_text), its members being engine, prompt_sha256 and each such extension under its own request name; intent_sha256 is its SHA-256; the vectors in vectors/start.intent give preimages byte for byte. A retry is looked up by (tenant, client_key) before anything is normalised: with a stored intent, an equal intent_sha256 is a retry and anything else is refused client_key_reused; with a key that has no intent (a legacy key), a request with no declared extension present is compared on the three legacy members as today, and a request with a declared extension present is refused client_key_reused.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["client_key", "engine", "prompt_sha256"],
+      "properties": {
+        "client_key": {"type": "string"},
+        "engine": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/engine_as_given"}]},
+        "prompt_sha256": {"$ref": "common.v1.json#/$defs/sha256"},
+        "intent_version": {"const": 1},
+        "intent_sha256": {"$ref": "common.v1.json#/$defs/sha256"}
+      },
+      "dependentRequired": {"intent_version": ["intent_sha256"], "intent_sha256": ["intent_version"]},
+      "if": {"required": ["engine"], "properties": {"engine": {"type": "null"}}},
+      "then": {"required": ["intent_version"]}
+    },
+    "stop_attestation": {
+      "description": "null unless the run is stopped. The stored proof is today's and only today's: 'empty', which says that the cgroup named here was read empty and every member listed was gone, at this generation of the record. A stored proof of 'removed' is RESERVED: the lane that owns Stop adds it together with the registry's own proof checks, and until then this schema refuses it. A reader that meets a proof it does not know treats the run as NOT stopped.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["proof", "cgroup", "cgroup_marker", "member_ids", "generation"],
+      "properties": {
+        "proof": {"const": "empty"},
+        "cgroup": {"type": "string", "minLength": 1},
+        "cgroup_marker": {"type": "string", "minLength": 1},
+        "member_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "generation": {"type": "integer", "minimum": 1}
+      }
+    },
+    "launch": {
+      "description": "The ONE typed launch snapshot of a run, written in the launch-intent write and nowhere else. None of it is copied from a request's params: each part comes from the entry point, from the principal, or from the validated output of a registrant of the start path. route_entry is the route entry as it was loaded for the engine (the route with its model, its connection and its limits; the deadline; the binary), or null when no registrant chose one, and then the starter looks the configured entry up as it does today. A retry reuses a selected route_entry snapshot. When route_entry is null because no registrant selected an entry, the existing configured-entry lookup remains in force. route_decision says how the route was chosen, or is null. workspace is where the run works, or null. containment_level is the level the run was launched at, or null. session_id and turn_id name the session and the turn the run belongs to, and are null for a run started without a session. owner is 'host' or the id of the plugin that started the run, derived by the server from the principal. budget is the cap; a budget of 0 lets nothing be spent, and a reservation's id and state live in the quota ledger, keyed by the run id, never here. The principal is NOT in this object: it is the record's own 'principal', beside it. At run time the starter hands one typed context to everything on the launch path, built from this whole object and that trusted sibling principal, with no field flattened or recomputed.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route_entry", "route_decision", "workspace", "containment_level", "session_id", "turn_id", "owner", "budget"],
+      "properties": {
+        "route_entry": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/route_entry"}]},
+        "route_decision": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/route_decision"}]},
+        "workspace": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/launch_workspace"}]},
+        "containment_level": {"anyOf": [{"type": "null"}, {"$ref": "stop.result.v1.json#/$defs/containment_level"}]},
+        "session_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/session_id"}]},
+        "turn_id": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]},
+        "owner": {"$ref": "common.v1.json#/$defs/owner"},
+        "budget": {"$ref": "common.v1.json#/$defs/budget"}
+      }
+    },
+    "route_entry": {
+      "description": "One route entry as the routes file gives it to the starter (daemon/control_adapter.py, load_routes): the route, the deadline in seconds, and the absolute path of the engine's binary, or null when the entry names none.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route", "deadline_s", "binary"],
+      "properties": {
+        "route": {"$ref": "#/$defs/launch_route"},
+        "deadline_s": {"type": "number", "exclusiveMinimum": 0},
+        "binary": {"type": ["string", "null"], "minLength": 1}
+      }
+    },
+    "launch_workspace": {
+      "description": "Where a run works, as its launch recorded it. source_path is the folder the caller named. In 'direct' mode the engine works in that folder and worktree_path is null. In 'worktree' mode it works in a git worktree cut from base_ref, and worktree_path is null until the worktree is made.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "source_path", "base_ref", "worktree_path"],
+      "properties": {
+        "mode": {"enum": ["direct", "worktree"]},
+        "source_path": {"type": "string", "minLength": 1},
+        "base_ref": {"type": ["string", "null"], "minLength": 1},
+        "worktree_path": {"type": ["string", "null"], "minLength": 1}
+      },
+      "if": {"required": ["mode"], "properties": {"mode": {"const": "direct"}}},
+      "then": {"properties": {"worktree_path": {"type": "null"}}}
+    },
+    "start_error": {
+      "description": "RESERVED. Why a start failed, kept with the record: a typed code and a detail. Nothing writes it today: the reason for a failed start lives only in the starter's memory, reaches the first run.start answer once and is gone after a restart. The lane that owns Stop will write it, in the write that records the failed start; until then it is absent. It is in the schema now so that a frozen version 1 needs no second version when that lane starts writing it. When it is present, the Task of the run gives its code as the detail of the failure (mcp.task.v1).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "detail"],
+      "properties": {
+        "code": {"$ref": "common.v1.json#/$defs/code_word"},
+        "detail": {"type": "string"}
+      }
+    },
+    "launch_route": {
+      "description": "The route the launch really used: the effective launch snapshot, shaped like one entry of the operator's routes file (the route part of a 'recursion.route/v0' request, core/recursion_core/routes/contract.py). A retry reuses this snapshot; nothing is routed again. engine, model and connection are always there. The other fields are the route contract's own and are present only when the entry had them. credential_env is the NAME of an environment variable, never a value. 'profile' is the engine adapter's own object.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine", "model", "connection"],
+      "properties": {
+        "engine": {"$ref": "common.v1.json#/$defs/engine_name"},
+        "model": {"type": "string", "minLength": 1},
+        "connection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": {
+            "kind": {"enum": ["subscription", "api_key", "passthrough"]},
+            "id": {"type": "string", "minLength": 1, "maxLength": 200, "not": {"pattern": "[\\r\\n]"}},
+            "credential_env": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$", "not": {"pattern": "[\\r\\n]"}},
+            "key_source": {"enum": ["custody", "api_key_helper"]},
+            "method": {"type": "string", "minLength": 1},
+            "metered_per_model": {"type": "boolean"}
+          }
+        },
+        "bare": {"type": "boolean"},
+        "api_key_helper": {"enum": ["absent", "present"]},
+        "billing_ack": {"const": "api_key_helper"},
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["on_limit"],
+          "properties": {
+            "on_limit": {"enum": ["ask", "wait", "fallback"]},
+            "fallback": {"type": "array", "items": {"$ref": "#/$defs/launch_route"}}
+          }
+        },
+        "profile": {"type": "object"}
+      }
+    },
+    "engine_session_id": {
+      "description": "The engine's own id for its conversation, used to resume or fork it. It is the engine's value and is treated as untrusted text.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "continues": {
+      "description": "The run this run continues: the run a fallback took over from after a limit, or the earlier run of a worker that was brought back.",
+      "$ref": "common.v1.json#/$defs/run_id"
+    },
+    "stopped_rules": {
+      "description": "The registry's own rules for 'stopped', which the public view shares.",
+      "allOf": [
+        {
+          "if": {"required": ["state"], "properties": {"state": {"const": "stopped"}}},
+          "then": {
+            "properties": {
+              "cgroup": {"type": "string"},
+              "cgroup_marker": {"type": "string"},
+              "stop_attestation": {"type": "object"},
+              "members": {"maxItems": 0}
+            }
+          },
+          "else": {"properties": {"stop_attestation": {"type": "null"}}}
+        }
+      ]
+    }
+  }
+}

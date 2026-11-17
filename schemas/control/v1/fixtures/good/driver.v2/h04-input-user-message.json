@@ -1,0 +1,6 @@
+{
+  "kind": "user_message",
+  "turn_id": "turn-000c",
+  "text": "Fix the failing test in tests/test_io.py.",
+  "delivery_id": "dlv-0007"
+}

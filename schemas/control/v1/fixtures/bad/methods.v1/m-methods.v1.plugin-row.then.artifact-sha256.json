@@ -1,0 +1,35 @@
+{
+  "method": "plugin.status",
+  "params": {
+    "plugin_id": "notes.search"
+  },
+  "answer": {
+    "code": "ok",
+    "plugin": {
+      "source": "/home/dev/.config/recursion/plugins/notes-search",
+      "plugin_id": "notes.search",
+      "state": "loaded",
+      "code": null,
+      "detail": "",
+      "trust": "signed",
+      "signer_key_id": "ed25519:5f1d3e2a9b8c7d6e5f4a3b2c1d0e9f8a",
+      "registry_label": null,
+      "permissions": [
+        "read",
+        "panel"
+      ],
+      "provides": [
+        "panels"
+      ],
+      "containment": "in process, same uid: not contained",
+      "findings": [
+        {
+          "stage": "verify",
+          "code": "manifest_ok",
+          "severity": "info",
+          "detail": "notes.search"
+        }
+      ]
+    }
+  }
+}

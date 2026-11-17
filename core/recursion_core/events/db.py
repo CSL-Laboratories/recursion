@@ -55,11 +55,17 @@ checks that both settings took effect, that the file, its WAL and shared-memory 
 regular files of this user that nobody else can read or write (one that is open to others is refused, not
 narrowed), that the file is this store's (``application_id``) and passes ``quick_check``, takes an
 exclusive ``flock`` on ``<path>.lock`` for the life of the store (one writer process), and raises the epoch
-by one. A store is made only in a file this opening created. A file that exists and holds nothing (emptied, or
-its first opening did not finish) is refused (``store_empty``) and never made again over, which would lose its
-receipts and events without a word: remove it to start a new store. A store without its epoch is refused
-(``store_epoch_missing``). The kill -9, full file system and file-size-limit tests in ``events/tests/test_durability.py`` are
-the evidence; a power cut was not emulated.
+by one. A store is made only in a file its own first opening made: that opening writes a mark into
+``<path>.lock`` before it creates the file and takes the mark away once the store in it is made, so a first
+opening that failed or was killed is made again by the next one, which then meets the same cause, if any. A
+file that exists, holds nothing and carries no such mark (an emptied store) is refused (``store_empty``) from
+the file system, before SQLite opens anything, and left as it is with whatever lies beside it: making a store
+over it would lose its receipts and events without a word. Remove it to start a new store. A file SQLite
+cannot read as a store is refused (``store_corrupt``; ``store_busy`` when it is locked). A store without its
+epoch row or table is refused (``store_epoch_missing``), and one whose epoch is not a whole number from 0
+(``store_epoch_invalid``). A store file with a second hard link is refused (``store_path_linked``): another name
+for it would escape the lock file. The kill -9, full file system and file-size-limit tests in
+``events/tests/test_durability.py`` are the evidence; a power cut was not emulated.
 
 FAILURES. A statement that fails inside a transaction raises to the block; the transaction is rolled back
 when the block ends. A statement's rows are fetched under the same rule as the statement (SQLite can find
@@ -169,14 +175,22 @@ class Receipt(NamedTuple):
 _HELD = threading.local()
 
 
+_WHERE_FRAMES = 8          # a traceback's first and last four frames, and how many lie between
+_WHERE_PART = 200          # characters of one frame
+
+
 def _where(tb) -> str:
     """Where an exception was raised, as ``file:line in function`` for each frame, oldest first: no value and no
-    exception text, which can carry what an event held."""
+    exception text, which can carry what an event held. At most the first and last four frames are named, with
+    how many lie between, and each in at most 200 characters, so one line stays short whatever the depth."""
     out = []
     while tb is not None:
         code = tb.tb_frame.f_code
-        out.append(f'{code.co_filename}:{tb.tb_lineno} in {code.co_name}')
+        out.append(f'{code.co_filename}:{tb.tb_lineno} in {code.co_name}'[:_WHERE_PART])
         tb = tb.tb_next
+    if len(out) > _WHERE_FRAMES:
+        half = _WHERE_FRAMES // 2
+        out = out[:half] + ['(%d more)' % (len(out) - 2 * half)] + out[-half:]
     return '; '.join(out) or 'an unknown place'
 
 
@@ -459,8 +473,14 @@ class EventStore:
         self._setup(os.fspath(path), clock)
         self._lock_fd = self._take_file_lock(self._path + '.lock')
         try:
-            created = self._make_file(self._path)
-            self._open(may_make=created)
+            may_make = self._first_opening_unfinished()
+            if not os.path.lexists(self._path):
+                self._mark_first_opening()      # before the file exists: a crash from here on leaves the mark
+            may_make = self._make_file(self._path) or may_make
+            if not may_make and os.path.getsize(self._path) == 0:
+                raise StoreError('store_empty')  # decided from the file system: SQLite has opened nothing
+            self._open(may_make=may_make)
+            self._clear_first_opening()
         except BaseException:
             os.close(self._lock_fd)
             self._lock_fd = None
@@ -498,6 +518,22 @@ class EventStore:
         if info.st_mode & 0o077:
             raise StoreError(f'{code}_not_private')
 
+    _FIRST_OPENING = b'the first opening of this store is under way\n'
+
+    def _first_opening_unfinished(self) -> bool:
+        """Whether an earlier first opening of this store wrote its mark into the lock file and did not finish."""
+        return os.pread(self._lock_fd, len(self._FIRST_OPENING) + 1, 0) == self._FIRST_OPENING
+
+    def _mark_first_opening(self) -> None:
+        os.ftruncate(self._lock_fd, 0)
+        os.pwrite(self._lock_fd, self._FIRST_OPENING, 0)
+        os.fsync(self._lock_fd)
+
+    def _clear_first_opening(self) -> None:
+        if self._first_opening_unfinished():
+            os.ftruncate(self._lock_fd, 0)
+            os.fsync(self._lock_fd)
+
     @staticmethod
     def _take_file_lock(path: str) -> int:
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
@@ -528,7 +564,10 @@ class EventStore:
         try:
             fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         except FileExistsError:
-            EventStore._private(os.lstat(path), 'store_path')
+            info = os.lstat(path)
+            EventStore._private(info, 'store_path')
+            if info.st_nlink != 1:
+                raise StoreError('store_path_linked') from None   # another name for it would escape the lock file
             return False
         os.close(fd)
         folder = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY | os.O_DIRECTORY)
@@ -589,9 +628,16 @@ class EventStore:
             conn.execute('BEGIN IMMEDIATE')
             try:
                 # Read before it is raised: SQLite would add 1 to a text value and store a number.
-                row = conn.execute("SELECT value FROM store_meta WHERE key = 'epoch'").fetchone()
-                if row is None or type(row[0]) is not int or row[0] < 0:
+                try:
+                    row = conn.execute("SELECT value FROM store_meta WHERE key = 'epoch'").fetchone()
+                except sqlite3.OperationalError as exc:
+                    if 'no such table' in str(exc):
+                        raise StoreError('store_epoch_missing') from exc   # store_meta itself is gone
+                    raise
+                if row is None:
                     raise StoreError('store_epoch_missing')
+                if type(row[0]) is not int or row[0] < 0:
+                    raise StoreError('store_epoch_invalid')
                 conn.execute("UPDATE store_meta SET value = value + 1 WHERE key = 'epoch'")
                 self._epoch = row[0] + 1
                 conn.execute('COMMIT')
@@ -599,6 +645,14 @@ class EventStore:
                 if conn.in_transaction:
                     conn.execute('ROLLBACK')
                 raise
+        except StoreError:
+            conn.close()
+            raise
+        except sqlite3.DatabaseError as exc:
+            conn.close()
+            # A file SQLite cannot read as a store is refused by name, not with SQLite's own error.
+            busy = (getattr(exc, 'sqlite_errorname', '') or '').startswith(('SQLITE_BUSY', 'SQLITE_LOCKED'))
+            raise StoreError('store_busy' if busy else 'store_corrupt') from exc
         except BaseException:
             conn.close()
             raise

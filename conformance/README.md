@@ -93,7 +93,8 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
   lists against the request it was asked with (its cursor, and the projection it asked for, which is
   the `transcript` when it names none), and so has no fault in any good exchange, where the same page under
   the other projection is caught; a transcript page that carries the raw page of the same read is
-  the projection of a raw page that is itself right;
+  the projection of a raw page that is itself right, and each of its lines says what its event says
+  (source, trust, state and the event's own text; the time only on a page that begins at position 1);
 - in an approval vector records are compared exactly (1 is not 1.0 and 0 is not -0.0), a refused step
   leaves the record and the private binding as they were, and the binding never changes;
 - wherever a good fixture or a vector holds an event, a `state.changed` carries the digest of its
@@ -101,7 +102,8 @@ For each folder of schemas (`schemas/control/v1`, and `schemas/plugin/v1` once i
   span filed under its last position;
 - every field typed as a timestamp holds a moment that exists, with seconds from 00 to 59 (the
   keyword `x-instant`, which this client adds to its validator; the check stands without the
-  pattern);
+  pattern), in every folder: a definition whose pattern takes a timestamp must carry the keyword,
+  and its pattern must refuse a second of 60;
 - in the method table, the seven mandatory built-ins are exactly the rows that cannot answer
   `unsupported`; every row can answer `unavailable`; a built-in that waits on no service answers it
   only for a closing daemon (`run.start` also for a start registrant that refused, `plugin.list` also

@@ -91,7 +91,9 @@ the bad fixtures show both.
   stand for several steps, and its time is when the core wrote the event. A creation time needs
   retained creation metadata, or an event whose producer writes it as part of creating the run or
   the turn, and this version has neither. `updated_at` is the time of the latest `state.changed`
-  that is retained.
+  of that run or that turn which is retained. The event's payload says what changed (`entity`,
+  `entity_id`); the run and the turn an event is filed under do not, so a change of the run that is
+  filed under a turn does not move the turn's Task (`t35` to `t38`, `x16` to `x19`).
 - **A queued message is delivered when the engine says so, and only then.** In one commit, BEFORE it
   writes anything toward the engine, the daemon stores the item as `delivering`, a delivery id that
   is never used again, and the full target BINDING: the item, the log, the run, the worker's

@@ -448,3 +448,144 @@ class PanelTests(GuiHarness):
         self.assertEqual(kept["provenance"]["inputs"], [{"venue": "kalshi_demo", "source": "KX-PROV-SECRET"},
                                                         {"source": "PROV-INPUT-636363"}])
         self.assertNotIn("result", kept)
+
+    # C7 finding 4 (gemini-wave R2): Astra's test, as written in R2/fix-4.patch.
+    def test_tuples_and_mapping_proxies_never_bypass_venue_redaction_or_filtering(self):
+        from types import MappingProxyType
+        from recursion_core.gui.surface import withhold_venue_data
+
+        redacted_tuple = withhold_venue_data(({"venue_data": "TUPLE-SECRET", "venue_data_switch": "off"},))
+        self.assertEqual(redacted_tuple[0]["venue_data"], "[withheld: venue data switch is off]")
+        redacted_proxy = withhold_venue_data(MappingProxyType({"venue_data": "PROXY-SECRET", "venue_data_switch": "off"}))
+        self.assertEqual(redacted_proxy["venue_data"], "[withheld: venue data switch is off]")
+        kept, withheld = filter_venue_rows(
+            {"paper_fills": ({"venue": "kalshi", "symbol": "KALSHI-TUPLE-SECRET"},
+                             {"venue": "paper", "symbol": "PAPER-TUPLE-OK"}),
+             "errors": ({"venue": "kalshi", "message": "KALSHI-ERR-SECRET"}, {"message": "PLAIN-ERR"})},
+            "paper",
+        )
+        self.assertTrue(withheld)
+        self.assertEqual(kept["paper_fills"], [{"venue": "paper", "symbol": "PAPER-TUPLE-OK"}])
+        self.assertEqual(kept["errors"], [{"message": "PLAIN-ERR"}])
+
+    def test_finding_4_containers_at_every_depth_come_back_as_json_containers(self):
+        # Beyond Astra's test: a mapping proxy that is the response, a tuple inside a labelled row,
+        # a proxy row on a non-paper panel, and the redaction inside a proxy inside a tuple.
+        from collections import OrderedDict
+        from types import MappingProxyType
+        from recursion_core.gui.surface import withhold_venue_data
+
+        response = MappingProxyType({
+            "errors": (MappingProxyType({"venue": "paper", "message": "PAPER-ERR-SECRET"}),),
+            "result": {"rows": (MappingProxyType({"venue": "kalshi", "symbol": "KALSHI-OK",
+                                                  "fills": ({"qty": 5},)}),
+                                OrderedDict(venue="paper", symbol="PAPER-SECRET"))}})
+        kept, withheld = filter_venue_rows(response, "kalshi")
+        self.assertTrue(withheld)
+        self.assertEqual(kept, {"errors": [], "result": {"rows": [
+            {"venue": "kalshi", "symbol": "KALSHI-OK", "fills": [{"qty": 5}]}]}})
+        self.assertIs(type(kept["result"]["rows"][0]), dict)
+        self.assertIs(type(kept["result"]["rows"][0]["fills"]), list)
+        nested = withhold_venue_data((MappingProxyType({"rows": ({"venue_data": "DEEP-SECRET"},)}),))
+        self.assertEqual(nested, [{"rows": [{"venue_data": "[withheld: venue data switch is off]"}]}])
+        self.assertEqual(withhold_venue_data(MappingProxyType({"venue_data": "ON-OK", "venue_data_switch": "on"})),
+                         {"venue_data": "ON-OK", "venue_data_switch": "on"})
+
+    def test_values_json_cannot_carry_are_withheld_by_both_filters(self):
+        # A set, a deque or another object is not what the control API sends. Neither filter passes
+        # one through, even inside a kept row or a paper_* key, and neither filter crashes the page.
+        from collections import deque
+        from recursion_core.gui.surface import withhold_venue_data
+
+        rows = deque([{"venue": "kalshi", "symbol": "DEQUE-KALSHI-SECRET"}])
+        kept, withheld = filter_venue_rows(
+            {"paper_fills": rows, "result": {"rows": [{"venue": "paper", "tags": {"SET-SECRET"},
+                                                       "symbol": "PAPER-OK"}]},
+             "errors": [object(), "PLAIN-ERR"], "provenance": {"inputs": rows}}, "paper")
+        self.assertTrue(withheld)
+        self.assertEqual(kept, {"result": {"rows": [{"venue": "paper", "symbol": "PAPER-OK"}]},
+                                "errors": ["PLAIN-ERR"], "provenance": {}})
+        self.assertEqual(filter_venue_rows([{"venue": "paper", "symbol": "LIST-RESPONSE"}], "paper"), ({}, True))
+        self.assertEqual(withhold_venue_data({"rows": rows, "n": 1, "x": 1.5, "b": True, "z": None}),
+                         {"rows": "[withheld: not JSON data]", "n": 1, "x": 1.5, "b": True, "z": None})
+        self.mount([{"id": "p", "title": "Paper", "reads": [READS[0]], "venue": "paper"}])
+        self.app._client.operator = lambda *_a, **_k: {"result": {"rows": [{"venue": "paper", "symbol": "PAPER-OK",
+                                                                            "tags": {"SET-SECRET"}}]}}
+        status, _, body = self.request("GET", "/panel", query="id=p")
+        self.assertEqual(status, "200 OK")
+        self.assertIn("PAPER-OK", body)
+        self.assertNotIn("SET-SECRET", body)
+        self.assertIn("Withheld: data not in the paper book", body)
+
+    def test_kept_response_metadata_in_any_mapping_stays_and_comes_back_plain(self):
+        # First review of #384 (both readers): an unlabelled or owned errors/provenance entry held in a
+        # mapping that is not a dict is kept, as a dict; a foreign entry nested in it still goes.
+        from collections import OrderedDict, UserDict
+        from types import MappingProxyType
+
+        for factory in (MappingProxyType, UserDict, OrderedDict):
+            for field in ("errors", "provenance"):
+                for venue in (None, "paper", "stock"):
+                    item = {"message": "KEPT-METADATA"}
+                    if venue:
+                        item["venue"] = venue
+                    with self.subTest(factory=factory.__name__, field=field, venue=venue):
+                        kept, withheld = filter_venue_rows({field: (factory(item),)}, "paper")
+                        self.assertEqual((kept, withheld), ({field: [item]}, False))
+                        self.assertIs(type(kept[field][0]), dict)
+                with self.subTest(factory=factory.__name__, field=field, nested="foreign"):
+                    value = factory({"source": "KEPT-SOURCE", "inputs": (
+                        factory({"venue": "kalshi", "source": "FOREIGN-SECRET"}), factory({"source": "KEPT-INPUT"}))})
+                    kept, withheld = filter_venue_rows({field: value}, "paper")
+                    self.assertEqual(kept, {field: {"source": "KEPT-SOURCE", "inputs": [{"source": "KEPT-INPUT"}]}})
+                    self.assertTrue(withheld)
+                    self.assertIs(type(kept[field]), dict)
+
+    # C7 finding 12 (gemini-wave R2): the test from R2/fix-12.patch, and only the test. Which side
+    # adapts the O7 answer shape is F1, held (CSL-DECISIONS.md section F, 7:07 PM Nov 12), so no
+    # fix is made here; lane PAGE's report carries the proposal. When the shape is decided and
+    # built, this test passes, unittest reports the unexpected success, and the marker goes.
+    @unittest.expectedFailure
+    def test_operator_reads_envelopes_render_truthfully_on_a_paper_panel(self):
+        import json
+        from recursion_core.control.operator_reads import OperatorReads
+
+        reads = OperatorReads({
+            "positions": lambda: {"venue": "paper", "rows": [], "empty_reason": "book_is_flat"},
+            "budgets": lambda: (_ for _ in ()).throw(RuntimeError("ledger down")),
+        })
+        self.app = compose(
+            ControlClient(lambda _m, _p, raw: (200, json.dumps(
+                reads.call(json.loads(raw)["command"], {})).encode("utf-8"))),
+            self.door, {HOST}, {ORIGIN},
+            plugins=({"panels": [{"id": "paper", "title": "Paper",
+                                  "reads": ["operator.positions.inspect", "operator.budgets.inspect"],
+                                  "venue": "paper"}]},),
+        )
+        status, _, body = self.request("GET", "/panel", query="id=paper")
+        self.assertEqual(status, "200 OK")
+        self.assertIn("book_is_flat", body)
+        self.assertNotIn("Withheld: data not in the paper book", body)
+        self.assertIn("source_unavailable", body)
+        self.assertNotIn("withheld by this panel&#x27;s venue filter", body)
+
+    def test_finding_12_fails_where_the_finding_says_it_fails(self):
+        # Keeps the expected failure above honest: on today's code the flat paper book is withheld
+        # and book_is_flat is not shown. If this starts failing, the expected failure may now be
+        # failing for another reason; read both before touching either.
+        import json
+        from recursion_core.control.operator_reads import OperatorReads
+
+        reads = OperatorReads({"positions": lambda: {"venue": "paper", "rows": [], "empty_reason": "book_is_flat"}})
+        self.app = compose(
+            ControlClient(lambda _m, _p, raw: (200, json.dumps(
+                reads.call(json.loads(raw)["command"], {})).encode("utf-8"))),
+            self.door, {HOST}, {ORIGIN},
+            plugins=({"panels": [{"id": "paper", "title": "Paper", "reads": ["operator.positions.inspect"],
+                                  "venue": "paper"}]},),
+        )
+        status, _, body = self.request("GET", "/panel", query="id=paper")
+        self.assertEqual(status, "200 OK")
+        self.assertIn("Withheld: data not in the paper book", body)
+        self.assertNotIn("book_is_flat", body)
+        self.assertIn("Visibility: not reported by the control API.", body)

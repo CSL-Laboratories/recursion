@@ -1,0 +1,85 @@
+Dev task 07: a least-recently-used cache.
+-- task.json --
+{"id": "dev-07-lru", "cluster": "dev", "created_at": null,
+ "test_command": ["{python}", "-B", "-m", "unittest", "{hidden_modules}"],
+ "timeout_s": 900, "grading_timeout_s": 120}
+-- prompt.md --
+Implement the class `LRUCache` in `cachekit/lru.py`.
+
+- `LRUCache(capacity)`: capacity is an integer of at least 1, else `ValueError`.
+- `get(key, default=None)` returns the stored value (and marks the key as most recently used) or `default`.
+- `put(key, value)` stores or replaces the value and marks the key as most recently used; when the cache then holds more than `capacity` keys, the least recently used key is dropped.
+- `len(cache)` is the number of keys held.
+-- start/cachekit/__init__.py --
+"""Caches."""
+-- start/cachekit/lru.py --
+class LRUCache:
+    def __init__(self, capacity):
+        raise NotImplementedError
+
+    def get(self, key, default=None):
+        raise NotImplementedError
+
+    def put(self, key, value):
+        raise NotImplementedError
+
+    def __len__(self):
+        raise NotImplementedError
+-- hidden/test_lru.py --
+import unittest
+
+from cachekit.lru import LRUCache
+
+
+class LRUTests(unittest.TestCase):
+    def test_evicts_least_recent(self):
+        cache = LRUCache(2)
+        cache.put("a", 1)
+        cache.put("b", 2)
+        cache.get("a")
+        cache.put("c", 3)
+        self.assertEqual(cache.get("b"), None)
+        self.assertEqual(cache.get("a"), 1)
+        self.assertEqual(cache.get("c"), 3)
+        self.assertEqual(len(cache), 2)
+
+    def test_replace_refreshes(self):
+        cache = LRUCache(2)
+        cache.put("a", 1)
+        cache.put("b", 2)
+        cache.put("a", 10)
+        cache.put("c", 3)
+        self.assertEqual(cache.get("a"), 10)
+        self.assertEqual(cache.get("b", "gone"), "gone")
+
+    def test_capacity(self):
+        for bad in (0, -1):
+            with self.assertRaises(ValueError):
+                LRUCache(bad)
+-- solution/cachekit/lru.py --
+from collections import OrderedDict
+
+
+class LRUCache:
+    def __init__(self, capacity):
+        if not isinstance(capacity, int) or capacity < 1:
+            raise ValueError(f"capacity must be at least 1, got {capacity!r}")
+        self._capacity = capacity
+        self._items = OrderedDict()
+
+    def get(self, key, default=None):
+        if key not in self._items:
+            return default
+        self._items.move_to_end(key)
+        return self._items[key]
+
+    def put(self, key, value):
+        self._items[key] = value
+        self._items.move_to_end(key)
+        while len(self._items) > self._capacity:
+            self._items.popitem(last=False)
+
+    def __len__(self):
+        return len(self._items)
+-- standin.json --
+{"outcomes": ["solve"]}

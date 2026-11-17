@@ -46,6 +46,8 @@ class EngineProcessTest(unittest.TestCase):
         process._buffer = b''
         process._out = -1
         process._poll_s = 0.05
+        process._closed = False
+        process._lock = threading.Lock()
         process._ended = lambda: False
         return process
 
@@ -70,7 +72,9 @@ class EngineProcessTest(unittest.TestCase):
         def capture(obj, name, *default):
             value = builtins.getattr(obj, name, *default)
             if obj is process and name == '_out' and value is not None:
-                # Make the gap between the read of the number and its clearing as wide as a closer can have it.
+                # close() does not call getattr, so this hook does not widen a gap on this head.
+                # It is here for the base, where close() did. The two threads still both call close();
+                # the lock is what keeps the second from closing a number the first released.
                 try:
                     gate.wait(timeout=0.25)
                 except threading.BrokenBarrierError:
@@ -267,8 +271,8 @@ class EngineProcessTest(unittest.TestCase):
 
     # -- E33: the exec wrapper does not wait for a daemon that is gone ---------------------------------
     def wrapper(self, fifo, code):
-        return subprocess.Popen([sys.executable, '-I', '-S', str(launcher.ENGINE_EXEC), str(fifo), '--',
-                                 sys.executable, '-I', '-c', code],
+        return subprocess.Popen([sys.executable, '-I', '-B', '-S', str(launcher.ENGINE_EXEC), str(fifo), '--',
+                                 sys.executable, '-I', '-B', '-c', code],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def test_the_exec_wrapper_refuses_a_fifo_with_no_writer(self):
@@ -342,7 +346,7 @@ class EngineProcessTest(unittest.TestCase):
                           'spec.loader.exec_module(module)\n'
                           'module.ENV_WAIT_S = 0.3\n'
                           'module.main(["x", sys.argv[2], "--", sys.executable, "-c", "pass"])\n')
-        child = subprocess.Popen([sys.executable, '-I', str(script), str(launcher.ENGINE_EXEC), str(fifo)],
+        child = subprocess.Popen([sys.executable, '-I', '-B', str(script), str(launcher.ENGINE_EXEC), str(fifo)],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             out, err = child.communicate(timeout=CHILD_LIMIT_S)
@@ -352,6 +356,85 @@ class EngineProcessTest(unittest.TestCase):
             self.fail('engine_exec has no limit on its wait for the environment')
         self.assertEqual(child.returncode, 127, err)
         self.assertIn(b'TimeoutError', err)
+
+    def test_an_over_long_line_is_dropped_and_the_next_line_is_read(self):
+        process = self.reader()
+        process._buffer = b'yyyyyyyyy\nok\n'
+        with patch.object(launcher, 'MAX_LINE_BYTES', 8):
+            with self.assertRaises(OSError) as raised:
+                process.read_line(0.1)
+            self.assertEqual(raised.exception.errno, errno.EMSGSIZE)
+            self.assertEqual(process.read_line(0.1), 'ok')
+            self.assertEqual(process._buffer, b'')
+
+    def test_an_unterminated_over_long_line_is_dropped(self):
+        process = self.reader()
+        process._buffer = b'yyyyyyyyy'
+        process._ended = lambda: True
+        with patch.object(launcher, 'MAX_LINE_BYTES', 8), \
+                patch.object(launcher.os, 'read', return_value=b''):
+            with self.assertRaises(OSError) as raised:
+                process.read_line(0.1)
+            self.assertEqual(raised.exception.errno, errno.EMSGSIZE)
+            self.assertEqual(process._buffer, b'')
+            self.assertIsNone(process.read_line(0.1))
+
+    def test_a_shut_process_with_an_empty_buffer_reads_as_ended(self):
+        out = self.root / 'stdout.jsonl'
+        out.write_bytes(b'later\n')
+        process = launcher.UnitEngineProcess(Mock(), 'run-one', None, out, None)
+        process.close()
+        self.assertIsNone(process.read_line(0.1))
+
+    def test_a_line_buffered_before_the_process_is_shut_is_still_returned(self):
+        out = self.root / 'stdout.jsonl'
+        out.write_bytes(b'')
+        process = launcher.UnitEngineProcess(Mock(), 'run-one', None, out, None)
+        process._buffer = b'hello\npartial'
+        process.close()
+        self.assertEqual(process.read_line(0.1), 'hello')
+        self.assertIsNone(process.read_line(0.1))
+
+    def test_a_non_positive_timeout_checks_the_buffer_once(self):
+        process = self.reader()
+        with patch.object(launcher.os, 'read', side_effect=AssertionError('polled')):
+            with self.assertRaises(launcher.ReadTimeout):
+                process.read_line(0.0)
+            with self.assertRaises(launcher.ReadTimeout):
+                process.read_line(float('nan'))
+        process._buffer = b'ready\n'
+        self.assertEqual(process.read_line(0.0), 'ready')
+        with self.assertRaises(launcher.ReadTimeout):
+            process.read_line(float('nan'))
+
+    def test_a_released_pidfd_is_not_an_engine_fault(self):
+        out = self.root / 'stdout.jsonl'
+        out.write_bytes(b'')
+        process = launcher.UnitEngineProcess(Mock(), 'run-one', None, out, None)
+        self.addCleanup(process.close)
+        # Open the pipe after the process, then release the read end, so the
+        # number is not reused by the process's own stdout descriptor.
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, write_end)
+        os.close(read_end)
+        process._pidfd = read_end
+        process._daemon.reconcile.return_value = SimpleNamespace(state='running')
+        self.assertFalse(process._ended())
+        process._daemon.reconcile.assert_called_once_with('run-one')
+
+    def test_a_clean_end_at_the_deadline_is_zero_bytes(self):
+        now = Clock()
+
+        class Sock:
+            def settimeout(self, timeout):
+                pass
+
+            def recv_into(self, buffer):
+                now.value = 2.0
+                return 0
+
+        with patch.object(gui, 'time', SimpleNamespace(monotonic=now)):
+            self.assertEqual(gui._DeadlineReader(Sock(), 1.0).readinto(bytearray(1)), 0)
 
 
 if __name__ == '__main__':

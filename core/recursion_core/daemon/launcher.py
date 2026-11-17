@@ -34,6 +34,7 @@ except ImportError:  # Windows: the launcher refuses in require_launcher_platfor
     fcntl = None
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -282,6 +283,7 @@ class UnitEngineProcess:
         self._stdin, self._pidfd, self._poll_s = stdin_fd, pidfd, poll_s
         self._out = os.open(stdout_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         self._buffer = b''
+        self._closed = False
         self._liveness_at = 0.0
         self._ended_seen = False
         self.fenced = []
@@ -317,9 +319,19 @@ class UnitEngineProcess:
         """True once the unit's main process is gone (pidfd), or the sweep recorded a terminal state."""
         if self._ended_seen:
             return True
-        if self._pidfd is not None:
-            self._ended_seen = bool(select.select([self._pidfd], [], [], 0)[0])
-            return self._ended_seen
+        with self._lock:
+            pidfd = self._pidfd
+        if pidfd is not None:
+            try:
+                gone = bool(select.select([pidfd], [], [], 0)[0])
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    raise
+                # The descriptor was released between the snapshot and the wait.
+                # That is not an engine fault: fall through to the registry.
+            else:
+                self._ended_seen = gone
+                return self._ended_seen
         now = time.monotonic()
         if now - self._liveness_at < 0.5:
             return False
@@ -331,27 +343,50 @@ class UnitEngineProcess:
         return self._ended_seen
 
     def read_line(self, timeout_s):
-        deadline = time.monotonic() + timeout_s
+        """One stdout line, None at EOF, or ReadTimeout.
+
+        A timeout that is not a finite number greater than zero checks the buffer
+        once and then raises ReadTimeout. It does not poll.
+        """
+        immediate = not (isinstance(timeout_s, (int, float)) and math.isfinite(timeout_s) and timeout_s > 0)
+        deadline = 0.0 if immediate else time.monotonic() + timeout_s
         while True:
-            cut = self._buffer.find(b'\n')
-            if cut >= 0:
-                if cut > MAX_LINE_BYTES:  # a newline does not excuse a line over the bound (E07)
+            with self._lock:
+                closed = self._closed
+                out = self._out
+                cut = self._buffer.find(b'\n')
+                if cut >= 0:
+                    if cut > MAX_LINE_BYTES:  # a newline does not excuse a line over the bound (E07)
+                        # Drop the refused line, including its newline, so a later line can be read.
+                        self._buffer = self._buffer[cut + 1:]
+                        raise OSError(errno.EMSGSIZE, 'engine stdout line is too long')
+                    line, self._buffer = self._buffer[:cut], self._buffer[cut + 1:]
+                    return _decode_line(line)
+                if len(self._buffer) > MAX_LINE_BYTES:
+                    self._buffer = b''
                     raise OSError(errno.EMSGSIZE, 'engine stdout line is too long')
-                line, self._buffer = self._buffer[:cut], self._buffer[cut + 1:]
-                return _decode_line(line)
-            if len(self._buffer) > MAX_LINE_BYTES:
-                raise OSError(errno.EMSGSIZE, 'engine stdout line is too long')
+                if closed or out is None:
+                    return None
+            if immediate:
+                raise ReadTimeout()
             ended = self._ended()  # read liveness first, so output written before the exit is not missed
-            chunk = os.read(self._out, 65536)
+            try:
+                chunk = os.read(out, 65536)
+            except OSError as exc:
+                if exc.errno == errno.EBADF:
+                    return None
+                raise
             if chunk:
-                self._buffer += chunk
+                with self._lock:
+                    self._buffer += chunk
                 if time.monotonic() > deadline:
                     raise ReadTimeout()  # output that arrives after the deadline is late; it stays buffered (E40)
                 continue
             if ended:
-                if self._buffer:
-                    line, self._buffer = self._buffer, b''
-                    return _decode_line(line)
+                with self._lock:
+                    if self._buffer:
+                        line, self._buffer = self._buffer, b''
+                        return _decode_line(line)
                 return None
             left = deadline - time.monotonic()
             if left <= 0:
@@ -371,6 +406,7 @@ class UnitEngineProcess:
         with self._lock:
             # Taken and cleared together: a second closer must not close a number the first one released,
             # which the process may already have given to something else (E06).
+            self._closed = True
             descriptors, self._out, self._pidfd = (self._out, self._pidfd), None, None
         for fd in descriptors:
             if fd is not None:

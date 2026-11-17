@@ -80,7 +80,7 @@ class _DeadlineReader(io.RawIOBase):
             raise TimeoutError("request deadline")
         self._sock.settimeout(min(left, RECV_TIMEOUT_S))
         count = self._sock.recv_into(buffer)
-        if time.monotonic() >= self.deadline:
+        if count and time.monotonic() >= self.deadline:
             raise TimeoutError("request deadline")  # bytes that arrive after the deadline are not a timely request (E40)
         return count
 

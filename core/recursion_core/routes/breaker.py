@@ -130,8 +130,11 @@ class ConnectionBreaker:
     # -- outcomes -----------------------------------------------------------------------------
     def record(self, connection: str, model: str, tenant: str, outcome: dict, probe: str | None = None) -> str:
         """Book one route result. Returns the effect: ``opened``, ``short_fault``, ``closed``,
-        ``probe_released`` or ``none``. Only ``outcome["limit"]`` on a PLAN_LIMIT opens a key."""
+        ``probe_released`` or ``none``. Only ``outcome["limit"]`` on a PLAN_LIMIT opens a key.
+        An outcome that is not a dict is ``none``: nothing is written."""
 
+        if not isinstance(outcome, dict):
+            return "none"
         code = outcome.get("code")
         with self._lock:
             now = self._clock()

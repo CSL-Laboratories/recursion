@@ -179,8 +179,14 @@ def validate_request(request: object, *, engines: object = None) -> dict:
     if engine not in engine_names(engines):  # read now, not at import (seam S3)
         raise RouteError(ENGINE_UNKNOWN, str(engine))
     model = route.get("model")
+    # NUL is refused on its own: encoding it succeeds, and Popen still rejects the byte.
+    # A lone surrogate is not UTF-8, so it is the same refusal before any launch.
     if not isinstance(model, str) or not model or "\x00" in model:
         raise RouteError(REQUEST_INVALID, "route.model")
+    try:
+        model.encode("utf-8")
+    except UnicodeEncodeError:
+        raise RouteError(REQUEST_INVALID, "route.model") from None
     conn = route.get("connection")
     if not isinstance(conn, Mapping) or conn.get("kind") not in CONNECTION_KINDS:
         raise RouteError(REQUEST_INVALID, "route.connection.kind")
@@ -234,11 +240,15 @@ def vendor_reset(epoch: object, clock: Callable[[], float], wall: Callable[[], f
 
 
 def limit_signal(scope: str, source: str, *, model: str | None = None, reset_at: float | None = None) -> dict:
-    """Build a limit signal. Adapters call this only from typed vendor fields, never from text."""
+    """Build a limit signal. Adapters call this only from typed vendor fields, never from text.
+
+    A reset that is not a finite int or float, including a bool or an int too large for a float,
+    is stored as None so the breaker uses its own cooldown.
+    """
 
     if scope not in ("connection", "model") or (scope == "model" and not model):
         raise ValueError(scope)
-    if reset_at is not None and (not isinstance(reset_at, (int, float)) or not math.isfinite(reset_at)):
+    if reset_at is not None and not _finite(reset_at):
         reset_at = None
     return {"scope": scope, "model": model if scope == "model" else None, "reset_at": reset_at, "source": source}
 

@@ -714,14 +714,45 @@ class ServeDriver(Driver):
         self._spawn, self._binary, self._port, self._abort = spawn, binary, port, abort
         self._ready_s, self._wall, self._clock = ready_s, wall, clock
         self._workers: dict[int, dict] = {}
-        # Guards the table and every worker's fields. Never held while a process, the spawn or the abort is called.
-        self._lock = threading.Lock()
+        # Guards the table and every worker's fields. An RLock only so a protected region can ask who owns it.
+        # Never a ``with``: on 3.14 the instruction after ``__enter__`` returns is outside that handler, and one
+        # signal there leaves the lock held. Never held while a process, the spawn or the abort is called, and a
+        # region is never entered from inside another one.
+        self._lock = threading.RLock()
+
+    def _under(self, step: Callable[[], object]) -> object:
+        """``step()`` once while the table lock is held, and its value. The lock is free again however one
+        interruption lands. The form is ``OpenCodeDriver._exclusive`` (``control.hooks`` OWNERSHIP): the taking
+        (``take_once``), the step and the release are inside one try. An interruption kept before the step was
+        called skips it. What a ``with`` on this lock cannot cover, this does: the instruction just after the
+        lock is taken."""
+        from recursion_core.control.hooks import raise_kept, take_once   # local: routes must not load control at import
+
+        kept: list = []
+        box: list = []
+        while True:
+            try:
+                if not kept and not box:
+                    if not self._lock._is_owned():
+                        take_once(self._lock, kept)
+                    if not kept:
+                        box.append(step())
+                if self._lock._is_owned():
+                    self._lock.release()
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the lock is released first
+                kept.append(exc)
+        raise_kept(kept)
+        return box[0]
 
     def _worker(self, handle) -> dict:
-        with self._lock:   # a registered worker holds its handle, so no other handle can have its id
+        def lookup():   # a registered worker holds its handle, so no other handle can have its id
             worker = self._workers.get(id(handle))
             if worker is not None and (worker["released"] or not worker["started"]):
                 worker = None   # kept only until its processes are terminated: closed to every call
+            return worker
+
+        worker = self._under(lookup)
         if worker is None:
             raise DriverStateError("this handle has no server (released, or never started)")
         return worker
@@ -748,14 +779,18 @@ class ServeDriver(Driver):
             url = self._await_ready(server, port)
             if url is None:
                 raise DriverStateError("opencode serve gave no readiness line for its loopback address")
-            with self._lock:
+            def publish() -> None:
                 worker["server"], worker["url"], worker["started"] = server, url, True
                 self._workers[id(handle)] = worker
+
+            self._under(publish)
         except BaseException as error:
-            with self._lock:
+            def owe() -> None:
                 worker["released"] = worker["closed"] = True
                 if self._workers.get(id(handle)) is not worker:   # kept in the table until nothing is live
                     self._workers[id(handle)] = worker
+
+            self._under(owe)
             self._clean(worker, noting=error)   # a termination that fails stays owed, its worker kept in the table
             raise
 
@@ -787,10 +822,12 @@ class ServeDriver(Driver):
         try:   # the first statement: the gate has reserved the turn already, so no line of this call is outside it
             if item["kind"] == "close":
                 worker = self._worker(handle)
-                with self._lock:
+
+                def mark_closed() -> bool:
                     worker["closed"] = True
-                    idle = worker["turn"] is None
-                if idle:
+                    return worker["turn"] is None
+
+                if self._under(mark_closed):
                     self.release(handle)
                 return
             turn_id, worker, turn, process, spawning, written = item["turn_id"], None, None, None, False, False
@@ -803,20 +840,25 @@ class ServeDriver(Driver):
                             clock=self._clock)
             turn = {"id": turn_id, "delivery": None, "process": None, "parser": parser, "accepted": False,
                     "finishing": False, "write": threading.RLock()}   # re-entrant: a release from the writer
-            with self._lock:
+            def publish() -> None:
+                nonlocal spawning
                 if worker["released"]:
                     raise DriverStateError("this handle has no server (released, or never started)")
                 worker["turn"], worker["spawning"], spawning = turn, worker["spawning"] + 1, True
+
+            self._under(publish)
             try:
                 worker["live"].append(process := self._spawn(argv, dict(worker["env"])))
                 turn["process"], worker["turns"] = process, worker["turns"] + 1   # a turn that started a process
             finally:
                 if spawning:
-                    with self._lock:
+                    def finish_spawn() -> None:
+                        nonlocal spawning
                         worker["spawning"], spawning = worker["spawning"] - 1, False
+
+                    self._under(finish_spawn)
             with turn["write"]:
-                with self._lock:
-                    released = worker["released"]
+                released = self._under(lambda: worker["released"])
                 if released:
                     raise DriverStateError("the handle was released before the message was written: nothing was "
                                            "written, and the process was terminated")
@@ -831,12 +873,13 @@ class ServeDriver(Driver):
             turn_id, worker, turn, process = item["turn_id"], here.get("worker"), here.get("turn"), here.get("process")
             spawning, written = here.get("spawning", False), here.get("written", False)
             if worker is not None and spawning:
-                with self._lock:
-                    worker["spawning"] -= 1
+                self._under(lambda: worker.__setitem__("spawning", worker["spawning"] - 1))
             if worker is not None and turn is not None and not written:
-                with self._lock:
+                def clear() -> None:
                     if worker["turn"] is turn:
                         worker["turn"] = None
+
+                self._under(clear)
                 self._end_turn(handle, turn_id)
                 if process is not None or worker["released"]:
                     self._clean(worker, None if worker["released"] else [process], noting=error)
@@ -885,28 +928,35 @@ class ServeDriver(Driver):
         worker = self._worker(handle)
         claimed = None
         try:   # the claim is inside: an interruption anywhere after this line gives it back
-            with self._lock:
+            def claim():
+                nonlocal claimed
                 turn = worker["turn"]
                 if turn is None or turn["finishing"]:
                     raise DriverStateError("no turn in progress")
                 if exit_code is not None and type(exit_code) is not int:
                     raise DriverInputError("exit_code")
-                turn["finishing"] = True; claimed = turn   # noqa: E702 - one line: one step
+                claimed = turn                 # before the flag, so the except can give the claim back
+                turn["finishing"] = True
+                return turn
+
+            turn = self._under(claim)
             parser = turn["parser"]
             if parser.outcome is None:
                 parser.end(exit_code)
             code, detail = parser.outcome
             drafts = [check_draft(_draft("result", {"code": code, "detail": detail}))]
             self._end_turn(handle, turn["id"])   # the gate's transition first: the turn stays reachable until it
-            with self._lock:
+
+            def retire() -> bool:
                 if worker["turn"] is turn:
                     worker["turn"] = None
                 _drop(worker["live"], turn["process"])   # it has exited
-                closed = worker["closed"]
+                return worker["closed"]
+
+            closed = self._under(retire)
         except BaseException:
             if claimed is not None:
-                with self._lock:
-                    claimed["finishing"] = False
+                self._under(lambda: claimed.__setitem__("finishing", False))
             raise
         if closed:
             try:
@@ -917,8 +967,7 @@ class ServeDriver(Driver):
 
     def _interrupt(self, handle, turn_id: str) -> None:
         worker = self._worker(handle)
-        with self._lock:
-            turn = worker["turn"]
+        turn = self._under(lambda: worker["turn"])
         if turn is None or turn["id"] != turn_id or turn["process"] is None:
             raise DriverStateError(f"{turn_id} has no process")
         session = handle.engine_session_id
@@ -938,12 +987,17 @@ class ServeDriver(Driver):
         process started for it (the turn's and the server) is terminated, each on its own. A termination that
         raised is tried again by the next call; a handle this driver does not hold is left as it is. A prompt
         being written when ``release`` comes is written first, then its process is terminated."""
-        with self._lock:
+        def mark():
             worker = self._workers.get(id(handle))
             if worker is None:
-                return
+                return None
             worker["released"] = worker["closed"] = True   # the one bookkeeping step: nothing moves between lists
-            turn = worker["turn"]
+            return worker
+
+        worker = self._under(mark)
+        if worker is None:
+            return
+        turn = worker["turn"]
         # A write in progress ends first (bounded; taken and given back in one line, so no interruption keeps it).
         if turn is not None and turn["write"].acquire(timeout=10.0): turn["write"].release()   # noqa: E701
         live = handle.live_turn
@@ -965,20 +1019,28 @@ class ServeDriver(Driver):
         A released worker leaves the table once nothing is live and no spawn is under way. The first termination
         error is raised after all were tried; with ``noting`` (an exception already leaving) each failure, a
         ``BaseException`` included, is noted on it instead and never replaces it."""
-        with self._lock:
-            todo = [p for p in (worker["live"][::-1] if processes is None else processes)   # the turn's first
+        def collect() -> list:
+            return [p for p in (worker["live"][::-1] if processes is None else processes)   # the turn's first
                     if any(p is q for q in worker["live"]) and not any(p is q for q in worker["busy"])]
+
+        todo = self._under(collect)
         errors = []
         for process in todo:
             claimed = False
             try:
-                with self._lock:   # looked at again: another cleaner may have ended it since the list was made
+                def claim(process=process) -> bool:
+                    # Looked at again: another cleaner may have ended it since the list was made.
+                    nonlocal claimed
                     if not any(process is q for q in worker["live"]) or any(process is q for q in worker["busy"]):
-                        continue
-                    worker["busy"].append(process); claimed = True   # noqa: E702 - one line: one step
+                        return False
+                    claimed = True   # before the append: an interruption after the append still drops it
+                    worker["busy"].append(process)
+                    return True
+
+                if not self._under(claim):
+                    continue
                 process.terminate()
-                with self._lock:
-                    _drop(worker["live"], process)
+                self._under(lambda process=process: _drop(worker["live"], process))
             except Exception as error:
                 errors.append(error)
             except BaseException as error:
@@ -987,13 +1049,15 @@ class ServeDriver(Driver):
                 errors.append(error)
             finally:
                 if claimed:
-                    with self._lock:
-                        _drop(worker["busy"], process)
-        with self._lock:
+                    self._under(lambda process=process: _drop(worker["busy"], process))
+
+        def forget() -> None:
             key = id(worker["handle"])
             if worker["released"] and not worker["live"] and not worker["spawning"] \
                     and self._workers.get(key) is worker:
                 del self._workers[key]
+
+        self._under(forget)
         if not errors:
             return
         if noting is not None:

@@ -9,6 +9,7 @@ name:
 
 from __future__ import annotations
 
+import dis
 import http.server
 import inspect
 import os
@@ -585,36 +586,60 @@ def step_start(sid: str, part_type: str = "step-start") -> str:
 
 
 class OnceRaisingLock:
-    """A lock whose first entry raises ``KeyboardInterrupt``: an interruption landing exactly there."""
+    """A lock whose first acquire raises ``KeyboardInterrupt``: an interruption landing exactly there."""
 
     def __init__(self) -> None:
-        self.lock, self.armed = threading.Lock(), True
+        self.lock, self.armed = threading.RLock(), True
 
-    def __enter__(self):
+    def acquire(self, *args, **kwargs):
         if self.armed:
             self.armed = False
             raise KeyboardInterrupt("one interruption at the first entry")
-        return self.lock.__enter__()
+        return self.lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self.lock.release()
+
+    def _is_owned(self) -> bool:
+        return self.lock._is_owned()
+
+    def __enter__(self):
+        self.acquire()
+        return self
 
     def __exit__(self, *exc):
-        return self.lock.__exit__(*exc)
+        if self._is_owned():
+            self.release()
+        return False
 
 
 class HookLock:
-    """The driver's lock, counting entries: before entry ``n`` it calls ``hooks[n]`` once (a call landing there)."""
+    """The driver's lock, counting acquires: before acquire ``n`` it calls ``hooks[n]`` once (a call landing there)."""
 
     def __init__(self, lock, hooks: dict) -> None:
         self.lock, self.hooks, self.entries = lock, dict(hooks), 0
 
-    def __enter__(self):
+    def acquire(self, *args, **kwargs):
         self.entries += 1
         hook = self.hooks.pop(self.entries, None)
         if hook is not None:
             hook()
-        return self.lock.__enter__()
+        return self.lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self.lock.release()
+
+    def _is_owned(self) -> bool:
+        return self.lock._is_owned()
+
+    def __enter__(self):
+        self.acquire()
+        return self
 
     def __exit__(self, *exc):
-        return self.lock.__exit__(*exc)
+        if self._is_owned():
+            self.release()
+        return False
 
 
 class ReleaseAndRaceTests(Base):
@@ -1315,6 +1340,174 @@ class ServeReviewThreadTests(unittest.TestCase):
                 with self.assertRaises(DriverInputError) as caught:
                     oc.ServeDriver(spy, port=lambda: PORT).start(start, ws, ENV)
                 self.assertEqual((caught.exception.field, spy.processes), (field, []))
+
+
+def _table_codes():
+    """The code a release walks while it holds, or is about to hold, the table lock."""
+    codes = {oc.ServeDriver.release.__code__}
+    under = getattr(oc.ServeDriver, "_under", None)
+    if under is not None:
+        codes.add(under.__code__)
+    return codes
+
+
+def _traced(run, codes, at=None):
+    """Count opcode events in ``codes``. Raise one KeyboardInterrupt at event number ``at`` (from 0).
+
+    Returns ``(how many events, where it was raised or None, the exception the call let out or None)``.
+    ``where`` is ``(code, f_lasti)``. Instruction events are switched back on before the run: a previous
+    tracer, or a function's first run, can leave them off."""
+    counted = [0]
+    where = [None]
+    cut = KeyboardInterrupt("one synthetic interruption")
+    leaked = [None]
+
+    def points(frame, event, arg):
+        if event == "opcode":
+            if counted[0] == at:
+                where[0] = (frame.f_code, frame.f_lasti)
+                raise cut
+            counted[0] += 1
+        return points
+
+    def calls(frame, event, arg):
+        if event == "call" and frame.f_code in codes:
+            frame.f_trace_opcodes = True
+            frame.f_trace_lines = False
+            return points
+        return None
+
+    sys.settrace(calls)
+    sys.monitoring.restart_events()
+    try:
+        try:
+            run()
+        except BaseException as exc:  # noqa: BLE001 - the call's own exception is the answer
+            leaked[0] = exc
+    finally:
+        sys.settrace(None)
+    return counted[0], where[0], leaked[0]
+
+
+def _marker(where) -> bool:
+    """The 3.14 instruction after a conditional jump that is not taken. No signal is delivered there."""
+    if where is None or sys.version_info < (3, 14):
+        return False
+    code, offset = where
+    name = next((ins.opname for ins in dis.get_instructions(code) if ins.offset == offset), "")
+    if name != "NOT_TAKEN":
+        return False
+    return not any(entry.start <= offset < entry.end for entry in dis.Bytecode(code).exception_entries)
+
+
+def _owned(lock) -> bool:
+    if hasattr(lock, "_is_owned"):
+        return lock._is_owned()
+    return lock.locked()
+
+
+def _other_takes(lock) -> bool:
+    got = []
+
+    def take():
+        ok = lock.acquire(timeout=0.3)
+        got.append(ok)
+        if ok:
+            lock.release()
+
+    thread = threading.Thread(target=take, daemon=True)
+    thread.start()
+    thread.join(1.0)
+    return got == [True] and not thread.is_alive()
+
+
+class MediumInterruptTests(Base):
+    """DeepSeek round 4, the three MEDIUM rows. One interruption, at the instruction the line walk never reaches."""
+
+    def begun(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        return driver, self.spy, handle
+
+    def test_an_interruption_after_the_busy_append_does_not_keep_the_process(self):
+        driver, spy, handle = self.begun()
+        worker = driver._worker(handle)
+
+        class CutBusy(list):
+            def append(self, item):
+                list.append(self, item)
+                raise KeyboardInterrupt("after the busy append, before the flag")
+
+        worker["busy"] = CutBusy()
+        with self.assertRaises(KeyboardInterrupt):
+            driver.release(handle)
+        worker["busy"] = list(worker["busy"])   # the cut has fired; the retry is the driver's own list
+        driver.release(handle)
+        self.assertGreaterEqual(spy.processes[0].terminated, 1)
+        self.assertGreaterEqual(spy.processes[1].terminated, 1)
+        self.assertEqual(driver._workers, {})
+        self.assertIsNone(handle.live_turn)
+
+    def test_an_interruption_after_finishing_is_set_can_finish_the_same_turn(self):
+        driver, _spy, handle = self.begun()
+        worker = driver._worker(handle)
+
+        class CutTurn(dict):
+            armed = True
+
+            def __setitem__(self, key, value):
+                dict.__setitem__(self, key, value)
+                if key == "finishing" and value is True and CutTurn.armed:
+                    CutTurn.armed = False
+                    raise KeyboardInterrupt("after finishing, before the claim")
+
+        worker["turn"] = CutTurn(worker["turn"])
+        with self.assertRaises(KeyboardInterrupt):
+            driver.finish_turn(handle, 0)
+        drafts = driver.finish_turn(handle, 0)
+        self.assertIsNone(drafts[0]["payload"]["code"])
+        self.assertIsNone(handle.live_turn)
+        driver.release(handle)
+        self.assertEqual(driver._workers, {})
+
+    def _prime(self, codes, total) -> None:
+        """Traced releases with no cut, until every instruction event is back. An earlier cut can switch one off."""
+        seen = []
+        for _ in range(8):
+            driver, _spy, handle = self.begun()
+            seen.append(_traced(lambda d=driver, h=handle: d.release(h), codes)[0])
+            if seen[-1] == total:
+                return
+        self.fail(f"instruction events did not come back: {seen}, of {total}")
+
+    def test_an_interruption_after_the_table_lock_is_taken_does_not_keep_it(self):
+        codes = _table_codes()
+        counts = []
+        for _ in range(8):
+            driver, _spy, handle = self.begun()
+            counts.append(_traced(lambda d=driver, h=handle: d.release(h), codes)[0])
+            if len(counts) >= 2 and counts[-1] == counts[-2] and counts[-1] > 8:
+                break
+        total = counts[-1]
+        self.assertGreater(total, 8, f"instruction events did not come back: {counts}")
+        for at in range(total):
+            where = raised = driver = None
+            for _aim in range(3):
+                self._prime(codes, total)
+                driver, _spy, handle = self.begun()
+                _count, where, raised = _traced(lambda d=driver, h=handle: d.release(h), codes, at)
+                if where is not None:
+                    break
+            with self.subTest(point=at):
+                self.assertIsNotNone(where, "the interruption was raised at the point it was aimed at")
+                self.assertIsInstance(raised, KeyboardInterrupt)
+                if _marker(where):
+                    while _owned(driver._lock):
+                        driver._lock.release()
+                    continue
+                self.assertFalse(_owned(driver._lock))
+                self.assertTrue(_other_takes(driver._lock))
 
 
 if __name__ == "__main__":

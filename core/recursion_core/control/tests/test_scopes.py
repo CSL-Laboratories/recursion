@@ -136,6 +136,8 @@ class MatrixTest(unittest.TestCase):
                 want_ok = scope in HOLDS[name]
                 if method == "run.stop" and name in ("internal", "agent", "plugin"):
                     want_ok = False   # internal and agent are not in the Stop row; run-s1 is host-owned
+                if name == "session" and method not in scopes.SESSION_DELEGABLE and method != "run.stop":
+                    want_ok = False   # session.token.v1's delegable list (the integration read of #385, F1)
                 if (got is None) != want_ok:
                     mismatches.append((method, name, got))
                 if got is not None:
@@ -196,7 +198,11 @@ class CeilingAtCallTest(unittest.TestCase):
                 principal = Principal(kind, "x") if kind == "plugin" else bearer(kind, "x")
                 self.assertEqual(auth(principal, "approval.answer", {}), ("scope_refused", "needs_approve"))
                 self.assertEqual(auth(principal, "workspace.publish", {}), ("scope_refused", "needs_manage"))
-                self.assertIsNone(auth(principal, "run.start", {}))
+                if kind == "session":   # run.start is not delegable to a session (the integration read of #385, F1)
+                    self.assertEqual(auth(principal, "run.start", {}), ("scope_refused", "method_not_delegable"))
+                    self.assertIsNone(auth(principal, "session.start", {}))
+                else:
+                    self.assertIsNone(auth(principal, "run.start", {}))
         self.assertIsNone(auth(bearer("device", "x"), "approval.answer", {}))
         self.assertEqual(auth(bearer("device", "x"), "workspace.publish", {}), ("scope_refused", "needs_manage"))
 

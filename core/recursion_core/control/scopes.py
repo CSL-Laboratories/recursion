@@ -85,6 +85,15 @@ PAGE_PRINCIPAL_ID = PAGE_DEVICE_ID   # control/hooks.py DEVICE: the page's door;
 # The page's device principal: read, run, approve (the brief's recommended option (a); the owner decides).
 PAGE_SCOPES = frozenset({"read", "run", "approve"})
 STOP_METHOD = "run.stop"
+# The methods a session grant may authorize: session.token.v1's $defs/delegable_method
+# (schemas/control/v1/session.token.v1.json, SPINE's #368), kept here so the decision reads no file. A session
+# principal is refused every other method, whatever its grant's scopes say, except run.stop, which keeps the
+# Stop row's own rule below (a session stops only runs of its own session and the sessions it started). A test
+# holds this set to the schema's list wherever the schema is in the tree (the integration read of #385, F1).
+SESSION_DELEGABLE = frozenset({
+    "session.start", "session.turn", "session.steer", "session.queue", "session.interrupt", "session.status",
+    "session.list", "session.stop", "events.read", "events.follow", "methods.list",
+})
 HOST_OWNER = "host"          # launch.owner of a run the host started (control/hooks.py launch_snapshot)
 SERVICE_NAME = "control.scopes"
 CREDENTIALS_PATH = ("control", "credentials.json")   # under the daemon's state directory
@@ -351,6 +360,10 @@ class Authorizer:
             return (SCOPE_REFUSED, "scope_unknown")   # a table row naming no known scope opens nothing
         if scope not in held:
             return (SCOPE_REFUSED, f"needs_{scope}")
+        if kind == "session" and method not in SESSION_DELEGABLE and method != STOP_METHOD:
+            # A session grant's scopes never reach a method session.token.v1 does not delegate (run.start,
+            # approval.list, workspace.restore and key.list were let through); run.stop keeps its own rule below.
+            return (SCOPE_REFUSED, "method_not_delegable")
         if method == STOP_METHOD:
             if "run" not in held:
                 # The Stop row's own rule, whatever the table's scope column says for run.stop.

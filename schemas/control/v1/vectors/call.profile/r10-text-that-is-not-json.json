@@ -1,0 +1,8 @@
+{
+  "tool": "Bash",
+  "cwd": null,
+  "input_text": "rm -rf /",
+  "expect": {
+    "refused": "not_json"
+  }
+}

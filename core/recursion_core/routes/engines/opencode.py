@@ -342,11 +342,48 @@ def _refuse_what_is_not_run(request: dict) -> None:
     """A start this driver would not run as asked is refused before anything is spawned (``DriverInputError``): a
     route naming another engine (``route.engine``; the gate checks only its shape), and a workspace
     (``workspace``): ``spawn(argv, env)`` takes no directory, so a run would start in the spawn's own directory, not
-    the one asked for. Running in a workspace waits for the launch path to carry it (lane DRIVER-CC's and LAUNCH's)."""
-    if request["route"]["engine"] != ENGINE:
+    the one asked for. Running in a workspace waits for the launch path to carry it (lane DRIVER-CC's and LAUNCH's).
+
+    The engine is checked before the guard, so a route that names both another engine and a refused model answers
+    ``route.engine``. The caller passes a record the gate built; another mapping raises ``KeyError``."""
+    engine = request["route"]["engine"]
+    # A ``str`` subclass can answer ``==`` as it likes and still pass the gate's shape check. Only a plain ``str``
+    # is this engine.
+    if type(engine) is not str or engine != ENGINE:
         raise DriverInputError("route.engine")
     if request["workspace"] is not None:
         raise DriverInputError("workspace")
+
+
+def _reopen_input(handle) -> None:
+    """Open the gate's input again after a close that did not complete.
+
+    The handle's lock is an ``RLock`` (set in ``OpenCodeDriver._start``) so this region can ask who owns it.
+    One protected region, the same form as ``_exclusive``: the taking (``take_once``), the store and the release
+    are inside one try. An interruption, including the instruction just after the lock is taken, leaves the lock
+    free and is raised once it is free. A ``with`` on this lock does not: the instructions that call its exit
+    sit outside the ``with``'s handler, so an interruption there leaves the lock owned and a later call from
+    another thread waits for ever.
+    """
+    from recursion_core.control.hooks import raise_kept, take_once  # local: routes must not load control at import
+
+    lock = handle._lock
+    kept: list = []
+    done = False
+    while True:
+        try:
+            if not kept and not done:
+                if not lock._is_owned():
+                    take_once(lock, kept)
+                if not kept:
+                    handle._closed = False
+                    done = True
+            if lock._is_owned():
+                lock.release()
+            break
+        except BaseException as exc:  # noqa: BLE001 - kept; the lock is released first
+            kept.append(exc)
+    raise_kept(kept)
 
 
 def _fence(process, reason: str) -> None:
@@ -380,10 +417,10 @@ class OpenCodeDriver(Driver):
     lock, so a finish waits for a line being read (a 429 in it decides the result) and a release waits for a
     finish. The lock is taken and released in ONE protected region (``_exclusive``, the form of
     ``control.hooks``' OWNERSHIP note, with its ``take_once``): one interruption anywhere in it, a real SIGINT
-    included, leaves the lock free, and the interruption is raised once it is free. A message the gate reserved
-    after ``finish`` or ``release`` (or while one ran) is refused with ``DriverStateError`` and its turn is ended
-    again, so the refusal leaves no live turn. A ``release`` that lands after that check and before the prompt
-    write lets the write reach the process, whose end is the caller's (see ``release``).
+    included, leaves the lock free, and the interruption is raised once it is free. A message whose reservation comes after
+    ``finish`` or ``release`` has returned is refused with ``DriverStateError`` and its turn is ended again, so the
+    refusal leaves no live turn. A ``finish`` or ``release`` that lands between that check and the prompt write lets
+    the write reach the process, whose end is the caller's (see ``release``).
     """
 
     declaration = Declaration(ENGINE, Flags(**FLAGS), input_ack=False)
@@ -406,6 +443,9 @@ class OpenCodeDriver(Driver):
         return worker
 
     def _start(self, handle, request: dict, env: dict) -> None:
+        # The gate's lock is a plain Lock. Reopening the input has to ask who owns it, and a ``with`` on a plain
+        # Lock is left held by one interruption on 3.14. An RLock is the same lock to every ``with`` the gate writes.
+        handle._lock = threading.RLock()
         route = request["route"]
         _refuse_what_is_not_run(request)
         model = held_to_the_guard(route["model"], None)
@@ -427,14 +467,16 @@ class OpenCodeDriver(Driver):
                 self._unreserve(handle, item)
                 raise DriverStateError("the run ended before its prompt was written")
             worker["process"].send(item["text"])
+            # Lines already read cannot accept this prompt. Record the count before the delivery, so a line whose
+            # feed began earlier fails the check even when the write lands inside that feed.
+            worker["written_at"] = worker["parser"].lines_read
             worker["delivery"] = item["delivery_id"]   # only a write that returned can be accepted later
         if not worker.get("stdin_closed"):     # the prompt is the whole input; a close only ends it sooner
             try:
                 worker["process"].close_stdin()
             except BaseException:
                 if item["kind"] == "close":    # the gate closed the input before this close: not done, so open again
-                    with handle._lock:
-                        handle._closed = False
+                    _reopen_input(handle)
                 raise
             worker["stdin_closed"] = True          # only a close that returned is done; a raised one is tried again
 
@@ -455,7 +497,8 @@ class OpenCodeDriver(Driver):
             if parser.engine_session_id is not None and handle.engine_session_id is None:
                 handle.set_engine_session_id(parser.engine_session_id)
             if not worker["accepted"] and worker["delivery"] is not None and parser.lines_read != fed \
-                    and parser.started:        # a start read by THIS call: an empty parse reads none
+                    and parser.started and fed >= worker["written_at"]:
+                # a start read by THIS call, and the feed began at or after the prompt was written
                 worker["accepted"] = True
                 drafts.append(_draft("input.accepted", {"delivery_id": worker["delivery"],
                                                         "turn_id": worker["turn"], "how": "new_turn"}))
@@ -783,7 +826,7 @@ class Parser:
         elif isinstance(error, dict) and isinstance(error.get("type"), str):      # 2.x session error
             tag, status, message = error["type"], error.get("status"), error.get("message")
             auth = tag == "provider.auth"
-            wait_of = lambda now: _positive_finite(error.get("retryAfterMs"), scale=1000.0)   # noqa: E731
+            wait_of = lambda now: _retry_ms(error.get("retryAfterMs"))   # noqa: E731
             source = "opencode.error.status"
         else:
             self._anomaly("error_shape")
@@ -794,10 +837,16 @@ class Parser:
         if status == LIMIT_STATUS:   # both clocks are read before anything is kept (see ``feed``)
             now = self._wall()     # read once: an HTTP date's wait and the reset share this one reading
             wait = wait_of(now)
-            reset_at = _timestamp(now + wait) if wait is not None else None
+            # The sum is exact. ``now + wait`` as floats can round under the real sum, and the ceiling of that
+            # float is then one millisecond earlier than the wait that was asked for.
+            if wait is not None and not (type(now) is float and not math.isfinite(now)):
+                reset_at = _timestamp(Fraction(now) + wait)
+            else:
+                reset_at = None
             if reset_at is None:
                 wait = None   # a wait too far off to write is not known: the event and the breaker agree
-            limit = c.limit_signal("connection", source, reset_at=self._clock() + wait if wait is not None else None)
+            limit = c.limit_signal("connection", source,
+                                   reset_at=self._clock() + float(wait) if wait is not None else None)
         self._errors.append({"tag": tag if tag in KNOWN_ERRORS else "error", "status": status, "auth": auth,
                              "quota_text": c.sounds_like_quota(message)})
         if limit is None:
@@ -865,6 +914,21 @@ def _cost(value: object) -> dict:
     return _known(number, "modelled") if number is not None else dict(_UNKNOWN)
 
 
+def _retry_ms(value: object) -> Fraction | None:
+    """``retryAfterMs`` as an exact fraction of a second, or None when it is not a positive finite number."""
+    if type(value) is bool or type(value) not in (int, float):
+        return None
+    if type(value) is float and not math.isfinite(value):
+        return None
+    try:
+        number = Fraction(value)
+    except (OverflowError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return number / 1000
+
+
 def _positive_finite(value: object, *, scale: float = 1.0) -> float | None:
     if type(value) not in (int, float):
         return None
@@ -887,7 +951,7 @@ def _js_float(text: str) -> float | None:
     return float(match.group(1)) if match else None
 
 
-def _retry_after_s(headers: object, now: float) -> float | None:
+def _retry_after_s(headers: object, now: float) -> Fraction | None:
     """The wait 1.x response headers ask for, in seconds, read the way OpenCode reads them (retry.ts:47-75).
 
     ``now`` is the wall clock's reading for this line. ``retry-after-ms`` when it holds a number (then nothing else
@@ -901,17 +965,24 @@ def _retry_after_s(headers: object, now: float) -> float | None:
     if millis:
         number = _js_float(millis)
         if number is not None:
-            return number / 1000.0 if number > 0 else None   # an infinite wait has no timestamp: no reset
+            if not math.isfinite(number) or number <= 0:   # an infinite wait has no timestamp: no reset
+                return None
+            return Fraction(number) / 1000
     after = lower.get("retry-after")
     if not after:
         return None
     number = _js_float(after)
     if number is not None:
-        return number if number > 0 else None
+        if not math.isfinite(number) or number <= 0:
+            return None
+        return Fraction(number)
     moment = _http_date(after, now)
     if moment is None:
         return None
-    wait = moment - now
+    try:
+        wait = Fraction(moment) - Fraction(now)
+    except (OverflowError, ValueError):
+        return None
     return wait if wait > 0 else None
 
 
@@ -961,13 +1032,14 @@ def _http_date(text: str, now: float) -> float | None:
     return moment
 
 
-def _timestamp(epoch: float) -> str | None:
-    """common.v1's timestamp, rounded UP to the millisecond (a reset is never earlier than asked).
+def _timestamp(epoch: float | Fraction) -> str | None:
+    """common.v1's timestamp, rounded UP to the millisecond (never earlier than the instant given).
 
-    None when it cannot be written: before the first second of the year 1, after 9999-12-31T23:59:58Z
-    (``_LAST_EPOCH``, kept a second short of the year's end so that rounding up never reaches the year 10000; the
-    last second of the year 9999 is refused too, and only an injected wall clock gets that far), infinite, or not
-    a number. The year is always written with four digits.
+    ``epoch`` is a float or an exact ``Fraction``. The ceiling is of that value, so a caller that passes the exact
+    sum of the wall reading and the wait is never a millisecond early. None when it cannot be written: before the
+    first second of the year 1, after 9999-12-31T23:59:58Z (``_LAST_EPOCH``, kept a second short of the year's end
+    so that rounding up never reaches the year 10000; the last second of the year 9999 is refused too, and only an
+    injected wall clock gets that far), infinite, or not a number. The year is always written with four digits.
     """
     if not _FIRST_EPOCH <= epoch <= _LAST_EPOCH:
         return None

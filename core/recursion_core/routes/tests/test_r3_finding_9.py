@@ -1,7 +1,5 @@
 """R3-9: malformed JSON-RPC responses must reach the existing protocol-error path."""
-import os
 import unittest
-from unittest import mock
 
 from recursion_core.routes import CodexAdapter, ConnectionBreaker, RouteService
 from recursion_core.routes import contract as c
@@ -35,14 +33,14 @@ class MalformedRpcTest(unittest.TestCase):
                     self.assertEqual(result["code"], c.PROTOCOL_ERROR)
                     self.assertEqual(launcher.processes[0].fenced, ["protocol_error"])
 
-    def test_a_windows_reported_host_keeps_the_protocol_error_and_fences_once(self):
-        # No simulation harness. os.name is nt in this process, which is enough for the host check
-        # to refuse. Without runs_adapter the code is launch_refused and no child starts.
-        with mock.patch.object(os, "name", "nt"):
-            for error in ("FAKE-error", [], 23, None):
-                for response_id in (1, 2, 4):
-                    with self.subTest(error=error, response_id=response_id):
-                        result, launcher = _nonobject_error(error, response_id)
-                        self.assertEqual(result["code"], c.PROTOCOL_ERROR)
-                        self.assertEqual(len(launcher.calls), 1)
-                        self.assertEqual(launcher.processes[0].fenced, ["protocol_error"])
+    def test_a_pinned_host_check_keeps_the_protocol_error_and_one_fence(self):
+        # The class marker pins the host check so a launch is allowed. This holds the protocol
+        # path and the one fence under that pin. It is not the host refusal: with the real check
+        # a Windows-reported host is launch_refused before any child, which test_r3_finding_7 holds.
+        for error in ("FAKE-error", [], 23, None):
+            for response_id in (1, 2, 4):
+                with self.subTest(error=error, response_id=response_id):
+                    result, launcher = _nonobject_error(error, response_id)
+                    self.assertEqual(result["code"], c.PROTOCOL_ERROR)
+                    self.assertEqual(
+                        (len(launcher.calls), launcher.processes[0].fenced), (1, ["protocol_error"]))

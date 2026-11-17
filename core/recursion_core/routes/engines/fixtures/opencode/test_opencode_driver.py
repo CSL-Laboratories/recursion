@@ -628,5 +628,223 @@ class ReviewThreadTests(unittest.TestCase):
                 self.assertEqual(spy.spawns, [])
 
 
+class RoundSixAnswerTests(unittest.TestCase):
+    """Round 5's open rows, and the round-4 required regressions those rows name."""
+
+    def setUp(self):
+        sys.settrace(None)
+
+    def tearDown(self):
+        sys.settrace(None)
+
+    def test_a_step_start_already_consumed_does_not_accept_the_later_prompt(self):
+        # The parse call has fed the run's own step_start. Only then is the prompt written.
+        # That line was not read after the write, so it does not accept the prompt. The next
+        # genuine start, fed after the write, does.
+        spy = Spy()
+        driver = oc.OpenCodeDriver(spy)
+        handle = driver.start(session(), None, ENV)
+        parser = driver._workers[id(handle)]["parser"]
+        real, fed, proceed = parser.feed, threading.Event(), threading.Event()
+
+        def feed(text, _real=real, _fed=fed, _go=proceed):
+            drafts = _real(text)
+            _fed.set()
+            if not _go.wait(5):
+                raise TimeoutError("the prompt was not written")
+            return drafts
+
+        parser.feed = feed
+        box: dict = {}
+
+        def reader():
+            try:
+                box["drafts"] = driver.parse(handle, START)
+            except BaseException as exc:  # noqa: BLE001 - the reader must not die silent
+                box["error"] = exc
+
+        reader_thread = threading.Thread(target=reader)
+        reader_thread.start()
+        self.assertTrue(fed.wait(5))
+        driver.send(handle, message())
+        proceed.set()
+        reader_thread.join(5)
+        self.assertFalse(reader_thread.is_alive())
+        self.assertNotIn("error", box)
+        self.assertEqual(spy.processes[0].sent, ["Run the tests."])
+        self.assertNotIn("input.accepted", [d["type"] for d in box["drafts"]])
+        later = driver.parse(handle, START)
+        self.assertIn("input.accepted", [d["type"] for d in later])
+
+    def test_an_interruption_at_the_reopen_does_not_keep_the_handle_lock(self):
+        # One interruption at each instruction of the failing-close reopen. The handle's lock
+        # is free again afterwards, on both interpreters: a later send from another thread must
+        # be able to take it. An RLock's acquire from its owner succeeds, so the check asks who
+        # owns it rather than acquiring from this thread.
+        from recursion_core.control.hooks import take_once
+
+        probe = oc.OpenCodeDriver(Spy()).start(session(), None, ENV)
+        self.assertTrue(hasattr(probe._lock, "_is_owned"))
+        codes = [oc.OpenCodeDriver._send.__code__, take_once.__code__]
+        reopen = getattr(oc, "_reopen_input", None)
+        if reopen is not None:
+            codes.append(reopen.__code__)
+        code_ids = {c: c for c in codes}
+        broken = []
+        for code in codes:
+            for inst in dis.get_instructions(code):
+                if inst.opname in ("RESUME", "CACHE", "NOT_TAKEN"):
+                    continue
+                spy = Spy()
+                driver = oc.OpenCodeDriver(spy)
+                handle = driver.start(session(), None, ENV)
+                spy.processes[0].close_errors = [OSError("not closed")]
+                fired = []
+
+                def trace(frame, event, arg, code=code, offset=inst.offset, fired=fired):
+                    if fired:
+                        return None
+                    if frame.f_code in code_ids:
+                        frame.f_trace_opcodes = True
+                        if frame.f_code is code and event == "opcode" and frame.f_lasti == offset:
+                            fired.append(inst.opname)
+                            sys.settrace(None)
+                            raise KeyboardInterrupt
+                        return trace
+                    return None
+
+                sys.settrace(trace)
+                try:
+                    driver.send(handle, {"kind": "close"})
+                except (KeyboardInterrupt, OSError):
+                    pass
+                finally:
+                    sys.settrace(None)
+                if not fired:
+                    continue
+                lock = handle._lock
+                if hasattr(lock, "_is_owned"):
+                    owned = lock._is_owned()
+                else:
+                    got = lock.acquire(blocking=False)
+                    owned = not got
+                    if got:
+                        lock.release()
+                if owned:
+                    broken.append((code.co_name, inst.offset, inst.opname))
+                    try:
+                        lock.release()
+                    except RuntimeError:
+                        pass
+        self.assertEqual(broken, [])
+
+    def test_a_str_subclass_naming_another_engine_does_not_spawn(self):
+        class Lies(str):
+            def __eq__(self, other):
+                return True
+
+            def __ne__(self, other):
+                return False
+
+            __hash__ = str.__hash__
+
+        spy = Spy()
+        start = session()
+        start["route"] = dict(start["route"], engine=Lies("codex"))
+        with self.assertRaises(DriverInputError) as caught:
+            oc.OpenCodeDriver(spy).start(start, None, ENV)
+        self.assertEqual((caught.exception.field, spy.spawns), ("route.engine", []))
+
+    def test_another_engine_and_a_refused_model_answers_the_engine(self):
+        # The engine is checked before the guard, so both together answer route.engine.
+        spy = Spy()
+        start = session("claude-agent/sonnet")
+        start["route"] = dict(start["route"], engine="codex")
+        with self.assertRaises(DriverInputError) as caught:
+            oc.OpenCodeDriver(spy).start(start, None, ENV)
+        self.assertEqual((caught.exception.field, spy.spawns), ("route.engine", []))
+        self.assertIn("checked before the guard", oc._refuse_what_is_not_run.__doc__)
+        self.assertIn("a record the gate built", oc._refuse_what_is_not_run.__doc__)
+
+    def test_the_feed_row_of_the_consumer_table_is_one_line(self):
+        rows = [line for line in (HERE / "README.md").read_text().splitlines() if line.startswith("| `Parser.feed")]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("TypeError", rows[0])
+        self.assertIn("`\\n`", rows[0])
+        self.assertIn("`\\r\\n`", rows[0])
+
+    def test_the_finish_and_release_window_is_named_for_both(self):
+        doc = oc.OpenCodeDriver.__doc__
+        self.assertIn("whose reservation comes after", doc)
+        self.assertIn("A ``finish`` or ``release`` that lands between that check and the prompt write", doc)
+        self.assertNotIn("after ``finish`` or ``release`` (or while one ran) is refused", doc)
+
+    def test_a_finish_after_the_lookup_and_before_the_recheck_writes_nothing(self):
+        driver = oc.OpenCodeDriver(Spy())
+        handle = driver.start(session(), None, ENV)
+        worker = driver._workers[id(handle)]
+
+        class TurnEnds(dict):
+            def __setitem__(self, key, value):
+                dict.__setitem__(self, key, value)
+                if key == "turn":
+                    driver.finish(handle, 0)
+
+        driver._workers[id(handle)] = TurnEnds(worker)
+        with self.assertRaises(DriverStateError) as caught:
+            driver.send(handle, message())
+        self.assertIn("before its prompt was written", str(caught.exception))
+        self.assertEqual(worker["process"].sent, [])
+        self.assertIsNone(handle.live_turn)
+        self.assertNotIn(id(handle), driver._workers)
+
+    def test_an_interruption_before_the_exclusive_step_leaves_the_transition_unstarted(self):
+        driver = oc.OpenCodeDriver(Spy())
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        inner = driver._ending
+
+        class Once:
+            def __init__(self):
+                self.n = 0
+
+            def acquire(self, blocking=True, timeout=-1):
+                self.n += 1
+                if self.n == 1:
+                    raise KeyboardInterrupt("before the step")
+                return inner.acquire(blocking, timeout)
+
+            def release(self):
+                return inner.release()
+
+            def _is_owned(self):
+                return inner._is_owned()
+
+        driver._ending = Once()
+        with self.assertRaises(KeyboardInterrupt):
+            driver.finish(handle, 0)
+        self.assertIn(id(handle), driver._workers)
+        self.assertEqual(handle.live_turn, "turn-1")
+        driver._ending = inner
+        driver.finish(handle, 0)
+        self.assertNotIn(id(handle), driver._workers)
+        self.assertIsNone(handle.live_turn)
+
+    def test_a_baseexception_from_close_can_be_asked_again(self):
+        driver = oc.OpenCodeDriver(Spy())
+        handle = driver.start(session(), None, ENV)
+        process = driver._workers[id(handle)]["process"]
+        process.close_errors = [OSError("a"), KeyboardInterrupt("b"), SystemExit("c")]
+        for exc in (OSError, KeyboardInterrupt, SystemExit):
+            with self.subTest(exc=exc.__name__):
+                with self.assertRaises(exc):
+                    driver.send(handle, {"kind": "close"})
+                self.assertEqual(process.closes, 0)
+                self.assertFalse(handle._closed)
+        driver.send(handle, {"kind": "close"})
+        self.assertEqual(process.closes, 1)
+        self.assertTrue(handle._closed)
+
+
 if __name__ == "__main__":
     unittest.main()

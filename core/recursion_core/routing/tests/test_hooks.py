@@ -553,6 +553,20 @@ class HookRegressions(unittest.TestCase):
         decision = router.decide(loaded, detection({"claude_code", "codex"}), {"task_kind": "review"})
         self.assertIsNone(rh.route_entry(loaded, {**decision, "rule": ComparingRaises(decision["rule"])}))
 
+
+    def test_the_limits_lookup_gets_only_the_three_members_it_reads(self) -> None:  # ds r5 F1
+        self.raw["rules"][0]["route"]["limits"] = {"on_limit": "wait"}
+        self.write("routing.json", self.raw)
+        loaded = rc.load(self.folder, {})
+        decision = router.decide(loaded, detection({"claude_code", "codex"}), {"task_kind": "review"})
+        with mock.patch.object(rh.router, "_route_limits", wraps=router._route_limits) as lookup:
+            entry = rh.route_entry(loaded, decision)
+        lookup.assert_called_once()
+        given = lookup.call_args.args[1]  # a new plain dict of the three members, never the decision or a copy of all
+        self.assertIs(type(given), dict)
+        self.assertEqual(given, {"reason": "config", "rule": decision["rule"], "engine": "codex"})
+        self.assertEqual(entry["route"]["limits"]["on_limit"], "wait")
+
     def test_hostile_hand_pick_is_typed_even_with_named_engine(self) -> None:  # sol's hardening note
         class BadRead(dict):
             def get(self, *args):

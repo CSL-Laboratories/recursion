@@ -825,6 +825,12 @@ MUTANTS = {
         "        return {",
         {"test_a_listed_route_the_daemon_refuses_is_passed_over_for_the_next",
          "test_a_refusal_source_that_raises_passes_the_route_over"}),
+    # #419's DeepSeek r5 (c8f01c73): its F1, a shallow copy of the decision in place of the three members.
+    "H27 the limits lookup handed a shallow copy of the whole decision": (
+        HOOKS,
+        '{"reason": reason, "rule": rule, "engine": engine}',
+        "dict(decision)",
+        {"test_the_limits_lookup_gets_only_the_three_members_it_reads"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

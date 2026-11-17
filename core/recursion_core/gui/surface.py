@@ -483,6 +483,13 @@ class Application:
             return "Stop not confirmed", ('<p role="status">Stop state: unknown. The control API did not '
                                           "answer (%s). Check the run before assuming it stopped.</p>"
                                           % escape(exc.code))
+        # gui_transport returns this body at HTTP 200. These codes are refusals; pending and stopped
+        # carry a state and use the line below (control/api.py stop, daemon/control_adapter.py).
+        code = data.get("code")
+        if type(code) is str and code in ("run_unknown", "request_invalid", "registry_unavailable"):
+            return "Stop refused", (
+                '<p role="status">Stop refused by the control API (%s). '
+                "Check the run before assuming it stopped.</p>" % escape(code))
         state = data.get("state") if type(data.get("state")) is str else None
         line = ("Stop state reported by the control API: <strong>%s</strong>" % escape(state) if state
                 else "Stop state: not reported by the control API (unknown)")

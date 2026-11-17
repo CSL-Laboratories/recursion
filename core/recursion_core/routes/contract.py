@@ -156,7 +156,7 @@ def _finite(value: object) -> bool:
 
 
 def validate_request(request: object, *, engines: object = None) -> dict:
-    """Return a normalised copy of ``request`` or raise ``RouteError(REQUEST_INVALID)``.
+    """Return a normalised copy of ``request`` or raise ``RouteError(REQUEST_INVALID or ENGINE_UNKNOWN)``.
 
     ``engines`` is what the composition registered (see ``engine_names``); None means nothing registered.
     """

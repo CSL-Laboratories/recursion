@@ -9,7 +9,7 @@ import unittest
 
 from recursion_core.routes import ClaudeCodeAdapter, ConnectionBreaker, RouteService
 from recursion_core.routes import contract as c
-from recursion_core.routes.tests.fakes import FakeClock, FakeProcess, request
+from recursion_core.routes.tests.fakes import FakeClock, FakeProcess, request, runs_adapter
 
 
 class _Launcher:
@@ -20,6 +20,7 @@ class _Launcher:
         return FakeProcess(self.script, self.clock)
 
 
+@runs_adapter
 class BreakerAgreementTest(unittest.TestCase):
     def test_rc06_connection_limit_survives_later_model_limit(self):
         cases = {

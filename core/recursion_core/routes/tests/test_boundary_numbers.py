@@ -13,7 +13,7 @@ import unittest
 from recursion_core.routes import ClaudeCodeAdapter, CodexAdapter, ConnectionBreaker, RouteService
 from recursion_core.routes import contract as c
 from recursion_core.routes.tests.fakes import (
-    FakeClock, FakeLauncher, FakeProcess, claude_ok, codex_script, request,
+    FakeClock, FakeLauncher, FakeProcess, claude_ok, codex_script, request, runs_adapter,
 )
 
 HUGE = "1" + "0" * 400
@@ -35,6 +35,7 @@ def _codex(script, clock=None):
     return svc, launcher, breaker, clock
 
 
+@runs_adapter
 class BoundaryNumberTest(unittest.TestCase):
     def _handle(self, svc, req):
         try:

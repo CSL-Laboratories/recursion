@@ -261,10 +261,8 @@ prefix or substring.
 
 What this package does not do:
 
-- The one-time prompt and the remembered trusted list live at the driver layer, not in
-  `child_env`. This package reads and writes no storage for them, reads no environment
-  variable for them, and never prompts. The driver asks the user once, saves the origin in
-  the user's config, and passes the saved origins in `trusted_base_urls` on later runs.
+- A driver must ask the user once, save the origin and pass it in `trusted_base_urls`; no driver does this yet.
+  This package reads and writes no storage for that list, reads no environment variable for it, and never prompts.
 - That prompt must warn the user that their subscription token goes to that endpoint.
 - The driver must show the danger notice when the named full-access profile is turned on.
   `child_env` renders no UI.

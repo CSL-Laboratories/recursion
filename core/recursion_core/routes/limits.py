@@ -91,7 +91,7 @@ def notice(result: Mapping, route: Mapping, limits: Mapping) -> dict | None:
         "message": f"{here['connection']} ({here['engine']}, {here['model']}) is at a usage limit",
         "route": here,
         "code": result["code"],
-        "scope": signal.get("scope", _refusal_scope(result)),
+        "scope": signal.get("scope", _refusal_scope(result, route)),
         "source": signal.get("source", result.get("detail", "")),
         "reset_at": reset_at,
         "on_limit": limits["on_limit"],
@@ -101,8 +101,21 @@ def notice(result: Mapping, route: Mapping, limits: Mapping) -> dict | None:
     }
 
 
-def _refusal_scope(result: Mapping) -> str:
-    """A breaker refusal names the key it hit in ``detail``: a model bucket key is model scope."""
+def _refusal_scope(result: Mapping, route: Mapping) -> str:
+    """Scope of a breaker refusal from the key it stored, compared whole.
+
+    ``detail`` is that key. A connection id may itself contain the display marker, so searching
+    for the marker inside the key reports a connection as a model bucket. The connection key
+    equals the route's connection. A model bucket is that key, the marker, and a model id.
+    """
 
     detail = result.get("detail")
-    return "model" if isinstance(detail, str) and "#model:" in detail else "connection"
+    if not isinstance(detail, str):
+        return "connection"
+    conn = c.connection_key(route)
+    marker = "#model:"
+    if detail == conn:
+        return "connection"
+    if detail.startswith(conn + marker) and len(detail) > len(conn) + len(marker):
+        return "model"
+    return "connection"

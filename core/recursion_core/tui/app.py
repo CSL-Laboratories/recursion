@@ -595,7 +595,8 @@ class TuiApp:
         rows instead of lines, so a long line's first row is reachable too)."""
 
         out = self.outputs.get(self.attached or "")
-        return max(0, out.total_rows(width or self._pane_width()) - 1) if out else 0  # width: the frame's own
+        # ``width``: the frame's own, given as it is (0 too); None reads the pane's (DeepSeek r7 of #404, F4)
+        return max(0, out.total_rows(self._pane_width() if width is None else width) - 1) if out else 0
 
     def _page(self, action: str, burst: bool = False) -> None:
         """Pager steps in display rows (a long line's rows are each reachable; review 1 of #404, R2)."""
@@ -943,16 +944,17 @@ class TuiApp:
                              "selected" if rid == self.selected else None))
             rows.extend((5, "", None) for _ in range(run_rows - len(self.runs[start:start + run_rows])))
         self._keys_row = rem >= 2  # a row for the header and one for an entry; else the prompt says so
-        if rem and self.mode == "help":  # the keys, in the output pane's place, until Esc, q or ?
+        if rem and self.mode == "help":  # the keys, in the output pane's place, until a key that closes them
             self._out_rows = rem - 1
+            scroll, leave = self._help_keys()  # the header and the prompt say the same (DeepSeek r7 of #404, F1)
             every = self._help_rows()
             self.help_scroll = min(self.help_scroll, max(0, len(every) - (rem - 1)))  # every row can be reached
             lines = every[self.help_scroll:self.help_scroll + rem - 1]
-            more = (f"; rows {self.help_scroll + 1}-{self.help_scroll + len(lines)} of {len(every)}, j/k and "
-                    f"Page Up/Down scroll" if len(every) > rem - 1 else "")
+            more = (f"; rows {self.help_scroll + 1}-{self.help_scroll + len(lines)} of {len(every)}"
+                    + (f", {scroll} scroll" if scroll else "") if len(every) > rem - 1 else "")
             if not lines:  # no row for an entry: name no range (review 2 of #404, Astra 2)
                 more = "; no room to show them here"
-            rows.append((6, f"-- keys ({self._help_keys()[1]} closes{more}; the transcript has them too) --", None))
+            rows.append((6, f"-- keys ({leave}{more}; the transcript has them too) --", None))
             rows.extend((6, "│ " + line, None) for line in lines)
             rows.extend((6, "│", None) for _ in range(rem - 1 - len(lines)))
         elif rem:
@@ -1094,10 +1096,10 @@ class TuiApp:
                 return f"search older lines: {shown}"
             return f"recursion: {'/' if self.line_kind == '/' else ''}{shown}"
         if self.mode == "help":
-            scroll, closes = self._help_keys()
+            scroll, leave = self._help_keys()
             if not self._keys_row:
-                return f"recursion: keys open, no room to show them here (the transcript has them); {closes} closes"
-            return f"recursion: keys shown; {scroll + ' scroll; ' if scroll else ''}{closes} closes"
+                return f"recursion: keys open, no room to show them here (the transcript has them); {leave}"
+            return f"recursion: keys shown; {scroll + ' scroll; ' if scroll else ''}{leave}"
         if self.focus == "output":
             return self._hints("output pager", (("pager.down", "pager.up", "line"), ("pager.half_down", "pager.half_up",
                                "half page"), ("pager.top", "pager.bottom", "top/newest"), ("pager.search", None, "search"),
@@ -1127,8 +1129,9 @@ class TuiApp:
 
     def _help_keys(self) -> tuple[str, str]:
         """The keys view's two hints, from the keymap in force: how it scrolls and what closes it ("j/k and
-        Page Up/Down" and "Esc, q or ?" with the default keys), so a binding file that rebinds ``q`` or adds a
-        close key is told what the keys do (the Sol sweep of #404 against master ff3f8071, F2)."""
+        Page Up/Down" and "Esc, q or ? closes" with the default keys), so a binding file that rebinds ``q`` or adds
+        a close key is told what the keys do (the Sol sweep of #404 against master ff3f8071, F2). A keymap with no
+        close key (a consumer's own; a binding file cannot remove Esc) says so (DeepSeek r7 of #404, F3)."""
 
         view, leader = self.keymap.view("help"), self.keymap.leader
         closers = [show_sequence(s, leader) for s, a in view.items() if a == "help.close"]
@@ -1137,7 +1140,7 @@ class TuiApp:
         scroll = ["/".join(k for k in steps if k)] if all(steps) else []
         if view.get(("pagedown",)) == "help.page_down" and view.get(("pageup",)) == "help.page_up":
             scroll.append("Page Up/Down")
-        return " and ".join(scroll), closes
+        return " and ".join(scroll), (f"{closes} closes" if closes else "no key closes it")
 
     # -- notices and errors (logged; an error is never redrawn away) -----------------------------
     def _notice(self, text: str, speech: str | None = None) -> None:

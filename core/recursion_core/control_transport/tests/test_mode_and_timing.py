@@ -9,6 +9,7 @@ All filesystem writes stay beneath TMPDIR.
 from __future__ import annotations
 
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -39,13 +40,21 @@ class ModeTests(ScratchCase):
     def test_only_exactly_0700_passes(self):
         os.mkdir(self.directory, 0o700)
         self.addCleanup(os.chmod, self.directory, 0o700)
-        for mode in (0o500, 0o600, 0o300, 0o710, 0o701, 0o750, 0o777):
+        for mode in (0o500, 0o600, 0o300, 0o710, 0o701, 0o750, 0o777, 0o2700):
             with self.subTest(mode=oct(mode)):
                 os.chmod(self.directory, mode)
                 with self.assertRaises(ct.InsecureSocketPath):
                     unix.ensure_private_dir(self.directory)
         os.chmod(self.directory, 0o700)
         unix.ensure_private_dir(self.directory)
+
+    def test_a_directory_this_function_creates_is_0700_under_a_masking_umask(self):
+        old = os.umask(0o200)
+        try:
+            unix.ensure_private_dir(self.directory)
+            self.assertEqual(stat.S_IMODE(os.lstat(self.directory).st_mode), 0o700)
+        finally:
+            os.umask(old)
 
 
 class TimingTests(ScratchCase):
@@ -68,8 +77,9 @@ class TimingTests(ScratchCase):
 
         def paused(seconds):
             self.assertTrue(read_entered.wait(3))
-            delays.append(seconds)
-            original_sleep(0.8 if len(delays) == 1 else seconds)
+            slept = 0.8 if not delays else seconds
+            delays.append(slept)
+            original_sleep(slept)
 
         def make_temp(*args, **kwargs):
             kwargs['dir'] = os.environ['TMPDIR']
@@ -84,6 +94,8 @@ class TimingTests(ScratchCase):
             test.run(result)
         failures = [(t.id(), detail.splitlines()[-1]) for t, detail in result.errors + result.failures]
         self.assertTrue(result.wasSuccessful(), f"correct idle expiry causes original test failure: {failures}")
+        self.assertEqual(len(delays), 4)
+        self.assertGreaterEqual(delays[0], 0.8)
 
 
 if __name__ == "__main__":

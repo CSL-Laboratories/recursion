@@ -178,6 +178,10 @@ def ensure_private_dir(directory: str) -> None:
         os.mkdir(directory, 0o700)
     except FileExistsError:
         pass
+    else:
+        # mkdir applies the process umask, so a mask of 0200 would leave 0500 and the
+        # exact-0700 check below would refuse a directory this function just made.
+        os.chmod(directory, 0o700)
     try:
         st = os.lstat(directory)
     except FileNotFoundError:
@@ -186,7 +190,7 @@ def ensure_private_dir(directory: str) -> None:
         raise InsecureSocketPath(f"{directory!r} is not a real directory")
     if st.st_uid != os.geteuid():
         raise InsecureSocketPath(f"{directory!r} is owned by uid {st.st_uid}")
-    if (st.st_mode & 0o777) != 0o700:   # exactly 0700, as documented: 0500 was accepted (sweep s7 D14)
+    if (st.st_mode & 0o7777) != 0o700:   # exactly 0700, including setuid/setgid/sticky: 0500 and 02700 were accepted
         # Quoted: a directory name holding a line break must not print as two lines (sweep s7 D12).
         raise InsecureSocketPath(f"{directory!r} has mode {stat.S_IMODE(st.st_mode):04o}, want 0700")
 

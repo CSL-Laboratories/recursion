@@ -658,6 +658,11 @@ REVIEW_AUTOMATION = re.compile(r"anthropics/claude-code|ANTHROPIC_API_KEY|CLAUDE
                                r"|@codex review|CODEX_TRIGGER_PAT|stuck_thread_watch|codex_gate")
 
 
+# The kept publisher scripts (scripts/ci/claude_fixer_*.py) are run by no workflow, and no
+# workflow pushes (CSL-238).
+PUBLISHER_OR_PUSH = re.compile(r"claude_fixer_|git\s+push")
+
+
 class RetiredReviewAutomationTests(unittest.TestCase):
     def test_no_workflow_runs_review_automation(self) -> None:
         workflows = ROOT / ".github" / "workflows"
@@ -666,6 +671,44 @@ class RetiredReviewAutomationTests(unittest.TestCase):
         self.assertEqual(found, [])
         for name in RETIRED_WORKFLOWS:
             self.assertFalse((workflows / name).exists(), name)
+
+    def test_no_workflow_runs_the_publisher_or_pushes(self) -> None:
+        workflows = ROOT / ".github" / "workflows"
+        found = sorted(p.name for p in workflows.glob("*.y*ml")
+                       if PUBLISHER_OR_PUSH.search(p.read_text(encoding="utf-8")))
+        self.assertEqual(found, [])
+
+    def test_the_scans_keep_every_needle_and_every_retired_name(self) -> None:
+        # The scans above are guards; pin what they look for so a tidy-up cannot weaken them.
+        self.assertEqual(RETIRED_WORKFLOWS, ("codex-gate.yml", "claude.yml", "claude-conflict-writer.yml",
+                                             "conflict-scan.yml", "stuck-thread-watch.yml"))
+        for needle in ("anthropics/claude-code", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "@codex review",
+                       "CODEX_TRIGGER_PAT", "stuck_thread_watch", "codex_gate"):
+            self.assertTrue(REVIEW_AUTOMATION.search(needle), needle)
+        for needle in ("scripts/ci/claude_fixer_publish.py", "git push", "git  push"):
+            self.assertTrue(PUBLISHER_OR_PUSH.search(needle), needle)
+
+
+class ContractJobsCellTests(unittest.TestCase):
+    """CSL-238: the contract's E1 and E7 rows must say windows and macos run on a same-repository PR."""
+
+    def row(self, key: str) -> list[str]:
+        text = (ROOT / "docs" / "ci-event-contract.md").read_text(encoding="utf-8")
+        lines = [ln for ln in text.splitlines() if ln.startswith(f"| {key} |")]
+        self.assertEqual(len(lines), 1, key)
+        return [c.strip() for c in lines[0].strip().strip("|").split("|")]
+
+    def test_e1_jobs_and_paid_cells_state_the_same_repository_rule(self) -> None:
+        cells = self.row("E1")
+        jobs, paid = cells[2], cells[3]
+        self.assertIn("comes from this repository", jobs)
+        self.assertIn("fork and already has `ci:full`", jobs)
+        self.assertNotIn("if the PR already has `ci:full`", jobs)
+        self.assertIn("same-repository PR", paid)
+        self.assertNotIn("windows-2025 only with `ci:full`", paid)
+
+    def test_e7_reads_as_e1(self) -> None:
+        self.assertTrue(self.row("E7")[2].startswith("as E1"))
 
 
 if __name__ == "__main__":

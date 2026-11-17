@@ -695,6 +695,18 @@ class HttpGuardTests(unittest.TestCase):
         self.assertEqual(got.pr_number, 191)
         self.assertEqual(got.default_branch, "master")
 
+    def test_from_env_without_reviewer_login_configures_no_reviewer(self) -> None:
+        # CSL-238: production builds its Config here; with REVIEWER_LOGIN unset (as the
+        # workflow leaves it) there is no reviewer, so no review line and no review reads.
+        env = {"GITHUB_REPOSITORY": "CSL-Laboratories/recursion", "GH_TOKEN": "t", "LINEAR_API_KEY": "k",
+               "PR_NUMBER": "191"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop("REVIEWER_LOGIN", None)
+            got = mod.Config.from_env()
+        self.assertEqual(got.reviewer_login, "")
+        workflow = (ROOT / ".github" / "workflows" / "linear-pr-sync.yml").read_text(encoding="utf-8")
+        self.assertNotIn("REVIEWER_LOGIN", workflow)
+
 
 class WorkflowAndDocsTests(unittest.TestCase):
     def test_agents_and_claude_are_identical(self) -> None:
@@ -761,6 +773,9 @@ class WorkflowAndDocsTests(unittest.TestCase):
         self.assertIn("## Branch", template)
         self.assertIn("## Test plan", template)
         self.assertIn("Touches other repos?", template)
+        # CSL-238: the template's review line is Devin's, answered by hand.
+        self.assertIn("- [ ] Devin Review threads on the current head read and answered by hand", template)
+        self.assertNotIn("Codex", template)
 
     def test_contributing_links_into_agents_md_reach_a_heading(self) -> None:
         # Replaces the master pin of AGENTS.md#when-claude-cant-fix-a-review-thread: that

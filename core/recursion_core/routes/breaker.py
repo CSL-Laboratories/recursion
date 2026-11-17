@@ -112,7 +112,9 @@ class ConnectionBreaker:
                     continue
                 if rec["state"] == OPEN and now < rec["open_until"]:
                     return _refused(c.BREAKER_OPEN, rec["open_until"], self._display(key))
-                if rec["state"] == HALF_OPEN and rec["lease_until"] is not None and now < rec["lease_until"]:
+                # A live probe lease blocks another probe after the open window as well as during it.
+                # A limit recorded without this probe's token must not have cleared the lease.
+                if rec.get("probe") and rec.get("lease_until") is not None and now < rec["lease_until"]:
                     return _refused(c.PROBE_IN_FLIGHT, rec["lease_until"], self._display(key))
                 probe_key = probe_key or key  # cooldown over, or the last probe's lease expired
             until = self._short.get((connection, model, tenant))
@@ -137,9 +139,9 @@ class ConnectionBreaker:
             now = self._clock()
             if code == c.PLAN_LIMIT and _is_signal(outcome.get("limit")):
                 until = self._open(connection, outcome["limit"], now, probe)
-                limit = outcome.get("limit")
-                if isinstance(limit, dict) and limit.get("reset_at") is None:
-                    outcome["retry_at"] = until  # the cooldown the notice can tell the user to wait for
+                # Always the open_until this call used, including when the signal names a vendor
+                # reset the breaker did not use. The notice reads this, not the unused vendor time.
+                outcome["retry_at"] = until
                 return "opened"
             if code == c.SHORT_FAULT:
                 self._short[(connection, model, tenant)] = now + self._short_s
@@ -157,14 +159,42 @@ class ConnectionBreaker:
         # it held does not refuse with PROBE_IN_FLIGHT while no probe runs.
         self._release(probe, now)
         rec = self._keys.setdefault(slot, {"state": CLOSED, "failures": 0, "probe": None, "lease_until": None})
+        held_until = rec.get("lease_until")
+        # A record with no token is another request. It must not drop a probe that still holds the lease.
+        live_lease = (
+            probe is None
+            and rec.get("probe") is not None
+            and isinstance(held_until, (int, float))
+            and not isinstance(held_until, bool)
+            and now < held_until
+        )
         rec["failures"] += 1
-        backoff = min(self._cooldown_s * 2 ** (rec["failures"] - 1), self._max_cooldown_s)
+        backoff = self._backoff(rec["failures"])
         reset_at = signal.get("reset_at")
         # reset_at is already on this clock. A raw vendor epoch that was not translated is far past
         # now + max_open_s and is capped here; adapters translate so a real reset is not the cap.
         until = min(reset_at, now + self._max_open_s) if reset_at is not None and reset_at > now else now + backoff
-        rec.update(state=OPEN, open_until=until, probe=None, lease_until=None, source=signal["source"])
+        if live_lease:
+            rec.update(state=OPEN, open_until=until, source=signal["source"])
+        else:
+            rec.update(state=OPEN, open_until=until, probe=None, lease_until=None, source=signal["source"])
         return until
+
+    def _backoff(self, failures: int) -> float:
+        """Cooldown for this incident. Doubling stops at the cap, before 2**1024 overflows float."""
+
+        cooldown, cap = float(self._cooldown_s), float(self._max_cooldown_s)
+        if failures <= 1 or cooldown <= 0 or cap <= cooldown:
+            return min(cooldown, cap)
+        delay = cooldown
+        for _ in range(failures - 1):
+            if delay >= cap:
+                return cap
+            nxt = delay * 2
+            if nxt >= cap or nxt == float("inf"):
+                return cap
+            delay = nxt
+        return delay
 
     def _find_probe(self, probe: str | None) -> dict | None:
         if probe is None:

@@ -78,10 +78,11 @@ def notice(result: Mapping, route: Mapping, limits: Mapping) -> dict | None:
     if result.get("code") not in LIMIT_CODES:
         return None
     signal = result.get("limit") or {}
-    reset_at = signal.get("reset_at") if isinstance(signal, Mapping) else None
-    if reset_at is None:
-        # A typed limit with no vendor reset still has the breaker's finite open_until on retry_at.
-        reset_at = result.get("retry_at")
+    vendor = signal.get("reset_at") if isinstance(signal, Mapping) else None
+    # The breaker writes the open_until it used onto retry_at. That is the wait. A vendor reset
+    # the breaker did not use stays on the signal and is not the time the notice names.
+    booked = result.get("retry_at")
+    reset_at = booked if booked is not None else vendor
     here = describe(route)
     choices = [{"action": "wait", "until": reset_at}]
     choices += [{"action": "switch", "route": describe(r)} for r in limits["fallback"]]

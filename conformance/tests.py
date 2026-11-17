@@ -137,6 +137,36 @@ class PublishedFilesTest(unittest.TestCase):
         if any("event.v1.json" in s.schemas for s in self.sets.values()):
             self.assertEqual(sorted(open_on_purpose - seen), [], "listed as open on purpose but not found: update the list")
 
+    def test_every_timestamp_in_every_folder_is_a_real_instant_with_seconds_below_sixty(self):
+        """A definition whose pattern takes a timestamp is a timestamp, in whichever folder of schemas it stands:
+        it carries ``x-instant``, so that the client's validator refuses a day that does not exist, and its
+        pattern refuses a second of 60. A pattern is taken for a timestamp's when it accepts a timestamp and
+        refuses the same shape spelt in letters. Until Nov 15, 2026 the revoked-key list's own definition had
+        neither, and a list that expired on the 31st of February fitted (a reader of the pull request showed
+        it); the client's check of the keyword was never asked there."""
+        a_time, same_shape, sixty = "2026-11-13T12:34:56.000Z", "abcd-ef-ghTij:kl:mn.opqZ", "2026-11-13T12:34:60.000Z"
+        found = set()
+
+        def walk(node, name, path):
+            if isinstance(node, dict):
+                pattern = node.get("pattern")
+                if isinstance(pattern, str) and re.search(pattern, a_time) and not re.search(pattern, same_shape):
+                    found.add((name, path))
+                    with self.subTest(schema=name, at=path):
+                        self.assertIs(node.get("x-instant"), True, "a timestamp without the real-instant keyword")
+                        self.assertIsNone(re.search(pattern, sixty), "a timestamp whose pattern takes a second of 60")
+                for key, value in node.items():
+                    walk(value, name, f"{path}/{key}")
+            elif isinstance(node, list):
+                for i, item in enumerate(node):
+                    walk(item, name, f"{path}/{i}")
+
+        for schemas in self.sets.values():
+            for name, schema in schemas.schemas.items():
+                walk(schema, name, "")
+        self.assertLessEqual({("common.v1.json", "/$defs/timestamp"), ("revoked-keys.v1.json", "/$defs/timestamp")}, found,
+                             "the walk does not see both folders' timestamps")
+
     # A rule that is only written down is not proved. The four tests below take every rule of one kind away,
     # one at a time, and require that a bad fixture notices: with the rule gone, a fixture that names that
     # keyword at that place is accepted, or is no longer refused for its own rule. So no closed object can
@@ -545,6 +575,102 @@ class RulesTest(unittest.TestCase):
 
     def vector(self, name):
         return client.read_json(next((self.folder / "vectors").glob(name)))
+
+    def test_a_transcript_page_is_held_to_what_the_events_of_its_raw_page_say(self):
+        """A transcript page was compared with its raw page by each line's seq and type only, so a line of
+        engine output with another text, relabelled as the core's and trusted, passed (a reader of the pull
+        request showed it on g08). Each line is now held to its event in source, trust, state and the
+        event's own text. The time is held only on a page that begins at position 1: it counts from the
+        log's first event, which no other page holds."""
+        g08 = self.vector("event.page/g08-*.json")
+
+        def found(vector, number=None, **changed):
+            page = copy.deepcopy(vector["page"])
+            if number is not None:
+                page["lines"][number - 1].update(changed)
+            return self.rules.transcript_page_problems(vector["params"], vector["raw"], page)
+        self.assertEqual(found(g08), [], "the published page is the projection of its raw page")
+        self.assertEqual((g08["raw"]["events"][1]["type"], g08["page"]["lines"][1]["source"], g08["page"]["lines"][1]["trust"]),
+                         ("engine.output", "engine", "untrusted"))
+        # (The last two the schemas refuse by themselves: an engine's line is untrusted there, and a line of
+        # engine output has no state. The first three they take, and only the rule finds them.)
+        for changed, wanted, the_schemas_take_it in (
+                ({"text": "something else", "source": "core", "trust": "trusted"}, ["2:source", "2:trust", "2:text"], True),
+                ({"text": "something else"}, ["2:text"], True), ({"source": "core"}, ["2:source"], True),
+                ({"trust": "trusted"}, ["2:trust"], False), ({"state": "running"}, ["2:state"], False)):
+            with self.subTest(changed=sorted(changed)):
+                self.assertEqual(found(g08, 2, **changed), wanted)
+                judged = client.judge_vector(self.schemas, "event.page", dict(g08, page=dict(
+                    g08["page"], lines=[g08["page"]["lines"][0], dict(g08["page"]["lines"][1], **changed)]), expect=wanted))
+                if the_schemas_take_it:
+                    self.assertIsNone(judged, "the record is one the schemas take: only the rule finds it")
+                else:
+                    self.assertIn("do not fit the method table", judged)
+        # What one page cannot say. g08 begins at position 9, so its lines' times are not compared;
+        self.assertEqual(found(g08, 2, time_rel_ms=g08["page"]["lines"][1]["time_rel_ms"] + 1), [])
+        # the renderer's own words are no rule's (the gap's line is the renderer's sentence);
+        self.assertEqual(found(g08, 1, text="other words", speech="other words"), [])
+        # and a page that begins at position 1 holds the first event, so there the time is held too.
+        first = self.vector("event.page/x18-*.json")
+        events = copy.deepcopy(first["raw"]["events"])
+        events[0]["seq"], events[1]["seq"], events[1]["time"] = 1, 2, "2026-11-13T07:34:02.124Z"
+        params = dict(first["params"], cursor=dict(first["params"]["cursor"], seq=0))
+        raw = dict(first["raw"], events=events, cursor=dict(first["raw"]["cursor"], seq=2))
+        lines = [dict(line, seq=seq, time_rel_ms=at) for line, seq, at in zip(first["page"]["lines"], (1, 2), (0, 50))]
+        whole = {"params": params, "raw": raw,
+                 "page": dict(first["page"], lines=lines, cursor=raw["cursor"], more=raw["more"], epoch_advanced=raw["epoch_advanced"])}
+        self.assertEqual(found(whole), [])
+        self.assertEqual(found(whole, 2, time_rel_ms=51), ["2:time_rel_ms"])
+        self.assertEqual(found(whole, 1, time_rel_ms=2074), ["1:time_rel_ms"])
+
+    def test_a_tasks_updated_at_follows_only_the_changes_of_its_own_run_or_turn(self):
+        """updated_at is the time of the latest state.changed OF the Task's own run or turn. What changed is
+        named in the event's payload (``entity`` and ``entity_id``); where the event is filed (the ``run_id``
+        and ``turn_id`` beside the payload) says under which turn it was logged. So a change of the run, or of
+        the session, that is filed under a turn does not move that turn's Task, and a change of a turn, of a
+        session or of another run in a run's log does not move the run's. A turn's scope is kept as it was:
+        a change that names the turn and is filed under another turn, or under none, does not move its Task
+        either. Its own later change, filed under it, moves each. (A reader of
+        the pull request found the rule counting every state.changed filed under the turn, and every one
+        there was for a run: the id the rule was handed was never used.) Every event here is a published
+        one, filed again, and the rule's own check says first that it fits event.v1."""
+        later = "2026-11-13T07:59:59.000Z"
+        good = self.folder / "fixtures" / "good" / "event.v1"
+        turn, run = self.vector("task.derivation/t03-*.json"), self.vector("task.derivation/r16-*.json")
+        of_the_run, of_the_turn = run["events"][-1], turn["events"][-1]
+        of_the_session = client.read_json(good / "h02-state-changed-session-created.json")
+        of_another_run = client.read_json(good / "h29-first-event-of-a-run-without-a-session.json")
+        # (A change that names the turn's id and is not a turn's: the kind is part of the name.)
+        of_a_session_with_the_turns_id = copy.deepcopy(of_the_session)
+        of_a_session_with_the_turns_id["payload"]["entity_id"] = turn["turn_id"]
+        self.assertEqual([(event["payload"]["entity"], event["payload"]["entity_id"])
+                          for event in (of_the_run, of_the_turn, of_the_session, of_a_session_with_the_turns_id)],
+                         [("run", run["view"]["run_id"]), ("turn", turn["turn_id"]),
+                          ("session", turn["session"]["session_id"]), ("session", turn["turn_id"])])
+        self.assertNotEqual(of_another_run["payload"]["entity_id"], run["view"]["run_id"])
+
+        def with_one_more(vector, event, turn_id):
+            """The vector with a copy of this change filed last in its log, under that turn or under none."""
+            last = vector["events"][-1]
+            filed = dict(copy.deepcopy(event), seq=last["seq"] + 1, session_id=last["session_id"],
+                         run_id=last["run_id"], turn_id=turn_id, time=later)
+            return dict(vector, events=vector["events"] + [filed])
+
+        under = turn["turn_id"]
+        cases = (("a turn", turn, of_the_turn, under, ((of_the_run, under), (of_the_session, under),
+                                                      (of_a_session_with_the_turns_id, under),
+                                                      (of_the_turn, None), (of_the_turn, "turn-000b"))),
+                 ("a run", run, of_the_run, None, ((of_the_turn, under), (of_the_session, None), (of_another_run, None))))
+        for name, vector, own, own_turn, others in cases:
+            self.assertIsNone(client.judge_vector(self.schemas, "task.derivation", vector), "the published vector agrees")
+            for other, filed_under in others:
+                with self.subTest(task_of=name, a_later_change_of=(other["payload"]["entity"], other["payload"]["entity_id"]),
+                                  filed_under=filed_under):
+                    self.assertIsNone(client.judge_vector(self.schemas, "task.derivation", with_one_more(vector, other, filed_under)),
+                                      "a change of something else moved the Task's updated_at")
+            with self.subTest(task_of=name, a_later_change_of="itself"):
+                self.assertEqual(client.judge_vector(self.schemas, "task.derivation", with_one_more(vector, own, own_turn)),
+                                 "the rule finds ['updated_at'], the vector says []", "its own later change moves it")
 
     def approved(self, vector="approval.lifecycle/s07-*.json", **binding):
         """A model of that vector's request with its binding (changed as given), shown and approved."""
@@ -1313,6 +1439,35 @@ class RulesTest(unittest.TestCase):
         for text in ("2026-11-13T12:34:60.000Z", "2016-12-31T23:59:60.000Z"):
             keywords = {keyword for keyword, _, _ in client.leaf_errors(timestamp, text)}
             self.assertLessEqual({"pattern", "x-instant"}, keywords, "refused by the pattern and by the real-instant check, each on its own")
+
+    def test_a_revocation_lists_times_are_real_instants_as_every_other_timestamp(self):
+        """The plugin folder's records go through the same client and the same real-instant check: a revoked-key
+        list whose issue, expiry or revocation time names a day that does not exist, or a second of 60, does
+        not fit, by the standard-library reader (``rules.fits``) and by the client's validator, which reports
+        the real-instant keyword itself (and the pattern for a second of 60). The first case is the witness a
+        reader of the pull request gave: h01 with expires_at on the 31st of February."""
+        plugin = next(folder for folder in client.folders() if (folder / "revoked-keys.v1.json").is_file())
+        schemas = client.SchemaSet(plugin)
+        validator = schemas.validator("revoked-keys.v1.json")
+        listed = client.read_json(plugin / "fixtures" / "good" / "revoked-keys.v1" / "h01-one-revoked-key.json")
+        # The standard-library reader is handed the one document: it refuses the folder whole, because the manifest
+        # uses minProperties, a keyword it does not read (a separate matter, named in the lane's report).
+        alone = {"revoked-keys.v1.json": schemas.schemas["revoked-keys.v1.json"]}
+        self.assertTrue(self.rules.fits("revoked-keys.v1.json", listed, alone))
+        self.assertEqual(client.leaf_errors(validator, listed), [])
+        for place in (("expires_at",), ("issued_at",), ("keys", 0, "revoked_at")):
+            for text, keywords in (("2026-02-31T00:00:00.000Z", {"x-instant"}), ("2025-02-29T08:00:00.000Z", {"x-instant"}),
+                                   ("2026-11-13T07:59:60.000Z", {"pattern", "x-instant"})):
+                with self.subTest(at=place, timestamp=text):
+                    changed = copy.deepcopy(listed)
+                    holder = changed
+                    for part in place[:-1]:
+                        holder = holder[part]
+                    holder[place[-1]] = text
+                    self.assertFalse(self.rules.fits("revoked-keys.v1.json", changed, alone))
+                    at = "".join(f"/{part}" for part in place)
+                    seen = {keyword for keyword, location, _ in client.leaf_errors(validator, changed) if location == at}
+                    self.assertLessEqual(keywords, seen)
 
     # ---- the delivery of a queue item
     def test_a_refused_delivery_step_changes_nothing_and_raises_nothing_but_a_refusal(self):

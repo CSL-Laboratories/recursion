@@ -831,10 +831,13 @@ class Daemon:
                 self.manager.start(run.unit, argv)
             except BaseException as exc:
                 # Keep the original launch error; the record says unknown, never terminated.
+                # The launch error is still active context, and its text is the argv, so
+                # this record names the reconcile error's type and nothing else.
                 try:
                     self._reconcile(self.registry.get(run_id), f'launch error: {type(exc).__name__}')
-                except Exception:
-                    log.exception('reconcile after launch failure of %s failed', run_id)
+                except Exception as reconcile_exc:
+                    log.error('reconcile after launch failure of %s failed: %s',
+                              run_id, type(reconcile_exc).__name__)
                 raise
             self._reconcile(self.registry.get(run_id))
             return self.registry.get(run_id)

@@ -234,25 +234,56 @@ def _compile(colours: dict, density: str | None, radius: int | None) -> str:
     return css
 
 
+def _process_uid() -> int | None:
+    """The user id this process is acting as, or None when it cannot be known.
+
+    ``os.geteuid`` is the POSIX-only call. The simulated-Windows child deletes
+    it when it sets ``os.name`` to ``nt``, and a Windows host has no such call.
+    The id is then the owner of this module, read with ``os.stat`` (not
+    ``lstat`` or ``fstat``, so a stand-in of those two still disagrees with it).
+    """
+    if hasattr(os, "geteuid"):
+        return os.geteuid()
+    try:
+        return os.stat(__file__).st_uid
+    except OSError:
+        return None
+
+
+def _owned(info: os.stat_result, kind) -> bool:
+    """A directory or regular file of this user, not writable by group or others."""
+    uid = _process_uid()
+    if uid is None:
+        return False
+    return kind(info.st_mode) and info.st_uid == uid and not info.st_mode & 0o022
+
+
 def _trusted_dir(path: Path) -> bool:
     """A real directory owned by this user and not writable by group or others."""
-    if not hasattr(os, "geteuid"):
-        return False
     try:
         info = os.lstat(path)
     except OSError:
         return False
-    return stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022
+    if stat.S_ISLNK(info.st_mode):
+        return False
+    return _owned(info, stat.S_ISDIR)
 
 
 def _read_owned(path: Path) -> bytes | None:
     """Bytes of an operator-owned regular file, or None when it cannot be used.
 
-    ``O_NOFOLLOW`` refuses a symlink. A FIFO is opened non-blocking and then
-    refused because it is not a regular file. Group or other write permission,
-    another owner's file, and a file over the size cap are not read as a theme.
+    A symlink is refused from ``lstat``. ``O_NOFOLLOW`` is POSIX-only: the
+    simulated-Windows child deletes it, and ``os.open`` would then follow the
+    link. Where the platform has the flag, the open still sets it. A FIFO is
+    opened non-blocking and then refused because it is not a regular file.
+    Group or other write permission, another owner's file, and a file over
+    the size cap are not read as a theme.
     """
-    if not hasattr(os, "geteuid"):
+    try:
+        linked = os.lstat(path)
+    except OSError:
+        return None
+    if stat.S_ISLNK(linked.st_mode):
         return None
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
@@ -261,7 +292,7 @@ def _read_owned(path: Path) -> bytes | None:
         return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        if not _owned(info, stat.S_ISREG):
             return None
         if info.st_size > MAX_THEME_BYTES:
             return None

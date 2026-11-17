@@ -104,6 +104,42 @@ def _own(path: Path, mode: int) -> None:
     os.chmod(path, mode)
 
 
+def _drop_os(*names: str) -> list:
+    """Remove POSIX-only ``os`` names for one test, the way the simulated-Windows child does.
+
+    A name that is already absent stays absent. The caller puts the saved values back.
+    """
+    saved = []
+    for name in names:
+        if hasattr(os, name):
+            saved.append((name, getattr(os, name)))
+            delattr(os, name)
+    return saved
+
+
+def _restore_os(saved: list) -> None:
+    for name, value in reversed(saved):
+        setattr(os, name, value)
+
+
+class _ShiftedUid:
+    """Stat fields the loader reads, with the user id one higher.
+
+    This is not an ``os.stat_result``. The simulated-Windows child hides the
+    posix module, and building a ``stat_result`` then faults the child.
+    """
+
+    def __init__(self, info) -> None:
+        self.st_mode = info.st_mode
+        self.st_uid = info.st_uid + 1
+        self.st_gid = info.st_gid
+        self.st_size = info.st_size
+
+
+def _other_uid(info):
+    return _ShiftedUid(info)
+
+
 def _write_gui(directory: Path, themes: dict, selection) -> Path:
     """An operator-owned gui directory: themes/*.json and selection.json."""
     gui = Path(directory)
@@ -703,14 +739,11 @@ class ThemePageTests(GuiHarness):
         real_lstat = themes.os.lstat
         real_fstat = themes.os.fstat
 
-        def other_uid(info):
-            return os.stat_result((*info[:4], info.st_uid + 1, *info[5:]))
-
         def other_lstat(path):
-            return other_uid(real_lstat(path))
+            return _other_uid(real_lstat(path))
 
         def other_fstat(fd):
-            return other_uid(real_fstat(fd))
+            return _other_uid(real_fstat(fd))
 
         with mock.patch.object(themes.os, "lstat", side_effect=other_lstat):
             self.assertNotIn('<style id="theme">', self._render(self._app(root))[2])
@@ -722,6 +755,50 @@ class ThemePageTests(GuiHarness):
         self.assertEqual(status, "200 OK")
         self.assertNotIn("<style id=\"theme\">", body)
         self.assertIn("Request stop", _core(body))
+
+    def test_an_owned_theme_applies_when_geteuid_is_absent(self) -> None:
+        # os.geteuid is POSIX-only. The simulated-Windows child deletes it, and a
+        # Windows host has no such call. An owned theme must still reach the page.
+        # Group write and another uid must still apply nothing.
+        root = self._gui({"dusk.json": DUSK}, {"theme": "dusk"})
+        saved = _drop_os("geteuid")
+        try:
+            body = self._render(self._app(root))[2]
+            self.assertIn(DUSK_CSS, body)
+            self.assertIn('<style id="theme">', body)
+            chosen = root / "selection.json"
+            _own(chosen, 0o666)
+            self.assertNotIn('<style id="theme">', self._render(self._app(root))[2])
+            _own(chosen, 0o600)
+            themes = _parser()
+            real_fstat = themes.os.fstat
+
+            def other_fstat(fd):
+                return _other_uid(real_fstat(fd))
+
+            with mock.patch.object(themes.os, "fstat", side_effect=other_fstat):
+                self.assertNotIn('<style id="theme">', self._render(self._app(root))[2])
+        finally:
+            _restore_os(saved)
+
+    def test_a_symlink_theme_is_refused_when_o_nofollow_is_absent(self) -> None:
+        # os.O_NOFOLLOW is POSIX-only. Without it, os.open follows a symlink.
+        # The selected theme must still apply nothing; a real file still applies.
+        root = self._gui({}, {"theme": "dusk"})
+        outside = Path(self._tmp.name) / "real-dusk.json"
+        outside.write_text(json.dumps(DUSK), encoding="utf-8")
+        _own(outside, 0o600)
+        os.symlink(outside, root / "themes" / "dusk.json")
+        real = self._gui({"dusk.json": DUSK}, {"theme": "dusk"})
+        saved = _drop_os("O_NOFOLLOW")
+        try:
+            body = self._render(self._app(root))[2]
+            self.assertNotIn('<style id="theme">', body)
+            self.assertNotIn(DUSK_CSS, body)
+            kept = self._render(self._app(real))[2]
+            self.assertIn(DUSK_CSS, kept)
+        finally:
+            _restore_os(saved)
 
 
 def _schema_errors_or_none():

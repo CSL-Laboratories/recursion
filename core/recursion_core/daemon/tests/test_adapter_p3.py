@@ -87,6 +87,92 @@ class AdapterP3Test(unittest.TestCase):
         with mock.patch.object(adapter, 'OUTPUT_TAIL_BYTES', 8):
             self.assertEqual(control._output('run-one', live=True)['lines'], ['ZZ'])
 
+    def test_a_non_empty_planted_directory_is_left_and_the_result_stays_in_memory(self):
+        folder = self.run_dir()
+        tmp = folder / 'result.json.tmp'
+        tmp.mkdir()
+        (tmp / 'planted').write_text('stay')
+        starter = adapter.RouteStarter(None, {}, None, self.root)
+        with self.assertLogs(adapter.log, 'ERROR'):
+            starter._record_result('run-one', {'status': 'new'})
+        self.assertEqual((tmp / 'planted').read_text(), 'stay')
+        self.assertFalse((folder / 'result.json').exists())
+        self.assertEqual(starter.results['run-one'], {'status': 'new'})
+
+    def test_an_empty_planted_directory_is_removed_so_the_write_can_proceed(self):
+        folder = self.run_dir()
+        tmp = folder / 'result.json.tmp'
+        tmp.mkdir()
+        starter = adapter.RouteStarter(None, {}, None, self.root)
+        starter._record_result('run-one', {'status': 'new'})
+        self.assertFalse(tmp.exists())
+        self.assertIn(b'new', (folder / 'result.json').read_bytes())
+
+    def test_a_fifo_swapped_in_for_the_opened_temp_is_left(self):
+        folder = self.run_dir()
+        starter = adapter.RouteStarter(None, {}, None, self.root)
+        tmp = folder / 'result.json.tmp'
+
+        def swap_to_fifo(obj, handle, **kwargs):
+            os.unlink(tmp)
+            os.mkfifo(tmp)
+            raise OSError(errno.ENOSPC, 'injected short write')
+
+        with self.assertLogs(adapter.log, 'ERROR'):
+            with mock.patch('recursion_core.daemon.control_adapter.json.dump', swap_to_fifo):
+                starter._record_result('run-one', {'status': 'new'})
+        self.assertTrue(tmp.is_fifo())
+        self.assertEqual(starter.results['run-one'], {'status': 'new'})
+
+    def test_a_file_planted_when_open_fails_is_left(self):
+        folder = self.run_dir()
+        starter = adapter.RouteStarter(None, {}, None, self.root)
+        tmp = folder / 'result.json.tmp'
+        real_open = os.open
+
+        def open_plants(path, flags, mode=0o777, *, dir_fd=None):
+            if Path(path).name == 'result.json.tmp':
+                fd = real_open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+                os.write(fd, b'planted')
+                os.close(fd)
+                raise OSError(errno.EIO, 'injected open failure')
+            if dir_fd is None:
+                return real_open(path, flags, mode)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with self.assertLogs(adapter.log, 'ERROR'):
+            with mock.patch('recursion_core.daemon.control_adapter.os.open', open_plants):
+                starter._record_result('run-one', {'status': 'new'})
+        self.assertEqual(tmp.read_bytes(), b'planted')
+        self.assertFalse((folder / 'result.json').exists())
+        self.assertEqual(starter.results['run-one'], {'status': 'new'})
+
+    def test_an_unlink_failure_keeps_the_result_in_memory(self):
+        folder = self.run_dir()
+        starter = adapter.RouteStarter(None, {}, None, self.root)
+        tmp = folder / 'result.json.tmp'
+        real_unlink = os.unlink
+
+        def unlink_refuses(path, *args, **kwargs):
+            if Path(path).name == 'result.json.tmp' and Path(path).exists():
+                raise OSError(errno.EPERM, 'injected unlink refusal')
+            return real_unlink(path, *args, **kwargs)
+
+        def short_write(obj, handle, **kwargs):
+            handle.write('{"status":')
+            handle.flush()
+            raise OSError(errno.ENOSPC, 'injected short write')
+
+        with self.assertLogs(adapter.log, 'ERROR'):
+            with mock.patch('recursion_core.daemon.control_adapter.os.unlink', unlink_refuses), \
+                 mock.patch('recursion_core.daemon.control_adapter.json.dump', short_write):
+                try:
+                    starter._record_result('run-one', {'status': 'new'})
+                except OSError:
+                    self.fail('a removal failure took the place of the in-memory result')
+        self.assertEqual(starter.results['run-one'], {'status': 'new'})
+        self.assertTrue(tmp.is_file())
+
 
 if __name__ == '__main__':
     unittest.main()

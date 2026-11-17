@@ -171,6 +171,9 @@ def schema_mode(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from recursion_core.std_fds import occupy_standard_fds
+
+    occupy_standard_fds()  # before any open: a hole at fd 0, 1 or 2 would be taken by the next pipe
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="mode", required=True)
     schema = sub.add_parser("schema", help="record the installed app-server protocol as a fixture")
@@ -182,4 +185,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # The documented command names this file. Its directory is not the package root, so the one
+    # helper (core/recursion_core/std_fds.py) is not importable until that root is on the path.
+    if __package__ in (None, ""):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     sys.exit(main())

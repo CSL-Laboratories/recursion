@@ -17,12 +17,31 @@ from __future__ import annotations
 import sys
 
 from recursion_core.control.client import SocketAPI
+from recursion_core.std_fds import occupy_standard_fds
 from recursion_core.tui import term
+
+
+def _attach_missing_streams() -> None:
+    """Give Python a text stream for a descriptor that was not open at startup.
+
+    The interpreter leaves ``sys.stdin`` (or stdout, stderr) as None in that case, and filling
+    the descriptor does not rebuild the stream. A later ``for line in sys.stdin`` would raise.
+    The stream does not own the descriptor: the helper's null device stays open for the process.
+    """
+
+    if sys.stdin is None:
+        sys.stdin = open(0, "r", encoding="utf-8", errors="surrogateescape", closefd=False)
+    if sys.stdout is None:
+        sys.stdout = open(1, "w", encoding="utf-8", errors="surrogateescape", closefd=False)
+    if sys.stderr is None:
+        sys.stderr = open(2, "w", encoding="utf-8", errors="surrogateescape", closefd=False)
 
 
 def main(argv: list[str] | None = None, **streams) -> int:
     """``streams`` are ``tui.term.main``'s own keyword arguments (tests pass stdin and stdout)."""
 
+    occupy_standard_fds()  # before any socket: a hole at fd 0, 1 or 2 would be taken by the next open
+    _attach_missing_streams()
     return term.main(sys.argv[1:] if argv is None else argv, SocketAPI, **streams)
 
 

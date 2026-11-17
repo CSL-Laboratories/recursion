@@ -4,18 +4,21 @@
 Times the PR head against a detached worktree of the base commit. Both kernels
 stay in one process and rounds alternate which side runs first, so a noisy
 host does not look like a slowdown. The harness and the frozen workload come
-from this checkout; each tree supplies only its planning kernel.
+from this checkout; each tree supplies its planning kernel and its Stop
+decision. A head Stop median above stop_bound_s (0.250 s) fails this process.
+The ratio warning still exits 0.
 
     python -X utf8 -B tools/perf_ci.py
 
 CI sets CI_BASE_SHA to the pull request base. PERF_REGRESSION_RATIO overrides
 the default 1.10 limit. PERF_ABSOLUTE_FLOOR_S overrides the default 25 us
 floor. A warning requires both. Regressions print GitHub warning annotations
-and a step summary, then exit 0. A harness crash, missing kernel, or invalid
-report exits 1.
+and a step summary, then exit 0. A harness crash, missing kernel, invalid
+report, or a Stop median over the bound exits 1.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import subprocess
@@ -127,6 +130,34 @@ def _emit(report: dict, *, baseline_label: str, candidate_label: str) -> None:
             print(f"WARNING: {line}", flush=True)
 
 
+def stop_bound_failure(report: dict) -> str | None:
+    """The head Stop median above the workload bound, or a missing Stop row.
+
+    ``None`` means the bound holds. The bound is absolute seconds on this
+    checkout's workload, not a ratio against the base tree.
+    """
+    path = HARNESS_ROOT / "tools" / "perf_workload.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"cannot read stop_bound_s: {exc}"
+    bound = payload.get("stop_bound_s")
+    if isinstance(bound, bool) or not isinstance(bound, (int, float)) or not math.isfinite(bound) or bound <= 0:
+        return "stop_bound_s is missing or not a positive finite number"
+    rows = report.get("benchmarks")
+    if not isinstance(rows, list):
+        return "stop_decision row is missing"
+    row = next((item for item in rows if isinstance(item, dict) and item.get("name") == "stop_decision"), None)
+    if row is None:
+        return "stop_decision row is missing"
+    median = row.get("median_s")
+    if isinstance(median, bool) or not isinstance(median, (int, float)) or not math.isfinite(median):
+        return "stop_decision median is not a finite number"
+    if float(median) > float(bound):
+        return f"stop_decision median {median} s exceeds stop_bound_s {bound} s"
+    return None
+
+
 def _print_side(label: str, report: dict) -> None:
     for row in report["benchmarks"]:
         print(
@@ -149,6 +180,10 @@ def main() -> int:
             _print_side("head", head)
             print("PERF_CI_NO_BASE no CI_BASE_SHA; recorded head only", flush=True)
             print(f"PERF_CI_SECONDS={time.perf_counter() - started:.3f}", flush=True)
+            failure = stop_bound_failure(head)
+            if failure:
+                print(f"PERF_CI_FAIL: {failure}", file=sys.stderr)
+                return perf_compare.job_exit_code(bench_ok=False)
             return job_ok()
         tree = _worktree(base_sha)
         baseline, head = run_paired(tree, HARNESS_ROOT)
@@ -160,6 +195,10 @@ def main() -> int:
         _emit(report, baseline_label=base_sha[:12], candidate_label="head")
         print(f"PERF_CI_SECONDS={time.perf_counter() - started:.3f}", flush=True)
         print(f"PERF_REGRESSIONS={len(report['regressions'])}", flush=True)
+        failure = stop_bound_failure(head)
+        if failure:
+            print(f"PERF_CI_FAIL: {failure}", file=sys.stderr)
+            return perf_compare.job_exit_code(bench_ok=False)
         return job_ok()
     except (PerfCIError, BenchError) as exc:
         print(f"PERF_CI_FAIL: {exc}", file=sys.stderr)

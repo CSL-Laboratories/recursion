@@ -16,9 +16,11 @@ import tempfile
 import time
 import unittest
 
+from recursion_core.control.client import SocketAPI
 from recursion_core.daemon import Daemon, Registry
 from recursion_core.daemon import control_adapter as adapter
 from recursion_core.daemon import launcher
+from recursion_core.daemon.gui import LoopbackGUI
 from recursion_core.control.registry import EMPTY
 
 BOOT = 'boot-adv1'
@@ -81,6 +83,36 @@ time.sleep(300)
 ARGV = r'''
 import json, sys
 open(sys.argv[1], "w").write(json.dumps(sys.argv[2:]))
+'''
+
+# Same-uid engine child: read the page device token and POST the page Stop for another run.
+# Stdlib only. The page's form is what a browser on this machine sends.
+TOKEN_STOP = r'''
+import json, sys, time
+import http.client
+token_path, host, origin, run_id, out = sys.argv[1:6]
+payload = {"status": None}
+try:
+    token = open(token_path).read().strip()
+    port = int(host.rsplit(":", 1)[1])
+    body = "run_id=%s&confirm=explicit" % run_id
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+    try:
+        conn.putrequest("POST", "/stop", skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Host", host)
+        conn.putheader("Origin", origin)
+        conn.putheader("Cookie", "recursion_device=" + token)
+        conn.putheader("Content-Type", "application/x-www-form-urlencoded")
+        conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders(body.encode())
+        resp = conn.getresponse()
+        payload = {"status": resp.status, "body": resp.read(65536).decode("utf-8", "replace")}
+    finally:
+        conn.close()
+except Exception as exc:
+    payload = {"status": payload.get("status"), "error": "%s: %s" % (type(exc).__name__, exc)}
+open(out, "w").write(json.dumps(payload))
+time.sleep(300)
 '''
 
 
@@ -191,6 +223,56 @@ class RealManagerAttackTest(unittest.TestCase):
         self.assertEqual(result['inside'].get('error', {}).get('code'), 'scope_refused', result)
         self.assertEqual(result['outside'].get('error', {}).get('code'), 'scope_refused',
                          'the same engine process got: %s' % json.dumps(result['outside'])[:200])
+
+    @unittest.expectedFailure  # DL-50 D5: expected failure until the separate engine user, not an interim check
+    def test_an_engine_child_with_the_page_device_token_cannot_stop_another_run(self):
+        """DL-50 D5: an engine child using the page's device token to stop another run (R1-2).
+
+        The token is mode 0600 and the child is the same uid, so it can read the file. The page
+        Stop checks the bearer token and does not check the caller's cgroup. Recorded as an
+        expected failure until the separate engine user, not by an interim check.
+        """
+        environ = {'XDG_RUNTIME_DIR': str(self.tmp / 'rt'), 'XDG_CONFIG_HOME': str(self.tmp / 'cfg'),
+                   'PATH': '/usr/bin:/bin', 'HOME': str(self.tmp), 'LANG': 'C.UTF-8'}
+        (self.tmp / 'rt').mkdir(mode=0o700)
+        bindir = self.tmp / 'bin'
+        bindir.mkdir(mode=0o700)
+        engine = bindir / 'claude'
+        shutil.copyfile(Path(launcher.__file__).with_name('evidence_standin_engine.py'), engine)
+        os.chmod(engine, 0o700)
+        routes = {'claude_code': {
+            'route': {'engine': 'claude_code', 'model': 'stand-in-model', 'api_key_helper': 'absent',
+                      'connection': {'kind': 'subscription', 'id': 'stand-in-login'}},
+            'deadline_s': 30.0, 'binary': str(engine)}}
+        composed = adapter.compose_control(
+            self.daemon, self.tmp / 'state', environ=environ, routes=routes, confirm_timeout_s=15.0)
+        self.addCleanup(composed.close)
+        token_path = self.tmp / 'rt' / 'recursion' / 'gui-device-token'
+        self.assertTrue(token_path.is_file(), 'the page token must be published for this test to mean anything')
+        self.assertEqual(token_path.stat().st_mode & 0o777, 0o600)
+        started = SocketAPI(composed.server.path, timeout_s=30).call(
+            'run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0'})
+        self.assertEqual(started.get('code'), 'started', started)
+        victim = started['run']['run_id']
+        unit = 'recursion-run-%s.service' % victim
+        self.addCleanup(lambda: subprocess.run(
+            ['systemctl', '--user', 'stop', unit], capture_output=True, check=False))
+        group, victim_pid = self.manager.unit_identity(unit)
+        self.assertTrue(group)
+        self.assertTrue(alive(victim_pid), 'the other run must be alive before the page Stop')
+        out = self.tmp / 'token-stop.json'
+        with LoopbackGUI(composed.client, composed.door, port=0) as gui:
+            port = gui.address[1]
+            host = '127.0.0.1:%d' % port
+            attacker = 'run-adv1tok%d' % os.getpid()
+            self.launch(attacker, [sys.executable, '-I', '-c', TOKEN_STOP, str(token_path), host,
+                                   'http://' + host, victim, str(out)])
+            result = json.loads(self.wait_file(out, seconds=25))
+        self.assertEqual(result.get('status'), 200, result)
+        self.assertIn('<strong>stopped</strong>', result.get('body', ''), result)
+        self.assertTrue(
+            alive(victim_pid),
+            'the other run is still alive after the engine child posted Stop: %s' % result)
 
     def test_unit_argv_reaches_the_engine_verbatim(self):
         """ADV1-11 (fixed): systemd-run would expand $VAR, ${VAR} and $$ in the unit argv from the user

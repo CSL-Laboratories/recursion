@@ -498,6 +498,50 @@ class InstallTests(unittest.TestCase):
                 self.assertTrue(upgrade(self.roots, EXEC).changed)
                 self.assertEqual(_read(self.unit), render_unit(EXEC))
 
+    # Grok's round 12 on #382 (d69b40a0). R1: systemd skips the first byte order mark it finds at the start of a line,
+    # not only one at byte 0, so a later one hid a directive the check then did not read; a line-leading one after the
+    # decode is refused. R2: a line continues only when the backslash is its very last character as read; one followed
+    # by a space or a tab does not continue it, and the check joined the next line into it.
+    def test_a_later_byte_order_mark_is_refused_and_a_blank_after_a_backslash_ends_the_line(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        elsewhere = os.path.join(self.case, "elsewhere")
+        refused = [
+            (f"[Service]\nEnvironment=A=1\n\ufeffEnvironment=XDG_STATE_HOME={elsewhere}\nExecStart=/old\n",
+             "has a byte order mark at the start of a line"),
+            (f"[Unit]\nDescription=x\n\ufeff[Service]\nEnvironment=XDG_STATE_HOME={elsewhere}\nExecStart=/old\n",
+             "has a byte order mark at the start of a line"),
+            (f"\ufeff[Service]\n\ufeffEnvironment=XDG_STATE_HOME={elsewhere}\nExecStart=/old\n",
+             "has a byte order mark at the start of a line"),
+            # a backslash and then a blank: the line does not continue, so the next one is read on its own
+            (f"[Service]\nDescription=x \\ \nEnvironment=XDG_STATE_HOME={elsewhere}\nExecStart=/old\n",
+             f"sets XDG_STATE_HOME={elsewhere}:"),
+            (f"[Service]\nDescription=x \\\t\nEnvironment=XDG_STATE_HOME={elsewhere}\nExecStart=/old\n",
+             f"sets XDG_STATE_HOME={elsewhere}:"),
+            # on an Environment line, the value then ends in a lone backslash, which systemd refuses to read
+            (f"[Service]\nEnvironment=XDG_STATE_HOME=%h/.local/state \\ \nEnvironment=XDG_STATE_HOME={elsewhere}\n"
+             "ExecStart=/old\n", "which cannot be read"),
+        ]
+        replaced = [
+            "[Service]\nEnvironment=A=\ufeff\nExecStart=/old\n",  # a mark inside a value, not at a line's start
+            "[Service]\nEnvironment=A=1 \\\n# a comment\nXDG_STATE_HOME=%h/.local/state\nExecStart=/old\n",
+        ]
+        for text, said in refused:
+            with self.subTest(text=text):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    upgrade(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
+                self.assertIn(said, caught.exception.detail)
+                self.assertEqual(_tree(self.home), before)  # the unit as it was
+        for text in replaced:
+            with self.subTest(text=text):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                self.assertTrue(upgrade(self.roots, EXEC).changed)
+                self.assertEqual(_read(self.unit), render_unit(EXEC))
+
     def test_upgrade_without_a_unit_is_refused(self) -> None:
         with self.assertRaises(InstallRefused) as caught:
             upgrade(self.roots, EXEC)

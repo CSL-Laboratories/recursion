@@ -137,18 +137,26 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
     unset: set[str] = set()  # names UnsetEnvironment drops whatever their value
     unset_pairs: set[str] = set()  # NAME=value assignments it drops, only those exactly
     lines = _LINE_END.split(text)  # not str.splitlines, whose other line ends systemd reads within a line (Grok R3)
+    # systemd skips the first byte order mark it finds at the start of a line, wherever that line is; one there after
+    # the decode above, which takes the one at byte 0 away, is refused rather than guessed at (Grok R1 of round 12).
+    if any(raw.startswith("\ufeff") for raw in lines):
+        return "has a byte order mark at the start of a line, so where it keeps the daemon's state cannot be told"
     i = 0
     while i < len(lines):
-        line = lines[i].strip(_BLANKS)
+        raw = lines[i]
+        line = raw.strip(_BLANKS)
         i += 1
         if not line or line[0] in "#;":  # a comment line is skipped whole, a backslash at its end too
             continue
-        # A line continues on an odd run of backslashes at its end (an even run is escaped backslashes), and comment
-        # lines inside a continuation are skipped, as systemd's parser skips them (DeepSeek F11-2 on #382).
-        while _continues(line) and i < len(lines):
-            following = lines[i].strip(_BLANKS)
+        # A line continues on an odd run of backslashes at its very end, as read (a blank after the backslash ends it,
+        # Grok R2 of round 12; an even run is escaped backslashes), and comment lines inside a continuation are
+        # skipped, as systemd's parser skips them (DeepSeek F11-2 on #382).
+        while _continues(raw) and i < len(lines):
+            raw = lines[i]
+            following = raw.strip(_BLANKS)
             i += 1
             if following[:1] in ("#", ";"):
+                raw = line  # a skipped comment leaves the line continuing
                 continue
             line = line[:-1] + " " + following
         if not line:
@@ -281,7 +289,8 @@ def _escape(value: str, i: int) -> tuple[str | None, int]:
 
 
 def _continues(line: str) -> bool:
-    """Whether ``line`` ends in a backslash that is not itself escaped: an odd run of them."""
+    """Whether ``line``, as read, ends in a backslash that is not itself escaped: an odd run of them, with nothing
+    after it."""
 
     return (len(line) - len(line.rstrip("\\"))) % 2 == 1
 

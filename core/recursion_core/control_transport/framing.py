@@ -42,6 +42,10 @@ def encode_frame(message: dict[str, Any], *, max_bytes: int = MAX_FRAME_BYTES) -
     except RecursionError:
         # A deeply nested message must refuse as a frame error, not kill the worker.
         raise FrameError("frame_too_deep") from None
+    except (TypeError, ValueError):
+        # Bytes, a non-finite number, a lone surrogate (UnicodeEncodeError) or a cycle: not JSON, refused as a
+        # frame error like everything else this function refuses (sweep s7 D01: they escaped as themselves).
+        raise FrameError("frame_not_json") from None
     if len(body) > max_bytes:
         raise FrameError("frame_too_large")
     return HEADER.pack(len(body)) + body
@@ -93,6 +97,10 @@ def _recv_exact(sock: socket.socket, n: int, deadline: float | None = None) -> b
             raise FrameError("frame_truncated")
         chunks.append(chunk)
         got += len(chunk)
+    if deadline is not None and deadline - time.monotonic() <= 0:
+        # The last recv may itself return after the deadline: bytes that complete late are refused, not
+        # returned (sweep s7 D15).
+        raise TimeoutError("frame_deadline")
     return b"".join(chunks)
 
 

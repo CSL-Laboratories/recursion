@@ -260,6 +260,10 @@ class UnixControlServer:
         directory = refuse_remote_bind(directory)
         if not name or "/" in name or name in (".", ".."):
             raise InsecureSocketPath("socket name must be a single path component")
+        if type(max_frame_bytes) is not int or max_frame_bytes < _MIN_FRAME_BYTES:
+            # A cap that cannot carry the server's own fallback reply is refused before startup (sweep s7 D19:
+            # at a cap of 32 the 50-byte fallback was written anyway).
+            raise ValueError(f"max_frame_bytes must be an int of at least {_MIN_FRAME_BYTES}")
         if max_connections < 1:
             raise ValueError("max_connections must be positive")
         if reserved_connections < 0 or (reserved_connections and priority is None):
@@ -474,18 +478,20 @@ class UnixControlServer:
                 if echo and "id" not in response:
                     response = {**response, **echo}
                 try:
-                    conn.settimeout(self._idle_timeout_s)  # sendall's timeout bounds the whole write
-                    write_frame(conn, response, max_bytes=self._max_frame_bytes)
-                except FrameError:
+                    frame = encode_frame(response, max_bytes=self._max_frame_bytes)
+                except FrameError as exc:
+                    if str(exc) == "frame_too_large":
+                        fallback = _LONGEST_FALLBACK
+                    else:
+                        # A handler reply that is not JSON (a non-finite number, an object, bytes) must not kill
+                        # the worker after the handler acted: the client gets a typed answer, not a silent close.
+                        fallback = _INTERNAL_ERROR
                     # The request's id stays on the refusal, so the client reads it as this request's answer.
-                    _send_quietly(conn, {**_LONGEST_FALLBACK, **echo}, max_bytes=self._max_frame_bytes)
+                    _send_quietly(conn, {**fallback, **echo}, max_bytes=self._max_frame_bytes)
                     return
-                except (TypeError, ValueError):
-                    # A handler reply that is not JSON (a non-finite number, an object) must not kill the
-                    # worker after the handler acted: the client gets a typed answer, not a silent close.
-                    _send_quietly(conn, {"ok": False, "error": {"code": "internal_error"}, **echo},
-                                  max_bytes=self._max_frame_bytes)
-                    return
+                try:
+                    conn.settimeout(self._idle_timeout_s)  # sendall's timeout bounds the whole write
+                    conn.sendall(frame)
                 except OSError:
                     return
                 if reserved:
@@ -542,6 +548,9 @@ def _is_busy(response: Message) -> bool:
 
 # The longest answer _serve writes for a request a handler has seen; with the request's id it must fit the cap.
 _LONGEST_FALLBACK: Message = {"ok": False, "error": {"code": "response_too_large"}}
+_INTERNAL_ERROR: Message = {"ok": False, "error": {"code": "internal_error"}}
+# The smallest frame cap a server takes: its fallbacks, without an id, must fit (an id is checked per request).
+_MIN_FRAME_BYTES = max(len(encode_frame(m)) - HEADER.size for m in (_LONGEST_FALLBACK, _INTERNAL_ERROR))
 
 
 def _fits(message: Message, request_id: object, max_bytes: int) -> bool:

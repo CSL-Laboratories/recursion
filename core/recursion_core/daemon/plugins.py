@@ -44,14 +44,19 @@ or not.
 A plugin effect is approved by the OS user who owns the daemon, over the owner-only socket, or by
 the device token, and only through ``approval.answer`` and then ``PluginEffectSink.carry`` (the
 effect is charged, then the approval is consumed, once). The in-memory gate still names no
-principal, so a decision there authorizes nothing. Not here: a plugin principal and a plugin-owned
-run (every run is bound to ``host``), the O7 interventions, and an installer (the authority ledger
-is never created by the daemon; without it an order effect refuses ``authority_unconfigured``).
+principal, so a decision there authorizes nothing. The daemon mints one principal for each loaded
+plugin. A run that principal starts is bound to that plugin, and the plugin's order may cite it.
+Every other run stays bound to ``host``. A plugin without the order permission cannot reach an
+order. A plugin with it is ``scope_refused`` for another plugin's run or the host's. The minted
+principal cannot approve its own effect. Not here: the O7 interventions, and an installer (the
+authority ledger is never created by the daemon; without it an order effect refuses
+``authority_unconfigured``).
 """
 from __future__ import annotations
 
 import collections
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -244,6 +249,33 @@ class DevicePresentation:
 
     def __init__(self, token):
         self.token = token
+
+
+class PluginPrincipal:
+    """A principal the daemon mints for one loaded plugin.
+
+    The instance ``PluginHost.principal`` returns is the principal. Another instance, a dict
+    or a string is not. ``approval.answer`` still refuses kind ``plugin``, so this principal
+    cannot approve its own effect.
+    """
+
+    __slots__ = ('kind', 'id')
+
+    def __init__(self, plugin_id):
+        self.kind = 'plugin'
+        self.id = plugin_id
+
+
+def _plugin_run_binder(breaker):
+    """The store's bind, which records an owner, or None when the breaker binds only ``host``."""
+    bind = getattr(breaker, 'bind_run', None)
+    try:
+        names = inspect.signature(bind).parameters
+    except (TypeError, ValueError):
+        return None
+    if not callable(bind) or 'plugin_id' not in names:
+        return None
+    return bind
 
 
 def _command_id():
@@ -588,6 +620,7 @@ class PluginHost:
         self.records, self.registries = [], ()
         self.pending_approvals = collections.deque(maxlen=64)  # (approval id, digest) drawn, newest last
         self._operators = {}
+        self._principals = {}  # plugin id -> the principal this daemon minted; identity, not a copy
         self._panels = []
         self.authority_state = 'not configured'
         available = backend_available() if verification_available is None else verification_available()
@@ -705,6 +738,72 @@ class PluginHost:
             raise PluginRefused('approval_surface_unavailable', 'no approver is composed')
         return self._approver.answer(peer, approval_id, effect, authority=authority, answer=answer)
 
+    def principal(self, plugin_id):
+        """The principal this daemon minted for a loaded plugin, or None."""
+        found = self._principals.get(plugin_id)
+        if type(found) is not PluginPrincipal:
+            return None
+        return found
+
+    def _admit_plugin(self, principal):
+        # Exact type and the minted instance. A plugin cannot widen admission by building another.
+        if type(principal) is not PluginPrincipal:
+            return None
+        minted = self._principals.get(principal.id)
+        if minted is not principal:
+            return None
+        return minted
+
+    def start_plugin_run(self, principal, run_id, connection, provider, model_version):
+        """Bind a run to the minted principal. The caller does not name the owner.
+
+        A run bound through ``DurableRouteBreaker`` stays ``host``. This is the path that
+        records a plugin as the owner. A principal this daemon did not mint is ``scope_refused``.
+        """
+        admitted = self._admit_plugin(principal)
+        if admitted is None:
+            raise PluginRefused('scope_refused', 'plugin')
+        bind = _plugin_run_binder(self._breaker)
+        if bind is None:
+            raise PluginRefused('breaker_unavailable', 'host-only breaker')
+        bind(run_id, connection, admitted.id, provider, model_version)
+        return {'run_id': run_id, 'owner': admitted.id, 'connection': connection,
+                'provider': provider, 'model_version': model_version}
+
+    def cite_plugin_order(self, principal, effect):
+        """Record an order that cites a run this principal started.
+
+        A plugin without the order permission does not reach the recorder. A plugin with it
+        is ``scope_refused`` when the run is bound to another plugin or to ``host``. The
+        owner still approves what was recorded. This principal cannot.
+        """
+        admitted = self._admit_plugin(principal)
+        if admitted is None:
+            raise PluginRefused('scope_refused', 'plugin')
+        if self.loader is None or 'order' not in self.loader.permissions(admitted.id):
+            raise PluginRefused('permission_required', 'order')
+        if type(effect) is not dict:
+            raise PluginRefused('request_invalid', 'effect')
+        kind = effect.get('kind')
+        family = kind.split('.', 1)[0] if type(kind) is str and kind else ''
+        if EFFECT_PERMISSIONS.get(family) != 'order':
+            raise PluginRefused('effect_kind_unmapped', family)
+        if effect.get('plugin_id') != admitted.id:
+            raise PluginRefused('scope_refused', 'run')
+        run_id, connection = effect.get('run_id'), effect.get('connection')
+        if type(run_id) is not str or type(connection) is not str or not run_id or not connection:
+            raise PluginRefused('request_invalid', 'run')
+        check = getattr(self._breaker, 'check', None)
+        if not callable(check):
+            raise PluginRefused('breaker_unavailable', 'no run register')
+        try:
+            check(run_id, connection, admitted.id)
+        except Refused as refused:
+            if refused.code == 'run_not_owned':
+                raise PluginRefused('scope_refused', 'run') from None
+            raise
+        return self.request_plugin_effect(effect)
+
     # -- one plugin -----------------------------------------------------------------------------
     def _load(self, source):
         record = {'source': str(source), 'plugin_id': None, 'state': 'refused', 'code': None, 'detail': '',
@@ -735,6 +834,8 @@ class PluginHost:
                       signer_key_id=loaded.signer_key_id, registry_label=loaded.registry_label,
                       permissions=list(loaded.permissions), artifact_sha256=loaded.artifact_sha256,
                       findings=list(loaded.findings), provides=[], containment='in process, same uid: not contained')
+        # Minted before plugin code runs, from the id the loader admitted, never from a value the plugin sends.
+        self._principals[loaded.plugin_id] = PluginPrincipal(loaded.plugin_id)
         self._attach(loaded, record)
         # After registry() and bind_core(), which are plugin code too. The plugin stays loaded.
         record['findings'] += self._import_findings(before, loaded.module)

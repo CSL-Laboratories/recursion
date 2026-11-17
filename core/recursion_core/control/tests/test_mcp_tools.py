@@ -154,6 +154,39 @@ class IsErrorTest(unittest.TestCase):
                 self.assertIs(mcp_tools.is_error(method, {"code": "ended"}), True)
                 self.assertIs(mcp_tools.is_error(method, {"code": "ok"}), False)
 
+    # Round 1 of #430, DeepSeek V4.1 Flash. F6: the exact-type check on the code is what keeps a str subclass,
+    # whose own hash may raise, out of the lookup (isinstance in its place stays green without this test). F1 and
+    # F2: a method that is not exactly a str (a subclass equal to another method, an unhashable value) is an error
+    # before the lookup, never another method's set and never a raise.
+
+    class PlainStr(str):
+        pass
+
+    class HashRaises(str):
+        def __hash__(self):
+            raise RuntimeError("synthetic: no hash")
+
+    class AlwaysEqual(str):
+        def __eq__(self, other):
+            return True
+
+        def __hash__(self):
+            return hash("run.stop")
+
+    def test_a_code_of_a_str_subclass_is_an_error(self) -> None:
+        for method in self.MAPPED:
+            for code in (self.PlainStr("pending"), self.HashRaises("pending")):
+                with self.subTest(method=method, code=type(code).__name__):
+                    self.assertIs(mcp_tools.is_error(method, {"code": code}), True)
+
+    def test_a_method_that_is_not_exactly_a_str_is_an_error(self) -> None:
+        methods = (self.AlwaysEqual("run.status"), self.PlainStr("run.stop"), self.HashRaises("run.stop"),
+                   ["run.stop"], {"run.stop": 1}, ("run.stop",), None, 1, b"run.stop")
+        for method in methods:
+            for code in ("pending", "ended", "ok", "stopped", "started"):
+                with self.subTest(method=repr(method), code=code):
+                    self.assertIs(mcp_tools.is_error(method, {"code": code}), True)
+
     def test_is_error_reads_the_one_mapping_and_call_tool_reads_is_error(self) -> None:
         from unittest import mock
         with mock.patch.dict(mcp_tools.NOT_ERRORS, {"run.stop": frozenset({"synthetic_answer"})}):

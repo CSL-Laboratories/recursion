@@ -4,6 +4,10 @@ Linux (tested): ``SO_PEERCRED`` returns ``struct ucred {pid_t pid; uid_t uid; gi
 macOS (designed in, not tested here): ``LOCAL_PEERCRED`` at ``SOL_LOCAL`` returns
 ``struct xucred``; same AF_UNIX family, same check. Any other platform raises, and the
 server treats a raise as a refusal (fail closed).
+
+Windows named pipes have no uid. A Windows peer leaves ``uid`` as ``None`` and sets
+``sid`` to the token user SID. ``check_peer`` still requires an int uid, so a Windows
+credential is not accepted on the POSIX path.
 """
 
 from __future__ import annotations
@@ -24,8 +28,9 @@ _LOCAL_PEERCRED = 0x001
 @dataclass(frozen=True)
 class PeerCred:
     pid: int | None
-    uid: int
+    uid: int | None
     gid: int | None
+    sid: str | None = None
 
 
 def get_peer_cred(sock: socket.socket) -> PeerCred:

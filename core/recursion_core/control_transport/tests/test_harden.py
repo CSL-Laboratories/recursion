@@ -453,10 +453,18 @@ class WindowsStubHardenTests(_TmpCase):
         self.assertFalse(os.path.exists(self.sock_dir))
 
     def test_windows_classes_are_not_unix_transports(self) -> None:
+        # The pipe door has start/path on the server and request on the client.
+        # They are still not the Unix classes. A caller with no pipe backend
+        # still gets the labelled refusal and binds nothing (the construction
+        # test above). That refusal is what keeps the class from serving.
         for cls in (windows.WindowsControlServer, windows.WindowsControlClient):
             self.assertFalse(issubclass(cls, (UnixControlServer, UnixControlClient)))
-            for attr in ("start", "request", "path"):
-                self.assertFalse(hasattr(cls, attr), f"{cls.__name__}.{attr} would look usable")
+        self.assertTrue(hasattr(windows.WindowsControlServer, "start"))
+        self.assertTrue(hasattr(windows.WindowsControlServer, "path"))
+        self.assertTrue(hasattr(windows.WindowsControlClient, "request"))
+        self.assertFalse(hasattr(windows.WindowsControlServer, "request"))
+        self.assertFalse(hasattr(windows.WindowsControlClient, "start"))
+        self.assertFalse(hasattr(windows.WindowsControlClient, "path"))
 
     @unittest.skipIf(NOT_POSIX, POSIX_ONLY)
     def test_linux_factory_never_returns_the_stub(self) -> None:

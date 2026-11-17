@@ -61,6 +61,8 @@ class PinTest(unittest.TestCase):
         self.assertEqual(excerpt["ErrorCode"]["Method not found"], acp.METHOD_NOT_FOUND)
         self.assertEqual(excerpt["ErrorCode"]["Authentication required"], acp.AUTH_REQUIRED)
         self.assertEqual(sorted(excerpt["RequestPermissionOutcome"]), ["cancelled", "selected"])
+        self.assertEqual(list(acp.TOOL_STATUSES), excerpt["ToolCallStatus"])
+        self.assertEqual(list(acp.TOOL_KINDS), excerpt["ToolKind"])
 
 
 class OpenTest(unittest.TestCase):
@@ -1968,6 +1970,131 @@ class ReviewRoundFourTest(unittest.TestCase):
                 self.assertIsNone(holder["s"].prompt("x", FAR).code)
                 self.assertEqual(taken, [False])
                 self.assertEqual(agent.permission_answers["perm-1"], {"outcome": {"outcome": "cancelled"}})
+
+
+def digest(value) -> str:
+    """A stand-in digest for these cases (the engine supplies the RFC 8785 one)."""
+    if isinstance(value, float) and value != value:
+        return None   # no canonical text: the ToolCalls contract (#408 round 4)
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def tool(update_kind: str = "tool_call_update", call_id: str = "call-1", **fields) -> dict:
+    return {"sessionId": "s1", "update": {"sessionUpdate": update_kind, "toolCallId": call_id, **fields}}
+
+
+def text_content(text: str) -> list:
+    return [{"type": "content", "content": {"type": "text", "text": text}}]
+
+
+class ToolCallsTest(unittest.TestCase):
+    def test_input_that_arrives_late_is_drafted_once_with_its_last_value(self) -> None:
+        calls = acp.ToolCalls(digest)
+        self.assertEqual(calls.update(tool("tool_call", title="Run ls", kind="execute", status="pending",
+                                           rawInput={})), [])
+        drafts = calls.update(tool(status="in_progress", rawInput={"command": "ls"}))
+        self.assertEqual(drafts, [{"type": "tool.call", "payload": {
+            "call_id": "call-1", "name": "execute", "input_digest": digest({"command": "ls"}),
+            "input": {"command": "ls"}}}])
+        self.assertEqual(calls.update(tool(rawInput={"command": "ls -la"})), [])   # drafted once
+        done = calls.update(tool(status="completed", content=text_content("a\n")))
+        self.assertEqual(done, [{"type": "tool.result", "payload": {
+            "call_id": "call-1", "status": "ok", "text": "a\n", "output_ref": None, "truncated": False}}])
+        self.assertEqual(calls.update(tool(status="completed")), [])                  # one result only
+
+    def test_a_call_reported_whole_then_completed_gives_call_then_result_on_completion(self) -> None:
+        calls = acp.ToolCalls(digest)
+        self.assertEqual(calls.update(tool("tool_call", title="Write", kind="edit", status="pending",
+                                           rawInput={"path": "/w/x"})), [])
+        drafts = calls.update(tool(status="completed", rawOutput="written"))
+        self.assertEqual([d["type"] for d in drafts], ["tool.call", "tool.result"])
+        self.assertEqual(drafts[0]["payload"]["input"], {"path": "/w/x"})
+        self.assertEqual(drafts[1]["payload"]["text"], "written")
+
+    def test_the_name_is_the_agents_tool_name_else_the_kind_never_the_title(self) -> None:
+        cases = ((dict(name="run_command", kind="execute"), "run_command"), (dict(kind="search"), "search"),
+                 (dict(), "other"), (dict(name="bad\nname", kind="read"), "read"), (dict(kind="nonsense"), "other"))
+        for fields, want in cases:
+            with self.subTest(fields=fields):
+                calls = acp.ToolCalls(digest)
+                drafts = calls.update(tool("tool_call", title="rm -rf /", status="in_progress", **fields))
+                self.assertEqual(drafts[0]["payload"]["name"], want)
+
+    def test_input_that_is_not_an_object_or_absent_is_carried_as_nothing_with_the_digest_of_what_came(self) -> None:
+        for raw, has in (("--- a\n+++ b\n", True), ([1, 2], True), (None, False)):
+            with self.subTest(raw=raw):
+                calls = acp.ToolCalls(digest)
+                fields = {"rawInput": raw} if has else {}
+                payload = calls.update(tool("tool_call", title="t", status="in_progress", **fields))[0]["payload"]
+                self.assertIsNone(payload["input"])
+                self.assertEqual(payload["input_digest"], digest(raw if has else None))
+
+    def test_an_input_with_no_canonical_text_is_a_protocol_error(self) -> None:          # R6, as one-shot
+        calls = acp.ToolCalls(digest)
+        with self.assertRaises(acp.AcpProtocolError):
+            calls.update(tool("tool_call", title="t", status="in_progress", rawInput=float("nan")))
+
+    def test_a_failed_call_is_denied_only_when_our_answer_refused_it(self) -> None:
+        for answer, want in ((acp.DENY, "denied"), ("cancelled", "denied"), (acp.APPROVE, "error"), (None, "error")):
+            with self.subTest(answer=answer):
+                calls = acp.ToolCalls(digest)
+                calls.update(tool("tool_call", title="t", kind="execute", status="pending"))
+                if answer is not None:
+                    ask = acp.PermissionAsk("ask-1", 1, {"toolCallId": "call-1"}, (), None)
+                    calls.asked(ask)
+                    ask.answer = answer
+                drafts = calls.update(tool(status="failed", content=text_content("no")))
+                self.assertEqual(drafts[-1]["payload"]["status"], want)
+
+    def test_calls_left_open_by_a_stopped_turn_end_cancelled(self) -> None:
+        calls = acp.ToolCalls(digest)
+        calls.update(tool("tool_call", call_id="a", title="t", status="in_progress"))
+        calls.update(tool("tool_call", call_id="b", title="t", status="in_progress"))
+        calls.update(tool(call_id="b", status="completed"))
+        calls.update(tool("tool_call", call_id="c", title="t", status="pending"))   # never ran: no call drafted
+        ended = calls.turn_ended(True)
+        self.assertEqual([(d["payload"]["call_id"], d["payload"]["status"]) for d in ended], [("a", "cancelled")])
+        self.assertEqual(calls.turn_ended(True), [])                       # one result per call
+        calls = acp.ToolCalls(digest)                                      # #408 round 1, F5: not stopped
+        calls.update(tool("tool_call", call_id="a", title="t", status="in_progress"))
+        ended = calls.turn_ended(False)
+        self.assertEqual([(d["payload"]["call_id"], d["payload"]["status"]) for d in ended], [("a", "error")])
+
+    def test_long_text_is_cut_and_marked(self) -> None:
+        calls = acp.ToolCalls(digest)
+        calls.update(tool("tool_call", title="t", status="in_progress"))
+        payload = calls.update(tool(status="completed", rawOutput="x" * (acp.TOOL_TEXT_LIMIT + 5)))[0]["payload"]
+        self.assertEqual(len(payload["text"]), acp.TOOL_TEXT_LIMIT)
+        self.assertTrue(payload["truncated"])
+
+    def test_updates_without_a_usable_id_and_other_kinds_give_nothing(self) -> None:
+        calls = acp.ToolCalls(digest)
+        for bad in ("", "x" * 129, "a\nb", 7):
+            self.assertEqual(calls.update(tool("tool_call", call_id=bad, title="t", status="in_progress")), [])
+        self.assertEqual(calls.ignored, 4)
+        self.assertEqual(calls.update({"sessionId": "s1", "update": {"sessionUpdate": "agent_message_chunk"}}), [])
+
+    def test_through_a_session(self) -> None:
+        agent = FakeAcpAgent([[
+            ("update", {"sessionUpdate": "tool_call", "toolCallId": "call-1", "title": "Run echo hi",
+                        "kind": "execute", "status": "pending", "rawInput": {}}),
+            ("ask", TOOL_CALL, OPTIONS_ALL),
+            ("update", {"sessionUpdate": "tool_call_update", "toolCallId": "call-1", "status": "failed",
+                        "rawInput": {"command": "echo hi"}}),
+            ("end", "end_turn")]])
+        calls = acp.ToolCalls(digest)
+        drafts = []
+        s = None
+
+        def on_ask(ask):
+            calls.asked(ask)
+            s.answer_permission(ask.token, acp.DENY)
+
+        s = opened(agent, on_update=lambda p: drafts.extend(calls.update(p)), on_ask=on_ask)
+        s.prompt("x", FAR)
+        self.assertEqual([d["type"] for d in drafts], ["tool.call", "tool.result"])
+        self.assertEqual(drafts[0]["payload"]["input"], {"command": "echo hi"})
+        self.assertEqual(drafts[1]["payload"]["status"], "denied")
 
 
 class DeadlineTest(unittest.TestCase):

@@ -229,6 +229,38 @@ class FakeAcpAgent:
                 raise ValueError(f"unknown fake step {kind!r}")
 
 
+def main(argv=None) -> int:
+    """Run the fake as a stdio process: ``python -m <this module> '<scenario JSON>'``.
+
+    The scenario is an object with ``scripts`` (a list of scripts, each a list of steps written as JSON
+    arrays) and optionally ``methods``, ``accept_methods``, ``load_session`` and ``replay``. Each stdin line is
+    handled as ``send`` handles it, and everything the agent queued is written to stdout at once, flushed.
+    The process exits 0 at stdin's end or after a ``die`` step (once what it queued is written)."""
+    import sys
+
+    args = sys.argv[1:] if argv is None else list(argv)
+    scenario = json.loads(args[0]) if args else {}
+    agent = FakeAcpAgent(
+        [[tuple(step) for step in script] for script in scenario.get("scripts", [])],
+        methods=tuple(scenario.get("methods", ANTIGRAVITY_METHODS)),
+        accept_methods=scenario.get("accept_methods"),
+        load_session=bool(scenario.get("load_session", False)),
+        replay=tuple(scenario.get("replay", ())),
+    )
+    out = sys.stdout
+    for raw in sys.stdin:
+        line = raw.rstrip("\n")
+        if not line:
+            continue
+        agent.send(line)
+        while agent._out:
+            out.write(agent._out.popleft() + "\n")
+        out.flush()
+        if agent._dead:
+            return 0
+    return 0
+
+
 # Permission options as agents send them (kinds from the pinned schema; ids made up).
 OPTIONS_ALL = [
     {"optionId": "proceed_always", "name": "Allow always", "kind": "allow_always"},
@@ -241,3 +273,7 @@ OPTIONS_ALWAYS_ONLY = [
 ]
 TOOL_CALL = {"toolCallId": "call-1", "title": "Run echo hi", "kind": "execute", "status": "pending",
              "rawInput": {"command": "echo hi"}}
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

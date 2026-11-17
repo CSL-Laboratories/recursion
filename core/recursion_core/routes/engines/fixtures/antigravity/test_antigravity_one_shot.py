@@ -1017,7 +1017,7 @@ class ReviewRoundFiveMaskTest(unittest.TestCase):
 
     def test_f2_ended_ids_at_their_length_limits_and_with_other_characters(self) -> None:   # Astra's follow-up
         from recursion_core.routes.engines.fixtures.antigravity import acp
-        out = acp.TurnOutcome(1, None, "end_turn", False, False, None, None, None, "", "hi")
+        out = acp.TurnOutcome(1, None, "end_turn", False, False, None, None, None, "", "hi", 0)
         for turn, delivery in (("turn-" + "a" * 60, "dlv-x"), ("turn-x", "dlv-" + "a" * 61),
                                ("turn-" + chr(0xE9), "dlv-x"), ("turn-x", "dlv-" + chr(10)), ("turn-x", "dlv-a b"),
                                ("turn-x", "dlv-x" + chr(10))):

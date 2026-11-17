@@ -117,14 +117,31 @@ that is not a str (``answer_permission``, ``ask``) or a request id that is not a
 ``pending_result``). ``answer_permission`` and ``ask`` raise ``KeyError`` for a str token this connection
 never issued, ``pending_result`` for an int id it never minted.
 
-WHAT IT DOES NOT DO (yet): map ``tool_call`` updates to tool.call drafts (their ``rawInput`` arrives late
-and differs by agent), read usage (stable ACP has only ``usage_update``: context size, and an optional
-running cost), or read a rate limit (stable ACP has none). The driver.v2 flags of an ACP engine say so.
+TOOL CALLS (``ToolCalls``). ``tool_call`` and ``tool_call_update`` become one tool.call and one tool.result
+draft per tool call id. The agent's ``rawInput`` arrives late and differs by agent (one sends ``{}`` while
+the call is pending and fills it in later; another sends it whole at once), so the call is drafted ONCE, at
+the first update whose status is past ``pending``, with the latest ``rawInput`` seen; the result when the
+status is ``completed`` or ``failed``. A failed call whose permission ask this client answered ``deny`` or
+``cancelled`` is ``denied``.
+When a turn ends, every call drafted without a result gets one: ``cancelled`` when the turn was stopped
+(the caller's cancel or Recursion's deadline; ACP: the client marks the turn's unfinished calls cancelled),
+``error`` otherwise (the agent ended the turn, or went away, with the call unfinished), so no tool.call is
+left without its tool.result. A caller that gives ``mask`` has the result text masked after its parts
+are joined, so a value split across two content items cannot be joined back. The draft's
+``name`` is the call's ``kind`` (ACP's fixed list: read, edit, execute, ...), never its ``title``, which is
+display text, unless the agent sends the call's ``name`` ("programmatic name of the tool", stable since
+schema 1.x): then that. The draft's input is ``rawInput`` when it is an object; when it is another JSON value
+the input is null and the digest is that value's; when the agent sent none, the input is null and the digest
+is that of JSON null. The digest function is the caller's (RFC 8785, then SHA-256).
+
+WHAT IT DOES NOT DO (yet): read usage (stable ACP has only ``usage_update``: context size, and an optional
+running cost) or read a rate limit (stable ACP has none). The driver.v2 flags of an ACP engine say so.
 """
 
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import math
 import threading
@@ -164,6 +181,9 @@ REFUSED_CLIENT_METHODS = (
 SENT_METHODS = (INITIALIZE, AUTHENTICATE, SESSION_NEW, SESSION_LOAD, SESSION_PROMPT, SESSION_CANCEL)
 ANSWERED_METHODS = (SESSION_UPDATE, REQUEST_PERMISSION) + REFUSED_CLIENT_METHODS
 
+# schema.json $defs/ToolCallStatus and ToolKind.
+TOOL_STATUSES = ("pending", "in_progress", "completed", "failed")
+TOOL_KINDS = ("read", "edit", "delete", "move", "search", "execute", "think", "fetch", "switch_mode", "other")
 # schema.json $defs/StopReason, PermissionOptionKind, RequestPermissionOutcome, ErrorCode.
 STOP_REASONS = ("end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled")
 ALLOW_ONCE, ALLOW_ALWAYS, REJECT_ONCE, REJECT_ALWAYS = "allow_once", "allow_always", "reject_once", "reject_always"
@@ -262,6 +282,9 @@ def _limit_signal(value: object) -> dict | None:
     return dict(value)
 
 
+_SERIALS = itertools.count(1)
+
+
 def _ask_token(token: object) -> None:
     """A token is the str an ask was given; anything else (a list, a dict) is the caller's error."""
     if not isinstance(token, str):
@@ -323,6 +346,7 @@ class TurnOutcome:
     limit: dict | None
     detail: str
     text: str                     # agent_message_chunk text of the turn; empty when code is not None
+    session: int                  # the connection's serial: (session, turn) names one turn across sessions
 
 
 @dataclass
@@ -368,6 +392,9 @@ class AcpConnection:
 
     def __init__(self, *, hooks: EngineHooks = NO_HOOKS, clock: Callable[[], float] | None = None,
                  permission_timeout_s: float | None = None) -> None:
+        # A serial no other connection in this process has: a turn's number starts again at 1 in each session,
+        # so (serial, number) is what names one turn.
+        self.serial = next(_SERIALS)
         if permission_timeout_s is not None and (
                 not _finite_number(permission_timeout_s) or not permission_timeout_s > 0):
             raise AcpInvalid("permission_timeout_s must be a finite number of seconds above zero")
@@ -900,7 +927,7 @@ class AcpConnection:
         # on as if they were its answer (they stay in the raw lines the caller was given with on_line).
         text = "".join(turn.text) if code is None else ""
         return TurnOutcome(turn.number, code, stop_reason, turn.cancel_requested, confirmed, late, error, limit,
-                           detail, text)
+                           detail, text, self.serial)
 
     def _end(self, turn: _Turn, **kwargs) -> TurnOutcome:
         turn.outcome = self._outcome(turn, **kwargs)
@@ -921,6 +948,21 @@ class AcpSession:
     from it). ``on_update(params)`` gets each session/update of the turn; ``on_ask(ask)`` each new permission
     ask (it must not block: the answer comes back through ``answer_permission``, from any thread). When one
     of them raises, the error reaches the caller of ``prompt`` and the turn is abandoned (item 12).
+    ``on_turn_start(key)`` is told each turn ``prompt`` began, once its prompt is written and before any line
+    of it is read (``key`` as below); when it raises, the turn is abandoned, as for the three above.
+    ``on_turn_end(key, outcome, code, detail)`` is told EVERY end of a turn ``prompt`` began, once: the
+    answer, the deadline, the agent going away (``outcome`` is the ``TurnOutcome``), and every raise while the
+    turn was handled (a protocol error, a line it cannot parse, any callback raising; ``outcome`` is None,
+    ``code`` and ``detail`` are the abandoned turn's, after the agent was asked to stop it). ``key`` is
+    ``(session, number)``, the connection's serial and the turn's number (``TurnOutcome.session`` and
+    ``.turn``), or None when no turn began (a prompt refused before it was written). An ``Exception`` out
+    of it is dropped and counted (``turn_end_failures``), so it never replaces the turn's own error or
+    outcome; an interruption is raised. A callback bound to an object that has a ``turn_end`` method (the
+    engine's draft maker) brings that method along as ``on_turn_end`` when none is given, so wiring that
+    object's callbacks wires its turn end too; callbacks of two such objects with no ``on_turn_end`` given are
+    refused (``AcpInvalid``), never left with none. The object that gives ``on_turn_end`` gives ``on_turn_start``
+    too, when it has a ``turn_start`` method and none is given. A callback that is neither None nor callable is
+    refused.
 
     The session reads the clock with its ordering lock held, at the moment a step that starts work is
     serialized (item 11); the connection's own lock is never held while calling out.
@@ -930,7 +972,13 @@ class AcpSession:
                  permission_timeout_s: float | None = None,
                  on_line: Callable[[str], object] | None = None,
                  on_update: Callable[[dict], object] | None = None,
-                 on_ask: Callable[[PermissionAsk], object] | None = None) -> None:
+                 on_ask: Callable[[PermissionAsk], object] | None = None,
+                 on_turn_end: Callable[[tuple | None, object, str, str], object] | None = None,
+                 on_turn_start: Callable[[tuple], object] | None = None) -> None:
+        for name, cb in (("on_line", on_line), ("on_update", on_update), ("on_ask", on_ask),
+                         ("on_turn_end", on_turn_end), ("on_turn_start", on_turn_start)):
+            if cb is not None and not callable(cb):
+                raise AcpInvalid(f"{name} must be callable")
         self.process = process
         self._clock = clock
         self.connection = AcpConnection(hooks=hooks, clock=clock, permission_timeout_s=permission_timeout_s)
@@ -942,6 +990,26 @@ class AcpSession:
         self._reading = threading.Lock()
         self.input_lost = False
         self._on_line, self._on_update, self._on_ask = on_line, on_update, on_ask
+        if on_turn_end is None:
+            owners: list = []   # by identity: a bound method's owner may be unhashable (a list's append)
+            for cb in (on_line, on_update, on_ask):
+                owner = getattr(cb, "__self__", None)
+                if callable(getattr(owner, "turn_end", None)) and not any(owner is o for o in owners):
+                    owners.append(owner)
+            if len(owners) > 1:
+                raise AcpInvalid("the callbacks belong to two draft makers: give on_turn_end")
+            on_turn_end = owners[0].turn_end if owners else None
+        if on_turn_start is None:
+            owner = getattr(on_turn_end, "__self__", None)
+            if callable(getattr(owner, "turn_start", None)):
+                on_turn_start = owner.turn_start
+        self._on_turn_end = on_turn_end
+        self._on_turn_start = on_turn_start
+        self.turn_end_failures = 0
+        # The number of the turn the running prompt began, kept from the moment its request is made (under the
+        # ordering lock) until its end is told: cleanup of the connection never erases it. None while no turn
+        # began (a prompt refused before its request was made).
+        self._started: int | None = None
 
     # -- writing ------------------------------------------------------------------------------------------
     def _write(self, lines) -> bool:
@@ -1069,19 +1137,60 @@ class AcpSession:
             return self._prompt(text, deadline_at)
 
     def _prompt(self, text: str, deadline_at: float) -> TurnOutcome:
+        self._started = None
         self._drain(deadline_at)
+        try:
+            outcome = self._turn(text, deadline_at)
+        except BaseException as error:
+            self._turn_ended(None, error)
+            raise
+        self._turn_ended(outcome, None)
+        return outcome
+
+    def _turn_ended(self, outcome: TurnOutcome | None, error: BaseException | None) -> None:
+        """THE one place the session tells a turn's end (``on_turn_end``): every exit of ``_turn`` passes here."""
+        if self._on_turn_end is None:
+            return
+        if outcome is not None:
+            key, code, detail = (outcome.session, outcome.turn), outcome.code, outcome.detail
+        else:
+            # The key of the turn this prompt began, whatever cleared the connection's turn since (a bad
+            # answer, a line on_line raised on, an interrupted write): None only when no turn began.
+            number = self._started
+            key = None if number is None else (self.connection.serial, number)
+            code = error.code if isinstance(error, AcpError) else c.ENGINE_ERROR
+            detail = f"handling the turn raised {type(error).__name__}"
+        try:
+            self._on_turn_end(key, outcome, code, detail)
+        except Exception:   # never replaces the turn's own error or outcome; an interruption still goes up
+            self.turn_end_failures += 1
+
+    def _turn_started(self) -> None:
+        """Tells ``on_turn_start`` the turn whose prompt was just written, before any line of it is read."""
+        number = self._started
+        if self._on_turn_start is not None and number is not None:
+            self._on_turn_start((self.connection.serial, number))
+
+    def _request_prompt(self, text: str, deadline_at: float):
+        """The prompt's request; the turn it begins is kept as this prompt's own (``_started``)."""
+        made = self.connection.prompt(text, deadline_at)
+        self._started = self.connection.turn_in_progress
+        return made
+
+    def _turn(self, text: str, deadline_at: float) -> TurnOutcome:
         # A prompt that could not be written is seen by the pump's first round (the input is lost): the turn
         # ends engine_exited there, as for any failed write. When the write was interrupted instead, the turn
         # it began ends here with the agent's input, before the interruption is raised: no turn is left in
         # progress with nothing to end it.
         try:
             rpc_id, _written = self._step(self._starting(deadline_at, "before the prompt was sent",
-                                                         lambda: self.connection.prompt(text, deadline_at)))
+                                                         lambda: self._request_prompt(text, deadline_at)))
         except BaseException:
             if self.input_lost:
                 self.connection.input_closed()
             raise
         try:
+            self._turn_started()
             while True:
                 outcome = self._pump_one(deadline_at)
                 if isinstance(outcome, TurnOutcome):
@@ -1091,8 +1200,9 @@ class AcpSession:
         except BaseException as error:
             # The turn ends here, typed by the failure, and the agent is asked to stop it: the session can
             # take the next turn once the agent has answered this one (the next prompt reads to that answer).
-            self.connection.abandon(error.code if isinstance(error, AcpError) else c.ENGINE_ERROR,
-                                    f"handling the turn raised {type(error).__name__}", rpc_id=rpc_id)
+            code = error.code if isinstance(error, AcpError) else c.ENGINE_ERROR
+            detail = f"handling the turn raised {type(error).__name__}"
+            self.connection.abandon(code, detail, rpc_id=rpc_id)
             self.cancel()
             raise
 
@@ -1232,3 +1342,165 @@ class AcpSession:
             fed = None
         if fed is not None and fed.replies:
             self._write(fed.replies)
+
+
+# -- tool calls -------------------------------------------------------------------------------------------
+TOOL_TEXT_LIMIT = 64_000   # characters of a result's text; beyond it the text is cut and marked truncated
+
+
+def _lone_surrogate(text: str) -> bool:
+    """Whether ``text`` holds a surrogate code point (JSON reads a pair as one character, so any left is lone)."""
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+
+
+@dataclass
+class _ToolCall:
+    call_id: str
+    name: str | None = None
+    kind: str | None = None
+    status: str = "pending"
+    raw_input: object = None
+    has_input: bool = False
+    raw_output: object = None
+    content: list = field(default_factory=list)
+    called: bool = False
+    resulted: bool = False
+    public_id: str = ""     # the id its drafts carry (masked, distinct); call_id stays the agent's own
+
+
+class NoCanonicalText(ValueError):
+    """A value that has no RFC 8785 text. A ``ToolCalls`` digest raises it (or returns None) for such a value,
+    and the call is then the agent's protocol error; anything else a digest raises is the caller's failure."""
+
+
+class ToolCalls:
+    """One turn's ``tool_call`` and ``tool_call_update`` updates as tool.call and tool.result drafts (driver.v2).
+
+    ``digest(value) -> sha256 hex`` is the caller's (RFC 8785 text, then SHA-256): this file writes no canonical
+    form of its own. For a value with no canonical text it raises ``NoCanonicalText`` or returns None (the
+    agent's protocol error); anything else it raises, a plain ``ValueError`` included, is the caller's failure
+    (``AcpInvalid``). Antigravity's ``input_digest`` is such a digest, as it stands.
+    ``update(params)`` takes a session/update's params and gives the drafts it causes;
+    ``asked(ask)`` tells it of a permission ask (its final answer is read when the call fails);
+    ``turn_ended(stopped)`` gives a result for every call drafted without one: ``cancelled`` when the turn was
+    stopped, ``error`` otherwise. ``mask(text) -> text``, when given, is applied to each result text once its
+    parts are joined, and again after any lone surrogate is replaced (a replacement can spell a value).
+    CALLS ARE KNOWN BY THE AGENT'S OWN ``toolCallId`` (updates and permission asks alike); a draft carries a
+    public id instead: the id masked, and, when that is taken by another call already (two ids that mask
+    alike, or an id equal to another's mask), ``redacted-call-<n>`` masked, so two calls never share a draft
+    id and no draft id carries a masked value. Not thread-safe: one turn's updates arrive on one thread.
+    """
+
+    def __init__(self, digest: Callable[[object], str], mask: Callable[[str], str] | None = None) -> None:
+        if not callable(digest) or (mask is not None and not callable(mask)):
+            raise AcpInvalid("digest (and mask, when given) must be callable")
+        self._digest = digest
+        self._mask = mask
+        self._calls: dict[str, _ToolCall] = {}
+        self._asks: dict[str, list] = {}
+        self._used: set = set()   # the public ids given so far
+        self.ignored = 0   # updates with no usable tool call id
+
+    def asked(self, ask: PermissionAsk) -> None:
+        call_id = ask.tool_call.get("toolCallId") if isinstance(ask.tool_call, Mapping) else None
+        if isinstance(call_id, str):
+            self._asks.setdefault(call_id, []).append(ask)
+
+    def update(self, params: Mapping) -> list[dict]:
+        update = params.get("update") if isinstance(params, Mapping) else None
+        if not isinstance(update, Mapping) or update.get("sessionUpdate") not in ("tool_call", "tool_call_update"):
+            return []
+        call_id = update.get("toolCallId")
+        if (not isinstance(call_id, str) or not 1 <= len(call_id) <= 128 or "\n" in call_id or "\r" in call_id
+                or _lone_surrogate(call_id)):
+            self.ignored += 1
+            return []
+        call = self._calls.get(call_id)
+        if call is None:
+            call = self._calls[call_id] = _ToolCall(call_id, public_id=self._public_id(call_id))
+        if isinstance(update.get("name"), str) and update["name"]:
+            call.name = update["name"]
+        if update.get("kind") in TOOL_KINDS:
+            call.kind = update["kind"]
+        if update.get("status") in TOOL_STATUSES:
+            call.status = update["status"]
+        if "rawInput" in update and update["rawInput"] is not None:
+            call.raw_input, call.has_input = update["rawInput"], True
+        if "rawOutput" in update:
+            call.raw_output = update["rawOutput"]
+        if isinstance(update.get("content"), list):
+            call.content = list(update["content"])   # ACP: a content list replaces the one before it
+        drafts = []
+        if not call.called and call.status != "pending":
+            drafts.append(self._call(call))
+        if call.called and not call.resulted and call.status in ("completed", "failed"):
+            drafts.append(self._result(call, "ok" if call.status == "completed" else self._failed(call)))
+        return drafts
+
+    @property
+    def has_open(self) -> bool:
+        """Whether a call is drafted without its result."""
+        return any(call.called and not call.resulted for call in self._calls.values())
+
+    def turn_ended(self, stopped: bool) -> list[dict]:
+        status = "cancelled" if stopped else "error"
+        return [self._result(call, status) for call in self._calls.values() if call.called and not call.resulted]
+
+    # -- internals ------------------------------------------------------------------------------------------
+    def _public_id(self, call_id: str) -> str:
+        """A draft id for a new call: distinct from every one given, and masked when a mask is given."""
+        public, n = (call_id if self._mask is None else self._mask(call_id)), 1
+        while public in self._used or len(public) > 128:
+            n += 1
+            public = f"redacted-call-{n}" if self._mask is None else self._mask(f"redacted-call-{n}")
+        self._used.add(public)
+        return public
+
+    def _name(self, call: _ToolCall) -> str:
+        name = call.name if call.name and len(call.name) <= 256 and not any(c in call.name for c in "\r\n") else None
+        if name is not None and _lone_surrogate(name):   # it could not be written as UTF-8 JSON
+            name = None
+        return name or call.kind or "other"
+
+    def _call(self, call: _ToolCall) -> dict:
+        """The tool.call draft. An input with no RFC 8785 text (an integer beyond 2^53 - 1, a float that is not
+        finite, or a string holding an unpaired surrogate, which RFC 8785 cannot write) is the agent's protocol
+        error, by design (R6, as the one-shot parser has it): its input is never altered or dropped."""
+        value = call.raw_input if call.has_input else None
+        try:
+            digest = self._digest(value)
+        except NoCanonicalText:     # the value has no canonical text: the agent's, below
+            digest = None
+        except Exception as err:    # the caller's digest failed: the caller's error, typed (ValueError too)
+            raise AcpInvalid(f"the digest function failed: {type(err).__name__}") from None
+        if digest is None:          # no canonical text: the agent's protocol error, never an input dropped
+            raise AcpProtocolError("tool input has no RFC 8785 text")
+        if not (isinstance(digest, str) and len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest)):
+            raise AcpInvalid("the digest function must give a SHA-256 as 64 lowercase hex characters")
+        call.called = True          # only once its draft exists: a refused call is never "drafted"
+        payload = {"call_id": call.public_id, "name": self._name(call), "input_digest": digest,
+                   "input": dict(value) if isinstance(value, Mapping) else None}
+        return {"type": "tool.call", "payload": payload}
+
+    def _failed(self, call: _ToolCall) -> str:
+        answers = [a.answer for a in self._asks.get(call.call_id, ())]
+        return "denied" if answers and answers[-1] in (DENY, "cancelled") else "error"
+
+    def _result(self, call: _ToolCall, status: str) -> dict:
+        call.resulted = True
+        parts = []
+        for item in call.content:
+            inner = item.get("content") if isinstance(item, Mapping) and item.get("type") == "content" else None
+            if isinstance(inner, Mapping) and inner.get("type") == "text" and isinstance(inner.get("text"), str):
+                parts.append(inner["text"])
+        text = "".join(parts) if parts else (call.raw_output if isinstance(call.raw_output, str) else "")
+        if self._mask is not None:
+            text = self._mask(text)   # after the join: parts masked one by one could spell a value together
+        if _lone_surrogate(text):     # a JSON line may carry one escaped; a draft must be writable as UTF-8
+            text = "".join(chr(0xFFFD) if 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in text)
+            if self._mask is not None:
+                text = self._mask(text)   # the replacement can spell a value: masked again, as it now stands
+        truncated = len(text) > TOOL_TEXT_LIMIT
+        payload = {"call_id": call.public_id, "status": status, "text": text[:TOOL_TEXT_LIMIT], "output_ref": None,
+                   "truncated": truncated}
+        return {"type": "tool.result", "payload": payload}

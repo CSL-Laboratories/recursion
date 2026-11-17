@@ -121,7 +121,7 @@ class LateStartedTest(unittest.TestCase):  # F4
         answer(pending, 0, {"code": "started", "duplicate": True, "run": dict(RUNNING)})
         self.assertEqual(app.runs[0]["state"], "stopped")
 
-    def test_a_started_answer_asked_after_the_confirmation_is_taken(self) -> None:  # holds
+    def test_a_started_answer_with_no_stop_confirmed_is_taken(self) -> None:  # holds
         app, pending = held()
         app.on_answer("run.list", {}, {"code": "ok", "runs": [dict(RUNNING)]})
         app.request("run.start", START)

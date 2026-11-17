@@ -396,8 +396,11 @@ class TuiApp:
         # write to the registry failed (recorded=false) leaves the run `running` with no stop (R2 finding
         # 6). A later answer about another run, or a run absent from the list, does not clear it either.
         attested = {f"run={r.get('run_id')}" for r in self.runs if r.get("state") == "stopped"}
-        # A start the API could not confirm stays UNCERTAIN until a list or a status names its run (T23)
-        attested |= {f"start={r.get('run_id')}" for r in self.runs}
+        # A start the API could not confirm stays UNCERTAIN until a later list or status names its run (T23): a run
+        # this answer names, not one already on screen, which a retry of the same key repeats (Grok r2 of #443, R1)
+        named = answer.get("runs") if method == "run.list" else [answer.get("run")] if method == "run.status" else []
+        if code == "ok" and isinstance(named, list):
+            attested |= {f"start={r.get('run_id')}" for r in named if isinstance(r, Mapping)}
         for subject in list(self._uncertain):
             if subject in attested:
                 del self._uncertain[subject]

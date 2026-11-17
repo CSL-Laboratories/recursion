@@ -185,7 +185,8 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   that run as `stopped`, or answers `stopped` to a Stop of it. A run listed with no stop record does not
   clear it, since a pending Stop whose registry write failed leaves exactly that. A `run.list`, `run.status` or `run.start`
   answer asked before a Stop was first confirmed does not show that run running again. A start's `UNCERTAIN` stays
-  until a list or a status names its run. The `conditions` command says the current set again on demand. The CLI has the same
+  until a later list or status answer names its run (a run already on screen, which a retry of
+  the same key repeats, does not end it). The `conditions` command says the current set again on demand. The CLI has the same
   command (`recursion-control conditions`), which reads `run.list` because it keeps no state. No control
   API method was added.
 - The latest error stays on its own row (and in the inline live region) until a newer error replaces

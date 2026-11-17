@@ -889,7 +889,9 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
         if created and registry.list():
             log.warning('the breaker store was missing and was created empty while run records exist: '
                         'earlier trips, run bindings and faults are not known to this daemon')
-    plugins = PluginHost(config_dir, state_dir, stored, plugin_dirs=plugin_dirs, **(plugin_options or {}))
+    # D1: nothing of a plugin is read or run before the control socket serves (Stop works while one hangs).
+    plugins = PluginHost(config_dir, state_dir, stored, plugin_dirs=plugin_dirs, load=False,
+                         **(plugin_options or {}))
     adapters = {}
     for engine, cls in (('claude_code', ClaudeCodeAdapter), ('codex', CodexAdapter)):
         entry = routes.get(engine)
@@ -920,6 +922,12 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
         raise
     try:
         door.publish()  # only now: the socket lock is ours, so no live daemon's token file is replaced
+    except BaseException:
+        server.close()
+        release()
+        raise
+    try:
+        plugins.load_installed()  # D1: after the socket serves, so Stop answers while a plugin hangs at import
     except BaseException:
         server.close()
         release()

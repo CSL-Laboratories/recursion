@@ -23,14 +23,29 @@ client entry, not a kernel one: it registers nothing and starts no daemon servic
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sys
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from . import server, socket_check
 from .stdio import FdReader, FdWriter
+from recursion_core.std_fds import occupy_standard_fds
 
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_INTERNAL, EXIT_INTERRUPTED = 0, 1, 2, 3, 130
+
+# Set by the process entry only. An in-process caller that is returned 130 still has the session's
+# threads reading stdin until that caller ends, and a further call can still be forwarded. The process
+# entry ends the process with the status, so that does not continue there.
+_process_entry = False
+
+
+def _hold_further_sigint(signum: int, frame: object) -> None:
+    """The first interrupt raises; any further one is ignored so the process can end at 130."""
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    raise KeyboardInterrupt
 
 
 def _stderr_line(stream: Any, event: dict) -> None:
@@ -62,9 +77,12 @@ def main(argv: list[str] | None = None, *, environ: Mapping[str, str] | None = N
          stdout: Any = None, stderr: Any = None, check=socket_check.check) -> int:
     argv = sys.argv[1:] if argv is None else argv
     line = _line_writer(stderr)
+    occupy_standard_fds()  # before any socket: a hole at fd 0, 1 or 2 would be taken by the next open
     if argv:
         line({"code": "usage", "detail": "python -m recursion_core.control.mcp takes no arguments"})
         return EXIT_USAGE
+    if _process_entry:  # a further interrupt is ignored, so the process can end at 130
+        signal.signal(signal.SIGINT, _hold_further_sigint)
     try:  # an interrupt anywhere after the usage check, the socket check's read included, is status 130
         return _run(environ, stdin, stdout, check, line)
     except KeyboardInterrupt:  # the client interrupted us: calls already sent to the daemon go on there
@@ -88,4 +106,5 @@ def _run(environ: Mapping[str, str] | None, stdin: Any, stdout: Any, check, line
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _process_entry = True
+    os._exit(main())

@@ -2,7 +2,7 @@
   "format": "mcp-stdio-fixture/1",
   "name": "tools/02-start-status-stop-list",
   "protocol": "2025-06-18",
-  "summary": "A run is started (client_key forwarded unchanged), read, stopped while a member lives (pending, which the control API's success codes leave as isError true), stopped again once the attested walk is empty (stopped), and listed. Each answer is the control API's, unchanged.",
+  "summary": "A run is started (client_key forwarded unchanged), read, stopped while a member lives (pending, which is not an error), stopped again once the attested walk is empty (stopped), and listed. Each answer is the control API's, unchanged.",
   "source": "MCP 2025-06-18 server/tools (Listing Tools, Calling Tools, Error Handling); control/api.py run verbs; D3 (CONTRACT 1712): a Stop answers stopped or pending truthfully",
   "api": [
     {
@@ -312,7 +312,7 @@
               "run_id": "run-1",
               "state": "pending"
             },
-            "isError": true
+            "isError": false
           }
         }
       ]

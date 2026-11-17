@@ -103,3 +103,6 @@ PYTHONPATH=core python -m unittest discover -s core/recursion_core/control/mcp/t
 
 `test_stdio.py` runs the module as a child process against the real owner-only transport with the
 real control API over the shared fakes (Linux; skipped where `SO_PEERCRED` is missing).
+
+Status 130 is for an interrupt once serving has begun (after the imports and the usage check). An
+interrupt during the imports, before that, ends by the signal.

@@ -339,9 +339,11 @@ def _wait_until_no_fence(gate, kept):
 
 def _while_a_fence_is_counted(gate):
     """The wait of ``_wait_until_no_fence``, whose caller holds the gate lock. A method of its own because a
-    protected region has no loop written in it."""
+    protected region has no loop written in it. A wait that runs out is logged and the wait goes on, as the
+    drain's does: a timeout is not permission to drop a fence that is still counted."""
     while gate._fences:
-        gate._changed.wait()
+        if not gate._changed.wait(gate.stall_log_s):
+            log.warning('closing waits for %d fence(s); the unit stop is left to finish', gate._fences)
 
 
 class RouteStarter:
@@ -577,23 +579,34 @@ class RouteStarter:
     def _fence_while_the_gate_is_open(self, process):
         """Count one fence while the gate is open, stop the unit without the gate lock, then drop the count.
 
-        An exception from the fence, or an interruption, drops the count and is raised with the lock free.
-        The fence is asked once: it has been entered, and a second stop is not implied by the interruption."""
-        begun, kept = self._claim_fence()
-        if not begun:
-            control_hooks.raise_kept(kept)
-            return
-        try:
-            process.fence('result_recorded')
-        except BaseException as exc:  # noqa: BLE001 - the count is dropped before this is raised
-            kept.append(exc)
-        kept.extend(self._release_fence())
+        The claim, the stop and the drop are one protected region (OWNERSHIP, in ``control/hooks.py``). The
+        count is marked owed in the same block that raises it, inside the claim, so an interruption on the way
+        back from the claim still owes a drop. Each step is skipped once it has been done: the stop is asked
+        once, and the drop writes the count from the value it read, so a second pass does not take it down
+        twice. What was kept is raised only after the count is dropped and the lock is free. A shut gate
+        counts nothing and stops nothing."""
+        mark = {'owed': False, 'asked': False, 'released': False}
+        kept = []
+        while True:
+            try:
+                if not mark['owed'] and not mark['released']:
+                    kept.extend(self._claim_fence(mark))
+                    if not mark['owed']:
+                        mark['released'] = True
+                if mark['owed'] and not mark['asked']:
+                    mark['asked'] = True
+                    process.fence('result_recorded')
+                if mark['owed'] and not mark['released']:
+                    kept.extend(self._release_fence(mark))
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the count is dropped before this is raised
+                kept.append(exc)
         control_hooks.raise_kept(kept)
 
-    def _claim_fence(self):
-        """Under the gate lock: a shut gate claims nothing; an open gate counts one fence. The lock is not held
-        on return. ``(True, kept)`` when this caller owes one fence. An interruption is kept and the claim is
-        still decided exactly once."""
+    def _claim_fence(self, mark):
+        """Under the gate lock: a shut gate claims nothing; an open gate counts one fence and marks it owed in
+        that same block. The lock is not held on return. The mark is the caller's, so the owed bit is visible
+        even when this return itself is interrupted. What interrupted the claim is returned, not raised."""
         gate = self._hooks.gate
         lock = gate._lock
         kept = []
@@ -610,18 +623,19 @@ class RouteStarter:
                         begun = False
                     else:
                         gate._fences = found + 1
+                        mark['owed'] = True
                         begun = True
                 if lock._is_owned():
                     lock.release()
                 break
             except BaseException as exc:  # noqa: BLE001 - kept; the claim is gone round again
                 kept.append(exc)
-        return bool(begun), kept
+        return kept
 
-    def _release_fence(self):
+    def _release_fence(self, mark):
         """Drop the one fence this caller claimed, and wake a shutting that is waiting on the count. The lock
-        is not held on return. What interrupted the drop is returned, not raised, so the caller can raise it
-        after the count is dropped."""
+        is not held on return. The count is written from the value read once, and the mark is set in that same
+        block, so a second pass does not drop it again. What interrupted the drop is returned, not raised."""
         gate = self._hooks.gate
         lock = gate._lock
         kept = []
@@ -636,6 +650,7 @@ class RouteStarter:
                         found = gate._fences
                     gate._fences = found - 1
                     gate._changed.notify_all()
+                    mark['released'] = True
                     done = True
                 if lock._is_owned():
                     lock.release()

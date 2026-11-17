@@ -573,8 +573,8 @@ class Admission:
     waits for a call that is inside (a handler, an authorizer, a result reader, a start registrant, the
     page's provider) and for a hook on a run's own thread (S13) and a hand-over (S9); a call, a run or a
     launch is refused once closing has begun, and the hook is not asked after it; and a settling fences
-    nothing once the gate is shut (its fence is made with the gate held open, ``while_open``: a close that
-    is asked for while a fence is being made waits for it). Without the gate a reference would count
+    nothing once the gate is shut (a fence that has started is counted, and a shutting sets the shut flag
+    and then waits for that count; the unit stop does not hold the gate lock). Without the gate a reference would count
     nothing and none of that would hold.
     """
 
@@ -684,8 +684,8 @@ class Admission:
         """Do ``act()`` with the gate held OPEN and return True; or, once the gate is closed, do nothing and
         return False.
 
-        It is for the one thing that must not be done once closing has begun and that is decided on a thread
-        closing may not be waiting for: the fence at the end of a settling (S9). To ask whether closing has
+        No production caller uses this for the settling fence. That fence is counted by the route starter,
+        which does not hold the gate lock across the unit stop. To ask whether closing has
         begun and then to act is two steps, and a close can begin between them. Here they are ONE step for
         ``close``, which takes the same condition: a close that begins meanwhile waits until ``act`` has
         returned, and one that began before is seen.

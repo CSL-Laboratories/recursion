@@ -75,6 +75,7 @@ from unittest import mock
 from recursion_core.control import api as A, cli, commands, hooks as H, methods
 from recursion_core.control.registry import InMemoryRunRegistry
 from recursion_core.control.tests.fakes import FakeKillTree, run_ids
+from recursion_core.daemon import control_adapter as fence_adapter
 from recursion_core.routes import ClaudeCodeAdapter, CodexAdapter, engines
 
 REPO = pathlib.Path(__file__).resolve().parents[4]
@@ -3434,12 +3435,14 @@ class RegionWalk:
     def at_the_marker(self) -> bool:
         """Whether the last interruption was raised at the one kind of point this walk names as beyond protection:
         on 3.14, the marker instruction the interpreter puts after a conditional jump that is not taken
-        (``NOT_TAKEN``), where it stands in the region's own function and outside every handler of it. No signal
+        (``NOT_TAKEN``), where it stands outside every handler, in the region or in a callee. No signal
         is delivered there. A trace callback can raise there, and nothing written in Python covers it."""
-        code, offset, outermost, event = self.raised_at
+        code, offset, _outermost, event = self.raised_at
         name = next((ins.opname for ins in dis.get_instructions(code) if ins.offset == offset), None)
         covered = any(entry.start <= offset < entry.end for entry in dis.Bytecode(code).exception_entries)
-        return outermost and name == 'NOT_TAKEN' and not covered
+        # A marker in a callee is outside that callee's handler and outside the caller's too, so the caller's
+        # except does not run and a lock the callee held is still held. No signal is delivered at it either.
+        return event == 'opcode' and name == 'NOT_TAKEN' and not covered
 
     def at_the_return(self) -> bool:
         """Whether the last interruption was raised as the region's own function RETURNED its answer: at its return
@@ -3616,6 +3619,9 @@ def _teardown_touches(pair) -> tuple:
 
 
 class OwnershipRegionTest(RegionWalk, unittest.TestCase):
+    # The settling fence lives in the route starter. Its frames are walked with the gate's, and nowhere else,
+    # so the walks of the gate's own regions do not start counting them.
+    FILES = RegionWalk.FILES + (fence_adapter.__file__,)
     """Every traceable point of each protected region, interrupted there once (the comment OWNERSHIP in
     ``control/hooks.py``). Three reads in a row found the point just past the last repair; this walks them all,
     so that the next one is found here.
@@ -3653,7 +3659,7 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
     while the first is being put away (the instructions of the ``except`` clause and the way back to the top of
     the loop execute only after an interruption); whatever the lock's own acquire and release do inside
     themselves (one call into C each, for ``threading.RLock``); and on 3.14 the marker instruction after a
-    conditional jump that is not taken, in the region's own function, which no handler covers. An interruption
+    conditional jump that is not taken, in the region or in a callee, which no handler covers. An interruption
     raised there by the trace callback leaves the lock owned; that is the one outcome the walk by instruction
     lets pass, by name (``at_the_marker``), and only there. No signal is delivered at it. The release CALL is
     inside the region and is walked like every other point.
@@ -3729,6 +3735,37 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         gate.enabled = True
         return gate
 
+    def fenced_gate(self):
+        """A gate with one hook registered, so it is on, and the fence wait installed. The wait itself is a
+        stand-in that drops the count at once: a real wait of ``stall_log_s`` would hold the walk."""
+        made = H.Hooks()
+        made.set('launch_check', lambda ctx, executable: None)
+        made.freeze()
+        fence_adapter._install_fence_wait(made.gate)
+
+        def waiting(timeout=None, gate=made.gate):
+            gate._fences = 0
+            return True
+
+        made.gate._changed.wait = waiting
+        return made
+
+    def claiming(self):
+        made = self.fenced_gate()
+        starter = fence_adapter.RouteStarter(mock.Mock(), {}, mock.Mock(closed=False), '/var/tmp/grok-spine-5', hooks=made)
+        mark = {'owed': False, 'asked': False, 'released': False}
+        return starter, made.gate, mark
+
+    def releasing(self):
+        starter, gate, mark = self.claiming()
+        gate._fences = 1
+        mark['owed'] = True
+        return starter, gate, mark
+
+    def stopping(self):
+        starter, gate, mark = self.claiming()
+        return starter, gate, mock.Mock()
+
     def leaving(self):
         """A gate with one call inside, the last one: its leaving wakes whoever waits for the gate to be empty."""
         gate = self.gate()
@@ -3768,6 +3805,27 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
                                lambda pair: pair[0]._lifecycle, _lifecycle_closed),
         'Signal.set': (lambda self: self.signalling(), lambda pair: pair[0].set(), None,
                        lambda pair: pair[0].is_set() and not any(waiter.locked() for waiter in pair[1])),
+        'RouteStarter._claim_fence': (lambda self: self.claiming(),
+                                      lambda subject: H.raise_kept(subject[0]._claim_fence(subject[2])),
+                                      lambda subject: subject[1]._lock,
+                                      lambda subject: subject[1]._fences == 1 and subject[2]['owed']),
+        'RouteStarter._release_fence': (lambda self: self.releasing(),
+                                        lambda subject: H.raise_kept(subject[0]._release_fence(subject[2])),
+                                        lambda subject: subject[1]._lock,
+                                        lambda subject: subject[1]._fences == 0 and subject[2]['released']),
+        # "Done" is the count not left owed. An interruption on the stop's own line, after the asked bit and
+        # before the call, drops the count and does not stop the unit: that end has the same shape as having
+        # done nothing, so it cannot be told apart by the count. The uninterrupted run stops the unit once;
+        # the tests of the gap and of a stop that raises hold that.
+        'RouteStarter._fence_while_the_gate_is_open': (lambda self: self.stopping(),
+                                                       lambda subject: subject[0]._fence_while_the_gate_is_open(subject[2]),
+                                                       lambda subject: subject[1]._lock,
+                                                       lambda subject: subject[1]._fences == 0),
+        'RouteStarter._wait_until_no_fence': (lambda self: self.fenced_gate().gate,
+                                              lambda gate: (lambda kept: fence_adapter._wait_until_no_fence(gate, kept) or H.raise_kept(kept))([]),
+                                              lambda gate: gate._lock, lambda gate: gate._fences == 0),
+        'RouteStarter.close': (lambda self: self.fenced_gate().gate, lambda gate: gate.close(),
+                               lambda gate: gate._lock, lambda gate: gate.closed and gate._fences == 0),
     }
     LOCKS = {
         'Hooks.stop_services': lambda pair: (pair[0]._lifecycle, pair[0].gate._lock),
@@ -3782,16 +3840,42 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         'Admission.drain': lambda gate: (gate.closed, gate.admitted),
         'Hooks.stop_services': _teardown_touches,
         'Hooks.finish_close': _teardown_touches,
+        'RouteStarter._claim_fence': lambda subject: (subject[1]._fences, subject[1].closed, subject[2]['owed']),
+        'RouteStarter._release_fence': lambda subject: (subject[1]._fences, subject[1].closed, subject[2]['released']),
+        'RouteStarter._fence_while_the_gate_is_open': lambda subject: (subject[1]._fences, subject[1].closed, subject[2].fence.call_count),
+        'RouteStarter._wait_until_no_fence': lambda gate: (gate._fences, gate.closed),
+        'RouteStarter.close': lambda gate: (gate._fences, gate.closed),
     }
-    ONCE = ('Admission.enter', 'Admission.leave')
+    ONCE = ('Admission.enter', 'Admission.leave',
+            'RouteStarter._claim_fence', 'RouteStarter._release_fence', 'RouteStarter._fence_while_the_gate_is_open')
     STEPS_BACK = ('Admission.enter',)
     RETRIED = ('Signal.set',)
+
+    def straight_def(self, function) -> None:
+        """The same shape ``straight`` requires, for a function that is not a method of a class."""
+        loop, = [node for node in function.body if isinstance(node, ast.While)]
+        self.assertEqual([type(node) for node in loop.body], [ast.Try], "the region's loop holds the try and nothing else")
+        region = loop.body[0]
+        nested = [type(node).__name__ for part in region.body for node in ast.walk(part)
+                  if isinstance(node, (ast.While, ast.For, ast.Try, ast.With, ast.AsyncFor, ast.AsyncWith))]
+        self.assertEqual(nested, [], 'no loop, no try and no with is written between the try and its except')
+        self.assertEqual((len(region.handlers), region.orelse, region.finalbody), (1, [], []), 'one except; no else, no finally')
 
     def test_the_regions_have_no_loop_no_try_and_no_with_written_in_them(self) -> None:
         for owner, name in (('Admission', 'enter'), ('Admission', 'leave'), ('Admission', 'close'), ('Admission', 'drain'),
                             ('Admission', 'while_open'), ('Hooks', 'stop_services'), ('Hooks', 'finish_close')):
             with self.subTest(region=f'{owner}.{name}'):
                 self.straight(H, owner, name)
+        for name in ('_claim_fence', '_release_fence', '_fence_while_the_gate_is_open'):
+            with self.subTest(region=f'RouteStarter.{name}'):
+                self.straight(fence_adapter, 'RouteStarter', name)
+        tree = ast.parse(pathlib.Path(fence_adapter.__file__).read_text(encoding='utf-8'))
+        wait, = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == '_wait_until_no_fence']
+        install, = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == '_install_fence_wait']
+        wrapped, = [node for node in install.body if isinstance(node, ast.FunctionDef) and node.name == 'close']
+        for function in (wait, wrapped):
+            with self.subTest(region=function.name):
+                self.straight_def(function)
 
     def test_no_lock_is_taken_in_python_code_on_the_gates_paths_or_by_the_closing_signal(self) -> None:
         """What OWNERSHIP says of them, read from the source: the gate has no ``with`` statement at all, and the
@@ -3846,6 +3930,26 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         self.walk('Signal.set', self.EVENTS)
 
     @quiet
+    def test_claiming_a_fence_at_every_event(self) -> None:
+        self.walk('RouteStarter._claim_fence', self.EVENTS)
+
+    @quiet
+    def test_releasing_a_fence_at_every_event(self) -> None:
+        self.walk('RouteStarter._release_fence', self.EVENTS)
+
+    @quiet
+    def test_the_settling_fence_at_every_event(self) -> None:
+        self.walk('RouteStarter._fence_while_the_gate_is_open', self.EVENTS)
+
+    @quiet
+    def test_the_fence_wait_at_every_event(self) -> None:
+        self.walk('RouteStarter._wait_until_no_fence', self.EVENTS)
+
+    @quiet
+    def test_the_fence_close_at_every_event(self) -> None:
+        self.walk('RouteStarter.close', self.EVENTS)
+
+    @quiet
     def test_entering_the_gate_at_every_instruction(self) -> None:
         self.by_instruction('Admission.enter')
 
@@ -3876,6 +3980,26 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
     @quiet
     def test_setting_the_closing_signal_at_every_instruction(self) -> None:
         self.by_instruction('Signal.set')
+
+    @quiet
+    def test_claiming_a_fence_at_every_instruction(self) -> None:
+        self.by_instruction('RouteStarter._claim_fence')
+
+    @quiet
+    def test_releasing_a_fence_at_every_instruction(self) -> None:
+        self.by_instruction('RouteStarter._release_fence')
+
+    @quiet
+    def test_the_settling_fence_at_every_instruction(self) -> None:
+        self.by_instruction('RouteStarter._fence_while_the_gate_is_open')
+
+    @quiet
+    def test_the_fence_wait_at_every_instruction(self) -> None:
+        self.by_instruction('RouteStarter._wait_until_no_fence')
+
+    @quiet
+    def test_the_fence_close_at_every_instruction(self) -> None:
+        self.by_instruction('RouteStarter.close')
 
     @quiet
     def test_a_region_called_from_inside_the_lifecycle_is_refused_at_every_event_and_takes_nothing(self) -> None:

@@ -14,6 +14,7 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1676,6 +1677,85 @@ class RunThreadLifetimeTest(unittest.TestCase):
                          (['result_recorded'], 0, False, 1))
         made.begin_close()
         self.assertTrue(made.gate.closed)
+
+    def test_an_interruption_after_the_claim_returns_drops_the_fence_count(self):
+        """N1. The count is owed when the claim returns. An interruption on the next line of the caller
+        is kept, the unit is stopped once, and the count is dropped before the interruption is raised.
+        A shutting then returns. The interruption lands before the stop; the region does the stop on the
+        way back round."""
+        made = hooks_of(launch_check=lambda ctx, executable: None)
+        folder = tempfile.mkdtemp(prefix='rc-seams-fence-gap-')
+        self.addCleanup(shutil.rmtree, folder, True)
+
+        def _release_a_leaked_count(gate=made.gate):
+            if gate._lock.acquire(timeout=1.0):
+                try:
+                    gate._fences = 0
+                    gate._changed.notify_all()
+                finally:
+                    gate._lock.release()
+
+        self.addCleanup(_release_a_leaked_count)
+        starter = adapter.RouteStarter(FakeService(), DriveOwnerSeamTest.ROUTES, mock.Mock(closed=False), folder,
+                                       hooks=made, exit_grace_s=0)
+        process = mock.Mock()
+        ctx = launcher.RunContext('run-1')
+        ctx.process = process
+        fence_code = adapter.RouteStarter._fence_while_the_gate_is_open.__code__
+        claim_code = adapter.RouteStarter._claim_fence.__code__
+        fired = []
+
+        def trace(frame, event, arg, fired=fired):
+            if frame.f_code is claim_code and event == 'return':
+                trace.claimed = True
+            elif trace.claimed and not fired and event == 'line' and frame.f_code is fence_code:
+                fired.append(frame.f_lineno)
+                raise KeyboardInterrupt('after the claim')
+            return trace
+
+        trace.claimed = False
+        sys.settrace(trace)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                starter._settle(ctx)
+        finally:
+            sys.settrace(None)
+        self.assertTrue(fired, 'the interruption landed on the caller after the claim returned')
+        self.assertEqual(process.fence.call_count, 1, 'the region stops the unit once before it raises')
+        self.assertEqual((made.gate._fences, made.gate._lock._is_owned(), process.close.call_count), (0, False, 1))
+        returned = []
+
+        def shutting():
+            made.begin_close()
+            returned.append(True)
+
+        worker = threading.Thread(target=shutting, daemon=True)
+        worker.start()
+        worker.join(1.0)
+        self.assertEqual(returned, [True], 'a shutting returns; a count left owed would still be waiting')
+
+    def test_a_fence_wait_logs_a_stall_and_goes_on(self):
+        """The wait on the fence count has the drain's stall log: a timeout is logged and the wait goes on."""
+        made = hooks_of(launch_check=lambda ctx, executable: None)
+        made.gate._fences = 1
+        waits = []
+
+        def waiting(timeout=None, waits=waits, gate=made.gate):
+            waits.append(timeout)
+            gate._fences = 0
+            return False
+
+        made.gate._changed.wait = waiting
+        with self.assertLogs('recursion_core.daemon.control_adapter', level='WARNING') as caught:
+            adapter._while_a_fence_is_counted(made.gate)
+        self.assertEqual(waits, [made.gate.stall_log_s])
+        self.assertIn('fence', caught.output[0])
+
+    def test_the_admission_text_does_not_say_the_settling_fence_is_while_open(self):
+        """N2. The settling fence is counted by the route starter. The gate's own text must not say otherwise."""
+        text = Path(H.__file__).read_text(encoding='utf-8')
+        self.assertNotIn('its fence is made with the gate held open, ``while_open``', text)
+        self.assertNotIn('the fence at the end of a settling (S9)', text)
 
     def test_a_settling_fence_keeps_a_second_start_and_stop_of_the_same_run_out(self):
         """While a settling's fence is inside the unit stop, a second start and a second stop of that same run

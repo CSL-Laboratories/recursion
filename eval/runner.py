@@ -134,7 +134,7 @@ def grade(task, work: Path, scratch) -> dict:
     if done["timed_out"]:
         return {"verdict": "unresolved", "error": "tests_failed", "exit": None, "log": log, "seconds": done["seconds"],
                 "detail": f"hidden tests ran past {task.grading_timeout_s:g} s"}
-    # Exit 0 with every collected test skipped is the same as no test ran: it is not a pass.
+    # Exit 0 whose final summary shows nothing passed is the same as no test ran.
     if done["exit"] == NO_TESTS_RAN or validate_mod.collected_tests_all_skipped(log):
         return {"verdict": "not_graded", "error": "no_tests_ran", "exit": done["exit"], "log": log,
                 "seconds": done["seconds"], "detail": "the hidden-test command ran no test"}

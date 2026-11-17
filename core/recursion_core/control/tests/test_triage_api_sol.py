@@ -44,6 +44,10 @@ def make_api(*, registry=None, cleanup=None, starter=None):
 
 class ControlSweepRegressions(unittest.TestCase):
     def test_f9_refused_attestation_never_answers_stopped(self):
+        """A live member on the refused proof answers ``member_alive``, not ``cgroup_changed``.
+
+        The same proof answers ``cleanup_error:OSError`` when the process table raises.
+        """
         for second in (True, OSError("synthetic process-table error")):
             with self.subTest(second=second):
                 samples = []
@@ -61,8 +65,15 @@ class ControlSweepRegressions(unittest.TestCase):
                 rid = api.call("run.start", PARAMS)["run"]["run_id"]
                 registry.join_member(rid, registry.get(rid)["generation"], "child", 123)
                 reply = api.call("run.stop", {"run_id": rid})
+                stored = registry.get(rid)
                 self.assertEqual(reply["code"], "pending", reply)
-                self.assertNotEqual(registry.get(rid)["state"], "stopped")
+                self.assertNotEqual(stored["state"], "stopped")
+                if second is True:
+                    self.assertEqual(reply.get("reason"), "member_alive", reply)
+                    self.assertEqual(stored["stop"]["reason"], "member_alive")
+                else:
+                    self.assertEqual(reply.get("reason"), "cleanup_error:OSError", reply)
+                    self.assertEqual(stored["stop"]["reason"], "cleanup_error:OSError")
 
     def test_f1_m02_m05_a_proof_table_error_names_that_error(self):
         """M05: the reason is the table's Exception, not ``member_alive``.

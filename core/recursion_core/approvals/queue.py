@@ -10,8 +10,10 @@ and the object the method handlers and the engine drivers call:
   fail. A request that cannot be made whole is refused with ``ApprovalRefused`` and nothing is written; any
   other ``Exception`` of the insert's transaction is ``store_unavailable`` with its cause chained, a store
   that fails and a caller's own misuse alike (a request made inside another transaction); an interruption
-  passes as it is. ``ask(effect, binding)`` is the same for a driver's tool call (the brief's
-  ``request(effect, binding)``).
+  passes as it is. So does EVENTS' ``CommitUnknown`` (its COMMIT raised): the request may or may not have been
+  written, so it is no refusal; its approval id was never returned, and a request that was written and no
+  surface took is offered again by the next start. ``ask(effect, binding)`` is the same for a driver's tool
+  call (the brief's ``request(effect, binding)``).
 * A request counts as SHOWN only once a subscriber took it without raising. One that no subscriber took
   (none was subscribed, or each one failed) is offered again by the next start, once its worker runs.
 * ``wait(approval_id)`` blocks until the request is no longer pending and returns its record: approved,
@@ -32,7 +34,14 @@ and the object the method handlers and the engine drivers call:
   If it had published its own worker, that worker is withdrawn (``ready`` too) and kept for ``stop`` to join,
   and the queue is left not started; if not, a worker an earlier start left running is left as it was, and so
   is ``ready``. One interrupted while it offers the backlog leaves the queue started; what it had not offered
-  stays unshown. (A second interruption that lands inside that withdrawal itself is not covered.)
+  stays unshown. (A second interruption that lands inside that withdrawal itself is not covered.) A second
+  start while the queue runs holds the surfaces back the same way: one that subscribes during it is offered
+  nothing until that start's own offering, and nothing at all if it fails.
+* With no event store composed (S13's ``ServiceContext.store`` is None, which the seams allow: "or None when no
+  event store is composed"), a start attaches nothing and starts nothing, and returns: the queue stays not
+  ``ready`` (S13: ready "only when the initialisation the service needs has succeeded"), so the other services
+  of the composition start, and a request is refused ``store_absent``. A start does not raise there, since S13
+  makes a service whose start raises fail the whole composition.
 * ``stop`` wakes and joins every worker a start launched and no stop has joined yet: the current one, one a
   later start replaced, one an interrupted launch kept. Those workers share one wake signal, and a worker that
   wakes to find the queue closing, or its generation gone, sets it again before it returns, so none takes the
@@ -78,6 +87,12 @@ from recursion_core.approvals import model
 from recursion_core.approvals import store as rows
 from recursion_core.approvals.model import ApprovalRefused
 from recursion_core.approvals.record import SURFACES, binding_problem, milliseconds
+
+try:  # EVENTS' store: a COMMIT that raised may or may not have been made durable
+    from recursion_core.events.db import CommitUnknown as _CommitUnknown
+    _OUTCOME_UNKNOWN: tuple = (_CommitUnknown,)
+except ImportError:  # pragma: no cover - a tree without EVENTS' store
+    _OUTCOME_UNKNOWN = ()
 
 __all__ = ["DEADLINE_SECONDS", "ApprovalQueue", "timestamp_of"]
 
@@ -164,6 +179,8 @@ class ApprovalQueue:
 
     def _start(self, context) -> None:
         if self._store is None:
+            if context.store is None:
+                return  # no event store is composed: nothing to recover or run, and the queue stays not ready
             self.attach(context.store)
         elif self._store is not context.store:
             raise RuntimeError("the approval queue is attached to another store")
@@ -284,12 +301,13 @@ class ApprovalQueue:
     def subscribe_requested(self, fn: Callable[[dict], None]) -> Callable[[], None]:
         """``fn(record)`` after a request commits. A start offers every pending request no surface took to each
         surface subscribed before it or during it, once its worker has launched (nothing before, and nothing at
-        all if the start fails); a surface that subscribes once the queue has started is offered those at once.
+        all if the start fails); a surface that subscribes once the queue has started is offered those at once,
+        unless a start is running then (a second one, still recovering): that start's own offering reaches it.
         So a surface can be offered one request more than once, always under the same approval id."""
         token = object()
         with self._lock:
             self._requested.append((token, fn))
-            running = self._running
+            running = self._running and self._late is None  # during a start, only its own offering is made
             if self._late is not None:
                 self._late.append((token, fn))
         if running:
@@ -357,9 +375,9 @@ class ApprovalQueue:
         except BaseException as exc:
             with self._lock:
                 self._done.pop(approval_id, None)
-            if isinstance(exc, Exception) and not isinstance(exc, ApprovalRefused):
+            if isinstance(exc, Exception) and not isinstance(exc, (ApprovalRefused, *_OUTCOME_UNKNOWN)):
                 raise ApprovalRefused("store_unavailable") from exc  # nothing was written
-            raise
+            raise  # an interruption, a refusal, or a COMMIT whose outcome is unknown, as it is
         # Committed. Nothing below can fail this request: wake the deadline worker first, then tell.
         self._wake.set()
         self._offer(record)

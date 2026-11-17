@@ -37,9 +37,9 @@ not run by this lane):
 How a run ends (``OneShotParser.finish``), first match wins:
 
 1. a line that is not blank and is not one JSON object with a string ``type`` (or is nested too deeply
-   to read), a tool line whose ``toolCallId`` is not a string or whose ``status``, when present and not
-   null, is not a string, or a second ``end``: ``protocol_error``. The last line counts here only if it
-   ends with its newline;
+   to read, or repeats a key in that object or in a nested object), a tool line whose ``toolCallId``
+   is not a string or whose ``status``, when present and not null, is not a string, or a second
+   ``end``: ``protocol_error``. The last line counts here only if it ends with its newline;
 2. the process ended on a signal (a negative return code, 130 or 143): ``engine_exited``. A kill that
    lands inside a write leaves a last line with no newline; it is a cut line, not a protocol fault;
 3. a last line with no newline that is not one typed JSON object, with no signal: ``protocol_error``;
@@ -48,7 +48,8 @@ How a run ends (``OneShotParser.finish``), first match wins:
    limit: text never trips a connection;
 5. an ``end`` line whose stop reason is ``end_turn``, with exit 0: success (code null);
 6. an ``end`` line with any other stop reason, or after ``max_turns_reached``: ``engine_error``, the
-   stop reason in the detail; an ``end_turn`` with a non-zero exit is ``engine_error`` too;
+   stop reason in the detail, cut to ``MAX_DETAIL_CHARS``; an ``end_turn`` with a non-zero exit is
+   ``engine_error`` too;
 7. no ``end`` and no ``error``: ``engine_error`` for exit 1, else ``engine_exited``.
 Whatever the code, the detail ends with how many tool calls got no draft because their input has no
 RFC 8785 form, when there were any, so such a run never looks complete.
@@ -79,7 +80,10 @@ not null and not a string, is a protocol fault; a string id that is empty, too l
 break or held a lone surrogate (cleaning it could make it another call's id) is counted and drafts
 nothing. A ``tool.result`` text is the call's text content blocks; else a string ``rawOutput`` as it
 stands; else the raw output as RFC 8785 writes it. Raw output with no RFC 8785 form gives an empty
-text marked truncated (counted), never another spelling such as ``Infinity``.
+text marked truncated (counted), never another spelling such as ``Infinity``. A completed line that
+carries neither text blocks nor a raw output (an empty ``content`` and a null ``rawOutput``, the
+shape of a field the emitter left out) keeps the text or raw output an earlier line of that call
+carried. A completed line that carries either one uses that line.
 
 What is public. ``OneShotParser`` (``parse``, ``finish``, ``outcome``), ``parse_run``,
 ``decode_line``, ``GrokProtocolError``, ``DECLARATION`` (read-only) and ``declaration()`` (a plain
@@ -216,8 +220,11 @@ def _decode(line: str) -> tuple[dict, bool, frozenset]:
     identity fields it changed, and ``"modelUsage"`` when it changed a model name."""
 
     try:
-        raw = json.loads(line, parse_constant=_refuse_constant)
-    except (ValueError, RecursionError):
+        raw = json.loads(line, parse_constant=_refuse_constant,
+                         object_pairs_hook=_object_without_duplicate_keys)
+    except (ValueError, RecursionError) as err:
+        if isinstance(err, ValueError) and str(err) == "duplicate key":
+            raise GrokProtocolError("stdout line repeats a JSON key") from None
         raise GrokProtocolError("stdout line is not JSON") from None
     if not isinstance(raw, dict):
         raise GrokProtocolError("stdout line is not a JSON object")
@@ -235,6 +242,17 @@ def _decode(line: str) -> tuple[dict, bool, frozenset]:
     if isinstance(model_usage, dict) and any(_clean_text(name) is not name for name in model_usage):
         altered.add("modelUsage")   # a model name that held a lone surrogate is no model name
     return message, cleaned, frozenset(altered)
+
+
+def _object_without_duplicate_keys(pairs: list) -> dict:
+    """One JSON object. A key that appears twice, at this object or in a nested one, is refused."""
+
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError("duplicate key")
+        obj[key] = value
+    return obj
 
 
 def _refuse_constant(name: str) -> object:
@@ -301,6 +319,7 @@ class OneShotParser:
         self._turn_unknown_drafted = False       # and an incomplete line with none, once, beside them
         self._open_calls: set[str] = set()       # tool calls drafted and not yet given a result
         self._done_calls: set[str] = set()
+        self._streamed_output: dict[str, tuple] = {}  # call id -> (content, rawOutput) last carried
         self._finished = False
 
     @property
@@ -383,9 +402,10 @@ class OneShotParser:
             return code, _cut(self._error, MAX_DETAIL_CHARS)
         if self._ended:
             if self._max_turns:
-                return c.ENGINE_ERROR, f"max turns reached (stop_reason {self.stop_reason})"
+                return c.ENGINE_ERROR, _cut(
+                    f"max turns reached (stop_reason {self.stop_reason})", MAX_DETAIL_CHARS)
             if self.stop_reason != STOP_END_TURN:
-                return c.ENGINE_ERROR, f"stop_reason {self.stop_reason}"
+                return c.ENGINE_ERROR, _cut(f"stop_reason {self.stop_reason}", MAX_DETAIL_CHARS)
             if returncode != 0:
                 return c.ENGINE_ERROR, f"exit {returncode} after end_turn"
             return None, f"stop_reason {STOP_END_TURN}"
@@ -461,7 +481,27 @@ class OneShotParser:
             return False
         return True
 
+    def _note_tool_output(self, message: dict) -> None:
+        """Remember text or raw output a non-empty update carried, so a later line can keep it."""
+
+        call_id = message.get("toolCallId")
+        content, raw = message.get("content"), message.get("rawOutput")
+        if isinstance(call_id, str) and _tool_output_present(content, raw):
+            self._streamed_output[call_id] = (content, raw)
+
+    def _output_for_result(self, message: dict) -> tuple:
+        """The completion's own output, or the earlier output when the completion omits both."""
+
+        content, raw = message.get("content"), message.get("rawOutput")
+        if _tool_output_present(content, raw):
+            return content, raw
+        call_id = message.get("toolCallId")
+        if isinstance(call_id, str) and call_id in self._streamed_output:
+            return self._streamed_output[call_id]
+        return content, raw
+
     def _tool_result(self, message: dict, drafts: list) -> None:
+        self._note_tool_output(message)
         status = _TERMINAL_TOOL_STATUS.get(message.get("status"))
         if status is None:
             return   # pending, in progress, or a token this module does not know: no result yet
@@ -469,7 +509,8 @@ class OneShotParser:
         if call_id not in self._open_calls:
             self._count("tool_result_without_call")
             return
-        text, truncated, written = _result_text(message.get("content"), message.get("rawOutput"))
+        content, raw = self._output_for_result(message)
+        text, truncated, written = _result_text(content, raw)
         if not written:
             self._count("tool_output_without_rfc8785_form")
         drafts.append(_draft("tool.result", {
@@ -477,6 +518,7 @@ class OneShotParser:
         }))
         self._open_calls.discard(call_id)
         self._done_calls.add(call_id)
+        self._streamed_output.pop(call_id, None)
 
     def _usage_line(self, message: dict, drafts: list) -> None:
         usage = message.get("usage")
@@ -688,6 +730,15 @@ def _single_model(model_usage: object) -> str | None:
         if isinstance(name, str) and name and name != "unknown" and _is_one_line(name, 256):
             return name
     return None
+
+
+def _tool_output_present(content: object, raw_output: object) -> bool:
+    """True when a tool line carries text blocks or a raw output. Empty content and null raw output
+    is how the emitter writes a field it left out, so that line does not replace an earlier one."""
+
+    if raw_output is not None:
+        return True
+    return isinstance(content, list) and len(content) > 0
 
 
 def _result_text(content: object, raw_output: object) -> tuple[str, bool, bool]:

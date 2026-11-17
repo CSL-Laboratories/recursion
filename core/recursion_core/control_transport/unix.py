@@ -48,6 +48,9 @@ MAX_CONNECTIONS = 16
 # How many of the latest refusal reasons ``UnixControlServer.refused`` keeps (sweep s7 D09: every refused peer
 # was appended and nothing was ever dropped). A diagnostic, not a count of refusals.
 REFUSED_KEPT = 128
+# A stored reason is a diagnostic, kept up to REFUSED_KEPT times. The stored text is at most
+# this many characters, so one huge message cannot pin mebibytes of history.
+REFUSED_REASON_MAX = 512
 # Whole-frame deadline: each request must arrive complete within this long of the server
 # being ready for it (connect or previous reply), however the bytes are spaced.
 IDLE_TIMEOUT_S = 30.0
@@ -126,14 +129,18 @@ def refuse_remote_bind(address: object) -> str:
 
 def _shown(address: str) -> str:
     """``address`` as a refusal may print it: quoted, so a line break cannot start a new log line, and with any
-    userinfo before an ``@`` in its authority (a user, a password, a token) replaced (sweep s7 D11)."""
-    scheme, sep, rest = address.partition("://")
+    userinfo before the last ``@`` replaced (sweep s7 D11).
+
+    A token in the query, the fragment, or the path is not userinfo and is still printed.
+    """
+    # A plain str, so a subclass cannot turn the redaction off by overriding partition or rsplit.
+    address = str.__str__(address)
+    head, sep, tail = str.rpartition(address, "@")
     if not sep:
-        rest = address
-    authority, slash, path = rest.partition("/")
-    if "@" in authority:
-        authority = "<userinfo>@" + authority.rsplit("@", 1)[1]
-    return repr((scheme + sep if sep else "") + authority + slash + path)
+        return repr(address)
+    scheme, scheme_sep, _rest = str.partition(head, "://")
+    prefix = (scheme + scheme_sep) if scheme_sep else ""
+    return repr(prefix + "<userinfo>@" + tail)
 
 
 def require_unix_transport() -> None:
@@ -171,7 +178,10 @@ def ensure_private_dir(directory: str) -> None:
         os.mkdir(directory, 0o700)
     except FileExistsError:
         pass
-    st = os.lstat(directory)
+    try:
+        st = os.lstat(directory)
+    except FileNotFoundError:
+        raise InsecureSocketPath(f"{directory!r} went away while it was being checked") from None
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
         raise InsecureSocketPath(f"{directory!r} is not a real directory")
     if st.st_uid != os.geteuid():
@@ -195,15 +205,17 @@ def _acquire_lock(path: str) -> int:
     try:
         fd = os.open(path, flags, 0o600)
     except OSError as exc:
-        raise InsecureSocketPath(f"{path} cannot be opened as our lock file: {exc}") from exc
+        detail = exc.strerror or exc.errno
+        raise InsecureSocketPath(
+            f"{path!r} cannot be opened as our lock file: [{exc.errno}] {detail}") from exc
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
-            raise InsecureSocketPath(f"{path} exists and is not our lock file")
+            raise InsecureSocketPath(f"{path!r} exists and is not our lock file")
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise InsecureSocketPath(f"{path} is held: another server is starting or live") from exc
+            raise InsecureSocketPath(f"{path!r} is held: another server is starting or live") from exc
     except BaseException:
         os.close(fd)
         raise
@@ -216,7 +228,7 @@ def _clear_stale_socket(path: str) -> None:
     except FileNotFoundError:
         return
     if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.geteuid():
-        raise InsecureSocketPath(f"{path} exists and is not our socket")
+        raise InsecureSocketPath(f"{path!r} exists and is not our socket")
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         probe.settimeout(1.0)
@@ -228,7 +240,7 @@ def _clear_stale_socket(path: str) -> None:
         return
     finally:
         probe.close()
-    raise InsecureSocketPath(f"{path} is live: another server is listening")
+    raise InsecureSocketPath(f"{path!r} is live: another server is listening")
 
 
 def check_peer(sock: socket.socket, getter: PeerCredGetter, expected_uid: int) -> PeerCred:
@@ -258,6 +270,8 @@ class UnixControlServer:
     when the ordinary ones are all taken: each serves one request, within
     ``reserved_timeout_s``, and only if ``priority`` says so; any other request gets the
     ``busy`` frame, not delivered. The handler still sees every request it is given.
+    At a configured cap, a request whose id could not ride the longest refusal is refused
+    before the handler, even when that request's own answer would have fit.
     """
 
     def __init__(
@@ -276,11 +290,19 @@ class UnixControlServer:
         reserved_timeout_s: float = RESERVED_TIMEOUT_S,
     ) -> None:
         directory = refuse_remote_bind(directory)
-        if not name or "/" in name or name in (".", ".."):
-            raise InsecureSocketPath("socket name must be a single path component")
+        if (
+            not name
+            or "/" in name
+            or name in (".", "..")
+            or not name.isascii()
+            or not name.isprintable()
+        ):
+            raise InsecureSocketPath("socket name must be a single printable path component")
         if type(max_frame_bytes) is not int or max_frame_bytes < _MIN_FRAME_BYTES:
-            # A cap that cannot carry the server's own fallback reply is refused before startup (sweep s7 D19:
-            # at a cap of 32 the 50-byte fallback was written anyway).
+            # A cap that cannot carry the server's own fallback, or the id_too_large refusal,
+            # is refused before startup. A smaller cap would drop that reply and the peer
+            # would see the connection end instead of a typed answer. At a cap of 32 the
+            # 50-byte fallback was written anyway (sweep s7 D19).
             raise ValueError(f"max_frame_bytes must be an int of at least {_MIN_FRAME_BYTES}")
         # Counts are exact ints (sweep s7 D08: 1.5, NaN and infinity passed, and a 1.5 semaphore granted eight
         # slots); a bool is not a count.
@@ -338,7 +360,7 @@ class UnixControlServer:
                 os.chmod(self._path, 0o600)
                 st = os.lstat(self._path)
                 if not stat.S_ISSOCK(st.st_mode) or st.st_uid != self._uid:
-                    raise InsecureSocketPath(f"{self._path} changed under us after bind")
+                    raise InsecureSocketPath(f"{self._path!r} changed under us after bind")
                 sock.listen(socket.SOMAXCONN)
                 sock.settimeout(_ACCEPT_POLL_S)
             except BaseException:
@@ -400,9 +422,20 @@ class UnixControlServer:
 
     def _refuse(self, reason: str) -> None:
         with self._lock:
+            # Make room before the append. A reader that does not take the lock then never
+            # sees more than REFUSED_KEPT rows, and an interrupt before the append cannot
+            # leave one past the cap. The list object stays the one constructed.
+            # A keep of 0 or below retains nothing: ``del [:-0]`` would delete nothing.
+            keep = REFUSED_KEPT
+            if type(keep) is not int or keep <= 0:
+                del self.refused[:]
+                return
+            if len(reason) > REFUSED_REASON_MAX:
+                reason = reason[:REFUSED_REASON_MAX]
+            extra = len(self.refused) + 1 - keep
+            if extra > 0:
+                del self.refused[:extra]
             self.refused.append(reason)
-            if len(self.refused) > REFUSED_KEPT:
-                del self.refused[:-REFUSED_KEPT]   # the oldest go; the list stays a list for its readers
 
     def _accept_loop(self) -> None:
         sock = self._sock
@@ -488,8 +521,7 @@ class UnixControlServer:
                     # longest fallback could not carry it within the frame cap is refused here, before any
                     # handler acts, so no answer of a handled request is ever over the cap or without its id
                     # (the integration read of #385, F3; the P3 of the same read on #377).
-                    _send_quietly(conn, {"ok": False, "error": {"code": "bad_frame", "detail": "id_too_large"}},
-                                  max_bytes=self._max_frame_bytes)
+                    _send_quietly(conn, _ID_TOO_LARGE_REPLY, max_bytes=self._max_frame_bytes)
                     return
                 try:
                     response = self._handler(request, connection)
@@ -573,8 +605,13 @@ def _is_busy(response: Message) -> bool:
 # The longest answer _serve writes for a request a handler has seen; with the request's id it must fit the cap.
 _LONGEST_FALLBACK: Message = {"ok": False, "error": {"code": "response_too_large"}}
 _INTERNAL_ERROR: Message = {"ok": False, "error": {"code": "internal_error"}}
-# The smallest frame cap a server takes: its fallbacks, without an id, must fit (an id is checked per request).
-_MIN_FRAME_BYTES = max(len(encode_frame(m)) - HEADER.size for m in (_LONGEST_FALLBACK, _INTERNAL_ERROR))
+# Sent when that fallback could not carry the id. The floor is the longest of this
+# refusal and the two id-less fallbacks: below it one of those replies would be dropped.
+_ID_TOO_LARGE_REPLY: Message = {"ok": False, "error": {"code": "bad_frame", "detail": "id_too_large"}}
+_MIN_FRAME_BYTES = max(
+    len(encode_frame(m)) - HEADER.size
+    for m in (_LONGEST_FALLBACK, _INTERNAL_ERROR, _ID_TOO_LARGE_REPLY)
+)
 
 
 def _fits(message: Message, request_id: object, max_bytes: int) -> bool:

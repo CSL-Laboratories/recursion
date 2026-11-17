@@ -284,7 +284,7 @@ class StopTest(unittest.TestCase):
         self.assertEqual(auth(PRINCIPALS["session"], "run.stop", {"run_id": "run-s1"}), ("scope_refused", "needs_run"))
         self.assertEqual(auth(PRINCIPALS["device-read"], "run.stop", {"run_id": "run-legacy"}), ("scope_refused", "needs_run"))
 
-    def test_a_session_stops_only_runs_of_its_own_session_and_the_sessions_it_started(self) -> None:
+    def test_a_session_stops_its_own_runs_and_lineage_runs_only_when_one_is_passed_in(self) -> None:
         auth = authorizer()
         session = PRINCIPALS["session"]
         self.assertIsNone(auth(session, "run.stop", {"run_id": "run-s1"}))

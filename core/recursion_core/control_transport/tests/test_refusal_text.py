@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from recursion_core import control_transport as ct
 from recursion_core.control_transport import unix
@@ -48,6 +49,66 @@ class RefusalTextTests(unittest.TestCase):
                 self.assertNotIn(marker, text)
                 self.assertNotIn("\n", text)
                 self.assertIn("<userinfo>@" + shown, text)
+
+    def test_a_subclass_or_a_second_at_does_not_print_the_token(self):
+        marker = "S7_CANARY_TOKEN"
+
+        class EvilPartition(str):
+            def partition(self, sep):
+                return ("", "", str.__str__(self))
+
+            def rsplit(self, sep, maxsplit=-1):
+                return [str.__str__(self)]
+
+        samples = (
+            EvilPartition(f"https://u:{marker}@example.invalid/control"),
+            f"https://u:{marker}/x@example.invalid/control",
+            f"https://u:{marker}@b://{marker}@c.example",
+        )
+        for address in samples:
+            with self.subTest(address=type(address).__name__):
+                with self.assertRaises(ct.RemoteBindRefused) as caught:
+                    ct.refuse_remote_bind(address)
+                text = str(caught.exception)
+                self.assertNotIn(marker, text)
+                self.assertNotIn("\n", text)
+                self.assertIn("https://<userinfo>@", text)
+        with self.assertRaises(ct.RemoteBindRefused) as caught:
+            ct.refuse_remote_bind(f"https://u:{marker}@b://{marker}@c.example")
+        self.assertIn("<userinfo>@c.example", str(caught.exception))
+
+    def test_a_lock_path_with_a_line_break_is_quoted(self):
+        with tempfile.TemporaryDirectory(prefix="s7-", dir=os.environ.get("TMPDIR")) as base:
+            directory = os.path.join(base, "server\ndir")
+            os.mkdir(directory, 0o700)
+            lock = os.path.join(directory, "control.sock.lock")
+            os.mkdir(lock)
+            with self.assertRaises(ct.InsecureSocketPath) as caught:
+                unix._acquire_lock(lock)
+            self.assertNotIn("\n", str(caught.exception))
+
+    def test_a_socket_name_with_a_line_break_is_refused(self):
+        with tempfile.TemporaryDirectory(prefix="s7-", dir=os.environ.get("TMPDIR")) as base:
+            with self.assertRaises(ct.InsecureSocketPath) as caught:
+                ct.UnixControlServer(base, ct.with_ping_health(), name="a\nb")
+            self.assertNotIn("\n", str(caught.exception))
+
+    def test_a_directory_that_vanishes_is_a_typed_refusal(self):
+        with tempfile.TemporaryDirectory(prefix="s7-", dir=os.environ.get("TMPDIR")) as base:
+            directory = os.path.join(base, "gone")
+            with mock.patch("os.lstat", side_effect=FileNotFoundError(2, "vanished", directory)):
+                with self.assertRaises(ct.InsecureSocketPath) as caught:
+                    unix.ensure_private_dir(directory)
+            self.assertNotIn("\n", str(caught.exception))
+
+    def test_a_file_whose_name_holds_a_line_break_is_not_a_directory(self):
+        with tempfile.TemporaryDirectory(prefix="s7-", dir=os.environ.get("TMPDIR")) as base:
+            path = os.path.join(base, "not\na-dir")
+            with open(path, "w", encoding="utf-8"):
+                pass
+            with self.assertRaises(ct.InsecureSocketPath) as caught:
+                unix.ensure_private_dir(path)
+            self.assertNotIn("\n", str(caught.exception))
 
 
 if __name__ == "__main__":

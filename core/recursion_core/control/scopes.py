@@ -56,8 +56,9 @@ recovery Stop never passes here.
    ``plugin.list`` and ``operator.read`` are ``read`` rows like any other.
 5. ``run.stop``, exactly as the method table's row (4) "Who may Stop" freezes it (PROVISIONAL, the owner's
    decision): it needs a currently held ``run`` scope; an owner or a device with ``run`` may stop any run,
-   one whose record names no principal included; a session principal only runs of its own session and the
-   sessions it started; a plugin principal only a run whose record's ``launch.owner`` is that plugin, never
+   one whose record names no principal included; a session principal only its own session's runs, and
+   those of sessions inside the lineage when one is passed in; a plugin principal only a run whose
+   record's ``launch.owner`` is that plugin, never
    a host-owned run, another plugin's, or one with no owner recorded. The row names no other kind, so an
    internal or agent principal is refused (``questions.md``). A target that cannot be read is refused to a
    session or plugin principal, which may stop only runs it can be shown to own.
@@ -88,7 +89,8 @@ STOP_METHOD = "run.stop"
 # The methods a session grant may authorize: session.token.v1's $defs/delegable_method
 # (schemas/control/v1/session.token.v1.json, SPINE's #368), kept here so the decision reads no file. A session
 # principal is refused every other method, whatever its grant's scopes say, except run.stop, which keeps the
-# Stop row's own rule below (a session stops only runs of its own session and the sessions it started). A test
+# Stop row's own rule below (a session stops only its own session's runs, and those of sessions inside the
+# lineage when one is passed in). A test
 # holds this set to the schema's list wherever the schema is in the tree (the integration read of #385, F1).
 SESSION_DELEGABLE = frozenset({
     "session.start", "session.turn", "session.steer", "session.queue", "session.interrupt", "session.status",

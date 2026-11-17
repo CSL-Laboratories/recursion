@@ -100,13 +100,20 @@ def descriptors() -> list[dict]:
 
 
 def call_tool(api: ControlAPI, name: str, arguments: dict | None) -> dict:
-    """``tools/call``: forward to the control API and return its answer verbatim as structured content. ``isError``
-    is ``is_error(method, answer)``: a Stop answering ``pending`` or ``ended`` is not an error."""
+    """``tools/call``: forward to the control API and return its answer verbatim as structured content.
+
+    Arguments are an object, or omitted (``None``, the same as ``{}``). A present value that is not an
+    object is ``request_invalid`` and the API is not called: it is not read as ``{}`` and it does not
+    raise. ``isError`` is ``is_error(method, answer)``: a Stop answering ``pending`` or ``ended`` is not
+    an error."""
 
     tool = next((t for t in TOOLS if t["name"] == name), None)
     if tool is None:
         return {"content": [{"type": "text", "text": json.dumps({"code": "method_unknown", "detail": name})}],
                 "isError": True}
-    result = api.call(tool["method"], arguments or {})
+    if arguments is not None and not isinstance(arguments, dict):
+        result = {"code": "request_invalid", "detail": "arguments"}
+    else:
+        result = api.call(tool["method"], arguments or {})
     return {"content": [{"type": "text", "text": json.dumps(result, sort_keys=True)}],
             "structuredContent": result, "isError": is_error(tool["method"], result)}

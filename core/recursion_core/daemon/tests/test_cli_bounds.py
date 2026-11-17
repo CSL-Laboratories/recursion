@@ -58,6 +58,13 @@ class CliBoundsTests(unittest.TestCase):
         self._assert_cli_rejects("--sweep-seconds", "-1")
         self._assert_cli_rejects("--sweep-seconds", "nan")
 
+    def test_a_tiny_positive_sweep_is_refused(self):
+        self._assert_cli_rejects("--sweep-seconds", "1e-300")
+        self._assert_cli_rejects("--sweep-seconds", "0.049")
+
+    def test_the_shortest_sweep_the_daemon_tests_run_is_accepted(self):
+        self._assert_cli_accepts(["--sweep-seconds", "0.05"], port=8765, sweep_seconds=0.05)
+
 
 if __name__ == "__main__":
     unittest.main()

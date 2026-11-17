@@ -141,9 +141,11 @@ def cli():
     if args.sweep_seconds is not None:
         sweep = args.sweep_seconds
         # inf and any value above threading.TIMEOUT_MAX make Event.wait raise.
-        if not (sweep > 0 and sweep <= threading.TIMEOUT_MAX):
-            parser.error("--sweep-seconds must be a finite positive number "
-                         "no greater than the thread wait limit")
+        # A positive value far below the shortest sweep the daemon tests already
+        # run (0.05s) makes the sweep loop spin. That floor is the lower bound.
+        if not (0.05 <= sweep <= threading.TIMEOUT_MAX):
+            parser.error("--sweep-seconds must be a finite number from 0.05 "
+                         "through the thread wait limit")
         extra["sweep_seconds"] = sweep
     if args.gui_port < 0 or args.gui_port > 65535:
         parser.error("--gui-port must be from 0 through 65535")

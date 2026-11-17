@@ -16,7 +16,8 @@ store's module is only called here, never changed.
   time is not stored), so that request is refused ``breaker_open``. A request whose store read
   fails is refused ``breaker_open`` too, and the next request reads the store again. After the cooldown one
   leased probe is admitted; the trip clears in the store only through that probe's lease
-  (``begin_probe`` / ``reset_after_probe``), and only when the probe run succeeded. The store's
+  (``begin_probe`` / ``reset_after_probe``), and only when the probe run succeeded; never when this
+  daemon reported a newer trip of that connection after the lease was taken (E01). The store's
   lease is as long as the longest route deadline plus the route breaker's grace; a trip the store
   still holds after a successful probe is logged and fenced again, never shown closed.
 * Every run the daemon launches is bound in the store to its connection, engine and model, owned
@@ -125,7 +126,13 @@ class DurableRouteBreaker:
         self._inner, self._stored = inner, stored
         self._lock = threading.Lock()
         self._restored = set()  # connections whose stored trip this process has already taken over
-        self._leases = {}       # route probe token -> the store's probe lease
+        self._leases = {}       # route probe token -> (the store's probe lease, the trip generation it was taken at)
+        # E01: every connection trip this daemon reports to the store counts one generation of that
+        # connection. A store lease is taken, a trip reported and a trip cleared under a fresh lease
+        # only while holding ``_trip_lock``, so "no newer trip since the lease" is checked and acted
+        # on as one step. Never taken while ``_lock`` is held.
+        self._trip_lock = threading.Lock()
+        self._trips = {}        # connection -> how many trips this process has reported for it
 
     # -- the store, with its refusals and errors kept out of a route request -------------------
     def tripped(self, connection):
@@ -191,25 +198,30 @@ class DurableRouteBreaker:
         probe = answer.get('probe')
         if answer.get('admitted') and probe is not None and self.tripped(connection):
             try:
-                lease = self._stored.begin_probe(connection)
+                with self._trip_lock:
+                    generation = self._trips.get(connection, 0)
+                    lease = self._stored.begin_probe(connection)
             except (Refused, sqlite3.Error) as exc:
                 log.error('no probe lease from the breaker store: %s', _code(exc))
             else:
                 with self._lock:
-                    self._leases[probe] = lease
+                    self._leases[probe] = (lease, generation)
         return answer
 
     def record(self, connection, model, tenant, outcome, probe=None):
         effect = self._inner.record(connection, model, tenant, outcome, probe)
         with self._lock:
-            lease = self._leases.pop(probe, None) if probe is not None else None
+            leased = self._leases.pop(probe, None) if probe is not None else None
+        lease = None if leased is None else leased[0]
         try:
             if effect == 'opened':
                 limit = outcome.get('limit')
                 if isinstance(limit, dict) and limit.get('scope') == 'connection':
-                    self._stored.report(connection, c.PLAN_LIMIT)  # also drops any lease the store held
+                    with self._trip_lock:  # a newer trip: no older probe may clear it under a fresh lease
+                        self._trips[connection] = self._trips.get(connection, 0) + 1
+                        self._stored.report(connection, c.PLAN_LIMIT)  # also drops any lease the store held
             elif effect == 'closed':
-                if self._stored.tripped(connection) and not self._clear_stored_trip(connection, lease):
+                if self._stored.tripped(connection) and not self._clear_stored_trip(connection, leased):
                     # The store still calls the connection tripped: do not show it closed (ADV2-2).
                     log.error('a successful probe could not clear the trip in the breaker store; the '
                               'connection is fenced again for the cooldown')
@@ -226,19 +238,31 @@ class DurableRouteBreaker:
                     self._restored.discard(connection)  # the next request reads the store again first
         return effect
 
-    def _clear_stored_trip(self, connection, lease):
+    def _clear_stored_trip(self, connection, leased):
         """Clear the stored trip after the route breaker closed on a successful probe. True when cleared.
 
-        The route breaker closes only for its own live probe (leased for the run's deadline plus
-        grace). The store's lease is one length for every probe; when it ran out first, or was never
-        taken, the trip is cleared under a fresh store lease, and that is logged.
+        ``leased`` is the probe's store lease with the trip generation it was taken at, or None. The
+        route breaker closes only for its own live probe (leased for the run's deadline plus grace).
+        The store's lease is one length for every probe; when it ran out first, the trip is cleared
+        under a fresh store lease, and that is logged. Never when this daemon reported a newer trip of
+        the connection after the probe's lease was taken (a newer typed limit also drops that lease):
+        the probe's success says nothing about it, so it stays and the caller fences the connection
+        again (E01). A probe that took no lease cleared nothing then and clears nothing now.
         """
+        if leased is None:
+            log.error('a successful probe held no breaker store lease; the stored trip stays')
+            return False
+        lease, generation = leased
         try:
-            if lease is not None and self._stored.reset_after_probe(connection, lease, True):
+            if self._stored.reset_after_probe(connection, lease, True):
                 return True
-            if lease is not None:
+            with self._trip_lock:
+                if self._trips.get(connection, 0) != generation:
+                    log.error('a newer trip of the connection was reported after the probe was leased; '
+                              'the older probe does not clear it')
+                    return False
                 log.warning("the breaker store's probe lease ended before the probe did; leasing again to clear the trip")
-            return self._stored.reset_after_probe(connection, self._stored.begin_probe(connection), True)
+                return self._stored.reset_after_probe(connection, self._stored.begin_probe(connection), True)
         except (Refused, sqlite3.Error) as exc:  # e.g. probe_lease_held: the trip stays in the store
             log.error('breaker store trip not cleared: %s', _code(exc))
             return False

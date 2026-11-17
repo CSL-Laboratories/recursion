@@ -1,16 +1,15 @@
 """The two arms: an engine run as its own CLI (direct), and the same engine under Recursion.
 
 Same model, route and effort in both (PROTOCOL.md, "Arms"). The direct arm reads tokens and cost
-from the engine's own output; it is not a Recursion surface. The Recursion arm drives the engine
-through the control socket, gives it the task repository through WORKSPACE's ``workspace`` field
-(seam S6) and reads usage from EVENTS' usage events, never from parsing output. Until both are on
-the evaluated base it refuses with REFUSAL and the rest of the run goes on.
+from the engine's own output; it is not a Recursion surface. The Recursion arm is not built yet:
+preflight refuses with REFUSAL when seams are missing and NOT_BUILT when they are present.
 """
 from __future__ import annotations
 
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -200,6 +199,9 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
     and the Popen object reaps the engine whenever it does exit.
     Times are monotonic.
     """
+    # Session cleanup calls getsid. Without it, do not start a process this function cannot reap.
+    if not hasattr(os, "getuid") or not hasattr(os, "getsid"):
+        raise ArmRefused("platform_unsupported")
     timeout_s = _finite_seconds(timeout_s)
     started = time.monotonic()
     try:
@@ -422,6 +424,22 @@ def _count(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(authorization|password|passwd|secret|api_key|apikey|access_token|refresh_token|token)\s*=\s*\S+"
+)
+
+
+def redact_detail(text):
+    """Drop assignment values for names that carry a credential.
+
+    The engine's own error text is copied into the record. A value after one of these names is replaced
+    so the record keeps the failure and not the value.
+    """
+    if not isinstance(text, str):
+        return text
+    return _SECRET_ASSIGNMENT.sub(lambda match: match.group(1) + "=[redacted]", text)
+
+
 def parse_stream_json(stdout: bytes, *, cost_basis: str) -> dict:
     """What the engine's own stream-json says: done or not, a typed failure, and its usage.
 
@@ -469,8 +487,10 @@ def parse_stream_json(stdout: bytes, *, cost_basis: str) -> dict:
     if failure is None and result.get("api_error_status") == 401:
         failure = "auth_failed"
     detail = error if isinstance(error, str) else result.get("subtype")
+    if detail is not None:
+        detail = redact_detail(str(detail))
     return {"has_result": True, "claimed_done": False, "failure": failure or "engine_error",
-            "detail": str(detail) if detail is not None else None, "usage": usage}
+            "detail": detail, "usage": usage}
 
 
 class Arm:

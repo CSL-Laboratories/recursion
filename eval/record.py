@@ -409,6 +409,10 @@ def _replacements(errors: _Errors, trials: list, by_id: dict, plan) -> None:
         before = (original.get("attempt") or {}).get("index") if isinstance(original.get("attempt"), dict) else None
         if _is_int(index) and _is_int(before) and index <= before:
             errors.add(where, f"index {index} does not come after the replaced trial's index {before}")
+    # PROTOCOL.md: at most 2 per task and arm, even when a record names a higher budget.
+    if _is_int(budget) and budget > 2:
+        errors.add("record.plan.replacements_per_task",
+                   "the protocol allows at most 2 replacements per task and arm")
     if not (_is_int(attempts) and _is_int(budget)):
         return
     for task_id, got in indexes.items():

@@ -12,6 +12,8 @@ from pathlib import Path
 
 FIXED_DATE = "2026-01-01T00:00:00+0000"
 IDENTITY = ("recursion-eval", "eval@invalid")
+# Small repositories this package builds finish well under this. A git that does not finish is a GitError.
+GIT_TIMEOUT_S = 120
 
 
 class GitError(RuntimeError):
@@ -41,8 +43,11 @@ def git_env(extra: dict | None = None) -> dict:
 def git(args: list, cwd: Path, *, input: bytes | None = None, check: bool = True) -> bytes:
     command = ["git", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", "core.quotePath=false",
                *args]
-    result = subprocess.run(command, cwd=str(cwd), input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            env=git_env(), check=False)
+    try:
+        result = subprocess.run(command, cwd=str(cwd), input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=git_env(), check=False, timeout=GIT_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(f"git {' '.join(args[:3])} did not finish within {GIT_TIMEOUT_S:g} s") from exc
     if check and result.returncode != 0:
         raise GitError(f"git {' '.join(args[:3])} failed ({result.returncode}): "
                        f"{result.stderr.decode('utf-8', 'replace').strip()[:500]}")

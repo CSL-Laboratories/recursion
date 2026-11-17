@@ -8,8 +8,8 @@ Two storage forms, one model:
 * harvested (held-out) tasks: a folder OUTSIDE the repository with ``task.json``, ``prompt.md``,
   ``start.tar``, ``hidden/...`` and ``solution/...``.
 
-The engine never sees anything but the start tree and the prompt. Hidden tests are written into the
-work tree only after the engine has finished, over whatever the engine left at those paths.
+The engine is given only the start tree and the prompt; hidden tests are written in after it finishes.
+Keeping held-out folders unreadable is the operator's job (heldout.py). A same-uid engine is not sandboxed.
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import io
 import json
 import math
 import os
+import posixpath
 import re
 import stat
 import sys
@@ -26,6 +27,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from eval import txtar
+
+# Tar names are POSIX even where os.path is the host module. On Linux os.path is posixpath, so a
+# replacement of os.path.normpath must not change this comparison. The function object is bound here.
+_posix_normpath = posixpath.normpath
 
 TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 DEFAULT_TIMEOUT_S = 1800.0
@@ -92,7 +97,7 @@ class Task:
         try:
             with tarfile.open(self.start_tar) as archive:
                 for member in archive.getmembers():
-                    if os.path.normpath(member.name) != name:
+                    if _posix_normpath(member.name) != name:
                         continue
                     if not member.isfile():
                         raise TaskError(f"task {self.id}: {name} in the start tree is not a regular file")
@@ -141,9 +146,28 @@ class Task:
             "task": self.id,
             "outcomes": list(self.standin.get("outcomes") or ["solve"]),
             "usage": self.standin.get("usage"),
-            "solution": {n: (None if d is None else d.decode("utf-8")) for n, d in self.solution.items()},
-            "wrong": {n: d.decode("utf-8") for n, d in self.wrong.items()},
+            "solution": {n: _plan_file(d, self.modes.get(n)) for n, d in self.solution.items()},
+            "wrong": {n: _plan_file(d, self.modes.get(n)) for n, d in self.wrong.items()},
         }
+
+
+def _plan_file(data, mode):
+    """A plan entry the stand-in can write back.
+
+    A UTF-8 file with the ordinary mode stays a string, which is what existing plans already are.
+    Bytes that are not UTF-8, and an executable mode, travel as base64 with the mode named.
+    """
+    if data is None:
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = None
+    if text is not None and mode in (None, 0o644):
+        return text
+    import base64
+    return {"encoding": "base64", "data": base64.b64encode(data).decode("ascii"),
+            "mode": "100755" if mode == 0o755 else "100644"}
 
 
 def _remove(path: Path) -> None:
@@ -323,7 +347,9 @@ def dir_digest(root: Path) -> str:
         for name in sorted(names):
             path = Path(dirpath) / name
             rel = path.relative_to(root).as_posix()
-            lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {rel}\n")
+            # A newline in a name must not become another row. Ordinary names are unchanged.
+            shown = rel.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
+            lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {shown}\n")
     return hashlib.sha256("".join(sorted(lines)).encode("utf-8")).hexdigest()
 
 

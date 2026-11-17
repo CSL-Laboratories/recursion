@@ -25,6 +25,7 @@ number is EVAL_STANDIN_TRIAL (1-based). The plan's ``outcomes`` list picks the b
 ``total_cost_usd`` beside it); without it the result carries no usage, so every token count is
 unknown (null), never 0.
 """
+import base64
 import json
 import os
 import posixpath
@@ -60,6 +61,21 @@ def _plain_above(name):
     return True
 
 
+def _material(content):
+    """Bytes to write, and a mode when the plan names one.
+
+    A plain string is the ordinary plan entry. A base64 object carries bytes that are not text, or a
+    mode the string form cannot name.
+    """
+    if isinstance(content, str):
+        return content.encode("utf-8"), None
+    if isinstance(content, dict) and content.get("encoding") == "base64":
+        raw = base64.b64decode(content.get("data") or "")
+        mode = {"100644": 0o644, "100755": 0o755}.get(content.get("mode"))
+        return raw, mode
+    return None, None
+
+
 def write_files(files):
     """Deletions first, then the files written, so a file replaced by a folder (or the reverse) is laid out
     whatever the order of the plan; what stands in a written path's way is removed, a link never followed."""
@@ -82,11 +98,17 @@ def write_files(files):
                 _remove(above)
         if os.path.islink(name) or os.path.isdir(name):
             _remove(name)
+        raw, mode = _material(content)
+        if raw is None:
+            emit(type="system", subtype="stand_in_bad_file", path=name)
+            continue
         folder = os.path.dirname(name)
         if folder:
             os.makedirs(folder, exist_ok=True)
-        with open(name, "w", encoding="utf-8") as handle:
-            handle.write(content)
+        with open(name, "wb") as handle:
+            handle.write(raw)
+        if mode is not None:
+            os.chmod(name, mode)
 
 
 def main():

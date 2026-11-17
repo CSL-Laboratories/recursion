@@ -352,6 +352,39 @@ class StopTest(unittest.TestCase):
                              ("scope_refused", "stop_not_granted_to_kind"))
             self.assertIsNone(auth(PRINCIPALS[name], "run.start", {}))
 
+    def test_a_two_faced_principal_cannot_stop_another_plugins_run(self) -> None:
+        """One call reads kind and id once, and the Stop rule uses that same pair.
+
+        A principal that answers plugin on the first pair and device on the second must be refused.
+        A second read would treat it as a device and allow it to stop another plugin's run.
+        """
+
+        class TwoFaced:
+            def __init__(self) -> None:
+                object.__setattr__(self, "reads", [])
+
+            @property
+            def in_run_unit(self) -> bool:
+                return False
+
+            def __getattribute__(self, name: str):
+                if name in ("kind", "id"):
+                    reads = object.__getattribute__(self, "reads")
+                    pair = len(reads) // 2
+                    reads.append(name)
+                    if pair == 0:
+                        return "plugin" if name == "kind" else "plugin.synthetic"
+                    return "device" if name == "kind" else "page"
+                return object.__getattribute__(self, name)
+
+        principal = TwoFaced()
+        grants = Grants({("plugin", "plugin.synthetic"): {"read", "run"}})
+        runs = {"run-1": {"launch": {"owner": "plugin.other", "session_id": "s1"}}}
+        verdict = authorizer(credentials=grants, run_record=runs.get)(
+            principal, "run.stop", {"run_id": "run-1"})
+        self.assertEqual(verdict, ("scope_refused", "run_not_owned"))
+        self.assertEqual(principal.reads, ["kind", "id"])
+
 
 @unittest.skipUnless(POSIX, "the credential store needs uids and O_NOFOLLOW (POSIX)")
 class WithTheRealStoreTest(unittest.TestCase):

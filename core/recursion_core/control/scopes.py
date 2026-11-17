@@ -188,9 +188,16 @@ class Authorizer:
         """The scopes ``principal`` holds now, within its kind's ceiling.
 
         A credential store that cannot be read raises here (``CredentialStoreError``, or whatever the store
-        raised); a call of the authorizer itself turns that into the refusal ``credentials_unavailable``."""
+        raised); a call of the authorizer itself turns that into the refusal ``credentials_unavailable``.
+        One direct call reads kind and id once. ``__call__`` does that read itself and shares the pair,
+        so the Stop rule cannot see a later pair."""
 
         kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
+        return self._held_for(principal, kind, pid)
+
+    def _held_for(self, principal, kind, pid) -> frozenset[str]:
+        """Scopes for a kind and id already read by the caller. Does not read them again."""
+
         try:
             # Each class's own dictionary first, read past any metaclass: a metaclass answering __dict__ hid a
             # declaration from getattr_static (round 7, Sol 1); then the instance and the metaclass as before.
@@ -234,8 +241,11 @@ class Authorizer:
     def __call__(self, principal, method, params) -> Verdict:
         if _attr(principal, "in_run_unit", True) is not False:
             return (SCOPE_REFUSED, "peer is inside a run unit")
+        # One pair for the scope calculation and for Stop. A second read let a principal answer plugin
+        # to the first and device to the second, and Stop then allowed another plugin's run.
+        kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
         try:
-            held = self.held(principal)
+            held = self._held_for(principal, kind, pid)
         except Exception:  # noqa: BLE001 - a credential store that cannot be read refuses; it never lets through
             log.exception("the credential store could not be read; the call is refused")
             return (SCOPE_REFUSED, "credentials_unavailable")
@@ -256,11 +266,10 @@ class Authorizer:
             if "run" not in held:
                 # The Stop row's own rule, whatever the table's scope column says for run.stop.
                 return (SCOPE_REFUSED, "needs_run")
-            return self._stop(principal, params)
+            return self._stop(principal, params, kind, pid)
         return None
 
-    def _stop(self, principal, params) -> Verdict:
-        kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
+    def _stop(self, principal, params, kind, pid) -> Verdict:
         if kind in ("owner", "device"):
             return None    # with run: any run, including one whose record names no principal
         if kind not in ("session", "plugin"):

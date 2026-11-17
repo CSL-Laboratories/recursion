@@ -1,0 +1,17 @@
+{
+  "method": "session.export",
+  "params": {
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "x-nobody-defined-this": true
+  },
+  "answer": {
+    "code": "ok",
+    "export": {
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "path": "/home/dev/.local/state/recursion/exports/ses-7f3a9c2e51d04b6a.jsonl",
+      "events": 412,
+      "turns": 3,
+      "secrets_included": false
+    }
+  }
+}

@@ -1,0 +1,1 @@
+{"type":"error","timestamp":1794614431000,"sessionID":"ses_synthv1error000000000001","error":{"name":"APIError","data":{"message":"Upstream quota exhausted for this deployment","statusCode":500,"isRetryable":true,"responseHeaders":{"content-type":"text/plain"},"responseBody":"quota exhausted","metadata":{"url":"https://api.example.invalid/v1/responses"}}}}

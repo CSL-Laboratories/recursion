@@ -108,7 +108,9 @@ def attempt(attempt_id: str, tmp_base: Path = DEFAULT_TMP_BASE, xdg_base: Path =
     created = []
     scratch = None
     # A removal error must not replace the attempt's own exception (a KeyboardInterrupt in particular),
-    # and a failure removing the first folder must not skip the second.
+    # and a failure removing the first folder must not skip the second. That includes a second
+    # interrupt raised inside the removal itself: it is remembered, the other folder is still
+    # removed, and it is raised only when the attempt itself raised nothing.
     body_error = False
     try:
         try:
@@ -129,7 +131,7 @@ def attempt(attempt_id: str, tmp_base: Path = DEFAULT_TMP_BASE, xdg_base: Path =
         for folder in created:
             try:
                 _rmtree(folder)
-            except Exception as exc:
+            except BaseException as exc:
                 if cleanup_error is None:
                     cleanup_error = exc
         if scratch is not None:

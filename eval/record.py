@@ -353,10 +353,11 @@ def validate(record) -> list:
             else:
                 by_id[tid] = trial
         task_id = trial.get("task_id")
-        if planned_tasks and task_id not in planned_tasks:
+        # A list or dict is already reported by _str. Membership must not raise.
+        if planned_tasks and _hashable(task_id) and task_id not in planned_tasks:
             errors.add(where, f"task {task_id!r} is not in the plan")
         attempt = trial.get("attempt")
-        if isinstance(attempt, dict) and attempt.get("planned") is True:
+        if isinstance(attempt, dict) and attempt.get("planned") is True and _hashable(task_id):
             planned_index.setdefault(task_id, []).append(attempt.get("index"))
     _replacements(errors, trials, by_id, plan)
     if isinstance(plan, dict) and _is_int(plan.get("attempts_per_task")):
@@ -393,7 +394,11 @@ def _replacements(errors: _Errors, trials: list, by_id: dict, plan) -> None:
             continue
         tid, task_id, index = trial.get("trial_id"), trial.get("task_id"), trial["attempt"].get("index")
         where = f"record.trials[{tid!r}]"
-        indexes.setdefault(task_id, []).append(index)
+        # _str already reported a list or dict. Using it as a key must not raise.
+        if _hashable(task_id):
+            indexes.setdefault(task_id, []).append(index)
+        if not _hashable(ref):
+            continue
         original = by_id.get(ref)   # a trial naming itself fails the index-order rule below
         if original is None:
             errors.add(where, f"replaces unknown trial {ref!r}")

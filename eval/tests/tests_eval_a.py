@@ -36,6 +36,23 @@ class FiniteTaskTimeoutTests(unittest.TestCase):
                         with self.assertRaises(tasks.TaskError):
                             tasks.load_txtar(path)
 
+    def test_a_boolean_time_limit_is_refused(self):
+        # True is a subclass of int. Without the bool rule it becomes one second and is accepted.
+        with outside_folder() as folder:
+            comment, files = txtar.parse(tiny_task("t", ["solve"], timeout=2))
+            for field in ("timeout_s", "grading_timeout_s"):
+                for literal in ("true", "false"):
+                    with self.subTest(field=field, literal=literal):
+                        metadata = json.loads(files["task.json"])
+                        metadata[field] = 2
+                        raw = json.dumps(metadata).replace(
+                            '"' + field + '": 2', '"' + field + '": ' + literal)
+                        text = txtar.format(comment, dict(files, **{"task.json": raw + "\n"}))
+                        path = folder / "boolean.txtar"
+                        path.write_text(text, encoding="utf-8")
+                        with self.assertRaises(tasks.TaskError):
+                            tasks.load_txtar(path)
+
     def test_a_huge_integer_time_limit_is_a_task_error(self):
         # 10**400 cannot be a float; loading must refuse it rather than raise OverflowError.
         for field in ("timeout_s", "grading_timeout_s"):

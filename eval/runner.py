@@ -616,7 +616,7 @@ def main(argv=None) -> int:
                       label=args.label or default_label(suite, args.engine), seed=args.seed, jobs=args.jobs,
                       out_dir=args.out, artifacts=args.artifacts, tmp_base=args.tmp_base, xdg_base=args.xdg_base)
     except (RunRefused, heldout.HeldOutDenied, suite_mod.SuiteError, scratch_mod.ScratchError,
-            task_mod.TaskError, json.JSONDecodeError) as exc:
+            task_mod.TaskError, json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     if outcome.interrupted:

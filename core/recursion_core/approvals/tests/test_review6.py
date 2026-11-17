@@ -38,7 +38,7 @@ from recursion_core.approvals import store as rows
 from recursion_core.approvals.effects import EffectRefused
 from recursion_core.approvals.model import ApprovalRefused
 from recursion_core.approvals.queue import ApprovalQueue
-from recursion_core.approvals.tests.test_queue import needs_fakes
+from recursion_core.approvals.tests.test_queue import Ticket, needs_fakes
 from recursion_core.approvals.tests.test_review1 import OWNER, _Base
 
 
@@ -232,11 +232,12 @@ class DrawerGrammarTests(_Base):
                 self.assertIn({"text": "session: " + session, "trust": "trusted"}, bound.rendered)
         longest = "run:" + "a" * 64
         approval_id = self.queue.request("engine_tool", dict(self.engine, session_id=longest), session_id=longest,
-                                         run_id=self.engine["run_id"], turn_id="turn-0001", engine_request_id="toolu_9")
+                                         run_id=self.engine["run_id"], turn_id="turn-0001", engine_request_id="toolu_9",
+                                         ticket=Ticket())
         with self.store.transaction() as tx:
             self.assertEqual(rows.load(tx, approval_id)["session_id"], longest)
         mixed = "run:" + "A_-" * 21 + "Z"  # sol's round-5 case: the longest, through a driver's ask
-        asked = self.queue.ask(dict(self.engine, session_id=mixed), {"engine_request_id": "toolu_10"})
+        asked = self.queue.ask(dict(self.engine, session_id=mixed), {"engine_request_id": "toolu_10"}, ticket=Ticket())
         with self.store.transaction() as tx:
             self.assertEqual(rows.load(tx, asked)["effect"]["session_id"], mixed)
         for session in ("run:" + "a" * 65, "ses-" + "b" * 61):

@@ -52,10 +52,37 @@ def _snapshot(plugin):
         raise ValueError("plugin must be a mapping")
     snapshot = dict(plugin)
     if "panels" in snapshot:
-        snapshot["panels"] = tuple(dict(p) if isinstance(p, Mapping) else p for p in snapshot["panels"])
+        snapshot["panels"] = tuple(_panel_snapshot(panel) for panel in snapshot["panels"])
     if "required" in snapshot:
-        snapshot["required"] = {cls: tuple(subjects) for cls, subjects in snapshot["required"].items()}
+        snapshot["required"] = {cls: _subject_tuple(subjects)
+                                for cls, subjects in snapshot["required"].items()}
     return snapshot
+
+
+def _panel_snapshot(panel):
+    """Copy one panel and detach a reads list from the caller.
+
+    Only a real list or tuple is copied. A string is one name, not a sequence
+    of characters, and any other value is left for the panel check to refuse.
+    """
+    if not isinstance(panel, Mapping):
+        return panel
+    copied = dict(panel)
+    reads = copied.get("reads")
+    if type(reads) in (list, tuple):
+        copied["reads"] = tuple(reads)
+    return copied
+
+
+def _subject_tuple(subjects):
+    """Materialise one required-subject sequence.
+
+    A string is one name, not a list of subjects. ``tuple`` on it would split
+    it into characters, so that shape is refused instead.
+    """
+    if isinstance(subjects, (str, bytes)):
+        raise ValueError("required subjects must be a collection of names, not a string")
+    return tuple(subjects)
 
 
 MAX_REQUEST_THREADS = 16

@@ -22,10 +22,10 @@ starts no process and changes no state:
 
 Which flag a call needs (driver.v2's description): a second user_message to the same worker needs
 ``multi_turn``; a user_message while a turn is in progress needs ``mid_turn_input``; an approval_answer
-needs ``permission_bridge``. A call whose flag is false raises ``DriverRefused`` (code ``unsupported``, the
-call and the flag), except the mid-turn send, which raises ``DriverBusy`` (code ``busy``, the frozen brief's
-word). PROVISIONAL, both that answer and the start and resume forms above: which of the brief's wording and
-driver.v2's stands is open with Lucas (lane questions Q1 and Q7); consumers must not rely on either yet.
+needs ``permission_bridge``. A call whose flag is false raises ``DriverRefused``. The refusal record's code
+is ``unsupported``, the only code driver.v2 publishes, including a mid-turn send (``DriverBusy``, still a
+``DriverRefused``, so a caller can tell that case by type). PROVISIONAL, the start and resume forms above:
+which of the brief's wording and driver.v2's stands is open with Lucas (lane question Q7).
 A malformed call raises ``DriverInputError``; a call the worker's state does not allow (closed input, an
 interrupt of a turn that is not in progress, a reused turn or delivery id) raises ``DriverStateError``. All
 of these are raised before the subclass is asked.
@@ -63,17 +63,19 @@ holds the state lock while calling the subclass.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import math
 import re
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 
+from recursion_core.control.methods import NoCanonicalText, canonical_text
+
 CONTRACT = 2
 FLAGS = ("multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge", "typed_limits", "usage")
 INPUT_KINDS = ("user_message", "approval_answer", "close")
 UNSUPPORTED = "unsupported"
-BUSY = "busy"  # PROVISIONAL: see DriverBusy
 # The calls a flag can refuse, and the flags that refuse a call (driver.v2 $defs/refusal).
 REFUSABLE_CALLS = ("send", "interrupt", "resume", "fork")
 REFUSING_FLAGS = ("multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge")
@@ -126,20 +128,15 @@ class DriverRefused(Exception):
 
 
 class DriverBusy(DriverRefused):
-    """A user_message sent while a turn is in progress, to a driver without ``mid_turn_input``. PROVISIONAL.
+    """A user_message sent while a turn is in progress, to a driver without ``mid_turn_input``.
 
-    The frozen brief says such a send "answers `busy`"; driver.v2's refusal record (#368) has only
-    ``unsupported``, with flag ``mid_turn_input``. Until Lucas settles which stands (lane questions Q1, put to
-    him by the Liaison on Nov 14), the gate answers the brief's ``busy``: code ``busy``, call ``send``, flag
-    ``mid_turn_input``. It is a ``DriverRefused``, so a caller that catches refusals sees it, and its ``code``
-    tells the two apart. Consumers must not rely on either answer yet.
+    driver.v2's refusal record has one code, ``unsupported``, and this record uses it, with call
+    ``send`` and flag ``mid_turn_input``. The class stays a ``DriverRefused`` so a caller that
+    catches refusals sees it, and so this case can still be told by type.
     """
-
-    code = BUSY
 
     def __init__(self) -> None:
         super().__init__("send", "mid_turn_input")
-        self.args = (f"{BUSY}: a turn is in progress and this driver takes no mid-turn input",)
 
 
 class DriverInputError(ValueError):
@@ -528,8 +525,19 @@ def _check_tool_call(p: Mapping, f: str) -> None:
     _text(p["call_id"], f"{f}.call_id", hi=128, no_newline=True)
     _text(p["name"], f"{f}.name", hi=256, no_newline=True)
     _matches(p["input_digest"], _SHA256, f"{f}.input_digest")
-    if p["input"] is not None and not isinstance(p["input"], Mapping):
+    carried = p["input"]
+    if carried is None:
+        return  # not carried: the digest is of an input this record does not hold
+    if not isinstance(carried, Mapping):
         raise DriverInputError(f"{f}.input")
+    try:
+        # event.v1: input_digest is the SHA-256 of the input as RFC 8785 writes it. A carried input
+        # whose digest is some other hash is refused, not kept.
+        text = canonical_text(carried if type(carried) is dict else dict(carried))
+    except (NoCanonicalText, TypeError, RecursionError, RuntimeError):
+        raise DriverInputError(f"{f}.input") from None
+    if hashlib.sha256(text.encode("utf-8")).hexdigest() != p["input_digest"]:
+        raise DriverInputError(f"{f}.input_digest")
 
 
 def _check_tool_result(p: Mapping, f: str) -> None:

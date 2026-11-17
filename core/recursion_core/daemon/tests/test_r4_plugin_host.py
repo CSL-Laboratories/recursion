@@ -1188,7 +1188,6 @@ class StopWhileAPluginHangsTests(HostCase):
     Liaison's to set (PLUGIN-HOST's questions.md).
     """
 
-    @unittest.expectedFailure
     def test_control_socket_stop_works_while_a_plugin_hangs_at_import(self):
         from recursion_core.control.client import SocketAPI
         from recursion_core.daemon import Daemon, Registry

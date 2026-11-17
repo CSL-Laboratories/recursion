@@ -2,9 +2,9 @@
 
 Lane ROUTING: the config (``config``: the ``routing.json`` file, its schema in
 ``schema/routing_config.v1.json``, and the loader's cross-field rules), the pure decision
-(``router.decide``, with ``explain`` and ``next_after_limit``) and detection (``detect``). Nothing here is
-wired into the daemon yet: no start path calls it, nothing is registered, nothing is launched, written or
-emitted. There is no learned router (grill Q45).
+(``router.decide``, with ``explain`` and ``next_after_limit``), detection (``detect``) and the start
+registrant (``hooks``, seam S6), which ``control/hooks.py`` imports at composition. The registrant is a pure
+decision: nothing here launches, writes or emits anything. There is no learned router (grill Q45).
 """
 
 from recursion_core.routing.config import (CONFIG_FILE, ENGINES, RECURSION_LOOP, VENDORS, Config, ConfigError, Login,

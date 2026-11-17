@@ -400,7 +400,7 @@ def read_routing_file(path: os.PathLike | str) -> object | None:
         with os.fdopen(fd, "rb", closefd=False) as fh:
             text = fh.read().decode("utf-8")
         parsed = json.loads(text, object_pairs_hook=_no_duplicate_members)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:  # RecursionError: nested deeper than the parser goes
         raise RoutingUnreadable(f"routing file unreadable: {type(exc).__name__}") from None
     finally:
         os.close(fd)
@@ -419,20 +419,31 @@ def _no_duplicate_members(pairs: list) -> dict:
     return out
 
 
-def load(config_dir: os.PathLike | str, keys: object) -> Config | None:
-    """Read ``routes.json`` (with ``load_routes`` itself) and ``routing.json`` beside it, and validate them.
+def load(config_dir: os.PathLike | str, keys: object, *, engines=None) -> Config | None:
+    """Read ``routing.json`` and ``routes.json`` beside it (with ``load_routes`` itself), and validate them.
 
-    None only when there is no routing file. Raises ``RoutingUnreadable`` (either file) or ``ConfigError``
-    (a routing file that is present but holds null or anything else that is not a valid config).
+    None only when there is no routing file; then ``routes.json`` is not read at all. ``engines``: the engines a
+    ``routes.json`` entry may name, as the daemon passes them to ``load_routes`` (its engine table's names);
+    None keeps ``load_routes``' own default, and a single string is refused (``TypeError``), as ``detect`` refuses
+    one for ``active``; any other iterable is taken as the names it yields (a mapping as its keys). Raises ``RoutingUnreadable`` (either file, one nested deeper than it can be parsed or
+    copied too) or ``ConfigError`` (a routing file that is present but holds null or anything else that is not a
+    valid config).
     """
+    if isinstance(engines, (str, bytes)):
+        raise TypeError("engines is a collection of engine names, not one string")
     from recursion_core.daemon.control_adapter import ROUTES_FILE, RoutesUnreadable, load_routes  # Linux only
 
     folder = Path(config_dir)
-    try:
-        routes = load_routes(folder / ROUTES_FILE)
-    except RoutesUnreadable as exc:
-        raise RoutingUnreadable(f"routes.json: {exc}") from None
     raw = read_routing_file(folder / CONFIG_FILE)
     if raw is None:
         return None
-    return load_config(raw, routes, keys)
+    try:
+        routes = load_routes(folder / ROUTES_FILE) if engines is None else load_routes(folder / ROUTES_FILE, tuple(engines))
+    except RoutesUnreadable as exc:
+        raise RoutingUnreadable(f"routes.json: {exc}") from None
+    except RecursionError:  # load_routes' own json.loads, on a routes.json nested deeper than the parser goes
+        raise RoutingUnreadable("routes.json: nested deeper than the JSON parser goes") from None
+    try:
+        return load_config(raw, routes, keys)
+    except RecursionError:  # a routing.json value that parses but is nested deeper than validation's copy goes
+        raise RoutingUnreadable("routing.json: nested deeper than it can be copied") from None

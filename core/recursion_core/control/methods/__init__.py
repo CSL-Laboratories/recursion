@@ -81,8 +81,10 @@ WHO OWNS THE TRANSACTION. For a method keyed by ``command_id`` the dispatcher do
    A ``command_id`` that is not common.v1's (8 to 128 of ``A-Z a-z 0-9 . _ : -``, matched whole) answers
    ``request_invalid``, detail ``command_id``, before the payload digest, the tenant and the store: no
    transaction is opened and nothing is read, kept or changed. So an id shorter than 8 characters is
-   refused: an id made from a counter is padded (``cmd-0001``, never ``cmd-1``). Params that are not an
-   object answer ``request_invalid``, detail ``params``, after the store-absent answer and before the id.
+   refused: an id made from a counter is padded (``cmd-0001``, never ``cmd-1``). Params that are not a
+   mapping answer ``request_invalid``, detail ``params``, after the store-absent answer and before the id.
+   A read is held to that same params rule before its handler is asked, so those params are a refusal
+   there too and not an unavailable answer from the handler.
 2. It takes the command's slot: commands with the same ``(tenant, method, command_id)`` run one at a
    time in this process, so two identical commands sent at once run the handler once.
 3. It opens the store's transaction and looks the receipt up IN it. A receipt with the same payload
@@ -175,7 +177,7 @@ import hashlib
 import logging
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import NamedTuple
 
 log = logging.getLogger(__name__)
@@ -555,6 +557,8 @@ class MethodTable:
                 scope.ended = True
 
     def _read(self, method, params, principal, handler, nested, scope) -> dict:
+        if not isinstance(params, Mapping):
+            return {'code': 'request_invalid', 'detail': 'params'}
         enclosing = scope.command   # the command this read is nested in, whose transaction is open; or None
         owner = enclosing if enclosing is not None else scope
         ctx = Context(principal, None, self.closing, nested, scope, owner)
@@ -589,7 +593,7 @@ class MethodTable:
         store = self.store
         if store is None:
             return {'code': 'unsupported', 'detail': 'store_absent'}
-        if not isinstance(params, dict):
+        if not isinstance(params, Mapping):
             return {'code': 'request_invalid', 'detail': 'params'}
         command_id = params.get('command_id')
         if not isinstance(command_id, str) or not _COMMAND_ID.fullmatch(command_id):

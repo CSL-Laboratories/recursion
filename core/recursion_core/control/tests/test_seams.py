@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import collections
 import contextlib
 import dis
 import hashlib
@@ -67,6 +68,8 @@ import threading
 import time
 import unittest
 import weakref
+from collections.abc import Mapping
+from types import MappingProxyType
 from unittest import mock
 
 from recursion_core.control import commands, hooks as H, methods
@@ -1447,7 +1450,8 @@ class CommandIdGrammarTest(unittest.TestCase):
     """
 
     BAD = ('short', 'cmd-001', 'z' * 129, 'cmd 0001', 'cmd-0001/x', 'cmd-0001\r', 'cmd-0001\n', 'cmd-0001\t',
-           'cmd-12' + chr(0) + 'x', 'cmd-12' + chr(0x7F) + 'x', 'cmd-0001' + chr(0xE9), 'cmd-000' + chr(0x661))
+           'cmd-12' + chr(0) + 'x', 'cmd-12' + chr(0x7F) + 'x', 'cmd-0001' + chr(0xE9), 'cmd-000' + chr(0x661),
+           '', b'cmd-0001', 'cmd-000' + '\ud800')
     GOOD = ('A._:-012', 'Z' * 128)
 
     class Store:
@@ -1533,10 +1537,10 @@ class CommandIdGrammarTest(unittest.TestCase):
     def test_exactly_the_grammars_characters_are_taken_at_every_place_in_an_id(self) -> None:
         """Every ASCII character and some lookalikes, at the end, the start and the middle of an 8-character id:
         the 66 of A-Z a-z 0-9 . _ : - are kept, every other one is refused before the store. A class widened by
-        one character (DeepSeek's round-1 MEDIUM 1) turns this red."""
+        one character (DeepSeek's round-1 MEDIUM 1), an emoji included, turns this red."""
         allowed = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-')
         self.assertEqual(len(allowed), 66)
-        others = (0x85, 0xA0, 0xE9, 0x130, 0x212A, 0x660, 0x2028, 0xFEFF, 0xFF10, 0xFF41)
+        others = (0x85, 0xA0, 0xE9, 0x130, 0x212A, 0x660, 0x2028, 0xFEFF, 0xFF10, 0xFF41, 0x1F600)
         for code in (*range(0x80), *others):
             ch = chr(code)
             for command_id in ('cmd-000' + ch, ch + 'cmd-000', 'cmd' + ch + '0000'):
@@ -1589,6 +1593,159 @@ class CommandIdGrammarTest(unittest.TestCase):
                 self.assertEqual(table.dispatch('session.turn', params, H.OWNER, None),
                                  {'code': 'request_invalid', 'detail': 'params'})
                 self.assertEqual((table.store.opened, table.store.used, asked), (0, [], []))
+
+    @quiet
+    def test_a_mapping_that_is_not_a_dict_is_accepted_and_a_bad_id_is_refused_before_the_store(self) -> None:
+        """DeepSeek's round 2, finding 1. A mapping that is not a dict was refused as ``params``.
+
+        A mapping is params: the handler runs, a receipt is kept, and a second caller with the same id
+        is answered from the receipt. The door stays strict for every one of these ids, on a dict and on
+        every other mapping, before the store is opened: empty, over-length, non-ASCII, a NUL, a lone
+        surrogate, and bytes. A handler that raises keeps nothing and answers unavailable. An
+        interruption still propagates and keeps nothing.
+        """
+        class Bag(Mapping):
+            def __init__(self, data):
+                self._data = dict(data)
+
+            def __getitem__(self, key):
+                return self._data[key]
+
+            def __iter__(self):
+                return iter(self._data)
+
+            def __len__(self):
+                return len(self._data)
+
+        def make(shape, payload):
+            data = dict(payload)
+            if shape == 'dict':
+                return data
+            if shape == 'proxy':
+                return MappingProxyType(data)
+            if shape == 'userdict':
+                return collections.UserDict(data)
+            return Bag(data)
+
+        offending = (
+            ('empty', ''),
+            ('over-length', 'z' * 129),
+            ('non-ascii', 'cmd-000' + '\u00e9'),
+            ('nul', 'cmd-12' + '\x00' + 'x'),
+            ('lone-surrogate', 'cmd-000' + '\ud800'),
+            ('bytes', b'cmd-0001'),
+        )
+        for shape in ('dict', 'proxy', 'userdict', 'subclass'):
+            table, asked = self.one_table()
+            for label, command_id in offending:
+                with self.subTest(shape=shape, command_id=label):
+                    params = make(shape, {'command_id': command_id, 'text': 'x'})
+                    answer = table.dispatch('session.turn', params, H.OWNER, None)
+                    self.assertEqual(answer, {'code': 'request_invalid', 'detail': 'command_id'})
+                    self.assertEqual((table.store.opened, asked), (0, []))
+            self.assertEqual((table.store.opened, table.store.used, table.store.kept, asked),
+                             (0, [], {}, []))
+            with self.subTest(shape=shape, command_id='good'):
+                params = make(shape, {'command_id': 'cmd-0001', 'text': 'x'})
+                self.assertEqual(table.dispatch('session.turn', params, H.OWNER, None), {'code': 'ok'})
+                self.assertEqual(
+                    table.dispatch('session.turn', {'command_id': 'cmd-0001', 'text': 'x'}, H.OWNER, None),
+                    {'code': 'ok'})
+                self.assertEqual(asked, ['cmd-0001'])
+                self.assertEqual(table.store.used, [
+                    ('get', 'session.turn', 'cmd-0001'),
+                    ('put', 'session.turn', 'cmd-0001'),
+                    ('get', 'session.turn', 'cmd-0001'),
+                ])
+                self.assertEqual(list(table._slots), [])
+
+        def raising(ctx, params):
+            raise RuntimeError('stand-in')
+
+        table = methods.MethodTable()
+        table.register('session.turn', raising, tenant=methods.INSTALL_TENANT)
+        table.store = self.Store()
+        proxy = MappingProxyType({'command_id': 'cmd-0001', 'text': 'x'})
+        self.assertEqual(table.dispatch('session.turn', proxy, H.OWNER, None),
+                         {'code': 'unavailable', 'detail': 'handler:RuntimeError'})
+        self.assertEqual((table.store.opened, table.store.kept, list(table._slots)), (1, {}, []))
+
+        def interrupted(ctx, params):
+            raise KeyboardInterrupt
+
+        table = methods.MethodTable()
+        table.register('session.turn', interrupted, tenant=methods.INSTALL_TENANT)
+        table.store = self.Store()
+        with self.assertRaises(KeyboardInterrupt):
+            table.dispatch('session.turn', proxy, H.OWNER, None)
+        self.assertEqual((table.store.opened, table.store.kept, list(table._slots)), (1, {}, []))
+
+    @quiet
+    def test_a_read_whose_params_are_not_a_mapping_is_refused_before_the_handler(self) -> None:
+        """DeepSeek's round 2, finding 2. None, a list, a string or a number on a read was
+        ``unavailable`` / ``handler:AttributeError``. The same params rule as a command applies before
+        the handler: ``request_invalid`` / ``params``, and the handler is not asked. A dict and a
+        mapping that is not a dict still reach the handler, a second call included. A handler that
+        raises is still unavailable, and an interruption still propagates.
+        """
+        def read_table(handler):
+            asked = []
+
+            def wrapped(ctx, params, asked=asked):
+                return handler(ctx, params, asked)
+
+            table = methods.MethodTable()
+            table.register('session.list', wrapped)
+            return table, asked
+
+        def taking(ctx, params, asked):
+            asked.append('called')
+            return {'code': 'ok', 'limit': params.get('limit')}
+
+        for params in (None, [], 'x', 7):
+            with self.subTest(params=type(params).__name__):
+                table, asked = read_table(taking)
+                answer = table.dispatch('session.list', params, H.OWNER, None)
+                self.assertEqual((answer, asked), ({'code': 'request_invalid', 'detail': 'params'}, []))
+
+        class Bag(Mapping):
+            def __init__(self, data):
+                self._data = dict(data)
+
+            def __getitem__(self, key):
+                return self._data[key]
+
+            def __iter__(self):
+                return iter(self._data)
+
+            def __len__(self):
+                return len(self._data)
+
+        table, asked = read_table(taking)
+        shapes = (
+            {'limit': 3},
+            MappingProxyType({'limit': 4}),
+            collections.UserDict({'limit': 5}),
+            Bag({'limit': 6}),
+        )
+        for params in shapes:
+            self.assertEqual(table.dispatch('session.list', params, H.OWNER, None),
+                             {'code': 'ok', 'limit': params.get('limit')})
+        self.assertEqual(asked, ['called', 'called', 'called', 'called'])
+
+        def raising(ctx, params, asked):
+            raise RuntimeError('stand-in')
+
+        table, asked = read_table(raising)
+        self.assertEqual(table.dispatch('session.list', {'limit': 1}, H.OWNER, None),
+                         {'code': 'unavailable', 'detail': 'handler:RuntimeError'})
+
+        def interrupted(ctx, params, asked):
+            raise KeyboardInterrupt
+
+        table, asked = read_table(interrupted)
+        with self.assertRaises(KeyboardInterrupt):
+            table.dispatch('session.list', {'limit': 1}, H.OWNER, None)
 
     def test_the_event_stores_own_file_keeps_no_receipt_for_an_id_outside_the_grammar(self) -> None:
         """The same promise measured a second way, on EVENTS' real store and its file: the bad ids keep nothing and

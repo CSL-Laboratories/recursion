@@ -151,7 +151,8 @@ class NewestTripTests(unittest.TestCase):
         self.assertEqual(durable.state(CONN), 'closed')
 
     def test_a_probe_with_no_store_lease_clears_nothing(self):
-        # F3: a probe admitted without a store lease does not clear, and does not take a fresh one.
+        # F3 on this branch: a refused store lease does not admit a route probe (E24), so
+        # nothing is handed out that could clear the stored trip, and the clear takes no fresh lease.
         durable, stored = self.boot()
         self._probe_after_a_trip(durable)
         self.clock.now += 301
@@ -162,15 +163,18 @@ class NewestTripTests(unittest.TestCase):
             raise Refused('probe_lease_held')
 
         with mock.patch.object(stored, 'begin_probe', side_effect=refusing):
-            again = durable.admit(CONN, MODEL, TENANT, deadline_s=30)
-            self.assertTrue(again['admitted'])
-            self.assertIsNotNone(again['probe'])
+            with self.assertLogs('recursion_core.daemon.breaker', 'ERROR'):
+                again = durable.admit(CONN, MODEL, TENANT, deadline_s=30)
             during_admit = len(calls)
             effect = durable.record(CONN, MODEL, TENANT, {'code': None}, again['probe'])
             during_clear = len(calls) - during_admit
+        self.assertFalse(again['admitted'])
+        self.assertIsNone(again['probe'])
+        self.assertEqual(again['code'], c.BREAKER_OPEN)
         self.assertEqual(effect, 'none')
         self.assertTrue(stored.tripped(CONN))
         self.assertNotEqual(durable.state(CONN), 'closed')
+        self.assertEqual(during_admit, 1)
         self.assertEqual(during_clear, 0)
 
 

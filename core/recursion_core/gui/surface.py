@@ -62,7 +62,7 @@ _CSS = ("body{font:16px/1.5 system-ui,sans-serif;margin:0 auto;max-width:72rem;p
         '[data-theme-scope] section[aria-label="Visibility"] *,'
         '[data-theme-scope] section[aria-labelledby="actions-h"],'
         '[data-theme-scope] section[aria-labelledby="actions-h"] *'
-        "{color:canvastext;background:transparent}"
+        "{color:canvastext;background:canvas}"
         'header,footer,nav,#core-approval,section[aria-labelledby="stop-h"]'
         "{color:canvastext;background:canvas}")
 _CSS_HASH = base64.b64encode(hashlib.sha256(_CSS.encode()).digest()).decode()

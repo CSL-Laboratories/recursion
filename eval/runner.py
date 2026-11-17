@@ -465,6 +465,7 @@ def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements:
                     pending.append((job, done[job]))
     except KeyboardInterrupt:
         result.interrupted = True
+        arms_mod.cancel_running()
         executor.shutdown(wait=True, cancel_futures=True)
         _collect(submitted, done)
     finally:

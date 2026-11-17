@@ -198,10 +198,19 @@ class ConfirmedEmptyScanTests(unittest.TestCase):
 
     def test_an_empty_scan_is_confirmed_and_a_member_found_then_is_killed(self):
         scans = [[], [910001], [], []]
+        sid = os.getsid(0) + 100000
+
+        def session_of(pid):
+            # The member is synthetic. Cleanup now signals only a pid a fresh check still places in the session.
+            if pid == 910001:
+                return sid, "S"
+            return None
+
         with patch.object(arms.os, "killpg"), patch.object(arms.os, "kill") as kill, \
                 patch.object(arms, "_session_members", side_effect=scans) as members, \
+                patch.object(arms, "_session_of", side_effect=session_of), \
                 patch.object(arms.time, "sleep"):
-            arms._kill_session(os.getsid(0) + 100000)
+            arms._kill_session(sid)
         self.assertEqual([c.args for c in kill.call_args_list], [(910001, signal.SIGKILL)])
         self.assertEqual(members.call_count, 4, "a member found after an empty scan restarts the confirmation")
 

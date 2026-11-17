@@ -111,6 +111,79 @@ def _finite_seconds(timeout_s: float) -> float:
     return number
 
 
+# Engines this process is still waiting on. The runner cancels them when it is interrupted, because the
+# signal is delivered to the main thread while the wait sits in a worker.
+_live_lock = threading.Lock()
+_live: set = set()
+
+
+def _track(process) -> None:
+    with _live_lock:
+        _live.add(process)
+
+
+def _untrack(process) -> None:
+    with _live_lock:
+        _live.discard(process)
+
+
+def cancel_running() -> None:
+    """Stop every engine still being waited on, each in the session this process started."""
+    with _live_lock:
+        processes = list(_live)
+    for process in processes:
+        if process.poll() is not None:
+            continue
+        try:
+            _kill_session(process.pid)
+        except (SessionCleanupError, OSError, RuntimeError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+
+def _close_stream(stream) -> None:
+    if stream is None or getattr(stream, "closed", False):
+        return
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
+def _reap(process, *, timeout: float) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _abandon_unwatched(process, started_threads: list) -> None:
+    """Popen succeeded and a reader never started, so the child and its pipes are still ours."""
+    try:
+        _kill_session(process.pid)
+    except (SessionCleanupError, OSError, RuntimeError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+    _reap(process, timeout=CLEANUP_GRACE_S)
+    streams = {"stdout": process.stdout, "stderr": process.stderr, "stdin": process.stdin}
+    owned = set(streams) - {thread.name for thread in started_threads}
+    for name in owned:
+        _close_stream(streams[name])
+
+
 def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeout_s: float) -> dict:
     """Run argv in its own session and wait for THAT process, at most ``timeout_s``.
 
@@ -134,6 +207,7 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
                                    stderr=subprocess.PIPE, start_new_session=True)
     except FileNotFoundError as exc:
         raise EngineMissing(f"{argv[0]}: {exc}") from None
+    _track(process)
     chunks: dict = {"stdout": [], "stderr": []}
 
     def read(name, pipe):
@@ -161,45 +235,62 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
     threads = [threading.Thread(target=read, args=("stdout", process.stdout), name="stdout", daemon=True),
                threading.Thread(target=read, args=("stderr", process.stderr), name="stderr", daemon=True),
                threading.Thread(target=feed, name="stdin", daemon=True)]
-    for thread in threads:
-        thread.start()
-    timed_out = False
     try:
-        process.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-    except BaseException as exc:
-        # An interruption is what is reported; the session is emptied first, as far as it can be.
+        started_threads: list = []
         try:
-            _kill_session(process.pid)
-        except SessionCleanupError as cleanup:
-            exc.add_note(f"cleanup after the interruption: {cleanup}")
-        raise
-    _kill_session(process.pid)
-    # The session is empty, so its leader, which can leave neither its session nor its process group, has
-    # exited: this wait ends at once. It is bounded all the same.
-    try:
-        process.wait(timeout=CLEANUP_GRACE_S)
-    except subprocess.TimeoutExpired:
-        raise SessionCleanupError(f"the engine (process {process.pid}) was not reaped {CLEANUP_GRACE_S:g} s after "
-                                  "its session was emptied") from None
-    deadline = time.monotonic() + CLEANUP_GRACE_S
-    for thread in threads:
-        thread.join(timeout=max(0.0, deadline - time.monotonic()))
-    held = [thread.name for thread in threads if thread.is_alive()]
-    if held:
-        raise SessionCleanupError(f"the engine's {' and '.join(held)} still open {CLEANUP_GRACE_S:g} s after its "
-                                  "session was emptied: a process outside the session (one that started a session "
-                                  "of its own) holds it")
-    code = process.returncode
-    return {
-        "exit": code if code is not None and code >= 0 else None,
-        "signal": -code if code is not None and code < 0 else None,
-        "timed_out": timed_out,
-        "stdout": b"".join(chunks["stdout"]),
-        "stderr": b"".join(chunks["stderr"]),
-        "seconds": time.monotonic() - started,
-    }
+            for thread in threads:
+                thread.start()
+                started_threads.append(thread)
+        except BaseException:
+            # No reader is blocked on a pipe that never started, so closing it cannot wait.
+            _abandon_unwatched(process, started_threads)
+            raise
+        timed_out = False
+        try:
+            process.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        except BaseException as exc:
+            # An interruption is what is reported; the session is emptied and the leader reaped first.
+            try:
+                _kill_session(process.pid)
+            except SessionCleanupError as cleanup:
+                exc.add_note(f"cleanup after the interruption: {cleanup}")
+            try:
+                process.wait(timeout=CLEANUP_GRACE_S)
+            except subprocess.TimeoutExpired:
+                exc.add_note(f"the engine (process {process.pid}) was not reaped {CLEANUP_GRACE_S:g} s after "
+                             "its session was emptied")
+            except BaseException:
+                pass
+            raise
+        _kill_session(process.pid)
+        # The session is empty, so its leader, which can leave neither its session nor its process group, has
+        # exited: this wait ends at once. It is bounded all the same.
+        try:
+            process.wait(timeout=CLEANUP_GRACE_S)
+        except subprocess.TimeoutExpired:
+            raise SessionCleanupError(f"the engine (process {process.pid}) was not reaped {CLEANUP_GRACE_S:g} s after "
+                                      "its session was emptied") from None
+        deadline = time.monotonic() + CLEANUP_GRACE_S
+        for thread in threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        held = [thread.name for thread in threads if thread.is_alive()]
+        if held:
+            raise SessionCleanupError(f"the engine's {' and '.join(held)} still open {CLEANUP_GRACE_S:g} s after its "
+                                      "session was emptied: a process outside the session (one that started a session "
+                                      "of its own) holds it")
+        code = process.returncode
+        return {
+            "exit": code if code is not None and code >= 0 else None,
+            "signal": -code if code is not None and code < 0 else None,
+            "timed_out": timed_out,
+            "stdout": b"".join(chunks["stdout"]),
+            "stderr": b"".join(chunks["stderr"]),
+            "seconds": time.monotonic() - started,
+        }
+    finally:
+        _untrack(process)
 
 
 def _session_of(pid: int):
@@ -225,6 +316,14 @@ def _session_members(sid: int) -> list:
     return members
 
 
+def _still_in_session(pid: int, sid: int) -> bool:
+    """True only when ``pid`` is still that session and not already dead. Checked again immediately before
+    a signal: a numeric id from an earlier scan, or a session id whose leader has been reaped, may have
+    been reused by an unrelated process."""
+    found = _session_of(pid)
+    return found is not None and found[0] == sid and found[1] not in ("Z", "X")
+
+
 def _kill_session(sid: int) -> None:
     """Kill every live process of session ``sid``, in any process group, rescanning until none is left.
 
@@ -233,13 +332,15 @@ def _kill_session(sid: int) -> None:
     while a scan reads /proc hides its child from that scan, never from the next (the child exists before
     its parent exits, so before the next listing). A chain of such exits, each inside one scan, is out of
     reach like a new session (PROTOCOL.md names both). The session is the engine's own
-    (start_new_session), never the runner's. SessionCleanupError if any is still alive after 10 s."""
+    (start_new_session), never the runner's. A signal is sent only after a fresh check that the pid is
+    still in this session. SessionCleanupError if any is still alive after 10 s."""
     if sid == os.getsid(0):
         raise RuntimeError("refusing to kill the runner's own session")
-    try:
-        os.killpg(sid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
+    if os.path.isdir("/proc") and _still_in_session(sid, sid):
+        try:
+            os.killpg(sid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
     if not os.path.isdir("/proc"):
         return
     deadline = time.monotonic() + 10
@@ -256,6 +357,8 @@ def _kill_session(sid: int) -> None:
         if time.monotonic() >= deadline:
             raise SessionCleanupError(f"processes {members} of the engine's session {sid} survived cleanup")
         for pid in members:
+            if not _still_in_session(pid, sid):
+                continue
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
@@ -495,10 +598,13 @@ class DirectArm(Arm):
             from eval import standin_engine
             return standin_engine.VERSION
         try:
-            out = subprocess.run([self.claude.binary, "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                 timeout=60, check=False).stdout.decode("utf-8", "replace").strip()
+            result = subprocess.run([self.claude.binary, "--version"], stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, timeout=60, check=False)
         except (OSError, subprocess.TimeoutExpired):
             return None
+        if result.returncode != 0:
+            return None
+        out = result.stdout.decode("utf-8", "replace").strip()
         return out.splitlines()[0] if out else None
 
     def run(self, task, work: Path, scratch, trial_index: int) -> EngineOutcome:
@@ -526,14 +632,23 @@ class DirectArm(Arm):
         done = run_process(self.argv(), cwd=work, env=env, stdin=message.encode("utf-8"), timeout_s=task.timeout_s)
         parsed = parse_stream_json(done["stdout"], cost_basis=self.cost_basis)
         failure, detail = parsed["failure"], parsed["detail"]
+        # A success line does not outrank the process status. A typed infra failure (limit, sign-in, give-up)
+        # keeps its class when the process exits non-zero; a success line plus a bad exit or a signal does not.
+        abnormal = done["signal"] is not None or done["exit"] not in (0, None)
         if done["timed_out"]:
             failure, detail = "timeout", f"engine ran past {task.timeout_s:g} s and was killed"
+        elif abnormal and parsed["claimed_done"] and failure not in ("vendor_limit", "auth_failed"):
+            failure = "engine_crash"
+            detail = f"engine ended with exit {done['exit']}, signal {done['signal']}"
         elif not parsed["has_result"]:
             failure = "engine_crash" if done["exit"] != 0 else "no_result"
             detail = f"no result line; exit {done['exit']}, signal {done['signal']}"
+        claimed_done = None if done["timed_out"] else parsed["claimed_done"]
+        if abnormal and failure == "engine_crash":
+            claimed_done = False
         return EngineOutcome(
             exit=done["exit"], signal=done["signal"], timed_out=done["timed_out"],
-            claimed_done=None if done["timed_out"] else parsed["claimed_done"], failure=failure, detail=detail,
+            claimed_done=claimed_done, failure=failure, detail=detail,
             usage=parsed["usage"], stdout=done["stdout"], stderr=done["stderr"], seconds=done["seconds"],
         )
 

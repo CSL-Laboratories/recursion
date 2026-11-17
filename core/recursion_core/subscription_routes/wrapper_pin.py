@@ -341,7 +341,10 @@ def _manifest(install_root: str, allowed: tuple[str, ...], full_access: bool,
             count += 1
             if count > _MAX_FILES:
                 raise WrapperPinRefused("wrapper_tree_too_large", str(count))
-            mode = os.lstat(path).st_mode
+            try:
+                mode = os.lstat(path).st_mode
+            except OSError:
+                raise WrapperPinRefused("wrapper_tree_unreadable", rel) from None
             if stat.S_ISDIR(mode):
                 pending.append((path, rel + "/", above + (os.path.realpath(path),)))
             elif stat.S_ISREG(mode):
@@ -349,7 +352,11 @@ def _manifest(install_root: str, allowed: tuple[str, ...], full_access: bool,
                     _require_owned_path(path, directory=False, detail=rel)
                 rows.append((rel, _hash_regular(path, rel)))
             elif stat.S_ISLNK(mode):
-                real = os.path.realpath(path)
+                # 3.12 realpath reads the link itself, so a vanished link raises here.
+                try:
+                    real = os.path.realpath(path)
+                except OSError:
+                    raise WrapperPinRefused("wrapper_tree_unreadable", rel) from None
                 try:
                     target_mode = os.stat(real).st_mode
                 except OSError:  # nothing there, or a link loop
@@ -360,7 +367,11 @@ def _manifest(install_root: str, allowed: tuple[str, ...], full_access: bool,
                 # The link itself: its text and where it resolves. Retargeting it changes the pin
                 # even when the new target holds the same bytes.
                 where = "in:" + os.path.relpath(real, real_root) if inside else "out:" + real
-                link = os.fsencode(os.readlink(path)) + b"\x00" + os.fsencode(where)
+                try:
+                    link_text = os.readlink(path)
+                except OSError:
+                    raise WrapperPinRefused("wrapper_tree_unreadable", rel) from None
+                link = os.fsencode(link_text) + b"\x00" + os.fsencode(where)
                 if stat.S_ISDIR(target_mode):
                     if require_owned:
                         _require_owned_path(path, directory=True, detail=rel)

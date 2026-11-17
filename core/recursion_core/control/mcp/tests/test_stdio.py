@@ -349,6 +349,31 @@ class StdioTest(unittest.TestCase):
         self.assertNotIn("Fatal Python error", stderr)
         self.assertNotIn("Traceback", stderr)
 
+    def test_an_interrupt_during_the_socket_probe_exits_130_with_no_traceback(self) -> None:
+        # The daemon accepts the check's run.list and never answers, so the child waits in the check's read,
+        # before it has read a byte of stdin or written the serving line. An interrupt there ends it with
+        # status 130 and no traceback, as an interrupt while serving does (not by the signal: status -2).
+        probe_seen, release = threading.Event(), threading.Event()
+
+        class Silent:
+            def call(self, method, params=None):
+                probe_seen.set()
+                release.wait(HANG_GUARD_S)
+                return {"code": "ok", "runs": []}
+
+        self.daemon(Silent())
+        self.addCleanup(release.set)  # runs before the server is closed
+        child = Child(self, self.runtime)
+        self.assertTrue(probe_seen.wait(HANG_GUARD_S), "the probe never reached the daemon")
+        child.proc.send_signal(signal.SIGINT)
+        status = child.proc.wait(timeout=HANG_GUARD_S)
+        child._guard.cancel()
+        stdout = child.proc.stdout.read()
+        stderr = child.proc.stderr.read().decode("ascii", "replace")
+        self.assertEqual(130, status, stderr[-2000:])
+        self.assertEqual(b"", stdout)
+        self.assertNotIn("Traceback", stderr)
+
     def test_with_stderr_full_end_of_input_still_ends_the_process_with_status_0(self) -> None:
         # The diagnostics left in the queue get at most the drain budget (2 s), then the process ends.
         self.daemon(make_api()[0])

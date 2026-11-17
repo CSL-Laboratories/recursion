@@ -8,9 +8,11 @@ four for a daemon from before the method table, else the published table's expos
 implements; a refused choice writes ``{"code": "tools_unavailable", "reason": ..., "detail": ...}``, writes
 nothing to stdout and exits 1, whether the daemon's answer, its ``methods.list`` call or the published files
 are at fault (``projection.py`` names each reason; ``published_unreadable`` is a file JSON cannot read). An
-exit or an interrupt while choosing is not a refusal and goes on. Otherwise it serves until the client ends stdin, or until stdout fails, and exits 0. It reads fd 0
-and writes fd 1 directly (``stdio.py``), so a client that stops reading ends the process cleanly instead of
-leaving a buffered stdout for the interpreter's final flush to fail on.
+exit while choosing is not a refusal and goes on; an interrupt while choosing is not one either (nothing is
+written for it) and ends the process with status 130. Otherwise it serves until the client ends stdin, or until
+stdout fails, and exits 0. It reads fd 0 and writes fd 1 directly (``stdio.py``), so a client that stops
+reading ends the process cleanly instead of leaving a buffered stdout for the interpreter's final flush to
+fail on.
 Every line it writes to stderr goes to fd 2 directly too, never through ``sys.stderr``: a client that
 closes stderr leaves nothing buffered for the final flush to fail on (exit 120), and the diagnostics
 thread (``server.py``, DIAGNOSTICS) holds no lock of ``sys.stderr`` while it waits on a stderr nobody reads
@@ -21,7 +23,9 @@ does not end, or that aborts after an interrupt.
 
 Exit statuses: 0 end of input or stdout failed; 1 the socket check failed or no tools could be chosen; 2
 usage (an argument was given); 3 an unexpected error while serving (one JSON line on stderr,
-``{"code": "internal_error", ...}``); 130 interrupted. This is a client entry, not a kernel one: it registers nothing and starts no daemon service.
+``{"code": "internal_error", ...}``); 130 interrupted, at any point after the usage check (the socket check's
+read and the choice of tools too), with no traceback. This is a client entry, not a kernel one: it registers
+nothing and starts no daemon service.
 """
 
 from __future__ import annotations
@@ -70,6 +74,14 @@ def main(argv: list[str] | None = None, *, environ: Mapping[str, str] | None = N
     if argv:
         line({"code": "usage", "detail": "python -m recursion_core.control.mcp takes no arguments"})
         return EXIT_USAGE
+    try:  # an interrupt anywhere after the usage check, the socket check's read included, is status 130
+        return _run(environ, stdin, stdout, check, published, line)
+    except KeyboardInterrupt:  # the client interrupted us: calls already sent to the daemon go on there
+        return EXIT_INTERRUPTED
+
+
+def _run(environ: Mapping[str, str] | None, stdin: Any, stdout: Any, check, published,
+         line: Callable[[dict], None]) -> int:
     try:
         api = check(environ)
     except socket_check.SocketCheckFailed as exc:
@@ -94,8 +106,6 @@ def main(argv: list[str] | None = None, *, environ: Mapping[str, str] | None = N
     line(chosen)
     try:
         return server.serve(api, instream, outstream, tools=tools, log=line)
-    except KeyboardInterrupt:  # the client interrupted us: calls already sent to the daemon go on there
-        return EXIT_INTERRUPTED
     except Exception as exc:  # noqa: BLE001 - one diagnostic line, an exit status of its own
         line({"code": "internal_error", "detail": f"{type(exc).__name__}: {exc}"})
         return EXIT_INTERNAL

@@ -204,15 +204,23 @@ class EntryTest(unittest.TestCase):
         self.assertEqual((1, [("tools_unavailable", "published_invalid")]), start(lambda: projection.Published(documents)))
 
     def test_an_exit_or_an_interrupt_while_choosing_is_not_a_refusal(self) -> None:
-        for exc in (SystemExit, KeyboardInterrupt):
+        for exc, status in ((SystemExit, None), (KeyboardInterrupt, 130)):
             class Raising:
                 def call(self, method, params, exc=exc):
                     raise exc()
 
             api, err = Raising(), io.StringIO()
-            with self.subTest(raised=exc.__name__), self.assertRaises(exc):
-                entry.main([], stdin=Untouchable(), stdout=Untouchable(), stderr=err,
-                           check=lambda environ, api=api: api, published=lambda: PUBLISHED)
+
+            def run(api=api, err=err):
+                return entry.main([], stdin=Untouchable(), stdout=Untouchable(), stderr=err,
+                                  check=lambda environ, api=api: api, published=lambda: PUBLISHED)
+
+            with self.subTest(raised=exc.__name__):
+                if status is None:  # an exit goes on
+                    with self.assertRaises(exc):
+                        run()
+                else:  # an interrupt ends the process with status 130 (no traceback), and is no refusal either
+                    self.assertEqual(status, run())
             self.assertEqual("", err.getvalue())
 
     def test_an_interrupt_exits_130(self) -> None:
@@ -226,6 +234,15 @@ class EntryTest(unittest.TestCase):
         legacy = ScriptedAPI([{"method": "methods.list", "params": {}, "answer": {"code": "method_unknown"}}])
         self.assertEqual(130, entry.main([], stdin=Interrupting(), stdout=io.BytesIO(), stderr=io.StringIO(),
                                          check=lambda environ: legacy))
+
+    def test_an_interrupt_during_the_socket_check_exits_130_and_nothing_is_read_or_written(self) -> None:
+        def interrupted(environ):
+            raise KeyboardInterrupt
+
+        err = io.StringIO()
+        self.assertEqual(130, entry.main([], environ={}, stdin=Untouchable(), stdout=Untouchable(), stderr=err,
+                                         check=interrupted))
+        self.assertEqual("", err.getvalue())
 
     def test_an_unexpected_error_while_serving_exits_3_with_one_json_line(self) -> None:
         class Failing(io.RawIOBase):

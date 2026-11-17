@@ -278,8 +278,10 @@ def _classify_result(rid: str, msg: dict, limit: dict | None, events: list, mode
         limit = c.limit_signal("connection", "claude.result.error")
     if limit is not None:
         return c.result(rid, c.PLAN_LIMIT, limit=limit, events=events, detail="typed limit")
-    # Auth error names and api_error_status are unverified field names. The detail is a code: a known
-    # auth name, or the status number. Arbitrary error text is not copied.
+    # Auth error names and api_error_status are unverified field names. The detail is the auth name,
+    # else the status number when that status is a non-negative int, else the code auth_failed when
+    # the status equals 401 but is not an int. Text with no status number is not an auth refusal.
+    # Arbitrary error text is not copied.
     if msg.get("error") in ("authentication_failed", "oauth_token_expired") or msg.get("api_error_status") == 401:
         return c.result(rid, c.AUTH_FAILED, events=events, detail=_auth_detail(msg))
     text = msg.get("result")
@@ -299,7 +301,10 @@ def _auth_detail(msg: dict) -> str:
 
 
 def _subtype_code(value: object) -> str:
-    """A snake_case subtype token. Anything else, including engine text, is the code ``error``."""
+    """A lowercase token of letters, digits and underscores.
+
+    Anything else, including engine text, is the code ``error``.
+    """
 
     if isinstance(value, str) and value and len(value) <= 64 and value[0].islower():
         for ch in value:

@@ -70,7 +70,7 @@ import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 
-from recursion_core.control.methods import NoCanonicalText, canonical_text
+from recursion_core.control.methods import canonical_text
 
 CONTRACT = 2
 FLAGS = ("multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge", "typed_limits", "usage")
@@ -407,26 +407,32 @@ def _matches(value: object, pattern: re.Pattern, field: str) -> str:
     return value
 
 
-def _whole_number(value: object, field: str, *, fraction: bool) -> None:
-    """A JSON number of 0 or more. A bool is not one. When ``fraction`` is false the value must be a
-    whole number, and a float whose value is whole (``0.0``, ``1e0``) counts: that is what event.v1's
-    integer means. The value is not rewritten. No ceiling: event.v1 sets none."""
-    if type(value) is bool:
-        raise DriverInputError(field)
+def _whole_number(value: object, field: str, *, fraction: bool) -> int | float:
+    """A JSON number of 0 or more, in the form a consumer can use.
+
+    Only a plain ``int`` or ``float``. A bool is neither, so it is refused, and a subclass
+    is not a JSON number here. When ``fraction`` is false the value must be whole, and a
+    float whose value is whole (``0.0``, ``1e0``) is returned as that ``int``. A fraction
+    is returned as the float it is. A plain ``int`` is returned as itself. The schema sets
+    no ceiling, so a huge int stays that int; the conformance reader refuses an integral
+    value beyond 2**53-1, and this gate does not.
+    """
     if type(value) is int:
         if value < 0:
             raise DriverInputError(field)
-        return
+        return value
     if (type(value) is float and math.isfinite(value) and value >= 0
             and (fraction or value.is_integer())):
-        return
+        return value if fraction else int(value)
     raise DriverInputError(field)
 
 
-def _count(value: object, field: str) -> object:
-    """A JSON integer of 0 or more, kept as given."""
-    _whole_number(value, field, fraction=False)
-    return value
+def _count(value: object, field: str) -> int:
+    """A whole JSON number of 0 or more, stored as an int."""
+    bound = _whole_number(value, field, fraction=False)
+    if type(bound) is not int:
+        raise DriverInputError(field)
+    return bound
 
 
 def _timestamp(value: object, field: str) -> str:
@@ -532,8 +538,8 @@ def _check_engine_output(p: Mapping, f: str) -> None:
         raise DriverInputError(f"{f}.stream")
     if not isinstance(p["text"], str):
         raise DriverInputError(f"{f}.text")
-    _count(p["offset_start"], f"{f}.offset_start")
-    _count(p["offset_end"], f"{f}.offset_end")
+    p["offset_start"] = _count(p["offset_start"], f"{f}.offset_start")
+    p["offset_end"] = _count(p["offset_end"], f"{f}.offset_end")
 
 
 def _check_tool_call(p: Mapping, f: str) -> None:
@@ -547,9 +553,11 @@ def _check_tool_call(p: Mapping, f: str) -> None:
         raise DriverInputError(f"{f}.input")
     try:
         # event.v1: input_digest is the SHA-256 of the input as RFC 8785 writes it. A carried input
-        # whose digest is some other hash is refused, not kept.
+        # whose digest is some other hash is refused, not kept. Any ordinary failure of the
+        # canonicaliser, or of reading a mapping that is not a dict, is the same refusal. An
+        # interruption still leaves.
         text = canonical_text(carried if type(carried) is dict else dict(carried))
-    except (NoCanonicalText, TypeError, RecursionError, RuntimeError):
+    except Exception:
         raise DriverInputError(f"{f}.input") from None
     if hashlib.sha256(text.encode("utf-8")).hexdigest() != p["input_digest"]:
         raise DriverInputError(f"{f}.input_digest")
@@ -646,5 +654,9 @@ def check_measurement(value: object, *, integer: bool, field: str) -> None:
         return
     if quality not in ("known", "lower_bound") or provenance not in ("observed", "modelled", "inferred"):
         raise DriverInputError(field)
-    # An int is never converted: no overflow. An integral float stays a float; it is still a whole number.
-    _whole_number(number, field, fraction=not integer)
+    # A whole float count is stored as that int. A dollar amount is not rewritten. A plain int is
+    # not converted, so a huge int does not overflow.
+    if integer:
+        value["value"] = _whole_number(number, field, fraction=False)
+    else:
+        _whole_number(number, field, fraction=True)

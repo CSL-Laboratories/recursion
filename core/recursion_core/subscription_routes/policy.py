@@ -650,6 +650,12 @@ def _check_own_store(engine: str, route_home: str, real_home: str, entry: str) -
     pending = [path]
     seen_dirs: set[str] = set()
     seen = 0
+
+    def _walk_error(_err: OSError) -> None:
+        # An unreadable directory is not a clean tree: skipping it would hide a link
+        # out of the route home. Fail closed, and do not echo the OS text.
+        raise SubscriptionRouteRefused(engine, "own_store_unreadable", entry) from None
+
     while pending:
         current = pending.pop()
         real_current = os.path.realpath(current)
@@ -658,13 +664,19 @@ def _check_own_store(engine: str, route_home: str, real_home: str, entry: str) -
         if not _within(real_current, real_home):
             raise SubscriptionRouteRefused(engine, "own_store_links_outside_route_home", entry)
         seen_dirs.add(real_current)
-        for top, dirs, files in os.walk(current, followlinks=False):
+
+        for top, dirs, files in os.walk(current, followlinks=False, onerror=_walk_error):
             linked_dirs: list[str] = []
             for name in list(dirs):
                 item = os.path.join(top, name)
                 if os.path.islink(item):
                     dirs.remove(name)
                     linked_dirs.append(item)
+                    continue
+                # An ordinary directory costs one step of the walk budget, the same as a file.
+                seen += 1
+                if seen > _STORE_WALK_CAP:
+                    raise SubscriptionRouteRefused(engine, "own_store_too_large", entry)
             for name in files:
                 seen += 1
                 if seen > _STORE_WALK_CAP:

@@ -89,8 +89,14 @@ STOP_RESERVED_CONNECTIONS = 4
 LIST_ENVELOPE_BYTES = 4096
 LIST_REPLY_BYTES = MAX_FRAME_BYTES - LIST_ENVELOPE_BYTES
 # The most bytes the route result of a run.status answer may take. The output tail and the run record share
-# the frame with it, so a result past this is cut, never left to fail the whole answer (E18).
+# the frame with it, so a result past this is shortened until the answer fits (E18). Every member that can
+# be large is shortened, not only text: a large detail alone used to fail the whole answer.
 RESULT_STATUS_BYTES = MAX_FRAME_BYTES // 4
+# Members of the status branch of run.view.v1 ``result``. A cut keeps these and adds none: the record
+# has no mark for a shortened result, and an added member matches no branch of that schema.
+_STATUS_RESULT_KEYS = ('contract', 'request_id', 'status', 'code', 'text', 'limit', 'events', 'detail',
+                       'retry_at', 'breaker_effect', 'limit_notice')
+_LIST_RESULT_KEYS = ('status', 'code', 'detail')
 
 
 def _wire_size(value):
@@ -98,23 +104,95 @@ def _wire_size(value):
     return len(json.dumps(value, separators=(',', ':'), ensure_ascii=False, default=str).encode('utf-8'))
 
 
+def _fit_chars(short, key, *, force=False):
+    """Shorten ``short[key]`` to the longest head that lets ``short`` fit the status budget.
+
+    Without ``force``, a member that is still over budget even when empty is left unchanged: some
+    other member is what does not fit, and emptying this one would only throw away a short value.
+    """
+    text = short.get(key)
+    if not isinstance(text, str) or _wire_size(short) <= RESULT_STATUS_BYTES:
+        return
+    if not force:
+        short[key] = ''
+        if _wire_size(short) > RESULT_STATUS_BYTES:
+            short[key] = text
+            return
+    lo, hi, best = 0, len(text), 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        short[key] = text[:mid]
+        if _wire_size(short) <= RESULT_STATUS_BYTES:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    short[key] = text[:best]
+
+
+def _fit_items(short, key, *, force=False):
+    """Keep the longest prefix of ``short[key]`` that lets ``short`` fit the status budget."""
+    items = short.get(key)
+    if not isinstance(items, list) or _wire_size(short) <= RESULT_STATUS_BYTES:
+        return
+    if not force:
+        short[key] = []
+        if _wire_size(short) > RESULT_STATUS_BYTES:
+            short[key] = items
+            return
+    lo, hi, best = 0, len(items), 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        short[key] = items[:mid]
+        if _wire_size(short) <= RESULT_STATUS_BYTES:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    short[key] = items[:best]
+
+
+def _drop_if_that_fits(short, key):
+    """Replace a bulky object with ``None`` when that is what brings ``short`` under the budget."""
+    if key not in short or short[key] is None or _wire_size(short) <= RESULT_STATUS_BYTES:
+        return
+    saved = short[key]
+    short[key] = None
+    if _wire_size(short) > RESULT_STATUS_BYTES:
+        short[key] = saved
+
+
 def _status_result(result):
     """The route result as ``run.status`` carries it: whole while it fits ``RESULT_STATUS_BYTES``.
 
-    A larger one keeps ``status``, ``code`` and ``detail`` and the longest head of its ``text`` that fits,
-    marked ``truncated``. The whole result stays in the run's ``result.json``.
+    A larger one keeps the members the public record already names. When the result has the status
+    branch (``run.view.v1``), those members stay and nothing is added; otherwise only status, code
+    and detail stay. Text is shortened first, then the events list, then a limit object is dropped,
+    and detail is shortened only once the rest cannot make room. The whole result stays in the run's
+    ``result.json`` when that write succeeded. A result kept only in memory is one whose write failed.
     """
-    if _wire_size(result) <= RESULT_STATUS_BYTES:
+    if not isinstance(result, dict) or _wire_size(result) <= RESULT_STATUS_BYTES:
         return result
-    short = {key: result.get(key) for key in ('status', 'code', 'detail')}
-    short['truncated'] = True
-    text = result.get('text')
-    if isinstance(text, str):
-        short['text'] = ''
-        length = len(text)
-        while length and _wire_size({**short, 'text': text[:length]}) > RESULT_STATUS_BYTES:
-            length = length * 3 // 4
-        short['text'] = text[:length]
+    keys = _STATUS_RESULT_KEYS if all(key in result for key in _STATUS_RESULT_KEYS) else _LIST_RESULT_KEYS
+    short = {key: result[key] for key in keys if key in result}
+    # Shorten one member at a time, and only when that member is what does not fit, so a short text
+    # survives a large detail and a short detail survives a large text.
+    _fit_chars(short, 'text')
+    _fit_items(short, 'events')
+    _drop_if_that_fits(short, 'limit_notice')
+    _drop_if_that_fits(short, 'limit')
+    _fit_chars(short, 'detail')
+    if _wire_size(short) > RESULT_STATUS_BYTES:
+        # More than one member is large. Detail gives way first, then text, then the lists and objects.
+        _fit_chars(short, 'detail', force=True)
+        _fit_chars(short, 'text', force=True)
+        _fit_items(short, 'events', force=True)
+        if 'limit_notice' in short:
+            short['limit_notice'] = None
+        if 'limit' in short:
+            short['limit'] = None
+        _fit_chars(short, 'detail', force=True)
+        _fit_chars(short, 'text', force=True)
     return short
 
 
@@ -122,7 +200,8 @@ def _open_regular(path):
     """``path`` open for reading, or ``OSError`` when it is not a regular file.
 
     Opened ``O_NONBLOCK``: the open of a FIFO that has no writer waits for one, and a status or list
-    call waited with it (E19).
+    call waited with it (E19). ``O_NOFOLLOW`` refuses a symlink, including one whose target is a
+    regular file.
     """
     # A host that lacks a flag (the simulated Windows run of the suites) opens without it.
     flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
@@ -134,6 +213,25 @@ def _open_regular(path):
     except BaseException:
         os.close(fd)
         raise
+
+
+def _clear_result_temp(tmp):
+    """Remove a stale or planted ``result.json.tmp`` so the result can be written beside it.
+
+    A file, a FIFO or a symlink is unlinked. An empty directory is removed too: this name is never
+    a directory the daemon created, and ``unlink`` refuses one. A directory that still has entries
+    is left in place, and the caller keeps the result in memory. The result is durable only when
+    the write that follows this succeeds.
+    """
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        return
+    except OSError:
+        info = os.lstat(tmp)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise
+        os.rmdir(tmp)
 
 
 # -- registry ------------------------------------------------------------------------------------
@@ -394,11 +492,15 @@ class RouteStarter:
                              daemon=True).start()
         except BaseException as exc:
             # No worker will ever run: nothing else would take the run out of ``_active``, and every retry
-            # would answer ``start_in_flight`` until the daemon restarted (E04).
+            # would answer ``start_in_flight`` until the daemon restarted (E04). The refusal is recorded
+            # in the same lock that gives the run up. Recording it afterwards let a second start take the
+            # id and then wear this attempt's error.
             with self._lock:
                 self._active.pop(run_id, None)
+                if isinstance(exc, Exception):
+                    self.failures[run_id] = {'code': 'worker_start_failed', 'detail': type(exc).__name__}
             if isinstance(exc, Exception):
-                raise self._refuse(run_id, 'worker_start_failed', type(exc).__name__) from None
+                raise StartRefused('worker_start_failed', type(exc).__name__) from None
             raise
         if ctx.wait_started(self._start_timeout_s):
             return {'cgroup': ctx.cgroup}
@@ -416,48 +518,95 @@ class RouteStarter:
 
     def _drive(self, ctx, request):
         interrupt = None
+        result = None
         try:
-            with bound_run(ctx):
-                try:
-                    result = self._service.handle(request)
-                except Exception as exc:  # noqa: BLE001 - a route bug must not leave the start waiting
-                    log.exception('route request for %s failed', ctx.run_id)
-                    result = route_contract.result(ctx.run_id, route_contract.ENGINE_ERROR,
-                                                   detail=f'route failure: {type(exc).__name__}')
-                except BaseException as exc:  # an interrupt or SystemExit from the callback (E34)
-                    # The published child must not outlive the worker that drove it: end it and release the
-                    # start below as for any route failure, then let the interrupt go on.
+            try:
+                with bound_run(ctx):
+                    try:
+                        result = self._service.handle(request)
+                    except Exception as exc:  # noqa: BLE001 - a route bug must not leave the start waiting
+                        log.exception('route request for %s failed', ctx.run_id)
+                        result = route_contract.result(ctx.run_id, route_contract.ENGINE_ERROR,
+                                                       detail=f'route failure: {type(exc).__name__}')
+                    except BaseException as exc:  # an interrupt or SystemExit from the callback (E34)
+                        # The published child must not outlive the worker that drove it: end it and release the
+                        # start below as for any route failure, then let the interrupt go on.
+                        log.error('route request for %s was ended by %s', ctx.run_id, type(exc).__name__)
+                        interrupt = exc
+                        result = route_contract.result(ctx.run_id, route_contract.ENGINE_ERROR,
+                                                       detail=f'route failure: {type(exc).__name__}')
+                self._after_route(ctx, result, interrupt)
+            except BaseException as exc:
+                # An interrupt in the result write, in finished, or in the settle is outside the callback
+                # handler. The published child was left running, with both descriptors open. Do the same
+                # release one step further out, on a best-effort basis, then let the interrupt go on.
+                if interrupt is None:
                     log.error('route request for %s was ended by %s', ctx.run_id, type(exc).__name__)
                     interrupt = exc
+                if result is None:
                     result = route_contract.result(ctx.run_id, route_contract.ENGINE_ERROR,
                                                    detail=f'route failure: {type(exc).__name__}')
-            closing = getattr(self._daemon, 'closed', False)  # shutdown: the run is left to the next daemon
-            if ctx.process is not None and not closing:
-                self._record_result(ctx.run_id, result)
-                if self._breaker is not None and result.get('code') is not None:
-                    self._breaker.fault_run(ctx.run_id)  # an effect citing this run is refused (4.2)
-            ctx.finished(result)
-            if ctx.process is not None:
-                if closing:
-                    ctx.process.close()
-                elif interrupt is not None:
-                    self._settle(ctx, grace_s=0.0, reason='route_interrupted')
-                else:
-                    self._settle(ctx)
+                self._after_interrupt(ctx, result)
         finally:
             with self._lock:
                 self._active.pop(ctx.run_id, None)
         if interrupt is not None:
             raise interrupt
 
+    def _after_route(self, ctx, result, interrupt):
+        closing = getattr(self._daemon, 'closed', False)  # shutdown: the run is left to the next daemon
+        if ctx.process is not None and not closing:
+            self._record_result(ctx.run_id, result)
+            if self._breaker is not None and result.get('code') is not None:
+                self._breaker.fault_run(ctx.run_id)  # an effect citing this run is refused (4.2)
+        ctx.finished(result)
+        if ctx.process is None:
+            return
+        if closing:
+            ctx.process.close()
+        elif interrupt is not None:
+            self._settle(ctx, grace_s=0.0, reason='route_interrupted')
+        else:
+            self._settle(ctx)
+
+    def _after_interrupt(self, ctx, result):
+        """Record, release and fence after an interrupt that landed past the route callback."""
+        closing = getattr(self._daemon, 'closed', False)
+        if ctx.process is not None and not closing:
+            try:
+                self._record_result(ctx.run_id, result)
+            except BaseException:
+                log.error('route result for %s was not written after an interrupt', ctx.run_id)
+                with self._lock:
+                    self.results.setdefault(ctx.run_id, result)
+        if ctx.result is None:
+            try:
+                ctx.finished(result)
+            except BaseException:
+                log.error('route result for %s was not published after an interrupt', ctx.run_id)
+        process = ctx.process
+        if process is None:
+            return
+        try:
+            if closing or process.fenced:
+                # A fence that already ran asked the daemon to stop the child. Only the handles remain.
+                process.close()
+            else:
+                self._settle(ctx, grace_s=0.0, reason='route_interrupted')
+        except BaseException:
+            try:
+                process.close()
+            except BaseException:
+                log.error('handles for %s stayed open after an interrupt', ctx.run_id)
+
     def _record_result(self, run_id, result):
         try:
             path = self._state / 'runs' / run_id / 'result.json'
             tmp = path.with_name('result.json.tmp')
-            try:
-                os.unlink(tmp)  # a stale or planted entry is replaced: opening a FIFO here would wait for a reader
-            except FileNotFoundError:
-                pass
+            # A stale or planted file is replaced: opening a FIFO here would wait for a reader.
+            # An empty planted directory is removed too. The result is durable only when this write
+            # succeeds; otherwise it is kept in memory.
+            _clear_result_temp(tmp)
             fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
                 json.dump(result, handle, sort_keys=True)

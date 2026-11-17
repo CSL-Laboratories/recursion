@@ -1,8 +1,10 @@
 """The start path of the daemon's control adapter survives a dead worker, a bad route number, an interrupt and a FIFO.
 
-Red tests of the sweep triage of daemon (STOP, CSL-238), entries E04, E05, E34, E19 and E18: each fails on
-master without the change in ``control_adapter.py`` and passes with it. Every fixture is synthetic and lies
-below a temporary folder; no manager, engine or provider runs.
+Red tests of the sweep triage of daemon (STOP, CSL-238), entries E04, E05, E34, E19 and E18. The tests that
+describe a defect fail on master without the change in ``control_adapter.py`` and pass with it. Four controls
+pin behaviour that already held and pass on master too: a finite deadline, a regular result file, a small
+route result carried whole, and an ordinary route failure waiting for the engine to exit. Every fixture is
+synthetic and lies below a temporary folder; no manager, engine or provider runs.
 """
 import json
 import os
@@ -26,6 +28,15 @@ from recursion_core.routes import contract
 
 LINUX = sys.platform.startswith('linux')
 CHILD_LIMIT_S = 20
+
+
+def result_fits(value):
+    """Whether ``value`` matches a branch of the public ``run.view.v1`` result."""
+    root = Path(__file__).resolve().parents[4]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from conformance.rules import fits
+    return fits('run.view.v1.json#/$defs/result', value)
 
 
 @unittest.skipUnless(LINUX, 'the daemon is Linux only')
@@ -188,7 +199,8 @@ class StartPathTest(unittest.TestCase):
         self.assertEqual(control._output('run-one', False),
                          {'bytes': 16, 'lines': ['{"a":1}', '{"b":2}'], 'complete': True})
 
-    # -- E18: run.status answers however large the route result is ------------------------------------
+    # -- E18: run.status stays readable however large the route result's text or detail is ------------
+    # A cut result matches the public record (no added member) and fits RESULT_STATUS_BYTES.
     def status_server(self, result):
         registry = InMemoryRunRegistry()
         registry.put({'run_id': 'run-one', 'tenant': 't', 'engine': 'claude_code',
@@ -214,9 +226,15 @@ class StartPathTest(unittest.TestCase):
         status = SocketAPI(str(server.path), timeout_s=3).call('run.status', {'run_id': 'run-one'})
         self.assertEqual(status['code'], 'ok', status)
         carried = status['run']['result']
-        self.assertEqual((carried['status'], carried['code'], carried['truncated']), ('ok', None, True))
+        self.assertEqual((carried['status'], carried['code'], carried['detail']), ('ok', None, ''))
+        self.assertNotIn('truncated', carried)
+        self.assertTrue(result_fits(carried), carried)
+        self.assertLessEqual(adapter._wire_size(carried), adapter.RESULT_STATUS_BYTES)
         self.assertTrue(carried['text'] and set(carried['text']) == {'x'})
         self.assertLess(len(carried['text']), len(result['text']))
+        self.assertEqual(carried['contract'], result['contract'])
+        self.assertEqual(carried['request_id'], result['request_id'])
+        self.assertEqual(carried['events'], [])
 
     def test_a_small_route_result_is_carried_whole(self):
         result = contract.result('run-one', None, text='done', events=[{'k': 1}])
@@ -228,9 +246,276 @@ class StartPathTest(unittest.TestCase):
     def test_a_route_result_of_many_escaped_characters_fits_the_budget(self):
         result = contract.result('run-one', None, text=chr(1) * (MAX_FRAME_BYTES // 2), detail='d')
         shown = adapter._status_result(result)
-        self.assertTrue(shown['truncated'] and shown['text'])
+        self.assertNotIn('truncated', shown)
+        self.assertTrue(shown['text'])
+        self.assertTrue(result_fits(shown), shown)
         self.assertLessEqual(adapter._wire_size(shown), adapter.RESULT_STATUS_BYTES)
         self.assertEqual((shown['status'], shown['code'], shown['detail']), ('ok', None, 'd'))
+
+    def test_a_large_detail_keeps_status_readable(self):
+        result = contract.result('run-one', None, text='kept', detail='d' * MAX_FRAME_BYTES)
+        fixed = {'status': result['status'], 'code': result['code'], 'detail': result['detail']}
+        self.assertGreater(adapter._wire_size(fixed), adapter.RESULT_STATUS_BYTES)
+        _, server = self.status_server(result)
+        status = SocketAPI(str(server.path), timeout_s=3).call('run.status', {'run_id': 'run-one'})
+        self.assertEqual(status['code'], 'ok', status)
+        carried = status['run']['result']
+        self.assertTrue(result_fits(carried), carried)
+        self.assertLessEqual(adapter._wire_size(carried), adapter.RESULT_STATUS_BYTES)
+        self.assertEqual(carried['text'], 'kept')
+        self.assertTrue(carried['detail'] and set(carried['detail']) <= {'d'})
+        self.assertLess(len(carried['detail']), len(result['detail']))
+        self.assertNotIn('truncated', carried)
+
+    def test_a_result_under_the_frame_but_over_the_status_budget_stays_readable(self):
+        # A budget equal to the whole frame would carry this result uncut, and the answer would then
+        # be too large. The carried result has to stay within a quarter of the frame.
+        quarter = MAX_FRAME_BYTES // 4
+        lo, hi, chosen = 0, MAX_FRAME_BYTES, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = contract.result('run-one', None, text='x' * mid)
+            size = adapter._wire_size(candidate)
+            if size <= MAX_FRAME_BYTES - 200:
+                chosen = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        self.assertIsNotNone(chosen)
+        self.assertGreater(adapter._wire_size(chosen), quarter)
+        self.assertLess(adapter._wire_size(chosen), MAX_FRAME_BYTES)
+        _, server = self.status_server(chosen)
+        status = SocketAPI(str(server.path), timeout_s=3).call('run.status', {'run_id': 'run-one'})
+        self.assertEqual(status['code'], 'ok', status)
+        carried = status['run']['result']
+        self.assertLessEqual(adapter._wire_size(carried), quarter)
+        self.assertTrue(result_fits(carried), carried)
+
+    def test_a_large_event_list_is_shortened_and_still_matches_the_record(self):
+        one = contract.event('text', 'vendor', {'n': 1})
+        result = contract.result('run-one', None, text='kept', events=[one] * 20000)
+        self.assertGreater(adapter._wire_size(result), adapter.RESULT_STATUS_BYTES)
+        shown = adapter._status_result(result)
+        self.assertEqual(shown['text'], 'kept')
+        self.assertLess(len(shown['events']), len(result['events']))
+        self.assertTrue(all(event == one for event in shown['events']))
+        self.assertLessEqual(adapter._wire_size(shown), adapter.RESULT_STATUS_BYTES)
+        self.assertTrue(result_fits(shown), shown)
+        self.assertNotIn('truncated', shown)
+
+    def test_a_large_limit_notice_is_dropped_so_the_result_still_fits(self):
+        result = contract.result('run-one', None, text='kept')
+        result['limit_notice'] = {'blob': 'n' * MAX_FRAME_BYTES}
+        shown = adapter._status_result(result)
+        self.assertIsNone(shown['limit_notice'])
+        self.assertEqual(shown['text'], 'kept')
+        self.assertLessEqual(adapter._wire_size(shown), adapter.RESULT_STATUS_BYTES)
+        self.assertTrue(result_fits(shown), shown)
+
+    # -- an interrupt one step after the callback still fences the published child -------------------
+    def test_an_interrupt_while_recording_the_result_still_fences_the_child(self):
+        ctx, process, daemon = self.published_run()
+        service = SimpleNamespace(handle=mock.Mock(return_value=contract.result(ctx.run_id, None, text='ok')))
+        starter = adapter.RouteStarter(service, {}, daemon, self.root, exit_grace_s=3.0)
+        starter._active[ctx.run_id] = ctx
+        real = starter._record_result
+
+        def boom(run_id, result):
+            starter._record_result = real
+            raise KeyboardInterrupt('record')
+
+        starter._record_result = boom
+        began = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            starter._drive(ctx, {})
+        self.assertLess(time.monotonic() - began, 2, 'an interrupt does not wait out the exit grace')
+        daemon.stop.assert_called_once_with(ctx.run_id)
+        self.assertEqual(process.fenced, ['route_interrupted'])
+        self.assertIsNone(process._out)
+        self.assertIsNone(process._pidfd)
+        self.assertFalse(starter.active(ctx.run_id))
+        self.assertEqual(ctx.result['text'], 'ok')
+
+    def test_an_interrupt_while_finishing_the_run_still_fences_the_child(self):
+        ctx, process, daemon = self.published_run()
+        service = SimpleNamespace(handle=mock.Mock(return_value=contract.result(ctx.run_id, None, text='ok')))
+        starter = adapter.RouteStarter(service, {}, daemon, self.root, exit_grace_s=3.0)
+        starter._active[ctx.run_id] = ctx
+        real = ctx.finished
+
+        def boom(result):
+            ctx.finished = real
+            raise KeyboardInterrupt('finish')
+
+        ctx.finished = boom
+        with self.assertRaises(KeyboardInterrupt):
+            starter._drive(ctx, {})
+        daemon.stop.assert_called_once_with(ctx.run_id)
+        self.assertEqual(process.fenced, ['route_interrupted'])
+        self.assertIsNone(process._out)
+        self.assertIsNone(process._pidfd)
+        self.assertEqual(ctx.result['text'], 'ok')
+        self.assertFalse(starter.active(ctx.run_id))
+
+    def test_an_interrupt_while_fencing_still_fences_and_shuts_the_child(self):
+        ctx, process, daemon = self.published_run()
+        service = SimpleNamespace(handle=mock.Mock(return_value=contract.result(ctx.run_id, None, text='ok')))
+        starter = adapter.RouteStarter(service, {}, daemon, self.root, exit_grace_s=3.0)
+        starter._active[ctx.run_id] = ctx
+        real = process.fence
+
+        def boom(reason):
+            process.fence = real
+            raise KeyboardInterrupt('fence')
+
+        process.fence = boom
+        with self.assertRaises(KeyboardInterrupt):
+            starter._drive(ctx, {})
+        self.assertEqual(process.fenced, ['route_interrupted'])
+        daemon.stop.assert_called_once_with(ctx.run_id)
+        self.assertIsNone(process._out)
+        self.assertIsNone(process._pidfd)
+        self.assertFalse(starter.active(ctx.run_id))
+
+    def test_an_interrupt_while_shutting_handles_shuts_them_on_the_retry(self):
+        ctx, process, daemon = self.published_run()
+        service = SimpleNamespace(handle=mock.Mock(return_value=contract.result(ctx.run_id, None, text='ok')))
+        starter = adapter.RouteStarter(service, {}, daemon, self.root, exit_grace_s=3.0)
+        starter._active[ctx.run_id] = ctx
+        real = process.close
+        calls = {'n': 0}
+
+        def boom():
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise KeyboardInterrupt('shut')
+            real()
+
+        process.close = boom
+        with self.assertRaises(KeyboardInterrupt):
+            starter._drive(ctx, {})
+        self.assertGreaterEqual(calls['n'], 2)
+        self.assertEqual(process.fenced, ['result_recorded'])
+        daemon.stop.assert_called_once_with(ctx.run_id)
+        self.assertIsNone(process._out)
+        self.assertIsNone(process._pidfd)
+        self.assertFalse(starter.active(ctx.run_id))
+
+    # -- a failed start does not label the attempt that takes the id next ---------------------------
+    def test_a_failed_worker_start_does_not_label_the_next_attempt(self):
+        routes = {'claude_code': {'deadline_s': 1, 'route': {}, 'binary': None}}
+        starter = adapter.RouteStarter(mock.Mock(), routes, mock.Mock(), self.root)
+        api = ControlAPI(InMemoryRunRegistry(), mock.Mock(), starter, time.time, new_run_id=lambda: 'run-one')
+        params = {'tenant': 't', 'engine': 'claude_code', 'prompt': 'p', 'client_key': 'one'}
+        gap = threading.Event()
+        second_done = threading.Event()
+        captured = {}
+
+        class Active(dict):
+            def pop(self, key, *args):
+                value = super().pop(key, *args)
+                if not captured.get('armed'):
+                    captured['armed'] = True
+                    starter._lock.opened = True
+                return value
+
+        class GapLock:
+            def __init__(self):
+                self._mu = threading.Lock()
+                self.opened = False
+
+            def __enter__(self):
+                self._mu.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                opened = self.opened
+                self.opened = False
+                self._mu.release()
+                if opened:
+                    gap.set()
+                    captured['waited'] = second_done.wait(3)
+                return False
+
+        starter._active = Active()
+        starter._lock = GapLock()
+        calls = {'n': 0}
+
+        def start(self):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise RuntimeError('worker unavailable')
+            raise ValueError('next')
+
+        def second():
+            try:
+                if not gap.wait(3):
+                    return
+                starter({**params, 'run_id': 'run-one'})
+            except adapter.StartRefused as exc:
+                captured['detail'] = exc.detail
+            finally:
+                second_done.set()
+
+        follower = threading.Thread(target=second, daemon=True)
+        self.addCleanup(lambda: follower.join(1))
+        follower.start()
+        with mock.patch.object(threading.Thread, 'start', start):
+            first = api.call('run.start', params)
+        self.assertTrue(captured.get('waited'), 'the next start did not run in the window')
+        self.assertEqual(first['code'], 'start_failed')
+        self.assertEqual(captured.get('detail'), 'ValueError')
+        self.assertEqual(starter.failures['run-one']['detail'], 'ValueError')
+        self.assertNotEqual(starter.failures['run-one']['detail'], 'RuntimeError')
+
+    # -- a planted temp directory, a symlink, and a file in the create window -----------------------
+    def test_a_result_temp_directory_is_replaced(self):
+        folder = self.run_dir()
+        tmp = folder / 'result.json.tmp'
+        tmp.mkdir()
+        starter = adapter.RouteStarter(None, {}, None, self.root)
+        starter._record_result('run-one', {'status': 'ok', 'code': None, 'detail': ''})
+        self.assertEqual(json.loads((folder / 'result.json').read_text()),
+                         {'status': 'ok', 'code': None, 'detail': ''})
+        self.assertFalse(tmp.exists())
+        self.assertNotIn('run-one', starter.results)
+
+    def test_a_nonempty_temp_directory_is_left_and_the_result_kept(self):
+        folder = self.run_dir()
+        tmp = folder / 'result.json.tmp'
+        tmp.mkdir()
+        (tmp / 'keep').write_text('x')
+        starter = adapter.RouteStarter(None, {}, None, self.root)
+        starter._record_result('run-one', {'status': 'ok', 'code': None, 'detail': ''})
+        self.assertEqual((tmp / 'keep').read_text(), 'x')
+        self.assertFalse((folder / 'result.json').exists())
+        self.assertEqual(starter.results['run-one']['status'], 'ok')
+
+    def test_a_symlink_result_is_not_read(self):
+        folder = self.run_dir()
+        secret = self.root / 'secret.json'
+        secret.write_text(json.dumps({'status': 'ok', 'code': None, 'detail': 'hidden'}))
+        (folder / 'result.json').symlink_to(secret)
+        control = object.__new__(adapter.DaemonControl)
+        control._state, control.starter = self.root, SimpleNamespace(results={})
+        self.assertIsNone(control._result('run-one'))
+
+    def test_a_temp_file_planted_in_the_create_window_is_not_written(self):
+        folder = self.run_dir()
+        starter = adapter.RouteStarter(None, {}, None, self.root)
+        real_open = os.open
+
+        def planting(path, flags, mode=0o777, *, dir_fd=None):
+            if str(path).endswith('result.json.tmp') and flags & os.O_EXCL:
+                real_open(path, os.O_CREAT | os.O_WRONLY | getattr(os, 'O_CLOEXEC', 0), 0o600)
+            if dir_fd is None:
+                return real_open(path, flags, mode)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch('os.open', side_effect=planting):
+            starter._record_result('run-one', {'status': 'ok', 'code': None, 'detail': ''})
+        self.assertFalse((folder / 'result.json').exists())
+        self.assertEqual(starter.results['run-one']['status'], 'ok')
 
 
 if __name__ == '__main__':

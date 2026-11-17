@@ -379,6 +379,45 @@ class RouteHomeTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"HOME": self.base}):
                     check(self.path, self.root)  # control
 
+    # Grok's pre-read of #401 (g1, 3905b856), R2 to R4: three rules whose removal left every test green.
+    def test_the_password_home_is_followed_through_its_links_too(self):
+        # R2: the password database's home is compared after links are followed, as $HOME is. Spelled through a link
+        # to the root, it names the route home, which is refused; compared as text, it would not be.
+        os.mkdir(self.path, 0o700)
+        link = os.path.join(self.base, "homes-link")
+        os.symlink(self.root, link)
+        spelled = os.path.join(link, "claude_code")
+        with mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=spelled)):
+            self.refused("route_home_is_operator_home", self.path)  # $HOME is the fixture's other folder
+
+    def test_dot_dot_in_a_home_goes_up_from_where_the_resolution_is_not_from_the_text(self):
+        # R3: "link/../homes/claude_code", where link points at the root, is the route home for the kernel (the link
+        # first, then its parent); read as text, ".." would take the link away and name base/homes/claude_code.
+        os.mkdir(self.path, 0o700)
+        link = os.path.join(self.base, "to-homes")
+        os.symlink(self.root, link)
+        spelled = os.path.join(link, "..", "homes", "claude_code")
+        self.assertNotEqual(os.path.normpath(spelled), self.path)  # the text alone names another folder
+        self.assertEqual(os.path.realpath(spelled), self.path)
+        with mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=spelled)):
+            self.refused("route_home_is_operator_home", self.path)
+        with mock.patch.dict(os.environ, {"HOME": spelled}):
+            self.refused("route_home_is_operator_home", self.path)
+
+    def test_a_sticky_bit_does_not_excuse_a_group_or_world_bit_below_the_root(self):
+        # R4: below the root, any bit of 0o077 is refused, sticky or not (above it, a sticky folder may be writable):
+        # another user could make a name in a sticky world-writable route home before private_dir does.
+        os.mkdir(self.path, 0o700)
+        for mode in (0o1777, 0o1770, 0o1702):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.path, mode)
+                error = self.refused("route_home_untrusted", self.path)
+                self.assertEqual(error.detail, f"{self.path} is open to group or world")
+        for mode in (0o1700, 0o2700):  # control: sticky or setgid with no group or world bit
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.path, mode)
+                check(self.path, self.root)
+
     def test_with_no_operators_home_known_the_check_refuses_rather_than_passes(self):
         # DeepSeek F4: an empty set of homes would let any path through the operator's-home rule.
         no_entry = mock.patch("pwd.getpwuid", side_effect=KeyError(os.geteuid()))

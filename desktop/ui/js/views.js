@@ -3,7 +3,8 @@
 // so the checks can hand it a stand-in.
 //
 // The approval region is the core's: only renderApproval draws in it, only from the opened request's
-// rendered lines, and no theme or panel reaches it (applyTheme writes to the workspace element alone).
+// rendered lines. applyTheme and applyLayout write only to the workspace element and, for a layout,
+// its own sections. Approvals, Stop, disclaimers and the floor are outside that element.
 
 import { field, sanitize } from "./sanitize.js";
 import { conditionsFor, deliveryNote, stopUnconfirmed } from "./model.js";
@@ -230,11 +231,35 @@ export function renderPlugins(doc, list, answer) {
   return rows.length;
 }
 
-// Theme tokens: the desktop's own names until lane PAGE publishes the theme API. A theme is applied whole
-// or not at all, only to the workspace element, only as colours, and only if its text keeps WCAG 2.2 AA
-// contrast (4.5:1 for text, 3:1 for the accent).
+// gui.theme/1 and gui.layout/1, the same documents the page reads. A document is applied whole or not
+// at all. Tokens are the five colours, plus optional density and radius. Contrast stays at 4.5:1 for
+// text and 3:1 for the accent. Nothing here fetches, and nothing here is taken from a plugin package.
 export const THEME_TOKENS = Object.freeze(["bg", "fg", "muted", "accent", "border"]);
-const COLOUR = /^#[0-9a-fA-F]{6}$/;
+const THEME_SCHEMA = "gui.theme/1";
+const LAYOUT_SCHEMA = "gui.layout/1";
+const THEME_DOC_KEYS = new Set(["schema", "name", "title", "tokens"]);
+const THEME_TOKEN_KEYS = new Set(["bg", "fg", "muted", "accent", "border", "density", "radius"]);
+const LAYOUT_DOC_KEYS = new Set(["schema", "name", "title", "columns", "slots"]);
+const SLOT_KEYS = new Set(["panel", "column", "span", "order", "collapsed"]);
+const DENSITY = new Set(["compact", "normal", "roomy"]);
+const RADIUS = new Set([0, 2, 4, 8]);
+const CORE_VIEWS = new Set(["routes", "reads", "interventions"]);
+const CORE_REGIONS = new Set(["stop", "approval", "header", "footer"]);
+const WORKSPACE_VIEWS = Object.freeze(["runs", "sessions", "start", "approvals", "plugins"]);
+const THEME_PROPS = Object.freeze([
+  "--theme-bg", "--theme-fg", "--theme-muted", "--theme-accent", "--theme-border", "--theme-density", "--theme-radius",
+]);
+const LAYOUT_PROPS = Object.freeze(["display", "grid-template-columns"]);
+const SECTION_PROPS = Object.freeze(["grid-column"]);
+const LAYOUT_ATTRS = Object.freeze(["data-column", "data-span", "data-order", "data-collapsed"]);
+const WORKSPACE_ATTRS = Object.freeze(["data-columns", "data-layout", "data-draw-columns"]);
+const NAME = /^[a-z][a-z0-9_-]{0,63}$/;
+const COLOUR = /^#[0-9A-Fa-f]{6}$/;
+const PANEL = /^[A-Za-z0-9_.-]{1,96}$/;
+const THEME_MAX = 8192;
+const LAYOUT_MAX = 65536;
+const JSON_MAX_DEPTH = 32;
+const NARROW_PX = 768;
 
 function channel(v) {
   const c = v / 255;
@@ -251,16 +276,470 @@ export function contrast(a, b) {
   return (hi + 0.05) / (lo + 0.05);
 }
 
-export function applyTheme(workspace, tokens) {
-  if (!isMapping(tokens)) return { applied: false, reason: "a theme is a set of named colours" };
-  for (const [name, value] of Object.entries(tokens)) {
-    if (!THEME_TOKENS.includes(name)) return { applied: false, reason: `unknown token ${field(name)}` };
-    if (typeof value !== "string" || !COLOUR.test(value)) return { applied: false, reason: `${name} is not a colour` };
+function refused(reason) {
+  return { applied: false, reason };
+}
+
+function ownKeys(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  return Object.keys(value);
+}
+
+function byteLength(text) {
+  if (typeof TextEncoder === "function") return new TextEncoder().encode(text).length;
+  return text.length;
+}
+
+// JSON text, refused on a duplicate member or a number that is not an integer. json.parse keeps the
+// last duplicate and turns 4.0 into 4, so the fixtures that pin those two defects have to be read here.
+function readJson(text, maxBytes) {
+  if (typeof text !== "string") return { ok: false, reason: "not_json" };
+  if (byteLength(text) > maxBytes) return { ok: false, reason: "too_large" };
+  try {
+    scanJson(text);
+  } catch (err) {
+    return { ok: false, reason: err && err.reason ? err.reason : "not_json" };
   }
-  for (const name of THEME_TOKENS) if (!(name in tokens)) return { applied: false, reason: `${name} is missing` };
-  if (contrast(tokens.fg, tokens.bg) < 4.5) return { applied: false, reason: "text contrast below 4.5:1" };
-  if (contrast(tokens.muted, tokens.bg) < 4.5) return { applied: false, reason: "muted text contrast below 4.5:1" };
-  if (contrast(tokens.accent, tokens.bg) < 3) return { applied: false, reason: "accent contrast below 3:1" };
-  for (const name of THEME_TOKENS) workspace.style.setProperty(`--theme-${name}`, tokens[name]);
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch {
+    return { ok: false, reason: "not_json" };
+  }
+}
+
+function scanJson(text) {
+  let i = 0;
+  let depth = 0;
+  const n = text.length;
+  const fail = (reason) => {
+    const err = new Error(reason);
+    err.reason = reason;
+    throw err;
+  };
+  const ws = () => {
+    while (i < n) {
+      const c = text[i];
+      if (c !== " " && c !== "\n" && c !== "\r" && c !== "\t") return;
+      i += 1;
+    }
+  };
+  const parseString = () => {
+    if (text[i] !== "\"") fail("not_json");
+    i += 1;
+    let out = "";
+    while (i < n) {
+      const c = text[i];
+      i += 1;
+      if (c === "\"") return out;
+      if (c === "\\") {
+        if (i >= n) fail("not_json");
+        const e = text[i];
+        i += 1;
+        if (e === "\"" || e === "\\" || e === "/") out += e;
+        else if (e === "b") out += "\b";
+        else if (e === "f") out += "\f";
+        else if (e === "n") out += "\n";
+        else if (e === "r") out += "\r";
+        else if (e === "t") out += "\t";
+        else if (e === "u") {
+          const hex = text.slice(i, i + 4);
+          if (!/^[0-9a-fA-F]{4}$/.test(hex)) fail("not_json");
+          out += String.fromCharCode(Number.parseInt(hex, 16));
+          i += 4;
+        } else fail("not_json");
+      } else if (c.charCodeAt(0) < 0x20) fail("not_json");
+      else out += c;
+    }
+    fail("not_json");
+  };
+  const parseNumber = () => {
+    if (text[i] === "-") i += 1;
+    if (text[i] === "0") i += 1;
+    else if (text[i] >= "1" && text[i] <= "9") {
+      while (text[i] >= "0" && text[i] <= "9") i += 1;
+    } else fail("not_json");
+    let integer = true;
+    if (text[i] === ".") {
+      integer = false;
+      i += 1;
+      if (!(text[i] >= "0" && text[i] <= "9")) fail("not_json");
+      while (text[i] >= "0" && text[i] <= "9") i += 1;
+    }
+    if (text[i] === "e" || text[i] === "E") {
+      integer = false;
+      i += 1;
+      if (text[i] === "+" || text[i] === "-") i += 1;
+      if (!(text[i] >= "0" && text[i] <= "9")) fail("not_json");
+      while (text[i] >= "0" && text[i] <= "9") i += 1;
+    }
+    if (!integer) fail("not_integer");
+  };
+  const parseLiteral = (word) => {
+    if (text.slice(i, i + word.length) !== word) fail("not_json");
+    i += word.length;
+  };
+  const parseValue = () => {
+    ws();
+    if (i >= n) fail("not_json");
+    const c = text[i];
+    if (c === "\"") return parseString();
+    if (c === "{") return parseObject();
+    if (c === "[") return parseArray();
+    if (c === "t") return parseLiteral("true");
+    if (c === "f") return parseLiteral("false");
+    if (c === "n") return parseLiteral("null");
+    if (c === "-" || (c >= "0" && c <= "9")) return parseNumber();
+    return fail("not_json");
+  };
+  const parseObject = () => {
+    if (depth >= JSON_MAX_DEPTH) fail("not_json");
+    depth += 1;
+    i += 1;
+    const keys = new Set();
+    ws();
+    if (text[i] === "}") {
+      i += 1;
+      depth -= 1;
+      return;
+    }
+    while (true) {
+      ws();
+      const key = parseString();
+      if (keys.has(key)) fail("duplicate_key");
+      keys.add(key);
+      ws();
+      if (text[i] !== ":") fail("not_json");
+      i += 1;
+      parseValue();
+      ws();
+      if (text[i] === "}") {
+        i += 1;
+        depth -= 1;
+        return;
+      }
+      if (text[i] !== ",") fail("not_json");
+      i += 1;
+    }
+  };
+  const parseArray = () => {
+    if (depth >= JSON_MAX_DEPTH) fail("not_json");
+    depth += 1;
+    i += 1;
+    ws();
+    if (text[i] === "]") {
+      i += 1;
+      depth -= 1;
+      return;
+    }
+    while (true) {
+      parseValue();
+      ws();
+      if (text[i] === "]") {
+        i += 1;
+        depth -= 1;
+        return;
+      }
+      if (text[i] !== ",") fail("not_json");
+      i += 1;
+    }
+  };
+  parseValue();
+  ws();
+  if (i !== n) fail("not_json");
+}
+
+function documentValue(document, maxBytes) {
+  if (typeof document === "string") return readJson(document, maxBytes);
+  if (!isMapping(document)) return { ok: false, reason: "not_object" };
+  return { ok: true, value: document };
+}
+
+function readProp(style, name) {
+  if (style && typeof style.getPropertyValue === "function") {
+    const value = style.getPropertyValue(name);
+    return value ? String(value) : "";
+  }
+  if (style && style.props instanceof Map && style.props.has(name)) return String(style.props.get(name));
+  return "";
+}
+
+function clearProp(style, name) {
+  if (style && typeof style.removeProperty === "function") style.removeProperty(name);
+}
+
+function canStyle(node) {
+  return Boolean(node && node.style && typeof node.style.setProperty === "function");
+}
+
+function writeProps(style, managed, entries) {
+  const previous = new Map();
+  for (const name of managed) previous.set(name, readProp(style, name));
+  try {
+    for (const name of managed) clearProp(style, name);
+    for (const [name, value] of entries) style.setProperty(name, value);
+  } catch (err) {
+    for (const name of managed) {
+      const old = previous.get(name) || "";
+      try {
+        if (old) style.setProperty(name, old);
+        else clearProp(style, name);
+      } catch {
+        // Report the original failure. A second failure while putting the old value back stops nothing else.
+      }
+    }
+    throw err;
+  }
+}
+
+function themeTitleOk(title) {
+  if (typeof title !== "string" || title.length < 1 || title.length > 100) return false;
+  for (let i = 0; i < title.length; i += 1) {
+    const code = title.charCodeAt(i);
+    if (code < 32 || code === 127) return false;
+  }
+  return true;
+}
+
+function layoutTitleOk(title) {
+  return typeof title === "string" && title.length >= 1 && title.length <= 100 && title.trim().length > 0;
+}
+
+function parseThemeValue(data) {
+  const keys = ownKeys(data);
+  if (keys === null) return { ok: false, reason: "not_object" };
+  if (keys.some((key) => !THEME_DOC_KEYS.has(key))) return { ok: false, reason: "unknown_key" };
+  if (![...THEME_DOC_KEYS].every((key) => keys.includes(key))) return { ok: false, reason: "missing_key" };
+  if (data.schema !== THEME_SCHEMA) return { ok: false, reason: "schema" };
+  if (typeof data.name !== "string" || NAME.test(data.name) !== true) return { ok: false, reason: "name" };
+  if (!themeTitleOk(data.title)) return { ok: false, reason: "title" };
+  const tokenKeys = ownKeys(data.tokens);
+  if (tokenKeys === null) return { ok: false, reason: "tokens" };
+  if (tokenKeys.some((key) => !THEME_TOKEN_KEYS.has(key))) return { ok: false, reason: "token_unknown" };
+  if (!THEME_TOKENS.every((key) => tokenKeys.includes(key))) return { ok: false, reason: "token_missing" };
+  const colours = {};
+  for (const name of THEME_TOKENS) {
+    const value = data.tokens[name];
+    if (typeof value !== "string" || COLOUR.test(value) !== true) return { ok: false, reason: "colour" };
+    colours[name] = value.toLowerCase();
+  }
+  let density = null;
+  if (tokenKeys.includes("density")) {
+    density = data.tokens.density;
+    if (typeof density !== "string" || !DENSITY.has(density)) return { ok: false, reason: "density" };
+  }
+  let radius = null;
+  if (tokenKeys.includes("radius")) {
+    radius = data.tokens.radius;
+    if (typeof radius !== "number" || Number.isSafeInteger(radius) !== true || !RADIUS.has(radius)) {
+      return { ok: false, reason: "radius" };
+    }
+  }
+  if (contrast(colours.fg, colours.bg) < 4.5 || contrast(colours.muted, colours.bg) < 4.5) {
+    return { ok: false, reason: "contrast" };
+  }
+  if (contrast(colours.accent, colours.bg) < 3) return { ok: false, reason: "contrast" };
+  const entries = THEME_TOKENS.map((name) => [`--theme-${name}`, colours[name]]);
+  if (density !== null) entries.push(["--theme-density", density]);
+  if (radius !== null) entries.push(["--theme-radius", `${radius}px`]);
+  return { ok: true, entries };
+}
+
+export function applyTheme(workspace, document) {
+  if (document == null) return refused("none");
+  const read = documentValue(document, THEME_MAX);
+  if (!read.ok) return refused(read.reason);
+  const parsed = parseThemeValue(read.value);
+  if (!parsed.ok) return refused(parsed.reason);
+  if (!canStyle(workspace)) return refused("no_workspace");
+  writeProps(workspace.style, THEME_PROPS, parsed.entries);
+  return { applied: true };
+}
+
+function knownPanels(workspace, options) {
+  const ids = new Set(CORE_VIEWS);
+  for (const view of WORKSPACE_VIEWS) ids.add(view);
+  const children = workspace && workspace.children ? workspace.children : [];
+  for (const child of children) {
+    if (!child || typeof child.getAttribute !== "function") continue;
+    const view = child.getAttribute("data-view");
+    const panel = child.getAttribute("data-panel");
+    if (typeof view === "string" && view) ids.add(view);
+    if (typeof panel === "string" && panel) ids.add(panel);
+  }
+  const extra = options && Array.isArray(options.knownPanels) ? options.knownPanels : [];
+  for (const id of extra) if (typeof id === "string" && id) ids.add(id);
+  for (const region of CORE_REGIONS) ids.delete(region);
+  return ids;
+}
+
+function viewportWidth(workspace, options) {
+  if (options && typeof options.viewportWidth === "number") return options.viewportWidth;
+  const view = workspace && workspace.ownerDocument && workspace.ownerDocument.defaultView;
+  if (view && typeof view.innerWidth === "number") return view.innerWidth;
+  return null;
+}
+
+function parseLayoutValue(data, known) {
+  const keys = ownKeys(data);
+  if (keys === null) return { ok: false, reason: "not_object" };
+  if (keys.some((key) => !LAYOUT_DOC_KEYS.has(key))) return { ok: false, reason: "unknown_key" };
+  if (![...LAYOUT_DOC_KEYS].every((key) => keys.includes(key))) return { ok: false, reason: "missing_key" };
+  if (data.schema !== LAYOUT_SCHEMA) return { ok: false, reason: "schema" };
+  if (typeof data.name !== "string" || NAME.test(data.name) !== true) return { ok: false, reason: "name" };
+  if (!layoutTitleOk(data.title)) return { ok: false, reason: "title" };
+  if (typeof data.columns !== "number" || Number.isSafeInteger(data.columns) !== true || data.columns < 1 || data.columns > 3) {
+    return { ok: false, reason: "columns" };
+  }
+  if (!Array.isArray(data.slots)) return { ok: false, reason: "slots" };
+  const seen = new Set();
+  const slots = [];
+  for (let index = 0; index < data.slots.length; index += 1) {
+    const slot = data.slots[index];
+    const slotKeys = ownKeys(slot);
+    if (slotKeys === null) return { ok: false, reason: "slot" };
+    if (slotKeys.some((key) => !SLOT_KEYS.has(key))) return { ok: false, reason: "unknown_key" };
+    if (![...SLOT_KEYS].every((key) => slotKeys.includes(key))) return { ok: false, reason: "slot" };
+    const panel = slot.panel;
+    if (typeof panel !== "string" || PANEL.test(panel) !== true || CORE_REGIONS.has(panel) || !known.has(panel) || seen.has(panel)) {
+      return { ok: false, reason: "panel" };
+    }
+    seen.add(panel);
+    const column = slot.column;
+    const span = slot.span;
+    if (typeof column !== "number" || Number.isSafeInteger(column) !== true || column < 1 || column > data.columns) {
+      return { ok: false, reason: "column" };
+    }
+    if (typeof span !== "number" || Number.isSafeInteger(span) !== true || span < 1 || span > 3 || column + span - 1 > data.columns) {
+      return { ok: false, reason: "span" };
+    }
+    if (typeof slot.order !== "number" || Number.isSafeInteger(slot.order) !== true) return { ok: false, reason: "order" };
+    if (typeof slot.collapsed !== "boolean") return { ok: false, reason: "collapsed" };
+    slots.push({ panel, column, span, order: slot.order, collapsed: slot.collapsed, index });
+  }
+  slots.sort((a, b) => a.column - b.column || a.order - b.order || a.index - b.index);
+  return { ok: true, name: data.name, columns: data.columns, slots };
+}
+
+function elementChildren(node) {
+  if (!node || !node.childNodes) return [];
+  return [...node.childNodes].filter((child) => child && child.nodeType === 1);
+}
+
+function sectionId(section) {
+  if (!section || typeof section.getAttribute !== "function") return "";
+  return section.getAttribute("data-panel") || section.getAttribute("data-view") || "";
+}
+
+function snapshotAttrs(node, names) {
+  const out = new Map();
+  for (const name of names) out.set(name, node.getAttribute(name));
+  return out;
+}
+
+function restoreAttrs(node, snap) {
+  for (const [name, value] of snap) {
+    if (value === null) node.removeAttribute(name);
+    else node.setAttribute(name, value);
+  }
+}
+
+function snapshotProps(style, names) {
+  const out = new Map();
+  for (const name of names) out.set(name, readProp(style, name));
+  return out;
+}
+
+function restoreProps(style, snap) {
+  for (const [name, value] of snap) {
+    if (value) style.setProperty(name, value);
+    else clearProp(style, name);
+  }
+}
+
+export function applyLayout(workspace, document, options = undefined) {
+  if (document == null) return refused("none");
+  const read = documentValue(document, LAYOUT_MAX);
+  if (!read.ok) return refused(read.reason);
+  const parsed = parseLayoutValue(read.value, knownPanels(workspace, options));
+  if (!parsed.ok) return refused(parsed.reason);
+  if (!canStyle(workspace) || typeof workspace.setAttribute !== "function" || typeof workspace.getAttribute !== "function") {
+    return refused("no_workspace");
+  }
+  const width = viewportWidth(workspace, options);
+  const narrow = typeof width === "number" && width < NARROW_PX;
+  const drawColumns = narrow ? 1 : parsed.columns;
+  const sections = elementChildren(workspace).filter((child) => child.tagName === "SECTION" || sectionId(child));
+  const byId = new Map();
+  for (const section of sections) {
+    const id = sectionId(section);
+    if (id && !byId.has(id)) byId.set(id, section);
+  }
+  const placed = [];
+  const used = new Set();
+  for (const slot of parsed.slots) {
+    const section = byId.get(slot.panel);
+    if (section && !used.has(section)) {
+      placed.push(section);
+      used.add(section);
+    }
+  }
+  const rest = elementChildren(workspace).filter((child) => !used.has(child));
+  const previousOrder = workspace.childNodes ? [...workspace.childNodes] : null;
+  const previousWorkspaceAttrs = snapshotAttrs(workspace, WORKSPACE_ATTRS);
+  const previousWorkspaceProps = snapshotProps(workspace.style, LAYOUT_PROPS);
+  const previousSections = elementChildren(workspace).map((section) => ({
+    section,
+    attrs: snapshotAttrs(section, LAYOUT_ATTRS),
+    props: canStyle(section) ? snapshotProps(section.style, SECTION_PROPS) : new Map(),
+  }));
+  const restore = () => {
+    try {
+      restoreAttrs(workspace, previousWorkspaceAttrs);
+      for (const row of previousSections) {
+        restoreAttrs(row.section, row.attrs);
+        if (canStyle(row.section)) restoreProps(row.section.style, row.props);
+      }
+      if (previousOrder && typeof workspace.replaceChildren === "function") workspace.replaceChildren(...previousOrder);
+      restoreProps(workspace.style, previousWorkspaceProps);
+    } catch {
+      // The original failure is reported by the caller.
+    }
+  };
+  try {
+    for (const row of previousSections) {
+      for (const name of LAYOUT_ATTRS) row.section.removeAttribute(name);
+      if (canStyle(row.section)) clearProp(row.section.style, "grid-column");
+    }
+    for (const slot of parsed.slots) {
+      const section = byId.get(slot.panel);
+      if (!section) continue;
+      section.setAttribute("data-column", String(slot.column));
+      section.setAttribute("data-span", String(slot.span));
+      section.setAttribute("data-order", String(slot.order));
+      section.setAttribute("data-collapsed", slot.collapsed ? "true" : "false");
+      if (canStyle(section)) {
+        section.style.setProperty("grid-column", narrow ? "auto" : `${slot.column} / span ${slot.span}`);
+      }
+    }
+    const desktopPlaced = parsed.slots.some((slot) => WORKSPACE_VIEWS.includes(slot.panel) && byId.has(slot.panel));
+    if (!desktopPlaced) {
+      for (const section of sections) {
+        if (section.hidden === true || !canStyle(section)) continue;
+        section.style.setProperty("grid-column", `1 / span ${drawColumns}`);
+      }
+    }
+    workspace.setAttribute("data-columns", String(parsed.columns));
+    workspace.setAttribute("data-layout", parsed.name);
+    workspace.setAttribute("data-draw-columns", String(drawColumns));
+    workspace.style.setProperty("display", "grid");
+    workspace.style.setProperty("grid-template-columns", narrow ? "minmax(0, 1fr)" : `repeat(${drawColumns}, minmax(0, 1fr))`);
+    if (typeof workspace.replaceChildren === "function") {
+      const keptText = previousOrder ? previousOrder.filter((node) => !node || node.nodeType !== 1) : [];
+      workspace.replaceChildren(...placed, ...rest, ...keptText);
+    }
+  } catch (err) {
+    restore();
+    throw err;
+  }
   return { applied: true };
 }

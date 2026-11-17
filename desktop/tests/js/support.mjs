@@ -14,6 +14,16 @@ class FakeStyle {
   setProperty(name, value) {
     this.props.set(name, value);
   }
+
+  getPropertyValue(name) {
+    return this.props.has(name) ? this.props.get(name) : "";
+  }
+
+  removeProperty(name) {
+    const previous = this.getPropertyValue(name);
+    this.props.delete(name);
+    return previous;
+  }
 }
 
 class FakeText {

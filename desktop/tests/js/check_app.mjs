@@ -443,3 +443,30 @@ test("a start that is refused by the daemon is not acknowledged as started", asy
   assert.match(text(doc, "start-conditions"), /start error: launch_refused breaker_admission_missing/);
   assert.doesNotMatch(text(doc, "start-conditions"), /STARTED/);
 });
+
+test("a layout keeps placed sections shown together and a plain window still shows one view", async () => {
+  const layout = {
+    schema: "gui.layout/1",
+    name: "desk",
+    title: "Desktop sections",
+    columns: 2,
+    slots: [
+      { panel: "runs", column: 1, span: 1, order: 0, collapsed: false },
+      { panel: "sessions", column: 2, span: 1, order: 0, collapsed: false },
+    ],
+  };
+  const laid = windowDocument();
+  await startWindow(laid, replayTransport([]), makeActions(), { layout });
+  assert.equal(laid.isShown(laid.querySelectorAll("main > section").find((section) => section.dataset.view === "runs")), true);
+  assert.equal(laid.isShown(laid.querySelectorAll("main > section").find((section) => section.dataset.view === "sessions")), true);
+  await press(laid, nav(laid, "sessions"));
+  assert.deepEqual(views(laid).sort(), ["runs", "sessions"]);
+  assert.equal(byId(laid, "core-approval").style.props.size, 0);
+  assert.equal(byId(laid, "stop-confirm").hidden, true);
+
+  const plain = windowDocument();
+  await startWindow(plain, replayTransport([]));
+  assert.deepEqual(views(plain), ["runs"]);
+  await press(plain, nav(plain, "sessions"));
+  assert.deepEqual(views(plain), ["sessions"]);
+});

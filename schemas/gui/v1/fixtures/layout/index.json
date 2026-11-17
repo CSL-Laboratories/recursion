@@ -1,0 +1,19 @@
+{
+  "about": "Every fixture of gui.layout/1. A file under good/ parses and validates. A file under bad/ is refused by the parser and is invalid for the schema.",
+  "fixtures": [
+    {"file": "good/h01-two-columns.json", "shows": "Routes and reads in column 1, interventions in column 2."},
+    {"file": "good/h02-no-panels.json", "shows": "No slots. The page still draws Stop and the disclaimers."},
+    {"file": "good/h03-one-panel-in-column-2.json", "shows": "One third-party panel in column 2."},
+    {"file": "good/h04-three-columns-and-a-span.json", "shows": "A span of 2 and a collapsed panel in column 3."},
+    {"file": "bad/b01-stop.json", "shows": "A slot named stop is a core region."},
+    {"file": "bad/b02-approval.json", "shows": "A slot named approval is a core region."},
+    {"file": "bad/b03-header.json", "shows": "A slot named header is a core region."},
+    {"file": "bad/b04-footer.json", "shows": "A slot named footer is a core region."},
+    {"file": "bad/b05-z-index.json", "shows": "z-index is not a layout field."},
+    {"file": "bad/b06-pixels.json", "shows": "A pixel size is not a layout field."},
+    {"file": "bad/b07-overlay.json", "shows": "overlay is not a layout field."},
+    {"file": "bad/b08-hide-core.json", "shows": "hide-core is not a layout field."},
+    {"file": "bad/b09-columns-zero.json", "shows": "columns is 1, 2 or 3."},
+    {"file": "bad/b10-span-past-columns.json", "shows": "column 2 span 2 does not fit in 2 columns."}
+  ]
+}

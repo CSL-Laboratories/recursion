@@ -1,0 +1,9 @@
+{
+  "schema": "gui.layout/1",
+  "name": "badfooter",
+  "title": "Names footer",
+  "columns": 1,
+  "slots": [
+    {"panel": "footer", "column": 1, "span": 1, "order": 0, "collapsed": false}
+  ]
+}

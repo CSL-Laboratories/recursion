@@ -10,12 +10,18 @@ import { listAllRuns } from "./model.js";
 import { field } from "./sanitize.js";
 import { inertTransport, RefusedHere, send } from "./transport.js";
 import {
-  renderApproval, renderApprovalList, renderConditions, renderPlugins, renderRoutes, renderRuns, renderSession,
-  renderSessions, renderTranscript,
+  applyLayout, applyTheme, renderApproval, renderApprovalList, renderConditions, renderPlugins, renderRoutes,
+  renderRuns, renderSession, renderSessions, renderTranscript,
 } from "./views.js";
 
-export function startWindow(doc, transport, actions = makeActions()) {
+export function startWindow(doc, transport, actions = makeActions(), appearance = null) {
   const $ = (id) => doc.getElementById(id);
+  // Operator documents only. This build does not load a plugin theme or a plugin layout, and it fetches nothing.
+  const chosen = appearance !== null && typeof appearance === "object" && !Array.isArray(appearance) ? appearance : null;
+  applyTheme($("workspace"), chosen === null ? null : chosen.theme ?? null);
+  applyLayout($("workspace"), chosen === null ? null : chosen.layout ?? null, {
+    knownPanels: chosen !== null && Array.isArray(chosen.panels) ? chosen.panels : undefined,
+  });
 
   // The status line shows the local refusal ("Not sent: ...") of one call of one action. Each call is
   // numbered. A newer call of the same action makes that refusal obsolete and takes it off the line when it
@@ -210,7 +216,18 @@ export function startWindow(doc, transport, actions = makeActions()) {
   };
 
   function show(view) {
-    for (const section of doc.querySelectorAll("main > section")) section.hidden = section.dataset.view !== view;
+    const workspace = $("workspace");
+    const laidOut = workspace !== null && workspace.getAttribute("data-layout") !== null;
+    for (const section of doc.querySelectorAll("main > section")) {
+      const placed = laidOut
+        && section.getAttribute("data-column") !== null
+        && section.getAttribute("data-collapsed") !== "true";
+      if (placed) {
+        section.hidden = false;
+        continue;
+      }
+      section.hidden = section.dataset.view !== view;
+    }
     for (const button of doc.querySelectorAll("nav button")) {
       if (button.dataset.view === view) button.setAttribute("aria-current", "page");
       else button.removeAttribute("aria-current");

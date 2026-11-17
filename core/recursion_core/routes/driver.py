@@ -407,10 +407,25 @@ def _matches(value: object, pattern: re.Pattern, field: str) -> str:
     return value
 
 
-def _count(value: object, field: str) -> int:
-    """A JSON integer of 0 or more; a bool is not one. No ceiling: event.v1 sets none."""
-    if type(value) is bool or not isinstance(value, int) or value < 0:
+def _whole_number(value: object, field: str, *, fraction: bool) -> None:
+    """A JSON number of 0 or more. A bool is not one. When ``fraction`` is false the value must be a
+    whole number, and a float whose value is whole (``0.0``, ``1e0``) counts: that is what event.v1's
+    integer means. The value is not rewritten. No ceiling: event.v1 sets none."""
+    if type(value) is bool:
         raise DriverInputError(field)
+    if type(value) is int:
+        if value < 0:
+            raise DriverInputError(field)
+        return
+    if (type(value) is float and math.isfinite(value) and value >= 0
+            and (fraction or value.is_integer())):
+        return
+    raise DriverInputError(field)
+
+
+def _count(value: object, field: str) -> object:
+    """A JSON integer of 0 or more, kept as given."""
+    _whole_number(value, field, fraction=False)
     return value
 
 
@@ -631,8 +646,5 @@ def check_measurement(value: object, *, integer: bool, field: str) -> None:
         return
     if quality not in ("known", "lower_bound") or provenance not in ("observed", "modelled", "inferred"):
         raise DriverInputError(field)
-    kinds = (int,) if integer else (int, float)
-    if type(number) is bool or not isinstance(number, kinds) or number < 0:
-        raise DriverInputError(field)
-    if isinstance(number, float) and not math.isfinite(number):  # an int is never converted: no overflow
-        raise DriverInputError(field)
+    # An int is never converted: no overflow. An integral float stays a float; it is still a whole number.
+    _whole_number(number, field, fraction=not integer)

@@ -172,8 +172,8 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   screen shows the API's own answer: `status=stopped`, or `status=pending` plus an `UNCERTAIN` line.
   Stop needs no input lease and has its own request lane, so it never waits behind a slow read. Keys are
   handled before queued output each tick.
-- Stale (snapshot older than `stale_after_s` or taken at a time that is not a number, a failed refresh, or
-  an answer marked `stale`) forces `watch_only`. A `run.list` or `run.status` marked `stale` keeps it until
+- Stale (snapshot older than `stale_after_s` or of an age that is no number, infinite or below zero,
+  a failed refresh, or an answer marked `stale`) forces `watch_only`. A `run.list` or `run.status` marked `stale` keeps it until
   a later answer of the same method is not; an answer to another method (a Stop) does not end it. Start
   is refused locally; reads and Stop stay available.
 - Every request, answer, condition edge, engine output chunk, notice and error is an event in
@@ -183,8 +183,8 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   `UNRECONCILED changed: ...`, `UNRECONCILED cleared, was: ...`), not again after every command. A
   usage error says only the error. `UNCERTAIN` for a run stays until the API attests the stop: it lists
   that run as `stopped`, or answers `stopped` to a Stop of it. A run listed with no stop record does not
-  clear it, since a pending Stop whose registry write failed leaves exactly that. A `run.list` or `run.status`
-  asked before a Stop was confirmed does not show that run running again. A start's `UNCERTAIN` stays
+  clear it, since a pending Stop whose registry write failed leaves exactly that. A `run.list`, `run.status` or `run.start`
+  answer asked before a Stop was first confirmed does not show that run running again. A start's `UNCERTAIN` stays
   until a list or a status names its run. The `conditions` command says the current set again on demand. The CLI has the same
   command (`recursion-control conditions`), which reads `run.list` because it keeps no state. No control
   API method was added.

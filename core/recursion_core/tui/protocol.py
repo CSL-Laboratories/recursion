@@ -128,7 +128,7 @@ def keyed_conditions(answer: Mapping) -> list[tuple[str, str, str]]:
                       f"reason={field(answer.get('reason', 'unknown'))}; run may still be running"))
     elif code == START_UNCONFIRMED:  # never a refusal: the run may be running (the triage of Nov 16, T23)
         run = answer.get("run")
-        rid = run.get("run_id") if isinstance(run, Mapping) else answer.get("run_id")
+        rid = run.get("run_id") if isinstance(run, Mapping) and run.get("run_id") is not None else answer.get("run_id")
         found.append((UNCERTAIN, f"start={rid}",
                       f"start not confirmed for run={field(rid)}: detail={field(answer.get('detail', 'unknown'))}; "
                       f"the run may be running"))

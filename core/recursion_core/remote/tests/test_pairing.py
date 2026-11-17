@@ -32,8 +32,8 @@ class ScopeTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "scope_invalid")
 
     def test_scopes_come_back_in_one_order(self) -> None:
-        self.assertEqual(device_scopes(["approve", "read"]), ("read", "approve"))
-        self.assertEqual(device_scopes(("run", "approve", "read")), ("read", "run", "approve"))
+        self.assertEqual(device_scopes(["stop", "read"]), ("read", "stop"))
+        self.assertEqual(device_scopes(("read", "stop")), ("read", "stop"))
 
     def test_a_label_is_printable_ascii_with_no_control_or_direction_characters(self) -> None:
         self.assertEqual(device_label("Owner's phone"), "Owner's phone")
@@ -53,10 +53,10 @@ class OfferTests(unittest.TestCase):
         return caught.exception.code
 
     def test_an_offer_redeems_once_with_its_own_scopes_and_label(self) -> None:
-        offer = self.book.issue(scopes=["read", "approve"], label="phone")
+        offer = self.book.issue(scopes=["read", "stop"], label="phone")
         grant = self.book.redeem(offer.offer_id, offer.code, source="phone")
         self.assertIsInstance(grant, PairingGrant)
-        self.assertEqual((grant.scopes, grant.label, grant.offer_id), (("read", "approve"), "phone", offer.offer_id))
+        self.assertEqual((grant.scopes, grant.label, grant.offer_id), (("read", "stop"), "phone", offer.offer_id))
         self.assertTrue(grant.device_id.startswith("dev_"))
         self.assertEqual(self.refused(offer.offer_id, offer.code), "pairing_code_used")
         self.assertEqual(self.book.state(offer.offer_id), REDEEMED)
@@ -152,7 +152,7 @@ class OfferTests(unittest.TestCase):
         self.assertEqual(outcome, ["pairing_code_used"])
 
     def test_racing_redemptions_of_one_offer_give_exactly_one_grant(self) -> None:
-        offer = self.book.issue(scopes=["read", "run"], label="phone")
+        offer = self.book.issue(scopes=["read", "stop"], label="phone")
         workers = 16
         barrier = threading.Barrier(workers)
         grants, refusals, lock = [], [], threading.Lock()

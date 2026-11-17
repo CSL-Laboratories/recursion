@@ -722,11 +722,18 @@ def _locations(schemas: dict) -> dict:
 
 
 def _supported(schemas: dict) -> dict:
-    """The schema locations of a checked set: the published set's are found once, any other set's every time."""
+    """The schema locations of a checked set: the published set's are found once, any other set's every time.
+
+    The published map is one assignment under the same lock as the schema set. A reader never sees a map
+    that is only partly filled, and a check that does not finish leaves the previous map in place so the
+    next reader tries again.
+    """
+    global _READ_LOCATIONS
     if schemas is _READ and _READ:
-        if not _READ_LOCATIONS:
-            _READ_LOCATIONS.update(_locations(_READ))
-        return _READ_LOCATIONS
+        with _PUBLISH_LOCK:
+            if not _READ_LOCATIONS:
+                _READ_LOCATIONS = _locations(_READ)
+            return _READ_LOCATIONS
     return _locations(schemas)
 
 
@@ -1197,13 +1204,14 @@ def task_of_run(view: dict, events: list = (), pending_approval_ids: list = ()) 
     """
     state, run_id, result = view["state"], view["run_id"], view.get("result")
     created_at, updated_at = _log_times(list(events), "run", run_id)
-    # A run id that starts with turn- would be the same Task id as a turn of that id. Prefix it when the
-    # result still fits the 64-character task id.
+    # A run id that starts with turn- would be the same Task id as a turn of that id. Carry it
+    # as run- plus that id. When that would pass 64 characters, refuse: leaving the run id would emit a turn id.
     task_id = run_id
     if isinstance(run_id, str) and run_id.startswith("turn-"):
-        prefixed = "run-" + run_id
-        if len(prefixed) <= 64:
-            task_id = prefixed
+        headed = "run-" + run_id
+        if len(headed) > 64:
+            raise Refused("task_id")
+        task_id = headed
     task = {"task_id": task_id, "source": "run", "session_id": None, "run_id": run_id, "turn_id": None,
             "outcome": None, "cancel_requested": False, "pending_approval_ids": [], "expires_at": None,
             "created_at": created_at, "updated_at": updated_at, "result": None}

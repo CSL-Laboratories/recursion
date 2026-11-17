@@ -137,6 +137,30 @@ class FirstUse(unittest.TestCase):
                 b.join(5)
         self.assertEqual((first, second), ([True], [True]))
 
+    def test_an_interrupted_location_fill_does_not_stay_partial(self):
+        """The location map is one assignment. A fill that stops after one document does not stay."""
+        rules.published()
+        saved = rules._READ_LOCATIONS
+
+        class Sticky(dict):
+            def update(self, other):
+                for i, (key, value) in enumerate(dict(other).items()):
+                    self[key] = value
+                    if i == 0:
+                        raise KeyboardInterrupt
+
+        rules._READ_LOCATIONS = Sticky()
+        try:
+            try:
+                rules._supported(rules._READ)
+            except KeyboardInterrupt:
+                pass
+            locations = rules._supported(rules._READ)
+            self.assertIn("mcp.task.v1.json", locations)
+            self.assertGreater(len(locations), 1)
+        finally:
+            rules._READ_LOCATIONS = saved
+
 
 class TaskIds(unittest.TestCase):
     # s1-mcp-task sol F1
@@ -146,6 +170,25 @@ class TaskIds(unittest.TestCase):
         a = rules.task_of_run(r["view"], r["events"], r["pending_approval_ids"])
         b = rules.task_of_turn(t["session"], t["turn_id"], t["events"], t["pending_approval_ids"])
         self.assertNotEqual(a["task_id"], b["task_id"])
+
+    def test_a_long_run_id_that_starts_with_turn_is_refused(self):
+        """A run id of 61 or more characters that starts with turn- is still a run id, and run- plus
+        that id does not fit a task id. The derivation refuses it rather than emitting a turn id."""
+        view = json.loads(json.dumps(own("task-id-collision.json")["run"]["view"]))
+        short = "turn-" + ("a" * 55)  # 60 characters; run- plus that is 64
+        view["run_id"] = short
+        task = rules.task_of_run(view)
+        self.assertEqual(task["task_id"], "run-" + short)
+        self.assertEqual(len(task["task_id"]), 64)
+        view["run_id"] = "turn-" + ("a" * 56)  # 61 characters; run- plus that is 65
+        with self.assertRaises(rules.Refused) as caught:
+            rules.task_of_run(view)
+        self.assertEqual(caught.exception.code, "task_id")
+
+    def test_a_run_id_that_is_not_text_is_left_as_the_task_id(self):
+        view = json.loads(json.dumps(own("task-id-collision.json")["run"]["view"]))
+        view["run_id"] = 5
+        self.assertEqual(rules.task_of_run(view)["task_id"], 5)
 
 
 class StopClaim(unittest.TestCase):
@@ -208,6 +251,46 @@ class WireClient(unittest.TestCase):
                 break
         self.assertIsNotNone(mutated, "no lifecycle vector answers with revision 1")
         self.assertIsNotNone(client.judge_vector(CONTROL, "approval.lifecycle", mutated))
+
+    def test_a_string_source_in_plugin_data_is_not_an_approval(self):
+        registry = own("approval-shaped-data-string.json")
+        self.assertEqual(client.leaf_errors(PLUGIN.validator("api.v1.json#/$defs/registry"), registry), [])
+        self.assertEqual(list(client.approvals_in(registry)), [])
+
+    def test_an_event_shape_without_a_run_is_not_an_event(self):
+        tool = own("event-shaped-with-time.json")
+        self.assertEqual(client.leaf_errors(PLUGIN.validator("api.v1.json#/$defs/tool"), tool), [])
+        self.assertEqual(list(client.events_in(tool)), [])
+
+    def test_a_run_task_wearing_a_turn_id_is_refused_for_that_not(self):
+        folder = ROOT / "schemas/control/v1"
+        entry = next(item for item in client.load_index(folder)
+                     if item["file"].endswith("b19-a-run-task-whose-id-is-a-turn-id.json"))
+        self.assertIsNone(client.check_entry(CONTROL, entry))
+        schema = CONTROL.schemas["mcp.task.v1.json"]
+        node = None
+        for branch in schema.get("allOf", ()):
+            task = ((branch.get("then") or {}).get("properties") or {}).get("task_id") or {}
+            if task.get("not") == {"pattern": "^turn-"}:
+                node = task
+                break
+        self.assertIsNotNone(node, "the run branch has no not on task_id")
+        saved = node.pop("not")
+        try:
+            self.assertIsNotNone(client.check_entry(CONTROL, entry))
+        finally:
+            node["not"] = saved
+
+
+class DraftNumbers(unittest.TestCase):
+    def test_the_four_narrowed_schemas_carry_the_next_draft(self):
+        published = rules.published()
+        self.assertEqual(published["approval.v1.json"]["x-version"], "1.0-draft.10")
+        self.assertEqual(published["methods.v1.json"]["x-version"], "1.0-draft.11")
+        self.assertEqual(published["mcp.task.v1.json"]["x-version"], "1.0-draft.7")
+        self.assertEqual(published["stop.result.v1.json"]["x-version"], "1.0-draft.3")
+        text = (ROOT / "schemas/control/v1/CHANGES.md").read_text(encoding="utf-8")
+        self.assertIn("a run Task id is not a turn id", text)
 
 
 if __name__ == "__main__":

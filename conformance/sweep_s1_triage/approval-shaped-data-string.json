@@ -1,0 +1,12 @@
+{
+  "panels": [],
+  "required": {
+    "user_data": {
+      "approval_id": "example",
+      "effect": {},
+      "digest": "example",
+      "rendered": [],
+      "source": "data"
+    }
+  }
+}

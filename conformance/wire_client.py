@@ -411,8 +411,10 @@ def vector_files(folder: Path) -> set[str]:
 def approvals_in(value: Any) -> Iterator[dict]:
     """Every approval record inside a JSON value: on its own, in an event's payload, in a method's answer."""
     if isinstance(value, dict):
-        # source is a string on an approval. Plugin-owned data can carry the same keys and is not one.
-        if {"approval_id", "effect", "digest", "rendered"} <= value.keys() and isinstance(value.get("source"), str):
+        # An approval carries the members the record requires, and source is text. Plugin-owned data
+        # can carry a few of those keys, including a string source, and is not one.
+        if {"approval_id", "source", "state", "revision", "digest", "digest_form",
+                "rendered_form", "requested_at"} <= value.keys() and isinstance(value.get("source"), str):
             yield value
         for item in value.values():
             yield from approvals_in(item)
@@ -438,8 +440,8 @@ def _exact(value) -> str:
 def events_in(value: Any) -> Iterator[dict]:
     """Every event inside a value, wherever it sits: an object with the envelope of event.v1."""
     if isinstance(value, dict):
-        # time is part of the envelope. An example that only shares the other keys is not an event.
-        if {"seq", "session_id", "type", "source", "trust", "payload", "time"} <= set(value) and isinstance(value["payload"], dict):
+        # The envelope is the members event.v1 requires. An example that shares some of them is not an event.
+        if {"seq", "session_id", "run_id", "turn_id", "time", "type", "source", "trust", "payload"} <= set(value) and isinstance(value["payload"], dict):
             yield value
         for inner in value.values():
             yield from events_in(inner)

@@ -16,15 +16,15 @@ Nothing is frozen yet.
 | `common.v1.json` | 1.0-draft.5 |
 | `run.record.v1.json` | 1.0-draft.4 |
 | `run.view.v1.json` | 1.0-draft.4 |
-| `stop.result.v1.json` | 1.0-draft.2 |
+| `stop.result.v1.json` | 1.0-draft.3 |
 | `session.v1.json` | 1.0-draft.3 |
 | `queue.item.v1.json` | 1.0-draft.7 |
 | `event.v1.json` | 1.0-draft.7 |
-| `approval.v1.json` | 1.0-draft.9 |
+| `approval.v1.json` | 1.0-draft.10 |
 | `driver.v2.json` | 1.0-draft.4 |
-| `mcp.task.v1.json` | 1.0-draft.6 |
+| `mcp.task.v1.json` | 1.0-draft.7 |
 | `transcript.line.v1.json` | 1.0-draft.3 |
-| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.10 |
+| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.11 |
 | `session.token.v1.json` | 1.0-draft.1 |
 
 ## The reference rules after sweep S1 (Nov 15, 2026)
@@ -591,6 +591,17 @@ Built as recommended and **not decided**. Each is the owner's decision or anothe
 | Keys of the Stop sentences | `cgroup_empty_whole_run_unverified`, `cgroup_removed_whole_run_unverified`, `ended_before_stop_removal_unverified` | Any other set | The lane that owns Stop, on the owner's decision |
 | MCP marks of the methods that are new | By effect: `interrupt`, `session.stop` and `workspace.restore` like Stop; `session.start`, `turn`, `steer`, `queue`, `fork`, `resume` like start | Other marks | The owner's |
 | What a session token may be granted | Eleven methods; never an approval method, never one that needs `manage` | A wider or narrower list | The lanes that own scopes and delegation |
+
+## Draft numbers for the wire-client narrowings (Nov 16, 2026)
+
+Four schemas had already narrowed, with no draft number and no entry here. Each now has the next draft
+number. `methods.table.v1.json` has no `x-version` of its own; its `table_version` moves with `methods.v1.json`, as the suite requires.
+
+| What changed | What it breaks |
+|---|---|
+| `approval.v1.json` and `methods.v1.json`: `plugin_id` refuses `host`, as the plugin api does | An effect or a method param whose `plugin_id` is `host` |
+| `stop.result.v1.json`: a claim of `cgroup_empty_whole_run_unverified` with proof `removed`, or of `cgroup_removed_whole_run_unverified` with proof `empty`, is refused | A stop answer that paired those |
+| `mcp.task.v1.json`: a run Task id is not a turn id. A run id that starts with `turn-` is carried as `run-` plus that id. When that would pass 64 characters, the derivation refuses `task_id` instead of emitting the run id | A producer that used a 61 to 64 character run id starting with `turn-` as a Task id |
 
 ## Candidates, not in any draft
 

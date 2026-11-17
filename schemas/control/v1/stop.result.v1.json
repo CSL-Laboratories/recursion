@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "stop.result.v1.json",
   "title": "stop.result.v1: what a Stop answers",
-  "x-version": "1.0-draft.2",
+  "x-version": "1.0-draft.3",
   "description": "The answer of run.stop when the run exists. THE LEGACY ANSWER is exactly what the daemon answers today and stays valid: code 'stopped' or 'pending', 'state' with the same word, 'repeat' on a stopped answer, 'reason' on a pending one, and 'recorded' only when it is false. THE ADDITIONS are optional, and each is added to the daemon's answers by the lane that owns Stop, in a versioned step of its own, never by the lane that wrote this schema: the code 'ended', and the fields 'attestation', 'containment_level', 'claim' and 'fence'. Until then no answer carries them, and the answer for a run id that was never registered stays today's. MEANINGS, frozen: 'stopped' means the run's removal was attested (today by proof 'empty'; by 'removed' once that is added). 'ended' means the run had already ended before this Stop, and this call stopped nothing; it never implies a verified removal. 'pending' means neither is established. A client that meets a code or a proof it does not know treats the run as NOT stopped. A client that meets a 'claim' it does not know shows nothing stronger than the weakest claim it does know.",
   "type": "object",
   "additionalProperties": false,

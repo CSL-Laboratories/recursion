@@ -100,8 +100,8 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     writable by group or world) and a custody root open to anyone else or unusable by its owner are
     refused before anything is made; the root as made (or as another caller made it meanwhile) is held
     to the same rule before the unit is written. A unit found is held open until the answer and checked against
-    its path and its bytes last: one removed, replaced or rewritten in place meanwhile is
-    ``unit_missing`` or ``unit_changed``. A refusal
+    its bytes and then its path last (``still_holds``, then ``still_names``): one removed, replaced or rewritten
+    in place meanwhile is ``unit_missing`` or ``unit_changed``. A refusal
     after the stores are begun (that, or a store refused after the other was made) leaves what was
     made; each store made is a whole, valid store, and the command run again finds it."""
 
@@ -123,8 +123,8 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
         homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
         check_private_dir(paths.home, paths.homes, required=True)  # as made, or as another caller made it
         if present:
-            still_names(paths.unit, info)  # the unit answered for is still the one at its path
-            still_holds(paths.unit, read)  # and still holds the bytes read (not rewritten in place)
+            still_holds(paths.unit, read)  # the bytes read, first: an in-place rewrite shows here
+            still_names(paths.unit, info)  # last: the path still names the file that was read
         else:
             ensure_dir(paths.home, paths.unit_dir, mode=_DIR_MODE)
             write_exclusive(paths.unit, unit, _UNIT_MODE)
@@ -141,7 +141,7 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     state folder, without the revocations and breaker trips kept in its own. The same bytes are not
     written again unless
     another user could change the file; a unit kept is held open until the answer and checked
-    against its path and its bytes last, as in ``install``, whose words on a refusal after the stores
+    against its bytes and then its path last, as in ``install``, whose words on a refusal after the stores
     apply."""
 
     paths = owned_paths(roots)
@@ -165,8 +165,8 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
         homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
         check_private_dir(paths.home, paths.homes, required=True)  # as made, or as another caller made it
         if current:
-            still_names(paths.unit, info)  # the unit kept is still the one at its path
-            still_holds(paths.unit, read)  # and still holds the bytes read (not rewritten in place)
+            still_holds(paths.unit, read)  # the bytes read, first: an in-place rewrite shows here
+            still_names(paths.unit, info)  # last: the path still names the file that was read
         else:
             replace_regular(paths.unit, unit, _UNIT_MODE)
         return _plan("upgrade", not current or _any_created(made) or homes, paths, made)

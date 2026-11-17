@@ -606,6 +606,56 @@ class InstallTests(unittest.TestCase):
                 self.assertTrue(upgrade(self.roots, EXEC).changed)
                 self.assertEqual(_read(self.unit), render_unit(EXEC))
 
+    # DeepSeek's round 3 on #410, F3-2, the part the assignment case does not cover: a valued unset with no
+    # Environment= assignment may remove the user manager's own value, which this package does not read.
+    def test_a_valued_unset_with_no_assignment_cannot_be_told(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        for value in ("/not-it", ""):
+            shown = f"XDG_STATE_HOME={value}"
+            text = f"[Service]\nUnsetEnvironment={shown}\nExecStart=/old\n"
+            with self.subTest(value=value):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    upgrade(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
+                self.assertIn(f"has UnsetEnvironment={shown}", caught.exception.detail)
+                self.assertIn("cannot be told", caught.exception.detail)
+                self.assertFalse(os.path.lexists(self.store_dir))
+                self.assertEqual(_tree(self.home), before)
+                self.assertEqual(_read(self.unit), text)
+
+    # DeepSeek's round 3 on #410, F3-4: the path was checked and then the bytes, so a new file put at the path
+    # between them was answered ok. The byte check runs first; the name check is last and sees that file.
+    def test_a_replacement_before_the_byte_check_is_refused_when_the_name_is_checked_last(self) -> None:
+        install(self.roots, EXEC)
+        foreign = b"# not our unit, put there between the checks\n"
+        # The package attribute ``install`` is the function; the module stays in sys.modules.
+        import sys
+        install_module = sys.modules["recursion_core.daemon_install.install"]
+        real_holds = install_module.still_holds
+
+        def holds(path: str, read) -> None:
+            os.unlink(path)  # the descriptor still holds the file that was read; the path gets a new inode
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            try:
+                os.write(fd, foreign)
+            finally:
+                os.close(fd)
+            return real_holds(path, read)
+
+        for action in (install, upgrade):
+            with self.subTest(action=action.__name__):
+                with open(self.unit, "wb") as handle:
+                    handle.write(render_unit(EXEC).encode())
+                with mock.patch.object(install_module, "still_holds", holds):
+                    with self.assertRaises(InstallRefused) as caught:
+                        action(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_changed")
+                self.assertIn("was replaced while it was read", caught.exception.detail)
+                self.assertEqual(Path(self.unit).read_bytes(), foreign)
+
     # Grok's round 10 on #382 (23f76e4a). R2: an empty XDG_STATE_HOME= was refused, but the daemon reads an empty value as
     # the default (daemon/__main__.py: XDG_STATE_HOME or Path.home()); the unit's HOME then decides. R3: str.splitlines
     # ended lines at \v, \f, \x1c-\x1e, \x85, \u2028 and \u2029, which systemd reads within a line, so the check could

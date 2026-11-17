@@ -118,8 +118,9 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
     and the last ``XDG_STATE_HOME`` counts; a value naming ``home``'s ``.local/state`` (``%h`` is
     ``home``) is this unit's own. ``EnvironmentFile=`` can set it (its file is not read here), and
     ``PassEnvironment=XDG_STATE_HOME`` gives the daemon the user manager's own value; ``UnsetEnvironment``
-    naming it leaves the default (a ``NAME=value`` there drops only that exact assignment, as systemd
-    drops it), under ``$HOME``: the daemon's default is ``Path.home()``, which reads
+    naming it with a bare name leaves the default (a ``NAME=value`` there drops only that exact assignment,
+    as systemd drops it; with no assignment of that name in the unit, the manager's own value may be the one
+    removed, which cannot be told), under ``$HOME``: the daemon's default is ``Path.home()``, which reads
     ``HOME``, so a unit's own ``HOME`` (or an ``EnvironmentFile``, which can set it) moves the state too,
     unless it names ``home`` or ``UnsetEnvironment`` drops it. The first column-0 byte order mark in the
     file is skipped and that line is read (one at byte 0 already counts); a later column-0 mark stays on
@@ -212,6 +213,12 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
             if _names(value, os.path.join(home, *STATE_HOME.split("/")), home):
                 return None
             return f"sets XDG_STATE_HOME={value}"
+        if value is None and any(pair.startswith("XDG_STATE_HOME=") for pair in unset_pairs):
+            # No assignment in the unit. systemd removes the manager's variable only when it holds this exact
+            # value, and this package does not read that environment, so the folder cannot be told (DeepSeek F3-2).
+            shown = min(pair for pair in unset_pairs if pair.startswith("XDG_STATE_HOME="))
+            return (f"has UnsetEnvironment={shown}, which may remove the user manager's own value, "
+                    "so where it keeps the daemon's state cannot be told")
     # No XDG_STATE_HOME: the state is under Path.home(), which reads HOME, so the unit's own HOME moves it too
     # (DeepSeek H9-2 on #382). The user manager's own HOME is the home's.
     if "HOME" not in unset:

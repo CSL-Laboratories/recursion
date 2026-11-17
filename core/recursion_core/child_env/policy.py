@@ -402,7 +402,7 @@ def build_child_env(
         except (TypeError, ValueError):
             raise EnvRefused(None, "override_malformed") from None
         if (not isinstance(name, str) or not isinstance(value, str) or not name or "=" in name
-                or "\0" in name + value or "\n" in name or "\r" in name):
+                or "\0" in name + value or not name.isprintable()):
             raise EnvRefused(None, "override_malformed")
         if (_DENIED.search(name) or name in _OVERRIDE_DENIED_NAMES or name in profile.scrub
                 or name in profile.passthrough or name in ("HOME", "PATH")):
@@ -772,7 +772,10 @@ def _unsafe_path(value: str) -> str | None:
             return cause
     names = PATH_TOOLS
     if names is None:
-        names = sorted({item for entry in entries if os.path.isdir(entry) for item in os.listdir(entry)})
+        try:
+            names = sorted({item for entry in entries if os.path.isdir(entry) for item in os.listdir(entry)})
+        except OSError:
+            return "value_unreadable"
     for name in names:
         located = shutil.which(name, path=value)
         if located is not None and (cause := _unsafe_file(located)) is not None:

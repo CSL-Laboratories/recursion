@@ -211,12 +211,16 @@ class ConnectionBreaker:
 
 
 def _is_signal(value: object) -> bool:
-    return (
+    if not (
         isinstance(value, dict)
         and value.get("scope") in ("connection", "model")
         and isinstance(value.get("source"), str)
         and (value["scope"] == "connection" or isinstance(value.get("model"), str))
-    )
+    ):
+        return False
+    # A reset that is not a number is refused before any key is written.
+    reset = value.get("reset_at")
+    return reset is None or (not isinstance(reset, bool) and isinstance(reset, (int, float)))
 
 
 def _refused(code: str, retry_at: float, key: str) -> dict:

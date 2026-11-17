@@ -3,7 +3,9 @@
 Asked by the Liaison on Nov 15, 2026 from lane ENGINE-E6's draft #412 (its DeepSeek round 1, F2): an exception
 outside the three typed exits (``Deadline``, ``_Protocol``, ``OSError``) used to leave ``run`` with the child
 unfenced, so every engine driver had to fence for itself. Now the boundary fences a started child on every
-exception, ``BaseException`` included, and the same exception object leaves. Fake processes only.
+exception, ``BaseException`` included. An ``Exception`` whose fence succeeds is answered
+(``engine_error``, or the ``RouteError``'s own code) and does not leave. An interruption still
+leaves as the same object. Fake processes only.
 """
 
 from __future__ import annotations
@@ -120,6 +122,13 @@ class EveryExceptionIsFencedTest(unittest.TestCase):
         for err in _kinds():
             with self.subTest(kind=type(err).__name__):
                 adapter = Adapter(drive=_raiser(err))
+                if isinstance(err, Exception):
+                    result = adapter.run(REQUEST, DEADLINE)
+                    code = err.code if isinstance(err, c.RouteError) else c.ENGINE_ERROR
+                    detail = err.detail if isinstance(err, c.RouteError) else type(err).__name__
+                    self.assertEqual((result["code"], result["detail"], adapter.process.fenced),
+                                     (code, detail, [UNEXPECTED]))
+                    continue
                 with self.assertRaises(BaseException) as caught:
                     adapter.run(REQUEST, DEADLINE)
                 self.assertIs(caught.exception, err)
@@ -132,6 +141,13 @@ class EveryExceptionIsFencedTest(unittest.TestCase):
                 continue  # read_message turns a read timeout into the typed deadline (below)
             with self.subTest(kind=type(err).__name__):
                 adapter = Adapter(Process(read=err))
+                if isinstance(err, Exception):
+                    result = adapter.run(REQUEST, DEADLINE)
+                    code = err.code if isinstance(err, c.RouteError) else c.ENGINE_ERROR
+                    detail = err.detail if isinstance(err, c.RouteError) else type(err).__name__
+                    self.assertEqual((result["code"], result["detail"], adapter.process.fenced),
+                                     (code, detail, [UNEXPECTED]))
+                    continue
                 with self.assertRaises(BaseException) as caught:
                     adapter.run(REQUEST, DEADLINE)
                 self.assertIs(caught.exception, err)
@@ -141,9 +157,9 @@ class EveryExceptionIsFencedTest(unittest.TestCase):
         # After the witness of #412's first DeepSeek read (F2, A4: a read_line that returns bytes, which its
         # parser refuses with TypeError). json.loads takes bytes, so here the line is a number.
         adapter = Adapter(Process(read=5))
-        with self.assertRaises(TypeError):
-            adapter.run(REQUEST, DEADLINE)
-        self.assertEqual(adapter.process.fenced, [UNEXPECTED])
+        result = adapter.run(REQUEST, DEADLINE)
+        self.assertEqual((result["code"], result["detail"], adapter.process.fenced),
+                         (c.ENGINE_ERROR, "TypeError", [UNEXPECTED]))
 
     def test_a_failing_fence_does_not_replace_the_exception(self) -> None:
         for fence_err in (RuntimeError("fence"), KeyboardInterrupt(), OSError(5, "io"), _Custom("f")):
@@ -178,16 +194,16 @@ class EveryExceptionIsFencedTest(unittest.TestCase):
                 return False
         err = ValueError("drive")
         adapter = Adapter(Falsy(), drive=_raiser(err))
-        with self.assertRaises(ValueError):
-            adapter.run(REQUEST, DEADLINE)
-        self.assertEqual(adapter.process.fenced, [UNEXPECTED])
+        result = adapter.run(REQUEST, DEADLINE)
+        self.assertEqual((result["code"], result["detail"], adapter.process.fenced),
+                         (c.ENGINE_ERROR, "ValueError", [UNEXPECTED]))
 
     def test_the_exception_leaves_by_a_bare_re_raise(self) -> None:
         # DeepSeek's F4: ``raise err`` would add the run frame to the traceback a second time.
-        err = ValueError("drive")
+        err = KeyboardInterrupt()
         try:
             Adapter(drive=_raiser(err)).run(REQUEST, DEADLINE)
-        except ValueError as caught:
+        except KeyboardInterrupt as caught:
             frames = [f.name for f in traceback.extract_tb(caught.__traceback__)]
         else:
             self.fail("run returned")

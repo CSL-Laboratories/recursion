@@ -144,6 +144,17 @@ class RouteError(Exception):
         self.code, self.detail = code, detail
 
 
+def _finite(value: object) -> bool:
+    """A real int or float. A bool is not one. A huge int that cannot be a float is not one."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def validate_request(request: object, *, engines: object = None) -> dict:
     """Return a normalised copy of ``request`` or raise ``RouteError(REQUEST_INVALID)``.
 
@@ -159,7 +170,7 @@ def validate_request(request: object, *, engines: object = None) -> dict:
         if not isinstance(request.get(name), str) or not request[name]:
             raise RouteError(REQUEST_INVALID, name)
     deadline = request.get("deadline_s")
-    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline) or deadline <= 0:
+    if not _finite(deadline) or deadline <= 0:
         raise RouteError(REQUEST_INVALID, "deadline_s")
     route = request.get("route")
     if not isinstance(route, Mapping):
@@ -167,7 +178,8 @@ def validate_request(request: object, *, engines: object = None) -> dict:
     engine = route.get("engine")
     if engine not in engine_names(engines):  # read now, not at import (seam S3)
         raise RouteError(ENGINE_UNKNOWN, str(engine))
-    if not isinstance(route.get("model"), str) or not route["model"]:
+    model = route.get("model")
+    if not isinstance(model, str) or not model or "\x00" in model:
         raise RouteError(REQUEST_INVALID, "route.model")
     conn = route.get("connection")
     if not isinstance(conn, Mapping) or conn.get("kind") not in CONNECTION_KINDS:
@@ -212,9 +224,10 @@ def vendor_reset(epoch: object, clock: Callable[[], float], wall: Callable[[], f
     the breaker uses its own cooldown instead of treating a real epoch as eight days away.
     """
 
-    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) or not math.isfinite(float(epoch)):
+    if not _finite(epoch):
         return None
-    translated = clock() + (float(epoch) - wall())
+    number = float(epoch)
+    translated = clock() + (number - wall())
     if not math.isfinite(translated) or translated <= clock():
         return None
     return translated

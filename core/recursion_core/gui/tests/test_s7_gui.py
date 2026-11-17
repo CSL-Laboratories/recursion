@@ -207,6 +207,27 @@ class SweepGuiRegressions(unittest.TestCase):
         self.assertIs(withheld, True)
         self.assertNotIn("venue_data_switch", kept)
 
+    def test_f3_another_keys_on_does_not_open_a_switch_that_is_off_or_missing(self):
+        # Mutant V07: drop `key == "venue_data_switch"`, so any unlabelled key whose
+        # value is exactly "on" counts as the switch. The panel then shows venue_data
+        # whose own switch is off or absent.
+        panel = {"id": "p", "title": "Paper", "reads": [READS[0]], "venue": "paper"}
+        owned = {"venue": "paper", "symbol": "X"}
+        cases = {
+            "switch off": {"venue_data_switch": "off", "status": "on",
+                           "venue_data": {"rows": [owned]}},
+            "switch missing": {"status": "on", "venue_data": {"rows": [dict(owned)]}},
+        }
+        for name, payload in cases.items():
+            with self.subTest(shape=name):
+                kept, _withheld = filter_venue_rows(payload, "paper")
+                self.assertNotIn("venue_data_switch", kept)
+                app, _calls = make_app(payload, panels=[panel])
+                statuses, _, page = request(app, path="/panel", query="id=p")
+                self.assertEqual(statuses, ["200 OK"])
+                self.assertNotIn("X", page)
+                self.assertIn("withheld: venue data switch is off", page)
+
     def test_f4_a_read_error_that_looks_like_a_refusal_is_the_first_refusal(self):
         # Mutant: tell a registry refusal from a read error by comparing text.
 

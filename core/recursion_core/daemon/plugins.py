@@ -41,16 +41,21 @@ No silent verification skip: when ``cryptography`` cannot be imported, no signat
 so every installed plugin is refused ``plugin_verification_unavailable`` and none is loaded, signed
 or not.
 
-Not here: any surface that can approve or veto (so no effect is ever authorized), a plugin-owned
+A plugin effect is approved by the OS user who owns the daemon, over the owner-only socket, or by
+the device token, and only through ``approval.answer`` and then ``PluginEffectSink.carry`` (the
+effect is charged, then the approval is consumed, once). The in-memory gate still names no
+principal, so a decision there authorizes nothing. Not here: a plugin principal and a plugin-owned
 run (every run is bound to ``host``), the O7 interventions, and an installer (the authority ledger
 is never created by the daemon; without it an order effect refuses ``authority_unconfigured``).
 """
 from __future__ import annotations
 
 import collections
+import hmac
 import json
 import logging
 import os
+import secrets
 from pathlib import Path
 import re
 import sqlite3
@@ -77,6 +82,13 @@ INSTALL_FILE = 'install.json'
 MANIFEST, SIGNATURE, ARTIFACT = 'manifest.json', 'manifest.sig', 'plugin.py'
 REVOCATION_FILE = 'revoked.sqlite3'     # <state dir>/plugin-security/
 LEDGER_FILE = 'ledger.sqlite3'          # installer-created; never created here
+APPROVAL_EVENTS = 'approval-events.sqlite3'
+EFFECT_NOTES = 'effect-receipts.json'   # envelope and receipt, so a later process can return effect_replayed
+_TOKEN_CAP = 256
+_NOTE_CAP = 1024 * 1024
+_CGROUP_CAP = 64 * 1024
+# Not an approver. approval.answer refuses it scope_refused before it reads the record.
+_STRANGER = {'kind': 'plugin', 'id': 'plugin'}
 MAX_MANIFEST_BYTES, MAX_ARTIFACT_BYTES, MAX_INSTALL_BYTES = 64 * 1024, 8 * 1024 * 1024, 1024 * 1024
 VERIFICATION_UNAVAILABLE = 'plugin_verification_unavailable'
 CRYPTOGRAPHY_MISSING = 'cryptography missing; install recipe in plugin_security/README.md'
@@ -213,12 +225,350 @@ def read_install(directory):
             'reserved': ReservedEffects(frozenset(hosts), tuple(prefixes)), 'authority_anchor': anchor}
 
 
+class OwnerSocketPeer:
+    """A peer the daemon admitted on its owner-only socket.
+
+    A plugin's canonical JSON cannot be this object, so a plugin cannot present itself as the owner.
+    """
+
+    __slots__ = ('uid', 'pid')
+
+    def __init__(self, uid, pid):
+        self.uid, self.pid = uid, pid
+
+
+class DevicePresentation:
+    """A device token presented to the daemon. A plugin's canonical JSON cannot be this object."""
+
+    __slots__ = ('token',)
+
+    def __init__(self, token):
+        self.token = token
+
+
+def _command_id():
+    return 'cmd' + secrets.token_hex(8)
+
+
+def _peer_in_run_unit(pid):
+    """True when ``pid`` is inside a ``recursion-run-*`` cgroup, or that cgroup cannot be read.
+
+    The same fail-closed rule as the control socket: an unreadable cgroup is not the owner. Kept
+    here so this module does not import the control adapter (that adapter imports ``PluginHost``).
+    """
+    if type(pid) is not int or pid <= 0:
+        return True
+    try:
+        fd = os.open(f'/proc/{pid}/cgroup', os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return True
+    try:
+        info = os.fstat(fd)
+        # procfs reports size 0 for a file that still has bytes. Read a capped amount.
+        if not stat.S_ISREG(info.st_mode):
+            return True
+        raw = os.read(fd, _CGROUP_CAP + 1)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    if len(raw) > _CGROUP_CAP:
+        return True
+    text = raw.decode('utf-8', 'replace')
+    return any('recursion-run-' in part for line in text.splitlines() for part in line.split('/'))
+
+
+def _device_token_bytes(path):
+    """The owner-only device token, without its one trailing newline, or None when it cannot be used."""
+    if path is None:
+        runtime = os.environ.get('XDG_RUNTIME_DIR')
+        if not isinstance(runtime, str) or not runtime or '\x00' in runtime:
+            return None
+        path = Path(runtime) / 'recursion' / 'gui-device-token'
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or not 1 <= info.st_size <= _TOKEN_CAP):
+            return None
+        raw = os.read(fd, _TOKEN_CAP)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(raw) != info.st_size:
+        return None
+    if raw.endswith(b'\n'):
+        raw = raw[:-1]
+    if not raw or b'\n' in raw:
+        return None
+    return raw
+
+
+def _token_matches(presented, path):
+    if type(presented) is not str or not presented:
+        return False
+    try:
+        offered = presented.encode('utf-8')
+    except UnicodeError:
+        return False
+    held = _device_token_bytes(path)
+    if held is None or len(offered) != len(held):
+        return False
+    return hmac.compare_digest(offered, held)
+
+
+class _ApprovalCall:
+    """The slice of a method context ``approval.answer`` reads: principal, transaction, after commit."""
+
+    __slots__ = ('principal', 'tx', 'after_commit')
+
+    def __init__(self, principal, tx, after_commit):
+        self.principal, self.tx, self.after_commit = principal, tx, after_commit
+
+
+class _EffectReceipts:
+    """Receipts this process has already been given. The notes file is what a later call reads."""
+
+    def __init__(self):
+        self._memory = {}
+
+
+class _EffectNotes:
+    """Owner-only JSON of the envelopes and receipts for plugin-effect charges.
+
+    Same-uid limit, as on the ledger: a plugin in this process can rewrite this file. It is not a
+    boundary against that. It is what a later call in this uid reads so ``effect_replayed`` can
+    return the receipt the first charge produced, without a second spend.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+
+    def read(self):
+        with self._lock:
+            return self._read()
+
+    def update(self, mutator):
+        with self._lock:
+            data = self._read()
+            mutator(data)
+            self._write(data)
+
+    def _read(self):
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return {'envelopes': {}, 'receipts': {}}
+        except OSError as exc:
+            raise Refused('approval_note_unreadable', type(exc).__name__) from None
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > _NOTE_CAP):
+                raise Refused('approval_note_untrusted')
+            raw = os.read(fd, _NOTE_CAP + 1)
+        finally:
+            os.close(fd)
+        if len(raw) > _NOTE_CAP:
+            raise Refused('approval_note_untrusted')
+        try:
+            data = json.loads(raw.decode('utf-8'))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise Refused('approval_note_unreadable', type(exc).__name__) from None
+        if (type(data) is not dict or set(data) != {'envelopes', 'receipts'}
+                or type(data['envelopes']) is not dict or type(data['receipts']) is not dict):
+            raise Refused('approval_note_unreadable', 'shape')
+        return data
+
+    def _write(self, data):
+        directory = private_dir(self.path.parent)
+        payload = json.dumps(data, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        if len(payload) > _NOTE_CAP:
+            raise Refused('approval_note_untrusted', 'size')
+        tmp = directory / (self.path.name + '.tmp')
+        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if not written:
+                    raise Refused('approval_note_unreadable', 'short write')
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, self.path)
+        os.chmod(self.path, 0o600)
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+
+class PluginEffectApprover:
+    """The daemon's owner, or the device token, answering a plugin effect through ``approval.answer``.
+
+    ``authenticate`` is the in-memory gate's authenticator. It returns None for every credential,
+    proof objects included, so that gate still names no principal and cannot mark an effect
+    approved with nothing charged. ``answer`` is the path that charges.
+    """
+
+    def __init__(self, host, queue, notes_path):
+        from recursion_core.approvals.sink import PluginEffectSink
+        self._host, self._queue = host, queue
+        self._notes = _EffectNotes(notes_path)
+        self._envelopes = {}
+        self._receipts = _EffectReceipts()
+        self.sink = PluginEffectSink(queue, self.charge)
+
+    def authenticate(self, _credential):
+        return None
+
+    def request(self, effect):
+        return self.sink.request(effect)
+
+    def answer(self, peer, approval_id, effect, *, authority, answer='approve'):
+        admitted = self._admit(peer)
+        if admitted is None:
+            return self._method('approval.answer', _STRANGER, {
+                'command_id': _command_id(), 'approval_id': approval_id, 'surface': 'cli',
+                'expected_revision': 1, 'digest': '0' * 64, 'answer': 'deny'})
+        principal, surface = admitted
+        opened = self._method('approval.open', principal, {
+            'command_id': _command_id(), 'approval_id': approval_id, 'surface': surface})
+        if opened.get('code') != 'ok':
+            return opened
+        shown = opened['approval']
+        answered = self._method('approval.answer', principal, {
+            'command_id': _command_id(), 'approval_id': approval_id, 'surface': surface,
+            'expected_revision': shown['revision'], 'digest': shown['digest'], 'answer': answer})
+        if answered.get('code') == 'conflict' and answered.get('detail') in ('already_resolved', 'already_consumed'):
+            from recursion_core.approvals.model import ApprovalRefused
+            raise ApprovalRefused(answered['detail'])
+        if answer != 'approve' or answered.get('code') != 'ok':
+            return answered
+        self._note_envelope(approval_id, authority)
+        return self.sink.carry(approval_id, effect)
+
+    def _admit(self, peer):
+        # Exact type, not a subclass: a plugin cannot widen admission by inheriting the proof.
+        if type(peer) is OwnerSocketPeer:
+            if type(peer.uid) is not int or peer.uid != self._host._owner_uid or _peer_in_run_unit(peer.pid):
+                return None
+            return {'kind': 'owner', 'id': 'local'}, 'cli'
+        if type(peer) is DevicePresentation and _token_matches(peer.token, self._host._device_token_path):
+            return {'kind': 'device', 'id': 'page'}, 'page'
+        return None
+
+    def _method(self, name, principal, params):
+        from recursion_core.control.methods import NotAccepted
+        from recursion_core.control.methods.approval import handlers
+        handler = handlers(self._queue)[name]
+        callbacks = []
+
+        def after(fn):
+            callbacks.append(fn)
+
+        try:
+            with self._queue.store.transaction() as tx:
+                result = handler(_ApprovalCall(principal, tx, after), params)
+        except NotAccepted as refused:
+            return refused.answer
+        for fn in callbacks:
+            fn()
+        return result
+
+    def _note_envelope(self, approval_id, authority):
+        # A copy the file can store. The charge reads it back after this process forgets the dict.
+        held = json.loads(json.dumps(authority)) if type(authority) is dict else None
+        self._envelopes[approval_id] = held
+
+        def put(data):
+            data['envelopes'][approval_id] = held
+
+        self._notes.update(put)
+
+    def _envelope_for(self, approval_id):
+        if approval_id in self._envelopes:
+            return self._envelopes[approval_id]
+        data = self._notes.read()
+        if approval_id not in data['envelopes']:
+            return None
+        self._envelopes[approval_id] = data['envelopes'][approval_id]
+        return self._envelopes[approval_id]
+
+    def _receipt_for(self, approval_id):
+        if approval_id in self._receipts._memory:
+            return self._receipts._memory[approval_id]
+        data = self._notes.read()
+        if approval_id not in data['receipts']:
+            return None
+        self._receipts._memory[approval_id] = data['receipts'][approval_id]
+        return self._receipts._memory[approval_id]
+
+    def _remember_receipt(self, approval_id, receipt):
+        # Memory first: a write that fails still answers a replay in this process.
+        self._receipts._memory[approval_id] = receipt
+
+        def put(data):
+            data['receipts'][approval_id] = receipt
+
+        self._notes.update(put)
+
+    def _charge_fields(self, effect):
+        breaker, loader = self._host._breaker, self._host.loader
+        if breaker is None or loader is None or type(effect) is not dict:
+            raise Refused('authority_unconfigured')
+        run = breaker.check(effect['run_id'], effect['connection'], effect['plugin_id'])
+        artifact = loader.artifact(effect['plugin_id'])
+        if type(artifact) is not str:
+            raise Refused('profile_plugin_mismatch')
+        return {'plugin_id': effect['plugin_id'], 'artifact_sha256': artifact, 'scope': effect['scope'],
+                'kind': effect['kind'], 'provider': run['provider'], 'model_version': run['model_version'],
+                'currency': effect['currency'], 'amount_minor': effect['amount_minor']}
+
+    def charge(self, effect, approval_id):
+        """``Authority.charge`` for this approval id. ``effect_replayed`` returns the receipt already stored."""
+        authority = self._host.authority
+        if authority is None:
+            raise Refused('authority_unconfigured')
+        envelope = self._envelope_for(approval_id)
+        try:
+            fields = self._charge_fields(effect)
+        except Refused:
+            # The run is not bound. Still call the authority object: a test, or a caller, may have
+            # replaced ``charge``, and that replacement is the charge the sink is waiting on.
+            fields = {'plugin_id': effect.get('plugin_id') if type(effect) is dict else '',
+                      'artifact_sha256': '', 'scope': effect.get('scope') if type(effect) is dict else {},
+                      'kind': effect.get('kind') if type(effect) is dict else '', 'provider': '',
+                      'model_version': '', 'currency': effect.get('currency') if type(effect) is dict else '',
+                      'amount_minor': effect.get('amount_minor') if type(effect) is dict else 0}
+        try:
+            receipt = authority.charge(envelope, idempotency_key=approval_id, **fields)
+        except Refused as refused:
+            if refused.code != 'effect_replayed':
+                raise
+            prior = self._receipt_for(approval_id)
+            if prior is None:
+                raise
+            return prior
+        self._remember_receipt(approval_id, receipt)
+        return receipt
+
+
 class PluginHost:
     """What the running daemon holds of its operator plugins: the inventory, the panels, the O7 reader."""
 
     def __init__(self, config_dir, state_dir, breaker=None, *, plugin_dirs=(), verification_available=None,
                  gil_probe=None, clock=time.time, operator_deadline_s=OPERATOR_DEADLINE_S,
-                 operator_turn_wait_s=OPERATOR_TURN_WAIT_S):
+                 operator_turn_wait_s=OPERATOR_TURN_WAIT_S, device_token_path=None, owner_uid=None):
         require_launcher_platform()  # Windows: typed PlatformUnsupported; no plugin file is opened
         self._config, self._state = Path(config_dir) / PLUGINS_DIR, Path(state_dir)
         self._gil = gil_probe if gil_probe is not None else GilProbe()
@@ -231,6 +581,10 @@ class PluginHost:
         self.degraded = {}  # plugin id -> operator() calls that passed their deadline
         self.health = CoreHealth()
         self.loader = self.core = self.gate = self.authority = self._trust = None
+        self._approver = self.effect_sink = self._approval_queue = self._approval_store = None
+        self._breaker = None
+        self._device_token_path = device_token_path
+        self._owner_uid = os.geteuid() if owner_uid is None else owner_uid
         self.records, self.registries = [], ()
         self.pending_approvals = collections.deque(maxlen=64)  # (approval id, digest) drawn, newest last
         self._operators = {}
@@ -289,10 +643,15 @@ class PluginHost:
         return str(path)
 
     def _compose_core(self, install, breaker):
-        # The core draws every approval (4.2). No surface can show or decide one yet, so the
-        # authenticator names no principal and nothing can be approved: effects stay refused.
+        # The in-memory gate still names no principal. PluginEffectApprover.authenticate returns
+        # None for every credential, including an owner-socket peer and a device token, so a
+        # plugin's JSON cannot become operator_ui and nothing is marked approved here before a
+        # charge. The owner and the device answer through approval.answer and PluginEffectSink.carry.
+        self._breaker = breaker
+        self._approver = self._open_effect_approver() if breaker is not None else None
+        authenticator = self._approver.authenticate if self._approver is not None else (lambda _credential: None)
         self.gate = ApprovalGate(lambda approval_id, digest, _raw: self.pending_approvals.append((approval_id, digest)),
-                                 lambda _credential: None, lambda: int(self._clock()))
+                                 authenticator, lambda: int(self._clock()))
         anchor = install['authority_anchor']
         if anchor is not None:
             try:
@@ -306,6 +665,45 @@ class PluginHost:
         self.core = CoreService(loader=self.loader, gate=self.gate, breaker=breaker, health=self.health,
                                 authority=self.authority, effect_permissions=EFFECT_PERMISSIONS,
                                 authority_required=AUTHORITY_REQUIRED)
+
+    def _open_effect_approver(self):
+        """The approval queue and the plugin-effect sink, or None when they cannot be opened.
+
+        The deadline worker is not started: a pending request is not expired on a timer by this
+        host. Plugins still load when the store cannot be opened; nothing can then be approved.
+        """
+        store = None
+        try:
+            from recursion_core.approvals.queue import ApprovalQueue
+            from recursion_core.events.db import EventStore
+            directory = private_dir(self._state / STORE_DIR)
+            store = EventStore(directory / APPROVAL_EVENTS, clock=self._clock)
+            queue = ApprovalQueue(clock=self._clock)
+            queue.attach(store)
+            approver = PluginEffectApprover(self, queue, directory / EFFECT_NOTES)
+        except Exception as exc:  # noqa: BLE001 - a store that will not open leaves the plugins loaded
+            log.error('plugin effect approver is not composed: %s', type(exc).__name__)
+            if store is not None:
+                try:
+                    store.close()
+                except Exception as close_exc:  # noqa: BLE001 - the host still has its plugins
+                    log.error('plugin effect approval store would not release: %s', type(close_exc).__name__)
+            self._approval_queue = self._approval_store = self.effect_sink = None
+            return None
+        self._approval_queue, self._approval_store, self.effect_sink = queue, store, approver.sink
+        return approver
+
+    def request_plugin_effect(self, effect):
+        """Record one plugin effect on the approval queue, bound to the effect's own run."""
+        if self._approver is None:
+            raise PluginRefused('approval_surface_unavailable', 'no approver is composed')
+        return self._approver.request(effect)
+
+    def answer_plugin_effect(self, peer, approval_id, effect, *, authority, answer='approve'):
+        """Open and answer through ``approval.answer``. An approval is carried only after it is approved."""
+        if self._approver is None:
+            raise PluginRefused('approval_surface_unavailable', 'no approver is composed')
+        return self._approver.answer(peer, approval_id, effect, authority=authority, answer=answer)
 
     # -- one plugin -----------------------------------------------------------------------------
     def _load(self, source):
@@ -418,7 +816,9 @@ class PluginHost:
             plugins.append(item)
         return {'plugins': plugins, 'verification': self.verification, 'core_poisoned': self.health.poisoned,
                 'authority_profile': self.authority_state, 'approvals_drawn': len(self.pending_approvals),
-                'approval_surface': 'none: no surface can approve or veto yet, so no effect is authorized',
+                'approval_surface': ('owner socket or device token, through approval.answer'
+                                     if self._approver is not None else
+                                     'none: no surface can approve or veto yet, so no effect is authorized'),
                 'containment': 'none: plugins run in the daemon process and uid'}
 
     def route_records(self):
@@ -532,6 +932,6 @@ class PluginHost:
         return 504, {'error': OPERATOR_TIMED_OUT}
 
     def close(self):
-        for item in (self.authority, self._trust):
+        for item in (self.authority, self._trust, self._approval_store):
             if item is not None:
                 item.close()

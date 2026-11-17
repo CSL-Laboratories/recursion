@@ -26,6 +26,9 @@ keeper of this file:
                                  failed lookup, an NSS or LDAP outage, reaches Python as no entry,
                                  so both are refused, whatever $HOME says), or neither it nor $HOME
                                  names an absolute home
+
+An operator of a container with an arbitrary user id gives the user a passwd entry, or runs as a named user.
+
     route_home_outside_root      path is the root itself, or not below it (a root of / has nothing below
                                  it: it is root's, never the operator's custodied root)
     route_home_is_operator_home  path, or the root, is the operator's own home (the password
@@ -236,7 +239,9 @@ def _operator_homes() -> set[str]:
     ``getpwuid_r`` (an NSS or LDAP outage) is reported as "uid not found" (``Modules/pwdmodule.c``, the
     same in 3.12.3 and 3.14.8). The two cannot be told apart, so both are refused: comparing against
     ``$HOME`` alone would let the rule pass on a value the operator's environment chose (Devin's thread on
-    #401). Refuses too when neither names an absolute home: the rule must not pass for want of a home to
+    #401).
+    An operator of a container with an arbitrary user id gives the user a passwd entry, or runs as a named user.
+    Refuses too when neither names an absolute home: the rule must not pass for want of a home to
     compare.
     """
 
@@ -245,8 +250,13 @@ def _operator_homes() -> set[str]:
     try:
         entry = pwd.getpwuid(os.geteuid()).pw_dir
     except KeyError:  # no entry, or a lookup that failed: CPython answers both so
-        raise RouteHomeRefused("route_home_untrusted", "the operator's home is unknown: the password database "
-                               "gives no entry for this user (none, or the lookup failed)") from None
+        raise RouteHomeRefused(
+            "route_home_untrusted",
+            "the operator's home is unknown: the password database "
+            "gives no entry for this user (none, or the lookup failed). "
+            "An operator of a container with an arbitrary user id gives the user a passwd entry, "
+            "or runs as a named user.",
+        ) from None
     homes = [os.environ.get("HOME"), entry]
     found = {_resolve(home) for home in homes if isinstance(home, str) and home.startswith("/")}
     if not found:

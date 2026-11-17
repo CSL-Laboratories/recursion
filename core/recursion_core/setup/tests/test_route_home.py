@@ -17,6 +17,16 @@ from unittest import mock
 from recursion_core.setup import route_home
 from recursion_core.setup.route_home import RouteHomeRefused, check
 
+# The sentence in the refusal message and in the documentation that ships.
+_CONTAINER_OPERATOR = (
+    "An operator of a container with an arbitrary user id gives the user a passwd entry, "
+    "or runs as a named user."
+)
+_NO_ENTRY = (
+    "the operator's home is unknown: the password database gives no entry "
+    "for this user (none, or the lookup failed)"
+)
+
 _real_lstat = os.lstat
 
 
@@ -355,10 +365,46 @@ class RouteHomeTests(unittest.TestCase):
             with self.subTest(HOME=home), mock.patch.dict(os.environ, {"HOME": home}), \
                     mock.patch("pwd.getpwuid", side_effect=failed):
                 error = self.refused("route_home_untrusted", self.path)
-            self.assertEqual(error.detail, "the operator's home is unknown: the password database gives no entry "
-                                           "for this user (none, or the lookup failed)")
+            self.assertEqual(error.detail, _NO_ENTRY + ". " + _CONTAINER_OPERATOR)
         with mock.patch.dict(os.environ, {"HOME": self.base}):
             check(self.path, self.root)  # control: the same check passes when the lookup answers
+
+    def test_the_refusal_message_names_what_an_operator_of_a_container_does(self):
+        # The message of a user id with no passwd entry carries this sentence, and the module
+        # docstring and the _operator_homes docstring carry the same sentence.
+        failed = KeyError(f"getpwuid(): uid not found: {os.geteuid()}")
+        with mock.patch("pwd.getpwuid", side_effect=failed), mock.patch.dict(os.environ, {"HOME": self.base}):
+            error = self.refused("route_home_untrusted", self.path)
+        self.assertIn(_CONTAINER_OPERATOR, error.detail)
+        self.assertEqual(error.detail.count(_CONTAINER_OPERATOR), 1)
+        self.assertIn(_CONTAINER_OPERATOR, route_home.__doc__)
+        self.assertEqual(route_home.__doc__.count(_CONTAINER_OPERATOR), 1)
+        self.assertIn(_CONTAINER_OPERATOR, route_home._operator_homes.__doc__)
+        self.assertEqual(route_home._operator_homes.__doc__.count(_CONTAINER_OPERATOR), 1)
+
+    def test_a_user_id_with_no_passwd_entry_is_still_refused_on_the_same_path(self):
+        # The refusal is kept. A KeyError from the password lookup (no entry, or a lookup that
+        # failed) still leaves through route_home_untrusted, before $HOME is compared, whatever
+        # $HOME says. The detail still names that no-entry exit, not the other unknown-home exit.
+        failed = KeyError(f"getpwuid(): uid not found: {os.geteuid()}")
+        homes = (self.base, self.state, "/", os.environ["HOME"])
+        for home in homes:
+            with self.subTest(HOME=home), mock.patch.dict(os.environ, {"HOME": home}), \
+                    mock.patch("pwd.getpwuid", side_effect=failed):
+                error = self.refused("route_home_untrusted", self.path)
+                self.assertTrue(error.detail.startswith(_NO_ENTRY), error.detail)
+                self.assertNotIn("no absolute HOME", error.detail)
+                self.assertIsNone(error.__cause__)
+        with mock.patch.dict(os.environ), mock.patch("pwd.getpwuid", side_effect=failed):
+            os.environ.pop("HOME", None)
+            error = self.refused("route_home_untrusted", self.path)
+        self.assertTrue(error.detail.startswith(_NO_ENTRY), error.detail)
+        self.assertIsNone(error.__cause__)
+        with mock.patch.dict(os.environ, {"HOME": "relative/home"}), \
+                mock.patch("pwd.getpwuid", side_effect=failed):
+            error = self.refused("route_home_untrusted", self.path)
+        self.assertTrue(error.detail.startswith(_NO_ENTRY), error.detail)
+        self.assertIsNone(error.__cause__)
 
     # Review 5 of #401 (Claude Fable 5.2), R1: since 3905b856 a KeyError is refused one step earlier, so the test below no
     # longer reached the refusal for no absolute home; removing it, changing its code or dropping the startswith("/")

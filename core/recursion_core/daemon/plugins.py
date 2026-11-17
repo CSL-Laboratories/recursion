@@ -5,10 +5,13 @@ checks the developer sees), 4.2 (approval gate and breaker), 4.3 (signed means s
 this install's trusted list; a plugin that fails the signature check loads as unsigned; grants are
 bound to the artifact digest and the signing key) and 3.5 (plugins contribute panels).
 
-The daemon never imports a plugin module by name. ``PluginHost`` reads each installed plugin as
-bytes and hands them to ``plugin_security.PluginLoader``, which checks the manifest, the artifact
-digest, the signature against this install's trusted keys and the installer's grant before any
-plugin code runs. A plugin the loader refuses stays out, its typed refusal and findings are kept,
+The daemon never imports a plugin module by name. ``PluginHost`` reads each installed plugin
+through ``verify_package`` and hands the verified bytes to ``plugin_security.PluginLoader``, which
+checks the manifest, the artifact digest, the signature against this install's trusted keys and
+the installer's grant before any plugin code runs. An extra, missing or changed file is not
+accepted as signed. A scope environment other than ``paper`` is refused unless that read was a
+whole signed version-1 package. A plugin the loader refuses stays out, its typed refusal and
+findings are kept,
 and the daemon runs without it. Nothing here is a containment boundary: a loaded plugin is
 ordinary Python in the daemon's process and uid (``plugin_security/README.md``).
 
@@ -65,6 +68,7 @@ from recursion_core.plugin_security import (ApprovalGate, Authority, CoreHealth,
                                             PluginLoader, Refused, ReservedEffects, TrustStore,
                                             create_revocation_store)
 from recursion_core.plugin_security.manifest import MAX_MANIFEST_BYTES, PERMISSIONS_V1, developer_key_id_ok
+from recursion_core.plugin_security.package import verify_package
 from recursion_core.plugin_security.signing import backend_available
 
 from .breaker import STORE_DIR
@@ -94,8 +98,9 @@ _SAFE_ID = re.compile(r'[^A-Za-z0-9_.-]')
 OPERATOR_DEADLINE_S = 10.0
 OPERATOR_TURN_WAIT_S = 1.5
 OPERATOR_TIMED_OUT = 'unavailable: operator plugin timed out'
-# ADV2-7 (owner call Nov 11 2:20am PST): a load-time finding, not a refusal. Only plugin.py's
-# bytes are digest- and signature-checked; whatever else it imports runs under the same grant.
+# ADV2-7 (owner call Nov 11 2:20am PST): a load-time finding, not a refusal. The package's
+# files are digest-checked by verify_package; whatever else plugin.py imports runs under the
+# same grant.
 UNVERIFIED_IMPORTS = 'plugin_imported_unverified_modules'
 # Not reported: the daemon's own package and its signature backend, whose submodules the host's
 # own signature check can import for the first time while a plugin loads.
@@ -112,6 +117,39 @@ class PluginRefused(Exception):
 
 def _finding(code, severity, detail=''):
     return {'stage': 'daemon', 'code': code, 'severity': severity, 'detail': detail}
+
+
+def _package_refusal(exc):
+    """Map a ``verify_package`` refusal onto the daemon's existing file-refusal codes.
+
+    The situations the install path already refused (a missing manifest, a file past the
+    size bound, a symlink, a file others can write) keep those codes. Anything else keeps
+    the package code.
+    """
+    detail = exc.detail or ''
+    name = detail.split(':', 1)[0]
+    if exc.code == 'package_manifest_missing':
+        return PluginRefused('plugin_file_missing', MANIFEST)
+    if exc.code == 'package_file_too_large':
+        return PluginRefused('plugin_file_too_large', name)
+    if exc.code == 'package_entry_unreadable' or 'symbolic link, device, pipe or socket' in detail:
+        return PluginRefused('plugin_file_unreadable', name)
+    if exc.code == 'package_entry_untrusted':
+        return PluginRefused('plugin_file_untrusted', name)
+    if exc.code == 'package_directory_unreadable':
+        return PluginRefused('plugin_directory_untrusted', detail)
+    return PluginRefused(exc.code, detail)
+
+
+class _InstalledAuthority(Authority):
+    """Authority for this install. ``package_for`` is this host's ``verify_package`` result.
+
+    The non-paper refusal stays in ``Authority.charge``, after the profile scope has matched,
+    so a paper profile presented with another environment still refuses ``profile_scope_mismatch``.
+    """
+
+    def __init__(self, packages, anchor_public_key, ledger_path, clock, csl_key_ids=frozenset()):
+        super().__init__(anchor_public_key, ledger_path, clock, csl_key_ids, package_for=packages.get)
 
 
 def _first_imports(before, own=None):
@@ -238,6 +276,7 @@ class PluginHost:
         self.health = CoreHealth()
         self.loader = self.core = self.gate = self.authority = self._trust = None
         self.records, self.registries = [], ()
+        self._verified = {}  # plugin id -> VerifiedPackage from this install's verify_package
         self.pending_approvals = collections.deque(maxlen=64)  # (approval id, digest) drawn, newest last
         self._operators = {}
         self._panels = []
@@ -302,7 +341,8 @@ class PluginHost:
         anchor = install['authority_anchor']
         if anchor is not None:
             try:
-                self.authority = Authority(anchor, str(self._state / STORE_DIR / LEDGER_FILE), lambda: int(self._clock()))
+                self.authority = _InstalledAuthority(
+                    self._verified, anchor, str(self._state / STORE_DIR / LEDGER_FILE), lambda: int(self._clock()))
                 self.authority_state = 'configured'
             except Refused as exc:
                 self.authority_state = f'unavailable: {exc.code}'
@@ -324,11 +364,20 @@ class PluginHost:
             if not _owned_directory(source):
                 raise PluginRefused('plugin_directory_untrusted',
                                     'must be an operator-owned directory, not group/other writable')
-            manifest = _read_owned(source / MANIFEST, MAX_MANIFEST_BYTES)
-            artifact = _read_owned(source / ARTIFACT, MAX_ARTIFACT_BYTES)
-            signature = _read_owned(source / SIGNATURE, 4096, missing_ok=True)
-            signature = None if signature is None else signature.decode('ascii', 'replace').strip()
-            loaded = self.loader.load(manifest, signature, artifact)
+            try:
+                verified = verify_package(source, self._trust)
+            except Refused as exc:
+                if exc.code.startswith('package_'):
+                    raise _package_refusal(exc) from None
+                raise
+            # The entry file's own mismatch stays the loader's artifact_digest_mismatch, and a
+            # missing entry file stays plugin_file_missing. Every other changed, added or missing
+            # file is not accepted as signed: the signature is withheld.
+            artifact = verified.files.get(ARTIFACT)
+            if artifact is None:
+                artifact = _read_owned(source / ARTIFACT, MAX_ARTIFACT_BYTES)
+            signature = verified.signature if verified.intact else None
+            loaded = self.loader.load(verified.manifest.raw, signature, artifact)
         except (PluginRefused, Refused) as exc:
             findings = list(self.loader.last_findings) if isinstance(exc, Refused) else []
             record.update(code=exc.code, detail=exc.detail,
@@ -343,6 +392,12 @@ class PluginHost:
                       signer_key_id=loaded.signer_key_id, registry_label=loaded.registry_label,
                       permissions=list(loaded.permissions), artifact_sha256=loaded.artifact_sha256,
                       findings=list(loaded.findings), provides=[], containment='in process, same uid: not contained')
+        self._verified[loaded.plugin_id] = verified
+        if not verified.intact:
+            record['findings'].append(_finding(
+                'package_files_changed', 'warn',
+                'changed=%s missing=%s added=%s' % (
+                    ','.join(verified.changed), ','.join(verified.missing), ','.join(verified.added))))
         self._attach(loaded, record)
         # After registry() and bind_core(), which are plugin code too. The plugin stays loaded.
         record['findings'] += self._import_findings(before, loaded.module)

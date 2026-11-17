@@ -177,8 +177,12 @@ anything; no real limit capture has gone through it.
   (`recursion_core/daemon/launcher.py`, a transient user unit and a pidfd; see `daemon/README.md`,
   "Composition"). No real launcher is in this module, and Pi, Hermes and OpenCode are not wired.
 - Vendor field and option names marked "unverified" in the code were not read from vendor source
-  (Claude `rate_limit_info` inner fields, Codex method names beyond `account/rateLimits/*`,
-  `codexErrorInfo` values). `check_for_update_on_startup` was read in openai/codex source at
+  (Claude `rate_limit_info` inner fields). Codex method names this adapter sends or handles, and
+  the `codexErrorInfo` values it reads, are checked against the schema `codex-cli 0.160.0` generates
+  for itself. Three things that schema does not settle stay unverified: the credential-wide bucket's
+  name (`limitId` is free text), where a JSON-RPC error carries `codexErrorInfo` (`error.data` is
+  any value), and the unit of `resetsAt` (an integer, read as Unix seconds). That schema check is
+  not a live provider run. `check_for_update_on_startup` was read in openai/codex source at
   `8703d32bd0ea5cf26768859a3dd476df906ba053`; no real-binary process-tree check has been run.
 - Pi/Hermes/OpenCode stdio drivers are injected, not built here.
 - No live provider call, real `claude`/`codex` process or network is used anywhere; tests use fakes only.

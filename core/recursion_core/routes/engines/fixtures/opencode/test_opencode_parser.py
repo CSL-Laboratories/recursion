@@ -1314,5 +1314,13 @@ class DeclarationTests(unittest.TestCase):
         self.assertEqual(hooks.engines.names(), SEEDED)
 
 
+class SweepDocumentationTests(unittest.TestCase):
+    def test_route_readme_does_not_retract_masters_codex_protocol_evidence(self):
+        routes = HERE.parents[2]
+        readme = (routes / "README.md").read_text(encoding="utf-8")
+        self.assertNotIn("Codex method names beyond `account/rateLimits/*`", readme)
+        self.assertNotIn("`codexErrorInfo` values).", readme)
+
+
 if __name__ == "__main__":
     unittest.main()

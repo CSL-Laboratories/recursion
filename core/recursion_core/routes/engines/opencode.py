@@ -102,6 +102,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 from types import MappingProxyType
 
 from recursion_core.routes import contract as c
@@ -970,7 +971,9 @@ def _timestamp(epoch: float) -> str | None:
     """
     if not _FIRST_EPOCH <= epoch <= _LAST_EPOCH:
         return None
-    millis = math.ceil(epoch * 1000)
+    # Fraction keeps the float's exact value. ``epoch * 1000`` can land on the previous millisecond,
+    # and ceiling that product would stamp a reset earlier than the wait that was asked for.
+    millis = math.ceil(Fraction(epoch) * 1000)
     m = _UNIX_EPOCH + timedelta(seconds=millis // 1000)
     return f"{m.year:04d}-{m.month:02d}-{m.day:02d}T{m.hour:02d}:{m.minute:02d}:{m.second:02d}.{millis % 1000:03d}Z"
 

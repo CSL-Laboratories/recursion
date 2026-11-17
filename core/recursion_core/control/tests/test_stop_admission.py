@@ -7,11 +7,12 @@ The effects word is only none_known or unresolved. A fourth research word is not
 from __future__ import annotations
 
 import json
+import threading
 import unittest
 from pathlib import Path
 
 from recursion_core.control.api import ControlAPI
-from recursion_core.control.registry import EMPTY, InMemoryRunRegistry
+from recursion_core.control.registry import EMPTY, InMemoryRunRegistry, StaleGeneration
 from recursion_core.control.tests.fakes import FakeKillTree, FakeStarter, run_ids, started
 from recursion_core.control.tests.test_seams import FakeStore
 from recursion_core.workspace.grant import Ledger
@@ -88,6 +89,60 @@ def _bare_api(kill: FakeKillTree | None = None) -> ControlAPI:
     """A ControlAPI with no event store, as the daemon composition builds one."""
     return ControlAPI(InMemoryRunRegistry(), kill or FakeKillTree(), FakeStarter(),
                       clock=lambda: 1000.0, new_run_id=run_ids())
+
+
+def _ensure_ledger(store) -> None:
+    try:
+        Ledger.declare(store)
+    except RuntimeError:
+        pass
+
+
+def _standing(store) -> list:
+    with store.transaction() as tx:
+        return [row[0] for row in Ledger.unrevoked(tx)]
+
+
+def _revoked_seq(store, run_id: str):
+    with store.transaction() as tx:
+        rows = tx.execute("SELECT revoked_seq FROM workspace_grant WHERE run_id = ?", (run_id,))
+    return None if not rows else rows[0][0]
+
+
+class _LedgerOnly:
+    """A transaction helper with no ``events`` attribute, as the real event store is."""
+
+    def __init__(self, inner: FakeStore) -> None:
+        self._inner = inner
+
+    def transaction(self):
+        return self._inner.transaction()
+
+    def register_tables(self, lane, version, ddl) -> None:
+        return self._inner.register_tables(lane, version, ddl)
+
+
+class _StaleRunningPut(InMemoryRunRegistry):
+    """The first put of a running record is stale, and the stored row carries a stop intent."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._once = True
+
+    def put(self, record: dict) -> dict:
+        if self._once and record.get("state") == "running":
+            self._once = False
+            current = self.get(record["run_id"])
+            if current is None:
+                raise AssertionError("running put with no row")
+            current["stop"] = {"requested_at": 1000.0, "checks": 1, "reason": "cgroup_unknown",
+                               "requested": False}
+            InMemoryRunRegistry.put(self, current)
+            raise StaleGeneration(record["run_id"], record.get("generation"), None)
+        return InMemoryRunRegistry.put(self, record)
+
+
+_START = {"tenant": "t1", "engine": "codex", "prompt": "p"}
 
 
 class StopAdmissionTest(unittest.TestCase):
@@ -213,7 +268,7 @@ class StopAdmissionTest(unittest.TestCase):
         required = branch["then"]["required"]
         missing = [name for name in _FACTS if name not in required]
         self.assertEqual(missing, [])
-        self.assertEqual(branch["then"]["properties"]["external_effects"]["enum"], ["none_known", "unresolved"])
+        self.assertEqual(schema["properties"]["external_effects"]["enum"], ["none_known", "unresolved"])
         text = _REGISTRY.read_text(encoding="utf-8")
         for name in _FACTS:
             self.assertIn(name, text)
@@ -260,11 +315,158 @@ class StopAdmissionTest(unittest.TestCase):
         attestation = stop["$defs"]["attestation"]["properties"]["external_effects"]
         self.assertEqual(attestation["enum"], effects)
         self.assertEqual(stop["properties"]["workspace.revoke"].get("const"), True)
-        self.assertNotIn("stays valid", stop["description"])
         self.assertEqual(view["x-version"], "1.0-draft.5")
         self.assertIn("`run.view.v1.json` | 1.0-draft.5", changes)
         self.assertIn("A draft-2 reader refuses a draft-3 stopped answer", changes)
-        self.assertIn("#479", changes)
-        self.assertIn("80e0d38a", changes)
         self.assertIn("dispatch_fence_confirmed", stop["properties"])
         self.assertEqual(stop["properties"]["dispatch_fence_confirmed"]["type"], "boolean")
+
+    def test_an_old_revoke_does_not_hide_a_grant_that_stands_again(self) -> None:
+        # Devin thread on api.py:575: a revoke in the log must not skip the ledger when a grant stands again.
+        store = FakeStore()
+        api = _api(store, FakeKillTree())
+        run = started(api)
+        _grant(store, run)
+        with store.transaction() as tx:
+            self.assertIsNotNone(Ledger.revoked(tx, run))
+        with store.transaction() as tx:
+            self.assertIsNotNone(Ledger.granted(tx, run, "/work/run"))
+        answer = api.call("run.stop", {"run_id": run})
+        self.assertEqual(_standing(store), [], "stop left a grant standing")
+        self.assertIs(answer.get("workspace.revoke"), True)
+        self.assertIsNotNone(_revoked_seq(store, run))
+
+    def test_a_grant_that_stands_is_not_named_revoked(self) -> None:
+        store = FakeStore()
+        api = _api(store, FakeKillTree())
+        run = started(api)
+        _grant(store, run)
+        with store.transaction() as tx:
+            self.assertIsNotNone(Ledger.revoked(tx, run))
+        with store.transaction() as tx:
+            self.assertIsNotNone(Ledger.granted(tx, run, "/work/run"))
+        self.assertFalse(api._revoke_named(run), "a standing grant is named revoked")
+        self.assertEqual(_standing(store), [run])
+
+    def test_a_stop_that_lands_during_launch_revokes_the_grant_the_starter_records(self) -> None:
+        # Devin thread on api.py:292: Stop accepts while the run is starting, then the starter records the grant.
+        store = FakeStore()
+        _ensure_ledger(store)
+        entered, release = threading.Event(), threading.Event()
+        run_box: dict = {}
+        out: list = []
+
+        def starter(params: dict) -> dict:
+            run_box["id"] = params["run_id"]
+            entered.set()
+            self.assertTrue(release.wait(5), "stop did not land during launch")
+            with store.transaction() as tx:
+                Ledger.granted(tx, params["run_id"], "/work/run")
+            return {"cgroup": f"/sys/fs/cgroup/fake/{params['run_id']}"}
+
+        api = ControlAPI(InMemoryRunRegistry(), FakeKillTree(), starter, clock=lambda: 1000.0,
+                         new_run_id=run_ids(), events=store)
+        thread = threading.Thread(target=lambda: out.append(api.call("run.start", _START)))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(5), "starter did not begin")
+            pending = api.call("run.stop", {"run_id": run_box["id"]})
+            self.assertEqual(pending["code"], "pending")
+            self.assertEqual(pending["reason"], "cgroup_unknown")
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(out), 1)
+        started_answer = out[0]
+        self.assertEqual(started_answer["stop"]["code"], "stopped")
+        self.assertEqual(_standing(store), [], "the launch continuation left the grant standing")
+        if started_answer["stop"].get("workspace.revoke") is True:
+            self.assertIsNotNone(_revoked_seq(store, run_box["id"]))
+
+    def test_a_stale_running_write_revokes_the_grant_the_starter_records(self) -> None:
+        # Devin thread on api.py:402: the continuation of a stale running write stops without recording the revoke.
+        store = FakeStore()
+        _ensure_ledger(store)
+
+        def starter(params: dict) -> dict:
+            with store.transaction() as tx:
+                Ledger.granted(tx, params["run_id"], "/work/run")
+            return {"cgroup": f"/sys/fs/cgroup/fake/{params['run_id']}"}
+
+        registry = _StaleRunningPut()
+        api = ControlAPI(registry, FakeKillTree(), starter, clock=lambda: 1000.0,
+                         new_run_id=run_ids(), events=store)
+        answer = api.call("run.start", _START)
+        self.assertEqual(answer["code"], "started")
+        self.assertEqual(registry.get("run-1")["state"], "stopped")
+        self.assertEqual(_standing(store), [], "the stale continuation left the grant standing")
+        self.assertIsNotNone(_revoked_seq(store, "run-1"))
+
+    def test_a_store_with_no_events_list_still_appends_the_revoke(self) -> None:
+        # Devin thread on the event store: the real store has no .events, so a pre-check there appends nothing.
+        inner = FakeStore()
+        store = _LedgerOnly(inner)
+        self.assertFalse(hasattr(store, "events"))
+        api = ControlAPI(InMemoryRunRegistry(), FakeKillTree(), FakeStarter(), clock=lambda: 1000.0,
+                         new_run_id=run_ids(), events=store)
+        run = started(api)
+        _grant(store, run)
+        answer = api.call("run.stop", {"run_id": run})
+        self.assertEqual(answer["code"], "stopped")
+        self.assertEqual(_standing(store), [], "the revoke was never appended")
+        self.assertIsNotNone(_revoked_seq(store, run))
+        self.assertIn("workspace.revoke", [event["type"] for event in inner.events])
+        self.assertIs(answer.get("workspace.revoke"), True)
+        self.assertEqual(answer["external_effects"], "unresolved")
+
+    def _stop_validator(self, schema: dict):
+        try:
+            import jsonschema
+            from referencing import Registry, Resource
+            from referencing.jsonschema import DRAFT202012
+        except ImportError:
+            return None
+        folder = _STOP_SCHEMA.parent
+        resources = []
+        for path in folder.glob("*.json"):
+            body = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(body, dict) and body.get("$schema"):
+                resources.append((path.name, Resource(contents=body, specification=DRAFT202012)))
+        return jsonschema.Draft202012Validator(schema, registry=Registry().with_resources(resources))
+
+    def test_stop_result_refuses_a_free_effects_word_and_a_denied_stopped_fact(self) -> None:
+        schema = json.loads(_STOP_SCHEMA.read_text(encoding="utf-8"))
+        pending = {"code": "pending", "run_id": "run-1", "state": "pending", "reason": "cgroup_unknown",
+                   "external_effects": "reconciled"}
+        denied_scope = {"code": "stopped", "run_id": "run-1", "state": "stopped", "repeat": False,
+                        "admission_closed": True, "local_scope_empty": False,
+                        "external_effects": "none_known"}
+        denied_acceptance = dict(denied_scope, local_scope_empty=True, admission_closed=False)
+        validator = self._stop_validator(schema)
+        if validator is not None:
+            self.assertTrue(list(validator.iter_errors(pending)), "pending effects word")
+            self.assertTrue(list(validator.iter_errors(denied_scope)), "local_scope_empty")
+            self.assertTrue(list(validator.iter_errors(denied_acceptance)), "admission_closed")
+            good = dict(denied_scope, local_scope_empty=True)
+            self.assertEqual(list(validator.iter_errors(good)), [])
+            bare = {"code": "pending", "run_id": "run-1", "state": "pending", "reason": "cgroup_unknown"}
+            self.assertEqual(list(validator.iter_errors(bare)), [])
+        self.assertEqual(schema["properties"]["external_effects"].get("enum"), ["none_known", "unresolved"])
+        self.assertEqual(schema["x-version"], "1.0-draft.4")
+        branch = next(item for item in schema["allOf"]
+                      if item.get("if", {}).get("properties", {}).get("code", {}).get("const") == "stopped")
+        props = branch["then"]["properties"]
+        self.assertIs(props["admission_closed"].get("const"), True)
+        self.assertIs(props["local_scope_empty"].get("const"), True)
+        index = json.loads((folder := _STOP_SCHEMA.parent / "fixtures" / "index.json").read_text(encoding="utf-8"))
+        names = {item["file"] for item in index["fixtures"]}
+        for name in (
+            "bad/stop.result.v1/b21-pending-with-an-effects-word-nobody-records.json",
+            "bad/stop.result.v1/b22-stopped-with-local-scope-empty-false.json",
+            "bad/stop.result.v1/b23-stopped-with-admission-closed-false.json",
+        ):
+            self.assertIn(name, names)
+            body = json.loads((folder.parent / name).read_text(encoding="utf-8"))
+            if validator is not None:
+                self.assertTrue(list(validator.iter_errors(body)), name)

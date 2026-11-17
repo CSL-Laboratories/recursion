@@ -16,7 +16,7 @@ Nothing is frozen yet.
 | `common.v1.json` | 1.0-draft.5 |
 | `run.record.v1.json` | 1.0-draft.5 |
 | `run.view.v1.json` | 1.0-draft.5 |
-| `stop.result.v1.json` | 1.0-draft.3 |
+| `stop.result.v1.json` | 1.0-draft.4 |
 | `session.v1.json` | 1.0-draft.3 |
 | `queue.item.v1.json` | 1.0-draft.7 |
 | `event.v1.json` | 1.0-draft.7 |
@@ -29,13 +29,16 @@ Nothing is frozen yet.
 
 ## Stop answer facts (Nov 17, 2026)
 
-`stop.result` draft 3. `run.record` draft 5. `run.view` draft 5. A stopped answer carries three facts beside `repeat`:
+`stop.result` draft 4. `run.record` draft 5. `run.view` draft 5. A stopped answer carries three facts beside `repeat`:
 `admission_closed`, `local_scope_empty` and `external_effects`, and the separate boolean `dispatch_fence_confirmed`.
-`external_effects` is `none_known` or `unresolved`. When a stopped answer carries `attestation`, that object carries the same effects word
+`external_effects` is `none_known` or `unresolved`, on a pending answer that carries the field as well as on a stopped one.
+When a stopped answer carries `attestation`, that object carries the same effects word
 as an enum, and may carry `dispatch_fence_confirmed`. The stored `stop_attestation` may carry them and still loads a row that does not.
+On a stopped answer `admission_closed` and `local_scope_empty` are true.
 `run.view` shows `stop_attestation` by reference, so the public view widened with the stored proof and is `1.0-draft.5`.
 A draft-2 reader refuses a draft-3 stopped answer (the new facts are not additional properties a draft-2 document allows).
-Pull request #479 (`80e0d38a`) also takes `stop.result` draft 3. Whichever of #538 and #479 lands second renumbers to draft 4.
+Pull request #479 (`80e0d38a`) takes `stop.result` draft 3. This file is draft 4. If that draft lands first, this draft 4 is the next number. If this file lands first, that draft takes draft 5.
+`workspace.revoke` is named only when the grant that stood has its revoke recorded. An older revoke does not count while a later grant stands.
 No event store means `unresolved`: `none_known` is never claimed without a log that was read. That default is an owner's point.
 `admission_closed` states acceptance only. `dispatch_fence_confirmed` is false until a path that really dispatches consults the admission set, and it is false today. That split is an owner's point. Open STOP drafts #504, #510, #511, #512, #513 and #514 do not name a boolean dispatch-fence fact; the provisional object `fence` is a different field. `run.dispatch` is not reachable through `call`.
 
@@ -47,6 +50,8 @@ No event store means `unresolved`: `none_known` is never claimed without a log t
 | A draft-2 reader refuses a draft-3 stopped answer | A stopped answer that had only `repeat` |
 | `workspace.revoke`, when present, is true | An answer that carried that field as false |
 | `dispatch_fence_confirmed` may be carried. It is false today | Nothing that omitted it |
+| `external_effects`, when carried on a pending answer, is `none_known` or `unresolved` | A pending answer whose effects word was any other string |
+| A stopped answer has `admission_closed` true and `local_scope_empty` true | A stopped answer that carried either fact as false |
 
 ## After two reads of the fifth read's answer (Nov 14, 2026)
 

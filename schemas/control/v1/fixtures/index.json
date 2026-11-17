@@ -13397,7 +13397,7 @@
     {
       "file": "bad/stop.result.v1/b18-stopped-with-an-effects-word-nobody-records.json",
       "schema": "stop.result.v1.json",
-      "rule": "The value at /external_effects must be one of the values listed at stop.result.v1.json#/allOf/0/then/properties/external_effects.",
+      "rule": "The value at /external_effects must be one of the values listed at stop.result.v1.json#/properties/external_effects.",
       "expect": {
         "keyword": "enum",
         "at": "/external_effects"
@@ -13419,6 +13419,33 @@
       "expect": {
         "keyword": "const",
         "at": "/workspace.revoke"
+      }
+    },
+    {
+      "file": "bad/stop.result.v1/b21-pending-with-an-effects-word-nobody-records.json",
+      "schema": "stop.result.v1.json",
+      "rule": "The value at /external_effects must be one of the values listed at stop.result.v1.json#/properties/external_effects.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/external_effects"
+      }
+    },
+    {
+      "file": "bad/stop.result.v1/b22-stopped-with-local-scope-empty-false.json",
+      "schema": "stop.result.v1.json",
+      "rule": "The value at /local_scope_empty on a stopped answer is the const at stop.result.v1.json#/allOf/0/then/properties/local_scope_empty.",
+      "expect": {
+        "keyword": "const",
+        "at": "/local_scope_empty"
+      }
+    },
+    {
+      "file": "bad/stop.result.v1/b23-stopped-with-admission-closed-false.json",
+      "schema": "stop.result.v1.json",
+      "rule": "The value at /admission_closed on a stopped answer is the const at stop.result.v1.json#/allOf/0/then/properties/admission_closed.",
+      "expect": {
+        "keyword": "const",
+        "at": "/admission_closed"
       }
     },
     {

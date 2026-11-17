@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "stop.result.v1.json",
   "title": "stop.result.v1: what a Stop answers",
-  "x-version": "1.0-draft.3",
-  "description": "The answer of run.stop when the run exists. A stopped answer carries 'repeat', admission_closed, local_scope_empty and external_effects. A stopped answer from before those facts is refused. It may also carry dispatch_fence_confirmed. A pending answer carries 'reason'. 'recorded' is present only when it is false. external_effects is none_known or unresolved and no other word: unresolved when an effect.outcome_unknown is recorded for the run, when that log cannot be read, or when no log was given; none_known only after a log was read and no such effect is in it. local_scope_empty is the cleanup that was seen, separate from admission_closed. admission_closed states acceptance only. dispatch_fence_confirmed is false until a path that really dispatches consults the admission set, and it is false today. workspace.revoke is present only when that event was appended for the run, and then it is true. THE OTHER ADDITIONS stay optional, each added by the lane that owns Stop in a versioned step of its own: the code 'ended', and the fields 'attestation', 'containment_level', 'claim' and 'fence'. The answer for a run id that was never registered stays today's. MEANINGS, frozen: 'stopped' means the run's removal was attested (today by proof 'empty'; by 'removed' once that is added). 'ended' means the run had already ended before this Stop, and this call stopped nothing; it never implies a verified removal. 'pending' means neither is established. A client that meets a code or a proof it does not know treats the run as NOT stopped. A client that meets a 'claim' it does not know shows nothing stronger than the weakest claim it does know.",
+  "x-version": "1.0-draft.4",
+  "description": "The answer of run.stop when the run exists. A stopped answer carries 'repeat', admission_closed, local_scope_empty and external_effects. A stopped answer from before those facts is refused. It may also carry dispatch_fence_confirmed. A pending answer carries 'reason'. 'recorded' is present only when it is false. external_effects is none_known or unresolved and no other word: unresolved when an effect.outcome_unknown is recorded for the run, when that log cannot be read, or when no log was given; none_known only after a log was read and no such effect is in it. local_scope_empty is the cleanup that was seen, separate from admission_closed. admission_closed states acceptance only. A stopped answer has admission_closed true and local_scope_empty true. dispatch_fence_confirmed is false until a path that really dispatches consults the admission set, and it is false today. workspace.revoke is present only when the grant that stood has its revoke recorded, and then it is true. An older revoke does not count while a later grant stands. THE OTHER ADDITIONS stay optional, each added by the lane that owns Stop in a versioned step of its own: the code 'ended', and the fields 'attestation', 'containment_level', 'claim' and 'fence'. The answer for a run id that was never registered stays today's. MEANINGS, frozen: 'stopped' means the run's removal was attested (today by proof 'empty'; by 'removed' once that is added). 'ended' means the run had already ended before this Stop, and this call stopped nothing; it never implies a verified removal. 'pending' means neither is established. A client that meets a code or a proof it does not know treats the run as NOT stopped. A client that meets a 'claim' it does not know shows nothing stronger than the weakest claim it does know.",
   "type": "object",
   "additionalProperties": false,
   "required": ["code", "run_id", "state"],
@@ -40,11 +40,11 @@
       "type": "boolean"
     },
     "external_effects": {
-      "description": "none_known only after the log was read and holds no effect.outcome_unknown. unresolved when that effect is recorded, when the log cannot be read, or when no log was given. No other word.",
-      "type": "string"
+      "description": "none_known only after the log was read and holds no effect.outcome_unknown. unresolved when that effect is recorded, when the log cannot be read, or when no log was given. No other word. A pending answer that carries the field uses the same two words.",
+      "enum": ["none_known", "unresolved"]
     },
     "workspace.revoke": {
-      "description": "Present and true only when a workspace.revoke event was appended for this run.",
+      "description": "Present and true only when the grant that stood has its revoke recorded. An older revoke does not count while a later grant stands.",
       "const": true
     }
   },
@@ -55,7 +55,8 @@
         "required": ["repeat", "admission_closed", "local_scope_empty", "external_effects"],
         "properties": {
           "state": {"const": "stopped"},
-          "external_effects": {"enum": ["none_known", "unresolved"]}
+          "admission_closed": {"const": true},
+          "local_scope_empty": {"const": true}
         },
         "not": {
           "anyOf": [

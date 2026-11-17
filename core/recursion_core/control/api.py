@@ -125,7 +125,6 @@ class ControlAPI:
         self._admission_lock = threading.Lock()
         self._admission: set[str] = set()
         self._effects: dict[str, str] = {}
-        self._revoked: set[str] = set()
         self._ledger_declared = False
         self._locks_lock = threading.Lock()
         # Exclusion is the registry's owner lock table when it has one, so two ControlAPIs over the same
@@ -289,6 +288,8 @@ class ControlAPI:
             self._launched[run_id] = dict(current)
             if current.get("stop") is not None or run_id in self._stop_wanted:
                 # A Stop arrived during the launch and answered pending; act on it now (red-team r3 finding 2).
+                # That accept ran before the starter recorded the grant, so record the revoke now.
+                self._record_revoke(run_id)
                 stop = self._stop(current)
                 code = START_UNCONFIRMED if stop.get("recorded") is False else STARTED
                 return {"code": code, "run": current, "duplicate": False, "stop": stop}
@@ -399,6 +400,8 @@ class ControlAPI:
                 rec.clear()
                 rec.update(fresh)
                 return True
+            # The stop may have been accepted before this attempt recorded its grant.
+            self._record_revoke(rec["run_id"])
             stop = self._stop(fresh)
             rec.clear()
             rec.update(fresh)
@@ -520,29 +523,27 @@ class ControlAPI:
             self._remember_effects(run_id, value)
         return value
 
-    def _mark_revoked(self, run_id: str) -> None:
-        with self._admission_lock:
-            self._revoked.add(run_id)
-
     def _revoke_named(self, run_id: str) -> bool:
-        with self._admission_lock:
-            if run_id in self._revoked:
-                return True
+        """True only when the ledger shows this run's grant revoked and no later grant standing."""
         store = self._events
         if store is None:
             return False
         try:
-            found = self._log_has_revoke(store, run_id)
+            return self._grant_is_revoked(store, run_id)
         except Exception:
             return False
-        if found:
-            self._mark_revoked(run_id)
-        return found
+
+    def _grant_is_revoked(self, store, run_id: str) -> bool:
+        with store.transaction() as tx:
+            rows = tx.execute(
+                "SELECT revoked_seq FROM workspace_grant WHERE run_id = ?", (run_id,))
+        return bool(rows) and rows[0][0] is not None
 
     def _read_effects(self, run_id: str) -> str:
         """none_known only after the log was read and holds no effect.outcome_unknown for the run.
 
-        No store, or a log that cannot be read (including a raise while iterating), is unresolved.
+        No store, or a log that cannot be read (including a raise while iterating, or a store
+        with no events listing), is unresolved. The revoke path does not use that listing.
         """
         store = self._events
         if store is None:
@@ -556,10 +557,6 @@ class ControlAPI:
             return "unresolved"
         return "none_known"
 
-    def _log_has_revoke(self, store, run_id: str) -> bool:
-        return any(isinstance(event, dict) and event.get("type") == "workspace.revoke"
-                   and event.get("run_id") == run_id for event in store.events)
-
     def _ledger(self):
         try:
             from recursion_core.workspace.grant import Ledger
@@ -568,13 +565,15 @@ class ControlAPI:
         return Ledger
 
     def _record_revoke(self, run_id: str) -> None:
+        """Append workspace.revoke for the grant that stands. A ledger error does not skip the kill.
+
+        An earlier revoke in the log is not a reason to return: a grant recorded after it stands
+        until Ledger.revoked runs. The log is not read through store.events.
+        """
         store = self._events
         if store is None:
             return
         try:
-            if self._log_has_revoke(store, run_id):
-                self._mark_revoked(run_id)
-                return
             ledger = self._ledger()
             if ledger is None:
                 return
@@ -585,20 +584,15 @@ class ControlAPI:
                     pass
                 self._ledger_declared = True
             with store.transaction() as tx:
-                seq = ledger.revoked(tx, run_id)
-            if seq is not None or self._log_has_revoke(store, run_id):
-                self._mark_revoked(run_id)
+                ledger.revoked(tx, run_id)
         except Exception:
-            try:
-                if self._log_has_revoke(store, run_id):
-                    self._mark_revoked(run_id)
-            except Exception:
-                return
+            return
 
     def _stamp(self, answer: dict, run_id: str) -> dict:
         """Put acceptance, the fence fact, the cleanup fact and the effects word on a Stop answer.
 
-        Name workspace.revoke only when that event is in the log. The fence is false until a path
+        Name workspace.revoke only when the ledger row shows the grant revoked and none standing.
+        An earlier event in the log is not enough. The fence is false until a path
         that really dispatches consults the admission set.
         """
         if not isinstance(answer, dict) or answer.get("code") == RUN_UNKNOWN:

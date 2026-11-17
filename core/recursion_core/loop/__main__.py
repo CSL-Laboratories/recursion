@@ -29,10 +29,12 @@ import sys
 import threading
 from pathlib import Path
 
+from recursion_core.loop import compaction
 from recursion_core.loop import done as d
 from recursion_core.loop import instructions as ins
 from recursion_core.loop import permissions as perm
 from recursion_core.loop import protocol as p
+from recursion_core.loop import store as st
 from recursion_core.loop.engine import DEFAULT_MAX_STEPS, Config, Engine, Session
 from recursion_core.loop.providers import anthropic, fake
 from recursion_core.loop.tools import edit, read, search, shell, write
@@ -70,6 +72,10 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--acceptance-rounds", type=int, default=d.DEFAULT_ROUNDS)
     ap.add_argument("--no-project-instructions", action="store_true",
                     help="do not read AGENTS.md and CLAUDE.md into the prompt")
+    ap.add_argument("--context-window", type=int, default=None,
+                    help="the model's context window in tokens, from the route; without it the loop never compacts")
+    ap.add_argument("--resume", default=None, metavar="ENGINE_SESSION_ID",
+                    help="continue the conversation stored under this id in the engine home")
     ap.add_argument("--fake-script", help="steps for the fake provider (tests and conformance runs)")
     ap.add_argument("--fake-record", help="append each request the fake provider receives to this file")
     return ap
@@ -175,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
                          f"(at most {threading.TIMEOUT_MAX:.0f} seconds)")
     try:
         acceptance = d.Acceptance(args.acceptance, rounds=args.acceptance_rounds) if args.acceptance else None
+        if args.context_window is not None:
+            compaction.ceiling(args.context_window)  # refuses a window too small for a tool session
     except ValueError as exc:
         raise SystemExit(f"recursion_loop: {exc}") from None
     provider, model = build(args, dict(os.environ))
@@ -197,16 +205,29 @@ def main(argv: list[str] | None = None) -> int:
     out = open(sys.stdout.fileno(), "w", encoding="utf-8", newline="\n", closefd=False, buffering=1)
     writer = p.Writer(out, redactor, seal_after="closed")  # nothing follows closed on standard output
     gate = perm.PermissionGate(writer, profile=args.permissions, deadline_s=args.approval_timeout)
-    session = Session(provider, registry, workspace, writer, redactor,
-                      Config(model=model, max_output_tokens=args.max_output_tokens, max_steps=args.max_steps,
-                             effort=args.effort, acceptance=acceptance, instructions=text), gate=gate)
+    try:
+        store = st.ConversationStore(home, args.resume or st.new_id(), redactor.scrub_obj)
+        loaded = store.load() if args.resume else None
+        if loaded is None:
+            store.create()  # the id the ready line names can be resumed from now on (astra R11, sol R10)
+        # A resumed conversation passes this run's secret policy here, or is refused (astra R8).
+        session = Session(provider, registry, workspace, writer, redactor,
+                          Config(model=model, max_output_tokens=args.max_output_tokens, max_steps=args.max_steps,
+                                 effort=args.effort, acceptance=acceptance, instructions=text,
+                                 context_window=args.context_window), gate=gate, store=store, loaded=loaded)
+    except (st.StoreError, ToolError, OSError) as exc:
+        raise SystemExit(f"recursion_loop: {exc}") from None
     engine = Engine(session, writer)
     writer.write("ready", protocol=p.PROTOCOL_VERSION, engine="recursion_loop", provider=provider.name, model=model,
                  tools=list(registry.names()), permissions=args.permissions,
                  acceptance=acceptance.command if acceptance else None,
-                 instructions=[f.to_wire() for f in found])
+                 instructions=[f.to_wire() for f in found], engine_session_id=store.session_id,
+                 resumed=loaded is not None, unknown_outcomes=list(loaded.repaired) if loaded else [])
 
-    return serve_input(engine, sys.stdin.fileno())
+    try:
+        return serve_input(engine, sys.stdin.fileno())
+    finally:
+        store.close()
 
 
 def serve_input(engine: Engine, fd: int) -> int:

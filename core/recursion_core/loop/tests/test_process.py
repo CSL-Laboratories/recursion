@@ -94,6 +94,10 @@ class FakeProviderProcess(unittest.TestCase):
         for path in (home / "spill").rglob("*") if (home / "spill").exists() else ():
             if path.is_file():
                 self.assertNotIn(FAKE_KEY, path.read_text(encoding="utf-8"))
+        sessions = list((home / "sessions").glob("*.jsonl"))
+        self.assertEqual(len(sessions), 1, "the conversation was stored for resume")
+        self.assertNotIn(FAKE_KEY, sessions[0].read_text(encoding="utf-8"))
+        self.assertIn("[redacted]", sessions[0].read_text(encoding="utf-8"))
 
     def test_full_access_needs_its_acknowledgement_and_instructions_are_listed(self) -> None:
         ws = private_dir(self, "loop-ws-")

@@ -13,7 +13,8 @@ id, which the driver takes from approval.v1's private binding (``engine_request_
 request it belongs to.
 
 Out (one object per line; standard output carries nothing else, diagnostics go to standard error):
-    ready           once, at start: protocol version, provider, model, tool names
+    ready           once, at start: protocol version, provider, model, tool names, permissions, acceptance,
+                    instruction files, engine_session_id (resume with --resume), resumed, unknown_outcomes
     input_accepted  {delivery_id, turn_id, how: "new_turn"}, written the moment the loop takes a message and
                     before anything is sent to the model; never for a message the loop did not take
     text            {turn_id, text}: one block of the model's text, written when its model call ends
@@ -34,6 +35,8 @@ Out (one object per line; standard output carries nothing else, diagnostics go t
                     unanswered (the call is denied, and an answer after it is refused)
     acceptance      {turn_id, command, exit_code, passed, timed_out, text}: the harness's acceptance check
                     (done.py)
+    compaction      {turn_id, before_tokens, replaced, kept, summary: "model" | "fallback", reason, ...}
+    retry           {turn_id, attempt, code, delay_s, detail}: a failed call is tried again after delay_s
     turn_ended      {turn_id, outcome, result, reason}
     interrupt       {turn_id, delivered}: delivered when that turn was running or waiting; such a line always
                     comes before the turn's turn_ended, which is interrupted unless the model had already

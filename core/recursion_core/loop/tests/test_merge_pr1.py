@@ -17,7 +17,8 @@ from recursion_core.loop.tests.test_edges import _interrupt, _message
 def _session(case, steps, acceptance=None):
     lines = Lines()
     session = Session(FakeProvider(steps), registry(), workspace(case, {"a.txt": "x\n"}), lines.writer,
-                      lines.redactor, Config(model="fake-model", acceptance=acceptance))
+                      lines.redactor, Config(model="fake-model", acceptance=acceptance,
+                                                             retry_delays=()))
     return session, lines
 
 

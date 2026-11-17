@@ -12,9 +12,16 @@ reason it would have had (a limit's line is still written, a failure's code stay
 model had already finished it (``candidate_done`` or ``done``) or the loop failed (``loop_error``).
 The main thread takes one message at a time: it writes ``input_accepted`` for it, then runs the turn:
 
-    the user's text is added; then, until the turn ends:
+    the user's text is added (and kept, word for word, in the session's ledger); then, until the turn ends:
+      if the route gave a context window and the request would pass its ceiling (by the provider's count of the
+      last prompt plus what was added since, or by the loop's own estimate of the conversation, the system
+      prompt and the tool list, whichever is larger), it is compacted first (compaction.py; a ``compaction``
+      line); when the user's words alone cannot fit, the turn ends ``failed`` with ``context_full`` and no call;
+      the summary call is made with no tool and a request under the ceiling, and a typed limit it meets ends
+      the turn as any limit does;
       the model is called with the whole conversation and the tool list (one ``usage`` line per call, a
-      failed or interrupted call included);
+      failed or interrupted call included, a retried one too); an overload, a server error or a broken
+      connection is retried after a wait (a ``retry`` line each);
       its text blocks are written as ``text`` lines and its reply is added to the conversation;
       if it asked for tools, each runs through the registry (``tool_call``, a ``permission_request`` for those
       that change something, then ``tool_result``) and the results go back as the next user message;
@@ -28,7 +35,7 @@ How a turn ends (``turn_ended``; outcomes are session.v1's):
                                              have had (a failure's code, a limit's detail); result null and
                                              reason ``interrupted`` when the interrupt itself ended it
     a typed limit                            paused, after a ``limit`` line (its retry_after_s null when the
-                                             provider's is not a finite number of seconds)
+                                             provider's is not a finite integer or a finite float)
     the reply hit the output limit           paused
     the step budget ran out                  paused (budget exhaustion is never done)
     a refusal, a provider failure, a full    failed, with the code
@@ -63,10 +70,19 @@ input that did not parse, its raw text dropped: the call gets an error result.
 However a turn ends, a loop error included, the conversation is left valid (``settle``): every tool call of
 the last reply has a result (its own when it ran, a "not run" one when it did not) and a reply follows the
 user's side.
+
+With a conversation store (store.py), every message added is journaled as it is added (a message that joins the
+last one is journaled on its own and joined again when the journal is read back), the user's text as one record
+that is both its message and its ledger entry, each tool result as soon as its call is over, a compaction as a
+replacement, and the totals at each turn's end, when the journal is synced. A resumed conversation passes the
+current run's secret policy before any of it is sent: its text, tool inputs and results, ledger and model names
+are scrubbed, and a vendor block, or a tool call's id or name, that holds a secret refuses the resume; the
+results message the journal put back together is journaled before anything else.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import queue
@@ -76,10 +92,12 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
 
+from recursion_core.loop import compaction as c
 from recursion_core.loop import done as d
 from recursion_core.loop import protocol as p
 from recursion_core.loop.permissions import PermissionGate
 from recursion_core.loop.providers import base as b
+from recursion_core.loop.store import ConversationStore, Loaded, StoreError, check_totals
 from recursion_core.loop.tools import registry as r
 from recursion_core.loop.tools.workspace import Workspace
 
@@ -102,6 +120,8 @@ NO_REPLY_WHY = {
 DETAIL_MAX = 2000
 KEEPS_OUTCOME = ("interrupted", "candidate_done", "done")  # outcomes a delivered interrupt does not replace
 NOT_RUN = "not run: the turn ended before this call ran"
+# Never retried, whatever a provider's subclass says about itself (DeepSeek F10).
+NOT_RETRIED = (b.LimitError, b.AuthError, b.BillingError, b.RequestError, b.ProtocolError)
 SECRET_INSIDE = ("the reply holds a secret the loop keeps, inside a vendor block or a tool call's id or name, which "
                  "cannot be changed")
 
@@ -196,6 +216,23 @@ class Config:
     system: str | None = None
     acceptance: d.Acceptance | None = None
     instructions: str = ""
+    # The model's context window in tokens, from the route. None: the loop never compacts (it does not guess a
+    # window from a model's name).
+    context_window: int | None = None
+    keep_tail_tokens: int = c.KEEP_TAIL_TOKENS
+    # Waits before each retry of a call that failed with an overload, a server error or a broken connection
+    # (as the vendor SDKs retry twice). A typed limit and an auth, billing or request failure are not retried.
+    retry_delays: tuple[float, ...] = (1.0, 2.0)
+    summary_max_tokens: int = 8192
+
+    def __post_init__(self) -> None:
+        for delay in self.retry_delays:
+            if isinstance(delay, bool) or not isinstance(delay, (int, float)) or not math.isfinite(delay) or delay < 0:
+                raise ValueError("a retry wait is a finite number of seconds, 0 or more")
+        if self.context_window is not None and (isinstance(self.context_window, bool)
+                                                or not isinstance(self.context_window, int)
+                                                or self.context_window <= 0):
+            raise ValueError("a context window is a whole number of tokens")
 
 
 @dataclass
@@ -253,10 +290,33 @@ class UsageTotal:
     def model(self) -> str | None:
         return next(iter(self.models)) if len(self.models) == 1 else None
 
+    def to_state(self) -> dict:
+        return {"calls": self.calls, "models": sorted(m for m in self.models if m is not None),
+                "null_model": None in self.models, "sum": self._sum, "known": self._known, "exact": self._exact,
+                "source": {name: PROVENANCE_ORDER[i] for name, i in self._source.items()}}
+
+    @classmethod
+    def from_state(cls, state: dict) -> "UsageTotal":
+        try:
+            check_totals(state)
+        except TypeError as exc:
+            raise ValueError(f"not a totals state: {exc}") from None
+        total = cls()
+        total.calls = int(state["calls"])
+        total.models = set(state["models"]) | ({None} if state.get("null_model") else set())
+        for name in b.USAGE_FIELDS:
+            total._sum[name] = state["sum"][name]
+            total._known[name] = int(state["known"][name])
+            total._exact[name] = bool(state["exact"][name])
+            # A journal written before the provenance was kept has none: it was labelled observed then.
+            total._source[name] = PROVENANCE_ORDER.index(state.get("source", {}).get(name, b.OBSERVED))
+        return total
+
 
 class Session:
     def __init__(self, provider: b.Provider, registry: r.ToolRegistry, workspace: Workspace, writer: p.Writer,
-                 redactor: p.Redactor, config: Config, gate: PermissionGate | None = None) -> None:
+                 redactor: p.Redactor, config: Config, gate: PermissionGate | None = None,
+                 store: ConversationStore | None = None, loaded: Loaded | None = None) -> None:
         self.provider = provider
         self.registry = registry
         self.workspace = workspace
@@ -274,6 +334,55 @@ class Session:
         self._turn_usage: UsageTotal | None = None  # the running turn's sum, for a turn the loop fails
         # How a turn's end is written; an Engine writes it under the lock an interrupt is answered under.
         self.ending: Callable[[Callable[[], None]], None] = _now
+        # Every message the user sent, word for word (scrubbed): compaction re-injects them from here.
+        self.user_messages: list[tuple[str, str]] = []
+        self._ceiling = c.ceiling(config.context_window) if config.context_window else None
+        self._prompt_tokens: int | None = None  # the provider's count of the last prompt it was sent
+        self._counted = 0  # the loop's own estimate of the messages that count covers
+        self.store = store
+        if loaded is not None:  # a resumed conversation
+            if store is not None and loaded.session_id != store.session_id:
+                # A missing id is not this session: journaling it here would publish another conversation's
+                # words under this id, and dropping it would lose them. The caller names the session or refuses.
+                if loaded.session_id is None:
+                    raise StoreError("the loaded conversation names no session")
+                raise StoreError("the loaded conversation is another session's")
+            self.messages = [self._resumed(m) for m in loaded.messages]
+            self.user_messages = [(redactor.scrub(turn), redactor.scrub(text))
+                                  for turn, text in loaded.user_messages]
+            if loaded.totals:
+                self.session_usage = UsageTotal.from_state(loaded.totals)
+                self.session_usage.models = {redactor.scrub(m) if m is not None else None
+                                             for m in self.session_usage.models}
+            if loaded.reconstructed and store is not None:
+                store.message(self.messages[-1])  # the results put back together are now part of the record
+
+    def _resumed(self, message: b.Message) -> b.Message:
+        """A loaded message under this run's secret policy (a value may be a secret in this run that was ordinary
+        in the run that wrote it): text, tool inputs and results scrubbed; a vendor block, or a tool call's id or
+        name, holding a secret cannot be changed, so the resume is refused (StoreError)."""
+
+        out: list[b.Part] = []
+        for part in message.parts:
+            if isinstance(part, b.TextPart):
+                part = b.TextPart(self.redactor.scrub(part.text))
+            elif isinstance(part, b.ToolResult):
+                if self.redactor.holds(part.call_id):
+                    raise StoreError(SECRET_INSIDE)
+                part = b.ToolResult(part.call_id, self.redactor.scrub(part.text), part.is_error)
+            elif isinstance(part, b.ToolCall):
+                if self.redactor.holds(part.call_id) or self.redactor.holds(part.name):
+                    raise StoreError(SECRET_INSIDE)
+                clean = self.redactor.scrub_obj(dict(part.input)) if part.input is not None else None
+                raw = self.redactor.scrub(part.raw_input)
+                if clean is not None and clean != dict(part.input):
+                    raw = json.dumps(clean, ensure_ascii=False)
+                part = b.ToolCall(part.call_id, part.name, clean, raw,
+                                  self.redactor.scrub(part.input_error) if part.input_error else part.input_error)
+            elif isinstance(part, b.OpaquePart) and self.redactor.holds(part.data):
+                raise StoreError(SECRET_INSIDE)
+            out.append(part)
+        return b.Message(message.role, tuple(out))
 
     # -- one turn ----------------------------------------------------------------------------------------
 
@@ -287,13 +396,123 @@ class Session:
         self._turn_usage = usage
         return self._turn(turn_id, text, cancel, usage)
 
+    def _call(self, turn_id: str, request: b.TurnRequest, cancel: b.CancelToken, usage: UsageTotal,
+              purpose: str = "turn") -> b.TurnResponse:
+        """One model call, retried after an overload, a server error or a broken connection (each wait written
+        as a ``retry`` line and cut short by an interrupt). Every attempt that fails has its own ``usage`` line,
+        written here; a wait cut short by an interrupt makes no call and has none. Raises what the provider
+        raised otherwise."""
+
+        attempt = 0
+        while True:
+            try:
+                return self.provider.stream_turn(request, cancel=cancel)
+            except (b.Cancelled, b.ProviderError) as exc:
+                self._usage(turn_id, usage, exc.usage, exc.served_model, purpose)
+                if (not isinstance(exc, b.ProviderError) or isinstance(exc, NOT_RETRIED) or not exc.retryable
+                        or attempt >= len(self.config.retry_delays)):
+                    raise
+                delay = self.config.retry_delays[attempt]
+                attempt += 1
+                self.writer.write("retry", turn_id=turn_id, attempt=attempt, code=exc.code, delay_s=delay,
+                                  detail=self.redactor.scrub(exc.detail))
+                if cancel.wait(delay):
+                    raise b.Cancelled() from None
+            except Exception:
+                self._usage(turn_id, usage, None, None, purpose)  # the call was made all the same; the error follows
+                raise
+
+    def _overhead(self) -> int:
+        """What every request carries besides its messages: the system prompt and the tool list (estimated)."""
+
+        return len(self.system) // c.CHARS_PER_TOKEN + c.estimate_tools(self.registry.specs())
+
+    def _size(self) -> int:
+        """The next request's size: the provider's count of the last prompt plus the loop's estimate of what was
+        added since (a reply that joined the last message included), or the loop's own estimate of the whole
+        request, whichever is larger."""
+
+        own = c.estimate(self.messages) + self._overhead()
+        if self._prompt_tokens is None:
+            return own
+        return max(own, self._prompt_tokens + max(0, c.estimate(self.messages) - self._counted))
+
+    def _maybe_compact(self, turn_id: str, cancel: b.CancelToken, usage: UsageTotal) -> None:
+        """Compact when the next request would pass the ceiling. Raises c.ContextFull when it cannot be brought
+        under it without dropping the user's words, and lets a typed limit of the summary call through."""
+
+        if self._ceiling is None:
+            return
+        size = self._size()
+        if size <= self._ceiling:
+            return
+
+        def summarize(prefix: list[b.Message]) -> b.TurnResponse | None:
+            # No tool; the instruction joins a last user message (the roles alternate); the request is kept
+            # under the ceiling by shortening the longest texts of the part to summarise, in this request only.
+            msgs = c.fit(c.summary_request(prefix), self._ceiling - len(self.system) // c.CHARS_PER_TOKEN)
+            if msgs is None:
+                raise c.NoSummary("the part to summarise does not fit the window, even shortened")
+            request = b.TurnRequest(self.config.model, self.system, tuple(msgs), (), self.config.summary_max_tokens,
+                                    self.config.effort)
+            try:
+                response = self._call(turn_id, request, cancel, usage, "compaction")
+            except (b.Cancelled, b.LimitError):
+                raise  # an interrupt or a typed limit ends the turn; it is not a failed summary
+            except b.ProviderError:
+                return None
+            self._measured(usage, response, turn_id, (), "compaction")
+            try:
+                # The summary joins the conversation: it passes the same checks as any reply (no secret, no lone
+                # surrogate, nothing JSON cannot write), or the record fallback is used.
+                return dataclasses.replace(response, parts=self._kept(response.parts))
+            except (_NotKept, RecursionError):
+                return None
+
+        room = self._ceiling - self._overhead()
+        done = c.compact(self.messages, self.user_messages, summarize, self.config.keep_tail_tokens, room=room)
+        if done is None:
+            # Nothing can be cut. The next call would still send _size(), which keeps the provider's count when
+            # that count is the larger one. Over the ceiling, the turn stops before that call.
+            if self._size() > self._ceiling:
+                raise c.ContextFull("the conversation is larger than the model's window and nothing in it can be "
+                                    "compacted")
+            return
+        self.messages = done.messages
+        if self.store is not None:
+            self.store.replace(self.messages)
+        self._prompt_tokens, self._counted = None, 0
+        self.writer.write("compaction", turn_id=turn_id, before_tokens=size, replaced=done.replaced, kept=done.kept,
+                          summary=done.summary_source, reason=done.reason,
+                          after_tokens_estimate=c.estimate(self.messages) + self._overhead())
+
+    def _limit(self, turn_id: str, exc: b.LimitError, usage: UsageTotal) -> str:
+        # A value JSON cannot write (NaN, an infinity) or that is not what the field holds would make the line
+        # unwritable: the line says the time is unknown instead, and the turn still pauses.
+        # An int is not passed to math.isfinite. That conversion raises OverflowError for an int past the
+        # float range, and a finite integer (however large) is a legal retry time the line can carry.
+        # The call's usage line was already written by _call before this ran.
+        retry = exc.retry_after_s
+        if isinstance(retry, bool) or not isinstance(retry, (int, float)):
+            retry = None
+        elif not isinstance(retry, int) and not math.isfinite(retry):
+            retry = None
+        reset_at = exc.reset_at if isinstance(exc.reset_at, str) else None
+        self.writer.write("limit", turn_id=turn_id, scope="connection", kind="plan_limit", model=None,
+                          bucket=None, reset_at=reset_at, retry_after_s=retry)
+        return self._end(turn_id, "paused", self._result(None, exc.detail), "limit", usage)
+
     def _turn(self, turn_id: str, text: str, cancel: b.CancelToken, usage: UsageTotal) -> str:
         self._cancel = cancel
         if b.holds_unencodable(text):
             # parse_input refuses such a message; a caller in-process could still pass one. Refused before it
             # joins the conversation, where every later request would have to carry it.
             raise ValueError("the user's text is not valid Unicode (a lone surrogate)")
-        self._append(b.Message("user", (b.TextPart(self.redactor.scrub(text)),)))
+        clean = self.redactor.scrub(text)
+        if self.store is not None:
+            self.store.user(turn_id, clean)  # its message and its ledger entry in one record: never one alone
+        self._append(b.Message("user", (b.TextPart(clean),)), journal=False)
+        self.user_messages.append((self.redactor.scrub(turn_id), clean))
         steps = 0
         checks = 0
         acceptance = self.config.acceptance
@@ -304,35 +523,25 @@ class Session:
                 return self._end(turn_id, "paused", self._result(None, f"the turn used its {steps} model calls"),
                                  "step_budget", usage)
             steps += 1
+            try:
+                self._maybe_compact(turn_id, cancel, usage)
+            except b.Cancelled:
+                return self._end(turn_id, "interrupted", None, "interrupted", usage)
+            except b.LimitError as exc:  # the summary call's: no further call in this turn (astra R9, sol R7)
+                return self._limit(turn_id, exc, usage)
+            except c.ContextFull as exc:  # nothing is sent over the ceiling (astra R6, sol R3)
+                return self._end(turn_id, "failed", self._result("context_full", str(exc)), "context_full", usage)
             request = b.TurnRequest(self.config.model, self.system, tuple(self.messages), self.registry.specs(),
                                     self.config.max_output_tokens, self.config.effort)
             try:
-                response = self.provider.stream_turn(request, cancel=cancel)
-            except b.Cancelled as exc:
-                self._usage(turn_id, usage, exc.usage, exc.served_model)
+                response = self._call(turn_id, request, cancel, usage)
+            except b.Cancelled:
                 return self._end(turn_id, "interrupted", None, "interrupted", usage)
             except b.LimitError as exc:
-                self._usage(turn_id, usage, exc.usage, exc.served_model)
-                # A value JSON cannot write (NaN, an infinity) or that is not what the field holds would make the
-                # line unwritable: the line says the time is unknown instead, and the turn still pauses.
-                # An int is not passed to math.isfinite. That conversion raises OverflowError for an int past the
-                # float range, and a finite integer (however large) is a legal retry time the line can carry.
-                retry = exc.retry_after_s
-                if isinstance(retry, bool) or not isinstance(retry, (int, float)):
-                    retry = None
-                elif not isinstance(retry, int) and not math.isfinite(retry):
-                    retry = None
-                reset_at = exc.reset_at if isinstance(exc.reset_at, str) else None
-                self.writer.write("limit", turn_id=turn_id, scope="connection", kind="plan_limit", model=None,
-                                  bucket=None, reset_at=reset_at, retry_after_s=retry)
-                return self._end(turn_id, "paused", self._result(None, exc.detail), "limit", usage)
+                return self._limit(turn_id, exc, usage)
             except b.ProviderError as exc:
-                self._usage(turn_id, usage, exc.usage, exc.served_model)
                 return self._end(turn_id, "failed", self._result(exc.code, exc.detail), "provider_error", usage)
-            except Exception:
-                self._usage(turn_id, usage, None, None)  # the call was made all the same; the loop error follows
-                raise
-            self._usage(turn_id, usage, response.usage, response.served_model)
+            self._measured(usage, response, turn_id, request.messages, "turn")
             try:
                 parts = self._kept(response.parts)
             except (_NotKept, RecursionError) as exc:  # RecursionError: a reply nested deeper than it can walk
@@ -409,25 +618,42 @@ class Session:
                               spill=({"ref": outcome.spill_ref, "bytes": outcome.output_bytes}
                                      if outcome.spill_ref else None))
             results.append(result)
+            if self.store is not None:
+                self.store.result(result)  # journaled as soon as the call is over
         self._append(b.Message("user", tuple(results)))
         self._ran = {}
 
-    def _append(self, message: b.Message) -> None:
+    def _append(self, message: b.Message, journal: bool = True) -> None:
         """Add a message; one with the same role as the last joins it, so the roles always alternate."""
 
+        if journal and self.store is not None:
+            self.store.message(message)  # journaled as added; the journal's reader joins it again
         if self.messages and self.messages[-1].role == message.role:
             last = self.messages.pop()
             message = b.Message(message.role, last.parts + message.parts)
         self.messages.append(message)
 
-    def _usage(self, turn_id: str, total: UsageTotal, usage: b.Usage | None, model: str | None) -> None:
+    def _usage(self, turn_id: str, total: UsageTotal, usage: b.Usage | None, model: str | None,
+               purpose: str = "turn") -> None:
         """One usage line for one model call, added to the turn's and the session's totals; a call that measured
-        nothing is all unknown, never 0 (and makes the totals lower bounds)."""
+        nothing is all unknown, never 0 (and makes the totals lower bounds). A compaction's call says so."""
 
         measured = usage or b.Usage()
         total.add(measured, model)
         self.session_usage.add(measured, model)
-        self.writer.write("usage", turn_id=turn_id, span="call", model=model, **measured.to_wire())
+        extra = {"purpose": purpose} if purpose != "turn" else {}
+        self.writer.write("usage", turn_id=turn_id, span="call", model=model, **measured.to_wire(), **extra)
+
+    def _measured(self, usage: UsageTotal, response: b.TurnResponse, turn_id: str, sent: tuple[b.Message, ...],
+                  purpose: str) -> None:
+        """A call that returned: its usage line, and the prompt size it measured, which compaction starts from."""
+
+        self._usage(turn_id, usage, response.usage, response.served_model, purpose)
+        u = response.usage
+        if purpose == "turn" and u.input_tokens.quality != b.UNKNOWN:
+            self._prompt_tokens = sum(m.value for m in (u.input_tokens, u.cache_read_tokens, u.cache_write_tokens)
+                                      if m.quality != b.UNKNOWN)
+            self._counted = c.estimate(sent)
 
     def _kept(self, parts: tuple[b.Part, ...]) -> tuple[b.Part, ...]:
         """The reply as the conversation keeps it, with every secret the loop holds removed from its text and its
@@ -519,7 +745,16 @@ class Session:
 
     def _end(self, turn_id: str, outcome: str, result: dict | None, reason: str, usage: UsageTotal) -> str:
         self.settle(reason)
+        self._journal_totals()
         return self._finish(turn_id, outcome, result, reason, usage)
+
+    def _journal_totals(self) -> None:
+        """The session's totals go to the journal, and the journal to the disk, once the turn has settled: outside
+        the engine's lock, so an interrupt is never kept waiting on the disk."""
+
+        if self.store is not None:
+            self.store.totals(self.session_usage.to_state())
+            self.store.sync()
 
     def _finish(self, turn_id: str, outcome: str, result: dict | None, reason: str, usage: UsageTotal,
                 keep: bool = False) -> str:
@@ -549,6 +784,7 @@ class Session:
 
         try:
             self.settle("loop_error")
+            self._journal_totals()  # the journal is synced as at any end (PR 3)
         except Exception:  # noqa: BLE001 - the turn has failed already; its end is written regardless
             pass
         usage = self._turn_usage if self._turn_usage is not None else UsageTotal()

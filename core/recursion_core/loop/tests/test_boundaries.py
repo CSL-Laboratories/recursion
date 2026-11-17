@@ -90,7 +90,8 @@ class _Replay:
 def _session(case, provider, *, files=None, system=None) -> tuple[Session, Lines]:
     lines = Lines([SECRET])
     session = Session(provider, registry(), workspace(case, files), lines.writer, lines.redactor,
-                      Config("synthetic-model", system=system))
+                      Config("synthetic-model", system=system,
+                             retry_delays=()))  # one call per failure (PR 3 retries)
     return session, lines
 
 

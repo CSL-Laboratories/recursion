@@ -73,7 +73,7 @@ def _session(case, steps) -> tuple[Session, FakeProvider, Lines]:
     provider = FakeProvider(steps)
     lines = Lines([SECRET])
     session = Session(provider, registry(), workspace(case, {"a.txt": "x\n"}), lines.writer, lines.redactor,
-                      Config("fake-model"))
+                      Config("fake-model", retry_delays=()))  # one call per scripted failure (PR 3 retries)
     return session, provider, lines
 
 

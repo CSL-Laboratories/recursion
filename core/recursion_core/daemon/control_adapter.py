@@ -880,7 +880,7 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
     try:
         stored, created = open_breaker_store(state_dir, clock=clock,
                                              probe_lease_seconds=store_probe_lease_s(routes, route_breaker))
-    except (Refused, OSError, sqlite3.Error) as exc:
+    except (Refused, OSError, sqlite3.Error, ValueError) as exc:
         breaker_unavailable = exc.code if isinstance(exc, Refused) else type(exc).__name__
         log.error('breaker store cannot be opened (%s): every start is refused; reads and Stop still work',
                   breaker_unavailable)

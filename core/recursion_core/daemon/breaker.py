@@ -22,10 +22,21 @@ store's module is only called here, never changed.
   still holds after a successful probe is logged and fenced again, never shown closed.
 * Every run the daemon launches is bound in the store to its connection, engine and model, owned
   by ``host``: a reserved plugin id, so no plugin's effect can cite an operator's run. A run whose
-  route result is an error is recorded as faulted. A trip or a fault the store does not take is
-  kept in ``breaker-pending.json`` beside the store and applied on the next open (and at shutdown
-  when the store accepts it). An error ``result.json`` with no fault row is faulted on that open,
-  so a stop between the result and ``fault_run`` does not drop the fault.
+  route result is an error is recorded as faulted. A trip or a fault the store failed to write
+  (a store error, not a refusal) is kept in ``breaker-pending.json`` beside the store and applied
+  on the next open, and again at shutdown when the store accepts it. A refusal is logged and not
+  kept: an id the store rejects can never become durable, and keeping it would only wedge the next
+  open. A pending entry the store refuses on a later open is dropped with a log, so one bad entry
+  cannot wedge every later open; a store error on that apply is kept for the next open. The pending
+  file sits on the same filesystem as the store. When that filesystem is full or the directory
+  cannot be written, the pending write fails as well: nothing is kept, the next start admits the
+  route, and the failure is logged. There is no journal on another mount. An error ``result.json``
+  with no fault row is faulted on that open, including an operator-owned regular file that is too
+  large to parse, not valid UTF-8, or not JSON. A symlink, another owner's file, or a group- or
+  other-writable file is skipped. An empty, non-JSON, or non-UTF-8 pending file is
+  ``breaker_store_untrusted`` and is left in place. A stand-in store that was not opened here
+  writes no pending file, and that is logged once when the breaker is built. An unreadable
+  ``runs`` directory is logged and skipped; it does not refuse the open.
 
 The store is ``<state dir>/plugin-security/breaker.sqlite3`` (0600 in a 0700 directory; the file, its
 WAL and shm files and the directory must not be symlinks: ``breaker_store_untrusted``). There is
@@ -35,10 +46,13 @@ daemon keeps serving reads and Stop, and refuses every start (``breaker_store_un
 """
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import logging
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import threading
@@ -54,14 +68,18 @@ log = logging.getLogger(__name__)
 
 STORE_DIR = 'plugin-security'
 STORE_FILE = 'breaker.sqlite3'
-PENDING_NAME = 'breaker-pending.json'  # trips and faults the sqlite store did not take
+PENDING_NAME = 'breaker-pending.json'  # trips and faults the sqlite store failed to write
 _PENDING_LIMIT = 1024 * 1024
+_RESULT_LIMIT = 64 * 1024 * 1024  # an owned error result above this is faulted without being parsed
+# The store's id rule (plugin_security.breaker._ID). Copied because that name is private and this
+# module only calls the store. A directory name that does not match is not inserted.
+_RUN_ID = re.compile(r'[A-Za-z0-9_.:@/-]{1,128}')
 HOST = 'host'  # plugin_security.protocol.HOST: reserved, so no plugin manifest can carry it
 RESTORED_SOURCE = 'recursion.breaker_store'
 STORE_PROBE_LEASE_S = 300.0  # plugin_security.ConnectionBreaker's default probe_lease_seconds
-# The path open_breaker_store used, so a trip the store does not take can be written beside that
+# The path open_breaker_store used, so a trip the store failed to write can be written beside that
 # file. The frozen store does not publish its path, and this module only calls it. A stand-in that
-# was not opened here has no entry and writes no pending file.
+# was not opened here has no entry and writes no pending file; building the breaker says so once.
 _OPENED = weakref.WeakKeyDictionary()
 
 
@@ -112,6 +130,7 @@ def open_breaker_store(state_dir, *, clock, probe_lease_seconds=None):
     lease_s =STORE_PROBE_LEASE_S if probe_lease_seconds is None else float(probe_lease_seconds)
     stored = StoredBreaker(str(path), clock=clock, probe_lease_seconds=lease_s)
     _OPENED[stored] = path
+    _sweep_pending_temps(path)
     try:
         _apply_pending(path, stored)
         _fault_error_results(state_dir, stored)
@@ -193,7 +212,15 @@ def _pending_path(store_file):
 def _load_pending(path):
     if not os.path.lexists(path):
         return [], []
-    data = json.loads(_read_private(path, _PENDING_LIMIT).decode('utf-8'))
+    try:
+        raw = _read_private(path, _PENDING_LIMIT)
+        data = json.loads(raw.decode('utf-8'))
+    except Refused:
+        raise
+    except (OSError, ValueError, UnicodeError) as exc:
+        # Empty, not JSON, or not UTF-8 used to escape as ValueError. It is a store refusal.
+        log.error('pending breaker file cannot be read (%s)', type(exc).__name__)
+        raise Refused('breaker_store_untrusted', Path(path).name) from None
     if not isinstance(data, dict):
         raise Refused('breaker_store_untrusted', Path(path).name)
     trips, faults = data.get('trips', []), data.get('faults', [])
@@ -213,27 +240,167 @@ def _store_pending(path, trips, faults):
     _write_private(path, raw)
 
 
+def _pending_lock(store_file):
+    """Exclusive lock beside the pending file. Caller already holds ``DurableRouteBreaker._lock`` when one exists."""
+    path = Path(store_file).with_name('.' + PENDING_NAME + '.lock')
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _unlock(fd):
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
 def _add_pending(store_file, *, trip=None, fault=None):
-    path = _pending_path(store_file)
-    trips, faults = _load_pending(path)
-    if trip is not None and trip not in trips:
-        trips.append(trip)
-    if fault is not None and fault not in faults:
-        faults.append(fault)
-    _store_pending(path, trips, faults)
+    lock_fd = _pending_lock(store_file)
+    try:
+        path = _pending_path(store_file)
+        trips, faults = _load_pending(path)
+        if trip is not None and trip not in trips:
+            trips.append(trip)
+        if fault is not None and fault not in faults:
+            faults.append(fault)
+        _store_pending(path, trips, faults)
+    finally:
+        _unlock(lock_fd)
 
 
 def _apply_pending(store_file, stored):
-    """Put trips and faults the previous process could not write into the store. Idempotent."""
+    """Put trips and faults the previous process could not write into the store. Idempotent.
+
+    An entry the store refuses is dropped with a log. A store error stays in the file for the next
+    open. The file is removed only when nothing remains.
+    """
     path = _pending_path(store_file)
     if not os.path.lexists(path):
         return
-    trips, faults = _load_pending(path)
-    for connection in trips:
-        stored.report(connection, c.PLAN_LIMIT)
-    for run_id in faults:
-        stored.fault_run(run_id)
-    os.unlink(path)
+    lock_fd = _pending_lock(store_file)
+    try:
+        if not os.path.lexists(path):
+            return
+        trips, faults = _load_pending(path)
+        kept_trips, kept_faults = [], []
+        for connection in trips:
+            try:
+                stored.report(connection, c.PLAN_LIMIT)
+            except Refused:
+                log.error('a pending trip the store refuses is dropped')
+            except sqlite3.Error:
+                kept_trips.append(connection)
+                log.error('a pending trip could not be written and stays for the next open')
+        for run_id in faults:
+            try:
+                stored.fault_run(run_id)
+            except Refused:
+                log.error('a pending fault the store refuses is dropped')
+            except sqlite3.Error:
+                kept_faults.append(run_id)
+                log.error('a pending fault could not be written and stays for the next open')
+        _store_pending(path, kept_trips, kept_faults)
+    finally:
+        _unlock(lock_fd)
+
+
+def _sweep_pending_temps(store_file):
+    """Drop pending temps whose writer is gone, and this process's own leftover. Leave a live writer's temp."""
+    directory = Path(store_file).parent
+    prefix = f'.{PENDING_NAME}.'
+    try:
+        names = os.listdir(directory)
+    except OSError as exc:
+        log.error('pending temp files could not be listed: %s', type(exc).__name__)
+        return
+    for name in names:
+        if not (name.startswith(prefix) and name.endswith('.tmp')):
+            continue
+        middle = name[len(prefix):-len('.tmp')]
+        if not middle.isdigit():
+            continue
+        pid = int(middle)
+        if pid != os.getpid():
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                continue
+            else:
+                continue
+        try:
+            os.unlink(directory / name)
+        except OSError:
+            pass
+
+
+def _result_verdict(path):
+    """``fault``, ``skip``, for one ``result.json``.
+
+    An untrusted shape (symlink, not ours, group- or other-writable) is skipped. An owned regular
+    file that is too big, not UTF-8, or not JSON is a fault: size and encoding must not leave an
+    error result trusted. Well-formed JSON whose ``code`` is None is not a fault.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno != errno.ELOOP:
+            log.error('an error result could not be opened (%s)', type(exc).__name__)
+        return 'skip'
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022):
+            return 'skip'
+        if info.st_size > _RESULT_LIMIT:
+            return 'fault'
+        with os.fdopen(os.dup(fd), 'rb') as handle:
+            raw = handle.read(_RESULT_LIMIT + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > _RESULT_LIMIT:
+        return 'fault'
+    try:
+        payload = json.loads(raw.decode('utf-8'))
+    except (ValueError, UnicodeError):
+        return 'fault'
+    if not isinstance(payload, dict) or payload.get('code') is None:
+        return 'skip'
+    return 'fault'
+
+
+def _record_faults(stored, run_ids):
+    """One transaction for every new fault. Does not call ``fault_run`` while holding the store lock."""
+    fresh = []
+    for run_id in run_ids:
+        if _RUN_ID.fullmatch(run_id):
+            fresh.append(run_id)
+        else:
+            log.error('an error result was not a fault the store can record')
+    if not fresh:
+        return
+    # The one place this module writes SQL. fault_run is one autocommit insert, so a scan of
+    # many error results cannot call it once per run. The store object is only called everywhere else.
+    db = getattr(stored, '_db', None)
+    lock = getattr(stored, '_lock', None)
+    if db is None or lock is None:
+        for run_id in fresh:
+            try:
+                stored.fault_run(run_id)
+            except Refused:
+                log.error('an error result was not a fault the store can record')
+        return
+    with lock:
+        already = {row[0] for row in db.execute('SELECT run_id FROM faulted')}
+        pending = [(run_id,) for run_id in fresh if run_id not in already]
+        if not pending:
+            return
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            db.executemany('INSERT OR IGNORE INTO faulted VALUES (?)', pending)
+            db.execute('COMMIT')
+        except BaseException:
+            db.execute('ROLLBACK')
+            raise
 
 
 def _fault_error_results(state_dir, stored):
@@ -243,24 +410,29 @@ def _fault_error_results(state_dir, stored):
         info = os.lstat(runs)
     except FileNotFoundError:
         return
+    except OSError as exc:
+        log.error('runs directory could not be read; error results are not scanned: %s', type(exc).__name__)
+        return
     if not stat.S_ISDIR(info.st_mode):
         return
-    for entry in os.scandir(runs):
-        if not entry.is_dir(follow_symlinks=False):
+    try:
+        entries = list(os.scandir(runs))
+    except OSError as exc:
+        log.error('runs directory could not be read; error results are not scanned: %s', type(exc).__name__)
+        return
+    faulted = []
+    for entry in entries:
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+        except OSError:
             continue
         result = Path(entry.path) / 'result.json'
         if not os.path.lexists(result):
             continue
-        try:
-            payload = json.loads(_read_private(result, _PENDING_LIMIT).decode('utf-8'))
-        except (OSError, Refused, ValueError, UnicodeError):
-            continue
-        if not isinstance(payload, dict) or payload.get('code') is None:
-            continue
-        try:
-            stored.fault_run(entry.name)
-        except Refused:
-            log.error('an error result was not a fault the store can record')
+        if _result_verdict(str(result)) == 'fault':
+            faulted.append(entry.name)
+    _record_faults(stored, faulted)
 
 
 class DurableRouteBreaker:
@@ -279,7 +451,13 @@ class DurableRouteBreaker:
         # ``DurableRouteBreaker`` on the same store does not share it.
         self._trip_lock = threading.Lock()
         self._trips = {}        # connection -> how many trip reports this instance has attempted
-        self._store_file = _OPENED.get(stored)
+        try:
+            self._store_file = _OPENED.get(stored)
+        except TypeError:
+            self._store_file = None
+        if self._store_file is None:
+            log.warning('this breaker store was not opened here, so a trip the store failed to write '
+                        'is not kept for the next open')
 
     # -- the store, with its refusals and errors kept out of a route request -------------------
     def tripped(self, connection):
@@ -330,6 +508,7 @@ class DurableRouteBreaker:
             self._stored.fault_run(run_id)
         except (Refused, sqlite3.Error) as exc:
             log.error('fault of run %s was not recorded in the breaker store: %s', run_id, _code(exc))
+            # A refusal is not kept: the store will not take this id, so a pending copy cannot become durable.
             if not isinstance(exc, Refused) and self._store_file is not None and type(run_id) is str:
                 self._keep_pending(fault=run_id)
 
@@ -390,6 +569,7 @@ class DurableRouteBreaker:
             # The in-memory breaker already holds the outcome; what did not reach the store is said.
             log.error('breaker store was not updated (%s after %s): the change is not durable', _code(exc), effect)
             limit = outcome.get('limit') if isinstance(outcome, dict) else None
+            # A refusal is not kept: the store will not take this id, so a pending copy cannot become durable.
             if (effect == 'opened' and not isinstance(exc, Refused) and self._store_file is not None
                     and isinstance(limit, dict) and limit.get('scope') == 'connection'):
                 self._keep_pending(trip=connection)
@@ -462,11 +642,13 @@ class DurableRouteBreaker:
             log.error('breaker state the store refused was not kept for the next open: %s', type(exc).__name__)
 
     def close(self):
-        if self._store_file is not None and os.path.lexists(_pending_path(self._store_file)):
-            try:
-                _apply_pending(self._store_file, self._stored)
-            except (OSError, Refused, sqlite3.Error, ValueError, UnicodeError) as exc:
-                log.error('pending breaker state was not applied at shutdown: %s', type(exc).__name__)
+        # ``_lock`` then the pending-file lock, the same order as ``_keep_pending``.
+        with self._lock:
+            if self._store_file is not None and os.path.lexists(_pending_path(self._store_file)):
+                try:
+                    _apply_pending(self._store_file, self._stored)
+                except (OSError, Refused, sqlite3.Error, ValueError, UnicodeError) as exc:
+                    log.error('pending breaker state was not applied at shutdown: %s', type(exc).__name__)
         self._stored.close()
 
 

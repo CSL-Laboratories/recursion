@@ -113,23 +113,37 @@ def plain(api, stdin: Iterable[str], stdout: TextIO, environ: Mapping[str, str],
     app = app or TuiApp(api, clock=clock, environ=environ, keymap=keymap)
     reader = LogReader(app)
 
-    def flush() -> None:
-        for line in reader.new_lines():
-            print(line, file=stdout, flush=True)
+    def flush() -> bool:
+        """Say the new lines. False when stdout answers EIO (it hung up); any other write error is raised."""
 
-    app.open()
-    flush()
-    for raw in stdin:
-        line = raw.strip()
-        if line.removeprefix("/") in ("q", "quit", "exit"):
-            break
-        if line:
-            app.sync_conditions()  # a condition that appeared with time alone is said before the answer
-            app.command(line)
-            flush()
-    if not app.closed:
-        app.close()
-    flush()
+        try:
+            for line in reader.new_lines():
+                print(line, file=stdout, flush=True)
+        except OSError as err:
+            if err.errno != errno.EIO:
+                raise
+            return False
+        return True
+
+    try:
+        app.open()
+        if flush():
+            for raw in stdin:
+                line = raw.strip()
+                if line.removeprefix("/") in ("q", "quit", "exit"):
+                    break
+                if line:
+                    app.sync_conditions()  # a condition that appeared with time alone is said before the answer
+                    app.command(line)
+                    if not flush():
+                        break
+    except KeyboardInterrupt:
+        pass  # Ctrl-C ends the session the way q does: nothing is sent
+    finally:
+        # The final event is logged even when the body was interrupted or stdout hung up.
+        if not app.closed:
+            app.close()
+        flush()
     return 0
 
 
@@ -227,12 +241,17 @@ class Tty:
             return b""
 
     def _fill(self, timeout: float) -> None:
-        """One read, plus the short waits that tell a lone Esc from the start of a sequence."""
+        """One read, plus the short waits that tell a lone Esc from the start of a sequence.
+
+        The first read uses the caller's timeout. Continuation bytes then share one ``esc_wait_s``
+        deadline, measured with ``time.monotonic`` around each of those reads, so one slow byte
+        cannot start the wait over."""
 
         decoder, keys = self._decoder, []
         held_before = decoder.holding  # part of a key held from an earlier read
         discarded_before = decoder.discarded
         data = self._read(timeout)
+        escape_deadline = None
         while data is not None:
             if not data:
                 self.eof = True
@@ -241,7 +260,12 @@ class Tty:
             keys += decoder.feed(data)
             if not decoder.waiting:
                 break
-            data = self._read(self.esc_wait_s)
+            if escape_deadline is None:
+                escape_deadline = time.monotonic() + self.esc_wait_s
+            remaining = escape_deadline - time.monotonic()
+            # A deadline already past still polls (timeout 0): bytes already waiting are not dropped,
+            # and ``esc_wait_s`` of 0 stays a poll, the way a pipe of a whole sequence is read.
+            data = self._read(remaining if remaining > 0 else 0)
             if data is None:
                 keys += decoder.timeout()  # a lone ESC becomes esc; a longer unfinished sequence is dropped
         # Other input in the same read: another key; part of one held before or after it; a sequence that
@@ -290,12 +314,14 @@ def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, al
             write(clear + to_ansi(frame, app.color))
 
         loop = Loop(app, api, sink=paint, size=size)
-        write("\x1b[?1049h\x1b[?25l")
     else:  # the full-screen painter homes the cursor and clears below; inline mode never uses it
         painter, reader = InlinePainter(app.color), LogReader(app)
         loop = Loop(app, api, sink=lambda frame: write(painter.paint(reader.new_lines(), app.live_rows())),
                     render=lambda: [], size=size)
+    cleanup_error: OSError | None = None
     try:
+        if alt_screen:
+            write("\x1b[?1049h\x1b[?25l")  # inside the try: a failure here still runs the restore below
         with terminal.cbreak():
             write(PASTE_ON)
             loop.start()
@@ -313,11 +339,23 @@ def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, al
         loop.shutdown()
         if not app.closed:
             app.close()
-        write(PASTE_OFF)
-        if alt_screen:
-            write("\x1b[?25h\x1b[?1049l")
-        else:
-            write(painter.end(reader.new_lines()))
+        # Each restore is its own attempt, so one failure cannot skip the cursor and the screen.
+        # The first of those errors is raised after this block, and only when the body did not
+        # already raise: the body's exception still propagates when the restore succeeds.
+        try:
+            write(PASTE_OFF)
+        except OSError as err:
+            cleanup_error = err
+        try:
+            if alt_screen:
+                write("\x1b[?25h\x1b[?1049l")
+            else:
+                write(painter.end(reader.new_lines()))
+        except OSError as err:
+            if cleanup_error is None:
+                cleanup_error = err
+    if cleanup_error is not None:
+        raise cleanup_error
     if alt_screen:  # also after the screen hung up: stderr may be another stream that still works (a log file)
         err = stderr or sys.stderr
         try:
@@ -350,7 +388,10 @@ def main(argv: list[str], api_factory: Callable[[], object] | None, *, stdin: Te
         else:
             unknown.append(arg)
     if unknown:  # diagnostics go to stderr, never into the transcript stream
-        print(f"usage error: unrecognized arguments: {' '.join(unknown)}; {USAGE}", file=stderr)
+        # A value after "=" or a bare word is left out: it may be a secret, or ESC or LF that would
+        # forge another line. A token that starts with "-" is kept as the name before "=".
+        shown = [token.split("=", 1)[0] for token in unknown if token.startswith("-")]
+        print(f"usage error: unrecognized arguments: {' '.join(shown)}; {USAGE}", file=stderr)
         return 2
     if "print_keys" in modes:  # the default binding file, to copy and edit; reads nothing, sends nothing
         stdout.write(default_toml())

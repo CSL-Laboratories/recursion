@@ -253,11 +253,21 @@ def cell_width(ch: str) -> int:
 
 
 def wrap(line: str, width: int) -> list[str]:
-    """Split one sanitized line into rows of at most ``width`` terminal cells."""
+    """Split one sanitized line into rows of at most ``width`` terminal cells.
+
+    A glyph wider than ``width`` is flushed out of the current row first. It becomes U+FFFD
+    when ``width`` is at least 1, and is dropped when ``width`` is less than 1."""
 
     rows, cur, used = [], [], 0
     for ch in line:
         w = cell_width(ch)
+        if w > width:
+            if cur:
+                rows.append("".join(cur))
+                cur, used = [], 0
+            if width < 1:
+                continue
+            ch, w = "\ufffd", cell_width("\ufffd")
         if used + w > width and cur:
             rows.append("".join(cur))
             cur, used = [], 0

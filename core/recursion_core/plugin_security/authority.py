@@ -98,8 +98,8 @@ def _model_version_ok(value: object) -> bool:
 
 def _file_identity(path: str) -> tuple:
     """The file a path names now: its device and inode, which a link pointed elsewhere or a file put in its
-    place changes, unless the file system gives the replacement the freed inode back (the last charge, below,
-    tells those apart)."""
+    place changes, unless the file system gives the replacement the freed inode back (the last charge the
+    authority saw, below, tells those apart when the ledger held one)."""
     status = os.stat(path)
     return (status.st_dev, status.st_ino)
 
@@ -110,7 +110,8 @@ _CHARGE_AT = "SELECT rowid, idempotency_key, profile_id, amount_minor FROM charg
 
 
 def _last_charge(db) -> tuple | None:
-    """The latest charge the ledger holds (row id and values), or None: what a reopen must find again."""
+    """The latest charge the ledger holds now (row id and values), or None. The authority keeps the one it read
+    last, at construction and at the start of each charge's transaction: a reopen must find that one again."""
     return db.execute(_LAST_CHARGE).fetchone()
 
 
@@ -145,12 +146,19 @@ class Authority:
         # Resolved once, here, to the file itself: a relative path names the ledger of the working directory of
         # now, and a link names whatever it points at when it is followed. A reopen after a failed rollback must
         # reach this same file, whatever the working directory is then and wherever a link points by then, so
-        # the resolved path and the file's identity are kept, and so is the last charge the ledger holds, which
-        # the reopen must find on the connection it opens (``_connect`` says why). A bytes or path-like name is
-        # taken, as ``create_ledger`` takes it; a name no file can have (a NUL in it, say) is ``ledger_missing``.
+        # the resolved path and the file's identity are kept, and so is the last charge the ledger holds (read
+        # again at the start of each charge's transaction), which the reopen must find on the connection it opens
+        # (``_connect`` says why). The identity is the path's file just before the open and just after it, the
+        # same file both times, or the ledger is ``ledger_invalid``: a file put in the place while it opens is
+        # not taken for the one it opened. A bytes or path-like name is taken, as ``create_ledger`` takes it; a
+        # name no file can have (a NUL in it, say) is ``ledger_missing``.
         try:
             self._path = os.path.realpath(os.fsdecode(ledger_path))
         except (OSError, ValueError):
+            raise Refused("ledger_missing") from None
+        try:
+            before = _file_identity(self._path)
+        except OSError:
             raise Refused("ledger_missing") from None
         self._db = self._connect(self._path)
         try:
@@ -158,6 +166,9 @@ class Authority:
         except OSError:
             self._db.close()
             raise Refused("ledger_missing") from None
+        if self._identity != before:
+            self._db.close()
+            raise Refused("ledger_invalid")
         try:
             self._witness = _last_charge(self._db)
         except sqlite3.Error:
@@ -262,9 +273,11 @@ class Authority:
         charge the authority saw, unchanged (charges are only ever added). The second check reads the
         connection, not the path, so it holds when a file is swapped in for the open and back out before the
         stat, and when the file system gives a file put in the ledger's place the freed inode back: such a
-        ledger, even of the same anchor, lacks that charge. An authority that has seen no charge has no spend
-        to lose and no witness. A copy of the ledger made after that charge holds it, as it holds every charge:
-        an actor who can copy or rewrite the ledger is the same-uid limit the module states (B17)."""
+        ledger, even of the same anchor, lacks that charge. The witness is read at the start of each charge's
+        transaction, under its write lock and before its guard is entered, so every charge committed before a
+        failure that leads here is at or before it; a ledger that held no charge then has none to lose. A copy
+        of the ledger made after that charge holds it, as it holds every charge, and so does a ledger rewritten
+        to keep it: an actor who can copy or rewrite the ledger is the same-uid limit the module states (B17)."""
         if not os.path.isfile(ledger_path):
             raise Refused("ledger_missing")
         db = None
@@ -390,9 +403,11 @@ class Authority:
             self._require_usable()
             self._db.execute("BEGIN IMMEDIATE")
             try:
+                # First, under the write lock and before the guard (whose entry may refuse): every charge committed
+                # until now is at or before this one, and a reopen after a failure from here on must find it.
+                self._witness = _last_charge(self._db)
                 if commit_guard is not None:
                     guarded.enter_context(commit_guard)
-                self._witness = _last_charge(self._db)  # committed before this transaction: a reopen must find it
                 row = self._db.execute("SELECT digest FROM profiles WHERE profile_id=?",
                                        (profile["profile_id"],)).fetchone()
                 if row is None:

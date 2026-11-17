@@ -1589,13 +1589,20 @@ class LedgerRepairTests(unittest.TestCase):
         self._assert_out_of_use()
 
     def test_a_stat_or_a_read_that_fails_at_construction_refuses_and_shuts_what_it_opened(self) -> None:
-        # Review 3 of #426 (sol's probe; DeepSeek's surviving R03 and R09), and the read of the last charge
+        # Review 3 of #426 (sol's probe; DeepSeek's surviving R03 and R09), and the read of the last charge. What
+        # fails is the call made once the ledger is open: the stat before the open (review 4) is not under test.
         for name, error, code in (("_file_identity", OSError("synthetic: no stat"), "ledger_missing"),
                                   ("_last_charge", sqlite3.OperationalError("synthetic: no read"), "ledger_invalid")):
             with self.subTest(failing=name):
                 opened: list = []
+
+                def fail_once_open(*args, real=getattr(authority_module, name), error=error, opened=opened):
+                    if not opened:
+                        return real(*args)
+                    raise error
+
                 with mock.patch.object(authority_module.sqlite3, "connect", side_effect=_observed_connect(opened)), \
-                        mock.patch.object(authority_module, name, side_effect=error):
+                        mock.patch.object(authority_module, name, side_effect=fail_once_open):
                     with self.assertRaises(Refused) as refused:
                         Authority(_ANCHOR, self.path, lambda: 0)
                 self.assertEqual(refused.exception.code, code)
@@ -1603,13 +1610,49 @@ class LedgerRepairTests(unittest.TestCase):
                 with self.assertRaises(sqlite3.ProgrammingError):  # shut
                     opened[0].execute("SELECT 1")
 
+    @unittest.skipIf(os.name == "nt", "a ledger open in this process cannot be replaced on Windows")
+    def test_a_file_put_in_the_place_as_the_ledger_opens_is_refused_at_construction(self) -> None:
+        # Review 4 of #426 (DeepSeek F8): the open reaches the ledger, and the path names another file by the time
+        # it is stat'ed; the identity kept would be the other file's, and so is refused.
+        other = self.path + ".other"
+        create_ledger(other, _ANCHOR)
+        opened: list = []
+        connect = sqlite3.connect
+
+        def open_then_replace(*args, **kwargs):
+            db = connect(*args, **kwargs)
+            opened.append(db)
+            os.replace(other, self.path)
+            return db
+
+        with mock.patch.object(authority_module.sqlite3, "connect", side_effect=open_then_replace):
+            with self.assertRaises(Refused) as refused:
+                Authority(_ANCHOR, self.path, lambda: 0)
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):  # shut
+            opened[0].execute("SELECT 1")
+
     def test_a_ledger_removed_after_the_check_is_not_created_by_the_open(self) -> None:  # F2: the open never creates
-        missing = os.path.join(temp_dir(self), "gone.db")
-        with mock.patch("recursion_core.plugin_security.authority.os.path.isfile", return_value=True):
+        missing = os.path.join(temp_dir(self), "gone.db")  # removed after the stat before the open (review 4) too
+        with mock.patch("recursion_core.plugin_security.authority.os.path.isfile", return_value=True), \
+                mock.patch.object(authority_module, "_file_identity", return_value=(0, 0)):
             with self.assertRaises(Refused) as refused:
                 Authority(_ANCHOR, missing, lambda: 0)
         self.assertEqual(refused.exception.code, "ledger_invalid")
         self.assertFalse(os.path.exists(missing), "the open created an empty ledger")
+
+    def test_a_directory_in_the_ledgers_place_is_missing_and_nothing_is_opened(self) -> None:
+        # Review 4 of #426: the stat before the open finds a directory as it finds a file, so the open is kept from
+        # it by the check that the path names a file: ledger_missing, with nothing opened.
+        folder = os.path.join(temp_dir(self), "ledger-dir")
+        os.mkdir(folder)
+        opened: list = []
+        with mock.patch.object(authority_module.sqlite3, "connect", side_effect=_observed_connect(opened)):
+            with self.assertRaises(Refused) as refused:
+                Authority(_ANCHOR, folder, lambda: 0)
+        self.assertEqual(refused.exception.code, "ledger_missing")
+        self.assertEqual(opened, [])
 
     def test_a_charge_once_the_authority_is_shut_down_is_refused_with_a_code(self) -> None:  # DeepSeek's consumer table
         self.auth.close()
@@ -1792,6 +1835,28 @@ class ChargeBoundaryTests(unittest.TestCase):
         self.assertEqual(seen, [0])
         with self.assertRaises(Refused) as refused:
             self._charge("prior")
+        self.assertEqual(refused.exception.code, "ledger_invalid")
+
+    def test_a_charge_whose_guard_refuses_at_entry_still_reads_the_last_charge(self) -> None:
+        # Review 4 of #426 (DeepSeek F7): the core's commit section can refuse as it is entered (a tripped
+        # connection); a charge another writer committed is still one the reopen must find.
+        with contextlib.closing(sqlite3.connect(self.path, timeout=5)) as other:  # after this authority opened
+            other.execute("INSERT INTO charges VALUES ('elsewhere', 'another-profile', 100)")
+            other.commit()
+
+        class RefusingGuard:
+            def __enter__(self):
+                raise Refused("connection_tripped")
+
+            def __exit__(self, *exc_info):
+                return False
+
+        self.auth._db = _FailingRollbackThenReplaced(self.auth._db, self._fresh_ledger)
+        with mock.patch.object(authority_module, "_file_identity", return_value=self.auth._identity):
+            with self.assertRaises(sqlite3.OperationalError):  # the rollback's error, in the refusal's place
+                self.auth.charge(self.envelope, **self.args, idempotency_key="tripped", commit_guard=RefusingGuard())
+        with self.assertRaises(Refused) as refused:
+            self._charge("after")
         self.assertEqual(refused.exception.code, "ledger_invalid")
 
     def test_charge_is_refused_after_a_failed_shutdown_a_refused_reopen_and_its_own_shutdown(self) -> None:

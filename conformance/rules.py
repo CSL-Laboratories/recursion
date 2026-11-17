@@ -42,6 +42,7 @@ import datetime
 import hashlib
 import json
 import re
+import threading
 from pathlib import Path
 
 MAX_INT = 2**53 - 1          # the largest whole number every binary64 reader keeps exact
@@ -532,6 +533,7 @@ def approval_problems(record: dict) -> list:
 PUBLISHED = Path(__file__).resolve().parent.parent / "schemas" / "control" / "v1"
 _READ: dict = {}
 _READ_LOCATIONS: dict = {}      # the published set's schema locations, found once, when the whole set has been checked
+_PUBLISH_LOCK = threading.Lock()
 _NOT_RULES = ("$schema", "$id", "$defs", "title", "description", "x-version", "then", "else")
 _DIALECT = "https://json-schema.org/draft/2020-12/schema"
 _DOCUMENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -580,13 +582,24 @@ _RULE_VALUE = {
 
 def published() -> dict:
     """The schemas of the published folder beside this file, by file name. Read once, and checked once by the
-    first ``fits`` that reads them: they are not changed in place afterwards."""
-    if not _READ:
+    first ``fits`` that reads them: they are not changed in place afterwards.
+
+    The set is published by one assignment. A second reader waits for that assignment and never sees a
+    folder that is only partly read.
+    """
+    global _READ
+    if _READ:
+        return _READ
+    with _PUBLISH_LOCK:
+        if _READ:
+            return _READ
+        loaded: dict = {}
         for file in sorted(PUBLISHED.glob("*.json")):
             schema = json.loads(file.read_text(encoding="utf-8"))
             if isinstance(schema, dict) and "$schema" in schema:
-                _READ[file.name] = schema
-    return _READ
+                loaded[file.name] = schema
+        _READ = loaded
+        return _READ
 
 
 def _pointer(tokens) -> str:
@@ -709,11 +722,18 @@ def _locations(schemas: dict) -> dict:
 
 
 def _supported(schemas: dict) -> dict:
-    """The schema locations of a checked set: the published set's are found once, any other set's every time."""
+    """The schema locations of a checked set: the published set's are found once, any other set's every time.
+
+    The published map is one assignment under the same lock as the schema set. A reader never sees a map
+    that is only partly filled, and a check that does not finish leaves the previous map in place so the
+    next reader tries again.
+    """
+    global _READ_LOCATIONS
     if schemas is _READ and _READ:
-        if not _READ_LOCATIONS:
-            _READ_LOCATIONS.update(_locations(_READ))
-        return _READ_LOCATIONS
+        with _PUBLISH_LOCK:
+            if not _READ_LOCATIONS:
+                _READ_LOCATIONS = _locations(_READ)
+            return _READ_LOCATIONS
     return _locations(schemas)
 
 
@@ -1184,7 +1204,15 @@ def task_of_run(view: dict, events: list = (), pending_approval_ids: list = ()) 
     """
     state, run_id, result = view["state"], view["run_id"], view.get("result")
     created_at, updated_at = _log_times(list(events), "run", run_id)
-    task = {"task_id": run_id, "source": "run", "session_id": None, "run_id": run_id, "turn_id": None,
+    # A run id that starts with turn- would be the same Task id as a turn of that id. Carry it
+    # as run- plus that id. When that would pass 64 characters, refuse: leaving the run id would emit a turn id.
+    task_id = run_id
+    if isinstance(run_id, str) and run_id.startswith("turn-"):
+        headed = "run-" + run_id
+        if len(headed) > 64:
+            raise Refused("task_id")
+        task_id = headed
+    task = {"task_id": task_id, "source": "run", "session_id": None, "run_id": run_id, "turn_id": None,
             "outcome": None, "cancel_requested": False, "pending_approval_ids": [], "expires_at": None,
             "created_at": created_at, "updated_at": updated_at, "result": None}
     if state in ("starting", "running", "stop_pending", "unknown"):

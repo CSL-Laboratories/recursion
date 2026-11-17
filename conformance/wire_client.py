@@ -411,7 +411,10 @@ def vector_files(folder: Path) -> set[str]:
 def approvals_in(value: Any) -> Iterator[dict]:
     """Every approval record inside a JSON value: on its own, in an event's payload, in a method's answer."""
     if isinstance(value, dict):
-        if {"approval_id", "effect", "digest", "rendered"} <= value.keys():
+        # An approval carries the members the record requires, and source is text. Plugin-owned data
+        # can carry a few of those keys, including a string source, and is not one.
+        if {"approval_id", "source", "state", "revision", "digest", "digest_form",
+                "rendered_form", "requested_at"} <= value.keys() and isinstance(value.get("source"), str):
             yield value
         for item in value.values():
             yield from approvals_in(item)
@@ -437,7 +440,8 @@ def _exact(value) -> str:
 def events_in(value: Any) -> Iterator[dict]:
     """Every event inside a value, wherever it sits: an object with the envelope of event.v1."""
     if isinstance(value, dict):
-        if {"seq", "session_id", "type", "source", "trust", "payload"} <= set(value) and isinstance(value["payload"], dict):
+        # The envelope is the members event.v1 requires. An example that shares some of them is not an event.
+        if {"seq", "session_id", "run_id", "turn_id", "time", "type", "source", "trust", "payload"} <= set(value) and isinstance(value["payload"], dict):
             yield value
         for inner in value.values():
             yield from events_in(inner)
@@ -535,7 +539,7 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
             else:
                 request = step["request"]
                 answer = model.call(step["principal"], request["method"], request["params"], step["at"])
-                if answer != step["answer"]:
+                if _exact(answer) != _exact(step["answer"]):
                     return f"step {number}: the rule answers {answer}, the vector says {step['answer']}"
                 misfit = _misfit(schemas, "methods.v1.json#/$defs/exchange", dict(request, answer=answer))
                 if misfit:

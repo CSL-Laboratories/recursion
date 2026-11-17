@@ -4667,6 +4667,15 @@
       }
     },
     {
+      "file": "bad/mcp.task.v1/b19-a-run-task-whose-id-is-a-turn-id.json",
+      "schema": "mcp.task.v1.json",
+      "rule": "A Task of a run does not wear a turn id.",
+      "expect": {
+        "keyword": "not",
+        "at": "/task_id"
+      }
+    },
+    {
       "file": "bad/mcp.task.v1/f-mcp.task.v1.allOf.2.then.cancel-requested.json",
       "schema": "mcp.task.v1.json",
       "rule": "The value at /cancel_requested is fixed by mcp.task.v1.json#/allOf/2/then/properties/cancel_requested.",

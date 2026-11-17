@@ -101,8 +101,10 @@ recorded on F60, CSL-762).
   and a stop cannot deadlock by taking those locks in opposite orders. A key is deleted once nobody holds
   it.
   The durable registry (B8, B9) and the real cgroup/pidfd cleanup (B6) are other build items.
-- `cli.py`: `recursion-control list | status RUN | stop RUN | start --tenant --engine --prompt`. It
-  makes one API call, prints the API's answer verbatim as JSON and exits 0 (ok, started, stopped),
+- `cli.py`: `recursion-control list | status RUN | stop RUN | start --tenant --engine --prompt`.
+  `start`, `status` and `stop` make one API call and print the answer verbatim as JSON.
+  `list` and `conditions` follow every `run.list` page and print one joined answer
+  (`conditions` reshaped to labels). It exits 0 (ok, started, stopped),
   3 (pending), 4 (run_unknown), 1 (other error) or 2 (usage). It imports no `os`, `signal` or
   `subprocess`. `recursion-control conditions` (CSL-799) reads `run.list` and prints the conditions it
   exposes with the TUI's labels and words (`{"code": ..., "conditions": [{"label", "text"}]}`); the TUI

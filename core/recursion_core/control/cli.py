@@ -1,7 +1,9 @@
 """Control CLI (CSL-798, candidate). See README.md.
 
-A thin surface over the control API: it parses arguments, makes one ``api.call(method, params)``, prints
-the API's answer verbatim as JSON and maps its code to an exit status. It has no process or signal
+A thin surface over the control API: it parses arguments and maps the answer's code to an exit status.
+``start``, ``status`` and ``stop`` make one ``api.call(method, params)`` and print that answer verbatim
+as JSON. ``list`` and ``conditions`` follow every ``run.list`` page and print one joined answer
+(``conditions`` reshaped to labels). It has no process or signal
 access of its own; Stop goes through the control API like every other surface.
 
 ``conditions`` (CSL-799) reads ``run.list`` and prints the conditions that answer exposes, with the

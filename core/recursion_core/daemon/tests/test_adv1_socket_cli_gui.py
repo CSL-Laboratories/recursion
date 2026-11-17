@@ -309,11 +309,13 @@ class SocketAttackTest(ComposedBase):
     def seed_settled_runs(self, count, *, state=None, one_by_one=False):
         """``count`` settled runs with systemd's real cgroup paths, as ADV1-5 measured them (~975 bytes each).
 
-        The rows are the ones ``Registry.add``, ``Registry.state(run_id, 'terminated', '')`` and
-        ``Registry.control_put`` leave, written in ONE commit through the registry's own ``_write`` (copy,
-        integrity_check, fsync, rename, directory fsync). Per-run calls are 3 * count commits, each copying
-        and checking the whole file: about 190 s of this file's run for 1300 runs on a loaded host.
-        ``one_by_one`` keeps that path for the test that pins both ways to the same rows.
+        The default writes, in one ``Registry._write``, the rows ``Registry.all`` and
+        ``Registry.control_all`` return. It does not call ``add``, ``state`` or ``control_put``.
+        ``one_by_one=True`` does: ``add``, then ``state(run_id, 'terminated', '')``, then
+        ``control_put``, one publish each. ``all`` does not return ``created`` or ``updated``.
+        The per-run path stamps those on two clocks and the batch path stamps them once, so
+        this helper does not claim those two values are equal. The list tests call this with
+        the default, which is the one commit.
         """
         store = Registry(state or self.state)
         long_group = ('/user.slice/user-1000.slice/user@1000.service/app.slice/'
@@ -348,16 +350,67 @@ class SocketAttackTest(ComposedBase):
         return ids
 
     def test_the_one_commit_seed_writes_the_rows_the_per_run_calls_write(self):
-        """The fixture above: one commit leaves what add, state and control_put leave, read back through Registry."""
-        seen = []
-        for one_by_one in (True, False):
-            state = self.tmp / ('seed-one-by-one' if one_by_one else 'seed-batched')
-            self.seed_settled_runs(5, state=state, one_by_one=one_by_one)
+        """The rows ``all`` and ``control_all`` return match, and the calls are the ones named above.
+
+        ``created`` and ``updated`` are not in that read and are not asserted equal.
+        """
+        calls = {'add': 0, 'state': 0, 'control_put': 0, 'write': 0}
+        state_args = []
+        real_add, real_state = Registry.add, Registry.state
+        real_put, real_write = Registry.control_put, Registry._write
+
+        def counting_add(self, run_id, boot_id):
+            calls['add'] += 1
+            return real_add(self, run_id, boot_id)
+
+        def counting_state(self, run_id, value, detail=''):
+            calls['state'] += 1
+            state_args.append((value, detail))
+            return real_state(self, run_id, value, detail)
+
+        def counting_put(self, run_id, document):
+            calls['control_put'] += 1
+            return real_put(self, run_id, document)
+
+        @contextlib.contextmanager
+        def counting_write(self):
+            calls['write'] += 1
+            with real_write(self) as db:
+                yield db
+
+        def planted(flag):
+            for key in calls:
+                calls[key] = 0
+            state_args.clear()
+            state = self.tmp / f'seed-{flag}'
+            if flag is None:
+                self.seed_settled_runs(5, state=state)
+            else:
+                self.seed_settled_runs(5, state=state, one_by_one=flag)
+            return dict(calls), list(state_args), state
+
+        def read_back(state):
             store = Registry(state)
-            seen.append((store.all(), store.control_all()))
-            store.close()
-        self.assertEqual(seen[0], seen[1])
-        self.assertEqual({run.state for run in seen[0][0]}, {'terminated'})
+            try:
+                return store.all(), store.control_all()
+            finally:
+                store.close()
+
+        with mock.patch.object(Registry, 'add', counting_add), \
+                mock.patch.object(Registry, 'state', counting_state), \
+                mock.patch.object(Registry, 'control_put', counting_put), \
+                mock.patch.object(Registry, '_write', counting_write):
+            per_run, per_args, per_state = planted(True)
+            batched, _, batch_state = planted(False)
+            default, _, default_state = planted(None)
+        per_rows = read_back(per_state)
+        self.assertEqual(per_rows, read_back(batch_state))
+        self.assertEqual(per_rows, read_back(default_state))
+        self.assertEqual({run.state for run in per_rows[0]}, {'terminated'})
+        self.assertEqual(per_run, {'add': 5, 'state': 5, 'control_put': 5, 'write': 15})
+        self.assertEqual(per_args, [('terminated', '')] * 5)
+        self.assertEqual(batched, {'add': 0, 'state': 0, 'control_put': 0, 'write': 1})
+        self.assertEqual(default, {'add': 0, 'state': 0, 'control_put': 0, 'write': 1})
 
     @staticmethod
     def unpaged_list(composed):

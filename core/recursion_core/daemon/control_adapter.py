@@ -238,6 +238,25 @@ def _clear_result_temp(tmp):
         os.rmdir(tmp)
 
 
+def _discard_opened_result_temp(tmp):
+    """Remove a result temp this write opened, after that write failed.
+
+    A regular file or a symlink is unlinked. A directory is left in place, so a
+    planted directory and its entries stay. The result stays in memory either way.
+    A failure to remove the temp does not replace that in-memory result.
+    """
+    try:
+        info = os.lstat(tmp)
+    except OSError:
+        return
+    if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+        return
+    try:
+        os.unlink(tmp)
+    except OSError:
+        return
+
+
 # -- registry ------------------------------------------------------------------------------------
 class ControlRecordInvalid(ValueError):
     """A stored control record is not a JSON object for the run it is filed under."""
@@ -614,14 +633,18 @@ class RouteStarter:
                 log.error('handles for %s stayed open after an interrupt', ctx.run_id)
 
     def _record_result(self, run_id, result):
+        tmp = None
+        opened = False
         try:
             path = self._state / 'runs' / run_id / 'result.json'
             tmp = path.with_name('result.json.tmp')
             # A stale or planted file is replaced: opening a FIFO here would wait for a reader.
             # An empty planted directory is removed too. The result is durable only when this write
-            # succeeds; otherwise it is kept in memory.
+            # succeeds; otherwise it is kept in memory. A temp this write opened is removed on that
+            # failure when it is a regular file or a symlink. A directory at that name is left.
             _clear_result_temp(tmp)
             fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            opened = True
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
                 json.dump(result, handle, sort_keys=True)
                 handle.flush()
@@ -629,6 +652,8 @@ class RouteStarter:
             os.replace(tmp, path)
         except (OSError, TypeError, ValueError) as exc:
             log.error('route result for %s was not written (%s)', run_id, type(exc).__name__)
+            if opened:
+                _discard_opened_result_temp(tmp)
             with self._lock:
                 self.results[run_id] = result
 
@@ -836,13 +861,18 @@ class DaemonControl:
             with _open_regular(self._state / 'runs' / run_id / 'stdout.jsonl') as handle:
                 size = os.fstat(handle.fileno()).st_size
                 start = max(0, size - OUTPUT_TAIL_BYTES)
+                # A nonzero start is mid-line unless the byte just before the window is a newline.
+                aligned = not start
+                if start:
+                    handle.seek(start - 1)
+                    aligned = handle.read(1) == b'\n'
                 handle.seek(start)
                 data = handle.read(OUTPUT_TAIL_BYTES)
         except FileNotFoundError:
             return None  # the run never reached a launch
         except OSError as exc:
             return {'unavailable': type(exc).__name__}
-        if start:  # the window opens mid-line: drop the partial first line
+        if start and not aligned:  # mid-line: drop the partial first line; a line start is kept
             data = data[data.find(b'\n') + 1:] if b'\n' in data else b''
         cut = data.rfind(b'\n')
         whole = data if not live else data[:cut + 1]  # a last line with no newline is complete once the engine is gone

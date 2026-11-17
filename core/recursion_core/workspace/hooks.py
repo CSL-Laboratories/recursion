@@ -11,27 +11,32 @@ The provider reads ``ctx.launch.workspace`` and makes no registry lookup.
 - ``direct``: the source folder, checked again with ``validate`` (another uid, the state directory and
   everything inside it, a link followed to its real folder). The same folder is returned if the launch
   asks a second time.
-- ``worktree``, and no worktree has been made yet: ``place.choose`` picks a directory outside the
-  repository. This door does not make the worktree, does not work in the source checkout, and does not
-  fall back to the engine home. The launch is refused. A second ask for the same run does not pick again.
-- ``worktree`` with a ``worktree_path`` already stored: that folder, checked again. This door never
-  writes one.
+- ``worktree``, and no worktree has been made yet: ``place.choose`` picks one directory outside the
+  repository, ``spawn.make`` builds it by that place's mechanism, and the path is stored on the launch
+  as ``worktree_path``. The same ask returns that directory. It does not work in the source checkout
+  and it does not fall back to the engine home. A linked worktree, which writes the source git common
+  directory, is made only when this provider was constructed with ``linked=True``.
+- ``worktree`` with a ``worktree_path`` already stored: that folder, checked again.
 """
 from __future__ import annotations
 
 import logging
 import os
 from pathlib import Path
+import re
 import threading
 
 from recursion_core.workspace import start
 from recursion_core.workspace.place import choose
+from recursion_core.workspace.spawn import SpawnFailed, make
 from recursion_core.workspace.start import Normalizer, default_state_dir
 from recursion_core.workspace.validate import WorkspaceInvalid, git_work_tree, unit_safe, validate
 
 log = logging.getLogger(__name__)
 
 STATE_ENV = 'RECURSION_STATE_DIR'
+# A run id is one path component. The API's own ids match; anything else is not a slot we will create.
+_RUN_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+-]{0,200}$')
 
 
 def _configured_state():
@@ -70,12 +75,20 @@ def _sizes(repository: Path) -> tuple[int, int]:
 
 
 class Provider:
-    """``working_directory(ctx)`` for seam S4. See the module text."""
+    """``working_directory(ctx)`` for seam S4. See the module text.
 
-    def __init__(self, *, state_dir=None) -> None:
+    ``linked`` is the explicit setting for a linked worktree. The default is false: the place is
+    outside the repository and the source git common directory is not written.
+    """
+
+    def __init__(self, *, state_dir=None, linked: bool = False) -> None:
+        if not isinstance(linked, bool):
+            raise TypeError('linked is true or false')
         self._state_dir = None if state_dir is None else Path(state_dir)
+        self._linked = linked
         self._lock = threading.Lock()
         self._folders: dict = {}
+        self._places: dict = {}
         self._refused: dict = {}
 
     def _state(self) -> Path:
@@ -88,25 +101,29 @@ class Provider:
         with self._lock:
             if run_id in self._folders:
                 return self._folders[run_id]
-            refused = self._refused.get(run_id)
-        if refused is not None:
-            raise refused
-        try:
-            folder = self._folder(ctx)
-        except WorkspaceInvalid:
-            raise
-        except Exception as exc:
-            # A worktree place was chosen, or the choice failed. Asking again must not choose a second place.
-            if run_id is None:
-                raise
-            with self._lock:
-                self._refused.setdefault(run_id, exc)
+            if run_id in self._refused:
                 raise self._refused[run_id]
-        if run_id is None:
-            return folder
-        with self._lock:
+            try:
+                folder = self._folder(ctx)
+            except WorkspaceInvalid:
+                raise
+            except Exception as exc:
+                # A place already chosen stays. The next ask makes that same place, and does not choose again.
+                if run_id is None or run_id not in self._places:
+                    if run_id is not None:
+                        self._refused[run_id] = exc
+                    raise
+                raise
+            if run_id is None:
+                return folder
             self._folders.setdefault(run_id, folder)
             return self._folders[run_id]
+
+    def _checked(self, path: str):
+        folder = validate(path, state_dir=None)
+        if not unit_safe(folder):
+            raise WorkspaceInvalid('not_unit_safe')
+        return folder
 
     def _folder(self, ctx):
         launch = getattr(ctx, 'launch', None)
@@ -122,28 +139,40 @@ class Provider:
                 raise WorkspaceInvalid('not_unit_safe')
             return folder
         if mode == 'worktree' and isinstance(made, str) and made:
-            folder = validate(made, state_dir=None)
-            if not unit_safe(folder):
-                raise WorkspaceInvalid('not_unit_safe')
-            return folder
+            return self._checked(made)
         if mode == 'worktree':
-            self._choose_and_stop(source)
+            return self._spawn(ctx, workspace, source)
         raise WorkspaceInvalid('not_a_directory')
 
-    def _choose_and_stop(self, source) -> None:
+    def _spawn(self, ctx, workspace, source):
+        run_id = getattr(ctx, 'run_id', None)
+        if not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None:
+            raise WorkspaceInvalid('not_unit_safe')
         top = git_work_tree(source)
         if top is None:
             raise RuntimeError('not_a_repository')
-        work, objects = _sizes(top)
-        candidate = self._state() / 'worktrees' / 'unbuilt'
-        chosen = choose(top, [candidate], work_bytes=work, object_bytes=objects, linked=False)
-        if chosen is None:
-            raise RuntimeError('no_place_outside_the_repository')
-        # The place is outside the repository. Making the worktree (reflink, hardlink or copy,
-        # then the path the run would work in) is the spawn half, and it is not this door.
-        log.error('place %s (%s) was chosen for %s and the worktree was not made',
-                  chosen.path, chosen.mechanism, top)
-        raise RuntimeError('worktree_not_made')
+        place = self._places.get(run_id)
+        if place is None:
+            work, objects = _sizes(top)
+            candidate = self._state() / 'worktrees' / run_id
+            place = choose(top, [candidate], work_bytes=work, object_bytes=objects, linked=self._linked)
+            if place is None or place.engine_worktree_switching:
+                raise RuntimeError('no_place_outside_the_repository')
+            if place.writes_git_common_dir and not self._linked:
+                raise RuntimeError('no_place_outside_the_repository')
+            self._places[run_id] = place
+        base_ref = workspace.get('base_ref') if isinstance(workspace.get('base_ref'), str) else None
+        try:
+            root = make(place, base_ref=base_ref)
+        except SpawnFailed as exc:
+            raise RuntimeError(exc.reason) from exc
+        relative = Path(os.path.realpath(source)).relative_to(Path(os.path.realpath(top)))
+        target = root if relative == Path('.') else root / relative
+        folder = self._checked(str(target))
+        if isinstance(workspace, dict):
+            workspace['worktree_path'] = str(folder)
+        log.info('worktree for %s made at %s by %s', run_id, folder, place.mechanism)
+        return folder
 
 
 def register(hooks) -> None:

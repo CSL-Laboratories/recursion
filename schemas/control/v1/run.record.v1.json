@@ -98,12 +98,12 @@
       "then": {"required": ["intent_version"]}
     },
     "stop_attestation": {
-      "description": "null unless the run is stopped. The stored proof is today's and only today's: 'empty', which says that the cgroup named here was read empty and every member listed was gone, at this generation of the record. A stored proof of 'removed' is RESERVED: the lane that owns Stop adds it together with the registry's own proof checks, and until then this schema refuses it. A reader that meets a proof it does not know treats the run as NOT stopped.",
+      "description": "null unless the run is stopped. The stored proof is 'empty' or 'removed'. 'empty' says the cgroup named here was read empty and every member listed was gone, at this generation of the record, and this Stop did not remove the directory. 'removed' says this Stop removed that directory after the empty walk. The registry accepts only these two, with the same generation, cgroup, marker and member checks. A reader that meets a proof it does not know treats the run as NOT stopped.",
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["proof", "cgroup", "cgroup_marker", "member_ids", "generation"],
       "properties": {
-        "proof": {"const": "empty"},
+        "proof": {"enum": ["empty", "removed"]},
         "cgroup": {"type": "string", "minLength": 1},
         "cgroup_marker": {"type": "string", "minLength": 1},
         "member_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},

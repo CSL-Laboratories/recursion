@@ -78,14 +78,19 @@ it, have returned, so distinct keys do not keep locks for the life of the proces
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import os
+from pathlib import Path
+import stat
 import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 
 from recursion_core.control.registry import (
-    EMPTY, POPULATED, TIMEOUT, KillTree, OwnerLockTable, RunRegistry, StaleGeneration, StopUnattested,
+    EMPTY, POPULATED, REMOVED, TIMEOUT, KillTree, OwnerLockTable, RunRegistry, StaleGeneration,
+    StopUnattested,
 )
 
 STARTED, OK, STOPPED, PENDING = "started", "ok", "stopped", "pending"
@@ -436,14 +441,46 @@ class ControlAPI:
             return f"cleanup_error:{type(err).__name__}"
         return None
 
-    def _attestation(self, rec: dict) -> dict | None:
-        """Proof for the cgroup identity on ``rec``. None when that record has no generation to bind."""
+    def _attestation(self, rec: dict, *, proof: str = "empty") -> dict | None:
+        """Proof for the cgroup identity on ``rec``. None when that record has no generation to bind.
+
+        ``proof`` is ``removed`` only when this Stop removed the cgroup directory, and ``empty`` when
+        the directory was already absent or is still on disk with no live process.
+        """
         if "generation" not in rec:
             return None
         members = rec.get("members") or []
-        return {"proof": "empty", "cgroup": rec.get("cgroup"), "cgroup_marker": rec.get("cgroup_marker"),
+        return {"proof": proof, "cgroup": rec.get("cgroup"), "cgroup_marker": rec.get("cgroup_marker"),
                 "member_ids": sorted(member["member_id"] for member in members),
                 "generation": rec["generation"]}
+
+    def _remove_recorded_cgroup(self, rec: dict) -> str:
+        """Remove the cgroup directory named on ``rec``, when that path is itself the directory.
+
+        ``removed``: this Stop removed it, or it vanished as this Stop removed it.
+        ``populated``: the kernel refused because the directory is in use.
+        ``empty``: there was nothing to remove, or the directory is still there.
+        A symlink is not followed and is not removed. Entries inside the directory are not unlinked.
+        """
+        path = rec.get("cgroup")
+        if not isinstance(path, str) or not path.startswith("/") or ".." in Path(path).parts:
+            return "empty"
+        directory = Path(path)
+        try:
+            info = directory.lstat()
+        except OSError:
+            return "empty"
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return "empty"
+        try:
+            os.rmdir(directory)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                return "removed"
+            if exc.errno == errno.EBUSY:
+                return "populated"
+            return "empty"
+        return "removed"
 
     def _enter_owner(self) -> None:
         depth = getattr(self._local, "depth", 0)
@@ -586,12 +623,22 @@ class ControlAPI:
             answer = self._kill.confirm(rec["cgroup"], self._confirm_timeout_s)
         except Exception as err:
             return self._pending(rec, f"cleanup_error:{type(err).__name__}")
-        if answer != EMPTY:
+        if answer not in (EMPTY, REMOVED):
             return self._pending(rec, _PENDING_REASON.get(answer, "confirm_unknown"))
         blocked = self._block_stop(rec)
         if blocked:  # confirm said empty, but a member is still alive: that is not an attested stop
             return self._pending(rec, blocked)
-        proof = self._attestation(rec)
+        if answer == REMOVED:
+            proof_name = "removed"
+        else:
+            # The kill tree reported an empty cgroup and did not remove it. When the stored path is
+            # the directory itself, this Stop removes that leaf. A logical path that is not a
+            # directory on disk stays proof empty; the manager removes the directory under its root.
+            removed = self._remove_recorded_cgroup(rec)
+            if removed == "populated":
+                return self._pending(rec, "cgroup_populated")
+            proof_name = "removed" if removed == "removed" else "empty"
+        proof = self._attestation(rec, proof=proof_name)
         if proof is None:  # cleanup ran, but this copy cannot name a generation: typed, not KeyError
             if run_id in self._stale_stops:
                 # An earlier write of this run's Stop came back stale and none has landed since, so

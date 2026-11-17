@@ -834,6 +834,28 @@ class Daemon:
                 return None  # the walk kills what it finds: never without a recorded Stop
             return self._walk_cgroups(run, [cgroup])
 
+    def remove_cleared_cgroup(self, run_id, cgroup):
+        """Remove the cgroup directory a Stop has already walked empty.
+
+        ``removed`` when this call removed it. ``populated`` when the kernel says the
+        directory is in use. ``absent`` when there is no directory, or this manager
+        does not remove cgroups. ``empty`` when the directory is still there.
+        A symlink is not removed.
+        """
+        remove = getattr(self.manager, 'remove_cleared_cgroup', None)
+        if not callable(remove):
+            return 'absent'
+        with self.lock:
+            self._open()
+            run = self.registry.get(run_id)
+            if not run.stop_requested:
+                return 'empty'
+            try:
+                return remove(run.unit, cgroup)
+            except Exception:
+                log.exception('removal of the cgroup of %s failed', run_id)
+                return 'empty'
+
     def _stop_send_due(self, run_id):
         held = self._stop_resend.get(run_id)
         return held is None or self.clock() >= held[0]
@@ -1214,6 +1236,39 @@ class SystemdUserManager:
             if time.monotonic() >= deadline:
                 return None if live is None else False
             time.sleep(0.05)
+
+    def remove_cleared_cgroup(self, unit, group):
+        """Remove the recorded cgroup directory after a walk found it empty.
+
+        ``removed``: this call removed the directory, or it vanished as the call removed it.
+        ``populated``: the kernel refused because the directory is in use, or a live process
+        is in it. ``empty``: the directory is still there. ``absent``: there was no directory.
+        A symlink is not followed and is not removed. Entries inside the directory are not unlinked.
+        """
+        if (not isinstance(group, str) or not group.startswith('/') or '..' in Path(group).parts
+                or not UNIT.fullmatch(unit) or Path(group).name != unit):
+            return 'empty'
+        directory = self.cgroup_root / group.lstrip('/')
+        try:
+            info = directory.lstat()
+        except OSError as exc:
+            return 'absent' if exc.errno == errno.ENOENT else 'empty'
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return 'empty'
+        try:
+            os.rmdir(directory)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                return 'removed'
+            if exc.errno == errno.EBUSY:
+                return 'populated'
+            if exc.errno == errno.ENOTEMPTY:
+                live = self._recorded_cgroup_live(directory, group)
+                if live is True:
+                    return 'populated'
+                return 'empty'
+            return 'empty'
+        return 'removed'
 
     def _recorded_cgroup_live(self, directory, group):
         try:

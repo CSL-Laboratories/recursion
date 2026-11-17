@@ -30,7 +30,8 @@ PYTHONPATH=core python -m unittest recursion_core.routes.engines.fixtures.cursor
     recursion_core.routes.engines.fixtures.cursor.test_cursor_switch \
     recursion_core.routes.engines.fixtures.cursor.test_cursor_argv \
     recursion_core.routes.engines.fixtures.cursor.test_cursor_fixtures \
-    recursion_core.routes.engines.fixtures.cursor.test_cursor_fake_agent
+    recursion_core.routes.engines.fixtures.cursor.test_cursor_fake_agent \
+    recursion_core.routes.engines.fixtures.cursor.test_cursor_adapter
 ```
 
 `test_cursor_fixtures` reads `schemas/control/v1/` (lane SPINE's, #368) from the repository root.
@@ -46,7 +47,7 @@ interpreter has no JSON Schema library, so `test_cursor_fixtures` checks each me
 | `StreamParser()` | one per worker, one reader, lines in order; no lock | Cursor's one-shot stream-json |
 | `StreamParser.wrote(delivery_id, turn_id, text) -> None` | `dlv-` + 1 to 60 of `[A-Za-z0-9_-]`; `turn-` + 1 to 59; non-empty text | `ValueError` for a bad argument; `StreamStateError` for a second write (the one-shot drive takes one input) |
 | `StreamParser.parse(line: str) -> list[dict]` | driver.v2 drafts: `tool.call`, `tool.result`, `result`, `input.accepted` | `TypeError` if `line` is not text; never drafts `engine.output`, `usage` or `limit`; the first result is terminal |
-| parser state | `engine_session_id`, `model`, `api_key_source` (`env`, `flag`, `login` or None), `result_seen`, `result_code`, `final_text`, `counts` | `final_text` is set only by a successful result whose answer is text |
+| parser state | `engine_session_id`, `model`, `api_key_source` (`env`, `flag`, `login` or None), `result_seen`, `result_code`, `final_text`, `init_seen` (a system/init came, whatever its key source), `counts` | `final_text` is set only by a successful result whose answer is text |
 | `COUNTS` | `not_json`, `unknown_type`, `no_session`, `other_session`, `after_result`, `result_repeated`, `unknown_subtype`, `init_repeated`, `user_unmatched`, `call_invalid`, `tool_shape_unknown`, `call_repeated`, `call_undigestible`, `input_withheld`, `result_unpaired`, `text_invalid` | what a line gave instead of a draft; each name is described in the module |
 | `input_digest(value) -> str` | SHA-256 hex of the RFC 8785 text (the core's `control.methods.canonical_text`) | `NoCanonicalText` (a `ValueError`) for a value with no such text |
 | `MAX_INPUT_BYTES`, `MAX_RESULT_BYTES` | 65,536 each | this lane's choice (questions.md Q4): a larger input is drafted with `input` null; a longer result text is cut, `truncated` true |
@@ -60,6 +61,20 @@ interpreter has no JSON Schema library, so `test_cursor_fixtures` checks each me
 | `DRIVES` | `("-p", "acp")` | what argv[2] must be: the one-shot drive or `agent acp` |
 | `unattended_switch() -> dict` | `{"engine": "cursor", "switch": "unattended", "state": "off", "refusal": "cursor_unattended_off", "waits_on": "counsel"}` | a copy of a read-only record; nothing reads it yet |
 | `unattended_refusal() -> dict` | `{"code": "cursor_unattended_off", "detail": <text>}` | run.record.v1's `start_error` shape |
+| `CursorAdapter(launcher, clock, credentials, environ, *, binary=None)` | a `RouteAdapter` on today's one-turn path; `run(request, deadline_at) -> result` | its own factory, registered nowhere; argv `oneshot_argv(...) + ["--", prompt]`; stdin closed; everything taken from the request is worked out before the launch, and a request id, prompt, model, connection kind, credential name, connection id or deadline that cannot be used is refused there with no child started; an empty prompt, one over `MAX_PROMPT_BYTES` (= `MAX_ARG_BYTES`), or one with a NUL or a lone surrogate is `request_invalid`; sign-in child: the allowlist only; API-key child: `CURSOR_API_KEY` from custody; a run whose first init reports a key source other than the route's is fenced and answers `route_choice_required`: another documented source (`env`, `flag`, `login`) is `billing_mismatch`, an absent or undocumented one is `billing_unknown`, and so is a result with no init before it; `check_argv` holds the exact argv handed to the launcher (`launch_refused`, the rule as detail); every draft reaches the result's `events` in order (`route_event`: the draft's type as kind, scalar fields only; the input's ids from `input_ids(request_id)`); any exception out of the drive but the three the route boundary types fences the child (`DRIVER_FENCE`) and leaves as it came |
+
+`CursorAdapter.drive` receives the values prepared before the launch, not the caller's request dict. It
+exposes `request_id` and nothing else through the mapping interface the route boundary uses; a subclass
+that reads `request["route"]` inside `drive` does not see the route. `run` is the entry that accepts a
+request. The events appended to a result are `input.accepted`, `tool.call`, `tool.result` and `result`.
+
+An ordinary failure while reading or copying the request mapping (its route, or that route's connection)
+is `request_invalid` and starts no child. `KeyboardInterrupt` and `SystemExit` from that mapping are not
+turned into a refusal. A refusal answers with the request id copied before the failure when that id is
+usable text, and with an empty id otherwise; it does not read the caller again. A connection kind is
+accepted only as a plain `str` before it is compared. If fencing the child also fails, a diagnostic note
+is attached when the exception accepts one; when the note cannot be attached, the original exception
+still leaves.
 
 `fake_agent.py`: `FakeLauncher(fixture)(argv, *, env, shell=False, **options)` records each launch in
 `.launches` and hands out the process in `.processes`; `fixture_lines(name)` and `fixture_header(name)` read

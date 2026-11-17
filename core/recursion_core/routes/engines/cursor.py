@@ -1,9 +1,12 @@
 # Written by Claude Opus 5.5 (claude-opus-5-5), builder lane ENGINE-E6, for Lucas.
-"""Cursor CLI (engine ``cursor``): the stream-json parser, the drives' argv, and the unattended switch.
+"""Cursor CLI (engine ``cursor``): the stream-json parser, the drives' argv, the unattended switch, and the
+one-shot driver.
 
-Lane ENGINE-E6, first slice (the Liaison's start note of Nov 14, 2026): fixtures, parser, and the switch
-written as data that is off. Nothing here starts a process, reads a file or the environment, reads a
-login store, or is registered anywhere: no factory is in the engine table, no daemon loads this module.
+Lane ENGINE-E6 (the Liaison's start notes of Nov 14 and 15, 2026). Slice 1: fixtures, the parser, the argv
+guard, and the switch written as data that is off. Slice 2: the one-shot driver, ``CursorAdapter``. The
+parser, the guard and the switch start nothing and read no file, environment or login store. The driver
+starts the engine only through the launcher composition hands it, and reads only the parent mapping it is
+handed. Nothing is registered anywhere: no factory is in the engine table, no daemon loads this module.
 
 SOURCES. Cursor publishes no schema for its stream. The shapes below are from its own pages, retrieved
 2026-11-15 about 01:05 UTC (Nov 14, about 5:05 PM PST): https://cursor.com/docs/cli/reference/output-format
@@ -51,13 +54,15 @@ as text that UTF-8 can write; any other success line is a ``protocol_error``, ne
 
 The parser serves ONE worker and one reader of its output, in order, and holds no lock. ``parse`` is not
 atomic: an exception that escapes it (a ``MemoryError``, an interrupt) may leave its line half recorded,
-so a driver that catches one discards the parser with the turn.
+so the driver discards the parser with the turn: ``CursorAdapter`` fences the child and lets the exception
+leave.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping
 from types import MappingProxyType
@@ -65,6 +70,9 @@ from types import MappingProxyType
 # The core's RFC 8785 writer (lane SPINE's, in the method table's module): the form event.v1 names
 # ``rfc8785/v1`` for ``input_digest``. The control package does not import ``routes``.
 from recursion_core.control.methods import NoCanonicalText, canonical_text
+from recursion_core.routes import contract as c
+from recursion_core.routes.base import Deadline, RouteAdapter, _Protocol, scalar
+from recursion_core.routes.launch import ReadTimeout, child_env
 
 ENGINE = "cursor"
 # The command a registration of this engine will state (``default_executable``, SPINE's contract as the
@@ -360,8 +368,8 @@ class StreamParser:
     other than assistant text),
     ``model`` and ``api_key_source`` (from the first system/init; None when absent or not one of the three
     documented sources), ``result_seen``, ``result_code`` (None on success and before a result),
-    ``final_text`` (the answer of a successful result, else None), and ``counts`` (``COUNTS``, every name
-    always present).
+    ``final_text`` (the answer of a successful result, else None), ``init_seen`` (whether a system/init of
+    this conversation came, whatever its key source), and ``counts`` (``COUNTS``, every name always present).
     """
 
     def __init__(self) -> None:
@@ -376,6 +384,10 @@ class StreamParser:
         self._input: tuple[str, str, str] | None = None   # (delivery_id, turn_id, text), until replayed
         self._wrote = False
         self._calls: dict[str, tuple[str, str, bool]] = {}   # call_id -> (tool key, tool name, completed)
+
+    @property
+    def init_seen(self) -> bool:
+        return self._init_seen
 
     # -- the one input ---------------------------------------------------------------------------------
     def wrote(self, delivery_id: object, turn_id: object, text: object) -> None:
@@ -554,3 +566,288 @@ class StreamParser:
         self.result_seen = True
         self.result_code = code
         return [{"type": "result", "payload": {"code": code, "detail": detail}}]
+
+
+# ------------------------------------------------------------------------------- the one-shot driver
+
+# The one name an API-key route may select, filled from custody. Neither CURSOR_API_KEY nor CURSOR_AUTH_TOKEN
+# (``--auth-token``'s variable, https://cursor.com/docs/cli/acp) is ever inherited from the daemon: the child's
+# environment is ``routes.launch.child_env``'s allowlist, which names neither, plus the route's one credential.
+CURSOR_API_KEY_ENV = ("CURSOR_API_KEY",)
+MAX_PROMPT_BYTES = MAX_ARG_BYTES   # the prompt is one argument
+# Where the run's key must come from, by the route's connection kind, as system/init reports it.
+_EXPECTED_KEY_SOURCE = {"subscription": "login", "api_key": "env"}
+# Lines the one-shot driver does not run past: its own process's stdout is the engine's stream and nothing else.
+_FATAL_COUNTS = ("not_json", "no_session", "other_session")
+# The stream line each draft is read from, named as a route event's ``source``.
+_EVENT_SOURCES = {"input.accepted": "cursor.user", "tool.call": "cursor.tool_call.started",
+                  "tool.result": "cursor.tool_call.completed", "result": "cursor.result"}
+# What a child is fenced for when the driver ends by anything the route boundary does not type
+# (routes/base.py types Deadline, _Protocol and OSError, and fences the child for each itself).
+DRIVER_FENCE = "driver_error"
+
+
+def input_ids(request_id: str) -> tuple[str, str]:
+    """The delivery id and the turn id of the one input, named from the request id.
+
+    Today's route request carries neither id, and event.v1 needs both (``dlv-``, ``turn-``). The run
+    record's own ids take their place when the driver is wired to it (lane SESSIONS); until then one
+    request always names the same pair.
+    """
+    digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:40]
+    return f"dlv-{digest}", f"turn-{digest}"
+
+
+def route_event(draft: dict) -> dict:
+    """A driver.v2 draft as a route result's event, in the order the stream gave it: the draft's type is the
+    event's kind, the line it was read from is its source, and only the payload's scalar fields are copied
+    (``routes.base.scalar``). A tool's ``input`` is nested model payload and is not copied; its
+    ``input_digest`` is."""
+    return c.event(draft["type"], _EVENT_SOURCES[draft["type"]],
+                   {name: scalar(value) for name, value in draft["payload"].items()})
+
+
+def _text(value: object) -> bool:
+    """Text a request field may hold: exactly a ``str``, not empty, and writable as UTF-8 (no lone surrogate)."""
+    return type(value) is str and bool(value) and not _has_surrogate(value)
+
+
+def _field(mapping: Mapping, name: str, path: str) -> object:
+    try:
+        return mapping[name]
+    except KeyError:
+        raise c.RouteError(c.REQUEST_INVALID, f"{path}: missing") from None
+
+
+def _refusal_id(value: object) -> str:
+    """The request id a refusal answers with: usable text already taken from the request, else empty.
+
+    It does not read the caller's request. A value that is not usable text is not echoed.
+    """
+    return value if _text(value) else ""
+
+
+def _snapshot(request: Mapping) -> dict:
+    """One plain copy of the request, its route and its connection.
+
+    Each of those three is read through the caller's mapping while the copy is built. An ordinary
+    failure of that read or copy is ``request_invalid``. ``KeyboardInterrupt`` and ``SystemExit``
+    are not caught here.
+    """
+    try:
+        route = _field(request, "route", "route")
+        if not isinstance(route, Mapping):
+            raise c.RouteError(c.REQUEST_INVALID, "route: not an object")
+        connection = _field(route, "connection", "route.connection")
+        if not isinstance(connection, Mapping):
+            raise c.RouteError(c.REQUEST_INVALID, "route.connection: not an object")
+        copy = dict(request)
+        copy["route"] = dict(route)
+        copy["route"]["connection"] = dict(connection)
+    except c.RouteError:
+        raise
+    except Exception as err:
+        raise c.RouteError(c.REQUEST_INVALID, f"request: not readable ({type(err).__name__})") from None
+    return copy
+
+
+class _Prepared:
+    """Everything a run takes from its request, worked out before the launch (the second break-it read of
+    #412, R1). The route boundary reads only ``request_id`` from it; the drive reads its plain values, inside
+    the fence. After the launch nothing reads the request."""
+
+    __slots__ = ("request_id", "argv", "env", "kind", "expected", "delivery_id", "turn_id", "prompt")
+
+    def __init__(self, **values: object) -> None:
+        for name, value in values.items():
+            setattr(self, name, value)
+
+    def __getitem__(self, key: str) -> object:
+        if key != "request_id":   # routes/base.py reads the request id and nothing else
+            raise KeyError(key)
+        return self.request_id
+
+
+class CursorAdapter(RouteAdapter):
+    """Cursor's one-shot drive on today's one-turn path. Its own factory; registered nowhere yet.
+
+    THE RULE OF ``run``: the request, its route and its connection are copied once before the launch.
+    An ordinary failure while reading or copying them is ``request_invalid`` and no child starts.
+    ``KeyboardInterrupt`` and ``SystemExit`` are not turned into a refusal. After a usable request id has
+    been copied, a later refusal answers with that id and does not read the caller again. When no usable
+    id was copied, the refusal's id is empty, and an unusable value is not echoed. After the launch the
+    only code that runs is the drive, inside the fence.
+
+    Every launch goes through ``check_argv``, over the exact argv handed to composition's launcher, which
+    only a closure holds. Once the child has started, every way out of the drive fences it: the route
+    boundary fences for a deadline, a protocol error and an OSError; this driver fences for anything else,
+    ``BaseException`` included, and the original exception is what leaves. A note that the fence also failed
+    is attached when the exception accepts one; if the note cannot be attached, the original still leaves.
+    """
+
+    engine = ENGINE
+
+    def __init__(self, *args, binary: object = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        _executable(binary)   # an option that is not an absolute path fails composition, not a run
+        self._binary = binary
+        launch = self._launcher   # composition's launcher, held by the closure below and nowhere else
+
+        def checked_launch(argv, *, env, shell=False, **options):
+            """The launch boundary. ``check_argv`` holds the exact argv this launch is handed, before anything
+            starts; a refusal is the launcher's own typed refusal (``launch_refused``, the rule as detail), so
+            the route boundary answers it as a refusal before launch (the first break-it read of #412, F3)."""
+            try:
+                check_argv(argv, binary=binary)
+            except ArgvRefused as err:
+                raise c.RouteError(c.LAUNCH_REFUSED, err.detail) from None
+            return launch(argv, env=env, shell=shell, **options)
+
+        self._launcher = checked_launch
+
+    def declaration(self) -> dict:
+        return oneshot_declaration()
+
+    def run(self, request: dict, deadline_at: float) -> dict:
+        try:
+            prepared, deadline = self._prepare(request, deadline_at)
+        except c.RouteError as err:
+            # The id copied during preparation, never a second read of the caller (Astra R3).
+            return c.result(_refusal_id(getattr(err, "answered_id", "")), err.code, detail=err.detail)
+        return super().run(prepared, deadline)
+
+    def _prepare(self, request: object, deadline_at: object) -> tuple[_Prepared, float]:
+        if not isinstance(request, Mapping):
+            raise c.RouteError(c.REQUEST_INVALID, "request: not an object")
+        # One plain copy of the route and connection, each read once (the first break-it read of #412, F4).
+        copy = _snapshot(request)
+        rid = copy.get("request_id")
+        try:
+            if not _text(rid):
+                raise c.RouteError(c.REQUEST_INVALID, "request_id: not text")
+            try:
+                deadline = float(deadline_at) if type(deadline_at) in (int, float) else math.nan
+            except OverflowError:   # an int past the float range (the second break-it read of #412, R2)
+                deadline = math.nan
+            if not math.isfinite(deadline):
+                raise c.RouteError(c.REQUEST_INVALID, "deadline_at: not a finite number")
+            argv = self._argv_for(copy)
+            env = self._env_for(copy)
+            kind = copy["route"]["connection"]["kind"]   # a plain str; _env_for refused anything else before comparing
+            delivery_id, turn_id = input_ids(rid)
+            return _Prepared(request_id=rid, argv=argv, env=env, kind=kind, expected=_EXPECTED_KEY_SOURCE[kind],
+                             delivery_id=delivery_id, turn_id=turn_id, prompt=copy["prompt"]), deadline
+        except c.RouteError as err:
+            err.answered_id = rid   # type: ignore[attr-defined]
+            raise
+
+    def argv(self, request: object) -> list[str]:
+        return request.argv if isinstance(request, _Prepared) else self._argv_for(request)
+
+    def env(self, request: object) -> dict[str, str]:
+        return request.env if isinstance(request, _Prepared) else self._env_for(request)
+
+    def _argv_for(self, request: dict) -> list[str]:
+        prompt = request.get("prompt")
+        if type(prompt) is not str:   # a subclass could show these checks one text and execve another (F8-1)
+            raise c.RouteError(c.REQUEST_INVALID, "prompt: not exactly a str")
+        if not prompt:
+            raise c.RouteError(c.REQUEST_INVALID, "prompt: empty")
+        if "\x00" in prompt or _has_surrogate(prompt):
+            raise c.RouteError(c.REQUEST_INVALID, "prompt: a NUL or a lone surrogate cannot be passed in argv")
+        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+            raise c.RouteError(c.REQUEST_INVALID, f"prompt: over {MAX_PROMPT_BYTES} bytes, the argv limit")
+        try:
+            options = oneshot_argv(request["route"].get("model"), binary=self._binary)
+        except ArgvRefused as err:
+            raise c.RouteError(c.LAUNCH_REFUSED, err.detail) from None
+        return [*options, "--", prompt]   # checked whole at the launch boundary
+
+    def _env_for(self, request: dict) -> dict[str, str]:
+        connection = request["route"]["connection"]
+        kind = connection.get("kind")
+        # Plain text before any comparison, so a subclass whose equality raises cannot escape (Astra R2).
+        if type(kind) is not str or not kind or _has_surrogate(kind):
+            raise c.RouteError(c.LAUNCH_REFUSED, "connection kind that is not text not supported for cursor")
+        if kind == "subscription":
+            return child_env(self._parent_env)
+        if kind == "api_key":
+            # The two values custody is asked with must be text it can be asked with (R1's rule).
+            if not _text(connection.get("credential_env")):
+                raise c.RouteError(c.REQUEST_INVALID, "route.connection.credential_env: not text")
+            if not _text(connection.get("id")):
+                raise c.RouteError(c.REQUEST_INVALID, "route.connection.id: not text")
+            return child_env(self._parent_env, credential=self.credential(request, CURSOR_API_KEY_ENV))
+        raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for cursor")
+
+    def drive(self, process, request, deadline_at, events):
+        try:
+            return self._drive(process, request, deadline_at, events)
+        except (Deadline, _Protocol, OSError):
+            raise   # the route boundary fences the child for each of these and types the result
+        except BaseException as err:
+            # Any other way out (a TypeError, a MemoryError, an interrupt, a defect): the child is fenced first
+            # and the original exception leaves. A fence that fails too does not replace it. The note is
+            # optional: if it cannot be attached, the original exception is still what leaves (Astra R1).
+            try:
+                process.fence(DRIVER_FENCE)
+            except BaseException as fence_err:
+                try:
+                    err.add_note(f"fencing the child also failed: {type(fence_err).__name__}")
+                except BaseException:
+                    pass
+            raise
+
+    def _drive(self, process, prepared, deadline_at, events):
+        rid, kind, expected = prepared.request_id, prepared.kind, prepared.expected
+        parser = StreamParser()   # one per run; discarded with the turn, whatever ends it
+        parser.wrote(prepared.delivery_id, prepared.turn_id, prepared.prompt)
+        process.close_stdin()   # the prompt is in argv; nothing is written to the child
+        while True:
+            remaining = deadline_at - self._clock()
+            if remaining <= 0:
+                raise Deadline()
+            try:
+                line = process.read_line(remaining)
+            except ReadTimeout:
+                raise Deadline() from None
+            if line is None:
+                return c.result(rid, c.ENGINE_EXITED, events=events, detail="stdout closed before result")
+            before = [parser.counts[name] for name in _FATAL_COUNTS]
+            drafts = parser.parse(line)
+            for name, count in zip(_FATAL_COUNTS, before, strict=True):
+                if parser.counts[name] != count:
+                    raise _Protocol(f"stdout line: {name}")
+            # The billing check, at the first system/init. The child's environment carries HOME for both kinds
+            # (routes.launch's allowlist), where Cursor's sign-in store may live, so an API-key route's child
+            # could still bill the sign-in: this check is what refuses such a run. The source must be the one
+            # the route picked: another documented source is a mismatch, and a source that is absent or one
+            # Cursor does not document is a meter not known (the second break-it read of #412, R3). A run with
+            # no init that gives a result is refused at that result; one that ends with no result is
+            # engine_exited, and one whose result line is not understood is a protocol error, as before.
+            if parser.init_seen and parser.api_key_source != expected:
+                if parser.api_key_source is None:
+                    process.fence("billing_unknown")
+                    return c.result(rid, c.ROUTE_CHOICE_REQUIRED, events=events, detail=(
+                        f"the {kind} route's run reported no apiKeySource Cursor documents, so which meter it "
+                        "billed is not known; choose the route again, or cancel"))
+                # The run reports a key source the route did not pick: it would bill another meter.
+                process.fence("billing_mismatch")
+                return c.result(rid, c.ROUTE_CHOICE_REQUIRED, events=events, detail=(
+                    f"the {kind} route's run reported apiKeySource {parser.api_key_source}, not {expected}: "
+                    "it would bill another meter; choose the route that matches, or cancel"))
+            for draft in drafts:
+                events.append(route_event(draft))
+                if draft["type"] != "result":
+                    continue
+                code = draft["payload"]["code"]
+                if code == "protocol_error":
+                    raise _Protocol(draft["payload"]["detail"])
+                if not parser.init_seen:
+                    process.fence("billing_unknown")
+                    return c.result(rid, c.ROUTE_CHOICE_REQUIRED, events=events, detail=(
+                        f"the {kind} route's run reported no system/init, so which meter it billed is not known; "
+                        "choose the route again, or cancel"))
+                if code is None:
+                    return c.result(rid, None, text=parser.final_text or "", events=events)
+                return c.result(rid, c.ENGINE_ERROR, events=events, detail=draft["payload"]["detail"])

@@ -890,8 +890,11 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
             log.warning('the breaker store was missing and was created empty while run records exist: '
                         'earlier trips, run bindings and faults are not known to this daemon')
     # D1: nothing of a plugin is read or run before the control socket serves (Stop works while one hangs).
-    plugins = PluginHost(config_dir, state_dir, stored, plugin_dirs=plugin_dirs, load=False,
-                         **(plugin_options or {}))
+    # ``load`` is a host keyword. The caller's value wins; the caller's mapping is left as given.
+    host_options = dict(plugin_options or {})
+    host_load = host_options.pop('load', False)
+    plugins = PluginHost(config_dir, state_dir, stored, plugin_dirs=plugin_dirs, load=host_load,
+                         **host_options)
     adapters = {}
     for engine, cls in (('claude_code', ClaudeCodeAdapter), ('codex', CodexAdapter)):
         entry = routes.get(engine)
@@ -915,6 +918,16 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
             if item is not None:
                 item.close()
 
+    answered = control._answer
+
+    def answer_while_composing(method, params, reserved):
+        # A start in this window would keep running after a failed load shuts the socket.
+        # Stop and reads still go through to the control API.
+        if method == 'run.start':
+            return {'code': 'unavailable', 'detail': 'composing'}
+        return answered(method, params, reserved)
+
+    control._answer = answer_while_composing
     try:
         server.start()
     except BaseException:
@@ -927,7 +940,9 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
         release()
         raise
     try:
-        plugins.load_installed()  # D1: after the socket serves, so Stop answers while a plugin hangs at import
+        if not host_load:  # the caller already loaded; a second load_installed raises
+            plugins.load_installed()  # D1: after the socket serves, so Stop answers while a plugin hangs at import
+        control._answer = answered
     except BaseException:
         server.close()
         release()

@@ -8,9 +8,11 @@ Security model: no token. Access is the socket owner's user only.
 - Directory: created ``0700`` if missing. The server refuses to serve (``SocketUnsafe``) if the
   directory is a symlink, is not owned by this uid, or is open to group or other.
 - Socket file: bound under umask ``0o077``, set to ``0600`` and checked before ``listen``.
-- Peer: each connection's uid is read with ``SO_PEERCRED``; another uid is answered ``peer_refused`` and
-  closed unread. Where ``AF_UNIX``, ``SO_PEERCRED`` or ``os.getuid`` is missing (macOS, Windows) the
-  server refuses to serve with ``PlatformNotSupported``.
+- Peer: each connection's uid is read through ``get_peer_cred`` (``SO_PEERCRED`` on Linux,
+  ``LOCAL_PEERCRED`` on macOS). Another uid is answered ``peer_refused`` and closed unread. Where
+  ``AF_UNIX`` or ``os.getuid`` is missing, or the platform has no peer-uid source (Windows), the
+  server refuses to serve with ``PlatformNotSupported``. On macOS a socket path longer than 104
+  bytes is refused before bind.
 
 Framing: one request per connection. The client sends one JSON object line ``{"method": str,
 "params": {}}`` of at most ``MAX_REQUEST_BYTES`` bytes; the server answers one JSON line and closes.
@@ -31,6 +33,7 @@ import os
 import socket
 import stat
 import struct
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -48,11 +51,14 @@ from recursion_core.control.operator_reads import (
     OperatorReads,
     refusal,
 )
+from recursion_core.control_transport.peercred import get_peer_cred
 
 MAX_REQUEST_BYTES = 4096
 MAX_REPLY_BYTES = 1 << 20
 SOCKET_DIR, SOCKET_NAME = "recursion", "operator-reads.sock"
 PLATFORM_UNSUPPORTED = "platform_unsupported"
+# Darwin sockaddr_un.sun_path is 104 bytes. A longer path is refused before bind.
+_DARWIN_SUN_PATH = 104
 
 _AF_UNIX = getattr(socket, "AF_UNIX", None)
 _SO_PEERCRED = getattr(socket, "SO_PEERCRED", None)
@@ -61,7 +67,7 @@ _BACKLOG = 32  # waiting to be accepted, not served: the accept loop answers "bu
 
 
 class PlatformNotSupported(RuntimeError):
-    """This platform lacks AF_UNIX, SO_PEERCRED or uids, so the owner-only rule cannot be enforced."""
+    """This platform lacks AF_UNIX, a peer-uid source or uids, so the owner-only rule cannot be enforced."""
 
 
 class SocketUnsafe(RuntimeError):
@@ -85,9 +91,18 @@ def default_socket_path(environ: Mapping[str, str] | None = None) -> str:
     return os.path.join(base, SOCKET_DIR, SOCKET_NAME)
 
 
+def _can_read_peer_uid() -> bool:
+    """Linux reads ``SO_PEERCRED``. Darwin reads ``LOCAL_PEERCRED``. Anything else cannot name the peer."""
+
+    if sys.platform == "darwin":
+        return True
+    if sys.platform.startswith("linux"):
+        return _SO_PEERCRED is not None
+    return False
+
+
 def _peer_uid(conn: socket.socket) -> int:
-    creds = conn.getsockopt(socket.SOL_SOCKET, _SO_PEERCRED, struct.calcsize("iII"))
-    return struct.unpack("iII", creds)[1]
+    return get_peer_cred(conn).uid
 
 
 def _secure_dir(directory: str, uid: int) -> None:
@@ -156,10 +171,12 @@ class OperatorReadsServer:
     def start(self) -> OperatorReadsServer:
         if self._listener is not None or self._stop.is_set():
             raise RuntimeError("the server was already started")
-        if _AF_UNIX is None or _SO_PEERCRED is None:
-            raise PlatformNotSupported("AF_UNIX with SO_PEERCRED is needed to serve owner-only")
+        if _AF_UNIX is None or not _can_read_peer_uid():
+            raise PlatformNotSupported("AF_UNIX with a peer uid source is needed to serve owner-only")
         self._uid = _getuid()
         path = self._path or default_socket_path()
+        if sys.platform == "darwin" and len(os.fsencode(path)) > _DARWIN_SUN_PATH:
+            raise SocketUnsafe("the socket path is longer than 104 bytes")
         _secure_dir(os.path.dirname(path), self._uid)
         _clear_stale(path)
         listener = socket.socket(_AF_UNIX, socket.SOCK_STREAM)
@@ -364,7 +381,7 @@ class OperatorReadsClient:
             try:
                 conn.settimeout(timeout)
                 conn.connect(path)
-                if _SO_PEERCRED is not None and _peer_uid(conn) != uid:
+                if _can_read_peer_uid() and _peer_uid(conn) != uid:
                     return _local(CONTROL_API_UNAVAILABLE, False, "server_not_this_user")
             except (OSError, ValueError, TypeError, struct.error) as exc:
                 return _local(CONTROL_API_UNAVAILABLE, False, f"connect_failed: {type(exc).__name__}")

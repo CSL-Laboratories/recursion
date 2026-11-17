@@ -24,7 +24,9 @@ store's module is only called here, never changed.
   route result is an error is recorded as faulted.
 
 The store is ``<state dir>/plugin-security/breaker.sqlite3`` (0600 in a 0700 directory; the file, its
-WAL and shm files and the directory must not be symlinks: ``breaker_store_untrusted``). There is
+WAL and shm files and the directory must not be symlinks: ``breaker_store_untrusted``). An existing
+store with group or other access is tightened to 0600, or the open is refused
+``breaker_store_not_private``. A mode with no group or other access is left as it is. There is
 no installer yet, so the daemon creates it on first start; a store deleted later is created empty
 again and that is logged, not hidden. A store that exists and cannot be read is not replaced: the
 daemon keeps serving reads and Stop, and refuses every start (``breaker_store_unavailable``).
@@ -116,17 +118,17 @@ def _require_own_file(path, *, required):
         return
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
         raise Refused('breaker_store_untrusted', f'{path.name} must be an operator-owned regular file, not a symlink')
-    if required and stat.S_IMODE(info.st_mode) != 0o600:
-        # An existing store keeps the mode it was left with. The file this daemon creates is 0600;
-        # a looser mode is tightened here, or the open is refused (the private-file rule).
+    if required and stat.S_IMODE(info.st_mode) & 0o077:
+        # Group or other access is cleared. A mode that already has none (0600, or stricter
+        # such as 0400) is left unchanged. When this mode cannot be cleared, the open is refused.
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except OSError as exc:
-            raise Refused('breaker_store_untrusted', path.name) from exc
+            raise Refused('breaker_store_not_private', f'{path.name}: could not be made 0600') from exc
         try:
             os.fchmod(fd, 0o600)
         except OSError as exc:
-            raise Refused('breaker_store_untrusted', path.name) from exc
+            raise Refused('breaker_store_not_private', f'{path.name}: could not be made 0600') from exc
         finally:
             os.close(fd)
 

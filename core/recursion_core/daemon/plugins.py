@@ -840,8 +840,9 @@ class PluginHost:
                                       'was made (plugin degraded)'}
             if self._busy:
                 return 503, {'error': 'unavailable: operator plugin busy with an earlier read; nothing was read'}
+            # Created before ``_busy`` is taken: an exception here must not leave the plugin busy.
+            outcome, done = {}, threading.Event()
             self._busy = True
-        outcome, done = {}, threading.Event()
 
         def run():
             try:

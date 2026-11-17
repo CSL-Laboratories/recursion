@@ -127,6 +127,8 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
     and the Popen object reaps the engine whenever it does exit.
     Times are monotonic.
     """
+    if stdin is not None and not isinstance(stdin, bytes):
+        raise ValueError("stdin must be bytes")
     timeout_s = _finite_seconds(timeout_s)
     started = time.monotonic()
     try:

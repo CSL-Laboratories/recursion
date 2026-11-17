@@ -335,6 +335,66 @@ class InterruptAnswersTest(unittest.TestCase):
                 self.assertTrue(committed, 'the request left a record')
                 self.assertEqual(committed, [{'kind': 'device', 'id': 'phone-1'}] * len(committed))
 
+    def _requester_paths(self):
+        """The three paths of ``interrupt`` that keep the requester: (path, session id, turn id) with a fresh lane."""
+        for path in ('native', 'fallback', 'no_live_turn'):
+            self.lane = Lane()
+            if path == 'no_live_turn':
+                yield path, self.lane.start(engine='codex')['session']['session_id'], 'turn-whatever'
+            else:
+                live = self.running('codex' if path == 'native' else 'opencode')
+                yield path, live['session_id'], live['active_turn_id']
+
+    def _committed_requesters(self):
+        with self.lane.store.transaction() as tx:
+            found = [operation['payload']['requested_by'] for operation in store.work(tx)
+                     if operation['kind'] == 'interrupt']
+        return found + [event['payload']['requested_by'] for event in self.events_of('interrupt')]
+
+    def test_the_value_that_is_checked_is_the_copy_not_the_callers_dict(self):
+        """Review 3 of #415 (Claude Fable 5.2, required change R1). The caller's dict is changed after the copy and
+        before the check: the check must be handed the copy (not the caller's object), and what was copied is what is
+        taken and committed. A service that checks the caller's dict and uses the copy refuses this valid request."""
+        real = records.check_principal
+        for path, sid, turn_id in self._requester_paths():
+            with self.subTest(path=path):
+                requested_by = {'kind': 'device', 'id': 'phone-1'}
+                handed = []
+
+                def change_then_check(value, where='/principal', requested_by=requested_by, handed=handed):
+                    if where == '/requested_by':            # the session's own principal is checked elsewhere too
+                        handed.append(value is requested_by)
+                        requested_by['id'] = ''             # the caller's dict, emptied after the copy
+                    real(value, where)
+
+                with mock.patch.object(records, 'check_principal', change_then_check):
+                    self.lane.sessions.interrupt(sid, turn_id, requested_by)
+                self.assertEqual(handed, [False], 'the check is handed the copy, not the caller\'s object')
+                committed = self._committed_requesters()
+                self.assertTrue(committed, 'the request left a record')
+                self.assertEqual(committed, [{'kind': 'device', 'id': 'phone-1'}] * len(committed))
+
+    def test_a_copy_that_is_not_a_principal_is_refused_though_the_callers_dict_is_mended_before_the_check(self):
+        """The mirror of the test above: what was copied is not a principal, the caller's dict is mended after the
+        copy and before the check. The copy is what is checked, so the request is refused and nothing is committed;
+        a service that checks the caller's dict would commit a principal that was never checked."""
+        real = records.check_principal
+        for path, sid, turn_id in self._requester_paths():
+            with self.subTest(path=path):
+                requested_by = {'kind': 'device', 'id': ''}         # what is copied is not a principal
+
+                def mend_then_check(value, where='/principal', requested_by=requested_by):
+                    if where == '/requested_by':
+                        requested_by['id'] = 'phone-1'      # mended after the copy, before the check
+                    real(value, where)
+
+                with mock.patch.object(records, 'check_principal', mend_then_check):
+                    with self.assertRaises(machine.Refused) as caught:
+                        self.lane.sessions.interrupt(sid, turn_id, requested_by)
+                self.assertEqual((caught.exception.code, caught.exception.detail), ('request_invalid', 'requested_by'))
+                self.assertEqual(self._committed_requesters(), [])
+                self.assertEqual(self.work_of('interrupt') + self.work_of('stop'), [], 'nothing written')
+
     # ---------------------------------------------------------------- one cancel per turn (R2, F2, O1)
     def test_a_second_request_while_a_cancel_is_pending_or_sent_sends_no_second_cancel(self):
         live = self.running()

@@ -380,10 +380,11 @@ class WorkflowShapeTests(unittest.TestCase):
     def test_full_matrix_pip_matches_ci_isolation(self) -> None:
         matrix = (ROOT / ".github" / "workflows" / "ci-full-matrix.yml").read_text(encoding="utf-8")
         pip = 'python -P -m pip install --only-binary=:all: -r "$REQUIREMENTS_CI"'
-        self.assertEqual(matrix.count(pip), 2)
-        self.assertEqual(matrix.count("working-directory: ${{ runner.temp }}"), 2)
-        self.assertEqual(matrix.count("REQUIREMENTS_CI: ${{ github.workspace }}/requirements-ci.txt"), 2)
-        self.assertEqual(matrix.count("shell: bash"), 2)
+        # windows, macos, and the two informing free-threaded legs.
+        self.assertEqual(matrix.count(pip), 4)
+        self.assertEqual(matrix.count("working-directory: ${{ runner.temp }}"), 4)
+        self.assertEqual(matrix.count("REQUIREMENTS_CI: ${{ github.workspace }}/requirements-ci.txt"), 4)
+        self.assertEqual(matrix.count("shell: bash"), 4)
         self.assertNotIn("python -m pip install", matrix)
         self.assertNotIn("cache: pip", matrix)
         self.assertNotIn("cache-dependency-path:", matrix)

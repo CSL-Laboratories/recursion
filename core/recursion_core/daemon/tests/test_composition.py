@@ -9,9 +9,11 @@ calls themselves are checked as argv here and against a real user manager by
 """
 import _thread
 import contextlib
+import decimal
 import http.client
 import io
 import json
+import numbers
 import os
 from pathlib import Path
 import shutil
@@ -1800,8 +1802,8 @@ class CompositionRootTest(unittest.TestCase):
         ``event`` is the class ``main`` makes its stop Event of. ``handlers`` are the handlers ``main``
         installs, by signal number. ``ended`` is set when the thread ``main`` starts for its stop has
         returned, however it returned: a thread that dies in this stand-in before it comes to
-        ``main``'s work sets it too. ``ended.started`` is true once such a thread really was started:
-        a start the machine refuses leaves it false, and ``ended`` is then never set. With ``held``
+        ``main``'s work sets it too. ``ended.started`` is true once the start has been asked for, and
+        false again when the machine refuses, and ``ended`` is then never set. With ``held``
         (which must be an Event) that thread does nothing until ``held`` is set, and ``ended.parked``
         is set when it has come to wait there.
 
@@ -1810,18 +1812,24 @@ class CompositionRootTest(unittest.TestCase):
         calling ``handlers[number]``, and a real signal sent to the process would take its default
         action. And ``ended`` is set by that thread alone: ask ``ended.started`` first, and never
         wait on ``ended`` without a bound (``STOP_BOUND_S``), or a ``main`` that started no thread
-        hangs the test. The bound is a number above 0 and below 60: anything else, a bound that is
-        not a number among it, is refused here with one message, before anything is replaced.
+        hangs the test. The bound is a real number above 0 and below 60, or a Decimal, and not a
+        bool: anything else is refused here with one message, before anything is replaced.
+        Two callers of this stand-in in one process share the patched module names, so a second
+        stopping wins.
 
         The lock ``main`` makes is a real one that also says what met it: ``ended.waits`` is true once
         a thread came to it, found it held and so waits for it; ``ended.moved`` is set at that moment,
         and again when the thread has returned.
         """
         from recursion_core.daemon import __main__ as entry
-        self.assertTrue(type(self.STOP_BOUND_S) in (int, float) and 0 < self.STOP_BOUND_S < 60,
+        bound = self.STOP_BOUND_S
+        # Decimal is a real number but not a numbers.Real: it is not registered, so it is named here.
+        self.assertTrue(((isinstance(bound, numbers.Real) and not isinstance(bound, bool))
+                         or isinstance(bound, decimal.Decimal)) and 0 < bound < 60,
                         'the bound must end a wait: with none, a broken stop hangs the file')
         handlers, ended = {}, threading.Event()
         ended.started, ended.waits, ended.moved, ended.parked = False, False, threading.Event(), threading.Event()
+        self._ended_of_this_stand_in = ended  # a test's stand-in for the start can mark it without running the thread
 
         class Latch:
             def __init__(self):
@@ -1847,8 +1855,12 @@ class CompositionRootTest(unittest.TestCase):
                 finally:
                     ended.set()
                     ended.moved.set()
-            thread = _thread.start_new_thread(run, ())
-            ended.started = True    # only now: a thread the machine refused was never started, and sets nothing
+            ended.started = True    # asked for, before the thread can be running and this call not yet returned
+            try:
+                thread = _thread.start_new_thread(run, ())
+            except BaseException:
+                ended.started = False    # the machine refused: no thread, and ``ended`` is never set
+                raise
             return thread
         for name in ('require_free_threaded', 'check_operator_linger', 'UserLock', 'Registry', 'SystemdUserManager',
                      'LoopbackGUI', 'compose_control'):
@@ -1928,7 +1940,10 @@ class CompositionRootTest(unittest.TestCase):
             entry.main(client=object(), door=bool, port=0, sweep_seconds=0.001)
         finally:
             ran_while_held = ended.is_set() or ended.waits
-            held.set()
+            try:    # a let-go that fails must not replace what main raised; KeyboardInterrupt still propagates
+                held.set()
+            except Exception:
+                pass
             ended_in_time = not ended.started or ended.wait(bound)
         self.assertTrue(ended_in_time, 'the thread main started did not end')
         return daemon, ended, ran_while_held
@@ -1952,10 +1967,17 @@ class CompositionRootTest(unittest.TestCase):
     def test_the_wait_that_runs_out_does_not_go_on_before_the_thread_is_at_its_hold(self):
         """What the test above says of its own witness, shown once, with a thread that never comes to
         its hold: the machine takes the thread and does not run it. The wait must end there and say
-        that the thread was not held back. With that taken out of the wait, the witness went on
-        beside a thread that was nowhere, and nothing failed."""
-        self.STOP_BOUND_S = 0.05    # this test waits its bound out twice: for the hold, and for the thread's end
-        with contextlib.ExitStack() as stack, mock.patch.object(_thread, 'start_new_thread', return_value=0) as taken:
+        that the thread was not held back. This test's stand-in for the start marks ``ended`` set
+        and does not park, so the failure is the hold guard's own message even when the wait for
+        the thread's end would pass."""
+        self.STOP_BOUND_S = 0.05    # this test waits its bound out once, for the hold; ended is already set
+
+        def start_and_mark_ended(function, args):
+            self._ended_of_this_stand_in.set()
+            return 0
+
+        with contextlib.ExitStack() as stack, mock.patch.object(
+                _thread, 'start_new_thread', side_effect=start_and_mark_ended) as taken:
             with self.assertRaisesRegex(AssertionError, 'the thread main started was not held back'):
                 self.a_wait_that_runs_out(stack, threading.Event())
         taken.assert_called_once()
@@ -2034,10 +2056,12 @@ class CompositionRootTest(unittest.TestCase):
 
         with contextlib.ExitStack() as stack:
             entry, daemon, handlers, ended = self.stopping(stack, NeverWaitedOn)
+            alive = threading.active_count()
             with mock.patch.object(_thread, 'start_new_thread', side_effect=RuntimeError("can't start new thread")) as refused:
                 with self.assertRaisesRegex(RuntimeError, "can't start new thread"):
                     entry.main(client=object(), door=bool, port=0)
             refused.assert_called_once()
+            self.assertEqual(threading.active_count(), alive)
             self.assertEqual((ended.started, ended.is_set()), (False, False),
                              'no thread was started, and the stand-in must not say that one was')
             daemon.close.assert_called_once()
@@ -2083,6 +2107,106 @@ class CompositionRootTest(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, 'the bound must end a wait'):
                     self.stopping(stack, threading.Event)
                 self.assertEqual((entry.signal.signal, entry.threading), before, 'nothing was replaced')
+
+    def test_a_let_go_that_fails_does_not_replace_what_main_raised(self):
+        """What ``main`` raised is what the caller of the witness sees.
+
+        The witness lets the thread go in a ``finally``. A ``held`` that is missing, or whose
+        ``set`` raises, used to raise from there and the caller saw that instead. ``main`` is
+        made to raise ``ValueError('the real failure')`` through ``_start_gui``: the witness
+        replaces ``sweep`` itself, so the failure has to come from another seam.
+        """
+        from recursion_core.daemon import __main__ as entry
+
+        class SetRaises:
+            def wait(self):
+                return None  # the thread goes on to its work and ends; it is not left parked
+
+            def set(self):
+                raise RuntimeError('a hold that cannot be let go')
+
+        for held, name in ((None, 'none'), (SetRaises(), 'set raises')):
+            with self.subTest(held=name), contextlib.ExitStack() as stack, \
+                    mock.patch.object(entry, '_start_gui', side_effect=ValueError('the real failure')):
+                with self.assertRaisesRegex(ValueError, 'the real failure'):
+                    self.a_wait_that_runs_out(stack, held)
+
+    def test_a_thread_still_in_its_hold_past_the_bound_is_what_the_end_wait_reports(self):
+        """The witness waits, within the bound, for the thread it started to end.
+
+        A hold whose ``wait`` blocks past the bound, and whose ``set`` does not let it go,
+        must end here with the end-wait's own message. A wait replaced by ``True`` would let
+        this pass. The hold ends on its own soon after, so no thread is left running.
+        """
+        self.STOP_BOUND_S = 0.05
+        finished = threading.Event()
+
+        class HoldsPastTheBound:
+            def wait(self):
+                try:
+                    time.sleep(0.4)
+                finally:
+                    finished.set()
+
+            def set(self):
+                return None  # does not unblock wait
+
+        with contextlib.ExitStack() as stack:
+            with self.assertRaisesRegex(AssertionError, 'the thread main started did not end'):
+                self.a_wait_that_runs_out(stack, HoldsPastTheBound())
+        self.assertTrue(finished.wait(2), 'the thread was still inside its hold')
+        time.sleep(0.05)  # tell() runs after the hold returns; let that thread leave
+
+    def test_ended_started_is_true_before_start_new_thread_returns(self):
+        """The thread can be running before ``start_new_thread`` returns.
+
+        ``ended.started`` is true once the start has been asked for, so a reader in that
+        window is not told that no thread exists. It used to be set only after the call
+        returned, and was still false while the thread was already able to run.
+        """
+        from recursion_core.daemon import __main__ as entry
+        seen, handlers = [], {}
+        real_start = _thread.start_new_thread
+
+        def pausing_start(function, args):
+            seen.append(ended.started)  # before this call returns
+            return real_start(function, args)
+
+        class RunsOut(threading.Event):
+            def wait(self, timeout=None):
+                handlers[signal.SIGTERM](signal.SIGTERM, None)
+                return super().wait(0)
+
+        held = threading.Event()
+        with contextlib.ExitStack() as stack:
+            entry, _daemon, installed, ended = self.stopping(stack, RunsOut, held)
+            handlers = installed
+            try:
+                with mock.patch.object(_thread, 'start_new_thread', side_effect=pausing_start):
+                    entry.main(client=object(), door=bool, port=0, sweep_seconds=0.001)
+            finally:
+                held.set()
+            self.assertTrue(ended.wait(self.STOP_BOUND_S), 'the thread main started did not end')
+        self.assertEqual(seen, [True], 'started was still false while start_new_thread had not returned')
+
+    def test_the_stand_in_accepts_a_real_number_that_is_not_a_bare_float(self):
+        """A Decimal, a Fraction, a float subclass and an int subclass are numbers in the bound.
+
+        The stand-in accepts each and returns. A check of the bare type used to refuse them
+        with the message that says a bound is not a number.
+        """
+        import fractions
+
+        class AsFloat(float):
+            pass
+
+        class AsInt(int):
+            pass
+
+        for bound in (decimal.Decimal('5'), fractions.Fraction(1, 2), AsFloat(5.0), AsInt(5)):
+            with self.subTest(bound=bound), contextlib.ExitStack() as stack:
+                self.STOP_BOUND_S = bound
+                self.stopping(stack, threading.Event)
 
     def test_a_composition_that_cannot_start_stops_the_daemon_before_any_gui(self):
         from recursion_core.daemon import __main__ as entry

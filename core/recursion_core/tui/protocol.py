@@ -119,6 +119,14 @@ def keyed_conditions(answer: Mapping) -> list[tuple[str, str, str]]:
 
     code = answer.get("code")
     found: list[tuple[str, str, str]] = []
+    # A list or a dict cannot be tested against the known codes (TypeError). A number can, and
+    # stays on the refusal path the parity vectors already hold.
+    if code is not None and not isinstance(code, str):
+        try:
+            hash(code)
+        except TypeError:
+            return [(UNAVAILABLE_LABEL, "answer",
+                     f"control API unavailable: code is a {type(code).__name__}, not text")]
     if code == UNAVAILABLE:
         found.append((UNAVAILABLE_LABEL, "api",
                       f"control API unavailable: {field(answer.get('detail', 'no answer'))}"))

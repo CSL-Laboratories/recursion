@@ -98,6 +98,112 @@ class OwnLoop(_Base):
             with self.subTest(users=users):
                 self.call(own_loop.nous_proxy_doctor, "http://127.0.0.1:8645/v1", interactive_users=users)
 
+    # F2 / F7: a refusal address is scheme and host only, or empty. Never the caller's string.
+    def test_sr01_refused_address_drops_the_caller_string(self):
+        secret = "S3KRET-PW"
+        with self.subTest("missing_slashes"):
+            out = own_loop.nous_proxy_doctor(f"http:u:{secret}@127.0.0.1:8645")
+            self.assertEqual(out["address"], "")
+            self.assertNotIn(secret, repr(out))
+        with self.subTest("query_on_bad_scheme"):
+            out = own_loop.nous_proxy_doctor(f"ftp://127.0.0.1/?token={secret}")
+            self.assertEqual(out["address"], "ftp://127.0.0.1")
+            self.assertEqual(out["cause"], "proxy_address_malformed")
+            self.assertNotIn(secret, repr(out))
+        with self.subTest("path_on_non_loopback"):
+            out = own_loop.nous_proxy_doctor(f"http://10.1.2.3:8645/{secret}")
+            self.assertEqual(out["ok"], False)
+            self.assertEqual(out["cause"], "proxy_not_loopback")
+            self.assertEqual(out["address"], "http://10.1.2.3:8645")
+            self.assertNotIn(secret, repr(out))
+        with self.subTest("bad_port"):
+            out = own_loop.nous_proxy_doctor(f"http://127.0.0.1:{MARK}/")
+            self.assertEqual(out["address"], "")
+            self.assertNotIn(MARK, repr(out))
+        with self.subTest("hostless_userinfo"):
+            out = self.call(own_loop.nous_proxy_doctor, "http://u:pw@:8645/")
+            self.assertEqual(out["address"], "")
+            self.assertNotIn("pw", repr(out))
+
+    # F3: a control character in the address is a refusal, and it is not a second line.
+    def test_sr01_control_character_address_is_refused(self):
+        injected = "http://127.0.0.1:8645/v1\nX-Injected: yes"
+        out = own_loop.nous_proxy_doctor(injected)
+        self.assertEqual(out["ok"], False)
+        self.assertEqual(out["cause"], "proxy_address_malformed")
+        self.assertNotIn("\n", out["address"])
+        self.assertNotIn("X-Injected", repr(out))
+        refused = own_loop.nous_proxy_doctor("ftp://127.0.0.1/\nX-Injected: yes")
+        self.assertNotIn("\n", refused["address"])
+        self.assertNotIn("X-Injected", repr(refused))
+
+    # F1: an inventory that raises, and an address whose strip() raises, stay inside the doctor.
+    def test_sr03_inventory_and_address_errors_stay_inside_the_doctor(self):
+        class Boom(list):
+            def __iter__(self):
+                raise RuntimeError("inventory failed")
+
+        class Stop(list):
+            def __iter__(self):
+                raise KeyboardInterrupt
+
+        class BadStr(str):
+            def strip(self, chars=None):
+                raise RuntimeError("strip broke")
+
+        with self.subTest("runtime"):
+            out = self.call(own_loop.nous_proxy_doctor, "http://127.0.0.1:8645/v1", interactive_users=Boom())
+            self.assertEqual(out["ok"], True)
+            self.assertTrue(out["warnings"][0].startswith("host users unknown"))
+            self.assertNotIn("inventory failed", repr(out))
+        with self.subTest("strip"):
+            out = self.call(own_loop.nous_proxy_doctor, BadStr("http://127.0.0.1:8645/v1"))
+            self.assertEqual(out["ok"], False)
+            self.assertEqual(out["address"], "")
+            self.assertNotIn("strip broke", repr(out))
+        with self.subTest("interrupt"):
+            with self.assertRaises(KeyboardInterrupt):
+                own_loop.nous_proxy_doctor("http://127.0.0.1:8645/v1", interactive_users=Stop())
+
+    # F1 / F4 / F7: a string, a one-shot iterator, and an over-long list are not a clean host.
+    def test_sr03_inventory_shape_is_not_a_clean_host(self):
+        url = "http://127.0.0.1:8645/v1"
+        with self.subTest("string"):
+            out = self.call(own_loop.nous_proxy_doctor, url, interactive_users="alice")
+            self.assertTrue(out["warnings"][0].startswith("host users unknown"))
+            self.assertNotIn("a, c, e, i, l", out["warnings"][0])
+        with self.subTest("generator"):
+            def names():
+                yield "alice"
+            out = own_loop.nous_proxy_doctor(url, current_user="u", interactive_users=names())
+            self.assertTrue(out["warnings"][0].startswith("host users unknown"))
+            self.assertNotIn("alice", out["warnings"][0])
+        with self.subTest("list_twice"):
+            users = ["alice"]
+            for _ in range(2):
+                out = own_loop.nous_proxy_doctor(url, current_user="u", interactive_users=users)
+                self.assertIn("alice", out["warnings"][0])
+        with self.subTest("over_cap"):
+            out = own_loop.nous_proxy_doctor(url, current_user="u", interactive_users=[f"user{i}" for i in range(10_001)])
+            self.assertTrue(out["warnings"][0].startswith("host users unknown"))
+        with self.subTest("name_newline"):
+            out = own_loop.nous_proxy_doctor(url, current_user="u", interactive_users=["alice\nX-Injected: yes"])
+            self.assertNotIn("\n", out["warnings"][0])
+            self.assertNotIn("\r", out["warnings"][0])
+            self.assertNotIn("X-Injected", out["warnings"][0])
+
+    # F5 / F7: empty argv, a NUL argument, and a non-string item are one refusal type.
+    def test_sr02_empty_nul_and_non_string_argv_are_one_refusal(self):
+        route = {"engine": "copilot", "auth": "subscription", "method": "copilot_cli_sign_in"}
+        parent = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+        shapes = {"empty": [], "nul": ["copilot", "a\x00b"], "non_str": ["copilot", 1]}
+        for name, argv in shapes.items():
+            with self.subTest(name):
+                with self.assertRaises(own_loop.OwnLoopRouteRefused) as caught:
+                    own_loop.spawn_copilot_own_loop(route, parent, argv, home=str(self.home),
+                                                    has_copilot_login=lambda: True)
+                self.assertEqual(caught.exception.cause, "argv_malformed")
+
 
 class Policy(_Base):
     def chatgpt(self):
@@ -249,6 +355,55 @@ class Policy(_Base):
                 check_route("opencode", {"provider": "bad\nforged", "auth": "api_key",
                                          "credential_env": "OPENAI_API_KEY"}, {}, route_home=str(self.home))
             self.assertNotIn("\n", str(caught.exception))
+            self.assertEqual(caught.exception.detail, "")
+
+    # F6 / F7: line and terminal controls are not echoed from provider, auth, or credential.
+    def test_sr05_control_characters_are_not_a_detail(self):
+        home = str(self.home)
+
+        def refuse(profile):
+            with self.assertRaises(SubscriptionRouteRefused) as caught:
+                check_route("opencode", profile, {}, route_home=home)
+            self.assertEqual(caught.exception.detail, "")
+            self.assertNotIn("forged", str(caught.exception))
+            self.assertNotIn("X: y", str(caught.exception))
+            return caught.exception
+
+        for name, provider in {
+            "cr": "bad\rforged",
+            "nul": "bad\x00forged",
+            "vt": "bad\x0bforged",
+            "ff": "bad\x0cforged",
+            "line_sep": "bad\u2028forged",
+            "esc": "bad\x1b[31mforged",
+        }.items():
+            with self.subTest(name):
+                exc = refuse({"provider": provider, "auth": "api_key", "credential_env": "OPENAI_API_KEY"})
+                self.assertEqual(exc.cause, "provider_not_allowed")
+        with self.subTest("auth"):
+            exc = refuse({"provider": "openai", "auth": "sign_in_with_chatgpt\nX: y",
+                          "credential_env": "OPENAI_API_KEY"})
+            self.assertEqual(exc.cause, "auth_not_api_key")
+            self.assertNotIn("\n", str(exc))
+        with self.subTest("credential"):
+            exc = refuse({"provider": "openai", "auth": "api_key", "credential_env": "OPENAI_API_KEY\nX: y"})
+            self.assertEqual(exc.cause, "credential_env_not_allowed")
+            self.assertNotIn("\n", str(exc))
+        with self.subTest("claude_provider"):
+            exc = refuse({"provider": "claude-code\nx: y", "auth": "api_key",
+                          "credential_env": "OPENAI_API_KEY"})
+            self.assertEqual(exc.cause, "claude_subscription_provider")
+            self.assertNotIn("\n", str(exc))
+        with self.subTest("unknown_field"):
+            exc = refuse({"provider": "openai", "auth": "api_key", "credential_env": "OPENAI_API_KEY",
+                          "bad\nfield": "x"})
+            self.assertEqual(exc.cause, "profile_unknown_field")
+            self.assertNotIn("\n", str(exc))
+        with self.subTest("model"):
+            exc = refuse({"provider": "openai", "auth": "api_key", "credential_env": "OPENAI_API_KEY",
+                          "model": "bad\nforged/name"})
+            self.assertEqual(exc.cause, "model_provider_mismatch")
+            self.assertNotIn("\n", str(exc))
 
 
 class WrapperPin(_Base):

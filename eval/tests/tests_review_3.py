@@ -189,7 +189,11 @@ class CleanupReportedAtOnceTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt) as caught:
                 arms.run_process(["synthetic"], cwd=Path(os.environ.get("TMPDIR", "/tmp")), env={}, stdin=None,
                                  timeout_s=1)
-        kill.assert_called_once_with(987654323)
+        # The session id is still the only positional argument. The leader object is passed so a reused
+        # session number is not signalled; the patched cleanup still raises and the interruption remains.
+        self.assertEqual(kill.call_args.args, (987654323,))
+        self.assertIs(kill.call_args.kwargs["leader"].pid, 987654323)
+        self.assertEqual(kill.call_count, 1)
         self.assertIn("cleanup after the interruption", " ".join(getattr(caught.exception, "__notes__", [])))
 
 
@@ -198,10 +202,19 @@ class ConfirmedEmptyScanTests(unittest.TestCase):
 
     def test_an_empty_scan_is_confirmed_and_a_member_found_then_is_killed(self):
         scans = [[], [910001], [], []]
+        sid = os.getsid(0) + 100000
+
+        def session_of(pid):
+            # The member is synthetic. Cleanup now signals only a pid a fresh check still places in the session.
+            if pid == 910001:
+                return sid, "S"
+            return None
+
         with patch.object(arms.os, "killpg"), patch.object(arms.os, "kill") as kill, \
                 patch.object(arms, "_session_members", side_effect=scans) as members, \
+                patch.object(arms, "_session_of", side_effect=session_of), \
                 patch.object(arms.time, "sleep"):
-            arms._kill_session(os.getsid(0) + 100000)
+            arms._kill_session(sid)
         self.assertEqual([c.args for c in kill.call_args_list], [(910001, signal.SIGKILL)])
         self.assertEqual(members.call_count, 4, "a member found after an empty scan restarts the confirmation")
 

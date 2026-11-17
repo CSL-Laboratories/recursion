@@ -126,7 +126,8 @@ def grade(task, work: Path, scratch) -> dict:
     task.write_hidden(work)
     env = scratch_mod.environment(scratch)
     try:
-        done = arms_mod.run_process(task.command(), cwd=work, env=env, stdin=None, timeout_s=task.grading_timeout_s)
+        done = arms_mod.run_process(task.command(), cwd=work, env=env, stdin=None,
+                                    timeout_s=task.grading_timeout_s, cancel_on_interrupt=False)
     except arms_mod.EngineMissing as exc:
         return {"verdict": "not_graded", "error": "grader_failed", "detail": str(exc), "exit": None, "log": b"",
                 "seconds": None}
@@ -465,6 +466,7 @@ def run(suite, arms: list, *, k: int, attempts: int | None = None, replacements:
                     pending.append((job, done[job]))
     except KeyboardInterrupt:
         result.interrupted = True
+        arms_mod.cancel_running()
         executor.shutdown(wait=True, cancel_futures=True)
         _collect(submitted, done)
     finally:

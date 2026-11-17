@@ -227,6 +227,13 @@ class NotAccepted(Exception):
         self.answer = dict(answer)
 
 
+def _typed_answer(answer):
+    """An answer the caller may see: a dict whose ``code`` is text. Anything else is not one."""
+    if isinstance(answer, dict) and isinstance(answer.get('code'), str):
+        return copy.deepcopy(answer)
+    return None
+
+
 class NoCanonicalText(ValueError):
     """The value has no RFC 8785 text."""
 
@@ -556,9 +563,13 @@ class MethodTable:
                 raise TypeError(f'handler of {method} returned no answer')
             scope.succeeded = True
         except NotAccepted as refusal:
-            return copy.deepcopy(refusal.answer)
+            answer = _typed_answer(refusal.answer)
+            if answer is None:
+                log.error('handler of %s refused without a typed answer', method)
+                return {'code': 'unavailable', 'detail': 'handler:NotAccepted'}
+            return answer
         except Exception as exc:  # noqa: BLE001 - a handler's bug is an answer, never a dropped call
-            log.exception('handler of %s failed', method)
+            log.error('handler of %s failed (%s)', method, type(exc).__name__)
             return {'code': 'unavailable', 'detail': f'handler:{type(exc).__name__}'}
         finally:
             scope.active = False
@@ -591,9 +602,13 @@ class MethodTable:
                 if not isinstance(tenant, str) or not tenant:
                     raise TypeError(f'tenant_of of {method} named no tenant')
             except NotAccepted as refusal:
-                return copy.deepcopy(refusal.answer)
+                answer = _typed_answer(refusal.answer)
+                if answer is None:
+                    log.error('the tenant of %s refused without a typed answer', method)
+                    return {'code': 'unavailable', 'detail': 'tenant:NotAccepted'}
+                return answer
             except Exception as exc:  # noqa: BLE001 - no tenant, no receipt: nothing is run
-                log.exception('the tenant of %s could not be derived', method)
+                log.error('the tenant of %s could not be derived (%s)', method, type(exc).__name__)
                 return {'code': 'unavailable', 'detail': f'tenant:{type(exc).__name__}'}
         key = (tenant, method, command_id)
         stage = 'store'
@@ -622,11 +637,15 @@ class MethodTable:
                     stage = 'store'
                     tx.receipt_put(tenant, method, command_id, digest, copy.deepcopy(committed_answer))
             except NotAccepted as refusal:
-                return copy.deepcopy(refusal.answer)
+                answer = _typed_answer(refusal.answer)
+                if answer is None:
+                    log.error('command %s refused without a typed answer', method)
+                    return {'code': 'unavailable', 'detail': 'handler:NotAccepted'}
+                return answer
             except Exception as exc:  # noqa: BLE001 - rolled back by the store's own context manager
                 # Whatever failed (the handler, the receipt's write, the commit itself), nothing of this
                 # command is committed and no callback runs, the nested reads' included.
-                log.exception('command %s was rolled back (%s)', method, stage)
+                log.error('command %s was rolled back (%s, %s)', method, stage, type(exc).__name__)
                 return {'code': 'unavailable', 'detail': f'{stage}:{type(exc).__name__}'}
             finally:
                 scope.in_transaction = False
@@ -649,11 +668,13 @@ class MethodTable:
                 continue                     # its own dispatch, or one around it, did not succeed
             try:
                 fn()
-            except Exception:  # noqa: BLE001 - the receipt is committed; a later callback still runs
-                log.exception('an after-commit callback of %s failed', method)
+            except Exception as exc:  # noqa: BLE001 - the receipt is committed; a later callback still runs
+                log.error('an after-commit callback of %s failed (%s)', method, type(exc).__name__)
 
     def _slot(self, key):
-        return _Slot(self, key)
+        # The ``with`` owns ``_SlotEntry.__exit__`` only after ``_Slot.__enter__`` has returned.
+        # An interruption on that return is raised in ``_SlotEntry.__enter__``, which drops the slot.
+        return _SlotEntry(_Slot(self, key))
 
 
 class _Slot:
@@ -661,6 +682,8 @@ class _Slot:
 
     def __init__(self, table: MethodTable, key: tuple) -> None:
         self._table, self._key = table, key
+        self._counted = False
+        self._held = False
 
     def __enter__(self):
         table = self._table
@@ -670,14 +693,51 @@ class _Slot:
                 slot = table._slots[self._key] = [threading.Lock(), 0]
             slot[1] += 1
         self._slot = slot
+        self._counted = True
         slot[0].acquire()
+        self._held = True
         return self
+
+    def abandon(self) -> None:
+        """Drop a slot whose entry did not finish. ``__exit__`` will not run."""
+        slot = getattr(self, '_slot', None)
+        if slot is not None and self._held:
+            slot[0].release()
+            self._held = False
+        if self._counted and slot is not None:
+            self._counted = False
+            table = self._table
+            with table._slots_lock:
+                slot[1] -= 1
+                if slot[1] == 0 and table._slots.get(self._key) is slot:
+                    del table._slots[self._key]
 
     def __exit__(self, *exc) -> bool:
         table, slot = self._table, self._slot
-        slot[0].release()
-        with table._slots_lock:
-            slot[1] -= 1
-            if slot[1] == 0 and table._slots.get(self._key) is slot:
-                del table._slots[self._key]
+        if self._held:
+            slot[0].release()
+            self._held = False
+        if self._counted:
+            self._counted = False
+            with table._slots_lock:
+                slot[1] -= 1
+                if slot[1] == 0 and table._slots.get(self._key) is slot:
+                    del table._slots[self._key]
         return False
+
+
+class _SlotEntry:
+    """The object a ``with`` enters. It releases the slot when ``_Slot.__enter__`` does not finish."""
+
+    def __init__(self, slot: _Slot) -> None:
+        self._slot = slot
+
+    def __enter__(self):
+        try:
+            return self._slot.__enter__()
+        except BaseException:
+            self._slot.abandon()
+            raise
+
+    def __exit__(self, *exc) -> bool:
+        return self._slot.__exit__(*exc)

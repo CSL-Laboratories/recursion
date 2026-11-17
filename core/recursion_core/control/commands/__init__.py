@@ -112,7 +112,8 @@ class CommandTable:
             except CommandTableError:
                 raise
             except Exception as exc:  # noqa: BLE001 - the facade has no way to another parser; whatever it tried failed
-                raise CommandTableError(f'commands {names!r}: the parser failed: {type(exc).__name__}: {exc}') from exc
+                # The refusal names the type only. The exception's own text can carry arbitrary values.
+                raise CommandTableError(f'commands {names!r}: the parser failed: {type(exc).__name__}') from exc
             if family.added != set(names):
                 raise CommandTableError('parser did not add every declared name')
 

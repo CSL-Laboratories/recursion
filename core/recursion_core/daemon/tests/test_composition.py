@@ -694,7 +694,7 @@ class ComposedDaemonTest(unittest.TestCase):
                                       'detail': 'daemon:scope_refused'})
             self.assertEqual(composed.server.refused, ['not_admitted'])
             # The per-request check stays: a peer that is inside a run unit by the time it sends a frame.
-            conn = mock.Mock(peer=mock.Mock(pid=os.getpid()))
+            conn = mock.Mock(peer=mock.Mock(pid=os.getpid(), uid=os.geteuid()))
             self.assertEqual(composed.control.handle({'op': 'control', 'method': 'run.list', 'params': {}}, conn),
                              {'ok': False, 'error': {'code': 'scope_refused', 'detail': 'peer is inside a run unit'}})
         self.assertFalse(adapter.peer_is_engine(os.getpid()))

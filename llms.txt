@@ -1,0 +1,14 @@
+# Recursion
+
+> Run each step in order on Linux. Each step is one recursiond command. Read stdout.
+> When the text after the arrow is a JSON object, that object is the success answer.
+> doctor_report is the doctor object (generated_at and checks). snippet is the Control
+> MCP snippet: TOML for codex, one JSON object for claude and cursor. The snippet is
+> printed. Nothing is written into a client config.
+
+- `recursiond doctor --json` -> doctor_report
+- `recursiond provision` -> {"code":"ok"}
+- `recursiond up` -> {"code":"ok","gui":"http://127.0.0.1:8765"}
+- `recursiond mcp-config --client codex` -> snippet
+- `recursiond mcp-config --client claude` -> snippet
+- `recursiond mcp-config --client cursor` -> snippet

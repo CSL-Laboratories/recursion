@@ -94,6 +94,8 @@ _NOTE_CAP = 1024 * 1024
 _CGROUP_CAP = 64 * 1024
 # Not an approver. approval.answer refuses it scope_refused before it reads the record.
 _STRANGER = {'kind': 'plugin', 'id': 'plugin'}
+# A socket call passes device_token. An in-process call omits it and keeps the peer-or-token rule.
+_TOKEN_UNSET = object()
 MAX_MANIFEST_BYTES, MAX_ARTIFACT_BYTES, MAX_INSTALL_BYTES = 64 * 1024, 8 * 1024 * 1024, 1024 * 1024
 VERIFICATION_UNAVAILABLE = 'plugin_verification_unavailable'
 CRYPTOGRAPHY_MISSING = 'cryptography missing; install recipe in plugin_security/README.md'
@@ -351,6 +353,15 @@ def _token_matches(presented, path):
     if held is None or len(offered) != len(held):
         return False
     return hmac.compare_digest(offered, held)
+
+
+def _owner_peer(host, peer):
+    """True when ``peer`` is the daemon owner's socket peer and is not inside a run unit."""
+    if type(peer) is not OwnerSocketPeer:
+        return False
+    if type(peer.uid) is not int or peer.uid != host._owner_uid:
+        return False
+    return not _peer_in_run_unit(peer.pid)
 
 
 class _ApprovalCall:
@@ -732,8 +743,20 @@ class PluginHost:
             raise PluginRefused('approval_surface_unavailable', 'no approver is composed')
         return self._approver.request(effect)
 
-    def answer_plugin_effect(self, peer, approval_id, effect, *, authority, answer='approve'):
-        """Open and answer through ``approval.answer``. An approval is carried only after it is approved."""
+    def answer_plugin_effect(self, peer, approval_id, effect, *, authority, answer='approve',
+                             device_token=_TOKEN_UNSET):
+        """Open and answer through ``approval.answer``. An approval is carried only after it is approved.
+
+        The control socket passes ``device_token`` with the socket peer. Both are required:
+        a missing token is ``request_invalid``, and a stranger peer or a token that does not
+        match is answered as a stranger (``scope_refused``). A call that omits ``device_token``
+        is the in-process door: the owner peer or the device presentation, as before.
+        """
+        if device_token is not _TOKEN_UNSET:
+            if type(device_token) is not str or not device_token:
+                return {'code': 'request_invalid', 'detail': 'device_token'}
+            if not _token_matches(device_token, self._device_token_path) or not _owner_peer(self, peer):
+                peer = OwnerSocketPeer(-1, 0)
         if self._approver is None:
             raise PluginRefused('approval_surface_unavailable', 'no approver is composed')
         return self._approver.answer(peer, approval_id, effect, authority=authority, answer=answer)

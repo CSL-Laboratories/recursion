@@ -11,9 +11,7 @@ Run from the repository root:
 from __future__ import annotations
 
 import dataclasses
-import json
 import os
-import re
 import subprocess
 import unittest
 from unittest import mock
@@ -278,19 +276,18 @@ class DocumentTests(unittest.TestCase):
                 self.assertIn("D10", text)
 
     def test_the_documented_parent_refusal_fits_the_start_error_code_pattern(self) -> None:
-        text = self.read("DECODER.md")
-        examples = re.findall(r"`(\{\"code\": [^`]+\})`", text)
-        self.assertTrue(examples)
-        for example in examples:
-            err = json.loads(example)
-            self.assertRegex(err["code"], r"^[a-z][a-z0-9_]{0,63}$")
-        self.assertIn('{"code": "launch_refused", "detail": "launch_check:binary_changed"}', text)
-        self.assertNotIn("`launch_check:<code>`, as `start_failed` with `start_error.code`", text)
+        # The design note left this package. Its bytes are for csl-research; the product
+        # text only says where that note lives.
+        self.assertFalse(os.path.exists(os.path.join(HERE, "DECODER.md")))
+        text = self.read("hooks.py")
+        self.assertIn("design note lives in csl-research", text)
+        self.assertNotIn("DECODER.md", text)
 
     def test_the_decoder_design_does_not_call_the_exec_line_a_proof(self) -> None:
-        text = self.read("DECODER.md")
-        self.assertNotIn('"exec" then end of file means the engine was executed', text)
-        self.assertIn("intent", text)
+        self.assertFalse(os.path.exists(os.path.join(HERE, "DECODER.md")))
+        text = self.read("README.md")
+        self.assertIn("design note lives in csl-research", text)
+        self.assertNotIn("DECODER.md", text)
 
 
 if __name__ == "__main__":

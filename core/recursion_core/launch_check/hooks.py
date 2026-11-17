@@ -18,8 +18,8 @@ What it will register, as a design and not as code (the seams' S10 contract at #
   reworded contract (the Liaison, 4:19 PM Nov 14) binds as the adapter's ``argv[0]``: the binary option
   when composition gave one, else the engine registration's ``default_executable``. That keyword is in
   neither #369 nor #370 yet; nothing here assumes another field.
-* A refusal at this hook means "no unit started" (the parent refused). The child-side re-check, which
-  ``DECODER.md`` designs, can only mean "no engine executed": the helper is already inside its unit.
+* A refusal at this hook means "no unit started" (the parent refused). The child-side re-check, whose
+  design note lives in csl-research, can only mean "no engine executed": the helper is already inside its unit.
 
 The grants this hook will read come from route load (the lane's next slice), not from here.
 """

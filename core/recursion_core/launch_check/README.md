@@ -533,7 +533,7 @@ this package ships.
   that read waiting: the probe still returns `version_probe_failed`, and leaves that pipe open to
   its reader rather than wait on it. Nothing here kills a Windows process tree.
   Holding the file open across the spawn (#1087 section 6.4, Windows spike) or `fexecve`
-  on Linux is follow-up work; `DECODER.md` designs the child-side re-check that narrows it.
+  on Linux is follow-up work; the design note lives in csl-research and describes the child-side re-check that narrows it.
 - The grant hashes a binary of any size, and a whole tree on every plan use. A huge or
   sparse file at a granted path makes the check slow, not wrong; no size cap is set (open
   question in the lane's notes).
@@ -603,7 +603,7 @@ Called by nothing, like the rest of this package. What it adds:
 - `hooks.py`, the registrant `recursion_core.launch_check.hooks` that the seams (#369/#370)
   will import. It registers nothing until they merge; its docstring says what it will set
   (the single-valued `launch_check` hook, S10).
-- `DECODER.md`, the design of the child-side decoder the launch envelope needs (no code).
+- The design note lives in csl-research: the child-side decoder the launch envelope needs (no code in this package).
 - `tests/fake_binaries.py`: fake-binary hash fixtures (bytes, recorded SHA-256, size, kind;
   a fixture whose record does not match its bytes is refused) and a version-line table per
   engine with the parse and the grant outcome each line must reach.
@@ -636,7 +636,7 @@ Called by nothing, like the rest of this package. What it adds:
 - A `path_string` that is not exactly `str` is `path_not_absolute`; `verify()` authenticates
   first; a forged field JSON cannot hold is `grant_forged`; `absent` records carry `hits` and
   `detection` like the other two outcomes.
-- Gemini's absence is described as held pending D10; `DECODER.md` treats the pre-exec line as
+- Gemini's absence is described as held pending D10; the design note lives in csl-research and treats the pre-exec line as
   intent, writes the parent refusal as `start_error.code=launch_refused` with the cause in the
   detail, and drops its FIFO-capacity assumption.
 

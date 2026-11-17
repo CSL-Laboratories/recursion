@@ -283,14 +283,17 @@ class TimedFloorTests(Base):
 
 class DocumentTests(unittest.TestCase):
     def test_decoder_plan_names_the_intent_line(self):
-        doc = text("DECODER.md")
-        self.assertNotIn('the "exec" line', doc)
-        self.assertIn('the "intent" line followed by end of file (outcome unknown)', doc)
+        # The design note left this package. The product text names csl-research and not the old file.
+        self.assertFalse(os.path.exists(os.path.join(HERE, "DECODER.md")))
+        doc = text("README.md")
+        self.assertIn("design note lives in csl-research", doc)
+        self.assertNotIn("DECODER.md", doc)
 
     def test_decoder_allows_a_second_line_after_a_failed_exec(self):
-        doc = text("DECODER.md")
-        self.assertNotIn("writes exactly one line:", doc)
-        self.assertIn("a second line only when `execve` returns", doc)
+        self.assertFalse(os.path.exists(os.path.join(HERE, "DECODER.md")))
+        doc = text("hooks.py")
+        self.assertIn("design note lives in csl-research", doc)
+        self.assertNotIn("DECODER.md", doc)
 
     def test_identity_wording_names_the_required_line(self):
         self.assertNotIn("An engine with no identity rule and no pin", text("README.md"))

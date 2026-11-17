@@ -720,5 +720,31 @@ class ContractJobsCellTests(unittest.TestCase):
         self.assertTrue(self.row("E7")[2].startswith("as E1"))
 
 
+class Section7LeadInTests(unittest.TestCase):
+    """CSL-238: pin the one section 7 lead-in sentence this head states."""
+
+    def test_section_7_lead_in_is_the_head_sentence(self) -> None:
+        # The lead-in is the prose line directly above section 7's list. The
+        # parent sentence in that place must fail; the bullets under it are not pinned.
+        text = (ROOT / "docs" / "ci-event-contract.md").read_text(encoding="utf-8")
+        start = text.find("## 7. ")
+        self.assertNotEqual(start, -1, "section 7 heading")
+        end = text.find("\n## ", start + 1)
+        self.assertGreater(end, start, "section 7 has no following heading")
+        lines = text[start:end].splitlines()
+        bullets = [i for i, line in enumerate(lines) if line.startswith("- ")]
+        self.assertTrue(bullets, "section 7 list")
+        lead = ""
+        for line in reversed(lines[:bullets[0]]):
+            if line.strip():
+                lead = line
+                break
+        self.assertEqual(
+            lead,
+            "A person's pushes start CI (free runners since CSL-408); "
+            "the workload in the table below does not:",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

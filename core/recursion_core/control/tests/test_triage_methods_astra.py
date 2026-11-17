@@ -12,6 +12,7 @@ import json
 import logging
 import sys
 import threading
+import time
 import unittest
 
 from recursion_core.control import commands, methods
@@ -56,19 +57,31 @@ def make_table(method, handler, *, tenant=methods.INSTALL_TENANT):
     return table
 
 
-def slot_observation():
-    """One interruption after slot acquisition; one bounded same-key retry.
+def _entry_return_code():
+    """The return the lone-caller test interrupts.
 
-    Trace return is the last event in __enter__, before the with body is armed.
+    The pre-change entry interrupts the return of ``_Slot.__enter__``. The answered entry has no
+    ``_Slot``; it interrupts the return of ``_enter_count``, which is the last event before the
+    per-key ``with``. The outcome assertions are the same either way.
+    """
+    if hasattr(methods, "_Slot"):
+        return methods._Slot.__enter__.__code__
+    return methods.MethodTable._enter_count.__code__
+
+
+def slot_observation():
+    """One interruption at slot entry; one bounded same-key retry.
+
     The fixture releases an orphaned lock only after recording the defect, so
     the helper thread always has a chance to finish; it is never left behind.
     """
     table = make_table("session.turn", lambda ctx, params: {"code": "ok"})
     params = {"command_id": "one", "text": "hello"}
     injected = []
+    entry_return = _entry_return_code()
 
     def trace(frame, event, arg):
-        if not injected and frame.f_code is methods._Slot.__enter__.__code__ and event == "return":
+        if not injected and frame.f_code is entry_return and event == "return":
             injected.append(True)
             raise KeyboardInterrupt("synthetic interruption at slot entry")
         return trace
@@ -185,6 +198,311 @@ def refusal_observation():
     return observations
 
 
+# Frames of the command-slot entry. Exit frames (after the handler has started) are not in this set:
+# the per-key ``with`` still has the ordinary exit window of any ``with``, and the entry path is what
+# the reviews hold.
+_SLOT_ENTRY = {
+    "_Slot.__enter__",
+    "_SlotEntry.__enter__",
+    "MethodTable._slot",
+    "MethodTable._with_slot",
+    "MethodTable._enter_count",
+}
+_BOUND_S = 2.0
+
+
+def _qual(frame):
+    return getattr(frame.f_code, "co_qualname", frame.f_code.co_name)
+
+
+def _is_slot_entry(frame):
+    return _qual(frame) in _SLOT_ENTRY
+
+
+def make_commands(turn_handler, queue_handler=None):
+    table = methods.MethodTable()
+    table.store = MemoryStore()
+    table.register("session.turn", turn_handler, tenant=methods.INSTALL_TENANT)
+    table.register(
+        "session.queue",
+        queue_handler or (lambda ctx, params: {"code": "ok"}),
+        tenant=methods.INSTALL_TENANT,
+    )
+    table.freeze()
+    return table
+
+
+def _lone_entry_events():
+    """Every slot-entry trace event of one cold dispatch, in order, before the handler runs."""
+    seen, done = [], []
+
+    def handler(ctx, params):
+        return {"code": "ok"}
+
+    table = make_commands(handler)
+
+    def trace(frame, event, arg):
+        if done:
+            return trace
+        if frame.f_code.co_name == "handler":
+            done.append(True)
+            return trace
+        if _is_slot_entry(frame):
+            seen.append((_qual(frame), event, frame.f_lineno, frame.f_lasti))
+        return trace
+
+    before = sys.gettrace()
+    sys.settrace(trace)
+    try:
+        table.dispatch("session.turn", {"command_id": "one", "text": "hello"}, None, None)
+    finally:
+        sys.settrace(before)
+    return seen
+
+
+def _interrupt_lone(nth):
+    """Interrupt the nth slot-entry event of a cold dispatch. Record locks before the test clears them."""
+    injected, done, count = [], [], [0]
+    params = {"command_id": "one", "text": "hello"}
+
+    def handler(ctx, params):
+        return {"code": "ok"}
+
+    table = make_commands(handler)
+
+    def trace(frame, event, arg):
+        if threading.current_thread().name != "lone":
+            return trace
+        if done:
+            return trace
+        if frame.f_code.co_name == "handler":
+            done.append(True)
+            return trace
+        if _is_slot_entry(frame):
+            if count[0] == nth and not injected:
+                injected.append((_qual(frame), event, frame.f_lineno))
+                raise KeyboardInterrupt("synthetic interruption at slot entry")
+            count[0] += 1
+        return trace
+
+    def run_caller():
+        try:
+            table.dispatch("session.turn", params, None, None)
+        except KeyboardInterrupt:
+            pass
+
+    # The caller is a helper so a stranded table lock fails this bound instead of stalling the run.
+    threading.settrace(trace)
+    caller = threading.Thread(target=run_caller, name="lone", daemon=True)
+    caller.start()
+    caller.join(_BOUND_S)
+    threading.settrace(None)
+    if caller.is_alive() and table._slots_lock.locked():
+        table._slots_lock.release()  # the test lets the helper go; the product did not
+        caller.join(_BOUND_S)
+    observed = {
+        "injected": injected,
+        "table_lock_held": table._slots_lock.locked(),
+        "slots": {key: (slot[0].locked(), slot[1]) for key, slot in table._slots.items()},
+    }
+    other_done, other = threading.Event(), []
+
+    def other_call():
+        try:
+            other.append(table.dispatch("session.queue", {"command_id": "other"}, None, None))
+        except BaseException as exc:  # noqa: BLE001 - the observation is the failure mode
+            other.append(type(exc).__name__)
+        finally:
+            other_done.set()
+
+    other_thread = threading.Thread(target=other_call, daemon=True)
+    other_thread.start()
+    observed["other_finished"] = other_done.wait(_BOUND_S)
+    observed["other"] = list(other)
+    retry_done, retry = threading.Event(), []
+
+    def retry_call():
+        try:
+            retry.append(table.dispatch("session.turn", params, None, None))
+        except BaseException as exc:  # noqa: BLE001 - the observation is the failure mode
+            retry.append(type(exc).__name__)
+        finally:
+            retry_done.set()
+
+    retry_thread = threading.Thread(target=retry_call, daemon=True)
+    retry_thread.start()
+    observed["retry_finished"] = retry_done.wait(_BOUND_S)
+    observed["retry"] = list(retry)
+    if table._slots_lock.locked():
+        table._slots_lock.release()  # the test lets the helper go; the product did not
+    for slot in list(table._slots.values()):
+        if slot[0].locked():
+            slot[0].release()
+    other_thread.join(_BOUND_S)
+    retry_thread.join(_BOUND_S)
+    observed["threads_left"] = other_thread.is_alive() or retry_thread.is_alive()
+    return observed
+
+
+def _post_acquire_events():
+    """Slot-entry events after a queued caller actually takes the per-key lock, before its handler."""
+    return _with_holder(record=True)
+
+
+def _interrupt_after_acquire(nth):
+    """Interrupt that nth post-acquire event while another caller is queued on the same lock."""
+    return _with_holder(record=False, nth=nth)
+
+
+def _with_holder(record, nth=None):
+    release, holding = threading.Event(), threading.Event()
+    params = {"command_id": "one", "text": "hello"}
+    key = (methods.INSTALL_TENANT, "session.turn", "one")
+
+    def handler(ctx, params):
+        # The holder waits inside the handler, then leaves by interruption so it stores no receipt.
+        # A stored receipt would make the next caller a replay, and the replay never reaches the handler.
+        if not holding.is_set():
+            holding.set()
+            release.wait(_BOUND_S)
+            raise KeyboardInterrupt("holder leaves without a receipt")
+        return {"code": "ok"}
+
+    def run_holder():
+        try:
+            table.dispatch("session.turn", params, None, None)
+        except KeyboardInterrupt:
+            pass
+
+    table = make_commands(handler)
+    holder = threading.Thread(target=run_holder, name="holder", daemon=True)
+    holder.start()
+    if not holding.wait(_BOUND_S):
+        release.set()
+        holder.join(_BOUND_S)
+        return {"setup": "holder did not enter", "events": [], "injected": []}
+    # ``capture`` turns on only once the victim has gone quiet inside the per-key acquire.
+    # Events before that are the entry that happens while the holder still owns the lock.
+    capture, recorded, injected, done = [], [], [], []
+    last_event = [time.monotonic()]
+
+    def trace(frame, event, arg):
+        if threading.current_thread().name != "victim":
+            return trace
+        last_event[0] = time.monotonic()
+        if not capture:
+            return trace
+        if done:
+            return trace
+        if frame.f_code.co_name == "handler":
+            done.append(True)
+            return trace
+        if not _is_slot_entry(frame):
+            return trace
+        recorded.append((_qual(frame), event, frame.f_lineno, frame.f_lasti))
+        if record or injected:
+            return trace
+        if len(recorded) == nth + 1:
+            injected.append(recorded[-1])
+            _queue_waiter(table, params, key, injected)
+            raise KeyboardInterrupt("synthetic interruption after acquire")
+        return trace
+
+    def victim_is_blocked():
+        slot = table._slots.get(key)
+        quiet = time.monotonic() - last_event[0] > 0.05
+        return slot is not None and slot[1] >= 2 and quiet
+
+    def run_victim():
+        try:
+            table.dispatch("session.turn", params, None, None)
+        except KeyboardInterrupt:
+            pass
+
+    threading.settrace(trace)
+    victim = threading.Thread(target=run_victim, name="victim", daemon=True)
+    victim_started = False
+    try:
+        victim.start()
+        victim_started = True
+        if not _wait_until(victim_is_blocked):
+            return {"setup": "victim did not block in acquire", "events": list(recorded), "injected": injected}
+        capture.append(True)
+        release.set()
+        victim.join(_BOUND_S)
+        holder.join(_BOUND_S)
+    finally:
+        threading.settrace(None)
+        release.set()
+        holder.join(_BOUND_S)
+        if victim_started:
+            victim.join(_BOUND_S)
+    if record:
+        return recorded
+    # The queued waiter was started from the trace, while the victim held the per-key lock.
+    waiter = injected[1] if len(injected) > 1 else None
+    finished = False
+    answer = []
+    if waiter is not None:
+        finished = waiter["done"].wait(_BOUND_S)
+        answer = list(waiter["answers"])
+    table_held = table._slots_lock.locked()
+    slots = {item: (slot[0].locked(), slot[1]) for item, slot in table._slots.items()}
+    if table._slots_lock.locked():
+        table._slots_lock.release()
+    for slot in list(table._slots.values()):
+        if slot[0].locked():
+            slot[0].release()
+    if waiter is not None:
+        waiter["thread"].join(_BOUND_S)
+    victim.join(_BOUND_S)
+    return {
+        "setup": "ok",
+        "injected": injected[:1],
+        "waiter_finished": finished,
+        "waiter_answers": answer,
+        "table_lock_held": table_held,
+        "slots": slots,
+        "threads_left": victim.is_alive() or (waiter is not None and waiter["thread"].is_alive()),
+    }
+
+
+def _queue_waiter(table, params, key, injected):
+    """Start a same-key caller and return once it is counted. The caller blocks on the lock we hold."""
+    box = {"done": threading.Event(), "answers": [], "thread": None}
+
+    def run():
+        try:
+            box["answers"].append(table.dispatch("session.turn", params, None, None))
+        except BaseException as exc:  # noqa: BLE001 - the observation is the failure mode
+            box["answers"].append(type(exc).__name__)
+        finally:
+            box["done"].set()
+
+    before = (table._slots.get(key) or [None, 0])[1]
+    thread = threading.Thread(target=run, name="queued", daemon=True)
+    box["thread"] = thread
+    thread.start()
+    _wait_until(lambda: (table._slots.get(key) or [None, 0])[1] >= before + 1)
+    injected.append(box)
+
+
+def _wait_until(predicate):
+    deadline = time.monotonic() + _BOUND_S
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+class _Uncopyable:
+    """A refusal value whose copy raises. The dispatcher must still answer."""
+
+    def __deepcopy__(self, memo):
+        raise TypeError("cannot copy me")
+
+
 class SweepS2bRegressionTest(unittest.TestCase):
     def test_f01_interrupted_slot_entry_releases_ownership(self):
         observed = slot_observation()
@@ -207,6 +525,105 @@ class SweepS2bRegressionTest(unittest.TestCase):
             with self.subTest(method=observed["method"], refusal=observed["refusal"]):
                 self.assertEqual(observed["answer"].get("code"), "unavailable", observed)
                 self.assertEqual((observed["callbacks"], observed["receipts"]), ([], 0))
+
+    def test_every_entry_frame_of_a_lone_caller_drops_the_slot(self):
+        events = _lone_entry_events()
+        self.assertGreater(len(events), 0, events)
+        for nth, event in enumerate(events):
+            with self.subTest(nth=nth, event=event):
+                observed = _interrupt_lone(nth)
+                self.assertEqual(observed["injected"], [event[:3]], observed)
+                self.assertFalse(observed["table_lock_held"], observed)
+                self.assertEqual(observed["slots"], {}, observed)
+                self.assertTrue(observed["other_finished"], observed)
+                self.assertEqual(observed["other"], [{"code": "ok"}], observed)
+                self.assertTrue(observed["retry_finished"], observed)
+                self.assertEqual(observed["retry"], [{"code": "ok"}], observed)
+                self.assertFalse(observed["threads_left"], observed)
+
+    def test_every_frame_after_acquire_with_a_waiter_queued_drops_the_lock(self):
+        events = _post_acquire_events()
+        self.assertIsInstance(events, list, events)
+        self.assertGreater(len(events), 0, events)
+        for nth, event in enumerate(events):
+            with self.subTest(nth=nth, event=event):
+                observed = _interrupt_after_acquire(nth)
+                self.assertEqual(observed["setup"], "ok", observed)
+                self.assertEqual(observed["injected"], [event], observed)
+                self.assertFalse(observed["table_lock_held"], observed)
+                self.assertEqual(observed["slots"], {}, observed)
+                self.assertTrue(observed["waiter_finished"], observed)
+                self.assertEqual(observed["waiter_answers"], [{"code": "ok"}], observed)
+                self.assertFalse(observed["threads_left"], observed)
+
+    def test_an_untyped_tenant_refusal_names_the_tenant(self):
+        for invalid in ({}, {"code": 7}, {"code": ""}):
+            with self.subTest(refusal=invalid):
+                called = []
+
+                def tenant_of(principal, params, invalid=invalid):
+                    raise methods.NotAccepted(invalid)
+
+                def handler(ctx, params):
+                    called.append("ran")
+                    return {"code": "ok"}
+
+                table = methods.MethodTable()
+                table.store = MemoryStore()
+                table.register("session.turn", handler, tenant=tenant_of)
+                table.freeze()
+                answer = table.dispatch("session.turn", {"command_id": "one"}, None, None)
+                self.assertEqual(answer, {"code": "unavailable", "detail": "tenant:NotAccepted"})
+                self.assertEqual(called, [])
+                self.assertEqual(table.store.receipts, {})
+                self.assertEqual(table.store.commits, 0)
+
+    def test_a_typed_tenant_refusal_is_returned_and_a_handler_refusal_names_the_handler(self):
+        def tenant_of(principal, params):
+            raise methods.NotAccepted({"code": "no", "detail": "because"})
+
+        table = make_table("session.turn", lambda ctx, params: {"code": "ok"}, tenant=tenant_of)
+        self.assertEqual(
+            table.dispatch("session.turn", {"command_id": "one"}, None, None),
+            {"code": "no", "detail": "because"},
+        )
+        for invalid in ({}, {"code": 7}, {"code": ""}):
+            with self.subTest(refusal=invalid):
+                callbacks = []
+
+                def handler(ctx, params, invalid=invalid):
+                    ctx.after_commit(lambda: callbacks.append("ran"))
+                    raise methods.NotAccepted(invalid)
+
+                table = make_table("session.turn", handler)
+                answer = table.dispatch("session.turn", {"command_id": "one"}, None, None)
+                self.assertEqual(answer, {"code": "unavailable", "detail": "handler:NotAccepted"})
+                self.assertEqual(callbacks, [])
+                self.assertEqual(table.store.receipts, {})
+
+    def test_a_refusal_that_cannot_be_copied_is_still_an_answer(self):
+        def handler(ctx, params):
+            raise methods.NotAccepted({"code": "no", "value": _Uncopyable()})
+
+        table = make_table("session.turn", handler)
+        try:
+            answer = table.dispatch("session.turn", {"command_id": "one"}, None, None)
+        except BaseException as exc:  # noqa: BLE001 - the old dispatcher lets the copy error escape
+            answer = exc
+        self.assertEqual(answer, {"code": "unavailable", "detail": "handler:NotAccepted"})
+
+    def test_a_command_whose_params_are_not_a_dict_is_refused(self):
+        table = make_commands(lambda ctx, params: {"code": "ok"})
+        for params in (None, [], "x"):
+            with self.subTest(params=params):
+                try:
+                    answer = table.dispatch("session.turn", params, None, None)
+                except BaseException as exc:  # noqa: BLE001 - the old dispatcher raises AttributeError
+                    answer = exc
+                self.assertEqual(answer, {"code": "request_invalid", "detail": "params"})
+        # A read with no params is the published behaviour and stays an answer, not a refusal.
+        read = make_table("session.status", lambda ctx, params: {"code": "ok"})
+        self.assertEqual(read.dispatch("session.status", None, None, None), {"code": "ok"})
 
 
 if __name__ == "__main__":

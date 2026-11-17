@@ -456,12 +456,17 @@ class SweepRegressionTests(unittest.TestCase):
                 candidate = Path(tmp)
                 canonical = candidate / "scripts/v3/planning/validation/canonical.py"
                 canonical.parent.mkdir(parents=True)
-                canonical.write_text('raise AssertionError("candidate must load")\n', encoding="utf-8")
-                try:
-                    product = perf_bench.load_product(candidate)
-                except perf_bench.BenchError:
-                    return
-                self.assertTrue(Path(product.digest.__code__.co_filename).is_relative_to(candidate))
+                flag = candidate / "candidate-ran"
+                canonical.write_text(
+                    f"open({str(flag)!r}, 'w', encoding='utf-8').write('ran')\n",
+                    encoding="utf-8",
+                )
+                before = sys.path[:]
+                with self.assertRaises(perf_bench.BenchError) as caught:
+                    perf_bench.load_product(candidate)
+                self.assertIn("no scripts package", str(caught.exception))
+                self.assertEqual(sys.path, before)
+                self.assertFalse(flag.exists())
         finally:
             perf_bench._drop_imported_product()
             sys.modules.update(saved_modules)
@@ -651,6 +656,170 @@ class SweepRegressionTests(unittest.TestCase):
             perf_ci._run(["git", "status"], cwd=ROOT)
         self.assertTrue(seen)
         self.assertTrue(all(value is not None and math.isfinite(value) for value in seen))
+    def test_f01_odd_count_uses_the_middle_sample(self):
+        self.assertEqual(perf_bench._positive_median([0.2, 0.1, 0.4]), 0.2)
+
+    def test_sign_and_type_of_durations_are_refused_before_work(self):
+        cases = (
+            ("round_s", -1),
+            ("round_s", 0),
+            ("round_s", -0.0),
+            ("warmup_s", -1),
+            ("round_s", True),
+            ("round_s", False),
+            ("round_s", None),
+            ("round_s", "0.01"),
+            ("warmup_s", True),
+            ("warmup_s", False),
+            ("warmup_s", None),
+            ("warmup_s", "0.01"),
+            ("warmup_s", 1e18),
+            ("round_s", 1e308),
+        )
+        for option, value in cases:
+            for paired in (False, True):
+                with self.subTest(option=option, value=value, paired=paired):
+                    fn = mock.Mock(side_effect=AssertionError("callback ran before refusal"))
+                    options = dict(rounds=2, round_s=0.001, warmup_s=0.0)
+                    options[option] = value
+                    with self.assertRaises(perf_bench.BenchError):
+                        if paired:
+                            perf_bench.measure_pair(fn, fn, repeats=1, **options)
+                        else:
+                            perf_bench.measure(fn, **options)
+                    fn.assert_not_called()
+
+    def test_rounds_must_be_an_integer_count(self):
+        fn = mock.Mock(side_effect=AssertionError("callback ran before refusal"))
+        for rounds in (2.0, "2", True):
+            with self.subTest(rounds=rounds):
+                with self.assertRaises(perf_bench.BenchError):
+                    perf_bench.measure(fn, rounds=rounds, round_s=0.001, warmup_s=0.0)
+                fn.assert_not_called()
+                with self.assertRaises(perf_bench.BenchError):
+                    perf_bench.measure_pair(fn, fn, rounds=rounds, round_s=0.001, warmup_s=0.0, repeats=1)
+                fn.assert_not_called()
+
+    def test_nan_or_infinite_sample_is_refused(self):
+        for samples in ([float("nan")], [float("inf")], [0.001, float("nan"), 0.003]):
+            with self.subTest(samples=samples):
+                with self.assertRaises(perf_bench.BenchError):
+                    perf_bench._positive_median(samples)
+
+    def test_cli_duration_gate_covers_round_and_warmup(self):
+        import contextlib
+        import io
+        refused = (
+            ["--round-ms", "inf"],
+            ["--round-ms", "nan"],
+            ["--round-ms", "0"],
+            ["--round-ms", "-5"],
+            ["--warmup-ms", "nan"],
+            ["--warmup-ms", "-1"],
+        )
+        for argv in refused:
+            with self.subTest(argv=argv):
+                with (mock.patch.object(perf_bench, "run_suite", return_value={"benchmarks": []}) as suite,
+                      contextlib.redirect_stdout(io.StringIO())):
+                    try:
+                        code = perf_bench.main(argv)
+                    except SystemExit as exc:
+                        code = exc.code
+                self.assertNotEqual(code, 0)
+                suite.assert_not_called()
+        with (mock.patch.object(perf_bench, "run_suite", return_value={"benchmarks": []}) as suite,
+              contextlib.redirect_stdout(io.StringIO())):
+            code = perf_bench.main(["--warmup-ms", "0"])
+        self.assertEqual(code, 0)
+        suite.assert_called_once()
+
+    def test_deadline_must_be_a_finite_positive_duration(self):
+        with (mock.patch.object(perf_bench, "install_network_guard"),
+              mock.patch.object(perf_bench, "load_workload", return_value={}),
+              mock.patch.object(perf_bench, "load_product", return_value=object()),
+              mock.patch.object(perf_bench, "build_cases", return_value=[]),
+              mock.patch.object(perf_bench.time, "perf_counter", return_value=0.0)):
+            for value in (float("nan"), float("inf"), -1, 0, None, "10", 1e18):
+                with self.subTest(value=value):
+                    with self.assertRaises(perf_bench.BenchError) as caught:
+                        perf_bench.run_paired(ROOT, ROOT, deadline_s=value)
+                    self.assertIn("deadline_s", str(caught.exception))
+                    self.assertNotIn("exceeded", str(caught.exception))
+
+    def test_kernel_outside_the_root_is_refused(self):
+        saved_path = sys.path[:]
+        saved_modules = {
+            key: value for key, value in sys.modules.items()
+            if key == "scripts" or key.startswith("scripts.")
+        }
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                candidate = Path(tmp) / "tree"
+                candidate.mkdir()
+                (candidate / "scripts").symlink_to(ROOT / "scripts")
+                with self.assertRaises(perf_bench.BenchError) as caught:
+                    perf_bench.load_product(candidate)
+                message = str(caught.exception)
+                self.assertIn("planning kernel loaded from", message)
+                self.assertIn(str(ROOT / "scripts"), message)
+                self.assertNotIn(str(candidate), message.split("loaded from", 1)[-1].split(", not", 1)[0])
+        finally:
+            perf_bench._drop_imported_product()
+            sys.modules.update(saved_modules)
+            sys.path[:] = saved_path
+
+    def test_main_returns_nonzero_when_worktree_remove_fails(self):
+        import contextlib
+        import io
+        tree = Path("/unused/synthetic-worktree")
+        locked = subprocess.CompletedProcess([], 128, "", "fatal: worktree is locked")
+        ok = subprocess.CompletedProcess([], 0, "", "")
+
+        def fake_run(cmd, **kwargs):
+            if "remove" in cmd:
+                return locked
+            return ok
+
+        report = _report({"sample": 0.001})
+        report["benchmarks"][0]["rounds"] = 1
+        report["benchmarks"][0]["iterations_per_round"] = 1
+        stderr = io.StringIO()
+        with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+              mock.patch.object(perf_ci, "_worktree", return_value=tree),
+              mock.patch.object(perf_ci, "run_paired", return_value=(report, report)),
+              mock.patch.object(perf_ci, "_run", side_effect=fake_run),
+              contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(stderr)):
+            code = perf_ci.main()
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "PERF_CI_FAIL: git worktree remove failed: fatal: worktree is locked",
+            stderr.getvalue(),
+        )
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+        stderr = io.StringIO()
+        with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+              mock.patch.object(perf_ci, "_worktree", return_value=tree),
+              mock.patch.object(perf_ci, "run_paired", side_effect=perf_bench.BenchError("paired benchmark exceeded 40s")),
+              mock.patch.object(perf_ci, "_run", return_value=subprocess.CompletedProcess([], 1, "", "")),
+              contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(stderr)):
+            code = perf_ci.main()
+        text = stderr.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("PERF_CI_FAIL: paired benchmark exceeded 40s", text)
+        self.assertIn("PERF_CI_FAIL: git worktree remove failed: exit 1", text)
+
+        stderr = io.StringIO()
+        with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+              mock.patch.object(perf_ci, "_worktree", return_value=tree),
+              mock.patch.object(perf_ci, "run_paired", return_value=(report, report)),
+              mock.patch.object(perf_ci, "_run", return_value=ok),
+              contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(stderr)):
+            code = perf_ci.main()
+        self.assertEqual(code, 0, stderr.getvalue())
 
 
 if __name__ == "__main__":

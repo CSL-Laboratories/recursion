@@ -903,8 +903,10 @@ class Hooks:
             secret = source(connection_id, env_name)
         except KeyError:
             raise KeyError(connection_id) from None
-        except Exception:  # noqa: BLE001 - a source that fails has no credential to give
-            log.exception('the credential source failed for a connection; it is treated as having none')
+        except Exception as exc:  # noqa: BLE001 - a source that fails has no credential to give
+            # CONTROL keeps credentials. The log names the type only; the source's text can carry a secret.
+            log.error('the credential source failed for a connection (%s); it is treated as having none',
+                      type(exc).__name__)
             raise KeyError(connection_id) from None
         if not isinstance(secret, str) or not secret:
             raise KeyError(connection_id)
@@ -928,11 +930,11 @@ class Hooks:
             return None
         try:
             owner = chooser(ctx, request)
+            if owner is not None and not callable(getattr(owner, 'run', None)):
+                log.error('the drive owner answered something with no run(); today\'s path drives %s', getattr(ctx, 'run_id', '?'))
+                return None
         except Exception:  # noqa: BLE001
             log.exception('the drive owner failed before accepting %s; today\'s path drives it', getattr(ctx, 'run_id', '?'))
-            return None
-        if owner is not None and not callable(getattr(owner, 'run', None)):
-            log.error('the drive owner answered something with no run(); today\'s path drives %s', getattr(ctx, 'run_id', '?'))
             return None
         return owner
 
@@ -945,10 +947,15 @@ class Hooks:
         except Exception:  # noqa: BLE001
             log.exception('page_methods failed; the page may call nothing')
             return frozenset()
-        if not isinstance(listed, (set, frozenset)) or not all(isinstance(name, str) for name in listed):
-            log.error('page_methods answered %r; the page may call nothing', type(listed).__name__)
+        try:
+            # The genexpr is what a trace pauses on. A provider that changes the set during it raises
+            # RuntimeError; the page then may call nothing.
+            if not isinstance(listed, (set, frozenset)) or not all(isinstance(name, str) for name in listed):
+                log.error('page_methods answered %r; the page may call nothing', type(listed).__name__)
+                return frozenset()
+            return frozenset(listed)
+        except RuntimeError:
             return frozenset()
-        return frozenset(listed)
 
     # -- S12 --------------------------------------------------------------------------------------
     def mark_changed(self, run_id) -> None:

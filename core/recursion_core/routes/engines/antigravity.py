@@ -638,6 +638,9 @@ class AntigravityOneShotAdapter(RouteAdapter):
             return c.result(rid, c.REQUEST_INVALID, detail="deadline_s")
         if not _finite(deadline_at):
             return c.result(rid, c.REQUEST_INVALID, detail="deadline_at")
+        if self._deadline_passed(deadline_at):
+            # Already expired: nothing is prepared and nothing is launched.
+            return c.result(rid, c.DEADLINE_EXCEEDED, detail="recursion deadline")
         try:
             request["prompt"].encode("utf-8")
         except UnicodeEncodeError:   # a lone surrogate: agy's stdin takes UTF-8, so it could never be sent
@@ -667,6 +670,9 @@ class AntigravityOneShotAdapter(RouteAdapter):
                 return c.result(rid, err.code, detail=mask(err.detail, forms))
             except OSError:      # the boundary could not set its capture up: nothing is launched
                 return c.result(rid, c.LAUNCH_REFUSED, detail=OUTPUT_UNPROTECTED)
+        if self._deadline_passed(deadline_at):
+            # Preparation (the route home, custody, the boundary) spent the time that was left.
+            return c.result(rid, c.DEADLINE_EXCEEDED, detail="recursion deadline")
         try:
             process = launcher(argv, env=env, shell=False)
         except c.RouteError as err:
@@ -748,9 +754,21 @@ class AntigravityOneShotAdapter(RouteAdapter):
             return None
         return posixpath.realpath(given)
 
+    def _deadline_passed(self, deadline_at: float) -> bool:
+        """True when the clock returns a time at or after ``deadline_at``. A clock that raises is not a
+        deadline reading: that failure is left until a child exists, so the child is fenced before it
+        propagates (a clock that fails on its first read must not skip the launch)."""
+        try:
+            now = self._clock()
+        except BaseException:
+            return False
+        return now >= deadline_at
+
     def drive(self, process: EngineProcess, request: dict, deadline_at: float, events: list[dict], *,
               redact=()) -> dict:
         rid, route = request["request_id"], request["route"]
+        if self._clock() >= deadline_at:
+            raise Deadline()   # nothing of the prompt is written once the deadline has passed
         process.send(one_shot_stdin(request["prompt"]))
         process.close_stdin()
         parser = OneShotParser(c.connection_key(route), route["model"], redact=redact)

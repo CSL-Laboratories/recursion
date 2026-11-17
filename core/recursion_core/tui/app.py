@@ -73,21 +73,7 @@ class _Output:
 
         self.events += 1
         chunk = self.sanitizer.feed(text)
-        # The truncation marker is display text, not part of the engine line, so a later chunk joins
-        # the retained tail (bot review 4503920972).
-        was_cut = self.partial_cut
-        body = self.partial[len(_TRUNCATED):] if was_cut else self.partial
-        *done, partial = (body + chunk).split("\n")
-        if was_cut and done:
-            done[0] = _TRUNCATED + done[0]
-        keep = PARTIAL_CAP - len(_TRUNCATED)
-        if len(partial) > keep:
-            self.dropped += len(partial) - keep
-            partial = _TRUNCATED + partial[-keep:]
-            self.partial_cut = True
-        else:
-            self.partial_cut = False
-        self.partial = partial
+        chunk, done = self._apply_chunk(chunk)
         # "Not counted" BEFORE the retained lines change, and counted again only once the counts are beside them:
         # a failure or an interruption between the two leaves the counts to be counted again, never old counts
         # beside as many new lines (round 3 of #404, Astra's required 1).
@@ -96,6 +82,55 @@ class _Output:
         if width >= 0:  # the counts stay beside the lines: the same maxlen drops the same oldest ones
             self._rows.extend(len(wrap(line, width)) for line in done)
             self._width = width
+        return chunk, done
+
+    def finish(self) -> tuple[str, list[str]]:
+        """End of this run's output: show a cut-off UTF-8 tail and the line that never got a newline."""
+
+        extra = self.sanitizer.flush()
+        if extra == "" and not self.partial:
+            return "", []
+        if not extra.endswith("\n"):
+            extra += "\n"
+        chunk, done = self._apply_chunk(extra)
+        self._keep_lines(done)
+        return chunk, done
+
+    def _keep_lines(self, done: list[str]) -> None:
+        width, self._width = self._width, -1
+        self.lines.extend(done)
+        if width >= 0:
+            self._rows.extend(len(wrap(line, width)) for line in done)
+            self._width = width
+
+    def _apply_chunk(self, chunk: str) -> tuple[str, list[str]]:
+        # The truncation marker is display text, not part of the engine line, so a later chunk joins
+        # the retained tail (bot review 4503920972).
+        was_cut = self.partial_cut
+        body = self.partial[len(_TRUNCATED):] if was_cut else self.partial
+        *done, partial = (body + chunk).split("\n")
+        keep = PARTIAL_CAP - len(_TRUNCATED)
+        capped: list[str] = []
+        for index, line in enumerate(done):
+            # A finished line keeps the same cap as the partial, including one that arrived with its
+            # newline in the same chunk. The marker is applied once, never twice.
+            if len(line) > keep:
+                self.dropped += len(line) - keep
+                line = _TRUNCATED + line[-keep:]
+            elif was_cut and index == 0:
+                line = _TRUNCATED + line
+            capped.append(line)
+        done = capped
+        if len(partial) > keep:
+            self.dropped += len(partial) - keep
+            partial = _TRUNCATED + partial[-keep:]
+            self.partial_cut = True
+        elif was_cut and not done:
+            partial = _TRUNCATED + partial
+            self.partial_cut = True
+        else:
+            self.partial_cut = False
+        self.partial = partial
         return chunk, done
 
     def extend(self, rows: list[str]) -> None:
@@ -215,6 +250,9 @@ class TuiApp:
         # while reading a caller's answer or logging engine output, so close() cannot wait on a stalled thread
         # (reviews of a1f16a20, C4).
         self._lock = threading.RLock()
+        # Pane update and its log line. Session end takes only ``_lock``, so it does not wait on a log
+        # write that has already begun.
+        self._output_lock = threading.RLock()
         self._state = "live"
         self.skipped_events = 0  # engine output events a Loop dropped from its presentation queue
         self.outputs: dict[str, _Output] = {}
@@ -292,8 +330,19 @@ class TuiApp:
         sent or changed, so a thread that is still busy cannot add to the log or send a request."""
 
         with self._lock:  # a state change already under way finishes first; none starts after this
+            self._flush_open_output()
             self.closed = True  # a second call changes nothing: the sealed log refuses its event
             self._emit("close", "operator", "closed: no request sent; runs keep going and can be reattached")
+
+    def _flush_open_output(self) -> None:
+        """Speak each run's unfinished line before the session-end event, while the log still accepts it."""
+
+        for out in self.outputs.values():
+            chunk, done = out.finish()
+            if not chunk and not done:
+                continue
+            speech = "\n".join(out.label + line for line in done)
+            self._emit("output", "engine", chunk, speech=speech, state=self._state)
 
     # -- requests -------------------------------------------------------------------------------
     def request(self, method: str, params: dict) -> None:
@@ -609,29 +658,33 @@ class TuiApp:
     # -- engine output (no control API stream exists yet; the caller feeds events here) ----------
     def on_event(self, event: Mapping) -> None:
         run_id, text = str(event.get("run_id")), event.get("text", "")  # the caller's object, read unlocked
-        with self._lock:
-            if self.closed:
-                return
-            if not isinstance(text, (str, bytes, bytearray)):  # said, not raised (review 2 of #404, DeepSeek L6)
-                self._error(f"output for run={field(run_id)} skipped: its text is a {type(text).__name__}, not text")
-                return
-            out = self.outputs.get(run_id)
-            if out is None:
-                out = self.outputs[run_id] = _Output(self._output_lines, run_id)
-            before = out.partial
-            chunk, done = out.feed(text)
-            if self.scroll and self.pane is None and run_id == self.attached:
-                # A scrolled pager stays on the rows it shows: it moves up by the display rows this chunk
-                # added at the end, a partial line begun, grown or finished included (review 1 of #404, R3).
-                # The frame and the pager keep it within the rows retained.
-                w = self._pane_width()
-                rows = lambda text: len(wrap(text, w)) if text else 0  # noqa: E731
-                added = sum(len(wrap(line, w)) for line in done) + rows(out.partial) - rows(before)
-                self.scroll = max(0, self.scroll + added)
-            speech, state = "\n".join(out.label + line for line in done), self._state
-        # Logged already sanitized, outside the lock; the linear renderer says each finished line once,
-        # marked as output. If the TUI ended meanwhile, the sealed log refuses it.
-        self._emit("output", "engine", chunk, speech=speech, state=state)
+        # Output lock then the app lock. The log write keeps the output lock and not the app lock, so a
+        # frame cannot show the line first and a second writer cannot pass, while session end can still
+        # take the app lock during a log write that has already begun.
+        with self._output_lock:
+            speech = state = chunk = None
+            with self._lock:
+                if self.closed:
+                    return
+                if not isinstance(text, (str, bytes, bytearray)):  # said, not raised (review 2 of #404, DeepSeek L6)
+                    self._error(f"output for run={field(run_id)} skipped: its text is a {type(text).__name__}, not text")
+                    return
+                out = self.outputs.get(run_id)
+                if out is None:
+                    out = self.outputs[run_id] = _Output(self._output_lines, run_id)
+                before = out.partial
+                chunk, done = out.feed(text)
+                if self.scroll and self.pane is None and run_id == self.attached:
+                    # A scrolled pager stays on the rows it shows: it moves up by the display rows this chunk
+                    # added at the end, a partial line begun, grown or finished included (review 1 of #404, R3).
+                    # The frame and the pager keep it within the rows retained.
+                    w = self._pane_width()
+                    rows = lambda text: len(wrap(text, w)) if text else 0  # noqa: E731
+                    added = sum(len(wrap(line, w)) for line in done) + rows(out.partial) - rows(before)
+                    self.scroll = max(0, self.scroll + added)
+                speech = "\n".join(out.label + line for line in done)
+                state = self._state
+            self._emit("output", "engine", chunk, speech=speech, state=state)
 
     # -- keys -----------------------------------------------------------------------------------
     def press(self, key: Key, *, burst: bool = False) -> None:
@@ -1054,8 +1107,9 @@ class TuiApp:
         in meanwhile waits for it, so the lines it reads cannot change under it (review 2 of #404, DeepSeek
         L5). It only reads and wraps; it calls nothing outside the app."""
 
-        with self._lock:
-            return self._frame()
+        with self._output_lock:
+            with self._lock:
+                return self._frame()
 
     def _frame(self) -> list[Row]:
         """One full-screen frame of exactly ``self.height`` rows, none wider than ``self.width`` cells.
@@ -1496,15 +1550,13 @@ class Loop:
                 break
             done(method, params, answer)
         deadline = time.monotonic() + self.drain_budget_s  # 3. engine output, time-sliced
-        while time.monotonic() < deadline:
+        # One event at a time: the budget and a queued key are checked between events, not after a batch.
+        while time.monotonic() < deadline and self._keys.empty():
             with self._events_lock:
-                batch = [self._events.popleft() for _ in range(min(256, len(self._events)))]
-            if not batch:
-                break
-            for event in batch:
-                app.on_event(event)
-            if not self._keys.empty():
-                break
+                if not self._events:
+                    break
+                event = self._events.popleft()
+            app.on_event(event)
         if self.dropped_events:
             app.skipped_events = self.dropped_events
         if self._size is not None:  # 4. one repaint, at the terminal's size now

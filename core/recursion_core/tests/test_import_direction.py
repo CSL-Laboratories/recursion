@@ -7,8 +7,9 @@ today; ``cgroup_leaf`` is part of that core and is not a lane to move out). ``ro
 ``tui`` are the optional packages that already live here. Other optional lanes are named in
 ``OPTIONAL_ROOTS`` even when their package is not installed yet.
 
-The one exception is a ``find_spec``-guarded import in ``control/hooks.py`` of a module named
-in ``REGISTRANTS``. ``control/cli.py`` and ``control/tui.py`` already import ``tui``; that
+The one exception is an import in ``control/hooks.py`` of a module named in ``REGISTRANTS``,
+in a function that returns when ``find_spec`` of that module, or of a parent package, is None.
+``control/cli.py`` and ``control/tui.py`` already import ``tui``; that
 ceiling is data here and is not widened. The engine table (``EngineTable`` and its catalogue)
 is core. An adapter module under ``routes.engines`` is an optional lane. The package module
 ``recursion_core/__init__.py`` is core product code and is scanned with the packages.
@@ -205,14 +206,20 @@ def _registrants(tree: ast.AST) -> frozenset[str]:
     raise AssertionError("control/hooks.py does not assign REGISTRANTS")
 
 
-def _guarded(func: ast.AST | None, module: str, lineno: int, registrants: frozenset[str]) -> bool:
-    """True when ``module`` is a registrant imported after ``find_spec`` in the same function."""
-    if func is None or module not in registrants:
-        return False
-    for node in ast.walk(func):
-        if not isinstance(node, ast.Call) or node.lineno >= lineno or not node.args:
+def _find_spec_absent(test: ast.AST):
+    """Module names for which ``test`` contains ``importlib.util.find_spec(name) is None``."""
+    for node in ast.walk(test):
+        if not isinstance(node, ast.Compare) or len(node.ops) != 1 or not isinstance(node.ops[0], ast.Is):
             continue
-        called = node.func
+        if len(node.comparators) != 1:
+            continue
+        none = node.comparators[0]
+        if not isinstance(none, ast.Constant) or none.value is not None:
+            continue
+        call = node.left
+        if not isinstance(call, ast.Call) or not call.args:
+            continue
+        called = call.func
         if not isinstance(called, ast.Attribute) or called.attr != "find_spec":
             continue
         util = called.value
@@ -221,12 +228,33 @@ def _guarded(func: ast.AST | None, module: str, lineno: int, registrants: frozen
         base = util.value
         if not isinstance(base, ast.Name) or base.id != "importlib":
             continue
-        spec = node.args[0]
-        if not isinstance(spec, ast.Constant) or not isinstance(spec.value, str):
+        spec = call.args[0]
+        if isinstance(spec, ast.Constant) and isinstance(spec.value, str):
+            yield spec.value
+
+
+def _guarded(func: ast.AST | None, module: str, lineno: int, registrants: frozenset[str]) -> bool:
+    """True when a registrant import follows a return on ``find_spec(...) is None``.
+
+    The import has to be a direct statement of that function. A bare ``find_spec`` call, a probe of
+    a child module, or an ``if`` that does not return, does not count: the import still runs when
+    the lane is absent.
+    """
+    if func is None or module not in registrants or not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    direct = any(
+        isinstance(stmt, (ast.Import, ast.ImportFrom)) and stmt.lineno == lineno for stmt in func.body
+    )
+    if not direct:
+        return False
+    for stmt in func.body:
+        if not isinstance(stmt, ast.If) or stmt.lineno >= lineno:
             continue
-        probed = spec.value
-        if probed == module or module.startswith(probed + ".") or probed.startswith(module + "."):
-            return True
+        if not stmt.body or not all(isinstance(item, (ast.Return, ast.Raise)) for item in stmt.body):
+            continue
+        for probed in _find_spec_absent(stmt.test):
+            if probed == module or module.startswith(probed + "."):
+                return True
     return False
 
 
@@ -394,6 +422,41 @@ class ImportDirectionTests(unittest.TestCase):
         unguarded = "import recursion_core.remote.hooks\n"
         bad = violations_in(HOOKS_REL, unguarded, registrants)
         self.assertEqual(bad, ["control/hooks.py:1: import recursion_core.remote.hooks"])
+
+    def test_a_registrant_import_without_an_absence_return_is_reported(self) -> None:
+        registrants = frozenset({"recursion_core.remote.hooks"})
+        ignored = (
+            "def _load_remote_hooks():\n"
+            "    importlib.util.find_spec('recursion_core.remote.hooks')\n"
+            "    import recursion_core.remote.hooks as module\n"
+        )
+        bad = violations_in(HOOKS_REL, ignored, registrants)
+        self.assertEqual(bad, ["control/hooks.py:3: import recursion_core.remote.hooks"])
+        child = (
+            "def _load_remote_hooks():\n"
+            "    if importlib.util.find_spec('recursion_core.remote.hooks.extra') is None:\n"
+            "        return None\n"
+            "    import recursion_core.remote.hooks as module\n"
+        )
+        bad = violations_in(HOOKS_REL, child, registrants)
+        self.assertEqual(bad, ["control/hooks.py:4: import recursion_core.remote.hooks"])
+        no_return = (
+            "def _load_remote_hooks():\n"
+            "    if importlib.util.find_spec('recursion_core.remote.hooks') is None:\n"
+            "        marker = 1\n"
+            "    import recursion_core.remote.hooks as module\n"
+        )
+        bad = violations_in(HOOKS_REL, no_return, registrants)
+        self.assertEqual(bad, ["control/hooks.py:4: import recursion_core.remote.hooks"])
+        real = (
+            "def _load_remote_hooks():\n"
+            "    if (importlib.util.find_spec('recursion_core.remote') is None\n"
+            "            or importlib.util.find_spec('recursion_core.remote.hooks') is None):\n"
+            "        return None\n"
+            "    import recursion_core.remote.hooks as module\n"
+            "    return module\n"
+        )
+        self.assertEqual(violations_in(HOOKS_REL, real, registrants), [])
 
 
 class PublicClientApiTests(unittest.TestCase):

@@ -14,8 +14,9 @@ the phone door of this lane's later slices keep, so that they are tested before 
   revocation, never admitted and missed.
 * A record the book hands out is a frozen snapshot: changing it is refused, and the book's own state
   changes only under its lock (a revocation replaces the record).
-* A wrong argument (no grant, a device id that is not a non-empty string, an expiry that is not a finite
-  number, a connection id that cannot be a key) is a typed refusal, never a ``TypeError``.
+* A wrong argument (no grant, a device id that is not a non-empty ``str``, a subclass of ``str`` included,
+  an expiry that is not a finite number, a connection id that cannot be a key) is a typed refusal, never a
+  ``TypeError``.
 
 How long a device stays paired is the owner's open choice (L1 in the lane's questions): the caller gives
 each device a finite expiry, and no default is built in.
@@ -82,7 +83,7 @@ class DeviceBook:
         """Record a redeemed offer as a device and return its frozen record. A known id (revoked too) is refused."""
         if not isinstance(grant, PairingGrant):
             raise PairingRefused("grant_invalid", "a device is added from a PairingGrant")
-        if not isinstance(grant.device_id, str) or not grant.device_id:
+        if type(grant.device_id) is not str or not grant.device_id:
             raise PairingRefused("grant_invalid", "a device id is a non-empty string")
         if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at):
             raise PairingRefused("expiry_invalid", "a device's expiry is a finite number on the book's clock")
@@ -133,7 +134,7 @@ class DeviceBook:
     def revoke(self, device_id: str) -> tuple[Hashable, ...]:
         """Revoke a device for good and return its live connections, which the caller must close."""
         with self._lock:
-            record = self._devices.get(device_id) if isinstance(device_id, str) else None
+            record = self._devices.get(device_id) if type(device_id) is str else None
             if record is None:
                 raise PairingRefused("device_unknown")
             if record.revoked_at is None:
@@ -151,7 +152,7 @@ class DeviceBook:
     def _admit(self, device_id: object, scope: str) -> Admission:
         """Called with the lock held. The clock is read after the revocation check, inside the window a
         racing revocation would use, so that a test can stand in that window (tests/test_device_state.py)."""
-        record = self._devices.get(device_id) if isinstance(device_id, str) else None
+        record = self._devices.get(device_id) if type(device_id) is str else None
         if record is None:
             return Admission(False, "device_unknown")
         if record.revoked_at is not None:

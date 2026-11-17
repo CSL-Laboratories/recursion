@@ -121,6 +121,34 @@ class DeviceTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "grant_invalid")
         self.assertEqual([row["device_id"] for row in self.book.list()], ["dev_one"])
 
+    def test_a_device_id_that_cannot_be_a_key_is_a_typed_refusal_not_a_type_error(self) -> None:
+        class UnhashableStr(str):
+            __hash__ = None  # type: ignore[assignment]
+
+        class ExplodingHashStr(str):
+            def __hash__(self) -> int:
+                raise TypeError("cannot hash this")
+
+        class UnhashableBytes(bytes):
+            __hash__ = None  # type: ignore[assignment]
+
+        class UnhashableInt(int):
+            __hash__ = None  # type: ignore[assignment]
+
+        for device_id in (UnhashableStr("dev_x"), ExplodingHashStr("dev_x"), UnhashableBytes(b"dev_x"), UnhashableInt(7)):
+            kind = type(device_id).__name__
+            with self.subTest(add=kind), self.assertRaises(PairingRefused) as caught:
+                self.book.add(grant(device_id), expires_at=self.clock.now + 60)  # type: ignore[arg-type]
+            self.assertEqual(caught.exception.code, "grant_invalid")
+            with self.subTest(revoke=kind), self.assertRaises(PairingRefused) as caught:
+                self.book.revoke(device_id)  # type: ignore[arg-type]
+            self.assertEqual(caught.exception.code, "device_unknown")
+            with self.subTest(admit=kind):
+                self.assertEqual(self.book.admit(device_id, "read").code, "device_unknown")
+            with self.subTest(connect=kind):
+                self.assertEqual(self.book.connect(device_id, "conn_x").code, "device_unknown")
+        self.assertEqual([row["device_id"] for row in self.book.list()], ["dev_one"])
+
     def test_the_list_shows_state_and_no_secret(self) -> None:
         self.book.add(grant("dev_two", scopes=("read",), label="tablet"), expires_at=self.clock.now + 10)
         self.book.revoke("dev_one")

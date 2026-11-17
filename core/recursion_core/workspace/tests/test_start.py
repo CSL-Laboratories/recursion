@@ -358,11 +358,17 @@ class RegistrationTest(unittest.TestCase):
         with self.assertRaises(H.HookError):
             S.register(hooks)
 
-    def test_the_package_registers_nothing_with_a_composition_yet(self) -> None:
+    def test_composition_loads_the_workspace_registrant(self) -> None:
+        # The provider module is what composition imports. While it was absent, this asserted that a
+        # composition skipped the lane. It is written now, so a composition loads it.
         import importlib.util
         self.assertIsNotNone(importlib.util.find_spec('recursion_core.workspace'))
-        self.assertIsNone(importlib.util.find_spec('recursion_core.workspace.hooks'))
-        self.assertIsNone(H._load_workspace_hooks())
+        self.assertIsNotNone(importlib.util.find_spec('recursion_core.workspace.hooks'))
+        self.assertIsNotNone(H._load_workspace_hooks())
+        composed = H.compose()
+        self.assertTrue(composed.start_on)
+        self.assertEqual(composed.start_order(), ('workspace',))
+        self.assertIn('workspace', composed.declared_fields())
 
 
 if __name__ == '__main__':

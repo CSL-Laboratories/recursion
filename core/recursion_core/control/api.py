@@ -7,8 +7,8 @@ none has its own Stop path.
 
 Methods and typed result codes::
 
-    run.start  {"tenant", "engine", "prompt", "client_key"?} -> started | request_invalid | start_failed
-                                                                | start_unconfirmed | registry_unavailable
+    run.start  {"tenant", "engine", "prompt", "client_key"?, "workspace"?} -> started | request_invalid
+               | start_failed | start_unconfirmed | registry_unavailable | workspace_invalid | unavailable
     run.status {"run_id"}                                    -> ok | run_unknown | request_invalid
                                                                 | registry_unavailable
     run.list   {"limit"?, "after"?}                          -> ok | request_invalid | registry_unavailable
@@ -64,6 +64,12 @@ launched. The key and digest live in the run record (``start_key``) and are look
 registry, so a ``ControlAPI`` rebuilt over the same durable registry after a restart still answers the
 retried start with the original run (11.3, B-17).
 
+``workspace`` is the field the control schema already declares (``path``, and ``mode`` and ``base_ref``
+when given). It is honoured only once a start registrant is registered: the folder is checked before a
+record exists, and a refusal launches nothing. A folder another user owns, or the daemon's state
+directory or a folder inside it, is ``workspace_invalid``. With no start registrant the key is ignored,
+as before, and the run's working directory stays the engine home.
+
 Stop decisions and launch records are serialised per run, so a slow or hung cleanup on one run never
 queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed during it.
 The registry write is a compare-and-swap on the record's generation, so a stop is also not overwritten by
@@ -113,10 +119,13 @@ def _new_run_id() -> str:
 
 class ControlAPI:
     def __init__(self, registry: RunRegistry, kill_tree: KillTree, starter: Starter, clock: Callable[[], float],
-                 *, confirm_timeout_s: float = 5.0, new_run_id: Callable[[], str] = _new_run_id) -> None:
+                 *, confirm_timeout_s: float = 5.0, new_run_id: Callable[[], str] = _new_run_id,
+                 hooks=None) -> None:
         self._registry, self._kill, self._starter, self._clock = registry, kill_tree, starter, clock
         self._new_run_id = new_run_id
         self._confirm_timeout_s = confirm_timeout_s
+        # None: the versioned start path is off and a workspace key is ignored, as before.
+        self._hooks = hooks
         self._locks_lock = threading.Lock()
         # Exclusion is the registry's owner lock table when it has one, so two ControlAPIs over the same
         # registry take the same locks. The owner is a token minted for the in-flight call, not a thread
@@ -220,18 +229,87 @@ class ControlAPI:
         finally:
             self._exit_owner()
 
+    def _versioned(self):
+        hooks = self._hooks
+        if hooks is None or not hooks.start_on:
+            return None
+        return hooks
+
+    def _reused(self, prior, start_key, params, hooks):
+        """A same-key start that is not the stored one, or None when it is a retry."""
+        stored = prior.get("start_key")
+        if hooks is None:
+            if stored != start_key:
+                return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
+            return None
+        stored = stored or {}
+        if "intent_sha256" in stored:
+            if stored.get("intent_sha256") != start_key.get("intent_sha256") or stored.get("intent_version") != 1:
+                return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
+            return None
+        # A key stored with the versioned path off. A request that names a declared extension is a
+        # different start. One that names none is still compared on the three members.
+        if hooks.declared_present(dict(params)):
+            return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
+        legacy = {"client_key": start_key["client_key"], "engine": start_key["engine"],
+                  "prompt_sha256": start_key["prompt_sha256"]}
+        if stored != legacy:
+            return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
+        return None
+
+    def _arm(self, run_id, rec) -> None:
+        """Hand the stored launch to the starter's ``RunContext``. No-op when this start has none."""
+        if self._hooks is None or "launch" not in rec:
+            return
+        from recursion_core.control.hooks import LaunchContext
+        from recursion_core.daemon.launcher import remember_launch
+        remember_launch(run_id, LaunchContext.from_record(rec), self._hooks)
+
+    def _disarm(self, run_id) -> None:
+        if self._hooks is None:
+            return
+        from recursion_core.daemon.launcher import drop_launch
+        drop_launch(run_id)
+
     def _start(self, params: Mapping) -> dict:
         key = params.get("client_key")
+        digest = hashlib.sha256(params["prompt"].encode("utf-8")).hexdigest()
+        hooks = self._versioned()
+        intent = None
+        if hooks is not None and isinstance(key, str):
+            try:
+                # The identity is the client's request, before any normaliser runs.
+                intent = hooks.start_intent(dict(params), digest)
+            except ValueError:
+                detail = "workspace" if params.get("workspace") is not None else "request"
+                return {"code": REQUEST_INVALID, "detail": detail}
         start_key = None
         if isinstance(key, str):
-            start_key = {"client_key": key, "engine": params["engine"],
-                         "prompt_sha256": hashlib.sha256(params["prompt"].encode("utf-8")).hexdigest()}
+            start_key = {"client_key": key, "engine": params["engine"], "prompt_sha256": digest}
+            if intent is not None:
+                start_key["intent_version"] = 1
+                start_key["intent_sha256"] = intent
         prior = self._reg("find_start", params["tenant"], key) if start_key is not None else None
-        if prior is not None and prior.get("start_key") != start_key:
-            return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
+        if prior is not None:
+            reused = self._reused(prior, start_key, params, hooks)
+            if reused is not None:
+                return reused
+            if hooks is not None and "intent_sha256" not in (prior.get("start_key") or {}):
+                start_key = {"client_key": key, "engine": params["engine"], "prompt_sha256": digest}
+            elif hooks is not None:
+                start_key = prior.get("start_key")
+        launch_pair = None
+        if prior is None and hooks is not None:
+            from recursion_core.control.hooks import OWNER
+            launch, refusal = hooks.launch_snapshot(OWNER, dict(params))
+            if refusal is not None:
+                return refusal
+            launch_pair = (launch, OWNER.public())
         run_id = prior["run_id"] if prior is not None else self._new_run_id()
         rec = {"run_id": run_id, "tenant": params["tenant"], "engine": params["engine"], "state": "starting",
                "cgroup": None, "started_at": self._clock(), "stop": None, "start_key": start_key}
+        if launch_pair is not None:
+            rec["launch"], rec["principal"] = launch_pair
         with self._run_lock(run_id):
             if prior is not None:  # a retried start is not run twice, across restarts too (11.3, 11.8)
                 answer = self._retry(self._current(prior))
@@ -250,7 +328,11 @@ class ControlAPI:
                 raise _RegistryError("put:StaleGeneration")
             self._failed.discard(run_id)
         try:
-            handle = self._starter({**params, "run_id": run_id})
+            self._arm(run_id, rec)
+            try:
+                handle = self._starter({**params, "run_id": run_id})
+            finally:
+                self._disarm(run_id)
         except Exception as err:  # the launch path refused or failed; the API answers with a code
             with self._run_lock(run_id):
                 # Re-read first: a Stop may have written its intent while the starter ran. If the read fails,

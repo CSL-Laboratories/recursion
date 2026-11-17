@@ -602,5 +602,36 @@ class CodexRoundOne411Test(unittest.TestCase):
                 self.assertEqual((rig.launches, rig.custody), ([], []))
 
 
+class ReviewRoundFour411Test(unittest.TestCase):
+    """DeepSeek's round-4 read of #411 at a6a6ada3. F1 fails on that head: a refusal detail keeps a lone
+    surrogate. F3 and F4 are the sentences the read asked for. F5 puts each test module on its own line."""
+
+    def test_f1_a_surrogate_in_the_connection_id_never_makes_a_refusal_unwritable(self) -> None:
+        bad = "conn-" + chr(0xD800)
+        for key in ("", "made-up\x00key"):
+            with self.subTest(key=repr(key)):
+                rig = Rig([[("chunk", "hi"), ("end", "end_turn")]], key=key)
+                req = request()
+                req["route"]["connection"]["id"] = bad
+                res = rig.run(req)
+                json.dumps(res, ensure_ascii=False).encode("utf-8")
+                self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+                self.assertNotIn(chr(0xD800), res["detail"])
+                self.assertEqual(rig.launches, [])
+
+    def test_f3_the_fence_is_named_on_launched_and_the_read_comes_first(self) -> None:
+        doc = " ".join(ag.AntigravityAcpAdapter.__doc__.split())
+        self.assertIn("fenced by ``_launched``, which both adapters' ``run`` calls", doc)
+        refused = " ".join(ag.AntigravityOneShotAdapter._refused.__doc__.split())
+        self.assertIn("reads the request once first, and that read is a shape check too", refused)
+
+    def test_f5_the_readme_command_gives_each_test_module_its_own_line(self) -> None:
+        text = (pathlib.Path(ag.__file__).parent / "fixtures" / "antigravity" / "README.md").read_text(
+            encoding="utf-8")
+        command = text.split("Run the tests by module name", 1)[1].split("`unittest discover", 1)[0]
+        for line in command.splitlines():
+            self.assertLessEqual(line.count("antigravity.test_"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

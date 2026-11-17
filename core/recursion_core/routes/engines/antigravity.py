@@ -631,7 +631,13 @@ class AntigravityOneShotAdapter(RouteAdapter):
         ``contract.validate_request`` has them. Which engine a route names is the dispatcher's check
         (``engine_unknown``), not this adapter's. ``deadline_at`` must be a finite number of the clock's
         seconds, or the request is refused the same way: no child starts with a deadline that cannot end it.
-        Whatever escapes once a child has started fences it first."""
+        The request is copied once before those checks, so a Mapping cannot answer the check one way and the
+        use another. Whatever escapes once a child has started fences it first."""
+        if isinstance(request, Mapping):
+            try:
+                request = _request_once(request)
+            except _RequestRefused as err:
+                return c.result(err.request_id, err.code, detail=err.detail)
         refused = self._refused(request, deadline_at)
         if refused is not None:
             return refused
@@ -643,7 +649,8 @@ class AntigravityOneShotAdapter(RouteAdapter):
     def _refused(self, request, deadline_at) -> dict | None:
         """The request's shape and ``deadline_at``, as ``run`` describes them: the refusal, or None. A
         ``request_id`` that is not a non-empty str is never echoed (the refusal carries ``""``). Every adapter
-        of this module calls it before anything of its own."""
+        of this module reads the request once first, and that read is a shape check too, then calls this
+        before any check of its own."""
         rid = request.get("request_id") if isinstance(request, Mapping) else None
         rid = rid if isinstance(rid, str) and rid else ""
         if not isinstance(request, Mapping) or not rid:
@@ -680,7 +687,7 @@ class AntigravityOneShotAdapter(RouteAdapter):
             argv = self.argv(request)
             env, secret = self._prepare(request)
         except c.RouteError as err:
-            return c.result(rid, err.code, detail=err.detail)
+            return c.result(rid, err.code, detail=_final_text(err.detail, ()))
         secrets = () if secret is None else (secret,)
         forms = mask_forms(secrets)
         launcher = self._launcher
@@ -688,7 +695,7 @@ class AntigravityOneShotAdapter(RouteAdapter):
             try:
                 launcher = self._output_boundary(secrets)
             except c.RouteError as err:
-                return c.result(rid, err.code, detail=mask(err.detail, forms))
+                return c.result(rid, err.code, detail=_final_text(err.detail, forms))
             except OSError:      # the boundary could not set its capture up: nothing is launched
                 return c.result(rid, c.LAUNCH_REFUSED, detail=OUTPUT_UNPROTECTED)
         if self._deadline_passed(deadline_at):
@@ -697,7 +704,7 @@ class AntigravityOneShotAdapter(RouteAdapter):
         try:
             process = launcher(argv, env=env, shell=False)
         except c.RouteError as err:
-            return c.result(rid, err.code, detail=mask(err.detail, forms))
+            return c.result(rid, err.code, detail=_final_text(err.detail, forms))
         except OSError as err:
             return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
         events: list[dict] = []
@@ -1574,8 +1581,8 @@ class AntigravityAcpAdapter(AntigravityOneShotAdapter):
     publishes events).
 
     Every failure path fences the child: a refusal or failure of the client (``AcpError``) and a turn that
-    did not succeed are fenced with their code, and anything else that escapes is fenced by the one-shot
-    adapter's ``run`` before it is raised. The turn's text is the agent's message chunks joined, masked
+    did not succeed are fenced with their code, and anything else that escapes is fenced by ``_launched``,
+    which both adapters' ``run`` calls, before it is raised. The turn's text is the agent's message chunks joined, masked
     once joined (``mask``), so a selected value split across chunks never reaches the result."""
 
     def run(self, request: dict, deadline_at: float) -> dict:

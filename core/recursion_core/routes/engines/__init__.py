@@ -12,9 +12,8 @@ itself, so it is called with exactly today's arguments::
     factory(launcher, clock, credentials, environ, **options) -> adapter
 
 ``options`` is ``{"binary": <absolute path>}`` when the route entry names a binary and empty otherwise.
-The three readers of "which engines are wired" take the names from the table and give what they give
-today while nothing else is registered: the route file's loader, the route inventory, and the loop
-that builds the adapters.
+When integrated, the route loader, route inventory and adapter loop will read names from this table;
+today they still use ``WIRED_ENGINES``.
 
 An engine lane registers its factory from its registrant module's ``register(hooks)``, through
 ``hooks.engines.register(name, factory)``. That happens once, at composition, before anything is

@@ -118,7 +118,7 @@ passes it to the draft makers: Antigravity's `OneShotParser(..., redact=(key,))`
 `AcpDrafts(redact=(key,))` mask it in every spelling JSON allows (as it stands, as a serializer escapes it, and
 with any character written as an escape), with a fill of the same UTF-8 length (asterisks, or `#` for a value
 made only of asterisks), so the byte offsets of `engine.output` still match a capture masked the same way
-(`mask(line, mask_forms(values))`). A decoded one-shot line that still holds the value fails closed. Antigravity's one-shot
+(`mask(line, mask_forms(values))`). The mask reads the value and its canonical spellings (NFC, NFD), never its compatibility spellings (NFKC, NFKD): a fullwidth, superscript or ligature spelling of the value's characters, which a reader applying NFKC would read as the value, is not masked, since such spelling is beyond ordinary output. A decoded one-shot line that still holds the value fails closed. Antigravity's one-shot
 adapter launches a keyed route only through an `output_boundary` (a launcher, asked for by the values to
 keep out, whose capture masks them before anything is persisted) and refuses it without one, before custody
 is asked (`antigravity_output_boundary_missing`). E4, E6, E7 and E9 need the same for their keyed routes.

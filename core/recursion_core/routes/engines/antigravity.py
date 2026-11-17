@@ -339,7 +339,8 @@ def mask_forms(values) -> tuple[str, ...]:
         if type(value) is not str or not value:
             raise ValueError("a value to mask is a non-empty str, exactly")
         forms.add(value)
-        # a normalization variant reads as the same text to anyone who normalizes it
+        # a canonical variant reads as the same text to anyone who normalizes it; a compatibility one (NFKC,
+        # NFKD: fullwidth, superscript, ligature forms) is beyond ordinary output and is not listed
         forms.update(unicodedata.normalize(form, value) for form in ("NFC", "NFD"))
     return tuple(sorted(forms, key=len, reverse=True))
 
@@ -363,8 +364,10 @@ def mask(text: str, forms: tuple[str, ...]) -> str:
 
     A spelling is any stretch of ``text`` that reads as the form: as it stands, once its JSON string escapes
     are read (a u-escape of any character, an escaped slash, a surrogate pair for a character beyond the
-    BMP), or once they are read again for JSON written inside a JSON string, to any depth. Whatever spelling
-    the agent chose, the value it decodes to is masked. Text that is not JSON is read the same way. Masking
+    BMP), or once they are read again for JSON written inside a JSON string, to any depth. Whatever escape
+    spelling the agent chose, the value it decodes to is masked, and so are the value's canonical spellings
+    (NFC, NFD; ``mask_forms`` lists them). Its compatibility spellings (NFKC, NFKD: fullwidth, superscript or
+    ligature forms of its characters) are not read. Text that is not JSON is read the same way. Masking
     repeats until no spelling is left, since a fill could complete a value partly made of the fill
     character.
 
@@ -485,6 +488,15 @@ def _utf8_length(raw: str, error: type) -> int:
         return len(raw.encode("utf-8"))
     except UnicodeEncodeError:
         raise error("stdout line is not UTF-8") from None
+
+
+def _read_length(line: str) -> int:
+    """A line's length in bytes as the reader read it: a surrogate a ``surrogateescape`` decode made is the one
+    byte it stands for; any other surrogate is counted as ``surrogatepass`` writes it."""
+    try:
+        return len(line.encode("utf-8", "surrogateescape"))
+    except UnicodeEncodeError:
+        return len(line.encode("utf-8", "surrogatepass"))
 
 
 def _count(value: object) -> bool:
@@ -1086,7 +1098,14 @@ class AcpDrafts:
             try:
                 raw, refused = _masked_line(line, self._redact)
                 raw += "\n"
-                length = _utf8_length(raw, acp_module().AcpProtocolError)
+                try:
+                    length = _utf8_length(raw, acp_module().AcpProtocolError)
+                except BaseException:
+                    # The line was read, so its bytes count, as the reader decoded them (a lone surrogate is a
+                    # byte that was not UTF-8): every later span stays at its true place in the stream. Nothing
+                    # is drafted.
+                    self.offset += _read_length(line) + 1
+                    raise
                 if refused is not None:
                     self.offset += length     # its bytes were read: later offsets stay those of the stream
                     raise acp_module().AcpProtocolError(refused)

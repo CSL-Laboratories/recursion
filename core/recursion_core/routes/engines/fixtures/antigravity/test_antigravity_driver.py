@@ -240,8 +240,11 @@ class AcpDraftsTest(unittest.TestCase):
         out = session.prompt("second", FAR)
         self.assertEqual((out.code, out.text), (None, "second"))
         spans = [d["payload"] for d in drafts.drafts if d["type"] == "engine.output"]
-        for one, two in zip(spans, spans[1:]):
-            self.assertEqual(one["offset_end"], two["offset_start"])   # the refused line left no partial span
+        # The refused line left no span; since the Devin thread on 46a39b0c its bytes still count, so the one
+        # gap between spans is exactly that line as the reader read it (it was contiguous before).
+        refused = len(json.dumps(update, ensure_ascii=False).encode("utf-8", "surrogateescape")) + 1
+        gaps = [two["offset_start"] - one["offset_end"] for one, two in zip(spans, spans[1:])]
+        self.assertEqual(sorted(gaps), [0] * (len(gaps) - 1) + [refused])
 
     def test_f2_ended_takes_both_ids_of_common_v1_form_or_neither(self) -> None:
         out = acp.TurnOutcome(1, None, "end_turn", False, False, None, None, None, "", "hi", 0)
@@ -318,7 +321,6 @@ class AcpDraftsTest(unittest.TestCase):
             _out, drafts, _ended = self.run_turn(script, cancel_on_update=cancel)
             for draft in drafts.drafts:
                 self.assertTrue(schema_check.fits("driver.v2.json#/$defs/event_draft", draft), draft)
-
 
 
 TOOL_KEY = "r5-made-up-custody-value-7d1"   # invented here; no real key, custody or auth file is read
@@ -1706,6 +1708,102 @@ class ReviewRoundSix408Test(unittest.TestCase):
 
 class Injected6(RuntimeError):
     pass
+
+
+class DevinThreads396Test(unittest.TestCase):
+    """The two review threads on 46a39b0c. Each fails on 46a39b0c unless marked a guard."""
+
+    def connection(self):
+        now = [0.0]
+        conn = acp.AcpConnection(clock=lambda: now[0])
+
+        def answer(made, result):
+            return conn.feed(json.dumps({"jsonrpc": "2.0", "id": made[0], "result": result}))
+        answer(conn.initialize(), {"protocolVersion": 1, "agentCapabilities": {},
+                                   "authMethods": [{"id": "gemini-api-key", "name": "k"}]})
+        answer(conn.authenticate("gemini-api-key"), {})
+        answer(conn.new_session(CWD), {"sessionId": "s1"})
+        return conn, now, answer
+
+    UPDATE = json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {
+        "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "hi"}}}})
+
+    # -- (A) a standalone AcpConnection keeps its turn's deadline ---------------------------------------------
+    def test_a_a_turn_fed_after_its_deadline_ends_deadline_exceeded(self) -> None:
+        conn, now, answer = self.connection()
+        now[0] = 100.0
+        made = conn.prompt("hello", 101.0)
+        now[0] = 102.0
+        fed = conn.feed(self.UPDATE)
+        self.assertEqual((fed.ended.code, fed.ended.text), (c.DEADLINE_EXCEEDED, ""))
+        self.assertEqual(fed.updates, [])
+        self.assertIsNone(answer(made, {"stopReason": "end_turn"}).ended)   # the late answer is dropped
+        self.assertIsNone(conn.abandoned_turn)
+
+    def test_a_a_prompt_whose_deadline_has_passed_starts_no_turn(self) -> None:
+        conn, now, _answer = self.connection()
+        now[0] = 102.0
+        with self.assertRaises(acp.AcpError) as ctx:
+            conn.prompt("hello", 101.0)
+        self.assertEqual(ctx.exception.code, c.DEADLINE_EXCEEDED)
+        self.assertIsNone(conn.turn_in_progress)
+
+    def test_a_guard_a_turn_answered_in_time_succeeds(self) -> None:
+        conn, now, answer = self.connection()
+        now[0] = 100.0
+        made = conn.prompt("hello", 101.0)
+        now[0] = 100.5
+        conn.feed(self.UPDATE)
+        out = answer(made, {"stopReason": "end_turn"}).ended
+        self.assertEqual((out.code, out.text), (None, "hi"))
+
+    # -- (B) a refused line's bytes still count --------------------------------------------------------------
+    BAD = '{"t":"' + chr(0xDCFF) + '"}'      # a byte that was not UTF-8, as a surrogateescape reader gives it
+
+    def test_b_the_line_after_a_refused_line_starts_at_its_true_place(self) -> None:
+        drafts = ag.AcpDrafts()
+        drafts.on_line('{"a":1}')
+        with self.assertRaises(acp.AcpProtocolError):
+            drafts.on_line(self.BAD)
+        drafts.on_line('{"b":2}')
+        payload = drafts.drafts[-1]["payload"]
+        self.assertEqual((payload["offset_start"], payload["offset_end"]), (18, 26))   # 8 + 10 bytes read
+        self.assertEqual(len(drafts.drafts), 2)                                       # the refused line: no draft
+
+    def test_b_two_refused_lines_in_a_row_both_count(self) -> None:
+        drafts = ag.AcpDrafts(offset=5)
+        for line in (self.BAD, '{"x":"' + chr(0xD800) + '"}'):         # the second as surrogatepass: 3 bytes
+            with self.assertRaises(acp.AcpProtocolError):
+                drafts.on_line(line)
+        drafts.on_line("{}")
+        self.assertEqual(drafts.drafts[-1]["payload"]["offset_start"], 5 + 10 + 12)
+
+    def test_b_through_the_session_every_span_is_its_lines_true_place(self) -> None:
+        drafts = ag.AcpDrafts()
+        agent = FakeAcpAgent([[("raw", self.BAD), ("wait_cancel",), ("end", "cancelled")],
+                              [("chunk", "hi"), ("end", "end_turn")]])
+        lines = []
+        read = agent.read_line
+
+        def read_line(timeout_s):
+            line = read(timeout_s)
+            if line is not None:
+                lines.append(line)
+            return line
+        agent.read_line = read_line
+        s = ag.open_acp(agent, agent.clock, route("gemini-api-key"), CWD, FAR, on_line=drafts.on_line)
+        with self.assertRaises(acp.AcpProtocolError):
+            s.prompt("one", FAR)
+        s.prompt("two", FAR)
+        true, at = {}, 0
+        for line in lines:                                    # each line's place in the stream, as read
+            true.setdefault(line, at)
+            at += len(line.encode("utf-8", "surrogateescape")) + 1
+        spans = [d["payload"] for d in drafts.drafts if d["type"] == "engine.output"]
+        self.assertIn(self.BAD, lines)
+        self.assertEqual(len(spans), len(lines) - 1)
+        for span in spans:
+            self.assertEqual(span["offset_start"], true[span["text"][:-1]])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,27 @@
+{
+  "about": "What the CLI's socket client (core/recursion_core/control/client.py at master_head) answers for each way one request can end. The desktop answers its window the same: 'code' and 'delivered' are the contract (delivered false: the request did not reach the control API; 'unknown': it was written and no complete reply came, so it may have been carried out; true: the daemon saw it and refused it before the control API), and 'detail' is the text the CLI prints. A Stop that got no answer is never shown as stopped. desktop/tests/check_fake_socket.py makes each case happen on a real socket and checks the client's answer.",
+  "master_head": "fb578e31a2c0469457a23dbcaa4030bdd24cef64",
+  "cases": [
+    {"case": "answered", "how": "the daemon answers run.status",
+     "request": {"method": "run.status", "params": {"run_id": "run-1"}},
+     "answer": {"code": "ok", "run": {"run_id": "run-1", "state": "running"}}},
+    {"case": "stop_pending", "how": "the daemon answers a Stop that it has asked for and not yet confirmed",
+     "request": {"method": "run.stop", "params": {"run_id": "run-1"}},
+     "answer": {"code": "pending", "run_id": "run-1", "reason": "cgroup_not_empty"}},
+    {"case": "no_daemon", "how": "nothing listens at the socket path",
+     "request": {"method": "run.list", "params": {}},
+     "answer": {"code": "control_api_unavailable", "delivered": false, "detail": "connect:FileNotFoundError"}},
+    {"case": "busy", "how": "every connection slot is taken and the request is not a Stop on a reserved slot",
+     "request": {"method": "run.status", "params": {"run_id": "run-1"}},
+     "answer": {"code": "control_api_unavailable", "delivered": false, "detail": "busy"}},
+    {"case": "not_admitted", "how": "the server's admission check refuses this peer at accept, before any slot",
+     "request": {"method": "run.list", "params": {}},
+     "answer": {"code": "control_api_unavailable", "delivered": false, "detail": "daemon:scope_refused"}},
+    {"case": "refused_by_handler", "how": "the daemon reads the request and refuses it before the control API (a peer inside a run unit)",
+     "request": {"method": "run.list", "params": {}},
+     "answer": {"code": "control_api_unavailable", "delivered": true, "detail": "daemon:scope_refused"}},
+    {"case": "never_answered", "how": "the request is written and the daemon closes without a reply",
+     "request": {"method": "run.stop", "params": {"run_id": "run-1"}},
+     "answer": {"code": "control_api_unavailable", "delivered": "unknown", "detail": "request:ConnectionError"}}
+  ]
+}

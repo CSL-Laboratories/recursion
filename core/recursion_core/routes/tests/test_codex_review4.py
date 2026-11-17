@@ -15,6 +15,7 @@ import time
 import unittest
 from unittest import mock
 
+from recursion_core.routes import driver as gate
 from recursion_core.routes.driver import DriverInputError
 from recursion_core.routes.engines import codex as cx
 from recursion_core.routes.tests import test_codex_attended as attended
@@ -227,15 +228,20 @@ class PortWaitTest(unittest.TestCase):
         server, driver, handle, _ = opened(Port(), port_wait_s=SHORT)
         reader, reader_errors = in_thread(lambda: feed(driver, handle, ask_command()("trn-1")))
         self.assertTrue(entered.wait(STUCK))
-        closer, closer_errors = in_thread(lambda: driver.send(handle, {"kind": "close"}))
-        closer.join(STUCK)
+        # Turned over for #432's corrected contract (the #402 reads, round 5, Astra 1 and Sol 1): the port call is a
+        # reveal, so close also waits for it, at most #432's REVEAL_WAIT_S, then raises instead of returning. Still
+        # bounded, which is the rule this test guards (round 4, DeepSeek R4-2).
+        with mock.patch.object(gate, "REVEAL_WAIT_S", SHORT):
+            closer, closer_errors = in_thread(lambda: driver.send(handle, {"kind": "close"}))
+            closer.join(STUCK)
         try:
             self.assertFalse(closer.is_alive(), "close waited for the port without a bound")
             self.assertTrue(reader.is_alive())  # the port is still being asked
         finally:
             go.set()
             reader.join(STUCK)
-        self.assertEqual((reader_errors, closer_errors), ([], []))
+        self.assertEqual(reader_errors, [])
+        self.assertEqual([type(err) for err in closer_errors], [gate.PortWithdrawIncomplete])
         self.assertTrue(server.stdin_closed)
         self.assertEqual(handle._codex.bindings, {})
 
@@ -281,7 +287,7 @@ class PortWaitOptionTest(unittest.TestCase):
             with self.subTest(value=value):
                 cx.CodexDriver(Launcher(AppServer()), FakeClock(), port_wait_s=value)
 
-    def test_a_wait_of_zero_ends_the_input_without_waiting_for_the_port(self):
+    def test_a_wait_of_zero_ends_the_input_at_once_then_waits_only_for_the_reveal(self):
         entered, go = threading.Event(), threading.Event()
 
         class Port(FakeApprovals):
@@ -293,9 +299,14 @@ class PortWaitOptionTest(unittest.TestCase):
         reader, reader_errors = in_thread(lambda: feed(driver, handle, ask_command()("trn-1")))
         self.assertTrue(entered.wait(STUCK))
         try:
-            driver.send(handle, {"kind": "close"})  # returns at once: the port is still being asked
+            # Turned over for #432's corrected contract (round 5, Astra 1 and Sol 1): the input still ends at once,
+            # but the port call already running is a reveal, waited for at most #432's REVEAL_WAIT_S, past which
+            # ending the input raises PortWithdrawIncomplete instead of returning.
+            with mock.patch.object(gate, "REVEAL_WAIT_S", SHORT):
+                with self.assertRaises(gate.PortWithdrawIncomplete):
+                    driver.send(handle, {"kind": "close"})
             self.assertTrue(server.stdin_closed)
-            self.assertTrue(reader.is_alive())
+            self.assertTrue(reader.is_alive())  # the port is still being asked
         finally:
             go.set()
             reader.join(STUCK)

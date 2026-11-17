@@ -8,7 +8,9 @@ field used here is in the schema the installed ``codex-cli 0.160.0`` generates f
 
 START runs ``initialize`` / ``initialized`` and then ``thread/start``, or ``thread/resume`` with the stored
 thread id when the start record names one, and reads their answers itself. The thread id the server
-reports becomes the handle's ``engine_session_id``. Nothing names an approval policy or a sandbox in
+reports becomes the handle's ``engine_session_id``. A start record that names a workspace sends its folder as
+``cwd`` (``path`` in direct mode, ``worktree_path`` in worktree mode), so the engine works there and not in the
+launcher's folder (the sweep of #402 against master, Nov 15, F1). Nothing names an approval policy or a sandbox in
 driver.v2's start record, so neither is sent: Codex applies its own (Lucas, grill Q20: "We shouldn't
 restrict the CLIs more than the provider's harness restricts them"), and the effective values the server
 reports back are kept on the session (``effective``). A resume the server refuses as an invalid request
@@ -91,11 +93,16 @@ last before the port is called, so a ``close`` that takes that lock first is see
 asked (the #402 reads, round 4: GPT-6 Astra 1). An admitted request is in flight: ``close`` waits for it, for
 at most ``port_wait_s`` seconds (an option of the driver, ``PORT_WAIT_S`` unless given: a number of seconds
 from 0 to ``threading.TIMEOUT_MAX``, or the driver is not made, ``DriverInputError("port_wait_s")``), and
-nothing that call opens is kept. Under the present port contract, which has no cancellation, a request already
-past its admission may still be delivered just after ``close`` returns; nothing of it is kept, but the approval
-opens. That is an OPEN defect, not an accepted limit: the #402 reads (round 5, GPT-6 Astra 1 and GPT-6.1 Sol 1;
-round 6, DeepSeek F1) require that no approval opens after ``close`` returns, which needs a withdraw in the port's
-contract; its keeper is lane DRIVER-CC (lane question Q10). A request read
+nothing that call opens is kept. After its admission each request takes a ticket from the gate (``admit_port``,
+DRIVER-CC's #432 as corrected after its first reads), refused once the worker's port is sealed; the gate seals it
+first when the input ends. The approval becomes visible only through ``ticket.publish(reveal)``, which runs the step
+that makes it visible under the ticket's lock, and only while the port is not sealed. A port whose ``request`` takes
+``ticket=`` (the form DRIVER-CC proposed to APPROVALS; PROVISIONAL until APPROVALS adopts one) calls it itself with
+its own commit; for a port without it, the driver runs the port's whole call as the reveal. Ending the input then
+waits for a reveal already running, at most #432's ``REVEAL_WAIT_S`` (5 seconds), and raises
+``PortWithdrawIncomplete`` past that; once it has returned, no approval of the worker becomes visible (the #402
+reads, round 5, GPT-6 Astra 1 and GPT-6.1 Sol 1; round 6, DeepSeek F1). An approval is kept only if its ticket was
+published. A request read
 while another is with the port waits for it as long at most, then is declined. The port must not call back
 into the driver: ``send`` or ``interrupt`` from inside its call, on the thread that is asking it, is refused
 (``DriverStateError``), and an approval request read there is declined, instead of waiting for ever on a
@@ -134,6 +141,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import hashlib
+import inspect
 import json
 import threading
 import time
@@ -143,6 +151,7 @@ from recursion_core.routes import contract as c
 from recursion_core.routes.codex import _AUTH_ERRORS, _LIMIT_ERRORS, NO_UPDATE_OVERRIDE, _error_info
 from recursion_core.routes.driver import (Declaration, Driver, DriverInputError, DriverStateError, Flags, Handle,
                                           check_input)
+from recursion_core.routes.driver import PUBLISHED, PortWithdrawIncomplete
 from recursion_core.routes.launch import ReadTimeout
 
 ENGINE = "codex"
@@ -184,6 +193,7 @@ class _Session:
         self.write_lock = threading.Lock()
         self.ask_lock = threading.Lock()         # held across one approval request; taken first, before both
         self.closed = False                      # standard input ended: nothing more is ever written
+        self.handle = None                       # the core's handle: the gate's port tickets are its (#432)
         self.flushing: set[str] = set()          # core turns whose held writes are being written now
         self.awaiting: set[str] = set()          # core turns whose turn/start has no answer yet
         self.deferred: dict[str, dict] = {}      # core turn -> its turn/completed, kept until that answer
@@ -243,13 +253,15 @@ class _Session:
         (the #402 reads, round 4: GPT-6 Astra 1). An admitted request is in flight and is waited for, for at
         most ``wait_s`` seconds (None: without a bound; the driver always passes its checked ``port_wait_s``),
         and nothing it opens is kept (round 4, DeepSeek R4-2: a port that waits for a thread which closes the
-        worker no longer holds it for good). Under the present port contract, which has no cancellation, an
-        admitted request may still be delivered just after this returns: an OPEN defect until the port can
-        withdraw (round 5, GPT-6 Astra 1 and GPT-6.1 Sol 1; round 6, DeepSeek F1; lane question Q10)."""
+        worker no longer holds it for good). The gate has sealed the worker's approvals port before this runs and
+        ends its tickets after it (#432), waiting for a reveal already running: once the gate's close returns, no
+        approval of the worker becomes visible (round 5, GPT-6 Astra 1 and GPT-6.1 Sol 1; round 6, F1). Every
+        binding is dropped here too, one the port answered just before included (round 7, DeepSeek F2)."""
 
         with self.write_lock:
             with self.lock:
                 self.closed = True  # from here no request is put to the port and nothing is kept or written
+                self.bindings.clear()  # nor kept: an approval the port answered just before is dropped too
             try:
                 self.process.close_stdin()
             except OSError:
@@ -271,6 +283,7 @@ class CodexDriver(Driver):
         self._port_wait_s = _seconds(port_wait_s, "port_wait_s")  # checked here, not first when the input ends
         self._wall = wall_clock or time.time
         self._approvals = approvals
+        self._port_takes_ticket = _takes_ticket(approvals)  # PROVISIONAL form: request(effect, binding, *, ticket)
         if approvals is not None:
             self.declaration = BRIDGED
 
@@ -306,6 +319,7 @@ class CodexDriver(Driver):
         session = _Session(process, connection_id, owner=self)
         session.session_id, session.run_id = request["session_id"], request["run_id"]
         handle._codex = session
+        session.handle = handle
         deadline = self._clock() + self._start_timeout_s
         try:
             self._call(session, "initialize", {"clientInfo": dict(CLIENT_INFO)}, deadline)
@@ -313,6 +327,9 @@ class CodexDriver(Driver):
             params: dict = {}
             if route.get("model") is not None:
                 params["model"] = route["model"]
+            folder = _workspace_folder(request["workspace"])
+            if folder is not None:  # the folder the engine works in, never the launcher's (the sweep, F1)
+                params["cwd"] = folder
             esid = request["engine_session_id"]
             if esid is None:
                 answer = self._call(session, "thread/start", params, deadline)
@@ -848,22 +865,39 @@ class CodexDriver(Driver):
         # is seen there and the port is not asked, so once ``close`` has returned only a request admitted before
         # it can still reach the port (round 4: GPT-6 Astra 1). The lock orders the admission against ``close``'s
         # record of the end: while a request is being admitted, ``close`` waits for that step (round 5, GPT-6.1
-        # Sol 2; round 6, DeepSeek F2; tested). Under the present port contract, which has no cancellation, a
-        # request already past its admission may still be delivered just after ``close`` returns, and its approval
-        # opens though nothing of it is kept here: an OPEN defect, not an accepted limit, until the port can
-        # withdraw (round 5, GPT-6 Astra 1 and GPT-6.1 Sol 1; round 6, DeepSeek F1; lane question Q10).
+        # Sol 2; round 6, DeepSeek F2: the admission's side is tested; ``close``'s side is also covered by #432's
+        # seal, so moving its record out of the lock changes nothing observable: round 7, DeepSeek F3). After the
+        # admission the request takes the gate's ticket
+        # (``admit_port``, #432). The approval becomes visible only through ``ticket.publish(reveal)``: a port that
+        # takes ``ticket=`` calls it with its own commit; for one that does not, its whole call is the reveal, run
+        # here under the ticket's lock, so once the gate's close has sealed the port no call begins, and a call
+        # already running is waited for (round 5, GPT-6 Astra 1 and GPT-6.1 Sol 1; round 6, DeepSeek F1). An
+        # approval is kept only if its ticket was published; one the port did not publish is withdrawn on return.
         with _waited(session.ask_lock, self._port_wait_s) as taken:
             if not taken:
                 return _DECLINE_NOW  # another request has been with the port longer than port_wait_s
-            session.asking = threading.get_ident()  # first: admitting the request is the last step before the port
+            session.asking = threading.get_ident()  # first: the admission and the ticket come last before the port
             try:
                 with session.lock:
                     if session.closed or turn not in session.core_turn or key in session.resolved:
                         return _ANSWERED  # input ended, the turn ended or the server settled it: nothing is opened
                 try:
-                    approval_id = self._approvals.request(effect, binding)
+                    ticket = self.admit_port(session.handle)
+                except DriverStateError:
+                    return _ANSWERED  # the worker's port is sealed (its input is ending): nothing is opened
+                opened: list = []
+                try:
+                    if self._port_takes_ticket:  # the port reveals the approval itself, through ticket.publish
+                        opened.append(self._approvals.request(effect, binding, ticket=ticket))
+                    else:  # a port without the ticket: its whole call is the reveal, run under the ticket's lock
+                        ticket.publish(lambda: opened.append(self._approvals.request(effect, binding)))
                 except Exception:  # noqa: BLE001 - any failure of the port: deny now, never leave the engine waiting
                     return _DECLINE_NOW
+                finally:
+                    with contextlib.suppress(PortWithdrawIncomplete):
+                        ticket.withdraw(0)  # a ticket the port did not publish is never published later
+                # kept only if the approval was revealed through its ticket; "" is no approval id, declined below
+                approval_id = opened[0] if opened and ticket.state == PUBLISHED else ""
             finally:
                 session.asking = None
             try:  # an id the gate would refuse in approval_answer could never be answered (round 2, R2-3)
@@ -965,6 +999,25 @@ def _adopt(session: _Session, core_turn: str, engine_turn: str) -> bool:
     session.core_turn[engine_turn] = core_turn
     session.flushing.add(core_turn)  # a write sent from now on queues behind the held ones
     return True
+
+
+def _workspace_folder(workspace: dict | None) -> str | None:
+    """The folder a start or resume names as the engine's ``cwd``: common.v1's workspace ``path`` in direct mode,
+    ``worktree_path`` in worktree mode, none without a workspace (the gate has checked its shape)."""
+
+    if workspace is None:
+        return None
+    return workspace["worktree_path"] if workspace["mode"] == "worktree" else workspace["path"]
+
+
+def _takes_ticket(port: object) -> bool:
+    """Whether the approvals port's ``request`` takes ``ticket=`` (the form DRIVER-CC proposed to APPROVALS for
+    #432's withdraw; PROVISIONAL until APPROVALS adopts one). A port that does not is published for by the driver."""
+
+    try:
+        return "ticket" in inspect.signature(port.request).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def _seconds(value: object, field: str) -> float:

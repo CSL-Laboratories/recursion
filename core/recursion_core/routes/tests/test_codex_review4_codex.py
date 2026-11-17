@@ -27,7 +27,7 @@ from recursion_core.routes.tests.test_codex_driver import (AppServer, FakeApprov
 from recursion_core.routes.tests.test_codex_review4 import STUCK, feed, in_thread, kinds, opened, start_answer
 
 ASKING = "session.asking = threading.get_ident()"
-PORT_CALL = "approval_id = self._approvals.request(effect, binding)"
+PORT_CALL = "ticket.publish(lambda: opened.append(self._approvals.request(effect, binding)))"  # #432's reveal
 
 
 def held_at(text):
@@ -78,11 +78,10 @@ class AdmissionTest(unittest.TestCase):
     def test_a_close_before_the_admission_is_seen_and_the_port_is_never_asked(self):
         self.assertEqual(self.close_while_held(ASKING).requests, [])
 
-    def test_a_request_admitted_before_the_close_is_in_flight_and_nothing_it_opens_is_kept(self):
-        # GPT-6.1 Sol's witness of the same boundary: past its admission the request is with the port. It pins
-        # an OPEN defect (round 5, Astra 1 and Sol 1; round 6, DeepSeek F1 and N1): turn it over, with
-        # test_codex_review6.PortWithdrawPendingTest, when the port gains a withdraw (lane question Q10).
-        self.assertEqual(len(self.close_while_held(PORT_CALL).requests), 1)
+    def test_a_request_admitted_but_not_published_before_the_close_reaches_no_port(self):
+        # Turned over (round 5, Astra 1 and Sol 1; round 6, DeepSeek F1 and N1): it pinned GPT-6.1 Sol's round-4
+        # boundary, a request past its admission delivered after the close; with #432's withdraw it reaches no port.
+        self.assertEqual(self.close_while_held(PORT_CALL).requests, [])
 
 
 class QuitDrainTest(unittest.TestCase):

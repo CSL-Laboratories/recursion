@@ -53,7 +53,7 @@ def main():
             if not isinstance(text, str):
                 raise TypeError
             prompt = text
-        except (ValueError, KeyError, IndexError, TypeError):
+        except (ValueError, KeyError, IndexError, TypeError, RecursionError):
             emit(type='system', subtype='stand_in_bad_input')
     emit(type='system', subtype='stand_in_stdin_eof', note='stdin closed; not treated as cancellation')
     if prompt is None:  # started by hand or by a probe: do nothing, start nothing

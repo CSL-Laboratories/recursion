@@ -24,6 +24,19 @@ class StandInPromptTests(unittest.TestCase):
         self.assertTrue(any(line.get('subtype') == 'stand_in_bad_input' for line in lines))
         self.assertEqual(result.returncode, 2)
 
+    def test_deeply_nested_line_is_bad_input_not_a_crash(self):
+        # A few thousand brackets are ordinary bad JSON. One hundred thousand
+        # raises RecursionError on both interpreters used here.
+        depth = 100000
+        result = subprocess.run(
+            [sys.executable, *CHILD_FLAGS, str(STANDIN)],
+            input='[' * depth + '\n',
+            capture_output=True, text=True, timeout=5)
+        lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+        self.assertNotIn('Traceback', result.stderr)
+        self.assertTrue(any(line.get('subtype') == 'stand_in_bad_input' for line in lines))
+        self.assertEqual(result.returncode, 2)
+
 
 if __name__ == '__main__':
     unittest.main()

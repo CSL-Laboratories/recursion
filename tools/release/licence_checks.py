@@ -42,8 +42,11 @@ what an escape leaves of one) opens a code span that the next run of the same le
 `<!--` outside code spans hides the text up to the next `-->`, or is text where the paragraph holds
 none. A fence, a comment or raw HTML that a quote or item holds further down is read as plain lines.
 Then a script or a style element hides what follows, past the block its start tag is in, up to its
-end tag or else to the end of the file, as a browser reads it: each tag counts in raw HTML, and in
-text outside code spans and not escaped.
+end tag or else to the end of the file, as a browser reads it. A start tag counts in raw HTML, and in
+text outside code spans and not escaped, only where an HTML tokenizer would start that element: not
+inside a quoted attribute value, and not in a link's destination or title. The element's source is
+read in order as one stretch, a code span that fell inside it included, when an address is looked for
+there.
 An e-mail address is read from each `@` outwards, as RFC 5322 writes one: its local part is the atoms
 of RFC 5322's atext and the dots that run up to the `@`, or a quoted string ending there with any
 atoms and dots before it; its domain the atoms and dots that run on from the `@`, less a final dot,
@@ -55,8 +58,9 @@ stay as written, so that a character so read beside one of them joins it. There 
 wrapped as Markdown wraps text: in a code span (backtick runs of one length, CONTACT exactly inside),
 in emphasis (runs of * or _ of one length on each side) or struck through (one or two ~ on each
 side), one inside another; three or more ~ are text, and so is a mark escaped or read from a
-character reference. In a comment or a code block nothing is Markdown, so there it must be CONTACT
-exactly. The sentence that names CONTACT is held word for word, so there CONTACT stands bare.
+character reference. In a comment, a fenced code block or indented code nothing is Markdown, so
+there it must be CONTACT exactly, a backslash included. The sentence that names CONTACT is held word
+for word, so there CONTACT stands bare.
 A file larger than SIZE_LIMIT bytes is named, no more than SIZE_LIMIT + 1 bytes of it read (it may
 grow after its size is taken), a missing file as missing, and one that cannot be read as such; the
 work the checks do grows in step with a file's size.
@@ -165,6 +169,7 @@ ITEM = re.compile(r" {0,3}(?:([-+*])|([0-9]{1,9})[.)])( {1,4}|\t)(?=\S)")  # a l
 BREAK = re.compile(r" {0,3}(?:(?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,}|=+[ \t]*)$")  # a rule or an underline
 INLINE = re.compile(r"\\[!-/:-@\[-`{-~]|`+|<!--")  # in a paragraph: an escape, a code span's run, a comment
 SEEN = ("shown", "code", "raw", "indented")  # the kinds of piece a reader sees (see _pieces)
+PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")  # ASCII punctuation, which a backslash may escape
 
 def _read(root: Path, rel: str, found: list[str]) -> bytes | None:
     path = root / rel
@@ -331,38 +336,263 @@ def _end_tag(name: str) -> re.Pattern[str]:
     return re.compile(rf"</{name}[ \t\n\f\r]*>", re.I)
 
 
+def _skip_link_ws(text: str, i: int) -> int:
+    """Past spaces and tabs, and at most one line ending, as CommonMark skips before a link's parts."""
+    n = len(text)
+    while i < n and text[i] in " \t":
+        i += 1
+    if i < n and text[i] == "\n":
+        i += 1
+        while i < n and text[i] in " \t":
+            i += 1
+    return i
+
+
+def _link_title_end(text: str, i: int) -> int | None:
+    """Where the link title that starts at `i` ends, after its closer; None if it never closes."""
+    closer = {"\"": "\"", "'": "'", "(": ")"}[text[i]]
+    i += 1
+    n = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n and text[i + 1] in PUNCT:
+            i += 2
+            continue
+        if text[i] == closer:
+            return i + 1
+        i += 1
+    return None
+
+
+def _link_interior(text: str, i: int) -> tuple[int, int, int] | None:
+    """From just after a link's `(`, the span of its destination and title, and the index after `)`,
+    when the link closes. None when it does not: then a tag there still counts."""
+    n = len(text)
+    start = i
+    i = _skip_link_ws(text, i)
+    if i >= n:
+        return None
+    if text[i] == "<":
+        i += 1
+        while i < n and text[i] not in ">\n":
+            if text[i] == "\\" and i + 1 < n and text[i + 1] in PUNCT:
+                i += 2
+                continue
+            if text[i] == "<":
+                return None  # an unescaped < is not an angle-bracket destination
+            i += 1
+        if i >= n or text[i] != ">":
+            return None
+        i += 1
+    else:
+        depth = 0
+        while i < n:
+            char = text[i]
+            if char == "\\" and i + 1 < n and text[i + 1] in PUNCT:
+                i += 2
+                continue
+            if char in " \t\n":
+                break
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            if ord(char) < 32:
+                return None
+            i += 1
+    i = _skip_link_ws(text, i)
+    if i < n and text[i] in "\"'(":
+        title = _link_title_end(text, i)
+        if title is None:
+            return None
+        i = _skip_link_ws(text, title)
+    if i < n and text[i] == ")":
+        return start, i, i + 1
+    return None
+
+
+def _link_spans(text: str) -> list[tuple[int, int]]:
+    """Where an inline link's destination and title sit: Markdown puts no HTML tag there."""
+    spans: list[tuple[int, int]] = []
+    opens: list[int] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n and text[i + 1] in PUNCT:
+            i += 2
+            continue
+        if text[i] == "[":
+            opens.append(i)
+            i += 1
+            continue
+        if text[i] == "]" and opens and i + 1 < n and text[i + 1] == "(":
+            opens.pop()
+            parsed = _link_interior(text, i + 2)
+            if parsed is not None:
+                start, end, after = parsed
+                spans.append((start, end))
+                i = after
+                continue
+        i += 1
+    return spans
+
+
+def _one_tag(text: str, i: int, spans: list[tuple[int, int]]) -> int:
+    """From a `<` at `i`, the index after that tag, recording each quoted attribute value. `i + 1`
+    when `i` does not open a tag, so a `<script` that follows is still seen."""
+    n = len(text)
+    j = i + 1
+    if j >= n:
+        return j
+    if text[j] == "/":
+        j += 1
+    elif text[j] in "!?":
+        return i + 1
+    if j >= n or not ("A" <= text[j] <= "Z" or "a" <= text[j] <= "z"):
+        return i + 1
+    j += 1
+    while j < n and ("A" <= text[j] <= "Z" or "a" <= text[j] <= "z" or "0" <= text[j] <= "9" or text[j] == "-"):
+        j += 1
+    if j >= n or text[j] not in " \t\n\r\f/>":
+        return i + 1
+    while j < n:
+        while j < n and text[j] in " \t\n\r\f":
+            j += 1
+        if j >= n:
+            break
+        if text[j] == ">":
+            return j + 1
+        if text[j] == "/":
+            return j + 2 if j + 1 < n and text[j + 1] == ">" else j + 1
+        while j < n and text[j] not in " \t\n\r\f=/>":
+            j += 1
+        while j < n and text[j] in " \t\n\r\f":
+            j += 1
+        if j >= n or text[j] != "=":
+            continue
+        j += 1
+        while j < n and text[j] in " \t\n\r\f":
+            j += 1
+        if j >= n:
+            break
+        if text[j] in "\"'":
+            quote = text[j]
+            j += 1
+            start = j
+            while j < n and text[j] != quote:
+                j += 1
+            spans.append((start, j))
+            if j < n:
+                j += 1
+        else:
+            while j < n and text[j] not in " \t\n\r\f>":
+                j += 1
+    return j
+
+
+def _attribute_spans(text: str, markdown: bool) -> list[tuple[int, int]]:
+    """Quoted attribute values, inside which a `<script` or `<style` is not a start tag."""
+    spans: list[tuple[int, int]] = []
+    i, n = 0, len(text)
+    while i < n:
+        if markdown and text[i] == "\\" and i + 1 < n and text[i + 1] in PUNCT:
+            i += 2
+            continue
+        if text[i] != "<":
+            i += 1
+            continue
+        nxt = _one_tag(text, i, spans)
+        i = nxt if nxt > i else i + 1
+    return spans
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """`spans` sorted and overlapping ones joined, so a point is in or out in one walk."""
+    if not spans:
+        return []
+    spans.sort()
+    merged = [spans[0]]
+    for start, end in spans[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _ignore_spans(text: str, markdown: bool) -> list[tuple[int, int]]:
+    """Where `<script` or `<style` is not the start of an element: a quoted attribute, and, in
+    Markdown text, an inline link's destination and title."""
+    spans = _attribute_spans(text, markdown)
+    if markdown:
+        spans.extend(_link_spans(text))
+    return _merge_spans(spans)
+
+
+def _in_spans(spans: list[tuple[int, int]], at: int) -> bool:
+    """Whether `at` lies in one of `spans` (sorted, non-overlapping)."""
+    lo, hi = 0, len(spans)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        start, end = spans[mid]
+        if at < start:
+            hi = mid
+        elif at >= end:
+            lo = mid + 1
+        else:
+            return True
+    return False
+
+
 def _html(pieces: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """`pieces` as a browser reads their HTML, in order. In raw HTML, a comment, `<!--` to the next `-->`,
     is hidden, and one left open hides the rest of the file. A script or a style element is hidden from
-    its start tag to its end tag, past the block the start tag is in, and holds no comment: each tag
-    counts in raw HTML, and in text, not escaped there (in a code span or indented code it is text);
-    with no end tag, the rest of the file is hidden."""
+    its start tag to its end tag, past the block the start tag is in, and holds no comment. A start tag
+    counts in raw HTML, and in text, not escaped there (in a code span or indented code it is text), and
+    not inside a quoted attribute or a link's destination or title; with no end tag, the rest of the file
+    is hidden. The element's source, a code span that fell inside it included, is one hidden piece."""
     found: list[tuple[str, str]] = []
     close: re.Pattern[str] | None = None  # while an element is open: its end tag
+    held: list[str] = []  # that element's source, one piece once its end tag or the file ends
+
+    def flush() -> None:
+        if held:
+            found.append(("hidden", "".join(held)))
+            held.clear()
+
     for index, (kind, piece) in enumerate(pieces):
         at = 0
         tag: re.Match[str] | bool | None = None  # the next start tag in `piece` (False: none), found once
         comment: int | None = None  # where the next comment in raw HTML starts (-1: none), found once
+        spans: list[tuple[int, int]] | None = None
         while at < len(piece):
             if close is not None:  # the element's text, up to its end tag
                 ends = close.finditer(piece, at) if kind in ("shown", "raw") else ()
                 end = next((one for one in ends if kind == "raw" or not _escaped(piece, one.start())), None)
                 stop = end.end() if end else len(piece)
-                found.append(("hidden", piece[at:stop]))
-                close, at = None if end else close, stop
+                held.append(piece[at:stop])
+                if end:
+                    flush()
+                    close = None
+                at = stop
                 continue
             if kind not in ("shown", "raw"):
                 found.append((kind, piece[at:]))
                 break
+            if spans is None:
+                spans = _ignore_spans(piece, kind == "shown")
             if tag is None or tag and tag.start() < at:
                 starts = SCRIPT.finditer(piece, at)
-                tag = next((one for one in starts if kind != "shown" or not _escaped(piece, one.start())), False)
+                tag = next((one for one in starts if not _in_spans(spans, one.start())
+                            and (kind != "shown" or not _escaped(piece, one.start()))), False)
             if kind == "raw" and (comment is None or 0 <= comment < at):
                 comment = piece.find("<!--", at)
             if kind == "raw" and comment >= 0 and (not tag or comment < tag.start()):
                 end = piece.find("-->", comment + 2)  # so <!--> and <!---> are comments too
                 found.append((kind, piece[at:comment]))
                 if end < 0:  # a browser reads the rest of the file into the comment
+                    flush()
                     return found + [("hidden", piece[comment:])] + [("hidden", rest) for _, rest in pieces[index + 1:]]
                 found.append(("hidden", piece[comment:end + 3]))
                 at = end + 3
@@ -370,6 +600,7 @@ def _html(pieces: list[tuple[str, str]]) -> list[tuple[str, str]]:
                 stop = tag.start() if tag else len(piece)
                 found.append((kind, piece[at:stop]))
                 close, at = _end_tag(tag.group(1)) if tag else None, stop
+    flush()
     return found
 
 
@@ -567,8 +798,9 @@ def security_problems(root: Path) -> list[str]:
               for sentence in (f"Report it privately to {CONTACT}.", PUBLIC_ISSUE) if sentence not in text]
     # As a reader sees it, the comments in paragraphs taken out: as written first; then with escapes and
     # character references read outside its code spans and the addresses found, which stay as written, so
-    # that a character read beside one of them joins it.
-    seen = [(kind, piece) for kind, piece in pieces if kind in SEEN]
+    # that a character read beside one of them joins it. Indented code is a code block: an address there
+    # is compared as written, the way a fence's is, not wrapped and not decoded.
+    seen = [(kind, piece) for kind, piece in pieces if kind in SEEN and kind != "indented"]
     written = "".join(piece for _, piece in seen)
     spans = _addresses(written)
     read: list[str] = []
@@ -594,7 +826,7 @@ def security_problems(root: Path) -> list[str]:
         """Where, in the address read[start:end], a character read from an escape or a reference stands."""
         return {at - start for at in literal[bisect.bisect_left(literal, start):bisect.bisect_left(literal, end)]}
 
-    unseen = [piece for kind, piece in pieces if kind not in SEEN]
+    unseen = [piece for kind, piece in pieces if kind not in SEEN or kind == "indented"]
     if (not all(_is_contact(written[start:end], {0} if _escaped(written, start) else set()) for start, end in spans)
             or not all(_is_contact(read[start:end], marks(start, end)) for start, end in _addresses(read))
             or any(piece[start:end] != CONTACT for piece in unseen for start, end in _addresses(piece))):
@@ -1145,7 +1377,11 @@ class BrokenRuleTests(unittest.TestCase):
         shapes = ("a." * 150000, '\\"@x' * 20000, "*" * 40000 + "x@example.invalid" + "*" * 40000,
                   "@[" * 20000, "x " + "<!--" * 20000, "a@" * 20000, '"' * 40000 + "@x", "`x``y" * 15000,
                   "\\`" * 20000, "- a <!--\n" * 3000, "> <!--\n" * 2000, "&#42;a@b\\* " * 5000,
-                  "x <style>\\</style> </style> " * 2500, "<!--" * 20000)
+                  "x <style>\\</style> </style> " * 2500, "<!--" * 20000,
+                  # A quoted attribute, a link destination, many unclosed brackets, and a code span
+                  # inside a script: the scans those shapes take stay linear in the file's size.
+                  '<div title="<script>">' * 200, "[a](http://e.invalid/<script>)" * 150,
+                  "[" * 5000 + "](u/<script>)", "Text <script>`a`</script> " * 150)
         body = text + "\n" + "\n\n".join(shapes) + "\n"
         self.assertLess(len(body.encode("utf-8")), SIZE_LIMIT)
         (self.root / "SECURITY.md").write_text(body, encoding="utf-8", newline="\n")
@@ -1632,6 +1868,59 @@ class BrokenRuleTests(unittest.TestCase):
                     self.assertNamed(r"^SECURITY\.md does not say " + re.escape(repr(sentence)))
                 else:
                     self.assertEqual(self.found(), [])
+
+    def test_a_script_split_by_a_code_span_is_one_address(self) -> None:
+        """R1: one script or style is one stretch of source, so an address split by a code span is named."""
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        quoted = '"audit `desk`"@example.invalid'  # desk sits in a one-backtick span
+        for line in (f"Text <script>{quoted}</script>",
+                     "Text <script>foreign@`example`.invalid</script>",
+                     f"Text <style>{quoted}</style>",
+                     "Text <script>foreign@example.invalid</script>",
+                     quoted):
+            with self.subTest(line=line):
+                (self.root / "SECURITY.md").write_text(text + "\n" + line + "\n", encoding="utf-8", newline="\n")
+                self.assertIn(self.EMAIL_PROBLEM, self.found())
+
+    def test_indented_code_is_read_as_written(self) -> None:
+        """R2: an address in indented code is compared as written, as in a fence; a paragraph may still wrap it."""
+        named = "security@example.invalid"
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8").replace(CONTACT, named)
+        with mock.patch.dict(globals(), {"CONTACT": named}):
+            for line, other in (("    *" + named + "*", True),
+                                ("    " + named + "\\.evil.example", False),
+                                ("    " + named, False),
+                                ("```\n*" + named + "*\n```", True),
+                                ("```\n" + named + "\\.evil.example\n```", False),
+                                ("    *other@example.invalid*", True),
+                                ("    other@example.invalid", True),
+                                ("*" + named + "*", False)):
+                with self.subTest(line=line):
+                    (self.root / "SECURITY.md").write_text(text + "\n" + line + "\n", encoding="utf-8", newline="\n")
+                    if other:
+                        self.assertIn(self.EMAIL_PROBLEM, self.found())
+                    else:
+                        self.assertEqual(self.found(), [])
+
+    def test_a_tag_in_an_attribute_or_a_link_hides_nothing(self) -> None:
+        """R3: a script or a style in an attribute or a link destination leaves the policy in sight."""
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for prefix in ('<div title="<script>">text</div>\n\n',
+                       "<div title='<script>'>text</div>\n\n",
+                       '<div title="<SCRIPT>">text</div>\n\n',
+                       'See <span title="<script>">\n\n',
+                       "See [docs](http://example.invalid/<script>).\n\n",
+                       'See [docs](http://example.invalid/ "<script>").\n\n',
+                       "See ![x](http://example.invalid/<script>).\n\n",
+                       "See [docs](http://example.invalid/ (<script>)).\n\n"):
+            with self.subTest(prefix=prefix):
+                (self.root / "SECURITY.md").write_text(prefix + text, encoding="utf-8", newline="\n")
+                self.assertEqual(self.found(), [])
+        for whole in ("Text <script>\n\n" + text,
+                      '<div title="<script>">text</div>\n\nText <script>\n\n' + text):
+            with self.subTest(whole=whole[:40]):
+                (self.root / "SECURITY.md").write_text(whole, encoding="utf-8", newline="\n")
+                self.assertIn("SECURITY.md has no '## Scope'", self.found())
 
     def named_in(self, source: str, constant: str, old: str, new: str) -> str:
         """`source` with the one top-level assignment of `constant`, found as Python reads it however

@@ -480,6 +480,9 @@ class AcpConnection:
         if not isinstance(text, str) or not text:
             raise AcpInvalid("text")
         _check_deadline(deadline_at)
+        now = self._now()
+        if now is not None and now >= deadline_at:   # a deadline already past starts no turn
+            raise AcpError(c.DEADLINE_EXCEEDED, "the deadline passed before the prompt was sent")
         with self._lock:
             self._open_check()
             if self.session_id is None:
@@ -587,7 +590,11 @@ class AcpConnection:
     # -- reading ----------------------------------------------------------------------------------------
     def feed(self, line: str) -> Fed:
         """One line of the agent's stdout, as a str. Raises ``AcpProtocolError`` for a line that is not JSON-RPC
-        2.0, and ``AcpInvalid`` for a ``line`` that is not a str (the caller's error, not the agent's)."""
+        2.0, and ``AcpInvalid`` for a ``line`` that is not a str (the caller's error, not the agent's).
+
+        With a clock, a turn whose deadline has passed when a line is fed ends HERE, ``deadline_exceeded``
+        (``fed.ended``), before the line is read: its updates are then stray and its answer is dropped as late,
+        exactly as after ``deadline()``. Asking the agent to cancel is the caller's (``AcpSession`` does)."""
         if not isinstance(line, str):
             raise AcpInvalid("feed takes one line of the agent's stdout as a str")
         try:
@@ -602,6 +609,10 @@ class AcpConnection:
         with self._lock:
             if self.closed:
                 return fed
+            turn = self._turn
+            if now is not None and turn is not None and turn.outcome is None and now >= turn.deadline_at:
+                turn.outcome = self._outcome(turn, code=c.DEADLINE_EXCEEDED, detail="recursion deadline")
+                fed.ended = turn.outcome
             if "method" in message:
                 if not isinstance(message["method"], str):
                     raise AcpProtocolError("method is not a string")

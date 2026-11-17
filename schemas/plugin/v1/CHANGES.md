@@ -4,6 +4,18 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `revoked-keys.v1.json` is `1.0-draft.2` (Nov 15, 2026)
+
+Its `timestamp` (a list's `issued_at` and `expires_at`, and each key's `revoked_at`) is now the control
+records' timestamp: a real UTC calendar instant, marked by the keyword `x-instant`, which the conformance
+client checks, with seconds from 00 to 59 in the pattern and in the check. Draft 1 had neither: a list
+that expired on the 31st of February fitted (a reader of the pull request showed it), and so did a second
+of 60. No other definition in this folder spells a time: `manifest.v1.json`, `install.v1.json` and
+`api.v1.json` hold no time, no `format` keyword and no reference into another file. What it breaks: a
+list that names a day that does not exist, or a second of 60. Three bad fixtures (`b07` to `b09`) and two
+tests in `conformance/tests.py` hold it; one of them requires the keyword and the seconds of every
+timestamp in every folder of schemas.
+
 ## `install.v1.json` is `1.0-draft.2` (Nov 13, 2026)
 
 A grant lists only the seven permissions today's reader takes. Draft 1 let a grant list the five names

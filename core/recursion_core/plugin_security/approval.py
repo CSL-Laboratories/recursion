@@ -250,3 +250,9 @@ class ApprovalGate:
                 raise Refused("approval_vetoed")
             self._retire(approval_id, item, "used")
             return digest
+
+    def is_vetoed(self, digest: str) -> bool:
+        """Whether the operator vetoed this digest. The core's commit section asks it again
+        after ``take``, so a veto acknowledged before the commit refuses it (R4-1)."""
+        with self._lock:
+            return digest in self._vetoed

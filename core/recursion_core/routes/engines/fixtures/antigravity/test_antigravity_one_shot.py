@@ -1190,5 +1190,22 @@ class ReviewRoundSevenTest(unittest.TestCase):
                     self.assertNotIn(value, json.dumps(drafts, ensure_ascii=False))
                     self.assertNotIn(value, parser.result["response"])
 
+
+class ReviewRoundEight396Test(unittest.TestCase):
+    """DeepSeek's round-8 LOW on #396 (the NFKC and NFKD spellings of a value): the code is left as it is and the
+    text says exactly what the mask reads. These pin the text and the reach it describes."""
+
+    def test_the_mask_reads_canonical_spellings_and_says_it_does_not_read_compatibility_ones(self) -> None:
+        self.assertEqual(set(ag.mask_forms(("x" + chr(0xB2) + "y",))), {"x" + chr(0xB2) + "y"})    # no NFKC "x2y"
+        self.assertEqual(ag.mask(chr(0xFF4B) + "ey", ag.mask_forms(("key",))), chr(0xFF4B) + "ey")  # fullwidth k
+        self.assertEqual(set(ag.mask_forms(("A" + chr(0x30A),))), {"A" + chr(0x30A), chr(0xC5)})   # NFC, NFD
+        doc = " ".join(ag.mask.__doc__.split())
+        self.assertIn("Its compatibility spellings (NFKC, NFKD", doc)
+        import pathlib
+
+        here = pathlib.Path(ag.__file__).parent / "fixtures" / "antigravity"
+        readme = (here / "README.md").read_text(encoding="utf-8")
+        self.assertIn("never its compatibility spellings (NFKC, NFKD)", " ".join(readme.split()))
+
 if __name__ == "__main__":
     unittest.main()

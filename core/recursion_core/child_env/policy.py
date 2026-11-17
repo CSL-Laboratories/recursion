@@ -381,7 +381,20 @@ def build_child_env(
 
     # Overrides are merged first and then checked by exactly the rules below, like any inherited value.
     # They may only set a name this engine's allowlist already carries: never HOME, PATH or a credential.
-    for name, value in (overrides or {}).items():
+    # Taken once. None is no overrides. A value that is not a mapping, including a falsy list or bool,
+    # is override_malformed rather than treated as empty or left as AttributeError. A mapping that
+    # changes while these pairs are applied is the same refusal: the child must not see a torn set,
+    # and the caller must not see RuntimeError from a live view.
+    if overrides is None:
+        override_items: tuple[tuple[object, object], ...] = ()
+    elif not isinstance(overrides, Mapping):
+        raise EnvRefused(None, "override_malformed")
+    else:
+        try:
+            override_items = tuple(overrides.items())
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            raise EnvRefused(None, "override_malformed") from None
+    for name, value in override_items:
         if not isinstance(name, str) or not isinstance(value, str) or not name or "=" in name or "\0" in name + value:
             raise EnvRefused(None, "override_malformed")
         if (_DENIED.search(name) or name in _OVERRIDE_DENIED_NAMES or name in profile.scrub
@@ -392,6 +405,13 @@ def build_child_env(
         if name in _CARRIED_ONLY_NAMES:
             raise EnvRefused(name, "override_denied")
         env[name] = value
+    if overrides is not None:
+        try:
+            current_items = tuple(overrides.items())
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            raise EnvRefused(None, "override_malformed") from None
+        if current_items != override_items:
+            raise EnvRefused(None, "override_malformed")
 
     # Serialization validity applies to passthrough and NO_PROXY too.
     # Temp values are replaced below, so they never reach the child unchanged.
@@ -451,8 +471,17 @@ def _route_env(profile: EngineProfile, auth_mode: str, route: ChildRoute | None)
         route = ChildRoute()
     if type(route) is not ChildRoute:
         raise EnvRefused(None, "route_malformed")
-    switches = route.provider_switches
-    if not isinstance(switches, (tuple, list, frozenset)) or not all(isinstance(name, str) for name in switches):
+    # Copied once, before the cloud-provider loop. ``for name in switches`` must walk that copy:
+    # the caller's list can be cleared after the emptiness check and before the loop, which used
+    # to return cloud_provider with no switch set. A copy that cannot be taken is route_malformed.
+    raw_switches = route.provider_switches
+    if not isinstance(raw_switches, (tuple, list, frozenset)):
+        raise EnvRefused(None, "route_malformed")
+    try:
+        switches = tuple(raw_switches)
+    except RuntimeError:
+        raise EnvRefused(None, "route_malformed") from None
+    if not all(isinstance(name, str) for name in switches):
         raise EnvRefused(None, "route_malformed")
     # The two subscription base-URL inputs are shape-checked in every mode, so a malformed route never launches;
     # well-formed, they change nothing outside a subscription route that has a base URL.

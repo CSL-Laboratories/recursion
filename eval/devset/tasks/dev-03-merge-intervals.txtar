@@ -1,0 +1,72 @@
+Dev task 03: merge overlapping and touching intervals.
+-- task.json --
+{"id": "dev-03-merge-intervals", "cluster": "dev", "created_at": null,
+ "test_command": ["{python}", "-B", "-m", "unittest", "{hidden_modules}"],
+ "timeout_s": 900, "grading_timeout_s": 120}
+-- prompt.md --
+Implement `merge(intervals)` in `spans/merge.py`.
+
+`intervals` is an iterable of closed intervals `(start, end)` in any order. Return a new list of tuples, sorted by start, where overlapping intervals are merged and so are touching ones (an interval that starts exactly where another ends). Raise `ValueError` if any interval has `start > end`. Do not modify the input. An empty input gives an empty list.
+-- start/spans/__init__.py --
+"""Interval helpers."""
+-- start/spans/merge.py --
+def merge(intervals):
+    """Merge overlapping and touching closed intervals."""
+    raise NotImplementedError
+-- hidden/test_merge.py --
+import unittest
+
+from spans.merge import merge
+
+
+class MergeTests(unittest.TestCase):
+    def test_overlapping(self):
+        self.assertEqual(merge([(1, 3), (2, 6), (8, 10)]), [(1, 6), (8, 10)])
+
+    def test_touching(self):
+        self.assertEqual(merge([(1, 2), (2, 4)]), [(1, 4)])
+
+    def test_unsorted(self):
+        self.assertEqual(merge([(5, 7), (1, 2), (6, 9)]), [(1, 2), (5, 9)])
+
+    def test_contained(self):
+        self.assertEqual(merge([(1, 10), (2, 3)]), [(1, 10)])
+
+    def test_empty(self):
+        self.assertEqual(merge([]), [])
+
+    def test_invalid(self):
+        with self.assertRaises(ValueError):
+            merge([(3, 1)])
+
+    def test_input_untouched(self):
+        given = [(4, 5), (1, 2)]
+        merge(given)
+        self.assertEqual(given, [(4, 5), (1, 2)])
+-- solution/spans/merge.py --
+def merge(intervals):
+    """Merge overlapping and touching closed intervals."""
+    items = sorted(tuple(item) for item in intervals)
+    for start, end in items:
+        if start > end:
+            raise ValueError(f"start after end: {(start, end)!r}")
+    out = []
+    for start, end in items:
+        if out and start <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], end))
+        else:
+            out.append((start, end))
+    return out
+-- wrong/spans/merge.py --
+def merge(intervals):
+    """Merge overlapping and touching closed intervals."""
+    items = sorted(tuple(item) for item in intervals)
+    out = []
+    for start, end in items:
+        if out and start < out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], end))
+        else:
+            out.append((start, end))
+    return out
+-- standin.json --
+{"outcomes": ["solve", "wrong", "solve", "solve", "give_up"]}

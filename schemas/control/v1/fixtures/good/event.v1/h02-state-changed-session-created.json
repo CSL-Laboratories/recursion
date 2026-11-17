@@ -1,0 +1,52 @@
+{
+  "seq": 2,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": null,
+  "turn_id": null,
+  "time": "2026-11-13T07:34:02.074Z",
+  "type": "state.changed",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "entity": "session",
+    "entity_id": "ses-7f3a9c2e51d04b6a",
+    "post_image": {
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "created_at": "2026-11-13T07:30:00.000Z",
+      "tenant": "t1",
+      "principal": {
+        "kind": "owner",
+        "id": "local"
+      },
+      "parent_session_id": null,
+      "spawn_kind": "root",
+      "state": "idle",
+      "workspace": {
+        "path": "/home/dev/projects/atlas",
+        "mode": "direct",
+        "base_ref": null,
+        "worktree_path": null
+      },
+      "route": {
+        "engine": "claude_code",
+        "model": "claude-sonnet-5-5",
+        "connection": {
+          "kind": "subscription",
+          "id": "personal-max"
+        }
+      },
+      "engine_session_id": null,
+      "worker": null,
+      "active_turn_id": null,
+      "turns": [],
+      "budget": {
+        "cap_usd": 0
+      },
+      "revision": 1
+    },
+    "post_image_sha256": "05afb1c8df8c3f930ed6f707ba86b8e2fa71015a097e53d3fb8ac1d3e022bbdf",
+    "reason": "commit",
+    "coalesced": null
+  },
+  "command_id": "tui-7c1e.0001"
+}

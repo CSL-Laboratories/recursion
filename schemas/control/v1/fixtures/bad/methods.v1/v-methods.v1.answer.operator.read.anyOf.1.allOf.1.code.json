@@ -1,0 +1,12 @@
+{
+  "method": "operator.read",
+  "params": {
+    "command": {
+      "command": "operator.conditions.inspect"
+    }
+  },
+  "answer": {
+    "code": "method_unknown",
+    "detail": "not_implemented"
+  }
+}

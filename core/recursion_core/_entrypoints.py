@@ -1,11 +1,13 @@
 """The ``recursiond`` console script (distribution ``csl-recursion``). Standard library only.
 
     recursiond install | upgrade | uninstall    the per-user systemd unit (control/commands/setup.py)
+    recursiond doctor [--json]                  report this machine; no daemon is required
     recursiond serve [daemon options]           run the daemon in the foreground
 
 Linux only: on any other system every command refuses with ``platform_unsupported`` (exit 1)
-before anything else is imported; ``--help`` still prints. Output is one JSON object per command;
-0 is ok, 1 a refusal, 2 a usage error.
+before anything else is imported; ``--help`` still prints. install, upgrade and uninstall print
+one JSON object. ``doctor --json`` prints one report; without ``--json`` it prints one line per
+check. 0 is ok, 1 a refusal or a report that has a fail, 2 a usage error.
 
 ``serve`` checks the build before it imports anything of the daemon's: the daemon needs
 free-threaded CPython 3.14 (``build_not_free_threaded`` otherwise). It then replaces this process
@@ -28,7 +30,31 @@ PROG = "recursiond"
 DAEMON_MODULE = "recursion_core.daemon"
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
 _DESCRIPTION = ("Recursion's per-user daemon and its installer. Linux only. "
-                "Each command prints one JSON object; \"code\": \"ok\" is success.")
+                "install, upgrade and uninstall each print one JSON object. "
+                "doctor prints a report.")
+
+
+def _configure_doctor(parser) -> None:
+    parser.add_argument("--json", action="store_true",
+                        help="print one doctor report; without this, print one line per check")
+
+
+def _handle_doctor(args) -> int:
+    import recursion_core.setup.doctor as doctor
+
+    report = doctor.run(None)
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        sys.stdout.write(doctor.text(report))
+    return doctor.exit_code(report)
+
+
+# Later cogs append a row: (name, help, configure, handle). configure adds that command's options.
+SUBCOMMANDS = (
+    ("doctor", "report what is ok, warn, fail or unknown on this machine",
+     _configure_doctor, _handle_doctor),
+)
 
 
 class _Usage(Exception):
@@ -53,6 +79,11 @@ def main(argv=None) -> int:
     setup.parser(commands)
     commands.add_parser("serve", help="run the daemon in the foreground; options after it go to the daemon",
                         add_help=False)
+    handlers = {}
+    for name, help_text, configure, handle in SUBCOMMANDS:
+        sub = commands.add_parser(name, help=help_text)
+        configure(sub)
+        handlers[name] = handle
     try:
         args = parser.parse_args(argv)
     except _Usage as exc:
@@ -64,6 +95,8 @@ def main(argv=None) -> int:
         parser.print_usage(sys.stderr)
         print("usage error: a command is required", file=sys.stderr)
         return EXIT_USAGE
+    if args.command in handlers:
+        return handlers[args.command](args)
     args.out, args.err = sys.stdout, sys.stderr
     return setup.dispatch(args, None)
 

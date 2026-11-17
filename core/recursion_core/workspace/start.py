@@ -29,6 +29,15 @@ its repository (a run asked to work in ``<top>/pkg`` works in ``<worktree>/pkg``
 unit-safe word. So a repository named ``my project`` may be worked on in worktree mode, and not in direct mode,
 where the launcher would refuse it after the record exists.
 
+THE PLACE of that worktree is chosen at spawn, not here. ``place.choose`` measures the machine: whether a
+candidate is on the same filesystem as the repository, whether a reflink or a hardlink can be made there, and
+how much space is free. It picks the cheapest mechanism that filesystem can carry out, in a directory outside
+the repository, and it does not write the repository's git common directory. A linked worktree, which does
+write that directory, is used only when the caller passes ``linked=True``. The engines' own worktree switching
+is off, and the ``Place`` returned is frozen, so the identity bound at spawn stays. This normaliser still
+judges unit-safety of ``<state_dir>/worktrees/<run_id>`` above, the only spelling it can see before a run id
+exists. The launcher's unit-path check applies to the directory ``choose`` returns.
+
 IT IS PURE. It creates no folder, worktree or branch, writes no file and appends no event: it reads the file
 system (``stat``, ``realpath``, and in a mode other than direct the ``.git`` files and folders and the
 repository's own config files ``validate.git_work_tree`` reads, the way git's own discovery reads them) and

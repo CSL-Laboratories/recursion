@@ -178,7 +178,11 @@ BOOLEANS = {'true': True, 'TRUE': True, 'yes': True, 'on': True, '1': True, '2':
             '-2147483648': None, '0x80000000': None, '020000000000': None, '1 k': None, '"1 "': None, '"yes "': None,
             '1kb': None, '1e3': None, '"\\b1"': None, '- 1': None, '+-1': None, '1t': None, 'tr\\ue': None,
             '" true"': None, '9' * 5000: None, '1' * 4400: None, '0' * 5000: False, '-' + '0' * 5000 + '1': True,
-            '0' * 5000 + 'k': False, '0' + '7' * 5000: None}
+            '0' * 5000 + 'k': False, '0' + '7' * 5000: None,
+            # 31 significant bits is still an int (the fourth reads). One more bit is not.
+            '0b' + '1' * 31: True, '0b' + '0' * 5001 + '1' * 31: True,
+            '0x' + '0' * 5001 + '7fffffff': True, '0' * 5001 + '17777777777': True,
+            '0b1' + '0' * 31: None}
 
 # Config files, and what git 2.43 made of each, asked from the folder they name: that top taken, the setting
 # ignored, or the file refused. <W> is the folder as a quoted value, <W1> and <W2> its two halves, <RAW> its path

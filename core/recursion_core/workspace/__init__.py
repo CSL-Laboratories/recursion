@@ -10,6 +10,10 @@ What is here now (pull request 1, new files only, nothing registered with a runn
 ``validate``  the checks on a folder (``validate.py``).
 ``start``     the start registrant's pure part (S6): a start request's ``workspace`` turned into the run's
               launch snapshot, or a typed refusal; it creates and writes nothing.
+``place``     the directory a run's worktree is put in, chosen at spawn from what the machine measures.
+              The default is outside the repository and does not write its git common directory. A linked
+              worktree is only an explicit setting. The engines' own worktree switching is off, and the
+              identity returned is frozen.
 ``grant``     ``grant(path, uid)`` and ``revoke(grant_id)``, the per-run access to a folder for another user
               that lane STOP builds on, and the ``workspace.grant`` and ``workspace.revoke`` events.
 

@@ -757,7 +757,9 @@ class PluginHost:
         if self._closed:  # the host shut down while this read ran or waited: its answer is not used
             return 503, {'error': SHUT_DOWN}
         if self.health.poisoned:
-            # D2: the call that turned the GIL on answers 503, as every later read does; its answer is not used.
+            # D2: a call that has returned when the GIL is read answers 503. One that passes its
+            # deadline answers 504, and the poison lands when that call returns, so every later
+            # read answers 503. The timed-out answer is not used.
             return 503, {'error': POISONED}
         if isinstance(outcome, tuple):
             return outcome

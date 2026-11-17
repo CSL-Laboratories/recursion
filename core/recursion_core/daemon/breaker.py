@@ -127,12 +127,14 @@ class DurableRouteBreaker:
         self._lock = threading.Lock()
         self._restored = set()  # connections whose stored trip this process has already taken over
         self._leases = {}       # route probe token -> (the store's probe lease, the trip generation it was taken at)
-        # E01: every connection trip this daemon reports to the store counts one generation of that
-        # connection. A store lease is taken, a trip reported and a trip cleared under a fresh lease
-        # only while holding ``_trip_lock``, so "no newer trip since the lease" is checked and acted
-        # on as one step. Never taken while ``_lock`` is held.
+        # E01: every connection trip this instance attempts to report to the store counts one
+        # generation of that connection, including a report the store then does not take. A store
+        # lease is taken, a trip reported and a trip cleared under a fresh lease only while holding
+        # ``_trip_lock``, so "no newer trip since the lease" is checked and acted on as one step.
+        # Never taken while ``_lock`` is held. The count belongs to this instance: another
+        # ``DurableRouteBreaker`` on the same store does not share it.
         self._trip_lock = threading.Lock()
-        self._trips = {}        # connection -> how many trips this process has reported for it
+        self._trips = {}        # connection -> how many trip reports this instance has attempted
 
     # -- the store, with its refusals and errors kept out of a route request -------------------
     def tripped(self, connection):
@@ -224,6 +226,7 @@ class DurableRouteBreaker:
                 limit = outcome.get('limit')
                 if isinstance(limit, dict) and limit.get('scope') == 'connection':
                     with self._trip_lock:  # a newer trip: no older probe may clear it under a fresh lease
+                        # Counted on the attempt, before the store takes the report.
                         self._trips[connection] = self._trips.get(connection, 0) + 1
                         self._stored.report(connection, c.PLAN_LIMIT)  # also drops any lease the store held
             elif effect == 'closed':
@@ -250,10 +253,13 @@ class DurableRouteBreaker:
         ``leased`` is the probe's store lease with the trip generation it was taken at, or None. The
         route breaker closes only for its own live probe (leased for the run's deadline plus grace).
         The store's lease is one length for every probe; when it ran out first, the trip is cleared
-        under a fresh store lease, and that is logged. Never when this daemon reported a newer trip of
-        the connection after the probe's lease was taken (a newer typed limit also drops that lease):
-        the probe's success says nothing about it, so it stays and the caller fences the connection
-        again (E01). A probe that took no lease cleared nothing then and clears nothing now.
+        under a fresh store lease, and that is logged. Never when this instance attempted a newer trip
+        report for the connection after the probe's lease was taken (a newer typed limit also drops
+        that lease): the probe's success says nothing about it, so it stays and the caller fences the
+        connection again (E01). The generation is this instance's count of report attempts. Another
+        ``DurableRouteBreaker`` on the same store, in this process or another, has its own count and
+        can still clear a trip this instance would have kept. A probe that took no lease cleared
+        nothing then and clears nothing now.
         """
         if leased is None:
             log.error('a successful probe held no breaker store lease; the stored trip stays')

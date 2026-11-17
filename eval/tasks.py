@@ -13,6 +13,7 @@ work tree only after the engine has finished, over whatever the engine left at t
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -107,8 +108,7 @@ class Task:
             _clear_the_way(work, path)
             path.parent.mkdir(parents=True, exist_ok=True)
             _release_shared_name(path)
-            path.write_bytes(data)
-            path.chmod(self.modes.get(name, 0o644))
+            _write_private(path, data, self.modes.get(name, 0o644))
 
     def apply_solution(self, work: Path) -> None:
         """The reference solution, for validation and for the stand-in engine only."""
@@ -193,17 +193,91 @@ def apply_files(work: Path, files: dict, modes: dict | None = None) -> None:
         _clear_the_way(work, path)
         path.parent.mkdir(parents=True, exist_ok=True)
         _release_shared_name(path)
-        path.write_bytes(data if isinstance(data, bytes) else data.encode("utf-8"))
-        path.chmod((modes or {}).get(name, 0o644))
+        payload = data if isinstance(data, bytes) else data.encode("utf-8")
+        _write_private(path, payload, (modes or {}).get(name, 0o644))
+
+
+_WRITE_ATTEMPTS = 8
+_TAKEN = {
+    errno.EEXIST,
+    errno.ELOOP,
+    errno.ENXIO,
+    errno.EISDIR,
+    errno.ENOTDIR,
+    errno.ENOTEMPTY,
+}
+
+
+def _unlink_name(path: Path) -> None:
+    """Remove ``path`` without following it. A real directory is removed as a tree."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return
+    if stat.S_ISDIR(info.st_mode):
+        import shutil
+        shutil.rmtree(path, ignore_errors=True)
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _write_private(path: Path, data: bytes, mode: int) -> None:
+    """Create a new private regular file and write ``data`` through that descriptor.
+
+    ``O_NOFOLLOW`` refuses a symlink. ``O_EXCL`` refuses a name that already exists, including a
+    FIFO, so the open does not wait for another process. ``O_NONBLOCK`` is the same refusal if a
+    FIFO is opened anyway. A taken name is removed and the create is retried. The descriptor is
+    kept only when ``fstat`` shows a regular file with one link, and its mode is set with
+    ``fchmod`` on that descriptor.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    last = "the name stayed taken"
+    for _ in range(_WRITE_ATTEMPTS):
+        try:
+            fd = os.open(path, flags, 0o600)
+        except OSError as exc:
+            if exc.errno in _TAKEN:
+                _unlink_name(path)
+                last = exc.strerror or last
+                continue
+            raise TaskError(f"cannot write {path.name}: {exc.strerror}") from None
+        discard = False
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                discard = True
+                last = "not a private regular file"
+                continue
+            os.fchmod(fd, mode & 0o777)
+            view = memoryview(data)
+            while len(view):
+                wrote = os.write(fd, view)
+                if wrote <= 0:
+                    raise TaskError(f"cannot write {path.name}")
+                view = view[wrote:]
+            return
+        except TaskError:
+            raise
+        except OSError as exc:
+            raise TaskError(f"cannot write {path.name}: {exc.strerror}") from None
+        finally:
+            os.close(fd)
+            if discard:
+                _unlink_name(path)
+    raise TaskError(f"cannot write {path.name}: {last}")
 
 
 def _release_shared_name(path: Path) -> None:
-    """Unlink a name that must not be opened for writing, then the caller creates a new file.
+    """Unlink a name that must not be opened for writing.
 
     Opening a FIFO or a socket for write waits for another process, and that wait is not the grading
     deadline. A hard-linked regular file shares its inode with another name, which may lie outside the
-    work tree; writing it in place would change that other file. A private regular file is left to be
-    replaced in place, as before.
+    work tree. This only removes a name that is already the wrong kind of object. The bytes are written
+    by ``_write_private``, which creates a new file with ``O_NOFOLLOW`` and ``O_EXCL`` so a name planted
+    after this returns is not followed and is not waited on.
     """
     try:
         info = path.lstat()

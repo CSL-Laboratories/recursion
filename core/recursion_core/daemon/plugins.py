@@ -493,6 +493,12 @@ class PluginHost:
         path = private_dir(self._state / STORE_DIR) / REVOCATION_FILE
         if not os.path.lexists(path):
             create_revocation_store(str(path))
+        # The directory check does not cover this file. A symlink would be followed by the
+        # store open, including a link to a 0666 file in a shared directory (E21).
+        info = os.lstat(path)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022):
+            raise PluginRefused('revocation_store_untrusted',
+                                'must be an operator-owned regular file, not a symlink and not group/other writable')
         return str(path)
 
     def _compose_core(self, install, breaker):

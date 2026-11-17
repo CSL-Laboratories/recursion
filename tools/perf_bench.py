@@ -66,8 +66,10 @@ class BenchError(RuntimeError):
 def install_network_guard() -> None:
     """Block connect, connect_ex, sendto, sendmsg, and create_connection.
 
-    A benchmark must not reach a live provider. This is not a full network
-    sandbox: send and sendall on an already connected socket are not covered.
+    A benchmark must not reach a live provider. This is a tripwire, not a
+    sandbox. send and sendall on an already connected socket are not covered.
+    The C socket type, the socket base class, a socket created before the
+    guard, and a child process remain reachable.
     """
     global _GUARD_INSTALLED
     if _GUARD_INSTALLED:
@@ -106,7 +108,10 @@ def _drop_imported_product() -> None:
 
 
 def load_product(root: Path):
-    """Import the planning kernel from ``root``, not from a previously imported tree."""
+    """Import the planning kernel from ``root``, not from a previously imported tree.
+
+    One caller at a time. Two overlapping callers can still mix kernels.
+    """
     sys.dont_write_bytecode = True
     root = root.resolve()
     if not (root / "scripts" / "__init__.py").is_file():
@@ -250,6 +255,8 @@ def load_workload() -> dict:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
         raise BenchError(f"cannot read {WORKLOAD_PATH.name}: {exc}") from exc
+    except RecursionError as exc:
+        raise BenchError(f"cannot read {WORKLOAD_PATH.name}: workload is not valid JSON") from exc
     if not isinstance(payload, dict):
         raise BenchError("workload must be an object")
     if not isinstance(payload.get("command_json"), str) or not payload["command_json"]:

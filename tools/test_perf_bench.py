@@ -821,6 +821,306 @@ class SweepRegressionTests(unittest.TestCase):
             code = perf_ci.main()
         self.assertEqual(code, 0, stderr.getvalue())
 
+    def test_finite_ratio_with_a_nonfinite_delta_is_refused(self):
+        pairs = (
+            ({"sample": 1.0}, {"sample": 1e307}),
+            ({"sample": 1e-308}, {"sample": 1.0}),
+        )
+        for base, head in pairs:
+            with self.subTest(base=base, head=head):
+                ratio = next(iter(head.values())) / next(iter(base.values()))
+                self.assertTrue(math.isfinite(ratio), ratio)
+                with self.assertRaises(perf_compare.CompareError) as caught:
+                    perf_compare.compare_reports(_report(base), _report(head))
+                self.assertIn("delta is not finite", str(caught.exception))
+
+    def test_compare_error_from_main_is_one_line(self):
+        import contextlib
+        import io
+        name = "row\n::error::SYNTHETIC"
+
+        def side(median):
+            report = _report({name: median})
+            report["benchmarks"][0]["rounds"] = 1
+            report["benchmarks"][0]["iterations_per_round"] = 1
+            return report
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+              mock.patch.object(perf_ci, "_worktree", return_value=Path("/unused/synthetic-worktree")),
+              mock.patch.object(perf_ci, "run_paired", return_value=(side(1.0), side(1e307))),
+              mock.patch.object(perf_ci, "_run", return_value=subprocess.CompletedProcess([], 0, "", "")),
+              contextlib.redirect_stdout(stdout),
+              contextlib.redirect_stderr(stderr)):
+            code = perf_ci.main()
+        err, out = stderr.getvalue(), stdout.getvalue()
+        self.assertEqual(code, 1, err)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("PERF_CI_FAIL:", err)
+        self.assertEqual(err.count("\n"), 1, err)
+        self.assertNotIn("\n::error::", err)
+        self.assertNotIn("\n::error::", out)
+        self.assertFalse(any(line.startswith("::error::") for line in (err + out).splitlines()))
+
+    def test_print_side_escapes_a_benchmark_name(self):
+        import contextlib
+        import io
+        report = _report({"n\n::error::SYNTHETIC": 0.001})
+        report["benchmarks"][0]["rounds"] = 1
+        report["benchmarks"][0]["iterations_per_round"] = 1
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            perf_ci._print_side("head", report)
+        text = output.getvalue()
+        self.assertEqual(text.count("\n"), 1, text)
+        self.assertIn("%0A", text)
+        self.assertFalse(any(line.startswith("::error::") for line in text.splitlines()))
+
+    def test_hostile_baseline_label_stays_one_line(self):
+        report = perf_compare.compare_reports(_report({"sample": 1.0}), _report({"sample": 1.1}))
+        text = perf_compare.render_markdown(
+            report, baseline_label="base\n::error::SYNTHETIC", candidate_label="head",
+        )
+        self.assertIn("%0A", text)
+        self.assertNotIn("\n::error::", text)
+        self.assertFalse(any(line.startswith("::error::") for line in text.splitlines()))
+
+    def test_remove_refusal_escapes_a_newline(self):
+        failed = subprocess.CompletedProcess([], 1, "", "fatal: locked\n::error::SYNTHETIC")
+        with mock.patch.object(perf_ci, "_run", return_value=failed):
+            with self.assertRaises(perf_ci.PerfCIError) as caught:
+                perf_ci._remove_worktree(Path("/unused/synthetic-worktree"))
+        message = str(caught.exception)
+        self.assertNotIn("\n", message)
+        self.assertIn("%0A", message)
+        self.assertNotIn("%250A", message)
+        self.assertFalse(any(line.startswith("::error::") for line in message.splitlines()))
+
+    def test_git_deadline_must_be_finite(self):
+        with self.assertRaises(perf_ci.PerfCIError) as caught:
+            perf_ci._run(["git", "status"], cwd=ROOT, timeout=float("inf"))
+        self.assertIn("deadline", str(caught.exception))
+
+    def test_run_turns_a_git_timeout_into_a_perf_error(self):
+        def boom(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 15)
+
+        with mock.patch.object(perf_ci.subprocess, "run", side_effect=boom):
+            with self.assertRaises(perf_ci.PerfCIError) as caught:
+                perf_ci._run(["git", "status"], cwd=ROOT)
+        message = str(caught.exception)
+        self.assertIn("timed out", message)
+        self.assertNotIn("\n", message)
+
+    def test_three_git_deadlines_stay_under_the_step_limit(self):
+        self.assertGreater(perf_ci.GIT_TIMEOUT_SECONDS, 0)
+        self.assertLessEqual(3 * perf_ci.GIT_TIMEOUT_SECONDS, 55)
+
+    def test_worktree_add_timeout_removes_the_directory(self):
+        import contextlib
+        import io
+        import shutil
+        made = {}
+
+        def fake_run(cmd, **kwargs):
+            if "add" in cmd:
+                target = Path(cmd[cmd.index("--detach") + 1])
+                target.mkdir(parents=True)
+                made["path"] = target
+                raise subprocess.TimeoutExpired(cmd, 20)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        stderr = io.StringIO()
+        try:
+            with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+                  mock.patch.object(perf_ci, "_run", side_effect=fake_run),
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(stderr)):
+                code = perf_ci.main()
+            self.assertEqual(code, 1, stderr.getvalue())
+            self.assertIn("path", made)
+            self.assertFalse(made["path"].exists())
+            text = stderr.getvalue()
+            self.assertNotIn("Traceback", text)
+            self.assertIn("timed out", text)
+            self.assertFalse(any(line.startswith("::error::") for line in text.splitlines()))
+        finally:
+            path = made.get("path")
+            if path is not None and path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_worktree_remove_timeout_removes_the_directory(self):
+        import contextlib
+        import io
+        import shutil
+        made = {}
+
+        def fake_run(cmd, **kwargs):
+            if "add" in cmd:
+                target = Path(cmd[cmd.index("--detach") + 1])
+                target.mkdir(parents=True)
+                made["path"] = target
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if "remove" in cmd:
+                raise subprocess.TimeoutExpired(cmd, 20)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        report = _report({"sample": 0.001})
+        report["benchmarks"][0]["rounds"] = 1
+        report["benchmarks"][0]["iterations_per_round"] = 1
+        stderr = io.StringIO()
+        try:
+            with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+                  mock.patch.object(perf_ci, "_run", side_effect=fake_run),
+                  mock.patch.object(perf_ci, "run_paired", return_value=(report, report)),
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(stderr)):
+                code = perf_ci.main()
+            self.assertEqual(code, 1, stderr.getvalue())
+            self.assertFalse(made["path"].exists())
+            text = stderr.getvalue()
+            self.assertNotIn("Traceback", text)
+            self.assertIn("timed out", text)
+            self.assertEqual(text.count("\n"), 1, text)
+        finally:
+            path = made.get("path")
+            if path is not None and path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_failed_worktree_add_removes_the_directory(self):
+        import contextlib
+        import io
+        import shutil
+        made = {}
+
+        def fake_run(cmd, **kwargs):
+            if "add" in cmd:
+                target = Path(cmd[cmd.index("--detach") + 1])
+                target.mkdir(parents=True)
+                made["path"] = target
+                return subprocess.CompletedProcess(cmd, 1, "", "fatal: boom\n::error::SYNTHETIC")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        stderr = io.StringIO()
+        try:
+            with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+                  mock.patch.object(perf_ci, "_run", side_effect=fake_run),
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(stderr)):
+                code = perf_ci.main()
+            self.assertEqual(code, 1, stderr.getvalue())
+            self.assertFalse(made["path"].exists())
+            text = stderr.getvalue()
+            self.assertNotIn("Traceback", text)
+            self.assertIn("%0A", text)
+            self.assertFalse(any(line.startswith("::error::") for line in text.splitlines()))
+        finally:
+            path = made.get("path")
+            if path is not None and path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_workload_recursion_is_a_bench_error(self):
+        nest = '{"command_json":' + ("[" * 10000) + '"x"' + ("]" * 10000) + "}"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "workload.json"
+            path.write_text(nest, encoding="utf-8")
+            with mock.patch.object(perf_bench, "WORKLOAD_PATH", path):
+                with self.assertRaises(perf_bench.BenchError):
+                    perf_bench.load_workload()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "workload.json"
+            path.write_text("{}", encoding="utf-8")
+            with (mock.patch.object(perf_bench, "WORKLOAD_PATH", path),
+                  mock.patch.object(perf_bench.json, "loads", side_effect=RecursionError("synthetic"))):
+                with self.assertRaises(perf_bench.BenchError) as caught:
+                    perf_bench.load_workload()
+            self.assertIn("not valid JSON", str(caught.exception))
+            self.assertNotIn("synthetic", str(caught.exception))
+
+    def test_subprocess_timeout_on_add_removes_the_directory(self):
+        import contextlib
+        import io
+        import shutil
+        made = {}
+
+        def fake(cmd, **kwargs):
+            if "add" in cmd:
+                target = Path(cmd[cmd.index("--detach") + 1])
+                target.mkdir(parents=True)
+                made["path"] = target
+                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 15)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        stderr = io.StringIO()
+        try:
+            with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+                  mock.patch.object(perf_ci.subprocess, "run", side_effect=fake),
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(stderr)):
+                code = perf_ci.main()
+            self.assertEqual(code, 1, stderr.getvalue())
+            self.assertIn("path", made)
+            self.assertFalse(made["path"].exists())
+            text = stderr.getvalue()
+            self.assertNotIn("Traceback", text)
+            self.assertIn("timed out", text)
+            self.assertEqual(text.count("\n"), 1, text)
+            self.assertFalse(any(line.startswith("::error::") for line in text.splitlines()))
+        finally:
+            path = made.get("path")
+            if path is not None and path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_subprocess_timeout_on_remove_removes_the_directory(self):
+        import contextlib
+        import io
+        import shutil
+        made = {}
+
+        def fake(cmd, **kwargs):
+            if "add" in cmd:
+                target = Path(cmd[cmd.index("--detach") + 1])
+                target.mkdir(parents=True)
+                made["path"] = target
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if "remove" in cmd:
+                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 15)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        report = _report({"sample": 0.001})
+        report["benchmarks"][0]["rounds"] = 1
+        report["benchmarks"][0]["iterations_per_round"] = 1
+        stderr = io.StringIO()
+        try:
+            with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+                  mock.patch.object(perf_ci.subprocess, "run", side_effect=fake),
+                  mock.patch.object(perf_ci, "run_paired", return_value=(report, report)),
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(stderr)):
+                code = perf_ci.main()
+            self.assertEqual(code, 1, stderr.getvalue())
+            self.assertFalse(made["path"].exists())
+            text = stderr.getvalue()
+            self.assertNotIn("Traceback", text)
+            self.assertIn("timed out", text)
+            self.assertEqual(text.count("\n"), 1, text)
+        finally:
+            path = made.get("path")
+            if path is not None and path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_guard_sentence_names_the_remaining_gaps(self):
+        text = " ".join(perf_bench.install_network_guard.__doc__.split())
+        self.assertIn("tripwire", text)
+        self.assertIn("base class", text)
+        self.assertIn("before the guard", text)
+        self.assertIn("child process", text)
+
+    def test_load_product_sentence_names_one_caller(self):
+        text = " ".join(perf_bench.load_product.__doc__.split())
+        self.assertIn("One caller at a time", text)
+        self.assertIn("mix kernels", text)
+
 
 if __name__ == "__main__":
     unittest.main()

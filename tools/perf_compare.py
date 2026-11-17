@@ -101,6 +101,8 @@ def compare_reports(
             raise CompareError(f"benchmark {name} ratio is not finite")
         delta_s = head_s - base_s
         delta_pct = (ratio - 1.0) * 100.0
+        if not math.isfinite(delta_pct):
+            raise CompareError(f"benchmark {name} delta is not finite")
         # Both gates are strict: equal to 10% or equal to the floor is not over it.
         over_ratio = ratio > limit
         over_floor = delta_s > floor

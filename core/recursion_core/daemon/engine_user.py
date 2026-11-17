@@ -41,7 +41,22 @@ SESSION_LAUNCHERS = frozenset({
     'su', 'sudo', 'sudoedit', 'runuser', 'login', 'machinectl', 'pkexec', 'doas',
     'ssh', 'sshd', 'systemd-run0', 'run0',
 })
-PAM_PROPERTY = re.compile(r'PAMName=', re.IGNORECASE)
+
+
+def _is_pam_name_property(arg: str) -> bool:
+    """True when this argv element sets the unit property PAMName.
+
+    The property key is compared, not searched. ``PAMName=`` inside another
+    property's value (an ``Environment=`` assignment, for example) does not
+    open a PAM session. The value is never copied into a refusal.
+    """
+    text = arg.split('\n', 1)[0].split('\r', 1)[0]
+    lowered = text.lower()
+    for prefix in ('--property=', '-p'):
+        if lowered.startswith(prefix):
+            name = text[len(prefix):].split('=', 1)[0]
+            return name.lower() == 'pamname'
+    return text.split('=', 1)[0].lower() == 'pamname'
 
 
 class EngineManagerPresent(RuntimeError):
@@ -50,6 +65,23 @@ class EngineManagerPresent(RuntimeError):
 
 class SessionLaunchRefused(ValueError):
     """The launch would open a PAM/logind session."""
+
+
+def _runtime_path_present(path: Path) -> bool:
+    """Whether ``path`` is present. Only ENOENT is absence.
+
+    ``os.path.lexists`` turns EACCES into False, so a runtime directory the
+    operator cannot search was reported as a missing manager socket or bus.
+    Any other OSError fails closed: the path was not shown to be absent.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise EngineManagerPresent(
+            f'runtime path cannot be inspected ({type(exc).__name__})') from exc
+    return True
 
 
 def refuse_session_launch(argv):
@@ -67,8 +99,8 @@ def refuse_session_launch(argv):
         # PAMName= opens a PAM session for the unit.
         head = argv[1:argv.index('--')] if '--' in argv else argv[1:]
         for arg in head:
-            if PAM_PROPERTY.search(arg):
-                raise SessionLaunchRefused(f'systemd-run {arg} opens a PAM session; refused')
+            if _is_pam_name_property(arg):
+                raise SessionLaunchRefused('systemd-run PAMName property opens a PAM session; refused')
 
 
 def check_engine_no_user_manager(user, uid, *, operator_uid=None, call=subprocess.run,
@@ -76,7 +108,7 @@ def check_engine_no_user_manager(user, uid, *, operator_uid=None, call=subproces
     """Read-only B9 pass probe for the engine user. Returns evidence; raises on doubt.
 
     Pass needs all three: `loginctl show-user <engine> -p Linger` says `no` or logind
-    has no such user; `systemctl is-active user@<uid>.service` says `inactive`;
+    has no such user; `systemctl is-active user@<uid>.service` says `inactive` and exits 3;
     `<runtime_root>/<uid>/systemd/private` does not exist. Anything else, including
     a probe that cannot run, fails closed. Masking user@<uid>.service is not part of
     the bar: it is proposed hardening, unmeasured.
@@ -110,12 +142,15 @@ def check_engine_no_user_manager(user, uid, *, operator_uid=None, call=subproces
                                    f'out={out[:40]!r})')
 
     state = (active.stdout or '').strip()
-    if state != 'inactive' or active.returncode == 0:
+    # `systemctl is-active` prints inactive and exits 3. A probe killed by a
+    # signal (returncode -9, or 137 when a wrapper stores 128+signal) can leave
+    # the same text and must not attest that the manager is absent.
+    if state != 'inactive' or active.returncode != 3:
         raise EngineManagerPresent(f'user@{uid}.service is {state[:40]!r}, not inactive')
     evidence['user_manager'] = 'inactive'
 
     socket = Path(runtime_root) / str(uid) / 'systemd' / 'private'
-    if os.path.lexists(socket):
+    if _runtime_path_present(socket):
         raise EngineManagerPresent(f'{socket} exists: an engine user manager is listening')
     evidence['manager_socket'] = 'absent'
     return evidence
@@ -158,7 +193,7 @@ def signin_without_session_bus(engine_env, uid, runtime_root=Path('/run/user')):
     if runtime:
         buses.append(Path(runtime) / 'bus')  # sd-bus falls back to $XDG_RUNTIME_DIR/bus
     for bus in buses:
-        if os.path.lexists(bus):
+        if _runtime_path_present(bus):
             raise EngineManagerPresent(f'{bus} exists: a session bus is reachable for the engine')
     return {
         'session_bus': 'absent from engine env',

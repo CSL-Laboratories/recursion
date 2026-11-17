@@ -241,13 +241,18 @@ def _claim(store, reader, *, take: bool) -> None:
 def _release(store, reader) -> None:
     if store is None:
         return
-    with _CLAIMS_LOCK:
-        try:
+
+    def drop() -> None:
+        with _CLAIMS_LOCK:
             holder = _CLAIMS.get(store)
-        except TypeError:                     # a store the map cannot hold was never claimed
-            return
-        if holder is reader:
-            del _CLAIMS[store]
+            if holder is reader:
+                del _CLAIMS[store]
+
+    # Outside the lock, so an interruption on this line holds nothing. The with inside drop releases the lock.
+    try:
+        drop()
+    except TypeError:                          # a store the map cannot hold was never claimed
+        return
 
 
 class ChangeReader:

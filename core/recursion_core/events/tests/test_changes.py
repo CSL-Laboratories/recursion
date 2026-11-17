@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import inspect
 import json
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -1489,6 +1491,61 @@ class ChangeReaderTest(unittest.TestCase):
                 reader.stop(mock.Mock(registry=self.registry, store=bad))    # returns: nothing to give up
                 reader.start(self.context())                                 # a real store: not "already started"
                 reader.stop(self.context())
+
+    def test_an_interruption_on_the_release_try_does_not_keep_the_claim_lock(self) -> None:
+        # Grok r7 on #403, R1 (changes.py _release): the ``try`` was the first line of ``with _CLAIMS_LOCK``.
+        # An interruption on that line returned with the process-wide claim lock still held, and stop did not return.
+        lines, start = inspect.getsourcelines(C._release)
+        try_at = next(start + offset for offset, line in enumerate(lines) if line.strip().startswith('try:'))
+        reader = C.ChangeReader(self.marker)
+        reader._run = lambda stopping=None: None
+        context = self.context()
+        store = context.store
+
+        def bind_raises(registry, store_):
+            raise RuntimeError('bind failed after the claim')
+
+        reader._bind = bind_raises
+        fired = []
+
+        def tracer(frame, event, arg):
+            if event == 'line' and frame.f_code is C._release.__code__ and frame.f_lineno == try_at and not fired:
+                fired.append(frame.f_lineno)
+                sys.settrace(None)
+                frame.f_trace = None
+                raise BaseException('injected at the release try')
+            return tracer
+
+        def release_a_stuck_lock() -> None:
+            if C._CLAIMS_LOCK.locked():
+                C._CLAIMS_LOCK.release()
+            if reader._binding.locked():
+                reader._binding.release()
+            try:
+                if C._CLAIMS.get(store) is reader:
+                    del C._CLAIMS[store]
+            except TypeError:
+                pass
+            reader._claimed = None
+
+        self.addCleanup(release_a_stuck_lock)
+        sys.settrace(tracer)
+        try:
+            with self.assertRaises(BaseException) as caught:
+                reader.start(context)
+        finally:
+            sys.settrace(None)
+        self.assertEqual(fired, [try_at])
+        self.assertEqual(str(caught.exception), 'injected at the release try')
+        self.assertFalse(C._CLAIMS_LOCK.locked())
+        self.assertFalse(reader._binding.locked())
+        reader.stop(context)
+        self.assertIsNone(reader._claimed)
+        self.assertNotIn(store, list(C._CLAIMS.keys()))
+        later = C.ChangeReader(self.marker)
+        later._run = lambda stopping=None: None
+        later.start(context)
+        later.stop(context)
 
     def test_a_start_whose_thread_never_started_refuses_a_rebind_until_its_stop(self) -> None:
         # Sol, round 3, required 1: the refusal holds from start to stop, a start that raised included.

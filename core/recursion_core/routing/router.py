@@ -119,8 +119,8 @@ def _task(task: object) -> tuple[str | None, frozenset, dict | None]:
     or null. A task, or a hand pick, that cannot be read is refused, never raised through. Every word is read
     as its plain text, a subclass of ``str`` too (its hash or its comparing could raise, or answer anything,
     later, outside a guard). A member that is not present is taken as absent, but it is still read (with ``get``,
-    inside the same guard as the presence checks), so a task whose reading raises is refused ``bad_task:task``
-    even when the member it raises on is not there.
+    inside the same guard as the presence checks), so a task whose ``get`` of a member raises is refused
+    ``bad_task:task`` even when that member is not there (tags that cannot be iterated are ``bad_task:tags``).
     """
     if not isinstance(task, Mapping):
         raise _Refuse("bad_task", "task")
@@ -542,7 +542,8 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
     # The decision, read inside one guard into plain data (each member once for presence and once for its value):
     # nothing below reads the caller's object again, and the checks read these copies, never the object. A member
     # that goes between its presence and its value raises inside the guard (no_decision); it never reads as absent.
-    # The connection's members are walked once (a connection that cannot be walked is not decide's).
+    # The connection's members are walked once, and only once it is known to be a mapping (one that is not is never
+    # walked; one that cannot be walked is not decide's).
     # A member it does not have reads as _MISSING; the presence check and the type check each answer for
     # their own rule, so each one is what refuses the decision it is about.
     try:
@@ -553,11 +554,13 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
             return {"action": "none", "reason": "no_route"}
         connection = decision.get("connection")
         read = {key: decision[key] if key in decision else _MISSING for key in ("engine", "model", "reason", "rule")}
-        names = set(connection) if connection is not None else set()  # the connection's members, walked once
-        conn = {key: connection[key] if key in names else _MISSING for key in ("kind", "id")}
         if (ok is not True or any(read[key] is _MISSING for key in ("reason", "rule", "engine", "model"))
-                or not isinstance(connection, Mapping) or any(conn[key] is _MISSING for key in ("kind", "id"))):
+                or not isinstance(connection, Mapping)):
             return {"action": "none", "reason": "no_decision"}  # routed in name only: not decide's answer
+        names = set(connection)  # the connection's members, walked once, now that it is known to be a mapping
+        conn = {key: connection[key] if key in names else _MISSING for key in ("kind", "id")}
+        if any(conn[key] is _MISSING for key in ("kind", "id")):
+            return {"action": "none", "reason": "no_decision"}  # a connection without its kind and its id
         # The values compared or formatted below must be decide's own words, plain str (a subclass could raise, or
         # answer anything, when compared or formatted), checked here, where comparing one that raises is still
         # inside the guard.

@@ -1137,5 +1137,52 @@ class SweepRegressionTests(unittest.TestCase):
                          [("review-to-codex", "no_match"), ("search-to-pi", "refused"), ("cheap-to-opencode", "not_reached")])
 
 
+class _AskingDeletes(dict):
+    """A decision (or a connection) that deletes one member the first time another one's presence is asked."""
+
+    def __init__(self, values, asked, deleted):
+        super().__init__(values)
+        self.asked, self.deleted, self.done = asked, deleted, False
+
+    def __contains__(self, key):
+        if key == self.asked and not self.done:
+            self.done = True
+            self.pop(self.deleted, None)
+        return super().__contains__(key)
+
+
+class DeepSeekNineRegressionTests(unittest.TestCase):
+    """The ninth DeepSeek read of #399 (a65df75d): its F1 and F2."""
+
+    def setUp(self) -> None:
+        self.cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
+        self.d = router.decide(self.cfg, SENTRY, {})
+        self.control = router.next_after_limit(self.cfg, self.d, LIMIT)
+        self.assertEqual(self.control["action"], "switch")
+
+    def test_a_connection_that_is_not_a_mapping_is_never_walked(self) -> None:  # ds r9 F1
+        walked = []
+
+        class Counted:
+            def __iter__(self):
+                for name in ("kind", "id"):
+                    walked.append(name)
+                    yield name
+
+            def __getitem__(self, key):
+                return "x"
+        self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "connection": Counted()}, LIMIT),
+                         {"action": "none", "reason": "no_decision"})
+        self.assertEqual(walked, [])
+
+    def test_each_members_value_is_read_where_its_presence_is_asked(self) -> None:  # ds r9 F2, its G2
+        decision = _AskingDeletes(self.d, asked="model", deleted="engine")  # engine is already read by then
+        self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT), self.control)
+
+    def test_the_connections_members_are_read_from_its_one_walk(self) -> None:  # ds r9 F2, its G4
+        connection = _AskingDeletes(self.d["connection"], asked="kind", deleted="id")  # nothing asks it again
+        self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "connection": connection}, LIMIT), self.control)
+
+
 if __name__ == "__main__":
     unittest.main()

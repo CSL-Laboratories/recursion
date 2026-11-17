@@ -67,7 +67,39 @@ NOT_GRANTED = "plugin_not_granted"
 # or ``__format__``, an object's ``__getattr__``. These read the interpreter's own slots and walk
 # dictionaries' tables instead, so they call none of it and raise nothing a plugin chose.
 _CLASS_NAME = type.__dict__["__name__"].__get__               # a type's own name slot
+_ABSENT = object()  # no entry of that name in sys.modules before a plugin ran
 _MODULE_DICT = types.ModuleType.__dict__["__dict__"].__get__  # a module's own namespace dict
+# One lock per module name, shared by every loader in the process. Held from the publish
+# until the restore, including while the plugin runs, so two loaders cannot hand each other
+# that name (PS6 review 1, F3). Not re-entrant: plugin code must not load this same name.
+_ENTRY_LOCKS_GUARD = threading.Lock()
+_ENTRY_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _entry_lock(name: str) -> threading.Lock:
+    with _ENTRY_LOCKS_GUARD:
+        lock = _ENTRY_LOCKS.get(name)
+        if lock is None:
+            lock = threading.Lock()
+            _ENTRY_LOCKS[name] = lock
+        return lock
+
+
+def _plain_entry(modules, name: str):
+    """The value at a plain-str ``name``, or ``_ABSENT`` when it is missing or unreadable.
+
+    Walks the dict's own table, so a key a plugin left there is not hashed. When that walk
+    raises, the entry is skipped and the caller still reads the GIL.
+    """
+    try:
+        if type(modules) is not dict:
+            return _ABSENT
+        for key, value in list(dict.items(modules)):
+            if type(key) is str and key == name:
+                return value
+    except Exception:  # noqa: BLE001 - the table can change, and a plugin key must not escape
+        return _ABSENT
+    return _ABSENT
 
 
 def type_name(value) -> str:
@@ -324,25 +356,53 @@ class PluginLoader:
     def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings,
                   developer: str, generation: int | None) -> LoadedPlugin:
         before = set(plain_modules())
-        module = types.ModuleType("csl_plugin_" + manifest.plugin_id.replace(".", "_").replace("-", "_"))
+        name = "csl_plugin_" + manifest.plugin_id.replace(".", "_").replace("-", "_")
+        module = types.ModuleType(name)
         failure: BaseException | None = None
-        try:
-            exec(code, module.__dict__)  # plugin code: _load_lock is held, _lock is not
-        except BaseException as exc:  # noqa: BLE001 - the GIL check must follow any outcome
-            failure = exc
-        finally:
+        # The module is in ``sys.modules`` under its own name while its code runs, as an import puts
+        # it, so code that looks its module up there (``dataclasses`` with postponed annotations,
+        # ``typing.get_type_hints``) works (PS6). The name's entry lock covers that whole stretch.
+        # The value that was there before, if any, is put back afterwards, and only when this module
+        # is still the one stored, through ``dict``'s own slot on the dict that was published into
+        # (a plugin that rebinds ``sys.modules`` does not keep the entry in the old dict). A key
+        # whose comparison raises costs the entry: the plugin still runs, and the GIL read below
+        # still runs, because the publish sits inside this try.
+        modules = sys.modules
+        registered = type(modules) is dict
+        previous = _ABSENT
+        with _entry_lock(name):
             try:
-                # Plain data only: nothing a plugin put in sys.modules runs here, and nothing raised
-                # here skips the GIL read below (review 3 of #380: an object in sys.modules whose
-                # __getattr__ raised ended the load here, with the GIL never read).
-                fresh = plain_modules()
-                for name in sorted(set(fresh) - before):
-                    if _module_file(fresh[name]).endswith(tuple(importlib.machinery.EXTENSION_SUFFIXES)):
-                        findings.append(_finding("active", "extension_module_loaded", "warn", name))
+                if registered:
+                    previous = _plain_entry(modules, name)
+                    try:
+                        dict.__setitem__(modules, name, module)
+                    except Exception:  # noqa: BLE001 - a colliding key's __eq__ is plugin code
+                        previous = _ABSENT
+                exec(code, module.__dict__)  # plugin code: _load_lock is held, _lock is not
+            except BaseException as exc:  # noqa: BLE001 - the GIL check must follow any outcome
+                failure = exc
             finally:
-                with self._lock:
-                    gil_on = self._gil_gate(manifest.plugin_id, findings)
-                    self.last_findings = tuple(findings)
+                try:
+                    if registered and type(modules) is dict:
+                        try:
+                            if _plain_entry(modules, name) is module:
+                                if previous is _ABSENT:
+                                    dict.pop(modules, name, None)
+                                else:
+                                    dict.__setitem__(modules, name, previous)
+                        except Exception:  # noqa: BLE001 - a colliding key's __eq__ is plugin code
+                            pass
+                    # Plain data only: nothing a plugin put in sys.modules runs here, and nothing raised
+                    # here skips the GIL read below (review 3 of #380: an object in sys.modules whose
+                    # __getattr__ raised ended the load here, with the GIL never read).
+                    fresh = plain_modules()
+                    for added in sorted(set(fresh) - before):
+                        if _module_file(fresh[added]).endswith(tuple(importlib.machinery.EXTENSION_SUFFIXES)):
+                            findings.append(_finding("active", "extension_module_loaded", "warn", added))
+                finally:
+                    with self._lock:
+                        gil_on = self._gil_gate(manifest.plugin_id, findings)
+                        self.last_findings = tuple(findings)
         if gil_on:
             raise Refused("core_poisoned_gil_enabled", manifest.plugin_id) from failure
         if failure is not None:

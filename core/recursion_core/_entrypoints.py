@@ -3,6 +3,8 @@
     recursiond install | upgrade | uninstall    the per-user systemd unit (control/commands/setup.py)
     recursiond serve [daemon options]           run the daemon in the foreground
     recursiond observe                          local tool setup, owner-only record
+    recursiond import --from codex|claude|cursor --dry-run
+                                                print a proposed config and write nothing
 
 Linux only: on any other system every command refuses with ``platform_unsupported`` (exit 1)
 before anything else is imported; ``--help`` still prints. Output is one JSON object per command;
@@ -33,6 +35,11 @@ EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
 SUBCOMMANDS = (
     ("observe", "report local tool setup into an owner-only record; secret values stay out"),
 )
+# A separate row from SUBCOMMANDS. import only prints a proposal; it writes nothing.
+IMPORT_SUBCOMMANDS = (
+    ("import", "print a proposed Recursion config and write nothing"),
+)
+_IMPORT_SOURCES = ("codex", "claude", "cursor")
 _DESCRIPTION = ("Recursion's per-user daemon and its installer. Linux only. "
                 "Each command prints one JSON object; \"code\": \"ok\" is success.")
 
@@ -57,8 +64,8 @@ def main(argv=None) -> int:
     parser = _Parser(prog=PROG, description=_DESCRIPTION)
     commands = parser.add_subparsers(dest="command", metavar="command")
     setup.parser(commands)
-    for name, help_text in SUBCOMMANDS:
-        commands.add_parser(name, help=help_text)
+    _add_subcommands(commands, SUBCOMMANDS)
+    _add_subcommands(commands, IMPORT_SUBCOMMANDS)
     commands.add_parser("serve", help="run the daemon in the foreground; options after it go to the daemon",
                         add_help=False)
     try:
@@ -73,9 +80,21 @@ def main(argv=None) -> int:
         print("usage error: a command is required", file=sys.stderr)
         return EXIT_USAGE
     args.out, args.err = sys.stdout, sys.stderr
-    if args.command in {name for name, _help in SUBCOMMANDS}:
+    known = {name for name, _help in (*SUBCOMMANDS, *IMPORT_SUBCOMMANDS)}
+    if args.command in known:
         return _dispatch_subcommand(args)
     return setup.dispatch(args, None)
+
+
+def _add_subcommands(commands, rows) -> None:
+    for name, help_text in rows:
+        sub = commands.add_parser(name, help=help_text)
+        if name != "import":
+            continue
+        sub.add_argument("--from", dest="source", required=True, choices=_IMPORT_SOURCES,
+                         help="local tool to read: codex, claude or cursor")
+        sub.add_argument("--dry-run", dest="dry_run", action="store_true",
+                         help="print the proposal and write nothing")
 
 
 def _dispatch_subcommand(args) -> int:
@@ -84,6 +103,11 @@ def _dispatch_subcommand(args) -> int:
     if args.command == "observe":
         module = importlib.import_module("recursion_core.setup.observe")
         return module.command(out=args.out, err=args.err)
+    if args.command == "import":
+        module = importlib.import_module("recursion_core.setup.import_")
+        return module.command(
+            out=args.out, err=args.err, source=args.source, dry_run=args.dry_run is True,
+        )
     print(f"usage error: {args.command}", file=sys.stderr)
     return EXIT_USAGE
 

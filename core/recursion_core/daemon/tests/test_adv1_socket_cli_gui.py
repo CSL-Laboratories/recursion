@@ -155,18 +155,17 @@ class SocketAttackTest(ComposedBase):
         winners[0].__exit__(None, None, None)
 
     def test_a_second_composition_without_the_user_lock_leaves_the_live_daemons_token_file_alone(self):
-        # ADV1-12 (fixed). main() takes UserLock first, so this only matters to an embedder or test that
-        # composes twice. The second compose fails at the socket lock; it used to have rewritten and then
-        # unlinked the token file the live daemon's GUI depends on. The file is now written only after
-        # server.start() succeeds, and a door removes only the file it wrote.
+        # ADV1-12. main() takes UserLock first. boot() does not: it builds a Registry on the same state
+        # folder, so the folder lease is what refuses the second one. The token file is what the first
+        # composition wrote, byte for byte, and a door removes only the file it wrote.
         daemon, first = self.boot()
         token_file = self.runtime / 'recursion' / 'gui-device-token'
-        live = token_file.read_text().strip()
-        # Over the same daemon: a second registry over the state folder is refused earlier, by its owner lock (E14).
-        with self.assertRaises(InsecureSocketPath):
-            adapter.compose_control(daemon, self.state, environ=self.environ, routes=self.routes)
+        live_bytes = token_file.read_bytes()
+        live = live_bytes.decode().strip()
+        with self.assertRaises(AlreadyRunning):
+            self.boot()
+        self.assertEqual(token_file.read_bytes(), live_bytes, 'the refused composition left the live token file')
         self.assertTrue(first.door({'HTTP_AUTHORIZATION': 'Bearer ' + live}))  # in-memory token unchanged
-        self.assertEqual(token_file.read_text().strip(), live, 'the losing composition left the live token file')
         self.assertEqual(os.listdir(token_file.parent).count('gui-device-token.tmp'), 0)
         # A door that never published, or whose file was replaced by another door, unlinks nothing.
         stranger = adapter.DeviceDoor(token_file.parent, publish=False)

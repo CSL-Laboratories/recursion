@@ -5,7 +5,10 @@ All real sleepers are four seconds or less, with explicit kill/wait cleanup.
 """
 import ctypes
 import errno
-import fcntl
+try:
+    import fcntl
+except ImportError:  # a Windows-shaped host has no fcntl; the witness below skips
+    fcntl = None
 import json
 import os
 from pathlib import Path
@@ -60,7 +63,8 @@ def reap(pid):
         pass
 
 
-@unittest.skipUnless(sys.platform.startswith('linux'), 'Linux process ownership witnesses')
+@unittest.skipUnless(sys.platform.startswith('linux') and fcntl is not None,
+                     'Linux process ownership witnesses need fcntl')
 class ScratchTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='s6-')
@@ -84,6 +88,45 @@ class ExitStatusTests(ScratchTest):
                 accepted.append(returncode)
         observe('F12', accepted_abnormal_returncodes=accepted)
         self.assertEqual(accepted, [])
+
+    def test_inactive_text_with_the_wrong_exit_names_the_exit(self):
+        call = mock.Mock(side_effect=[
+            subprocess.CompletedProcess([], 0, 'no\n', ''),
+            subprocess.CompletedProcess([], 0, 'inactive\n', ''),
+        ])
+        with self.assertRaises(engine_user.EngineManagerPresent) as raised:
+            engine_user.check_engine_no_user_manager(
+                'engine', 12345, operator_uid=999, call=call, runtime_root=self.base)
+        text = str(raised.exception)
+        self.assertIn("(exit 0)", text)
+        self.assertIn("not inactive (exit 3)", text)
+        self.assertNotIn("is 'inactive', not inactive", text)
+        # A second caller with the attesting exit still passes.
+        call_ok = mock.Mock(side_effect=[
+            subprocess.CompletedProcess([], 0, 'no\n', ''),
+            subprocess.CompletedProcess([], 3, 'inactive\n', ''),
+        ])
+        evidence = engine_user.check_engine_no_user_manager(
+            'engine', 12345, operator_uid=999, call=call_ok, runtime_root=self.base)
+        self.assertEqual('inactive', evidence['user_manager'])
+
+
+class FcntlImportTests(unittest.TestCase):
+    def test_the_module_imports_when_fcntl_is_absent(self):
+        code = (
+            "import sys\n"
+            "sys.modules['fcntl'] = None\n"
+            "import importlib\n"
+            "mod = importlib.import_module('recursion_core.daemon.tests.test_sweep_s6_proc')\n"
+            "assert mod.fcntl is None\n"
+            "print('IMPORTED')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, '-B', '-c', code],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn('IMPORTED', proc.stdout)
 
 
 if __name__ == '__main__':

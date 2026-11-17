@@ -65,12 +65,50 @@ class S2bRegressions(unittest.TestCase):
 
     def test_f08_session_refusal_does_not_echo_arbitrary_option_values(self):
         # This is only a synthetic marker, never an actual key or credential.
-        value = '--property=Environment=S2B_EXAMPLE=PAMName=login\nS2B_PRIVATE_MARKER'
-        try:
-            engine_user.refuse_session_launch(['systemd-run', value, '--', '/bin/true'])
-        except engine_user.SessionLaunchRefused as exc:
-            self.assertNotIn('S2B_PRIVATE_MARKER', str(exc))
-            self.assertNotIn('\n', str(exc))
+        marker = 'S2B_PRIVATE_MARKER'
+        refused = (
+            f'--property=PAMName=login\n{marker}',
+            f'-qpPAMName=login\n{marker}',
+            f'--prop=PAMName={marker}',
+            f'--prope=PAMName=login\n{marker}',
+            f'--property=Environment=A\nPAMName={marker}',
+            f'-pEnvironment=A\nPAMName={marker}',
+            f'X=1\nPAMName={marker}',
+            '-p',
+            f'PAMName={marker}',
+        )
+        # '-p' and the following element are two argv elements, not one string.
+        argvs = [
+            ['systemd-run', element, '--', '/bin/true']
+            for element in refused
+            if element not in ('-p', f'PAMName={marker}')
+        ]
+        argvs.append(['systemd-run', '-p', f'PAMName={marker}', '--', '/bin/true'])
+        argvs.append(['systemd-run', '--prop', f'PAMName={marker}', '--', '/bin/true'])
+        for argv in argvs:
+            with self.subTest(argv=argv):
+                with self.assertRaises(engine_user.SessionLaunchRefused) as raised:
+                    engine_user.refuse_session_launch(argv)
+                text = str(raised.exception)
+                self.assertNotIn(marker, text)
+                self.assertNotIn('\n', text)
+                self.assertNotIn('PAMName=', text)
+        # A value that merely contains the letters is not the PAMName property.
+        # ``-p=`` keeps the '=' in the attached argument, so the key is empty.
+        # ``--p`` is an ambiguous prefix (property, path-property, pty, pipe).
+        allowed = (
+            '--property=Environment=S2B_EXAMPLE=PAMName=login',
+            f'--property=Environment=S2B_EXAMPLE=PAMName=login\n{marker}',
+            '-p=PAMName=login',
+            '--p=PAMName=login',
+        )
+        for element in allowed:
+            with self.subTest(element=element):
+                engine_user.refuse_session_launch(['systemd-run', element, '--', '/bin/true'])
+        # A second caller: the same spelling still refuses, and a plain command does not.
+        with self.assertRaises(engine_user.SessionLaunchRefused):
+            engine_user.refuse_session_launch(['systemd-run', '-qpPAMName=login', '--', '/bin/true'])
+        engine_user.refuse_session_launch(['/opt/engine/bin/claude', '--print'])
 
 
 if __name__ == '__main__':

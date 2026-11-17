@@ -43,20 +43,96 @@ SESSION_LAUNCHERS = frozenset({
 })
 
 
+# systemd-run's options, from ``systemd-run --help`` on this host. A long name may
+# be written as any unambiguous prefix, the way getopt_long accepts it. Short
+# options cluster, and an option that takes an argument consumes the rest of
+# the element (``-qpPAMName=login`` is ``-q`` then ``-p PAMName=login``).
+_LONG_WITH_ARG = (
+    'host', 'machine', 'unit', 'property', 'description', 'slice',
+    'expand-environment', 'service-type', 'uid', 'gid', 'nice',
+    'working-directory', 'setenv', 'path-property', 'socket-property',
+    'on-active', 'on-boot', 'on-startup', 'on-unit-active', 'on-unit-inactive',
+    'on-calendar', 'timer-property',
+)
+_LONG_FLAGS = (
+    'help', 'version', 'no-ask-password', 'user', 'scope', 'slice-inherit',
+    'no-block', 'remain-after-exit', 'wait', 'send-sighup', 'same-dir',
+    'pty', 'pipe', 'quiet', 'collect', 'shell', 'on-timezone-change',
+    'on-clock-change',
+)
+_SHORT_WITH_ARG = frozenset('HMupE')  # -H -M -u -p -E
+_SHORT_FLAGS = frozenset('hrdtPqGS')
+_LONG_NAMES = _LONG_WITH_ARG + _LONG_FLAGS
+
+
+def _lines_of(arg: str) -> list[str]:
+    """Split on LF and CR only. A later line of the same element is its own assignment."""
+    lines: list[str] = []
+    buf: list[str] = []
+    for ch in arg:
+        if ch in '\n\r':
+            lines.append(''.join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    lines.append(''.join(buf))
+    return lines
+
+
+def _long_option(name: str) -> str | None:
+    """The one long option ``name`` names, or None when it is unknown or ambiguous."""
+    folded = name.lower()
+    exact = [item for item in _LONG_NAMES if item == folded]
+    if exact:
+        return exact[0]
+    matches = [item for item in _LONG_NAMES if item.startswith(folded) and folded]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _assignment_is_pam(value: str) -> bool:
+    """True when the property key, not a searched value, is PAMName."""
+    return value.split('=', 1)[0].lower() == 'pamname'
+
+
+def _element_sets_pam(text: str) -> bool:
+    if text.startswith('--'):
+        body = text[2:]
+        name, sep, value = body.partition('=')
+        resolved = _long_option(name)
+        if resolved == 'property' and sep:
+            return _assignment_is_pam(value)
+        return False
+    if text.startswith('-') and len(text) > 1 and text[1].isalpha():
+        index = 1
+        while index < len(text):
+            letter = text[index]
+            index += 1
+            if letter in _SHORT_WITH_ARG:
+                attached = text[index:]
+                if letter == 'p' and attached:
+                    return _assignment_is_pam(attached)
+                return False
+            if letter in _SHORT_FLAGS:
+                continue
+            return False
+        return False
+    if '=' in text:
+        return _assignment_is_pam(text)
+    return False
+
+
 def _is_pam_name_property(arg: str) -> bool:
     """True when this argv element sets the unit property PAMName.
 
     The property key is compared, not searched. ``PAMName=`` inside another
     property's value (an ``Environment=`` assignment, for example) does not
-    open a PAM session. The value is never copied into a refusal.
+    open a PAM session. A clustered short option, an unambiguous prefix of
+    ``--property``, and a PAMName assignment on a later line of the same
+    element do. The value is never copied into a refusal.
     """
-    text = arg.split('\n', 1)[0].split('\r', 1)[0]
-    lowered = text.lower()
-    for prefix in ('--property=', '-p'):
-        if lowered.startswith(prefix):
-            name = text[len(prefix):].split('=', 1)[0]
-            return name.lower() == 'pamname'
-    return text.split('=', 1)[0].lower() == 'pamname'
+    return any(_element_sets_pam(line) for line in _lines_of(arg) if line)
 
 
 class EngineManagerPresent(RuntimeError):
@@ -146,7 +222,8 @@ def check_engine_no_user_manager(user, uid, *, operator_uid=None, call=subproces
     # signal (returncode -9, or 137 when a wrapper stores 128+signal) can leave
     # the same text and must not attest that the manager is absent.
     if state != 'inactive' or active.returncode != 3:
-        raise EngineManagerPresent(f'user@{uid}.service is {state[:40]!r}, not inactive')
+        raise EngineManagerPresent(
+            f'user@{uid}.service is {state[:40]!r} (exit {active.returncode}), not inactive (exit 3)')
     evidence['user_manager'] = 'inactive'
 
     socket = Path(runtime_root) / str(uid) / 'systemd' / 'private'

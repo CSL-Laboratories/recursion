@@ -293,8 +293,10 @@ class StructureTest(unittest.TestCase):
 
     MODULES = ("operator_reads.py", "operator_reads_socket.py")
     STDLIB = {"__future__", "collections.abc", "json", "math", "os", "re", "socket", "stat", "struct",
-              "threading", "time", "uuid"}
-    OWN = {"recursion_core.control.operator_reads", "recursion_core.control.operator_reads_socket"}
+              "sys", "threading", "time", "uuid"}
+    # peercred is the peer-uid reader (SO_PEERCRED / LOCAL_PEERCRED). It is not the run control API.
+    OWN = {"recursion_core.control.operator_reads", "recursion_core.control.operator_reads_socket",
+           "recursion_core.control_transport.peercred"}
 
     def trees(self):
         for name in self.MODULES:

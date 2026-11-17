@@ -106,7 +106,8 @@ S9  ``drive_owner(ctx, request) -> None, or an owner``. Asked at the top of the 
     what was launched unless the daemon is closing, and releases; an owner that wants another end does
     not raise. While the daemon or its composition is closing nothing is settled: the run's
     descriptors are closed, nothing is fenced, and the unit is left alive for the next daemon. That
-    holds for a settling that is already under way when closing begins, too.
+    holds for a settling that is already under way when closing begins, too. (A fence that is being
+    made at the moment a close is asked for is finished first: the close begins after it.)
     That fallback is for an ordinary exception out of ``owner.run`` itself. A failure after
     the hand-over, in the owner's own worker, is the driver's own try/finally, and the fallback is no
     promise to record a final result or to call ``fault_run``.
@@ -121,7 +122,9 @@ S9  ``drive_owner(ctx, request) -> None, or an owner``. Asked at the top of the 
 S10 ``launch_check(ctx, executable) -> None, or a refusal code``. Called by the launcher on the run's
     thread, after the executable is resolved and before the run directory's FIFOs and files are made,
     so a refusal leaves nothing in the way of a relaunch. It reads the route and the containment level
-    from ``ctx.launch``. Parent side only: nothing is added to the child's environment. Default: None.
+    from ``ctx.launch``. Parent side only: nothing is added to the child's environment. Default: refused
+    ``launch_check_absent`` when no check is registered. The launch answers that as ``launch_refused``
+    with detail ``launch_check_absent``, the detail the schema's ``start_error`` already names.
     A refusal code refuses the launch ``launch_check:<code>``. Raises: refused ``launch_check_failed``.
 S11 ``page_methods() -> a frozen set of method names``: the methods the page may call through
     ``POST /v1/control``. On the page's request thread. Default: the empty set, so the path answers
@@ -143,13 +146,13 @@ S13 ``hooks.service(service)``, ``hooks.start_services(context)``, ``hooks.stop_
 The after-commit subscription to events is not a hook: it is the event store's own interface, which
 other lanes call from their services.
 
-BUILDING AGAINST THIS FILE before the calls from the daemon's files have landed. A lane needs no daemon
-to test what it registers: make ``Hooks()``, call the lane's own ``register(hooks)`` on it, ``freeze()``
+BUILDING AGAINST THIS FILE. A lane needs no daemon to test what it registers: make ``Hooks()``, call the lane's own ``register(hooks)`` on it, ``freeze()``
 it, and call the hook, or ``hooks.methods.dispatch(method, params, principal, call)`` for a handler.
 That object IS the shared fake: every lane's tests go through these same defaults and these same checks,
 not through a guess of them. The one fake of the event store's transaction helper is ``FakeStore`` in
-``control/tests/test_seams.py``. Until the daemon's files call a hook, registering into it changes
-nothing in a running daemon.
+``control/tests/test_seams.py``. The calls themselves are in ``control/api.py``, ``control/cli.py``,
+``daemon/control_adapter.py``, ``daemon/launcher.py`` and ``daemon/__init__.py``, each marked with its
+seam's number, and are tested in the two ``test_seams.py`` files.
 
 Direct MethodTable.dispatch is an already-authorized, already-admitted primitive, not an entry point.
 Entry points must preserve the supplied principal, authorize before receipt access, hold the one
@@ -207,7 +210,14 @@ PRINCIPAL_KINDS = ('owner', 'device', 'internal', 'plugin', 'session')
 
 
 class HookError(Exception):
-    """Composition cannot go on: a registrant failed, or two of them claim one thing. The daemon does not start."""
+    """Composition cannot go on: a registrant failed, or two of them claim one thing. The daemon does not start.
+
+    ``registrant`` is the registrant module ``compose()`` stopped at, when it stopped at one. The error's text is
+    the failure's own, and names that module only where composition wrote the text itself. The name is an aid
+    to whoever reports the failure and no more: an error object that takes no attribute carries none, and
+    leaves composition as it was raised."""
+
+    registrant: str | None = None
 
 
 class HookRefused(Exception):
@@ -448,7 +458,8 @@ class ServiceContext:
 # OWNERSHIP. Four methods below take a lock for a piece of work that has to be finished and must not leave the lock
 # held, whatever interrupts them: Admission.close and Admission.drain, Hooks.stop_services and Hooks.finish_close.
 # (The composition's own close, in the daemon, has the same form; so have the gate's enter and leave, whose work is
-# the count of admitted calls.) Each is ONE protected region, written out in each:
+# the count of admitted calls, and its while_open, whose work is a caller's.) Each is ONE protected region, written
+# out in each:
 #
 #     done = False
 #     while True:
@@ -544,6 +555,7 @@ class Admission:
     reference until ``leave()``: through its handler, its transaction and ALL its after-commit
     callbacks. A ``ctx.call`` made inside a handler belongs to that admitted call and takes no new
     admission. ``close()`` stops new admissions; ``drain()`` waits until every admitted call has left.
+    ``while_open(act)`` does one thing with the gate held open, or nothing once it is closed.
 
     ``drain`` has no timeout, on purpose. The daemon's main closes its registry after the composition
     closes, even when closing raises, so closing must not return while a handler, a callback or a
@@ -551,9 +563,21 @@ class Admission:
     their resources alive. A timeout is never taken as permission to tear them down. Neither is an
     interruption of the wait: it is kept, the wait goes on, and it is raised once every call has left.
 
-    The gate does nothing until it is ``enabled``, which composition does when a lane has registered a
-    handler, a service or an event store. With nothing registered a call is never refused and closing
-    waits for nothing, as today.
+    ONE RULE says when the gate is on. It does nothing until it is ``enabled``, and composition enables it
+    when ANYTHING AT ALL was registered (``Hooks.anything_registered``): a single hook, a start registrant,
+    a service, the change marker, a method handler, a command family or an engine factory. It is off only
+    for the bare composition, where a call is never refused and closing waits for nothing, as today. No
+    registration is exempt, and none has to be argued about: not one whose code is asked on a client's
+    thread and not on a run's own, and not one that brings no code into the daemon at all (a command
+    family is the CLI's; the change marker is this module's own).
+
+    So with any one thing registered, and nothing beside it, what S13 and S9 say of closing holds: closing
+    waits for a call that is inside (a handler, an authorizer, a result reader, a start registrant, the
+    page's provider) and for a hook on a run's own thread (S13) and a hand-over (S9); a call, a run or a
+    launch is refused once closing has begun, and the hook is not asked after it; and a settling fences
+    nothing once the gate is shut (a fence that has started is counted, and a shutting sets the shut flag
+    and then waits for that count; the unit stop does not hold the gate lock). Without the gate a reference would count
+    nothing and none of that would hold.
     """
 
     def __init__(self) -> None:
@@ -657,6 +681,67 @@ class Admission:
             except BaseException as exc:  # noqa: BLE001 - kept; the region is gone round again
                 kept.append(exc)
         raise_kept(kept)
+
+    def while_open(self, act) -> bool:
+        """Do ``act()`` with the gate held OPEN and return True; or, once the gate is closed, do nothing and
+        return False.
+
+        No production caller uses this for the settling fence. That fence is counted by the route starter,
+        which does not hold the gate lock across the unit stop. To ask whether closing has
+        begun and then to act is two steps, and a close can begin between them. Here they are ONE step for
+        ``close``, which takes the same condition: a close that begins meanwhile waits until ``act`` has
+        returned, and one that began before is seen.
+
+        ``act`` runs on the calling thread, which holds the gate's condition for as long. Every call waits at
+        the gate meanwhile, on its way in and on its way out, so ``act`` is brief, waits for nothing that
+        passes the gate, and does not call the gate itself (another method of the gate, called from inside
+        ``act``, would take this hold of the condition for its own and give it up).
+
+        A failure of ``act`` (an ``Exception``) is raised here once the condition is free again, and ``act`` is
+        not asked again. An interruption that lands while ``act`` is being asked is kept like any other in a
+        region, and ``act`` is asked ONCE more: it may not have begun, and nothing here can tell. Whatever ends
+        that second asking is kept too; there is no third. So ``act`` is something that may be done twice, as a
+        fence may. With the gate off (nothing registered) ``act`` is simply called.
+
+        One protected region (OWNERSHIP)."""
+        if not self.enabled:
+            act()
+            return True
+        kept: list = []
+        answer = None           # None until it is decided: False, the gate was closed; True, act was asked
+        asked = 0
+        while True:
+            try:
+                if answer is None:
+                    if not self._lock._is_owned():
+                        take_once(self._lock, kept)
+                    if self._closed:
+                        answer = False
+                    else:
+                        asked += 1
+                        self._asked(act, kept, asked > 1)
+                        answer = True
+                if self._lock._is_owned():
+                    self._lock.release()
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the region is gone round again
+                kept.append(exc)
+        raise_kept(kept)
+        return answer
+
+    def _asked(self, act, kept: list, last: bool) -> None:
+        """``act()`` for ``while_open``, whose caller holds the condition. A method of its own because a
+        protected region has no try written in it (OWNERSHIP). A failure of ``act`` is kept and this returns:
+        the region releases the condition and raises it. An interruption goes out to the region, which asks
+        again; on that ``last`` asking it is kept here like a failure, so that nothing is asked for ever."""
+        try:
+            act()
+        except Exception as exc:  # noqa: BLE001 - kept; raised by the region once the condition is free
+            kept.append(exc)
+        except BaseException as exc:  # noqa: BLE001 - an interruption: out to the region, unless this was the last asking
+            if not last:
+                raise
+            kept.append(exc)
 
     @property
     def closed(self) -> bool:
@@ -822,8 +907,20 @@ class Hooks:
         if self._engines is not None:
             self._engines.freeze()
         self.methods.service_ready = self.service_ready
-        # The gate guards what a lane brought: a handler, a service, a store. With none of them it stays off.
-        self.gate.enabled = bool(self._services or self.methods.registered() or 'event_store' in self._single)
+        # ONE RULE: the gate is on when anything at all was registered into this composition, and off only for the
+        # bare one (``Admission``). No registration is exempt.
+        self.gate.enabled = self.anything_registered()
+
+    def anything_registered(self) -> bool:
+        """Whether anything at all was registered into these hooks, by any of the ways there are: a single hook
+        (``set``), a start registrant, a service, the change marker, a method handler, a command family, or an
+        engine factory (one added, or a seeded one replaced). False only for the bare composition. Each table
+        is asked what was registered into it. The engine table is made on first use: one that nobody asked for
+        has nothing registered in it, and it is not made here."""
+        engines = self._engines
+        return bool(self._single or self._start or self._services or self.changes is not None
+                    or self.methods.registered() or self.commands.names()
+                    or (engines is not None and engines.registered()))
 
     # -- S5 ---------------------------------------------------------------------------------------
     def authorize(self, principal: Principal, method, params) -> dict | None:
@@ -867,10 +964,10 @@ class Hooks:
         return Path(folder)
 
     def launch_check(self, ctx, executable) -> None:
-        """Returns when the launch may go on. Raises ``HookRefused`` when the check refuses it, or fails."""
+        """Returns when the launch may go on. Raises ``HookRefused`` when no check is registered, when the check refuses it, or when the check fails."""
         check = self._single.get('launch_check')
         if check is None:
-            return
+            raise HookRefused('launch_check_absent')
         try:
             verdict = check(ctx, executable)
         except Exception:  # noqa: BLE001
@@ -1360,9 +1457,15 @@ def compose() -> Hooks:
             if module is None:
                 continue        # the lane is not installed, or its package has no such module
             module.register(hooks)
-        except HookError:
+        except HookError as exc:
+            try:
+                exc.registrant = name   # its text stays its own; the registrant composition stopped at goes beside it
+            except Exception:           # noqa: BLE001 - an error that takes no attribute leaves as it was raised
+                pass
             raise
         except Exception as exc:
-            raise HookError(f'registrant {name}: {type(exc).__name__}: {exc}') from exc
+            failed = HookError(f'registrant {name}: {type(exc).__name__}: {exc}')
+            failed.registrant = name
+            raise failed from exc
     hooks.freeze()
     return hooks

@@ -15,6 +15,7 @@ import tempfile
 import unittest
 
 from recursion_core.control.client import SocketAPI
+from recursion_core.control.hooks import Hooks
 from recursion_core.daemon import Daemon, Registry
 from recursion_core.daemon import breaker as daemon_breaker
 from recursion_core.daemon import control_adapter as adapter
@@ -66,7 +67,12 @@ class Adv2BrokenStoreTests(unittest.TestCase):
     def boot(self):
         daemon = Daemon(Registry(self.state), ProcessUnitManager(self.units), boot_id=lambda: BOOT)
         daemon.sweep()
-        composed = adapter.compose_control(daemon, self.state, environ=self.environ, routes=self.routes)
+        # The installed launch-check registrant sets no function, and a launch with none is refused.
+        # These tests are about the composed daemon, so a check that admits is registered here.
+        made = Hooks()
+        made.set('launch_check', lambda ctx, executable: None)
+        made.freeze()
+        composed = adapter.compose_control(daemon, self.state, environ=self.environ, routes=self.routes, hooks=made)
         composed.control.reconcile()
         self.open.append((daemon, composed))
         return daemon, composed

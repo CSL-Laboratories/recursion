@@ -1,0 +1,761 @@
+"""CSL-732 (B10, R2a): floor table, strict version parse, static detection, one-pass check (candidate tests).
+
+Run from the repository root:
+``PYTHONPATH=core python3 -B -m unittest discover -s core/recursion_core/launch_check/tests -t core -v``.
+Fake binaries only; no real engine, network or credential.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+import re
+import threading
+import unittest
+from types import MappingProxyType
+from unittest import mock
+
+from recursion_core.launch_check import (
+    FLOOR_TABLE_VERSION,
+    FLOORS,
+    LaunchRefused,
+    codex_vendored_binary,
+    detect,
+    detect_all,
+    grant,
+    launch_check,
+    launch_plan,
+    npm_hermes_agent_root,
+    parse_version,
+    table_record,
+    verify,
+)
+from recursion_core.launch_check import binary as binary_mod
+from recursion_core.launch_check import floors as floors_mod
+from recursion_core.launch_check import pins as pins_mod
+from recursion_core.launch_check.detect import _triples
+from recursion_core.launch_check.tests.fixtures import Factory
+
+F: Factory
+
+
+def setUpModule() -> None:
+    global F
+    F = Factory()
+
+
+def tearDownModule() -> None:
+    F.cleanup()
+
+
+class FloorTableTests(unittest.TestCase):
+    def test_table_version_is_versioned_candidate(self) -> None:
+        self.assertRegex(FLOOR_TABLE_VERSION, r"^r2a-floors/\d+\.\d+\.\d+-candidate-\d{4}-\d{2}-\d{2}$")
+        self.assertEqual(FLOOR_TABLE_VERSION, table_record()["floor_table"])
+
+    def test_eight_engines_and_binary_names(self) -> None:
+        names = {e: s.names for e, s in FLOORS.items()}
+        self.assertEqual(
+            {
+                "claude_code": ("claude",), "codex": ("codex",), "opencode": ("opencode", "opencode2"),
+                "grok": ("grok",), "antigravity": ("agy",), "cursor": ("agent", "cursor-agent"),
+                "pi": ("pi",), "hermes": ("hermes",),
+            },
+            names,
+        )
+        self.assertEqual([], [e for e, s in FLOORS.items() if s.probe_name])
+        self.assertEqual("date", FLOORS["cursor"].scheme)
+        self.assertEqual(
+            {"antigravity": "binary+launcher", "cursor": "launcher+tree", "pi": "launcher+tree", "hermes": "launcher+tree"},
+            {e: s.pin for e, s in FLOORS.items() if s.pin},
+        )
+        # Gemini CLI is dropped (Lucas, 2026-11-09): no row, no binary name, no api_key_only field.
+        self.assertNotIn("gemini", FLOORS)
+        self.assertNotIn("gemini", [n for s in FLOORS.values() for n in s.names])
+        self.assertNotIn("gemini", table_record()["engines"])
+        self.assertFalse(hasattr(FLOORS["grok"], "api_key_only"))
+        self.assertNotIn("api_key_only", table_record()["engines"]["grok"])
+        self.assertEqual("r2a-floors/1.5.0-candidate-2026-11-09", FLOOR_TABLE_VERSION)
+
+    def test_two_slots(self) -> None:
+        slots = {e: (s.functional, s.security) for e, s in FLOORS.items()}
+        self.assertEqual(
+            {
+                "claude_code": ("2.1.314", "2.1.260"), "codex": (None, "0.131.0"),
+                "opencode": (None, "1.18.33"), "grok": (None, None), "antigravity": (None, None),
+                "cursor": (None, "2025.09.17-25b418f"), "pi": (None, None),
+                "hermes": (None, None),
+            },
+            slots,
+        )
+        self.assertIn("beta until measured", FLOORS["codex"].functional_basis)
+        self.assertIn("0.145.0", FLOORS["codex"].functional_basis)
+
+    def test_identity_column(self) -> None:
+        engines = table_record()["engines"]
+        required = {"claude_code", "codex", "opencode"}
+        pinned = {"pi", "hermes", "cursor", "antigravity"}
+        for engine in required:
+            self.assertEqual("required", engines[engine]["identity"], engine)
+        for engine in pinned:
+            self.assertEqual("pin", engines[engine]["identity"], engine)
+        for engine in set(FLOORS) - required - pinned:  # #424 round 1: no required line, no pin
+            self.assertEqual("unverified", engines[engine]["identity"], engine)
+        self.assertEqual({"grok"}, set(FLOORS) - required - pinned)
+
+    def test_table_is_read_only(self) -> None:
+        self.assertIsInstance(FLOORS, MappingProxyType)
+        with self.assertRaises(TypeError):
+            FLOORS["kiro"] = FLOORS["grok"]  # type: ignore[index]
+
+    def test_every_floor_parses_as_a_release(self) -> None:
+        for spec in FLOORS.values():
+            for floor in (spec.functional, spec.security):
+                if floor is not None:
+                    with self.subTest(engine=spec.engine, floor=floor):
+                        parsed = parse_version(spec.scheme, floor)
+                        self.assertIsNotNone(parsed)
+                        self.assertIsNone(parsed.prerelease)
+
+
+class ParseTests(unittest.TestCase):
+    def test_real_shape_lines(self) -> None:
+        cases = [
+            ("semver", "2.1.318 (Claude Code)", (2, 1, 318)),
+            ("semver", "codex-cli 0.160.0", (0, 160, 0)),
+            ("semver", "opencode v2.2.5", (2, 2, 5)),
+            ("semver", "hermes-acp 0.9.1", (0, 9, 1)),
+            ("semver", "0.39.1", (0, 39, 1)),
+            ("date", "2026.10.22", (2026, 10, 22, 0, 0, 0)),
+            ("date", "2026.10.01-e373342", (2026, 10, 1, 0, 0, 0)),
+            ("date", "v2026.10.22", (2026, 10, 22, 0, 0, 0)),
+            ("date", "2026.10.01-14-05-09-e373342", (2026, 10, 1, 14, 5, 9)),
+            ("date", "2025.09.17-25b418f", (2025, 9, 17, 0, 0, 0)),
+        ]
+        for scheme, line, key in cases:
+            with self.subTest(line=line):
+                parsed = parse_version(scheme, line)
+                self.assertIsNotNone(parsed)
+                self.assertEqual(key, parsed.key)
+                self.assertIsNone(parsed.prerelease)
+
+    def test_date_versions_compare_numerically(self) -> None:
+        def key(s: str) -> tuple[int, ...]:
+            return parse_version("date", s).key
+
+        self.assertLess(key("2025.09.17-25b418f"), key("2026.10.01-e373342"))
+        self.assertLess(key("2026.9.30"), key("2026.10.01"))  # not a string compare
+        self.assertLess(key("2026.10.01-e373342"), key("2026.10.22"))
+        self.assertEqual(key("2026.10.01-aaaaaaa"), key("2026.10.01-bbbbbbb"))
+        self.assertLess(key("2026.10.01"), key("2026.10.01-00-00-01-abcdef0"))
+
+    def test_prerelease_is_reported_not_accepted(self) -> None:
+        for line in ("2.1.318-beta.1 (Claude Code)", "codex-cli 0.131.0-alpha.2", "v1.0.0-rc1"):
+            with self.subTest(line=line):
+                self.assertIsNotNone(parse_version("semver", line).prerelease)
+
+    def test_strict_rejects(self) -> None:
+        bad = ["", "Claude Code", "2.1", "2.1.318.4", "2.1.318abc", "2.1.318+build.5", "2.1.318-beta+b",
+               "02.1.3", "2.01.3", "1234567890.0.0", "2.1.-1", "x2.1.318", "2.1.318_1", None, 5,
+               "1." * 200]
+        for line in bad:
+            with self.subTest(line=line):
+                self.assertIsNone(parse_version("semver", line))
+        for line in ("2026.13.01", "2026.00.10", "2026.10.32", "26.10.22", "2026.10.22-zz",
+                     "2026.10.22.1", "2026.10.22-25-00-00-abcdef0", "2026.10.22-ABCDEF0"):
+            with self.subTest(line=line):
+                self.assertIsNone(parse_version("date", line))
+        self.assertIsNone(parse_version("calver", "2026.10.22"))
+
+    def test_impossible_calendar_dates_are_unparsed(self) -> None:
+        # Devin r4503714950: day 31 is not valid in every month.
+        for line in ("2026.02.31", "2026.02.29", "2026.04.31", "2026.06.31", "2026.09.31", "2026.11.31",
+                     "2025.02.29-e373342"):
+            with self.subTest(line=line):
+                self.assertIsNone(parse_version("date", line))
+        for line, key in (("2028.02.29", (2028, 2, 29, 0, 0, 0)), ("2026.01.31", (2026, 1, 31, 0, 0, 0))):
+            with self.subTest(line=line):
+                self.assertEqual(key, parse_version("date", line).key)
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX fixtures")
+class DetectTests(unittest.TestCase):
+    def test_native_hit_and_symlinked_native(self) -> None:
+        d1, d2 = F.dir(), F.dir()
+        real = F.make("claude-2.1.318", "2.1.318 (Claude Code)", where=d2)
+        os.symlink(real, os.path.join(d1, "claude"))
+        found = detect("claude_code", os.pathsep.join([d1, d2]))
+        self.assertEqual(os.path.join(d1, "claude"), found.candidate)
+        self.assertEqual(real, found.hits[0].realpath)
+        self.assertEqual("native", found.hits[0].kind)
+
+    def test_script_only_is_not_a_candidate(self) -> None:
+        d = F.dir()
+        F.script(os.path.join(d, "claude"))
+        found = detect("claude_code", d)
+        self.assertIsNone(found.candidate)
+        self.assertEqual("script", found.hits[0].kind)
+        self.assertIn("fail closed", found.note)
+
+    def test_wrapper_first_on_path_shadows_later_native(self) -> None:
+        d1, d2 = F.dir(), F.dir()
+        F.script(os.path.join(d1, "claude"))
+        F.make("claude", "2.1.318 (Claude Code)", where=d2)
+        found = detect("claude_code", os.pathsep.join([d1, d2]))
+        self.assertIsNone(found.candidate)
+        self.assertEqual(2, len(found.hits))
+
+    def test_non_executable_file_does_not_shadow_a_later_native(self) -> None:
+        # Devin r4503714702: a shell skips a file it cannot execute; so does detection.
+        d1, d2 = F.dir(), F.dir()
+        stray = F.make("claude", "2.1.318 (Claude Code)", where=d1)
+        os.chmod(stray, 0o644)
+        real = F.make("claude", "2.1.318 (Claude Code)", where=d2)
+        found = detect("claude_code", os.pathsep.join([d1, d2]))
+        self.assertEqual(real, found.candidate)
+        self.assertEqual([real], [h.path for h in found.hits])
+
+    def test_detection_never_executes_a_hit(self) -> None:
+        d = F.dir()
+        marker = os.path.join(d, "ran")
+        F.script(os.path.join(d, "claude"), f"#!/bin/sh\ntouch {marker}\n")
+        detect_all(d)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_explicit_path_string_not_environ(self) -> None:
+        d = F.dir()
+        F.make("claude", "2.1.318 (Claude Code)", where=d)
+        with mock.patch.dict(os.environ, {"PATH": d}):
+            self.assertEqual((), detect("claude_code", "").hits)
+        self.assertEqual((), detect("claude_code", "relative/dir" + os.pathsep + ".").hits)
+
+    def test_unknown_engine(self) -> None:
+        with self.assertRaises(LaunchRefused) as cm:
+            detect("kiro", "/usr/bin")
+        self.assertEqual("engine_unknown", cm.exception.code)
+
+    def test_gemini_is_not_an_engine(self) -> None:
+        # Dropped row: `gemini` is an unknown id even with a native `gemini` on PATH.
+        d = F.dir()
+        F.make("gemini", "0.39.1", where=d)
+        with self.assertRaises(LaunchRefused) as cm:
+            detect("gemini", d)
+        self.assertEqual("engine_unknown", cm.exception.code)
+        self.assertNotIn("gemini", detect_all(d))
+        for found in detect_all(d).values():
+            self.assertEqual((), found.hits)
+            self.assertIsNone(found.candidate)
+
+    def test_cursor_both_names(self) -> None:
+        d = F.dir()
+        F.make("cursor-agent", "2026.10.22", where=d)
+        found = detect("cursor", d)
+        self.assertEqual(os.path.join(d, "cursor-agent"), found.candidate)
+        self.assertIn("pinned route (launcher+tree)", found.note)
+
+    def _npm_codex(self, triple: str | None, layout: str = "vendor") -> tuple[str, str | None]:
+        prefix = F.dir()
+        pkg = os.path.join(prefix, "lib", "node_modules", "@openai", "codex")
+        os.makedirs(os.path.join(pkg, "bin"))
+        F.script(os.path.join(pkg, "bin", "codex.js"), "#!/usr/bin/env node\nrequire('child_process')\n")
+        os.makedirs(os.path.join(prefix, "bin"))
+        os.symlink(os.path.join("..", "lib", "node_modules", "@openai", "codex", "bin", "codex.js"),
+                   os.path.join(prefix, "bin", "codex"))
+        native = None
+        if triple:
+            base = pkg if layout == "vendor" else os.path.join(pkg, "node_modules", "@openai", "codex-linux-x64")
+            vdir = os.path.join(base, "vendor", triple, "codex")
+            os.makedirs(vdir)
+            native = F.make("codex", "codex-cli 0.160.0", where=vdir)
+        return os.path.join(prefix, "bin"), native
+
+    def test_npm_codex_shim_followed_to_vendored_native(self) -> None:
+        triples = _triples()
+        if not triples:
+            self.skipTest("no known vendor triple on this platform")
+        for layout in ("vendor", "optional-dependency"):
+            with self.subTest(layout=layout):
+                bindir, native = self._npm_codex(triples[0], layout)
+                found = detect("codex", bindir)
+                self.assertEqual(native, found.candidate)
+                g = grant("codex", found.candidate, probe=F.probe)
+                self.assertEqual("0.160.0", g.version)
+
+    def test_npm_codex_unrecognised_layout_fails_closed(self) -> None:
+        bindir, _ = self._npm_codex(None)
+        found = detect("codex", bindir)
+        self.assertIsNone(found.candidate)
+        self.assertIn("not recognised", found.note)
+        bindir, _ = self._npm_codex("riscv64-unknown-none")
+        self.assertIsNone(detect("codex", bindir).candidate)
+
+    def test_vendored_lookup_needs_the_npm_path_shape(self) -> None:
+        d = F.dir()
+        js = F.script(os.path.join(d, "codex.js"), "#!/usr/bin/env node\n")
+        self.assertIsNone(codex_vendored_binary(js))
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX fixtures")
+class NpmHermesBridgeTests(unittest.TestCase):
+    """B27 (CSL-772): the unofficial npm hermes-agent bridge is named and never a candidate."""
+
+    def _bridge(self, *, package_name: str = "hermes-agent", under_node_modules: bool = True) -> tuple[str, str]:
+        prefix = F.dir()
+        base = os.path.join(prefix, "lib", "node_modules") if under_node_modules else os.path.join(prefix, "pkgs")
+        root = os.path.join(base, package_name if under_node_modules else "x")
+        os.makedirs(os.path.join(root, "bin"))
+        with open(os.path.join(root, "package.json"), "w") as f:
+            f.write('{"name": "%s", "version": "0.23.0"}' % package_name)
+        js = F.script(os.path.join(root, "bin", "hermes.js"), "#!/usr/bin/env node\n")
+        bindir = os.path.join(prefix, "bin")
+        os.makedirs(bindir)
+        os.symlink(js, os.path.join(bindir, "hermes"))
+        return bindir, root
+
+    def test_npm_bridge_is_named_and_refused(self) -> None:
+        bindir, root = self._bridge()
+        found = detect("hermes", bindir)
+        self.assertIsNone(found.candidate)
+        self.assertIn("npm hermes-agent bridge", found.note)
+        self.assertIn("not upstream Hermes", found.note)
+        _, records = launch_check(bindir, probe=F.probe)
+        rec = next(r for r in records if r["engine"] == "hermes")
+        self.assertEqual("refused", rec["outcome"])
+        self.assertIn("npm hermes-agent bridge", rec["detection"])
+
+    def test_package_json_name_recognises_the_bridge_outside_node_modules(self) -> None:
+        bindir, root = self._bridge(under_node_modules=False)
+        # Not under node_modules/hermes-agent, but package.json says hermes-agent.
+        self.assertEqual(root, npm_hermes_agent_root(os.path.join(root, "bin", "hermes.js")))
+        self.assertIn("npm hermes-agent bridge", detect("hermes", bindir).note)
+
+    def test_other_packages_are_not_called_the_bridge(self) -> None:
+        d = F.dir()
+        os.makedirs(os.path.join(d, "bin"))
+        with open(os.path.join(d, "package.json"), "w") as f:
+            f.write('{"name": "something-else"}')
+        self.assertIsNone(npm_hermes_agent_root(os.path.join(d, "bin", "hermes.js")))
+        with open(os.path.join(d, "package.json"), "w") as f:
+            f.write("not json")
+        self.assertIsNone(npm_hermes_agent_root(os.path.join(d, "bin", "hermes.js")))
+        self.assertIsNone(npm_hermes_agent_root(os.path.join(d, "hermes")))
+
+    def test_package_json_recursion_error_is_not_recognised_and_does_not_abort(self) -> None:
+        # json.loads can raise RecursionError on a deeply nested package.json.
+        # That must mean "not recognised", not abort launch_check for every engine.
+        bindir, root = self._bridge(under_node_modules=False)
+        path = os.path.join(root, "bin", "hermes.js")
+        with mock.patch("recursion_core.launch_check.detect.json.loads", side_effect=RecursionError):
+            self.assertIsNone(npm_hermes_agent_root(path))
+            _grants, records = launch_check(bindir, probe=F.probe)
+        self.assertEqual(set(FLOORS), {r["engine"] for r in records})
+
+    def test_package_json_that_is_not_a_regular_file_does_not_hang_detection(self) -> None:
+        # /usr/bin/hermes makes detect() look at /usr/package.json. A FIFO there must mean
+        # "not recognised", not a blocking open that stops launch_check for every engine.
+        prefix = F.dir()
+        bindir = os.path.join(prefix, "bin")
+        os.makedirs(bindir)
+        F.make("hermes", "hermes 0.9.1", where=bindir)
+        fifo = os.path.join(prefix, "package.json")
+        os.mkfifo(fifo)
+        out: dict[str, object] = {}
+        t = threading.Thread(target=lambda: out.update(found=detect("hermes", bindir)), daemon=True)
+        t.start()
+        t.join(5)
+        if t.is_alive():
+            os.close(os.open(fifo, os.O_RDWR))  # release the blocked reader before failing
+            self.fail("detect() blocked on a FIFO package.json")
+        self.assertEqual(os.path.join(bindir, "hermes"), out["found"].candidate)
+        self.assertIsNone(npm_hermes_agent_root(os.path.join(bindir, "hermes")))
+        os.remove(fifo)
+        os.makedirs(fifo)  # a directory named package.json is not recognised either
+        self.assertIsNone(npm_hermes_agent_root(os.path.join(bindir, "hermes")))
+
+    def test_native_file_in_the_bridge_tree_is_not_a_candidate(self) -> None:
+        bindir, root = self._bridge()
+        native = F.make("hermes-native", "hermes 0.9.1", where=os.path.join(root, "bin"))
+        os.remove(os.path.join(bindir, "hermes"))
+        os.symlink(native, os.path.join(bindir, "hermes"))
+        found = detect("hermes", bindir)
+        self.assertEqual("native", found.hits[0].kind)
+        self.assertIsNone(found.candidate)
+        self.assertIn("npm hermes-agent bridge", found.note)
+
+    @staticmethod
+    def _linked_bridge() -> tuple[str, str, str]:
+        """``npm link`` / ``npm install -g <folder>``: ``lib/node_modules/hermes-agent`` is a symlink to a
+        source folder outside any node_modules, with native files under ``vendor/`` (not ``bin/``)."""
+        prefix = F.dir()
+        src = os.path.join(prefix, "src", "hermes-agent")
+        vendor = os.path.join(src, "vendor")
+        os.makedirs(vendor)
+        with open(os.path.join(src, "package.json"), "w") as f:
+            f.write('{"name": "hermes-agent", "version": "0.23.0"}')
+        F.make("hermes", "hermes 0.9.1", where=vendor)
+        F.make("hermes-acp", "hermes-acp 0.9.1", where=vendor)
+        nm = os.path.join(prefix, "lib", "node_modules")
+        os.makedirs(nm)
+        os.symlink(src, os.path.join(nm, "hermes-agent"))
+        bindir = os.path.join(prefix, "bin")
+        os.makedirs(bindir)
+        for name in ("hermes", "hermes-acp"):
+            os.symlink(os.path.join("..", "lib", "node_modules", "hermes-agent", "vendor", name),
+                       os.path.join(bindir, name))
+        return bindir, src, nm
+
+    def test_symlinked_package_root_is_still_the_bridge(self) -> None:
+        bindir, src, nm = NpmHermesBridgeTests._linked_bridge()
+        hermes = os.path.join(bindir, "hermes")
+        self.assertEqual(os.path.join(src, "vendor", "hermes"), os.path.realpath(hermes))
+        self.assertEqual(os.path.join(nm, "hermes-agent"), npm_hermes_agent_root(hermes))
+        found = detect("hermes", bindir)
+        self.assertEqual("native", found.hits[0].kind)
+        self.assertIsNone(found.candidate)
+        self.assertIn("npm hermes-agent bridge", found.note)
+
+    def test_symlinked_package_root_without_package_json_is_still_the_bridge(self) -> None:
+        # Only the symlink hop names node_modules/hermes-agent; the realpath does not, and no package.json.
+        bindir, src, nm = NpmHermesBridgeTests._linked_bridge()
+        os.remove(os.path.join(src, "package.json"))
+        self.assertEqual(os.path.join(nm, "hermes-agent"), npm_hermes_agent_root(os.path.join(bindir, "hermes")))
+        self.assertIsNone(detect("hermes", bindir).candidate)
+
+    def test_native_outside_bin_is_recognised_by_an_ancestor_package_json(self) -> None:
+        # Reached directly (no symlink hop), a native nested under <root>/bin/<platform>/ or
+        # <root>/vendor/ is still in the tree named by <root>/package.json.
+        bindir, src, nm = NpmHermesBridgeTests._linked_bridge()
+        nested = os.path.join(src, "bin", "linux-x64")
+        os.makedirs(nested)
+        native = F.make("hermes", "hermes 0.9.1", where=nested)
+        self.assertEqual(src, npm_hermes_agent_root(native))
+        self.assertEqual(src, npm_hermes_agent_root(os.path.join(src, "vendor", "hermes")))
+        found = detect("hermes", nested)
+        self.assertIsNone(found.candidate)
+        self.assertIn("npm hermes-agent bridge", found.note)
+
+    def test_detection_never_executes_the_bridge(self) -> None:
+        bindir, root = self._bridge()
+        marker = os.path.join(F.dir(), "ran")
+        F.script(os.path.join(root, "bin", "hermes.js"), f"#!/bin/sh\ntouch {marker}\n")
+        detect("hermes", bindir)
+        self.assertFalse(os.path.exists(marker))
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX fixtures")
+class NpmHermesBridgeGrantTests(unittest.TestCase):
+    """B27 (CSL-772): grant(), its hermes-acp probe and verify() refuse the bridge too, not only detect()."""
+
+    def _tree(self) -> tuple[str, str]:
+        """A hermes-agent package tree under node_modules and an empty bin/ outside it."""
+        prefix = F.dir()
+        root = os.path.join(prefix, "lib", "node_modules", "hermes-agent")
+        os.makedirs(os.path.join(root, "bin"))
+        with open(os.path.join(root, "package.json"), "w") as f:
+            f.write('{"name": "hermes-agent", "version": "0.23.0"}')
+        bindir = os.path.join(prefix, "bin")
+        os.makedirs(bindir)
+        return bindir, root
+
+    def _no_probe(self, *a: object) -> None:
+        self.fail("the version probe ran on the npm hermes-agent bridge")
+
+    def _probed_hermes(self) -> None:
+        """Hermes as the probed native row it was before it became a pinned route (CSL-732, 2026-11-09).
+
+        The ``hermes-acp`` probe and the native-path rules stay covered on this patched row, as in
+        ``test_launch_check.py``; the pinned row is covered by ``NpmHermesBridgePinnedTests``.
+        """
+        table = dict(floors_mod.FLOORS)
+        table["hermes"] = dataclasses.replace(table["hermes"], pin=None, probe_name="hermes-acp", ident_required=True)
+        patch = mock.patch.object(floors_mod, "FLOORS", table)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _refused(self, fn, *a, **kw) -> LaunchRefused:
+        with self.assertRaises(LaunchRefused) as cm:
+            fn(*a, **kw)
+        self.assertEqual("wrapper_refused", cm.exception.code)
+        self.assertIn("npm hermes-agent bridge", cm.exception.detail)
+        return cm.exception
+
+    def test_grant_refuses_a_hermes_path_into_the_bridge_tree(self) -> None:
+        bindir, root = self._tree()
+        os.symlink(F.make("hermes-native", "hermes 0.9.1", where=os.path.join(root, "bin")),
+                   os.path.join(bindir, "hermes"))
+        os.symlink(F.make("hermes-acp-native", "hermes-acp 0.9.1", where=os.path.join(root, "bin")),
+                   os.path.join(bindir, "hermes-acp"))
+        self._refused(grant, "hermes", os.path.join(bindir, "hermes"), probe=self._no_probe)
+
+    def test_grant_refuses_a_hermes_acp_probe_into_the_bridge_tree(self) -> None:
+        # A native hermes outside the bridge, but the hermes-acp that the version probe runs is
+        # inside it: refused before anything runs, on the default (real) probe path as well.
+        bindir, root = self._tree()
+        F.make("hermes", "hermes 0.9.1", where=bindir)
+        os.symlink(F.make("hermes-acp-native", "hermes-acp 0.9.1", where=os.path.join(root, "bin")),
+                   os.path.join(bindir, "hermes-acp"))
+        self._probed_hermes()
+        r = self._refused(grant, "hermes", os.path.join(bindir, "hermes"), probe=self._no_probe)
+        self.assertIn("hermes-acp", r.detail)
+        with mock.patch("recursion_core.launch_check.grant.run_version_probe", side_effect=self._no_probe) as run:
+            self._refused(grant, "hermes", os.path.join(bindir, "hermes"))
+            grants, records = launch_check(bindir)
+        run.assert_not_called()
+        self.assertNotIn("hermes", grants)
+        rec = next(r for r in records if r["engine"] == "hermes")
+        self.assertEqual(("refused", "wrapper_refused"), (rec["outcome"], rec["refusal"]))
+
+    def test_verify_refuses_a_grant_whose_tree_became_the_bridge(self) -> None:
+        prefix = F.dir()
+        bindir = os.path.join(prefix, "bin")
+        os.makedirs(bindir)
+        F.make("hermes", "hermes 0.9.1", where=bindir)
+        F.make("hermes-acp", "hermes-acp 0.9.1", where=bindir)
+        self._probed_hermes()
+        g = grant("hermes", os.path.join(bindir, "hermes"), probe=F.probe)
+        plan = launch_plan(g, ["hermes", "acp"])
+        with open(os.path.join(prefix, "package.json"), "w") as f:
+            f.write('{"name": "hermes-agent"}')
+        self._refused(verify, g)
+        self._refused(plan.exec_argv)
+
+    def test_grant_and_verify_refuse_a_symlinked_package_root(self) -> None:
+        # npm link layout: the realpath is src/hermes-agent/vendor/hermes, outside node_modules.
+        bindir, _src, _nm = NpmHermesBridgeTests._linked_bridge()
+        self._refused(grant, "hermes", os.path.join(bindir, "hermes"), probe=self._no_probe)
+        with mock.patch("recursion_core.launch_check.grant.run_version_probe", side_effect=self._no_probe) as run:
+            grants, records = launch_check(bindir)
+        run.assert_not_called()
+        self.assertNotIn("hermes", grants)
+        rec = next(r for r in records if r["engine"] == "hermes")
+        self.assertEqual("refused", rec["outcome"])
+
+    def test_verify_refuses_a_grant_whose_path_was_relinked_through_the_bridge_root(self) -> None:
+        # Same realpath and digest, but the configured path now reaches it through node_modules/hermes-agent.
+        prefix = F.dir()
+        src = os.path.join(prefix, "src")
+        os.makedirs(src)
+        F.make("hermes", "hermes 0.9.1", where=src)
+        F.make("hermes-acp", "hermes-acp 0.9.1", where=src)
+        link = os.path.join(prefix, "link")
+        os.symlink(src, link)
+        self._probed_hermes()
+        g = grant("hermes", os.path.join(link, "hermes"), probe=F.probe)
+        verify(g)
+        nm = os.path.join(prefix, "node_modules")
+        os.makedirs(nm)
+        os.symlink(src, os.path.join(nm, "hermes-agent"))
+        os.remove(link)
+        os.symlink(os.path.join(nm, "hermes-agent"), link)
+        self._refused(verify, g)
+
+    def test_other_engines_are_not_judged_by_the_hermes_bridge_rule(self) -> None:
+        prefix = F.dir()
+        bindir = os.path.join(prefix, "bin")
+        os.makedirs(bindir)
+        with open(os.path.join(prefix, "package.json"), "w") as f:
+            f.write('{"name": "hermes-agent"}')
+        p = F.make("claude", "2.1.318 (Claude Code)", where=bindir)
+        self.assertEqual(p, grant("claude_code", p, probe=F.probe).path)
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX fixtures")
+class NpmHermesBridgePinnedTests(unittest.TestCase):
+    """B27 (CSL-772) on the pinned Hermes route (CSL-732): the bridge is refused before any hash or pin lookup.
+
+    Fake installs measured in place into a patched pin table; Windows is simulated through
+    ``binary.is_windows()``. No pin here is real.
+    """
+
+    LAUNCHERS = ("hermes", "hermes.cmd", "hermes.ps1")
+
+    def _no_probe(self, *a: object) -> None:
+        self.fail("the version probe ran on the npm hermes-agent bridge")
+
+    def _refused(self, fn, *a, **kw) -> LaunchRefused:
+        with self.assertRaises(LaunchRefused) as cm:
+            fn(*a, **kw)
+        self.assertEqual("wrapper_refused", cm.exception.code, cm.exception)
+        self.assertIn("npm hermes-agent bridge", cm.exception.detail)
+        return cm.exception
+
+    @staticmethod
+    def _windows():
+        return mock.patch.object(binary_mod, "is_windows", return_value=True)
+
+    @staticmethod
+    def _pin(path: str, target: str, entry: tuple[str, ...] = ()) -> pins_mod.Pin:
+        return pins_mod.measure(
+            "hermes", "launcher+tree", path, target, version="0.9.1", platform="test", measured="2026-11-10",
+            source="fake install built by test_floors_detect.py", entry=entry,
+        )
+
+    @staticmethod
+    def _table(*pins: pins_mod.Pin):
+        return mock.patch.object(pins_mod, "PINS", tuple(pins))
+
+    @staticmethod
+    def _bridge_root() -> tuple[str, str]:
+        prefix = F.dir()
+        root = os.path.join(prefix, "lib", "node_modules", "hermes-agent")
+        os.makedirs(os.path.join(root, "bin"))
+        os.makedirs(os.path.join(prefix, "bin"))
+        return prefix, root
+
+    @staticmethod
+    def _install(package: str, launcher: str = "hermes") -> tuple[str, str]:
+        """A script ``<prefix>/bin/<launcher>`` in front of the tree ``<prefix>/lib/<package>``; returns launcher, prefix."""
+        prefix = F.dir()
+        root = os.path.join(prefix, "lib", *package.split("/"))
+        os.makedirs(root)
+        F.script(os.path.join(root, "cli.js"), "#!/usr/bin/env node\n")
+        F.make("node.exe", "v22.0.0", where=root)
+        os.makedirs(os.path.join(prefix, "bin"))
+        return F.script(os.path.join(prefix, "bin", launcher), "#!/bin/sh\n"), prefix
+
+    def test_pinned_grant_refuses_the_bridge_before_hashing_or_pin_lookup(self) -> None:
+        # Even a pin that matches the bridge byte for byte does not get it granted.
+        for launcher in self.LAUNCHERS:
+            with self.subTest(launcher=launcher):
+                _prefix, root = self._bridge_root()
+                path = F.script(os.path.join(root, "bin", launcher), "#!/usr/bin/env node\n")
+                pin = self._pin(path, "..")
+                with self._windows(), self._table(pin), \
+                        mock.patch("recursion_core.launch_check.grant.sha256_file") as hashed, \
+                        mock.patch.object(pins_mod, "match") as matched:
+                    self._refused(grant, "hermes", path, probe=self._no_probe)
+                hashed.assert_not_called()
+                matched.assert_not_called()
+
+    def test_pinned_grant_refuses_a_launcher_linked_into_the_bridge(self) -> None:
+        # bin/hermes, bin/hermes.cmd or bin/hermes.ps1 outside the tree, each a link into it.
+        for launcher in self.LAUNCHERS:
+            with self.subTest(launcher=launcher):
+                prefix, root = self._bridge_root()
+                js = F.script(os.path.join(root, "bin", "hermes.js"), "#!/usr/bin/env node\n")
+                path = os.path.join(prefix, "bin", launcher)
+                os.symlink(js, path)
+                with self._windows(), self._table(self._pin(path, "..")), \
+                        mock.patch("recursion_core.launch_check.grant.sha256_file") as hashed:
+                    self._refused(grant, "hermes", path, probe=self._no_probe)
+                    found = detect("hermes", os.path.dirname(path))
+                hashed.assert_not_called()
+                self.assertEqual([path], [h.path for h in found.hits])
+                self.assertIsNone(found.candidate)
+                self.assertIn("npm hermes-agent bridge", found.note)
+
+    def test_pinned_route_detection_names_the_bridge_and_offers_nothing(self) -> None:
+        self.assertIsNotNone(FLOORS["hermes"].pin)
+        bindir, _src, _nm = NpmHermesBridgeTests._linked_bridge()
+        found = detect("hermes", bindir)
+        self.assertIsNone(found.candidate)
+        self.assertIn("npm hermes-agent bridge", found.note)
+        self.assertIn("fail closed", found.note)
+        _grants, records = launch_check(bindir, probe=self._no_probe)
+        rec = next(r for r in records if r["engine"] == "hermes")
+        self.assertEqual(("refused", "wrapper_refused"), (rec["outcome"], rec["refusal"]))
+
+    def test_a_pinned_hermes_outside_the_bridge_is_still_offered_and_granted(self) -> None:
+        path, _prefix = self._install("hermes_agent")
+        with self._table(self._pin(path, "../lib/hermes_agent")):
+            found = detect("hermes", os.path.dirname(path))
+            self.assertEqual(path, found.candidate)
+            g = grant("hermes", path, probe=self._no_probe)
+            verify(g)
+        self.assertEqual("launcher+tree", g.pin_kind)
+
+    def test_pinned_tree_in_the_bridge_is_refused_behind_a_launcher_outside_it(self) -> None:
+        # The launcher is outside the bridge; the tree its pin names (what a check-only launch executes) is in it.
+        for launcher in self.LAUNCHERS:
+            with self.subTest(launcher=launcher):
+                path, _prefix = self._install("node_modules/hermes-agent", launcher)
+                pin = self._pin(path, "../lib/node_modules/hermes-agent", ("node.exe", "cli.js"))
+                with self._windows(), self._table(pin):
+                    r = self._refused(grant, "hermes", path, probe=self._no_probe)
+                self.assertIn("pinned target", r.detail)
+
+    def test_verify_refuses_a_pinned_grant_whose_launcher_became_the_bridge(self) -> None:
+        # package.json lands in bin/, outside the pinned tree: every digest still matches the grant.
+        for launcher in self.LAUNCHERS:
+            with self.subTest(launcher=launcher):
+                path, prefix = self._install("hermes_agent", launcher)
+                with self._windows(), self._table(self._pin(path, "../lib/hermes_agent", ("node.exe", "cli.js"))):
+                    g = grant("hermes", path, probe=self._no_probe)
+                    self.assertTrue(g.check_only)
+                    plan = launch_plan(g, ["hermes"], {})
+                    plan.exec_argv()
+                    with open(os.path.join(prefix, "bin", "package.json"), "w") as f:
+                        f.write('{"name": "hermes-agent"}')
+                    with mock.patch("recursion_core.launch_check.grant.sha256_file") as hashed:
+                        self._refused(verify, g)
+                        self._refused(plan.exec_argv)
+                    hashed.assert_not_called()
+
+    def test_verify_refuses_a_pinned_grant_whose_tree_became_the_bridge(self) -> None:
+        # package.json lands above the pinned tree, outside it and not above the launcher.
+        path, prefix = self._install("hermes_agent", "hermes.cmd")
+        with self._windows(), self._table(self._pin(path, "../lib/hermes_agent", ("node.exe", "cli.js"))):
+            g = grant("hermes", path, probe=self._no_probe)
+            plan = launch_plan(g, ["hermes"], {})
+            with open(os.path.join(prefix, "lib", "package.json"), "w") as f:
+                f.write('{"name": "hermes-agent"}')
+            with mock.patch.object(pins_mod, "target_sha256") as hashed:
+                r = self._refused(verify, g)
+                self._refused(plan.exec_argv)
+            hashed.assert_not_called()
+        self.assertIn("pinned target", r.detail)
+
+    def test_other_pinned_routes_are_not_judged_by_the_hermes_bridge_rule(self) -> None:
+        _prefix, root = self._bridge_root()
+        path = F.script(os.path.join(root, "bin", "pi"), "#!/usr/bin/env node\n")
+        pin = dataclasses.replace(self._pin(path, ".."), engine="pi")
+        with self._table(pin):
+            self.assertEqual(path, grant("pi", path, probe=self._no_probe).path)
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX fixtures")
+class LaunchCheckTests(unittest.TestCase):
+    def test_one_record_per_engine_and_grants_only_when_clean(self) -> None:
+        d = F.dir()
+        F.make("claude", "2.1.318 (Claude Code)", where=d)
+        F.make("codex", "codex-cli 0.160.0", where=d)
+        F.make("opencode", "opencode v2.2.5", where=d)
+        F.make("gemini", "0.39.1", where=d)  # a leftover Gemini CLI: not an engine, never granted
+        F.script(os.path.join(d, "agent"), "#!/bin/sh\nexec node index.js \"$@\"\n")
+        F.make("pi", "0.30.2", where=d)  # a native `pi` is not Pi (F3): no pin matches it
+        grants, records = launch_check(d, probe=F.probe)
+        by = {r["engine"]: r for r in records}
+        self.assertEqual(set(FLOORS), set(by))
+        self.assertEqual({"claude_code", "codex", "opencode"}, set(grants))
+        self.assertEqual("granted", by["claude_code"]["outcome"])
+        self.assertEqual("2.1.318 (Claude Code)", by["claude_code"]["version_raw"])
+        self.assertFalse(by["claude_code"]["beta"])
+        self.assertTrue(by["codex"]["beta"])
+        self.assertEqual("granted", by["opencode"]["outcome"])
+        self.assertTrue(by["opencode"]["beta"])
+        self.assertNotIn("gemini", by)
+        self.assertNotIn("gemini", grants)
+        self.assertFalse([r for r in records if any(os.path.basename(h) == "gemini" for h in r.get("hits", ()))])
+        self.assertEqual("pin_mismatch", by["cursor"]["refusal"])
+        self.assertEqual("pin_mismatch", by["pi"]["refusal"])
+        for engine in ("grok", "antigravity", "hermes"):
+            self.assertEqual("absent", by[engine]["outcome"])
+        for r in records:
+            self.assertEqual(FLOOR_TABLE_VERSION, r["floor_table"])
+            if r["outcome"] == "granted":
+                self.assertRegex(r["sha256"], re.compile(r"^[0-9a-f]{64}$"))
+
+    def test_repeated_passes_are_stable(self) -> None:
+        d = F.dir()
+        F.make("claude", "2.1.318 (Claude Code)", where=d)
+        F.make("codex", "codex-cli 0.131.0", where=d)
+        first = None
+        for _ in range(5):
+            grants, records = launch_check(d, probe=F.probe)
+            digest = {e: g.sha256 for e, g in grants.items()}
+            first = first or digest
+            self.assertEqual(first, digest)
+
+
+if __name__ == "__main__":
+    unittest.main()

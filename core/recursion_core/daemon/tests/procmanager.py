@@ -33,6 +33,8 @@ class ProcessGroupManager:
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.stop_hook, self.observe_hook, self.grace = stop_hook, observe_hook, grace
+        # Leaders this process started. A re-adopted record has no entry here.
+        self._direct_children = {}
 
     def _record(self, unit):
         try:
@@ -57,6 +59,7 @@ class ProcessGroupManager:
         tmp = self.directory / (unit + '.tmp')
         tmp.write_text(json.dumps({'pid': process.pid, 'start': stat[1]}))
         os.replace(tmp, self.directory / unit)
+        self._direct_children[process.pid] = process
 
     def _alive(self, record):
         stat = _proc_stat(record['pid'])
@@ -97,37 +100,62 @@ class ProcessGroupManager:
             return True
         return False
 
+    def _reap_direct_child(self, record):
+        """Collect the leader this manager started, once that leader has exited.
+
+        stop's kill wait already bounds a live child, so this does not block:
+        poll is WNOHANG, and a child that is still running is left in the map.
+        A re-adopted pid was not started here and is not waited.
+        """
+        process = self._direct_children.get(record['pid'])
+        if process is None or process.returncode is not None:
+            self._direct_children.pop(record['pid'], None)
+            return
+        stat = _proc_stat(process.pid)
+        if stat is not None and stat[1] == record['start'] and stat[0] not in ('Z', 'X'):
+            return
+        if stat is not None and stat[1] == record['start']:
+            process.poll()
+        elif process.returncode is None:
+            # Already gone, or the pid is a different process. Do not wait it.
+            process.returncode = 0
+        if process.returncode is not None:
+            self._direct_children.pop(record['pid'], None)
+
     def stop(self, unit):
         if self.stop_hook:
             self.stop_hook('before_signal', unit)
         record = self._record(unit)
         if record is None:
             raise OSError(f'no record for {unit}')
-        # The leader may already have exited. The group is still there while a
-        # descendant lives, and that descendant has to be signalled too.
-        if self._group_alive(record):
-            try:
-                os.killpg(record['pid'], signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            if self.stop_hook:
-                self.stop_hook('signal_sent', unit)
-            deadline = time.monotonic() + self.grace
-            while self._group_alive(record) and time.monotonic() < deadline:
-                time.sleep(0.01)
+        try:
+            # The leader may already have exited. The group is still there while a
+            # descendant lives, and that descendant has to be signalled too.
             if self._group_alive(record):
                 try:
-                    os.killpg(record['pid'], signal.SIGKILL)
+                    os.killpg(record['pid'], signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-                # SIGKILL delivery is asynchronous: return only once the run is
-                # positively gone (dead or zombie), so a caller that checks right after
-                # stop() never sees a run that is merely still dying (Devin r4506539119).
-                deadline = time.monotonic() + KILL_WAIT
+                if self.stop_hook:
+                    self.stop_hook('signal_sent', unit)
+                deadline = time.monotonic() + self.grace
                 while self._group_alive(record) and time.monotonic() < deadline:
-                    time.sleep(0.005)
-        if self.stop_hook:
-            self.stop_hook('after_signal', unit)
+                    time.sleep(0.01)
+                if self._group_alive(record):
+                    try:
+                        os.killpg(record['pid'], signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    # SIGKILL delivery is asynchronous: return only once the run is
+                    # positively gone (dead or zombie), so a caller that checks right after
+                    # stop() never sees a run that is merely still dying (Devin r4506539119).
+                    deadline = time.monotonic() + KILL_WAIT
+                    while self._group_alive(record) and time.monotonic() < deadline:
+                        time.sleep(0.005)
+            if self.stop_hook:
+                self.stop_hook('after_signal', unit)
+        finally:
+            self._reap_direct_child(record)
 
     def observe(self, unit):
         if self.observe_hook:

@@ -73,8 +73,11 @@ may not be durable, the store is failed, and the caller must not treat it as rol
 a retry with the same command_id finds the receipt if it committed. An interruption (KeyboardInterrupt or
 SystemExit, an exception that is not an ``Exception``) is never turned into another error. One that arrives
 after ``BEGIN`` rolls that transaction back and gives up the helper's lock before it is raised again, so the next
-owner finds no transaction left open in the connection. One at a COMMIT fails the store the same way
-(``commit_outcome_unknown``: the commit may have happened) and is raised as itself.
+owner finds no transaction left open in the connection; so does one after a declaration's ``BEGIN``. One at a
+COMMIT fails the store the same way (``commit_outcome_unknown``: the commit may have happened) and is raised as
+itself. One during a ROLLBACK is followed by one more ROLLBACK; a connection that still holds the transaction then
+fails the store (``rollback_failed``), so the next owner is refused ``store_failed``, not given a connection still in
+a transaction.
 
 WHAT THIS DOES NOT GIVE. Subscribers are callbacks of this process: one that has not run when the process
 dies does not run; a consumer that must not miss an event reads the log from a stored position (lane
@@ -662,9 +665,11 @@ class EventStore:
                 # Whatever ended the opening after BEGIN, an interruption included: roll back what the connection
                 # holds open, so that the next owner does not find this transaction still in it.
                 _HELD.store = None
-                self._rollback(counted=False)
-                with self._guard:
-                    self._open_count -= 1
+                try:
+                    self._rollback(counted=False)
+                finally:
+                    with self._guard:           # given back even when the rollback itself is interrupted
+                        self._open_count -= 1
                 raise
         except BaseException:
             self._lock.release()
@@ -723,6 +728,15 @@ class EventStore:
                 self._conn.execute('ROLLBACK')
         except sqlite3.Error as exc:
             self._fail(exc, 'rollback_failed')
+        except BaseException as exc:            # an interruption during the rollback: it may not have run
+            try:
+                if self._conn.in_transaction:
+                    self._conn.execute('ROLLBACK')
+            except BaseException:               # noqa: BLE001 - the first interruption is the one raised
+                pass
+            if self._conn.in_transaction:
+                self._fail(exc, 'rollback_failed')
+            raise
 
     def _statement(self, sql: str) -> None:
         self._query(sql)
@@ -845,8 +859,8 @@ class EventStore:
             return frozenset(json.loads(rows[0][2]))
         taken = {name for (name,) in self._query("SELECT name FROM sqlite_master")}
         rules = _DeclarationRules(taken, lane + '_')
-        self._statement('BEGIN IMMEDIATE')
         try:
+            self._statement('BEGIN IMMEDIATE')  # inside: an interruption right after it is rolled back below
             for statement in _statements(ddl):
                 if not _has_sql(statement):
                     continue                    # a comment or blank text after the last statement

@@ -13,11 +13,14 @@ work tree only after the engine has finished, over whatever the engine left at t
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
+import math
 import os
 import re
+import stat
 import sys
 import tarfile
 from dataclasses import dataclass, field
@@ -103,9 +106,9 @@ class Task:
         for name, data in self.hidden.items():
             path = work / safe_relpath(name)
             _clear_the_way(work, path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
-            path.chmod(self.modes.get(name, 0o644))
+            _make_parent(path)
+            _release_shared_name(path)
+            _write_private(path, data, self.modes.get(name, 0o644))
 
     def apply_solution(self, work: Path) -> None:
         """The reference solution, for validation and for the stand-in engine only."""
@@ -144,11 +147,20 @@ class Task:
 
 
 def _remove(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-    elif path.is_dir():
+    """Remove ``path`` without following a link.
+
+    A real directory is removed as a tree. Anything else at the name (a file, a link, a FIFO or a
+    socket) is unlinked. ``unlink`` removes the name and does not follow a link.
+    """
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(info.st_mode):
         import shutil
         shutil.rmtree(path)
+        return
+    path.unlink()
 
 
 def _plain_folders_above(work: Path, path: Path) -> bool:
@@ -162,9 +174,9 @@ def _plain_folders_above(work: Path, path: Path) -> bool:
 
 
 def _clear_the_way(work: Path, path: Path) -> None:
-    """Remove what stands where ``path`` is to be written: a file or link where one of its folders must be
-    (a file replaced by a folder), and a folder or link at the path itself (a folder replaced by a file).
-    A link is removed, never followed, so nothing is written outside ``work``."""
+    """Remove what stands where ``path`` is to be written: anything that is not a real folder where one
+    of its folders must be (a file, a link, a FIFO or a socket), and a folder or link at the path
+    itself. A link is removed, never followed, so nothing is written outside ``work``."""
     here = work
     for part in path.relative_to(work).parts[:-1]:
         here = here / part
@@ -172,6 +184,14 @@ def _clear_the_way(work: Path, path: Path) -> None:
             _remove(here)
     if path.is_symlink() or path.is_dir():
         _remove(path)
+
+
+def _make_parent(path: Path) -> None:
+    """Make the folders above ``path``. A name that is still in the way is a TaskError, not a raw OSError."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise TaskError(f"cannot write {path.name}: {exc.strerror}") from None
 
 
 def apply_files(work: Path, files: dict, modes: dict | None = None) -> None:
@@ -188,9 +208,122 @@ def apply_files(work: Path, files: dict, modes: dict | None = None) -> None:
             continue
         path = work / safe_relpath(name)
         _clear_the_way(work, path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data if isinstance(data, bytes) else data.encode("utf-8"))
-        path.chmod((modes or {}).get(name, 0o644))
+        _make_parent(path)
+        _release_shared_name(path)
+        payload = data if isinstance(data, bytes) else data.encode("utf-8")
+        _write_private(path, payload, (modes or {}).get(name, 0o644))
+
+
+_WRITE_ATTEMPTS = 8
+_TAKEN = {
+    errno.EEXIST,
+    errno.ELOOP,
+    errno.ENXIO,
+    errno.EISDIR,
+    errno.ENOTDIR,
+    errno.ENOTEMPTY,
+}
+
+
+def _unlink_name(path: Path) -> None:
+    """Remove ``path`` without following it. A real directory is removed as a tree."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return
+    if stat.S_ISDIR(info.st_mode):
+        import shutil
+        shutil.rmtree(path, ignore_errors=True)
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _write_private(path: Path, data: bytes, mode: int) -> None:
+    """Create a new private regular file and write ``data`` through that descriptor.
+
+    ``O_NOFOLLOW`` refuses a symlink. ``O_EXCL`` refuses a name that already exists, including a
+    FIFO, so the open does not wait for another process. ``O_NONBLOCK`` is the same refusal if a
+    FIFO is opened anyway. A taken name is removed and the create is retried. The descriptor is
+    kept only when ``fstat`` shows a regular file with one link, and its mode is set with
+    ``fchmod`` on that descriptor.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    last = "the name stayed taken"
+    for _ in range(_WRITE_ATTEMPTS):
+        try:
+            fd = os.open(path, flags, 0o600)
+        except OSError as exc:
+            if exc.errno in _TAKEN:
+                _unlink_name(path)
+                last = exc.strerror or last
+                continue
+            raise TaskError(f"cannot write {path.name}: {exc.strerror}") from None
+        discard = False
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                discard = True
+                last = "not a private regular file"
+                continue
+            os.fchmod(fd, mode & 0o777)
+            view = memoryview(data)
+            while len(view):
+                wrote = os.write(fd, view)
+                if wrote <= 0:
+                    raise TaskError(f"cannot write {path.name}")
+                view = view[wrote:]
+            return
+        except TaskError:
+            raise
+        except OSError as exc:
+            raise TaskError(f"cannot write {path.name}: {exc.strerror}") from None
+        finally:
+            os.close(fd)
+            if discard:
+                _unlink_name(path)
+    raise TaskError(f"cannot write {path.name}: {last}")
+
+
+def _release_shared_name(path: Path) -> None:
+    """Unlink a name that must not be opened for writing.
+
+    Opening a FIFO or a socket for write waits for another process, and that wait is not the grading
+    deadline. A hard-linked regular file shares its inode with another name, which may lie outside the
+    work tree. This only removes a name that is already the wrong kind of object. The bytes are written
+    by ``_write_private``, which creates a new file with ``O_NOFOLLOW`` and ``O_EXCL`` so a name planted
+    after this returns is not followed and is not waited on.
+    """
+    try:
+        info = path.lstat()
+    except OSError:
+        return
+    if stat.S_ISLNK(info.st_mode) or stat.S_ISDIR(info.st_mode):
+        return
+    if stat.S_ISREG(info.st_mode) and info.st_nlink <= 1:
+        return
+    path.unlink()
+
+
+def _positive_limit(task_id: str, key: str, value) -> None:
+    """Refuse a time limit that is not a finite positive number of seconds.
+
+    NaN and Infinity pass a ``<= 0`` check (NaN compares false; Infinity is not ``<= 0``) and then
+    ``process.wait`` has no deadline. An integer that does not fit in a float (``10**400``) would raise
+    OverflowError while the task is built.
+    """
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TaskError(f"{task_id}: {key} must be a positive number")
+    try:
+        number = float(value)
+    except OverflowError:
+        raise TaskError(f"{task_id}: {key} must be a finite positive number") from None
+    if not math.isfinite(number) or number <= 0:
+        raise TaskError(f"{task_id}: {key} must be a finite positive number")
 
 
 def _modes(task_id: str, meta: dict) -> dict:
@@ -215,9 +348,7 @@ def _meta(task_id_hint: str, meta: dict) -> dict:
     if not isinstance(command, list) or not command or not all(isinstance(p, str) and p for p in command):
         raise TaskError(f"{task_id}: test_command must be a non-empty list of strings")
     for key in ("timeout_s", "grading_timeout_s"):
-        value = meta.get(key)
-        if value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0):
-            raise TaskError(f"{task_id}: {key} must be a positive number")
+        _positive_limit(task_id, key, meta.get(key))
     return meta
 
 

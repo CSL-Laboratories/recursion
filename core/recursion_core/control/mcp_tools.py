@@ -1,7 +1,8 @@
 """Control MCP tool descriptors and dispatch (CSL-798, candidate). See README.md.
 
-Each tool is one control API method; ``call_tool`` forwards to ``ControlAPI.call`` and adds nothing,
-so the MCP face has no Stop path of its own. Every annotation is set explicitly (PRODUCT.md 055cc7a5,
+Each tool is one control API method; ``call_tool`` forwards to ``ControlAPI.call`` after it refuses
+an ``arguments`` value that is present and is not a ``dict``, so the MCP face has no Stop path of its
+own. Every annotation is set explicitly (PRODUCT.md 055cc7a5,
 O41, decided Nov 7 "All picks"; Q48 is recorded on F60, CSL-762):
 
 * read tools: ``readOnlyHint: true``, ``destructiveHint: false``, ``idempotentHint: true``,
@@ -102,8 +103,8 @@ def descriptors() -> list[dict]:
 def call_tool(api: ControlAPI, name: str, arguments: dict | None) -> dict:
     """``tools/call``: forward to the control API and return its answer verbatim as structured content.
 
-    Arguments are an object, or omitted (``None``, the same as ``{}``). A present value that is not an
-    object is ``request_invalid`` and the API is not called: it is not read as ``{}`` and it does not
+    Arguments are a ``dict``, or omitted (``None``, the same as ``{}``). A present value that is not a
+    ``dict`` is ``request_invalid`` and the API is not called: it is not read as ``{}`` and it does not
     raise. ``isError`` is ``is_error(method, answer)``: a Stop answering ``pending`` or ``ended`` is not
     an error."""
 

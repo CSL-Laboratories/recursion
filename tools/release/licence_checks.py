@@ -26,32 +26,40 @@ backtick fence's info string holds no backtick), and a line of the same characte
 and with nothing after it, closes it, or else the end of the file does. A line that starts, after at
 most three spaces, with `<!--` opens an HTML comment block, which ends on the first line holding
 `-->`; so does one that starts with block-quote or list-item markers and then `<!--`, whose comment
-ends on the first line inside that quote or item holding `-->`. A line that starts with `<script` or
-`<style` opens raw HTML no reader sees, which ends on the line holding its end tag; one that starts
-with another tag (one of CommonMark's block tags, or any tag where no paragraph is open) opens raw
-HTML that runs to the next blank line, its comments read as in a comment block. A comment or a
-script left open (at the end of its line, of its quote or item, of its raw HTML, or of the file)
-hides the rest of the file, as a browser reads the raw HTML. A paragraph runs to a blank line, a
-block that starts as above, a heading, a rule, a list item or a deeper block quote (a line without
-the quote's marker goes on in it). In a paragraph and in a heading, read left to right, a backslash
-escape is its character, a run of backticks opens a code span that the next run of the same length
-ends, and a `<!--` outside code spans hides the text up to the next `-->`, or is text where the
-paragraph holds none. A fence, a comment or raw HTML that a quote or item holds further down is read
-as plain lines.
+ends on the first line inside that quote or item holding `-->`. A line that starts with `<script`,
+`<pre`, `<style` or `<textarea` opens raw HTML that ends on the line holding an end tag of one of the
+four; so does one that starts with block-quote or list-item markers and then such a tag, whose raw
+HTML ends at the end of that quote or item at the latest. A line that starts with another tag (one
+of CommonMark's block tags, or any tag where no paragraph is open) opens raw HTML that runs to the
+next blank line. A browser reads raw HTML's comments, outside its scripts and styles, as in a comment
+block; a comment left open (at the end of its line, of its quote or item, of its raw HTML, or of the
+file) hides the rest of the file. A paragraph runs to a blank line, a block that starts as above, a
+heading, a rule, a list item or a deeper block quote (a line without the quote's marker goes on in
+it). A line indented as code, where no paragraph is open, is indented code, read as written; after a
+list item, until a block at the left margin, it goes on in that item as a paragraph. In a paragraph
+and in a heading, read left to right, a backslash escape is its character, a run of backticks (or
+what an escape leaves of one) opens a code span that the next run of the same length ends, and a
+`<!--` outside code spans hides the text up to the next `-->`, or is text where the paragraph holds
+none. A fence, a comment or raw HTML that a quote or item holds further down is read as plain lines.
+Then a script or a style element hides what follows, past the block its start tag is in, up to its
+end tag or else to the end of the file, as a browser reads it: each tag counts in raw HTML, and in
+text outside code spans and not escaped.
 An e-mail address is read from each `@` outwards, as RFC 5322 writes one: its local part is the atoms
 of RFC 5322's atext and the dots that run up to the `@`, or a quoted string ending there with any
 atoms and dots before it; its domain the atoms and dots that run on from the `@`, less a final dot,
 or a bracketed literal and any Markdown marks right after it; an `@` inside a quoted local part or a
 bracketed domain is that address's own. It is compared whole with CONTACT. The text a reader sees
-(comments taken out) is read as written, and, outside its code spans and the addresses so found,
-again with Markdown's backslash escapes and character references (each with its semicolon) read.
-There CONTACT may stand wrapped as Markdown wraps text: in a code span (backtick runs of one length,
-CONTACT exactly inside), in emphasis (runs of * or _ of one length on each side) or struck through
-(one or two ~ on each side), one inside another; three or more ~ are text. In a comment or a code
-block nothing is Markdown, so there it must be CONTACT exactly. The sentence that names CONTACT is
-held word for word, so there CONTACT stands bare.
-A file larger than SIZE_LIMIT bytes is named without being read, a missing file as missing, and one
-that cannot be read as such; the work the checks do grows in step with a file's size.
+(comments taken out) is read as written, and again with Markdown's backslash escapes and character
+references (each with its semicolon) read outside its code spans and the addresses so found, which
+stay as written, so that a character so read beside one of them joins it. There CONTACT may stand
+wrapped as Markdown wraps text: in a code span (backtick runs of one length, CONTACT exactly inside),
+in emphasis (runs of * or _ of one length on each side) or struck through (one or two ~ on each
+side), one inside another; three or more ~ are text, and so is a mark escaped or read from a
+character reference. In a comment or a code block nothing is Markdown, so there it must be CONTACT
+exactly. The sentence that names CONTACT is held word for word, so there CONTACT stands bare.
+A file larger than SIZE_LIMIT bytes is named, no more than SIZE_LIMIT + 1 bytes of it read (it may
+grow after its size is taken), a missing file as missing, and one that cannot be read as such; the
+work the checks do grows in step with a file's size.
 The tests check the committed files, then break, in a scratch copy of the four files, each rule
 that they name, and check that it is named; and they check that naming the contact or the holder,
 each the edit of two files the comments below describe, leaves them green, also for a quoted
@@ -82,7 +90,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 FILES = ("LICENSE", "NOTICE", "CONTRIBUTING.md", "SECURITY.md")
-SIZE_LIMIT = 1 << 20  # bytes; no licence file is near it, so a larger one is named, never read
+SIZE_LIMIT = 1 << 20  # bytes; no licence file is near it, so a larger one is named, never read whole
 GIT_TIMEOUT = 60  # seconds for one git call
 
 # https://www.apache.org/licenses/LICENSE-2.0.txt, fetched Nov 14, 2026: 11358 bytes. The same
@@ -141,7 +149,10 @@ DECODE = re.compile(r"\\([!-/:-@\[-`{-~])|&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|
 MARKUP = "`*_~"  # Markdown's code, emphasis and strikethrough marks, which may wrap CONTACT where a reader sees it
 FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")  # a line that may open or close a fenced code block
 COMMENT_BLOCK = re.compile(r" {0,3}<!--")  # a line that opens an HTML comment block
-HIDDEN_BLOCK = re.compile(r" {0,3}<(script|style)(?=[\s>]|$)", re.I)  # raw HTML whose text no reader sees
+RAW_BLOCK = re.compile(r" {0,3}<(?:script|pre|style|textarea)(?=[\s>]|$)", re.I)  # raw HTML to a line holding RAW_END
+RAW_END = re.compile(r"</(?:script|pre|style|textarea)>", re.I)  # an end tag that ends such raw HTML (CommonMark)
+SCRIPT = re.compile(r"<(script|style)(?=[\s/>])", re.I)  # the start tag of raw HTML whose text no reader sees
+INDENTED = re.compile(r" {0,3}\t| {4}")  # a line indented as code
 HTML_BLOCK = re.compile(r" {0,3}</?([A-Za-z][A-Za-z0-9-]*)(?=[\s/>]|$)")  # a line that may open other raw HTML
 BLOCK_TAGS = frozenset(  # CommonMark's HTML block tags: one ends a paragraph; another tag opens raw HTML only after one
     "address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt "
@@ -153,6 +164,7 @@ QUOTE = re.compile(r" {0,3}>[ \t]?")  # a block quote's marker
 ITEM = re.compile(r" {0,3}(?:([-+*])|([0-9]{1,9})[.)])( {1,4}|\t)(?=\S)")  # a list item's marker, before its text
 BREAK = re.compile(r" {0,3}(?:(?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,}|=+[ \t]*)$")  # a rule or an underline
 INLINE = re.compile(r"\\[!-/:-@\[-`{-~]|`+|<!--")  # in a paragraph: an escape, a code span's run, a comment
+SEEN = ("shown", "code", "raw", "indented")  # the kinds of piece a reader sees (see _pieces)
 
 def _read(root: Path, rel: str, found: list[str]) -> bytes | None:
     path = root / rel
@@ -163,7 +175,12 @@ def _read(root: Path, rel: str, found: list[str]) -> bytes | None:
         if path.stat().st_size > SIZE_LIMIT:
             found.append(f"{rel} is larger than {SIZE_LIMIT} bytes, which no licence file is")
             return None
-        return path.read_bytes()
+        with path.open("rb") as handle:
+            data = handle.read(SIZE_LIMIT + 1)  # no more: the file may have grown since its size was taken
+        if len(data) > SIZE_LIMIT:
+            found.append(f"{rel} is larger than {SIZE_LIMIT} bytes, which no licence file is")
+            return None
+        return data
     except OSError as exc:  # a file that is there but cannot be read: named, not raised
         found.append(f"{rel} cannot be read ({type(exc).__name__})")
         return None
@@ -175,25 +192,11 @@ def _text(data: bytes) -> str:
     return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("utf-8", errors="replace")
 
 
-def _comments(text: str) -> tuple[list[tuple[str, str]], bool]:
-    """A comment block's `text` cut at its HTML comments, `<!--` to the next `-->`, into (kind, piece),
-    and whether a `<!--` is left open at its end, which hides the rest of `text`."""
-    pieces: list[tuple[str, str]] = []
-    done = 0
-    while (start := text.find("<!--", done)) >= 0:
-        end = text.find("-->", start + 2)  # so <!--> and <!---> are comments too
-        if end < 0:
-            return pieces + [("shown", text[done:start]), ("hidden", text[start:])], True
-        pieces += [("shown", text[done:start]), ("hidden", text[start:end + 3])]
-        done = end + 3
-    return pieces + [("shown", text[done:])], False
-
-
 def _inline(text: str) -> list[tuple[str, str]]:
     """A paragraph's or a heading's `text` cut into (kind, piece), read left to right as CommonMark reads
-    it: a backslash escape is its character; a run of backticks opens a code span ("code") that the next
-    run of the same length ends, or else is text; a `<!--` opens a comment ("gone") that the next `-->`
-    ends, or else is text."""
+    it: a backslash escape is its character; a run of backticks, or what an escape leaves of one, opens a
+    code span ("code") that the next run of the same length ends, or else is text; a `<!--` opens a
+    comment ("gone") that the next `-->` ends, or else is text."""
     runs: dict[int, list[int]] = {}
     for run in re.finditer("`+", text):
         runs.setdefault(len(run.group()), []).append(run.start())
@@ -208,7 +211,7 @@ def _inline(text: str) -> list[tuple[str, str]]:
                 pieces += [("shown", text[done:mark.start()]), ("gone", text[mark.start():end])]
                 done = at = end
         elif token[0] == "`":
-            starts = runs[len(token)]
+            starts = runs.get(len(token), [])  # what an escape leaves of a run: a length no whole run may have
             later = bisect.bisect_left(starts, at)
             if later < len(starts):
                 end = starts[later] + len(token)
@@ -251,16 +254,16 @@ def _inside(line: str, boxes: list[int]) -> bool:
     return True
 
 
-def _pieces(text: str) -> list[tuple[str, str]]:
-    """`text` cut, in order, into (kind, piece): "shown", what a reader of the rendered page sees as
-    text; "code", a code span, which a reader sees as written; "hidden", a fenced code block, a comment
-    or a script, whose place on its lines a reader sees empty; "gone", a comment in a paragraph or a
-    heading, which the text around it closes over. Read block first, as the docstring says."""
+def _blocks(text: str) -> list[tuple[str, str]]:
+    """`text` cut into (kind, piece) as `_pieces` cuts it, read block first, as the docstring says, raw
+    HTML's text whole: its comments, scripts and styles are read after, as a browser reads them."""
     rows = [row for row in re.split(r"(?<=\n)", text) if row]
     pieces: list[tuple[str, str]] = []
     paragraph: list[str] = []
     depth = 0  # the block quotes the paragraph starts in
     listed = False  # whether the paragraph starts as a list item
+    in_item = False  # whether a list item began since the last block at the left margin: a line indented
+    # as code then goes on in that item, as a paragraph, and is no code
 
     def end_paragraph() -> None:
         pieces.extend(_inline("".join(paragraph)))
@@ -274,6 +277,7 @@ def _pieces(text: str) -> list[tuple[str, str]]:
         while quote := QUOTE.match(line, after):
             quotes, after = quotes + 1, quote.end()
         boxes, inner = _containers(line)
+        margin = line[after:after + 1] not in ("", " ", "\t") and not ITEM.match(line, after)  # no item, no indent
         if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
             end_paragraph()
             last = next((i for i in range(at + 1, len(rows)) if _closes(rows[i].rstrip("\n"), opening.group(1))),
@@ -286,49 +290,104 @@ def _pieces(text: str) -> list[tuple[str, str]]:
             while not closed and last + 1 < len(rows) and (not boxes or _inside(rows[last + 1].rstrip("\n"), boxes)):
                 last += 1
                 closed = "-->" in rows[last]
-            found, left_open = _comments("".join(rows[at:last + 1])[start:])
-            pieces += [("shown", line[:start])] + found
-            if left_open:  # open at the end of its line, of its quote or item, or of the file: a browser
-                # reads the rest of the file into that comment
-                return pieces + [("hidden", "".join(rows[last + 1:]))]
-        elif hidden := HIDDEN_BLOCK.match(line):
-            end_paragraph()
-            close = re.compile(rf"</{hidden.group(1)}\s*>", re.I)
-            last = next((i for i in range(at, len(rows)) if close.search(rows[i])), None)
-            if last is None:  # a browser reads the rest of the file as script or style
-                return pieces + [("hidden", "".join(rows[at:]))]
-            block = "".join(rows[at:last + 1])
-            cut = len(block) - len(rows[last]) + close.search(rows[last]).end()
-            pieces += [("hidden", block[:cut]), ("shown", block[cut:])]
+            pieces += [("shown", line[:start]), ("raw", "".join(rows[at:last + 1])[start:])]
+        elif RAW_BLOCK.match(line) or (boxes and RAW_BLOCK.match(line, inner)):
+            end_paragraph()  # raw HTML to the line holding RAW_END, or to the end of its quote or item
+            last = at
+            while not RAW_END.search(rows[last]) and last + 1 < len(rows) and (
+                    not boxes or _inside(rows[last + 1].rstrip("\n"), boxes)):
+                last += 1
+            pieces.append(("raw", "".join(rows[at:last + 1])))
         elif (raw := HTML_BLOCK.match(line)) and (raw.group(1).lower() in BLOCK_TAGS or not paragraph):
-            end_paragraph()  # raw HTML to the next blank line: a browser reads its comments, open ones too
+            end_paragraph()  # raw HTML to the next blank line
             last = next((i for i in range(at + 1, len(rows)) if not rows[i].strip(" \t\n")), len(rows)) - 1
-            found, left_open = _comments("".join(rows[at:last + 1]))
-            pieces += found
-            if left_open:
-                return pieces + [("hidden", "".join(rows[last + 1:]))]
+            pieces.append(("raw", "".join(rows[at:last + 1])))
         elif not line[inner:].strip(" \t") or HEADING.match(line, after) or BREAK.match(line, after):
             end_paragraph()  # a blank line, a heading, a rule or an underline
             pieces += _inline(rows[at])
+            last = at
+        elif not paragraph and not in_item and INDENTED.match(line, inner):
+            pieces.append(("indented", rows[at]))  # a line of indented code, read as written
             last = at
         else:
             item = ITEM.match(line, after)
             if paragraph and (quotes > depth or item and (item.group(1) or int(item.group(2)) == 1 or listed)):
                 end_paragraph()  # a deeper block quote, or a list item, starts a paragraph of its own
             if not paragraph:
-                listed, depth = bool(item), quotes
+                listed, depth, in_item = bool(item), quotes, in_item or bool(item)
+            else:
+                margin = False  # a line that goes on in the paragraph starts no block
             paragraph.append(rows[at])  # a line with fewer quote markers goes on, lazily, in the same paragraph
             last = at
+        if margin:
+            in_item = False  # a block at the left margin ends the list item before it
         at = last + 1
     end_paragraph()
     return pieces
+
+
+def _end_tag(name: str) -> re.Pattern[str]:
+    """The end tag of the script or style element `name`, in any case, as a browser ends one with it."""
+    return re.compile(rf"</{name}[ \t\n\f\r]*>", re.I)
+
+
+def _html(pieces: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """`pieces` as a browser reads their HTML, in order. In raw HTML, a comment, `<!--` to the next `-->`,
+    is hidden, and one left open hides the rest of the file. A script or a style element is hidden from
+    its start tag to its end tag, past the block the start tag is in, and holds no comment: each tag
+    counts in raw HTML, and in text, not escaped there (in a code span or indented code it is text);
+    with no end tag, the rest of the file is hidden."""
+    found: list[tuple[str, str]] = []
+    close: re.Pattern[str] | None = None  # while an element is open: its end tag
+    for index, (kind, piece) in enumerate(pieces):
+        at = 0
+        tag: re.Match[str] | bool | None = None  # the next start tag in `piece` (False: none), found once
+        comment: int | None = None  # where the next comment in raw HTML starts (-1: none), found once
+        while at < len(piece):
+            if close is not None:  # the element's text, up to its end tag
+                ends = close.finditer(piece, at) if kind in ("shown", "raw") else ()
+                end = next((one for one in ends if kind == "raw" or not _escaped(piece, one.start())), None)
+                stop = end.end() if end else len(piece)
+                found.append(("hidden", piece[at:stop]))
+                close, at = None if end else close, stop
+                continue
+            if kind not in ("shown", "raw"):
+                found.append((kind, piece[at:]))
+                break
+            if tag is None or tag and tag.start() < at:
+                starts = SCRIPT.finditer(piece, at)
+                tag = next((one for one in starts if kind != "shown" or not _escaped(piece, one.start())), False)
+            if kind == "raw" and (comment is None or 0 <= comment < at):
+                comment = piece.find("<!--", at)
+            if kind == "raw" and comment >= 0 and (not tag or comment < tag.start()):
+                end = piece.find("-->", comment + 2)  # so <!--> and <!---> are comments too
+                found.append((kind, piece[at:comment]))
+                if end < 0:  # a browser reads the rest of the file into the comment
+                    return found + [("hidden", piece[comment:])] + [("hidden", rest) for _, rest in pieces[index + 1:]]
+                found.append(("hidden", piece[comment:end + 3]))
+                at = end + 3
+            else:  # text, up to a start tag
+                stop = tag.start() if tag else len(piece)
+                found.append((kind, piece[at:stop]))
+                close, at = _end_tag(tag.group(1)) if tag else None, stop
+    return found
+
+
+def _pieces(text: str) -> list[tuple[str, str]]:
+    """`text` cut, in order, into (kind, piece): "shown", what a reader of the rendered page sees as
+    text; "code", a code span, which a reader sees as written; "raw", raw HTML's text, which a reader
+    sees as text; "indented", a line of indented code, which a reader sees as written;
+    "hidden", a fenced code block, a comment or a script, whose place on its lines a reader sees empty;
+    "gone", a comment in a paragraph or a heading, which the text around it closes over. Read as the
+    docstring says: block first, then the HTML, as a browser reads it."""
+    return _html(_blocks(text))
 
 
 def _visible(text: str) -> str:
     """What a reader of the rendered page sees as text: `text` without its comments in paragraphs and
     headings, and with each character of its fenced code blocks, comments and scripts, line endings
     aside, blanked to a space."""
-    return "".join(piece if kind in ("shown", "code") else "" if kind == "gone" else re.sub(r"[^\n]", " ", piece)
+    return "".join(piece if kind in SEEN else "" if kind == "gone" else re.sub(r"[^\n]", " ", piece)
                    for kind, piece in _pieces(text))
 
 
@@ -375,10 +434,11 @@ def _addresses(text: str) -> list[tuple[int, int]]:
     return [(start, end) for start, _, end in found]
 
 
-def _is_contact(address: str) -> bool:
+def _is_contact(address: str, literal: set[int] | frozenset[int] = frozenset()) -> bool:
     """Whether `address` is CONTACT, bare or wrapped as Markdown wraps text: in a code span (backtick runs
     of one length, CONTACT exactly inside), in emphasis (runs of * or _ of one length on each side), or
-    struck through (one or two ~ on each side), one inside another."""
+    struck through (one or two ~ on each side), one inside another. A mark at an offset in `literal`,
+    escaped or read from a character reference, is a character, and wraps nothing."""
     start, end = 0, len(address)
     while not (end - start == len(CONTACT) and address.startswith(CONTACT, start)):
         mark = address[start:start + 1]
@@ -392,10 +452,27 @@ def _is_contact(address: str) -> bool:
             outer -= 1
         if end - outer != inner - start or (mark == "~" and inner - start > 2):
             return False  # unequal runs, or three or more tildes, are text
+        if any(at in literal for at in (*range(start, inner), *range(outer, end))):
+            return False  # and so is a mark escaped or read from a character reference
         if mark == "`":
             return outer - inner == len(CONTACT) and address.startswith(CONTACT, inner)
         start, end = inner, outer
     return True
+
+
+def _decoded(text: str, at: int, literal: list[int]) -> str:
+    """`text` with Markdown's backslash escapes and character references read as a reader sees them. `at`
+    is where `text` starts in the text read; where each character so read stands there goes on
+    `literal`."""
+    parts: list[str] = []
+    done = 0
+    for one in DECODE.finditer(text):
+        char = one.group(1) if one.group(1) is not None else html.unescape(one.group())
+        at += one.start() - done
+        parts += [text[done:one.start()], char]
+        literal.extend(range(at, at + len(char)))
+        at, done = at + len(char), one.end()
+    return "".join(parts) + text[done:]
 
 
 def _committed(root: Path, rel: str, found: list[str]) -> list[tuple[str, bytes]]:
@@ -488,25 +565,38 @@ def security_problems(root: Path) -> list[str]:
             found.append(f"SECURITY.md's section {part.strip()!r} is empty")
     found += [f"SECURITY.md does not say {sentence!r}"
               for sentence in (f"Report it privately to {CONTACT}.", PUBLIC_ISSUE) if sentence not in text]
-    # As a reader sees it, the comments in paragraphs taken out: as written first, then, outside its code
-    # spans and the addresses found, with escapes and character references read.
-    seen = [(kind, piece) for kind, piece in pieces if kind in ("shown", "code")]
+    # As a reader sees it, the comments in paragraphs taken out: as written first; then with escapes and
+    # character references read outside its code spans and the addresses found, which stay as written, so
+    # that a character read beside one of them joins it.
+    seen = [(kind, piece) for kind, piece in pieces if kind in SEEN]
     written = "".join(piece for _, piece in seen)
     spans = _addresses(written)
-    masked, done = [], 0
-    for start, end in spans:
-        masked += [written[done:start], " " * (end - start)]
-        done = end
-    masked = "".join(masked) + written[done:]
-    read, done = [], 0
+    read: list[str] = []
+    literal: list[int] = []  # where, in the text read, a character read from an escape or a reference stands
+    done = ahead = size = 0
     for kind, piece in seen:
-        segment, done = masked[done:done + len(piece)], done + len(piece)
-        read.append(segment if kind == "code" else DECODE.sub(
-            lambda one: one.group(1) if one.group(1) is not None else html.unescape(one.group()), segment))
+        last = done + len(piece)
+        while done < last:
+            while ahead < len(spans) and spans[ahead][1] <= done:
+                ahead += 1  # the addresses that end before here
+            start, end = spans[ahead] if ahead < len(spans) else (last, last)
+            if kind == "code" or start <= done:  # a code span, or an address found as written: as written
+                cut = last if kind == "code" else min(end, last)
+                part = written[done:cut]
+            else:
+                cut = min(start, last)
+                part = _decoded(written[done:cut], size, literal)
+            read.append(part)
+            size, done = size + len(part), cut
     read = "".join(read)
-    unseen = [piece for kind, piece in pieces if kind not in ("shown", "code")]
-    if (not all(_is_contact(written[start:end]) for start, end in spans)
-            or not all(_is_contact(read[start:end]) for start, end in _addresses(read))
+
+    def marks(start: int, end: int) -> set[int]:
+        """Where, in the address read[start:end], a character read from an escape or a reference stands."""
+        return {at - start for at in literal[bisect.bisect_left(literal, start):bisect.bisect_left(literal, end)]}
+
+    unseen = [piece for kind, piece in pieces if kind not in SEEN]
+    if (not all(_is_contact(written[start:end], {0} if _escaped(written, start) else set()) for start, end in spans)
+            or not all(_is_contact(read[start:end], marks(start, end)) for start, end in _addresses(read))
             or any(piece[start:end] != CONTACT for piece in unseen for start, end in _addresses(piece))):
         found.append("SECURITY.md holds an e-mail address that is not its contact (CONTACT)")
     return found
@@ -632,14 +722,19 @@ class BrokenRuleTests(unittest.TestCase):
 
     def test_a_file_at_the_size_limit_is_read_and_a_larger_one_is_not(self) -> None:
         reads: list[str] = []
-        read_bytes = Path.read_bytes
+        read_bytes, opened = Path.read_bytes, Path.open
 
         def spy(path: Path) -> bytes:
             reads.append(path.name)
             return read_bytes(path)
+
+        def spy_open(path: Path, *args: object, **kwargs: object) -> object:
+            reads.append(path.name)
+            return opened(path, *args, **kwargs)
         for rel in FILES:
             size = (self.root / rel).stat().st_size
-            with self.subTest(rel=rel), mock.patch.object(Path, "read_bytes", spy):
+            with self.subTest(rel=rel), mock.patch.object(Path, "read_bytes", spy), \
+                    mock.patch.object(Path, "open", spy_open):
                 reads.clear()
                 with mock.patch.dict(globals(), {"SIZE_LIMIT": size}):
                     self.assertEqual([p for p in self.found() if p.startswith(f"{rel} is larger")], [])
@@ -1049,7 +1144,8 @@ class BrokenRuleTests(unittest.TestCase):
         text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
         shapes = ("a." * 150000, '\\"@x' * 20000, "*" * 40000 + "x@example.invalid" + "*" * 40000,
                   "@[" * 20000, "x " + "<!--" * 20000, "a@" * 20000, '"' * 40000 + "@x", "`x``y" * 15000,
-                  "\\`" * 20000, "- a <!--\n" * 3000, "> <!--\n" * 2000, "<!--" * 20000)
+                  "\\`" * 20000, "- a <!--\n" * 3000, "> <!--\n" * 2000, "&#42;a@b\\* " * 5000,
+                  "x <style>\\</style> </style> " * 2500, "<!--" * 20000)
         body = text + "\n" + "\n\n".join(shapes) + "\n"
         self.assertLess(len(body.encode("utf-8")), SIZE_LIMIT)
         (self.root / "SECURITY.md").write_text(body, encoding="utf-8", newline="\n")
@@ -1089,14 +1185,53 @@ class BrokenRuleTests(unittest.TestCase):
 
     def test_a_file_that_cannot_be_read_is_named(self) -> None:
         """F6: a file that is there, under SIZE_LIMIT, and cannot be read is named, not raised."""
-        read_bytes = Path.read_bytes
+        opened = Path.open
         for rel in FILES:
-            def refuse(path: Path, rel: str = rel) -> bytes:
+            def refuse(path: Path, *args: object, rel: str = rel, **kwargs: object) -> object:
                 if path.name == rel:
                     raise PermissionError(13, "Permission denied", str(path))
-                return read_bytes(path)
-            with self.subTest(rel=rel), mock.patch.object(Path, "read_bytes", refuse):
+                return opened(path, *args, **kwargs)
+            with self.subTest(rel=rel), mock.patch.object(Path, "open", refuse):
                 self.assertNamed(rf"^{re.escape(rel)} cannot be read \(PermissionError\)$")
+
+    def test_a_file_that_grows_after_its_size_is_taken_is_named_not_read_whole(self) -> None:
+        """DeepSeek r5 F3 and F8: the size a stat gave is not trusted; at most SIZE_LIMIT + 1 bytes are
+        read, and a file that holds more is named."""
+        real_stat, opened = Path.stat, Path.open
+        sizes: list[int] = []
+
+        class Counted:
+            """A file opened for reading that notes how much each read asks for."""
+
+            def __init__(self, handle: object) -> None:
+                self.handle = handle
+
+            def __enter__(self) -> "Counted":
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                self.handle.close()
+
+            def read(self, size: int = -1) -> bytes:
+                sizes.append(size)
+                return self.handle.read(size)
+
+        def counted(path: Path, *args: object, **kwargs: object) -> Counted:
+            return Counted(opened(path, *args, **kwargs))
+        for rel in FILES:
+            data = (self.root / rel).read_bytes()
+
+            def stale(path: Path, *args: object, rel: str = rel, size: int = len(data),
+                      **kwargs: object) -> os.stat_result:
+                result = real_stat(path, *args, **kwargs)  # the size the file had before it grew
+                return os.stat_result((*result[:6], size, *result[7:10])) if path.name == rel else result
+            with self.subTest(rel=rel), mock.patch.dict(globals(), {"SIZE_LIMIT": len(data) * 2}):
+                (self.root / rel).write_bytes(data * 3)
+                sizes.clear()
+                with mock.patch.object(Path, "stat", stale), mock.patch.object(Path, "open", counted):
+                    self.assertNamed(rf"^{re.escape(rel)} is larger than {len(data) * 2} bytes")
+                self.assertTrue(sizes and all(0 <= size <= len(data) * 2 + 1 for size in sizes), sizes)
+                (self.root / rel).write_bytes(data)
 
     def test_what_is_and_is_not_an_address(self) -> None:
         """An `@` with no local part, no domain, or a quoted string that its line or an escape leaves
@@ -1400,6 +1535,103 @@ class BrokenRuleTests(unittest.TestCase):
                         self.assertIn(self.EMAIL_PROBLEM, self.found())
                     else:
                         self.assertEqual(self.found(), [])
+
+    # Grok's fifth read (R1-R3), with Devin's two threads on 506c2b04 (R1, R2): their cases, on this harness.
+    def test_what_an_escape_leaves_of_a_backtick_run_is_a_run(self) -> None:
+        """R1: a backslash and two backticks are a backtick and a run of one, which the next run of one
+        ends, or else is text; the checks answer, and do not crash."""
+        sentence = f"Report it privately to {CONTACT}."
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for case, (changed, hidden) in enumerate((
+                (text + "\nA literal backtick is written \\``.\n", False),
+                (text + "\nTwo are written \\```.\n", False),
+                (text.replace(sentence, "A marker is \\``<!--`. " + sentence + " Its end is -->."), False),
+                (text.replace(sentence, "A marker is \\``<!--. " + sentence + " Its end is -->."), True))):
+            with self.subTest(case=case):
+                (self.root / "SECURITY.md").write_text(changed, encoding="utf-8", newline="\n")
+                if hidden:
+                    self.assertNamed(r"^SECURITY\.md does not say " + re.escape(repr(sentence)))
+                else:
+                    self.assertEqual(self.found(), [])
+
+    def test_a_character_read_beside_the_contact_joins_it(self) -> None:
+        """R2: an escape or a character reference beside CONTACT is the character a reader sees there,
+        which makes another address; a mark escaped or read from a reference wraps nothing."""
+        original = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        named = "security@example.invalid"
+        text = original.replace(CONTACT, named)
+        with mock.patch.dict(globals(), {"CONTACT": named}):
+            for line, other in ((f"Or write to {named}\\.evil.example.", True), (f"evil&#46;{named}", True),
+                                (f"xx&#97;{named}", True), (f"Or write to {named}\\~extra.example.", True),
+                                (f"Or write to &#42;{named}\\*.", True), (f"Or write to \\_{named}_.", True),
+                                (f"Or write to \\`{named}`.", True),
+                                (f"Or write to \\({named}\\) or *{named}*\\.", False)):
+                with self.subTest(line=line):
+                    (self.root / "SECURITY.md").write_text(text + "\n" + line + "\n", encoding="utf-8", newline="\n")
+                    if other:
+                        self.assertIn(self.EMAIL_PROBLEM, self.found())
+                    else:
+                        self.assertEqual(self.found(), [])
+        star = "*@example.invalid"  # a contact that starts with a mark is that contact, escaped or read too
+        text = original.replace(CONTACT, star) + f"\nOr write to \\{star} or &#42;{star[1:]}.\n"
+        (self.root / "SECURITY.md").write_text(text, encoding="utf-8", newline="\n")
+        with mock.patch.dict(globals(), {"CONTACT": star}):
+            self.assertEqual(self.found(), [])
+        literal: list[int] = []  # where each character read stands, text that is not read before it
+        self.assertEqual(_decoded("a\\*b&#42;", 5, literal), "a*b*")
+        self.assertEqual(literal, [6, 8])
+
+    def test_a_script_or_a_style_that_opens_in_text_hides_what_follows(self) -> None:
+        """R3: in raw HTML, after a quote's or an item's marker, or in a paragraph, a script or a style
+        hides what follows, past its block, up to its end tag, as a browser reads it."""
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        flat = re.sub(r"\n\n+", "\n", text)  # no blank line: raw HTML or a paragraph runs on to the end
+        sentence = f"Report it privately to {CONTACT}."
+        for changed, hidden in (("<div>\n<script>\n" + flat + "</script>\n</div>\n", "all"),
+                                ("<div>\n<Style>\n" + flat + "</STYLE>\n</div>\n", "all"),
+                                ("> <script>\n" + text + "\n</script>\n", "all"),
+                                ("- <script>\n" + flat + "</script>\n", "all"),
+                                ("<div><script>\n</div>\n\n" + text, "all"),  # never ended
+                                ("<div>\n\\<script>\n" + flat, "all"),  # raw HTML has no escapes
+                                ("Text <script/>\n\n" + text, "all"),
+                                ("Text <script>\n`</script>`\n\n" + text + "</script>\n", "all"),  # code shows it
+                                ("Text <script>\n\\</script>\n\n" + text + "</script>\n", "all"),  # so does an escape
+                                ("Text <script>\n</script\u00a0>\n\n" + text + "</script>\n", "all"),  # no end tag
+                                (text.replace(sentence, f"See <script>{sentence}</script>"), "sentence"),
+                                ("<script>\n</Style>\n\\</script>\n" + text + "</script>\n", "all"),  # CommonMark ends
+                                # the raw HTML at </Style>, so the escape after it is Markdown's
+                                ("<script>\n</script >\nx <!--\n" + text, "all"),  # the raw HTML goes on, comment too
+                                ("Text <script>\n\n    </script>\n\n" + text + "</script>\n", "all"),  # indented code
+                                ("- item\n\n    <script>\n\n" + text, "all"),  # the item's text, which opens it
+                                ("    </script>\n</script >\n`<!--`\n" + text, "all"),  # raw HTML after the code
+                                ("- item\n\n    a\n\n    <!-- " + sentence + " -->\n\n" + text.replace(sentence, "x"),
+                                 "sentence"),  # an item's paragraphs, each indented as code, are no code
+                                ("    <script>alert(1)</script>\n    <style>\n\n" + text, ""),  # code shows its tags
+                                ("- item\nlazy\n\n    <!-- " + sentence + " -->\n\n" + text.replace(sentence, "x"),
+                                 "sentence"),  # a lazy line is the item's
+                                ("- item\n\nText\n\n    <style>\n\n" + text, ""),  # the item has ended
+                                ("- item\n## Heading\n    <style>\n\n" + text, ""),  # a heading ends it too
+                                ("> <script>\n</script>\nx `<script>` y\n\n" + text, "all"),  # raw HTML: no code spans
+                                ("x \\<script>\nx <style>\n</script>\n\n" + text, "all"),  # the style is open
+                                ("<pre>\n\n\\<script>\n</pre>\n\n" + text, "all"),  # <pre> raw HTML runs to </pre>
+                                ("x \\<script>\n\n" + text, ""),  # in text an escaped tag opens nothing
+                                ("Text <script>\n    </script>\n\n" + text, ""),  # a paragraph's indented line is text
+                                ("<!-- a --> " + sentence + "\n\n" + text.replace(sentence, "x"), ""),  # after -->
+                                ("<div>\n" + sentence + "\n</div>\n\n" + text.replace(sentence, "x"), ""),  # raw HTML
+                                ("<div><script>\n\\</script>\n</div>\n\n" + text, ""),  # in raw HTML it ends one
+                                ("<script>\n<!--\n</script>\n\n" + text, ""),  # a script holds no comment
+                                ("<div><SCRIPT>x</script></div>\n\n" + text, ""),
+                                ("Text <style>\nmore\n\nNote </style> done.\n\n" + text, ""),
+                                (text.replace(sentence, f"See `<script>`. {sentence}"), ""),
+                                ("    " + sentence + "\n\n" + text.replace(sentence, "x"), "")):  # indented code: seen
+            with self.subTest(changed=changed[:40]):
+                (self.root / "SECURITY.md").write_text(changed, encoding="utf-8", newline="\n")
+                if hidden == "all":
+                    self.assertIn("SECURITY.md has no '## Scope'", self.found())
+                elif hidden:
+                    self.assertNamed(r"^SECURITY\.md does not say " + re.escape(repr(sentence)))
+                else:
+                    self.assertEqual(self.found(), [])
 
     def named_in(self, source: str, constant: str, old: str, new: str) -> str:
         """`source` with the one top-level assignment of `constant`, found as Python reads it however

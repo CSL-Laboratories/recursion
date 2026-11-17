@@ -164,27 +164,46 @@ def nests_deeper(value: Any, limit: int) -> bool:
     return False
 
 
+def _walk_container(stack: list, seen: set[int], item: Any, *, keys: bool) -> None:
+    """Push a container's children once. A container already seen is skipped, so a cycle ends."""
+
+    if isinstance(item, Mapping):
+        ident = id(item)
+        if ident in seen:
+            return
+        seen.add(ident)
+        if keys:
+            stack.extend(item.keys())
+        stack.extend(item.values())
+    elif isinstance(item, (list, tuple)):
+        ident = id(item)
+        if ident in seen:
+            return
+        seen.add(ident)
+        stack.extend(item)
+
+
 def holds_nonfinite(value: Any) -> bool:
-    """Whether ``value`` holds a float that is NaN or infinite, which JSON cannot write. Walked without recursion;
-    call it on a value already known not to nest too deep (``nests_deeper``)."""
+    """Whether ``value`` holds a float that is NaN or infinite, which JSON cannot write. Walked without recursion.
+    A container already seen is not walked again, so a cycle ends. Call it on a value already known not to nest
+    too deep (``nests_deeper``)."""
 
     stack = [value]
+    seen: set[int] = set()
     while stack:
         item = stack.pop()
         if isinstance(item, float) and not math.isfinite(item):
             return True
-        if isinstance(item, Mapping):
-            stack.extend(item.values())
-        elif isinstance(item, (list, tuple)):
-            stack.extend(item)
+        _walk_container(stack, seen, item, keys=False)
     return False
 
 
 def holds_unencodable(value: Any) -> bool:
     """Whether ``value`` holds text UTF-8 cannot encode (a lone surrogate), in a string or an object's key. Walked
-    without recursion."""
+    without recursion. A container already seen is not walked again, so a cycle ends."""
 
     stack = [value]
+    seen: set[int] = set()
     while stack:
         item = stack.pop()
         if isinstance(item, str):
@@ -192,11 +211,8 @@ def holds_unencodable(value: Any) -> bool:
                 item.encode("utf-8")
             except UnicodeEncodeError:
                 return True
-        elif isinstance(item, Mapping):
-            stack.extend(item.keys())
-            stack.extend(item.values())
-        elif isinstance(item, (list, tuple)):
-            stack.extend(item)
+            continue
+        _walk_container(stack, seen, item, keys=True)
     return False
 
 

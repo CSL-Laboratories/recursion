@@ -108,6 +108,44 @@ def _writable(value: object) -> bool:
     return True
 
 
+def _plain(value: object, seen: set[int] | None = None) -> object:
+    """A copy whose mappings are plain dicts, nested, so a UserDict or a mapping proxy can be written as JSON.
+    A container already being copied is an empty stand-in, so a cycle cannot grow the copy. A value reached by
+    two paths is copied at each path."""
+
+    if seen is None:
+        seen = set()
+    if isinstance(value, Mapping):
+        ident = id(value)
+        if ident in seen:
+            return {}
+        seen.add(ident)
+        try:
+            return {(key if isinstance(key, str) else _plain(key, seen)): _plain(item, seen)
+                    for key, item in value.items()}
+        finally:
+            seen.discard(ident)
+    if isinstance(value, list):
+        ident = id(value)
+        if ident in seen:
+            return []
+        seen.add(ident)
+        try:
+            return [_plain(item, seen) for item in value]
+        finally:
+            seen.discard(ident)
+    if isinstance(value, tuple):
+        ident = id(value)
+        if ident in seen:
+            return ()
+        seen.add(ident)
+        try:
+            return tuple(_plain(item, seen) for item in value)
+        finally:
+            seen.discard(ident)
+    return value
+
+
 def _texts(part: b.Part) -> object:
     """Every text a reply's part carries, for the Unicode check."""
 
@@ -163,7 +201,10 @@ class Session:
     # -- one turn ----------------------------------------------------------------------------------------
 
     def run_turn(self, turn_id: str, text: str, cancel: b.CancelToken) -> str:
-        """Run one turn to its end and return its outcome."""
+        """Run one turn to its end and return its outcome.
+
+        Raises ValueError, changing nothing, when the text is not UTF-8 encodable.
+        """
 
         self._cancel = cancel
         if b.holds_unencodable(text):
@@ -190,8 +231,12 @@ class Session:
                 self._usage(turn_id, exc.usage, exc.served_model)
                 # A value JSON cannot write (NaN, an infinity) or that is not what the field holds would make the
                 # line unwritable: the line says the time is unknown instead, and the turn still pauses.
+                # An int is not passed to math.isfinite. That conversion raises OverflowError for an int past the
+                # float range, and a finite integer (however large) is a legal retry time the line can carry.
                 retry = exc.retry_after_s
-                if isinstance(retry, bool) or not isinstance(retry, (int, float)) or not math.isfinite(retry):
+                if isinstance(retry, bool) or not isinstance(retry, (int, float)):
+                    retry = None
+                elif not isinstance(retry, int) and not math.isfinite(retry):
                     retry = None
                 reset_at = exc.reset_at if isinstance(exc.reset_at, str) else None
                 self.writer.write("limit", turn_id=turn_id, scope="connection", kind="plan_limit", model=None,
@@ -284,6 +329,18 @@ class Session:
         for part in parts:
             if not isinstance(part, (b.TextPart, b.ToolCall, b.OpaquePart)):
                 raise _NotKept(f"the reply holds a {type(part).__name__} part, which a reply cannot carry")
+            # A mapping that is not a dict (a proxy, a UserDict, and the same nested) is what ToolCall accepts.
+            # JSON only writes a plain dict, so normalise before the checks. A value nested too deep, a cycle
+            # included, is refused here, before the Unicode walk, so that walk never follows it.
+            if isinstance(part, b.ToolCall) and isinstance(part.input, Mapping):
+                if b.nests_deeper(part.input, b.MAX_INPUT_DEPTH):
+                    part = b.ToolCall(part.call_id, part.name, None, "", b.INPUT_TOO_DEEP)
+                else:
+                    part = b.ToolCall(part.call_id, part.name, _plain(part.input), part.raw_input,
+                                      part.input_error)
+            elif isinstance(part, b.OpaquePart) and isinstance(part.data, Mapping):
+                if not b.nests_deeper(part.data, b.MAX_INPUT_DEPTH):
+                    part = b.OpaquePart(part.vendor, _plain(part.data))
             if b.holds_unencodable(_texts(part)):
                 # A lone surrogate: no line could carry it and no request send it, and it cannot be changed.
                 raise _NotKept("the reply holds text that is not valid Unicode (a lone surrogate)")

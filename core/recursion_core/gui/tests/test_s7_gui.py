@@ -1,6 +1,9 @@
-"""Proposed GUI regressions for sweep S2b; use only local in-memory adapters.
+"""GUI page tests that use only local in-memory adapters.
 
-From the repository root, after applying the accompanying patch:
+Blank or extra fields are refused before dispatch, a lone surrogate stays inside the
+response, and a venue switch opens only beside venue data the filter kept.
+
+Run from the repository root:
 PYTHONPATH=core python -B -m unittest recursion_core.gui.tests.test_s7_gui -v
 """
 import io

@@ -409,6 +409,12 @@ class LeafRun:
         else:
             state = 'unknown'  # includes populated 0 with the main exit unseen
         if state in ('leaf_empty', 'empty'):
+            # rmdir uses the name. A new leaf can take that name after the last
+            # identity check in the loop, and only an empty new leaf would be removed.
+            if self._pin is not None and not self._names_pinned_leaf():
+                self.removed = True
+                self._unpin()
+                return Outcome('empty', None, False, False)
             self.removing = True
             try:
                 self.fs.remove(self.leaf)

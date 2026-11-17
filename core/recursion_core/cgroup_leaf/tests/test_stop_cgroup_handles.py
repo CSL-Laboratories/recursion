@@ -160,6 +160,32 @@ class AdoptedHandleTest(LeafCase):
         self.assertEqual(adopted.close().state, 'empty')
         self.assertIsNone(adopted._pin)
 
+    def test_an_adopted_handle_does_not_remove_a_leaf_that_took_the_name_before_rmdir(self):
+        name = 'run-swap'
+        old = self.spawn(name, kill_timeout=0.2)
+        adopted = self.root.adopt(name, kill_timeout=0.2)
+        self.runs.append(adopted)
+        real_kill = self.fs.kill
+
+        def kill_then_replace(leaf):
+            real_kill(leaf)
+            if old.proc.poll() is None:
+                old.proc.kill()
+            old.proc.wait(timeout=5)
+            for child in list(leaf.iterdir()):
+                child.unlink()
+            leaf.rmdir()
+            leaf.mkdir()
+            for fname in ('cgroup.procs', 'cgroup.kill', 'cgroup.events'):
+                (leaf / fname).touch()
+
+        with patch.object(self.fs, 'kill', side_effect=kill_then_replace):
+            outcome = adopted.close()
+        self.assertEqual(outcome.state, 'empty')
+        self.assertEqual(outcome.errors, ())
+        self.assertTrue((self.root_path / name).is_dir())
+        self.assertIsNone(adopted._pin)
+
     def test_an_adopted_handle_whose_leaf_is_gone_books_empty_and_holds_nothing(self):
         old = self.spawn('run-gone', kill_timeout=0.2)
         adopted = self.root.adopt('run-gone', kill_timeout=0.2)
@@ -367,6 +393,8 @@ class EvidenceTest(unittest.TestCase):
     def test_pid_keys(self):
         self.assertEqual(_pid_key('4242'), 4242)
         self.assertEqual(_pid_key(4242), 4242)
+        self.assertEqual(_pid_key('1' * 19), int('1' * 19))
+        self.assertIsNone(_pid_key('1' * 20))
         for bad in ('0', '042', '-1', '1' * 4301, '١٢٣', True, 0, -5, None, 1.5):
             self.assertIsNone(_pid_key(bad), repr(bad)[:20])
 

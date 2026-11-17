@@ -240,6 +240,8 @@ class UnixControlServer:
     when the ordinary ones are all taken: each serves one request, within
     ``reserved_timeout_s``, and only if ``priority`` says so; any other request gets the
     ``busy`` frame, not delivered. The handler still sees every request it is given.
+    At a configured cap, a request whose id could not ride the longest refusal is refused
+    before the handler, even when that request's own answer would have fit.
     """
 
     def __init__(
@@ -260,6 +262,10 @@ class UnixControlServer:
         directory = refuse_remote_bind(directory)
         if not name or "/" in name or name in (".", ".."):
             raise InsecureSocketPath("socket name must be a single path component")
+        if type(max_frame_bytes) is not int or max_frame_bytes < _MIN_FRAME_BYTES:
+            # The id_too_large refusal is a fixed body. A smaller cap would drop it and the
+            # peer would see the connection end instead of a typed answer.
+            raise ValueError(f"max_frame_bytes must be an int of at least {_MIN_FRAME_BYTES}")
         if max_connections < 1:
             raise ValueError("max_connections must be positive")
         if reserved_connections < 0 or (reserved_connections and priority is None):
@@ -460,8 +466,7 @@ class UnixControlServer:
                     # longest fallback could not carry it within the frame cap is refused here, before any
                     # handler acts, so no answer of a handled request is ever over the cap or without its id
                     # (the integration read of #385, F3; the P3 of the same read on #377).
-                    _send_quietly(conn, {"ok": False, "error": {"code": "bad_frame", "detail": "id_too_large"}},
-                                  max_bytes=self._max_frame_bytes)
+                    _send_quietly(conn, _ID_TOO_LARGE_REPLY, max_bytes=self._max_frame_bytes)
                     return
                 try:
                     response = self._handler(request, connection)
@@ -542,6 +547,10 @@ def _is_busy(response: Message) -> bool:
 
 # The longest answer _serve writes for a request a handler has seen; with the request's id it must fit the cap.
 _LONGEST_FALLBACK: Message = {"ok": False, "error": {"code": "response_too_large"}}
+# Sent when that fallback could not carry the id. Its body is the floor for max_frame_bytes:
+# below it the refusal itself would be dropped.
+_ID_TOO_LARGE_REPLY: Message = {"ok": False, "error": {"code": "bad_frame", "detail": "id_too_large"}}
+_MIN_FRAME_BYTES = len(encode_frame(_ID_TOO_LARGE_REPLY)) - HEADER.size
 
 
 def _fits(message: Message, request_id: object, max_bytes: int) -> bool:

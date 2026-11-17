@@ -270,9 +270,9 @@ class RoundTripTests(_TmpCase):
         self.assertEqual(srv.accepted, 8)
 
     def test_oversized_and_malformed_frames_get_bad_frame(self) -> None:
-        srv = self.server(max_frame_bytes=64)
+        srv = self.server(max_frame_bytes=80)
         for payload in (
-            framing.HEADER.pack(65) + b"x" * 65,
+            framing.HEADER.pack(81) + b"x" * 81,
             framing.HEADER.pack(5) + b"nope!",
             framing.HEADER.pack(2) + b"[]",
         ):

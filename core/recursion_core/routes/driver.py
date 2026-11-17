@@ -70,7 +70,7 @@ import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 
-from recursion_core.control.methods import NoCanonicalText, canonical_text
+from recursion_core.control.methods import canonical_text
 
 CONTRACT = 2
 FLAGS = ("multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge", "typed_limits", "usage")
@@ -547,9 +547,11 @@ def _check_tool_call(p: Mapping, f: str) -> None:
         raise DriverInputError(f"{f}.input")
     try:
         # event.v1: input_digest is the SHA-256 of the input as RFC 8785 writes it. A carried input
-        # whose digest is some other hash is refused, not kept.
+        # whose digest is some other hash is refused, not kept. Any ordinary failure of the
+        # canonicaliser, or of reading a mapping that is not a dict, is the same refusal. An
+        # interruption still leaves.
         text = canonical_text(carried if type(carried) is dict else dict(carried))
-    except (NoCanonicalText, TypeError, RecursionError, RuntimeError):
+    except Exception:
         raise DriverInputError(f"{f}.input") from None
     if hashlib.sha256(text.encode("utf-8")).hexdigest() != p["input_digest"]:
         raise DriverInputError(f"{f}.input_digest")

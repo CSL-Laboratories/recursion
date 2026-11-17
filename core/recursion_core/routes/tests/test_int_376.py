@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 
 from recursion_core.routes import driver as d
@@ -66,6 +67,63 @@ class CarriedToolInputTest(unittest.TestCase):
         draft = {"type": "tool.call", "payload": {"call_id": "c1", "name": "Read",
                  "input": None, "input_digest": "0" * 64}}
         self.assertEqual(d.check_draft(draft)["payload"]["input"], None)
+
+
+class _IterRaises(dict):
+    """A dict whose walk raises. Nested in a plain dict, the canonicaliser meets it."""
+
+    def __init__(self, exc: BaseException) -> None:
+        super().__init__(a=1)
+        self._exc = exc
+
+    def __iter__(self):
+        raise self._exc
+
+
+class _MappingRaises(Mapping):
+    """Not a dict, so the check builds one and meets the raise there."""
+
+    def __init__(self, exc: BaseException, *, on_item: bool = False) -> None:
+        self._exc = exc
+        self._on_item = on_item
+
+    def __iter__(self):
+        if not self._on_item:
+            raise self._exc
+        yield "a"
+
+    def __len__(self) -> int:
+        return 1 if self._on_item else 0
+
+    def __getitem__(self, key: object) -> object:
+        raise self._exc
+
+
+def _carried(value: object) -> dict:
+    return {"type": "tool.call", "payload": {"call_id": "c1", "name": "Read",
+            "input": value, "input_digest": "0" * 64}}
+
+
+class CarriedInputFailureTest(unittest.TestCase):
+    def test_an_ordinary_failure_while_reading_a_carried_input_is_refused(self) -> None:
+        cases = (
+            ("value_error", {"nested": _IterRaises(ValueError("boom"))}),
+            ("key_error", {"nested": _IterRaises(KeyError("k"))}),
+            ("memory", {"nested": _IterRaises(MemoryError())}),
+            ("mapping_key", _MappingRaises(KeyError("k"))),
+            ("mapping_value", _MappingRaises(ValueError("boom"), on_item=True)),
+        )
+        for label, carried in cases:
+            with self.subTest(label=label):
+                with self.assertRaises(d.DriverInputError) as caught:
+                    d.check_draft(_carried(carried))
+                self.assertEqual(caught.exception.field, "draft.tool.call.input")
+
+    def test_an_interruption_while_reading_a_carried_input_still_leaves(self) -> None:
+        for exc in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exc=exc.__name__):
+                with self.assertRaises(exc):
+                    d.check_draft(_carried({"nested": _IterRaises(exc())}))
 
 
 if __name__ == "__main__":

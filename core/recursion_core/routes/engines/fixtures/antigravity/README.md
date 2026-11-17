@@ -29,6 +29,7 @@ root:
         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_acp \
         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_acp_pipe \
         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_one_shot \
+        recursion_core.routes.engines.fixtures.antigravity.test_s7_antigravity \
         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_driver         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_turns         recursion_core.routes.engines.fixtures.antigravity.test_antigravity_acp_adapter
 
 `unittest discover -s core` does not find them (it needs an `__init__.py` in every folder on the way); the

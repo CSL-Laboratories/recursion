@@ -146,11 +146,11 @@ class FlagRefusalTest(unittest.TestCase):
         driver, h = self.started()
         driver.send(h, msg())  # the first message needs no flag
         self.assertEqual(len(driver.written), 1)
-        self.assertRefused("send", "mid_turn_input", lambda: driver.send(h, msg(delivery="dlv-2")), driver, "busy")
+        self.assertRefused("send", "mid_turn_input", lambda: driver.send(h, msg(delivery="dlv-2")), driver, "unsupported")
         # A worker with a second turn but no mid-turn input: still refused while the turn is in progress.
         driver, h = self.started(Flags(multi_turn=True))
         driver.send(h, msg())
-        self.assertRefused("send", "mid_turn_input", lambda: driver.send(h, msg(delivery="dlv-2")), driver, "busy")
+        self.assertRefused("send", "mid_turn_input", lambda: driver.send(h, msg(delivery="dlv-2")), driver, "unsupported")
 
     def test_a_second_turn_without_multi_turn_writes_nothing(self) -> None:
         driver, h = self.started()

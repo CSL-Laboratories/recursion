@@ -38,9 +38,10 @@ THE FENCE BETWEEN A LAUNCH AND A STOP. Two passes may run at once (nothing here 
 
 THE RESTART (``recover``), in one transaction:
 1. every delivery still ``delivering`` becomes ``outcome_unknown``, with its event (queue.item.v1);
-2. every launch or send not done becomes ``outcome_unknown``: its delivery was quarantined, so it is never
-   written, even when the crash came before the write. Its outcome says whether it was ``attempted`` (the claim
-   was committed, so the port may have been called) or was still pending (the port was never called);
+2. every launch, send or interrupt not done becomes ``outcome_unknown``: a delivery was quarantined, so it is
+   never written, even when the crash came before the write, and an interrupt is overtaken by step 3. Its outcome
+   says whether it was ``attempted`` (the claim was committed, so the port may have been called) or was still
+   pending (the port was never called);
 3. every session that has, or may have, a unit (a worker, live or waiting) is given a recovery Stop and goes
    ``stop_pending``: nothing here can reattach to a unit that outlived the daemon, so no new unit starts for
    that session until the old one is confirmed stopped. A session already ``stop_pending`` keeps waiting, and
@@ -62,6 +63,25 @@ conversation to continue
 or to lose, so its next turn launches afresh. One whose conversation may have begun and cannot be continued is
 refused ``unsupported`` (questions.md Q6, Lucas's).
 
+AN INTERRUPT (``interrupt``) acts on a turn, not a run. Where the driver declares ``interrupt`` and the turn is
+running in a live worker, the driver's own cancel is committed as work and the turn ends ``interrupted`` only when
+the driver reports it (``turn_interrupted``); the worker lives on. The cancel is sent only if, at its claim, the
+turn is still the one in progress of a live session: not once it ended (another turn may be in progress in the
+same worker by then) and not under a pending Stop. Otherwise (no such flag, or the turn has not started) a Stop
+of the unit is asked instead (the method table's fallback ``stop_then_resume``): the session is
+``stop_pending`` and refuses new turns until the Stop is confirmed, and the next turn then runs in a new unit that
+resumes the engine's session where the driver can. A driver that refuses the cancel, or whose cancel has an outcome
+nobody can vouch for, while the turn is still in progress, gets the same Stop: an interrupt is never left hanging.
+The ``interrupt`` event says ``delivered`` only once the driver reported the interruption.
+A request is refused (``request_invalid``/``requested_by``) before anything is written unless its asker is a
+common.v1 principal; its kind and id are kept, nothing else. ONE CANCEL PER TURN (the Liaison's ruling on the
+first reads, Nov 15; Lucas may change it): while a cancel for the session's turn is pending, attempting or sent and
+not yet reported, a second request sends no second cancel and gets the first's answer (``requested``); the
+delivered event names the first asker. Whether asking again should ever escalate to a Stop is a product choice
+not built here. When the commit of what a finished cancel, or a Stop that answered, came to fails, that outcome is
+kept and committed by a later pass (``_settle``); the cancel is never sent again, and a Stop is asked again only as
+the committed state says (one recorded as ``pending`` is; one confirmed is not).
+
 ``Sessions`` holds what the handlers and the service share; ``SessionsService`` is the S13 service object.
 Nothing in this module is registered anywhere (``hooks.py``).
 """
@@ -71,7 +91,7 @@ import logging
 import threading
 
 from recursion_core.sessions import delivery, events, machine, records, store
-from recursion_core.sessions.ports import LaunchOrder, Ports, SendOrder, UnitRefused
+from recursion_core.sessions.ports import InterruptOrder, LaunchOrder, Ports, SendOrder, UnitRefused
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +114,8 @@ class Sessions:
         self.mint = mint
         self.now = now
         self.wake = threading.Event()
+        self._unsettled: list = []          # outcomes of finished outside calls whose commit failed (``_settle``)
+        self._unsettled_lock = threading.Lock()
 
     # ------------------------------------------------------------- planning, inside the caller's transaction
     def declaration(self, engine: str):
@@ -214,7 +236,7 @@ class Sessions:
         with self.store.transaction() as tx:
             delivery.quarantine_all(tx)
             for operation in store.work(tx, state='pending') + store.work(tx, state='attempting'):
-                if operation['kind'] in TURN_KINDS:
+                if operation['kind'] != 'stop':
                     store.move_work(tx, operation['operation_id'], operation['state'], 'outcome_unknown',
                                     {'why': 'daemon_restart', 'attempted': operation['state'] == 'attempting'})
                 elif operation['state'] == 'attempting':
@@ -274,7 +296,12 @@ class Sessions:
             return 0
 
     def run_pending(self) -> int:
-        """Carry out every work intent that was pending when the pass began, each once. Returns how many it tried."""
+        """Carry out every work intent that was pending when the pass began, each once. Returns how many it tried.
+        First it commits again every outcome kept because its commit failed (``_settle``)."""
+        with self._unsettled_lock:
+            kept, self._unsettled = self._unsettled, []
+        for step in kept:
+            self._settle(step)
         with self.store.transaction() as tx:
             pending = [operation['operation_id'] for operation in store.work(tx, state='pending')]
         tried = 0
@@ -295,6 +322,13 @@ class Sessions:
                 if store.load(tx, operation['session_id'])['state'] == 'stop_pending':
                     store.move_work(tx, operation_id, 'pending', 'failed', {'code': 'stop_requested'})
                     return 0
+            if operation['kind'] == 'interrupt':
+                # A cancel is sent only while its turn is the one in progress of a live session: once the turn
+                # ended, or a Stop of its unit is pending, there is nothing left for the cancel to do.
+                session = store.load(tx, operation['session_id'])
+                if session['state'] != 'live' or session['active_turn_id'] != operation['payload']['turn_id']:
+                    store.move_work(tx, operation_id, 'pending', 'failed', {'code': 'turn_not_in_progress'})
+                    return 0
             if not store.move_work(tx, operation_id, 'pending', 'attempting'):
                 return 0
             if operation['kind'] == 'stop':
@@ -303,6 +337,8 @@ class Sessions:
                 operation['may_register'] = self._launch_may_register(tx, operation['payload']['run_id'])
         if operation['kind'] == 'stop':
             self._stop(operation)
+        elif operation['kind'] == 'interrupt':
+            self._interrupt(operation)
         else:
             self._write(operation)
         return 1
@@ -382,6 +418,128 @@ class Sessions:
         if stop_worker and after['state'] == 'idle' and after['worker'] is not None:
             self._ask_stop(tx, after)
 
+    # ---------------------------------------------------------------------------------------- interrupt
+    def _settle(self, step) -> None:
+        """Commit, by ``step``, what an outside call that has already finished came to. If that commit fails (a
+        store error, or a conflict in a store whose transactions overlap), the step is kept and run again at the
+        start of every later pass of ``run_pending`` until it commits; the outside call is never made again. A kept
+        step lives in this process only: after a restart its intent is still ``attempting`` and is recovered."""
+        try:
+            step()
+        except Exception:  # noqa: BLE001 - kept and committed by a later pass, never left behind
+            log.exception('an outcome was not committed; it is kept and committed by the next pass')
+            with self._unsettled_lock:
+                self._unsettled.append(step)
+
+    @staticmethod
+    def _requester(requested_by) -> dict:
+        """``requested_by`` as a common.v1 principal of its own (its kind and id, nothing else), or
+        ``machine.Refused('request_invalid', 'requested_by')``. A dict is copied first and the copy is the one
+        checked and used: the caller's dict may be changed by another thread once the check has passed."""
+        snapshot = dict(requested_by) if isinstance(requested_by, dict) else requested_by
+        try:
+            records.check_principal(snapshot, '/requested_by')
+        except records.RecordError:
+            raise machine.Refused('request_invalid', 'requested_by') from None
+        return {'kind': snapshot['kind'], 'id': snapshot['id']}
+
+    def interrupt(self, session_id: str, expected_turn_id: str, requested_by: dict) -> tuple:
+        """Ask the interruption of the turn in progress, which must be ``expected_turn_id``. Commits what it asks and
+        returns ``(outcome, session after)``: 'requested' (the driver's cancel is committed as work, or one for
+        this turn is already pending, attempting or sent: no second cancel), 'fell_back_to_stop' (a Stop of the
+        unit is committed instead), 'stop_pending' (a Stop was already pending: nothing more is asked) or
+        'no_live_turn'. Raises ``machine.Refused``: ``request_invalid``/``requested_by`` (the asker is not a
+        common.v1 principal; checked before anything is read or written), ``session_unknown``, or
+        ``conflict``/``stale_turn`` when another turn is in progress. Nothing outside the store happens here."""
+        requester = self._requester(requested_by)
+        with self.store.transaction() as tx:
+            session = store.load(tx, session_id)
+            if session is None:
+                raise machine.Refused('session_unknown')
+            active = session['active_turn_id']
+            if active is None:
+                tx.append(events.interrupt(session_id, None, None, requester, 'no_live_turn'))
+                return 'no_live_turn', session
+            if active != expected_turn_id:
+                raise machine.Refused('conflict', 'stale_turn')
+            if session['state'] == 'stop_pending':
+                return 'stop_pending', session
+            if any(operation['kind'] == 'interrupt' and operation['payload']['turn_id'] == active
+                   and operation['state'] in ('pending', 'attempting', 'done')
+                   for operation in store.work(tx, session_id=session_id)):
+                return 'requested', session         # one cancel per turn: the first request's answer
+            turn = next(turn for turn in session['turns'] if turn['turn_id'] == active)
+            found = self.declaration(session['route']['engine'])
+            worker = session['worker']
+            if (found is not None and found['flags'].get('interrupt') and turn['state'] == 'running'
+                    and worker is not None and worker['alive'] and worker['run_id'] == turn['run_id']):
+                store.insert_work(tx, self.mint('op-'), session_id, 'interrupt',
+                                  {'turn_id': active, 'run_id': worker['run_id'],
+                                   'worker_incarnation': incarnation_of(worker['run_id']),
+                                   'requested_by': requester})
+                outcome, after = 'requested', session
+            else:
+                after = self._ask_stop(tx, session)
+                tx.append(events.interrupt(session_id, worker['run_id'], active, requester, 'fell_back_to_stop'))
+                outcome = 'fell_back_to_stop'
+        self.wake.set()
+        return outcome, after
+
+    def _interrupt(self, operation: dict) -> None:
+        payload = operation['payload']
+        try:
+            self.ports.units.interrupt(InterruptOrder(session_id=operation['session_id'], turn_id=payload['turn_id'],
+                                                      run_id=payload['run_id'],
+                                                      worker_incarnation=payload['worker_incarnation']))
+        except UnitRefused as refusal:
+            refused = {'code': str(refusal.code), 'detail': str(refusal.detail)}
+            self._settle(lambda: self._interrupt_fell_back(operation, 'failed', refused))
+            return
+        except Exception as exc:  # noqa: BLE001 - an outcome nobody can vouch for: never retried; a Stop instead
+            log.exception('the interrupt of %s ended with an unknown outcome', payload['turn_id'])
+            unknown = {'error': type(exc).__name__}
+            self._settle(lambda: self._interrupt_fell_back(operation, 'outcome_unknown', unknown))
+            return
+        self._settle(lambda: self._interrupt_sent(operation))
+
+    def _interrupt_sent(self, operation: dict) -> None:
+        with self.store.transaction() as tx:
+            store.move_work(tx, operation['operation_id'], 'attempting', 'done', {'sent': True})
+
+    def _interrupt_fell_back(self, operation: dict, state: str, outcome: dict) -> None:
+        """The driver did not cancel the turn, or nobody can say whether it did: if that turn is still the one in
+        progress, a Stop of its unit is asked instead, so an interrupt never leaves the turn running unseen."""
+        payload = operation['payload']
+        with self.store.transaction() as tx:
+            store.move_work(tx, operation['operation_id'], 'attempting', state, outcome)
+            session = store.load(tx, operation['session_id'])
+            if session['state'] == 'live' and session['active_turn_id'] == payload['turn_id']:
+                self._ask_stop(tx, session)
+                tx.append(events.interrupt(session['session_id'], payload['run_id'], payload['turn_id'],
+                                           payload['requested_by'], 'fell_back_to_stop'))
+        self.wake.set()
+
+    def turn_interrupted(self, session_id: str, turn_id: str, *, worker_alive: bool) -> dict:
+        """The driver reports that its cancel interrupted the turn: the turn is ``interrupted``, every delivery aimed
+        at it with no acceptance is unknown, and ``turn.ended`` and ``interrupt`` (``delivered``) are appended, in one
+        commit. ``requested_by`` is the asker of the interrupt intent for that turn. Returns the session after."""
+        with self.store.transaction() as tx:
+            session = store.load(tx, session_id)
+            if session is None:
+                raise machine.Refused('session_unknown')
+            asked = [operation for operation in store.work(tx, session_id=session_id)
+                     if operation['kind'] == 'interrupt' and operation['payload']['turn_id'] == turn_id]
+            if not asked:
+                raise machine.Refused('no_interrupt_asked', turn_id)
+            after = machine.turn_interrupted(session, turn_id, self.now(), worker_alive=worker_alive)
+            store.save(tx, session, after)
+            delivery.quarantine_turn(tx, session_id, turn_id)
+            run_id = next(turn['run_id'] for turn in after['turns'] if turn['turn_id'] == turn_id)
+            tx.append(events.turn_ended(session_id, run_id, turn_id, 'interrupted', None))
+            tx.append(events.interrupt(session_id, run_id, turn_id, asked[-1]['payload']['requested_by'], 'delivered'))
+        self.wake.set()
+        return after
+
     def _stop(self, operation: dict) -> None:
         run_id = operation['payload']['run_id']
         try:
@@ -396,6 +554,9 @@ class Sessions:
             code = 'pending' if operation['may_register'] else 'ended'
         else:
             code = records.stop_confirmed(answer, run_id) or 'pending'
+        self._settle(lambda: self._stop_answered(operation, run_id, code))
+
+    def _stop_answered(self, operation: dict, run_id: str, code: str) -> None:
         with self.store.transaction() as tx:
             if code == 'pending':
                 store.move_work(tx, operation['operation_id'], 'attempting', 'pending', {'answer': 'pending'})

@@ -7,7 +7,7 @@ transaction, asks the machine, and saves what comes back (``store.save``) in the
 
 THE SESSION, as session.v1 (#368) freezes it:
 
-    idle --open_turn--> live --turn_finished--> idle
+    idle --open_turn--> live --turn_finished or turn_interrupted--> idle
      |                    |
      |                    +--request_stop--> stop_pending --stop_settled(stopped|ended)--> idle
      +--request_stop (only with a worker) ---^      |
@@ -124,6 +124,28 @@ def turn_finished(session: dict, turn_id: str, *, outcome: str, result: dict | N
     record = _next(session)
     turn = _turn(record, turn_id)
     turn.update(state=state, ended_at=at, outcome=outcome, result=copy.deepcopy(result))
+    if record['active_turn_id'] == turn_id:
+        record['active_turn_id'] = None
+    if record['state'] == 'live':
+        record['state'] = 'idle'
+        alive = bool(worker_alive) and record['worker'] is not None and record['worker']['run_id'] == turn['run_id']
+        record['worker'] = {'run_id': turn['run_id'], 'alive': True} if alive else None
+    elif record['state'] == 'stop_pending' and record['worker'] is not None:
+        record['worker']['alive'] = bool(worker_alive)
+    records.check_session_kept(record)
+    return record
+
+
+def turn_interrupted(session: dict, turn_id: str, at: str, *, worker_alive: bool) -> dict:
+    """The driver interrupted the running turn (its own cancel): the turn is ``interrupted``, final, with no
+    result. Only a running turn can be interrupted this way (session.v1 gives an interrupted turn a start time).
+    The session goes ``idle`` keeping a worker that is still alive, or stays ``stop_pending`` if a Stop is pending."""
+    turn = _turn(session, turn_id)
+    if turn['state'] != 'running':
+        raise Refused('turn_not_running', turn['state'])
+    record = _next(session)
+    turn = _turn(record, turn_id)
+    turn.update(state='interrupted', ended_at=at, outcome='interrupted', result=None)
     if record['active_turn_id'] == turn_id:
         record['active_turn_id'] = None
     if record['state'] == 'live':

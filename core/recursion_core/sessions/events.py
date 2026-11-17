@@ -52,6 +52,15 @@ def turn_ended(session_id: str, run_id, turn_id: str, outcome: str, result) -> d
                     trust='trusted' if result is None else 'untrusted')
 
 
+def interrupt(session_id: str, run_id, turn_id, requested_by: dict, outcome: str) -> dict:
+    """An interrupt was asked, and what came of it: 'delivered' (the turn WAS interrupted; written only when the
+    driver reported it), 'fell_back_to_stop' (the driver cannot interrupt, so a Stop was asked instead) or
+    'no_live_turn' (with no turn id). ``requested_by`` is a common.v1 principal, checked by the caller
+    (``Sessions.interrupt``) before anything is written."""
+    return envelope('interrupt', session_id, run_id, turn_id,
+                    {'turn_id': turn_id, 'requested_by': dict(requested_by), 'outcome': outcome})
+
+
 def outcome_unknown(session_id: str, run_id, turn_id, kind: str, effect_id: str, why: str) -> dict:
     """Something with an outside effect was in flight and nobody can say whether it happened. Never retried."""
     return envelope('effect.outcome_unknown', session_id, run_id, turn_id,

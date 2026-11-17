@@ -49,7 +49,7 @@ def declaration(engine: str, *, input_ack: bool = False, **on) -> dict:
 # an engine with no typed acceptance sets ``input_ack`` false on its own copy.
 DECLARATIONS = {
     'one_turn': declaration('claude_code'),
-    'worker': declaration('codex', input_ack=True, multi_turn=True, mid_turn_input=True, resume=True),
+    'worker': declaration('codex', input_ack=True, multi_turn=True, mid_turn_input=True, resume=True, interrupt=True),
     'resumer': declaration('opencode', input_ack=True, resume=True),
 }
 ENGINE_OF = {'one_turn': 'claude_code', 'worker': 'codex', 'resumer': 'opencode'}
@@ -91,6 +91,7 @@ class FakeUnits:
     def __init__(self) -> None:
         self.launched: list = []
         self.sent: list = []
+        self.interrupts: list = []
         self.stops: list = []
         self.then: list = []
         self.stop_answers: list = []
@@ -118,6 +119,9 @@ class FakeUnits:
 
     def send(self, order) -> None:
         self._do(self.sent, order)
+
+    def interrupt(self, order) -> None:
+        self._do(self.interrupts, order)
 
     def stop(self, run_id):
         self.stops.append(run_id)

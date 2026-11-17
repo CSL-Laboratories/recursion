@@ -93,8 +93,9 @@ class Adv2RealGilTests(unittest.TestCase):
         out = self.run_host(b'def operator(command):\n    import adv2gil\n    return {"status_code": "ok"}\n')
         self.assertEqual(out['records'], [['loaded', None]])
         self.assertIsNone(out['poisoned'])
-        # Observed: the call that turned the GIL on is still answered 200; every later read refuses.
-        self.assertEqual(out['read'][0], 200)
+        # Decision D2: discard the answer from the call that turned the GIL on.
+        self.assertEqual(out['read'], [503, {
+            'error': 'unavailable: core_poisoned_restart_required'}])
         self.assertEqual(out['poisoned_after'], 'gil_enabled_after_plugin_call')
         self.assertEqual(out['read_again'], [503, {'error': 'unavailable: core_poisoned_restart_required'}])
 

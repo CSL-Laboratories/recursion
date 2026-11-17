@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -1178,14 +1179,9 @@ def _run_catching(call):
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)
 class StopWhileAPluginHangsTests(HostCase):
-    """D1 through STOP (fix-3's socket test, adapted: the hanging plugin is granted, so it really runs).
+    """The socket is serving while a granted plugin is held in its import, so Stop answers ``stopped``.
 
-    An EXPECTED FAILURE until lane STOP applies decision D1's reorder in
-    ``daemon/control_adapter.py`` (``compose_control`` builds the plugin host before
-    ``server.start()``; ``PluginHost(load=False)`` and ``load_installed()`` are what it needs).
-    The reorder makes this an unexpected success, which fails the suite, so ``expectedFailure``
-    comes off in step with it: this file is PLUGIN-HOST's, and the two lanes' order is the
-    Liaison's to set (PLUGIN-HOST's questions.md).
+    The hanging plugin is granted, so it really runs.
     """
 
     def test_control_socket_stop_works_while_a_plugin_hangs_at_import(self):
@@ -1247,6 +1243,75 @@ class StopWhileAPluginHangsTests(HostCase):
             thread.join(WATCHDOG_S)
             if composed:
                 composed[0].close()
+
+
+@unittest.skipUnless(LINUX, LINUX_ONLY)
+class RoundFiveAnswerTests(HostCase):
+    """Round 5 of #380: the load-failure cleanup, and a call that passes its deadline."""
+
+    def test_a_load_that_raises_shuts_the_socket_and_drops_the_device_token(self):
+        """Removing the cleanup after ``load_installed`` leaves the socket and the device token."""
+        from recursion_core.control.client import SocketAPI
+        from recursion_core.daemon import Daemon, Registry
+        from recursion_core.daemon import control_adapter as adapter
+        from recursion_core.daemon.tests.test_composition import BOOT, ProcessUnitManager, Units
+
+        runtime = self.tmp / 'rt'
+        runtime.mkdir(mode=0o700)
+        environ = {'PATH': '/usr/bin:/bin', 'HOME': str(self.tmp), 'LANG': 'C.UTF-8',
+                   'XDG_RUNTIME_DIR': str(runtime), 'XDG_CONFIG_HOME': str(self.tmp / 'config')}
+        options = {'gil_probe': FakeGilProbe(), 'verification_available': lambda: True}
+        units = Units()
+        sock = runtime / 'recursion' / 'control.sock'
+        token = runtime / 'recursion' / 'gui-device-token'
+        daemon = Daemon(Registry(self.state), ProcessUnitManager(units), boot_id=lambda: BOOT)
+        self.addCleanup(daemon.close)
+        daemon.sweep()
+        composed = None
+        try:
+            with mock.patch.object(plugins.PluginHost, 'load_installed',
+                                   side_effect=RuntimeError('load blew up')):
+                with self.assertRaises(RuntimeError) as caught:
+                    composed = adapter.compose_control(
+                        daemon, self.state, environ=environ, routes={}, plugin_options=options)
+            self.assertEqual(str(caught.exception), 'load blew up')
+        finally:
+            if composed is not None:
+                composed.close()
+        self.assertFalse(sock.exists(), 'a failed load left the control socket')
+        self.assertFalse(token.exists(), 'a failed load left the device token')
+        daemon.close()
+        daemon2 = Daemon(Registry(self.state), ProcessUnitManager(units), boot_id=lambda: BOOT)
+        self.addCleanup(daemon2.close)
+        second = adapter.compose_control(
+            daemon2, self.state, environ=environ, routes={}, plugin_options=options)
+        self.addCleanup(second.close)
+        answer = SocketAPI(second.server.path, timeout_s=10).call('plugin.list')
+        self.assertEqual(answer['code'], 'ok', answer)
+
+    def test_a_call_past_its_deadline_answers_504_and_later_reads_answer_503(self):
+        """The call that is still out when the GIL is read answers 504; the next read answers 503."""
+        entered, release = threading.Event(), threading.Event()
+        sys._r4_deadline = (entered, release)
+        self.addCleanup(lambda: delattr(sys, '_r4_deadline'))
+        self.addCleanup(release.set)
+        source = (b'import sys\ndef operator(command):\n    entered, release = sys._r4_deadline\n'
+                  b'    entered.set()\n    release.wait(%d)\n'
+                  b'    return {"status_code": "ok", "result": {}}\n' % int(WATCHDOG_S))
+        self.install(('slow', source, 'fixture.operator', ('read',)))
+        host = self.host(gil_probe=FakeGilProbe([False, True]), operator_deadline_s=0.2,
+                         operator_turn_wait_s=0.2)
+        with self.assertLogs('recursion_core.daemon.plugins', 'WARNING'):
+            first = self.read(host)
+            self.assertTrue(entered.is_set(), 'the plugin call never started')
+            self.assertEqual(first, (504, {'error': plugins.OPERATOR_TIMED_OUT}))
+            self.assertIsNone(host.health.poisoned, 'the poison landed before the timed-out call returned')
+            release.set()
+            limit = time.monotonic() + WATCHDOG_S
+            while host.health.poisoned is None and time.monotonic() < limit:
+                time.sleep(0.01)
+            self.assertEqual(host.health.poisoned, 'gil_enabled_after_plugin_call')
+            self.assertEqual(self.read(host), POISONED)
 
 
 if __name__ == '__main__':

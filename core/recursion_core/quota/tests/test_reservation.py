@@ -195,6 +195,8 @@ class AdmissionTest(Case):
         self.assertRefused(self.res.admit(KEY, key_route(), RUN_B), "cap_held")
         other = self.res.admit(KEY_B, key_route("key-B"), RUN_C)  # another key is another meter
         self.assertTrue(other["allowed"])
+        # A known final cost is what ends the hold. An unsettled release would keep counting.
+        self.res.record_usage(RUN_A, cost_micro_usd=1_000_000)
         self.assertEqual(self.res.release(RUN_A), [first["reservation_id"]])
         again = self.res.admit(KEY, key_route(), RUN_B)
         self.assertTrue(again["allowed"])
@@ -246,6 +248,7 @@ class AdmissionTest(Case):
 
     def test_release_ends_the_hold_once(self):
         answer = self.res.admit(KEY, key_route(), RUN_A)
+        self.res.record_usage(RUN_A, cost_micro_usd=1_000_000)  # known final cost: the hold ends
         self.assertEqual(self.res.release(RUN_A), [answer["reservation_id"]])
         count = len(rows(self.store))
         self.assertEqual(self.res.release(RUN_A), [])
@@ -257,8 +260,13 @@ class AdmissionTest(Case):
 
     def test_rows_are_only_appended(self):
         seen = []
+
+        def end_with_a_known_cost(run_id: str):
+            self.res.record_usage(run_id, cost_micro_usd=1_000_000)
+            return self.res.release(run_id)
+
         steps = (lambda: self.res.admit(SUB, route(), RUN_A), lambda: self.res.admit(KEY, key_route(), RUN_B),
-                 lambda: self.res.admit(KEY, key_route(), RUN_C), lambda: self.res.release(RUN_B),
+                 lambda: self.res.admit(KEY, key_route(), RUN_C), lambda: end_with_a_known_cost(RUN_B),
                  lambda: self.res.admit(KEY, key_route(), RUN_A), lambda: self.res.release(RUN_A))
         for step in steps:
             step()

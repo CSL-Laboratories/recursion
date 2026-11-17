@@ -9,8 +9,10 @@ with the module ABSENT, launch is as at the base). It answers one of::
 
 and a refusal launches nothing. On the wire a refused start answers as every launch-path refusal does today:
 ``start_failed`` with ``start_error`` {code: reservation_refused, detail: <reason>}. Admission is where the
-reservation is made: there is no separate ``reserve`` call. ``release(run_id)`` ends the run's reservation once the
-run is over. Until composition installs a ``Reservations`` (``install``), nothing can be recorded and no cap read,
+reservation is made: there is no separate ``reserve`` call. ``release(run_id)`` ends a hold whose final
+usage is known. A metered hold with no final usage, or with an unreconciled unknown effect, is marked
+``unresolved`` and still counts. Amounts are integer micro-USD. Until composition installs a ``Reservations``
+(``install``), nothing can be recorded and no cap read,
 so a route that can spend money is refused (``quota_not_composed``) and one that cannot is admitted with no row.
 
 The rules. Decided: money is a reservation at zero unless the user opts in with their own pay-per-token key
@@ -35,6 +37,16 @@ under a cap the user sets (grill Q44, O59); unknown stays unknown (P10); the met
 * A metered hold reserves the headroom left under the cap at its admission. The holds of other runs on the same
   connection count against the cap, so while one paid run holds all of it a second is refused (``cap_held``). A
   raised cap opens new headroom that another run can take.
+* Amounts are an integer number of micro-USD. The decimal text is that integer written exactly. An unknown
+  cost is null, never 0. ``release`` of a metered hold with no final known usage marks it ``unresolved``; the
+  hold still counts, so a second admission on that key is ``cap_held``. ``settle`` writes one row per
+  reservation id, status ``settled`` or ``unresolved``; a second settle under that id leaves the first row.
+* A restart sweep marks a metered hold whose run reported no final usage ``provisional`` and does not end it.
+* A hold whose run has an unreconciled ``outcome_unknown`` effect survives ``release`` until ``reconcile_effect``
+  and a settle at the real cost. It is never settled at 0.
+* The daemon's own spend for a session is counted once across resumes (a later cumulative total replaces the
+  earlier one). It is never taken from the engine's budget flag. Admission uses it only when the spend reader
+  still has nothing.
 * One current reservation per run. A retried start is checked again. It reuses the run's hold when that hold
   still fits: free for a free attempt, or within the headroom now left for a paid one. Otherwise the hold is
   released (``superseded``) and a new one made, in the same transaction. On another connection the old hold is
@@ -96,7 +108,43 @@ RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 QUALITIES = ("known", "lower_bound", "unknown")
 PROVENANCES = ("observed", "modelled", "inferred", "unavailable")
 ZERO = Decimal(0)
+MICRO_USD = 1_000_000
 _FAILED = object()  # a paid-fallback read that failed or answered something that is not typed
+
+
+def micro_usd(value: object) -> int:
+    """An amount as an integer number of micro-USD. A fraction of a micro-USD is refused.
+
+    Unknown is not an amount. Callers pass None around this function and store null, never 0.
+    """
+
+    amount = dollars(value)
+    scaled = amount * MICRO_USD
+    integral = scaled.to_integral_value()
+    if scaled != integral:
+        raise ValueError("an amount is an integer number of micro-USD")
+    return int(integral)
+
+
+def text_of_micro(micro: int) -> str:
+    """An integer micro-USD amount as the decimal text the reservation rows keep."""
+
+    if isinstance(micro, bool) or not isinstance(micro, int) or micro < 0:
+        raise ValueError("an amount is an integer number of micro-USD")
+    whole, frac = divmod(micro, MICRO_USD)
+    if frac == 0:
+        return str(whole)
+    return f"{whole}.{frac:06d}".rstrip("0")
+
+
+def _micro_int(value: int | None) -> int | None:
+    """A caller-supplied micro-USD integer, or None when the cost is unknown. A bool is not an integer."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("a cost is an integer number of micro-USD, or unknown")
+    return value
 
 
 def dollars(value: object) -> Decimal:
@@ -114,9 +162,9 @@ def dollars(value: object) -> Decimal:
 
 
 def text_of(amount: Decimal) -> str:
-    """An amount as the decimal text the tables keep: no exponent, no trailing zeros."""
+    """An amount as the decimal text the tables keep: the exact integer micro-USD, no exponent."""
 
-    return format(amount.normalize(), "f")
+    return text_of_micro(micro_usd(amount))
 
 
 @dataclass(frozen=True)
@@ -226,13 +274,29 @@ class _Policy:
 
 
 _COLUMNS = ("reservation_id", "run_id", "connection_id", "engine", "model", "state", "metered", "basis", "reason",
-            "amount_usd", "cap_usd", "spent_usd", "spent_quality", "spent_provenance", "paid_fallback")
+            "amount_usd", "amount_micro_usd", "cap_usd", "spent_usd", "spent_quality", "spent_provenance",
+            "paid_fallback")
 _INSERT = (f"INSERT INTO quota_reservation ({', '.join(_COLUMNS)}) "
            f"VALUES ({', '.join('?' for _ in _COLUMNS)})")
+_HELD_WHERE = ("h.state = 'held' AND NOT EXISTS (SELECT 1 FROM quota_reservation r "
+               "WHERE r.reservation_id = h.reservation_id AND r.state = 'released')")
 _HELD = ("SELECT h.reservation_id, h.run_id, h.connection_id, h.engine, h.model, h.metered, h.basis, h.reason, "
-         "h.amount_usd, h.cap_usd FROM quota_reservation h WHERE h.state = 'held' AND h.{column} = ? AND NOT EXISTS "
-         "(SELECT 1 FROM quota_reservation r WHERE r.reservation_id = h.reservation_id AND r.state = 'released') "
-         "ORDER BY h.row_id")
+         "h.amount_usd, h.cap_usd FROM quota_reservation h WHERE h.{column} = ? AND " + _HELD_WHERE +
+         " ORDER BY h.row_id")
+_ALL_HELD = ("SELECT h.reservation_id, h.run_id, h.connection_id, h.engine, h.model, h.metered, h.basis, h.reason, "
+             "h.amount_usd, h.cap_usd FROM quota_reservation h WHERE " + _HELD_WHERE + " ORDER BY h.row_id")
+_HAS_STATE = "SELECT 1 FROM quota_reservation WHERE reservation_id = ? AND state = ?"
+_USAGE = "SELECT cost_micro_usd FROM quota_usage WHERE reservation_id = ? ORDER BY row_id"
+_INSERT_USAGE = "INSERT INTO quota_usage (reservation_id, run_id, cost_micro_usd) VALUES (?, ?, ?)"
+_EFFECT = "SELECT outcome FROM quota_effect WHERE run_id = ? ORDER BY row_id"
+_INSERT_EFFECT = "INSERT INTO quota_effect (reservation_id, run_id, outcome) VALUES (?, ?, ?)"
+_SETTLE_READ = "SELECT status, amount_micro_usd FROM quota_settle WHERE reservation_id = ?"
+_INSERT_SETTLE = ("INSERT INTO quota_settle (reservation_id, run_id, status, amount_micro_usd) VALUES (?, ?, ?, ?)")
+_RUN_OF = "SELECT run_id FROM quota_reservation WHERE reservation_id = ? ORDER BY row_id LIMIT 1"
+_SESSION = ("SELECT run_id, cost_micro_usd, reported_total_micro_usd FROM quota_session_spend "
+            "WHERE connection_id = ? AND session_id = ? ORDER BY row_id")
+_INSERT_SESSION = ("INSERT INTO quota_session_spend (session_id, connection_id, run_id, cost_micro_usd, "
+                   "reported_total_micro_usd, max_budget_micro_usd) VALUES (?, ?, ?, ?, ?, ?)")
 _HELD_NAMES = ("reservation_id", "run_id", "connection_id", "engine", "model", "metered", "basis", "reason",
                "amount_usd", "cap_usd")
 _LAST_READING = ("SELECT paid_fallback FROM quota_reservation WHERE connection_id = ? AND paid_fallback IS NOT NULL "
@@ -260,37 +324,170 @@ class Reservations:
         try:
             connection_id, engine, model = _checked(connection, route, run_id)
             basis = spend_basis(route)
+            session_id = route.get("session_id")
+            if session_id is not None and (not isinstance(session_id, str) or not RUN_ID.fullmatch(session_id)):
+                return _answer(False, None, ROUTE_INVALID, False)
         except (ValueError, KeyError, TypeError):
             return _answer(False, None, ROUTE_INVALID, False)
         # Outside the transaction: KEYS' own file, and only for the key it belongs to.
         policy = self._policy(connection_id) if basis == API_KEY else None
         try:
             with self._db.transaction() as tx:
-                return self._decide(tx, connection, run_id, engine, model, basis, policy)
+                return self._decide(tx, connection, run_id, engine, model, basis, policy, session_id)
         except Exception:  # noqa: BLE001 - a store that cannot record the reservation admits nothing
             log.exception("quota: the reservation for run %s could not be recorded", run_id)
             return _answer(False, None, STORE_UNAVAILABLE, basis is not None)
 
     def release(self, run_id: str) -> list[str] | None:
-        """End the run's held reservations. Returns their ids: [] when none is held, so a second release writes
-        nothing; None when the store could not record it, and the hold then stays and still counts."""
+        """End the run's held reservations, or mark an unsettled metered hold unresolved.
+
+        Returns the ids this call recorded: [] when none was open, or when a metered hold was already
+        unresolved (a second release writes nothing). None when the store could not record it, and the hold
+        then stays and still counts. A metered hold with no final known usage, or with an unreconciled
+        unknown effect, is marked unresolved and still counts. A known final usage, and a hold that was not
+        metered, are released.
+        """
 
         if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
             return []
         try:
             with self._db.transaction() as tx:
-                held = self._held(tx, "run_id", run_id)
-                for row in held:
-                    self._close(tx, row, RUN_ENDED)
-                return [row["reservation_id"] for row in held]
+                ended = []
+                for row in self._held(tx, "run_id", run_id):
+                    if self._has_state(tx, row["reservation_id"], "unresolved"):
+                        continue
+                    self._end_run(tx, row)
+                    ended.append(row["reservation_id"])
+                return ended
         except Exception:  # noqa: BLE001 - the run is over either way; the hold is what is left behind
             log.exception("quota: the release of run %s could not be recorded", run_id)
             return None
 
+    def record_usage(self, run_id: str, *, cost_micro_usd: int | None) -> None:
+        """Append the run's usage. ``None`` is an unknown cost and is stored as null, never as 0."""
+
+        if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+            raise ValueError("run_id")
+        cost = _micro_int(cost_micro_usd)
+        with self._db.transaction() as tx:
+            hold = self._open_hold(tx, run_id)
+            if hold is None:
+                raise ValueError("run has no hold")
+            tx.execute(_INSERT_USAGE, (hold["reservation_id"], run_id, cost))
+
+    def record_effect(self, run_id: str, *, outcome: str) -> None:
+        """Record ``outcome_unknown`` for the run's open hold. The hold then survives release."""
+
+        if outcome != "outcome_unknown":
+            raise ValueError("outcome")
+        if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+            raise ValueError("run_id")
+        with self._db.transaction() as tx:
+            hold = self._open_hold(tx, run_id)
+            if hold is None:
+                raise ValueError("run has no hold")
+            tx.execute(_INSERT_EFFECT, (hold["reservation_id"], run_id, outcome))
+
+    def reconcile_effect(self, run_id: str) -> None:
+        """Append ``reconciled`` when the run's latest effect is still ``outcome_unknown``. Writes nothing otherwise."""
+
+        if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+            raise ValueError("run_id")
+        with self._db.transaction() as tx:
+            if not self._effect_open(tx, run_id):
+                return
+            hold = self._open_hold(tx, run_id)
+            reservation_id = hold["reservation_id"] if hold is not None else self._effect_reservation(tx, run_id)
+            tx.execute(_INSERT_EFFECT, (reservation_id, run_id, "reconciled"))
+
+    def record_session_spend(self, connection: str, session_id: str, run_id: str, *,
+                             cost_micro_usd: int | None = None, total_cost_usd: object = None,
+                             max_budget_usd: object = None) -> None:
+        """Append one daemon observation for a session.
+
+        ``cost_micro_usd`` is the daemon's own cost for ``run_id``. ``total_cost_usd`` is the engine's
+        cumulative figure for the session and replaces the earlier one; it is not added to it.
+        ``max_budget_usd`` is the engine's budget flag and is stored unused: it is not spend.
+        """
+
+        if not isinstance(connection, str) or not connection:
+            raise ValueError("connection")
+        if not isinstance(session_id, str) or not RUN_ID.fullmatch(session_id):
+            raise ValueError("session_id")
+        if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+            raise ValueError("run_id")
+        cost = _micro_int(cost_micro_usd)
+        reported = None if total_cost_usd is None else micro_usd(total_cost_usd)
+        budget = None if max_budget_usd is None else micro_usd(max_budget_usd)
+        if cost is None and reported is None:
+            raise ValueError("a session record has a daemon cost or a cumulative total")
+        with self._db.transaction() as tx:
+            tx.execute(_INSERT_SESSION, (session_id, connection, run_id, cost, reported, budget))
+
+    def restart_sweep(self) -> list[str]:
+        """Mark each open metered hold with no final usage as provisional. Does not end any hold.
+
+        A second call writes nothing more. Holds that already have a final known cost are left as they are.
+        Returns the reservation ids of the holds this rule covers.
+        """
+
+        with self._db.transaction() as tx:
+            marked = []
+            for raw in tx.execute(_ALL_HELD):
+                row = dict(zip(_HELD_NAMES, raw))
+                if not row["metered"]:
+                    continue
+                if self._final_usage_micro(tx, row["reservation_id"]) is not None:
+                    continue
+                marked.append(row["reservation_id"])
+                if self._has_state(tx, row["reservation_id"], "provisional"):
+                    continue
+                self._mark(tx, row, "provisional", "no_final_usage")
+            return marked
+
+    def settle(self, reservation_id: str, *, status: str, amount_micro_usd: int | None = None) -> dict:
+        """One settle row for ``reservation_id``. A second call writes nothing and returns the first row.
+
+        ``unresolved`` carries no amount (unknown is null, never 0). ``settled`` carries an integer micro-USD
+        amount and ends the hold. A settled write is refused, and nothing is written, while the run has an
+        unreconciled unknown effect, so the hold is never settled at 0 in that case.
+        """
+
+        if not isinstance(reservation_id, str) or not reservation_id.startswith("rsv-"):
+            raise ValueError("reservation_id")
+        if status not in ("settled", "unresolved"):
+            raise ValueError("status")
+        if status == "unresolved":
+            if amount_micro_usd is not None:
+                raise ValueError("an unresolved amount is unknown, never a number")
+            amount = None
+        else:
+            amount = _micro_int(amount_micro_usd)
+            if amount is None:
+                raise ValueError("a settled amount is an integer number of micro-USD")
+        with self._db.transaction() as tx:
+            existing = self._read_settle(tx, reservation_id)
+            if existing is not None:
+                return existing
+            run_rows = tx.execute(_RUN_OF, (reservation_id,))
+            if not run_rows:
+                raise ValueError("unknown reservation")
+            run_id = run_rows[0][0]
+            if status == "settled" and self._effect_open(tx, run_id):
+                return {"reservation_id": reservation_id, "status": "unresolved",
+                        "amount_micro_usd": None, "written": False}
+            tx.execute(_INSERT_SETTLE, (reservation_id, run_id, status, amount))
+            if status == "settled":
+                for row in self._held(tx, "run_id", run_id):
+                    if row["reservation_id"] == reservation_id:
+                        self._close(tx, row, "settled")
+            return {"reservation_id": reservation_id, "status": status,
+                    "amount_micro_usd": amount, "written": True}
+
     # -- inside one transaction
 
     def _decide(self, tx, connection: str, run_id: str, engine: str, model: str, basis: str | None,
-                policy: _Policy | str | None) -> dict:
+                policy: _Policy | str | None, session_id: str | None = None) -> dict:
         own = None
         for row in self._held(tx, "run_id", run_id):
             if own is None and row["connection_id"] == connection:
@@ -321,32 +518,35 @@ class Reservations:
         if basis != API_KEY:
             return self._refuse(tx, own, run_id, connection, engine, model, basis, CONSENT_UNSUPPORTED, None,
                                 None, reading)
-        spent = self._spent(tx, connection)
-        refusal, headroom = None, ZERO
+        spent = self._spent(tx, connection, session_id)
+        refusal = None
+        headroom_micro = 0
         if isinstance(policy, str):
             refusal = policy
         elif policy is None or not policy.opted_in:
             refusal = NO_OPT_IN
         elif policy.cap <= 0:
             refusal = CAP_ZERO
-        elif spent.quality != "unknown" and spent.value >= policy.cap:
+        elif spent.quality != "unknown" and micro_usd(spent.value) >= micro_usd(policy.cap):
             refusal = CAP_REACHED  # a lower bound at or past the cap already shows it reached
         elif spent.quality != "known":
             refusal = SPEND_UNKNOWN
         else:
-            others = sum((Decimal(row["amount_usd"]) for row in self._held(tx, "connection_id", connection)
-                          if row["metered"] and row["run_id"] != run_id), ZERO)
-            headroom = policy.cap - spent.value - others
-            if headroom <= 0:
+            others = sum((micro_usd(Decimal(row["amount_usd"])) for row in self._held(tx, "connection_id", connection)
+                          if row["metered"] and row["run_id"] != run_id), 0)
+            headroom_micro = micro_usd(policy.cap) - micro_usd(spent.value) - others
+            if headroom_micro <= 0:
                 refusal = CAP_HELD
         cap = policy.cap if isinstance(policy, _Policy) else None
         if refusal is not None:
             return self._refuse(tx, own, run_id, connection, engine, model, basis, refusal, cap, spent, None)
         if own is not None:
-            if own["metered"] and Decimal(own["amount_usd"]) <= headroom:
+            own_micro = micro_usd(Decimal(own["amount_usd"]))
+            if own["metered"] and own_micro <= headroom_micro:
                 return _answer(True, own["reservation_id"], WITHIN_CAP, True)  # the hold still fits: no second one
             self._close(tx, own, SUPERSEDED)  # a zero hold, or one larger than the headroom the cap now leaves
-        return self._hold(tx, run_id, connection, engine, model, basis, WITHIN_CAP, headroom, cap, spent, None)
+        amount = Decimal(text_of_micro(headroom_micro))
+        return self._hold(tx, run_id, connection, engine, model, basis, WITHIN_CAP, amount, cap, spent, None)
 
     def _refuse(self, tx, own, run_id, connection, engine, model, basis, reason, cap, spent, reading) -> dict:
         if own is not None:
@@ -364,16 +564,32 @@ class Reservations:
     def _insert(self, tx, reservation_id, run_id, connection, engine, model, state, metered, basis, reason, amount,
                 cap, spent: Spend | None, reading: str | None) -> None:
         tx.execute(_INSERT, (reservation_id, run_id, connection, engine, model, state, 1 if metered else 0, basis,
-                             reason, text_of(amount), None if cap is None else text_of(cap),
+                             reason, text_of(amount), micro_usd(amount), None if cap is None else text_of(cap),
                              None if spent is None or spent.value is None else text_of(spent.value),
                              None if spent is None else spent.quality, None if spent is None else spent.provenance,
                              reading))
 
     def _close(self, tx, row: dict, reason: str) -> None:
+        self._mark(tx, row, "released", reason)
+
+    def _mark(self, tx, row: dict, state: str, reason: str) -> None:
         cap = None if row["cap_usd"] is None else Decimal(row["cap_usd"])
         self._insert(tx, row["reservation_id"], row["run_id"], row["connection_id"], row["engine"], row["model"],
-                     "released", bool(row["metered"]), row["basis"], reason, Decimal(row["amount_usd"]), cap, None,
-                     None)
+                     state, bool(row["metered"]), row["basis"], reason, Decimal(row["amount_usd"]), cap, None, None)
+
+    def _end_run(self, tx, row: dict) -> None:
+        """A known final usage releases the hold. An unsettled metered hold is marked unresolved and still counts."""
+
+        if not row["metered"]:
+            self._close(tx, row, RUN_ENDED)
+            return
+        if self._effect_open(tx, row["run_id"]):
+            self._mark(tx, row, "unresolved", "effect_unknown")
+            return
+        if self._final_usage_micro(tx, row["reservation_id"]) is None:
+            self._mark(tx, row, "unresolved", "cost_unknown")
+            return
+        self._close(tx, row, RUN_ENDED)
 
     def _held(self, tx, column: str, value: str) -> list[dict]:
         assert column in ("run_id", "connection_id"), column
@@ -383,13 +599,79 @@ class Reservations:
         rows = tx.execute(_LAST_READING, (connection,))
         return rows[0][0] if rows else None
 
-    def _spent(self, tx, connection: str) -> Spend:
+    def _spent(self, tx, connection: str, session_id: str | None = None) -> Spend:
         try:
             spent = self._reads.spent(tx, connection)
         except Exception:  # noqa: BLE001 - a reader that fails knows nothing: the spend is unknown
             log.exception("quota: the spend of %s could not be read", connection)
-            return UNKNOWN_SPEND
-        return spent if isinstance(spent, Spend) else UNKNOWN_SPEND
+            spent = UNKNOWN_SPEND
+        if not isinstance(spent, Spend):
+            spent = UNKNOWN_SPEND
+        # The daemon's own session book counts only while the reader has nothing. It is not added on top of a
+        # known figure, which would count the same spend twice.
+        if session_id and spent.quality == "unknown":
+            micro = self._daemon_session_micro(tx, connection, session_id)
+            if micro is not None:
+                return known_spend(Decimal(text_of_micro(micro)), "observed")
+        return spent
+
+    def _has_state(self, tx, reservation_id: str, state: str) -> bool:
+        return bool(tx.execute(_HAS_STATE, (reservation_id, state)))
+
+    def _open_hold(self, tx, run_id: str) -> dict | None:
+        found = self._held(tx, "run_id", run_id)
+        return found[-1] if found else None
+
+    def _final_usage_micro(self, tx, reservation_id: str) -> int | None:
+        """The latest known cost, or None when the run has no final usage (no row, or the latest cost is unknown)."""
+
+        found = tx.execute(_USAGE, (reservation_id,))
+        if not found or found[-1][0] is None:
+            return None
+        return int(found[-1][0])
+
+    def _effect_open(self, tx, run_id: str) -> bool:
+        found = tx.execute(_EFFECT, (run_id,))
+        return bool(found) and found[-1][0] == "outcome_unknown"
+
+    def _effect_reservation(self, tx, run_id: str) -> str:
+        found = tx.execute("SELECT reservation_id FROM quota_effect WHERE run_id = ? ORDER BY row_id DESC LIMIT 1",
+                           (run_id,))
+        if not found:
+            raise ValueError("run has no effect")
+        return found[0][0]
+
+    def _read_settle(self, tx, reservation_id: str) -> dict | None:
+        found = tx.execute(_SETTLE_READ, (reservation_id,))
+        if not found:
+            return None
+        status, amount = found[0]
+        return {"reservation_id": reservation_id, "status": status,
+                "amount_micro_usd": None if amount is None else int(amount), "written": False}
+
+    def _daemon_session_micro(self, tx, connection: str, session_id: str) -> int | None:
+        """The session's spend in micro-USD, counted once.
+
+        The latest cumulative total replaces every earlier one and already includes the runs, so per-run costs
+        are not added to it. With no cumulative total, the daemon's own cost of each run is summed once.
+        The engine budget flag is not read.
+        """
+
+        found = tx.execute(_SESSION, (connection, session_id))
+        if not found:
+            return None
+        latest_total = None
+        per_run: dict[str, int] = {}
+        for run_id, cost, reported in found:
+            if cost is not None:
+                per_run[run_id] = int(cost)
+            if reported is not None:
+                latest_total = int(reported)
+        if latest_total is not None:
+            return latest_total
+        if not per_run:
+            return None
+        return sum(per_run.values())
 
     def _paid_fallback(self, tx, connection: str):
         try:

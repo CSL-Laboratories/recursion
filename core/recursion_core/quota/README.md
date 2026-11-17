@@ -18,9 +18,11 @@ applies the call there through a guarded import: with the module ABSENT nothing 
 - **A refusal launches nothing.** On the wire it is a launch-path refusal like every other: `start_failed` with
   `start_error` {code: `reservation_refused`, detail: the reason}. It is not a direct code of `run.start`.
 - **Admission is where the reservation is made.** There is no separate `reserve` call.
-- **`reservation.release(run_id) -> list[str] | None`** ends the run's held reservations once the run is over.
-  It returns their ids. `[]` means none was held, so a second release writes nothing. `None` means the store
-  could not record the release; the hold then stays and still counts.
+- **`reservation.release(run_id) -> list[str] | None`** ends a hold whose final usage is known, and marks a
+  metered hold with no final usage, or with an unreconciled unknown effect, `unresolved`. An unresolved hold
+  still counts. It returns the ids this call recorded. `[]` means none was open, or the hold was already
+  unresolved, so a second release writes nothing. `None` means the store could not record it; the hold then
+  stays and still counts.
 - **Composition** builds `reservation.Reservations(db, spend_policy, *, reads=None)` and calls
   `reservation.install(reservations)` once. A second call raises `RuntimeError`; anything but a `Reservations`
   raises `TypeError`. Before it does, a route that can spend is refused (`quota_not_composed`), and one that cannot
@@ -67,10 +69,15 @@ limit meets the same rules.
 ## Where it keeps things
 
 - `tables.py` declares the lane's tables once through the event store's transaction helper (lane EVENTS').
-- The table `quota_reservation` is append-only: one row per admission (`held` or `refused`), and one per release
-  (`released`, with `run_ended`, `superseded` or `refused_on_retry`).
-- Money is decimal text. What admission knew of the spend is kept with its quality and provenance; an unknown
-  spend is null, never 0.
+- The table `quota_reservation` is append-only: one row per admission (`held` or `refused`), one marker when a
+  restart sweep keeps a metered hold with no final usage (`provisional`) or when release leaves it `unresolved`,
+  and one `released` row when the hold ends (`run_ended`, `superseded`, `refused_on_retry`, or `settled`).
+- Money is an integer number of micro-USD, also kept as that integer's exact decimal text. What admission knew
+  of the spend is kept with its quality and provenance; an unknown spend is null, never 0.
+- `quota_settle` is one row per reservation id, status `settled` or `unresolved`. A second settle leaves that row.
+- `quota_usage` is the run's reported cost (null when unknown). `quota_effect` records `outcome_unknown` until
+  `reconcile_effect`. `quota_session_spend` is the daemon's own session book: a later cumulative total replaces
+  the earlier one, and the engine's budget flag is stored and not counted as spend.
 - A subscription's typed meter reading is kept on its admission row (`paid_fallback`: `active` or `inactive`).
 
 KEYS' policy is read before the transaction, for API-key routes only. The spend, the holds and the last meter
@@ -79,9 +86,11 @@ engine.
 
 ## Not here yet
 
-- The ledger (slice 2): `spent` and `paid_fallback_active` read from it. Until then every spend is unknown, so
-  every route that can spend is refused (`spend_unknown`).
+- The usage-event feed, the session-total span rules, the meters, and `paid_fallback_active` read from a ledger.
+  Until a reader is passed in, every spend is unknown, so every route that can spend is refused (`spend_unknown`),
+  except a session whose daemon book already has a figure.
 - A consent interface for funding sources other than a stored key (passthrough, helper billing, plan overage).
 - The part of the start path that writes `budget {cap_usd}` into the run record (`quota/hooks.py`).
 - `budget.show` and `route.explain` (slice 3).
-- A sweep that releases the holds of runs that ended while the daemon was down.
+- Replaying the event log into the settle rows after a restart. The settle rows that were written are read back
+  from the store; catching the ledger up from the log needs the event-store reader, which is not in this slice.

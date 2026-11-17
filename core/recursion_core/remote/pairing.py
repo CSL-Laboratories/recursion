@@ -7,7 +7,8 @@ redemption returns is a ``PairingGrant``: what to ask that authority for, never 
 
 The rules, each with a test that fails without it:
 
-* A device's scopes are a non-empty subset of read, run and approve. Manage is never granted by pairing
+* A device's scopes are a non-empty subset of read and stop (watch and Stop). This package has no
+  passkey, so run and approve are refused. Manage is never granted by pairing
   (PRODUCT.md 1017-1018, O34; grill Q40), and an unknown scope is refused.
 * An offer is bound when it is issued to its scopes, its label and its deadline. Redeeming it cannot
   widen or change any of them: the redeemer sends only the offer id and the code.
@@ -23,6 +24,12 @@ The rules, each with a test that fails without it:
 
 Whether a phone needs a second factor at pairing or per approval (F-14 step-up, and what happens where a
 passkey is not supported) is the owner's open choice; nothing here assumes an answer to it.
+
+What this package keeps is the settled values of record 20261115-csl238-harness-dr-09-phone-pairing-01,
+named once below: a pairing lasts at most 30 days, and 7 days if unused; a dangerous action needs a
+fresh assertion per action, valid 60 seconds; without a passkey a device may only watch and Stop.
+There is no passkey here, so every device is passkey-less. A 90-day cap, a 15-minute step-up and a
+TOTP fallback are not these values and are not built.
 """
 
 from __future__ import annotations
@@ -39,7 +46,17 @@ from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
-DEVICE_SCOPES = ("read", "run", "approve")
+# Settled pairing values of csl-research record 20261115-csl238-harness-dr-09-phone-pairing-01.
+# One block, and the only place these numbers are named. A pairing lasts at most 30 days, and
+# 7 days if unused. A dangerous action needs a fresh assertion per action, valid 60 seconds.
+# Without a passkey a paired device may watch and Stop only. This package has no passkey, so
+# every device is passkey-less and DEVICE_SCOPES is read and stop only. No action here was
+# marked dangerous; run and approve are treated as the dangerous actions.
+PAIRING_MAX_AGE_S = 30 * 24 * 60 * 60
+PAIRING_UNUSED_AGE_S = 7 * 24 * 60 * 60
+DANGEROUS_ASSERTION_TTL_S = 60.0
+DEVICE_SCOPES = ("read", "stop")
+DANGEROUS_ACTIONS = ("run", "approve")
 MANAGE = "manage"
 OFFER_TTL_S = 120.0
 CODE_BYTES = 16
@@ -75,7 +92,12 @@ class PairingRefused(Exception):
 
 
 def device_scopes(scopes: Iterable[str]) -> tuple[str, ...]:
-    """A paired device's scopes, checked and in canonical order; ``manage`` is ``scope_refused``."""
+    """A paired device's scopes, checked and in canonical order.
+
+    ``manage``, and the dangerous actions ``run`` and ``approve``, are ``scope_refused``.
+    There is no passkey in this package, so a device may only watch (``read``) and Stop
+    (``stop``).
+    """
     if isinstance(scopes, (str, bytes)):
         raise PairingRefused("scope_invalid", "scopes are a list of words, not one string")
     try:
@@ -87,11 +109,25 @@ def device_scopes(scopes: Iterable[str]) -> tuple[str, ...]:
     for scope in items:
         if scope == MANAGE:
             raise PairingRefused("scope_refused", "pairing never grants manage")
+        if scope in DANGEROUS_ACTIONS:
+            raise PairingRefused("scope_refused", "without a passkey a device may only watch and stop")
         if scope not in DEVICE_SCOPES:
             raise PairingRefused("scope_invalid", f"unknown scope {scope!r}")
     if len(set(items)) != len(items):
         raise PairingRefused("scope_invalid", "a scope is named twice")
     return tuple(scope for scope in DEVICE_SCOPES if scope in items)
+
+
+def pairing_lapsed(paired_at: float, last_accepted_at: float | None, now: float) -> bool:
+    """True at the 30-day cap, or at 7 days with no accepted call since pairing or since the last one.
+
+    ``last_accepted_at is None`` means there has been no accepted call since pairing, so the
+    unused bound is measured from ``paired_at``. At the bound the pairing has lapsed.
+    """
+    if now >= paired_at + PAIRING_MAX_AGE_S:
+        return True
+    idle_from = paired_at if last_accepted_at is None else last_accepted_at
+    return now >= idle_from + PAIRING_UNUSED_AGE_S
 
 
 def device_label(label: object) -> str:
@@ -302,3 +338,65 @@ class OfferBook:
     def _fail(self, source: str, now: float, code: str) -> None:
         self.limiter.record_failure(source, now)
         raise PairingRefused(code)
+
+
+@dataclass
+class _Assertion:
+    assertion_id: str
+    action: str
+    issued_at: float
+    used: bool = False
+
+
+@dataclass
+class AssertionBook:
+    """A fresh assertion for one dangerous action, valid for ``DANGEROUS_ASSERTION_TTL_S`` seconds.
+
+    No action in this package was marked dangerous. ``run`` and ``approve`` are treated as the
+    dangerous actions. Each assertion authorizes its own action once, and only while ``now`` is
+    still before ``issued_at + DANGEROUS_ASSERTION_TTL_S`` (at 60 seconds, and later, it is
+    refused). Replaying it, including for a second action, is refused. The assertion does not
+    grant a scope: a passkey-less device still may not run or approve.
+
+    ``clock`` is a monotonic clock (seconds). Tests inject one; nothing here reads the wall clock.
+    """
+
+    clock: Callable[[], float] = time.monotonic
+    random_bytes: Callable[[int], bytes] = secrets.token_bytes
+
+    def __post_init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_id: dict[str, _Assertion] = {}
+
+    def issue(self, action: str) -> str:
+        """A new assertion id for one dangerous action. Watch and Stop take none."""
+        if not isinstance(action, str) or action not in DANGEROUS_ACTIONS:
+            raise PairingRefused("action_not_dangerous", "only a dangerous action takes an assertion")
+        with self._lock:
+            now = self.clock()
+            assertion_id = _urlsafe(self.random_bytes(9))
+            if assertion_id in self._by_id:
+                raise PairingRefused("assertion_busy", "assertion id collision")
+            self._by_id[assertion_id] = _Assertion(assertion_id, action, now)
+            return assertion_id
+
+    def accept(self, assertion_id: object, action: str) -> None:
+        """Consume ``assertion_id`` for ``action`` once, inside the 60-second window.
+
+        The clock is read under the lock, before the assertion is marked used, so a second
+        caller either waits and is then refused or does not run inside this one.
+        """
+        if not isinstance(action, str):
+            raise PairingRefused("action_invalid", "an action is a string")
+        with self._lock:
+            now = self.clock()
+            record = self._by_id.get(assertion_id) if type(assertion_id) is str else None
+            if record is None:
+                raise PairingRefused("assertion_invalid")
+            if now >= record.issued_at + DANGEROUS_ASSERTION_TTL_S:
+                raise PairingRefused("assertion_expired")
+            if record.used:
+                raise PairingRefused("assertion_replayed")
+            if record.action != action:
+                raise PairingRefused("assertion_wrong_action")
+            record.used = True

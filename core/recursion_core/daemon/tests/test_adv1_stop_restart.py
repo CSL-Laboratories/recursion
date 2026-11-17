@@ -691,16 +691,20 @@ class RestartTest(ComposedBase):
         self.assertIsNotNone(proc.poll())
 
     def test_reconcile_racing_a_start_does_not_mark_it_failed(self):
-        """ADV1-8 (fixed): reconcile() in the window between the API's launch-intent write and RouteStarter
+        """ADV1-8: reconcile() in the window between the API's launch-intent write and RouteStarter
         registering the run wrote start_failed for a start that then succeeded (the record flapped).
         The window here opens before the real starter has the run, so ``starter.active`` is False in it and the
-        control's count of starts in flight is what holds the record; the next test holds the other half."""
+        control's count of starts in flight is what holds the record; the next test holds the other half.
+        The stand-in opens the window and waits for the racer to reconcile before the real starter runs, so a
+        prompt racer reads ``starting``. A racer that runs only after ``run.start`` returns reads ``running``.
+        Either reading is the product; ``start_failed`` in the window is not."""
         daemon, composed = self.boot()
         api = self.api(composed)
         starter = composed.control.starter
         original = type(starter).__call__
         seen = []
         gate = threading.Event()
+        release = threading.Event()
         received = []
         real = mock.Mock(wraps=original)  # the real starter itself: its calls are the ones that reached it
 
@@ -708,25 +712,32 @@ class RestartTest(ComposedBase):
             # The control API calls the starter as (params) on master, and as (params, record) when a lane's
             # start registrant is on the start path (SPINE's seams draft, #370). Whatever came is passed on.
             received.append((self_, args, kwargs))
-            gate.set()
-            time.sleep(0.5)
+            gate.set()  # the window is open: the launch intent is written, the real starter has not run
+            # The racer reconciles, records, then releases. Two seconds is only a backstop so a witness
+            # that delays the racer until after run.start returns cannot deadlock this stand-in.
+            release.wait(2)
             return real(self_, *args, **kwargs)
 
         def reconcile_in_window():
             gate.wait(10)
-            composed.control.reconcile()
-            seen.extend(r['state'] for r in composed.control.registry.list())
+            try:
+                composed.control.reconcile()
+                seen.extend(r['state'] for r in composed.control.registry.list())
+            finally:
+                release.set()
 
         with mock.patch.object(type(starter), '__call__', slow):
             racer = threading.Thread(target=reconcile_in_window)
             racer.start()
             answer = api.call('run.start', {'tenant': 't1', 'engine': 'claude_code', 'prompt': 'helper=0'})
             racer.join(30)
+        self.assertFalse(racer.is_alive(), 'reconcile did not finish')
         self.assertEqual(answer['code'], 'started', answer)
         run_id = answer['run']['run_id']
         self.assertEqual(api.call('run.status', {'run_id': run_id})['run']['state'], 'running')
         self.assertNotIn('start_failed', seen, 'the record flapped starting -> start_failed -> running')
-        self.assertEqual(seen, ['starting'])
+        self.assertTrue(seen, 'reconcile did not run')
+        self.assertTrue(all(state in ('starting', 'running') for state in seen), seen)
         self.assertEqual(len(received), 1, received)
         called_on, args, kwargs = received[0]
         self.assertIs(called_on, starter)

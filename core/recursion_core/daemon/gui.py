@@ -24,6 +24,7 @@ the page (``gui.surface``), so a Stop cut short this way names no run at all.
 """
 from collections.abc import Mapping
 import io
+import os
 import socket
 from socketserver import ThreadingMixIn
 from threading import Lock, Thread
@@ -123,6 +124,19 @@ class _Server(ThreadingMixIn, WSGIServer):
         self._reading = {}    # connections still sending headers, oldest first
         self._working = {}    # connections whose request is being answered -> is it a Stop
         super().__init__(*args)
+
+    def server_bind(self):
+        # PRODUCT 3952-3954: a default Windows bind lets a later socket co-bind
+        # this port and take connections that carry bearer tokens. Set the
+        # exclusive option before bind, and do not also set SO_REUSEADDR (that
+        # is the co-bind HTTPServer would apply).
+        if os.name == "nt":
+            option = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+            if option is None:
+                option = ~socket.SO_REUSEADDR
+            self.socket.setsockopt(socket.SOL_SOCKET, option, 1)
+            self.allow_reuse_address = False
+        super().server_bind()
 
     def process_request(self, request, client_address):
         evicted = None

@@ -1,0 +1,9 @@
+{
+  "method": "surface.prefs.set",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "surface": "x-nobody-defined-this",
+    "theme": "dusk",
+    "expected_revision": 3
+  }
+}

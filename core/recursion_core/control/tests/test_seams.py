@@ -729,7 +729,14 @@ class RegistrationTest(unittest.TestCase):
         asks whether a package or a module outside the core is there, it is told no. Each registrant is then
         asked for once, at the outermost thing it needs that is not part of the core, and no further; nothing
         of it is imported; and nothing registers. (It used to rely on one lane's package not being in the
-        tree, which stops being true the day that lane lands.)"""
+        tree, which stops being true the day that lane lands.)
+
+        Whatever lanes this tree has, now or later. The keys package's absence is made for the test, as the
+        real finder shows it: asked for the package, it says None; asked for anything below it, it raises
+        ModuleNotFoundError naming the package. Whatever of the package is already imported is set aside for the
+        test and put back after it. The names asked are kept: the loader decides absence at the package, so the
+        package is the only name under it that is ever asked for. (It used to rely on no keys lane being in the
+        tree: the keys lane's own package made it fail.)"""
         find_spec, asked = importlib.util.find_spec, []
 
         def absent(name, package=None):
@@ -747,6 +754,34 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual(set(sys.modules) - before, set(), 'nothing was imported for a registrant that is not there')
         self.assertEqual((composed.methods.registered(), composed.commands.names(), composed.engines.names()),
                          ((), (), ('claude_code', 'codex')))
+
+        package = 'recursion_core.keys'
+        self.fake._set_aside(package)
+        find_spec, asked = importlib.util.find_spec, []
+
+        def absent(name, parent=None):
+            asked.append(name)
+            if name.startswith(package + '.'):  # what the real find_spec does below a package that is absent
+                raise ModuleNotFoundError(f'No module named {package!r}', name=package)
+            return None if name == package else find_spec(name, parent)
+        with mock.patch.object(importlib.util, 'find_spec', absent):
+            composed = H.compose()
+        self.assertEqual([name for name in asked if name.startswith(package)], [package],
+                         'absent is decided at the package: the module below it is not asked for, and the package is asked once')
+        self.assertEqual(composed.methods.registered(), ())
+        # Nothing is registered, whatever kind it is: the same defaults as a composition with no lane installed
+        # (test_nothing_is_installed_today...), and every table a registrant can write to. A registrant that was
+        # reached after an answer of None, and put an engine, a command, a single hook, a start registrant or a
+        # service anywhere, shows here; the method table alone did not show it.
+        self.assertEqual(composed.commands.names(), (), 'no command')
+        self.assertEqual(composed.engines.names(), ('claude_code', 'codex'), 'no engine')
+        self.assertFalse(composed.start_on, 'no start registrant')
+        self.assertIsNone(composed.read_result('run-1'), 'no result reader')
+        self.assertFalse(composed.gate.enabled)
+        self.assertIsNone(composed.changes)
+        self.assertEqual((composed._single, composed._start, composed._services), ({}, {}, []),
+                         'no single hook, no start registrant, no service')
+        self.assertNotIn('recursion_core.keys', sys.modules)
 
     def test_a_package_with_no_hooks_module_is_skipped(self) -> None:
         package = self.fake.lane('keys')

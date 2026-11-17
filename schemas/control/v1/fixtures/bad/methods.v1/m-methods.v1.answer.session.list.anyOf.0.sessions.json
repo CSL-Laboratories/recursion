@@ -1,0 +1,10 @@
+{
+  "method": "session.list",
+  "params": {
+    "state": "live",
+    "limit": 20
+  },
+  "answer": {
+    "code": "ok"
+  }
+}

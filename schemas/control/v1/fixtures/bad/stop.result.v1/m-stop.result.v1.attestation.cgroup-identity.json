@@ -1,0 +1,12 @@
+{
+  "code": "stopped",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "state": "stopped",
+  "repeat": false,
+  "attestation": {
+    "proof": "empty",
+    "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/recursion-run-run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7.service",
+    "time": "2026-11-13T07:41:02.118Z"
+  },
+  "claim": "cgroup_empty_whole_run_unverified"
+}

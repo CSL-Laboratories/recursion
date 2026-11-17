@@ -1,0 +1,5 @@
+{
+  "name": "search-notes",
+  "description": "Search the notes folder and return matching lines.",
+  "permission": "tool"
+}

@@ -1,0 +1,6 @@
+{
+  "kind": "approval",
+  "name": "my-approval",
+  "title": "Approve",
+  "permission": "surface"
+}

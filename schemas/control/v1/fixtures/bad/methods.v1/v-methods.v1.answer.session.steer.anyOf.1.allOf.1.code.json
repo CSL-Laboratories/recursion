@@ -1,0 +1,13 @@
+{
+  "method": "session.steer",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "text": "Only the failing test.",
+    "expected_turn_id": "turn-000c"
+  },
+  "answer": {
+    "code": "method_unknown",
+    "detail": "not_implemented"
+  }
+}

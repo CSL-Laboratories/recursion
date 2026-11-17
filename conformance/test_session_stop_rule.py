@@ -37,6 +37,15 @@ def _problems(exchange: dict) -> list:
     return report(exchange)
 
 
+def _every_run_stopped(exchange: dict) -> None:
+    # A stopped run the published schema accepts carries repeat and does not carry reason.
+    for run in exchange["answer"]["runs"]:
+        run["code"] = "stopped"
+        run["state"] = "stopped"
+        run.pop("reason", None)
+        run["repeat"] = False
+
+
 class SessionStopRuleTest(unittest.TestCase):
     def setUp(self) -> None:
         self.h13 = _h13()
@@ -62,7 +71,7 @@ class SessionStopRuleTest(unittest.TestCase):
         mutated = copy.deepcopy(self.h13)
         mutated["answer"]["code"] = "stopped"
         self.assertTrue(self._fits(mutated), "the schema accepts a stopped answer over a pending run")
-        self.assertTrue(_problems(mutated), "a stopped answer names a run that is still pending")
+        self.assertIn("stopped_while_pending", _problems(mutated), "a stopped answer names a run that is still pending")
         if self.schemas is not None:
             self.assertIsNotNone(self._client(mutated), "the client reports the stopped answer")
 
@@ -70,7 +79,7 @@ class SessionStopRuleTest(unittest.TestCase):
         mutated = copy.deepcopy(self.h13)
         mutated["answer"]["pending"] = []
         self.assertTrue(self._fits(mutated), "the schema accepts a pending list that names nothing")
-        self.assertTrue(_problems(mutated), "pending does not name the pending run")
+        self.assertIn("pending_names", _problems(mutated), "pending does not name the pending run")
         if self.schemas is not None:
             self.assertIsNotNone(self._client(mutated), "the client reports the unnamed pending run")
 
@@ -84,9 +93,73 @@ class SessionStopRuleTest(unittest.TestCase):
             "state": "ended",
         }]
         self.assertTrue(self._fits(mutated), "the schema accepts a stopped answer over an ended run")
-        self.assertTrue(_problems(mutated), "a stopped answer includes a run that is not stopped")
+        self.assertIn("not_every_run_stopped", _problems(mutated), "a stopped answer includes a run that is not stopped")
         if self.schemas is not None:
             self.assertIsNotNone(self._client(mutated), "the client reports the run that is not stopped")
+
+    def test_ended_while_a_run_is_pending_is_reported(self) -> None:
+        mutated = copy.deepcopy(self.h13)
+        mutated["answer"]["code"] = "ended"
+        self.assertIn("ended_while_pending", _problems(mutated))
+        if self.schemas is not None:
+            message = self._client(mutated)
+            self.assertIsNotNone(message)
+            self.assertIn("ended_while_pending", message)
+
+    def test_stopped_pending_names_a_run_that_is_not_in_runs(self) -> None:
+        mutated = copy.deepcopy(self.h13)
+        mutated["answer"]["code"] = "stopped"
+        mutated["answer"]["pending"] = ["run-11111111111111111111111111111111"]
+        _every_run_stopped(mutated)
+        found = _problems(mutated)
+        self.assertIn("stopped_while_pending", found)
+        self.assertIn("pending_names", found)
+
+    def test_pending_without_a_pending_run_is_reported(self) -> None:
+        mutated = copy.deepcopy(self.h13)
+        mutated["answer"]["pending"] = []
+        _every_run_stopped(mutated)
+        self.assertEqual(mutated["answer"]["code"], "pending")
+        self.assertIn("pending_without_a_pending_run", _problems(mutated))
+        if self.schemas is not None:
+            message = self._client(mutated)
+            self.assertIsNotNone(message)
+            self.assertIn("pending_without_a_pending_run", message)
+
+    def test_ended_without_an_ended_run_is_reported(self) -> None:
+        mutated = copy.deepcopy(self.h13)
+        mutated["answer"]["code"] = "ended"
+        mutated["answer"]["pending"] = []
+        _every_run_stopped(mutated)
+        self.assertIn("ended_without_an_ended_run", _problems(mutated))
+        if self.schemas is not None:
+            message = self._client(mutated)
+            self.assertIsNotNone(message)
+            self.assertIn("ended_without_an_ended_run", message)
+
+    def test_ended_with_an_ended_run_and_an_empty_pending_list_is_clean(self) -> None:
+        mutated = copy.deepcopy(self.h13)
+        mutated["answer"]["code"] = "ended"
+        mutated["answer"]["pending"] = []
+        mutated["answer"]["runs"] = [{
+            "code": "ended",
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "state": "ended",
+        }]
+        self.assertEqual(_problems(mutated), [])
+        if self.schemas is not None:
+            self.assertTrue(self._fits(mutated))
+            self.assertIsNone(self._client(mutated))
+
+    def test_a_runs_value_that_is_not_a_list_is_shape(self) -> None:
+        mutated = copy.deepcopy(self.h13)
+        mutated["answer"]["runs"] = "not-a-list"
+        self.assertIn("shape", _problems(mutated))
+
+    def test_a_run_that_is_not_an_object_is_run(self) -> None:
+        mutated = copy.deepcopy(self.h13)
+        mutated["answer"]["runs"] = ["not-an-object"]
+        self.assertIn("run", _problems(mutated))
 
 
 if __name__ == "__main__":

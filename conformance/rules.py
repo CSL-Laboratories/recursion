@@ -1677,8 +1677,8 @@ def session_stop_problems(exchange) -> list:
     """What does not agree in a ``session.stop`` answer. Empty when it agrees, or when this is not one.
 
     A Stop is ``stopped`` only when every run in it is stopped and ``pending`` is empty. One pending run
-    makes the answer ``pending``, and ``pending`` names those runs and no others. ``fits`` stays true:
-    the published schema does not say this.
+    makes the answer ``pending``, and ``pending`` names those runs and no others. An ``ended`` answer has
+    a run whose code is ``ended``. ``fits`` stays true: the published schema does not say this.
     """
     if not isinstance(exchange, dict) or exchange.get("method") != "session.stop":
         return []
@@ -1709,6 +1709,10 @@ def session_stop_problems(exchange) -> list:
         problems.append("ended_while_pending")
     if code == "stopped" and not every_run_stopped:
         problems.append("not_every_run_stopped")
+    if code == "pending" and not pending_ids:
+        problems.append("pending_without_a_pending_run")
+    if code == "ended" and not any(isinstance(run, dict) and run.get("code") == "ended" for run in runs):
+        problems.append("ended_without_an_ended_run")
     if any(not isinstance(item, str) for item in named) or sorted(named) != sorted(pending_ids):
         problems.append("pending_names")
     return problems

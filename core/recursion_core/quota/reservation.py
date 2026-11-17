@@ -17,9 +17,13 @@ The rules. Decided: money is a reservation at zero unless the user opts in with 
 under a cap the user sets (grill Q44, O59); unknown stays unknown (P10); the meter is the connection (grill Q8).
 
 * A route that cannot spend money (a subscription that bills nothing) is admitted with a zero hold.
-* An API-key route is admitted only when KEYS' spend policy for that key says the user opted in, with a cap
-  above 0 (an absent cap is 0), and the connection's spend is KNOWN to be below the cap. A spend that is unknown,
-  or only a lower bound below the cap, refuses: nothing shows the cap is not reached.
+* An API-key route whose key is the stored key (``key_source`` absent or ``custody``) is admitted only when
+  KEYS' spend policy for that key says the user opted in, with a cap above 0 (an absent cap is 0), and the
+  connection's spend is KNOWN to be below the cap. A spend that is unknown, or only a lower bound below the
+  cap, refuses: nothing shows the cap is not reached.
+* An API-key route whose key comes from an ``api_key_helper`` is refused (``consent_unsupported``) until that
+  helper's key is bound. KEYS is not asked. The stored key's consent and known spend are not applied, even
+  when the connection id is the same.
 * Every other route that can spend money is refused (``consent_unsupported``) until a consent interface for its
   funding source exists. KEYS' policy belongs to a stored key and is never applied to another kind of
   connection that happens to share its id. These are a passthrough route (a cloud or gateway bills it); a
@@ -78,6 +82,7 @@ REFUSAL_REASONS = frozenset({NO_OPT_IN, CAP_ZERO, CAP_REACHED, CAP_HELD, SPEND_U
 # Why a route can spend money. None means it cannot.
 API_KEY = "api_key"
 PASSTHROUGH = "passthrough"
+API_KEY_HELPER = "api_key_helper"  # an unbound helper key, not the stored key the connection id names
 API_KEY_HELPER_BILLING = "api_key_helper_billing"
 PLAN_PAID_FALLBACK = "plan_paid_fallback"
 
@@ -175,6 +180,10 @@ def spend_basis(route: Mapping) -> str | None:
     conn = route["connection"]
     kind = conn["kind"]
     if kind == "api_key":
+        # The user's helper supplies this key. It is not the stored key the connection id names, and nothing
+        # in this slice binds the two. A stored key's consent must not cover it.
+        if conn.get("key_source") == API_KEY_HELPER:
+            return API_KEY_HELPER
         return API_KEY
     if kind == "passthrough":
         return PASSTHROUGH
@@ -235,7 +244,8 @@ class Reservations:
 
     ``db`` is the helper (``transaction()``), with the lane's tables declared (``tables.declare``).
     ``spend_policy(key_id)`` is KEYS': ``{metered_spend_allowed, cap_usd}`` for the stored key an API-key route's
-    connection id names; a KeyError means KEYS keeps no key by that id. It is asked about API-key routes only.
+    connection id names; a KeyError means KEYS keeps no key by that id. It is asked only for a stored key
+    (``key_source`` absent or ``custody``), never for a key an ``api_key_helper`` supplies.
     ``reads`` answers ``spent`` and ``paid_fallback_active`` (see ``NoReads``); ``NoReads`` until the ledger exists.
     """
 

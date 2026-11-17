@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,9 @@ import perf_compare
 from perf_bench import BenchError, HARNESS_ROOT, run_paired, run_suite
 
 GIT = ["git", "-c", "core.longpaths=true", "-c", "core.quotePath=false"]
+# Each git call has its own deadline. Three calls at this limit stay under
+# the workflow step's outer limit of 55 seconds.
+GIT_TIMEOUT_SECONDS = 15
 DEFAULT_RATIO = perf_compare.DEFAULT_RATIO_LIMIT
 
 
@@ -47,7 +51,7 @@ def _env_float(name: str, default: float) -> float:
     try:
         value = float(raw)
     except ValueError as exc:
-        raise PerfCIError(f"{name}={raw!r} is not a number") from exc
+        raise PerfCIError(f"{name} is not a number") from exc
     if not math.isfinite(value):
         raise PerfCIError(f"{name}={raw!r} must be a finite number")
     return value
@@ -68,16 +72,47 @@ def _absolute_floor() -> float:
 
 
 def _run(cmd: list[str], *, cwd: Path, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd,
-        cwd=cwd,
-        timeout=timeout,
-        check=False,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-    )
+    if timeout is None:
+        timeout = GIT_TIMEOUT_SECONDS
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(float(timeout)) or float(timeout) <= 0:
+        raise PerfCIError("git deadline must be a positive finite number of seconds")
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            timeout=timeout,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PerfCIError(f"git timed out after {timeout} seconds: {_command_text(' '.join(cmd))}") from exc
+
+
+def _delete_tree(path: Path) -> None:
+    """Drop a leftover worktree directory. Does not call ``_run``."""
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+    elif path.exists() or path.is_symlink():
+        path.unlink(missing_ok=True)
+
+
+def _unregister_worktree(path: Path) -> None:
+    """Drop a git worktree registration without going through ``_run``."""
+    try:
+        subprocess.run(
+            [*GIT, "worktree", "remove", "--force", str(path)],
+            cwd=HARNESS_ROOT,
+            timeout=GIT_TIMEOUT_SECONDS,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    _delete_tree(path)
 
 
 def _worktree(sha: str) -> Path:
@@ -88,19 +123,36 @@ def _worktree(sha: str) -> Path:
         )
     path = Path(tempfile.mkdtemp(prefix="perf-base-"))
     path.rmdir()
-    added = _run([*GIT, "worktree", "add", "--detach", str(path), sha], cwd=HARNESS_ROOT)
+    try:
+        added = _run([*GIT, "worktree", "add", "--detach", str(path), sha], cwd=HARNESS_ROOT)
+    except subprocess.TimeoutExpired as exc:
+        _unregister_worktree(path)
+        raise PerfCIError(f"git worktree add timed out for {_command_text(sha[:12])}") from exc
+    except PerfCIError:
+        _unregister_worktree(path)
+        raise
     if added.returncode != 0:
-        sys.stderr.write(added.stderr)
-        raise PerfCIError(f"git worktree add failed for {sha[:12]}")
+        detail = _command_text(added.stderr)
+        if detail:
+            sys.stderr.write(detail + "\n")
+        _unregister_worktree(path)
+        raise PerfCIError(f"git worktree add failed for {_command_text(sha[:12])}")
     return path
 
 
 def _remove_worktree(path: Path | None) -> None:
     if path is None:
         return
-    removed = _run([*GIT, "worktree", "remove", "--force", str(path)], cwd=HARNESS_ROOT)
+    try:
+        removed = _run([*GIT, "worktree", "remove", "--force", str(path)], cwd=HARNESS_ROOT)
+    except subprocess.TimeoutExpired as exc:
+        _unregister_worktree(path)
+        raise PerfCIError(f"git worktree remove timed out: {_command_text(str(path))}") from exc
+    except PerfCIError:
+        _unregister_worktree(path)
+        raise
     if removed.returncode != 0:
-        detail = removed.stderr.strip() or f"exit {removed.returncode}"
+        detail = _command_text(removed.stderr.strip()) or f"exit {removed.returncode}"
         raise PerfCIError(f"git worktree remove failed: {detail}")
 
 
@@ -124,7 +176,7 @@ def _emit(report: dict, *, baseline_label: str, candidate_label: str) -> None:
     warnings = perf_compare.warning_lines(report)
     if os.environ.get("GITHUB_ACTIONS") == "true":
         for line in warnings:
-            print(f"::warning title=Performance regression::{_command_text(line)}", flush=True)
+            print(f"::warning title=Performance regression::{line}", flush=True)
     else:
         for line in warnings:
             print(f"WARNING: {line}", flush=True)
@@ -133,7 +185,7 @@ def _emit(report: dict, *, baseline_label: str, candidate_label: str) -> None:
 def _print_side(label: str, report: dict) -> None:
     for row in report["benchmarks"]:
         print(
-            f"PERF_BENCH side={label} name={row['name']} median_s={row['median_s']:.9f} "
+            f"PERF_BENCH side={label} name={_command_text(str(row['name']))} median_s={row['median_s']:.9f} "
             f"rounds={row['rounds']} repeats={row.get('repeats', 1)} "
             f"iters={row['iterations_per_round']}",
             flush=True,
@@ -166,14 +218,14 @@ def main() -> int:
             print(f"PERF_CI_SECONDS={time.perf_counter() - started:.3f}", flush=True)
             print(f"PERF_REGRESSIONS={len(report['regressions'])}", flush=True)
             code = job_ok()
-    except (PerfCIError, BenchError) as exc:
-        print(f"PERF_CI_FAIL: {exc}", file=sys.stderr)
+    except (PerfCIError, BenchError, perf_compare.CompareError) as exc:
+        print(f"PERF_CI_FAIL: {_command_text(str(exc))}", file=sys.stderr)
         code = perf_compare.job_exit_code(bench_ok=False)
     finally:
         try:
             _remove_worktree(tree)
         except PerfCIError as exc:
-            print(f"PERF_CI_FAIL: {exc}", file=sys.stderr)
+            print(f"PERF_CI_FAIL: {_command_text(str(exc))}", file=sys.stderr)
             code = perf_compare.job_exit_code(bench_ok=False)
     return code
 
@@ -186,5 +238,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (OSError, ValueError) as exc:
-        print(f"PERF_CI_FAIL: {exc}", file=sys.stderr)
+        print(f"PERF_CI_FAIL: {_command_text(str(exc))}", file=sys.stderr)
         raise SystemExit(perf_compare.job_exit_code(bench_ok=False))

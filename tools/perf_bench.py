@@ -17,6 +17,7 @@ import json
 import math
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,7 +64,13 @@ class BenchError(RuntimeError):
 
 
 def install_network_guard() -> None:
-    """Refuse connect/send so a benchmark cannot call a live provider."""
+    """Block connect, connect_ex, sendto, sendmsg, and create_connection.
+
+    A benchmark must not reach a live provider. This is a tripwire, not a
+    sandbox. send and sendall on an already connected socket are not covered.
+    The C socket type, the socket base class, a socket created before the
+    guard, and a child process remain reachable.
+    """
     global _GUARD_INSTALLED
     if _GUARD_INSTALLED:
         return
@@ -79,6 +86,9 @@ def install_network_guard() -> None:
         def sendto(self, data, *args):  # noqa: ANN001
             raise RuntimeError("perf benchmarks must not open network connections")
 
+        def sendmsg(self, buffers, ancdata=None, flags=0, address=None):  # noqa: ANN001
+            raise RuntimeError("perf benchmarks must not open network connections")
+
     def blocked(*args, **kwargs):  # noqa: ANN002, ANN003
         raise RuntimeError("perf benchmarks must not open network connections")
 
@@ -87,14 +97,21 @@ def install_network_guard() -> None:
     _GUARD_INSTALLED = True
 
 
+_DROP_LOCK = threading.Lock()
+
+
 def _drop_imported_product() -> None:
-    for name in list(sys.modules):
-        if name == "scripts" or name.startswith("scripts."):
-            del sys.modules[name]
+    with _DROP_LOCK:
+        for name in list(sys.modules):
+            if name == "scripts" or name.startswith("scripts."):
+                del sys.modules[name]
 
 
 def load_product(root: Path):
-    """Import the planning kernel from ``root``, not from a previously imported tree."""
+    """Import the planning kernel from ``root``, not from a previously imported tree.
+
+    One caller at a time. Two overlapping callers can still mix kernels.
+    """
     sys.dont_write_bytecode = True
     root = root.resolve()
     if not (root / "scripts" / "__init__.py").is_file():
@@ -231,9 +248,17 @@ def _replay_stream(product, count: int = REPLAY_EVENTS):
 
 def load_workload() -> dict:
     try:
-        payload = json.loads(WORKLOAD_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        text = WORKLOAD_PATH.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
         raise BenchError(f"cannot read {WORKLOAD_PATH.name}: {exc}") from exc
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise BenchError(f"cannot read {WORKLOAD_PATH.name}: {exc}") from exc
+    except RecursionError as exc:
+        raise BenchError(f"cannot read {WORKLOAD_PATH.name}: workload is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise BenchError("workload must be an object")
     if not isinstance(payload.get("command_json"), str) or not payload["command_json"]:
         raise BenchError("workload command_json is missing")
     policies = payload.get("policies")
@@ -332,18 +357,34 @@ def _calibrate_iterations(fn, round_s: float) -> int:
     return max(1, min(20000, int(round_s / per_call)))
 
 
+_GC_LOCK = threading.Lock()
+_GC_DEPTH = 0
+_GC_RESTORE = False
+
+
 def _timed_call(fn, iterations: int) -> float:
-    """Time ``iterations`` calls of ``fn``; re-enables GC afterward only if the caller had it on."""
-    was_enabled = gc.isenabled()
-    gc.disable()
+    """Time ``iterations`` calls of ``fn``.
+
+    GC stays off until the outermost call returns. A nested or overlapping
+    call does not turn it back on. A callback that turns GC on is left on,
+    matching the one-way restore of a single caller.
+    """
+    global _GC_DEPTH, _GC_RESTORE
+    with _GC_LOCK:
+        if _GC_DEPTH == 0:
+            _GC_RESTORE = gc.isenabled()
+            gc.disable()
+        _GC_DEPTH += 1
     try:
         start = time.perf_counter()
         for _index in range(iterations):
             fn()
         elapsed = time.perf_counter() - start
     finally:
-        if was_enabled:
-            gc.enable()
+        with _GC_LOCK:
+            _GC_DEPTH -= 1
+            if _GC_DEPTH == 0 and _GC_RESTORE:
+                gc.enable()
     return elapsed / iterations
 
 

@@ -6,6 +6,7 @@ import ast
 import gc
 import importlib.util
 import json
+import math
 import os
 import socket
 import subprocess
@@ -477,6 +478,184 @@ class SweepRegressionTests(unittest.TestCase):
             with self.assertRaises(perf_ci.PerfCIError):
                 perf_ci._remove_worktree(Path("/unused/synthetic-worktree"))
 
+    def test_f04_malformed_numeric_inputs_have_typed_refusals(self):
+        inputs = [
+            (_report({"x": 1}), _report({"x": 2}), {"ratio_limit": "1.1"}),
+            (_report({"x": 10**400}), _report({"x": 1}), {}),
+            (_report({"x": 1}), _report({"x": 1}), {"absolute_floor_s": 10**400}),
+        ]
+        for baseline, candidate, options in inputs:
+            with self.subTest(options=options, median=baseline["benchmarks"][0]["median_s"]):
+                with self.assertRaises(perf_compare.CompareError):
+                    perf_compare.compare_reports(baseline, candidate, **options)
+
+    def test_f05_finite_reports_do_not_produce_infinity_in_json(self):
+        try:
+            result = perf_compare.compare_reports(_report({"x": 5e-324}), _report({"x": 1.0}))
+        except perf_compare.CompareError:
+            return
+        json.dumps(result, allow_nan=False)
+
+    def test_f06_wrong_shape_and_bad_encoding_are_bench_errors(self):
+        for content in (b"[]", b"null", b"\xff"):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "workload.json"
+                path.write_bytes(content)
+                with mock.patch.object(perf_bench, "WORKLOAD_PATH", path):
+                    with self.assertRaises(perf_bench.BenchError):
+                        perf_bench.load_workload()
+
+    def test_f09_markdown_log_cannot_inject_workflow_commands(self):
+        import contextlib
+        import io
+        name = "ordinary\n::error::SYNTHETIC_ANNOTATION"
+        result = perf_compare.compare_reports(_report({name: 1.0}), _report({name: 2.0}))
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_STEP_SUMMARY": ""}),
+              contextlib.redirect_stdout(output)):
+            perf_ci._emit(result, baseline_label="base", candidate_label="head")
+        self.assertFalse(any(line.startswith("::error::") for line in output.getvalue().splitlines()))
+
+    def test_f09_invalid_base_refusal_cannot_inject_workflow_commands(self):
+        import contextlib
+        import io
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "missing\n::error::SYNTHETIC_REFUSAL",
+                                            "PERF_REGRESSION_RATIO": "", "PERF_ABSOLUTE_FLOOR_S": ""}),
+              mock.patch.object(perf_ci, "_run", return_value=subprocess.CompletedProcess([], 1, "", "")),
+              contextlib.redirect_stderr(output)):
+            self.assertEqual(perf_ci.main(), 1)
+        self.assertFalse(any(line.startswith("::error::") for line in output.getvalue().splitlines()))
+
+    def test_f09_numeric_env_refusal_does_not_echo_arbitrary_rejected_text(self):
+        sentinel = "SYNTHETIC_NOT_A_REAL_KEY"
+        with mock.patch.dict(os.environ, {"PERF_REGRESSION_RATIO": sentinel}):
+            with self.assertRaises(perf_ci.PerfCIError) as caught:
+                perf_ci._ratio_limit()
+        self.assertNotIn(sentinel, str(caught.exception))
+
+    def test_f10_two_droppers_do_not_raise_keyerror(self):
+        import threading
+        import types
+        marker = "scripts.sweep_s2b_drop_probe"
+        saved = {key: value for key, value in sys.modules.items() if key == "scripts" or key.startswith("scripts.")}
+        sys.modules[marker] = types.ModuleType(marker)
+        barrier = threading.Barrier(2)
+        original_list = list
+        errors = []
+
+        def snapshot(mapping):
+            keys = original_list(mapping)
+            try:
+                barrier.wait(timeout=0.25)
+            except threading.BrokenBarrierError:
+                pass
+            return keys
+
+        def drop():
+            try:
+                perf_bench._drop_imported_product()
+            except Exception as exc:
+                errors.append(exc)
+
+        try:
+            with mock.patch.object(perf_bench, "list", snapshot, create=True):
+                threads = [threading.Thread(target=drop) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=2)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+        finally:
+            sys.modules.pop(marker, None)
+            sys.modules.update(saved)
+
+    def test_f11_overlapping_samples_keep_gc_disabled(self):
+        import threading
+        first_inside = threading.Event()
+        second_inside = threading.Event()
+        first_done = threading.Event()
+        observed = []
+        errors = []
+        was_enabled = gc.isenabled()
+
+        def first_callback():
+            first_inside.set()
+            second_inside.wait(0.25)
+
+        def second_callback():
+            second_inside.set()
+            if not first_done.wait(2):
+                raise AssertionError("first timed call did not finish")
+            observed.append(gc.isenabled())
+
+        def first():
+            try:
+                perf_bench._timed_call(first_callback, 1)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                first_done.set()
+
+        def second():
+            try:
+                if not first_inside.wait(2):
+                    raise AssertionError("first timed call did not start")
+                perf_bench._timed_call(second_callback, 1)
+            except Exception as exc:
+                errors.append(exc)
+
+        try:
+            gc.enable()
+            threads = [threading.Thread(target=first), threading.Thread(target=second)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(observed, [False])
+        finally:
+            if was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+
+    @unittest.skipUnless(hasattr(socket.socket, "sendmsg"), "sendmsg is a POSIX socket API")
+    def test_f12_guard_blocks_udp_sendmsg(self):
+        original_socket = socket.socket
+        original_connect = socket.create_connection
+        installed = perf_bench._GUARD_INSTALLED
+        receiver = original_socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            receiver.bind(("127.0.0.1", 0))
+            perf_bench.install_network_guard()
+            sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                with self.assertRaises(RuntimeError):
+                    sender.sendmsg([b"x"], [], 0, receiver.getsockname())
+            finally:
+                sender.close()
+        finally:
+            receiver.close()
+            socket.socket = original_socket
+            socket.create_connection = original_connect
+            perf_bench._GUARD_INSTALLED = installed
+
+    def test_f19_git_helpers_supply_finite_deadlines(self):
+        # The evidence witness also calls frozen ci_gate and other lanes.
+        # This row is only the perf_ci helper.
+        seen = []
+
+        def run(*args, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            return subprocess.CompletedProcess(args[0] if args else [], 0, "", "")
+
+        with mock.patch.object(perf_ci.subprocess, "run", side_effect=run):
+            perf_ci._run(["git", "status"], cwd=ROOT)
+        self.assertTrue(seen)
+        self.assertTrue(all(value is not None and math.isfinite(value) for value in seen))
     def test_f01_odd_count_uses_the_middle_sample(self):
         self.assertEqual(perf_bench._positive_median([0.2, 0.1, 0.4]), 0.2)
 
@@ -641,6 +820,306 @@ class SweepRegressionTests(unittest.TestCase):
               contextlib.redirect_stderr(stderr)):
             code = perf_ci.main()
         self.assertEqual(code, 0, stderr.getvalue())
+
+    def test_finite_ratio_with_a_nonfinite_delta_is_refused(self):
+        pairs = (
+            ({"sample": 1.0}, {"sample": 1e307}),
+            ({"sample": 1e-308}, {"sample": 1.0}),
+        )
+        for base, head in pairs:
+            with self.subTest(base=base, head=head):
+                ratio = next(iter(head.values())) / next(iter(base.values()))
+                self.assertTrue(math.isfinite(ratio), ratio)
+                with self.assertRaises(perf_compare.CompareError) as caught:
+                    perf_compare.compare_reports(_report(base), _report(head))
+                self.assertIn("delta is not finite", str(caught.exception))
+
+    def test_compare_error_from_main_is_one_line(self):
+        import contextlib
+        import io
+        name = "row\n::error::SYNTHETIC"
+
+        def side(median):
+            report = _report({name: median})
+            report["benchmarks"][0]["rounds"] = 1
+            report["benchmarks"][0]["iterations_per_round"] = 1
+            return report
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+              mock.patch.object(perf_ci, "_worktree", return_value=Path("/unused/synthetic-worktree")),
+              mock.patch.object(perf_ci, "run_paired", return_value=(side(1.0), side(1e307))),
+              mock.patch.object(perf_ci, "_run", return_value=subprocess.CompletedProcess([], 0, "", "")),
+              contextlib.redirect_stdout(stdout),
+              contextlib.redirect_stderr(stderr)):
+            code = perf_ci.main()
+        err, out = stderr.getvalue(), stdout.getvalue()
+        self.assertEqual(code, 1, err)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("PERF_CI_FAIL:", err)
+        self.assertEqual(err.count("\n"), 1, err)
+        self.assertNotIn("\n::error::", err)
+        self.assertNotIn("\n::error::", out)
+        self.assertFalse(any(line.startswith("::error::") for line in (err + out).splitlines()))
+
+    def test_print_side_escapes_a_benchmark_name(self):
+        import contextlib
+        import io
+        report = _report({"n\n::error::SYNTHETIC": 0.001})
+        report["benchmarks"][0]["rounds"] = 1
+        report["benchmarks"][0]["iterations_per_round"] = 1
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            perf_ci._print_side("head", report)
+        text = output.getvalue()
+        self.assertEqual(text.count("\n"), 1, text)
+        self.assertIn("%0A", text)
+        self.assertFalse(any(line.startswith("::error::") for line in text.splitlines()))
+
+    def test_hostile_baseline_label_stays_one_line(self):
+        report = perf_compare.compare_reports(_report({"sample": 1.0}), _report({"sample": 1.1}))
+        text = perf_compare.render_markdown(
+            report, baseline_label="base\n::error::SYNTHETIC", candidate_label="head",
+        )
+        self.assertIn("%0A", text)
+        self.assertNotIn("\n::error::", text)
+        self.assertFalse(any(line.startswith("::error::") for line in text.splitlines()))
+
+    def test_remove_refusal_escapes_a_newline(self):
+        failed = subprocess.CompletedProcess([], 1, "", "fatal: locked\n::error::SYNTHETIC")
+        with mock.patch.object(perf_ci, "_run", return_value=failed):
+            with self.assertRaises(perf_ci.PerfCIError) as caught:
+                perf_ci._remove_worktree(Path("/unused/synthetic-worktree"))
+        message = str(caught.exception)
+        self.assertNotIn("\n", message)
+        self.assertIn("%0A", message)
+        self.assertNotIn("%250A", message)
+        self.assertFalse(any(line.startswith("::error::") for line in message.splitlines()))
+
+    def test_git_deadline_must_be_finite(self):
+        with self.assertRaises(perf_ci.PerfCIError) as caught:
+            perf_ci._run(["git", "status"], cwd=ROOT, timeout=float("inf"))
+        self.assertIn("deadline", str(caught.exception))
+
+    def test_run_turns_a_git_timeout_into_a_perf_error(self):
+        def boom(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 15)
+
+        with mock.patch.object(perf_ci.subprocess, "run", side_effect=boom):
+            with self.assertRaises(perf_ci.PerfCIError) as caught:
+                perf_ci._run(["git", "status"], cwd=ROOT)
+        message = str(caught.exception)
+        self.assertIn("timed out", message)
+        self.assertNotIn("\n", message)
+
+    def test_three_git_deadlines_stay_under_the_step_limit(self):
+        self.assertGreater(perf_ci.GIT_TIMEOUT_SECONDS, 0)
+        self.assertLessEqual(3 * perf_ci.GIT_TIMEOUT_SECONDS, 55)
+
+    def test_worktree_add_timeout_removes_the_directory(self):
+        import contextlib
+        import io
+        import shutil
+        made = {}
+
+        def fake_run(cmd, **kwargs):
+            if "add" in cmd:
+                target = Path(cmd[cmd.index("--detach") + 1])
+                target.mkdir(parents=True)
+                made["path"] = target
+                raise subprocess.TimeoutExpired(cmd, 20)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        stderr = io.StringIO()
+        try:
+            with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+                  mock.patch.object(perf_ci, "_run", side_effect=fake_run),
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(stderr)):
+                code = perf_ci.main()
+            self.assertEqual(code, 1, stderr.getvalue())
+            self.assertIn("path", made)
+            self.assertFalse(made["path"].exists())
+            text = stderr.getvalue()
+            self.assertNotIn("Traceback", text)
+            self.assertIn("timed out", text)
+            self.assertFalse(any(line.startswith("::error::") for line in text.splitlines()))
+        finally:
+            path = made.get("path")
+            if path is not None and path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_worktree_remove_timeout_removes_the_directory(self):
+        import contextlib
+        import io
+        import shutil
+        made = {}
+
+        def fake_run(cmd, **kwargs):
+            if "add" in cmd:
+                target = Path(cmd[cmd.index("--detach") + 1])
+                target.mkdir(parents=True)
+                made["path"] = target
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if "remove" in cmd:
+                raise subprocess.TimeoutExpired(cmd, 20)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        report = _report({"sample": 0.001})
+        report["benchmarks"][0]["rounds"] = 1
+        report["benchmarks"][0]["iterations_per_round"] = 1
+        stderr = io.StringIO()
+        try:
+            with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+                  mock.patch.object(perf_ci, "_run", side_effect=fake_run),
+                  mock.patch.object(perf_ci, "run_paired", return_value=(report, report)),
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(stderr)):
+                code = perf_ci.main()
+            self.assertEqual(code, 1, stderr.getvalue())
+            self.assertFalse(made["path"].exists())
+            text = stderr.getvalue()
+            self.assertNotIn("Traceback", text)
+            self.assertIn("timed out", text)
+            self.assertEqual(text.count("\n"), 1, text)
+        finally:
+            path = made.get("path")
+            if path is not None and path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_failed_worktree_add_removes_the_directory(self):
+        import contextlib
+        import io
+        import shutil
+        made = {}
+
+        def fake_run(cmd, **kwargs):
+            if "add" in cmd:
+                target = Path(cmd[cmd.index("--detach") + 1])
+                target.mkdir(parents=True)
+                made["path"] = target
+                return subprocess.CompletedProcess(cmd, 1, "", "fatal: boom\n::error::SYNTHETIC")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        stderr = io.StringIO()
+        try:
+            with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+                  mock.patch.object(perf_ci, "_run", side_effect=fake_run),
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(stderr)):
+                code = perf_ci.main()
+            self.assertEqual(code, 1, stderr.getvalue())
+            self.assertFalse(made["path"].exists())
+            text = stderr.getvalue()
+            self.assertNotIn("Traceback", text)
+            self.assertIn("%0A", text)
+            self.assertFalse(any(line.startswith("::error::") for line in text.splitlines()))
+        finally:
+            path = made.get("path")
+            if path is not None and path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_workload_recursion_is_a_bench_error(self):
+        nest = '{"command_json":' + ("[" * 10000) + '"x"' + ("]" * 10000) + "}"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "workload.json"
+            path.write_text(nest, encoding="utf-8")
+            with mock.patch.object(perf_bench, "WORKLOAD_PATH", path):
+                with self.assertRaises(perf_bench.BenchError):
+                    perf_bench.load_workload()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "workload.json"
+            path.write_text("{}", encoding="utf-8")
+            with (mock.patch.object(perf_bench, "WORKLOAD_PATH", path),
+                  mock.patch.object(perf_bench.json, "loads", side_effect=RecursionError("synthetic"))):
+                with self.assertRaises(perf_bench.BenchError) as caught:
+                    perf_bench.load_workload()
+            self.assertIn("not valid JSON", str(caught.exception))
+            self.assertNotIn("synthetic", str(caught.exception))
+
+    def test_subprocess_timeout_on_add_removes_the_directory(self):
+        import contextlib
+        import io
+        import shutil
+        made = {}
+
+        def fake(cmd, **kwargs):
+            if "add" in cmd:
+                target = Path(cmd[cmd.index("--detach") + 1])
+                target.mkdir(parents=True)
+                made["path"] = target
+                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 15)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        stderr = io.StringIO()
+        try:
+            with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+                  mock.patch.object(perf_ci.subprocess, "run", side_effect=fake),
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(stderr)):
+                code = perf_ci.main()
+            self.assertEqual(code, 1, stderr.getvalue())
+            self.assertIn("path", made)
+            self.assertFalse(made["path"].exists())
+            text = stderr.getvalue()
+            self.assertNotIn("Traceback", text)
+            self.assertIn("timed out", text)
+            self.assertEqual(text.count("\n"), 1, text)
+            self.assertFalse(any(line.startswith("::error::") for line in text.splitlines()))
+        finally:
+            path = made.get("path")
+            if path is not None and path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_subprocess_timeout_on_remove_removes_the_directory(self):
+        import contextlib
+        import io
+        import shutil
+        made = {}
+
+        def fake(cmd, **kwargs):
+            if "add" in cmd:
+                target = Path(cmd[cmd.index("--detach") + 1])
+                target.mkdir(parents=True)
+                made["path"] = target
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if "remove" in cmd:
+                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 15)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        report = _report({"sample": 0.001})
+        report["benchmarks"][0]["rounds"] = 1
+        report["benchmarks"][0]["iterations_per_round"] = 1
+        stderr = io.StringIO()
+        try:
+            with (mock.patch.dict(os.environ, {"CI_BASE_SHA": "abcdef1234567890"}, clear=False),
+                  mock.patch.object(perf_ci.subprocess, "run", side_effect=fake),
+                  mock.patch.object(perf_ci, "run_paired", return_value=(report, report)),
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(stderr)):
+                code = perf_ci.main()
+            self.assertEqual(code, 1, stderr.getvalue())
+            self.assertFalse(made["path"].exists())
+            text = stderr.getvalue()
+            self.assertNotIn("Traceback", text)
+            self.assertIn("timed out", text)
+            self.assertEqual(text.count("\n"), 1, text)
+        finally:
+            path = made.get("path")
+            if path is not None and path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_guard_sentence_names_the_remaining_gaps(self):
+        text = " ".join(perf_bench.install_network_guard.__doc__.split())
+        self.assertIn("tripwire", text)
+        self.assertIn("base class", text)
+        self.assertIn("before the guard", text)
+        self.assertIn("child process", text)
+
+    def test_load_product_sentence_names_one_caller(self):
+        text = " ".join(perf_bench.load_product.__doc__.split())
+        self.assertIn("One caller at a time", text)
+        self.assertIn("mix kernels", text)
 
 
 if __name__ == "__main__":

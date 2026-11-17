@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from recursion_core import control_transport as ct
 from recursion_core.control_transport import unix
@@ -71,6 +72,28 @@ class RefusalHistoryTests(ScratchCase):
         self.assertEqual(srv.refused[-1], "not_admitted")
         self.assertIsInstance(srv.refused, list)
         self.assertEqual(len(srv.refused), unix.REFUSED_KEPT)
+
+    def test_a_keep_of_zero_retains_nothing_and_keeps_the_list_object(self):
+        """A keep of 0 used to be ``del refused[:0]``, which retains every reason."""
+        srv = ct.UnixControlServer(self.directory, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        held = srv.refused
+        with mock.patch.object(unix, "REFUSED_KEPT", 0):
+            srv._refuse("a")
+            srv._refuse("b")
+        self.assertIs(srv.refused, held)
+        self.assertEqual(held, [])
+
+    def test_a_huge_refusal_reason_is_stored_short_and_a_short_one_whole(self):
+        """A diagnostic reason is retained 128 times; a huge message must not be one of them."""
+        srv = ct.UnixControlServer(self.directory, ct.with_ping_health())
+        self.addCleanup(srv.close)
+        huge = "x" * (unix.REFUSED_REASON_MAX + 40)
+        srv._refuse("not_admitted")
+        srv._refuse(huge)
+        self.assertEqual(srv.refused[0], "not_admitted")
+        self.assertEqual(len(srv.refused[1]), unix.REFUSED_REASON_MAX)
+        self.assertTrue(srv.refused[1].startswith("x"))
 
 
 if __name__ == "__main__":

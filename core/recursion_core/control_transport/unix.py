@@ -48,6 +48,9 @@ MAX_CONNECTIONS = 16
 # How many of the latest refusal reasons ``UnixControlServer.refused`` keeps (sweep s7 D09: every refused peer
 # was appended and nothing was ever dropped). A diagnostic, not a count of refusals.
 REFUSED_KEPT = 128
+# A stored reason is a diagnostic, kept up to REFUSED_KEPT times. The stored text is at most
+# this many characters, so one huge message cannot pin mebibytes of history.
+REFUSED_REASON_MAX = 512
 # Whole-frame deadline: each request must arrive complete within this long of the server
 # being ready for it (connect or previous reply), however the bytes are spaced.
 IDLE_TIMEOUT_S = 30.0
@@ -256,6 +259,8 @@ class UnixControlServer:
     when the ordinary ones are all taken: each serves one request, within
     ``reserved_timeout_s``, and only if ``priority`` says so; any other request gets the
     ``busy`` frame, not delivered. The handler still sees every request it is given.
+    At a configured cap, a request whose id could not ride the longest refusal is refused
+    before the handler, even when that request's own answer would have fit.
     """
 
     def __init__(
@@ -277,8 +282,10 @@ class UnixControlServer:
         if not name or "/" in name or name in (".", ".."):
             raise InsecureSocketPath("socket name must be a single path component")
         if type(max_frame_bytes) is not int or max_frame_bytes < _MIN_FRAME_BYTES:
-            # A cap that cannot carry the server's own fallback reply is refused before startup (sweep s7 D19:
-            # at a cap of 32 the 50-byte fallback was written anyway).
+            # A cap that cannot carry the server's own fallback, or the id_too_large refusal,
+            # is refused before startup. A smaller cap would drop that reply and the peer
+            # would see the connection end instead of a typed answer. At a cap of 32 the
+            # 50-byte fallback was written anyway (sweep s7 D19).
             raise ValueError(f"max_frame_bytes must be an int of at least {_MIN_FRAME_BYTES}")
         # Counts are exact ints (sweep s7 D08: 1.5, NaN and infinity passed, and a 1.5 semaphore granted eight
         # slots); a bool is not a count.
@@ -398,9 +405,20 @@ class UnixControlServer:
 
     def _refuse(self, reason: str) -> None:
         with self._lock:
+            # Make room before the append. A reader that does not take the lock then never
+            # sees more than REFUSED_KEPT rows, and an interrupt before the append cannot
+            # leave one past the cap. The list object stays the one constructed.
+            # A keep of 0 or below retains nothing: ``del [:-0]`` would delete nothing.
+            keep = REFUSED_KEPT
+            if type(keep) is not int or keep <= 0:
+                del self.refused[:]
+                return
+            if len(reason) > REFUSED_REASON_MAX:
+                reason = reason[:REFUSED_REASON_MAX]
+            extra = len(self.refused) + 1 - keep
+            if extra > 0:
+                del self.refused[:extra]
             self.refused.append(reason)
-            if len(self.refused) > REFUSED_KEPT:
-                del self.refused[:-REFUSED_KEPT]   # the oldest go; the list stays a list for its readers
 
     def _accept_loop(self) -> None:
         sock = self._sock
@@ -486,8 +504,7 @@ class UnixControlServer:
                     # longest fallback could not carry it within the frame cap is refused here, before any
                     # handler acts, so no answer of a handled request is ever over the cap or without its id
                     # (the integration read of #385, F3; the P3 of the same read on #377).
-                    _send_quietly(conn, {"ok": False, "error": {"code": "bad_frame", "detail": "id_too_large"}},
-                                  max_bytes=self._max_frame_bytes)
+                    _send_quietly(conn, _ID_TOO_LARGE_REPLY, max_bytes=self._max_frame_bytes)
                     return
                 try:
                     response = self._handler(request, connection)
@@ -571,8 +588,13 @@ def _is_busy(response: Message) -> bool:
 # The longest answer _serve writes for a request a handler has seen; with the request's id it must fit the cap.
 _LONGEST_FALLBACK: Message = {"ok": False, "error": {"code": "response_too_large"}}
 _INTERNAL_ERROR: Message = {"ok": False, "error": {"code": "internal_error"}}
-# The smallest frame cap a server takes: its fallbacks, without an id, must fit (an id is checked per request).
-_MIN_FRAME_BYTES = max(len(encode_frame(m)) - HEADER.size for m in (_LONGEST_FALLBACK, _INTERNAL_ERROR))
+# Sent when that fallback could not carry the id. The floor is the longest of this
+# refusal and the two id-less fallbacks: below it one of those replies would be dropped.
+_ID_TOO_LARGE_REPLY: Message = {"ok": False, "error": {"code": "bad_frame", "detail": "id_too_large"}}
+_MIN_FRAME_BYTES = max(
+    len(encode_frame(m)) - HEADER.size
+    for m in (_LONGEST_FALLBACK, _INTERNAL_ERROR, _ID_TOO_LARGE_REPLY)
+)
 
 
 def _fits(message: Message, request_id: object, max_bytes: int) -> bool:

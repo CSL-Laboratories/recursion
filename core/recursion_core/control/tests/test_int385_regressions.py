@@ -124,15 +124,14 @@ class FallbackFrameCapTest(unittest.TestCase):
             return {"ok": True, "blob": "x" * 200}
 
         cap = 128
-        request = {"op": "big", "id": "i" * 100}
+        request = {"op": "big", "id": "i" * 40}
         encoded = framing.encode_frame(request, max_bytes=cap)
-        self.assertEqual(len(encoded) - framing.HEADER.size, 120)
+        self.assertLess(len(encoded) - framing.HEADER.size, cap)
         server = self.serve(cap, handler)
         reply = self.exchange(server, request, cap)
-        self.assertIsInstance(reply, dict)
-        self.assertIs(reply.get("ok"), False)
-        if seen:
-            self.assertEqual(reply.get("id"), request["id"])
+        self.assertEqual(seen, [request])
+        self.assertEqual(reply, {"ok": False, "error": {"code": "response_too_large"}, "id": request["id"]})
+        self.assertLessEqual(len(framing.encode_frame(reply)) - framing.HEADER.size, cap)
 
     def test_an_id_too_long_to_echo_is_refused_before_the_handler(self):
         seen = []
@@ -153,6 +152,36 @@ class FallbackFrameCapTest(unittest.TestCase):
         reply = self.exchange(self.serve(cap, handler), request, cap)
         self.assertEqual(reply, {"ok": False, "error": {"code": "response_too_large"}, "id": request["id"]})
         self.assertEqual(len(seen), 1)
+        self.assertLessEqual(len(framing.encode_frame(reply)) - framing.HEADER.size, cap)
+
+    def test_internal_error_fallback_at_a_small_cap_echoes_the_id(self):
+        cap = 128
+        request = {"op": "bad", "id": "i" * 40}
+
+        def handler(message, connection):
+            return {"ok": True, "n": float("nan")}
+
+        reply = self.exchange(self.serve(cap, handler), request, cap)
+        self.assertEqual(reply, {"ok": False, "error": {"code": "internal_error"}, "id": request["id"]})
+        self.assertLessEqual(len(framing.encode_frame(reply)) - framing.HEADER.size, cap)
+
+    def test_a_cap_that_cannot_carry_the_typed_refusal_is_rejected(self):
+        from recursion_core.control_transport import unix as unix_mod
+
+        folder = tempfile.TemporaryDirectory(prefix="s6-floor-", dir=os.environ.get("TMPDIR"))
+        self.addCleanup(folder.cleanup)
+        path = os.path.join(folder.name, "run")
+        for cap in (40, 60, 64):
+            with self.subTest(cap=cap):
+                with self.assertRaises(ValueError):
+                    UnixControlServer(path, lambda message, connection: {"ok": True}, max_frame_bytes=cap)
+        floor = unix_mod._MIN_FRAME_BYTES
+        seen: list = []
+        server = self.serve(floor, lambda message, connection: seen.append(message) or {"ok": True})
+        reply = self.exchange(server, {"op": "x", "id": "i" * 40}, floor)
+        self.assertEqual(seen, [])
+        self.assertEqual(reply, {"ok": False, "error": {"code": "bad_frame", "detail": "id_too_large"}})
+        self.assertLessEqual(len(framing.encode_frame(reply)) - framing.HEADER.size, floor)
 
 
 if __name__ == "__main__":

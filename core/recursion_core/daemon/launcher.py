@@ -428,7 +428,8 @@ class ProductionLauncher:
         # Seam S13. A launch runs on the run's own thread, which no client call's admission covers once the start
         # has answered. It holds one lifetime reference of its own, through its hooks (S10, S4) and until it has
         # launched or refused: closing waits for it with the services and the store alive, and once closing has
-        # begun nothing is launched. With nothing registered the gate is off and this is the call it always was.
+        # begun nothing is launched. With nothing registered the gate is off. The call still asks the launch
+        # check, and with no check registered the seam refuses launch_check_absent.
         gate = self._hooks.gate
         if not gate.enter():
             raise refused('daemon_closing')

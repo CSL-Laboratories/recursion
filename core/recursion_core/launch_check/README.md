@@ -600,9 +600,9 @@ this package ships.
 
 Called by nothing, like the rest of this package. What it adds:
 
-- `hooks.py`, the registrant `recursion_core.launch_check.hooks` that the seams (#369/#370)
-  will import. It registers nothing until they merge; its docstring says what it will set
-  (the single-valued `launch_check` hook, S10).
+- `hooks.py`, the registrant `recursion_core.launch_check.hooks` on the seams' import list
+  since #369. It registers nothing. With no `launch_check` set, every launch is refused
+  `launch_check_absent`. Its docstring says what it will set (the single-valued `launch_check` hook, S10).
 - The design note lives in csl-research: the child-side decoder the launch envelope needs (no code in this package).
 - `tests/fake_binaries.py`: fake-binary hash fixtures (bytes, recorded SHA-256, size, kind;
   a fixture whose record does not match its bytes is refused) and a version-line table per

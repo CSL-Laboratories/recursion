@@ -4,8 +4,9 @@ The registrant is left unregistered by making the find_spec guard miss. ``run.st
 goes through the composed daemon and reaches the launcher. The seam answers one typed
 refusal, ``launch_check_absent``, and starts no child process.
 
-This belongs on the launch-check draft. On master the same refusal would meet every
-launch, because that tree has no launch-check registrant at all.
+The same refusal meets every launch at this head with the registrant present but empty,
+because ``register`` sets no check. This test makes the registrant missing through
+``find_spec``, so it does not tell that case apart from the present-but-empty one.
 """
 from __future__ import annotations
 

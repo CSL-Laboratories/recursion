@@ -122,7 +122,9 @@ S9  ``drive_owner(ctx, request) -> None, or an owner``. Asked at the top of the 
 S10 ``launch_check(ctx, executable) -> None, or a refusal code``. Called by the launcher on the run's
     thread, after the executable is resolved and before the run directory's FIFOs and files are made,
     so a refusal leaves nothing in the way of a relaunch. It reads the route and the containment level
-    from ``ctx.launch``. Parent side only: nothing is added to the child's environment. Default: None.
+    from ``ctx.launch``. Parent side only: nothing is added to the child's environment. Default: refused
+    ``launch_check_absent`` when no check is registered. The launch answers that as ``launch_refused``
+    with detail ``launch_check_absent``, the detail the schema's ``start_error`` already names.
     A refusal code refuses the launch ``launch_check:<code>``. Raises: refused ``launch_check_failed``.
 S11 ``page_methods() -> a frozen set of method names``: the methods the page may call through
     ``POST /v1/control``. On the page's request thread. Default: the empty set, so the path answers

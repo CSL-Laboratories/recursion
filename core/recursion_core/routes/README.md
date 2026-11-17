@@ -37,8 +37,9 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
   the daemon calls it before starting processes and after each plugin load) and `child_env()` (explicit
   env from an allowlist; never `os.environ`).
 - `driver.py`: driver contract version 2 (lane SPINE's `driver.v2` schema, draft 4, in #368). A driver
-  declares its engine, eight flags (`multi_turn`, `mid_turn_input`, `interrupt`, `resume`, `fork`,
-  `permission_bridge`, `typed_limits`, `usage`) and `input_ack`. `Driver` is the gate every engine's driver
+  declares its engine, eleven flags (`multi_turn`, `mid_turn_input`, `interrupt`, `resume`, `fork`,
+  `permission_bridge`, `typed_limits`, `usage`, `observes_subagents`, `cancels_subagents`,
+  `usage_complete`) and `input_ack`. `Driver` is the gate every engine's driver
   subclasses: a call whose flag is false raises `DriverRefused` (`unsupported`, the call, the flag) before
   the subclass is asked, so no process starts and no byte reaches the engine; a malformed call or one the
   worker's state does not allow (closed input, a reused turn or delivery id, an interrupt of a turn not in

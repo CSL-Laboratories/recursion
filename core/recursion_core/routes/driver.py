@@ -73,7 +73,11 @@ from dataclasses import dataclass, fields
 from recursion_core.control.methods import canonical_text
 
 CONTRACT = 2
-FLAGS = ("multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge", "typed_limits", "usage")
+# observes_subagents, cancels_subagents and usage_complete say what the engine does with sub-agents
+# and whether its usage figure is complete. Each is false unless the driver sets it. The route label
+# lists every flag, these three included.
+FLAGS = ("multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge", "typed_limits",
+         "usage", "observes_subagents", "cancels_subagents", "usage_complete")
 INPUT_KINDS = ("user_message", "approval_answer", "close")
 UNSUPPORTED = "unsupported"
 # The calls a flag can refuse, and the flags that refuse a call (driver.v2 $defs/refusal).
@@ -161,6 +165,9 @@ class Flags:
     permission_bridge: bool = False
     typed_limits: bool = False
     usage: bool = False
+    observes_subagents: bool = False
+    cancels_subagents: bool = False
+    usage_complete: bool = False
 
     def __post_init__(self) -> None:
         for f in fields(self):
@@ -208,6 +215,14 @@ class Declaration:
 def one_turn(engine: str) -> Declaration:
     """Today's path (``RouteAdapter.run``: one prompt, standard input closed, read until the result)."""
     return Declaration(engine, Flags(), input_ack=False)
+
+
+def route_label(declaration: Declaration) -> str:
+    """The route's capability label: the engine and every flag, false ones included."""
+
+    flags = declaration.flags.as_dict()
+    shown = " ".join(f"{name}={str(flags[name]).lower()}" for name in FLAGS)
+    return f"{declaration.engine} {shown}"
 
 
 class Handle:

@@ -1,6 +1,8 @@
 """Claude Code adapter: stream-json over stdio (CSL-797, candidate). See README.md.
 
-Launch: ``claude -p --input-format stream-json --output-format stream-json --verbose --model <m>``.
+Launch: ``claude -p --input-format stream-json --output-format stream-json --verbose
+--permission-mode dontAsk --permission-prompts none --model <m>``. The mode is the fail-closed
+value unless the route names another; a reported mode that differs ends the run refused.
 One user message goes in as a JSONL line, stdin is closed, and stdout is read until the ``result``
 envelope. The Claude subscription is used only here (Q12); other harnesses go through
 ``profile_route`` and ``subscription_routes``.
@@ -144,6 +146,82 @@ def passthrough_env(parent_env: dict[str, str], method: object) -> dict[str, str
     return env
 
 
+# Claude Code's own permission modes, as `claude --help` lists them (recorded in eval/arms.py at 2.1.318).
+# The fail-closed pair is PRODUCT.md 11.6: `--permission-mode dontAsk --permission-prompts none`.
+# bypassPermissions is that product line's full-access profile, and only when this run acknowledges it.
+PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan")
+FAIL_CLOSED_PERMISSION_MODE = "dontAsk"
+FAIL_CLOSED_PERMISSION_PROMPTS = "none"
+FULL_ACCESS_MODE = "bypassPermissions"
+FULL_ACCESS_ACK = "full_access"
+# The permission bridge is a PreToolUse hook. Init confirms it only when the hook was applied and a
+# hook failure denies the tool. Anything else, when the route asks for the bridge, refuses the run.
+PERMISSION_BRIDGE_HOOK = "PreToolUse"
+_DENIAL_TYPES = frozenset({"permission_denial", "permission_denied"})
+_DENIAL_SUBTYPES = frozenset({"permission_denial", "permission_denied", "hook_denied"})
+_ERROR_SUBTYPES = frozenset({"error", "hook_error"})
+
+
+def _permission_mode(route: dict) -> str:
+    """The mode this launch passes. Omitted means the fail-closed value, named on the argv anyway."""
+
+    mode = route.get("permission_mode", FAIL_CLOSED_PERMISSION_MODE)
+    if not isinstance(mode, str) or mode not in PERMISSION_MODES:
+        raise c.RouteError(c.REQUEST_INVALID, "route.permission_mode")
+    if mode == FULL_ACCESS_MODE and route.get("permission_ack") != FULL_ACCESS_ACK:
+        raise c.RouteError(c.LAUNCH_REFUSED, "bypassPermissions needs a full-access profile acknowledged for this run")
+    return mode
+
+
+def _bridge_requested(route: dict) -> bool:
+    """True when the route asks for the permission bridge. Absent, or an explicit false, does not."""
+
+    if "permission_bridge" not in route:
+        return False
+    return route["permission_bridge"] is not False
+
+
+def _bridge_confirmed(msg: dict) -> bool:
+    return msg.get("hooks_applied") is True and msg.get("hook_on_failure_supported") is True
+
+
+def _init_refusal(msg: dict, passed: str, bridge: bool) -> str | None:
+    """A system/init that reports a different mode, or a bridge init that is not confirmed.
+
+    An init that omits ``permissionMode`` is not a reported disagreement: streams that predate the
+    field keep their result. A present value that is not the mode this launch passed refuses the run.
+    """
+
+    if "permissionMode" in msg and msg.get("permissionMode") != passed:
+        return f"permission mode {scalar(msg.get('permissionMode'))} is not the mode passed ({passed})"
+    if bridge and not _bridge_confirmed(msg):
+        return f"permission bridge {PERMISSION_BRIDGE_HOOK} is not confirmed at init"
+    return None
+
+
+def _stream_fault(msg: dict) -> str | None:
+    """A typed permission denial or error event, or None. Assistant and user payload is not read."""
+
+    kind, sub = msg.get("type"), msg.get("subtype")
+    if kind in ("assistant", "user"):
+        return None
+    if kind in _DENIAL_TYPES or sub in _DENIAL_SUBTYPES:
+        return "denial"
+    denials = msg.get("permission_denials")
+    if "permission_denials" in msg and denials not in (None, [], ""):
+        return "denial"
+    if kind == "error" or (kind == "system" and sub in _ERROR_SUBTYPES):
+        return "error"
+    return None
+
+
+def _turn_blocks_success(msg: dict, events: list) -> bool:
+    if any(isinstance(event, dict) and event.get("kind") in ("denial", "error") for event in events):
+        return True
+    denials = msg.get("permission_denials")
+    return "permission_denials" in msg and denials not in (None, [], "")
+
+
 class ClaudeCodeAdapter(RouteAdapter):
     engine = "claude_code"
 
@@ -167,8 +245,14 @@ class ClaudeCodeAdapter(RouteAdapter):
         if kind == "subscription":
             self._check_api_key_helper(route)
         # --verbose: stream-json output in print mode is documented to need it (unverified on this box).
+        # The model stays last. Every launch names its permission mode; the fail-closed value also
+        # sets permission-prompts to none (PRODUCT.md 11.6).
+        mode = _permission_mode(route)
+        prompts = (["--permission-prompts", FAIL_CLOSED_PERMISSION_PROMPTS]
+                   if mode == FAIL_CLOSED_PERMISSION_MODE else [])
         return [self._binary, *(["--bare"] if bare else []), "-p", "--input-format", "stream-json",
-                "--output-format", "stream-json", "--verbose", "--model", route["model"]]
+                "--output-format", "stream-json", "--verbose", "--permission-mode", mode, *prompts,
+                "--model", route["model"]]
 
     def env(self, request: dict) -> dict[str, str]:
         conn = request["route"]["connection"]
@@ -216,6 +300,16 @@ class ClaudeCodeAdapter(RouteAdapter):
 
     def drive(self, process, request, deadline_at, events):
         rid, model = request["request_id"], request["route"]["model"]
+        route = request["route"]
+        try:
+            passed = _permission_mode(route)
+        except c.RouteError as err:
+            # drive can be entered only after argv, which already refused a bad mode. A request that
+            # changed in between still ends as a typed result, and the prompt is not written.
+            process.fence("permission_mode")
+            return c.result(rid, err.code, events=events, detail=err.detail)
+        bridge = _bridge_requested(route)
+        bridge_ok = not bridge
         process.send(json.dumps({"type": "user", "message": {"role": "user", "content": [
             {"type": "text", "text": request["prompt"]}]}}))
         process.close_stdin()
@@ -227,7 +321,14 @@ class ClaudeCodeAdapter(RouteAdapter):
                     return c.result(rid, c.PLAN_LIMIT, limit=limit, events=events, detail="exit after limit")
                 return c.result(rid, c.ENGINE_EXITED, events=events, detail="stdout closed before result")
             kind, sub = msg.get("type"), msg.get("subtype")
-            if kind == "system" and sub == "api_retry":
+            if kind == "system" and sub == "init":
+                refusal = _init_refusal(msg, passed, bridge)
+                if refusal is not None:
+                    process.fence("permission_mode" if "permission mode" in refusal else "permission_bridge")
+                    return c.result(rid, c.LAUNCH_REFUSED, events=events, detail=refusal)
+                if bridge:
+                    bridge_ok = True
+            elif kind == "system" and sub == "api_retry":
                 events.append(c.event("retry", "claude.system.api_retry", {
                     k: scalar(msg.get(k)) for k in ("attempt", "max_retries", "retry_delay_ms", "error_status", "error")}))
                 # Not booked. A retry Claude is still attempting is not a rejected plan limit, even when
@@ -237,7 +338,15 @@ class ClaudeCodeAdapter(RouteAdapter):
                 events.append(c.event("usage", "claude.rate_limit_event", _info_fields(info)))
                 limit = _rejected(info, "claude.rate_limit_event", self.vendor_reset) or limit
             elif kind == "result":
+                if bridge and not bridge_ok:
+                    process.fence("permission_bridge")
+                    return c.result(rid, c.LAUNCH_REFUSED, events=events,
+                                    detail=f"permission bridge {PERMISSION_BRIDGE_HOOK} is not confirmed at init")
                 return _classify_result(rid, msg, limit, events, model, self.vendor_reset)
+            else:
+                fault = _stream_fault(msg)
+                if fault is not None:
+                    events.append(c.event(fault, "claude.stream", {"type": scalar(kind), "subtype": scalar(sub)}))
             # assistant / user / other system envelopes: model payload or progress, never classified
 
 
@@ -267,9 +376,13 @@ def _rate_limit_info(params: object, source: str, translate) -> dict | None:
 
 
 def _classify_result(rid: str, msg: dict, limit: dict | None, events: list, model: str, translate) -> dict:
-    if msg.get("is_error") is not True and msg.get("subtype") == "success":
+    # Success needs subtype success and no permission denial or error event in the same turn.
+    # A denial carried on the result itself counts: the final line must not hide it.
+    if msg.get("is_error") is not True and msg.get("subtype") == "success" and not _turn_blocks_success(msg, events):
         text = msg.get("result")
         return c.result(rid, None, text=text if isinstance(text, str) else "", events=events)
+    if msg.get("is_error") is not True and msg.get("subtype") == "success":
+        return c.result(rid, c.ENGINE_ERROR, events=events, detail="permission denial or error in the turn")
     limit = _rate_limit_info(msg.get("api_error_params"), "claude.result.rate_limit_info", translate) or limit
     if limit is None and msg.get("error") == "rate_limit":
         limit = c.limit_signal("connection", "claude.result.error")

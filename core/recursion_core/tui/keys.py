@@ -133,9 +133,10 @@ class KeyDecoder:
     @property
     def holding(self) -> bool:
         """It holds part of a key: bytes of an unfinished UTF-8 character, or an unfinished sequence. (A
-        paste is one event however many reads it takes, so an unfinished paste does not count.)"""
+        paste is one event however many reads it takes, so an unfinished paste does not count, nor do the
+        bytes of a character inside it: they are the paste's, not a key's; review 5 of #372, Sol, later.)"""
 
-        return bool(self._utf8.getstate()[0]) or self.waiting
+        return bool(self._utf8.getstate()[0]) and not self.in_paste or self.waiting
 
     def feed(self, data: bytes | str) -> list[Key]:
         text = self._utf8.decode(data) if isinstance(data, (bytes, bytearray)) else data

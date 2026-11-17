@@ -209,7 +209,7 @@ class CloseDrainsTests(ScratchCase):
         self.assertFalse(os.path.exists(srv.path))
 
     def test_shutdown_bounds_each_join(self):
-        """The accept thread and a handler still running are both joined with the one named bound."""
+        """The accept thread and a handler share one shutdown deadline, not a fresh wait each."""
         seen = []
         real_join = threading.Thread.join
         entered = threading.Event()
@@ -241,7 +241,14 @@ class CloseDrainsTests(ScratchCase):
                 time.sleep(0.01)
         self.assertFalse(closer.is_alive())
         self.assertGreaterEqual(len(seen), 2, seen)
-        self.assertTrue(all(item == unix.SHUTDOWN_DRAIN_BOUND_S for item in seen), seen)
+        # One deadline: the first join is handed the whole budget, and a later join only what is left.
+        budget = max(unix.SHUTDOWN_DRAIN_BOUND_S, srv._idle_timeout_s + 1.0)
+        self.assertAlmostEqual(seen[0], budget, delta=0.5)
+        self.assertLess(seen[-1], seen[0], seen)
+        self.assertTrue(
+            all(item is not None and 0.0 <= item <= budget + 1e-6 for item in seen),
+            seen,
+        )
 
     def test_two_handlers_may_shut_the_server_down_together(self):
         """Two handlers that both shut the server down both return, and a fresh server can take the path.
@@ -299,6 +306,131 @@ class CloseDrainsTests(ScratchCase):
         nxt = self.server()
         with ct.UnixControlClient(nxt.path) as client:
             self.assertEqual(client.request({"op": "ping"})["op"], "pong")
+
+    def test_default_idle_drain_budget_matches_the_idle_drain(self):
+        """At the default idle timeout the shutdown budget is idle_timeout_s + 1, not the short bound.
+
+        The daemon builds the server with no idle timeout. Master waits that long for each handler.
+        """
+        seen = []
+        entered = threading.Event()
+
+        def record(thread, timeout=None):
+            seen.append(timeout)
+            return None
+
+        def handler(message, connection):
+            entered.set()
+            return {"ok": True}
+
+        srv = self.server(handler)
+        self.assertEqual(srv._idle_timeout_s, unix.IDLE_TIMEOUT_S)
+        budget = max(unix.SHUTDOWN_DRAIN_BOUND_S, srv._idle_timeout_s + 1.0)
+        self.assertGreater(budget, unix.SHUTDOWN_DRAIN_BOUND_S)
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(raw.close)
+        raw.settimeout(2)
+        raw.connect(srv.path)
+        raw.sendall(framing.encode_frame({"op": "ordinary"}))
+        self.assertTrue(entered.wait(2))
+        with mock.patch.object(threading.Thread, "join", record):
+            srv.close()
+        self.assertGreaterEqual(len(seen), 1, seen)
+        self.assertAlmostEqual(seen[0], budget, delta=0.5)
+        self.assertTrue(all(item is not None and item > unix.SHUTDOWN_DRAIN_BOUND_S for item in seen), seen)
+
+    def test_default_idle_drain_keeps_the_path_past_the_short_bound(self):
+        """A handler still running a little past the short bound keeps the path at the default idle timeout."""
+        entered = threading.Event()
+        release = threading.Event()
+        begun = threading.Event()
+
+        def handler(message, connection):
+            entered.set()
+            release.wait(60)
+            return {"ok": True}
+
+        def shutdown():
+            begun.set()
+            srv.close()
+
+        srv = self.server(handler)
+        closer = threading.Thread(target=shutdown, daemon=True)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as raw:
+            raw.settimeout(2)
+            raw.connect(srv.path)
+            raw.sendall(framing.encode_frame({"op": "ordinary"}))
+            self.assertTrue(entered.wait(2))
+            closer.start()
+            self.assertTrue(begun.wait(5), "shutdown did not start")
+            time.sleep(unix.SHUTDOWN_DRAIN_BOUND_S + 2.0)
+            try:
+                self.assertTrue(closer.is_alive(), "shutdown gave the path back inside the default idle drain")
+                self.assertTrue(os.path.exists(srv.path))
+                rival = ct.UnixControlServer(self.directory, ct.with_ping_health())
+                with self.assertRaises(Exception):
+                    rival.start()
+            finally:
+                release.set()
+                closer.join(srv._idle_timeout_s + 5)
+        self.assertFalse(closer.is_alive())
+
+    def test_one_deadline_covers_every_wedged_handler(self):
+        """Wedged handlers share one shutdown budget. A fresh wait per handler would stack it."""
+        hold = threading.Event()
+        ready = threading.Event()
+        count = {"n": 0}
+        lock = threading.Lock()
+
+        def handler(message, connection):
+            with lock:
+                count["n"] += 1
+                if count["n"] >= 2:
+                    ready.set()
+            hold.wait(90)
+            return {"ok": True}
+
+        srv = self.server(handler, idle_timeout_s=1.0)
+        budget = max(unix.SHUTDOWN_DRAIN_BOUND_S, srv._idle_timeout_s + 1.0)
+        self.assertEqual(budget, unix.SHUTDOWN_DRAIN_BOUND_S)
+        raws = []
+        closer = None
+        try:
+            for _ in range(2):
+                raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                raw.settimeout(2)
+                raw.connect(srv.path)
+                raw.sendall(framing.encode_frame({"op": "ordinary"}))
+                raws.append(raw)
+            self.assertTrue(ready.wait(5), "both handlers did not start")
+            started = time.monotonic()
+            closer = threading.Thread(target=srv.close, daemon=True)
+            closer.start()
+            closer.join(budget * 2 + 5)
+            elapsed = time.monotonic() - started
+        finally:
+            hold.set()
+            for raw in raws:
+                raw.close()
+        self.assertIsNotNone(closer)
+        self.assertFalse(closer.is_alive(), "shutdown did not return")
+        self.assertLess(elapsed, budget + 4.0, f"shutdown took {elapsed:.2f}s; one budget is {budget:.0f}s")
+        self.assertGreater(elapsed, budget - 2.0, f"shutdown returned in {elapsed:.2f}s, short of the one budget")
+
+    def test_accept_loop_returns_when_the_listener_is_no_longer_its_socket(self):
+        """An accept loop whose listener was cleared without the stop flag returns, instead of spinning."""
+        srv = self.server()
+        thread = srv._thread
+        sock = srv._sock
+        self.assertIsNotNone(thread)
+        self.assertIsNotNone(sock)
+        srv._sock = None
+        sock.close()
+        thread.join(1.5)
+        self.assertFalse(
+            thread.is_alive(),
+            "accept loop kept spinning after its listener was replaced",
+        )
 
 
 if __name__ == "__main__":

@@ -62,9 +62,10 @@ NOT_ADMITTED_FRAME = encode_frame(
 # A connection on a reserved slot must send its one priority request within this long.
 RESERVED_TIMEOUT_S = 2.0
 _ACCEPT_POLL_S = 0.1
-# How long shutdown waits for the accept thread and for each handler. Long enough that a handler
-# still inside a request keeps the path and the lock (the drain tests wait several seconds), and
-# short enough that two handlers waiting on each other both return. One name, both joins.
+# Floor of the one shutdown deadline shared by the accept thread and every handler. The deadline
+# is also at least idle_timeout_s + 1, the per-handler drain already used for the daemon's default
+# of 30 s, so that drain is never shortened. One clock for the whole shutdown, not a fresh wait
+# per thread: many wedged handlers cannot stack this bound.
 SHUTDOWN_DRAIN_BOUND_S = 15.0
 # Linux sun_path is 108 bytes including the trailing NUL.
 _MAX_SUN_PATH = 107
@@ -380,19 +381,22 @@ class UnixControlServer:
     def close(self) -> None:
         """Stop accepting, wait for handlers that have begun, then give up the path and the lock.
 
-        Shutdown waits up to ``SHUTDOWN_DRAIN_BOUND_S`` for the accept thread and for each started
-        connection worker. A handler still running inside that bound keeps this call from giving up
-        the path and the lock (sweep s7 D06: a short timed join returned, and the next owner took the
-        lock, while a handler could still write). Each open connection is shut first, so a worker
-        waiting for its peer ends at once. After the bound, this call returns and gives up the path
-        and the lock even if a handler has not returned, so two handlers each waiting on the other
-        both return. Whether an incomplete drain should be reported is not decided here. A call from
-        one of this server's own threads does not wait for that thread.
+        One deadline covers the accept thread and every started connection worker. Its length is the
+        longer of ``SHUTDOWN_DRAIN_BOUND_S`` and ``idle_timeout_s + 1`` (the per-handler drain the
+        daemon already had; 31 s at the default idle timeout). A handler still running inside that
+        deadline keeps this call from giving up the path and the lock (sweep s7 D06: a short timed
+        join returned, and the next owner took the lock, while a handler could still write). Each
+        open connection is shut first, so a worker waiting for its peer ends at once. After the
+        deadline, this call returns and gives up the path and the lock even if a handler has not
+        returned, so two handlers each waiting on the other both return. The worst case is that one
+        deadline, not one fresh wait per thread. Whether an incomplete drain should be reported is
+        not decided here. A call from one of this server's own threads does not wait for that thread.
         """
+        deadline = time.monotonic() + max(SHUTDOWN_DRAIN_BOUND_S, self._idle_timeout_s + 1.0)
         self._stop.set()
         thread = self._thread
         if thread is not None and thread.ident is not None and thread is not threading.current_thread():
-            thread.join(timeout=SHUTDOWN_DRAIN_BOUND_S)
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
         with self._lock:
             workers = list(self._workers)
             conns = list(self._conns)
@@ -407,7 +411,7 @@ class UnixControlServer:
             # (the round-2 read of #407 by DeepSeek, F2; the same on master). Its connection was shut above.
             if worker.ident is None or worker is threading.current_thread():
                 continue
-            worker.join(timeout=SHUTDOWN_DRAIN_BOUND_S)
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
         with self._lock:
             sock, self._sock = self._sock, None
             lock_fd, self._lock_fd = self._lock_fd, None
@@ -451,7 +455,9 @@ class UnixControlServer:
             except TimeoutError:
                 continue
             except OSError:
-                if self._stop.is_set():
+                # The listener this loop captured may already have been dropped. An interrupt during
+                # Thread.start can clear it before ident is visible; retrying on that socket spins.
+                if self._stop.is_set() or self._sock is not sock:
                     return
                 continue
             try:

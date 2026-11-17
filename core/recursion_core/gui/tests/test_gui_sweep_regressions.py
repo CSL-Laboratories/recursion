@@ -1,7 +1,9 @@
-"""Proposed GUI regressions for S2b; all transports and device doors are local fakes.
+"""GUI page tests. Transports and device doors here are local fakes.
+
+A lone surrogate gets a page answer, a venue switch stays beside its data, and an
+unreadable panel mapping becomes a contract refusal.
 
 Run from the repository root with PYTHONPATH=core python -B <this file> -v.
-These tests assert corrected behavior and are expected to fail on the reviewed commit.
 """
 import io
 import json
@@ -122,6 +124,19 @@ class GuiSweepRegressions(unittest.TestCase):
                     client.routes()
                 self.assertIn(caught.exception.code, ("control_api_response_invalid", "control_api_unavailable"))
                 self.assertIsNone(caught.exception.refused)
+
+    def test_f3_module_notes_describe_tests_of_this_tree(self):
+        # The notes used to say these tests fail on a reviewed commit and need a patch applied first.
+        import recursion_core.gui.tests.test_s7_gui as s7
+
+        notes = {"test_gui_sweep_regressions": __doc__, "test_s7_gui": s7.__doc__}
+        for name, text in notes.items():
+            self.assertIsInstance(text, str, name)
+            self.assertNotIn("reviewed commit", text, name)
+            self.assertNotIn("expected to fail", text, name)
+            self.assertNotIn("accompanying patch", text, name)
+            self.assertNotIn("S2b", text, name)
+            self.assertIn("repository root", text, name)
 
 
 if __name__ == "__main__":

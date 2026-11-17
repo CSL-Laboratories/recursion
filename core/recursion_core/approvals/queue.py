@@ -10,8 +10,10 @@ and the object the method handlers and the engine drivers call:
   fail. A request that cannot be made whole is refused with ``ApprovalRefused`` and nothing is written; any
   other ``Exception`` of the insert's transaction is ``store_unavailable`` with its cause chained, a store
   that fails and a caller's own misuse alike (a request made inside another transaction); an interruption
-  passes as it is. ``ask(effect, binding, ticket=...)`` is the same for a driver's tool call (the brief's
-  ``request(effect, binding)``).
+  passes as it is. So does EVENTS' ``CommitUnknown`` (its COMMIT raised): the request may or may not have been
+  written, so it is no refusal; its approval id was never returned, and a request that was written and no
+  surface took is offered again by the next start. ``ask(effect, binding, ticket=...)`` is the same for a driver's
+  tool call (the brief's ``request(effect, binding)``).
 * THE DRIVER'S TICKET (DRIVER-CC's port withdraw, #432). Every engine request carries the ticket the driver
   admitted it with (anything with ``publish() -> bool``; the driver's ``PortTicket``); one without is refused
   ``ticket``, so no driver skips its withdraw, and a plugin's effect carries none. ``publish()`` is called
@@ -41,11 +43,34 @@ and the object the method handlers and the engine drivers call:
   If it had published its own worker, that worker is withdrawn (``ready`` too) and kept for ``stop`` to join,
   and the queue is left not started; if not, a worker an earlier start left running is left as it was, and so
   is ``ready``. One interrupted while it offers the backlog leaves the queue started; what it had not offered
-  stays unshown. (A second interruption that lands inside that withdrawal itself is not covered.)
+  stays unshown. (A second interruption that lands inside that withdrawal itself is not covered.) A second
+  start while the queue runs holds the surfaces back the same way: one that subscribes during it is offered
+  nothing until that start's own offering, and nothing at all if it fails.
+* With no event store composed (S13's ``ServiceContext.store`` is None, which the seams allow: "or None when no
+  event store is composed"), a start attaches nothing and starts nothing, and returns: the queue stays not
+  ``ready`` (S13: ready "only when the initialisation the service needs has succeeded"), so the other services
+  of the composition start, and a request is refused ``store_absent``. A start does not raise there, since S13
+  makes a service whose start raises fail the whole composition.
 * ``stop`` wakes and joins every worker a start launched and no stop has joined yet: the current one, one a
   later start replaced, one an interrupted launch kept. Those workers share one wake signal, and a worker that
   wakes to find the queue closing, or its generation gone, sets it again before it returns, so none takes the
   signal another is waiting on.
+* ``start`` and ``stop`` run one at a time, whoever calls them: a start that comes while a stop runs waits until
+  that stop has joined its workers, and a stop waits for a start in progress. So no worker is published or
+  launched while a stop withdraws and joins, none a stop has read is forgotten, and no start clears the wake
+  a stop's worker is still waiting on. The lock is re-entrant, so a call on the thread that is inside a start or
+  a stop never waits for itself, wherever it lands: a subscriber the start calls (recovery tells the answered
+  ones, the start's offering the requested ones), or a signal handler.
+  - A ``stop`` there runs at once, joins every worker and stands: a start counts the stops its own thread makes
+    from the moment it is called, and one that sees a stop publishes no worker after it (one that had published
+    ends stopped). A stop another thread made while this start waited for it is not this start's to undo.
+  - A ``start`` inside a start or a stop on its thread is refused with ``RuntimeError`` and changes nothing. One
+    that lands before the outer call has recorded its thread runs whole first, as if called just before it.
+  - ``start`` and ``stop`` on a deadline worker's own thread (its sweep tells the answered subscribers) are
+    refused with ``RuntimeError`` at once and change nothing: a worker cannot join itself, and one that waited
+    there could be waiting on a stop that is joining it. The refusal is this queue's own: a worker of one queue
+    may start or stop another queue, waiting for it as any caller does, so two queues whose workers stop each
+    other would join each other for ever (the daemon runs one queue).
 * ``open_in`` / ``answer_in`` run inside the dispatcher's transaction for approval.open and approval.answer;
   ``list_page`` serves approval.list (summaries only).
 * ``consume(...)`` carries an approved effect out once, against the private binding; every refusal is a
@@ -77,6 +102,12 @@ from recursion_core.approvals import model
 from recursion_core.approvals import store as rows
 from recursion_core.approvals.model import ApprovalRefused
 from recursion_core.approvals.record import SURFACES, binding_problem, milliseconds
+
+try:  # EVENTS' store: a COMMIT that raised may or may not have been made durable
+    from recursion_core.events.db import CommitUnknown as _CommitUnknown
+    _OUTCOME_UNKNOWN: tuple = (_CommitUnknown,)
+except ImportError:  # pragma: no cover - a tree without EVENTS' store
+    _OUTCOME_UNKNOWN = ()
 
 __all__ = ["DEADLINE_SECONDS", "ApprovalQueue", "timestamp_of"]
 
@@ -135,6 +166,10 @@ class ApprovalQueue:
         self._closing = threading.Event()
         self._worker: threading.Thread | None = None
         self._workers: list = []       # every worker a start launched and no stop has joined yet
+        self._lifecycle = threading.RLock()  # held across all of start and all of stop: one at a time
+        self._lifecycle_owner = None   # the thread inside start or stop, once recorded: a start it calls is refused
+        self._stopped_here = threading.local()  # each thread's count of its stops, which a start reads first
+        self._on_a_worker = threading.local()  # marked on each deadline worker's own thread
         self._generation = None        # the running worker's token; a worker whose token is gone returns
         self._running = False          # started and not stopped: a surface that subscribes now is offered
         self._late = None              # while a start runs: (token, fn) of surfaces that subscribed during it
@@ -155,7 +190,29 @@ class ApprovalQueue:
         return self._store
 
     def start(self, context) -> None:
+        """Recover, launch the deadline worker and let the surfaces through (the module text says how a start
+        that fails or is interrupted leaves the queue). One at a time with ``stop``: under ``_lifecycle``.
+        Refused with ``RuntimeError``, nothing changed, inside a start or stop on this thread (a subscriber it
+        calls) and on a deadline worker's thread. A stop this thread makes from the moment of the call stands."""
+        stops = self._stops_here()  # first: a stop on this thread from here on is one this start must not undo
+        self._refuse_on_a_worker("started")
+        with self._lifecycle:
+            if self._lifecycle_owner == threading.get_ident():
+                raise RuntimeError("the approval queue cannot be started inside its own start or stop")
+            self._lifecycle_owner = threading.get_ident()
+            try:
+                self._start(context, stops)
+            finally:
+                self._lifecycle_owner = None
+
+    def _stops_here(self) -> int:
+        """How many stops this thread has made on this queue."""
+        return getattr(self._stopped_here, "count", 0)
+
+    def _start(self, context, stops: int) -> None:
         if self._store is None:
+            if context.store is None:
+                return  # no event store is composed: nothing to recover or run, and the queue stays not ready
             self.attach(context.store)
         elif self._store is not context.store:
             raise RuntimeError("the approval queue is attached to another store")
@@ -170,6 +227,12 @@ class ApprovalQueue:
             worker = threading.Thread(target=self._run, args=(generation,), name="approvals-deadlines",
                                       daemon=True)
             with self._lock:
+                if self._stops_here() != stops:
+                    # A stop ran on this thread since this start was called (a subscriber that recovery told, or a
+                    # signal handler). It stands: no worker is published or launched, the surfaces are let
+                    # through, and the queue is left stopped.
+                    self._late = None
+                    return
                 # Ready before the worker runs, in one step with its generation: from here only this worker
                 # withdraws ready (on a failure) and restores it (after a sweep), so start never overwrites a
                 # failure the worker has already reported, and a worker whose generation has ended changes
@@ -185,7 +248,7 @@ class ApprovalQueue:
             # left running with every surface held back.
             with self._lock:
                 self._late = None
-                self._running = True
+                self._running = self._stops_here() == stops  # a stop since the publication left it stopped
         except BaseException:
             # Failed or interrupted anywhere above: the surfaces are let through, so a request after this is
             # offered to every surface at once. If this start published its worker (the thread may have launched
@@ -205,14 +268,38 @@ class ApprovalQueue:
         # Every surface subscribed now (before the start or during it, unless it unsubscribed) is offered what no
         # surface took, once, here; from here a surface that subscribes is offered it when it subscribes. The queue
         # has started: an interruption while this offers leaves it started, and what was not offered stays unshown.
-        self._offer_backlog()
+        # After a stop on this thread since the publication, nothing is offered: the queue is stopped.
+        if self._stops_here() == stops:
+            self._offer_backlog()
 
     def stop(self, context=None) -> None:
         """Signal every worker and return only once each has joined: the current one, one a later start replaced
         and one an interrupted launch kept (a start never joins one: it only publishes its own). Interrupted,
         the workers not yet joined are kept, and a second ``stop`` joins them. A worker whose thread never
         launched (its start failed) has nothing to join and is let go; were it to launch late, its generation is
-        gone and it returns at once."""
+        gone and it returns at once. One at a time with ``start`` (under ``_lifecycle``), so no start publishes
+        or launches a worker while this withdraws and joins. Called on a thread already inside a start or stop (a
+        subscriber, a signal handler), which holds the re-entrant ``_lifecycle``, it runs at once, and a start it
+        ran inside publishes nothing after it. Called on a deadline worker's thread it is refused with
+        ``RuntimeError`` and changes nothing: a worker cannot join itself, and one waiting there for
+        ``_lifecycle`` could be waiting on a stop joining it."""
+        self._refuse_on_a_worker("stopped")
+        with self._lifecycle:
+            outer = self._lifecycle_owner  # this thread's own start or stop, if this call is inside one
+            self._lifecycle_owner = threading.get_ident()
+            try:
+                self._stop()
+            finally:
+                self._lifecycle_owner = outer  # a start the outer call makes after this is still refused
+
+    def _refuse_on_a_worker(self, what: str) -> None:
+        """A deadline worker's own thread (its sweep tells the answered subscribers) neither starts nor stops
+        the queue: it is refused at once, before it could wait for ``_lifecycle``. The thread's own mark is read,
+        so no lock is taken."""
+        if getattr(self._on_a_worker, "marked", False):
+            raise RuntimeError("the approval queue cannot be %s on its own deadline worker's thread" % what)
+
+    def _stop(self) -> None:
         self._withdraw()
         while True:
             with self._lock:
@@ -240,17 +327,19 @@ class ApprovalQueue:
             self._running = False
             self._closing.set()
             self._generation = None
+        self._stopped_here.count = self._stops_here() + 1
         self._wake.set()
 
     def subscribe_requested(self, fn: Callable[[dict], None]) -> Callable[[], None]:
         """``fn(record)`` after a request commits. A start offers every pending request no surface took to each
         surface subscribed before it or during it, once its worker has launched (nothing before, and nothing at
-        all if the start fails); a surface that subscribes once the queue has started is offered those at once.
+        all if the start fails); a surface that subscribes once the queue has started is offered those at once,
+        unless a start is running then (a second one, still recovering): that start's own offering reaches it.
         So a surface can be offered one request more than once, always under the same approval id."""
         token = object()
         with self._lock:
             self._requested.append((token, fn))
-            running = self._running
+            running = self._running and self._late is None  # during a start, only its own offering is made
             if self._late is not None:
                 self._late.append((token, fn))
         if running:
@@ -324,9 +413,9 @@ class ApprovalQueue:
         except BaseException as exc:
             with self._lock:
                 self._done.pop(approval_id, None)
-            if isinstance(exc, Exception) and not isinstance(exc, ApprovalRefused):
+            if isinstance(exc, Exception) and not isinstance(exc, (ApprovalRefused, *_OUTCOME_UNKNOWN)):
                 raise ApprovalRefused("store_unavailable") from exc  # nothing was written
-            raise
+            raise  # an interruption, a refusal, or a COMMIT whose outcome is unknown, as it is
         # Committed. Nothing below can fail this request: wake the deadline worker first, then tell.
         self._wake.set()
         self._offer(record)
@@ -452,27 +541,35 @@ class ApprovalQueue:
         return expired
 
     def _run(self, generation=None) -> None:
-        """The deadline worker: sweep at each deadline; on a failure, withdraw ``ready``, pause, try again.
+        """The deadline worker: sweep at each deadline; on a failure, withdraw ``ready``, pause, and sweep again
+        at once (not at the next deadline, which an empty queue does not have): ``ready`` comes back with the
+        first sweep that succeeds.
         It returns once the queue closes or its generation is no longer the queue's; a sweep it is in when that
         happens is finished, and from then on it changes ``ready`` no more. The wake signal is shared with any
         other worker still alive (one a later start replaced, or one an interrupted launch kept): a worker that
         wakes to find the queue closing, or its generation gone, sets it again before it returns, so its own
         clear never takes the wake another worker waits on, a stop's above all."""
+        self._on_a_worker.marked = True  # its start or stop calls are refused (see ``stop``)
+        failed = False
         while not self._closing.is_set() and self._generation is generation:
             try:
                 with self._store.transaction() as tx:
                     deadline = rows.next_deadline(tx)
                 wait = None if deadline is None else max(0.0, deadline / 1000 - self._clock())
+                if failed:
+                    wait = 0.0  # after a failure, sweep at once: only a sweep that succeeds restores ready
                 self._wake.wait(wait)
                 self._wake.clear()
                 if self._closing.is_set() or self._generation is not generation:
                     self._wake.set()  # passed on: the clear above may have taken another worker's wake
                     break
                 self.sweep()
+                failed = False
                 with self._lock:
                     if not self._closing.is_set() and self._generation is generation:
                         self.ready = True
             except Exception as exc:  # noqa: BLE001 - the worker must outlive a failed transaction
+                failed = True
                 with self._lock:
                     if self._generation is generation:  # a worker whose generation has ended changes nothing
                         self.ready = False

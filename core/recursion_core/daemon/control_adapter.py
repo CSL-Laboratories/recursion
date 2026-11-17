@@ -100,12 +100,54 @@ _LIST_RESULT_KEYS = ('status', 'code', 'detail')
 
 
 def _wire_size(value):
-    """Bytes ``value`` takes in a control frame (``framing.encode_frame``'s JSON settings).
+    """Bytes ``value`` takes with the control frame's JSON separators.
 
-    ``surrogatepass`` counts a lone surrogate instead of raising. Other text keeps the same length.
+    ``surrogatepass`` counts a lone surrogate instead of raising, and a non-finite float is
+    counted as its dump text. ``framing.encode_frame`` refuses both, so a route result is
+    rewritten with ``_frame_scalar`` before an answer carries it. Other text keeps the same
+    length as a strict UTF-8 encode.
     """
     return len(json.dumps(value, separators=(',', ':'), ensure_ascii=False, default=str).encode(
         'utf-8', 'surrogatepass'))
+
+
+def _frame_scalar(value):
+    """A value ``framing.encode_frame`` can send. ``value`` itself is not changed.
+
+    A lone surrogate code point becomes one U+FFFD. A non-finite float becomes None.
+    A list, a tuple or an object is walked. When nothing needs that, ``value`` is returned
+    as it stands, so a clean result stays the same object.
+    """
+    if isinstance(value, str):
+        if any('\ud800' <= char <= '\udfff' for char in value):
+            return ''.join('\ufffd' if '\ud800' <= char <= '\udfff' else char for char in value)
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        rebuilt = None
+        for key, item in value.items():
+            new_key = _frame_scalar(key) if isinstance(key, str) else key
+            new_item = _frame_scalar(item)
+            if rebuilt is None and (new_key is not key or new_item is not item):
+                rebuilt = dict(value)
+            if rebuilt is not None:
+                if new_key is not key:
+                    rebuilt.pop(key, None)
+                rebuilt[new_key] = new_item
+        return value if rebuilt is None else rebuilt
+    if isinstance(value, (list, tuple)):
+        rebuilt = None
+        for index, item in enumerate(value):
+            new_item = _frame_scalar(item)
+            if rebuilt is None and new_item is not item:
+                rebuilt = list(value)
+            if rebuilt is not None:
+                rebuilt[index] = new_item
+        if rebuilt is None:
+            return value
+        return type(value)(rebuilt)
+    return value
 
 
 def _fit_chars(short, key, *, force=False):
@@ -806,6 +848,9 @@ class DaemonControl:
                 run['state'] = {'terminated': ENDED, 'lost_reboot': LOST_REBOOT}.get(row.state, 'unknown')
         result = self._result(run_id) if isinstance(run_id, str) else None
         if result is not None:
+            # Counted surrogates still sit in the answer. The frame encode refuses them, and a
+            # non-finite float, and the socket worker does not turn that into an error reply.
+            result = _frame_scalar(result)
             run['result'] = _status_result(result) if full else {k: result.get(k) for k in ('status', 'code', 'detail')}
         if full and isinstance(run_id, str):
             # run.status carries the tail of the engine's stdout, so every surface that can read a

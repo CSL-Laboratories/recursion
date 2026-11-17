@@ -43,7 +43,7 @@
       "not": {"pattern": "[\\r\\n]"}
     },
     "grant": {
-      "description": "What the user granted one plugin. signer_key_id is the key the grant is bound to, or null for a manual grant to an unsigned plugin. unsigned_order_acknowledged records that the user granted 'order' to an unsigned plugin behind the warning. order_after_revoked_key and order_after_revocation_generation record that the user turned 'order' back on after that key was revoked, at that generation of the revoked-key list.",
+      "description": "What the user granted one plugin. signer_key_id is the key the grant is bound to, or null for a manual grant to an unsigned plugin. unsigned_order_acknowledged records that the user granted 'order' to an unsigned plugin behind the warning. order_after_revoked_key and order_after_revocation_generation record that the user turned 'order' back on after that key was revoked, at that generation of the revoked-key list. developer_key_id is the developer key a manual grant is bound to, or null when the grant names none.",
       "type": "object",
       "additionalProperties": false,
       "required": ["plugin_id", "artifact_sha256", "permissions"],
@@ -58,7 +58,8 @@
         },
         "unsigned_order_acknowledged": {"type": "boolean"},
         "order_after_revoked_key": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/key_id"}]},
-        "order_after_revocation_generation": {"type": ["integer", "null"]}
+        "order_after_revocation_generation": {"type": ["integer", "null"]},
+        "developer_key_id": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/key_id"}]}
       }
     }
   }

@@ -58,6 +58,8 @@ exclusive ``flock`` on ``<path>.lock`` for the life of the store (one writer pro
 by one. A store is made only in a file its own first opening made: that opening writes a mark into
 ``<path>.lock`` before it creates the file and takes the mark away once the store in it is made, so a first
 opening that failed or was killed is made again by the next one, which then meets the same cause, if any. A
+failure once the connection is open shuts that connection in the same step that gives the lock back, and the
+original error is raised unchanged. A
 file that exists, holds nothing and carries no such mark (an emptied store) is refused (``store_empty``) from
 the file system, before SQLite opens anything, and left as it is with whatever lies beside it: making a store
 over it would lose its receipts and events without a word. Remove it to start a new store. A file SQLite
@@ -482,6 +484,9 @@ class EventStore:
             self._open(may_make=may_make)
             self._clear_first_opening()
         except BaseException:
+            if self._conn is not None:          # set only once _open has returned; shut it with the lock
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.close()
             os.close(self._lock_fd)
             self._lock_fd = None
             raise

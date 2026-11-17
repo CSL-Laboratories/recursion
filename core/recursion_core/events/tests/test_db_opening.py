@@ -4,11 +4,14 @@ Draft 2 (EV7, EV5, EV4, EV8).
 The four red tests of the triage (``EVENTS-red-tests.patch``: ``OpeningTests``, ``test_EV4_*``, ``FakeStoreTests``) are
 kept as they were written. Around them: a new path still makes a store, a store that existed keeps what it holds, an
 empty file that exists before any opening is refused too, an epoch that is not a whole number is refused, the log of a
-failed subscriber still says what failed and where, and a table name without a quote reads as before.
+failed subscriber still says what failed and where, a frame is cut at 200 characters, a locked store is ``store_busy``,
+the mark is written before the file exists, a failure after the connection is open shuts that connection, and a table
+name without a quote reads as before.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shutil
@@ -74,6 +77,23 @@ class SubscriberLogTests(unittest.TestCase):
         self.assertLess(len(line), 3000)
         self.assertRegex(line, r'\(\d+ more\)')
         self.assertIn('in deep', line)
+        self.assertNotIn(MARKER, line)
+
+    def test_a_frame_is_cut_at_200_characters(self) -> None:
+        # Grok r2 on #442, R2 (db.py _where): deleting the 200-character cut left every opening test green.
+        store = FakeStore()
+        self.addCleanup(store.close)
+        filename = ('N' * 210) + MARKER
+        namespace = {}
+        exec(compile('def failing(events):\n    raise ValueError("x")\n', filename, 'exec'), namespace)
+        store.subscribe(namespace['failing'])
+        with self.assertLogs(events_db.LOG.name, level='ERROR') as logs:
+            with store.transaction() as tx:
+                tx.append(event())
+        line, = logs.output
+        where = line.split(' at ', 1)[1]
+        for frame in where.split('; '):
+            self.assertLessEqual(len(frame), 200, frame)
         self.assertNotIn(MARKER, line)
 
     def test_the_log_still_says_what_failed_and_where(self) -> None:
@@ -191,6 +211,89 @@ class OpeningTests(unittest.TestCase):
         os.close(fd)
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(fd)
+        store = EventStore(path)
+        self.addCleanup(store.close)
+        self.assertEqual(store.epoch, 1)
+
+    def test_a_failure_after_the_connection_is_open_shuts_it(self) -> None:
+        # Grok r2 on #442, R1 (db.py __init__): the handler gave the lock back and left the connection executing.
+        real = EventStore._clear_first_opening
+
+        def store_on(exc):
+            found, tb = None, exc.__traceback__
+            while tb is not None:
+                candidate = tb.tb_frame.f_locals.get('self')
+                if type(candidate) is EventStore and getattr(candidate, '_conn', None) is not None:
+                    found = candidate
+                tb = tb.tb_next
+            return found
+
+        for kind in (OSError, KeyboardInterrupt, SystemExit):
+            with self.subTest(kind=kind.__name__):
+                path = _path(self)
+
+                def clear_then_raise(store, _kind=kind):
+                    real(store)
+                    if _kind is OSError:
+                        raise OSError(5, 'clear failed')
+                    if _kind is SystemExit:
+                        raise SystemExit(3)
+                    raise KeyboardInterrupt()
+
+                alive = None
+                with mock.patch.object(EventStore, '_clear_first_opening', clear_then_raise):
+                    try:
+                        EventStore(path)
+                    except kind as exc:
+                        # Walk while the frames are still alive: a finished frame no longer has its locals.
+                        if kind is OSError:
+                            self.assertEqual(exc.errno, 5)
+                        if kind is SystemExit:
+                            self.assertEqual(exc.code, 3)
+                        leaked = store_on(exc)
+                        self.assertIsNotNone(leaked)
+                        try:
+                            leaked._conn.execute('SELECT 1')
+                            alive = True
+                        except sqlite3.ProgrammingError:
+                            alive = False
+                        with contextlib.suppress(sqlite3.Error):
+                            leaked._conn.close()
+                    else:
+                        self.fail('the opening returned a store')
+                self.assertFalse(alive, 'the connection from the failed opening still executes')
+                opened = EventStore(path)
+                self.addCleanup(opened.close)
+                self.assertEqual(opened.epoch, 2)
+
+    def test_a_locked_store_is_busy(self) -> None:
+        # Grok r2 on #442, R3 (db.py _open): naming a locked store store_corrupt left every opening test green.
+        path = _path(self)
+        EventStore(path).close()
+        other = sqlite3.connect(path, isolation_level=None, timeout=0)
+        self.addCleanup(other.close)
+        other.execute('BEGIN EXCLUSIVE')
+        with self.assertRaisesRegex(StoreError, 'store_busy'):
+            EventStore(path)
+
+    def test_the_mark_is_written_before_the_store_file_is_created(self) -> None:
+        # Grok r2 on #442, R4 (db.py __init__): creating the file and only then writing the mark left the tests green.
+        path = _path(self)
+        real_open = os.open
+
+        def open_and_stop(file, flags, mode=0o777, *, dir_fd=None):
+            fd = real_open(file, flags, mode) if dir_fd is None else real_open(file, flags, mode, dir_fd=dir_fd)
+            if file == path and flags & os.O_EXCL:
+                os.close(fd)
+                raise OSError(5, 'after the exclusive create')
+            return fd
+
+        with mock.patch('os.open', open_and_stop):
+            with self.assertRaises(OSError) as caught:
+                EventStore(path)
+        self.assertEqual(caught.exception.errno, 5)
+        with open(path + '.lock', 'rb') as fh:
+            self.assertEqual(fh.read(), EventStore._FIRST_OPENING)
         store = EventStore(path)
         self.addCleanup(store.close)
         self.assertEqual(store.epoch, 1)

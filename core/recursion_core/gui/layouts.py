@@ -8,7 +8,9 @@ views. Anything else must be a panel id the page already accepted.
 
 The file is the operator's. A symlink, a file or parent directory someone else can write, or
 a file over 64 KiB is refused. A missing or refused file is no layout: the page stays as it
-is. This module does not import a schema package; the rules below are the check.
+is. When ``os.geteuid`` is absent, the user id is the owner of this module. A symlink is
+refused from ``lstat`` even when ``os.O_NOFOLLOW`` is absent, and an owned regular file is
+still read. This module does not import a schema package; the rules below are the check.
 """
 
 from __future__ import annotations
@@ -155,6 +157,22 @@ def user_layout_path(environ=None) -> Path:
     return Path(base) / "recursion" / "gui" / "layout.json"
 
 
+def _process_uid() -> int | None:
+    """The user id this process is acting as, or None when it cannot be known.
+
+    ``os.geteuid`` is the POSIX-only call. The simulated-Windows child deletes
+    it when it sets ``os.name`` to ``nt``, and a Windows host has no such call.
+    The id is then the owner of this module, read with ``os.stat`` (not
+    ``lstat`` or ``fstat``, so a stand-in of those two still disagrees with it).
+    """
+    if hasattr(os, "geteuid"):
+        return os.geteuid()
+    try:
+        return os.stat(__file__).st_uid
+    except OSError:
+        return None
+
+
 def _dir_trust(path: Path) -> str:
     """``ok``, ``missing``, or ``untrusted``. Only this directory, not its parents.
 
@@ -169,29 +187,36 @@ def _dir_trust(path: Path) -> str:
         return "untrusted"
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         return "untrusted"
-    if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+    uid = _process_uid()
+    if uid is None or info.st_uid != uid or info.st_mode & 0o022:
         return "untrusted"
     return "ok"
 
 
 def read_layout(path, *, known_panels) -> Mapping:
-    """Read one layout file. ``FileNotFoundError`` when there is nothing to read."""
+    """Read one layout file. ``FileNotFoundError`` when there is nothing to read.
+
+    A symlink is refused from ``lstat``. ``O_NOFOLLOW`` is POSIX-only: the
+    simulated-Windows child deletes it when ``os.name`` is ``nt``, and
+    ``os.open`` would then follow the link. Where the platform has the flag,
+    the open still sets it. An owned regular file is read either way.
+    """
     path = Path(path)
-    if not hasattr(os, "O_NOFOLLOW"):
-        # Following a link is not allowed, and there is no flag to refuse one. Do not open it.
-        try:
-            os.lstat(path)
-        except FileNotFoundError:
-            raise
-        except OSError as exc:
-            raise LayoutRefused("untrusted") from exc
-        raise LayoutRefused("untrusted")
     parent = _dir_trust(path.parent)
     if parent == "missing":
         raise FileNotFoundError(path)
     if parent != "ok":
         raise LayoutRefused("untrusted")
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | getattr(os, "O_NONBLOCK", 0)
+    try:
+        linked = os.lstat(path)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise LayoutRefused("untrusted") from exc
+    if stat.S_ISLNK(linked.st_mode):
+        raise LayoutRefused("untrusted")
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NONBLOCK", 0))
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
@@ -200,7 +225,8 @@ def read_layout(path, *, known_panels) -> Mapping:
         raise LayoutRefused("untrusted") from exc
     try:
         info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+        uid = _process_uid()
+        if (uid is None or not stat.S_ISREG(info.st_mode) or info.st_uid != uid
                 or info.st_mode & 0o022):
             raise LayoutRefused("untrusted")
         if info.st_size > MAX_BYTES:

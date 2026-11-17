@@ -23,6 +23,7 @@ from http.client import HTTPConnection
 
 from recursion_core.daemon.tests import plugin_fixture as fx
 from recursion_core.gui.client import READS, ControlClient
+from recursion_core.gui import layouts as layout_mod
 from recursion_core.gui.layouts import (
     MAX_BYTES, SCHEMA, LayoutRefused, load_user_layout, parse_layout, parse_layout_text, read_layout,
 )
@@ -91,6 +92,42 @@ def element_at(html: str, marker: str) -> str:
         if depth == 0:
             return html[open_at:match.end()]
     raise AssertionError("unclosed %s" % tag)
+
+
+def _drop_os(*names: str) -> list:
+    """Remove POSIX-only ``os`` names for one test, the way the simulated-Windows child does.
+
+    A name that is already absent stays absent. The caller puts the saved values back.
+    """
+    saved = []
+    for name in names:
+        if hasattr(os, name):
+            saved.append((name, getattr(os, name)))
+            delattr(os, name)
+    return saved
+
+
+def _restore_os(saved: list) -> None:
+    for name, value in reversed(saved):
+        setattr(os, name, value)
+
+
+class _ShiftedUid:
+    """Stat fields the loader reads, with the user id one higher.
+
+    This is not an ``os.stat_result``. The simulated-Windows child hides the
+    posix module, and building a ``stat_result`` then faults the child.
+    """
+
+    def __init__(self, info) -> None:
+        self.st_mode = info.st_mode
+        self.st_uid = info.st_uid + 1
+        self.st_gid = info.st_gid
+        self.st_size = info.st_size
+
+
+def _other_uid(info):
+    return _ShiftedUid(info)
 
 
 class LayoutFixtureTests(unittest.TestCase):
@@ -441,6 +478,63 @@ class LayoutPageTests(GuiHarness):
         self.assertIn('id="reads-h"', page)
         self.assertIn("I confirm this request", page)
         self.assertEqual([call for call in self.api.calls if call[1] == "/v1/operator"], [])
+
+    def test_an_owned_layout_is_drawn_when_geteuid_is_absent(self) -> None:
+        # os.geteuid and os.O_NOFOLLOW are POSIX-only. The simulated-Windows child
+        # deletes both when it sets os.name to nt. The page must still draw an
+        # owned layout, so element_at finds the panel. Group write, another uid,
+        # and a file over the byte cap still apply nothing.
+        self.mount([{"id": "fixture.panel", "title": "Fixture panel", "reads": [READS[0]]}])
+        self.write_layout(_layout("fixture.panel", columns=2, column=2))
+        saved = _drop_os("geteuid", "O_NOFOLLOW")
+        try:
+            status, _, page = self.home()
+            self.assertEqual(status, "200 OK")
+            slot = element_at(page, 'data-panel="fixture.panel"')
+            self.assertIn('data-column="2"', slot)
+            os.chmod(self.layout_path, 0o666)
+            self.assertNotIn("data-column=", self.home()[2])
+            os.chmod(self.layout_path, 0o600)
+            self.layout_path.write_bytes(b" " * (MAX_BYTES + 1))
+            os.chmod(self.layout_path, 0o600)
+            with self.assertRaises(LayoutRefused) as caught:
+                read_layout(self.layout_path, known_panels=frozenset())
+            self.assertEqual(caught.exception.reason, "too_large")
+            self.write_layout(_layout("fixture.panel", columns=2, column=2))
+            real_fstat = layout_mod.os.fstat
+
+            def other_fstat(fd):
+                return _other_uid(real_fstat(fd))
+
+            with unittest.mock.patch.object(layout_mod.os, "fstat", side_effect=other_fstat):
+                self.assertNotIn("data-column=", self.home()[2])
+        finally:
+            _restore_os(saved)
+
+    def test_a_symlink_is_refused_and_a_regular_layout_is_drawn_when_o_nofollow_is_absent(self) -> None:
+        # Without os.O_NOFOLLOW, os.open follows a symlink. A symlink must still
+        # apply nothing. An owned regular file must be drawn: refusing every
+        # existing file is what left the marker out and made element_at raise
+        # ValueError: substring not found.
+        self.mount([{"id": "fixture.panel", "title": "Fixture panel", "reads": [READS[0]]}])
+        outside = self.tmp / "real-layout.json"
+        outside.write_text(
+            json.dumps(_layout("fixture.panel", columns=2, column=2)), encoding="utf-8")
+        os.chmod(outside, 0o600)
+        os.symlink(outside, self.layout_path)
+        saved = _drop_os("O_NOFOLLOW")
+        try:
+            status, _, linked = self.home()
+            self.assertEqual(status, "200 OK")
+            self.assertNotIn("data-column=", linked)
+            self.layout_path.unlink()
+            self.write_layout(_layout("fixture.panel", columns=2, column=2))
+            status, _, page = self.home()
+            self.assertEqual(status, "200 OK")
+            slot = element_at(page, 'data-panel="fixture.panel"')
+            self.assertIn('data-column="2"', slot)
+        finally:
+            _restore_os(saved)
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "the daemon entry point is Linux-only")

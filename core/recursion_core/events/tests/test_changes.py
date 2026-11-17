@@ -1466,6 +1466,30 @@ class ChangeReaderTest(unittest.TestCase):
         self.assertIs(reader._store, self.store, 'the start binds last')
         reader.stop(context)
 
+    def test_a_store_the_claim_map_cannot_hold_is_refused_before_any_mark(self) -> None:
+        # Grok r6, R1 (changes.py:322-328, 350 at c14a461d; Devin's thread on 326-328): such a store set the mark, the
+        # release raised the same TypeError, a later start was refused as already started, and stop never returned.
+        class Slots:
+            __slots__ = ()
+
+        class Unhashable:
+            __hash__ = None
+
+        for bad in ({}, [], 1, Slots(), Unhashable()):
+            with self.subTest(store=type(bad).__name__):
+                reader = C.ChangeReader(self.marker)
+                reader._run = lambda stopping=None: None
+                with self.assertRaisesRegex(TypeError, 'hashable and weak-referenceable'):
+                    reader.start(mock.Mock(registry=self.registry, store=bad))
+                self.assertIsNone(reader._claimed)
+                C._release(bad, reader)                                      # nothing was claimed: nothing raised
+                with self.assertRaisesRegex(TypeError, 'hashable and weak-referenceable'):
+                    reader.bind(self.registry, bad)
+                self.assertIsNot(reader._store, bad)
+                reader.stop(mock.Mock(registry=self.registry, store=bad))    # returns: nothing to give up
+                reader.start(self.context())                                 # a real store: not "already started"
+                reader.stop(self.context())
+
     def test_a_start_whose_thread_never_started_refuses_a_rebind_until_its_stop(self) -> None:
         # Sol, round 3, required 1: the refusal holds from start to stop, a start that raised included.
         context, service, other = self.context(), C.ChangeReader(self.marker), self.other_store()

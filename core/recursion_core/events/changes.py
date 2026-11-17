@@ -214,6 +214,18 @@ def _check_options(*, scan_interval_s: float = 60.0, page: int = PAGE, slice_siz
     return float(scan_interval_s), page, slice_size, monotonic
 
 
+def _holdable(store) -> None:
+    """Refuses (``TypeError``) a store the claim map cannot hold: one that is not hashable or not weak-referenceable.
+    ``start`` and ``bind`` ask this before anything changes, so such a store leaves no mark and no claim behind."""
+    if store is None:
+        return
+    try:
+        hash(store)
+        weakref.ref(store)
+    except TypeError:
+        raise TypeError('the event store must be hashable and weak-referenceable, not %s' % type(store).__name__) from None
+
+
 def _claim(store, reader, *, take: bool) -> None:
     """Refuses ``store`` when another reader's ``start`` holds it; with ``take``, ``reader`` then holds it."""
     if store is None:
@@ -230,7 +242,11 @@ def _release(store, reader) -> None:
     if store is None:
         return
     with _CLAIMS_LOCK:
-        if _CLAIMS.get(store) is reader:
+        try:
+            holder = _CLAIMS.get(store)
+        except TypeError:                     # a store the map cannot hold was never claimed
+            return
+        if holder is reader:
             del _CLAIMS[store]
 
 
@@ -297,6 +313,7 @@ class ChangeReader:
         store: that is refused, and binding the same two changes nothing. The check and the change are one step with
         ``start``'s claim and binding (the reader's own lock), so a ``bind`` on another thread cannot land between
         them. So its thread reads and writes only what it was started with, on the store its claim holds."""
+        _holdable(store)
         with self._binding:
             if self._claimed is not None and (registry is not self._registry or store is not self._store):
                 raise RuntimeError('the change reader is started: bind cannot change its registry or store until stop')
@@ -316,17 +333,12 @@ class ChangeReader:
             raise RuntimeError('the change reader is already started')
         if context.store is None:
             raise RuntimeError('the change reader needs the event store')
+        _holdable(context.store)              # before any mark: a store the claim map cannot hold leaves nothing
         with self._binding:
             if self._claimed is not None:     # a start that raised after its claim, with no stop since
                 raise RuntimeError('the change reader is already started')
-            self._claimed = context.store     # remembered first: an interruption after the claim leaves it findable
-            try:
-                _claim(context.store, self, take=True)
-                self._bind(context.registry, context.store)
-            except BaseException:
-                _release(context.store, self)  # gives up only a claim this reader holds
-                self._claimed = None
-                raise
+            # A call of its own: whatever it raises, at any of its lines, leaves this ``with`` by its handler.
+            self._claim_and_bind(context)
         self._reset()
         stopping = self._stopping = threading.Event()
         thread = threading.Thread(target=self._run, args=(stopping,), name='events-change-reader', daemon=True)
@@ -334,6 +346,19 @@ class ChangeReader:
         # interruption while ``Thread.start`` waits for it), and then only ``stop`` ends and joins it.
         self._thread = thread
         thread.start()
+
+    def _claim_and_bind(self, context) -> None:
+        """``start``'s one step under the reader's lock: remember the store, claim it, bind. Whatever ends it once the
+        claim is asked for gives the claim back and clears the mark; anything earlier took no claim, and ``stop``
+        clears the mark."""
+        self._claimed = context.store         # remembered first: an interruption after the claim leaves it findable
+        try:
+            _claim(context.store, self, take=True)
+            self._bind(context.registry, context.store)
+        except BaseException:
+            _release(context.store, self)     # gives up only a claim this reader holds
+            self._claimed = None
+            raise
 
     def stop(self, context) -> None:
         """Ends the current start's thread, joins it, and gives up the claim that start took, on the store it was

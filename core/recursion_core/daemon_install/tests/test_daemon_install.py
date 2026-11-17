@@ -516,7 +516,7 @@ class InstallTests(unittest.TestCase):
              f"sets XDG_STATE_HOME={elsewhere}:"),
             (f"[Service]\nDescription=x \\\t\nEnvironment=XDG_STATE_HOME={elsewhere}\nExecStart=/old\n",
              f"sets XDG_STATE_HOME={elsewhere}:"),
-            # a backslash and a blank on an Environment line: that assignment is unused, and the next one counts
+            # a backslash and a blank keeps the words on that line; the next line replaces them
             (f"[Service]\nEnvironment=XDG_STATE_HOME=%h/.local/state \\ \nEnvironment=XDG_STATE_HOME={elsewhere}\n"
              "ExecStart=/old\n", f"sets XDG_STATE_HOME={elsewhere}:"),
         ]
@@ -599,10 +599,7 @@ class InstallTests(unittest.TestCase):
              f"sets XDG_STATE_HOME={elsewhere}:"),
         ]
         replaced = [
-            # the only state assignment is the broken one: systemd ignores it, the folder is the default
-            f"[Service]\nEnvironment=XDG_STATE_HOME={elsewhere} \\ \nExecStart=/old\n",
-            f"[Service]\nEnvironment=XDG_STATE_HOME={elsewhere} \\\t\nExecStart=/old\n",
-            # a broken elsewhere line, then the default folder: the later line counts
+            # the elsewhere words stay, and a later line that names the default folder replaces them
             f"[Service]\nEnvironment=XDG_STATE_HOME={elsewhere} \\ \n"
             "Environment=XDG_STATE_HOME=%h/.local/state\nExecStart=/old\n",
             f"[Service]\nEnvironment=XDG_STATE_HOME={elsewhere} \\\t\n"
@@ -650,7 +647,8 @@ class InstallTests(unittest.TestCase):
                 with self.assertRaises(InstallRefused) as caught:
                     upgrade(self.roots, EXEC)
                 self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
-                self.assertIn("which cannot be read", caught.exception.detail)
+                # the bad escape stores nothing on its line; the earlier assignment is the one systemd applies
+                self.assertIn(f"sets XDG_STATE_HOME={earlier}:", caught.exception.detail)
                 self.assertEqual(_tree(self.home), before)
         # a plain override to the default folder is still rewritten: systemd accepts that assignment
         with open(self.unit, "w", encoding="utf-8") as handle:
@@ -658,6 +656,110 @@ class InstallTests(unittest.TestCase):
                          "Environment=XDG_STATE_HOME=%h/.local/state\nExecStart=/old\n")
         self.assertTrue(upgrade(self.roots, EXEC).changed)
         self.assertEqual(_read(self.unit), render_unit(EXEC))
+
+    # Grok's review 14 on #382 (29794e9d). R1: a backslash then a blank does not drop the line. systemd keeps
+    # every word it already stored and stops the line. Dropping the line let upgrade rewrite a unit whose
+    # state folder is another one.
+    def test_a_backslash_then_a_blank_keeps_the_words_already_read(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        elsewhere = os.path.join(self.case, "elsewhere")
+        refused = [
+            (f"[Service]\nEnvironment=XDG_STATE_HOME={elsewhere} \\ \nExecStart=/old\n",
+             f"sets XDG_STATE_HOME={elsewhere}:"),
+            (f"[Service]\nEnvironment=XDG_STATE_HOME={elsewhere} \\\t\nExecStart=/old\n",
+             f"sets XDG_STATE_HOME={elsewhere}:"),
+            (f'[Service]\nEnvironment="XDG_STATE_HOME={elsewhere}" \\ \nExecStart=/old\n',
+             f"sets XDG_STATE_HOME={elsewhere}:"),
+            (f"[Service]\nEnvironment=XDG_STATE_HOME={elsewhere} \\\\\\ \nExecStart=/old\n",
+             f"sets XDG_STATE_HOME={elsewhere}:"),
+            (f"[Service]\nEnvironment=XDG_STATE_HOME={elsewhere} \\q \\ \nExecStart=/old\n",
+             f"sets XDG_STATE_HOME={elsewhere}:"),
+            (f"[Service]\nEnvironment=A=1 XDG_STATE_HOME={elsewhere} \\ \nExecStart=/old\n",
+             f"sets XDG_STATE_HOME={elsewhere}:"),
+            ("[Service]\nPassEnvironment=XDG_STATE_HOME \\ \nExecStart=/old\n",
+             "passes the user manager's own XDG_STATE_HOME"),
+            ("[Service]\nPassEnvironment=HOME XDG_STATE_HOME \\ \nExecStart=/old\n",
+             "passes the user manager's own XDG_STATE_HOME"),
+            (f"[Service]\nEnvironment=HOME={elsewhere} \\ \nExecStart=/old\n",
+             f"sets HOME={elsewhere}, so"),
+            # the name before the blank is not the one that moves the state; the earlier assignment stays
+            (f"[Service]\nEnvironment=XDG_STATE_HOME={elsewhere}\nUnsetEnvironment=OTHER \\ \nExecStart=/old\n",
+             f"sets XDG_STATE_HOME={elsewhere}:"),
+        ]
+        replaced = [
+            # a later line names the default folder, so that line wins
+            f"[Service]\nEnvironment=XDG_STATE_HOME={elsewhere} \\ \n"
+            "Environment=XDG_STATE_HOME=%h/.local/state\nExecStart=/old\n",
+            # the name before the blank is applied, so the earlier elsewhere assignment is dropped
+            f"[Service]\nEnvironment=XDG_STATE_HOME={elsewhere}\n"
+            "UnsetEnvironment=XDG_STATE_HOME \\ \nExecStart=/old\n",
+            f"[Service]\nEnvironment=XDG_STATE_HOME={elsewhere}\n"
+            f"UnsetEnvironment=XDG_STATE_HOME={elsewhere} \\ \nExecStart=/old\n",
+        ]
+        for text, said in refused:
+            with self.subTest(text=text):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    upgrade(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
+                self.assertIn(said, caught.exception.detail)
+                self.assertEqual(_tree(self.home), before)
+        for text in replaced:
+            with self.subTest(text=text):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                self.assertTrue(upgrade(self.roots, EXEC).changed)
+                self.assertEqual(_read(self.unit), render_unit(EXEC))
+
+    # Grok's review 14 on #382 (29794e9d). R2: a \u noncharacter skips that word and the line continues; a \U
+    # noncharacter stops the line. A unit whose applied assignments leave the default folder is rewritten.
+    # An earlier folder is kept. Following every noncharacter let /.. name the default over that folder.
+    def test_a_noncharacter_escape_follows_systemds_two_outcomes(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        refused = [
+            # \U stops the line: the later default is not read, and /srv/old stays
+            ("[Service]\n"
+             "Environment=XDG_STATE_HOME=/srv/old "
+             "XDG_STATE_HOME=/x/\\U0010FFFF "
+             "XDG_STATE_HOME=%h/.local/state\n"
+             "ExecStart=/old\n",
+             "sets XDG_STATE_HOME=/srv/old:"),
+            # the second line stops before it can name the default through /..
+            ("[Service]\n"
+             "Environment=XDG_STATE_HOME=/srv/old-state\n"
+             "Environment=XDG_STATE_HOME=%h/.local/state/\\U0000FFFF/..\n"
+             "ExecStart=/old\n",
+             "sets XDG_STATE_HOME=/srv/old-state:"),
+        ]
+        replaced = [
+            # a lone bad word stores nothing; the folder is the default
+            "[Service]\nEnvironment=XDG_STATE_HOME=/srv/x/\\uFFFF/..\nExecStart=/old\n",
+            "[Service]\nEnvironment=XDG_STATE_HOME=%h/.local/state/\\U0000FFFF/..\nExecStart=/old\n",
+            # \u skips that word and the later default is read
+            "[Service]\n"
+            "Environment=XDG_STATE_HOME=/srv/old "
+            "XDG_STATE_HOME=/x/\\uFFFF "
+            "XDG_STATE_HOME=%h/.local/state\n"
+            "ExecStart=/old\n",
+        ]
+        for text, said in refused:
+            with self.subTest(text=text):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    upgrade(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
+                self.assertIn(said, caught.exception.detail)
+                self.assertEqual(_tree(self.home), before)
+        for text in replaced:
+            with self.subTest(text=text):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                self.assertTrue(upgrade(self.roots, EXEC).changed)
+                self.assertEqual(_read(self.unit), render_unit(EXEC))
 
     def test_upgrade_without_a_unit_is_refused(self) -> None:
         with self.assertRaises(InstallRefused) as caught:

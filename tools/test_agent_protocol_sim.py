@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -2523,11 +2524,17 @@ class SweepRobustnessRegressionTests(unittest.TestCase):
         snap = self.released_fixture()
         snap['runs'] = [{'id': 'delayed-ci', 'claim': U1,
                          'started_at': ts(6), 'ended_at': None}]
-        try:
-            result = sim.evaluate(snap)
-        except sim.SnapshotError:
-            return  # Rejecting an impossible event order is also fail-closed.
-        self.assertTrue(any(v['claim'] == U1 for v in result['violations']), result)
+        result = sim.evaluate(snap)
+        late = [(v['code'], v['claim'], v['detail']) for v in result['violations']
+                if v['code'] == 'run_after_release']
+        self.assertEqual(late, [('run_after_release', U1, 'delayed-ci')])
+
+    def test_run_that_starts_at_the_release_instant_stays_the_overlap_rule(self):
+        snap = self.released_fixture()
+        snap['runs'] = [{'id': 'edge', 'claim': U1, 'started_at': ts(5), 'ended_at': None}]
+        rows = [(v['code'], v['claim'], v['detail']) for v in sim.evaluate(snap)['violations']]
+        self.assertIn(('release_before_writers_stopped', U1, 'edge'), rows)
+        self.assertNotIn(('run_after_release', U1, 'edge'), rows)
 
     def test_sweep_unsorted_pings_cannot_hide_a_held_write(self):
         blocked, question = issue('CSL-1'), issue('CSL-2')
@@ -2545,7 +2552,7 @@ class SweepRobustnessRegressionTests(unittest.TestCase):
     def test_sweep_cli_invalid_utf8_is_a_typed_input_error(self):
         rc, stderr, stdout = self.invoke_bytes(b'\xff')
         self.assertEqual(rc, 2)
-        self.assertTrue(stderr.startswith('AGENT_PROTOCOL_SIM_ERROR '))
+        self.assertEqual(stderr, 'AGENT_PROTOCOL_SIM_ERROR snapshot is not valid UTF-8\n')
         self.assertEqual(stdout, '')
 
     def test_sweep_cli_integer_limit_is_a_typed_input_error(self):
@@ -2566,6 +2573,18 @@ class SweepRobustnessRegressionTests(unittest.TestCase):
         self.assertIn('now', stderr)
         self.assertNotIn(marker, stderr)
 
+    def test_sweep_offset_and_range_refusals_omit_the_timestamp(self):
+        for now in ('2026-10-20T10:00:00', '0001-01-01T00:00:00+01:00', '9999-12-31T23:59:59-01:00'):
+            with self.subTest(now=now):
+                snap = snapshot(10, [issue('CSL-1')], [])
+                snap['now'] = now
+                rc, stderr, stdout = self.invoke_bytes(json.dumps(snap).encode())
+                self.assertEqual(rc, 2)
+                self.assertEqual(stdout, '')
+                self.assertIn('now', stderr)
+                self.assertNotIn(now, stderr)
+                self.assertEqual(stderr.count('\n'), 1)
+
     def test_sweep_refusal_escapes_identifier_controls(self):
         bad_id = 'bad\x1b[31mID\nFORGED_LOG'
         snap = snapshot(10, [issue('CSL-1')], [comment(bad_id, 'CSL-404', 0, 'note')])
@@ -2573,6 +2592,20 @@ class SweepRobustnessRegressionTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertNotIn('\x1b', stderr)
         self.assertEqual(stderr.count('\n'), 1)
+        for splitter in ('\u2028', '\u2029'):
+            forged = comment(f'id{splitter}TAIL', 'CSL-404', 0, 'note')
+            snap = snapshot(10, [issue('CSL-1')], [forged])
+            rc, stderr, _ = self.invoke_bytes(json.dumps(snap).encode())
+            self.assertEqual(rc, 2)
+            self.assertNotIn(splitter, stderr)
+            self.assertEqual(stderr.splitlines(), [stderr.rstrip('\n')])
+            self.assertFalse(any(line.startswith('TAIL') for line in stderr.splitlines()), stderr)
+        surrogate = comment('bad\ud800ID', 'CSL-404', 0, 'note')
+        snap = snapshot(10, [issue('CSL-1')], [surrogate])
+        rc, stderr, _ = self.invoke_bytes(json.dumps(snap).encode())
+        self.assertEqual(rc, 2, stderr)
+        stderr.encode('utf-8')
+        self.assertFalse(any(0xD800 <= ord(char) <= 0xDFFF for char in stderr))
 
     def test_sweep_shared_evaluation_keeps_each_call_horizon(self):
         from threading import Event, Thread, current_thread
@@ -2639,6 +2672,146 @@ class SweepRobustnessRegressionTests(unittest.TestCase):
                 raise RuntimeError("iter hook")
         with self.assertRaises(sim.SnapshotError):
             sim.evaluate({"now": "2026-11-15T00:00:00Z", "issues": [], "comments": [], "repo": BombStr("recursion")})
+
+    def test_run_after_each_end_kind_is_reported(self):
+        withdrawn = claim(
+            'c1', 'CSL-1', U1,
+            more_edits=[{'at': ts(30), 'body': claim_body(U1, extra=(f'withdrawn: superseded by {U2}',))}],
+        )
+        revoked = claim('c1', 'CSL-1', U1)
+        deleted = claim('c1', 'CSL-1', U1)
+        deleted['deleted'] = True
+        deleted['deleted_at'] = ts(30)
+        expired = claim('c1', 'CSL-1', U1, confirm_after=None)
+        late = [{'id': 'r', 'claim': U1, 'started_at': ts(40), 'ended_at': None}]
+        cases = (
+            ('run_after_withdrawal', snapshot(60, [issue('CSL-1')], [withdrawn], runs=late)),
+            ('run_after_revoke', snapshot(60, [issue('CSL-1')], [revoked, comment('h1', 'CSL-1', 30, f'REVOKE CLAIM {U1}')], runs=late)),
+            ('run_after_deletion', snapshot(60, [issue('CSL-1')], [deleted], runs=late)),
+            ('run_after_expiry', snapshot(200, [issue('CSL-1')], [expired], runs=[{'id': 'r', 'claim': U1, 'started_at': ts(150), 'ended_at': None}])),
+        )
+        for code, snap in cases:
+            with self.subTest(code=code):
+                self.assertIn(code, codes(sim.evaluate(snap)))
+        same_instant = [{'id': 'r', 'claim': U1, 'started_at': ts(30), 'ended_at': None}]
+        withdrawn_now = snapshot(60, [issue('CSL-1')], [withdrawn], runs=same_instant)
+        self.assertIn('run_after_withdrawal', codes(sim.evaluate(withdrawn_now)))
+
+    def test_deep_nesting_and_memory_error_are_json_refusals(self):
+        from unittest import mock
+        # 10000 nested arrays raise RecursionError from json.loads on 3.12.
+        # The free-threaded 3.14 parser accepts that document, so the refusal
+        # there is the snapshot check. Both interpreters still have to turn a
+        # RecursionError or MemoryError from json.loads into the JSON sentence.
+        payload = b'{"issues":' + (b'[' * 10000) + b'0' + (b']' * 10000) + b'}'
+        try:
+            json.loads(payload)
+            parser_raises = False
+        except RecursionError:
+            parser_raises = True
+        rc, stderr, stdout = self.invoke_bytes(payload)
+        self.assertEqual(rc, 2, stderr)
+        self.assertEqual(stdout, '')
+        self.assertNotIn('Traceback', stderr)
+        self.assertEqual(stderr.count('\n'), 1)
+        if parser_raises:
+            self.assertIn('snapshot is not valid JSON', stderr)
+        else:
+            self.assertIn("missing 'now'", stderr)
+        for boom in (RecursionError('synthetic'), MemoryError('synthetic')):
+            with self.subTest(boom=type(boom).__name__):
+                with mock.patch.object(sim.json, 'loads', side_effect=boom):
+                    rc, stderr, stdout = self.invoke_bytes(b'{}')
+                self.assertEqual(rc, 2, stderr)
+                self.assertEqual(stdout, '')
+                self.assertNotIn('Traceback', stderr)
+                self.assertIn('snapshot is not valid JSON', stderr)
+                self.assertNotIn('synthetic', stderr)
+                self.assertEqual(stderr.count('\n'), 1)
+
+    def test_fifo_snapshot_is_refused(self):
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest('requires FIFO support')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'snap.fifo'
+            os.mkfifo(path)
+            done = subprocess.run(
+                [sys.executable, '-B', str(SIM), str(path)],
+                timeout=5, capture_output=True, text=True, check=False,
+            )
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn('not a regular file', done.stderr)
+        self.assertNotIn('Traceback', done.stderr)
+
+    def test_refusal_caps_a_huge_value(self):
+        snap = snapshot(10, [issue('CSL-1')], [claim('c1', 'CSL-1', U1)])
+        snap['writes'] = [{'kind': 'x' * 100000, 'issue': 'CSL-1', 'claim': U1, 'at': ts(3)}]
+        rc, stderr, stdout = self.invoke_bytes(json.dumps(snap).encode())
+        self.assertEqual(rc, 2, stderr[:300])
+        self.assertEqual(stdout, '')
+        self.assertLess(len(stderr), 400)
+        self.assertNotIn('x' * 500, stderr)
+        self.assertTrue(stderr.endswith('...\n'))
+
+    def test_ping_after_now_is_refused(self):
+        question = issue('CSL-2', decision=decision(pings=(30,)))
+        with self.assertRaises(sim.SnapshotError) as caught:
+            sim.evaluate(snapshot(10, [issue('CSL-1'), question], []))
+        self.assertIn('pings after the snapshot time', str(caught.exception))
+
+    def test_settled_loss_does_not_read_another_calls_horizon(self):
+        from threading import Event, Thread, current_thread
+        snap = snapshot(10, [issue('CSL-2'), issue('CSL-1')], [
+            claim('c1', 'CSL-2', U1, at=0, branch='branch-a'),
+            claim('c2', 'CSL-2', U2, at=1, branch='shared', session='cursor/s2'),
+            claim('c3', 'CSL-1', U3, at=2, branch='shared', session='codex/s3'),
+        ])
+        ev = sim.Evaluation(snap)
+        now = ev.now
+        u2 = ev.claims[U2]
+        self.assertEqual(ev.settled_loss(u2, now).uuid, U1)
+        self.assertTrue(ev.lost_by(u2, now))
+        self.assertFalse(ev.blocks_overlap(u2, now))
+        self.assertEqual(ev.holder('CSL-1', 'recursion', now).uuid, U3)
+        early = sim.parse_ts(ts(0), 'early')
+        entered, resume, returned = Event(), Event(), Event()
+        original = ev._live_claims
+        results, errors = {}, []
+
+        def paused(issue_id, repo, at):
+            if current_thread().name == 'publisher' and at == early:
+                entered.set()
+                if not resume.wait(15):
+                    raise TimeoutError('controlled schedule timeout')
+            return original(issue_id, repo, at)
+
+        def read_while_published():
+            try:
+                results['settled'] = ev.settled_loss(u2, now)
+                results['lost'] = ev.lost_by(u2, now)
+                results['blocks'] = ev.blocks_overlap(u2, now)
+                returned.set()
+            except BaseException as exc:
+                errors.append(exc)
+                returned.set()
+
+        ev._live_claims = paused
+        publisher = Thread(target=lambda: ev.live_claims('CSL-2', 'recursion', early), name='publisher', daemon=True)
+        reader = Thread(target=read_while_published, name='reader', daemon=True)
+        publisher.start()
+        self.assertTrue(entered.wait(5), 'publisher did not pause')
+        reader.start()
+        self.assertFalse(returned.wait(0.4), results)
+        resume.set()
+        publisher.join(5)
+        reader.join(5)
+        self.assertEqual(errors, [])
+        self.assertFalse(publisher.is_alive())
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(results['settled'].uuid, U1)
+        self.assertTrue(results['lost'])
+        self.assertFalse(results['blocks'])
+        self.assertIsNone(ev._horizon)
 
 
 if __name__ == "__main__":

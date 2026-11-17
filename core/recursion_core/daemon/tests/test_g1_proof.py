@@ -39,7 +39,7 @@ except ImportError:  # the free-threaded interpreter has no jsonschema
 
 ROOT = Path(__file__).resolve().parents[4]
 SCHEMA_DIR = ROOT / "schemas" / "gui" / "v1"
-FIXTURES = SCHEMA_DIR / "fixtures"
+FIXTURES = SCHEMA_DIR / "fixtures" / "layout"
 PLUGIN = Path(__file__).resolve().parent / "fixtures" / "g1_plugin"
 
 # Bytes the layout must not change. Taken from the unthemed page's header and footer.
@@ -105,6 +105,11 @@ class LayoutFixtureTests(unittest.TestCase):
                          for path in FIXTURES.glob("*/*.json"))
         self.assertEqual(sorted(listed), on_disk)
         self.assertEqual(len(listed), len(set(listed)))
+        for path in FIXTURES.glob("*/*.json"):
+            text = path.read_text(encoding="utf-8")
+            shown = str(path.relative_to(FIXTURES))
+            self.assertNotIn("gui.theme/1", text, shown)
+            self.assertIn("gui.layout/1", text, shown)
 
     def test_good_fixtures_parse_and_bad_fixtures_are_refused(self) -> None:
         schema = json.loads((SCHEMA_DIR / "layout.v1.json").read_text(encoding="utf-8"))
@@ -347,6 +352,95 @@ class LayoutPageTests(GuiHarness):
         os.chmod(self.layout_path, 0o600)
         self.assertEqual(self.home()[0], "200 OK")
         self.assertNotIn("data-column=", self.home()[2])
+
+    def test_dusk_holds_pinned_safety_text_on_an_opaque_canvas(self) -> None:
+        self.mount([])
+        themes = self.gui_dir / "themes"
+        themes.mkdir(mode=0o700)
+        os.chmod(themes, 0o700)
+        dusk = {
+            "schema": "gui.theme/1", "name": "dusk", "title": "Dusk",
+            "tokens": {
+                "bg": "#101418", "fg": "#f2f4f7", "muted": "#b8c0cc",
+                "accent": "#7cc4ff", "border": "#3a4450",
+            },
+        }
+        theme_path = themes / "dusk.json"
+        theme_path.write_text(json.dumps(dusk), encoding="utf-8")
+        os.chmod(theme_path, 0o600)
+        selection = self.gui_dir / "selection.json"
+        selection.write_text(json.dumps({"theme": "dusk"}), encoding="utf-8")
+        os.chmod(selection, 0o600)
+        status, _, page = self.home()
+        self.assertEqual(status, "200 OK")
+        self.assertIn('<style id="theme">', page)
+        self.assertIn("--theme-bg:#101418", page)
+        match = re.search(
+            r'section\[aria-label="Visibility"\].*?'
+            r'section\[aria-labelledby="actions-h"\] \*'
+            r'\{color:canvastext;background:([^;}]+)\}',
+            page,
+        )
+        self.assertIsNotNone(match, page)
+        self.assertEqual(match.group(1), "canvas")
+        self.assertNotIn("background:transparent", match.group(0))
+
+    def test_a_lone_surrogate_title_is_refused_and_the_page_stays_default(self) -> None:
+        body = _layout(None)
+        body["title"] = "\ud800"
+        with self.assertRaises(LayoutRefused) as caught:
+            parse_layout(body, known_panels=frozenset())
+        self.assertEqual(caught.exception.reason, "title")
+        emoji = "\U0001f600"
+        kept = _layout(None)
+        kept["title"] = emoji
+        parsed = parse_layout(kept, known_panels=frozenset())
+        self.assertEqual(parsed["title"], emoji)
+        self.mount([])
+        self.write_layout(body)
+        status, _, page = self.home()
+        self.assertEqual(status, "200 OK")
+        self.assertNotIn("data-column=", page)
+
+    def test_later_columns_start_on_the_first_row(self) -> None:
+        self.mount([])
+        document = json.loads((FIXTURES / "good" / "h01-two-columns.json").read_text(encoding="utf-8"))
+        self.write_layout(document)
+        status, _, page = self.home()
+        self.assertEqual(status, "200 OK")
+        style = re.search(r"<style>(.*?)</style>", page, re.S).group(1)
+        self.assertIn(
+            ".layout{display:grid;grid-auto-flow:dense;grid-template-columns:minmax(0,1fr)}",
+            style,
+        )
+        narrow = style.split(NARROW, 1)[1]
+        self.assertIn("grid-column:auto", narrow)
+        interventions = element_at(page, 'data-panel="interventions"')
+        self.assertIn('data-column="2"', interventions)
+
+    def test_a_symlink_layout_is_not_applied(self) -> None:
+        self.mount([{"id": "fixture.panel", "title": "Fixture panel", "reads": [READS[0]]}])
+        outside = self.tmp / "real-layout.json"
+        outside.write_text(
+            json.dumps(_layout("fixture.panel", columns=2, column=2)), encoding="utf-8")
+        os.chmod(outside, 0o600)
+        os.symlink(outside, self.layout_path)
+        self.assertIsNone(load_user_layout(frozenset({"fixture.panel"})))
+        status, _, page = self.home()
+        self.assertEqual(status, "200 OK")
+        self.assertNotIn("data-column=", page)
+
+    def test_h01_draws_the_three_core_views_without_an_operator_read(self) -> None:
+        self.mount([])
+        document = json.loads((FIXTURES / "good" / "h01-two-columns.json").read_text(encoding="utf-8"))
+        self.write_layout(document)
+        self.api.calls.clear()
+        status, _, page = self.home()
+        self.assertEqual(status, "200 OK")
+        self.assertIn("Routes from the control API", page)
+        self.assertIn('id="reads-h"', page)
+        self.assertIn("I confirm this request", page)
+        self.assertEqual([call for call in self.api.calls if call[1] == "/v1/operator"], [])
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "the daemon entry point is Linux-only")

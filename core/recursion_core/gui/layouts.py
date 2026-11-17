@@ -69,6 +69,8 @@ def parse_layout(data, *, known_panels) -> Mapping:
         raise LayoutRefused("name")
     if type(title) is not str or not 1 <= len(title) <= 100 or not title.strip():
         raise LayoutRefused("title")
+    if any(0xD800 <= ord(ch) <= 0xDFFF for ch in title):
+        raise LayoutRefused("title")
     if type(columns) is not int or not 1 <= columns <= 3:
         raise LayoutRefused("columns")
     if type(slots) is not list:

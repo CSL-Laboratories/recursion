@@ -62,7 +62,7 @@ _CSS = ("body{font:16px/1.5 system-ui,sans-serif;margin:0 auto;max-width:72rem;p
         "pre{white-space:pre-wrap;overflow-wrap:anywhere}"
         "table{display:block;overflow-x:auto}"
         "summary{min-height:24px;min-inline-size:24px}"
-        ".layout{display:grid;grid-template-columns:minmax(0,1fr)}"
+        ".layout{display:grid;grid-auto-flow:dense;grid-template-columns:minmax(0,1fr)}"
         ".cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}"
         ".cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}"
         ".slot{min-inline-size:0;padding:.5rem}"

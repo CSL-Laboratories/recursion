@@ -4,6 +4,14 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `install.v1.json` is `1.0-draft.3` (Nov 17, 2026)
+
+A grant may name `developer_key_id` as null or as a key id (`ed25519:` and 32 lower-case hex digits). Draft 2
+allowed the member and the reader refused it as an unknown grant field, so a file of the schema was not read.
+The reader now takes that shape and refuses any other. What it breaks: a `developer_key_id` that is not null
+and not a key id. A file that omits the member is unchanged. No rule here ties `developer_key_id` to
+`signer_key_id`. The reader checks the shape and does not store the id on the grant.
+
 ## `revoked-keys.v1.json` is `1.0-draft.2` (Nov 15, 2026)
 
 Its `timestamp` (a list's `issued_at` and `expires_at`, and each key's `revoked_at`) is now the control

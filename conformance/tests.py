@@ -1574,8 +1574,8 @@ def _add_vector_tests():
 _add_vector_tests()
 
 
-# ed25519: and 32 lower-case hex digits. Made up: no manifest in this folder pairs plugin id
-# paper-desk with a developer key, so the owner keeps this id in step with that manifest.
+# ed25519: and 32 lower-case hex digits. A shape only. The good sample names null: no manifest in this
+# folder pairs plugin id paper-desk with a developer key.
 _DEVELOPER_KEY_ID = "ed25519:a1b2c3d4e5f60718293a4b5c6d7e8f90"
 
 
@@ -1598,12 +1598,26 @@ class InstallGrantDeveloperKeyTest(unittest.TestCase):
         self.assertEqual(self.errors_for(_DEVELOPER_KEY_ID), [])
         self.assertEqual(self.errors_for(None), [])
 
+    def test_the_schema_is_draft_3_and_the_good_sample_names_no_invented_key(self):
+        """Draft 2 let the member in and did not bump. The published good sample must not rest on an id
+        no manifest in this folder pairs with paper-desk."""
+        folder = client.REPO / "schemas" / "plugin" / "v1"
+        schema = client.read_json(folder / "install.v1.json")
+        self.assertEqual(schema["x-version"], "1.0-draft.3")
+        self.assertIn("developer_key_id", schema["description"])
+        self.assertNotIn("with nothing added", schema["description"])
+        self.assertIsNone(self.base["grants"][0]["developer_key_id"])
+
     def test_a_malformed_developer_key_id_is_refused(self):
         malformed = (
             "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",  # 64 hex, not a key id
             "ed25519:A1B2C3D4E5F60718293A4B5C6D7E8F90",  # upper case
             "ed25519:a1b2c3d4e5f60718293a4b5c6d7e8f9",  # 31 hex digits
             "ed25519:a1b2c3d4e5f60718293a4b5c6d7e8f901",  # 33 hex digits
+            _DEVELOPER_KEY_ID + "\n",  # trailing newline: pattern $ matches before it; the not-guard must refuse
+            True,
+            [],
+            "",
             0,
             {"id": _DEVELOPER_KEY_ID},
         )

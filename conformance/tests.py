@@ -213,6 +213,24 @@ class PublishedFilesTest(unittest.TestCase):
             self.assertEqual(len(listed), len(set(listed)), f"{folder}: a fixture is listed twice")
             self.assertEqual(set(listed), client.fixture_files(folder), f"{folder}: index and folders differ")
 
+    def test_each_install_fixture_id_is_listed_once(self):
+        """install.v1 lists each numbered fixture id once. b09 is the developer key; b10 is the label."""
+        folder = client.REPO / "schemas" / "plugin" / "v1"
+        seen = {}
+        for entry in client.load_index(folder):
+            _kind, schema, name = entry["file"].split("/", 2)
+            if schema != "install.v1":
+                continue
+            ident = name.split("-", 1)[0]
+            if len(ident) < 2 or ident[0] not in "bh" or not ident[1:].isdigit():
+                continue
+            self.assertNotIn(ident, seen, f"install.v1 {ident} is {seen.get(ident)} and {entry['file']}")
+            seen[ident] = entry["file"]
+        self.assertEqual(seen.get("b09"),
+                         "bad/install.v1/b09-a-developer-key-that-is-not-a-key-id.json")
+        self.assertEqual(seen.get("b10"),
+                         "bad/install.v1/b10-a-label-the-reader-does-not-know.json")
+
     def test_every_fixture_names_a_schema_that_exists(self):
         for folder, schemas in self.sets.items():
             for entry in client.load_index(folder):
@@ -1598,12 +1616,13 @@ class InstallGrantDeveloperKeyTest(unittest.TestCase):
         self.assertEqual(self.errors_for(_DEVELOPER_KEY_ID), [])
         self.assertEqual(self.errors_for(None), [])
 
-    def test_the_schema_is_draft_3_and_the_good_sample_names_no_invented_key(self):
-        """Draft 2 let the member in and did not bump. The published good sample must not rest on an id
-        no manifest in this folder pairs with paper-desk."""
+    def test_the_schema_is_draft_4_and_the_good_sample_names_no_invented_key(self):
+        """The developer-key member is a bumped draft, not an unbumped draft 2. The label bump
+        lands on that draft, so the published schema is draft 4. The published good sample must
+        not rest on an id no manifest in this folder pairs with paper-desk."""
         folder = client.REPO / "schemas" / "plugin" / "v1"
         schema = client.read_json(folder / "install.v1.json")
-        self.assertEqual(schema["x-version"], "1.0-draft.3")
+        self.assertEqual(schema["x-version"], "1.0-draft.4")
         self.assertIn("developer_key_id", schema["description"])
         self.assertNotIn("with nothing added", schema["description"])
         self.assertIsNone(self.base["grants"][0]["developer_key_id"])

@@ -553,7 +553,7 @@
       }
     },
     {
-      "file": "bad/install.v1/b09-a-label-the-reader-does-not-know.json",
+      "file": "bad/install.v1/b10-a-label-the-reader-does-not-know.json",
       "schema": "install.v1.json",
       "rule": "A registry label is verified or non_verified. Any other value is refused, and the label is not a grant.",
       "expect": {

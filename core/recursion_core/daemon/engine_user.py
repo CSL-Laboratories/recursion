@@ -4,13 +4,16 @@ The engine user gets no linger and no systemd user manager; the operator keeps
 linger. Nothing here enables, disables, masks or starts anything: the probe only
 reads `loginctl`, `systemctl is-active` and the presence of one socket path.
 
-This module does not choose the engine spawn path. B7 (CSL-734) picks it. It only
-provides a guard that refuses launch wrappers that would open a PAM/logind session
-for the engine user and so start `user@<engine uid>.service` again.
+This module does not choose the daemon's spawn path. The recorded path stays the
+same-uid transient unit (SPAWN_PATH). The daemon still refuses RECURSION_ENGINE_USER
+and does not call spawn_as_engine_user: that refusal is the default until a real
+engine user exists. The function drops uid, gid and supplementary groups only when
+the caller injects an id switch; it never calls the operating system's setuid.
+It also refuses launch wrappers that would open a PAM/logind session for the engine
+user and so start `user@<engine uid>.service` again.
 
-Nothing in the daemon calls these yet: the cross-uid path is not implemented and
-`RECURSION_ENGINE_USER` is refused, so the daemon does not enforce engine-manager
-absence today. Same-uid operator runs (`Daemon.start`) are not filtered by them.
+Same-uid operator runs (`Daemon.start`) are not filtered by these guards. The
+daemon does not enforce engine-manager absence today.
 """
 from __future__ import annotations
 
@@ -27,7 +30,9 @@ SPAWN_PATH = {
              "--property=RemainAfterExit=yes -- <argv>"),
     'engine_uid': 'none (RECURSION_ENGINE_USER is refused; Nov 11 is same-uid)',
     'pam_or_logind_session': 'none (no su, runuser, sudo, login or PAMName=)',
-    'cross_uid_owner': 'B7 (CSL-734) picks the cross-uid spawn path; not implemented here',
+    'cross_uid_owner': ('B7 (CSL-734) records the cross-uid spawn; spawn_as_engine_user '
+                        'drops ids only when the caller injects a switch, and the daemon '
+                        'still refuses RECURSION_ENGINE_USER'),
 }
 
 USER = re.compile(r'[a-z_][a-z0-9_-]{0,31}')
@@ -285,4 +290,242 @@ def signin_without_session_bus(engine_env, uid, runtime_root=Path('/run/user')):
         'engines': {name: dict(row, signed_in_run=SIGNED_IN_RUN)
                     for name, row in SIGNIN_STORES.items()},
         'verdict': 'pending',
+    }
+
+
+# Credential-shaped environment names. Matched by a whole '_' segment so a name such as
+# MONKEY is kept and ANTHROPIC_API_KEY is not. The command environment is an allowlist;
+# these names are refused even when the caller copied them into the engine identity.
+_CREDENTIAL_PARTS = frozenset({
+    'KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'PASSWD', 'CREDENTIAL', 'COOKIE',
+})
+_ENGINE_ENV_NAMES = ('PATH', 'LANG', 'LC_ALL', 'TERM', 'TZ', 'TMPDIR')
+
+
+class EngineSpawnRefused(RuntimeError):
+    """The cross-uid spawn did not start the command."""
+
+
+class EngineUserUnconfigured(EngineSpawnRefused):
+    """No engine user is configured. Refusal is the default."""
+
+
+class EngineSwitchFailed(EngineSpawnRefused):
+    """The id switch failed. The command was not started as the owner."""
+
+
+def _credential_name(name):
+    if name in SESSION_BUS_NAMES or name == 'SSH_AUTH_SOCK':
+        return True
+    return any(part in _CREDENTIAL_PARTS for part in name.split('_'))
+
+
+def _positive_id(value, label):
+    """A uid or gid the switch may target. Zero and booleans are refused."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value >= 2**32:
+        raise ValueError(f'{label} must be a positive int (never root)')
+    return value
+
+
+def _group_tuple(value):
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError('engine groups must be a list of positive ints')
+    return tuple(_positive_id(item, 'supplementary group') for item in value)
+
+
+def _parse_identity(identity):
+    if not isinstance(identity, dict):
+        raise ValueError('engine identity must be a mapping')
+    user = identity.get('user')
+    if not isinstance(user, str) or not USER.fullmatch(user):
+        raise ValueError('invalid engine user name')
+    home = identity.get('home')
+    if (not isinstance(home, str) or not home.startswith('/') or home == '/'
+            or home.endswith('/') or '\x00' in home):
+        raise ValueError('engine home must be an absolute directory')
+    environ = identity.get('environ', {})
+    if environ is None:
+        environ = {}
+    if not isinstance(environ, dict):
+        raise ValueError('engine environ must be a mapping')
+    return {
+        'user': user,
+        'uid': _positive_id(identity.get('uid'), 'engine uid'),
+        'gid': _positive_id(identity.get('gid'), 'engine gid'),
+        'groups': _group_tuple(identity.get('groups')),
+        'home': home,
+        'environ': environ,
+    }
+
+
+def _path_inside(path, parent):
+    if not isinstance(path, str) or not isinstance(parent, str) or not parent.startswith('/'):
+        return False
+    root = parent.rstrip('/') or '/'
+    if root == '/':
+        return path.startswith('/')
+    return path == root or path.startswith(root + '/')
+
+
+def _store_mode(value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 0o777:
+        raise ValueError('store mode must be a file mode')
+    return value
+
+
+def _store_readable(store, uid, gid, groups):
+    """Unix read bit for one simulated store. No path is opened."""
+    if not isinstance(store, dict):
+        raise ValueError('store record must be a mapping')
+    mode = _store_mode(store.get('mode'))
+    owner_uid = _positive_id(store.get('owner_uid'), 'store owner uid')
+    owner_gid = _positive_id(store.get('owner_gid'), 'store owner gid')
+    if uid == owner_uid:
+        return bool(mode & 0o400)
+    if gid == owner_gid or owner_gid in groups:
+        return bool(mode & 0o040)
+    return bool(mode & 0o004)
+
+
+def _store_map(stores, uid, gid, groups):
+    if stores is None:
+        return {}
+    if isinstance(stores, (str, bytes)) or not isinstance(stores, (list, tuple)):
+        raise ValueError('stores must be a list of records')
+    reads = {}
+    for store in stores:
+        if not isinstance(store, dict):
+            raise ValueError('store record must be a mapping')
+        path = store.get('path')
+        if not isinstance(path, str) or not path.startswith('/') or '\x00' in path:
+            raise ValueError('store path must be an absolute path')
+        reads[path] = _store_readable(store, uid, gid, groups)
+    return reads
+
+
+def _owner_secrets(owner_env):
+    secrets = set()
+    for name, value in owner_env.items():
+        if isinstance(name, str) and isinstance(value, str) and value and _credential_name(name):
+            secrets.add(value)
+    return secrets
+
+
+def _tainted(value, secrets, owner_home, store_paths):
+    if (not isinstance(value, str) or value == '' or '\x00' in value
+            or '\n' in value or '\r' in value):
+        return True
+    # Exact or embedded. Short values are not scanned, so LANG=C is kept.
+    if any(secret and len(secret) >= 8 and secret in value for secret in secrets):
+        return True
+    if owner_home and _path_inside(value, owner_home):
+        return True
+    return any(path and path in value for path in store_paths)
+
+
+def _engine_environment(identity, owner_env, owner_stores):
+    """Allowlisted engine environment. Owner credential names and values are absent."""
+    owner_env = owner_env or {}
+    source = identity['environ']
+    # Values copied onto the identity under a credential name are secrets too.
+    secrets = _owner_secrets(owner_env) | _owner_secrets(source)
+    owner_home = owner_env.get('HOME') if isinstance(owner_env.get('HOME'), str) else None
+    store_paths = [store.get('path') for store in owner_stores or () if isinstance(store, dict)]
+    env = {
+        'HOME': identity['home'],
+        'USER': identity['user'],
+        'LOGNAME': identity['user'],
+    }
+    for name in _ENGINE_ENV_NAMES:
+        if _credential_name(name):
+            continue
+        value = source.get(name)
+        if _tainted(value, secrets, owner_home, store_paths):
+            continue
+        env[name] = value
+    if 'PATH' not in env:
+        env['PATH'] = '/usr/bin'
+    return env
+
+
+def _read_back(id_switch, uid, gid, groups):
+    try:
+        got_uid = id_switch.getuid()
+        got_gid = id_switch.getgid()
+        got_groups = id_switch.getgroups()
+    except OSError as exc:
+        raise EngineSwitchFailed('uid switch failed; command not started') from exc
+    if isinstance(got_groups, (str, bytes)) or not isinstance(got_groups, (list, tuple)):
+        raise EngineSwitchFailed('uid switch failed; command not started')
+    same_groups = (
+        len(got_groups) == len(groups)
+        and all(not isinstance(item, bool) and isinstance(item, int) for item in got_groups)
+        and set(got_groups) == set(groups))
+    if (isinstance(got_uid, bool) or not isinstance(got_uid, int) or got_uid != uid
+            or isinstance(got_gid, bool) or not isinstance(got_gid, int) or got_gid != gid
+            or not same_groups):
+        raise EngineSwitchFailed('uid switch failed; command not started')
+    return got_uid, got_gid
+
+
+def spawn_as_engine_user(argv, *, identity=None, id_switch=None, start=None,
+                         owner_env=None, owner_uid=None, owner_stores=None,
+                         own_stores=None):
+    """Start argv as the engine user, or refuse without starting it.
+
+    The default is a refusal: no identity, no injected id switch, or no start
+    seam means the command does not run. The daemon does not call this. A real
+    operating-system switch is not armed here; tests pass a simulated switch.
+
+    Supplementary groups are set first, then the gid, then the uid. If any call
+    fails, or the ids read back are not the engine ids, the command is not
+    started and the owner identity is not used as a fallback. The environment
+    passed to start is the engine allowlist, never the owner's credential names.
+    An owner store the engine ids could read also refuses the start.
+    """
+    if identity is None or id_switch is None or start is None:
+        raise EngineUserUnconfigured('no engine user is configured; cross-uid spawn refused')
+    parsed = _parse_identity(identity)
+    # A session launcher is refused before any id call, so su never becomes the switch.
+    refuse_session_launch(argv)
+    if owner_uid is not None and _positive_id(owner_uid, 'owner uid') == parsed['uid']:
+        raise EngineSpawnRefused('engine uid equals the owner uid; command not started')
+    owner_home = None
+    if isinstance(owner_env, dict):
+        home = owner_env.get('HOME')
+        if isinstance(home, str):
+            owner_home = home
+    if owner_home and _path_inside(parsed['home'], owner_home):
+        raise EngineSpawnRefused('engine home is inside the owner home; command not started')
+
+    # setgroups and setgid must run before setuid: afterwards they are refused by the kernel.
+    try:
+        id_switch.setgroups(parsed['groups'])
+    except OSError as exc:
+        raise EngineSwitchFailed('uid switch failed; command not started') from exc
+    try:
+        id_switch.setgid(parsed['gid'])
+    except OSError as exc:
+        raise EngineSwitchFailed('uid switch failed; command not started') from exc
+    try:
+        id_switch.setuid(parsed['uid'])
+    except OSError as exc:
+        raise EngineSwitchFailed('uid switch failed; command not started') from exc
+
+    uid, gid = _read_back(id_switch, parsed['uid'], parsed['gid'], parsed['groups'])
+    env = _engine_environment(parsed, owner_env if isinstance(owner_env, dict) else {},
+                              owner_stores)
+    stores = _store_map(owner_stores, uid, gid, parsed['groups'])
+    if any(stores.values()):
+        raise EngineSpawnRefused('engine identity can read an owner store; command not started')
+    own = _store_map(own_stores, uid, gid, parsed['groups'])
+    creds = (uid, gid, parsed['groups'])
+    start(list(argv), env, creds)
+    return {
+        'uid': uid,
+        'gid': gid,
+        'groups': parsed['groups'],
+        'env': env,
+        'stores': stores,
+        'own_stores': own,
     }

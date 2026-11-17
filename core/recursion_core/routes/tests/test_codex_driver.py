@@ -1,0 +1,1512 @@
+"""The Codex session driver (routes/engines/codex.py) against a stand-in app-server (lane DRIVER-CX).
+
+The stand-in answers each request the driver writes the way codex-cli 0.160.0's protocol says it answers
+(the schema extract in routes/engines/fixtures/codex/), and checks every message in BOTH directions against
+that extract, all the way down (``test_codex_protocol.check_value``: types, enums, unions, required and
+unknown keys, nested members and list items): the driver's requests and its answers to server requests,
+and the stand-in's own notifications, server requests and answers (each answer against the response type
+of the request it answers). A test that feeds the driver a malformed line on purpose wraps it in ``Raw``,
+which alone is not checked. Its lines are synthetic, built from the schema, not captured from a real run:
+the captured fixtures come from Lucas's attended run. No real codex process, credential or network is used.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import threading
+import unittest
+from pathlib import Path
+
+from recursion_core.routes import contract as c
+from recursion_core.routes.codex import CodexAdapter
+from recursion_core.routes.driver import DriverRefused, DriverStateError
+from recursion_core.routes.engines import codex as cx
+from recursion_core.routes.launch import ReadTimeout
+from recursion_core.routes.tests.fakes import FakeClock
+from recursion_core.routes.tests.test_codex_protocol import check_value
+
+FIXTURE = Path(__file__).resolve().parents[1] / "engines" / "fixtures" / "codex" / "app-server-0.160.0.json"
+PROTOCOL = json.loads(FIXTURE.read_text(encoding="utf-8"))
+TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+# The response type of each request the driver makes, and of each server request it answers (0.160.0).
+RESPONSES = {"initialize": "InitializeResponse", "thread/start": "ThreadStartResponse",
+             "thread/resume": "ThreadResumeResponse", "turn/start": "TurnStartResponse",
+             "turn/steer": "TurnSteerResponse", "turn/interrupt": "TurnInterruptResponse",
+             "item/commandExecution/requestApproval": "CommandExecutionRequestApprovalResponse",
+             "item/fileChange/requestApproval": "FileChangeRequestApprovalResponse"}
+
+
+def check_params(table: str, method: str, params) -> None:
+    """A message's params against the recorded protocol, recursively (the #402 read, GPT-6 Astra R5)."""
+
+    assert method in PROTOCOL[table], f"{method} is not in {table}"
+    declared = PROTOCOL[table][method]
+    if declared is None:
+        assert params in (None, {}), (method, params)
+        return
+    check_value(PROTOCOL, declared, {} if params is None else params, f"{method}.params")
+
+
+def check_answer(method: str, msg: dict) -> None:
+    """An answer (to a request of ``method``) against the protocol: a result against the method's response
+    type, an error against JSONRPCErrorError."""
+
+    assert "id" in msg and len({"result", "error"} & set(msg)) == 1, msg
+    if "error" in msg:
+        check_value(PROTOCOL, "ref:JSONRPCErrorError", msg["error"], f"answer/{method}.error")
+    elif method in RESPONSES:
+        check_value(PROTOCOL, f"ref:{RESPONSES[method]}", msg["result"], f"answer/{method}.result")
+
+
+class Raw:
+    """A line the stand-in emits WITHOUT checking it: a test's deliberately malformed input."""
+
+    def __init__(self, msg) -> None:
+        self.msg = msg
+
+
+def turn(tid, status="inProgress", error=None):
+    return {"id": tid, "items": [], "status": status, **({"error": error} if error else {})}
+
+
+def thread(tid):
+    """A complete 0.160.0 ``Thread`` (every required field), as thread/start and thread/resume answer it."""
+
+    return {"id": tid, "cliVersion": "0.160.0", "createdAt": 1_763_200_000, "updatedAt": 1_763_200_000,
+            "cwd": "/w", "ephemeral": False, "modelProvider": "openai", "preview": "", "projectId": None,
+            "sessionId": "codex-session-synthetic", "source": "appServer", "status": {"type": "idle"},
+            "turns": []}
+
+
+class AppServer:
+    """An EngineProcess (routes.launch) that answers like the 0.160.0 app-server. ``script`` maps a turn
+    number to the notifications that follow its ``turn/start`` answer."""
+
+    def __init__(self, threads=("thr-1",), script=None, refuse=(), model="gpt-5.1-codex", silent=False,
+                 silent_turns=False, steer_turn=None):
+        self.threads, self.script, self.refuse, self.model = set(threads), script or {}, dict(refuse), model
+        self.out: list[str] = []
+        self.sent: list[dict] = []
+        self.stdin_closed, self.fenced, self.turns, self.silent = False, [], 0, silent
+        self.silent_turns, self.steer_turn = silent_turns, steer_turn
+        self.requests: dict = {}  # the driver's request id -> its method
+        self.asked: dict = {}     # a server request's id (JSON text) -> its method
+
+    # -- EngineProcess ----------------------------------------------------------------------------
+    def send(self, line: str) -> None:
+        assert not self.stdin_closed, "send after close_stdin"
+        msg = json.loads(line)
+        self.sent.append(msg)
+        method = msg.get("method")
+        if method is None:  # our answer to a server request
+            check_answer(self.asked.get(json.dumps(msg.get("id")), ""), msg)
+            return
+        if "id" not in msg:
+            check_params("client_notifications", method, msg.get("params"))
+            return
+        check_params("client_requests", method, msg.get("params"))
+        self.requests[msg["id"]] = method
+        if self.silent or (self.silent_turns and method == "turn/start"):
+            return
+        if method in self.refuse:
+            # The test's own error, as it gives it (not checked: it may carry codexErrorInfo beside code and
+            # message, outside the schema's ``data``, a place the driver also reads).
+            self.emit(Raw({"id": msg["id"], "error": self.refuse[method]}))
+            return
+        p = msg["params"]
+        if method == "initialize":
+            self.emit({"id": msg["id"], "result": {"userAgent": "fake/0.160.0", "codexHome": "/h/.codex",
+                                                   "platformFamily": "unix", "platformOs": "linux"}})
+        elif method in ("thread/start", "thread/resume"):
+            tid = p.get("threadId", "thr-1")
+            if method == "thread/resume" and tid not in self.threads:
+                self.emit({"id": msg["id"], "error": {"code": -32600, "message": "no rollout found"}})
+                return
+            self.emit({"id": msg["id"], "result": {
+                "thread": thread(tid), "model": self.model, "modelProvider": "openai", "cwd": "/w",
+                "approvalPolicy": "on-request", "approvalsReviewer": "user",
+                "sandbox": {"type": "workspaceWrite"}}})
+        elif method == "turn/start":
+            self.turns += 1
+            tid = f"trn-{self.turns}"
+            self.emit({"id": msg["id"], "result": {"turn": turn(tid)}})
+            self.emit({"method": "turn/started", "params": {"threadId": "thr-1", "turn": turn(tid)}})
+            for note in self.script.get(self.turns, ()):
+                self.emit(note(tid) if callable(note) else note)
+        elif method == "turn/steer":
+            self.emit({"id": msg["id"], "result": {"turnId": self.steer_turn or p["expectedTurnId"]}})
+        elif method == "turn/interrupt":
+            self.emit({"id": msg["id"], "result": {}})
+            self.emit({"method": "turn/completed", "params": {"threadId": "thr-1",
+                                                              "turn": turn(p["turnId"], "interrupted")}})
+
+    def close_stdin(self) -> None:
+        self.stdin_closed = True
+
+    def read_line(self, timeout_s: float):
+        if not self.out:
+            raise ReadTimeout()
+        line = self.out.pop(0)
+        return None if line is EOF else line
+
+    def fence(self, reason: str) -> None:
+        self.fenced.append(reason)
+
+    # -- the stand-in's own output ----------------------------------------------------------------
+    def emit(self, msg) -> None:
+        if msg is EOF:
+            self.out.append(EOF)
+            return
+        if isinstance(msg, Raw):
+            self.out.append(msg.msg if isinstance(msg.msg, str) else json.dumps(msg.msg))
+            return
+        method = msg.get("method")
+        if method is not None:
+            table = "server_requests" if "id" in msg else "server_notifications"
+            check_params(table, method, msg.get("params"))
+            if "id" in msg:
+                self.asked[json.dumps(msg["id"])] = method
+        else:  # an answer to one of the driver's requests
+            check_answer(self.requests.get(msg.get("id"), ""), msg)
+        self.out.append(json.dumps(msg))
+
+
+EOF = object()
+
+
+def agent(text):
+    return lambda tid: {"method": "item/completed", "params": {"threadId": "thr-1", "turnId": tid,
+                                                               "completedAtMs": 1, "item": {
+                                                                   "type": "agentMessage", "id": "i1", "text": text}}}
+
+
+def usage(total, last=None):
+    def note(tid):
+        return {"method": "thread/tokenUsage/updated", "params": {"threadId": "thr-1", "turnId": tid, "tokenUsage": {
+            "total": total, "last": last or total}}}
+    return note
+
+
+def done(status="completed", error=None):
+    return lambda tid: {"method": "turn/completed", "params": {"threadId": "thr-1", "turn": turn(tid, status, error)}}
+
+
+BREAKDOWN = {"inputTokens": 1200, "cachedInputTokens": 1000, "outputTokens": 80, "reasoningOutputTokens": 30,
+             "totalTokens": 1280}
+
+
+class Launcher:
+    def __init__(self, *servers):
+        self.servers, self.calls = list(servers), []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append({"argv": list(argv), **kwargs})
+        return self.servers.pop(0)
+
+
+def record(esid=None, model="gpt-5.1-codex", run_id="run-1"):
+    return {"session_id": "ses-1", "run_id": run_id, "workspace": None, "engine_session_id": esid,
+            "route": {"engine": "codex", "model": model, "connection": {"kind": "subscription", "id": "login-A"}}}
+
+
+def begin(driver, rec, env):
+    """Start or resume through #376's PROVISIONAL call forms (driver.py, 5079080c): ``start(session, workspace,
+    env)`` and ``resume(engine_session_id, session, workspace, env)``. One place to edit if they change again."""
+    session = {key: rec[key] for key in ("session_id", "run_id", "route")}
+    if rec["engine_session_id"] is None:
+        return driver.start(session, rec["workspace"], env)
+    return driver.resume(rec["engine_session_id"], session, rec["workspace"], env)
+
+
+def message(turn_id="turn-1", delivery="dlv-1", text="list the files"):
+    return {"kind": "user_message", "turn_id": turn_id, "text": text, "delivery_id": delivery}
+
+
+class FakeApprovals:
+    """APPROVALS' request(effect, binding) -> approval_id, as its brief publishes it (a fake until it lands)."""
+
+    def __init__(self, fail=False, answer=None):
+        self.requests, self.fail, self.answer = [], fail, answer
+
+    def request(self, effect, binding):
+        if self.fail:
+            raise RuntimeError("the approval store is down")
+        approval_id = self.answer if self.answer is not None else f"apr-{len(self.requests) + 1}"
+        self.requests.append((effect, binding, approval_id))
+        return approval_id
+
+
+class Base(unittest.TestCase):
+    approvals = None
+
+    def open(self, server=None, esid=None, **kw):
+        self.server = server or AppServer(**kw)
+        self.launcher = Launcher(self.server)
+        self.driver = cx.CodexDriver(self.launcher, FakeClock(), approvals=self.approvals,
+                                     wall_clock=lambda: 1_763_200_000.0)
+        self.handle = begin(self.driver, record(esid), {"PATH": "/usr/bin"})
+        return self.handle
+
+    def drain(self):
+        drafts = []
+        while self.server.out:
+            drafts += self.driver.pump(self.handle, 1.0) or []
+        return drafts
+
+    def sent_methods(self):
+        return [m.get("method") for m in self.server.sent]
+
+
+class StartTest(Base):
+    def test_start_runs_initialize_then_thread_start_once_and_sends_no_policy(self):
+        h = self.open()
+        self.assertEqual(self.sent_methods(), ["initialize", "initialized", "thread/start"])
+        self.assertEqual(self.server.sent[2]["params"], {"model": "gpt-5.1-codex"})
+        self.assertEqual(h.engine_session_id, "thr-1")
+        self.assertEqual(self.launcher.calls[0]["argv"], ["codex", "-c", "check_for_update_on_startup=false",
+                                                          "app-server"])
+        self.assertEqual(self.launcher.calls[0]["env"], {"PATH": "/usr/bin"})
+        self.assertEqual(h._codex.effective, {"approvalPolicy": "on-request", "sandbox": {"type": "workspaceWrite"}})
+
+    def test_a_model_left_to_the_engine_is_not_sent(self):
+        server = AppServer()
+        driver = cx.CodexDriver(Launcher(server), FakeClock())
+        begin(driver, record(model=None), {})
+        self.assertEqual(server.sent[2]["params"], {})
+
+    def test_eof_during_start_is_engine_exited_and_fences(self):
+        server = AppServer(silent=True)
+        server.out.append(EOF)
+        with self.assertRaises(c.RouteError) as cm:
+            begin(cx.CodexDriver(Launcher(server), FakeClock()), record(), {})
+        self.assertEqual(cm.exception.code, c.ENGINE_EXITED)
+        self.assertEqual((server.stdin_closed, server.fenced), (True, ["start_refused"]))
+
+    def test_a_typed_refusal_of_the_start_keeps_its_type(self):
+        for info, code in (("unauthorized", c.AUTH_FAILED), ("usageLimitExceeded", c.PLAN_LIMIT)):
+            with self.subTest(info=info):
+                server = AppServer(refuse={"thread/start": {"code": -32000, "message": "x",
+                                                            "data": {"codexErrorInfo": info}}})
+                with self.assertRaises(c.RouteError) as cm:
+                    begin(cx.CodexDriver(Launcher(server), FakeClock()), record(), {})
+                self.assertEqual(cm.exception.code, code)
+                self.assertTrue(server.stdin_closed)
+
+
+class ResumeTest(Base):
+    def test_a_stored_thread_id_sends_thread_resume_not_thread_start(self):
+        h = self.open(esid="thr-1")
+        self.assertEqual(self.sent_methods(), ["initialize", "initialized", "thread/resume"])
+        self.assertEqual(self.server.sent[2]["params"], {"threadId": "thr-1", "model": "gpt-5.1-codex"})
+        self.assertEqual(h.engine_session_id, "thr-1")
+
+    def test_an_unknown_id_refuses_cleanly(self):
+        server = AppServer(threads=())
+        with self.assertRaises(c.RouteError) as cm:
+            begin(cx.CodexDriver(Launcher(server), FakeClock()), record("thr-gone"), {})
+        self.assertEqual(cm.exception.code, c.REQUEST_INVALID)
+        self.assertEqual([m.get("method") for m in server.sent], ["initialize", "initialized", "thread/resume"])
+        self.assertEqual((server.stdin_closed, server.fenced), (True, ["start_refused"]))
+
+    def test_a_thread_another_worker_writes_refuses_cleanly(self):
+        busy = {"code": -32600, "message": "thread thr-1 already has an active writer"}
+        server = AppServer(refuse={"thread/resume": busy})
+        with self.assertRaises(c.RouteError) as cm:
+            begin(cx.CodexDriver(Launcher(server), FakeClock()), record("thr-1"), {})
+        self.assertEqual(cm.exception.code, c.REQUEST_INVALID)
+
+    def test_an_answer_naming_another_thread_is_a_protocol_error(self):
+        server = AppServer(threads=("thr-1", "thr-2"))
+        driver = cx.CodexDriver(Launcher(server), FakeClock())
+        orig = server.send
+
+        def send(line):
+            msg = json.loads(line)
+            if msg.get("method") == "thread/resume":
+                msg["params"]["threadId"] = "thr-2"  # the stand-in answers for another thread
+                line = json.dumps(msg)
+            orig(line)
+        server.send = send
+        with self.assertRaises(c.RouteError) as cm:
+            begin(driver, record("thr-1"), {})
+        self.assertEqual(cm.exception.code, c.PROTOCOL_ERROR)
+
+
+class TwoTurnsTest(Base):
+    def test_two_turns_on_one_thread_in_one_worker_with_input_open_between(self):
+        self.open(script={1: [agent("three files"), usage(BREAKDOWN), done()],
+                          2: [agent("3"), done()]})
+        self.driver.send(self.handle, message())
+        first = self.drain()
+        self.assertEqual([d["type"] for d in first], ["input.accepted", "engine.output", "usage", "result"])
+        self.assertEqual(first[0]["payload"], {"delivery_id": "dlv-1", "turn_id": "turn-1", "how": "new_turn"})
+        self.assertEqual(first[1]["payload"]["text"], "three files")
+        self.assertEqual(first[3]["payload"], {"code": None, "detail": ""})
+        self.assertFalse(self.server.stdin_closed)
+        self.assertIsNone(self.handle.live_turn)
+        self.driver.send(self.handle, message("turn-2", "dlv-2", "count them"))
+        second = self.drain()
+        self.assertEqual(second[0]["payload"], {"delivery_id": "dlv-2", "turn_id": "turn-2", "how": "new_turn"})
+        starts = [m for m in self.server.sent if m.get("method") == "turn/start"]
+        self.assertEqual([s["params"]["threadId"] for s in starts], ["thr-1", "thr-1"])
+        self.assertEqual([s["params"]["clientUserMessageId"] for s in starts], ["dlv-1", "dlv-2"])
+        self.assertEqual(self.sent_methods().count("thread/start"), 1)
+        self.assertEqual(len(self.launcher.calls), 1)  # no process but the one app-server
+
+    def test_close_closes_input_and_nothing_is_written_after(self):
+        self.open()
+        self.driver.send(self.handle, {"kind": "close"})
+        self.assertTrue(self.server.stdin_closed)
+        with self.assertRaises(DriverStateError):
+            self.driver.send(self.handle, message())
+
+    def test_engine_output_spans_are_byte_offsets_of_the_output(self):
+        self.open(script={1: [agent("a\u00e9"), done()]})
+        before = self.handle._codex.offset
+        self.driver.send(self.handle, message())
+        lines = list(self.server.out)
+        drafts = self.drain()
+        out = next(d for d in drafts if d["type"] == "engine.output")["payload"]
+        sizes = [len(x.encode("utf-8")) + 1 for x in lines]
+        self.assertEqual(out["offset_start"], before + sum(sizes[:2]))
+        self.assertEqual(out["offset_end"], before + sum(sizes[:3]))
+
+
+class AcceptanceTest(Base):
+    def test_no_acceptance_for_a_message_the_server_refused(self):
+        refused = {"code": -32000, "message": "x", "data": {"codexErrorInfo": "badRequest"}}
+        self.open(refuse={"turn/start": refused})
+        self.driver.send(self.handle, message())
+        drafts = self.drain()
+        self.assertEqual([d["type"] for d in drafts], ["result"])
+        self.assertEqual(drafts[0]["payload"]["code"], c.ENGINE_ERROR)
+        self.assertIsNone(self.handle.live_turn)
+
+    def test_notifications_and_stray_answers_never_accept(self):
+        self.open(silent_turns=True)
+        self.driver.send(self.handle, message())
+        self.server.emit({"method": "turn/started", "params": {"threadId": "thr-1", "turn": turn("trn-9")}})
+        self.server.emit({"id": 99, "result": {"turn": turn("trn-9")}})        # no request of ours
+        self.server.emit({"method": "item/completed", "params": {"threadId": "thr-1", "turnId": "trn-9",
+                                                                 "completedAtMs": 1, "item": {
+                                                                     "type": "userMessage", "id": "u",
+                                                                     "content": [], "clientId": "dlv-1"}}})
+        self.assertEqual([d["type"] for d in self.drain()], [])
+
+    def test_a_turn_refused_on_a_typed_limit_drafts_the_limit(self):
+        self.open(refuse={"turn/start": {"code": -32000, "message": "x",
+                                         "data": {"codexErrorInfo": "usageLimitExceeded"}}})
+        self.driver.send(self.handle, message())
+        self.assertEqual([d["type"] for d in self.drain()], ["limit", "result"])
+
+
+class MidTurnTest(Base):
+    def test_a_steer_is_turn_steer_and_its_typed_answer_accepts_mid_turn(self):
+        self.open()
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.driver.send(self.handle, message("turn-1", "dlv-2", "also count them"))
+        steer = self.server.sent[-1]
+        self.assertEqual(steer["method"], "turn/steer")
+        self.assertEqual(steer["params"], {"threadId": "thr-1", "expectedTurnId": "trn-1",
+                                           "input": [{"type": "text", "text": "also count them"}],
+                                           "clientUserMessageId": "dlv-2"})
+        self.assertEqual(self.drain(), [{"type": "input.accepted", "payload": {
+            "delivery_id": "dlv-2", "turn_id": "turn-1", "how": "mid_turn"}}])
+
+    def test_a_steer_before_the_engine_named_the_turn_is_held_then_written(self):
+        self.open()
+        self.driver.send(self.handle, message())
+        self.driver.send(self.handle, message("turn-1", "dlv-2", "more"))  # turn/start not answered yet
+        self.assertEqual(self.sent_methods()[-1], "turn/start")
+        drafts = self.drain()
+        self.assertEqual(self.sent_methods()[-1], "turn/steer")
+        self.assertEqual(self.server.sent[-1]["params"]["expectedTurnId"], "trn-1")
+        drafts += self.drain()
+        self.assertEqual([(d["payload"]["delivery_id"], d["payload"]["how"]) for d in drafts
+                          if d["type"] == "input.accepted"], [("dlv-1", "new_turn"), ("dlv-2", "mid_turn")])
+
+    def test_a_refused_steer_is_not_accepted(self):
+        self.open(refuse={"turn/steer": {"code": -32000, "message": "x",
+                                         "data": {"codexErrorInfo": {"activeTurnNotSteerable": {}}}}})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.driver.send(self.handle, message("turn-1", "dlv-2", "more"))
+        self.assertEqual(self.drain(), [])
+        self.assertEqual(self.handle.live_turn, "turn-1")
+
+    def test_a_steer_answer_naming_another_turn_is_not_an_acceptance(self):
+        self.open(steer_turn="trn-other")
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.driver.send(self.handle, message("turn-1", "dlv-2", "more"))
+        self.assertEqual(self.drain(), [])
+
+    def test_the_declaration_says_the_engine_acknowledges_mid_turn_input(self):
+        self.assertEqual(cx.DECLARATION.as_record(), {"engine": "codex", "driver": 2, "input_ack": True, "flags": {
+            "multi_turn": True, "mid_turn_input": True, "interrupt": True, "resume": True, "fork": False,
+            "permission_bridge": False, "typed_limits": True, "usage": True}})
+
+
+def item_note(method, item):
+    def note(tid):
+        params = {"threadId": "thr-1", "turnId": tid, "item": item}
+        params["startedAtMs" if method == "item/started" else "completedAtMs"] = 1
+        return {"method": method, "params": params}
+    return note
+
+
+def plain_digest(value):
+    """RFC 8785 text of a value made only of ASCII strings, lists and objects: sorted keys, no spaces."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+class ToolDraftTest(Base):
+    def drafts_of(self, notes):
+        self.open(script={1: [*notes, done()]})
+        self.driver.send(self.handle, message())
+        return [d for d in self.drain() if d["type"] in ("tool.call", "tool.result")]
+
+    def command(self, status, output="a\nb"):
+        return {"type": "commandExecution", "id": "it-1", "command": "ls", "commandActions": [], "cwd": "/w",
+                "status": status, **({"aggregatedOutput": output} if status != "inProgress" else {})}
+
+    def test_a_command_is_a_call_and_its_completion_the_result(self):
+        drafts = self.drafts_of([item_note("item/started", self.command("inProgress")),
+                                 item_note("item/completed", self.command("completed"))])
+        tool_input = {"command": "ls", "cwd": "/w"}
+        self.assertEqual(drafts, [
+            {"type": "tool.call", "payload": {"call_id": "it-1", "name": "commandExecution",
+                                              "input_digest": plain_digest(tool_input), "input": tool_input}},
+            {"type": "tool.result", "payload": {"call_id": "it-1", "status": "ok", "text": "a\nb",
+                                                "output_ref": None, "truncated": False}}])
+
+    def test_statuses(self):
+        for status, word in (("failed", "error"), ("declined", "denied")):
+            with self.subTest(status=status):
+                drafts = self.drafts_of([item_note("item/started", self.command("inProgress")),
+                                         item_note("item/completed", self.command(status, ""))])
+                self.assertEqual(drafts[-1]["payload"]["status"], word)
+
+    def test_file_changes_and_mcp_tools(self):
+        changes = [{"path": "/w/a.txt", "kind": {"type": "add"}, "diff": "x"}]
+        patch_item = {"type": "fileChange", "id": "it-2", "changes": changes, "status": "inProgress"}
+        mcp = {"type": "mcpToolCall", "id": "it-3", "server": "docs", "tool": "search", "status": "inProgress",
+               "arguments": {"q": "codex"}}
+        drafts = self.drafts_of([item_note("item/started", patch_item), item_note("item/started", mcp),
+                                 item_note("item/completed", dict(mcp, status="failed", error={"message": "down"}))])
+        self.assertEqual([(d["payload"]["call_id"], d["payload"].get("name")) for d in drafts],
+                         [("it-2", "fileChange"), ("it-3", "docs/search"), ("it-3", None)])
+        self.assertEqual(drafts[0]["payload"]["input"], {"changes": changes})
+        self.assertEqual(drafts[1]["payload"]["input_digest"], plain_digest({"q": "codex"}))
+        self.assertEqual((drafts[2]["payload"]["status"], drafts[2]["payload"]["text"]), ("error", "down"))
+
+    def test_a_completion_without_its_announcement_still_gives_the_call_first(self):
+        drafts = self.drafts_of([item_note("item/completed", self.command("completed"))])
+        self.assertEqual([d["type"] for d in drafts], ["tool.call", "tool.result"])
+
+    def test_large_input_and_output_are_cut_and_said_so(self):
+        big = "x" * (cx.CARRY_LIMIT + 10)
+        item = dict(self.command("inProgress"), command=big)
+        drafts = self.drafts_of([item_note("item/started", item),
+                                 item_note("item/completed", dict(item, status="completed", aggregatedOutput=big))])
+        self.assertIsNone(drafts[0]["payload"]["input"])
+        self.assertEqual(drafts[0]["payload"]["input_digest"], plain_digest({"command": big, "cwd": "/w"}))
+        self.assertEqual((len(drafts[1]["payload"]["text"]), drafts[1]["payload"]["truncated"]), (cx.CARRY_LIMIT, True))
+
+    def test_a_call_is_drafted_once_and_an_unfinished_one_has_no_result(self):
+        started = item_note("item/started", self.command("inProgress"))
+        drafts = self.drafts_of([started, started, item_note("item/completed", self.command("inProgress"))])
+        self.assertEqual([d["type"] for d in drafts], ["tool.call"])
+
+
+class OtherThreadTest(Base):
+    def test_notifications_about_another_thread_are_not_this_workers(self):
+        def other(note):
+            def build(tid):
+                msg = note(tid)
+                msg["params"]["threadId"] = "thr-other"
+                return msg
+            return build
+        self.open(script={1: [other(agent("not mine")), other(done()), agent("mine"), done()]})
+        self.driver.send(self.handle, message())
+        drafts = self.drain()
+        self.assertEqual([d["payload"]["text"] for d in drafts if d["type"] == "engine.output"], ["mine"])
+        self.assertEqual([d["type"] for d in drafts].count("result"), 1)
+
+
+class InterruptTest(Base):
+    def test_interrupt_is_the_protocols_own_and_ends_the_turn(self):
+        self.open()
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.driver.interrupt(self.handle, "turn-1")
+        self.assertEqual(self.server.sent[-1]["method"], "turn/interrupt")
+        self.assertEqual(self.server.sent[-1]["params"], {"threadId": "thr-1", "turnId": "trn-1"})
+        drafts = self.drain()
+        self.assertEqual(drafts[-1]["payload"]["code"], "interrupted")
+        self.assertIsNone(self.handle.live_turn)
+        self.assertFalse(self.server.stdin_closed)
+
+    def test_an_interrupt_before_the_engine_named_the_turn_is_held(self):
+        self.open()
+        self.driver.send(self.handle, message())
+        self.driver.interrupt(self.handle, "turn-1")
+        self.assertNotIn("turn/interrupt", self.sent_methods())
+        self.drain()
+        self.assertIn("turn/interrupt", self.sent_methods())
+
+
+class UsageTest(Base):
+    def usage_of(self, notes):
+        self.open(script={1: [*notes, done()]})
+        self.driver.send(self.handle, message())
+        return next(d for d in self.drain() if d["type"] == "usage")["payload"]
+
+    def test_observed_counts_and_unknown_cost_and_cache_writes(self):
+        p = self.usage_of([usage(BREAKDOWN)])
+        self.assertEqual(p["span"], "session_total")
+        self.assertEqual(p["connection_id"], "subscription:login-A")
+        self.assertEqual(p["model"], "gpt-5.1-codex")
+        self.assertEqual(p["input_tokens"], {"value": 1200, "quality": "known", "provenance": "observed"})
+        self.assertEqual(p["cache_read_tokens"]["value"], 1000)
+        self.assertEqual(p["reasoning_tokens"]["value"], 30)
+        unknown = {"value": None, "quality": "unknown", "provenance": "unavailable"}
+        self.assertEqual(p["cache_write_tokens"], unknown)
+        self.assertEqual(p["cost_usd"], unknown)
+
+    def test_no_usage_notice_gives_every_count_unknown_never_zero(self):
+        p = self.usage_of([])
+        self.assertEqual(p["span"], "turn")
+        for name in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_write_tokens"):
+            self.assertEqual(p[name], {"value": None, "quality": "unknown", "provenance": "unavailable"})
+
+    def test_the_last_notice_of_the_turn_counts_and_a_rerouted_model_is_named(self):
+        later = dict(BREAKDOWN, inputTokens=2000)
+        reroute = lambda tid: {"method": "model/rerouted", "params": {  # noqa: E731
+            "threadId": "thr-1", "turnId": tid, "fromModel": "gpt-5.1-codex", "toModel": "gpt-5.1-codex-mini",
+            "reason": "highRiskCyberActivity"}}
+        p = self.usage_of([usage(BREAKDOWN), reroute, usage(later)])
+        self.assertEqual(p["input_tokens"]["value"], 2000)
+        self.assertEqual(p["model"], "gpt-5.1-codex-mini")
+
+    def test_one_usage_event_per_turn(self):
+        self.open(script={1: [usage(BREAKDOWN), usage(BREAKDOWN), done()], 2: [done()]})
+        for n in (1, 2):
+            self.driver.send(self.handle, message(f"turn-{n}", f"dlv-{n}"))
+            self.assertEqual([d["type"] for d in self.drain()].count("usage"), 1)
+
+
+class LimitTest(Base):
+    def window(self, limit_id="codex", used=100, resets=1_763_200_000):
+        snap = {"limitId": limit_id, "primary": {"usedPercent": used, "resetsAt": resets}}
+        return lambda tid: {"method": "account/rateLimits/updated", "params": {"rateLimits": snap}}
+
+    def test_an_exhausted_window_fences_the_connection_and_names_its_bucket(self):
+        for bucket in ("codex", "codex_gpt5_weekly"):
+            with self.subTest(bucket=bucket):
+                self.open(script={1: [self.window(bucket), done()]})
+                self.driver.send(self.handle, message())
+                limit = next(d for d in self.drain() if d["type"] == "limit")["payload"]
+                self.assertEqual((limit["scope"], limit["model"], limit["bucket"], limit["kind"]),
+                                 ("connection", None, bucket, "plan_limit"))
+                self.assertEqual(limit["reset_at"], "2025-11-15T09:46:40.000Z")
+                self.assertTrue(TIMESTAMP.match(limit["reset_at"]))
+
+    def test_a_window_below_100_drafts_nothing(self):
+        self.open(script={1: [self.window(used=99), done()]})
+        self.driver.send(self.handle, message())
+        self.assertNotIn("limit", [d["type"] for d in self.drain()])
+
+    def test_a_typed_usage_limit_fails_the_turn_as_plan_limit(self):
+        err = {"message": "You've hit your usage limit.", "codexErrorInfo": "usageLimitExceeded"}
+        retry = lambda tid: {"method": "error", "params": {"threadId": "thr-1", "turnId": tid,  # noqa: E731
+                                                           "willRetry": True, "error": {"message": "reconnecting"}}}
+        self.open(script={1: [retry, self.window(), done("failed", err)]})
+        self.driver.send(self.handle, message())
+        drafts = self.drain()
+        self.assertEqual([d["type"] for d in drafts], ["input.accepted", "limit", "usage", "limit", "result"])
+        self.assertEqual(drafts[-1]["payload"], {"code": c.PLAN_LIMIT, "detail": "the turn failed"})
+        self.assertNotIn("usage limit", json.dumps(drafts))
+
+    def test_an_untyped_failure_after_an_exhausted_window_in_that_turn_is_the_limit(self):
+        self.open(script={1: [self.window(), done("failed", {"message": "upstream error"})], 2: [
+            done("failed", {"message": "upstream error"})]})
+        self.driver.send(self.handle, message())
+        self.assertEqual(self.drain()[-1]["payload"]["code"], c.PLAN_LIMIT)
+        self.driver.send(self.handle, message("turn-2", "dlv-2"))
+        self.assertEqual(self.drain()[-1]["payload"]["code"], c.ENGINE_ERROR)  # the window was the last turn's
+
+    def test_a_retried_error_notice_is_not_an_outcome(self):
+        retry = lambda tid: {"method": "error", "params": {"threadId": "thr-1", "turnId": tid,  # noqa: E731
+                                                           "willRetry": True, "error": {
+                                                               "message": "x", "codexErrorInfo": "usageLimitExceeded"}}}
+        self.open(script={1: [retry, done("failed", {"message": "upstream error"})], 2: [retry, done()]})
+        self.driver.send(self.handle, message())
+        drafts = self.drain()
+        self.assertEqual(drafts[-1]["payload"]["code"], c.ENGINE_ERROR)
+        self.assertNotIn("limit", [d["type"] for d in drafts])
+        self.driver.send(self.handle, message("turn-2", "dlv-2"))
+        self.assertEqual(self.drain()[-1]["payload"], {"code": None, "detail": ""})
+
+    def test_typed_auth_and_untyped_quota_text(self):
+        cases = (({"message": "x", "codexErrorInfo": "unauthorized"}, c.AUTH_FAILED),
+                 ({"message": "rate limit exceeded upstream"}, c.SHORT_FAULT),
+                 ({"message": "boom", "codexErrorInfo": {"responseStreamDisconnected": {}}}, c.ENGINE_ERROR))
+        for err, code in cases:
+            with self.subTest(err=err):
+                self.open(script={1: [done("failed", err)]})
+                self.driver.send(self.handle, message())
+                self.assertEqual(self.drain()[-1]["payload"]["code"], code)
+
+
+class ServerRequestTest(Base):
+    def test_an_approval_is_declined_on_its_own_id_and_never_refused_unsupported(self):
+        for method in cx.APPROVAL_REQUESTS:
+            with self.subTest(method=method):
+                ask = lambda tid, m=method: {"id": 77, "method": m, "params": {  # noqa: E731
+                    "threadId": "thr-1", "turnId": tid, "itemId": "it-1", "startedAtMs": 1}}
+                self.open(script={1: [ask, done()]})
+                self.driver.send(self.handle, message())
+                self.drain()
+                answers = [m for m in self.server.sent if m.get("id") == 77 and "method" not in m]
+                self.assertEqual(answers, [{"id": 77, "result": {"decision": "decline"}}])
+
+    def test_other_server_requests_are_refused_unsupported(self):
+        ask = {"id": "q", "method": "item/tool/requestUserInput", "params": {
+            "threadId": "thr-1", "turnId": "trn-1", "itemId": "it", "questions": [], "isBlocking": True}}
+        self.open(script={1: [ask, done()]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.assertIn({"id": "q", "error": {"code": -32601, "message": "unsupported"}}, self.server.sent)
+
+    def test_an_approval_answer_is_refused_until_the_bridge_exists(self):
+        self.open()
+        with self.assertRaises(DriverRefused):
+            self.driver.send(self.handle, {"kind": "approval_answer", "approval_id": "apr-1", "decision": "approve"})
+
+
+SCHEMAS = Path(__file__).resolve().parents[4] / "schemas" / "control" / "v1"
+
+
+def ask_command(rid=77, command="ls", item="it-1"):
+    def note(tid):
+        return {"id": rid, "method": "item/commandExecution/requestApproval", "params": {
+            "threadId": "thr-1", "turnId": tid, "itemId": item, "startedAtMs": 1, "command": command, "cwd": "/w",
+            "reason": "list the files"}}
+    return note
+
+
+def answers(server, rid):
+    return [m for m in server.sent if m.get("id") == rid and "method" not in m]
+
+
+class ApprovalBridgeTest(Base):
+    def setUp(self):
+        self.approvals = FakeApprovals()
+
+    def approve(self, approval_id, decision="approve"):
+        self.driver.send(self.handle, {"kind": "approval_answer", "approval_id": approval_id, "decision": decision})
+
+    def test_the_bridge_is_declared_only_with_a_port(self):
+        self.assertTrue(cx.CodexDriver(Launcher(), FakeClock(), approvals=FakeApprovals()).declaration.flags
+                        .permission_bridge)
+        self.assertFalse(cx.CodexDriver(Launcher(), FakeClock()).declaration.flags.permission_bridge)
+
+    def test_an_approval_request_becomes_one_approval_and_waits_for_the_queue(self):
+        self.open(script={1: [ask_command()]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.assertEqual(len(self.approvals.requests), 1)
+        effect, binding, approval_id = self.approvals.requests[0]
+        self.assertEqual(effect, {"kind": "engine_tool", "engine": "codex", "session_id": "ses-1", "run_id": "run-1",
+                                  "tool": "commandExecution", "cwd": "/w",
+                                  "input": {"command": "ls", "cwd": "/w", "reason": "list the files"}})
+        self.assertEqual(binding, {"run_id": "run-1", "engine": "codex", "engine_request_id": "77",
+                                   "bound_at": "2025-11-15T09:46:40.000Z"})
+        self.assertEqual(answers(self.server, 77), [])  # nothing until the queue answers
+        self.approve(approval_id)
+        self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "accept"}}])
+
+    def test_a_deny_is_the_protocols_decline(self):
+        self.open(script={1: [ask_command()]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.approve("apr-1", "deny")
+        self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+
+    def test_an_answer_is_written_once_and_only_for_a_request_waiting(self):
+        self.open(script={1: [ask_command()]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.approve("apr-1")
+        for approval_id in ("apr-1", "apr-9"):
+            with self.subTest(approval_id=approval_id):
+                with self.assertRaises(DriverStateError):
+                    self.approve(approval_id)
+        self.assertEqual(len(answers(self.server, 77)), 1)
+
+    def test_two_approvals_in_flight_reach_their_own_requests(self):
+        self.open(script={1: [ask_command(70, "ls", "it-1"), ask_command("r-71", "rm x", "it-2")]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.approve("apr-2", "deny")
+        self.approve("apr-1")
+        self.assertEqual(answers(self.server, "r-71"), [{"id": "r-71", "result": {"decision": "decline"}}])
+        self.assertEqual(answers(self.server, 70), [{"id": 70, "result": {"decision": "accept"}}])
+        self.assertEqual(self.approvals.requests[1][1]["engine_request_id"], '"r-71"')
+
+    def test_a_file_change_carries_the_changes_the_server_announced(self):
+        changes = [{"path": "/w/new.txt", "kind": {"type": "add"}, "diff": "hello\n"}]
+        started = lambda tid: {"method": "item/started", "params": {  # noqa: E731
+            "threadId": "thr-1", "turnId": tid, "startedAtMs": 1, "item": {
+                "type": "fileChange", "id": "it-5", "changes": changes, "status": "inProgress"}}}
+        ask = lambda tid: {"id": 80, "method": "item/fileChange/requestApproval", "params": {  # noqa: E731
+            "threadId": "thr-1", "turnId": tid, "itemId": "it-5", "startedAtMs": 1, "reason": None}}
+        self.open(script={1: [started, ask]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        effect = self.approvals.requests[0][0]
+        self.assertEqual((effect["tool"], effect["cwd"], effect["input"]["changes"]), ("fileChange", None, changes))
+
+    def test_after_the_server_resolved_the_request_nothing_is_written(self):
+        resolved = {"method": "serverRequest/resolved", "params": {"threadId": "thr-1", "requestId": 77}}
+        self.open(script={1: [ask_command(), resolved]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        with self.assertRaises(DriverStateError):
+            self.approve("apr-1")
+        self.assertEqual(answers(self.server, 77), [])
+
+    def test_after_the_turn_ended_nothing_is_written(self):
+        self.open(script={1: [ask_command(), done()]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        with self.assertRaises(DriverStateError):
+            self.approve("apr-1")
+        self.assertEqual(answers(self.server, 77), [])
+
+    def test_a_port_that_fails_or_gives_no_id_means_decline_at_once(self):
+        for port in (FakeApprovals(fail=True), FakeApprovals(answer=""), FakeApprovals(answer=7)):
+            with self.subTest(port=port.__dict__):
+                self.approvals = port
+                self.open(script={1: [ask_command()]})
+                self.driver.send(self.handle, message())
+                self.drain()
+                self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+
+    def test_a_request_the_driver_cannot_bind_is_declined_without_asking(self):
+        stray = lambda tid: Raw({"id": 90, "method": "item/commandExecution/requestApproval", "params": {  # noqa: E731
+            "threadId": "thr-1", "turnId": tid, "startedAtMs": 1, "itemId": 5}})  # malformed on purpose
+        self.open(script={1: [stray]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.assertEqual(self.approvals.requests, [])
+        self.assertEqual(answers(self.server, 90), [{"id": 90, "result": {"decision": "decline"}}])
+
+    def test_a_request_about_another_thread_is_declined_without_asking(self):
+        # A complete request for the turn in progress: only its thread is wrong.
+        other = lambda tid: {"id": 91, "method": "item/commandExecution/requestApproval", "params": {  # noqa: E731
+            "threadId": "thr-other", "turnId": tid, "startedAtMs": 1, "itemId": "it-1", "command": "ls",
+            "cwd": "/w"}}
+        self.open(script={1: [other]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.assertEqual(self.approvals.requests, [])
+        self.assertEqual(answers(self.server, 91), [{"id": 91, "result": {"decision": "decline"}}])
+
+    def test_an_approval_id_the_port_gives_twice_binds_only_the_first(self):
+        self.approvals = FakeApprovals(answer="apr-x")
+        self.open(script={1: [ask_command(70, "ls", "it-1"), ask_command(71, "rm x", "it-2")]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.assertEqual(answers(self.server, 71), [{"id": 71, "result": {"decision": "decline"}}])
+        self.approve("apr-x")
+        self.assertEqual(answers(self.server, 70), [{"id": 70, "result": {"decision": "accept"}}])
+
+    def test_a_request_without_its_command_shows_the_command_the_server_announced(self):
+        started = lambda tid: {"method": "item/started", "params": {  # noqa: E731
+            "threadId": "thr-1", "turnId": tid, "startedAtMs": 1, "item": {
+                "type": "commandExecution", "id": "it-3", "command": "ls -la", "commandActions": [], "cwd": "/w",
+                "status": "inProgress"}}}
+        ask = lambda tid: {"id": 81, "method": "item/commandExecution/requestApproval", "params": {  # noqa: E731
+            "threadId": "thr-1", "turnId": tid, "itemId": "it-3", "startedAtMs": 1}}
+        self.open(script={1: [started, ask]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        effect = self.approvals.requests[0][0]
+        self.assertEqual((effect["input"], effect["cwd"]), ({"command": "ls -la", "cwd": "/w"}, "/w"))
+
+    def test_no_approval_request_is_ever_refused_unsupported(self):
+        self.open(script={1: [ask_command(), ask_command(78, "pwd", "it-2")]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        self.approve("apr-1")
+        self.approve("apr-2", "deny")
+        self.assertFalse([m for m in self.server.sent if m.get("error", {}).get("code") == -32601])
+
+    def test_effect_and_binding_have_approval_v1_keys(self):
+        path = SCHEMAS / "approval.v1.json"
+        if not path.is_file():
+            self.skipTest("SPINE's approval.v1 (#368) is not in this tree")
+        defs = json.loads(path.read_text(encoding="utf-8"))["$defs"]
+        self.open(script={1: [ask_command()]})
+        self.driver.send(self.handle, message())
+        self.drain()
+        effect, binding, approval_id = self.approvals.requests[0]
+        shape = defs["engine_tool_effect"]
+        self.assertEqual(set(effect), set(shape["required"]))
+        self.assertLessEqual(set(effect), set(shape["properties"]))
+        self.assertEqual(effect["kind"], shape["properties"]["kind"]["const"])
+        self.assertEqual(set(binding) | {"approval_id"}, set(defs["binding"]["required"]))
+        self.assertTrue(TIMESTAMP.match(binding["bound_at"]))
+
+
+class RegistrationTest(unittest.TestCase):
+    def test_register_replaces_the_seeded_factory(self):
+        calls = []
+
+        class Engines:
+            def register(self, *args, **kwargs):
+                calls.append((args, kwargs))
+
+        class Hooks:
+            engines = Engines()
+        cx.register(Hooks())
+        self.assertEqual(calls, [(("codex", cx.factory), {"replace": True})])
+
+    def test_the_factory_runs_the_binary_it_was_given_or_the_default(self):
+        for options, argv0 in (({}, "codex"), ({"binary": "/opt/codex/bin/codex"}, "/opt/codex/bin/codex")):
+            with self.subTest(options=options):
+                adapter = cx.factory(Launcher(), FakeClock(), lambda *_: "", {}, **options)
+                self.assertIsInstance(adapter, CodexAdapter)
+                self.assertEqual(adapter.argv({})[0], argv0)
+                self.assertEqual(adapter.session.argv()[0], argv0)
+
+    def test_against_spines_engine_table(self):
+        try:
+            from recursion_core.routes.engines import EngineTable
+        except ImportError:
+            self.skipTest("SPINE's engine table (#369) is not in this tree")
+        table = EngineTable()
+        cx.register(type("Hooks", (), {"engines": table})())
+        self.assertIs(dict(table.items())["codex"], cx.factory)
+
+
+# -- the two reads of #402 (Codex GPT-6 Astra R1 to R8, DeepSeek V4.1 Flash F1 to F16) ----------------------
+def started_command(item="it-1", command="pwd", cwd="/synthetic-workspace"):
+    return item_note("item/started", {"type": "commandExecution", "id": item, "command": command, "cwd": cwd,
+                                      "status": "inProgress", "commandActions": []})
+
+
+class ExactApprovalTest(Base):
+    """R1: an approval names the exact action, or none is opened; R2, F7, F8: one approval per pending
+    request of the turn in progress."""
+
+    approvals = None
+
+    def setUp(self):
+        self.approvals = FakeApprovals()
+
+    def run_turn(self, notes):
+        self.open(script={1: notes})
+        self.driver.send(self.handle, message())
+        return self.drain()
+
+    def test_a_file_change_without_its_announced_changes_is_declined_and_not_published(self):
+        ask = lambda tid: {"id": 77, "method": "item/fileChange/requestApproval", "params": {  # noqa: E731
+            "threadId": "thr-1", "turnId": tid, "itemId": "missing-item", "startedAtMs": 1, "reason": None}}
+        self.run_turn([ask])
+        self.assertEqual(self.approvals.requests, [])
+        self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+
+    def test_a_null_command_and_folder_come_from_the_announced_command(self):
+        def ask(tid):
+            note = ask_command(command=None)(tid)
+            note["params"]["cwd"] = None
+            return note
+        self.run_turn([started_command(), ask])
+        effect = self.approvals.requests[0][0]
+        self.assertEqual((effect["input"]["command"], effect["input"]["cwd"], effect["cwd"]),
+                         ("pwd", "/synthetic-workspace", "/synthetic-workspace"))
+
+    def test_a_command_with_no_known_command_or_folder_is_declined(self):
+        for command, cwd in ((None, "/w"), ("ls", None)):
+            with self.subTest(command=command, cwd=cwd):
+                self.setUp()
+
+                def ask(tid, command=command, cwd=cwd):
+                    note = ask_command(command=command)(tid)
+                    note["params"]["cwd"] = cwd
+                    return note
+                self.run_turn([ask])
+                self.assertEqual(self.approvals.requests, [])
+                self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+
+    def test_an_announced_item_of_another_turn_is_not_used(self):
+        def other_turn(tid):
+            note = started_command(command="rm -rf /")(tid)
+            note["params"]["turnId"] = "trn-old"
+            return note
+
+        def ask(tid):
+            note = ask_command(command=None)(tid)
+            return note
+        self.run_turn([other_turn, ask])
+        self.assertEqual(self.approvals.requests, [])
+
+    def test_a_request_for_a_turn_not_in_progress_is_declined_and_not_published(self):
+        unrelated = lambda tid: ask_command()("trn-unrelated")  # noqa: E731
+        self.run_turn([unrelated])
+        self.assertEqual(self.approvals.requests, [])
+        self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+
+    def test_a_request_after_its_turn_ended_is_declined_and_not_published(self):
+        self.run_turn([done()])
+        self.driver.parse(self.handle, json.dumps(ask_command()("trn-1")))
+        self.assertEqual(self.approvals.requests, [])
+        self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+
+    def test_the_same_pending_request_twice_withdraws_its_approval_and_is_declined_once(self):
+        self.run_turn([ask_command(), ask_command()])
+        self.assertEqual(len(self.approvals.requests), 1)
+        self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+        with self.assertRaises(DriverStateError):
+            self.driver.send(self.handle, {"kind": "approval_answer", "approval_id": "apr-1", "decision": "approve"})
+        self.assertEqual(len(answers(self.server, 77)), 1)
+
+    def test_a_repeat_of_a_request_already_answered_gets_nothing(self):
+        self.run_turn([ask_command()])
+        self.driver.send(self.handle, {"kind": "approval_answer", "approval_id": "apr-1", "decision": "approve"})
+        self.driver.parse(self.handle, json.dumps(ask_command()("trn-1")))
+        self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "accept"}}])
+        self.assertEqual(len(self.approvals.requests), 1)
+
+    def test_an_approval_id_the_gate_refuses_is_declined_at_once(self):
+        # DeepSeek's round-2 R2-3: such an id could never be answered through approval_answer.
+        for bad in ("apr-1\n", "x" * 65, "not an id"):
+            with self.subTest(bad=bad):
+                self.approvals = FakeApprovals(answer=bad)
+                self.run_turn([ask_command()])
+                self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+                self.assertEqual(self.handle._codex.bindings, {})
+
+    def test_a_request_whose_turn_or_item_is_not_text_is_declined(self):
+        # DeepSeek's round-2 R2-4: no TypeError out of parse.
+        for field, value in (("itemId", []), ("turnId", {"t": 1})):
+            with self.subTest(field=field):
+                self.setUp()
+
+                def ask(tid, field=field, value=value):
+                    note = ask_command()(tid)
+                    note["params"][field] = value
+                    return Raw(note)
+                self.run_turn([ask])
+                self.assertEqual(self.approvals.requests, [])
+                self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+
+    def test_a_binding_minted_after_its_turn_ended_is_not_kept(self):
+        # DeepSeek's round-2 R2-1: the port call straddles the turn's end; nothing is bound or written after.
+        outer = self
+
+        class EndingPort(FakeApprovals):
+            def request(self, effect, binding):
+                approval_id = super().request(effect, binding)
+                outer.driver.parse(outer.handle, json.dumps(done()("trn-1")))  # the turn ends meanwhile
+                return approval_id
+        self.approvals = EndingPort()
+        self.run_turn([ask_command()])
+        self.assertEqual(self.handle._codex.bindings, {})
+        with self.assertRaises(DriverStateError):
+            self.driver.send(self.handle, {"kind": "approval_answer", "approval_id": "apr-1", "decision": "approve"})
+        self.assertEqual(answers(self.server, 77), [])
+
+    def test_a_port_interrupted_by_a_base_exception_declines_then_lets_it_go_on(self):
+        for exc in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exc=exc.__name__):
+                class Interrupted:
+                    def request(self, effect, binding, exc=exc):
+                        raise exc()
+                self.approvals = Interrupted()
+                self.open(script={1: [ask_command()]})
+                self.driver.send(self.handle, message())
+                with self.assertRaises(exc):
+                    self.drain()
+                self.assertEqual(answers(self.server, 77), [{"id": 77, "result": {"decision": "decline"}}])
+
+
+class WriteDisciplineTest(unittest.TestCase):
+    """R3: one write path; nothing after close; held writes keep the gate's order. F1: an answer and the
+    server's resolution of its request never both win."""
+
+    def test_close_drops_a_held_steer_and_a_held_interrupt(self):
+        for held in ("steer", "interrupt"):
+            with self.subTest(held=held):
+                server = AppServer()
+                driver = cx.CodexDriver(Launcher(server), FakeClock())
+                handle = begin(driver, record(), {})
+                driver.send(handle, message())
+                if held == "steer":
+                    driver.send(handle, message(delivery="dlv-2", text="additional context"))
+                else:
+                    driver.interrupt(handle, "turn-1")
+                driver.send(handle, {"kind": "close"})
+                before = list(server.sent)
+                while server.out:
+                    driver.pump(handle, 1)
+                self.assertEqual(server.sent, before)
+
+    def test_nothing_is_answered_or_put_to_the_port_after_close(self):
+        server, port = AppServer(), FakeApprovals()
+        driver = cx.CodexDriver(Launcher(server), FakeClock(), approvals=port)
+        handle = begin(driver, record(), {})
+        driver.send(handle, message())
+        while server.out:  # the turn is in progress and the engine has named it
+            driver.pump(handle, 1)
+        driver.send(handle, {"kind": "close"})
+        before = list(server.sent)
+        driver.parse(handle, json.dumps(ask_command()("trn-1")))  # a complete request for the live turn
+        driver.parse(handle, json.dumps({"id": 5, "method": "item/tool/requestUserInput", "params": {}}))
+        self.assertEqual((server.sent, port.requests), (before, []))
+
+    def test_a_steer_sent_while_a_held_one_is_written_still_goes_out(self):
+        writing, release = threading.Event(), threading.Event()
+        errors = []
+
+        class SlowServer(AppServer):
+            def send(self, line):
+                if '"dlv-2"' in line:
+                    writing.set()
+                    release.wait(5)
+                super().send(line)
+        server = SlowServer()
+        driver = cx.CodexDriver(Launcher(server), FakeClock())
+        handle = begin(driver, record(), {})
+        driver.send(handle, message())
+        driver.send(handle, message(delivery="dlv-2", text="earlier context"))  # held: no engine turn yet
+
+        def reader():
+            try:
+                driver.pump(handle, 1)  # the turn/start answer: dlv-2 is written, slowly
+            except BaseException as err:  # noqa: BLE001
+                errors.append(err)
+        thread_ = threading.Thread(target=reader)
+        thread_.start()
+        self.assertTrue(writing.wait(5))
+        try:
+            driver.send(handle, message(delivery="dlv-3", text="later context"))  # while dlv-2 is being written
+        finally:
+            release.set()
+            thread_.join(5)
+        self.assertEqual(errors, [])
+        written = [m["params"]["clientUserMessageId"] for m in server.sent if m.get("method") in ("turn/start",
+                                                                                                  "turn/steer")]
+        self.assertEqual(written, ["dlv-1", "dlv-2", "dlv-3"])
+
+    def test_close_waits_for_a_port_call_in_progress(self):
+        # DeepSeek's round-2 R2-2: once close has returned, no request is put to the port; one in flight ends
+        # first (and its approval can never be answered: the input has ended).
+        asking, release = threading.Event(), threading.Event()
+
+        class SlowPort(FakeApprovals):
+            def request(self, effect, binding):
+                asking.set()
+                release.wait(5)
+                return super().request(effect, binding)
+        server, port = AppServer(), SlowPort()
+        driver = cx.CodexDriver(Launcher(server), FakeClock(), approvals=port)
+        handle = begin(driver, record(), {})
+        driver.send(handle, message())
+        while server.out:
+            driver.pump(handle, 1)
+        reader = threading.Thread(target=driver.parse, args=(handle, json.dumps(ask_command()("trn-1"))))
+        reader.start()
+        self.assertTrue(asking.wait(5))
+        closer = threading.Thread(target=driver.send, args=(handle, {"kind": "close"}))
+        closer.start()
+        closer.join(0.2)
+        try:
+            self.assertTrue(closer.is_alive(), "close returns only after the port call in progress")
+        finally:
+            release.set()
+            reader.join(5)
+            closer.join(5)
+        self.assertEqual((len(port.requests), answers(server, 77)), (1, []))
+
+    def test_a_later_steer_queues_behind_the_held_ones(self):
+        ready, release = threading.Event(), threading.Event()
+        errors = []
+
+        class PausingDriver(cx.CodexDriver):
+            def _release_held(self, session, turn_id):
+                ready.set()
+                release.wait(5)
+                return super()._release_held(session, turn_id)
+        server = AppServer()
+        driver = PausingDriver(Launcher(server), FakeClock())
+        handle = begin(driver, record(), {})
+        driver.send(handle, message())
+        driver.send(handle, message(delivery="dlv-2", text="earlier context"))
+
+        def reader():
+            try:
+                driver.pump(handle, 1)
+            except BaseException as err:  # noqa: BLE001
+                errors.append(err)
+        thread_ = threading.Thread(target=reader)
+        thread_.start()
+        self.assertTrue(ready.wait(5))
+        try:
+            driver.send(handle, message(delivery="dlv-3", text="later context"))
+        finally:
+            release.set()
+            thread_.join(5)
+        self.assertFalse(thread_.is_alive())
+        self.assertEqual(errors, [])
+        written = [m["params"]["clientUserMessageId"] for m in server.sent if m.get("method") in ("turn/start",
+                                                                                                  "turn/steer")]
+        self.assertEqual(written, ["dlv-1", "dlv-2", "dlv-3"])
+
+    def bridged(self):
+        """A turn left in progress with approval apr-1 waiting on request 77."""
+        server, port = AppServer(script={1: [ask_command()]}), FakeApprovals()
+        driver = cx.CodexDriver(Launcher(server), FakeClock(), approvals=port)
+        handle = begin(driver, record(), {})
+        driver.send(handle, message())
+        while server.out:
+            driver.pump(handle, 1)
+        return server, driver, handle
+
+    def test_the_resolution_waits_for_an_answer_being_written(self):
+        server, driver, handle = self.bridged()
+        writing, release = threading.Event(), threading.Event()
+        send = server.send
+
+        def slow_send(line):
+            if '"decision"' in line:
+                writing.set()
+                release.wait(5)
+            send(line)
+        server.send = slow_send
+        answer = threading.Thread(target=driver.send, args=(handle, {
+            "kind": "approval_answer", "approval_id": "apr-1", "decision": "approve"}))
+        answer.start()
+        self.assertTrue(writing.wait(5))
+        resolved = threading.Thread(target=driver.parse, args=(handle, json.dumps({
+            "method": "serverRequest/resolved", "params": {"threadId": "thr-1", "requestId": 77}})))
+        resolved.start()
+        resolved.join(0.2)
+        try:
+            self.assertTrue(resolved.is_alive(), "the resolution is not processed while the answer is written")
+        finally:
+            release.set()
+            answer.join(5)
+            resolved.join(5)
+        self.assertEqual(answers(server, 77), [{"id": 77, "result": {"decision": "accept"}}])
+
+    def test_the_turn_end_waits_for_an_answer_being_written(self):
+        server, driver, handle = self.bridged()
+        writing, release = threading.Event(), threading.Event()
+        send = server.send
+
+        def slow_send(line):
+            if '"decision"' in line:
+                writing.set()
+                release.wait(5)
+            send(line)
+        server.send = slow_send
+        answer = threading.Thread(target=driver.send, args=(handle, {
+            "kind": "approval_answer", "approval_id": "apr-1", "decision": "approve"}))
+        answer.start()
+        self.assertTrue(writing.wait(5))
+        ended = threading.Thread(target=driver.parse, args=(handle, json.dumps(done()("trn-1"))))
+        ended.start()
+        ended.join(0.2)
+        try:
+            self.assertTrue(ended.is_alive(), "the turn's end is not processed while the answer is written")
+        finally:
+            release.set()
+            answer.join(5)
+            ended.join(5)
+        self.assertEqual(answers(server, 77), [{"id": 77, "result": {"decision": "accept"}}])
+        self.assertIsNone(handle.live_turn)
+
+    def test_an_answer_after_the_resolution_was_processed_writes_nothing(self):
+        server, driver, handle = self.bridged()
+        driver.parse(handle, json.dumps({"method": "serverRequest/resolved",
+                                         "params": {"threadId": "thr-1", "requestId": 77}}))
+        with self.assertRaises(DriverStateError):
+            driver.send(handle, {"kind": "approval_answer", "approval_id": "apr-1", "decision": "approve"})
+        self.assertEqual(answers(server, 77), [])
+
+
+class LifecycleTest(unittest.TestCase):
+    """R4, F10, M05, R8, F6, F14."""
+
+    def test_an_end_before_the_answer_waits_for_it(self):
+        server = AppServer(silent_turns=True)
+        driver = cx.CodexDriver(Launcher(server), FakeClock())
+        handle = begin(driver, record(), {})
+        driver.send(handle, message())
+        rid = server.sent[-1]["id"]
+        drafts = []
+        for note in ({"method": "turn/started", "params": {"threadId": "thr-1", "turn": turn("trn-1")}},
+                     done()("trn-1"), {"id": rid, "result": {"turn": turn("trn-1")}}):
+            drafts += driver.parse(handle, json.dumps(note))
+        self.assertEqual([d["type"] for d in drafts], ["input.accepted", "usage", "result"])
+        self.assertIsNone(handle.live_turn)
+
+    def test_an_end_before_a_refusal_gives_the_refusal_only(self):
+        server = AppServer(silent_turns=True)
+        driver = cx.CodexDriver(Launcher(server), FakeClock())
+        handle = begin(driver, record(), {})
+        driver.send(handle, message())
+        rid = server.sent[-1]["id"]
+        drafts = []
+        for note in ({"method": "turn/started", "params": {"threadId": "thr-1", "turn": turn("trn-1")}},
+                     done()("trn-1"), {"id": rid, "error": {"code": -32000, "message": "x"}}):
+            drafts += driver.parse(handle, json.dumps(note))
+        self.assertEqual([(d["type"], d["payload"].get("code")) for d in drafts], [("result", c.ENGINE_ERROR)])
+        self.assertIsNone(handle.live_turn)
+
+    def test_a_turn_start_answer_naming_no_turn_ends_the_turn_as_protocol_error(self):
+        server = AppServer(silent_turns=True)
+        driver = cx.CodexDriver(Launcher(server), FakeClock())
+        handle = begin(driver, record(), {})
+        driver.send(handle, message())
+        rid = server.sent[-1]["id"]
+        drafts = driver.parse(handle, json.dumps({"id": rid, "result": {}}))
+        self.assertEqual(drafts, [{"type": "result", "payload": {
+            "code": c.PROTOCOL_ERROR, "detail": "the answer to turn/start names no turn"}}])
+        self.assertIsNone(handle.live_turn)
+
+    def test_two_ids_for_one_turn_is_a_protocol_error(self):
+        server = AppServer(silent_turns=True)
+        driver = cx.CodexDriver(Launcher(server), FakeClock())
+        handle = begin(driver, record(), {})
+        driver.send(handle, message())
+        rid = server.sent[-1]["id"]
+        driver.parse(handle, json.dumps({"method": "turn/started", "params": {"threadId": "thr-1",
+                                                                             "turn": turn("trn-1")}}))
+        with self.assertRaises(c.RouteError) as cm:
+            driver.parse(handle, json.dumps({"id": rid, "result": {"turn": turn("trn-2")}}))
+        self.assertEqual(cm.exception.code, c.PROTOCOL_ERROR)
+
+    def test_resume_keeps_typed_auth_and_limit_errors(self):
+        for info, expected in (("unauthorized", c.AUTH_FAILED), ("usageLimitExceeded", c.PLAN_LIMIT)):
+            with self.subTest(info=info):
+                server = AppServer(refuse={"thread/resume": {"code": -32000, "message": "synthetic failure",
+                                                             "data": {"codexErrorInfo": info}}})
+                with self.assertRaises(c.RouteError) as cm:
+                    begin(cx.CodexDriver(Launcher(server), FakeClock()), record("thr-1"), {})
+                self.assertEqual(cm.exception.code, expected)
+                self.assertEqual((server.stdin_closed, server.fenced), (True, ["start_refused"]))
+
+    def test_an_os_error_of_the_launcher_or_the_pipe_is_engine_error(self):
+        def missing(argv, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", argv[0])
+        with self.assertRaises(c.RouteError) as cm:
+            begin(cx.CodexDriver(missing, FakeClock()), record(), {})
+        self.assertEqual((cm.exception.code, cm.exception.detail), (c.ENGINE_ERROR, "launch failed: FileNotFoundError"))
+
+        class Dying(AppServer):
+            def send(self, line):
+                if json.loads(line).get("method") == "turn/start":
+                    raise OSError(5, "Input/output error")
+                super().send(line)
+        driver = cx.CodexDriver(Launcher(Dying()), FakeClock())
+        handle = begin(driver, record(), {})
+        with self.assertRaises(c.RouteError) as cm:
+            driver.send(handle, message())
+        self.assertEqual((cm.exception.code, cm.exception.detail), (c.ENGINE_ERROR, "engine io: OSError"))
+
+    def test_a_handle_from_another_driver_is_refused(self):
+        server = AppServer()
+        mine = cx.CodexDriver(Launcher(server), FakeClock())
+        handle = begin(mine, record(), {})
+        other = cx.CodexDriver(Launcher(), FakeClock())
+        before = list(server.sent)
+        with self.assertRaises(DriverStateError):
+            other.send(handle, message())
+        self.assertEqual(server.sent, before)
+
+
+class ToolDraftEdgeTest(Base):
+    """F3, F4, M13, M14 and F13."""
+
+    def drafts_of(self, notes):
+        self.open(script={1: notes})
+        self.driver.send(self.handle, message())
+        return self.drain()
+
+    def test_an_input_rfc8785_cannot_write_still_gets_its_call_and_result(self):
+        mcp = {"type": "mcpToolCall", "id": "it-9", "server": "s", "tool": "t", "status": "inProgress",
+               "arguments": {"n": 1}}
+        started = lambda tid: Raw(json.dumps(item_note("item/started", mcp)(tid)).replace(  # noqa: E731
+            '"n": 1', '"n": 1e999'))
+        finished = item_note("item/completed", {**mcp, "status": "completed", "result": None})
+        drafts = self.drafts_of([started, finished])
+        tools = [d for d in drafts if d["type"].startswith("tool.")]
+        self.assertEqual([(d["type"], d["payload"]["call_id"]) for d in tools],
+                         [("tool.call", "it-9"), ("tool.result", "it-9")])
+        call = tools[0]["payload"]
+        self.assertIsNone(call["input"])
+        self.assertEqual(call["input_digest"], hashlib.sha256(b'{"n":Infinity}').hexdigest())
+
+    def test_a_repeated_completion_drafts_nothing(self):
+        item = {"type": "commandExecution", "id": "it-1", "command": "ls", "cwd": "/w", "commandActions": [],
+                "status": "completed", "aggregatedOutput": "a"}
+        completed = item_note("item/completed", item)
+        started = item_note("item/started", {**item, "status": "inProgress"})
+        drafts = self.drafts_of([completed, completed, started])
+        self.assertEqual([d["type"] for d in drafts if d["type"].startswith("tool.")], ["tool.call", "tool.result"])
+
+    def test_a_bad_call_id_or_tool_name_gives_no_draft(self):
+        long_id, base = "x" * 129, {"type": "mcpToolCall", "server": "s", "status": "inProgress", "arguments": {}}
+        for case, item in (("id too long", {**base, "id": long_id, "tool": "t"}),
+                           ("id with a newline", {**base, "id": "it\n1", "tool": "t"}),
+                           ("name with a newline", {**base, "id": "it-1", "tool": "t\nx"}),
+                           ("name too long", {**base, "id": "it-1", "tool": "t" * 256})):
+            with self.subTest(case=case):
+                drafts = self.drafts_of([item_note("item/started", item)])
+                self.assertEqual([d for d in drafts if d["type"].startswith("tool.")], [])
+
+    def test_what_was_kept_for_a_turn_goes_with_it(self):
+        self.approvals = FakeApprovals()
+        self.drafts_of([started_command(), ask_command(command="pwd"),
+                        item_note("item/completed", {"type": "commandExecution", "id": "it-1", "command": "pwd",
+                                                     "cwd": "/w", "commandActions": [], "status": "completed"}),
+                        started_command(item="it-2"), done()])
+        session = self.handle._codex
+        self.assertEqual((session.items, session.engine_turn, session.core_turn, session.done_calls,
+                          session.seen_requests, session.bindings), ({}, {}, {}, set(), set(), {}))
+
+
+class SurvivorTest(unittest.TestCase):
+    """M07 (DeepSeek F11) and F16, and GPT-6 Astra's six coverage witnesses for the guards no test held."""
+
+    def session(self):
+        return cx._Session(AppServer(), "subscription:synthetic")
+
+    def test_a_boolean_or_negative_count_stays_unknown(self):
+        driver = cx.CodexDriver(Launcher(), FakeClock())
+        for value in (True, False, -1):
+            with self.subTest(value=value):
+                payload = driver._usage_draft(self.session(), {"total": {"inputTokens": value}})["payload"]
+                self.assertEqual(payload["input_tokens"], {"value": None, "quality": "unknown",
+                                                           "provenance": "unavailable"})
+
+    def test_a_window_without_limit_id_names_no_bucket(self):
+        driver = cx.CodexDriver(Launcher(), FakeClock())
+        drafts = driver._rate_limits(self.session(), {"primary": {"usedPercent": 100, "resetsAt": 1000}})
+        self.assertIsNone(drafts[0]["payload"]["bucket"])
+
+    def test_launcher_explicitly_disables_shell(self):
+        launch = Launcher(AppServer())
+        begin(cx.CodexDriver(launch, FakeClock()), record(), {})
+        self.assertIs(launch.calls[0]["shell"], False)
+
+    def test_already_elapsed_start_deadline_refuses_before_read(self):
+        values = iter([0.0, 100.0, 100.0, 100.0, 100.0])
+        with self.assertRaises(c.RouteError) as caught:
+            begin(cx.CodexDriver(Launcher(AppServer()), lambda: next(values)), record(), {})
+        self.assertEqual(caught.exception.code, c.DEADLINE_EXCEEDED)
+
+    def test_connection_limit_uses_latest_of_exhausted_windows(self):
+        driver = cx.CodexDriver(Launcher(), FakeClock())
+        drafts = driver._rate_limits(self.session(), {"primary": {"usedPercent": 100, "resetsAt": 1000},
+                                                      "secondary": {"usedPercent": 100, "resetsAt": 2000}})
+        self.assertEqual(drafts[0]["payload"]["reset_at"], cx._timestamp(2000))
+
+    def test_utf8_cut_ends_at_codepoint_boundary(self):
+        text, truncated = cx._cut("x" * (cx.CARRY_LIMIT - 1) + "\u00e9")
+        self.assertEqual(text, "x" * (cx.CARRY_LIMIT - 1))
+        self.assertTrue(truncated)
+
+    def test_parallel_writers_never_enter_the_process_together(self):
+        entered_first, second_calling = threading.Event(), threading.Event()
+        entered_second, release_first = threading.Event(), threading.Event()
+        errors = []
+
+        class Process:
+            def send(self, line):
+                if "first" in line:
+                    entered_first.set()
+                    release_first.wait(5)
+                else:
+                    entered_second.set()
+        session = cx._Session(Process(), "subscription:synthetic")
+
+        def write(tag, signal=None):
+            if signal is not None:
+                signal.set()
+            try:
+                session.write({"synthetic": tag})
+            except BaseException as err:  # noqa: BLE001
+                errors.append(err)
+        a = threading.Thread(target=write, args=("first",))
+        b = threading.Thread(target=write, args=("second", second_calling))
+        a.start()
+        self.assertTrue(entered_first.wait(5))
+        b.start()
+        self.assertTrue(second_calling.wait(5))
+        try:
+            self.assertFalse(entered_second.wait(0.1))  # time checks only the absence of an overlap
+        finally:
+            release_first.set()
+            a.join(5)
+            b.join(5)
+        self.assertTrue(entered_second.is_set())
+        self.assertEqual(errors, [])
+
+
+class ProtocolCheckTest(unittest.TestCase):
+    """R5: the stand-in's checks are recursive and its own answers fit the protocol."""
+
+    def test_the_checker_refuses_a_nested_wrong_type(self):
+        with self.assertRaises(AssertionError):
+            check_params("client_requests", "turn/start", {"threadId": "thr-1", "input": [{"type": "text",
+                                                                                           "text": 7}]})
+
+    def test_the_stand_in_thread_answers_fit_the_recorded_protocol(self):
+        for method in ("thread/start", "thread/resume"):
+            with self.subTest(method=method):
+                server = AppServer()
+                server.send(json.dumps({"id": 1, "method": method, "params": {"threadId": "thr-1"}
+                                        if method == "thread/resume" else {}}))
+                check_value(PROTOCOL, f"ref:{RESPONSES[method]}", json.loads(server.out[0])["result"])
+
+    def test_an_answer_that_does_not_fit_its_response_type_is_refused(self):
+        server = AppServer()
+        server.requests[1] = "thread/start"
+        with self.assertRaises(AssertionError):
+            server.emit({"id": 1, "result": {"thread": {"id": "thr-1"}, "model": "m", "modelProvider": "openai",
+                                             "cwd": "/w", "approvalPolicy": "on-request", "approvalsReviewer": "user",
+                                             "sandbox": {"type": "workspaceWrite"}}})
+        server.asked[json.dumps(77)] = "item/commandExecution/requestApproval"
+        with self.assertRaises(AssertionError):
+            server.send(json.dumps({"id": 77, "result": {"decision": "maybe"}}))
+
+    def test_a_malformed_line_must_be_marked_raw(self):
+        with self.assertRaises(AssertionError):
+            AppServer().emit({"id": 9, "method": "item/commandExecution/requestApproval", "params": {
+                "threadId": "thr-1", "turnId": "trn-1", "startedAtMs": 1, "itemId": 5}})
+
+    def test_the_fixture_has_every_definition_its_definitions_name(self):
+        def refs(node):
+            if isinstance(node, str):
+                return {node[4:]} if node.startswith("ref:") else set()
+            if isinstance(node, dict):
+                return set().union(set(), *(refs(v) for v in node.values()))
+            if isinstance(node, list):
+                return set().union(set(), *(refs(v) for v in node))
+            return set()
+        named = set().union(*(refs(d) for d in PROTOCOL["definitions"].values()))
+        self.assertEqual(sorted(named - set(PROTOCOL["definitions"])), [])
+        self.assertEqual(PROTOCOL["missing"], [])
+
+
+if __name__ == "__main__":
+    unittest.main()

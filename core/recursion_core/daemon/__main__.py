@@ -23,6 +23,7 @@ from . import (Daemon, Registry, SystemdUserManager, UserLock, check_operator_li
 from .control_adapter import compose_control
 from .gui import LoopbackGUI
 from .launcher import EngineUnitManager
+from recursion_core.hostos import select
 
 log = logging.getLogger('recursion_core.daemon')
 
@@ -35,7 +36,7 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
     logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s: %(message)s')
     refuse_engine_user(os.environ)
     check_operator_linger(getpass.getuser())
-    runtime = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}')
+    runtime = Path(select().runtime_dir())
     state = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'recursion'
     stopped = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stopped.set())

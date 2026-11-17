@@ -29,6 +29,9 @@ Result::
      "breaker_effect": "none" | "opened" | "short_fault" | "closed" | "probe_released",
      "limit_notice": None | <limits.notice>}   # shown to the user at a limit; never a silent switch
 
+``text``, ``detail`` and every string inside ``limit`` and ``events`` are stored with a
+credential shape replaced. The daemon writes this dict as ``result.json``.
+
 Event::
 
     {"kind": "retry" | "usage" | "limit" | "text" | "fallback", "source": "<vendor field it was read from>", "data": {...}}
@@ -45,6 +48,7 @@ Limit signal (the only thing that can trip a connection's breaker)::
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Mapping
 
 CONTRACT_VERSION = "recursion.route/v0"
@@ -185,7 +189,8 @@ def limit_signal(scope: str, source: str, *, model: str | None = None, reset_at:
 
 
 def event(kind: str, source: str, data: Mapping | None = None) -> dict:
-    return {"kind": kind, "source": source, "data": dict(data or {})}
+    # String values are redacted here. The daemon writes the result, events included, as result.json.
+    return {"kind": kind, "source": source, "data": _redact_tree(dict(data or {}))}
 
 
 def result(request_id: str, code: str | None, *, text: str = "", limit: dict | None = None,
@@ -197,10 +202,10 @@ def result(request_id: str, code: str | None, *, text: str = "", limit: dict | N
         "request_id": request_id,
         "status": OK if code is None else "error",
         "code": code,
-        "text": text,
-        "limit": limit,
-        "events": list(events or []),
-        "detail": detail,
+        "text": redact(text),
+        "limit": _redact_tree(limit),
+        "events": [_redact_tree(item) for item in (events or [])],
+        "detail": redact(detail),
         "retry_at": retry_at,
         "breaker_effect": "none",
         "limit_notice": None,
@@ -214,3 +219,469 @@ _QUOTA_WORDS = ("quota", "rate limit", "rate-limit", "usage limit", "limit reach
 
 def sounds_like_quota(text: object) -> bool:
     return isinstance(text, str) and any(word in text.lower() for word in _QUOTA_WORDS)
+
+
+# Credential shapes. Word boundaries so "task-12345678" is not an sk- key. Case-insensitive.
+# JSON ``\uXXXX`` / ``\/`` and ``%HH`` are peeled in turn, and every intermediate view is searched
+# for secret tokens. Userinfo is not peeled that way: one token reader and one state walk decide
+# every delimiter, so ``%20`` in a password is never turned into a space before the scheme matches.
+# A hyphen written as ``\u002d`` still matches. Decoded text is only a search view.
+_SECRET = re.compile(
+    r"(?<!\w)eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?!\w)"
+    r"|(?<!\w)sk-[A-Za-z0-9_-]{8,}(?!\w)"
+    r"|(?<!\w)(?:AKIA|ASIA)[A-Z0-9]{16}(?!\w)"
+    r"|(?<!\w)bearer\s+[A-Za-z0-9+/=._~-]{8,}"
+    r"|(?<!\w)ghp_[A-Za-z0-9]{20,}(?!\w)"
+    r"|(?<!\w)github_pat_[A-Za-z0-9_]{20,}(?!\w)"
+    r"|(?<!\w)xox[baprs]-[A-Za-z0-9-]{10,}(?!\w)"
+    r"|(?<!\w)ya29\.[A-Za-z0-9._-]{10,}(?!\w)",
+    re.IGNORECASE,
+)
+_JSON_U = re.compile(r"\\u([0-9a-fA-F]{4})")
+_HEX = frozenset("0123456789abcdefABCDEF")
+# End-delimiters, raw or decoded. The walk's state decides which of them actually stop.
+_WS = frozenset(" \t\r\n")
+_END_CHARS = frozenset("/?#\"',;<>()[]{}") | _WS
+# A backslash run escapes these into a single token of that character. ``\\/`` is still a slash.
+_ESCAPED = frozenset("/?#:@\\")
+_PEEL_LIMIT = 8
+
+
+# One round is a JSON peel and then a percent peel. Eight rounds are shared. A value that is still
+# changing after that has not reached a fixed point, and the whole field is redacted.
+_ESCAPE_PASSES = 8
+_PCT = re.compile(r"%([0-9a-fA-F]{2})")
+
+
+def _port_end(text: str, index: int) -> int | None:
+    """Index of the delimiter after a port, or the text length when the digits run to the end.
+
+    A port is logical ``/`` ``?`` ``#`` immediately, or logical decimal digits (raw or encoded) and then
+    any end-delimiter. With no digits, a quote, bracket, or encoded space is not a port, so a password
+    that starts with one of those is still redacted. ``None`` means this colon is not a port, so
+    ``user:8080@host`` and ``user:%34%34%34%34@host`` stay passwords. ``@`` is not an end-delimiter.
+    """
+
+    saw_digit = False
+    length = len(text)
+    while index < length:
+        token = _read_logical(text, index)
+        if token is None:
+            break
+        char, end, _raw, _bad = token
+        if end <= index:
+            end = index + 1
+        if char.isdecimal():
+            saw_digit = True
+            index = end
+            continue
+        if char in _END_CHARS and (saw_digit or char in "/?#"):
+            return index
+        return None
+    return index if saw_digit else None
+
+
+def _hex_at(text: str, index: int) -> int | None:
+    if index + 1 >= len(text):
+        return None
+    pair = text[index:index + 2]
+    if pair[0] not in _HEX or pair[1] not in _HEX:
+        return None
+    return int(pair, 16)
+
+
+def _hex4_at(text: str, index: int) -> bool:
+    if index + 3 >= len(text):
+        return False
+    return all(char in _HEX for char in text[index:index + 4])
+
+
+def _from_decoded(char: str, text: str, index: int, depth: int) -> tuple[str, int, bool, bool]:
+    """Finish a peeled ``%`` or ``\\``. Returns char, end, raw, unresolved."""
+
+    if char == "%":
+        if depth > _PEEL_LIMIT:
+            return ("%", index, False, True)
+        byte = _hex_at(text, index)
+        if byte is None:
+            return ("%", index, False, False)
+        return _from_decoded(chr(byte), text, index + 2, depth + 1)
+    if char == "\\":
+        return _from_backslash(text, index, depth)
+    return (char, index, False, False)
+
+
+def _from_backslash(text: str, index: int, depth: int) -> tuple[str, int, bool, bool]:
+    """A backslash run collapses into the escaped character. ``%5C%5C%2F`` is one slash."""
+
+    if depth > _PEEL_LIMIT:
+        return ("\\", index, False, True)
+    if index < len(text) and text[index] in "uU" and _hex4_at(text, index + 1):
+        return _from_decoded(chr(int(text[index + 1:index + 5], 16)), text, index + 5, depth + 1)
+    nxt = _read_logical(text, index, depth)
+    if nxt is None:
+        return ("\\", index, False, False)
+    char, end, _raw, bad = nxt
+    if char == "\\":
+        return _from_backslash(text, end, depth + 1)
+    if char in _ESCAPED:
+        return (char, end, False, bad)
+    return ("\\", index, False, bad)
+
+
+def _read_logical(text: str, index: int, depth: int = 0) -> tuple[str, int, bool, bool] | None:
+    """One logical character at ``index``.
+
+    Percent-encoding, ``%25`` layers, ``\\uXXXX`` and backslash runs are one token. ``raw`` is true
+    only for a single source character, so ``%20`` is a space that is not raw whitespace.
+    The fourth value is true when the peel limit was hit.
+    """
+
+    if index >= len(text):
+        return None
+    if depth > _PEEL_LIMIT:
+        return (text[index], index + 1, True, True)
+    if text[index] == "%" and (byte := _hex_at(text, index + 1)) is not None:
+        return _from_decoded(chr(byte), text, index + 3, depth + 1)
+    if text[index] == "\\":
+        return _from_backslash(text, index + 1, depth + 1)
+    return (text[index], index + 1, True, False)
+
+
+def _slash_pair_end(text: str, index: int) -> int:
+    """Index after two slash tokens, or 0."""
+
+    first = _read_logical(text, index)
+    if first is None or first[0] != "/":
+        return 0
+    second = _read_logical(text, first[1])
+    if second is None or second[0] != "/":
+        return 0
+    return second[1]
+
+
+def _scheme_authority_start(text: str, index: int) -> int:
+    """Index where the authority starts, or 0 when ``index`` is not an http(s) scheme.
+
+    The colon and the slashes are the same tokens the authority walk uses. An encoded colon may
+    sit between the scheme colon and the slashes (``https:%5C%3A%2F%2F``). Nothing else is rewritten.
+    """
+
+    if text[index:index + 5].lower() == "https":
+        cursor = index + 5
+    elif text[index:index + 4].lower() == "http":
+        cursor = index + 4
+    else:
+        return 0
+    colon = _read_logical(text, cursor)
+    if colon is None or colon[0] != ":":
+        return 0
+    cursor = colon[1]
+    extra = _read_logical(text, cursor)
+    if extra is not None and extra[0] == ":":
+        slashes = _slash_pair_end(text, extra[1])
+        if slashes:
+            return slashes
+    return _slash_pair_end(text, cursor)
+
+
+def _authority_userinfo(text: str) -> list[tuple[int, int]]:
+    """Userinfo spans from one forward walk. The token reader is the only delimiter table.
+
+    Before a colon, any end-delimiter (raw, or ``/`` ``?`` ``#`` and the other host delimiters in
+    any encoding) ends the authority and there is no credential. A colon followed by logical ``/``
+    ``?`` ``#``, or by logical decimal digits and then any end-delimiter, is a port, so that
+    authority has no credential. The digits may be encoded. With no digits, a quote or space is not
+    a port. Any other colon opens the password. In the password, only a raw space, tab, CR or LF
+    ends the run; a quote, bracket or encoded slash stays inside it. The separator is the last
+    ``@`` or ``%40`` before the first end-delimiter that follows a separator. After that separator,
+    any end-delimiter in any form ends the authority. The span stops before the separator, so the
+    host stays.
+    """
+
+    found: list[tuple[int, int]] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        auth = _scheme_authority_start(text, index)
+        if not auth:
+            index += 1
+            continue
+        cursor = auth
+        state = "before"
+        separators: list[int] = []
+        while cursor < length:
+            token = _read_logical(text, cursor)
+            if token is None:
+                break
+            char, end, raw, _bad = token
+            if end <= cursor:
+                end = cursor + 1
+            if state == "before":
+                if char in _END_CHARS:
+                    break
+                if char == ":":
+                    # ``:443/`` and ``:/`` are ports. ``:8080@`` is a numeric password.
+                    port_at = _port_end(text, end)
+                    if port_at is not None:
+                        cursor = port_at
+                        break
+                    state = "password"
+                cursor = end
+                continue
+            if state == "password":
+                if raw and char in _WS:
+                    break
+                if char == "@":
+                    separators.append(cursor)
+                    state = "after"
+                cursor = end
+                continue
+            if char in _END_CHARS:
+                break
+            if char == "@":
+                separators.append(cursor)
+            cursor = end
+        if separators:
+            found.append((auth, separators[-1]))
+        index = cursor if cursor > index else index + 1
+    return found
+
+
+class _SpanMap:
+    """Map a decoded view back to the original string.
+
+    ``runs`` is empty for an identity view. Otherwise each run is
+    ``(out_at, src_at, out_len, src_len)``: a 1:1 stretch, or one decoded character whose source
+    is longer. A plain tail stays one run, so a long field is not a tuple per character.
+    """
+
+    def __init__(self, parent: "_SpanMap | None", runs: list[tuple[int, int, int, int]] | None):
+        self.parent = parent
+        self.runs = runs
+
+    def bounds(self, start: int, end: int) -> tuple[int, int]:
+        if not self.runs:
+            src_start, src_end = start, end
+        else:
+            src_start = self._edge(start, at_end=False)
+            src_end = self._edge(end - 1, at_end=True)
+        if self.parent is None:
+            return src_start, src_end
+        return self.parent.bounds(src_start, src_end)
+
+    def _edge(self, out_index: int, at_end: bool) -> int:
+        runs = self.runs or ()
+        lo = 0
+        hi = len(runs) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            out_at, src_at, out_len, src_len = runs[mid]
+            if out_index < out_at:
+                hi = mid - 1
+                continue
+            if out_index >= out_at + out_len:
+                lo = mid + 1
+                continue
+            if out_len == src_len:
+                src = src_at + (out_index - out_at)
+                return src + 1 if at_end else src
+            return src_at + src_len if at_end else src_at
+        raise RuntimeError("span map missed an output index")
+
+
+def _append_run(runs: list[tuple[int, int, int, int]], out_at: int, src_at: int, out_len: int, src_len: int) -> None:
+    if out_len <= 0:
+        return
+    if runs and out_len == src_len:
+        prev_out, prev_src, prev_out_len, prev_src_len = runs[-1]
+        if prev_out_len == prev_src_len and prev_out + prev_out_len == out_at and prev_src + prev_src_len == src_at:
+            runs[-1] = (prev_out, prev_src, prev_out_len + out_len, prev_src_len + src_len)
+            return
+    runs.append((out_at, src_at, out_len, src_len))
+
+
+def _decode_layer(value: str) -> tuple[str, list[tuple[int, int, int, int]] | None, bool]:
+    """Decode one layer of ``\\uXXXX`` and ``\\/``. Unchanged text is one run, not one tuple per character."""
+
+    if "\\" not in value:
+        return value, None, False
+    pieces: list[str] = []
+    runs: list[tuple[int, int, int, int]] = []
+    index = 0
+    out_at = 0
+    length = len(value)
+    changed = False
+    while index < length:
+        if value.startswith("\\/", index):
+            pieces.append("/")
+            _append_run(runs, out_at, index, 1, 2)
+            out_at += 1
+            index += 2
+            changed = True
+            continue
+        match = _JSON_U.match(value, index)
+        if match is not None:
+            pieces.append(chr(int(match.group(1), 16)))
+            _append_run(runs, out_at, index, 1, match.end() - index)
+            out_at += 1
+            index = match.end()
+            changed = True
+            continue
+        nxt = value.find("\\", index)
+        if nxt < 0:
+            nxt = length
+        if nxt == index:
+            nxt = index + 1
+            while (
+                nxt < length
+                and value[nxt] == "\\"
+                and not value.startswith("\\/", nxt)
+                and _JSON_U.match(value, nxt) is None
+            ):
+                nxt += 1
+        pieces.append(value[index:nxt])
+        _append_run(runs, out_at, index, nxt - index, nxt - index)
+        out_at += nxt - index
+        index = nxt
+    if not changed:
+        return value, None, False
+    return "".join(pieces), runs, True
+
+
+def _decode_pct_layer(value: str) -> tuple[str, list[tuple[int, int, int, int]] | None, bool]:
+    """Decode one layer of ``%HH``. A plain stretch stays one run."""
+
+    if "%" not in value:
+        return value, None, False
+    pieces: list[str] = []
+    runs: list[tuple[int, int, int, int]] = []
+    index = 0
+    out_at = 0
+    length = len(value)
+    changed = False
+    while index < length:
+        match = _PCT.match(value, index)
+        if match is not None:
+            pieces.append(chr(int(match.group(1), 16)))
+            _append_run(runs, out_at, index, 1, 3)
+            out_at += 1
+            index = match.end()
+            changed = True
+            continue
+        nxt = value.find("%", index + 1 if value[index] == "%" else index)
+        if nxt < 0:
+            nxt = length
+        if nxt == index:
+            nxt = index + 1
+        pieces.append(value[index:nxt])
+        _append_run(runs, out_at, index, nxt - index, nxt - index)
+        out_at += nxt - index
+        index = nxt
+    if not changed:
+        return value, None, False
+    return "".join(pieces), runs, True
+
+
+def _json_pending(value: str) -> bool:
+    start = 0
+    while True:
+        found = value.find("\\", start)
+        if found < 0:
+            return False
+        if value.startswith("\\/", found) or _JSON_U.match(value, found) is not None:
+            return True
+        start = found + 1
+
+
+def _decode_views(value: str) -> list[tuple[str, _SpanMap]] | None:
+    """Alternate a JSON peel and a percent peel. None means the cap was not a fixed point."""
+
+    if "\\" not in value and "%" not in value:
+        return [(value, _SpanMap(None, None))]
+    text = value
+    spans = _SpanMap(None, None)
+    views = [(text, spans)]
+    for _ in range(_ESCAPE_PASSES):
+        changed = False
+        decoded, layer, json_changed = _decode_layer(text)
+        if json_changed:
+            spans = _SpanMap(spans, layer)
+            text = decoded
+            views.append((text, spans))
+            changed = True
+        decoded, layer, pct_changed = _decode_pct_layer(text)
+        if pct_changed:
+            spans = _SpanMap(spans, layer)
+            text = decoded
+            views.append((text, spans))
+            changed = True
+        if not changed:
+            return views
+    if _json_pending(text) or _PCT.search(text) is not None:
+        return None
+    return views
+
+
+def _collect_secret_hits(text: str, spans: _SpanMap, hits: list[tuple[int, int]]) -> None:
+    def add(start: int, end: int) -> None:
+        if end > start:
+            hits.append(spans.bounds(start, end))
+
+    for start, end in _authority_userinfo(text):
+        add(start, end)
+    for match in _SECRET.finditer(text):
+        add(match.start(), match.end())
+
+
+def redact(value: str) -> str:
+    """Replace credential-shaped substrings. Connection ids and ordinary error codes are left as they are.
+
+    JSON and percent-encoding are peeled in turn, and every intermediate view is searched for secret
+    tokens. Userinfo is one state walk on each view: before a colon any end-delimiter means there
+    is no credential, the password keeps its delimiters, and the host ends at the first delimiter
+    after the last ``@``. A value that is still changing after the shared cap is replaced as a whole.
+    """
+
+    if not value:
+        return value
+    views = _decode_views(value)
+    if views is None:
+        return "[redacted]"
+    hits: list[tuple[int, int]] = []
+    for text, spans in views:
+        _collect_secret_hits(text, spans, hits)
+    if not hits:
+        return value
+    hits.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in hits:
+        if merged and start < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            continue
+        merged.append((start, end))
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        pieces.append(value[cursor:start])
+        pieces.append("[redacted]")
+        cursor = end
+    pieces.append(value[cursor:])
+    return "".join(pieces)
+
+
+def _redact_tree(value):
+    """Replace credential shapes in every string. Numbers, bools and None stay."""
+
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, Mapping):
+        return {
+            redact(key) if isinstance(key, str) else key: _redact_tree(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_tree(item) for item in value)
+    return value

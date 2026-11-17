@@ -530,9 +530,11 @@ class AcpConnection:
         """The caller's answer: the line to write, or None when the ask was already answered (counted late).
 
         The answer is decided when it CLAIMS the ask under the lock; the clock is read after the claim,
-        with no lock held. When that reading is at or after the ask's deadline the answer is the deadline's
-        ``deny``, whatever the caller said: the line returned is that deny, and ``ask.answered_by`` is
-        ``deadline``. However long the claim waited for the lock, a late answer never approves."""
+        with no lock held. When that reading is at or after the ask's own deadline, or at or after the
+        deadline of the turn the ask belongs to, the answer is the deadline's ``deny``, whatever the caller
+        said: the line returned is that deny, and ``ask.answered_by`` is ``deadline``. A permission timeout
+        later than the turn does not extend the turn. However long the claim waited for the lock, a late
+        answer never approves."""
         if decision not in (APPROVE, DENY):
             raise AcpInvalid("decision must be approve or deny")
         _ask_token(token)
@@ -546,7 +548,10 @@ class AcpConnection:
             if ask.answer is not None or ask._claimed or self.closed:
                 self.late_answers += 1
                 return None
-            if ask.deadline_at is None:   # no deadline: nothing to read the clock for
+            turn = self._turn
+            turn_deadline = turn.deadline_at if turn is not None and turn.number == ask.turn else None
+            # No permission timeout and no turn deadline: nothing to read the clock for.
+            if ask.deadline_at is None and turn_deadline is None:
                 return self._settle(ask, decision, "caller")
             ask._claimed = True
         try:
@@ -560,7 +565,9 @@ class AcpConnection:
             if ask.answer is not None:    # the output ended, or the turn was answered, during the claim
                 self.late_answers += 1
                 return None
-            if now >= ask.deadline_at:
+            if now is not None and (
+                    (ask.deadline_at is not None and now >= ask.deadline_at)
+                    or (turn_deadline is not None and now >= turn_deadline)):
                 return self._settle(ask, DENY, "deadline")
             return self._settle(ask, decision, "caller")
 
@@ -754,6 +761,10 @@ class AcpConnection:
             deadline_at = None
             if self._permission_timeout_s is not None and now is not None:
                 deadline_at = now + self._permission_timeout_s
+                # The ask's own deadline cannot be later than the turn's: a permission timeout does not
+                # keep an approval open after the turn has expired.
+                if deadline_at > turn.deadline_at:
+                    deadline_at = turn.deadline_at
             tool_call = params.get("toolCall") if isinstance(params.get("toolCall"), Mapping) else {}
             options = tuple(params.get("options")) if isinstance(params.get("options"), list) else ()
             ask = PermissionAsk(token, turn.number, dict(tool_call), options, deadline_at, _rpc_id=rpc_id)
@@ -824,7 +835,10 @@ class AcpConnection:
             answered = self._prompt_answered(pending)
             if isinstance(answered, _HookNeeded):
                 return answered
-            fed.ended = answered
+            # The block above may already have ended the turn on its deadline. A late answer that
+            # decides nothing must not replace that outcome with None.
+            if answered is not None:
+                fed.ended = answered
         return None
 
     def _initialized(self, result: object) -> None:
@@ -1209,9 +1223,10 @@ class AcpSession:
     def answer_permission(self, token: str, decision: str) -> bool:
         """The caller's answer to an ask. True only when the agent was sent the option the caller's decision
         names (``allow_once`` for approve, ``reject_once`` for deny). False when the ask was already answered
-        (deadline, cancel, or an earlier answer), when its deadline had passed (the deadline's deny is sent
-        instead), when the agent did not offer the option the decision needs (it is sent the ``cancelled``
-        outcome, which runs nothing; ``ask.option_id`` is None), or when the agent's input is gone."""
+        (deadline, cancel, or an earlier answer), when its own deadline or its turn's deadline had passed
+        (the deadline's deny is sent instead), when the agent did not offer the option the decision needs (it
+        is sent the ``cancelled`` outcome, which runs nothing; ``ask.option_id`` is None), or when the agent's
+        input is gone."""
         with self._order:
             line = self.connection.answer_permission(token, decision)
             if line is None:
@@ -1279,6 +1294,12 @@ class AcpSession:
                 # interruption is raised, never swallowed.
                 self._line_refused(line, error)
                 raise
+        # on_line may have spent the rest of the turn. Notice that before feed, while the turn is
+        # still open, so the agent is asked to stop and a late line cannot make a success.
+        if abandoned is None and self._clock() >= deadline_at:
+            abandoned = conn.deadline()
+            if abandoned is not None:
+                self.cancel()
         if self.input_lost:
             # A write failed while this line was read (on another thread, or the cancel just above): nothing
             # the line says can make a success. An outcome the turn already had (its deadline) stays.
@@ -1300,6 +1321,10 @@ class AcpSession:
         if late and fed.ended is None:
             raise AcpError(c.DEADLINE_EXCEEDED, "recursion deadline (an answer read after it)")
         if fed.ended is not None:
+            # feed can be the first to see the deadline (the clock moved during on_line or inside feed).
+            # Returning that outcome without asking the agent to stop leaves the turn running.
+            if abandoned is None and fed.ended.code == c.DEADLINE_EXCEEDED:
+                self.cancel()
             return fed.ended
         return True  # a write of this round that failed is seen at the top of the next one, before any read
 

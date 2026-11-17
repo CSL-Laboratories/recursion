@@ -191,7 +191,7 @@ class TuiApp:
         # Per run (a Stop) until the API attests that Stop, or per launch (a start) until a list or status names it
         self._uncertain: dict[str, str] = {}
         self._asked = 0  # requests asked so far, in order: a read asked before a confirmed Stop is known by it
-        self._stopped: dict[str, int] = {}  # run id -> requests asked when its Stop was confirmed (T2)
+        self._stopped: dict[str, int] = {}  # run id -> requests asked when its Stop was first confirmed (T2)
         self.errors: list[str] = []
         self.last_error: Event | None = None  # kept here too, so a bounded log cannot drop it
         self.mode, self.line, self.stop_target = "keys", "", None
@@ -367,16 +367,20 @@ class TuiApp:
                 self.status_refresh_failed = None
                 # A stale status stays stale until a later status is not, as a list does: an answer to another
                 # method (a Stop) is no fresh status (the triage of Nov 16, T3).
-                self.status_stale = answer.get("stale") is True
-                if isinstance(answer.get("run"), dict) and not self._before_stop(answer["run"], asked):
-                    self._merge(answer["run"])  # a status asked before its run's Stop was confirmed is not taken (T2)
+                got = answer.get("run")
+                if isinstance(got, dict):  # an ok status with no run is no fresh status (#443 r1, N4)
+                    self.status_stale = answer.get("stale") is True
+                if isinstance(got, dict) and not self._before_stop(got, asked):
+                    self._merge(got)  # a status asked before its run's Stop was confirmed is not taken (T2)
             elif code == p.UNAVAILABLE:
                 self.status_refresh_failed = f"run.status answered {field(code)}"
         elif code == "ok" and isinstance(answer.get("run"), dict):
             self._merge(answer["run"])
         elif code in ("stopped", "pending") and isinstance(answer.get("run_id"), str):
-            if code == "stopped":  # every request asked so far was asked before this confirmation (T2)
-                self._stopped[answer["run_id"]] = self._asked
+            # Every request asked so far was asked before this confirmation (T2). The first confirmation stays: a
+            # second Stop, or the same answer again, does not hide reads asked after it (#443 r1, F2).
+            if code == "stopped":
+                self._stopped.setdefault(answer["run_id"], self._asked)
             for run in self.runs:
                 if run.get("run_id") == answer["run_id"]:
                     run["state"] = "stopped" if code == "stopped" else "stop_pending"
@@ -386,7 +390,8 @@ class TuiApp:
                     run["stop"] = {**(prior if isinstance(prior, Mapping) else {}),
                                    "reason": answer.get("reason")}
         elif code == "started" and isinstance(answer.get("run"), dict):
-            self._merge(answer["run"])
+            if not self._before_stop(answer["run"], asked):  # a late retry cannot undo a Stop (#443 r1, F4)
+                self._merge(answer["run"])
         self._answer_keyed = p.keyed_conditions(answer)
         self.answer_conditions = [(label, text) for label, _, text in self._answer_keyed]
         self._uncertain.update({subject: text for label, subject, text in self._answer_keyed if label == p.UNCERTAIN})
@@ -395,8 +400,20 @@ class TuiApp:
         # write to the registry failed (recorded=false) leaves the run `running` with no stop (R2 finding
         # 6). A later answer about another run, or a run absent from the list, does not clear it either.
         attested = {f"run={r.get('run_id')}" for r in self.runs if r.get("state") == "stopped"}
-        # A start the API could not confirm stays UNCERTAIN until a list or a status names its run (T23)
-        attested |= {f"start={r.get('run_id')}" for r in self.runs}
+        # A start the API could not confirm stays UNCERTAIN until a later list or status takes its run (T23):
+        # a run this answer takes, not one already on screen, which a retry of the same key repeats (r2 of #443,
+        # R1). A status counts when it is merged; one asked before the Stop was confirmed is not taken and does
+        # not end the warning. A list run counts when that read was not asked before the Stop. An answer this
+        # call does not take does not end the warning. A run.start answer does not name the launch, including
+        # the retry body that carries the prior run (r3 of #443, R1 and R2).
+        taken = []
+        if code == "ok" and method == "run.list" and isinstance(answer.get("runs"), list):
+            taken = [r for r in answer["runs"] if isinstance(r, Mapping) and not self._before_stop(r, asked)]
+        elif code == "ok" and method == "run.status":
+            got = answer.get("run")
+            if isinstance(got, Mapping) and not self._before_stop(got, asked):
+                taken = [got]
+        attested |= {f"start={r.get('run_id')}" for r in taken}
         for subject in list(self._uncertain):
             if subject in attested:
                 del self._uncertain[subject]
@@ -587,8 +604,8 @@ class TuiApp:
         return asked is not None and asked <= self._stopped.get(str(run.get("run_id")), 0)
 
     def _after_stops(self, runs: list[dict], asked: int | None) -> list[dict]:
-        """``runs`` from a list, but a run whose Stop was confirmed after the list was asked stays as that Stop
-        left it (``stopped``)."""
+        """``runs`` from a list, but a run whose Stop was confirmed after the list was asked keeps the entry the
+        app held for it (as the Stop left it), or, one the app did not hold, is shown ``stopped`` (#443 r1, N5)."""
 
         old = {str(r.get("run_id")): r for r in self.runs}
         return [old.get(str(r.get("run_id")), {**r, "state": "stopped"}) if self._before_stop(r, asked) else r
@@ -978,9 +995,10 @@ class TuiApp:
         if (self.refresh_failed or self.status_refresh_failed or self.list_stale or self.status_stale
                 or any(label == p.STALE for label, _ in self.answer_conditions)):
             return True
-        # Fresh only while the snapshot's age is a number within the limit: a clock that gave no number (NaN), at
-        # the list or now, leaves the view stale, never fresh for ever (the triage of Nov 16, T4).
-        return self.snapshot_at is not None and not self._clock() - self.snapshot_at <= self.stale_after_s
+        # Fresh only while the snapshot's age is a number from 0 to the limit: a clock sample that is no number
+        # (NaN), infinite, or later than now leaves the view stale, never fresh for ever (the triage of Nov 16, T4;
+        # DeepSeek's round 1 of #443, F1).
+        return self.snapshot_at is not None and not 0 <= self._clock() - self.snapshot_at <= self.stale_after_s
 
     @property
     def watch_only(self) -> bool:
@@ -1002,9 +1020,9 @@ class TuiApp:
         if any(label == p.STALE for label, _ in self.answer_conditions):
             reasons.append("API marked its answer stale")
         age = self._clock() - self.snapshot_at if self.snapshot_at is not None else 0.0
-        if age != age:  # NaN: the clock gave no number (T4)
-            reasons.append("snapshot time unknown: the clock gave no number")
-        elif not age <= self.stale_after_s:
+        if not age - age == 0 or age < 0:  # NaN, infinite, or later than now: no usable age (T4; #443 r1, F1)
+            reasons.append("snapshot time unknown: the clock gave no usable time")
+        elif age > self.stale_after_s:
             reasons.append(f"snapshot older than {self.stale_after_s:.1f}s")
         return "; ".join(reasons)
 

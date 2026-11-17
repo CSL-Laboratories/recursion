@@ -50,7 +50,9 @@ def plan_commands(action: str) -> tuple[tuple[str, ...], ...]:
 
 def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     """Write the unit. The same bytes already there change nothing; other bytes are refused, and so
-    is a unit another user could change (another user's, or writable by group or world)."""
+    is a unit another user could change (another user's, or writable by group or world). A platform
+    with no ``os.geteuid`` is refused ``platform_unsupported`` (one line naming the platform) before
+    any path is read or written."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args).encode()
@@ -74,7 +76,8 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     whose daemon may keep its state in another folder (``state_elsewhere``: its own ``XDG_STATE_HOME``,
     an ``EnvironmentFile``, the manager's value passed through) is refused ``unit_state_elsewhere``,
     left as it is: replacing it would point the daemon at another state folder, without the revocations
-    and breaker trips kept in its own."""
+    and breaker trips kept in its own. A platform with no ``os.geteuid`` is refused
+    ``platform_unsupported`` (one line naming the platform) before any path is read or written."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args).encode()

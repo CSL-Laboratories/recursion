@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 import tempfile
 import unittest
 
@@ -17,6 +18,7 @@ from recursion_core.daemon_install import (
     InstallRefused,
     Roots,
     daemon_exec_args,
+    install,
     render_unit,
     upgrade,
 )
@@ -52,6 +54,7 @@ def _tree(root: str) -> dict[str, tuple]:
     return found
 
 
+@unittest.skipUnless(os.name == "posix", "the installer is Linux-only")
 @unittest.skipUnless(POSIX_PATHS, "this host does not take the unit's interpreter path as absolute")
 class SurrogateWordTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -90,6 +93,33 @@ class SurrogateWordTests(unittest.TestCase):
         self.assertNotEqual(_read(self.unit), render_unit(EXEC))
         with self.assertRaises(InstallRefused):
             upgrade(self.roots, EXEC)
+
+
+@unittest.skipIf(hasattr(os, "geteuid"), "this host has os.geteuid; the refusal is what a platform without it answers")
+class NoGeteuidRefusalTests(unittest.TestCase):
+    def test_install_and_upgrade_refuse_in_one_line_that_names_the_platform(self) -> None:
+        # The owner check cannot be made. install and upgrade answer a refusal and leave the state folder.
+        tmp = tempfile.TemporaryDirectory(prefix="install-")
+        self.addCleanup(tmp.cleanup)
+        home = os.path.join(tmp.name, "home")
+        os.mkdir(home, 0o700)
+        state = os.path.join(home, ".local", "state", "recursion")
+        os.makedirs(state, 0o700)
+        with open(os.path.join(state, "runs.sqlite3"), "wb") as handle:
+            handle.write(b"rows-v1")
+        before = _tree(home)
+        roots = Roots(home=home)
+        expected = f"the per-user installer needs os.geteuid, which {sys.platform} does not provide"
+        for name, call in (("install", install), ("upgrade", upgrade)):
+            with self.subTest(name=name):
+                with self.assertRaises(InstallRefused) as caught:
+                    call(roots, EXEC)
+                self.assertEqual(caught.exception.kind, "platform_unsupported")
+                self.assertEqual(caught.exception.detail, expected)
+                self.assertNotIn("\n", caught.exception.detail)
+                self.assertNotIn("\n", str(caught.exception))
+                self.assertIn(sys.platform, caught.exception.detail)
+        self.assertEqual(_tree(home), before)
 
 
 if __name__ == "__main__":

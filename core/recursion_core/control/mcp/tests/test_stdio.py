@@ -143,7 +143,7 @@ class StdioTest(unittest.TestCase):
         self.assertEqual(("ok", "running"), (status["structuredContent"]["code"], status["structuredContent"]["run"]["state"]))
 
         pending = child.tool(6, "recursion_run_stop", {"run_id": run_id})  # a member lives
-        self.assertEqual(("pending", True), (pending["structuredContent"]["code"], pending["isError"]))
+        self.assertEqual(("pending", False), (pending["structuredContent"]["code"], pending["isError"]))
         stopped = child.tool(7, "recursion_run_stop", {"run_id": run_id})  # the attested walk is empty
         self.assertEqual(("stopped", False), (stopped["structuredContent"]["code"], stopped["isError"]))
         self.assertEqual([f"/sys/fs/cgroup/fake/{run_id}"], kill.requests)

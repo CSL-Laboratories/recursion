@@ -5,7 +5,8 @@ their assertions as written. They run on this module's store (each case runs on 
 store), EV6's proxy is this module's ``ConnProxy``, and EV3 also asserts that the failure is logged. Around them, the
 same promise is held at its other points: an interruption right after BEGIN ran, an owner that ends its transaction
 after a foreign exit was refused, SystemExit at COMMIT, an interruption at a declaration's COMMIT, an interruption
-after a declaration's BEGIN, an interruption during a ROLLBACK, and an interruption that a subscriber raises.
+after a declaration's BEGIN, an interruption during a ROLLBACK, a fatal error on the retried ROLLBACK, SystemExit on
+that rollback and after a declaration's BEGIN, and an interruption that a subscriber raises.
 An interruption here is an exception that is not an ``Exception``: KeyboardInterrupt, SystemExit.
 """
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -206,6 +208,130 @@ class TransactionTests(Case):
         with self.assertRaisesRegex(StoreError, 'store_failed'):
             store.transaction().__enter__()             # refused by name, not a raw sqlite3 error
         real.execute('ROLLBACK')                        # for the cleanup: the test's own connection state
+
+    def test_a_fatal_error_on_the_retried_rollback_fails_the_store(self) -> None:
+        # Grok r2 on #441, R1 (db.py _rollback): the retried ROLLBACK's fatal error was dropped once the
+        # transaction had ended, and the next transaction committed.
+        store = self.new_store()
+        real = store._conn
+        err = sqlite3.OperationalError('injected SQLITE_IOERR')
+        err.sqlite_errorcode, err.sqlite_errorname = 10, 'SQLITE_IOERR'
+
+        class Proxy:
+            def __init__(self) -> None:
+                self.n = 0
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def execute(self, sql, *args):
+                if sql == 'ROLLBACK':
+                    self.n += 1
+                    if self.n == 1:
+                        raise KeyboardInterrupt()
+                    real.execute(sql, *args)
+                    raise err
+                return real.execute(sql, *args)
+
+        store._conn = Proxy()
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                with store.transaction() as tx:
+                    tx.append(event())
+                    raise ValueError('the body fails')
+        finally:
+            store._conn = real
+        self.assertEqual(store.events, [])
+        self.assertEqual(store._failed, 'rollback_failed')
+        with self.assertRaisesRegex(StoreError, 'store_failed'):
+            store.transaction().__enter__()
+
+    def test_a_nonfatal_error_on_the_retried_rollback_leaves_the_store_usable(self) -> None:
+        # The other half of R1: a code the page cache can be trusted after, once the transaction has ended
+        # (SQLITE_FULL), does not fail the store. test_each_fatal_code already says that of a statement.
+        store = self.new_store()
+        real = store._conn
+        err = sqlite3.OperationalError('injected SQLITE_FULL')
+        err.sqlite_errorcode, err.sqlite_errorname = 13, 'SQLITE_FULL'
+
+        class Proxy:
+            def __init__(self) -> None:
+                self.n = 0
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def execute(self, sql, *args):
+                if sql == 'ROLLBACK':
+                    self.n += 1
+                    if self.n == 1:
+                        raise KeyboardInterrupt()
+                    real.execute(sql, *args)
+                    raise err
+                return real.execute(sql, *args)
+
+        store._conn = Proxy()
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                with store.transaction() as tx:
+                    tx.append(event())
+                    raise ValueError('the body fails')
+        finally:
+            store._conn = real
+        self.assertIsNone(store._failed)
+        self.assertEqual(store.events, [])
+        self.assertUsable(store)
+
+    def test_systemexit_during_a_rollback_leaves_no_transaction_open(self) -> None:
+        # Grok r2 on #441, R2: the rollback handler catches BaseException, and SystemExit had no test.
+        store = self.new_store()
+        real = store._conn
+
+        class Proxy:
+            def __init__(self) -> None:
+                self.n = 0
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def execute(self, sql, *args):
+                if sql == 'ROLLBACK':
+                    self.n += 1
+                    if self.n == 1:
+                        raise SystemExit(3)
+                return real.execute(sql, *args)
+
+        store._conn = Proxy()
+        try:
+            with self.assertRaises(SystemExit):
+                with store.transaction() as tx:
+                    tx.append(event())
+                    raise ValueError('the body fails')
+        finally:
+            store._conn = real
+        self.assertIsNone(store._failed)
+        self.assertEqual(store.events, [])
+        self.assertUsable(store)
+
+    def test_systemexit_after_a_declarations_begin_leaves_the_store_usable(self) -> None:
+        # Grok r2 on #441, R2: the declaration handler catches BaseException, and SystemExit had no test.
+        store = self.new_store()
+        real, calls = store._statement, []
+
+        def begun(sql):
+            real(sql)
+            if sql == 'BEGIN IMMEDIATE' and not calls:
+                calls.append(1)
+                raise SystemExit(3)
+        store._statement = begun
+        try:
+            with self.assertRaises(SystemExit):
+                store.register_tables('triage', 1, 'CREATE TABLE triage_items (id INTEGER PRIMARY KEY)')
+        finally:
+            del store._statement
+        self.assertIsNone(store._failed)
+        self.assertUsable(store)
+        store.register_tables('triage', 1, 'CREATE TABLE triage_items (id INTEGER PRIMARY KEY)')
 
     def test_EV2_another_thread_cannot_exit_the_owners_transaction(self) -> None:
         # The triage's red test (s2b-events-db-sol F02, s2b-events-db-astra F02; db.py:320).

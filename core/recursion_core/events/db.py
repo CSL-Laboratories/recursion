@@ -81,9 +81,9 @@ SystemExit, an exception that is not an ``Exception``) is never turned into anot
 after ``BEGIN`` rolls that transaction back and gives up the helper's lock before it is raised again, so the next
 owner finds no transaction left open in the connection; so does one after a declaration's ``BEGIN``. One at a
 COMMIT fails the store the same way (``commit_outcome_unknown``: the commit may have happened) and is raised as
-itself. One during a ROLLBACK is followed by one more ROLLBACK; a connection that still holds the transaction then
-fails the store (``rollback_failed``), so the next owner is refused ``store_failed``, not given a connection still in
-a transaction.
+itself. One during a ROLLBACK is followed by one more ROLLBACK. The store fails (``rollback_failed``) when that
+connection still holds the transaction, or when the second ROLLBACK raises an error the page cache cannot be trusted
+after (SQLite may have ended the transaction itself). The next owner is refused ``store_failed``.
 
 WHAT THIS DOES NOT GIVE. Subscribers are callbacks of this process: one that has not run when the process
 dies does not run; a consumer that must not miss an event reads the log from a stored position (lane
@@ -783,12 +783,15 @@ class EventStore:
         except sqlite3.Error as exc:
             self._fail(exc, 'rollback_failed')
         except BaseException as exc:            # an interruption during the rollback: it may not have run
+            fatal_retry = False
             try:
                 if self._conn.in_transaction:
                     self._conn.execute('ROLLBACK')
-            except BaseException:               # noqa: BLE001 - the first interruption is the one raised
-                pass
-            if self._conn.in_transaction:
+            except BaseException as retry:      # noqa: BLE001 - the first interruption is the one raised
+                fatal_retry = _fatal(retry)
+            # A fatal error can arrive after SQLite has already ended the transaction. The page cache is then
+            # not to be trusted, so the store fails even though in_transaction is already false.
+            if self._conn.in_transaction or fatal_retry:
                 self._fail(exc, 'rollback_failed')
             raise
 

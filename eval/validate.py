@@ -21,25 +21,37 @@ from eval import gitutil
 from eval import scratch as scratch_mod
 
 NO_TESTS_RAN = 5
-# unittest exits 0 and prints this when it collected tests and skipped every one.
-_RAN_TESTS = re.compile(rb"\bRan (\d+) tests?\b")
-_OK_SKIPPED = re.compile(rb"\bOK \(skipped=(\d+)\)")
+# The unittest summary that ends the log. An earlier "Ran N / OK (skipped=N)" can be a nested suite
+# the command printed; only a summary that reaches the end of the log decides.
+_FINAL_SUMMARY = re.compile(
+    rb"Ran (\d+) tests? in [0-9.]+s\s+(OK|FAILED)(?: \(([^)]*)\))?\s*\Z",
+    re.DOTALL,
+)
+_SKIPPED = re.compile(rb"(?:^|, )skipped=(\d+)")
+_EXPECTED_FAILURES = re.compile(rb"(?:^|, )expected failures=(\d+)")
 
 
 def collected_tests_all_skipped(log: bytes) -> bool:
-    """True when the hidden-test log shows every collected test was skipped.
+    """True when the final hidden-test summary shows that nothing passed.
 
-    That command exits 0, the same code as a pass. A pass on the parent would say there is nothing to
-    solve, and a pass when grading would count the task done. Neither is true: no test ran.
+    A skipped suite exits 0, the same code as a pass. So does a suite whose only results are skips and
+    expected failures. A pass on the parent would say there is nothing to solve, and a pass when grading
+    would count the task done. An earlier summary inside the log is not the one that counts: a passing
+    suite can print a nested run that skipped everything. Unexpected successes count as passes.
     """
     if not log:
         return False
-    ran = _RAN_TESTS.search(log)
-    skipped = _OK_SKIPPED.search(log)
-    if ran is None or skipped is None:
+    found = _FINAL_SUMMARY.search(log)
+    if found is None or found.group(2) != b"OK":
         return False
-    count = int(ran.group(1))
-    return count > 0 and count == int(skipped.group(1))
+    ran = int(found.group(1))
+    body = found.group(3) or b""
+    skipped = _SKIPPED.search(body)
+    expected = _EXPECTED_FAILURES.search(body)
+    skipped_n = int(skipped.group(1)) if skipped else 0
+    expected_n = int(expected.group(1)) if expected else 0
+    passed = ran - skipped_n - expected_n
+    return ran > 0 and passed <= 0
 
 
 @dataclass

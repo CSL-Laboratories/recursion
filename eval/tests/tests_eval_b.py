@@ -130,8 +130,10 @@ class LifecycleWitnesses(unittest.TestCase):
                         arms.run_process([sys.executable, "-B", "-c", "import time; time.sleep(.8)"],
                                          cwd=Path(folder), env=SAFE_ENV, stdin=None, timeout_s=.1)
                 process = made[0]
-                print(f"F3 child alive={process.poll() is None}; stdin closed={process.stdin.closed}", flush=True)
-                self.assertIsNotNone(process.returncode, "launched child is lost before the protected wait")
+                # /proc only: poll() would reap the child and hide a missing reap.
+                observed = state(process.pid)
+                print(f"F3 child state={observed}; stdin closed={process.stdin.closed}", flush=True)
+                self.assertIsNone(observed, "launched child is lost before the protected wait")
                 self.assertTrue(all(stream.closed for stream in (process.stdin, process.stdout, process.stderr)))
             finally:
                 for process in made:

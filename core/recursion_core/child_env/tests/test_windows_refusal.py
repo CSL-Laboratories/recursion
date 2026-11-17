@@ -1,13 +1,16 @@
-"""What child_env does on Windows: a typed refusal, asserted on a real Windows host (CSL-785).
+"""What child_env does on Windows, asserted on a real Windows host (CSL-785).
 
-The POSIX suites in test_child_env.py skip there, so without this file the Windows gate would
-assert nothing about child_env. On a POSIX host the same class runs under the simulation in
-test_simulated_windows.py. Every value is fake; no engine, provider or network is used.
+``build_child_env`` keeps an allow-list. ``spawn`` and the owner helpers still refuse, because
+there is no Windows launcher and no ``os.geteuid``. The POSIX suites in test_child_env.py skip
+here, so without this file the Windows gate would assert nothing about child_env. On a POSIX
+host the same class runs under the simulation in test_simulated_windows.py. Every value is
+fake; no engine, provider or network is used.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -19,16 +22,37 @@ WINDOWS_ONLY = "Windows-only assertions; a POSIX host runs them simulated (child
 
 @unittest.skipUnless(os.name == "nt", WINDOWS_ONLY)
 class WindowsRefusalTests(unittest.TestCase):
-    def test_build_child_env_refuses_platform_unsupported_for_every_engine_and_mode(self) -> None:
-        home = tempfile.gettempdir()
+    def test_build_child_env_keeps_the_windows_allow_list_for_every_engine_and_mode(self) -> None:
+        # The old assertion was platform_unsupported for every engine and mode. The allow-list
+        # keeps that promise for parent names: a credential is dropped, not copied through.
+        home = tempfile.mkdtemp(prefix="csl785-win-home-")
+        self.addCleanup(shutil.rmtree, home, True)
+        canary = "fake-not-a-key"
+        parent = {"PATH": os.defpath, "ANTHROPIC_API_KEY": canary, "SystemRoot": home}
+        routes = {
+            "subscription": None,
+            "api_key": policy.ChildRoute(api_key="fake-user-entered-key-not-a-credential"),
+            "cloud_provider": policy.ChildRoute(provider_switches=("CLAUDE_CODE_USE_BEDROCK",)),
+        }
         for engine in sorted(policy.ENGINE_PROFILES):
+            profile = policy.ENGINE_PROFILES[engine]
             for mode in ("subscription", "api_key", "cloud_provider"):
-                with self.subTest(engine=engine, mode=mode), self.assertRaises(EnvRefused) as caught:
-                    build_child_env(engine, home=home, auth_mode=mode, parent={"PATH": os.defpath})
-                self.assertEqual((None, "platform_unsupported"), (caught.exception.name, caught.exception.cause))
+                with self.subTest(engine=engine, mode=mode):
+                    if mode == "cloud_provider" and not profile.provider_switches:
+                        with self.assertRaises(EnvRefused) as caught:
+                            build_child_env(engine, home=home, auth_mode=mode, route=routes[mode], parent=parent)
+                        self.assertEqual((None, "auth_mode_unsupported"), (caught.exception.name, caught.exception.cause))
+                        continue
+                    env = build_child_env(engine, home=home, auth_mode=mode, route=routes[mode], parent=parent)
+                    self.assertNotIn(canary, env.to_dict().values())
+                    self.assertIn("ANTHROPIC_API_KEY", env.dropped)
+                    self.assertNotIn("PATH", env)
+                    self.assertEqual(home, env["USERPROFILE"])
+                    self.assertEqual(home, env["SystemRoot"])
 
     def test_spawn_refuses_before_any_process_starts(self) -> None:
-        # build_child_env never returns here, so the only ValidatedEnv a caller could hold is one made with the seal.
+        # spawn is still refused on Windows. The sealed value is how this test holds a ValidatedEnv
+        # without starting a process.
         env = ValidatedEnv({"PATH": os.defpath}, "codex", (), auth_mode="subscription", _seal=ValidatedEnv._seal)
         calls: list = []
         with self.assertRaises(EnvRefused) as caught:

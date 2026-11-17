@@ -5325,6 +5325,11 @@
       "shows": "events.follow with projection 'raw' returns the events themselves, with their whole payloads: a caller that wants them says so."
     },
     {
+      "file": "good/methods.v1/h78-an-absent-launch-check.json",
+      "schema": "methods.v1.json#/$defs/start_error",
+      "shows": "When no launch-check function is registered, a refused start carries code launch_refused and detail launch_check_absent."
+    },
+    {
       "file": "good/methods.v1/n01-session-start-not-built-yet.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "shows": "session.start is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
@@ -6045,6 +6050,15 @@
       "expect": {
         "keyword": "const",
         "at": "/answer/interrupt/outcome"
+      }
+    },
+    {
+      "file": "bad/methods.v1/b43-an-absent-launch-check-code-with-a-hyphen.json",
+      "schema": "methods.v1.json#/$defs/start_error",
+      "rule": "The code of a start error is a plain word. A hyphen is not one, so launch-check-absent is refused.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/code"
       }
     },
     {

@@ -962,10 +962,10 @@ class Hooks:
         return Path(folder)
 
     def launch_check(self, ctx, executable) -> None:
-        """Returns when the launch may go on. Raises ``HookRefused`` when the check refuses it, or fails."""
+        """Returns when the launch may go on. Raises ``HookRefused`` when no check is registered, when the check refuses it, or when the check fails."""
         check = self._single.get('launch_check')
         if check is None:
-            return
+            raise HookRefused('launch_check_absent')
         try:
             verdict = check(ctx, executable)
         except Exception:  # noqa: BLE001

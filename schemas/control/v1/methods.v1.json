@@ -601,7 +601,7 @@
       ]
     },
     "start_error": {
-      "description": "Why the launch path refused a start, under 'start_failed': a typed code and a detail. The code is the launch path's own (for example route_not_configured, launch_refused, breaker_store_unavailable, reservation_refused).",
+      "description": "Why the launch path refused a start, under 'start_failed': a typed code and a detail. The code is the launch path's own (for example route_not_configured, launch_refused, breaker_store_unavailable, reservation_refused). When no launch-check function is registered, the code is launch_refused and the detail is launch_check_absent.",
       "type": "object",
       "additionalProperties": false,
       "required": [

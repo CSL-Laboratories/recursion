@@ -40,13 +40,20 @@ LIVE = 'helper=0 fast=1'            # the stand-in engine runs until it is stopp
 ENDS = 'helper=0 ticks=1 fast=1'    # the stand-in engine ends on its own, with a result
 
 
-def hooks_of(register=None, **single):
-    """Hooks as ``compose()`` leaves them, with what a test's fake lane registered."""
+def hooks_of(register=None, *, bare=False, **single):
+    """Hooks as ``compose()`` leaves them, with what a test's fake lane registered.
+
+    A launch with no launch-check function is refused. Unless ``bare`` is set, or the caller
+    passed ``launch_check``, an admitting check is registered so the launch under test is not
+    that refusal.
+    """
     made = H.Hooks()
     for name, function in single.items():
         made.set(name, function)
     if register is not None:
         register(made)
+    if not bare and 'launch_check' not in made._single:
+        made.set('launch_check', lambda ctx, executable: None)
     made.freeze()
     return made
 
@@ -246,7 +253,15 @@ class NothingRegisteredTest(Composed):
                          {'ok': False, 'error': {'code': 'scope_refused', 'detail': 'peer is inside a run unit'}})
         self.assertEqual(control.handle({'op': 'control', 'method': 'run.list', 'params': {}}, peer()),
                          {'ok': True, 'result': {'code': 'ok', 'runs': []}})
-        # A start stores what it stored: three members of identity, no principal, no launch object.
+        # A start with no launch-check function is refused, and no child runs.
+        answer = api.call('run.start', self.request(client_key='k1', workspace={'path': '/x'}, owner='notes.search'))
+        self.assertEqual((answer.get('code'), answer.get('start_error')),
+                         ('start_failed', {'code': 'launch_refused', 'detail': 'launch_check_absent'}), answer)
+        self.assertEqual(self.units.started, [])
+        self.shutdown()
+        # The record a start stores is the same once a check admits the launch.
+        _, composed = self.boot(hooks_of(launch_check=lambda ctx, executable: None))
+        api, control = self.api(composed), composed.control
         run_id = self.start(api, client_key='k1', workspace={'path': '/x'}, owner='notes.search')
         record = control.registry.get(run_id)
         self.assertEqual(sorted(record['start_key']), ['client_key', 'engine', 'prompt_sha256'])
@@ -672,7 +687,7 @@ class EngineSeamTest(Composed):
         def register(made):
             made.engines.register('claude_code', factory, replace=True)    # only so that the test gets the lookup
             made.set('credentials', source)
-        made = hooks_of(register)
+        made = hooks_of(register, bare=True)
         self.assertEqual((sorted(made._single), made.gate.enabled), (['credentials'], True), 'the source is the only hook: the gate is on')
         daemon, composed = self.boot(made)
         lookup, = built
@@ -1557,7 +1572,7 @@ class RunThreadLifetimeTest(unittest.TestCase):
         what it was before the seams: a close of the composition, which shuts that gate all the same, does not
         keep it from fencing. Only the daemon's own closed flag does, as before."""
         for daemon_closed, fenced in ((False, [mock.call('result_recorded')]), (True, [])):
-            bare = hooks_of()
+            bare = hooks_of(bare=True)
             folder = tempfile.mkdtemp(prefix='rc-seams-settle-')
             self.addCleanup(shutil.rmtree, folder, True)
             reconcile = mock.Mock(return_value=mock.Mock(state='running'))
@@ -2008,7 +2023,8 @@ class RunThreadLifetimeTest(unittest.TestCase):
                 leave.wait(HELD_BOUND_S)
                 return mock.Mock(state='running')
             made = hooks_of(drive_owner=lambda ctx, request: Owner())
-            self.assertEqual((sorted(made._single), made.gate.enabled), (['drive_owner'], True), 'the owner alone: the gate is on')
+            self.assertEqual((sorted(made._single), made.gate.enabled), (['drive_owner', 'launch_check'], True),
+                             'the owner is registered, and a check that admits so the launch reaches the owner: the gate is on')
             folder = tempfile.mkdtemp(prefix='rc-seams-settle-')
             self.addCleanup(shutil.rmtree, folder, True)
             starter = adapter.RouteStarter(FakeService(), DriveOwnerSeamTest.ROUTES, mock.Mock(closed=False, reconcile=reconcile),
@@ -2079,12 +2095,12 @@ class RunThreadLifetimeTest(unittest.TestCase):
         call()
         self.assertEqual((outcome, asked), ([(c.LAUNCH_REFUSED, 'daemon_closing')], []))
         manager.prepare.assert_not_called()
-        # With hooks nobody registered into the gate is off: a launch during a close is the launch it always was.
-        bare = hooks_of()
+        # With no check registered the launch is refused, and it does not reach the unit manager.
+        bare = hooks_of(bare=True)
         bare.begin_close()
         ctx, manager, state, call, outcome = self.launch(bare)
         call()
-        self.assertEqual(outcome, ['reached the unit manager'])
+        self.assertEqual(outcome, [(c.LAUNCH_REFUSED, 'launch_check_absent')])
 
     def test_a_launch_hook_registered_alone_is_waited_for_and_its_launch_then_starts_nothing(self):
         """The fifth reads. A lane can register ``launch_check`` or ``working_directory`` and nothing else: no
@@ -2098,7 +2114,9 @@ class RunThreadLifetimeTest(unittest.TestCase):
                 held, entered, leave, seen = held_hook(ended)
                 self.addCleanup(leave.set)
                 made = hooks_of(**{hook: held})
-                self.assertEqual((sorted(made._single), made.gate.enabled), ([hook], True), 'the hook alone: the gate is on')
+                expected = [hook] if hook == 'launch_check' else ['launch_check', hook]
+                self.assertEqual((sorted(made._single), made.gate.enabled), (expected, True),
+                                 'the hook is registered, and a check admits when this hook is not the check: the gate is on')
                 ctx, manager, state, call, outcome = self.launch(made)
                 user = threading.Thread(target=call, daemon=True)
                 user.start()
@@ -2165,7 +2183,7 @@ class ClientSideHookAloneTest(Composed):
                 ended = mock.Mock(closed=False)     # no store here: this says the close has ended, as a store's flag does
                 held, entered, leave, seen = held_hook(ended, frozenset({'route.list'}) if target == 'page_methods' else None)
                 self.addCleanup(leave.set)
-                made = hooks_of(**{name: held if name == target else (lambda *args: None) for name in names})
+                made = hooks_of(bare=True, **{name: held if name == target else (lambda *args: None) for name in names})
                 self.assertEqual((sorted(made._single), made.gate.enabled), (sorted(names), True))
                 daemon, composed = self.boot(made)
                 control = composed.control
@@ -2193,7 +2211,7 @@ class ClientSideHookAloneTest(Composed):
         ended = mock.Mock(closed=False)     # no store here: this says the close has ended, as a store's flag does
         held, entered, leave, seen = held_hook(ended, H.Refusal('workspace_busy'))   # it refuses, so no run is made
         self.addCleanup(leave.set)
-        made = hooks_of(lambda made: made.start_registrant('workspace', (), (), held))
+        made = hooks_of(lambda made: made.start_registrant('workspace', (), (), held), bare=True)
         self.assertEqual((made.start_on, sorted(made._single), made.gate.enabled), (True, [], True))
         daemon, composed = self.boot(made)
         answers = []
@@ -2427,7 +2445,7 @@ class ChangeMarkerRegistryTest(unittest.TestCase):
     def registry(self, name='state', marker=True):
         registry = Registry(self.tmp / name)
         self.addCleanup(registry.close)
-        made = hooks_of(lambda hooks: hooks.enable_changes()) if marker else hooks_of()
+        made = hooks_of(lambda hooks: hooks.enable_changes(), bare=True) if marker else hooks_of(bare=True)
         if made.changes is not None:
             registry.mark_changed = made.mark_changed
         return registry, made.changes
@@ -2633,7 +2651,7 @@ class ChangeMarkerStopTest(Composed):
                 after['state'], after['observed']['state'], after['stop_attestation']['proof'])
 
     def base_shape(self):
-        _, composed = self.boot()
+        _, composed = self.boot(hooks_of())
         run_id = self.start(composed.control)
         shape = self.shape(composed, run_id, composed.control.call('run.stop', {'run_id': run_id}))
         self.shutdown()

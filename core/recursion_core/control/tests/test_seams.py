@@ -907,13 +907,17 @@ class DefaultsTest(unittest.TestCase):
     def test_the_other_defaults_add_nothing(self) -> None:
         ctx = object()
         self.assertIsNone(self.hooks.working_directory(ctx))
-        self.assertIsNone(self.hooks.launch_check(ctx, '/usr/bin/engine'))
         self.assertIsNone(self.hooks.read_result('run-1'))
         self.assertIsNone(self.hooks.drive_owner(ctx, {'request_id': 'run-1'}))
         self.assertEqual(self.hooks.page_methods(), frozenset())
         self.assertIsNone(self.hooks.mark_changed('run-1'))
         self.assertIsNone(self.hooks.open_store('/nowhere'))
         self.assertIsNone(self.hooks.methods.store)
+
+    def test_an_unregistered_launch_check_refuses(self) -> None:
+        with self.assertRaises(H.HookRefused) as caught:
+            self.hooks.launch_check(object(), '/usr/bin/engine')
+        self.assertEqual((caught.exception.code, caught.exception.detail), ('launch_check_absent', ''))
 
     def test_a_principal_is_one_of_five_kinds_and_shows_only_its_kind_and_label(self) -> None:
         self.assertEqual(H.Principal('plugin', 'notes.search').public(), {'kind': 'plugin', 'id': 'notes.search'})

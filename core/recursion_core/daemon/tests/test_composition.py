@@ -27,6 +27,7 @@ from unittest import mock
 from recursion_core.control import cli
 from recursion_core.control.api import ControlAPI
 from recursion_core.control.client import SocketAPI
+from recursion_core.control.hooks import Hooks
 from recursion_core.control.registry import (
     EMPTY, POPULATED, TIMEOUT, UNKNOWN, InMemoryRunRegistry, StaleGeneration, StopUnattested,
 )
@@ -171,6 +172,13 @@ class ComposedDaemonTest(unittest.TestCase):
     def boot(self, **options):
         daemon = Daemon(Registry(self.state), ProcessUnitManager(self.units), boot_id=lambda: BOOT)
         daemon.sweep()
+        # The installed launch-check registrant sets no function, and a launch with none is refused.
+        # These tests are about the composed daemon, so a check that admits is registered here.
+        if 'hooks' not in options:
+            made = Hooks()
+            made.set('launch_check', lambda ctx, executable: None)
+            made.freeze()
+            options['hooks'] = made
         composed = adapter.compose_control(daemon, self.state, environ=self.environ, routes=self.routes, **options)
         composed.control.reconcile()
         self.open.append((daemon, composed))

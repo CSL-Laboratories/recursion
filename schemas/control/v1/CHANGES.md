@@ -27,6 +27,17 @@ Nothing is frozen yet.
 | `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.10 |
 | `session.token.v1.json` | 1.0-draft.1 |
 
+## A start with no launch-check function (Nov 17, 2026)
+
+`methods` stays `1.0-draft.10`. The start-error record does not change shape. Its description now names
+the detail `launch_check_absent`: code `launch_refused` and that detail, when no launch-check function is
+registered. The draft number stays, because moving it would have to move `methods.table.v1.json` and
+`control/methods` `TABLE_VERSION` with it, and those are outside this change.
+
+| What changed | What it breaks |
+|---|---|
+| `start_error` description names that detail. Good fixture h78. Bad fixture b43: a hyphen in the code, refused by the existing word pattern | A reader that treated the description as not naming this detail |
+
 ## After two reads of the fifth read's answer (Nov 14, 2026)
 
 `approval` draft 9; every other schema keeps its draft. Both reads of `5aface43` found the four fifth-read

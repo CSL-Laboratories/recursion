@@ -83,6 +83,23 @@ class EvidenceRegressions(unittest.TestCase):
                     self.assertNotIn('\n', reason, 'untrusted newline reached a refusal')
                     self.assertNotIn('\r', reason, 'untrusted carriage return reached a refusal')
 
+    def test_other_line_separators_in_a_field_stay_on_one_refusal_line(self):
+        """splitlines breaks on more than newline and carriage return."""
+        nasty = '\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029'
+        for index, field, value in (
+            (10, 'target', '/outside' + nasty + '/cgroup.procs'),
+            (20, 'unit', 'synthetic' + nasty + 'FORGED'),
+        ):
+            with self.subTest(field=field):
+                record = host_record()
+                record['manager_absent']['attempts'][index].update({field: value, 'refused': False})
+                result = evaluate(record)
+                self.assertEqual(result['verdict'], 'fail')
+                marker = 'FORGED' if field == 'unit' else '/cgroup.procs'
+                self.assertTrue(any(marker in reason for reason in result['reasons']))
+                for reason in result['reasons']:
+                    self.assertEqual(len(reason.splitlines()), 1, repr(reason))
+
 
 class ProcessGroupFS(Cgroup2):
     """A leaf has just one real child, in its own process group."""
@@ -91,6 +108,7 @@ class ProcessGroupFS(Cgroup2):
         leaf.mkdir()
         for name in ('cgroup.procs', 'cgroup.kill', 'cgroup.events'):
             (leaf / name).touch()
+        self.created_leaf = leaf
 
     def kill(self, leaf):
         text = (leaf / 'cgroup.procs').read_text().strip()
@@ -176,6 +194,78 @@ class MkdirInterruptTests(unittest.TestCase):
             self.root.launch('run-kept', ['/bin/true'])
         self.assertTrue(leaf.is_dir())
         self.assertTrue((leaf / 'cgroup.procs').is_file())
+
+    def test_a_leaf_this_call_did_not_record_is_left_when_make_leaf_is_interrupted(self):
+        """Another creator can mkdir in the gap before this call records the leaf."""
+        leaf = self.root_path / 'run-other'
+
+        def planter(path):
+            path.mkdir()
+            for fname in ('cgroup.procs', 'cgroup.kill', 'cgroup.events'):
+                (path / fname).touch()
+            raise KeyboardInterrupt('injected before this call recorded a leaf')
+
+        with patch.object(self.fs, 'make_leaf', side_effect=planter):
+            with self.assertRaises(KeyboardInterrupt):
+                self.root.launch('run-other', ['/bin/true'])
+        self.assertTrue(leaf.is_dir())
+        self.assertTrue((leaf / 'cgroup.procs').is_file())
+
+    def test_a_preexisting_leaf_stays_when_creation_is_interrupted(self):
+        """FileExistsError is not the only refusal. existed still has to hold."""
+        leaf = self.root_path / 'run-kept'
+        self.fs.make_leaf(leaf)
+
+        def claim_then_interrupt(path):
+            self.fs.created_leaf = path
+            raise KeyboardInterrupt('refused an existing leaf')
+
+        with patch.object(self.fs, 'make_leaf', side_effect=claim_then_interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.root.launch('run-kept', ['/bin/true'])
+        self.assertTrue(leaf.is_dir())
+        self.assertTrue((leaf / 'cgroup.procs').is_file())
+
+    def test_an_interrupt_after_make_leaf_returns_drops_the_new_leaf(self):
+        leaf = self.root_path / 'run-after'
+        state = {'armed': False}
+        real_lstat = os.lstat
+        make_leaf = self.fs.make_leaf
+
+        def lstat_after(path, *args, **kwargs):
+            if state['armed'] and Path(path) == leaf:
+                state['armed'] = False
+                raise KeyboardInterrupt('after the leaf was created')
+            return real_lstat(path, *args, **kwargs)
+
+        def make_then_arm(path):
+            make_leaf(path)
+            state['armed'] = True
+
+        with patch.object(os, 'lstat', lstat_after), \
+             patch.object(self.fs, 'make_leaf', side_effect=make_then_arm):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                self.root.launch('run-after', ['/bin/true'])
+        self.assertIn('after the leaf was created', str(caught.exception))
+        self.assertFalse(leaf.exists())
+
+    def test_an_interrupt_during_removal_is_not_replaced_by_the_first_error(self):
+        make_leaf = self.fs.make_leaf
+
+        def interrupted(path):
+            make_leaf(path)
+            raise OSError('write failed after mkdir')
+
+        def removal_interrupted(path):
+            raise KeyboardInterrupt('rmdir interrupted')
+
+        with patch.object(self.fs, 'make_leaf', side_effect=interrupted), \
+             patch.object(self.fs, 'remove', side_effect=removal_interrupted):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                self.root.launch('run-cancel', ['/bin/true'])
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        self.assertIn('write failed after mkdir', str(caught.exception.__cause__))
+        self.assertTrue((self.root_path / 'run-cancel').is_dir())
 
 
 class PipeFilesystem:

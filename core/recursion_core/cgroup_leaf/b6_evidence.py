@@ -179,7 +179,19 @@ def _scope_refusal(attempt, leaf):
 
 def _one_line(text):
     """Keep an untrusted field inside one refusal line. A raw newline would be a second record."""
-    return text.replace('\r', '\\r').replace('\n', '\\n')
+    # \\r and \\n stay spelled this way. The other separators are the ones splitlines also breaks on.
+    return (
+        text.replace('\r', '\\r')
+        .replace('\n', '\\n')
+        .replace('\x0b', '\\v')
+        .replace('\x0c', '\\f')
+        .replace('\x1c', '\\x1c')
+        .replace('\x1d', '\\x1d')
+        .replace('\x1e', '\\x1e')
+        .replace('\x85', '\\x85')
+        .replace('\u2028', '\\u2028')
+        .replace('\u2029', '\\u2029')
+    )
 
 
 def _absent_attempt(attempt, leaf, engine_uid):

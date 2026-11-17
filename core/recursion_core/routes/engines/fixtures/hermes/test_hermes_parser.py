@@ -428,6 +428,26 @@ class StreamTest(unittest.TestCase):
         self.assertEqual(alone.parse(typed_call)[0]['payload']['call_id'], 'e9n-2')
         self.assertEqual(alone.parse(done)[0]['payload']['call_id'], 'e9n-2', 'drained: pairing starts afresh')
 
+    def test_a_rejected_id_less_call_cannot_steal_a_later_calls_result(self):
+        parser = HermesStreamParser(CONNECTION)
+        rejected = json.dumps({'type': 'tool_use', 'name': 'read_file',
+                               'input': {'path': chr(0xD800)}}) + '\n'
+        valid = json.dumps({'type': 'tool_use', 'name': 'read_file',
+                            'input': {'path': 'b.txt'}}) + '\n'
+        self.assertEqual(parser.parse(rejected)[0]['type'], 'engine.output')
+        valid_id = parser.parse(valid)[0]['payload']['call_id']
+        # The rejected call finishes first. Neither id-less result can be safely paired:
+        # both calls were open, and the stream never says which result belongs to which.
+        results = [parser.parse(json.dumps({'type': 'tool_result', 'name': 'read_file',
+                                           'output': text, 'is_error': error}) + '\n')
+                   [0]['payload']['call_id']
+                   for text, error in (('invalid path', True), ('contents of b.txt', False))]
+        self.assertNotIn(valid_id, results)
+        fresh_id = parser.parse(valid)[0]['payload']['call_id']
+        self.assertEqual(parser.parse(json.dumps({'type': 'tool_result', 'name': 'read_file',
+                                                  'output': 'b', 'is_error': False}) + '\n')
+                         [0]['payload']['call_id'], fresh_id)
+
     def test_a_call_with_no_truthful_digest_is_raw_whatever_its_id(self):
         cases = [{'tool_call_id': 'c'}, {'tool_call_id': 'c', 'input': None}, {'tool_call_id': 'c', 'input': [1, 2]},
                  {'tool_call_id': 'c', 'input': 'text'}, {'tool_call_id': 'c', 'input': {'n': 9007199254740993}},
@@ -527,11 +547,15 @@ class StreamTest(unittest.TestCase):
 
     def test_a_lone_surrogate_anywhere_makes_the_line_raw_and_changes_no_state(self):
         lone = 'x' + chr(0xD800)
+        # Recognisable unnamed calls: counted open and uncertain, so the next result is not e9n-1.
+        rejected_unnamed = (
+            {'type': 'tool_use', 'name': 't', 'input': {lone: 1}},
+            {'type': 'tool_use', 'name': 't', 'input': {'k': [lone]}},
+        )
         records = [
             {'type': 'text', 'text': lone},
             {'type': 'tool_use', 'name': lone, 'input': {}},
-            {'type': 'tool_use', 'name': 't', 'input': {lone: 1}},
-            {'type': 'tool_use', 'name': 't', 'input': {'k': [lone]}},
+            *rejected_unnamed,
             {'type': 'tool_result', 'name': 't', 'output': lone, 'is_error': False},
             {'type': 'result', 'session_id': 's', 'exit_code': 0, 'text': lone, 'tokens': {'output': 1}},
             {'type': 'system', 'subtype': 'init', 'model': lone, 'session_id': 's'},
@@ -548,9 +572,13 @@ class StreamTest(unittest.TestCase):
                 self.assertIsNone(parser.model)
                 self.assertIsNone(parser.engine_session_id)
                 self.assertEqual(parser.parse(json.dumps({'type': 'tool_use', 'name': 't', 'input': {}}) + '\n')[0]
-                                 ['payload']['call_id'], 'e9n-1', 'no call was opened or id minted by the raw line')
-                self.assertEqual(parser.parse(json.dumps({'type': 'tool_result', 'name': 't', 'output': '',
-                                                          'is_error': False}) + '\n')[0]['payload']['call_id'], 'e9n-1')
+                                 ['payload']['call_id'], 'e9n-1', 'the raw line minted no id')
+                result_id = parser.parse(json.dumps({'type': 'tool_result', 'name': 't', 'output': '',
+                                                     'is_error': False}) + '\n')[0]['payload']['call_id']
+                if record in rejected_unnamed:
+                    self.assertNotEqual(result_id, 'e9n-1')
+                else:
+                    self.assertEqual(result_id, 'e9n-1')
 
     def test_a_valid_surrogate_pair_is_one_character_and_is_kept(self):
         parser = HermesStreamParser(CONNECTION)

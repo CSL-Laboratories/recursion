@@ -63,7 +63,12 @@ own and pairs with nothing, because a guess would pair the wrong output with a c
 arrives while several calls of a name are open, which call it ended is unknown, so every result of that
 name pairs with nothing until all the calls open then, and any started meanwhile, have ended. Then
 pairing starts afresh. An id-less call whose line stayed raw is counted as open too, so that its result
-is never paired with another call.
+is never paired with another call. A line rejected before it is a record is counted the same way when
+``json.loads`` still yields an object whose ``type`` is ``tool_use``, whose ``name`` is 1 to 256
+characters with no line break, and which has no ``tool_call_id`` (the key absent or JSON null): it is
+open under that name with no id, and the name is uncertain at once, so every result of the name takes
+a fresh id until the open calls have ended. The line itself stays raw and mints no id. A line
+``json.loads`` cannot parse is not counted, and nothing rejected after the result record is counted.
 
 OFFSETS. ``parse`` takes each line exactly as it was read, newline included; ``offset_start`` and
 ``offset_end`` are byte offsets (UTF-8) into that stream, the end exclusive. stdout and stderr are
@@ -259,6 +264,8 @@ class HermesStreamParser:
         drafts = None if record is None or self._result_seen else self._typed(record, start, end)
         if drafts is None:
             self.raw_lines += 1
+            if record is None and not self._result_seen:
+                self._note_rejected_unnamed(text)
             return [_output('stdout', line, start, end)]
         return drafts
 
@@ -415,6 +422,23 @@ class HermesStreamParser:
     def _mint(self) -> str:
         self._minted += 1
         return f'e9n-{self._minted}'
+
+    def _note_rejected_unnamed(self, text: str) -> None:
+        """An id-less tool_use refused before it was a record: open, and uncertain until it drains."""
+        try:
+            value = json.loads(text)
+        except (ValueError, RecursionError):
+            return
+        if not isinstance(value, dict) or value.get('type') != 'tool_use':
+            return
+        name = value.get('name')
+        if not isinstance(name, str) or not _NAME.fullmatch(name):
+            return
+        # A present id, even one this parser would refuse, is a named call, not an unnamed one.
+        if 'tool_call_id' in value and value['tool_call_id'] is not None:
+            return
+        self._open_unnamed.setdefault(name, []).append(None)
+        self._ambiguous.add(name)
 
     def _end_unnamed(self, name: str) -> str:
         """The call id for an id-less result of ``name``: its call's, only when that call is beyond doubt."""

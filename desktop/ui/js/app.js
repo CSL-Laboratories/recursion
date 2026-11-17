@@ -10,12 +10,18 @@ import { listAllRuns } from "./model.js";
 import { field } from "./sanitize.js";
 import { inertTransport, RefusedHere, send } from "./transport.js";
 import {
-  renderApproval, renderApprovalList, renderConditions, renderPlugins, renderRoutes, renderRuns, renderSession,
-  renderSessions, renderTranscript,
+  applyLayout, applyTheme, renderApproval, renderApprovalList, renderConditions, renderPlugins, renderRoutes,
+  renderRuns, renderSession, renderSessions, renderTranscript,
 } from "./views.js";
 
-export function startWindow(doc, transport, actions = makeActions()) {
+export function startWindow(doc, transport, actions = makeActions(), appearance = null) {
   const $ = (id) => doc.getElementById(id);
+  // Operator documents only. This build does not load a plugin theme or a plugin layout, and it fetches nothing.
+  const chosen = appearance !== null && typeof appearance === "object" && !Array.isArray(appearance) ? appearance : null;
+  applyTheme($("workspace"), chosen === null ? null : chosen.theme ?? null);
+  applyLayout($("workspace"), chosen === null ? null : chosen.layout ?? null, {
+    knownPanels: chosen !== null && Array.isArray(chosen.panels) ? chosen.panels : undefined,
+  });
 
   // The status line shows the local refusal ("Not sent: ...") of one call of one action. Each call is
   // numbered. A newer call of the same action makes that refusal obsolete and takes it off the line when it

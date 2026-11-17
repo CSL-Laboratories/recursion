@@ -1,0 +1,11 @@
+{
+  "schema": "gui.layout/1",
+  "name": "twocol",
+  "title": "Two columns",
+  "columns": 2,
+  "slots": [
+    {"panel": "routes", "column": 1, "span": 1, "order": 0, "collapsed": false},
+    {"panel": "reads", "column": 1, "span": 1, "order": 1, "collapsed": false},
+    {"panel": "interventions", "column": 2, "span": 1, "order": 0, "collapsed": false}
+  ]
+}

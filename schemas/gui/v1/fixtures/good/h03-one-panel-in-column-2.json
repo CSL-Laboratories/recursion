@@ -1,0 +1,9 @@
+{
+  "schema": "gui.layout/1",
+  "name": "column2",
+  "title": "Panel in column 2",
+  "columns": 2,
+  "slots": [
+    {"panel": "fixture.panel", "column": 2, "span": 1, "order": 0, "collapsed": false}
+  ]
+}

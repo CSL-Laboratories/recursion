@@ -1,0 +1,10 @@
+{
+  "schema": "gui.layout/1",
+  "name": "span",
+  "title": "Three columns",
+  "columns": 3,
+  "slots": [
+    {"panel": "routes", "column": 1, "span": 2, "order": 0, "collapsed": false},
+    {"panel": "fixture.panel", "column": 3, "span": 1, "order": 0, "collapsed": true}
+  ]
+}

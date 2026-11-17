@@ -1,0 +1,6 @@
+{
+  "mode": "worktree",
+  "source_path": "/home/dev/projects/atlas/pkg",
+  "base_ref": "origin/main~2",
+  "worktree_path": null
+}

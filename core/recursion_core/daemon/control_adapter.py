@@ -32,10 +32,15 @@ those reads and the loaded operator plugin's O7 reads. A read with no source ans
 The route breaker is ``breaker.DurableRouteBreaker``: trips, run bindings and faults are kept in
 the plugin-security breaker store under the daemon's state directory and survive a restart.
 
+The socket binds the caller's principal from the peer credentials and asks the authorizer
+before the method runs. The peer whose uid is the daemon's is the owner and keeps every
+scope. A named peer with any other uid holds nothing (no device credential). Credentials
+that cannot be read, and a uid that names no process, are refused and are not the owner.
+
 Not here: custody (an API-key route has no credential source and refuses; a route that brings
 its own credential, ``key_source: api_key_helper`` or ``passthrough``, is refused before launch,
 see ``route_unsupported``), the O7 interventions, bar evidence for any route (every route reads
-BETA), scopes on the socket beyond the uid check, and the Control MCP transport.
+BETA), a device credential, and the Control MCP transport.
 """
 from __future__ import annotations
 
@@ -53,7 +58,9 @@ import uuid
 
 from recursion_core.control.api import ControlAPI
 from recursion_core.control.client import socket_directory
+from recursion_core.control.hooks import Hooks, Principal
 from recursion_core.control.registry import InMemoryRunRegistry, StaleGeneration
+from recursion_core.control.scopes import register as register_scopes
 from recursion_core.control_transport import UnixControlServer, with_ping_health
 from recursion_core.control_transport.framing import MAX_FRAME_BYTES
 from recursion_core.gui.client import ControlClient
@@ -77,6 +84,18 @@ OUTPUT_TAIL_LINES = 50
 ENDED, LOST_REBOOT = 'ended', 'lost_reboot'
 WIRED_ENGINES = ('claude_code', 'codex')  # the engines compose_control builds an adapter and a launcher for
 NO_BAR_EVIDENCE = 'no bar evidence is recorded by the daemon'
+
+
+def _scope_hooks():
+    """The authorizer in seam S5, and nothing else. The credential service stays unregistered."""
+    hooks = Hooks()
+    register_scopes(hooks)
+    hooks.freeze()
+    return hooks
+
+
+def _scope_refused(detail):
+    return {'ok': False, 'error': {'code': 'scope_refused', 'detail': detail}}
 # reconcile() asks again for a Stop whose request never got through only after a wait that doubles
 # from the base to the cap (ADV1-6).
 STOP_RETRY_BASE_S, STOP_RETRY_MAX_S = 30.0, 600.0
@@ -429,6 +448,9 @@ class DaemonControl:
         self._stop_retry = {}  # run_id -> (not before, wait) for a Stop reconcile() could not get sent
         self._starts_lock = threading.Lock()
         self._starts_in_flight = 0  # run.start calls of this process that have not answered yet
+        # The uid of the process that built this door. A peer with that uid is the owner.
+        self._owner_uid = os.geteuid() if hasattr(os, 'geteuid') else None
+        self._hooks = _scope_hooks()
 
     # -- calls ---------------------------------------------------------------------------------
     def call(self, method, params=None):
@@ -680,20 +702,42 @@ class DaemonControl:
 
     # -- socket --------------------------------------------------------------------------------
     def handle(self, message, conn):
-        """``{"op": "control", "method", "params"}`` -> ``{"ok": true, "result": <control answer>}``."""
+        """``{"op": "control", "method", "params"}`` -> ``{"ok": true, "result": <control answer>}``.
+
+        The principal is taken from the peer credentials, never from the request. The authorizer
+        is asked for every method, and a refusal is returned before the method runs.
+        """
         if message.get('op') != 'control':
             return {'ok': False, 'error': {'code': 'unknown_op', 'op': message.get('op')}}
         method, params = message.get('method'), message.get('params')
         if not isinstance(method, str) or not isinstance(params, (dict, type(None))):
             return {'ok': False, 'error': {'code': 'request_invalid'}}
-        if peer_is_engine(conn.peer.pid):
-            # The uid check passes for every engine child too (control_transport.handlers). Until
-            # scopes exist (D3), a peer inside a run unit, or one whose cgroup cannot be read, gets
-            # no control at all.
-            return {'ok': False, 'error': {'code': 'scope_refused', 'detail': 'peer is inside a run unit'}}
+        principal, refused = self._principal_from_peer(conn)
+        if refused is not None:
+            return refused
+        verdict = self._hooks.authorize(principal, method, {} if params is None else params)
+        if verdict is not None:
+            return {'ok': False, 'error': {'code': verdict['code'], 'detail': verdict.get('detail', '')}}
         # The transport echoes the request's "id" in the reply frame; a run.list page leaves room for it.
         reserved = _wire_size(message['id']) + len(',"id":') if 'id' in message else 0
         return {'ok': True, 'result': self._answer(method, params, reserved)}
+
+    def _principal_from_peer(self, conn):
+        """``(principal, None)`` or ``(None, refusal)``. A bad read is never the owner."""
+        try:
+            peer = conn.peer
+            uid, pid = peer.uid, peer.pid
+        except Exception:  # noqa: BLE001 - unreadable credentials refuse the call
+            return None, _scope_refused('peer_credentials_unreadable')
+        if type(uid) is not int:
+            return None, _scope_refused('peer_credentials_unreadable')
+        if uid != self._owner_uid:
+            # Not the owner. A positive pid names the process; with no device credential that
+            # principal holds nothing. No pid means there is no principal to authorize.
+            if type(pid) is int and pid > 0:
+                return Principal('device', None, in_run_unit=peer_is_engine(pid)), None
+            return None, _scope_refused('unknown_principal')
+        return Principal('owner', 'local', in_run_unit=peer_is_engine(pid)), None
 
     # -- GUI -----------------------------------------------------------------------------------
     def gui_transport(self, method, path, body):

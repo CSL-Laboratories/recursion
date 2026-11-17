@@ -576,6 +576,7 @@ class ListBudgetTest(unittest.TestCase):
         control = self.control(6, budget)
         conn = mock.Mock()
         conn.peer.pid = os.getpid()
+        conn.peer.uid = os.geteuid()
         with mock.patch.object(adapter, 'peer_is_engine', return_value=False):
             plain = control.handle({'op': 'control', 'method': 'run.list', 'params': {}}, conn)['result']
             big_id = control.handle({'op': 'control', 'method': 'run.list', 'params': {}, 'id': 'x' * 400}, conn)

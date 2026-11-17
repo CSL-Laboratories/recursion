@@ -95,8 +95,8 @@ def _pid_key(key):
         return None
     if isinstance(key, int):
         return key if key > 0 else None
-    if isinstance(key, str) and key.isascii() and key.isdigit() and not key.startswith('0'):
-        return int(key)
+    if isinstance(key, str) and key.isascii() and key.isdigit() and not key.startswith('0') and len(key) <= 19:
+        return int(key)  # no pid has more digits than an int64; int() refuses 4301 (E27)
     return None
 
 

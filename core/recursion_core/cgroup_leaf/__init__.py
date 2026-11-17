@@ -24,6 +24,7 @@ engine linger plus an operator leaf is not containment (Lucas, 2026-11-07, on B6
 from __future__ import annotations
 
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -70,6 +71,33 @@ def require_linux_calls():
     if os.name == 'nt' or missing:
         raise PlatformUnsupported('platform_unsupported: the cgroup v2 leaf launcher needs Linux '
                                   f'(missing: {", ".join(missing) or "POSIX"})')
+
+
+def _kill_timeout(value):
+    """``value`` as seconds: a finite number of 0 or more. A string left the child alive after the context
+    exited, and NaN or infinity took the bound off the kill loop (E25)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise LaunchError('kill_timeout must be a finite number of seconds')
+    try:
+        seconds = float(value)
+    except OverflowError:
+        seconds = math.inf
+    if not math.isfinite(seconds) or seconds < 0:
+        raise LaunchError('kill_timeout must be a finite number of seconds, 0 or more')
+    return seconds
+
+
+FD_SETSIZE = 1024
+
+
+def _readable(fd, left):
+    """Wait up to ``left`` seconds for ``fd`` to be readable. select() cannot take a number of
+    FD_SETSIZE (1024 with glibc) or more, so a daemon holding many descriptors used to fail here with ValueError (E26)."""
+    if fd < FD_SETSIZE:
+        return bool(select.select([fd], [], [], left)[0])
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    return bool(poller.poll(math.ceil(left * 1000)))
 
 
 class CleanupIncomplete(RuntimeError):
@@ -168,6 +196,7 @@ class DelegatedRoot:
         if not argv:
             raise ValueError('Empty launch')
         leaf = self.leaf(name)
+        kill_timeout = _kill_timeout(kill_timeout)  # before the leaf exists
         self.fs.make_leaf(leaf)
         if leaf.is_symlink() or os.lstat(leaf).st_uid != os.getuid():
             raise PermissionError('Leaf is not an operator-owned directory')
@@ -188,7 +217,9 @@ class DelegatedRoot:
         leaf = self.leaf(name)
         if leaf.is_symlink() or not leaf.is_dir() or os.lstat(leaf).st_uid != os.getuid():
             raise PermissionError('Leaf is not an operator-owned directory')
-        return LeafRun(self.fs, leaf, kill_timeout)
+        run = LeafRun(self.fs, leaf, kill_timeout)
+        run._pin_leaf()
+        return run
 
     def sweep(self, keep, kill_timeout=5.0):
         """Kill leftover leaves that the durable run registry does not list.
@@ -217,9 +248,10 @@ class DelegatedRoot:
 class LeafRun:
     def __init__(self, fs: Cgroup2, leaf: Path, kill_timeout: float):
         require_linux_calls()
-        self.fs, self.leaf, self.kill_timeout = fs, leaf, kill_timeout
+        self.fs, self.leaf, self.kill_timeout = fs, leaf, _kill_timeout(kill_timeout)
         self.proc = None
         self.pidfd = None
+        self._pin = None  # an adopted handle's open directory: the identity of the leaf it adopted (E02)
         self.outcome = None
         self.removing = self.removed = False
         self.lock = threading.Lock()
@@ -227,6 +259,32 @@ class LeafRun:
     @property
     def pid(self):
         return self.proc.pid if self.proc else None
+
+    def _pin_leaf(self):
+        """Hold the leaf's directory open. The name of a removed leaf can be given to a new run, and a handle
+        that holds only the name would then kill that run; a directory held open cannot be given to another
+        leaf, so the handle can tell its own leaf from a later one (E02)."""
+        try:
+            fd = os.open(self.leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as exc:
+            raise PermissionError('Leaf is not an operator-owned directory') from exc
+        if os.fstat(fd).st_uid != os.getuid():
+            os.close(fd)
+            raise PermissionError('Leaf is not an operator-owned directory')
+        self._pin = fd
+
+    def _unpin(self):
+        fd, self._pin = self._pin, None  # detach first, so an interrupt leaks the number rather than closing it twice
+        if fd is not None:
+            os.close(fd)
+
+    def _names_pinned_leaf(self):
+        try:
+            named = os.stat(self.leaf, follow_symlinks=False)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        held = os.fstat(self._pin)
+        return (named.st_dev, named.st_ino) == (held.st_dev, held.st_ino)
 
     def _spawn(self, argv, env, cwd, stdin, stdout, stderr, start_timeout):
         procs = self.fs.open_procs(self.leaf)
@@ -237,8 +295,8 @@ class LeafRun:
                 [sys.executable, '-I', '-S', '-c', TRAMPOLINE, str(procs), str(write_end), *argv],
                 pass_fds=(procs, write_end), close_fds=True, start_new_session=True,
                 env=env, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr)
-            os.close(write_end)
-            write_end = -1
+            fd, write_end = write_end, -1  # detach first: an interrupt inside the close must not close the number again
+            os.close(fd)
             # Unreaped child: its pid cannot be reused, so this pidfd names exactly it.
             self.pidfd = os.pidfd_open(self.proc.pid)
             message = self._read_status(read_end, start_timeout)
@@ -258,7 +316,7 @@ class LeafRun:
         data, deadline = b'', time.monotonic() + timeout
         while True:
             left = deadline - time.monotonic()
-            if left <= 0 or not select.select([fd], [], [], left)[0]:
+            if left <= 0 or not _readable(fd, left) or time.monotonic() > deadline:  # a late EOF is no confirmation
                 raise LaunchError('trampoline did not report exec in time')
             chunk = os.read(fd, 4096)
             if not chunk:
@@ -285,6 +343,7 @@ class LeafRun:
         if self.removing and not os.path.lexists(self.leaf):
             self.removed = True  # interrupted inside or after the rmdir
         if self.removed:  # the leaf was empty and is gone: rebuild the outcome
+            self._unpin()
             seen = self.proc is not None and self.proc.returncode is not None
             return Outcome('leaf_empty' if seen else 'empty',
                            self.proc.returncode if self.proc else None, False, seen)
@@ -292,6 +351,12 @@ class LeafRun:
         deadline = time.monotonic() + self.kill_timeout
         populated = None
         while True:
+            if self._pin is not None and not self._names_pinned_leaf():
+                # The leaf this handle adopted is gone and its name is another run's now: kill nothing (E02). The
+                # check and the kill are two steps; the window is the time between them, not the time since the adopt.
+                self.removed = True
+                self._unpin()
+                return Outcome('empty', None, False, False)
             try:
                 self.fs.kill(self.leaf)
             except OSError as exc:
@@ -331,6 +396,7 @@ class LeafRun:
             try:
                 self.fs.remove(self.leaf)
                 self.removed = True
+                self._unpin()
             except OSError as exc:
                 errors.setdefault(f'rmdir: {exc!r}')
         outcome = Outcome(state, self.proc.returncode if self.proc else None, populated,

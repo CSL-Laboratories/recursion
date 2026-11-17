@@ -24,7 +24,9 @@ from pathlib import Path
 from recursion_core import control_transport as ct
 from recursion_core.control_transport import windows
 from recursion_core.control_transport.peercred import PeerCred, get_peer_cred
-from recursion_core.control_transport.unix import UnixControlClient, UnixControlServer, check_peer
+from recursion_core.control_transport.unix import (
+    REFUSED_KEPT, UnixControlClient, UnixControlServer, check_peer,
+)
 
 LINUX = sys.platform.startswith("linux")
 
@@ -147,7 +149,11 @@ class PeerRaceTests(_TmpCase):
         self.assertEqual(errors, [])
         self.assertTrue(bad_replies)
         self.assertEqual(set(bad_replies), {b""})
-        self.assertGreaterEqual(len(srv.refused), len(bad_replies))
+        # The history keeps at most REFUSED_KEPT latest reasons, so a long hammer
+        # records fewer rows than replies. Refusals are still recorded.
+        self.assertGreater(len(srv.refused), 0)
+        self.assertLessEqual(len(srv.refused), REFUSED_KEPT)
+        self.assertLessEqual(len(srv.refused), len(bad_replies))
         self.assertEqual(srv.accepted, 2)
 
     def test_getter_raising_any_exception_refuses_and_keeps_accepting(self) -> None:

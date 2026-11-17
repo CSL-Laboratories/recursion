@@ -75,6 +75,8 @@ limit meets the same rules.
 - Money is an integer number of micro-USD, also kept as that integer's exact decimal text. What admission knew
   of the spend is kept with its quality and provenance; an unknown spend is null, never 0.
 - `quota_settle` is one row per reservation id, status `settled` or `unresolved`. A second settle leaves that row.
+  `ledger.Ledger(db).read(reservation_id)` reads that row back. A new `Ledger` on the same store reads the
+  same row, and a read writes nothing. An unresolved amount is null, never 0. A known zero stays 0.
 - `quota_usage` is the run's reported cost (null when unknown). `quota_effect` records `outcome_unknown` until
   `reconcile_effect`. `quota_session_spend` is the daemon's own session book: a later cumulative total replaces
   the earlier one, and the engine's budget flag is stored and not counted as spend.
@@ -92,5 +94,5 @@ engine.
 - A consent interface for funding sources other than a stored key (passthrough, helper billing, plan overage).
 - The part of the start path that writes `budget {cap_usd}` into the run record (`quota/hooks.py`).
 - `budget.show` and `route.explain` (slice 3).
-- Replaying the event log into the settle rows after a restart. The settle rows that were written are read back
-  from the store; catching the ledger up from the log needs the event-store reader, which is not in this slice.
+- Replaying the event log into the settle rows after a restart. `Ledger` reads the rows that were written;
+  catching the book up from the log needs the event-store reader, which is not in this slice.

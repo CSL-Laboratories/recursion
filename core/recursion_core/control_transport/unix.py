@@ -263,8 +263,10 @@ class UnixControlServer:
         if not name or "/" in name or name in (".", ".."):
             raise InsecureSocketPath("socket name must be a single path component")
         if type(max_frame_bytes) is not int or max_frame_bytes < _MIN_FRAME_BYTES:
-            # The id_too_large refusal is a fixed body. A smaller cap would drop it and the
-            # peer would see the connection end instead of a typed answer.
+            # A cap that cannot carry the server's own fallback, or the id_too_large refusal,
+            # is refused before startup. A smaller cap would drop that reply and the peer
+            # would see the connection end instead of a typed answer. At a cap of 32 the
+            # 50-byte fallback was written anyway (sweep s7 D19).
             raise ValueError(f"max_frame_bytes must be an int of at least {_MIN_FRAME_BYTES}")
         if max_connections < 1:
             raise ValueError("max_connections must be positive")
@@ -479,18 +481,20 @@ class UnixControlServer:
                 if echo and "id" not in response:
                     response = {**response, **echo}
                 try:
-                    conn.settimeout(self._idle_timeout_s)  # sendall's timeout bounds the whole write
-                    write_frame(conn, response, max_bytes=self._max_frame_bytes)
-                except FrameError:
+                    frame = encode_frame(response, max_bytes=self._max_frame_bytes)
+                except FrameError as exc:
+                    if str(exc) == "frame_too_large":
+                        fallback = _LONGEST_FALLBACK
+                    else:
+                        # A handler reply that is not JSON (a non-finite number, an object, bytes) must not kill
+                        # the worker after the handler acted: the client gets a typed answer, not a silent close.
+                        fallback = _INTERNAL_ERROR
                     # The request's id stays on the refusal, so the client reads it as this request's answer.
-                    _send_quietly(conn, {**_LONGEST_FALLBACK, **echo}, max_bytes=self._max_frame_bytes)
+                    _send_quietly(conn, {**fallback, **echo}, max_bytes=self._max_frame_bytes)
                     return
-                except (TypeError, ValueError):
-                    # A handler reply that is not JSON (a non-finite number, an object) must not kill the
-                    # worker after the handler acted: the client gets a typed answer, not a silent close.
-                    _send_quietly(conn, {"ok": False, "error": {"code": "internal_error"}, **echo},
-                                  max_bytes=self._max_frame_bytes)
-                    return
+                try:
+                    conn.settimeout(self._idle_timeout_s)  # sendall's timeout bounds the whole write
+                    conn.sendall(frame)
                 except OSError:
                     return
                 if reserved:
@@ -547,10 +551,14 @@ def _is_busy(response: Message) -> bool:
 
 # The longest answer _serve writes for a request a handler has seen; with the request's id it must fit the cap.
 _LONGEST_FALLBACK: Message = {"ok": False, "error": {"code": "response_too_large"}}
-# Sent when that fallback could not carry the id. Its body is the floor for max_frame_bytes:
-# below it the refusal itself would be dropped.
+_INTERNAL_ERROR: Message = {"ok": False, "error": {"code": "internal_error"}}
+# Sent when that fallback could not carry the id. The floor is the longest of this
+# refusal and the two id-less fallbacks: below it one of those replies would be dropped.
 _ID_TOO_LARGE_REPLY: Message = {"ok": False, "error": {"code": "bad_frame", "detail": "id_too_large"}}
-_MIN_FRAME_BYTES = len(encode_frame(_ID_TOO_LARGE_REPLY)) - HEADER.size
+_MIN_FRAME_BYTES = max(
+    len(encode_frame(m)) - HEADER.size
+    for m in (_LONGEST_FALLBACK, _INTERNAL_ERROR, _ID_TOO_LARGE_REPLY)
+)
 
 
 def _fits(message: Message, request_id: object, max_bytes: int) -> bool:

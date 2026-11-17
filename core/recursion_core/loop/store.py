@@ -11,8 +11,10 @@ its message and its entry in the verbatim ledger (so no crash can keep the one w
 result as soon as its call finishes; a compaction (which replaces the conversation); and the session's usage
 totals. Every string is scrubbed of the loop's secrets before it is written, and a record is checked against
 the shape the reader accepts before it is written. The folder is 0700 and the file 0600, a plain file owned by
-this user: both are checked on every open, for reading and for writing, and a link is refused (opened with
-O_NOFOLLOW, then checked on the opened descriptor).
+this user: both are checked on every open and again before every append, for reading and for writing. A
+symbolic link is refused (opened with O_NOFOLLOW, then checked on the opened descriptor), and so is a second
+name of the same file. Where the host has a file lock, a second opener is refused while this one holds the
+journal, so it cannot cut a record the first is still writing.
 
 Reading it back gives the conversation as it stood. A tool call whose result never reached the journal (the
 engine stopped while it ran or before it ran) gets a result that says its outcome is unknown and that it is
@@ -40,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from recursion_core.loop.compaction import HARNESS
 from recursion_core.loop.providers import base as b
 from recursion_core.loop.tools.workspace import check_private_dir
 
@@ -133,16 +136,39 @@ class Loaded:
 
 
 def check_file(fd: int, what: str) -> None:
-    """Refuse an opened journal that is not a plain file, not this user's, or open to other users."""
+    """Refuse an opened journal that is not a plain file, has another name, is not this user's, or is open to
+    other users."""
 
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode):
         raise StoreError(f"{what} is not a plain file")
+    # A hard link is a second name of this inode. O_NOFOLLOW refuses a symbolic link only.
+    if getattr(info, "st_nlink", 1) > 1:
+        raise StoreError(f"{what} has another name")
     if hasattr(os, "getuid"):
         if info.st_uid != os.getuid():
             raise StoreError(f"{what} is not owned by this user")
         if info.st_mode & 0o077:
             raise StoreError(f"{what} is open to other users (mode {stat.S_IMODE(info.st_mode):o})")
+
+
+def _lock_journal(fd: int, what: str) -> None:
+    """Hold this journal for as long as the descriptor is open. A host with no file lock (Windows) skips the hold.
+
+    Success takes the lock and returns. A journal already held is a StoreError and the caller writes nothing.
+    Any other error from the lock is the same refusal. ImportError means the host has no lock, and the caller
+    continues. KeyboardInterrupt while locking propagates after the caller releases the descriptor; nothing was
+    written. A second caller, in this process or another, gets the refusal and does not truncate or append.
+    """
+
+    try:
+        import fcntl
+    except ImportError:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise StoreError(f"{what} is in use") from None
 
 
 def _committed_end(fd: int, size: int) -> int:
@@ -196,6 +222,7 @@ class ConversationStore:
                 raise StoreError(f"{self._what()} cannot be opened ({exc.strerror})") from None
             try:
                 check_file(fd, self._what())
+                _lock_journal(fd, self._what())  # before any truncate, so a second opener cannot cut a live write
                 size = os.fstat(fd).st_size
                 end = _committed_end(fd, size)
                 if end < size:
@@ -229,6 +256,11 @@ class ConversationStore:
         except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
             raise StoreError(f"a record the journal cannot hold ({type(exc).__name__})") from None
         fh = self._open()
+        # The descriptor may have been opened on an earlier append. The folder and the file are checked again
+        # here, and a refusal writes nothing. A check that raises (StoreError, ToolError, or an interrupt)
+        # propagates before write. A second append on this handle, or from another caller, runs the same checks.
+        check_private_dir(self.folder, "the session store")
+        check_file(fh.fileno(), self._what())
         fh.write(data)
         fh.flush()
 
@@ -315,6 +347,7 @@ class ConversationStore:
                         out.repaired.append(call.call_id)
                 out.messages.append(b.Message("user", tuple(results)))
                 out.reconstructed = True
+        _keep_unpaired(out)  # a legacy message whose ledger line was cut off still keeps the user's words
         return out
 
 
@@ -348,6 +381,33 @@ def check_totals(state: Any) -> None:
         raise TypeError("a totals record's source has one provenance per usage field")
 
 
+def _legacy_text(msg: b.Message) -> str | None:
+    """The user's own words in a legacy message record: one text part, not a tool result and not a harness line.
+
+    Anything else is not a pair a following user record can complete, and it is not copied into the ledger from
+    a result or a harness line.
+    """
+
+    if msg.role != "user" or len(msg.parts) != 1 or not isinstance(msg.parts[0], b.TextPart):
+        return None
+    text = msg.parts[0].text
+    if text.startswith(HARNESS):
+        return None
+    return text
+
+
+def _keep_unpaired(out: Loaded) -> None:
+    """A legacy user message with no following user record keeps its words in the ledger, once."""
+
+    pending = getattr(out, "_legacy_pending", None)
+    if not isinstance(pending, str):
+        return
+    n = getattr(out, "_legacy_n", 0) + 1
+    out._legacy_n = n
+    out.user_messages.append((f"legacy-{n}", pending))
+    out._legacy_pending = None
+
+
 def _add(out: Loaded, msg: b.Message) -> None:
     if out.messages and out.messages[-1].role == msg.role:
         msg = b.Message(msg.role, out.messages.pop().parts + msg.parts)  # joined, as the engine joined it
@@ -373,13 +433,22 @@ def _read_record(out: Loaded, pending: dict[str, b.ToolResult], rec: Any) -> Non
         msg = _message(rec, {"k", "role", "parts"})
         if msg.role == "user" and any(isinstance(p, b.ToolResult) for p in msg.parts):
             pending.clear()
+        _keep_unpaired(out)
         _add(out, msg)
+        own = _legacy_text(msg)
+        if own is not None:
+            out._legacy_pending = own  # the following user record, if it is this text, is the same words
     elif kind == "user":
         if keys != {"k", "turn", "text"} or not _text(rec["turn"]) or not _text(rec["text"]):
             raise TypeError("a user record holds a turn id and text")
         out.user_messages.append((rec["turn"], rec["text"]))
-        _add(out, b.Message("user", (b.TextPart(rec["text"]),)))
+        if getattr(out, "_legacy_pending", None) == rec["text"]:
+            out._legacy_pending = None  # the message record already holds these words: do not add them again
+        else:
+            _keep_unpaired(out)
+            _add(out, b.Message("user", (b.TextPart(rec["text"]),)))
     elif kind == "result":
+        _keep_unpaired(out)
         if keys != {"k", "part"}:
             raise TypeError("a result record holds one part")
         part = part_from_json(rec["part"], "user")
@@ -389,9 +458,11 @@ def _read_record(out: Loaded, pending: dict[str, b.ToolResult], rec: Any) -> Non
     elif kind == "replace":
         if keys != {"k", "messages"} or not isinstance(rec["messages"], list):
             raise TypeError("a replace record holds a list of messages")
+        _keep_unpaired(out)  # the words are about to leave the message list; the ledger keeps them
         out.messages = [_message(m, {"role", "parts"}) for m in rec["messages"]]
         pending.clear()
     elif kind == "totals":
+        _keep_unpaired(out)
         if keys != {"k", "state"}:
             raise TypeError("a totals record holds one state")
         check_totals(rec["state"])

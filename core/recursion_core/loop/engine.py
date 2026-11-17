@@ -341,10 +341,15 @@ class Session:
         self._counted = 0  # the loop's own estimate of the messages that count covers
         self.store = store
         if loaded is not None:  # a resumed conversation
-            if store is not None and loaded.session_id not in (None, store.session_id):
+            if store is not None and loaded.session_id != store.session_id:
+                # A missing id is not this session: journaling it here would publish another conversation's
+                # words under this id, and dropping it would lose them. The caller names the session or refuses.
+                if loaded.session_id is None:
+                    raise StoreError("the loaded conversation names no session")
                 raise StoreError("the loaded conversation is another session's")
             self.messages = [self._resumed(m) for m in loaded.messages]
-            self.user_messages = [(turn, redactor.scrub(text)) for turn, text in loaded.user_messages]
+            self.user_messages = [(redactor.scrub(turn), redactor.scrub(text))
+                                  for turn, text in loaded.user_messages]
             if loaded.totals:
                 self.session_usage = UsageTotal.from_state(loaded.totals)
                 self.session_usage.models = {redactor.scrub(m) if m is not None else None
@@ -467,10 +472,12 @@ class Session:
         room = self._ceiling - self._overhead()
         done = c.compact(self.messages, self.user_messages, summarize, self.config.keep_tail_tokens, room=room)
         if done is None:
-            if c.estimate(self.messages) + self._overhead() > self._ceiling:
+            # Nothing can be cut. The next call would still send _size(), which keeps the provider's count when
+            # that count is the larger one. Over the ceiling, the turn stops before that call.
+            if self._size() > self._ceiling:
                 raise c.ContextFull("the conversation is larger than the model's window and nothing in it can be "
                                     "compacted")
-            return  # the provider's count is over, the loop's estimate is not, and nothing can be cut: sent as is
+            return
         self.messages = done.messages
         if self.store is not None:
             self.store.replace(self.messages)
@@ -505,7 +512,7 @@ class Session:
         if self.store is not None:
             self.store.user(turn_id, clean)  # its message and its ledger entry in one record: never one alone
         self._append(b.Message("user", (b.TextPart(clean),)), journal=False)
-        self.user_messages.append((turn_id, clean))
+        self.user_messages.append((self.redactor.scrub(turn_id), clean))
         steps = 0
         checks = 0
         acceptance = self.config.acceptance

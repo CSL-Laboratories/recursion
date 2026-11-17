@@ -13,8 +13,8 @@ cutting at a tool result, and a shrink ladder") and vault records 20261028-recur
   never from the summary ("re-inject the control kernel from the ledger, never from the summary"; record G: late
   restrictions are compiled, not summarised), except a message the kept tail still holds word for word, which
   is not repeated. The summary covers the work; the constraints stand beside it, word for word, however many
-  times the conversation is compacted. Each is checked to be in the result, in its place, and a ledger that is
-  empty while the part replaced holds the user's text is refused (LedgerMismatch).
+  times the conversation is compacted. Each is checked to be in the result, in its place, and a ledger that does
+  not hold every user message (an empty one included) is refused (LedgerMismatch).
 - The result fits the room it is given (the ceiling less the system prompt and the tool list), by a shrink
   ladder: the tail is sized to the room left after the user's words; a tail that still does not fit goes into
   the summary too; the summary is cut to what is left. When the user's words alone do not fit, nothing is
@@ -72,6 +72,8 @@ class NoSummary(Exception):
 
 
 def ceiling(window: int) -> int:
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise ValueError("a context window is a whole number of tokens")
     if window < MIN_WINDOW:
         raise WindowTooSmall(f"a context window of {window} tokens is below the {MIN_WINDOW} a tool session needs")
     reserve = max(int(window * 0.15), 16_384 if window >= 32_768 else 0)
@@ -168,6 +170,8 @@ def check_summary(response: b.TurnResponse | None) -> tuple[str | None, str]:
 
     if response is None:
         return None, "the summary call failed"
+    if not isinstance(response, b.TurnResponse):
+        raise ValueError("a summary is a turn response")
     if response.stop_reason == b.REFUSAL:
         return None, "the summary was refused"
     if response.stop_reason == b.MAX_TOKENS:
@@ -269,8 +273,9 @@ def compact(messages: Sequence[b.Message], user_messages: Sequence[tuple[str, st
     ContextFull is raised before any summary call. ``summarize`` may raise NoSummary (no call was made) and lets a
     typed limit or a cancellation through."""
 
-    if not user_messages and any(not t.startswith(HARNESS) for t in _user_texts(messages)):
-        raise LedgerMismatch("the ledger is empty while the conversation holds the user's text")
+    if isinstance(keep_tokens, bool) or not isinstance(keep_tokens, int) or keep_tokens <= 0:
+        raise ValueError("keep_tokens is a positive whole number")
+    _require_ledger(messages, user_messages)
     full = estimate([b.Message("user", (b.TextPart(_head_text("", user_messages)),))])
     limit = None if room is None else room - SUMMARY_MIN_TOKENS
     tail_tokens = keep_tokens if limit is None else max(1, min(keep_tokens, (limit - full) // 2))
@@ -311,6 +316,23 @@ def compact(messages: Sequence[b.Message], user_messages: Sequence[tuple[str, st
     if room is not None and estimate(out) > room:
         raise ContextFull("the compacted conversation does not fit the model's window")
     return Compacted(out, source, len(prefix), len([m for m in messages[cut:] if _kept_parts(m)]), reason)
+
+
+def _require_ledger(messages: Sequence[b.Message], user_messages: Sequence[tuple[str, str]]) -> None:
+    """Every user message that is not a harness line is in the ledger, or compaction would drop those words.
+
+    A harness line is the loop's own text. A short ledger, a foreign one and an empty one all fail this.
+    """
+
+    have: dict[str, int] = {}
+    for _, text in user_messages:
+        have[text] = have.get(text, 0) + 1
+    for text in _user_texts(messages):
+        if text.startswith(HARNESS):
+            continue
+        if have.get(text, 0) <= 0:
+            raise LedgerMismatch("the ledger does not hold every user message")
+        have[text] -= 1
 
 
 def _check_verbatim(out: Sequence[b.Message], user_messages: Sequence[tuple[str, str]]) -> None:

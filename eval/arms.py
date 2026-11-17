@@ -8,6 +8,7 @@ the evaluated base it refuses with REFUSAL and the rest of the run goes on.
 """
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -144,7 +145,7 @@ def cancel_running() -> None:
         if process.poll() is not None:
             continue
         try:
-            _kill_session(process.pid)
+            _kill_session(process.pid, leader=process)
         except (SessionCleanupError, OSError, RuntimeError):
             try:
                 process.kill()
@@ -207,7 +208,7 @@ def _abandon_unwatched(process, started_threads: list) -> list:
     waits on the blocked read.
     """
     try:
-        _kill_session(process.pid)
+        _kill_session(process.pid, leader=process)
     except (SessionCleanupError, OSError, RuntimeError):
         try:
             process.kill()
@@ -245,96 +246,122 @@ def run_process(argv: list, *, cwd: Path, env: dict, stdin: bytes | None, timeou
         raise ValueError("stdin must be bytes")
     timeout_s = _finite_seconds(timeout_s)
     started = time.monotonic()
+    process = None
+    tracked = False
     try:
-        process = subprocess.Popen(argv, cwd=str(cwd), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, start_new_session=True)
-    except FileNotFoundError as exc:
-        raise EngineMissing(f"{argv[0]}: {exc}") from None
-    chunks: dict = {"stdout": [], "stderr": []}
-
-    def read(name, pipe):
         try:
-            for block in iter(lambda: pipe.read(65536), b""):
-                chunks[name].append(block)
-        finally:
+            process = subprocess.Popen(argv, cwd=str(cwd), env=env, stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       start_new_session=True)
+        except FileNotFoundError as exc:
+            raise EngineMissing(f"{argv[0]}: {exc}") from None
+        _remember_leader(process)
+        chunks: dict = {"stdout": [], "stderr": []}
+
+        def read(name, pipe):
             try:
-                pipe.close()
-            except OSError:
+                for block in iter(lambda: pipe.read(65536), b""):
+                    chunks[name].append(block)
+            finally:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
+        def feed():
+            try:
+                if stdin:
+                    process.stdin.write(stdin)
+            except (BrokenPipeError, OSError):
                 pass
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
 
-    def feed():
+        threads = [threading.Thread(target=read, args=("stdout", process.stdout), name="stdout", daemon=True),
+                   threading.Thread(target=read, args=("stderr", process.stderr), name="stderr", daemon=True),
+                   threading.Thread(target=feed, name="stdin", daemon=True)]
         try:
-            if stdin:
-                process.stdin.write(stdin)
-        except (BrokenPipeError, OSError):
-            pass
-        finally:
+            _track(process, cancel=cancel_on_interrupt)
+            tracked = True
+            started_threads: list = []
             try:
-                process.stdin.close()
-            except OSError:
-                pass
-
-    threads = [threading.Thread(target=read, args=("stdout", process.stdout), name="stdout", daemon=True),
-               threading.Thread(target=read, args=("stderr", process.stderr), name="stderr", daemon=True),
-               threading.Thread(target=feed, name="stdin", daemon=True)]
-    try:
-        _track(process, cancel=cancel_on_interrupt)
-        started_threads: list = []
-        try:
-            for thread in threads:
-                thread.start()
-                started_threads.append(thread)
-        except BaseException as exc:
-            # No reader is blocked on a pipe that never started, so closing it cannot wait.
-            # A reader that did start may still be blocked on a helper outside the session.
-            held = _abandon_unwatched(process, started_threads)
-            if held:
-                exc.add_note(_held_pipes_sentence(held))
-            raise
-        timed_out = False
-        try:
-            process.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-        except BaseException as exc:
-            # An interruption is what is reported; the session is emptied and the leader reaped first.
+                for thread in threads:
+                    thread.start()
+                    started_threads.append(thread)
+            except BaseException as exc:
+                # No reader is blocked on a pipe that never started, so shutting it cannot wait.
+                # A reader that did start may still be blocked on a helper outside the session.
+                held = _abandon_unwatched(process, started_threads)
+                if held:
+                    exc.add_note(_held_pipes_sentence(held))
+                raise
+            timed_out = False
             try:
-                _kill_session(process.pid)
-            except SessionCleanupError as cleanup:
-                exc.add_note(f"cleanup after the interruption: {cleanup}")
+                process.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            except BaseException as exc:
+                # An interruption is what is reported; the session is emptied and the leader reaped first.
+                try:
+                    _kill_session(process.pid, leader=process)
+                except BaseException as cleanup:
+                    exc.add_note(f"cleanup after the interruption: {cleanup}")
+                try:
+                    process.wait(timeout=CLEANUP_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    exc.add_note(f"the engine (process {process.pid}) was not reaped "
+                                 f"{CLEANUP_GRACE_S:g} s after its session was emptied")
+                except BaseException:
+                    try:
+                        process.poll()
+                    except Exception:
+                        pass
+                    if process.returncode is None:
+                        try:
+                            process.wait(timeout=CLEANUP_GRACE_S)
+                        except (subprocess.TimeoutExpired, OSError):
+                            pass
+                        except BaseException:
+                            pass
+                    exc.add_note("a second interruption during the reap")
+                    if process.returncode is None:
+                        exc.add_note(f"the engine (process {process.pid}) was not reaped")
+                held = _join_readers(threads)
+                if held:
+                    exc.add_note(_held_pipes_sentence(held))
+                raise
+            _kill_session(process.pid, leader=process)
+            # The session is empty, so its leader, which can leave neither its session nor its process
+            # group, has exited: this wait ends at once. It is bounded all the same.
             try:
                 process.wait(timeout=CLEANUP_GRACE_S)
             except subprocess.TimeoutExpired:
-                exc.add_note(f"the engine (process {process.pid}) was not reaped {CLEANUP_GRACE_S:g} s after "
-                             "its session was emptied")
-            except BaseException:
-                pass
+                raise SessionCleanupError(
+                    f"the engine (process {process.pid}) was not reaped {CLEANUP_GRACE_S:g} s after "
+                    "its session was emptied") from None
             held = _join_readers(threads)
             if held:
-                exc.add_note(_held_pipes_sentence(held))
-            raise
-        _kill_session(process.pid)
-        # The session is empty, so its leader, which can leave neither its session nor its process group, has
-        # exited: this wait ends at once. It is bounded all the same.
-        try:
-            process.wait(timeout=CLEANUP_GRACE_S)
-        except subprocess.TimeoutExpired:
-            raise SessionCleanupError(f"the engine (process {process.pid}) was not reaped {CLEANUP_GRACE_S:g} s after "
-                                      "its session was emptied") from None
-        held = _join_readers(threads)
-        if held:
-            raise SessionCleanupError(_held_pipes_sentence(held))
-        code = process.returncode
-        return {
-            "exit": code if code is not None and code >= 0 else None,
-            "signal": -code if code is not None and code < 0 else None,
-            "timed_out": timed_out,
-            "stdout": b"".join(chunks["stdout"]),
-            "stderr": b"".join(chunks["stderr"]),
-            "seconds": time.monotonic() - started,
-        }
+                raise SessionCleanupError(_held_pipes_sentence(held))
+            code = process.returncode
+            return {
+                "exit": code if code is not None and code >= 0 else None,
+                "signal": -code if code is not None and code < 0 else None,
+                "timed_out": timed_out,
+                "stdout": b"".join(chunks["stdout"]),
+                "stderr": b"".join(chunks["stderr"]),
+                "seconds": time.monotonic() - started,
+            }
+        finally:
+            if process is not None:
+                _untrack(process)
     finally:
-        _untrack(process)
+        if process is not None and not tracked:
+            _stop_untracked(process)
+        if process is not None:
+            _forget_leader(process)
 
 
 def _session_of(pid: int):
@@ -361,14 +388,80 @@ def _session_members(sid: int) -> list:
 
 
 def _still_in_session(pid: int, sid: int) -> bool:
-    """True only when ``pid`` is still that session and not already dead. Checked again immediately before
-    a signal: a numeric id from an earlier scan, or a session id whose leader has been reaped, may have
-    been reused by an unrelated process."""
+    """True only when ``pid`` is still that session and not already dead.
+
+    Checked again immediately before a signal to a member. This does not prove the number is the
+    process that was started: a session id whose leader has been reaped may have been reused.
+    The leader itself is signalled only through a pidfd opened at start.
+    """
     found = _session_of(pid)
     return found is not None and found[0] == sid and found[1] not in ("Z", "X")
 
 
-def _kill_session(sid: int) -> None:
+def _remember_leader(process) -> None:
+    """Open a pidfd on the leader now, before its pid can be reused."""
+    try:
+        process._csl_pidfd = os.pidfd_open(process.pid)
+    except OSError:
+        process._csl_pidfd = None
+
+
+def _forget_leader(process) -> None:
+    fd = getattr(process, "_csl_pidfd", None)
+    if isinstance(fd, int):
+        process._csl_pidfd = None
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _stop_untracked(process) -> None:
+    """End a process that exists and was never tracked, so an interrupt cannot leave it running."""
+    fd = getattr(process, "_csl_pidfd", None)
+    if isinstance(fd, int):
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        except OSError:
+            pass
+    else:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=CLEANUP_GRACE_S)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def _signal_leader(leader) -> bool:
+    """Signal the leader through the pidfd opened when it started.
+
+    False when that pidfd is gone (the leader was reaped, so the numeric id may belong to someone
+    else) or when no leader was supplied. A bare number is not signalled.
+    """
+    if leader is None:
+        return False
+    fd = getattr(leader, "_csl_pidfd", None)
+    if not isinstance(fd, int):
+        if leader.poll() is not None:
+            return False
+        try:
+            leader.kill()
+        except OSError:
+            return False
+        return True
+    try:
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
+    except OSError as exc:
+        if exc.errno in (errno.ESRCH, errno.EPERM, errno.EINVAL):
+            return False
+        raise
+    return True
+
+
+def _kill_session(sid: int, leader=None) -> None:
     """Kill every live process of session ``sid``, in any process group, rescanning until none is left.
 
     A process forked between a scan and a kill is found by the next scan, and a killed one forks no more.
@@ -376,11 +469,19 @@ def _kill_session(sid: int) -> None:
     while a scan reads /proc hides its child from that scan, never from the next (the child exists before
     its parent exits, so before the next listing). A chain of such exits, each inside one scan, is out of
     reach like a new session (PROTOCOL.md names both). The session is the engine's own
-    (start_new_session), never the runner's. A signal is sent only after a fresh check that the pid is
-    still in this session. SessionCleanupError if any is still alive after 10 s."""
+    (start_new_session), never the runner's. The leader is signalled through its pidfd. A bare session
+    number is not used to signal that leader. Other members are signalled only after a fresh check that
+    the pid is still in this session. When a leader was supplied, its pidfd is already gone, and that
+    number is a live session leader, nothing is signalled: the number was reused. When the pidfd is gone
+    and the number is not a live leader, other members are still signalled. SessionCleanupError if any
+    member we do signal is still alive after 10 s."""
     if sid == os.getsid(0):
-        raise RuntimeError("refusing to kill the runner's own session")
-    if os.path.isdir("/proc") and _still_in_session(sid, sid):
+        raise RuntimeError("refusing to signal the runner's own session")
+    ours = _signal_leader(leader)
+    if leader is not None and not ours and _still_in_session(sid, sid):
+        # The pidfd is gone and the number is a live session leader: it was reused. Do not signal it.
+        return
+    if ours and os.path.isdir("/proc"):
         try:
             os.killpg(sid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
@@ -400,13 +501,21 @@ def _kill_session(sid: int) -> None:
         empty = 0
         if time.monotonic() >= deadline:
             raise SessionCleanupError(f"processes {members} of the engine's session {sid} survived cleanup")
+        refused_leader = False
+        acted = False
         for pid in members:
+            if pid == sid and not ours:
+                refused_leader = True
+                continue
             if not _still_in_session(pid, sid):
                 continue
+            acted = True
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
+        if refused_leader and not acted:
+            return
         time.sleep(0.01)
 
 
@@ -466,6 +575,30 @@ def _count(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+def _json_loads(line: bytes):
+    """Parse one stream line. An integer past the platform digit limit stays text, not an error."""
+    def parse_int(text):
+        try:
+            return int(text)
+        except ValueError:
+            return text
+
+    return json.loads(line, parse_int=parse_int)
+
+
+def _finite_cost(cost):
+    """A non-negative finite cost, or None. A huge integer is not a cost and must not raise."""
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    try:
+        number = float(cost)
+    except OverflowError:
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
 def parse_stream_json(stdout: bytes, *, cost_basis: str) -> dict:
     """What the engine's own stream-json says: done or not, a typed failure, and its usage.
 
@@ -476,7 +609,7 @@ def parse_stream_json(stdout: bytes, *, cost_basis: str) -> dict:
     result = None
     for line in stdout.splitlines():
         try:
-            message = json.loads(line)
+            message = _json_loads(line)
         except ValueError:
             continue
         if isinstance(message, dict) and message.get("type") == "result":
@@ -493,16 +626,9 @@ def parse_stream_json(stdout: bytes, *, cost_basis: str) -> dict:
             "output": _count(raw.get("output_tokens")),
             "source": "engine_output",
         })
-    cost = result.get("total_cost_usd")
-    finite_cost = False
-    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-        try:
-            # A 401-digit integer is a JSON number. math.isfinite converts it to float and raises.
-            finite_cost = math.isfinite(cost) and cost >= 0
-        except OverflowError:
-            finite_cost = False
-    if finite_cost:
-        usage.update({"cost": float(cost), "cost_unit": "USD", "cost_basis": cost_basis, "source": "engine_output"})
+    number = _finite_cost(result.get("total_cost_usd"))
+    if number is not None:
+        usage.update({"cost": number, "cost_unit": "USD", "cost_basis": cost_basis, "source": "engine_output"})
     if result.get("subtype") == "success" and result.get("is_error") is not True:
         return {"has_result": True, "claimed_done": True, "failure": None, "detail": None, "usage": usage}
     error = result.get("error")

@@ -106,7 +106,7 @@ class Task:
         for name, data in self.hidden.items():
             path = work / safe_relpath(name)
             _clear_the_way(work, path)
-            path.parent.mkdir(parents=True, exist_ok=True)
+            _make_parent(path)
             _release_shared_name(path)
             _write_private(path, data, self.modes.get(name, 0o644))
 
@@ -147,11 +147,20 @@ class Task:
 
 
 def _remove(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-    elif path.is_dir():
+    """Remove ``path`` without following a link.
+
+    A real directory is removed as a tree. Anything else at the name (a file, a link, a FIFO or a
+    socket) is unlinked. ``unlink`` removes the name and does not follow a link.
+    """
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(info.st_mode):
         import shutil
         shutil.rmtree(path)
+        return
+    path.unlink()
 
 
 def _plain_folders_above(work: Path, path: Path) -> bool:
@@ -165,9 +174,9 @@ def _plain_folders_above(work: Path, path: Path) -> bool:
 
 
 def _clear_the_way(work: Path, path: Path) -> None:
-    """Remove what stands where ``path`` is to be written: a file or link where one of its folders must be
-    (a file replaced by a folder), and a folder or link at the path itself (a folder replaced by a file).
-    A link is removed, never followed, so nothing is written outside ``work``."""
+    """Remove what stands where ``path`` is to be written: anything that is not a real folder where one
+    of its folders must be (a file, a link, a FIFO or a socket), and a folder or link at the path
+    itself. A link is removed, never followed, so nothing is written outside ``work``."""
     here = work
     for part in path.relative_to(work).parts[:-1]:
         here = here / part
@@ -175,6 +184,14 @@ def _clear_the_way(work: Path, path: Path) -> None:
             _remove(here)
     if path.is_symlink() or path.is_dir():
         _remove(path)
+
+
+def _make_parent(path: Path) -> None:
+    """Make the folders above ``path``. A name that is still in the way is a TaskError, not a raw OSError."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise TaskError(f"cannot write {path.name}: {exc.strerror}") from None
 
 
 def apply_files(work: Path, files: dict, modes: dict | None = None) -> None:
@@ -191,7 +208,7 @@ def apply_files(work: Path, files: dict, modes: dict | None = None) -> None:
             continue
         path = work / safe_relpath(name)
         _clear_the_way(work, path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _make_parent(path)
         _release_shared_name(path)
         payload = data if isinstance(data, bytes) else data.encode("utf-8")
         _write_private(path, payload, (modes or {}).get(name, 0o644))

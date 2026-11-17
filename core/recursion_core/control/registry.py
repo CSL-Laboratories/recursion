@@ -282,7 +282,8 @@ class InMemoryRunRegistry:
         An update that omits ``generation``, carries an older one, or would leave ``stopped``,
         raises ``StaleGeneration`` and leaves the stored record unchanged. A transition to
         ``stopped`` raises ``StopUnattested`` unless the attestation names this generation, the
-        cgroup path and its marker, and every current member is gone. Returns the stored copy.
+        cgroup path and its marker, and every current member is gone. An error from the process
+        table is not proof a member is gone. Returns the stored copy.
         """
         if self.commit_gate is None:
             with self._lock:
@@ -450,7 +451,22 @@ class InMemoryRunRegistry:
         member_ids = attestation.get("member_ids")
         if member_ids != sorted(member["member_id"] for member in members):
             return False
-        return not any(self.process_alive(member.get("pid")) for member in members)
+        return self._members_proved_gone(members)
+
+    def _members_proved_gone(self, members: list[dict]) -> bool:
+        """True when every member's process is shown to be gone.
+
+        A process-table error is not that proof. The stopped write is then refused with
+        ``StopUnattested`` instead of letting the table's exception leave ``put``.
+        """
+        for member in members:
+            try:
+                alive = self.process_alive(member.get("pid"))
+            except Exception:
+                return False
+            if alive:
+                return False
+        return True
 
     def _join_locked(self, run_id: str, expected_generation: int, member_id: str, pid: int,
                      *, store: bool = True) -> dict:

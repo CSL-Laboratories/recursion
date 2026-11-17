@@ -32,7 +32,9 @@ A registry error never escapes ``call``: a read or a start that cannot reach the
 answer even if writing it back fails, with ``"recorded": false``. A write refused as stale is different:
 the record moved under the Stop, so the decision is applied to a fresh read, at most ``STALE_RETRIES``
 times, and from that stale write until a write of the run lands an empty result answers ``pending``,
-never ``stopped``.
+never ``stopped``. A write refused as unattested is different again: the registry rejected the stopped
+row because a member is alive or the process table errored during the proof. That Stop answers
+``pending``, never ``stopped``, and the refused row is not what the registry keeps.
 
 Start writes a launch intent first: the API picks the run id, records the run as ``starting`` (with its
 ``start_key``), and only then calls the starter with that id. So a launched run is always listed, Stop
@@ -82,7 +84,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 
 from recursion_core.control.registry import (
-    EMPTY, POPULATED, TIMEOUT, KillTree, OwnerLockTable, RunRegistry, StaleGeneration,
+    EMPTY, POPULATED, TIMEOUT, KillTree, OwnerLockTable, RunRegistry, StaleGeneration, StopUnattested,
 )
 
 STARTED, OK, STOPPED, PENDING = "started", "ok", "stopped", "pending"
@@ -326,7 +328,11 @@ class ControlAPI:
             return False
 
     def _commit(self, rec: dict) -> str:
-        """``ok``, ``stale``, or raise ``_RegistryError``. A stale write leaves the registry untouched.
+        """``ok``, ``stale``, ``unattested``, or raise ``_RegistryError``.
+
+        A stale write leaves the registry untouched. ``unattested`` is a stopped row the registry
+        refused (``StopUnattested``): a member is alive, or the process table errored while the proof
+        was checked. That is not a failed disk, and the row was not stored.
 
         On success ``rec`` becomes the snapshot this put stored, not a later read. A registry that does
         not return that snapshot is refreshed in full, so a newer generation is never paired with an
@@ -336,6 +342,8 @@ class ControlAPI:
             stored = self._registry.put(dict(rec))
         except StaleGeneration:
             return "stale"
+        except StopUnattested:
+            return "unattested"
         except Exception as err:
             raise _RegistryError(f"put:{type(err).__name__}") from err
         if isinstance(stored, dict):
@@ -627,6 +635,22 @@ class ControlAPI:
         rec["stop_attestation"] = None
         return {"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": reason}
 
+    def _refused_attestation(self, rec: dict) -> dict:
+        """Answer pending after the registry refused a stopped row.
+
+        The check this attempt already counted stays. The reason is a live member, or the
+        process-table error ``_block_stop`` names. The pending row is what gets written; the
+        refused stopped row is not.
+        """
+        reason = self._block_stop(rec) or "member_alive"
+        rec["state"] = "stop_pending"
+        rec["stop_attestation"] = None
+        if not isinstance(rec.get("stop"), dict):
+            rec["stop"] = {"requested_at": self._clock(), "checks": 0, "reason": None, "requested": False}
+        rec["stop"]["reason"] = reason
+        return self._recorded(
+            {"code": PENDING, "run_id": rec["run_id"], "state": "pending", "reason": reason}, rec)
+
     def _recorded(self, res: dict, rec: dict, *, reconfirm: bool = False) -> dict:
         # The cleanup layer's answer is the truth; a failed write-back is reported, not raised. The next
         # stop then sees the old state and asks again, which is safe (cgroup.kill and pidfds repeat).
@@ -691,6 +715,11 @@ class ControlAPI:
                 rec.update(fresh)
                 if outcome != "stale":
                     break
+        if outcome == "unattested" and rec.get("state") == "stopped":
+            # A refused proof is not a failed disk. Pending, never stopped.
+            if moved:
+                self._stale_stops.add(run_id)
+            return self._refused_attestation(rec)
         if outcome == "ok":
             self._stale_stops.discard(run_id)
         elif moved:

@@ -468,6 +468,16 @@ class FencingTest(unittest.TestCase):
         self.assertEqual(process.fenced, [cursor.DRIVER_FENCE])
         self.assertIn("fencing the child also failed: RuntimeError", caught.exception.__notes__)
 
+    def test_a_failed_note_keeps_the_original_exception(self):
+        """Astra R1: a diagnostic note that cannot be attached must not replace the driver exception."""
+        original = RuntimeError("synthetic original")
+        original.__notes__ = "not-a-list"
+        process = RaisingProcess([init()], original, fence_error=RuntimeError("synthetic fence failure"))
+        with self.assertRaises(RuntimeError) as caught:
+            launched(process).run(request(), 10.0)
+        self.assertIs(caught.exception, original)
+        self.assertEqual(process.fenced, [cursor.DRIVER_FENCE])
+
     def test_the_typed_ways_out_are_fenced_once_by_the_route_boundary(self):
         for error, code, reason in ((BrokenPipeError(), c.ENGINE_ERROR, "io_error"),
                                     (ReadTimeout(), c.DEADLINE_EXCEEDED, "deadline")):
@@ -634,6 +644,225 @@ class LaunchBoundaryTest(unittest.TestCase):
         self.assertEqual(adapter(launcher).run(request(), 10.0)["code"], None)
         self.assertEqual([step for step, _ in seen], ["checked", "launched"])
         self.assertIs(seen[0][1], seen[1][1])
+
+    def test_a_mapping_the_run_cannot_read_is_refused_before_launch(self):
+        """Astra R2 and DeepSeek round 3 F1: an ordinary failure while reading or copying the request, its
+        route or its connection is a typed refusal and starts no child. The connection kind is judged as
+        plain text before it is compared. KeyboardInterrupt from the mapping still leaves ``run``."""
+
+        class BadMapping(Mapping):
+            def __init__(self, data, operation):
+                self.data, self.operation = data, operation
+
+            def __len__(self):
+                return len(self.data)
+
+            def __iter__(self):
+                if self.operation == "iterate":
+                    raise ValueError("synthetic iteration failure")
+                return iter(self.data)
+
+            def __getitem__(self, key):
+                if self.operation == "lookup":
+                    raise ValueError("synthetic lookup failure")
+                return self.data[key]
+
+        class BadEquality(str):
+            __hash__ = str.__hash__
+
+            def __eq__(self, other):
+                raise ValueError("synthetic comparison failure")
+
+        class KeysRaise(Mapping):
+            def __init__(self):
+                self.data = request(kind="api_key")
+
+            def __iter__(self):
+                return iter(self.data)
+
+            def __len__(self):
+                return len(self.data)
+
+            def __getitem__(self, key):
+                return self.data[key]
+
+            def keys(self):
+                raise RuntimeError("hostile keys")
+
+        class InterruptOnId(Mapping):
+            def __iter__(self):
+                return iter(["request_id"])
+
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, key):
+                raise KeyboardInterrupt("hostile getitem")
+
+        cases = []
+        for level in ("request", "route", "connection"):
+            for operation in ("lookup", "iterate"):
+                req = request(kind="api_key")
+                broken = BadMapping(
+                    req if level == "request" else req["route"] if level == "route" else req["route"]["connection"],
+                    operation)
+                if level == "request":
+                    req = broken
+                elif level == "route":
+                    req["route"] = broken
+                else:
+                    req["route"]["connection"] = broken
+                cases.append((f"{level} {operation}", req, c.REQUEST_INVALID, "ValueError"))
+        cases.append(("keys", KeysRaise(), c.REQUEST_INVALID, "RuntimeError"))
+        kind_req = request(kind="api_key")
+        kind_req["route"]["connection"]["kind"] = BadEquality("api_key")
+        cases.append(("kind", kind_req, c.LAUNCH_REFUSED, None))
+        for label, req, code, exc_name in cases:
+            with self.subTest(label):
+                launcher = LinesLauncher([])
+                result = adapter(launcher).run(req, 10.0)
+                self.assertEqual(result["code"], code)
+                self.assertEqual(launcher.launches, [])
+                self.assertIsInstance(result["request_id"], str)
+                if exc_name is not None:
+                    self.assertEqual(result["detail"], f"request: not readable ({exc_name})")
+        launcher = LinesLauncher([])
+        with self.assertRaises(KeyboardInterrupt):
+            adapter(launcher).run(InterruptOnId(), 10.0)
+        self.assertEqual(launcher.launches, [])
+
+    def test_a_refusal_answers_the_request_id_it_already_read(self):
+        """Astra R3 and DeepSeek round 3 F4: a refusal answers with the id copied while preparing, and does
+        not read the caller's request id again."""
+
+        class FlipId(Mapping):
+            def __init__(self):
+                self.base = request(prompt="")
+                self.n = 0
+
+            def __iter__(self):
+                return iter(self.base)
+
+            def __len__(self):
+                return len(self.base)
+
+            def __getitem__(self, key):
+                if key == "request_id":
+                    self.n += 1
+                    return "first" if self.n == 1 else "second"
+                return self.base[key]
+
+        req = FlipId()
+        launcher = LinesLauncher([])
+        result = adapter(launcher).run(req, 10.0)
+        self.assertEqual((result["request_id"], result["code"], req.n, launcher.launches),
+                         ("first", c.REQUEST_INVALID, 1, []))
+
+    def test_a_general_mapping_launches_the_first_route(self):
+        """Astra R4: a general mapping whose route changes on the next lookup launches the first route."""
+
+        class FlipRoute(Mapping):
+            def __init__(self):
+                self.base = request(kind="api_key", model="first-model")
+                self.other = request(kind="subscription", model="second-model")["route"]
+                self.n = 0
+
+            def __len__(self):
+                return len(self.base)
+
+            def __iter__(self):
+                return iter(self.base)
+
+            def __getitem__(self, key):
+                if key == "route":
+                    self.n += 1
+                    return self.base[key] if self.n == 1 else self.other
+                return self.base[key]
+
+        req = FlipRoute()
+        launcher = LinesLauncher([init("env"), line(type="result", subtype="success", is_error=False, result="ok")])
+        result = adapter(launcher).run(req, 10.0)
+        self.assertIsNone(result["code"])
+        self.assertEqual(launcher.launches[0]["argv"][-3:], ["first-model", "--", req.base["prompt"]])
+        self.assertEqual(launcher.launches[0]["env"]["CURSOR_API_KEY"], KEY)
+
+    def test_a_general_mapping_connection_is_read_once(self):
+        """Astra R4: a general mapping connection is snapshotted once; env and the billing check use that kind."""
+
+        class Flip(Mapping):
+            def __init__(self):
+                self.n = 0
+
+            def __iter__(self):
+                return iter(["kind", "id", "credential_env"])
+
+            def __len__(self):
+                return 3
+
+            def __getitem__(self, key):
+                if key == "kind":
+                    self.n += 1
+                    return "api_key" if self.n == 1 else "subscription"
+                return {"id": "synthetic-connection", "credential_env": "CURSOR_API_KEY"}[key]
+
+        req = request(kind="api_key")
+        connection = Flip()
+        req["route"]["connection"] = connection
+        launcher = LinesLauncher([init("login")])
+        result = adapter(launcher).run(req, 10.0)
+        self.assertEqual(connection.n, 1)
+        self.assertEqual(launcher.launches[0]["env"]["CURSOR_API_KEY"], KEY)
+        self.assertEqual(result["code"], c.ROUTE_CHOICE_REQUIRED)
+
+    def test_a_valid_request_id_is_kept_on_a_refusal(self):
+        """Astra R4: a usable, distinctive request id is the id of a refusal."""
+        req = request(prompt="")
+        req["request_id"] = "distinct-refusal-id"
+        launcher = LinesLauncher([])
+        result = adapter(launcher).run(req, 10.0)
+        self.assertEqual((result["request_id"], result["code"], launcher.launches),
+                         ("distinct-refusal-id", c.REQUEST_INVALID, []))
+
+    def test_a_valid_request_id_is_kept_on_success(self):
+        """Astra R4: a usable, distinctive request id is the id of a successful run."""
+        req = request()
+        req["request_id"] = "distinct-success-id"
+        launcher = LinesLauncher([init(), line(type="result", subtype="success", is_error=False, result="ok")])
+        result = adapter(launcher).run(req, 10.0)
+        self.assertEqual((result["request_id"], result["code"]), ("distinct-success-id", None))
+
+    def test_a_request_that_is_not_an_object_is_refused(self):
+        """DeepSeek round 3 F2: a request that is not a mapping is request_invalid and starts no child."""
+        for value in (None, [], "request", 7, object()):
+            with self.subTest(value=type(value).__name__):
+                launcher = LinesLauncher([])
+                result = adapter(launcher).run(value, 10.0)
+                self.assertEqual((result["code"], result["detail"], result["request_id"], launcher.launches),
+                                 (c.REQUEST_INVALID, "request: not an object", "", []))
+
+    def test_a_refusal_does_not_echo_an_unusable_request_id(self):
+        """DeepSeek round 3 F2: a refusal never puts an unusable request id on the result."""
+
+        class Sub(str):
+            pass
+
+        cases = (
+            (dict(request(), request_id=7), 10.0),
+            (dict(request(), request_id="r" + chr(0xD800)), 10.0),
+            (dict(request(), request_id=""), 10.0),
+            (dict(request(), request_id=None), 10.0),
+            (dict(request(), request_id=Sub("r1")), 10.0),
+        )
+        missing = request()
+        del missing["request_id"]
+        cases = (*cases, (missing, 10.0))
+        for req, deadline in cases:
+            with self.subTest(request_id=req.get("request_id")):
+                launcher = LinesLauncher([])
+                result = adapter(launcher).run(req, deadline)
+                self.assertEqual(result["code"], c.REQUEST_INVALID)
+                self.assertEqual(result["request_id"], "")
+                self.assertEqual(launcher.launches, [])
 
 
 if __name__ == "__main__":

@@ -63,6 +63,19 @@ interpreter has no JSON Schema library, so `test_cursor_fixtures` checks each me
 | `unattended_refusal() -> dict` | `{"code": "cursor_unattended_off", "detail": <text>}` | run.record.v1's `start_error` shape |
 | `CursorAdapter(launcher, clock, credentials, environ, *, binary=None)` | a `RouteAdapter` on today's one-turn path; `run(request, deadline_at) -> result` | its own factory, registered nowhere; argv `oneshot_argv(...) + ["--", prompt]`; stdin closed; everything taken from the request is worked out before the launch, and a request id, prompt, model, connection kind, credential name, connection id or deadline that cannot be used is refused there with no child started; an empty prompt, one over `MAX_PROMPT_BYTES` (= `MAX_ARG_BYTES`), or one with a NUL or a lone surrogate is `request_invalid`; sign-in child: the allowlist only; API-key child: `CURSOR_API_KEY` from custody; a run whose first init reports a key source other than the route's is fenced and answers `route_choice_required`: another documented source (`env`, `flag`, `login`) is `billing_mismatch`, an absent or undocumented one is `billing_unknown`, and so is a result with no init before it; `check_argv` holds the exact argv handed to the launcher (`launch_refused`, the rule as detail); every draft reaches the result's `events` in order (`route_event`: the draft's type as kind, scalar fields only; the input's ids from `input_ids(request_id)`); any exception out of the drive but the three the route boundary types fences the child (`DRIVER_FENCE`) and leaves as it came |
 
+`CursorAdapter.drive` receives the values prepared before the launch, not the caller's request dict. It
+exposes `request_id` and nothing else through the mapping interface the route boundary uses; a subclass
+that reads `request["route"]` inside `drive` does not see the route. `run` is the entry that accepts a
+request. The events appended to a result are `input.accepted`, `tool.call`, `tool.result` and `result`.
+
+An ordinary failure while reading or copying the request mapping (its route, or that route's connection)
+is `request_invalid` and starts no child. `KeyboardInterrupt` and `SystemExit` from that mapping are not
+turned into a refusal. A refusal answers with the request id copied before the failure when that id is
+usable text, and with an empty id otherwise; it does not read the caller again. A connection kind is
+accepted only as a plain `str` before it is compared. If fencing the child also fails, a diagnostic note
+is attached when the exception accepts one; when the note cannot be attached, the original exception
+still leaves.
+
 `fake_agent.py`: `FakeLauncher(fixture)(argv, *, env, shell=False, **options)` records each launch in
 `.launches` and hands out the process in `.processes`; `fixture_lines(name)` and `fixture_header(name)` read
 a fixture. The ACP process takes only the transcript's own next client message, compared by `same_json` (a

@@ -619,6 +619,38 @@ def _field(mapping: Mapping, name: str, path: str) -> object:
         raise c.RouteError(c.REQUEST_INVALID, f"{path}: missing") from None
 
 
+def _refusal_id(value: object) -> str:
+    """The request id a refusal answers with: usable text already taken from the request, else empty.
+
+    It does not read the caller's request. A value that is not usable text is not echoed.
+    """
+    return value if _text(value) else ""
+
+
+def _snapshot(request: Mapping) -> dict:
+    """One plain copy of the request, its route and its connection.
+
+    Each of those three is read through the caller's mapping while the copy is built. An ordinary
+    failure of that read or copy is ``request_invalid``. ``KeyboardInterrupt`` and ``SystemExit``
+    are not caught here.
+    """
+    try:
+        route = _field(request, "route", "route")
+        if not isinstance(route, Mapping):
+            raise c.RouteError(c.REQUEST_INVALID, "route: not an object")
+        connection = _field(route, "connection", "route.connection")
+        if not isinstance(connection, Mapping):
+            raise c.RouteError(c.REQUEST_INVALID, "route.connection: not an object")
+        copy = dict(request)
+        copy["route"] = dict(route)
+        copy["route"]["connection"] = dict(connection)
+    except c.RouteError:
+        raise
+    except Exception as err:
+        raise c.RouteError(c.REQUEST_INVALID, f"request: not readable ({type(err).__name__})") from None
+    return copy
+
+
 class _Prepared:
     """Everything a run takes from its request, worked out before the launch (the second break-it read of
     #412, R1). The route boundary reads only ``request_id`` from it; the drive reads its plain values, inside
@@ -639,15 +671,18 @@ class _Prepared:
 class CursorAdapter(RouteAdapter):
     """Cursor's one-shot drive on today's one-turn path. Its own factory; registered nowhere yet.
 
-    THE RULE OF ``run`` (the second break-it read of #412, R1): everything that reads the request, and
-    everything that can raise from a request value (each encode, hash, conversion, lookup and format), is done
-    before the launch, into one ``_Prepared``; a value that cannot be used is refused with a typed code and
-    no child is started. After the launch the only code that runs is the drive, inside the fence.
+    THE RULE OF ``run``: the request, its route and its connection are copied once before the launch.
+    An ordinary failure while reading or copying them is ``request_invalid`` and no child starts.
+    ``KeyboardInterrupt`` and ``SystemExit`` are not turned into a refusal. After a usable request id has
+    been copied, a later refusal answers with that id and does not read the caller again. When no usable
+    id was copied, the refusal's id is empty, and an unusable value is not echoed. After the launch the
+    only code that runs is the drive, inside the fence.
 
     Every launch goes through ``check_argv``, over the exact argv handed to composition's launcher, which
     only a closure holds. Once the child has started, every way out of the drive fences it: the route
     boundary fences for a deadline, a protocol error and an OSError; this driver fences for anything else,
-    ``BaseException`` included, and the original exception is what leaves.
+    ``BaseException`` included, and the original exception is what leaves. A note that the fence also failed
+    is attached when the exception accepts one; if the note cannot be attached, the original still leaves.
     """
 
     engine = ENGINE
@@ -677,37 +712,34 @@ class CursorAdapter(RouteAdapter):
         try:
             prepared, deadline = self._prepare(request, deadline_at)
         except c.RouteError as err:
-            return c.result(_request_id(request), err.code, detail=err.detail)
+            # The id copied during preparation, never a second read of the caller (Astra R3).
+            return c.result(_refusal_id(getattr(err, "answered_id", "")), err.code, detail=err.detail)
         return super().run(prepared, deadline)
 
     def _prepare(self, request: object, deadline_at: object) -> tuple[_Prepared, float]:
         if not isinstance(request, Mapping):
             raise c.RouteError(c.REQUEST_INVALID, "request: not an object")
         # One plain copy of the route and connection, each read once (the first break-it read of #412, F4).
-        route = _field(request, "route", "route")
-        if not isinstance(route, Mapping):
-            raise c.RouteError(c.REQUEST_INVALID, "route: not an object")
-        connection = _field(route, "connection", "route.connection")
-        if not isinstance(connection, Mapping):
-            raise c.RouteError(c.REQUEST_INVALID, "route.connection: not an object")
-        copy = dict(request)
-        copy["route"] = dict(route)
-        copy["route"]["connection"] = dict(connection)
+        copy = _snapshot(request)
         rid = copy.get("request_id")
-        if not _text(rid):
-            raise c.RouteError(c.REQUEST_INVALID, "request_id: not text")
         try:
-            deadline = float(deadline_at) if type(deadline_at) in (int, float) else math.nan
-        except OverflowError:   # an int past the float range (R2)
-            deadline = math.nan
-        if not math.isfinite(deadline):
-            raise c.RouteError(c.REQUEST_INVALID, "deadline_at: not a finite number")
-        argv = self._argv_for(copy)
-        env = self._env_for(copy)
-        kind = copy["route"]["connection"]["kind"]   # env() refused every kind but these two
-        delivery_id, turn_id = input_ids(rid)
-        return _Prepared(request_id=rid, argv=argv, env=env, kind=kind, expected=_EXPECTED_KEY_SOURCE[kind],
-                         delivery_id=delivery_id, turn_id=turn_id, prompt=copy["prompt"]), deadline
+            if not _text(rid):
+                raise c.RouteError(c.REQUEST_INVALID, "request_id: not text")
+            try:
+                deadline = float(deadline_at) if type(deadline_at) in (int, float) else math.nan
+            except OverflowError:   # an int past the float range (the second break-it read of #412, R2)
+                deadline = math.nan
+            if not math.isfinite(deadline):
+                raise c.RouteError(c.REQUEST_INVALID, "deadline_at: not a finite number")
+            argv = self._argv_for(copy)
+            env = self._env_for(copy)
+            kind = copy["route"]["connection"]["kind"]   # a plain str; _env_for refused anything else before comparing
+            delivery_id, turn_id = input_ids(rid)
+            return _Prepared(request_id=rid, argv=argv, env=env, kind=kind, expected=_EXPECTED_KEY_SOURCE[kind],
+                             delivery_id=delivery_id, turn_id=turn_id, prompt=copy["prompt"]), deadline
+        except c.RouteError as err:
+            err.answered_id = rid   # type: ignore[attr-defined]
+            raise
 
     def argv(self, request: object) -> list[str]:
         return request.argv if isinstance(request, _Prepared) else self._argv_for(request)
@@ -734,6 +766,9 @@ class CursorAdapter(RouteAdapter):
     def _env_for(self, request: dict) -> dict[str, str]:
         connection = request["route"]["connection"]
         kind = connection.get("kind")
+        # Plain text before any comparison, so a subclass whose equality raises cannot escape (Astra R2).
+        if type(kind) is not str or not kind or _has_surrogate(kind):
+            raise c.RouteError(c.LAUNCH_REFUSED, "connection kind that is not text not supported for cursor")
         if kind == "subscription":
             return child_env(self._parent_env)
         if kind == "api_key":
@@ -743,8 +778,7 @@ class CursorAdapter(RouteAdapter):
             if not _text(connection.get("id")):
                 raise c.RouteError(c.REQUEST_INVALID, "route.connection.id: not text")
             return child_env(self._parent_env, credential=self.credential(request, CURSOR_API_KEY_ENV))
-        shown = kind if _text(kind) else "that is not text"
-        raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {shown} not supported for cursor")
+        raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for cursor")
 
     def drive(self, process, request, deadline_at, events):
         try:
@@ -753,11 +787,15 @@ class CursorAdapter(RouteAdapter):
             raise   # the route boundary fences the child for each of these and types the result
         except BaseException as err:
             # Any other way out (a TypeError, a MemoryError, an interrupt, a defect): the child is fenced first
-            # and the original exception leaves. A fence that fails too does not replace it; it is noted on it.
+            # and the original exception leaves. A fence that fails too does not replace it. The note is
+            # optional: if it cannot be attached, the original exception is still what leaves (Astra R1).
             try:
                 process.fence(DRIVER_FENCE)
             except BaseException as fence_err:
-                err.add_note(f"fencing the child also failed: {type(fence_err).__name__}")
+                try:
+                    err.add_note(f"fencing the child also failed: {type(fence_err).__name__}")
+                except BaseException:
+                    pass
             raise
 
     def _drive(self, process, prepared, deadline_at, events):
@@ -813,13 +851,3 @@ class CursorAdapter(RouteAdapter):
                 if code is None:
                     return c.result(rid, None, text=parser.final_text or "", events=events)
                 return c.result(rid, c.ENGINE_ERROR, events=events, detail=draft["payload"]["detail"])
-
-
-def _request_id(request: object) -> str:
-    """The request id to answer a refusal before the launch with: the request's own when it is usable text,
-    else empty. Never raises."""
-    try:
-        rid = request["request_id"]   # type: ignore[index]
-    except Exception:
-        return ""
-    return rid if _text(rid) else ""

@@ -852,6 +852,46 @@
       "shows": "An approval is pending for the run and the Task says working, with no approval named."
     },
     {
+      "file": "task.derivation/t35-turn-with-a-later-change-of-its-run-filed-under-it.json",
+      "rule": "task.derivation",
+      "shows": "A turn whose own last change is followed, in the log, by a change of its run that is filed under the turn. That is not a change of the turn: the Task's updated_at stays the time of the turn's own last state.changed. The payload says what changed (entity, entity_id)."
+    },
+    {
+      "file": "task.derivation/t36-turn-with-a-later-change-of-its-session-filed-under-it.json",
+      "rule": "task.derivation",
+      "shows": "The same with a change of the session filed under the turn."
+    },
+    {
+      "file": "task.derivation/t37-turn-with-only-a-change-of-its-run-filed-under-it.json",
+      "rule": "task.derivation",
+      "shows": "The log holds a change of the run filed under the turn and no change of the turn itself: the Task's updated_at is null."
+    },
+    {
+      "file": "task.derivation/t38-turn-with-only-a-change-of-its-session-filed-under-it.json",
+      "rule": "task.derivation",
+      "shows": "The same with a change of the session and none of the turn: null."
+    },
+    {
+      "file": "task.derivation/x16-a-later-change-of-the-run-given-as-the-turns-update.json",
+      "rule": "task.derivation",
+      "shows": "The log of t35, and a Task of the turn whose updated_at is the time of the run's change."
+    },
+    {
+      "file": "task.derivation/x17-a-later-change-of-the-session-given-as-the-turns-update.json",
+      "rule": "task.derivation",
+      "shows": "The log of t36, and a Task of the turn whose updated_at is the time of the session's change."
+    },
+    {
+      "file": "task.derivation/x18-the-only-change-of-the-run-given-as-the-turns-update.json",
+      "rule": "task.derivation",
+      "shows": "The log of t37, and a Task whose updated_at is not null."
+    },
+    {
+      "file": "task.derivation/x19-the-only-change-of-the-session-given-as-the-turns-update.json",
+      "rule": "task.derivation",
+      "shows": "The log of t38, and a Task whose updated_at is not null."
+    },
+    {
       "file": "start.intent/i01-the-legacy-path.json",
       "rule": "start.intent",
       "shows": "No lane has registered on the start path: the stored identity is today's three members and nothing else, whatever else the request carries. No intent is computed."
@@ -1095,6 +1135,11 @@
       "file": "event.page/x18-a-transcript-page-under-another-cursor-than-its-raw-page.json",
       "rule": "event.page",
       "shows": "One line for each event, and the transcript page says there is more where the raw page said there was none."
+    },
+    {
+      "file": "event.page/x19-a-transcript-line-of-engine-output-relabelled-as-the-cores-own.json",
+      "rule": "event.page",
+      "shows": "The raw page of g08 and a transcript page with a line for each of its events, right in seq and type. The line of the engine's output carries another text, and says it came from the core and is trusted. The schemas take it; the rule holds each line to what its event says."
     }
   ]
 }

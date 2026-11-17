@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "revoked-keys.v1.json",
   "title": "revoked-keys.v1: the signed list of revoked developer keys ('csl-revoked-keys/1')",
-  "x-version": "1.0-draft.1",
+  "x-version": "1.0-draft.2",
   "description": "DRAFT: revocation's details are an open question, and the lane that owns signing supplies the fields and the fixtures. The minimum is here. A list names the developer keys that are revoked. An install applies a list only when it is signed by a list key that install trusts. list_version is a whole number that only rises: a list lower than the last one an install accepted is refused, so an old list cannot be replayed to bring a key back. The signature is over the list's canonical bytes without the 'signature' field. NOT DECIDED: what an install does with a list that has expired or cannot be fetched. Until that is answered, the last accepted list stays in force, and the absence of a list never means that nothing is revoked.",
   "type": "object",
   "additionalProperties": false,
@@ -44,9 +44,10 @@
       "not": {"pattern": "[\\r\\n]"}
     },
     "timestamp": {
-      "description": "A moment in UTC as RFC 3339 with exactly three decimal places and a 'Z'.",
+      "description": "A moment in UTC as RFC 3339 with exactly three decimal places and a 'Z', the same form as the control records' timestamp (common.v1.json). It is a real UTC calendar instant: a pattern cannot say that February has no 31st, so the keyword 'x-instant' says it, and the conformance client checks it (conformance/wire_client.py); a validator that does not know that keyword ignores it and must make the check itself. The profile of these records supports no leap second: seconds are 00 to 59, in the pattern and in the check.",
       "type": "string",
-      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)\\.[0-9]{3}Z$",
+      "x-instant": true,
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$",
       "not": {"pattern": "[\\r\\n]"}
     }
   }

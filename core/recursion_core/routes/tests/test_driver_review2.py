@@ -139,7 +139,7 @@ class ProvisionalAnswerTest(unittest.TestCase):
         with self.assertRaises(d.DriverBusy) as caught:
             driver.send(handle, {"kind": "user_message", "turn_id": "turn-1", "text": "b", "delivery_id": "dlv-2"})
         self.assertIsInstance(caught.exception, d.DriverRefused)
-        self.assertEqual(caught.exception.as_record(), {"code": "busy", "call": "send", "flag": "mid_turn_input"})
+        self.assertEqual(caught.exception.as_record(), {"code": "unsupported", "call": "send", "flag": "mid_turn_input"})
         self.assertEqual(len(driver.written), 1)
 
     def test_start_takes_the_briefs_three_arguments_and_resume_names_the_conversation(self):

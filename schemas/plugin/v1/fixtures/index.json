@@ -875,6 +875,33 @@
       }
     },
     {
+      "file": "bad/revoked-keys.v1/b07-a-list-that-expires-on-a-day-that-does-not-exist.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "A list's times are real moments: February has no 31st. The pattern cannot say so; the keyword x-instant does.",
+      "expect": {
+        "keyword": "x-instant",
+        "at": "/expires_at"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/b08-a-key-revoked-at-a-second-of-sixty.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "Seconds are 00 to 59: the profile of these records supports no leap second, and a :60 is never read as the next minute.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/keys/0/revoked_at"
+      }
+    },
+    {
+      "file": "bad/revoked-keys.v1/b09-a-list-issued-at-a-second-of-sixty.json",
+      "schema": "revoked-keys.v1.json",
+      "rule": "The real-instant check refuses a second of 60 by itself, without the pattern.",
+      "expect": {
+        "keyword": "x-instant",
+        "at": "/issued_at"
+      }
+    },
+    {
       "file": "bad/revoked-keys.v1/f-revoked-keys.v1.schema.json",
       "schema": "revoked-keys.v1.json",
       "rule": "The value at /schema is fixed by revoked-keys.v1.json#/properties/schema.",

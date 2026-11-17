@@ -22,16 +22,25 @@ starts no process and changes no state:
 
 Which flag a call needs (driver.v2's description): a second user_message to the same worker needs
 ``multi_turn``; a user_message while a turn is in progress needs ``mid_turn_input``; an approval_answer
-needs ``permission_bridge``. A call whose flag is false raises ``DriverRefused`` (code ``unsupported``, the
-call and the flag), except the mid-turn send, which raises ``DriverBusy`` (code ``busy``, the frozen brief's
-word). PROVISIONAL, both that answer and the start and resume forms above: which of the brief's wording and
-driver.v2's stands is open with Lucas (lane questions Q1 and Q7); consumers must not rely on either yet.
-PORT WITHDRAW (the Liaison's ruling of Nov 15, 7:07 PM, for #402's round 5, P2). A driver that puts a request to
-the approvals port first takes a ticket, ``admit_port(handle)``, and hands it to the port with the request; the port
-opens the approval only if ``ticket.publish()`` answers True. ``withdraw_port(handle)``, which a ``close`` input also
-runs, withdraws every ticket admitted and not yet published and admits no more. So after it returns, no approval
-opens and no request is delivered to the port for that worker, and it never waits for the port. The port's side
-(refuse a withdrawn request with a typed reason) is lane APPROVALS'.
+needs ``permission_bridge``. A call whose flag is false raises ``DriverRefused``. The refusal record's code
+is ``unsupported``, the only code driver.v2 publishes, including a mid-turn send (``DriverBusy``, still a
+``DriverRefused``, so a caller can tell that case by type). PROVISIONAL, the start and resume forms above:
+which of the brief's wording and driver.v2's stands is open with Lucas (lane question Q7).
+PORT WITHDRAW (the Liaison's ruling of Nov 15, 7:07 PM, for #402's round 5, P2; corrected after #432's first reads).
+A driver that puts a request to the approvals port first takes a ticket, ``admit_port(handle)``, and hands it to the
+port with the request. The port makes the approval visible ONLY through ``ticket.publish(reveal)``: ``reveal`` is the
+port's own step that makes the approval visible (the commit of its row, say), and the ticket runs it under the
+ticket's lock, only while the ticket is admitted and the worker's port is not sealed. ``withdraw_port(handle)``, which a
+``close`` input also runs, seals the worker's port first (from that instant no ticket of it can begin a reveal) and
+then ends every ticket admitted and not yet published, waiting only for a reveal that is already running, and for
+at most ``wait`` seconds in all. The guarantee, when ``withdraw_port`` RETURNS: every ticket of the worker is
+published or withdrawn, every approval that is visible became visible before it returned, and no approval of that
+worker becomes visible afterwards. "Delivered" in the ruling's words means accepted by the port, that is revealed:
+the driver does not make the port call, so a caller that still holds a ticket can call the port after the withdraw,
+and the port refuses it there (``publish`` answers False and the reveal never runs); no new ticket is admitted. If a
+reveal runs past the wait, or a step raises, ``withdraw_port`` RAISES instead of returning (``PortWithdrawIncomplete``,
+or the interruption itself), the port stays sealed, and a later ``withdraw_port`` finishes the job. The port's side
+(refuse a withdrawn request with a typed reason, keep ``reveal`` short) is lane APPROVALS'.
 
 A malformed call raises ``DriverInputError``; a call the worker's state does not allow (closed input, an
 interrupt of a turn that is not in progress, a reused turn or delivery id) raises ``DriverStateError``. All
@@ -70,17 +79,20 @@ holds the state lock while calling the subclass.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import math
 import re
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
+
+from recursion_core.control.methods import NoCanonicalText, canonical_text
 
 CONTRACT = 2
 FLAGS = ("multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge", "typed_limits", "usage")
 INPUT_KINDS = ("user_message", "approval_answer", "close")
 UNSUPPORTED = "unsupported"
-BUSY = "busy"  # PROVISIONAL: see DriverBusy
 # The calls a flag can refuse, and the flags that refuse a call (driver.v2 $defs/refusal).
 REFUSABLE_CALLS = ("send", "interrupt", "resume", "fork")
 REFUSING_FLAGS = ("multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge")
@@ -133,20 +145,15 @@ class DriverRefused(Exception):
 
 
 class DriverBusy(DriverRefused):
-    """A user_message sent while a turn is in progress, to a driver without ``mid_turn_input``. PROVISIONAL.
+    """A user_message sent while a turn is in progress, to a driver without ``mid_turn_input``.
 
-    The frozen brief says such a send "answers `busy`"; driver.v2's refusal record (#368) has only
-    ``unsupported``, with flag ``mid_turn_input``. Until Lucas settles which stands (lane questions Q1, put to
-    him by the Liaison on Nov 14), the gate answers the brief's ``busy``: code ``busy``, call ``send``, flag
-    ``mid_turn_input``. It is a ``DriverRefused``, so a caller that catches refusals sees it, and its ``code``
-    tells the two apart. Consumers must not rely on either answer yet.
+    driver.v2's refusal record has one code, ``unsupported``, and this record uses it, with call
+    ``send`` and flag ``mid_turn_input``. The class stays a ``DriverRefused`` so a caller that
+    catches refusals sees it, and so this case can still be told by type.
     """
-
-    code = BUSY
 
     def __init__(self) -> None:
         super().__init__("send", "mid_turn_input")
-        self.args = (f"{BUSY}: a turn is in progress and this driver takes no mid-turn input",)
 
 
 class DriverInputError(ValueError):
@@ -238,8 +245,10 @@ class Handle:
         self._deliveries: set[str] = set()   # every delivery id written, accepted or not
         self._pending: dict[str, tuple[str, str]] = {}  # delivery id -> (turn id, how), until accepted
         self._closed = False
-        self._port_sealed = False             # set by withdraw_port; no request is admitted to the port after it
-        self._tickets: list[PortTicket] = []  # requests admitted to the port and not yet published or withdrawn
+        self._port_seal = _PortSeal()          # shared with every ticket of this handle (PORT WITHDRAW)
+        # Tickets admitted to the port that withdraw_port has not yet seen ended. A published or withdrawn ticket
+        # stays here until the next admit_port or withdraw_port drops it; nothing reads it but those two.
+        self._tickets: list[PortTicket] = []
 
     @property
     def engine_session_id(self) -> str | None:
@@ -262,54 +271,152 @@ class Handle:
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def port_sealed(self) -> bool:
+        """True once withdraw_port (or a ``close`` input) began for this handle: no ticket of it can open again."""
+        return self._port_seal.sealed
+
     def as_record(self) -> dict:
         """driver.v2's handle record."""
         return {"run_id": self.run_id, "engine_session_id": self._engine_session_id}
 
 
-ADMITTED, PUBLISHED, WITHDRAWN = "admitted", "published", "withdrawn"
+ADMITTED, OPENING, PUBLISHED, WITHDRAWN = "admitted", "opening", "published", "withdrawn"
+# How long withdraw_port waits, in all, for reveals that are already running. A reveal is the port's one step that
+# makes an approval visible and must be short (no wait on a person, the network, or anything that calls the driver).
+REVEAL_WAIT_S = 5.0
+
+
+class PortWithdrawIncomplete(DriverStateError):
+    """withdraw_port could not end every ticket: a reveal ran past the wait. ``tickets`` are the ones not ended.
+
+    The worker's port is sealed all the same, so no other ticket can begin a reveal; a ticket named here may still
+    finish the reveal it began. Calling withdraw_port again waits for them again.
+    """
+
+    def __init__(self, tickets: list[PortTicket]) -> None:
+        super().__init__(f"{len(tickets)} reveal(s) of the approvals port still running after the wait")
+        self.tickets = list(tickets)
+
+
+class _PortSeal:
+    """One per handle, shared by its tickets: once ``sealed`` is True no ticket of the handle can begin a reveal."""
+
+    __slots__ = ("sealed",)
+
+    def __init__(self) -> None:
+        self.sealed = False
 
 
 class PortTicket:
-    """One request admitted to the approvals port. It ends in exactly one of two states, once:
+    """One request admitted to the approvals port: a latch. It ends once, published or withdrawn.
 
-    - ``publish()``: the port calls it at the moment it would make the approval visible (inside its own commit).
-      True means it may open the approval; False means the request was withdrawn and the port opens nothing.
-    - ``withdraw()``: ``Driver.withdraw_port`` calls it. True means the request will never be published.
+    - ``publish(reveal)``: the port calls it ONCE, with ``reveal``, its own step that makes the approval visible.
+      Under the ticket's lock, and only while the ticket is admitted and its worker's port is not sealed, the ticket
+      runs ``reveal()`` and answers True: the approval is visible, and it became so before any withdraw of this ticket
+      could return. Otherwise ``reveal`` is never run and the answer is False: the port opens nothing (the request
+      was withdrawn, or this ticket was already used). If ``reveal`` raises, the ticket ends withdrawn and the
+      exception leaves ``publish``: the port must then have made nothing visible (its commit failed and rolled back).
+    - ``withdraw(wait)``: ends the ticket withdrawn if it is still admitted, waiting at most ``wait`` seconds for a
+      reveal that is already running (``PortWithdrawIncomplete`` past that). ``Driver.withdraw_port`` does this for
+      every ticket of a worker; True means this call withdrew it.
 
-    Whichever comes first wins; the other answers False. Neither ever waits for anything but the ticket's own
-    lock, which is held only to change the state.
+    ``state`` is a snapshot for tests and reports: ``admitted``, ``opening`` (a reveal is running, or was cut off by an
+    interruption with its outcome unknown), ``published`` or ``withdrawn`` (an admitted ticket of a sealed worker reads
+    withdrawn: it can never open). Any code can make a ticket; only one that ``Driver.admit_port`` gave is known to a
+    worker and ended by its withdraw.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, seal: _PortSeal | None = None) -> None:
         self._lock = threading.Lock()
         self._state = ADMITTED
+        self._seal = seal if seal is not None else _PortSeal()
+        self._revealer: int | None = None  # the thread running reveal, while it runs
 
     @property
     def state(self) -> str:
-        return self._state
+        state = self._state
+        return WITHDRAWN if state == ADMITTED and self._seal.sealed else state
 
-    def publish(self) -> bool:
+    def publish(self, reveal: object) -> bool:
+        if not callable(reveal):
+            raise DriverInputError("reveal")
         with self._lock:
             if self._state != ADMITTED:
                 return False
+            if self._seal.sealed:
+                self._state = WITHDRAWN
+                return False
+            self._state = OPENING
+            self._revealer = threading.get_ident()
+            try:
+                reveal()
+            except BaseException:
+                self._revealer = None
+                self._state = WITHDRAWN  # the port made nothing visible (its side of the contract)
+                raise
+            self._revealer = None
             self._state = PUBLISHED
             return True
 
-    def withdraw(self) -> bool:
-        with self._lock:
+    def withdraw(self, wait: float = REVEAL_WAIT_S) -> bool:
+        ended = self._end(_check_wait(wait))
+        if ended is None:
+            raise PortWithdrawIncomplete([self])
+        return ended
+
+    def _end(self, wait: float) -> bool | None:
+        """End the ticket if it is admitted, waiting at most ``wait`` for a running reveal. None: the wait ran out;
+        True: this call withdrew it; False: it had already ended (and no reveal of it is running)."""
+        if self._revealer == threading.get_ident():
+            raise DriverStateError("withdraw called from inside this ticket's own reveal")
+        if not self._lock.acquire(timeout=wait):
+            return None
+        try:
             if self._state != ADMITTED:
                 return False
             self._state = WITHDRAWN
             return True
+        finally:
+            self._lock.release()
 
 
-def _withdraw_all(handle: Handle) -> None:
-    """Under ``handle._lock``: admit no more requests and withdraw every one not yet published."""
-    handle._port_sealed = True
-    for ticket in handle._tickets:
-        ticket.withdraw()
-    handle._tickets = []
+def _check_wait(wait: object) -> float:
+    if type(wait) not in (int, float) or not math.isfinite(wait) or wait < 0:
+        raise DriverInputError("wait")
+    return float(wait)
+
+
+def _check_handle(handle: object) -> Handle:
+    if not isinstance(handle, Handle):
+        raise DriverInputError("handle")
+    return handle
+
+
+def _end_tickets(handle: Handle, wait: float) -> None:
+    """The second half of a withdraw, after the seal, NOT under the handle's lock: end every ticket of the handle,
+    waiting at most ``wait`` seconds in all for reveals already running. Every ticket is tried even when one step
+    raises; the first exception then leaves (an interruption is kept), else ``PortWithdrawIncomplete`` if a reveal
+    outlasted the wait. Tickets not seen ended stay on the handle, so a later withdraw waits for them again."""
+    with handle._lock:
+        tickets = list(handle._tickets)
+    deadline = time.monotonic() + wait
+    unended: list[PortTicket] = []
+    first: BaseException | None = None
+    for ticket in tickets:
+        try:
+            if ticket._end(max(0.0, deadline - time.monotonic())) is None:
+                unended.append(ticket)
+        except BaseException as exc:  # noqa: B036 -- kept and raised below, after every ticket was tried
+            unended.append(ticket)
+            if first is None:
+                first = exc
+    with handle._lock:
+        handle._tickets = [t for t in handle._tickets if t not in tickets or t in unended]
+    if first is not None:
+        raise first
+    if unended:
+        raise PortWithdrawIncomplete(unended)
 
 
 class Driver:
@@ -348,43 +455,80 @@ class Driver:
         kind = item["kind"]
         with handle._write_lock:  # the write happens in the order of the reservation (ORDER AND LOCKS)
             with handle._lock:
+                first_close = kind == "close" and not handle._closed
+                if kind == "close":
+                    handle._port_seal.sealed = True  # first: no ticket of the worker can begin a reveal (PORT WITHDRAW)
                 if handle._closed:
-                    raise DriverStateError("the worker's input is closed")
-                if kind == "approval_answer":
+                    if kind != "close":
+                        raise DriverStateError("the worker's input is closed")
+                elif kind == "approval_answer":
                     self._need("send", "permission_bridge")
                 elif kind == "close":
                     handle._closed = True  # before the write: nothing is sent after a close
-                    _withdraw_all(handle)  # and nothing admitted to the approvals port is published after it
                 else:
                     self._reserve(handle, item)
-            self._send(handle, item)
+            if kind != "close":
+                self._send(handle, item)
+                return
+            self._close(handle, item, first_close)
+
+    def _close(self, handle: Handle, item: dict, first_close: bool) -> None:
+        """The close input, under the write lock and after the seal: the write (once), then the tickets' end. Both
+        run even if the other raises; the first exception leaves. A repeated close writes nothing, finishes the
+        withdraw an earlier close left unfinished, and is then refused as before."""
+        failure: BaseException | None = None
+        if first_close:
+            try:
+                self._send(handle, item)
+            except BaseException as exc:  # noqa: B036 -- kept and raised below, after the tickets were ended
+                failure = exc
+        try:
+            _end_tickets(handle, REVEAL_WAIT_S)
+        except BaseException as exc:  # noqa: B036
+            if failure is None:
+                raise
+            failure.add_note(f"the approvals port's withdraw also failed: {exc!r}")
+        if failure is not None:
+            raise failure
+        if not first_close:
+            raise DriverStateError("the worker's input is closed")
 
     # -- the approvals port (PORT WITHDRAW) ----------------------------------------------------------
     def admit_port(self, handle: Handle) -> PortTicket:
         """Admit one request to the approvals port for ``handle``: the ticket the port publishes with.
 
-        Raises ``DriverStateError`` once ``withdraw_port`` (or a ``close`` input) has run for the handle, so no
-        request is delivered to the port for a closed worker. The caller hands the ticket to the port with the
-        request; the port opens the approval only if ``ticket.publish()`` answers True.
+        Raises ``DriverStateError`` once the worker's port is sealed (``withdraw_port`` or a ``close`` input began)
+        or its input is closed, so no new request is admitted for that worker. The caller hands the ticket to the
+        port with the request; the port makes the approval visible only through ``ticket.publish(reveal)``.
         """
+        _check_handle(handle)
         with handle._lock:
-            if handle._port_sealed:
+            if handle._port_seal.sealed or handle._closed:
                 raise DriverStateError("the worker's approvals port is sealed")
-            handle._tickets = [t for t in handle._tickets if t.state == ADMITTED]
-            ticket = PortTicket()
+            handle._tickets = [t for t in handle._tickets if t._state in (ADMITTED, OPENING)]
+            ticket = PortTicket(handle._port_seal)
             handle._tickets.append(ticket)
             return ticket
 
-    def withdraw_port(self, handle: Handle) -> None:
-        """Withdraw every request admitted to the port for ``handle`` and not yet published, and admit no more.
+    def withdraw_port(self, handle: Handle, wait: float = REVEAL_WAIT_S) -> None:
+        """Seal the worker's approvals port, then end every ticket admitted for it and not yet published.
 
-        Bounded: it takes the handle's lock and each ticket's lock, which are held only to change a state,
-        never across a call to the port, the engine or the subclass. When it returns, each of the handle's
-        tickets is published or withdrawn, and no ``publish`` can succeed any more: no approval opens and no
-        request is delivered for this worker after it. A ``close`` input calls it too. Idempotent.
+        The seal comes first and is one assignment: from then on no ticket of the worker can begin a reveal, so an
+        interruption anywhere after it leaves every unpublished ticket unable to open. Then each ticket is ended,
+        waiting only for a reveal that is already running, at most ``wait`` seconds in all; nothing else the port,
+        the engine or the subclass does is waited for, and no lock of the handle is held while waiting.
+
+        When it RETURNS: every ticket is published or withdrawn, every visible approval of the worker became visible
+        before it returned, and none becomes visible after. It RAISES instead if a reveal outlasted the wait
+        (``PortWithdrawIncomplete``) or a step raised (that exception, after every ticket was tried); the port stays
+        sealed and a later call finishes. A ``close`` input runs the same steps. Calling it again is harmless.
+        Raises ``DriverStateError`` if called from inside one of the worker's own reveals.
         """
+        _check_handle(handle)
+        wait = _check_wait(wait)
         with handle._lock:
-            _withdraw_all(handle)
+            handle._port_seal.sealed = True
+        _end_tickets(handle, wait)
 
     def interrupt(self, handle: Handle, turn_id: object) -> None:
         self._need("interrupt", "interrupt")
@@ -610,8 +754,19 @@ def _check_tool_call(p: Mapping, f: str) -> None:
     _text(p["call_id"], f"{f}.call_id", hi=128, no_newline=True)
     _text(p["name"], f"{f}.name", hi=256, no_newline=True)
     _matches(p["input_digest"], _SHA256, f"{f}.input_digest")
-    if p["input"] is not None and not isinstance(p["input"], Mapping):
+    carried = p["input"]
+    if carried is None:
+        return  # not carried: the digest is of an input this record does not hold
+    if not isinstance(carried, Mapping):
         raise DriverInputError(f"{f}.input")
+    try:
+        # event.v1: input_digest is the SHA-256 of the input as RFC 8785 writes it. A carried input
+        # whose digest is some other hash is refused, not kept.
+        text = canonical_text(carried if type(carried) is dict else dict(carried))
+    except (NoCanonicalText, TypeError, RecursionError, RuntimeError):
+        raise DriverInputError(f"{f}.input") from None
+    if hashlib.sha256(text.encode("utf-8")).hexdigest() != p["input_digest"]:
+        raise DriverInputError(f"{f}.input_digest")
 
 
 def _check_tool_result(p: Mapping, f: str) -> None:

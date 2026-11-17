@@ -7,7 +7,7 @@ The records a plugin package and its install share with the core. Each is a JSON
 | File | Record | What it is for | Who must send a fixture |
 |---|---|---|---|
 | `manifest.v1.json` | `csl-plugin-manifest/1` | The manifest a developer signs: the ten fields of the present manifest, plus `runtime`, `interface` and `files` (every file of the package with its SHA-256) | PLUGIN-SIGN, PLUGIN-HOST, PAGE |
-| `install.v1.json` | `install.json` | This install's trusted keys and grants, exactly as the daemon reads the file today | PLUGIN-SIGN, PLUGIN-HOST, INSTALL |
+| `install.v1.json` | `install.json` | This install's trusted keys, grants, and the registry label the installer recorded for each manifest's bytes, exactly as the daemon reads the file today | PLUGIN-SIGN, PLUGIN-HOST, INSTALL |
 | `api.v1.json` | `csl-plugin-api/1` | The plugin API's entry points as plain data. A skeleton: the shapes are for the lanes that host plugins and draw the page to supply | PLUGIN-HOST, PAGE |
 | `revoked-keys.v1.json` | `csl-revoked-keys/1` | The signed list of revoked developer keys. A draft: revocation's details are open | PLUGIN-SIGN |
 
@@ -40,6 +40,9 @@ Manifest:
 Install file:
 - No two grants name the same `plugin_id`.
 - The file is a regular file of the operator's that no one else can write.
+- A registry label applies only when its key is the SHA-256 of the installed `manifest.json` bytes.
+  A key for any other bytes is not this manifest's label, and the daemon shows the plugin unlisted.
+  The label is not a permission and not a grant.
 
 ## What is not decided
 

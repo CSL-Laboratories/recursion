@@ -4,6 +4,17 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `install.v1.json` is `1.0-draft.3` (Nov 17, 2026)
+
+The install file may carry `registry_labels`: a map from the SHA-256 of one installed manifest's bytes
+to `verified` or `non_verified`. Draft 2 had no place for that label, and the reader refused any
+top-level field it did not know, so a label the installer had seen could not be stored and every plugin
+was shown unlisted. What it breaks: a label other than those two, and a key that is not 64 lower-case
+hex digits. An omitted map and an empty map are still no label. The label decides nothing: it is not a
+permission and not a grant. One good fixture (`h05`) and one bad fixture (`b09`) hold the new list of
+values. A label whose key is not the bytes of the manifest now installed is the reader's rule, and a
+schema cannot see that file (`README.md`).
+
 ## `revoked-keys.v1.json` is `1.0-draft.2` (Nov 15, 2026)
 
 Its `timestamp` (a list's `issued_at` and `expires_at`, and each key's `revoked_at`) is now the control

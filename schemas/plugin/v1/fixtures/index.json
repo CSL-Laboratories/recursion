@@ -476,9 +476,14 @@
       "shows": "The user turned 'order' back on after the signing key was revoked."
     },
     {
+      "file": "good/install.v1/h05-registry-labels-for-two-manifests.json",
+      "schema": "install.v1.json",
+      "shows": "The installer recorded verified for one manifest's bytes and non_verified for another's. The label is not a grant."
+    },
+    {
       "file": "bad/install.v1/b01-a-field-the-reader-does-not-know.json",
       "schema": "install.v1.json",
-      "rule": "Today's reader refuses a top-level field it does not know, so version 1 adds none.",
+      "rule": "Today's reader refuses a top-level field it does not know. registry_labels is a field it knows; any other new field is still refused.",
       "expect": {
         "keyword": "additionalProperties",
         "at": ""
@@ -545,6 +550,15 @@
       "expect": {
         "keyword": "enum",
         "at": "/grants/0/permissions/1"
+      }
+    },
+    {
+      "file": "bad/install.v1/b09-a-label-the-reader-does-not-know.json",
+      "schema": "install.v1.json",
+      "rule": "A registry label is verified or non_verified. Any other value is refused, and the label is not a grant.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/registry_labels/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
       }
     },
     {

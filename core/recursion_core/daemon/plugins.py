@@ -25,7 +25,13 @@ Install layout, all operator-owned and not group- or other-writable::
      "grants": [{"plugin_id": "...", "artifact_sha256": "...", "signer_key_id": "ed25519:..." or null,
                  "permissions": ["read", "panel"]}],
      "reserved": {"hosts": [], "credential_prefixes": []},
-     "authority_anchor": "<64 hex installer public key>" or null}
+     "authority_anchor": "<64 hex installer public key>" or null,
+     "registry_labels": {"<sha256 of manifest.json bytes>": "verified" or "non_verified"}}
+
+``registry_labels`` is the label the installer saw for that manifest. The key is the SHA-256 of
+the manifest file's bytes. A missing key, or a key that is not the manifest now installed, is
+unlisted. The label is not a permission and not a grant: it never changes trust, a permission,
+or whether the plugin loads.
 
 What a loaded plugin may give the daemon (plain values; a plugin imports nothing from Recursion):
 
@@ -48,6 +54,7 @@ is never created by the daemon; without it an order effect refuses ``authority_u
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
 import logging
 import os
@@ -82,7 +89,9 @@ VERIFICATION_UNAVAILABLE = 'plugin_verification_unavailable'
 CRYPTOGRAPHY_MISSING = 'cryptography missing; install recipe in plugin_security/README.md'
 EFFECT_PERMISSIONS = {'order': 'order'}
 AUTHORITY_REQUIRED = frozenset({'order'})
-_INSTALL_KEYS = frozenset({'trusted_keys', 'grants', 'reserved', 'authority_anchor'})
+_INSTALL_KEYS = frozenset({'trusted_keys', 'grants', 'reserved', 'authority_anchor', 'registry_labels'})
+_LABELS = frozenset({'verified', 'non_verified'})
+_SHA256 = re.compile(r'[0-9a-f]{64}')
 _GRANT_KEYS = frozenset({'plugin_id', 'artifact_sha256', 'signer_key_id', 'permissions', 'unsigned_order_acknowledged',
                          'order_after_revoked_key', 'order_after_revocation_generation'})
 _SAFE_ID = re.compile(r'[^A-Za-z0-9_.-]')
@@ -164,11 +173,25 @@ def _owned_directory(path):
     return stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022
 
 
+def _registry_labels(value):
+    """The installer's labels, or a typed refusal. Absent and ``{}`` are no labels."""
+    if not isinstance(value, dict):
+        raise PluginRefused('plugin_install_config_invalid', 'registry_label')
+    labels = {}
+    for digest, label in value.items():
+        if (not isinstance(digest, str) or _SHA256.fullmatch(digest) is None
+                or not isinstance(label, str) or label not in _LABELS):
+            raise PluginRefused('plugin_install_config_invalid', 'registry_label')
+        labels[digest] = label
+    return labels
+
+
 def read_install(directory):
-    """Parse ``install.json``. With no file: no trusted key and no grant, so nothing gets a permission."""
+    """Parse ``install.json``. With no file: no trusted key, no grant and no label."""
     raw = _read_owned(Path(directory) / INSTALL_FILE, MAX_INSTALL_BYTES, missing_ok=True)
     if raw is None:
-        return {'trusted_keys': {}, 'grants': {}, 'reserved': ReservedEffects(), 'authority_anchor': None}
+        return {'trusted_keys': {}, 'grants': {}, 'reserved': ReservedEffects(), 'authority_anchor': None,
+                'registry_labels': {}}
     try:
         data = json.loads(raw.decode('utf-8'))
     except (ValueError, RecursionError):
@@ -210,7 +233,8 @@ def read_install(directory):
     if not (anchor is None or isinstance(anchor, str)):
         raise PluginRefused('plugin_install_config_invalid', 'authority_anchor')
     return {'trusted_keys': keys, 'grants': grants,
-            'reserved': ReservedEffects(frozenset(hosts), tuple(prefixes)), 'authority_anchor': anchor}
+            'reserved': ReservedEffects(frozenset(hosts), tuple(prefixes)), 'authority_anchor': anchor,
+            'registry_labels': _registry_labels(data.get('registry_labels', {}))}
 
 
 class PluginHost:
@@ -231,6 +255,7 @@ class PluginHost:
         self.degraded = {}  # plugin id -> operator() calls that passed their deadline
         self.health = CoreHealth()
         self.loader = self.core = self.gate = self.authority = self._trust = None
+        self._labels = {}
         self.records, self.registries = [], ()
         self.pending_approvals = collections.deque(maxlen=64)  # (approval id, digest) drawn, newest last
         self._operators = {}
@@ -259,6 +284,7 @@ class PluginHost:
             log.error('no plugin can load: revocation_store_invalid: %s', type(exc).__name__)
             self._refuse_all(sources, 'revocation_store_invalid', type(exc).__name__)
             return
+        self._labels = install['registry_labels']
         self.loader = PluginLoader(self._trust, install['grants'], install['reserved'], self.health, self._gil)
         self._compose_core(install, breaker)
         for source in sources:
@@ -322,7 +348,9 @@ class PluginHost:
             artifact = _read_owned(source / ARTIFACT, MAX_ARTIFACT_BYTES)
             signature = _read_owned(source / SIGNATURE, 4096, missing_ok=True)
             signature = None if signature is None else signature.decode('ascii', 'replace').strip()
-            loaded = self.loader.load(manifest, signature, artifact)
+            # The label is for these manifest bytes. Any other digest is not this manifest's label.
+            label = self._labels.get(hashlib.sha256(manifest).hexdigest())
+            loaded = self.loader.load(manifest, signature, artifact, registry_label=label)
         except (PluginRefused, Refused) as exc:
             findings = list(self.loader.last_findings) if isinstance(exc, Refused) else []
             record.update(code=exc.code, detail=exc.detail,
@@ -407,6 +435,19 @@ class PluginHost:
                 self.health.poison('gil_enabled_after_plugin_call')
 
     # -- reads ----------------------------------------------------------------------------------
+    def status(self, plugin_id):
+        """One installed plugin, the same row ``inventory`` carries, or a typed refusal.
+
+        The registry label on that row is what the installer recorded for this manifest.
+        It is ``unlisted`` when the install recorded none, or recorded one for other bytes.
+        """
+        if not isinstance(plugin_id, str) or not plugin_id:
+            return {'code': 'request_invalid', 'detail': 'plugin_id'}
+        for item in self.inventory()['plugins']:
+            if item.get('plugin_id') == plugin_id:
+                return {'code': 'ok', 'plugin': item}
+        return {'code': 'plugin_unknown', 'detail': plugin_id}
+
     def inventory(self):
         """Every installed plugin, loaded or refused, with its findings. Plain JSON values."""
         plugins = []

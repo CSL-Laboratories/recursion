@@ -161,7 +161,8 @@ class TrustStore:
     earlier revocation does not apply to the later one. The next generation is taken
     from the stored row inside one write transaction, so two handles on one store never
     write a generation that is not above the row (no roll-back to an older number whose
-    grant would apply again). The daemon never creates the
+    grant would apply again). A row another writer left below 1 is not a floor: the
+    revoke refuses and writes nothing. The daemon never creates the
     store; a named store that is missing or invalid refuses. Without a store, or when
     the SQLite write fails, ``revoke`` still revokes in memory but refuses
     ``revocation_not_durable`` (the SQLite error does not escape). The same-uid limit
@@ -243,8 +244,8 @@ class TrustStore:
         another handle opened earlier on the same store cannot write an older number.
         A key id not in ``signing.key_id``'s form is refused ``invalid_key_id`` before
         anything changes, and the refusal does not repeat it. A stored generation that
-        is not an integer, or a next generation past SQLite's INTEGER range, writes
-        nothing and refuses ``revocation_not_durable``.
+        is not an integer or is below 1, or a next generation past SQLite's INTEGER
+        range, writes nothing and refuses ``revocation_not_durable``.
         """
         if type(kid) is not str or not _KEY_ID.fullmatch(kid):
             raise Refused("invalid_key_id")
@@ -280,7 +281,10 @@ class TrustStore:
         try:
             row = db.execute("SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
             stored = 0 if row is None else row[0]
-            if type(stored) is not int:
+            # An absent row is a first revoke (stored stands in as 0). A row that exists
+            # and is below 1 is a damaged store, same as a value that is not an integer:
+            # writing generation 1 again would let a grant that cites generation 1 apply.
+            if row is not None and (type(stored) is not int or stored < 1):
                 db.execute("ROLLBACK")
                 return None
             generation = max(stored + 1, floor)

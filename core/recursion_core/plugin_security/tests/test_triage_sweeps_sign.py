@@ -20,6 +20,7 @@ from recursion_core.plugin_security import (
     CoreHealth, PluginLoader, Refused, ReservedEffects, TrustStore, create_revocation_store,
 )
 from recursion_core.plugin_security.manifest import Grant, effective_permissions, parse_manifest
+from recursion_core.plugin_security.signing import key_id
 from recursion_core.plugin_security import canonical
 
 KID = "ed25519:" + "ab" * 16
@@ -77,15 +78,27 @@ class RevocationTests(unittest.TestCase):
         fresh = TrustStore({}, revocation_store=path)
         self.addCleanup(fresh.close)
         source = b"VALUE = 1\n"
+        manifest_key = "33" * 32
         manifest = parse_manifest(canonical({
             "schema": "csl-plugin-manifest/vNext", "plugin_id": "demo.plugin", "version": "1.0.0",
             "artifact_sha256": hashlib.sha256(source).hexdigest(), "dependency_lock_sha256": "0" * 64,
-            "install_scripts": [], "developer_key": "33" * 32, "permissions": ["read", "propose", "order"],
+            "install_scripts": [], "developer_key": manifest_key, "permissions": ["read", "propose", "order"],
             "network_destinations": [], "credential_refs": []}))
+        named = {
+            "unsigned_order_acknowledged": True,
+            "order_after_revoked_key": KID,
+            "order_after_revocation_generation": 1,
+        }
+        # Draft #374 binds a manual grant to developer_key_id when Grant has that field,
+        # and otherwise treats order_after_revoked_key as the bound key. Name the manifest's
+        # key so order stays off only because this revocation's generation has moved on.
+        if "developer_key_id" in Grant.__dataclass_fields__:
+            named["developer_key_id"] = key_id(manifest_key)
         grant = Grant("demo.plugin", manifest.artifact_sha256, None, ("read", "propose", "order"),
-                      unsigned_order_acknowledged=True, order_after_revoked_key=KID,
-                      order_after_revocation_generation=1)
+                      **named)
         perms, _ = effective_permissions(manifest, "unsigned", None, grant, KID, fresh.generation(KID))
+        self.assertIn("read", perms)
+        self.assertIn("propose", perms)
         self.assertNotIn("order", perms)
 
     def test_PS7_malformed_key_ids_are_refused_and_not_stored(self):
@@ -241,6 +254,90 @@ class GenerationRuleTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "revocation_not_durable")
         self.assertEqual(self._open(path).generation(KID), 2 ** 63 - 1)
 
+    def test_a_row_another_writer_lowered_below_1_writes_nothing(self):
+        # A stored 0 or a negative is not a floor. Handing generation 1 out again would
+        # let a grant that cites generation 1 take order. The row stays as it was, and a
+        # later handle refuses the store, so that grant is not applied from disk.
+        for generation in (0, -1):
+            with self.subTest(generation=generation):
+                path = _store(self)
+                trust = self._open(path)
+                _set_row(path, generation)
+                with self.assertRaises(Refused) as caught:
+                    trust.revoke(KID)
+                self.assertEqual(caught.exception.code, "revocation_not_durable")
+                db = sqlite3.connect(path)
+                try:
+                    self.assertEqual(
+                        db.execute("SELECT generation FROM revoked").fetchall(), [(generation,)])
+                finally:
+                    db.close()
+                applied = False
+                try:
+                    fresh = TrustStore({}, revocation_store=path)
+                except Refused as exc:
+                    self.assertEqual(exc.code, "revocation_store_invalid")
+                else:
+                    self.addCleanup(fresh.close)
+                    source = b"VALUE = 1\n"
+                    manifest_key = "33" * 32
+                    manifest = parse_manifest(canonical({
+                        "schema": "csl-plugin-manifest/vNext", "plugin_id": "demo.plugin",
+                        "version": "1.0.0",
+                        "artifact_sha256": hashlib.sha256(source).hexdigest(),
+                        "dependency_lock_sha256": "0" * 64,
+                        "install_scripts": [], "developer_key": manifest_key,
+                        "permissions": ["read", "propose", "order"],
+                        "network_destinations": [], "credential_refs": []}))
+                    named = {
+                        "unsigned_order_acknowledged": True,
+                        "order_after_revoked_key": KID,
+                        "order_after_revocation_generation": 1,
+                    }
+                    if "developer_key_id" in Grant.__dataclass_fields__:
+                        named["developer_key_id"] = key_id(manifest_key)
+                    grant = Grant(
+                        "demo.plugin", manifest.artifact_sha256, None,
+                        ("read", "propose", "order"), **named)
+                    perms, _ = effective_permissions(
+                        manifest, "unsigned", None, grant, KID, fresh.generation(KID))
+                    applied = "order" in perms
+                self.assertFalse(applied)
+
+    def test_open_refuses_a_generation_below_1_or_not_an_integer(self):
+        path = _store(self)
+        for generation in (-1, 0, "two", b"\x01"):
+            with self.subTest(generation=generation):
+                _set_row(path, generation)
+                with self.assertRaises(Refused) as caught:
+                    TrustStore({}, revocation_store=path)
+                self.assertEqual(caught.exception.code, "revocation_store_invalid")
+        db = sqlite3.connect(path)
+        try:
+            db.execute("DROP TABLE revoked")
+            db.execute(
+                "CREATE TABLE revoked (key_id TEXT PRIMARY KEY, generation INTEGER)")
+            db.execute("INSERT INTO revoked VALUES (?, NULL)", (KID,))
+            db.commit()
+        finally:
+            db.close()
+        with self.assertRaises(Refused) as caught:
+            TrustStore({}, revocation_store=path)
+        self.assertEqual(caught.exception.code, "revocation_store_invalid")
+        again = sqlite3.connect(path)
+        try:
+            self.assertEqual(again.execute("SELECT generation FROM revoked").fetchone(), (None,))
+        finally:
+            again.close()
+
+    def test_a_handle_with_no_store_refuses_revoke(self):
+        trust = TrustStore({})
+        self.addCleanup(trust.close)
+        with self.assertRaises(Refused) as caught:
+            trust.revoke(KID)
+        self.assertEqual(
+            (caught.exception.code, caught.exception.detail),
+            ("revocation_not_durable", KID))
 
 if __name__ == "__main__":
     unittest.main()

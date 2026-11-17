@@ -95,6 +95,34 @@ class ShutdownRetryTest(unittest.TestCase):
         self.assertEqual(closed_while_alive, [False], 'the store closed before the interrupted worker was joined')
         self.assertEqual(worker.joins, 2)
 
+    def test_a_start_whose_thread_never_begins_lets_stop_return(self):
+        """``start`` stores its thread only once ``Thread.start`` has returned. A start that raises there used to
+        leave an unstarted thread assigned, and ``stop`` then raised ``RuntimeError`` on every call, so SPINE's
+        teardown (which tries a raising stop again until it returns) never finished. DeepSeek round 7 of #398, F2."""
+        sessions = SimpleNamespace(wake=threading.Event(), recover=lambda: None, dispatch_queued=lambda: 0,
+                                   run_pending=lambda: 0)
+        service = SessionsService(sessions, interval_s=30)
+        real_start = threading.Thread.start
+
+        def refuse(thread):
+            raise RuntimeError("can't start new thread")
+
+        threading.Thread.start = refuse
+        try:
+            with self.assertRaises(RuntimeError):
+                service.start(None)
+        finally:
+            threading.Thread.start = real_start
+        service.stop(None)
+        self.assertIsNone(service._thread)
+        service.stop(None)
+        service.start(None)
+        self.assertIsNotNone(service._thread)
+        self.assertTrue(service._thread.is_alive())
+        service.stop(None)
+        self.assertIsNone(service._thread)
+        self.assertFalse(service.ready)
+
 
 if __name__ == '__main__':
     unittest.main()

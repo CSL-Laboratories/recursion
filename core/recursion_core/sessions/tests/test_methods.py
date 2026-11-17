@@ -298,6 +298,37 @@ class MethodsTest(unittest.TestCase):
                                             'text': 'skip the docs', 'expected_turn_id': mid_turn['active_turn_id']})
         self.assertEqual(steer['item']['delivery'], 'steer')
 
+    def test_an_edit_that_asks_for_the_next_turn_stays_the_next_turn(self):
+        """An edit that names ``delivery: next_turn`` keeps that delivery. The comparison is equality with
+        ``steer``, so naming the next turn is not a request to steer: the answer, the stored item and the event
+        say ``next_turn``. On a driver with ``input_ack`` false the same edit is still accepted. DeepSeek round 7
+        of #398, F1."""
+        live = self.start(engine='codex', prompt='first')['session']
+        item = self.call('session.steer', {'command_id': 'cmd-steer-nt-01', 'session_id': live['session_id'],
+                                           'text': 'skip the docs', 'expected_turn_id': live['active_turn_id']})['item']
+        self.assertEqual(item['delivery'], 'steer')
+        edited = self.call('queue.update', {'command_id': 'cmd-edit-nt-001', 'item_id': item['item_id'],
+                                            'expected_revision': 1, 'delivery': 'next_turn'})
+        self.assertEqual((edited['code'], edited['item']['delivery'], edited['item']['revision']),
+                         ('ok', 'next_turn', 2))
+        with self.lane.store.transaction() as tx:
+            self.assertEqual([found['delivery'] for found in store.items(tx, live['session_id'])], ['next_turn'])
+        queued = [event['payload']['delivery'] for event in self.lane.store.events
+                  if event['type'] == 'steer.queued']
+        self.assertEqual(queued, ['steer', 'next_turn'])
+
+        self.lane = Lane()
+        self.lane.drivers.by_engine['codex']['input_ack'] = False
+        held = self.start(engine='codex', prompt='first', command_id='cmd-start-nt-02')['session']
+        queued_item = self.call('session.queue', {'command_id': 'cmd-queue-nt-02', 'session_id': held['session_id'],
+                                                  'text': 'later'})['item']
+        edited = self.call('queue.update', {'command_id': 'cmd-edit-nt-002', 'item_id': queued_item['item_id'],
+                                            'expected_revision': 1, 'delivery': 'next_turn'})
+        self.assertEqual((edited['code'], edited['item']['delivery']), ('ok', 'next_turn'))
+        with self.lane.store.transaction() as tx:
+            self.assertEqual([(found['delivery'], found['revision']) for found in store.items(tx, held['session_id'])],
+                             [('next_turn', 2)])
+
     def test_a_steer_aimed_at_a_stale_turn_is_a_conflict_before_the_driver_is_asked(self):
         """The order of checks (methods.v1 README, rule 3): the receipt, then the revision or turn, then the driver's
         flags. A client that remembers an ended turn is told so (and the answer is kept for its id), whatever the

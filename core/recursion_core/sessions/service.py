@@ -526,8 +526,9 @@ class SessionsService:
                 return
             self._stopping.clear()
             self.failure = None
-            self._thread = threading.Thread(target=self._loop, name='sessions-service', daemon=True)
-            self._thread.start()
+            thread = threading.Thread(target=self._loop, name='sessions-service', daemon=True)
+            thread.start()
+            self._thread = thread     # stored only after it has begun: a thread that never began makes stop raise
 
     def stop(self, context) -> None:
         with self._lock:

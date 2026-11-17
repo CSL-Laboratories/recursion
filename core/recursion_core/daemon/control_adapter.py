@@ -100,8 +100,12 @@ _LIST_RESULT_KEYS = ('status', 'code', 'detail')
 
 
 def _wire_size(value):
-    """Bytes ``value`` takes in a control frame (``framing.encode_frame``'s JSON settings)."""
-    return len(json.dumps(value, separators=(',', ':'), ensure_ascii=False, default=str).encode('utf-8'))
+    """Bytes ``value`` takes in a control frame (``framing.encode_frame``'s JSON settings).
+
+    ``surrogatepass`` counts a lone surrogate instead of raising. Other text keeps the same length.
+    """
+    return len(json.dumps(value, separators=(',', ':'), ensure_ascii=False, default=str).encode(
+        'utf-8', 'surrogatepass'))
 
 
 def _fit_chars(short, key, *, force=False):
@@ -282,13 +286,23 @@ class RoutesUnreadable(Exception):
     pass
 
 
+def _json_object(pairs):
+    """One JSON object. A key that appears twice is refused, at whatever depth it sits."""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError('repeated key')
+        obj[key] = value
+    return obj
+
+
 def load_routes(path):
     """Read the operator's route file: ``{"routes": {"<engine>": {...}}}``, or {} when there is none.
 
     Each entry is the route part of a ``recursion.route/v0`` request (model, connection, and the
     engine's own fields) plus ``deadline_s`` and an optional absolute ``binary``. Nothing is
-    defaulted: an engine with no entry cannot be started. The file must be a regular file of
-    ours that no one else can write.
+    defaulted: an engine with no entry cannot be started. A repeated key in any object is refused.
+    The file must be a regular file of ours that no one else can write.
     """
     require_launcher_platform()  # the owner check below needs a uid
     path = Path(path)
@@ -299,7 +313,7 @@ def load_routes(path):
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
         raise RoutesUnreadable('routes file must be an operator-owned regular file, not group/other writable')
     try:
-        data = json.loads(path.read_text(encoding='utf-8'))
+        data = json.loads(path.read_text(encoding='utf-8'), object_pairs_hook=_json_object)
     except (OSError, ValueError) as exc:
         raise RoutesUnreadable(f'routes file unreadable: {type(exc).__name__}') from None
     routes = data.get('routes') if isinstance(data, dict) else None
@@ -525,7 +539,7 @@ class RouteStarter:
                     try:
                         result = self._service.handle(request)
                     except Exception as exc:  # noqa: BLE001 - a route bug must not leave the start waiting
-                        log.exception('route request for %s failed', ctx.run_id)
+                        log.error('route request for %s failed (%s)', ctx.run_id, type(exc).__name__)
                         result = route_contract.result(ctx.run_id, route_contract.ENGINE_ERROR,
                                                        detail=f'route failure: {type(exc).__name__}')
                     except BaseException as exc:  # an interrupt or SystemExit from the callback (E34)
@@ -613,8 +627,8 @@ class RouteStarter:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, path)
-        except (OSError, TypeError, ValueError):
-            log.exception('route result for %s was not written', run_id)
+        except (OSError, TypeError, ValueError) as exc:
+            log.error('route result for %s was not written (%s)', run_id, type(exc).__name__)
             with self._lock:
                 self.results[run_id] = result
 

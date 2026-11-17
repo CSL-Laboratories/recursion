@@ -55,6 +55,48 @@ class AdapterLogTest(unittest.TestCase):
         self.assertIn('FileNotFoundError', '\n'.join(record.getMessage() for record in logs.records))
         self.assertEqual(starter.results['run-one'], result)
 
+    def test_settle_log_names_the_exception_type_only(self):
+        marker = 'SYNTHETIC-PRIVATE-DIAGNOSTIC'
+        path_marker = str(self.root)
+        daemon = mock.Mock()
+        daemon.closed = False
+        daemon.reconcile.side_effect = RuntimeError(f'{marker} {path_marker}')
+        starter = adapter.RouteStarter(mock.Mock(), {}, daemon, self.root)
+        ctx = launcher.RunContext('run-one')
+        ctx.process = mock.Mock()
+        with self.assertLogs(adapter.log, 'ERROR') as logs:
+            starter._settle(ctx, grace_s=1.0)
+        text = '\n'.join(logs.output)
+        self.assertNotIn(marker, text)
+        self.assertNotIn(path_marker, text)
+        self.assertTrue(all(not record.exc_info for record in logs.records))
+        self.assertIn('RuntimeError', '\n'.join(record.getMessage() for record in logs.records))
+        ctx.process.fence.assert_called_once_with('result_recorded')
+        ctx.process.close.assert_called_once()
+
+    def test_registry_read_log_names_the_exception_type_only(self):
+        marker = 'SYNTHETIC-PRIVATE-DIAGNOSTIC'
+        path_marker = str(self.root)
+        daemon = SimpleNamespace(registry=mock.Mock())
+        daemon.registry.get.side_effect = RuntimeError(f'{marker} {path_marker}')
+        control = adapter.DaemonControl(
+            mock.Mock(), None, daemon, SimpleNamespace(results={}), self.root)
+        with self.assertLogs(adapter.log, 'ERROR') as logs:
+            row = control._row('run-one')
+        self.assertIs(row, False)
+        text = '\n'.join(logs.output)
+        self.assertNotIn(marker, text)
+        self.assertNotIn(path_marker, text)
+        self.assertTrue(all(not record.exc_info for record in logs.records))
+        self.assertIn('RuntimeError', '\n'.join(record.getMessage() for record in logs.records))
+
+    def test_wire_size_of_a_lone_surrogate_matches_surrogatepass_not_backslashreplace(self):
+        lone = {'detail': '\ud800'}
+        dumped = json.dumps(lone, separators=(',', ':'), ensure_ascii=False, default=str)
+        counted = adapter._wire_size(lone)
+        self.assertEqual(counted, len(dumped.encode('utf-8', 'surrogatepass')))
+        self.assertNotEqual(counted, len(dumped.encode('utf-8', 'backslashreplace')))
+
     def test_result_with_non_scalar_unicode_does_not_break_list(self):
         run_dir = self.root / 'runs' / 'run-one'
         run_dir.mkdir(parents=True)

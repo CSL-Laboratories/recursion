@@ -685,8 +685,8 @@ class RouteStarter:
                 try:
                     if self._daemon.reconcile(ctx.run_id).state in TERMINAL:
                         return
-                except Exception:  # noqa: BLE001
-                    log.exception('observing %s after its result failed', ctx.run_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.error('observing %s after its result failed (%s)', ctx.run_id, type(exc).__name__)
                     break
                 time.sleep(0.2)
             process.fence(reason)
@@ -827,8 +827,8 @@ class DaemonControl:
             return self.daemon.registry.get(run_id)
         except KeyError:
             return None
-        except Exception:  # noqa: BLE001 - an unreadable registry is reported, never guessed around
-            log.exception('daemon registry read for %s failed', run_id)
+        except Exception as exc:  # noqa: BLE001 - an unreadable registry is reported, never guessed around
+            log.error('daemon registry read for %s failed (%s)', run_id, type(exc).__name__)
             return False
 
     def _observe(self, run, *, full):

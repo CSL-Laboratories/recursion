@@ -340,11 +340,6 @@ if __name__ == '__main__':
     status = refusal_instead_of_cells()
     if status is not None:
         sys.exit(status)
-    counts = measure()
-    for phase, cells in counts.items():
-        passed = sum(not check_cell(c) for c in cells)
-        print(f'{phase}: {passed}/{len(cells)} pass; states after restart: '
-              f'{sorted({tuple(c["observed"]) for c in cells})}')
-        for c in cells:
-            for failure in check_cell(c):
-                print(f'  FAIL {c["run_id"]}: {failure}')
+    # Collect the crash cells once via setUpClass, and run every test in this file.
+    # A failed assertion is a nonzero script exit.
+    unittest.main()

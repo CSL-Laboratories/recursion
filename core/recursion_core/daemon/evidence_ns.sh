@@ -31,7 +31,10 @@ SYSTEMD_PID=$!
 stop_all() {
     systemctl --user exit >/dev/null 2>&1 || kill -TERM "$SYSTEMD_PID" 2>/dev/null
     for _ in $(seq 1 50); do kill -0 "$SYSTEMD_PID" 2>/dev/null || break; sleep 0.2; done
-    kill -KILL "$SYSTEMD_PID" 2>/dev/null
+    # The wait already saw this pid exit. Signalling it again can hit a reused pid.
+    if kill -0 "$SYSTEMD_PID" 2>/dev/null; then
+        kill -KILL "$SYSTEMD_PID" 2>/dev/null
+    fi
     [ -n "$DBUS_PID" ] && kill -TERM "$DBUS_PID" 2>/dev/null
     for controller in $(cat "$ROOT_CG/cgroup.subtree_control" 2>/dev/null); do
         echo "-$controller" >"$ROOT_CG/cgroup.subtree_control" 2>/dev/null \

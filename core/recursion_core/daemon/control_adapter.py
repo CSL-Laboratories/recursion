@@ -288,6 +288,62 @@ class StartRefused(Exception):
         self.code, self.detail = code, detail
 
 
+def _install_fence_wait(gate):
+    """A shutting sets the gate's flag, then waits until every fence that had started has finished.
+
+    The wait does not hold the gate lock across a fence. Installed once, by the starter that fences.
+    ``gate.close`` stays the admission's own method until then; with the gate off the wait is nothing."""
+    if getattr(gate, '_fence_wait_installed', False):
+        return
+    gate._fences = 0
+    gate._fence_wait_installed = True
+    original = gate.close
+
+    def close():
+        kept = []
+        shut = False
+        while True:
+            try:
+                if not shut:
+                    original()
+                    shut = True
+                _wait_until_no_fence(gate, kept)
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the wait is gone round again
+                kept.append(exc)
+        control_hooks.raise_kept(kept)
+
+    gate.close = close
+
+
+def _wait_until_no_fence(gate, kept):
+    """Return when no fence is counted. The caller does not hold the gate lock. An interruption is kept in
+    ``kept`` and the wait goes on; the lock is not held when this returns."""
+    if not gate.enabled:
+        return
+    lock = gate._lock
+    done = False
+    while True:
+        try:
+            if not done:
+                if not lock._is_owned():
+                    control_hooks.take_once(lock, kept)
+                _while_a_fence_is_counted(gate)
+                done = True
+            if lock._is_owned():
+                lock.release()
+            return
+        except BaseException as exc:  # noqa: BLE001 - a fence may still be counted; the wait is gone round again
+            kept.append(exc)
+
+
+def _while_a_fence_is_counted(gate):
+    """The wait of ``_wait_until_no_fence``, whose caller holds the gate lock. A method of its own because a
+    protected region has no loop written in it."""
+    while gate._fences:
+        gate._changed.wait()
+
+
 class RouteStarter:
     """``starter(params) -> {"cgroup"}`` for the control API.
 
@@ -301,6 +357,10 @@ class RouteStarter:
                  breaker=None, breaker_unavailable=None, hooks=None):
         self._service, self._routes, self._daemon = service, dict(routes), daemon
         self._hooks = hooks  # the composed hooks (control.hooks), or None: then no hook is asked, as before
+        if hooks is not None:
+            # The fence at the end of a settling is counted here, and a shutting waits that count out. The
+            # gate's own lock is not held across the unit stop (the admission gate).
+            _install_fence_wait(hooks.gate)
         # ``breaker`` is the DurableRouteBreaker (None in a test that composes without one);
         # ``breaker_unavailable`` is why its store could not be opened, and refuses every start.
         self._breaker, self._breaker_unavailable = breaker, breaker_unavailable
@@ -487,11 +547,13 @@ class RouteStarter:
     def _settle(self, ctx):
         """After the route result: give the engine a moment to exit, then end what is left of its tree.
 
-        A settling that is under way when the composition begins to close fences nothing either. That is asked
-        each time round. For the fence itself it is not asked and then acted on, which a close could get between:
-        the fence is made with the gate held open (``Admission.while_open``), so a close that begins at that
-        moment waits until the fence is made, and one that had begun is seen and nothing is fenced: the unit is
-        left alive for the next daemon. Its descriptors are closed whichever way it ends."""
+        A settling that is under way when the composition begins to shut fences nothing either. That is asked
+        each time round. For the fence itself the question and the start of the fence are one step under the
+        gate lock: if the gate is already shut, nothing is fenced; if it is open, one fence is counted and the
+        lock is released. The unit stop runs after that, and the lock is not held across it. A shutting sets
+        the gate's flag and then waits until that count is zero, without holding the lock across the wait, so
+        a fence that has started finishes and one that has not started does not run. With the gate off, or with
+        no hooks, the fence is the one it always was. Descriptors are closed whichever way it ends."""
         process = ctx.process
         try:
             deadline = time.monotonic() + self._exit_grace_s
@@ -505,12 +567,82 @@ class RouteStarter:
                     log.exception('observing %s after its result failed', ctx.run_id)
                     break
                 time.sleep(0.2)
-            if self._hooks is None:
+            if self._hooks is None or not self._hooks.gate.enabled:
                 process.fence('result_recorded')
-            else:  # with nothing registered the gate is off, and this is the fence it always was
-                self._hooks.gate.while_open(lambda: process.fence('result_recorded'))
+            else:
+                self._fence_while_the_gate_is_open(process)
         finally:
             process.close()
+
+    def _fence_while_the_gate_is_open(self, process):
+        """Count one fence while the gate is open, stop the unit without the gate lock, then drop the count.
+
+        An exception from the fence, or an interruption, drops the count and is raised with the lock free.
+        The fence is asked once: it has been entered, and a second stop is not implied by the interruption."""
+        begun, kept = self._claim_fence()
+        if not begun:
+            control_hooks.raise_kept(kept)
+            return
+        try:
+            process.fence('result_recorded')
+        except BaseException as exc:  # noqa: BLE001 - the count is dropped before this is raised
+            kept.append(exc)
+        kept.extend(self._release_fence())
+        control_hooks.raise_kept(kept)
+
+    def _claim_fence(self):
+        """Under the gate lock: a shut gate claims nothing; an open gate counts one fence. The lock is not held
+        on return. ``(True, kept)`` when this caller owes one fence. An interruption is kept and the claim is
+        still decided exactly once."""
+        gate = self._hooks.gate
+        lock = gate._lock
+        kept = []
+        begun = None
+        found = None
+        while True:
+            try:
+                if begun is None:
+                    if not lock._is_owned():
+                        control_hooks.take_once(lock, kept)
+                    if found is None:
+                        found = gate._fences
+                    if gate._closed:
+                        begun = False
+                    else:
+                        gate._fences = found + 1
+                        begun = True
+                if lock._is_owned():
+                    lock.release()
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the claim is gone round again
+                kept.append(exc)
+        return bool(begun), kept
+
+    def _release_fence(self):
+        """Drop the one fence this caller claimed, and wake a shutting that is waiting on the count. The lock
+        is not held on return. What interrupted the drop is returned, not raised, so the caller can raise it
+        after the count is dropped."""
+        gate = self._hooks.gate
+        lock = gate._lock
+        kept = []
+        found = None
+        done = False
+        while True:
+            try:
+                if not done:
+                    if not lock._is_owned():
+                        control_hooks.take_once(lock, kept)
+                    if found is None:
+                        found = gate._fences
+                    gate._fences = found - 1
+                    gate._changed.notify_all()
+                    done = True
+                if lock._is_owned():
+                    lock.release()
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the drop is gone round again
+                kept.append(exc)
+        return kept
 
 
 # -- the object every surface calls -----------------------------------------------------------------

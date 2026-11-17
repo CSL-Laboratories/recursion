@@ -16,6 +16,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -1574,40 +1575,20 @@ class RunThreadLifetimeTest(unittest.TestCase):
             self.assertEqual((ctx.process.fence.call_args_list, ctx.process.close.call_count), (fenced, 1))
 
     def test_a_settling_makes_its_fence_with_the_gate_held_open_and_a_close_that_begins_then_waits_for_it(self):
-        """The fifth reads. A settling asked whether closing had begun and then fenced: two steps, and a close
-        could begin between them, so that a unit was fenced with the gate shut. The fence is now made with the
-        gate held open (``Admission.while_open``). Here a settling is making its fence when a close begins: the
-        close finds the gate's condition taken and WAITS, and the gate is open from the first moment of the
-        fence to its last. Nothing is traced; the gate's condition says whether the closing thread found it
-        free, which no schedule decides once the fence is inside."""
-        process, inside, leave, moved = mock.Mock(), threading.Event(), threading.Event(), threading.Event()
-        seen, found_taken = [], []
+        """The fifth reads, restated for the admission gate. The decision to fence and the start of the fence
+        are one step: a shutting that has already set the gate's flag fences nothing, and a fence that has
+        started is finished. The unit stop does not hold the gate lock. A shutting sets that flag and then
+        waits, without the lock, until the fence returns; a call that arrives once the flag is set is refused
+        at once. Nothing is traced."""
+        process, inside, leave = mock.Mock(), threading.Event(), threading.Event()
+        seen, owned = [], []
         self.addCleanup(leave.set)
         made = hooks_of(launch_check=lambda ctx, executable: None)   # one hook that is asked on a run's thread
         self.assertTrue(made.gate.enabled)
-        condition = made.gate._lock
-
-        class Asked:
-            """The gate's condition's lock, writing down whether the closing thread found it taken."""
-
-            def acquire(inner, *how):
-                if threading.current_thread().name == 'the close' and not how:
-                    free = condition.acquire(False)
-                    found_taken.append(not free)
-                    moved.set()
-                    if free:
-                        return True
-                return condition.acquire(*how)
-
-            def release(inner):
-                condition.release()
-
-            def _is_owned(inner):
-                return condition._is_owned()
-        made.gate._lock = Asked()
 
         def fence(reason):
             seen.append((reason, made.gate.closed))
+            owned.append(made.gate._lock._is_owned())
             inside.set()
             leave.wait(HELD_BOUND_S)
             seen.append((reason, made.gate.closed))
@@ -1616,26 +1597,313 @@ class RunThreadLifetimeTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, folder, True)
         starter = adapter.RouteStarter(FakeService(), DriveOwnerSeamTest.ROUTES, mock.Mock(closed=False), folder,
                                        hooks=made, exit_grace_s=0)
+        control = adapter.DaemonControl(mock.Mock(call=lambda method, params, principal=None: {'code': 'ok'}),
+                                        None, None, starter, folder, hooks=made)
         ctx = launcher.RunContext('run-1')
         ctx.process = process
         settling = threading.Thread(target=starter._settle, args=(ctx,), daemon=True)
-        close = threading.Thread(target=made.begin_close, name='the close', daemon=True)
+        finished = []
+
+        def shutting():
+            try:
+                made.begin_close()
+            finally:
+                finished.append(True)
+        close = threading.Thread(target=shutting, name='the close', daemon=True)
         settling.start()
         self.assertTrue(inside.wait(HELD_BOUND_S), 'the fence is being made')
+        self.assertEqual((seen[0], owned), (('result_recorded', False), [False]),
+                         'the fence started with the gate open, and the stop does not hold the gate lock')
         close.start()
-        self.assertTrue(moved.wait(HELD_BOUND_S), 'the close asked for the gate')
-        self.assertEqual((found_taken, made.gate.closed), ([True], False), 'the close WAITS, with the gate still open')
+        self.assertTrue(until(lambda: made.gate.closed), 'the shut flag is set while the fence is still inside')
+        self.assertEqual(finished, [], 'a shutting does not return until the fence returns')
+        self.assertFalse(made.gate._lock._is_owned())
+        refused = control.call('run.status', {'run_id': 'run-b'})
+        self.assertEqual(refused, {'code': 'unavailable', 'detail': 'daemon_closing'})
+        self.assertEqual(finished, [], 'the refusal did not wait for the fence')
         leave.set()
         settling.join(HELD_BOUND_S)
         close.join(HELD_BOUND_S)
-        self.assertEqual(seen, [('result_recorded', False), ('result_recorded', False)],
-                         'the gate was open from the first moment of the fence to its last')
-        self.assertEqual((made.gate.closed, made.closing.is_set(), process.close.call_count), (True, True, 1))
-        # And a settling that comes to its fence once the close has begun fences nothing, and closes its descriptors.
+        self.assertEqual(seen[0], ('result_recorded', False))
+        self.assertEqual(seen[1][0], 'result_recorded')
+        self.assertEqual((finished, made.gate.closed, made.closing.is_set(), process.close.call_count),
+                         ([True], True, True, 1))
+        self.assertEqual(made.gate._fences, 0)
+        # A settling that comes to its fence once shutting has begun fences nothing, and closes its descriptors.
         late = launcher.RunContext('run-2')
         late.process = mock.Mock()
         starter._settle(late)
         self.assertEqual((late.process.fence.call_count, late.process.close.call_count), (0, 1))
+
+    def test_a_fence_that_raises_drops_its_count_and_frees_the_gate(self):
+        """An exception from the fence is raised with the gate lock free and the fence count back at zero, and
+        the descriptors are still closed. A shutting after that returns."""
+        made = hooks_of(launch_check=lambda ctx, executable: None)
+        folder = tempfile.mkdtemp(prefix='rc-seams-fence-exc-')
+        self.addCleanup(shutil.rmtree, folder, True)
+        starter = adapter.RouteStarter(FakeService(), DriveOwnerSeamTest.ROUTES, mock.Mock(closed=False), folder,
+                                       hooks=made, exit_grace_s=0)
+        process = mock.Mock()
+        process.fence.side_effect = RuntimeError('the unit stop failed')
+        ctx = launcher.RunContext('run-1')
+        ctx.process = process
+        with self.assertRaises(RuntimeError):
+            starter._settle(ctx)
+        self.assertEqual((made.gate._fences, made.gate._lock._is_owned(), process.close.call_count), (0, False, 1))
+        made.begin_close()
+        self.assertTrue(made.gate.closed)
+
+    def test_an_interruption_of_a_fence_drops_its_count_and_frees_the_gate(self):
+        """An interruption of the fence is raised with the gate lock free and the fence count back at zero.
+        The fence was entered, so it is not asked again. The descriptors are still closed, and a shutting
+        after that returns."""
+        made = hooks_of(launch_check=lambda ctx, executable: None)
+        folder = tempfile.mkdtemp(prefix='rc-seams-fence-int-')
+        self.addCleanup(shutil.rmtree, folder, True)
+        starter = adapter.RouteStarter(FakeService(), DriveOwnerSeamTest.ROUTES, mock.Mock(closed=False), folder,
+                                       hooks=made, exit_grace_s=0)
+        process, asked = mock.Mock(), []
+
+        def fence(reason):
+            asked.append(reason)
+            raise KeyboardInterrupt
+        process.fence.side_effect = fence
+        ctx = launcher.RunContext('run-1')
+        ctx.process = process
+        with self.assertRaises(KeyboardInterrupt):
+            starter._settle(ctx)
+        self.assertEqual((asked, made.gate._fences, made.gate._lock._is_owned(), process.close.call_count),
+                         (['result_recorded'], 0, False, 1))
+        made.begin_close()
+        self.assertTrue(made.gate.closed)
+
+    def test_a_settling_fence_keeps_a_second_start_and_stop_of_the_same_run_out(self):
+        """While a settling's fence is inside the unit stop, a second start and a second stop of that same run
+        do not enter the manager. Two hundred rounds. Removing the fence lets the rivals run during the stop."""
+        folder = tempfile.mkdtemp(prefix='rc-seams-same-')
+        self.addCleanup(shutil.rmtree, folder, True)
+        os.chmod(folder, 0o700)
+
+        class Manager:
+            def __init__(self):
+                self.inside = threading.Event()
+                self.release = threading.Event()
+                self.primary = False
+                self.overlap = []
+
+            def begin(self):
+                self.inside.clear()
+                self.release.clear()
+                self.primary = True
+                self.overlap.clear()
+
+            def stop(self, unit):
+                if self.primary:
+                    self.primary = False
+                    self.inside.set()
+                    self.release.wait(HELD_BOUND_S)
+                    return None
+                if not self.release.is_set():
+                    self.overlap.append(('stop', unit))
+                return None
+
+            def start(self, unit, argv):
+                if not self.release.is_set():
+                    self.overlap.append(('start', unit))
+
+            def observe(self, unit):
+                return 'running'
+
+            def processes_gone(self, unit):
+                return False
+
+            def owned_units(self):
+                return set()
+
+        manager = Manager()
+        daemon = Daemon(Registry(folder), manager, boot_id=lambda: 'boot-1')
+        self.addCleanup(daemon.close)
+        self.addCleanup(manager.release.set)
+        made = hooks_of(launch_check=lambda ctx, executable: None)
+        starter = adapter.RouteStarter(FakeService(), DriveOwnerSeamTest.ROUTES, daemon, folder, hooks=made,
+                                       exit_grace_s=0)
+        real_lock = daemon.lock
+        arrived = []
+        both = threading.Event()
+
+        class Watched:
+            def acquire(self, blocking=True, timeout=-1):
+                if threading.current_thread().name.startswith('rival-'):
+                    arrived.append(threading.current_thread().name)
+                    if len(arrived) >= 2:
+                        both.set()
+                return real_lock.acquire(blocking, timeout)
+
+            def release(self):
+                real_lock.release()
+
+            def _is_owned(self):
+                return real_lock._is_owned()
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, *exc):
+                self.release()
+
+        daemon.lock = Watched()
+        for round_index in range(200):
+            run_id = f'run-{round_index}'
+            daemon.registry.add(run_id, 'boot-1')
+            manager.begin()
+            arrived.clear()
+            both.clear()
+            process = mock.Mock()
+            process.fence.side_effect = lambda reason, run_id=run_id: daemon.stop(run_id)
+            ctx = launcher.RunContext(run_id)
+            ctx.process = process
+            done = {'start': None, 'stop': None}
+
+            def rival_start(run_id=run_id):
+                try:
+                    daemon.start(run_id, ['argv'])
+                except BaseException as exc:  # noqa: BLE001 - the run is already recorded; the rival must return
+                    done['start'] = (type(exc).__name__, manager.release.is_set())
+                else:
+                    done['start'] = ('returned', manager.release.is_set())
+
+            def rival_stop(run_id=run_id):
+                try:
+                    daemon.stop(run_id)
+                except BaseException as exc:  # noqa: BLE001 - a rival that fails still has to have waited
+                    done['stop'] = (type(exc).__name__, manager.release.is_set())
+                else:
+                    done['stop'] = ('returned', manager.release.is_set())
+
+            settling = threading.Thread(target=starter._settle, args=(ctx,), daemon=True)
+            settling.start()
+            self.assertTrue(manager.inside.wait(HELD_BOUND_S), f'round {round_index}: the fence reached the unit stop')
+            starter_thread = threading.Thread(target=rival_start, name='rival-start', daemon=True)
+            stopper = threading.Thread(target=rival_stop, name='rival-stop', daemon=True)
+            starter_thread.start()
+            stopper.start()
+            self.assertTrue(both.wait(HELD_BOUND_S), f'round {round_index}: both rivals asked for the run lock')
+            self.assertEqual((done['start'], done['stop'], manager.overlap), (None, None, []),
+                             f'round {round_index}: a second start and stop stay out while the fence is inside')
+            manager.release.set()
+            settling.join(HELD_BOUND_S)
+            starter_thread.join(HELD_BOUND_S)
+            stopper.join(HELD_BOUND_S)
+            self.assertFalse(settling.is_alive() or starter_thread.is_alive() or stopper.is_alive())
+            self.assertEqual(manager.overlap, [])
+            self.assertEqual((done['start'][1], done['stop'][1]), (True, True))
+            self.assertEqual(process.close.call_count, 1)
+
+    def test_an_unrelated_call_returns_while_a_settling_fence_stops_the_unit(self):
+        """R1. With the gate on, a settling's fence stops the unit. Another run's ``run.status``, and
+        ``route.list``, return while that stop is still inside, and a call that was already admitted
+        leaves then too. The gate's lock is not held across the stop."""
+        gate_owned, inside, release, left = [], threading.Event(), threading.Event(), threading.Event()
+
+        class Manager:
+            def stop(self, unit):
+                gate_owned.append(made.gate._lock._is_owned())
+                inside.set()
+                release.wait(HELD_BOUND_S)
+                left.set()
+
+            def start(self, unit, argv):
+                return None
+
+            def observe(self, unit):
+                return 'running'
+
+            def processes_gone(self, unit):
+                return False
+
+            def owned_units(self):
+                return set()
+
+        folder = tempfile.mkdtemp(prefix='rc-seams-fence-')
+        self.addCleanup(shutil.rmtree, folder, True)
+        os.chmod(folder, 0o700)
+        daemon = Daemon(Registry(folder), Manager(), boot_id=lambda: 'boot-1')
+        self.addCleanup(daemon.close)
+        self.addCleanup(release.set)
+        daemon.registry.add('run-1', 'boot-1')
+        made = hooks_of(launch_check=lambda ctx, executable: None)
+        self.assertTrue(made.gate.enabled)
+        starter = adapter.RouteStarter(FakeService(), DriveOwnerSeamTest.ROUTES, daemon, folder, hooks=made,
+                                       exit_grace_s=0)
+        control = adapter.DaemonControl(mock.Mock(call=lambda method, params, principal=None: {'code': 'ok'}),
+                                        None, daemon, starter, folder, hooks=made)
+        process = mock.Mock()
+        process.fence.side_effect = lambda reason: daemon.stop('run-1')
+        ctx = launcher.RunContext('run-1')
+        ctx.process = process
+        settling = threading.Thread(target=starter._settle, args=(ctx,), daemon=True)
+        settling.start()
+        self.assertTrue(inside.wait(HELD_BOUND_S), 'the unit stop is inside')
+        begun = time.monotonic()
+        status, routes = {}, {}
+
+        def read_status():
+            status['answer'] = control.call('run.status', {'run_id': 'run-b'})
+            status['left'] = left.is_set()
+            status['s'] = time.monotonic() - begun
+
+        def read_routes():
+            routes['answer'] = control.call('route.list')
+            routes['left'] = left.is_set()
+            routes['s'] = time.monotonic() - begun
+
+        status_thread = threading.Thread(target=read_status, daemon=True)
+        routes_thread = threading.Thread(target=read_routes, daemon=True)
+        status_thread.start()
+        routes_thread.start()
+        status_thread.join(0.4)
+        routes_thread.join(0.4)
+        self.assertFalse(status_thread.is_alive(), 'run.status returned while the other run was still stopping')
+        self.assertFalse(routes_thread.is_alive(), 'route.list returned while the stop was still inside')
+        self.assertFalse(status['left'])
+        self.assertFalse(routes['left'])
+        self.assertLess(status['s'], 0.4)
+        self.assertLess(routes['s'], 0.4)
+        self.assertEqual(status['answer']['code'], 'ok')
+        self.assertEqual(routes['answer']['code'], 'ok')
+        self.assertEqual(gate_owned, [False], 'the gate lock is not held across the stop')
+        # A call already admitted leaves while the stop is still inside: its authorizer returns, then leave.
+        held, authorizer_back = threading.Event(), threading.Event()
+
+        def authorize(principal, method, params):
+            if method == 'run.status' and (params or {}).get('run_id') == 'run-held':
+                held.set()
+                authorizer_back.wait(HELD_BOUND_S)
+                admitted['back'] = time.monotonic()
+            return None
+
+        made._single['authorize'] = authorize
+        admitted = {}
+
+        def held_call():
+            admitted['answer'] = control.call('run.status', {'run_id': 'run-held'})
+            admitted['after_s'] = time.monotonic() - admitted['back']
+            admitted['left'] = left.is_set()
+
+        admitted_thread = threading.Thread(target=held_call, daemon=True)
+        admitted_thread.start()
+        self.assertTrue(held.wait(HELD_BOUND_S), 'the call was admitted and is in its authorizer')
+        authorizer_back.set()
+        admitted_thread.join(0.4)
+        self.assertFalse(admitted_thread.is_alive(), 'an admitted call left while the stop was still inside')
+        self.assertFalse(admitted['left'])
+        self.assertLess(admitted['after_s'], 0.4)
+        self.assertEqual(admitted['answer']['code'], 'ok')
+        release.set()
+        settling.join(HELD_BOUND_S)
+        self.assertFalse(settling.is_alive())
+        self.assertEqual(process.close.call_count, 1)
 
     @quiet
     def test_an_owner_registered_alone_is_waited_for_and_its_settling_fences_nothing_once_closing_began(self):

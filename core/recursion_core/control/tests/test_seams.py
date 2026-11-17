@@ -739,6 +739,18 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual([name for name in asked if name.startswith(package)], [package],
                          'absent is decided at the package: the module below it is not asked for, and the package is asked once')
         self.assertEqual(composed.methods.registered(), ())
+        # Nothing is registered, whatever kind it is: the same defaults as a composition with no lane installed
+        # (test_nothing_is_installed_today...), and every table a registrant can write to. A registrant that was
+        # reached after an answer of None, and put an engine, a command, a single hook, a start registrant or a
+        # service anywhere, shows here; the method table alone did not show it.
+        self.assertEqual(composed.commands.names(), (), 'no command')
+        self.assertEqual(composed.engines.names(), ('claude_code', 'codex'), 'no engine')
+        self.assertFalse(composed.start_on, 'no start registrant')
+        self.assertIsNone(composed.read_result('run-1'), 'no result reader')
+        self.assertFalse(composed.gate.enabled)
+        self.assertIsNone(composed.changes)
+        self.assertEqual((composed._single, composed._start, composed._services), ({}, {}, []),
+                         'no single hook, no start registrant, no service')
         self.assertNotIn('recursion_core.keys', sys.modules)
 
     def test_a_package_with_no_hooks_module_is_skipped(self) -> None:

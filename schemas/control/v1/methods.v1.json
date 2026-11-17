@@ -110,9 +110,7 @@
     "plugin_id": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9_.-]{1,63}$",
-      "not": {
-        "pattern": "[\\r\\n]"
-      }
+      "not": {"anyOf": [{"const": "host"}, {"pattern": "[\\r\\n]"}]}
     },
     "workspace_request": {
       "description": "The folder a caller asks to work in. mode defaults to the configured one. It is validated by the workspace lane before anything is launched; what was granted is in the record's 'workspace'.",

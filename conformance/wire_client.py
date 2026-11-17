@@ -411,7 +411,8 @@ def vector_files(folder: Path) -> set[str]:
 def approvals_in(value: Any) -> Iterator[dict]:
     """Every approval record inside a JSON value: on its own, in an event's payload, in a method's answer."""
     if isinstance(value, dict):
-        if {"approval_id", "effect", "digest", "rendered"} <= value.keys():
+        # source is a string on an approval. Plugin-owned data can carry the same keys and is not one.
+        if {"approval_id", "effect", "digest", "rendered"} <= value.keys() and isinstance(value.get("source"), str):
             yield value
         for item in value.values():
             yield from approvals_in(item)
@@ -437,7 +438,8 @@ def _exact(value) -> str:
 def events_in(value: Any) -> Iterator[dict]:
     """Every event inside a value, wherever it sits: an object with the envelope of event.v1."""
     if isinstance(value, dict):
-        if {"seq", "session_id", "type", "source", "trust", "payload"} <= set(value) and isinstance(value["payload"], dict):
+        # time is part of the envelope. An example that only shares the other keys is not an event.
+        if {"seq", "session_id", "type", "source", "trust", "payload", "time"} <= set(value) and isinstance(value["payload"], dict):
             yield value
         for inner in value.values():
             yield from events_in(inner)
@@ -535,7 +537,7 @@ def judge_vector(schemas: SchemaSet, rule: str, vector: dict) -> str | None:
             else:
                 request = step["request"]
                 answer = model.call(step["principal"], request["method"], request["params"], step["at"])
-                if answer != step["answer"]:
+                if _exact(answer) != _exact(step["answer"]):
                     return f"step {number}: the rule answers {answer}, the vector says {step['answer']}"
                 misfit = _misfit(schemas, "methods.v1.json#/$defs/exchange", dict(request, answer=answer))
                 if misfit:

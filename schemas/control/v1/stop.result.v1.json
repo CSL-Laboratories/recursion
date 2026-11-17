@@ -52,6 +52,24 @@
         "not": {"anyOf": [{"required": ["reason"]}, {"required": ["repeat"]}, {"required": ["attestation"]}]}
       },
       "else": {"properties": {"claim": {"enum": ["cgroup_empty_whole_run_unverified", "cgroup_removed_whole_run_unverified"]}}}
+    },
+    {
+      "not": {
+        "required": ["claim", "attestation"],
+        "properties": {
+          "claim": {"const": "cgroup_empty_whole_run_unverified"},
+          "attestation": {"required": ["proof"], "properties": {"proof": {"const": "removed"}}}
+        }
+      }
+    },
+    {
+      "not": {
+        "required": ["claim", "attestation"],
+        "properties": {
+          "claim": {"const": "cgroup_removed_whole_run_unverified"},
+          "attestation": {"required": ["proof"], "properties": {"proof": {"const": "empty"}}}
+        }
+      }
     }
   ],
   "$defs": {
@@ -83,7 +101,7 @@
       "enum": ["host_integrated", "engine_user", "contained"]
     },
     "claim": {
-      "description": "PROVISIONAL, the Stop lane's. The key of the sentence a surface shows for this Stop. No surface writes its own wording. cgroup_empty_whole_run_unverified: the supervised cgroup was read empty; nothing is claimed about a process that left it. cgroup_removed_whole_run_unverified: the supervised cgroup is gone; nothing is claimed about a process that left it. ended_before_stop_removal_unverified: the run had ended before the Stop; this call stopped nothing and no removal was verified.",
+      "description": "PROVISIONAL, the Stop lane's. The key of the sentence a surface shows for this Stop. No surface writes its own wording. cgroup_empty_whole_run_unverified: the supervised cgroup was read empty; nothing is claimed about a process that left it. cgroup_removed_whole_run_unverified: the supervised cgroup is gone; nothing is claimed about a process that left it. ended_before_stop_removal_unverified: the run had ended before the Stop; this call stopped nothing and no removal was verified. cgroup_empty_whole_run_unverified is said only with proof empty, and cgroup_removed_whole_run_unverified only with proof removed.",
       "enum": ["cgroup_empty_whole_run_unverified", "cgroup_removed_whole_run_unverified", "ended_before_stop_removal_unverified"]
     },
     "fence": {

@@ -1,0 +1,22 @@
+{
+  "name": "example",
+  "description": "Tool with an example",
+  "input_schema": {
+    "examples": [
+      {
+        "seq": 1,
+        "session_id": "ordinary",
+        "type": "tool.call",
+        "source": "data",
+        "trust": "untrusted",
+        "payload": {
+          "input": {
+            "x": 1
+          },
+          "input_digest": "example"
+        }
+      }
+    ]
+  },
+  "permission": "tool"
+}

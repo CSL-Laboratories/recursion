@@ -8,7 +8,8 @@ the `recursiond` command). Linux only; `recursiond` refuses every command elsewh
 ## What it writes
 
 Under the home folder the caller passes (the password database's, which is what the user manager
-calls `%h`; never `$HOME`). The command layer reads `XDG_CONFIG_HOME` and `XDG_STATE_HOME` from its
+calls `%h`; never `$HOME`; a password database that gives no entry for this user, none or a failed
+lookup, refuses `home_unknown`). The command layer reads `XDG_CONFIG_HOME` and `XDG_STATE_HOME` from its
 environment only to refuse, before anything is read, a value naming another folder than `~/.config`
 (`config_home_elsewhere`: a user manager started with it reads its units from there) or, for install
 and upgrade, than `~/.local/state` (`state_home_elsewhere`: a daemon started with it keeps its state

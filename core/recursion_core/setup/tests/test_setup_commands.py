@@ -344,6 +344,28 @@ class CommandTests(unittest.TestCase):
         code, answer = self.run_action("upgrade")
         self.assertEqual((code, answer["code"], answer["action"]), (1, "unit_state_elsewhere", "upgrade"))
         self.assertIn("sets XDG_STATE_HOME=/elsewhere", answer["detail"])
+        # DeepSeek H9-1 on #382: a NUL byte in the value was a ValueError traceback; it is one JSON refusal.
+        with open(self.unit, "w", encoding="utf-8") as handle:
+            handle.write("[Service]\nEnvironment=XDG_STATE_HOME=/a\0b\nExecStart=/old\n")
+        code, answer = self.run_action("upgrade")
+        self.assertEqual((code, answer["code"]), (1, "unit_state_elsewhere"))
+        self.assertIn("sets XDG_STATE_HOME=/a:", answer["detail"])  # the NUL ends the line (Grok R1 of round 11)
+
+    # The Liaison's item 4 (Nov 16): a password lookup that fails (CPython raises KeyError for no entry and for a
+    # failed lookup alike) ended `recursiond install` with a traceback; it is the JSON refusal home_unknown.
+    def test_a_password_lookup_that_fails_is_a_json_refusal(self):
+        # DeepSeek F10-2 on #382: an OSError from the lookup is held to the same refusal (CPython raises KeyError).
+        failures = (KeyError(f"getpwuid(): uid not found: {os.geteuid()}"), OSError(5, "Input/output error"))
+        for failed, action in ((failed, action) for failed in failures for action in setup.NAMES):
+            with self.subTest(action=action, failed=type(failed).__name__):
+                out = io.StringIO()
+                with mock.patch.object(setup.sys, "platform", "linux"), mock.patch("pwd.getpwuid", side_effect=failed), \
+                        mock.patch.object(setup, "run") as run:
+                    self.assertEqual(setup.dispatch(mock.Mock(command=action, out=out), None), 1)
+                answer = json.loads(out.getvalue())
+                self.assertEqual((answer["code"], answer["action"]), ("home_unknown", action))
+                self.assertIn("the password database gives no entry for this user", answer["detail"])
+                run.assert_not_called()
 
     def test_the_default_home_is_the_password_databases_not_HOME(self):
         import pwd

@@ -24,6 +24,16 @@ it); each refusal says how to run the command without the variable. Off Linux th
 anything (``recursiond`` refuses there first; this holds the same once the family is registered in
 the control CLI).
 
+``XDG_CONFIG_HOME`` naming another folder than ``~/.config`` is refused ``config_home_elsewhere``,
+before anything is read: a user manager started with it reads its units from there, not from
+``~/.config/systemd/user`` where these commands write. ``XDG_STATE_HOME`` naming another folder than
+``~/.local/state`` is refused ``state_home_elsewhere`` by ``install`` and ``upgrade``: a daemon started
+with it keeps its state there, and the unit leaves it in ``~/.local/state/recursion`` (the S6 sweep's F2
+and F1 on #410, reachable here too). Both are read from this command's own environment, the nearest
+this package gets to the user manager's (it starts no process to ask it); each refusal says how to
+run the command without the variable. A password database that gives no entry for this user (none,
+or a failed lookup: CPython raises ``KeyError`` for both) is ``home_unknown``, before anything is read.
+
 ``install`` and ``upgrade`` point the unit at the interpreter running this command, and first ask
 that interpreter, started as the unit will start it (``-I``, from ``/``), what it is: it must be
 free-threaded CPython 3.14 (``interpreter_not_free_threaded``), and it must import this same
@@ -76,7 +86,12 @@ def dispatch(args, client) -> int:
         _print(out, {"code": "platform_unsupported", "action": args.command,
                      "detail": f"the per-user service needs Linux with systemd; this system is {sys.platform}"})
         return EXIT_REFUSED
-    return run(args.command, out=out, roots=default_roots(), interpreter=sys.executable,
+    try:
+        roots = default_roots()
+    except InstallRefused as exc:  # no password entry for this user, or the lookup failed
+        _print(out, {"code": exc.kind, "action": args.command, "detail": exc.detail})
+        return EXIT_REFUSED
+    return run(args.command, out=out, roots=roots, interpreter=sys.executable,
                package=recursion_core.__file__)
 
 
@@ -85,7 +100,14 @@ def default_roots() -> Roots:
 
     import pwd  # POSIX only; ``recursiond`` refuses every command elsewhere before this runs
 
-    return Roots(home=pwd.getpwuid(os.geteuid()).pw_dir)
+    try:
+        home = pwd.getpwuid(os.geteuid()).pw_dir
+    # CPython 3.12 and 3.14 raise KeyError for no entry and for a lookup that failed (NSS, LDAP) alike
+    # (Modules/pwdmodule.c); an OSError, from another implementation, is held to the same refusal (DeepSeek F10-2).
+    except (KeyError, OSError):
+        raise InstallRefused("home_unknown", "the password database gives no entry for this user (none, or "
+                             "the lookup failed), so the user manager's %h is not known") from None
+    return Roots(home=home)
 
 
 def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe=None, environ=None) -> int:

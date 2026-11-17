@@ -1331,11 +1331,30 @@ def _private_dir(path: str | None) -> bool:
     euid = _posix_euid()
     if euid is None:
         return False
-    return stat.S_ISDIR(st.st_mode) and st.st_uid == euid and not st.st_mode & 0o077 and _owned_chain(real)
+    # Exactly 0700. A tighter mode such as 0500 has no group or other bits and was accepted;
+    # the contract is owner read, write and search, nothing else.
+    return (stat.S_ISDIR(st.st_mode) and st.st_uid == euid and stat.S_IMODE(st.st_mode) == 0o700
+            and _owned_chain(real))
 
 
 _TMP: dict[int, str] = {}
 _TMP_LOCK = threading.Lock()
+
+
+def _tmp_lock_after_fork_in_child() -> None:
+    """Give a fork child a free temp lock and an empty cache.
+
+    The child does not contain the thread that held ``_TMP_LOCK``, so the inherited
+    lock stays acquired and ``_route_tmp`` would block on it. No production caller
+    forks. The parent keeps the lock and the cache it already had.
+    """
+    global _TMP_LOCK
+    _TMP_LOCK = threading.Lock()
+    _TMP.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_tmp_lock_after_fork_in_child)
 
 
 def _tmp_bases() -> list[str]:
@@ -1375,7 +1394,7 @@ def _route_tmp() -> str:
         euid = _posix_euid()
         if euid is None:
             raise EnvRefused("TMPDIR", "tmp_root_unsafe")
-        if (st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != euid or st.st_mode & 0o077
-                or not _owned_chain(path)):
+        if (st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != euid
+                or stat.S_IMODE(st.st_mode) != 0o700 or not _owned_chain(path)):
             path = _TMP[key] = _make_route_tmp()
         return path

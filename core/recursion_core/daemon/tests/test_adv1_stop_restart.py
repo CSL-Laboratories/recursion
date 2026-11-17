@@ -758,12 +758,15 @@ class RestartTest(ComposedBase):
         daemon, composed = self.boot()
         control = composed.control
         original = adapter.RouteStarter._drive
-        reconcile_one = type(control)._reconcile_one
-        held, counted, seen, looked = [], [], [], []
+        saved = type(control)._reconcile_one
+        step = mock.Mock(wraps=saved)
+        held, counted, seen, looked, returned = [], [], [], [], []
 
         def looking(self_, rec, row):
             looked.append((rec['run_id'], rec.get('state'), row))
-            return reconcile_one(self_, rec, row)
+            outcome = step(self_, rec, row)
+            returned.append(outcome)
+            return outcome
 
         def reconcile_first(self_, ctx, request):
             held.append(self_.active(ctx.run_id))
@@ -783,6 +786,14 @@ class RestartTest(ComposedBase):
         self.assertEqual(seen, ['starting'], 'the record flapped starting -> start_failed -> running')
         self.assertEqual([entry for entry in looked if entry[0] == run_id], [(run_id, 'starting', None)],
                          'reconcile looked at the starting record once, before the unit existed')
+        self.assertEqual(len(returned), 1, 'the saved per-record step returned')
+        self.assertEqual(len(step.call_args_list), 1, step.call_args_list)
+        receiver, record, row = step.call_args_list[0].args
+        self.assertIs(receiver, control)
+        self.assertEqual(record.get('run_id'), run_id)
+        self.assertEqual(record.get('state'), 'starting')
+        self.assertIsNone(record.get('cgroup'))
+        self.assertIsNone(row)
         self.assertEqual(self.api(composed).call('run.status', {'run_id': run_id})['run']['state'], 'running')
 
 

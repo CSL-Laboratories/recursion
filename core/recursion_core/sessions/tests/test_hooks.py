@@ -123,6 +123,39 @@ class ShutdownRetryTest(unittest.TestCase):
         self.assertIsNone(service._thread)
         self.assertFalse(service.ready)
 
+    def test_an_interrupt_inside_start_after_the_worker_is_spawned_is_joined_by_stop(self):
+        """``Thread.start`` can raise ``KeyboardInterrupt`` after the worker is already running. That
+        interrupt used to skip the line that stores the thread, so the next ``stop`` returned with the
+        recovery worker still running. The worker is alive before that ``stop``; afterwards ``_thread``
+        is None and the worker is not alive. Read of b7a2f9f0, F1."""
+        sessions = SimpleNamespace(wake=threading.Event(), recover=lambda: None, dispatch_queued=lambda: 0,
+                                   run_pending=lambda: 0)
+        service = SessionsService(sessions, interval_s=0.05)
+        real_start = threading.Thread.start
+        spawned = []
+
+        def spawn_then_interrupt(thread):
+            real_start(thread)
+            spawned.append(thread)
+            raise KeyboardInterrupt
+
+        threading.Thread.start = spawn_then_interrupt
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                service.start(None)
+            self.assertEqual(len(spawned), 1)
+            worker = spawned[0]
+            self.assertIs(service._thread, worker)
+            self.assertTrue(worker.is_alive())
+            service.stop(None)
+            self.assertIsNone(service._thread)
+            self.assertFalse(worker.is_alive())
+        finally:
+            threading.Thread.start = real_start
+            if spawned and spawned[0].is_alive():
+                service._stopping.set()
+                sessions.wake.set()
+                spawned[0].join(timeout=5)
 
 if __name__ == '__main__':
     unittest.main()

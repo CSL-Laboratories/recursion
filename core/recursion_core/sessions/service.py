@@ -527,8 +527,14 @@ class SessionsService:
             self._stopping.clear()
             self.failure = None
             thread = threading.Thread(target=self._loop, name='sessions-service', daemon=True)
-            thread.start()
-            self._thread = thread     # stored only after it has begun: a thread that never began makes stop raise
+            try:
+                thread.start()
+            except Exception:
+                raise                    # never spawned (CPython removed it from _limbo): nothing to join
+            except BaseException:        # noqa: BLE001 - an interrupt after the spawn is not an Exception
+                self._thread = thread    # spawned, wait interrupted: stop must join it
+                raise
+            self._thread = thread        # stored only after it has begun
 
     def stop(self, context) -> None:
         with self._lock:

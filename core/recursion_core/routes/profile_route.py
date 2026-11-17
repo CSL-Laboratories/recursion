@@ -65,6 +65,10 @@ class ProfileRouteAdapter(RouteAdapter):
         except OSError as err:
             return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
         events: list[dict] = []
+        if self._clock() >= deadline_at:
+            # The launch spent the deadline. Do not call the driver, so nothing is written. The child is fenced.
+            process.fence("deadline")
+            return c.result(rid, c.DEADLINE_EXCEEDED, events=events, detail="recursion deadline")
         try:
             return self._driver(process, request, deadline_at, events)
         except Deadline:

@@ -11,12 +11,16 @@ from recursion_core.keys.tests.support import FakeKeychain, busctl, needs_posix
 from recursion_core.keys.tests.test_macos import ELSEWHERE, LOGIN
 from recursion_core.keys.tests.test_pr2_review_3 import MacCase
 
+ADVICE = ('unfinished remove of codex-key: its value may still be in the store; "key remove codex-key" clears it, or '
+          'names the refusal that stops it')
+
 
 @needs_posix
 class AuditAdviceFollowsEveryRefusalTest(MacCase):
-    """DeepSeek r5 F1, Codex sol r5 change 1: for an unfinished operation, ``key audit`` does not advise ``key
-    remove`` while the store's backend refuses, whatever the refusal (a keychain code or not); it names the refusal,
-    and the removal it no longer advises refuses with that code. An answering keychain still gets the advice."""
+    """DeepSeek r5 F1, Codex sol r5 change 1, as DeepSeek r6 F1 and F2 left them: for an unfinished operation, ``key
+    audit`` names the refusal its count met, whatever the refusal (a keychain code or not), and says that ``key
+    remove`` clears the value or names the refusal that stops it; beside a backend that refuses, the removal refuses
+    with that code. An answering keychain's removal clears it."""
 
     def unfinished(self, name):
         store, system, security = self.mac(name)
@@ -32,7 +36,7 @@ class AuditAdviceFollowsEveryRefusalTest(MacCase):
         status = entry.main(['audit', '--no-journal'], out=out, err=io.StringIO(), store=store)
         return status, out.getvalue()
 
-    def test_a_refusing_backend_is_named_and_no_removal_advised(self) -> None:
+    def test_a_refusing_backend_is_named_and_the_removal_refuses_with_it(self) -> None:
         for failure, code in (('locked', 'keychain_locked'), ('dump_error', 'keychain_failed'),
                               ('fails', 'keychain_failed'), ('timeout', 'keychain_timeout'),
                               ('missing', 'keychain_tool_missing'), ('backend_changed', 'backend_changed')):
@@ -52,9 +56,8 @@ class AuditAdviceFollowsEveryRefusalTest(MacCase):
                     system.tools['security'] = unavailable
                 status, text = self.audit(store)
                 self.assertEqual(status, 4)
-                self.assertNotIn('"key remove codex-key" clears it', text)
-                self.assertIn(f'unfinished remove of codex-key: its value may still be in the store; its keychain is '
-                              f'refused ({code}), so "key remove codex-key" cannot clear it now', text)
+                self.assertIn(ADVICE, text)
+                self.assertIn(f'keychain: its items were not counted ({code})', text)
                 with self.assertRaises(KeyStoreError) as caught:
                     store.remove('codex-key')
                 self.assertEqual(caught.exception.code, code)

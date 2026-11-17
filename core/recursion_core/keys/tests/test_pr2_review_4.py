@@ -82,15 +82,18 @@ class UnrecordedIndexIsRefusedTest(MacCase):
         self.assertEqual(caught.exception.code, 'keychain_unavailable')
         self.assertEqual((store.list().pending, calls, len(security.items)), (unfinished.pending, [], 2))
 
-    def test_key_audit_does_not_advise_a_removal_the_keychain_refuses(self) -> None:
+    def test_key_audit_names_the_refusal_its_removal_meets(self) -> None:
         store, _, _ = self.arranged('its own keychain')
         with self.assertRaises(KeyStoreError):
             store.remove('codex-key')
         out, err = io.StringIO(), io.StringIO()
         self.assertEqual(entry.main(['audit', '--no-journal'], out=out, err=err, store=store), 4)
-        self.assertNotIn('"key remove codex-key" clears it', out.getvalue())
-        self.assertIn('unfinished remove of codex-key: its value may still be in the store; its keychain is refused '
-                      '(keychain_unavailable), so "key remove codex-key" cannot clear it now', out.getvalue())
+        self.assertIn('unfinished remove of codex-key: its value may still be in the store; "key remove codex-key" '
+                      'clears it, or names the refusal that stops it', out.getvalue())
+        self.assertIn('keychain: its items were not counted (keychain_unavailable)', out.getvalue())
+        with self.assertRaises(KeyStoreError) as caught:
+            store.remove('codex-key')                       # DeepSeek r6: the removal meets the refusal named
+        self.assertEqual(caught.exception.code, 'keychain_unavailable')
 
 
 @needs_posix

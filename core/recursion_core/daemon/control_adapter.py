@@ -124,7 +124,9 @@ def _open_regular(path):
     Opened ``O_NONBLOCK``: the open of a FIFO that has no writer waits for one, and a status or list
     call waited with it (E19).
     """
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    # A host that lacks a flag (the simulated Windows run of the suites) opens without it.
+    flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+    fd = os.open(path, flags)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(errno.EINVAL, 'not a regular file')

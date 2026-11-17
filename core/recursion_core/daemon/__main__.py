@@ -139,9 +139,14 @@ def cli():
     args = parser.parse_args()
     extra = {}
     if args.sweep_seconds is not None:
-        if not args.sweep_seconds > 0:
-            parser.error("--sweep-seconds must be positive")
-        extra["sweep_seconds"] = args.sweep_seconds
+        sweep = args.sweep_seconds
+        # inf and any value above threading.TIMEOUT_MAX make Event.wait raise.
+        if not (sweep > 0 and sweep <= threading.TIMEOUT_MAX):
+            parser.error("--sweep-seconds must be a finite positive number "
+                         "no greater than the thread wait limit")
+        extra["sweep_seconds"] = sweep
+    if args.gui_port < 0 or args.gui_port > 65535:
+        parser.error("--gui-port must be from 0 through 65535")
     require_free_threaded()
     for value in args.plugin:
         if not os.path.isabs(value):

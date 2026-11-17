@@ -2,9 +2,10 @@
 
 A presentation adapter over the control API, like the CLI: it reads routes, runs the
 11 O7 reads, sends the three O7 interventions and forwards a run Stop. It has no order
-path and no Stop of its own, and it shows every result as the control API returned it
-(a Stop that is ``pending`` is shown as pending; the page never says "terminated" on
-its own).
+path and no Stop of its own, and it shows every result as the control API returned it,
+except venue panels, which filter rows and do not yet show empty_reason/outage fields
+(held C7 finding 12). A Stop that is ``pending`` is shown as pending; the page never
+says "terminated" on its own.
 
 The door, in order, on every request:
 
@@ -146,11 +147,18 @@ def _withheld_note(venue: str) -> str:
     return '<p role="note">Withheld: data not labelled <code>%s</code>.</p>' % escape(venue)
 
 
+def _required_snapshot(required: dict | None) -> dict | None:
+    """Copy requirement lists at construction so a later caller mutation cannot change them."""
+    if required is None:
+        return None
+    return {cls: list(subjects) for cls, subjects in required.items()}
+
+
 class Application:
     def __init__(self, client: ControlClient, door: Callable[[dict], bool], hosts: frozenset,
                  origins: frozenset, required: dict | None = None, panels=()) -> None:
         self._client = client
-        self._required = required
+        self._required = _required_snapshot(required)
         self._panels = panel_registry(panels)
         self._door = door
         self._hosts = frozenset(hosts)
@@ -464,9 +472,24 @@ class Application:
         try:
             data = self._client.stop_run(form["run_id"])
         except ControlError as exc:
+            if exc.code == "run_id_invalid":
+                # Raised before the transport call. This is not a missing reply.
+                return "Stop not sent", '<p role="status">Stop not sent: %s</p>' % escape(exc.code)
+            if exc.refused is not None:
+                # The control API answered with its own refusal. Name that, not a missing reply.
+                return "Stop refused", (
+                    '<p role="status">Stop refused by the control API (%s). '
+                    "Check the run before assuming it stopped.</p>" % escape(exc.refused))
             return "Stop not confirmed", ('<p role="status">Stop state: unknown. The control API did not '
                                           "answer (%s). Check the run before assuming it stopped.</p>"
                                           % escape(exc.code))
+        # gui_transport returns this body at HTTP 200. These codes are refusals; pending and stopped
+        # carry a state and use the line below (control/api.py stop, daemon/control_adapter.py).
+        code = data.get("code")
+        if type(code) is str and code in ("run_unknown", "request_invalid", "registry_unavailable"):
+            return "Stop refused", (
+                '<p role="status">Stop refused by the control API (%s). '
+                "Check the run before assuming it stopped.</p>" % escape(code))
         state = data.get("state") if type(data.get("state")) is str else None
         line = ("Stop state reported by the control API: <strong>%s</strong>" % escape(state) if state
                 else "Stop state: not reported by the control API (unknown)")

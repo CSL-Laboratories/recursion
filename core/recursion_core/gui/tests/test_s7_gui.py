@@ -135,6 +135,33 @@ class SweepGuiRegressions(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "control_api_response_invalid")
                 self.assertIsNone(caught.exception.refused)
 
+    def test_f6_constructor_requirements_are_a_snapshot_of_caller_configuration(self):
+        required = {"engine": ["plugin_engine"]}
+        app, _ = make_app({"routes": []}, required=required)
+        required["engine"][:] = ["replacement_engine"]
+        required["venue_use"] = ["paper:own_trading"]
+        statuses, _, page = request(app, path="/", query="")
+        self.assertEqual(statuses, ["200 OK"])
+        self.assertTrue("gap:engine:plugin_engine" in page, "the original requirements were not retained")
+        self.assertNotIn("gap:engine:replacement_engine", page)
+        self.assertNotIn("gap:venue_use:paper:own_trading", page)
+
+    def test_f7_local_stop_validation_is_reported_as_not_sent(self):
+        app, calls = make_app({"state": "pending"})
+        statuses, _, page = request(app, "POST", "/stop", body=b"run_id=bad+id&confirm=explicit")
+        self.assertEqual(calls, [])
+        self.assertTrue("not sent" in page.lower(), "local validation was labelled as no API reply")
+        self.assertIn("run_id_invalid", page)
+        self.assertNotIn("The control API did not answer", page)
+
+    def test_f7_typed_stop_refusal_is_distinguished_from_no_reply(self):
+        app, calls = make_app({"error": "run_not_found"}, status=404)
+        statuses, _, page = request(app, "POST", "/stop", body=b"run_id=run-1&confirm=explicit")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue("refused" in page.lower(), "a typed API refusal was labelled as no reply")
+        self.assertIn("run_not_found", page)
+        self.assertNotIn("The control API did not answer", page)
+
     def test_f1_a_sole_blank_run_id_is_refused_before_dispatch(self):
         # Mutant: drop `or v[0] == ""` in _form. A duplicate blank is already 400 by length.
         app, calls = make_app({"state": "pending"})
@@ -284,6 +311,107 @@ class SweepGuiRegressions(unittest.TestCase):
             client.routes()
         self.assertEqual(caught.exception.code, "control_api_unavailable")
         self.assertIsNone(caught.exception.refused)
+
+    def test_f1_daemon_stop_refusal_is_the_control_answer_at_http_200(self):
+        # DaemonControl.gui_transport returns every Stop as HTTP 200 plus the control API body.
+        # An unknown run is {"code": "run_unknown", "run_id": ...}, not a 409 or a 404.
+        from recursion_core.control.api import ControlAPI
+        from recursion_core.control.registry import EMPTY, POPULATED, InMemoryRunRegistry
+        from recursion_core.control.tests.fakes import FakeKillTree, make_api, started
+        from recursion_core.daemon.control_adapter import DaemonControl
+
+        def show(call, run_id="run-1"):
+            seen = []
+
+            def transport(method, path, body):
+                pair = DaemonControl.gui_transport(call, method, path, body)
+                seen.append(pair)
+                return pair
+
+            app = Application(ControlClient(transport), lambda env: True, {HOST}, {ORIGIN})
+            body = ("run_id=%s&confirm=explicit" % run_id).encode()
+            statuses, _, page = request(app, "POST", "/stop", body=body, query="")
+            return statuses, page, seen
+
+        class Forward:
+            def __init__(self, api):
+                self.api, self.calls = api, []
+
+            def call(self, method, params=None):
+                self.calls.append((method, dict(params or {})))
+                return self.api.call(method, params)
+
+        control = ControlAPI(InMemoryRunRegistry(), None, lambda params: {}, lambda: 0.0)
+        witnessed = control.call("run.stop", {"run_id": "run-1"})
+        self.assertEqual(witnessed, {"code": "run_unknown", "run_id": "run-1"})
+        door = Forward(control)
+        statuses, page, seen = show(door)
+        self.assertEqual(statuses, ["200 OK"])
+        self.assertEqual(door.calls, [("run.stop", {"run_id": "run-1"})])
+        self.assertEqual(seen, [(200, json.dumps(witnessed, sort_keys=True).encode())])
+        self.assertIn("Stop refused by the control API (run_unknown).", page)
+        self.assertIn("Check the run before assuming it stopped.", page)
+        self.assertNotIn("not reported", page)
+        self.assertNotIn("did not answer", page)
+        # A second caller is labelled from its own answer.
+        _, page, seen = show(door)
+        self.assertEqual(len(door.calls), 2)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("Stop refused by the control API (run_unknown).", page)
+
+        class Down:
+            def get(self, run_id):
+                raise OSError("unreadable")
+
+        down = ControlAPI(Down(), None, lambda params: {}, lambda: 0.0)
+        unavailable = down.call("run.stop", {"run_id": "run-1"})
+        self.assertEqual(unavailable["code"], "registry_unavailable")
+        _, page, seen = show(Forward(down))
+        self.assertEqual(seen[0][0], 200)
+        self.assertEqual(json.loads(seen[0][1]), unavailable)
+        self.assertIn("Stop refused by the control API (registry_unavailable).", page)
+        self.assertNotIn("did not answer", page)
+
+        # The page refuses a blank id before send. This is the body the API returns when run_id is absent.
+        invalid = control.call("run.stop", {})
+        self.assertEqual(invalid, {"code": "request_invalid", "detail": "run_id"})
+
+        class Answers:
+            def __init__(self, body):
+                self.body = body
+
+            def call(self, method, params=None):
+                return self.body
+
+        _, page, seen = show(Answers(invalid))
+        self.assertEqual(seen[0][0], 200)
+        self.assertEqual(json.loads(seen[0][1]), invalid)
+        self.assertIn("Stop refused by the control API (request_invalid).", page)
+
+        pending_api, _, _, _ = make_api(FakeKillTree([POPULATED]))
+        run = started(pending_api)
+        _, page, seen = show(Forward(pending_api), run)
+        pending = json.loads(seen[0][1])
+        self.assertEqual(seen[0][0], 200)
+        self.assertEqual((pending["code"], pending["state"]), ("pending", "pending"))
+        self.assertIn("Stop state reported by the control API: <strong>pending</strong>", page)
+        self.assertNotIn("Stop refused", page)
+
+        stopped_api, _, _, _ = make_api(FakeKillTree([EMPTY]))
+        run = started(stopped_api)
+        _, page, seen = show(Forward(stopped_api), run)
+        stopped = json.loads(seen[0][1])
+        self.assertEqual((stopped["code"], stopped["state"]), ("stopped", "stopped"))
+        self.assertIn("Stop state reported by the control API: <strong>stopped</strong>", page)
+        self.assertNotIn("Stop refused", page)
+
+        def broken(method, path, body):
+            raise ConnectionError("down")
+
+        app = Application(ControlClient(broken), lambda env: True, {HOST}, {ORIGIN})
+        _, _, page = request(app, "POST", "/stop", body=b"run_id=run-1&confirm=explicit", query="")
+        self.assertIn("The control API did not answer", page)
+        self.assertNotIn("Stop refused", page)
 
 
 class _RaisesOnTitle(Mapping):

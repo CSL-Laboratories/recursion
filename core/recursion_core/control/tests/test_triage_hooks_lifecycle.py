@@ -141,6 +141,95 @@ class HooksLifecycleRegressionTest(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(observed, [True])
 
+    def test_a_table_made_before_freeze_is_frozen_before_a_reader_sees_it(self):
+        """The composition path: a lane registers an engine, then freeze runs.
+
+        A reader that arrives while the table is being frozen must not observe an open table
+        from a composition that already says it is frozen, and must not register into that window.
+        """
+        hooks = H.Hooks()
+        table = hooks.engines
+        self.assertFalse(table._frozen)
+        entered, release = threading.Event(), threading.Event()
+        original = engines.EngineTable.freeze
+        seen = []
+
+        def pause(table_self):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("test synchronization timed out")
+            original(table_self)
+
+        def reader():
+            # The saved table, under the same lock freeze holds. Going back through the
+            # property would freeze the table as a side effect and hide a freeze that
+            # publishes the flag before it freezes the table.
+            while not hooks._frozen:
+                pass
+            with hooks._engines_lock:
+                seen.append(table._frozen)
+                try:
+                    table.register("pi", lambda *args, **kwargs: None)
+                    seen.append("accepted")
+                except engines.EngineTableError:
+                    seen.append("refused")
+
+        freer = threading.Thread(target=hooks.freeze, daemon=True)
+        watcher = threading.Thread(target=reader, daemon=True)
+        with mock.patch.object(engines.EngineTable, "freeze", pause):
+            try:
+                freer.start()
+                self.assertTrue(entered.wait(3), "freeze did not reach the table")
+                watcher.start()
+                watcher.join(0.2)
+            finally:
+                release.set()
+                freer.join(3)
+                watcher.join(3)
+        self.assertFalse(freer.is_alive() or watcher.is_alive())
+        self.assertEqual(seen, [True, "refused"])
+        self.assertTrue(table._frozen)
+        self.assertNotIn("pi", tuple(table.names()))
+
+    def test_a_second_directory_is_refused_and_the_first_store_stays(self):
+        stores = []
+
+        def factory(state_dir):
+            store = Store()
+            stores.append(state_dir)
+            return store
+
+        hooks = configured("event_store", factory)
+        try:
+            first = hooks.open_store("/state-a")
+            with self.assertRaises(H.HookError):
+                hooks.open_store("/state-b")
+            self.assertIs(hooks.open_store("/state-a"), first)
+            self.assertIs(hooks.store, first)
+            self.assertEqual(stores, ["/state-a"])
+        finally:
+            hooks.finish_close(H.ServiceContext())
+        self.assertTrue(first.closed)
+
+    def test_a_factory_that_returns_none_is_called_once(self):
+        calls = []
+
+        def factory(state_dir):
+            calls.append(state_dir)
+            return None
+
+        hooks = configured("event_store", factory)
+        self.assertIsNone(hooks.open_store("/state-a"))
+        self.assertIsNone(hooks.open_store("/state-a"))
+        self.assertEqual(calls, ["/state-a"])
+
+    def test_start_services_after_teardown_with_no_service_is_refused(self):
+        hooks = H.Hooks()
+        hooks.freeze()
+        hooks.finish_close(H.ServiceContext())
+        with self.assertRaises(H.HookError):
+            hooks.start_services(H.ServiceContext())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

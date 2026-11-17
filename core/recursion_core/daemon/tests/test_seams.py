@@ -1590,17 +1590,20 @@ class RunThreadLifetimeTest(unittest.TestCase):
                 starter._settle(ctx)
             self.assertEqual((ctx.process.fence.call_args_list, ctx.process.close.call_count), (fenced, 1))
 
-    def test_a_settling_makes_its_fence_with_the_gate_held_open_and_a_close_that_begins_then_waits_for_it(self):
+    def test_a_settling_counts_a_fence_without_the_gate_lock_and_a_shutdown_wakes_when_the_count_drops(self):
         """The fifth reads, restated for the admission gate. The decision to fence and the start of the fence
-        are one step: a shutting that has already set the gate's flag fences nothing, and a fence that has
-        started is finished. The unit stop does not hold the gate lock. A shutting sets that flag and then
+        are one step: a shutdown that has already set the gate's flag fences nothing, and a fence that has
+        started is finished. The unit stop does not hold the gate lock. A shutdown sets that flag and then
         waits, without the lock, until the fence returns; a call that arrives once the flag is set is refused
-        at once. Nothing is traced."""
+        at once. The wake-up is what lets that wait return: with ``stall_log_s`` set high, the method that
+        begins the shutdown returns well inside it after the count drops. Nothing is traced."""
         process, inside, leave = mock.Mock(), threading.Event(), threading.Event()
         seen, owned = [], []
         self.addCleanup(leave.set)
         made = hooks_of(launch_check=lambda ctx, executable: None)   # one hook that is asked on a run's thread
         self.assertTrue(made.gate.enabled)
+        # High on purpose. Without the wake-up the wait lasts this long; the return must be well inside it.
+        made.gate.stall_log_s = 60.0
 
         def fence(reason):
             seen.append((reason, made.gate.closed))
@@ -1638,6 +1641,13 @@ class RunThreadLifetimeTest(unittest.TestCase):
         self.assertEqual(refused, {'code': 'unavailable', 'detail': 'daemon_closing'})
         self.assertEqual(finished, [], 'the refusal did not wait for the fence')
         leave.set()
+        dropped_at = time.monotonic()
+        close.join(5.0)
+        waited = time.monotonic() - dropped_at
+        self.assertEqual(finished, [True], 'the method that begins a shutdown returns once the count drops')
+        self.assertLess(waited, 5.0)
+        self.assertLess(waited * 4, made.gate.stall_log_s,
+                        'the return is well inside stall_log_s after the drop')
         settling.join(HELD_BOUND_S)
         close.join(HELD_BOUND_S)
         self.assertEqual(seen[0], ('result_recorded', False))

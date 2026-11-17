@@ -725,11 +725,18 @@ class RegistrationTest(unittest.TestCase):
             self.assertIn(sentence, text)
 
     def test_a_registrant_whose_parent_package_is_absent_is_skipped(self) -> None:
-        """Whatever lanes this tree has, now or later: the absence is made for the test. Where the composition
-        asks whether a package or a module outside the core is there, it is told no. Each registrant is then
-        asked for once, at the outermost thing it needs that is not part of the core, and no further; nothing
-        of it is imported; and nothing registers. (It used to rely on one lane's package not being in the
-        tree, which stops being true the day that lane lands.)"""
+        """Whatever lanes this tree has, now or later, the absence is made for the test.
+
+        Where the composition asks whether a package or a module outside the core is there, it is told no.
+        Each registrant is then asked for once, at the outermost thing it needs that is not part of the core,
+        and no further; nothing of it is imported; and nothing registers. (It used to rely on one lane's
+        package not being in the tree, which stops being true the day that lane lands.)
+
+        The keys package is that same absence as the real finder shows it: asked for the package, it says
+        None; asked for anything below it, it raises ModuleNotFoundError naming the package. Whatever of the
+        package is already imported is set aside for the test and put back after it. The names asked are kept:
+        the loader decides absence at the package, so the package is the only name under it that is ever asked
+        for. (It used to rely on no keys lane being in the tree: the keys lane's own package made it fail.)"""
         find_spec, asked = importlib.util.find_spec, []
 
         def absent(name, package=None):
@@ -747,6 +754,34 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual(set(sys.modules) - before, set(), 'nothing was imported for a registrant that is not there')
         self.assertEqual((composed.methods.registered(), composed.commands.names(), composed.engines.names()),
                          ((), (), ('claude_code', 'codex')))
+
+        package = 'recursion_core.keys'
+        self.fake._set_aside(package)
+        find_spec, asked = importlib.util.find_spec, []
+
+        def absent(name, parent=None):
+            asked.append(name)
+            if name.startswith(package + '.'):  # what the real find_spec does below a package that is absent
+                raise ModuleNotFoundError(f'No module named {package!r}', name=package)
+            return None if name == package else find_spec(name, parent)
+        with mock.patch.object(importlib.util, 'find_spec', absent):
+            composed = H.compose()
+        self.assertEqual([name for name in asked if name.startswith(package)], [package],
+                         'absent is decided at the package: the module below it is not asked for, and the package is asked once')
+        self.assertEqual(composed.methods.registered(), ())
+        # Nothing is registered, whatever kind it is: the same defaults as a composition with no lane installed
+        # (test_nothing_is_installed_today...), and every table a registrant can write to. A registrant that was
+        # reached after an answer of None, and put an engine, a command, a single hook, a start registrant or a
+        # service anywhere, shows here; the method table alone did not show it.
+        self.assertEqual(composed.commands.names(), (), 'no command')
+        self.assertEqual(composed.engines.names(), ('claude_code', 'codex'), 'no engine')
+        self.assertFalse(composed.start_on, 'no start registrant')
+        self.assertIsNone(composed.read_result('run-1'), 'no result reader')
+        self.assertFalse(composed.gate.enabled)
+        self.assertIsNone(composed.changes)
+        self.assertEqual((composed._single, composed._start, composed._services), ({}, {}, []),
+                         'no single hook, no start registrant, no service')
+        self.assertNotIn('recursion_core.keys', sys.modules)
 
     def test_a_package_with_no_hooks_module_is_skipped(self) -> None:
         package = self.fake.lane('keys')
@@ -3439,14 +3474,12 @@ class RegionWalk:
     def at_the_marker(self) -> bool:
         """Whether the last interruption was raised at the one kind of point this walk names as beyond protection:
         on 3.14, the marker instruction the interpreter puts after a conditional jump that is not taken
-        (``NOT_TAKEN``), where it stands outside every handler, in the region or in a callee. No signal
+        (``NOT_TAKEN``), where it stands in the region's own function and outside every handler of it. No signal
         is delivered there. A trace callback can raise there, and nothing written in Python covers it."""
-        code, offset, _outermost, event = self.raised_at
+        code, offset, outermost, _event = self.raised_at
         name = next((ins.opname for ins in dis.get_instructions(code) if ins.offset == offset), None)
         covered = any(entry.start <= offset < entry.end for entry in dis.Bytecode(code).exception_entries)
-        # A marker in a callee is outside that callee's handler and outside the caller's too, so the caller's
-        # except does not run and a lock the callee held is still held. No signal is delivered at it either.
-        return event == 'opcode' and name == 'NOT_TAKEN' and not covered
+        return outermost and name == 'NOT_TAKEN' and not covered
 
     def at_the_return(self) -> bool:
         """Whether the last interruption was raised as the region's own function RETURNED its answer: at its return
@@ -3663,10 +3696,11 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
     while the first is being put away (the instructions of the ``except`` clause and the way back to the top of
     the loop execute only after an interruption); whatever the lock's own acquire and release do inside
     themselves (one call into C each, for ``threading.RLock``); and on 3.14 the marker instruction after a
-    conditional jump that is not taken, in the region or in a callee, which no handler covers. An interruption
+    conditional jump that is not taken, in the region's own function, which no handler covers. An interruption
     raised there by the trace callback leaves the lock owned; that is the one outcome the walk by instruction
     lets pass, by name (``at_the_marker``), and only there. No signal is delivered at it. The release CALL is
-    inside the region and is walked like every other point.
+    inside the region and is walked like every other point. The settling fence names one callee beside that,
+    ``RouteStarter._release_fence``, and no other (``OwnershipRegionTest.at_the_marker``).
 
     Two regions are walked by a rule of their own. ENTERING the gate steps back: a call that raises is not in
     the count. One point is let pass there by name (``at_the_return``): the return of its answer, which the
@@ -3675,6 +3709,15 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
     gate is done once for a call. What no function can cover for itself is an interruption as it is ENTERED,
     before its first instruction, and a signal is delivered there: for ``leave`` the call is then still in the
     count, and only its caller could ask again. That is measured, not walked (see OWNERSHIP)."""
+
+    def at_the_marker(self) -> bool:
+        """Master's rule stands: a marker passes in the region's own function. The settling fence calls
+        ``_release_fence``, and a marker in that one callee is outside the caller's handler too. It is let
+        pass by the same name, in that one function and no other, the way the composition walk names
+        ``Hooks.finish_close``."""
+        code, offset, outermost, event = self.raised_at
+        self.raised_at = (code, offset, outermost or code is fence_adapter.RouteStarter._release_fence.__code__, event)
+        return super().at_the_marker()
 
     def setUp(self) -> None:
         # What the walks below rely on, looked at first, so that a closing signal without it fails here and does not
@@ -3756,7 +3799,7 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
 
     def claiming(self):
         made = self.fenced_gate()
-        starter = fence_adapter.RouteStarter(mock.Mock(), {}, mock.Mock(closed=False), '/var/tmp/grok-spine-5', hooks=made)
+        starter = fence_adapter.RouteStarter(mock.Mock(), {}, mock.Mock(closed=False), '/state', hooks=made)
         mark = {'owed': False, 'asked': False, 'released': False}
         return starter, made.gate, mark
 
@@ -3932,6 +3975,39 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
     @quiet
     def test_setting_the_closing_signal_at_every_event(self) -> None:
         self.walk('Signal.set', self.EVENTS)
+
+    def test_a_marker_in_an_unnamed_callee_does_not_pass(self) -> None:
+        """Master's rule: a NOT_TAKEN marker passes in the region's own function, outside every handler.
+        This walk names one callee, the fence's release, and no other. A marker in any other callee does
+        not pass. The instruction is supplied here, so the rule is asked on an interpreter that has no
+        such opcode of its own."""
+        release = fence_adapter.RouteStarter._release_fence.__code__
+        claim = fence_adapter.RouteStarter._claim_fence.__code__
+        marker = mock.Mock(opname='NOT_TAKEN', offset=4)
+        other = mock.Mock(opname='NOP', offset=4)
+
+        def ask(code, outermost):
+            self.raised_at = (code, 4, outermost, 'opcode')
+            return self.at_the_marker()
+
+        def ask_base(code, outermost):
+            self.raised_at = (code, 4, outermost, 'opcode')
+            return RegionWalk.at_the_marker(self)
+
+        uncovered = mock.Mock(exception_entries=[])
+        with mock.patch('dis.get_instructions', return_value=[marker]), \
+                mock.patch('dis.Bytecode', return_value=uncovered):
+            self.assertFalse(ask_base(release, False), 'the base rule refuses a callee')
+            self.assertTrue(ask_base(release, True), "the base rule passes the region's own function")
+            self.assertFalse(ask(claim, False), 'the claim frame is not the named callee')
+            self.assertTrue(ask(release, False), 'the fence walk names the release frame')
+        covered = mock.Mock(exception_entries=[mock.Mock(start=0, end=8)])
+        with mock.patch('dis.get_instructions', return_value=[marker]), \
+                mock.patch('dis.Bytecode', return_value=covered):
+            self.assertFalse(ask_base(release, True), 'a marker inside a handler does not pass')
+        with mock.patch('dis.get_instructions', return_value=[other]), \
+                mock.patch('dis.Bytecode', return_value=uncovered):
+            self.assertFalse(ask_base(release, True), 'only the marker instruction passes')
 
     @quiet
     def test_claiming_a_fence_at_every_event(self) -> None:

@@ -5,7 +5,8 @@ clipboard and OSC 0/2 titles), DCS, SOS, PM, APC, their C1 forms, other C0/C1 co
 and other invisible characters never reach the terminal. Each is replaced by a visible marker such as
 ``⟦OSC 52⟧`` so nothing is hidden either. Invisible characters are every Unicode format (``Cf``),
 private-use (``Co``) and unassigned (``Cn``) character, the line and paragraph separators (``Zl``,
-``Zp``: U+2028 and U+2029 end a line for some readers, so they could forge one), plus variation
+``Zp``: U+2028 and U+2029 end a line for some readers, so they could forge one), every lone surrogate
+(``Cs``: JSON carries one, and none can be written to a UTF-8 terminal; review 1 of #405, DeepSeek M1), plus variation
 selectors and the blank Hangul fillers, which are not in those categories but render as nothing. Parser
 state carries across chunks, so splitting the same bytes at any point gives the same text; bytes that
 end inside a UTF-8 sequence are shown as U+FFFD at ``flush``, not dropped. A control string longer than
@@ -55,7 +56,7 @@ def _marked(ch: str) -> bool:
         return False
     if ch in _EXTRA:
         return True
-    return unicodedata.category(ch) in ("Cf", "Co", "Cn", *_SEPARATORS)
+    return unicodedata.category(ch) in ("Cf", "Co", "Cs", "Cn", *_SEPARATORS)
 
 
 def visible(ch: str) -> bool:

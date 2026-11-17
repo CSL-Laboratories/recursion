@@ -110,6 +110,99 @@ class CommitWindowTests(unittest.TestCase):
             self._charge(None)
         self.assertEqual(caught.exception.code, "profile_expired")  # the early read refuses it now
 
+    def _trace(self):
+        trace = _SqlTrace(self.auth._db)
+        self.auth._db = trace
+        return trace
+
+    def test_a_clock_that_raises_on_the_reread_is_clock_invalid(self):
+        # F2: the re-read, not the early read. The first call is a valid int; the second raises.
+        clock = _RaisesOnLaterCall()
+        self.auth._clock = clock
+        with self.assertRaises(Refused) as caught:
+            self._charge(None)
+        self.assertEqual(caught.exception.code, "clock_invalid")
+        self.assertGreaterEqual(clock.calls, 2)
+        self.assertEqual(self._ledger(), (0, 0))
+
+    def test_a_moving_clock_is_reread_without_a_commit_guard(self):
+        # F4: the re-read runs even when no commit guard was given.
+        clock = _MovesAfterFirstCall(199, 200)
+        self.auth._clock = clock
+        with self.assertRaises(Refused) as caught:
+            self._charge(None)
+        self.assertEqual(caught.exception.code, "profile_expired")
+        self.assertGreaterEqual(clock.calls, 2)
+        self.assertEqual(self._ledger(), (0, 0))
+
+    def test_an_expired_profile_with_no_guard_executes_no_sql(self):
+        # F3: the early read refuses before the write transaction begins.
+        self.clock.now = 200
+        trace = self._trace()
+        with self.assertRaises(Refused) as caught:
+            self._charge(None)
+        self.assertEqual(caught.exception.code, "profile_expired")
+        self.assertEqual(trace.sql, [])
+        self.assertEqual(self._ledger(), (0, 0))
+
+    def test_a_charge_refused_under_the_guard_stops_before_the_spend_read(self):
+        # F3: the window re-read is before the spend aggregate. No SUM, no charge row.
+        trace = self._trace()
+        self._refused(MovesTheClock(self.clock, 200), "profile_expired")
+        text = "\n".join(trace.sql)
+        self.assertNotIn("SUM(amount_minor)", text)
+        self.assertNotIn("INSERT INTO charges", text)
+        self.assertTrue(trace.sql, text)
+        self.assertEqual(trace.sql[-1], "ROLLBACK")
+        self.assertTrue(trace.sql[-2].startswith("SELECT 1 FROM charges"))
+
+    def test_a_replayed_charge_stops_at_the_replay_read(self):
+        # F3: a replay refusal writes nothing further after the replay SELECT.
+        self._charge(MovesTheClock(self.clock, 150), key="idem-replay")
+        trace = self._trace()
+        with self.assertRaises(Refused) as caught:
+            self._charge(MovesTheClock(self.clock, 150), key="idem-replay")
+        self.assertEqual(caught.exception.code, "effect_replayed")
+        text = "\n".join(trace.sql)
+        self.assertNotIn("SUM(amount_minor)", text)
+        self.assertNotIn("INSERT INTO charges", text)
+        self.assertEqual(trace.sql[-1], "ROLLBACK")
+        self.assertTrue(trace.sql[-2].startswith("SELECT 1 FROM charges"))
+
+
+class _SqlTrace:
+    def __init__(self, real):
+        self._real = real
+        self.sql = []
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def execute(self, sql, *args):
+        self.sql.append(" ".join(str(sql).split()))
+        return self._real.execute(sql, *args)
+
+
+class _RaisesOnLaterCall:
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if self.calls >= 2:
+            raise RuntimeError("clock source died on the re-read")
+        return 199
+
+
+class _MovesAfterFirstCall:
+    def __init__(self, first, later):
+        self.calls = 0
+        self.first, self.later = first, later
+
+    def __call__(self):
+        self.calls += 1
+        return self.first if self.calls == 1 else self.later
+
 
 if __name__ == "__main__":
     unittest.main()

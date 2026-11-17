@@ -24,8 +24,10 @@ This breaker is the other way round (PRODUCT.md 055cc7a5, CSLR-D-011: 3.4 S3 and
   lease is bounded at the probe run's own deadline plus ``probe_grace_s`` (PRODUCT.md 11.2, C1-18),
   or ``probe_lease_s`` when the caller gives no deadline: a probe that never reports cannot hold it
   forever, and a probe still inside its deadline is never joined by a second one.
-  Probe success closes; a probe that hits a limit reopens with backoff (the key the limit names);
-  its lease is freed on whichever key held it; ``reset`` closes at once.
+  Probe success shuts the key, unless a limit was booked at or after the moment this probe's lease
+  began: that success is about a run that started earlier, so the lease is released and the key
+  stays open for the vendor window. A probe that hits a limit reopens with backoff (the key the
+  limit names); its lease is freed on whichever key held it; ``reset`` closes at once.
 
 The cooldown, lease and short-fault numbers are uncalibrated defaults (PRODUCT.md 11.2, B-10);
 this module does not claim to have measured anything. It is thread-safe: one lock guards all
@@ -41,6 +43,22 @@ from collections.abc import Callable
 from recursion_core.routes import contract as c
 
 CLOSED, OPEN, HALF_OPEN = "closed", "open", "half_open"
+
+
+def _escape_marker(text: str) -> str:
+    """Double every ``#`` so an id cannot forge the ``#model:`` display marker."""
+
+    return text.replace("#", "##")
+
+
+def _clock_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _booked_during_lease(booked: object, started: object) -> bool:
+    """True when the limit was booked at the same clock reading as the lease, or later."""
+
+    return _clock_number(booked) and _clock_number(started) and booked >= started
 
 
 class ConnectionBreaker:
@@ -68,16 +86,26 @@ class ConnectionBreaker:
     # -- keys ---------------------------------------------------------------------------------
     @staticmethod
     def model_key(connection: str, model: str) -> str:
-        """Display form of a model bucket. Storage uses a tuple, so this string is not a dict key."""
+        """Display form of a model bucket. Storage uses a tuple, so this string is not a dict key.
 
-        return f"{connection}#model:{model}"
+        ``#`` inside either id is doubled, so the ``#model:`` marker between them cannot be forged.
+        """
+
+        return f"{_escape_marker(connection)}#model:{_escape_marker(model)}"
 
     @staticmethod
     def _slot(connection: str, model: str | None) -> tuple:
         return (connection,) if model is None else (connection, model)
 
     def _display(self, slot: tuple) -> str:
-        return slot[0] if len(slot) == 1 else self.model_key(slot[0], slot[1])
+        if len(slot) == 1:
+            connection = slot[0]
+            # A connection id may itself contain the model marker. Doubling '#' keeps a notice from
+            # reading that id as a model bucket. An id with no '#' is unchanged.
+            if "#" in connection:
+                return _escape_marker(connection)
+            return connection
+        return self.model_key(slot[0], slot[1])
 
     def _slots_for(self, connection: str, model: str) -> tuple[tuple, ...]:
         slots = [self._slot(connection, None), self._slot(connection, model)]
@@ -126,7 +154,8 @@ class ConnectionBreaker:
                 return {"admitted": True, "code": None, "probe": None, "retry_at": None, "key": None}
             rec = self._keys[probe_key]
             token = f"probe-{next(self._tokens)}"
-            rec.update(state=HALF_OPEN, probe=token, lease_until=now + self.probe_lease_s(deadline_s))
+            rec.update(state=HALF_OPEN, probe=token, lease_until=now + self.probe_lease_s(deadline_s),
+                       lease_started=now)
             return {"admitted": True, "code": None, "probe": token, "retry_at": None, "key": self._display(probe_key)}
 
     # -- outcomes -----------------------------------------------------------------------------
@@ -178,9 +207,10 @@ class ConnectionBreaker:
         # now + max_open_s and is capped here; adapters translate so a real reset is not the cap.
         until = min(reset_at, now + self._max_open_s) if reset_at is not None and reset_at > now else now + backoff
         if live_lease:
-            rec.update(state=OPEN, open_until=until, source=signal["source"])
+            rec.update(state=OPEN, open_until=until, source=signal["source"], booked_at=now)
         else:
-            rec.update(state=OPEN, open_until=until, probe=None, lease_until=None, source=signal["source"])
+            rec.update(state=OPEN, open_until=until, probe=None, lease_until=None, lease_started=None,
+                       source=signal["source"], booked_at=now)
         return until
 
     def _backoff(self, failures: int) -> float:
@@ -208,14 +238,20 @@ class ConnectionBreaker:
         rec = self._find_probe(probe)
         if rec is None:
             return None
-        rec.update(state=CLOSED, failures=0, probe=None, lease_until=None)
+        # A limit booked while this probe ran is newer evidence than the probe's success.
+        # Release the lease and leave the vendor window in place.
+        if rec.get("state") == OPEN and _booked_during_lease(rec.get("booked_at"), rec.get("lease_started")):
+            rec.update(probe=None, lease_until=None, lease_started=None)
+            return "probe_released"
+        rec.update(state=CLOSED, failures=0, probe=None, lease_until=None, lease_started=None, booked_at=None)
         return "closed"
 
     def _release(self, probe: str | None, now: float) -> str | None:
         rec = self._find_probe(probe)
         if rec is None:
             return None
-        rec.update(probe=None, lease_until=None)  # stays half-open; next admit leases a new probe
+        # State stays. The next admit leases a new probe when the window allows it.
+        rec.update(probe=None, lease_until=None)
         return "probe_released"
 
     # -- operator -----------------------------------------------------------------------------

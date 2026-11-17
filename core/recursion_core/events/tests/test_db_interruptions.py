@@ -1,10 +1,12 @@
 """Transaction ownership and interruptions in events/db.py: the sweeps' triage of Nov 16, Draft 1 (EV1, EV2, EV6, EV3).
 
-The four red tests of the triage (``EVENTS-red-tests.patch``, its ``TransactionTests`` and ``test_EV3_*``) are kept as
-they were written, and each case runs on the helper's fake and on the real store. Around them, the same promise is
-held at its other points: an interruption right after BEGIN ran, an owner that ends its transaction after a foreign
-exit was refused, SystemExit at COMMIT, an interruption at a declaration's COMMIT, and an interruption that a
-subscriber raises. An interruption here is an exception that is not an ``Exception``: KeyboardInterrupt, SystemExit.
+The four red tests of the triage (``EVENTS-red-tests.patch``, its ``TransactionTests`` and ``test_EV3_*``) are here with
+their assertions as written. They run on this module's store (each case runs on the helper's fake and on the real
+store), EV6's proxy is this module's ``ConnProxy``, and EV3 also asserts that the failure is logged. Around them, the
+same promise is held at its other points: an interruption right after BEGIN ran, an owner that ends its transaction
+after a foreign exit was refused, SystemExit at COMMIT, an interruption at a declaration's COMMIT, an interruption
+after a declaration's BEGIN, an interruption during a ROLLBACK, and an interruption that a subscriber raises.
+An interruption here is an exception that is not an ``Exception``: KeyboardInterrupt, SystemExit.
 """
 
 from __future__ import annotations
@@ -32,16 +34,19 @@ def event(kind='result', log='run:run-1', payload=None, **extra):
 
 
 class ConnProxy:
-    """The store's connection, with one statement made to raise ``exc`` instead of running."""
+    """The store's connection, with one statement made to raise ``exc`` instead of running: every time, or only its
+    first ``times`` times."""
 
-    def __init__(self, real, statement: str, exc: BaseException) -> None:
-        self._real, self._statement, self._exc = real, statement, exc
+    def __init__(self, real, statement: str, exc: BaseException, times: int | None = None) -> None:
+        self._real, self._statement, self._exc, self._left = real, statement, exc, times
 
     def __getattr__(self, name):
         return getattr(self._real, name)
 
     def execute(self, sql, *args):
-        if sql == self._statement:
+        if sql == self._statement and (self._left is None or self._left > 0):
+            if self._left is not None:
+                self._left -= 1
             raise self._exc
         return self._real.execute(sql, *args)
 
@@ -125,6 +130,82 @@ class TransactionTests(Case):
                     pass
             self.assertFalse(events_db.in_transaction(), 'the mark is taken back')
             self.assertUsable(store)
+
+    def test_an_interruption_after_a_declarations_begin_leaves_the_store_usable(self) -> None:
+        # DeepSeek r1 on #441, FINDING 1 (db.py:823): the declaration's BEGIN was outside its try.
+        store = self.new_store()
+        real, calls = store._statement, []
+
+        def begun_then_interrupted(sql):
+            real(sql)
+            if sql == 'BEGIN IMMEDIATE' and not calls:
+                calls.append(1)
+                raise KeyboardInterrupt
+        store._statement = begun_then_interrupted
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                store.register_tables('triage', 1, 'CREATE TABLE triage_items (id INTEGER PRIMARY KEY)')
+        finally:
+            del store._statement
+        self.assertIsNone(store._failed)
+        self.assertUsable(store)
+        store.register_tables('triage', 1, 'CREATE TABLE triage_items (id INTEGER PRIMARY KEY)')   # nothing was kept
+
+    def test_an_interruption_during_a_rollback_leaves_no_transaction_open(self) -> None:
+        # DeepSeek r1 on #441, FINDING 2 (probe P10): the body raises, and the rollback is interrupted once.
+        store = self.new_store()
+        real = store._conn
+        store._conn = ConnProxy(real, 'ROLLBACK', KeyboardInterrupt(), times=1)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                with store.transaction() as tx:
+                    tx.append(event())
+                    raise ValueError('the body fails')
+        finally:
+            store._conn = real
+        self.assertIsNone(store._failed, 'the second ROLLBACK ran')
+        self.assertEqual(store.events, [])
+        self.assertUsable(store)
+
+    def test_an_interruption_during_the_openings_rollback_still_gives_the_count_back(self) -> None:
+        # DeepSeek r1 on #441, FINDING 2 (probe P2): interrupted after BEGIN, then again during the rollback.
+        store = self.new_store()
+        real_statement, real_conn, calls = store._statement, store._conn, []
+
+        def begun_then_interrupted(sql):
+            real_statement(sql)
+            if sql == 'BEGIN IMMEDIATE' and not calls:
+                calls.append(1)
+                raise KeyboardInterrupt
+        store._statement = begun_then_interrupted
+        store._conn = ConnProxy(real_conn, 'ROLLBACK', KeyboardInterrupt(), times=1)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                with store.transaction():
+                    pass
+        finally:
+            del store._statement
+            store._conn = real_conn
+        self.assertUsable(store)
+
+    def test_a_rollback_that_cannot_be_run_again_fails_the_store(self) -> None:
+        # FINDING 2's other end: every ROLLBACK is interrupted, so the connection still holds the transaction.
+        store = self.new_store()
+        real = store._conn
+        store._conn = ConnProxy(real, 'ROLLBACK', KeyboardInterrupt())
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                with store.transaction() as tx:
+                    tx.append(event())
+                    raise ValueError('the body fails')
+        finally:
+            store._conn = real
+        self.assertEqual(store._failed, 'rollback_failed')
+        self.assertEqual(store._open_count, 0)
+        self.assertFalse(store._lock.locked())
+        with self.assertRaisesRegex(StoreError, 'store_failed'):
+            store.transaction().__enter__()             # refused by name, not a raw sqlite3 error
+        real.execute('ROLLBACK')                        # for the cleanup: the test's own connection state
 
     def test_EV2_another_thread_cannot_exit_the_owners_transaction(self) -> None:
         # The triage's red test (s2b-events-db-sol F02, s2b-events-db-astra F02; db.py:320).

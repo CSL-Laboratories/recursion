@@ -46,6 +46,22 @@ REFUSALS = (
 )
 (_NEEDS_KEYS, _ONLY_READS, _BAD_ID, _DUPLICATE_OR_TITLE, _BAD_READS, _BAD_VENUE, _BAD_VENUE_USE,
  _BAD_WITHHOLD) = REFUSALS
+# Identity, not text. A declaration can raise ValueError with the same characters as a refusal.
+_OWN_REFUSAL = object()
+
+
+def _mark_refusal(text):
+    """Raise a refusal this registry decided. The marker is not part of the public text."""
+    exc = ValueError(text)
+    object.__setattr__(exc, "_own_refusal", _OWN_REFUSAL)
+    raise exc
+
+
+def _is_own_refusal(exc):
+    try:
+        return object.__getattribute__(exc, "_own_refusal") is _OWN_REFUSAL
+    except AttributeError:
+        return False
 
 
 def panel_registry(panels):
@@ -66,34 +82,36 @@ def panel_registry(panels):
             raise ValueError(_NEEDS_KEYS) from exc
         try:
             if not isinstance(panel, Mapping) or not REQUIRED_PANEL_KEYS <= panel.keys():
-                raise ValueError(_NEEDS_KEYS)
+                _mark_refusal(_NEEDS_KEYS)
             if set(panel) - PANEL_KEYS:
-                raise ValueError(_ONLY_READS)
+                _mark_refusal(_ONLY_READS)
             pid, title, reads = panel["id"], panel["title"], panel["reads"]
             if type(pid) is not str or not re.fullmatch(r"[A-Za-z0-9_.-]{1,96}", pid):
-                raise ValueError(_BAD_ID)
+                _mark_refusal(_BAD_ID)
             if pid in registered or type(title) is not str or not title.strip():
-                raise ValueError(_DUPLICATE_OR_TITLE)
+                _mark_refusal(_DUPLICATE_OR_TITLE)
             # One copy, taken before any check: what is checked is what is kept.
             reads = tuple(reads) if type(reads) in (list, tuple) else ()
             if not reads or any(type(r) is not str or r not in READS for r in reads):
-                raise ValueError(_BAD_READS)
+                _mark_refusal(_BAD_READS)
             venue = panel.get("venue")
             if venue is not None and (type(venue) is not str or not re.fullmatch(r"[a-z0-9_]{1,48}", venue)):
-                raise ValueError(_BAD_VENUE)
+                _mark_refusal(_BAD_VENUE)
             venue_use = panel.get("venue_use")
             if venue_use is not None and (type(venue_use) is not str
                                           or not re.fullmatch(r"[a-z0-9_]{1,48}:[a-z0-9_]{1,48}", venue_use)):
-                raise ValueError(_BAD_VENUE_USE)
+                _mark_refusal(_BAD_VENUE_USE)
             if type(panel.get("withhold_venue_data", True)) is not bool:
-                raise ValueError(_BAD_WITHHOLD)
+                _mark_refusal(_BAD_WITHHOLD)
             # Always use the shared venue-data filter, even if the plugin asks otherwise.
             # O7 reads stay unscoped; venue_use is a label; declared venue filters data after the read.
             # paper and stock are one book in that filter (PAPER_BOOK); the panel still declares one id.
             registered[pid] = MappingProxyType({"title": title, "reads": tuple(dict.fromkeys(reads)),
                                                 "venue": venue, "venue_use": venue_use})
         except ValueError as exc:
-            if exc.args and exc.args[0] in REFUSALS:
+            # A read error can carry a refusal's text, be a subclass, or refuse equality.
+            # Only a refusal this function marked is passed on unchanged.
+            if _is_own_refusal(exc):
                 raise
             raise ValueError(_NEEDS_KEYS) from exc
         except Exception as exc:  # noqa: BLE001 - an unreadable declaration gets the first refusal

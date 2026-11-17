@@ -39,16 +39,19 @@ class GuiSweepRegressions(unittest.TestCase):
 
     def test_f1_json_surrogates_get_an_encoded_response_with_page_headers(self):
         replies = [
-            ("/read", "command=" + READS[0], None, (200, b'{"status_code":"\\ud800"}')),
-            ("/", "", None, (200, b'{"routes":[{"class":"engine","engine":"codex","sign_in":"\\ud800"}]}')),
-            ("/stop", "", {"run_id": "run-1", "confirm": "explicit"}, (200, b'{"state":"\\ud800"}')),
+            ("/read", "command=" + READS[0], None, (200, b'{"status_code":"MARKER\\ud800"}')),
+            ("/", "", None, (200, b'{"routes":[{"class":"engine","engine":"codex","sign_in":"MARKER\\ud800"}]}')),
+            ("/stop", "", {"run_id": "run-1", "confirm": "explicit"}, (200, b'{"state":"MARKER\\ud800"}')),
         ]
         for path, query, form, reply in replies:
             with self.subTest(path=path):
                 status, headers, body = self.request(self.make_app(reply), path, query=query, form=form)
-                self.assertIn(status[:3], ("200", "500", "502"))
+                self.assertEqual(status, "500 Internal Server Error")
                 self.assertEqual(headers["Cache-Control"], "no-store")
                 self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
+                self.assertIn("does not know whether", body)
+                self.assertIn("UnicodeEncodeError", body)
+                self.assertNotIn("MARKER", body)
 
     def test_f2_enabled_switch_survives_venue_filtering(self):
         panel = {"id": "p", "title": "Paper", "reads": [READS[0]], "venue": "paper"}
@@ -97,6 +100,8 @@ class GuiSweepRegressions(unittest.TestCase):
             panel_registry([UnreadablePanel()])
         self.assertIs(type(caught.exception), ValueError)
         self.assertEqual(caught.exception.args, (REFUSALS[0],))
+        self.assertIs(type(caught.exception.__cause__), OSError)
+        self.assertEqual(caught.exception.__cause__.args, ("declaration source is unavailable",))
 
     def test_f5_installed_requirements_are_isolated_from_the_callers_mutations(self):
         required = {"venue_use": ["paper:own_trading"]}

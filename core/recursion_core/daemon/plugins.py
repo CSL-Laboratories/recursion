@@ -191,6 +191,11 @@ def _finding(code, severity, detail=''):
     return {'stage': 'daemon', 'code': code, 'severity': severity, 'detail': detail}
 
 
+def _one_line(value):
+    """Log text with CR and LF escaped, so a plugin path cannot forge a second log record."""
+    return str(value).replace('\r', '\\r').replace('\n', '\\n')
+
+
 def _first_imports(before, own=None):
     """Non-stdlib modules in ``sys.modules`` now that were not in ``before``, sorted.
 
@@ -418,7 +423,7 @@ class PluginHost:
         try:
             sources, trusted = self._sources(self._plugin_dirs)
         except OSError as exc:  # the install directory could not be listed: typed, never an escape
-            log.error('plugin directory %s cannot be listed (%s): no plugin is loaded', self._config,
+            log.error('plugin directory %s cannot be listed (%s): no plugin is loaded', _one_line(self._config),
                       type(exc).__name__)
             self._publish({'source': str(self._config), 'plugin_id': None, 'state': 'refused',
                            'code': 'plugin_directory_unreadable', 'detail': type(exc).__name__,
@@ -478,7 +483,7 @@ class PluginHost:
             return explicit, True
         if not _owned_directory(self._config):
             log.error('plugin directory %s is not an operator-owned directory, or is group/other writable: '
-                      'install.json is not read and every plugin is refused', self._config)
+                      'install.json is not read and every plugin is refused', _one_line(self._config))
             self._publish({'source': str(self._config), 'plugin_id': None, 'state': 'refused',
                            'code': 'plugin_directory_untrusted', 'detail': 'install directory', 'findings': []})
             return explicit, False
@@ -549,7 +554,7 @@ class PluginHost:
             manifest_ok = next((f for f in findings if f.get('code') == 'manifest_ok'), None)
             if manifest_ok is not None:
                 record['plugin_id'] = manifest_ok.get('detail')
-            log.error('plugin at %s refused: %s; the daemon runs without it', source, exc)
+            log.error('plugin at %s refused: %s; the daemon runs without it', _one_line(source), _one_line(exc))
             return record, {}
         record.update(plugin_id=loaded.plugin_id, state='loaded', code=None, trust=loaded.trust,
                       signer_key_id=loaded.signer_key_id, registry_label=loaded.registry_label,
@@ -816,14 +821,21 @@ class PluginHost:
             raise
         if done.wait(self._operator_deadline_s):
             return outcome
+        # The wait already ended. A worker that finishes before this thread takes ``_turn`` again
+        # does not turn that timeout into a timely answer (F07). It is not left marked stuck.
         with self._turn:
-            if done.is_set():
-                return outcome
-            self._stuck = plugin_id
+            finished = done.is_set()
             self.degraded[plugin_id] = self.degraded.get(plugin_id, 0) + 1
+            if not finished:
+                self._stuck = plugin_id
             self._turn.notify_all()
-        log.error('operator plugin %s did not answer within %.1f s: answered %s; marked degraded, and no new '
-                  'call goes to it until this one returns', plugin_id, self._operator_deadline_s, OPERATOR_TIMED_OUT)
+        if finished:
+            log.error('operator plugin %s answered after its %.1f s deadline: answered %s; marked degraded',
+                      _one_line(plugin_id), self._operator_deadline_s, OPERATOR_TIMED_OUT)
+        else:
+            log.error('operator plugin %s did not answer within %.1f s: answered %s; marked degraded, and no new '
+                      'call goes to it until this one returns', _one_line(plugin_id), self._operator_deadline_s,
+                      OPERATOR_TIMED_OUT)
         return 504, {'error': OPERATOR_TIMED_OUT}
 
     def close(self):

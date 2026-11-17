@@ -1,6 +1,7 @@
-"""E21: a symlinked revocation store is not opened.
+"""E21, and a plugin directory name that must not forge a log record.
 
-``test_a_symlinked_revocation_store_must_not_be_opened``. Fixture bytes are generated here.
+``test_a_symlinked_revocation_store_must_not_be_opened`` and
+``test_plugin_paths_must_not_inject_log_records``.
 """
 import os
 from pathlib import Path
@@ -45,6 +46,16 @@ class PluginRegressions(unittest.TestCase):
         (state_dir / 'revoked.sqlite3').symlink_to(target)
         host = self.host(b'VALUE = 1\n')
         self.assertEqual(host.records[0]['state'], 'refused', 'loaded through a symlinked revocation store')
+
+    def test_plugin_paths_must_not_inject_log_records(self):
+        source = self.root / 'fixture\nSYNTHETIC-FORGED-LOG-LINE'
+        source.mkdir(mode=0o700)
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR') as captured:
+            host = plugins.PluginHost(self.root / 'config', self.root / 'state',
+                                      plugin_dirs=(source,), gil_probe=GilOff(), verification_available=lambda: True)
+        self.addCleanup(host.close)
+        self.assertEqual(host.records[0]['code'], 'plugin_file_missing')
+        self.assertNotIn('\nSYNTHETIC-FORGED-LOG-LINE', '\n'.join(captured.output))
 
 
 if __name__ == '__main__':

@@ -116,6 +116,19 @@ def _require_own_file(path, *, required):
         return
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
         raise Refused('breaker_store_untrusted', f'{path.name} must be an operator-owned regular file, not a symlink')
+    if required and stat.S_IMODE(info.st_mode) != 0o600:
+        # An existing store keeps the mode it was left with. The file this daemon creates is 0600;
+        # a looser mode is tightened here, or the open is refused (the private-file rule).
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as exc:
+            raise Refused('breaker_store_untrusted', path.name) from exc
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError as exc:
+            raise Refused('breaker_store_untrusted', path.name) from exc
+        finally:
+            os.close(fd)
 
 
 class DurableRouteBreaker:

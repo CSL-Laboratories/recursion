@@ -36,7 +36,9 @@ How a turn ends (``turn_ended``; outcomes are session.v1's):
 
 Before every ``turn_ended`` (a turn interrupted before its first call, and a loop error, included) the turn's
 usage (``span: "turn"``, the sum of its calls) and the session's running total (``span: "session_total"``, never
-to be added up) are written. A sum that includes a call whose count is unknown is a lower bound, never a guess;
+to be added up) are written. If the turn's own finaliser raises, those two spans are written from the sums
+already held, or as unknown when that write itself fails; the end line is written after them. A sum that
+includes a call whose count is unknown is a lower bound, never a guess;
 a sum over no call at all is a known 0 (no call was made), which is not the unknown of a call that measured
 nothing. A sum keeps where its numbers came from: ``observed`` only when every count in it was observed;
 otherwise ``modelled`` when some were modelled and none inferred, and ``inferred`` when any was inferred (the
@@ -646,11 +648,33 @@ class Engine:
                     f"recursion_loop: turn {item.turn_id} failed inside the loop: {type(exc).__name__}: {exc}"))
                 try:
                     self.session.fail_turn(item.turn_id, type(exc).__name__)
-                except Exception:  # noqa: BLE001 - the end is written regardless, without its totals
-                    self._ending(partial(self.writer.write, "turn_ended", turn_id=item.turn_id, outcome="failed",
-                                         result={"code": "loop_error", "detail": type(exc).__name__,
-                                                 "result_ref": None},
-                                         reason="loop_error"))
+                except Exception:  # noqa: BLE001 - the end is written regardless; the totals already summed go first
+                    turn_id = item.turn_id
+                    detail = type(exc).__name__
+
+                    def write_end() -> None:
+                        # The call's usage was counted before fail_turn ran. Write those sums, then the end.
+                        # If that write fails, write unknown totals. If that fails too, the end line still goes out.
+                        try:
+                            turn_usage = self.session._turn_usage or UsageTotal()
+                            self.writer.write("usage", turn_id=turn_id, span="turn", model=turn_usage.model,
+                                              **turn_usage.to_wire())
+                            session_usage = self.session.session_usage
+                            self.writer.write("usage", turn_id=turn_id, span="session_total",
+                                              model=session_usage.model, **session_usage.to_wire())
+                        except Exception:  # noqa: BLE001 - unknown totals, then the end line, still
+                            try:
+                                blank = b.Usage().to_wire()
+                                self.writer.write("usage", turn_id=turn_id, span="turn", model=None, **blank)
+                                self.writer.write("usage", turn_id=turn_id, span="session_total", model=None,
+                                                  **blank)
+                            except Exception:  # noqa: BLE001 - the end line below is the one that must be written
+                                pass
+                        self.writer.write("turn_ended", turn_id=turn_id, outcome="failed",
+                                          result={"code": "loop_error", "detail": detail, "result_ref": None},
+                                          reason="loop_error")
+
+                    self._ending(write_end)
             finally:
                 with self._lock:
                     self._live = None

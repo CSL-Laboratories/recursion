@@ -40,6 +40,7 @@ from typing import Any
 
 from recursion_core.loop.providers import base as b
 from recursion_core.loop.tools.registry import ERROR, OK, Tool, ToolContext, ToolOutput
+from recursion_core.loop.tools.workspace import ToolError
 
 DEFAULT_TIMEOUT_S = 120
 MAX_TIMEOUT_S = 600
@@ -259,7 +260,13 @@ def run_command(command: str, cwd: str, cancel: b.CancelToken, timeout_s: float)
     unregister = None
     timed_out = False
     try:
-        capture = _Capture(proc.stdout)
+        try:
+            capture = _Capture(proc.stdout)
+        except OSError as exc:
+            # The capture's own line says an unreadable pipe refuses the command. Raised as a tool error so the
+            # caller sees a refusal, not a crash of the tool (DeepSeek R3-6). The finally below stops the process.
+            raise ToolError("refused: the command's output cannot be waited on or polled "
+                            f"({type(exc).__name__}: {exc})") from None
         unregister = cancel.on_cancel(lambda: _ask_stop(proc, reaper))  # at once if cancelled since the check
         try:
             proc.wait(max(0.0, deadline - time.monotonic()))

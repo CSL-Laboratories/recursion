@@ -154,8 +154,9 @@ class PermissionGate:
     def ask(self, turn_id: str, call: b.ToolCall, cwd: str, cancel: b.CancelToken,
             facts: Mapping[str, Any] | None = None) -> Decision:
         """Ask for one call and wait. Called on the turn's thread. ``facts`` (from the tool's precheck) are
-        written on the request beside the input; facts ``check_facts`` refuses raise ValueError before anything is
-        asked."""
+        written on the request beside the input. None, or a precheck value that is not a mapping, means no
+        facts. A non-mapping passed here (not via that precheck path) raises ValueError before anything is
+        asked, as do facts ``check_facts`` refuses."""
 
         args = snapshot(dict(call.input or {}))  # this copy is the request; nothing outside holds it
         size = len(json.dumps({"tool": call.name, "cwd": cwd, "input": args}, ensure_ascii=False,
@@ -164,6 +165,10 @@ class PermissionGate:
             return Decision(TOO_LARGE)
         if cancel.cancelled:
             return Decision(CANCELLED)  # nothing is asked for a turn already interrupted (a later one is caught below)
+        # A precheck may return a non-mapping, and check_facts ignores that. ask itself was given facts to
+        # write: anything that is not a mapping (or None) is refused before a request exists.
+        if facts is not None and not isinstance(facts, Mapping):
+            raise ValueError("facts must be a mapping of names the request may show")
         extra = check_facts(facts) or {}
         request_id = self._mint()
         if self.profile == FULL_ACCESS:
@@ -202,10 +207,16 @@ class PermissionGate:
                     remaining = pending.expires - self._clock()
                 pending.done.wait(remaining)
         finally:
-            if unregister is not None:
-                unregister()
+            # Pop first. The remover runs after the request is gone, and a remover that raises must not
+            # leave it waiting or replace the decision already made (DeepSeek R4-1). A real token's remover
+            # only drops its callback; it does not raise.
             with self._lock:
                 self._pending.pop(request_id, None)
+            if unregister is not None:
+                try:
+                    unregister()
+                except Exception:  # noqa: BLE001 - the request is already gone; bookkeeping must not undo that
+                    pass
         if cancel.cancelled:
             return Decision(CANCELLED)  # an interrupt is final, whatever came before it
         decision = pending.decision

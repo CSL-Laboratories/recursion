@@ -1,4 +1,4 @@
-"""The per-user daemon's systemd user unit: install, upgrade, uninstall (lane INSTALL).
+"""The per-user daemon's systemd user unit and its stores: install, upgrade, uninstall (lane INSTALL).
 
 Ported from branch cursor/csl-758-daemon-install-b4bd (59b96a7b, CSL-758), not merged; see README.md
 for what changed. It writes files under the roots the caller passes and returns the
@@ -6,9 +6,9 @@ for what changed. It writes files under the roots the caller passes and returns 
 """
 
 from .errors import InstallRefused
-from .install import Plan, install, leftovers, plan_commands, uninstall, upgrade
+from .install import Plan, ensure_stores, install, leftovers, plan_commands, uninstall, upgrade
 from .layout import Owned, Roots, owned_paths
-from .unit import DAEMON_MODULE, MARKER, STOP_TIMEOUT_S, UNIT_NAME, daemon_exec_args, render_unit, service_fields
+from .unit import DAEMON_MODULE, MARKER, STATE_HOME, STOP_TIMEOUT_S, UNIT_NAME, daemon_exec_args, render_unit, service_fields
 
 __all__ = [
     "DAEMON_MODULE",
@@ -17,9 +17,11 @@ __all__ = [
     "Owned",
     "Plan",
     "Roots",
+    "STATE_HOME",
     "STOP_TIMEOUT_S",
     "UNIT_NAME",
     "daemon_exec_args",
+    "ensure_stores",
     "install",
     "leftovers",
     "owned_paths",

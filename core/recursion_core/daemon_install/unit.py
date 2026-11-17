@@ -25,6 +25,11 @@ DAEMON_MODULE = "recursion_core.daemon"
 # The unit's first line. ``uninstall`` removes only a unit that starts with it.
 MARKER = "# Recursion per-user daemon, written by `recursiond install` (csl-recursion)."
 STOP_TIMEOUT_S = 90  # systemd's own default, stated: finite, and long enough for a normal drain
+# The daemon keeps its state in $XDG_STATE_HOME/recursion, or <home>/.local/state/recursion when the
+# variable is unset (daemon/__main__.py). The unit sets the variable to that default under the user
+# manager's %h, the folder `install` creates the stores in, so a value in the user manager's own
+# environment cannot point the daemon at another state folder than the one install prepared.
+STATE_HOME = ".local/state"  # relative to the home
 MAX_ARGS = 16
 MAX_ARG_LEN = 256
 _ARG = re.compile(r"[A-Za-z0-9_./:%@=+-]+")
@@ -81,12 +86,14 @@ def render_unit(exec_args: tuple[str, ...]) -> str:
         "# unit's cgroup, so stopping or killing this unit never stops a run.\n"
         f"# A stop still running after {STOP_TIMEOUT_S} s is ended with SIGKILL: a daemon crash,\n"
         "# with the run units left alive and their state recovered at the next start.\n"
+        f"# The daemon's state, with the stores `recursiond install` creates, is in %h/{STATE_HOME}/recursion.\n"
         "[Unit]\n"
         "Description=Recursion per-user daemon\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
         "UnsetEnvironment=PYTHONPATH PYTHONHOME\n"
+        f"Environment=XDG_STATE_HOME=%h/{STATE_HOME}\n"
         f"ExecStart={' '.join(exec_args)}\n"
         "Restart=on-failure\n"
         "RestartSec=2\n"
@@ -102,18 +109,18 @@ def render_unit(exec_args: tuple[str, ...]) -> str:
 
 
 def state_elsewhere(unit: bytes, home: str) -> str | None:
-    """Why the daemon a unit starts may keep its state in another folder than ``home``'s ``.local/state``
-    (the daemon's default, which the unit ``render_unit`` writes leaves in place), or ``None``: what
-    ``upgrade`` checks in a unit before it replaces it (the S6 sweep's F1 on #410, reachable here too: a
-    hand-placed unit's own ``XDG_STATE_HOME`` was dropped, and the daemon's revocations with it).
+    """Why the daemon a unit starts may keep its state in another folder than the one ``render_unit``
+    names, or ``None``: what ``upgrade`` checks in a unit before it replaces it (the S6 sweep's F1 on
+    #410: a hand-placed unit's own ``XDG_STATE_HOME`` was dropped, and the daemon's revocations with it).
 
     Its ``[Service]`` section is read as systemd reads it, near enough: an ``Environment=`` line is a
     list of assignments, each in double or single quotes or none, an empty one drops those before it,
     and the last ``XDG_STATE_HOME`` counts; a value naming ``home``'s ``.local/state`` (``%h`` is
     ``home``) is this unit's own. ``EnvironmentFile=`` can set it (its file is not read here), and
     ``PassEnvironment=XDG_STATE_HOME`` gives the daemon the user manager's own value; ``UnsetEnvironment``
-    naming it leaves the default (a ``NAME=value`` there drops only that exact assignment, as systemd
-    drops it), under ``$HOME``: the daemon's default is ``Path.home()``, which reads
+    naming it with a bare name leaves the default (a ``NAME=value`` there drops only that exact assignment,
+    as systemd drops it; with no assignment of that name in the unit, the manager's own value may be the one
+    removed, which cannot be told), under ``$HOME``: the daemon's default is ``Path.home()``, which reads
     ``HOME``, so a unit's own ``HOME`` (or an ``EnvironmentFile``, which can set it) moves the state too,
     unless it names ``home`` or ``UnsetEnvironment`` drops it. The first column-0 byte order mark in the
     file is skipped and that line is read (one at byte 0 already counts); a later column-0 mark stays on
@@ -209,9 +216,15 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
             return "passes the user manager's own XDG_STATE_HOME to the daemon (PassEnvironment)"
         value = assigned.get("XDG_STATE_HOME")
         if value and f"XDG_STATE_HOME={value}" not in unset_pairs:  # empty: the default, as the daemon reads it (Grok R2)
-            if _names(value, os.path.join(home, ".local", "state"), home):
+            if _names(value, os.path.join(home, *STATE_HOME.split("/")), home):
                 return None
             return f"sets XDG_STATE_HOME={value}"
+        if value is None and any(pair.startswith("XDG_STATE_HOME=") for pair in unset_pairs):
+            # No assignment in the unit. systemd removes the manager's variable only when it holds this exact
+            # value, and this package does not read that environment, so the folder cannot be told (DeepSeek F3-2).
+            shown = min(pair for pair in unset_pairs if pair.startswith("XDG_STATE_HOME="))
+            return (f"has UnsetEnvironment={shown}, which may remove the user manager's own value, "
+                    "so where it keeps the daemon's state cannot be told")
     # No XDG_STATE_HOME: the state is under Path.home(), which reads HOME, so the unit's own HOME moves it too
     # (DeepSeek H9-2 on #382). The user manager's own HOME is the home's.
     if "HOME" not in unset:

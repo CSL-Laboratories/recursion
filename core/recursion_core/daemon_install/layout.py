@@ -18,7 +18,19 @@ import stat
 from dataclasses import dataclass
 
 from .errors import InstallRefused
-from .unit import UNIT_NAME
+from .unit import STATE_HOME, UNIT_NAME
+
+# Where the daemon opens its stores, under its state folder (tests/test_daemon_install.py holds these
+# to the daemon's own names): daemon/__main__.py's "recursion", daemon/breaker.py's STORE_DIR and
+# STORE_FILE, daemon/plugins.py's REVOCATION_FILE.
+STATE_FOLDER = "recursion"
+STORE_FOLDER = "plugin-security"
+BREAKER_FILE = "breaker.sqlite3"
+REVOCATION_FILE = "revoked.sqlite3"
+# The route homes' custody root: daemon/launcher.py makes each route home at <state>/homes/<engine>
+# (its private_dir), and setup.route_home.check refuses a root that is missing or not owner-only, so
+# install makes it, 0700, before the first launch (lane INSTALL's question 15).
+HOMES_FOLDER = "homes"
 
 
 @dataclass(frozen=True)
@@ -30,10 +42,15 @@ class Roots:
 
 @dataclass(frozen=True)
 class Owned:
-    home: str        # the resolved root
-    unit_dir: str    # <home>/.config/systemd/user
-    unit: str        # <unit_dir>/recursion-daemon.service
-    enabled: str     # <unit_dir>/default.target.wants/recursion-daemon.service, made by `enable`
+    home: str              # the resolved root
+    unit_dir: str          # <home>/.config/systemd/user
+    unit: str              # <unit_dir>/recursion-daemon.service
+    enabled: str           # <unit_dir>/default.target.wants/recursion-daemon.service, made by `enable`
+    state: str             # <home>/.local/state/recursion, the daemon's state folder under the unit
+    store_dir: str         # <state>/plugin-security
+    breaker_store: str     # <store_dir>/breaker.sqlite3
+    revocation_store: str  # <store_dir>/revoked.sqlite3
+    homes: str             # <state>/homes, the route homes' custody root (route_home.check's root)
 
 
 def owned_paths(roots: Roots) -> Owned:
@@ -41,11 +58,18 @@ def owned_paths(roots: Roots) -> Owned:
         raise InstallRefused("roots")
     home = _directory_root(roots.home)
     unit_dir = os.path.join(home, ".config", "systemd", "user")
+    state = os.path.join(home, *STATE_HOME.split("/"), STATE_FOLDER)
+    store_dir = os.path.join(state, STORE_FOLDER)
     return Owned(
         home=home,
         unit_dir=unit_dir,
         unit=os.path.join(unit_dir, UNIT_NAME),
         enabled=os.path.join(unit_dir, "default.target.wants", UNIT_NAME),
+        state=state,
+        store_dir=store_dir,
+        breaker_store=os.path.join(store_dir, BREAKER_FILE),
+        revocation_store=os.path.join(store_dir, REVOCATION_FILE),
+        homes=os.path.join(state, HOMES_FOLDER),
     )
 
 
@@ -121,7 +145,11 @@ def ensure_dir(root: str, path: str, *, mode: int = 0o700) -> bool:
     for cur in _folders_below(root, path):
         if _existing_folder(cur):
             continue
-        os.mkdir(cur, mode)
+        try:
+            os.mkdir(cur, mode)
+        except FileExistsError:  # another caller made it since the look above: the same rule holds for it
+            _existing_folder(cur)
+            continue
         created = True
     return created
 
@@ -131,6 +159,27 @@ def check_dirs(root: str, path: str) -> None:
 
     for cur in _folders_below(root, path):
         _existing_folder(cur)
+
+
+def check_private_dir(root: str, path: str, *, required: bool = False) -> None:
+    """``check_dirs``, and ``path`` itself, if it is there, open to nobody else at all (no bit of
+    0o077) and usable by its owner (read, write and search): the route homes' custody root, which
+    ``setup.route_home.check`` (lane INSTALL's #401, a separate pull request) holds to the first rule
+    and the launcher's ``private_dir`` (``daemon/launcher.py``) needs the second for. With ``required``,
+    ``path`` must be there: the check after the root was made, which a missing root must not pass."""
+
+    check_dirs(root, path)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        if required:
+            raise InstallRefused("folder_untrusted", f"{path} is not there: it was removed after it was made; "
+                                 "run the command again") from None
+        return
+    if info.st_mode & 0o077:
+        raise InstallRefused("folder_untrusted", f"{path} is open to group or world; route homes need it owner-only: `chmod 700` it")
+    if (info.st_mode & stat.S_IRWXU) != stat.S_IRWXU:
+        raise InstallRefused("folder_untrusted", f"{path} must be readable, writable and searchable by its owner; `chmod 700` it")
 
 
 def _folders_below(root: str, path: str) -> list[str]:
@@ -188,7 +237,7 @@ def read_regular_and_stat(path: str) -> tuple[bytes, os.stat_result]:
     is for ``file_untrusted``; a caller that must compare the path again uses ``held_regular``."""
 
     with held_regular(path) as read:
-        return read
+        return read[0], read[1]
 
 
 @contextlib.contextmanager
@@ -223,9 +272,27 @@ def held_regular(path: str):
                 raise InstallRefused("too_large", path)
             chunks.append(block)
         still_names(path, info)  # while the descriptor is open: the inode is not free to be reused
-        yield b"".join(chunks), info
+        read = _Held((b"".join(chunks), info))
+        read.fd = fd
+        yield read
     finally:
         os.close(fd)
+
+
+class _Held(tuple):
+    """``(bytes, fstat)`` from ``held_regular``, with ``.fd``, the descriptor still open, for ``still_holds``."""
+
+    fd: int
+
+
+def still_holds(path: str, read: _Held) -> None:
+    """Refuse ``unit_changed`` unless the file still held open holds the bytes read from it: its owner can
+    rewrite a file in place (the same inode), which ``still_names`` cannot see. Read again through the
+    held descriptor from the start, one byte past the length read, so an append shows too."""
+
+    data = read[0]
+    if os.pread(read.fd, len(data) + 1, 0) != data:
+        raise InstallRefused("unit_changed", f"{path} was rewritten while it was read; run the command again")
 
 
 def still_names(path: str, info: os.stat_result) -> None:

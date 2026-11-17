@@ -2,17 +2,20 @@
 
 Runs outlive a daemon restart (grill Q38), so losing breaker state would remove a refusal.
 These tests need no signing, so they also run where ``cryptography`` is missing.
+``StoreOpenTests``: the store is opened through ``stores.open_store`` (lane INSTALL's handoff).
 """
 
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 import unittest
+from unittest import mock
 
 from recursion_core.plugin_security import (
     ApprovalGate, ConnectionBreaker, CoreHealth, CoreService, PluginLoader, Refused, ReservedEffects,
-    TrustStore, canonical, create_breaker_store, parse,
+    TrustStore, canonical, create_breaker_store, create_revocation_store, parse, stores,
 )
 from recursion_core.plugin_security.tests.support import FakeGilProbe, authenticate, temp_dir
 
@@ -176,6 +179,143 @@ class ProbeOverProtocolTests(unittest.TestCase):
         self._call(self.host, "breaker.report", connection="conn-a", event_type="rate_limit")
         self.assertFalse(self._call(self.host, "breaker.probe_reset", connection="conn-a", lease=lease,
                                     probe_ok=True)["result"]["reset"])
+
+
+_real_lstat = os.lstat
+
+
+@unittest.skipUnless(os.name == "posix", "Unix file modes, owners and links")
+class StoreOpenTests(unittest.TestCase):
+    """The constructor opens the store through ``stores.open_store`` (lane INSTALL's handoff).
+
+    ``daemon/breaker.py`` uses this class as ``StoredBreaker``, so the daemon's breaker refuses every
+    store ``open_store`` refuses, with the same code and detail, and still never creates one. Each
+    case below is a store ``open_store`` refuses; the constructor refused none of the
+    ``breaker_store_untrusted`` ones before the handoff.
+    """
+
+    def setUp(self) -> None:
+        self.dir = temp_dir(self)
+        self.path = os.path.join(self.dir, "breaker.db")
+
+    def assertSameRefusal(self, code: str, path: str) -> Refused:
+        with self.assertRaises(Refused) as direct:
+            stores.open_store(path, stores.BREAKER_MAGIC)
+        with self.assertRaises(Refused) as through:
+            ConnectionBreaker(path)
+        self.assertEqual(direct.exception.code, code)
+        self.assertEqual((through.exception.code, through.exception.detail),
+                         (direct.exception.code, direct.exception.detail))
+        return through.exception
+
+    def assertNothingAt(self, path: str) -> None:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            self.assertFalse(os.path.lexists(path + suffix), path + suffix)
+
+    def test_a_store_opens_with_the_settings_the_constructor_used_before(self) -> None:
+        create_breaker_store(self.path)
+        breaker = ConnectionBreaker(self.path)
+        self.addCleanup(breaker.close)
+        db = breaker._db
+        self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+        self.assertEqual(db.execute("PRAGMA synchronous").fetchone()[0], 2)  # FULL
+        self.assertEqual(db.execute("PRAGMA busy_timeout").fetchone()[0], 30000)
+        self.assertIsNone(db.isolation_level)
+        seen: list = []  # check_same_thread=False: another thread may use the connection
+        worker = threading.Thread(target=lambda: seen.append(db.execute("SELECT 1").fetchone()[0]))
+        worker.start()
+        worker.join()
+        self.assertEqual(seen, [1])
+        breaker.bind_run("run-1", "conn-a", "demo.plugin", "prov", "m1")
+        self.assertEqual(breaker.check("run-1", "conn-a", "demo.plugin"),
+                         {"provider": "prov", "model_version": "m1"})
+
+    def test_a_missing_store_is_refused_and_not_created(self) -> None:
+        error = self.assertSameRefusal("breaker_store_missing", self.path)
+        self.assertEqual(error.detail, "breaker.db")
+        self.assertNothingAt(self.path)
+
+    def test_a_store_removed_after_the_checks_is_refused_and_not_created(self) -> None:
+        create_breaker_store(self.path)
+        real_check = stores.check_store
+
+        def check_then_remove(path, magic):
+            real_check(path, magic)
+            for suffix in ("", "-wal", "-shm"):
+                if os.path.lexists(path + suffix):
+                    os.unlink(path + suffix)
+
+        with mock.patch.object(stores, "check_store", side_effect=check_then_remove):
+            with self.assertRaises(Refused) as caught:
+                ConnectionBreaker(self.path)
+        self.assertEqual(caught.exception.code, "breaker_store_missing")
+        self.assertNothingAt(self.path)
+
+    def test_a_relative_path_is_refused(self) -> None:
+        create_breaker_store(self.path)
+        self.assertSameRefusal("breaker_store_untrusted", os.path.relpath(self.path))
+
+    def test_a_link_is_refused_even_to_a_good_store(self) -> None:
+        create_breaker_store(self.path)
+        link = os.path.join(self.dir, "link.db")
+        os.symlink(self.path, link)
+        self.assertIn("symlink", self.assertSameRefusal("breaker_store_untrusted", link).detail)
+        dangling = os.path.join(self.dir, "dangling.db")
+        os.symlink(os.path.join(self.dir, "nowhere.db"), dangling)
+        self.assertSameRefusal("breaker_store_untrusted", dangling)
+        self.assertNothingAt(os.path.join(self.dir, "nowhere.db"))
+
+    def test_a_store_group_or_world_can_write_is_refused(self) -> None:
+        create_breaker_store(self.path)
+        for mode in (0o620, 0o602):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.path, mode)
+                self.assertIn("group or world", self.assertSameRefusal("breaker_store_untrusted", self.path).detail)
+        os.chmod(self.path, 0o600)
+        ConnectionBreaker(self.path).close()
+
+    def test_a_folder_that_is_a_link_or_group_writable_is_refused(self) -> None:
+        create_breaker_store(self.path)
+        linked = os.path.join(temp_dir(self), "linked")
+        os.symlink(self.dir, linked)
+        self.assertSameRefusal("breaker_store_untrusted", os.path.join(linked, "breaker.db"))
+        os.chmod(self.dir, 0o770)
+        self.addCleanup(os.chmod, self.dir, 0o700)
+        self.assertSameRefusal("breaker_store_untrusted", self.path)
+
+    def test_a_side_file_that_is_a_link_is_refused(self) -> None:
+        create_breaker_store(self.path)
+        for suffix in ("-wal", "-shm", "-journal"):
+            with self.subTest(side=suffix):
+                os.symlink(os.path.join(self.dir, "elsewhere" + suffix), self.path + suffix)
+                self.assertSameRefusal("breaker_store_untrusted", self.path)
+                os.unlink(self.path + suffix)
+        ConnectionBreaker(self.path).close()
+
+    def test_a_store_another_user_owns_is_refused(self) -> None:
+        create_breaker_store(self.path)
+
+        def fake(path, *args, **kwargs):
+            info = _real_lstat(path, *args, **kwargs)
+            if os.fspath(path) == self.path:
+                fields = list(info[:10])
+                fields[4] = info.st_uid + 1
+                return os.stat_result(fields)
+            return info
+
+        with mock.patch("os.lstat", side_effect=fake):
+            self.assertIn("another user", self.assertSameRefusal("breaker_store_untrusted", self.path).detail)
+
+    def test_a_file_that_is_not_this_store_is_refused_invalid(self) -> None:
+        with open(self.path, "wb") as fh:
+            fh.write(b"not sqlite" * 16)
+        self.assertSameRefusal("breaker_store_invalid", self.path)
+        other = os.path.join(self.dir, "revoked.db")
+        create_revocation_store(other)
+        self.assertSameRefusal("breaker_store_invalid", other)
+        empty = os.path.join(self.dir, "empty.db")
+        sqlite3.connect(empty).close()
+        self.assertSameRefusal("breaker_store_invalid", empty)
 
 
 if __name__ == "__main__":

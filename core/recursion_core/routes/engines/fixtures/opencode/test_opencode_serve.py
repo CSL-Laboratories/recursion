@@ -1510,5 +1510,133 @@ class MediumInterruptTests(Base):
                 self.assertTrue(_other_takes(driver._lock))
 
 
+def _codes_under(code):
+    """``code`` and every nested code object it holds."""
+    found = []
+
+    def walk(item):
+        if item in found:
+            return
+        found.append(item)
+        for const in item.co_consts:
+            if isinstance(const, type(item)):
+                walk(const)
+
+    walk(code)
+    return found
+
+
+class ServeRoundFiveTests(unittest.TestCase):
+    """Round 5: a cut while a turn is starting must not leave a published turn or a live process."""
+
+    def test_an_interruption_while_a_turn_starts_leaves_nothing_owed(self):
+        # One interruption at each instruction of the send, including a try line and the nested
+        # publish. Afterwards a release must end the gate turn, terminate every process, and drop
+        # the worker. An RLock acquired from its owner looks free, so the settle does not do that.
+        codes = _codes_under(oc.ServeDriver._send.__code__)
+        code_ids = set(codes)
+        broken = []
+        for code in codes:
+            for inst in dis.get_instructions(code):
+                if inst.opname in ("RESUME", "CACHE", "NOT_TAKEN"):
+                    continue
+                # The store of the spawn's return is the instruction that binds it. Raised before that
+                # store runs, the return is still on the stack: the driver does not have it yet.
+                if inst.opname in ("STORE_FAST", "STORE_DEREF") and inst.argrepr == "process":
+                    continue
+                spy = Spy()
+                driver = oc.ServeDriver(spy, port=lambda: PORT)
+                handle = driver.start(session(), None, ENV)
+                fired = []
+
+                def trace(frame, event, arg, code=code, offset=inst.offset, fired=fired):
+                    if fired:
+                        return None
+                    if frame.f_code in code_ids:
+                        frame.f_trace_opcodes = True
+                        if frame.f_code is code and event == "opcode" and frame.f_lasti == offset:
+                            fired.append(1)
+                            sys.settrace(None)
+                            raise KeyboardInterrupt
+                        return trace
+                    return None
+
+                sys.settrace(trace)
+                try:
+                    driver.send(handle, message())
+                except BaseException:  # noqa: BLE001 - the cut is the point; the settle is the assertion
+                    pass
+                finally:
+                    sys.settrace(None)
+                if not fired:
+                    continue
+                try:
+                    driver.release(handle)
+                except BaseException:  # noqa: BLE001 - a second release is the one that finishes a partial stop
+                    try:
+                        driver.release(handle)
+                    except BaseException:
+                        pass
+                owed = driver._workers != {} or handle.live_turn is not None or any(
+                    p.terminated < 1 for p in spy.processes)
+                if owed:
+                    broken.append((code.co_name, inst.offset, inst.opname,
+                                   handle.live_turn, [p.terminated for p in spy.processes],
+                                   bool(driver._workers)))
+        self.assertEqual(broken, [])
+
+    def test_an_empty_parse_after_a_start_already_read_does_not_accept(self):
+        # The start is fed while the write is still inside send, so delivery is not set yet.
+        # The empty parse afterwards reads no line. It must not accept. The next start must.
+        entered, go = threading.Event(), threading.Event()
+        spy = Spy()
+
+        def spawn(argv, env):
+            process = spy(argv, env)
+            if len(argv) > 1 and argv[1] == "run":
+                real = process.send
+
+                def send(text, _real=real):
+                    entered.set()
+                    if not go.wait(5):
+                        raise TimeoutError("the early parse did not finish")
+                    _real(text)
+
+                process.send = send
+            return process
+
+        driver = oc.ServeDriver(spy, port=lambda: PORT)
+        driver._spawn = spawn
+        handle = driver.start(session(), None, ENV)
+        box: dict = {}
+
+        def sender():
+            try:
+                driver.send(handle, message())
+            except BaseException as exc:  # noqa: BLE001 - the sender must not die silent
+                box["error"] = exc
+
+        thread = threading.Thread(target=sender)
+        thread.start()
+        self.assertTrue(entered.wait(5))
+        early = driver.parse(handle, step_start("ses_x"))
+        self.assertNotIn("input.accepted", [d["type"] for d in early])
+        go.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", box)
+        empty = driver.parse(handle, "")
+        self.assertNotIn("input.accepted", [d["type"] for d in empty])
+        later = driver.parse(handle, step_start("ses_x"))
+        self.assertIn("input.accepted", [d["type"] for d in later])
+        driver.release(handle)
+
+    def test_release_names_the_calls_that_need_the_server(self):
+        self.assertIn("every later call that needs the handle's server", oc.ServeDriver.__doc__)
+
+    def test_the_abort_text_says_the_status_line_decides(self):
+        self.assertIn("The status line decides", oc.http_abort.__doc__)
+
+
 if __name__ == "__main__":
     unittest.main()

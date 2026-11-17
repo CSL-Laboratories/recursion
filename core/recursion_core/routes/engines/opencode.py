@@ -676,7 +676,8 @@ def pick_port() -> int:
 def http_abort(url: str, session: str, *, timeout: float = 5.0) -> bool:
     """OpenCode's own abort of the session's running turn: ``POST <url>/session/<id>/abort`` on the loopback server,
     never through a proxy and never following a redirect. True when the server answered 2xx; False when it
-    answered otherwise or not at all."""
+    answered otherwise or not at all. The status line decides: a reply that ends immediately after a 2xx
+    status line is still True."""
     if not _loopback_url_ok(url):
         raise ValueError("url")
     if not _session_ok(session):
@@ -718,9 +719,10 @@ class ServeDriver(Driver):
     accepts the message (``new_turn``) once its write has returned (a write that raised is never accepted);
     ``finish_turn(handle, exit_code)`` drafts the turn's result once its process has exited, and ends the turn. A
     later turn of a handle whose conversation id is still unknown cannot reach the same conversation: it is refused
-    (``DriverStateError``), that turn is ended, and nothing is spawned. Whatever stops a turn before its process is
-    registered (its preparation, a spawn that raises, an interruption) ends that turn at once and leaves; a process
-    the spawn gave back by then is terminated. A session id the turn reports that a later turn could not pass as
+    (``DriverStateError``), that turn is ended, and nothing is spawned. Whatever stops a turn after the region is
+    entered and before its process is registered ends that turn at once and leaves. The ``try`` line itself is
+    before that region, so nothing has been published yet. A process the spawn gave back is terminated even when
+    it has not yet been appended to the live list. A session id the turn reports that a later turn could not pass as
     ``--session`` (``attach_argv``'s rule) is not adopted: it is recorded in the turn parser's ``anomalies``
     (``session_id_unusable``). A turn that reports another session id than the conversation's is recorded there too
     (``conversation_changed``).
@@ -731,8 +733,9 @@ class ServeDriver(Driver):
     then the same exception leaves, a failing termination (``BaseException`` included) noted on it. Either way the turn ends through ``finish_turn``, one finisher per turn.
     ``close`` ends the handle's input: the server is stopped then, or once the turn in progress is finished.
 
-    ``release(handle)`` is terminal: from its first call the handle refuses every later call of this driver on it
-    (``DriverStateError``), its turn in progress is ended, and the turn's process and the server are terminated,
+    ``release(handle)`` is terminal: from its first call every later call that needs the handle's server is refused
+    (``DriverStateError``). ``interrupt`` names the turn, which the gate checks before the server. Its turn in
+    progress is ended, and the turn's process and the server are terminated,
     each on its own. A turn whose process is still being spawned when ``release`` runs is terminated as soon as the
     spawn gives it back, and nothing is written to it (its ``send`` raises ``DriverStateError``, with any failed
     termination noted on it). A prompt being written when ``release`` comes is written first (release waits for
@@ -856,13 +859,15 @@ class ServeDriver(Driver):
                 return url
 
     def _send(self, handle, item: dict) -> None:
-        # A user_message: the gate reserved it as a new turn (mid_turn_input is false). The turn is published on the
-        # worker BEFORE its process is spawned, and the process enters "live" in the statement its spawn returns in:
-        # whatever stops this call then (a release, an error, an interruption) ends the turn at the gate and
-        # terminates its process. The write is made holding the turn's own write lock, after a last look at the
-        # released flag; release sets that flag first and then takes the same lock, so a prompt is either refused
-        # unwritten or written before its process is terminated.
-        try:   # the first statement: the gate has reserved the turn already, so no line of this call is outside it
+        # A user_message: the gate reserved it as a new turn (mid_turn_input is false). The region begins at the
+        # ``try`` line, which is the one instruction outside its own handler, and nothing is published yet. Inside
+        # it the turn is published, then the spawn's return is stored in a local, then that local joins "live".
+        # A cut after the region is entered ends the turn at the gate and terminates the process, including one
+        # that has not been appended yet. The spawn flag is one boolean store, set and cleared on its own, so a
+        # cut cannot leave a count of 1 or -1. The write is made holding the turn's own write lock, after a last
+        # look at the released flag; release sets that flag first and then takes the same lock, so a prompt is
+        # either refused unwritten or written before its process is terminated.
+        try:   # the first statement, and the only instruction of this call outside the handler
             if item["kind"] == "close":
                 worker = self._worker(handle)
 
@@ -873,7 +878,7 @@ class ServeDriver(Driver):
                 if self._under(mark_closed):
                     self.release(handle)
                 return
-            turn_id, worker, turn, process, spawning, written = item["turn_id"], None, None, None, False, False
+            turn_id, worker, turn, process, written = item["turn_id"], None, None, None, False
             worker = self._worker(handle)
             session = handle.engine_session_id
             if worker["turns"] and session is None:
@@ -883,23 +888,21 @@ class ServeDriver(Driver):
                             clock=self._clock)
             turn = {"id": turn_id, "delivery": None, "process": None, "parser": parser, "accepted": False,
                     "finishing": False, "write": threading.RLock()}   # re-entrant: a release from the writer
+
             def publish() -> None:
-                nonlocal spawning
                 if worker["released"]:
                     raise DriverStateError("this handle has no server (released, or never started)")
-                worker["turn"], worker["spawning"], spawning = turn, worker["spawning"] + 1, True
+                # One store each. A cut between them leaves the flag clear, so the handler cannot
+                # count down past it, and it cannot leave the flag set without the handler seeing it.
+                worker["turn"] = turn
+                worker["spawning"] = True
 
             self._under(publish)
-            try:
-                worker["live"].append(process := self._spawn(argv, dict(worker["env"])))
-                turn["process"], worker["turns"] = process, worker["turns"] + 1   # a turn that started a process
-            finally:
-                if spawning:
-                    def finish_spawn() -> None:
-                        nonlocal spawning
-                        worker["spawning"], spawning = worker["spawning"] - 1, False
-
-                    self._under(finish_spawn)
+            # Stored before it joins "live", so a cut at the append still names the process.
+            process = self._spawn(argv, dict(worker["env"]))
+            worker["live"].append(process)
+            turn["process"], worker["turns"] = process, worker["turns"] + 1   # a turn that started a process
+            self._under(lambda: worker.__setitem__("spawning", False))
             with turn["write"]:
                 released = self._under(lambda: worker["released"])
                 if released:
@@ -914,9 +917,16 @@ class ServeDriver(Driver):
                 raise
             here = locals()   # an interruption on the first line leaves the names below unbound
             turn_id, worker, turn, process = item["turn_id"], here.get("worker"), here.get("turn"), here.get("process")
-            spawning, written = here.get("spawning", False), here.get("written", False)
-            if worker is not None and spawning:
-                self._under(lambda: worker.__setitem__("spawning", worker["spawning"] - 1))
+            written = here.get("written", False)
+            if worker is not None and worker.get("spawning"):
+                self._under(lambda: worker.__setitem__("spawning", False))
+            # A spawn that returned, has not joined "live", and is not yet this turn's process is
+            # still owed. Put it there, then the cleaner terminates it. One already stored on the
+            # turn and later taken out of "live" was ended by whoever took it out: putting it back
+            # would end it a second time. Setting the flag false is idempotent, so a second clear stays false.
+            if worker is not None and process is not None and (turn is None or turn.get("process") is not process) \
+                    and not any(process is q for q in worker["live"]):
+                self._under(lambda process=process: worker["live"].append(process))
             if worker is not None and turn is not None and not written:
                 def clear() -> None:
                     if worker["turn"] is turn:

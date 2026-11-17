@@ -513,7 +513,8 @@ def _same_route(route: Mapping, seen: tuple) -> bool:
     return all(theirs is _ANY or ours == theirs for ours, theirs in zip(mine, seen))
 
 
-def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detection: object = None) -> dict:
+def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detection: object = None, *,
+                     route_refusal: object = None) -> dict:
     """What a limit on a decided route leads to: the next route the user listed, or ask; never anything else.
 
     Four arguments (the brief writes two; the limits are read from the config, so it is passed too):
@@ -523,7 +524,11 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
     ``connection``, one whose words are not decide's own plain ``str`` (a subclass of ``str`` is not), or one
     that cannot be read answers ``no_decision``; a refusal answers ``no_route``); ``limit``, the route result that ended the run (its ``code`` and, when the route
     service made one, its ``limit_notice`` with the ``attempts`` already made); ``detection``, optionally a
-    snapshot. ``wait`` waits until the limit's ``reset_at``, or the result's ``retry_at`` when ``reset_at`` is
+    snapshot; ``route_refusal``, optionally the daemon's own pre-launch refusal of a route entry (what
+    ``detect.daemon_route_refusal(breaker)`` gives): a listed route it refuses, taken as the entry the daemon
+    would launch, is passed over and skipped with its code (``launch_refused``, or ``route_unbindable``'s), as
+    a route whose engine detection calls unroutable is, and one whose refusal raises is skipped
+    ``detection_source_failed``. ``wait`` waits until the limit's ``reset_at``, or the result's ``retry_at`` when ``reset_at`` is
     absent, null or not a finite time, else null; ``routes.limits.notice`` keeps the raw value. A time already
     past is passed through as the vendor gave it (``contract.vendor_reset`` would make it None; this module has
     no clock), so a surface that waits clamps it to now and never sleeps a negative interval. The answer::
@@ -625,6 +630,15 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
             why = _state(config, entries, err, route["engine"])
             if why is not None:
                 skipped.append({"place": place, **route_limits.describe(route), "skipped": why})
+                continue
+        if route_refusal is not None:
+            try:  # the daemon's own pre-launch refusal of this route, as the entry it would launch (Grok r10 R1)
+                why = route_refusal({"route": copy.deepcopy(route)})
+            except Exception:  # noqa: BLE001 - a refusal source that raises: the route is not taken, as detect has it
+                why = "detection_source_failed"
+            if why is not None:
+                skipped.append({"place": place, **route_limits.describe(route),
+                                "skipped": why if type(why) is str else "detection_source_failed"})
                 continue
         return {"action": "switch", "place": place, "route": copy.deepcopy(route), "source": source,
                 "skipped": skipped, "choices": choices}

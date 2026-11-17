@@ -7,6 +7,7 @@ import copy
 import itertools
 import json
 import re
+import sys
 import unittest
 from collections.abc import Mapping
 
@@ -1182,6 +1183,57 @@ class DeepSeekNineRegressionTests(unittest.TestCase):
     def test_the_connections_members_are_read_from_its_one_walk(self) -> None:  # ds r9 F2, its G4
         connection = _AskingDeletes(self.d["connection"], asked="kind", deleted="id")  # nothing asks it again
         self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "connection": connection}, LIMIT), self.control)
+
+
+class GrokTenRegressionTests(unittest.TestCase):
+    """The Grok read of #399, round 10 (3a0236af): its R1, a listed route the daemon refuses before launch."""
+
+    def setUp(self) -> None:
+        self.refused = {**copy.deepcopy(CODEX), "model": "codex-model-refused"}
+        self.second = {**copy.deepcopy(CODEX), "model": "codex-model-b"}
+
+    @staticmethod
+    def refusal(entry):
+        return "launch_refused" if entry["route"]["model"] == "codex-model-refused" else None
+
+    def test_a_listed_route_the_daemon_refuses_is_passed_over_for_the_next(self) -> None:  # grok r10 R1
+        cfg = with_limits({"on_limit": "fallback", "fallback": [self.refused, self.second]})
+        out = router.next_after_limit(cfg, router.decide(cfg, SENTRY, {}), LIMIT, SENTRY, route_refusal=self.refusal)
+        self.assertEqual((out["action"], out["place"], out["route"]["model"]), ("switch", 2, "codex-model-b"))
+        self.assertEqual([(row["place"], row["skipped"]) for row in out["skipped"]], [(1, "launch_refused")])
+        cfg = with_limits({"on_limit": "fallback", "fallback": [self.refused]})  # none left: ask, never the refused one
+        out = router.next_after_limit(cfg, router.decide(cfg, SENTRY, {}), LIMIT, SENTRY, route_refusal=self.refusal)
+        self.assertEqual((out["action"], out["reason"]), ("ask", "fallback_exhausted"))
+
+    def test_a_refusal_source_that_raises_passes_the_route_over(self) -> None:  # grok r10 R1, as detect has it
+        def raising(entry):
+            raise RuntimeError("made-up refusal source")
+        cfg = with_limits({"on_limit": "fallback", "fallback": [self.second]})
+        out = router.next_after_limit(cfg, router.decide(cfg, SENTRY, {}), LIMIT, SENTRY, route_refusal=raising)
+        self.assertEqual((out["action"], out["skipped"][0]["skipped"]), ("ask", "detection_source_failed"))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the daemon's own refusals are read on Linux only")
+    def test_the_daemons_refusal_passes_a_helper_key_route_over(self) -> None:  # grok r10's witness
+        helper = {"engine": "claude_code", "model": "helper-model",
+                  "connection": {"kind": "api_key", "id": "anthropic-helper", "key_source": "api_key_helper"}}
+        raw = {"version": 1,
+               "logins": [{"id": "openai-sub", "vendor": "openai", "kind": "subscription", "connection_id": "chatgpt-main",
+                           "engines": ["codex"]},
+                          {"id": "anthropic-helper", "vendor": "anthropic", "kind": "api_key",
+                           "connection_id": "anthropic-helper", "engines": ["claude_code"]}],
+               "default": {"engine": "codex", "limits": {"on_limit": "fallback", "fallback": [helper, self.second]}},
+               "rules": []}
+        routes = {"codex": copy.deepcopy(ROUTES["codex"]),
+                  "claude_code": {"route": copy.deepcopy(helper), "deadline_s": 600, "binary": "claude"}}
+        cfg = rc.load_config(raw, routes, {"anthropic-helper": {"provider": "anthropic"}})
+        snap = detection({"claude_code", "codex"})
+        decision = router.decide(cfg, snap, {})
+        self.assertEqual(decision["engine"], "codex")
+        daemon = detect.daemon_route_refusal(None)
+        out = router.next_after_limit(cfg, decision, LIMIT, snap, route_refusal=daemon)
+        self.assertEqual((out["action"], out["place"], out["route"]["model"]), ("switch", 2, "codex-model-b"))
+        self.assertEqual((out["skipped"][0]["place"], out["skipped"][0]["skipped"]), (1, "launch_refused"))
+        self.assertIsNone(daemon({"route": out["route"]}))  # the route it switches to is one the daemon launches
 
 
 if __name__ == "__main__":

@@ -614,6 +614,17 @@ MUTANTS = {
         'conn = {key: connection[key] if key in names else _MISSING for key in ("kind", "id")}',
         'conn = {key: connection[key] if key in connection else _MISSING for key in ("kind", "id")}',
         {"test_the_connections_members_are_read_from_its_one_walk"}),
+    # The Grok read of round 10 (3a0236af): its R1.
+    "M116 a listed route the daemon refuses before launch switched to": (
+        ROUTER,
+        "            if why is not None:\n"
+        '                skipped.append({"place": place, **route_limits.describe(route),\n'
+        '                                "skipped": why if type(why) is str else "detection_source_failed"})\n'
+        "                continue\n"
+        "        return {",
+        "        return {",
+        {"test_a_listed_route_the_daemon_refuses_is_passed_over_for_the_next",
+         "test_a_refusal_source_that_raises_passes_the_route_over"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

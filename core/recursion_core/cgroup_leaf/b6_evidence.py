@@ -177,6 +177,23 @@ def _scope_refusal(attempt, leaf):
     return True, ''
 
 
+def _one_line(text):
+    """Keep an untrusted field inside one refusal line. A raw newline would be a second record."""
+    # \\r and \\n stay spelled this way. The other separators are the ones splitlines also breaks on.
+    return (
+        text.replace('\r', '\\r')
+        .replace('\n', '\\n')
+        .replace('\x0b', '\\v')
+        .replace('\x0c', '\\f')
+        .replace('\x1c', '\\x1c')
+        .replace('\x1d', '\\x1d')
+        .replace('\x1e', '\\x1e')
+        .replace('\x85', '\\x85')
+        .replace('\u2028', '\\u2028')
+        .replace('\u2029', '\\u2029')
+    )
+
+
 def _absent_attempt(attempt, leaf, engine_uid):
     ok, why, readback = _shape(attempt, leaf, engine_uid)
     if not ok:
@@ -186,9 +203,9 @@ def _absent_attempt(attempt, leaf, engine_uid):
         if not ok:
             return False, why
     elif attempt['method'] == 'direct_write' and attempt['refused'] is not True:
-        return False, f'write of own pid to {attempt["target"]} was not refused'
+        return False, f'write of own pid to {_one_line(attempt["target"])} was not refused'
     elif attempt['method'] == 'attach_unit' and attempt['refused'] is not True:
-        return False, f'AttachProcessesToUnit into {attempt["unit"]} was not refused'
+        return False, f'AttachProcessesToUnit into {_one_line(attempt["unit"])} was not refused'
     stray = sorted(str(p) for p, group in readback.items() if not _inside(group, leaf))
     if stray:
         return False, f'pids outside the leaf after the attempt: {", ".join(stray)}'

@@ -124,6 +124,7 @@ class Cgroup2:
 
     def make_leaf(self, leaf: Path):
         os.mkdir(leaf, 0o755)  # exclusive: an existing leaf is never reused
+        self.created_leaf = leaf  # set only after mkdir, so a raise before it did not create this leaf
 
     def open_procs(self, leaf: Path) -> int:
         return os.open(leaf / 'cgroup.procs', os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -197,16 +198,50 @@ class DelegatedRoot:
             raise ValueError('Empty launch')
         leaf = self.leaf(name)
         kill_timeout = _kill_timeout(kill_timeout)  # before the leaf exists
-        self.fs.make_leaf(leaf)
-        if leaf.is_symlink() or os.lstat(leaf).st_uid != os.getuid():
-            raise PermissionError('Leaf is not an operator-owned directory')
-        run = LeafRun(self.fs, leaf, kill_timeout)
+        existed = os.path.lexists(leaf)
+        self.fs.created_leaf = None
+        try:
+            self.fs.make_leaf(leaf)
+            # An interrupt after mkdir, while the ownership check or LeafRun() runs,
+            # still has to drop a leaf this call created.
+            if leaf.is_symlink() or os.lstat(leaf).st_uid != os.getuid():
+                raise PermissionError('Leaf is not an operator-owned directory')
+            run = LeafRun(self.fs, leaf, kill_timeout)
+        except BaseException as exc:
+            # make_leaf can create the directory and then be interrupted, before spawn.
+            # Drop only a directory this call created. An OSError from removal is noted on exc.
+            # An interrupt during removal propagates, with exc as its cause.
+            self._drop_leaf_this_call_created(leaf, existed, exc)
+            raise
         try:
             run._spawn(list(argv), env, cwd, stdin, stdout, stderr, start_timeout)
         except BaseException as exc:
             run._cleanup_after(exc)
             raise
         return run
+
+    def _drop_leaf_this_call_created(self, leaf, existed, exc):
+        """Remove a leaf this call's mkdir recorded.
+
+        An interrupt during removal propagates, with ``exc`` as its cause. Any other
+        removal failure is noted on ``exc`` and does not take its place.
+        """
+        if isinstance(exc, FileExistsError) or not os.path.lexists(leaf):
+            return
+        # Sampled before make_leaf. A leaf that was already there is not this call's,
+        # even when the filesystem object claims created_leaf.
+        if existed:
+            return
+        # Set only after this call's mkdir. An interrupt before that leaves another
+        # creator's leaf in place.
+        if getattr(self.fs, 'created_leaf', None) != leaf:
+            return
+        try:
+            self.fs.remove(leaf)
+        except (KeyboardInterrupt, SystemExit) as cleanup:
+            raise cleanup from exc
+        except BaseException as cleanup:
+            exc.add_note(f'leaf removal raised: {cleanup!r}')
 
     def adopt(self, name, kill_timeout=5.0):
         """Re-adopt a registered leaf after a restart: a handle that can kill it later.
@@ -337,6 +372,7 @@ class LeafRun:
         with self.lock:
             if self.outcome is None or not self.removed:
                 self.outcome = self._terminate()
+            self._release_captured_stdio()
             return self.outcome
 
     def _terminate(self):
@@ -410,6 +446,20 @@ class LeafRun:
         if state not in ('leaf_empty', 'empty') or errors:
             log.error('leaf %s: %s', self.leaf, outcome)
         return outcome
+
+    def _release_captured_stdio(self):
+        """Shut pipes this launcher opened. Only PIPE is stored on the Popen; a caller's own file is not.
+        A failure here must not replace the outcome already booked by ``_terminate``."""
+        proc = self.proc
+        if proc is None:
+            return
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is None or stream.closed:
+                continue
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     def _close_retrying(self):
         """close(), retried when an interrupt lands inside it (C2-10: finally can be

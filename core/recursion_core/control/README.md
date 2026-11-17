@@ -166,18 +166,65 @@ recorded on F60, CSL-762).
   `/run/user/<uid>/recursion/operator-reads.sock`: its own file, so it can never carry a control request.
 - **Security model.** No token. Owner-only socket: directory `0700` (created if missing; the server
   refuses to serve if it is a symlink, not owned by this uid, or open to group or other), socket file
-  `0600`, and each peer's uid checked with `SO_PEERCRED` (another uid is answered `peer_refused` unread).
-  Any process of the same user can read. Linux only: where `AF_UNIX`, `SO_PEERCRED` or uids are missing
-  (macOS, Windows) the modules import, `start()` raises `PlatformNotSupported`, and the socket tests skip.
+  `0600`, and each peer's uid checked with `SO_PEERCRED` (another uid, or one whose uid cannot be read,
+  is answered `peer_refused` unread and with no host profile, `{"profile_id": null, "signature_state":
+  "no_profile"}`). Refusals are written without blocking the accept thread. With no path given, the
+  runtime folder (`$XDG_RUNTIME_DIR`, else `/run/user/<uid>`) must exist, be a real directory of this
+  uid and be closed to group and other, or `start()` raises `SocketUnsafe`. One server per path: `start()`
+  takes an exclusive `flock` on `<path>.lock` (an owner-only file) before it looks at the socket path and
+  holds it while serving, so a second server refuses (`SocketUnsafe`) instead of replacing the first's
+  socket; `close()` removes the lock file. Any process of the same user can read. Linux only: where
+  `AF_UNIX`, `SO_PEERCRED`, `flock` or uids are missing (macOS, Windows) the modules import, `start()`
+  raises `PlatformNotSupported`, and the socket tests skip.
 - **Client.** `from recursion_core.control.operator_reads import connect`;
   `connect(path: str | None = None, *, timeout_s: float = 5.0)` returns an object whose
   `call(method, params) -> dict` opens one connection per call and never raises. Unreachable answers
   `{"code": "control_api_unavailable", "delivered": false, "detail": ...}` (`detail`
-  `platform_unsupported` without `AF_UNIX` or uids); a request written with no complete reply answers
+  `platform_unsupported` without `AF_UNIX`, `SO_PEERCRED` or uids: without `SO_PEERCRED` the server's
+  uid cannot be checked, so nothing is connected); a request written with no complete reply answers
   `"delivered": "unknown"`. A name that is not `operator.<name>.inspect` is refused locally
   (`method_not_allowed`, `"delivered": false`).
 
 No host composes or starts this server yet; that belongs to the daemon adapter below.
+
+## Credentials and scopes (registered into seam S5)
+
+`credentials.py` and `scopes.py` are the control API's caller scopes (`read`, `run`, `approve`,
+`manage`, the method table's scope column). `scopes.register(hooks)` registers the authorizer into seam
+S5 (`control/hooks.py`, lane SPINE), reading each method's scope from `control.methods.METHODS`. As
+registered it holds no credentials and reads no run record, so only owner, internal and the page's
+device principal hold scopes, and today's callers keep every answer. `ScopesService` (S13,
+`control.scopes`) is built and tested but not registered: started, it opens the credential store at
+`<state_dir>/control/credentials.json` and reads run records through the control registry's `get`, for
+plugin and session principals, which no entry point makes yet. Every client call reaches the
+authorizer once the seams' daemon edits call S5.
+
+- **Credentials.** Each principal kind has a ceiling: `owner` and `internal` hold all four and are never
+  tokens; `device` (the page and paired devices) never holds `manage`; `plugin`, `session` and `agent`
+  (the MCP face) hold at most `read` and `run`. `CredentialStore(path)` mints tokens (`rst1_` for a
+  session, `rct1_` otherwise, 32 random bytes), returns each once, and keeps only its SHA-256 in one
+  owner-only JSON file, written whole and renamed into place; the rename is the commit point (a failure
+  after it, syncing the directory, is `CredentialStoreUncertain`: the change is made and memory keeps it).
+  Every write takes an exclusive lock on a sibling `.<name>.lock` and reads the file again under it, and a
+  store reads the file again when another has written it, so two stores on one file never drop each
+  other's grants and each sees the other's revocations at its next check.
+  `revoke` takes effect at once (dated no earlier than the grant's issue) and answers success only once
+  written; a failed write is retried by the next `revoke`. No grant may name the page's own door (`device`, `page`). Issue and revoke are reported
+  to an `emit` callback without the token or its digest, a revocation once it is durable. Failed token
+  checks are limited per peer (`FailedAuthLimit`) and logged without the token. Every refusal is
+  `scope_refused`.
+- **Token principals.** A principal made from a verified token names its grant (`grant`, a field this
+  lane asks SPINE to add to `Principal`) and holds only that grant's live scopes (`grant_scopes`); a
+  device, session or agent principal without one holds nothing, and a principal whose `grant` cannot be
+  read holds nothing at all. A plugin the host attributes by identity
+  holds the union of its identity's live grants (`held`).
+- **Scopes.** `Authorizer(scope_of=..., credentials=..., run_record=...)` answers S5's
+  `authorize(principal, method, params)`: a run-unit peer is refused; otherwise the method's scope must
+  be one the principal holds now, within its kind's ceiling; a credential store that raises is refused
+  (`credentials_unavailable`). `run.stop` follows the method table's row "Who may Stop", and needs a held
+  `run` scope whatever the row's scope column says: an owner or device with `run` may stop any run; a session principal only its own
+  session's runs (and its descendants' once the session lineage is passed in); a plugin principal only a
+  run whose `launch.owner` is that plugin. Internal and agent principals are not in the Stop row.
 
 ## Candidate and unwired
 
@@ -189,7 +236,10 @@ Claude Code client, a provider or the network; tests use fakes only.
 `recursion_core/daemon/control_adapter.py` constructs `ControlAPI` over a durable registry and the
 daemon's cleanup layer and serves it on the owner-only Unix socket. `python -m recursion_core.control`
 is the packaged CLI entry point; its API factory is `control/client.py` `SocketAPI`, and with the daemon
-down it answers `control_api_unavailable` (exit 1). See `daemon/README.md`, "Composition". The Control
+down it answers `control_api_unavailable` (exit 1). A request the transport cannot frame (over its 1 MiB
+cap, or not JSON) is refused before anything is connected: `delivered: false`, detail
+`not_sent:<reason>`. On Windows every call answers `platform_unsupported` before any path or connector
+is looked at, an explicit path included (D9). See `daemon/README.md`, "Composition". The Control
 MCP transport is still not implemented. The paragraph below is the state before that composition.
 
 **Not built here, owner not assigned: the daemon adapter.** This PR does not build the production

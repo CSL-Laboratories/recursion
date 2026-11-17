@@ -56,6 +56,40 @@ def _unknown_effect(store: FakeStore, run_id: str) -> None:
         tx.append(event)
 
 
+class _IterRaises:
+    """Events that fetch cleanly and raise on the first step of iteration."""
+
+    def __iter__(self):
+        raise RuntimeError("events cursor")
+        yield None  # makes this a generator so the raise happens while iterating
+
+
+class _RaisingEvents:
+    """A store whose event log raises during iteration."""
+
+    @property
+    def events(self):
+        return _IterRaises()
+
+
+class _EffectDuringKill(FakeKillTree):
+    """Appends effect.outcome_unknown from inside the kill, after admission was recorded."""
+
+    def __init__(self, store: FakeStore, run_id: str) -> None:
+        super().__init__([EMPTY])
+        self.store, self.run_id = store, run_id
+
+    def request_stop(self, cgroup: str) -> None:
+        _unknown_effect(self.store, self.run_id)
+        super().request_stop(cgroup)
+
+
+def _bare_api(kill: FakeKillTree | None = None) -> ControlAPI:
+    """A ControlAPI with no event store, as the daemon composition builds one."""
+    return ControlAPI(InMemoryRunRegistry(), kill or FakeKillTree(), FakeStarter(),
+                      clock=lambda: 1000.0, new_run_id=run_ids())
+
+
 class StopAdmissionTest(unittest.TestCase):
     def test_b2_17_stop_refuses_a_later_dispatch_and_records_revoke_before_the_kill(self) -> None:
         store = FakeStore()
@@ -63,8 +97,7 @@ class StopAdmissionTest(unittest.TestCase):
         api = _api(store, kill)
         run = started(api)
         _grant(store, run)
-        before = api.call("run.dispatch", {"run_id": run})
-        self.assertEqual(before, {"code": "ok", "run_id": run})
+        self.assertFalse(api._dispatch_refused(run, api._stop_target(run)))
         answer = api.call("run.stop", {"run_id": run})
         self.assertEqual(answer["code"], "stopped")
         self.assertIs(answer["admission_closed"], True)
@@ -77,16 +110,14 @@ class StopAdmissionTest(unittest.TestCase):
         self.assertEqual(
             [event["type"] for event in store.events if event.get("run_id") == run and event["type"].startswith("workspace.")],
             ["workspace.grant", "workspace.revoke"])
-        refused = api.call("run.dispatch", {"run_id": run})
-        self.assertEqual(refused, {"code": "refused", "run_id": run, "detail": "admission_closed"})
-        again = api.call("run.dispatch", {"run_id": run})
-        self.assertEqual(again, refused)
+        self.assertTrue(api._dispatch_refused(run, api._stop_target(run)))
+        self.assertTrue(api._dispatch_refused(run, api._stop_target(run)))
         repeat = api.call("run.stop", {"run_id": run})
         self.assertIs(repeat["admission_closed"], True)
         self.assertIs(repeat["workspace.revoke"], True)
         self.assertEqual(sum(event["type"] == "workspace.revoke" for event in store.events), 1)
-        unknown = api.call("run.dispatch", {"run_id": "nope"})
-        self.assertEqual(unknown["code"], "run_unknown")
+        self.assertIsNone(api._stop_target("nope"))
+        self.assertEqual(api.call("run.stop", {"run_id": "nope"})["code"], "run_unknown")
         stored = api.call("run.status", {"run_id": run})["run"]["stop_attestation"]
         self.assertIs(stored["admission_closed"], True)
         self.assertIs(stored["local_scope_empty"], True)
@@ -105,6 +136,75 @@ class StopAdmissionTest(unittest.TestCase):
         self.assertTrue(kill.revoke_before_kill)
         stored = api.call("run.status", {"run_id": run})["run"]["stop_attestation"]
         self.assertEqual(stored["external_effects"], "unresolved")
+
+    def test_a_log_that_raises_during_iteration_still_kills_and_answers_unresolved(self) -> None:
+        kill = FakeKillTree()
+        api = ControlAPI(InMemoryRunRegistry(), kill, FakeStarter(), clock=lambda: 1000.0,
+                         new_run_id=run_ids(), events=_RaisingEvents())
+        run = started(api)
+        answer = api.call("run.stop", {"run_id": run})
+        self.assertEqual(answer["code"], "stopped")
+        self.assertEqual(kill.requests, [f"/sys/fs/cgroup/fake/{run}"])
+        self.assertEqual(answer["external_effects"], "unresolved")
+
+    def test_an_unknown_effect_appended_inside_the_kill_answers_unresolved(self) -> None:
+        store = FakeStore()
+        kill = _EffectDuringKill(store, "run-1")
+        api = _api(store, kill)
+        run = started(api)
+        _grant(store, run)
+        answer = api.call("run.stop", {"run_id": run})
+        self.assertEqual(answer["code"], "stopped")
+        self.assertEqual(answer["external_effects"], "unresolved")
+        stored = api.call("run.status", {"run_id": run})["run"]["stop_attestation"]
+        self.assertEqual(stored["external_effects"], "unresolved")
+
+    def test_no_event_store_answers_unresolved(self) -> None:
+        api = _bare_api()
+        run = started(api)
+        answer = api.call("run.stop", {"run_id": run})
+        self.assertEqual(answer["code"], "stopped")
+        self.assertEqual(answer["external_effects"], "unresolved")
+        stored = api.call("run.status", {"run_id": run})["run"]["stop_attestation"]
+        self.assertEqual(stored["external_effects"], "unresolved")
+
+    def test_todays_answer_claims_no_dispatch_fence(self) -> None:
+        api = _api(FakeStore(), FakeKillTree())
+        run = started(api)
+        answer = api.call("run.stop", {"run_id": run})
+        self.assertIs(answer["admission_closed"], True)
+        self.assertIs(answer["dispatch_fence_confirmed"], False)
+        bare = _bare_api()
+        bare_run = started(bare)
+        bare_answer = bare.call("run.stop", {"run_id": bare_run})
+        self.assertIs(bare_answer["dispatch_fence_confirmed"], False)
+
+    def test_run_dispatch_is_not_reachable_through_call(self) -> None:
+        store = FakeStore()
+        api = _api(store, FakeKillTree())
+        run = started(api)
+        unknown = api.call("run.dispatch", {"run_id": "nope"})
+        self.assertEqual(unknown["code"], "method_unknown")
+        before = api.call("run.dispatch", {"run_id": run})
+        self.assertEqual(before["code"], "method_unknown")
+        self.assertFalse(api._dispatch_refused(run, api._stop_target(run)))
+        api.call("run.stop", {"run_id": run})
+        self.assertTrue(api._dispatch_refused(run, api._stop_target(run)))
+        again = api.call("run.dispatch", {"run_id": run})
+        self.assertEqual(again["code"], "method_unknown")
+
+    def test_an_exception_inside_accept_cannot_skip_the_kill(self) -> None:
+        kill = FakeKillTree()
+        api = _bare_api(kill)
+        run = started(api)
+
+        def boom(_run_id: str) -> None:
+            raise RuntimeError("accept")
+
+        api._record_revoke = boom
+        answer = api.call("run.stop", {"run_id": run})
+        self.assertEqual(answer["code"], "stopped")
+        self.assertEqual(kill.requests, [f"/sys/fs/cgroup/fake/{run}"])
 
     def test_b2_27_a_stopped_answer_lacking_the_facts_is_refused_by_the_schema(self) -> None:
         schema = json.loads(_STOP_SCHEMA.read_text(encoding="utf-8"))
@@ -148,3 +248,23 @@ class StopAdmissionTest(unittest.TestCase):
         attested["attestation"] = {**attested["attestation"], "admission_closed": True,
                                    "local_scope_empty": True, "external_effects": "none_known"}
         self.assertEqual(list(validator.iter_errors(attested)), [])
+
+    def test_schema_records_the_effects_word_the_view_and_the_fence_fact(self) -> None:
+        folder = _STOP_SCHEMA.parent
+        stop = json.loads(_STOP_SCHEMA.read_text(encoding="utf-8"))
+        record = json.loads((folder / "run.record.v1.json").read_text(encoding="utf-8"))
+        view = json.loads((folder / "run.view.v1.json").read_text(encoding="utf-8"))
+        changes = (folder / "CHANGES.md").read_text(encoding="utf-8")
+        effects = ["none_known", "unresolved"]
+        self.assertEqual(record["$defs"]["stop_attestation"]["properties"]["external_effects"]["enum"], effects)
+        attestation = stop["$defs"]["attestation"]["properties"]["external_effects"]
+        self.assertEqual(attestation["enum"], effects)
+        self.assertEqual(stop["properties"]["workspace.revoke"].get("const"), True)
+        self.assertNotIn("stays valid", stop["description"])
+        self.assertEqual(view["x-version"], "1.0-draft.5")
+        self.assertIn("`run.view.v1.json` | 1.0-draft.5", changes)
+        self.assertIn("A draft-2 reader refuses a draft-3 stopped answer", changes)
+        self.assertIn("#479", changes)
+        self.assertIn("80e0d38a", changes)
+        self.assertIn("dispatch_fence_confirmed", stop["properties"])
+        self.assertEqual(stop["properties"]["dispatch_fence_confirmed"]["type"], "boolean")

@@ -119,7 +119,8 @@ class ControlAPI:
         self._new_run_id = new_run_id
         self._confirm_timeout_s = confirm_timeout_s
         # Optional event store the workspace ledger writes through. The daemon composition does not
-        # pass one yet: with none, admission still shuts and the answer does not name workspace.revoke.
+        # pass one yet: with none, admission still shuts, the effects word is unresolved (no log was
+        # read), and the answer does not name workspace.revoke.
         self._events = events
         self._admission_lock = threading.Lock()
         self._admission: set[str] = set()
@@ -162,7 +163,9 @@ class ControlAPI:
             return self.list_runs(params)
         if method == "run.start":
             return self.start(params)
-        handler = {"run.status": self.status, "run.stop": self.stop, "run.dispatch": self.dispatch}.get(method)
+        # run.dispatch is not a wire method: it is in no methods file and its old answer code is
+        # outside CODES. The admission check stays internal (_dispatch_refused).
+        handler = {"run.status": self.status, "run.stop": self.stop}.get(method)
         if handler is None:
             return {"code": METHOD_UNKNOWN, "detail": str(method)}
         run_id = params.get("run_id")
@@ -442,7 +445,7 @@ class ControlAPI:
         return {"proof": "empty", "cgroup": rec.get("cgroup"), "cgroup_marker": rec.get("cgroup_marker"),
                 "member_ids": sorted(member["member_id"] for member in members),
                 "generation": rec["generation"], "admission_closed": True, "local_scope_empty": True,
-                "external_effects": self._effects_for(rec["run_id"])}
+                "external_effects": self._effects_for(rec["run_id"]), "dispatch_fence_confirmed": False}
 
     def _enter_owner(self) -> None:
         depth = getattr(self._local, "depth", 0)
@@ -472,7 +475,11 @@ class ControlAPI:
             if self._stop_target(run_id) is None:  # no lock is kept for ids that name no run
                 return {"code": RUN_UNKNOWN, "run_id": run_id}
             # Admission and the workspace revoke happen before the run lock and before the kill.
-            self._accept_stop(run_id)
+            # An exception here must not skip the kill. The effects word is read again with the answer.
+            try:
+                self._accept_stop(run_id)
+            except Exception:
+                pass
             with self._run_lock(run_id):
                 rec = self._stop_target(run_id)
                 if rec is None:
@@ -480,15 +487,6 @@ class ControlAPI:
                 return self._stop(rec)
         finally:
             self._exit_owner()
-
-    def dispatch(self, run_id: str) -> dict:
-        """A later dispatch of a run whose Stop was accepted is refused. An unknown run stays unknown."""
-        rec = self._stop_target(run_id)
-        if rec is None:
-            return {"code": RUN_UNKNOWN, "run_id": run_id}
-        if self._dispatch_refused(run_id, rec):
-            return {"code": "refused", "run_id": run_id, "detail": "admission_closed"}
-        return {"code": OK, "run_id": run_id}
 
     def _dispatch_refused(self, run_id: str, rec: dict) -> bool:
         with self._admission_lock:
@@ -502,7 +500,9 @@ class ControlAPI:
         """Shut admission and append workspace.revoke while no run lock is held. A ledger error does not skip the kill."""
         with self._admission_lock:
             self._admission.add(run_id)
-        self._remember_effects(run_id, self._read_effects(run_id))
+        word = self._read_effects(run_id)
+        if word == "unresolved":  # none_known is not cached: a later unknown effect must still be seen
+            self._remember_effects(run_id, word)
         self._record_revoke(run_id)
 
     def _remember_effects(self, run_id: str, value: str) -> None:
@@ -510,13 +510,15 @@ class ControlAPI:
             self._effects[run_id] = value
 
     def _effects_for(self, run_id: str) -> str:
+        """Re-read at attestation and stamp time. Only unresolved may be cached."""
         with self._admission_lock:
             cached = self._effects.get(run_id)
-        if cached is not None:
-            return cached
+        if cached == "unresolved":
+            return "unresolved"
         value = self._read_effects(run_id)
-        with self._admission_lock:
-            return self._effects.setdefault(run_id, value)
+        if value == "unresolved":
+            self._remember_effects(run_id, value)
+        return value
 
     def _mark_revoked(self, run_id: str) -> None:
         with self._admission_lock:
@@ -538,18 +540,20 @@ class ControlAPI:
         return found
 
     def _read_effects(self, run_id: str) -> str:
-        """none_known when no effect.outcome_unknown is recorded for the run. Unreadable log: unresolved."""
+        """none_known only after the log was read and holds no effect.outcome_unknown for the run.
+
+        No store, or a log that cannot be read (including a raise while iterating), is unresolved.
+        """
         store = self._events
         if store is None:
-            return "none_known"
+            return "unresolved"
         try:
-            events = store.events
+            for event in store.events:
+                if (isinstance(event, dict) and event.get("type") == "effect.outcome_unknown"
+                        and event.get("run_id") == run_id):
+                    return "unresolved"
         except Exception:
             return "unresolved"
-        for event in events:
-            if (isinstance(event, dict) and event.get("type") == "effect.outcome_unknown"
-                    and event.get("run_id") == run_id):
-                return "unresolved"
         return "none_known"
 
     def _log_has_revoke(self, store, run_id: str) -> bool:
@@ -592,10 +596,15 @@ class ControlAPI:
                 return
 
     def _stamp(self, answer: dict, run_id: str) -> dict:
-        """Put the admission fact, the cleanup fact and the effects word on a Stop answer. Name workspace.revoke only when that event is in the log."""
+        """Put acceptance, the fence fact, the cleanup fact and the effects word on a Stop answer.
+
+        Name workspace.revoke only when that event is in the log. The fence is false until a path
+        that really dispatches consults the admission set.
+        """
         if not isinstance(answer, dict) or answer.get("code") == RUN_UNKNOWN:
             return answer
         answer["admission_closed"] = True
+        answer["dispatch_fence_confirmed"] = False
         answer["local_scope_empty"] = answer.get("code") == STOPPED
         answer["external_effects"] = self._effects_for(run_id)
         if self._revoke_named(run_id):

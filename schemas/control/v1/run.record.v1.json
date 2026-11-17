@@ -98,7 +98,7 @@
       "then": {"required": ["intent_version"]}
     },
     "stop_attestation": {
-      "description": "null unless the run is stopped. The stored proof is today's and only today's: 'empty', which says that the cgroup named here was read empty and every member listed was gone, at this generation of the record. It may also carry admission_closed, local_scope_empty and external_effects. Those three are optional on a stored row, so a row written before them still loads. A stored proof of 'removed' is RESERVED: the lane that owns Stop adds it together with the registry's own proof checks, and until then this schema refuses it. A reader that meets a proof it does not know treats the run as NOT stopped.",
+      "description": "null unless the run is stopped. The stored proof is today's and only today's: 'empty', which says that the cgroup named here was read empty and every member listed was gone, at this generation of the record. It may also carry admission_closed, local_scope_empty, external_effects and dispatch_fence_confirmed. external_effects is none_known or unresolved. Those fields are optional on a stored row, so a row written before them still loads. admission_closed is acceptance only; dispatch_fence_confirmed is a separate fact and is false until a real dispatch path consults the admission set. A stored proof of 'removed' is RESERVED: the lane that owns Stop adds it together with the registry's own proof checks, and until then this schema refuses it. A reader that meets a proof it does not know treats the run as NOT stopped.",
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["proof", "cgroup", "cgroup_marker", "member_ids", "generation"],
@@ -110,7 +110,8 @@
         "generation": {"type": "integer", "minimum": 1},
         "admission_closed": {"type": "boolean"},
         "local_scope_empty": {"type": "boolean"},
-        "external_effects": {"type": "string"}
+        "external_effects": {"enum": ["none_known", "unresolved"]},
+        "dispatch_fence_confirmed": {"type": "boolean"}
       }
     },
     "launch": {

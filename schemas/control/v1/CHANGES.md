@@ -15,7 +15,7 @@ Nothing is frozen yet.
 |---|---|
 | `common.v1.json` | 1.0-draft.5 |
 | `run.record.v1.json` | 1.0-draft.5 |
-| `run.view.v1.json` | 1.0-draft.4 |
+| `run.view.v1.json` | 1.0-draft.5 |
 | `stop.result.v1.json` | 1.0-draft.3 |
 | `session.v1.json` | 1.0-draft.3 |
 | `queue.item.v1.json` | 1.0-draft.7 |
@@ -29,15 +29,24 @@ Nothing is frozen yet.
 
 ## Stop answer facts (Nov 17, 2026)
 
-`stop.result` draft 3. `run.record` draft 5. A stopped answer carries three facts beside `repeat`:
-`admission_closed`, `local_scope_empty` and `external_effects`. `external_effects` is `none_known` or
-`unresolved`. When a stopped answer carries `attestation`, that object carries the same three facts.
-The stored `stop_attestation` may carry them and still loads a row that does not.
+`stop.result` draft 3. `run.record` draft 5. `run.view` draft 5. A stopped answer carries three facts beside `repeat`:
+`admission_closed`, `local_scope_empty` and `external_effects`, and the separate boolean `dispatch_fence_confirmed`.
+`external_effects` is `none_known` or `unresolved`. When a stopped answer carries `attestation`, that object carries the same effects word
+as an enum, and may carry `dispatch_fence_confirmed`. The stored `stop_attestation` may carry them and still loads a row that does not.
+`run.view` shows `stop_attestation` by reference, so the public view widened with the stored proof and is `1.0-draft.5`.
+A draft-2 reader refuses a draft-3 stopped answer (the new facts are not additional properties a draft-2 document allows).
+Pull request #479 (`80e0d38a`) also takes `stop.result` draft 3. Whichever of #538 and #479 lands second renumbers to draft 4.
+No event store means `unresolved`: `none_known` is never claimed without a log that was read. That default is an owner's point.
+`admission_closed` states acceptance only. `dispatch_fence_confirmed` is false until a path that really dispatches consults the admission set, and it is false today. That split is an owner's point. Open STOP drafts #504, #510, #511, #512, #513 and #514 do not name a boolean dispatch-fence fact; the provisional object `fence` is a different field. `run.dispatch` is not reachable through `call`.
 
 | What changed | What it breaks |
 |---|---|
 | A stopped `stop.result` without `admission_closed`, `local_scope_empty` or `external_effects`, or with any other effects word, is refused. A stopped answer whose `attestation` lacks those facts is refused | A captured stopped answer that had only `repeat` |
-| `run.record` `stop_attestation` may carry the same three facts. They are not required on a stored row | A reader that refused a stored proof with a field it had not listed |
+| `run.record` `stop_attestation` may carry the same three facts. `external_effects` there is `none_known` or `unresolved` | A reader that refused a stored proof with a field it had not listed, and a stored proof whose effects word is any other string |
+| `run.view` is `1.0-draft.5` because it shows that stored proof | A reader that pinned `run.view` at draft 4 |
+| A draft-2 reader refuses a draft-3 stopped answer | A stopped answer that had only `repeat` |
+| `workspace.revoke`, when present, is true | An answer that carried that field as false |
+| `dispatch_fence_confirmed` may be carried. It is false today | Nothing that omitted it |
 
 ## After two reads of the fifth read's answer (Nov 14, 2026)
 

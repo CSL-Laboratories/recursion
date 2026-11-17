@@ -10,10 +10,12 @@
     "time": "2026-11-13T07:41:02.118Z",
     "admission_closed": true,
     "local_scope_empty": true,
-    "external_effects": "none_known"
+    "external_effects": "unresolved",
+    "dispatch_fence_confirmed": false
   },
   "claim": "cgroup_empty_whole_run_unverified",
   "admission_closed": true,
   "local_scope_empty": true,
-  "external_effects": "none_known"
+  "external_effects": "unresolved",
+  "dispatch_fence_confirmed": false
 }

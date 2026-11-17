@@ -265,6 +265,14 @@ class EngineUnitManager(SystemdUserManager):
         return fd
 
 
+def _decode_line(raw):
+    """An engine's line as text. Bytes that are not UTF-8 are refused, never replaced into valid JSON (E42)."""
+    try:
+        return raw.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise OSError(errno.EILSEQ, 'engine stdout is not valid UTF-8') from exc
+
+
 class UnitEngineProcess:
     """``routes.launch.EngineProcess`` over one run unit: FIFO stdin, a tailed stdout file, a pidfd."""
 
@@ -291,6 +299,8 @@ class UnitEngineProcess:
                     raise TimeoutError(errno.ETIMEDOUT, 'engine did not read its stdin')
                 if not select.select([], [self._stdin], [], min(left, 1.0))[1]:
                     continue
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(errno.ETIMEDOUT, 'engine did not read its stdin')  # the select used the budget up (E40)
                 try:
                     written = os.write(self._stdin, data)
                 except BlockingIOError:
@@ -325,19 +335,23 @@ class UnitEngineProcess:
         while True:
             cut = self._buffer.find(b'\n')
             if cut >= 0:
+                if cut > MAX_LINE_BYTES:  # a newline does not excuse a line over the bound (E07)
+                    raise OSError(errno.EMSGSIZE, 'engine stdout line is too long')
                 line, self._buffer = self._buffer[:cut], self._buffer[cut + 1:]
-                return line.decode('utf-8', 'replace')
+                return _decode_line(line)
             if len(self._buffer) > MAX_LINE_BYTES:
                 raise OSError(errno.EMSGSIZE, 'engine stdout line is too long')
             ended = self._ended()  # read liveness first, so output written before the exit is not missed
             chunk = os.read(self._out, 65536)
             if chunk:
                 self._buffer += chunk
+                if time.monotonic() > deadline:
+                    raise ReadTimeout()  # output that arrives after the deadline is late; it stays buffered (E40)
                 continue
             if ended:
                 if self._buffer:
                     line, self._buffer = self._buffer, b''
-                    return line.decode('utf-8', 'replace')
+                    return _decode_line(line)
                 return None
             left = deadline - time.monotonic()
             if left <= 0:
@@ -354,9 +368,11 @@ class UnitEngineProcess:
 
     def close(self):
         self.close_stdin()
-        for name in ('_out', '_pidfd'):
-            fd = getattr(self, name)
-            setattr(self, name, None)
+        with self._lock:
+            # Taken and cleared together: a second closer must not close a number the first one released,
+            # which the process may already have given to something else (E06).
+            descriptors, self._out, self._pidfd = (self._out, self._pidfd), None, None
+        for fd in descriptors:
             if fd is not None:
                 try:
                     os.close(fd)

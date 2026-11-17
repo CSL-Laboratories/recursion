@@ -9,7 +9,7 @@ import json
 import unittest
 
 from recursion_core.routes import ClaudeCodeAdapter, ConnectionBreaker, RouteService
-from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, FakeProcess, claude_ok, request
+from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, FakeProcess, claude_ok, request, runs_adapter
 
 MARK = "S7-TRIAGE-MARKER\nFORGED-LINE"
 
@@ -22,6 +22,7 @@ def _claude(scripts, clock=None, **kw):
     return svc, launcher, breaker, clock
 
 
+@runs_adapter
 class ClaudeDiagnosticsTest(unittest.TestCase):
     def test_rc02_claude_diagnostics_do_not_echo_engine_text(self):
         cases = {
@@ -38,6 +39,7 @@ class ClaudeDiagnosticsTest(unittest.TestCase):
                 self.assertNotIn("S7-TRIAGE-MARKER", json.dumps(res))
 
 
+@runs_adapter
 class DeadlineWorkTest(unittest.TestCase):
     def test_rc11_no_work_after_deadline(self):
         with self.subTest("launch_spends_deadline"):

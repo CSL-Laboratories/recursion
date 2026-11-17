@@ -212,8 +212,8 @@ class ChildRoute:
     picked, by name.
 
     The next two matter on a ``subscription`` route with a ``base_url`` and nowhere else. ``trusted_base_urls``
-    are the origins (``scheme://host[:port]``) the user already agreed to send their subscription sign-in to;
-    the driver keeps that list and fills it in, this module only compares. ``full_access_acknowledged`` says
+    are the origins (``scheme://host[:port]``) a driver must ask the user once to save and then pass in;
+    no driver does this yet. This module only compares a list when a caller supplies one. ``full_access_acknowledged`` says
     this run uses the named full-access profile and the user acknowledged it for this run (PRODUCT.md 055cc7a5
     Q20, O44, H-06); only the bool ``True`` counts. ``repr`` and ``str`` show whether a value is set, a count or
     a flag, never a key or a URL.

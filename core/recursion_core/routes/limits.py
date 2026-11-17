@@ -20,6 +20,7 @@ default is show and ask, never a silent switch."
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 
 from recursion_core.routes import contract as c
@@ -77,13 +78,25 @@ def notice(result: Mapping, route: Mapping, limits: Mapping) -> dict | None:
 
     if result.get("code") not in LIMIT_CODES:
         return None
-    signal = result.get("limit") or {}
-    reset_at = signal.get("reset_at") if isinstance(signal, Mapping) else None
-    if reset_at is None:
-        # A typed limit with no vendor reset still has the breaker's finite open_until on retry_at.
-        reset_at = result.get("retry_at")
+    raw = result.get("limit")
+    signal = raw if isinstance(raw, Mapping) else {}
+    vendor = signal.get("reset_at")
+    # The breaker writes the open_until it used onto retry_at. When that value is a real number,
+    # it is the wait, and a vendor reset the breaker did not use is not the time the notice names.
+    # When the breaker booked no number, a numeric vendor reset is the wait. Anything else is not
+    # a time: the choice says the breaker gave no time.
+    booked = result.get("retry_at")
+    if _real_number(booked):
+        reset_at = booked
+    elif _real_number(vendor):
+        reset_at = vendor
+    else:
+        reset_at = None
     here = describe(route)
-    choices = [{"action": "wait", "until": reset_at}]
+    wait = {"action": "wait", "until": reset_at}
+    if reset_at is None:
+        wait["detail"] = "the breaker gave no time"
+    choices = [wait]
     choices += [{"action": "switch", "route": describe(r)} for r in limits["fallback"]]
     choices.append({"action": "cancel"})
     return {
@@ -100,8 +113,41 @@ def notice(result: Mapping, route: Mapping, limits: Mapping) -> dict | None:
     }
 
 
+def _real_number(value: object) -> bool:
+    """A wait that can be scheduled: a finite int or float, never a bool."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def _refusal_scope(result: Mapping) -> str:
-    """A breaker refusal names the key it hit in ``detail``: a model bucket key is model scope."""
+    """A breaker refusal names the key it hit in ``detail``.
+
+    A model bucket is ``escaped(connection) + '#model:' + escaped(model)``, and a connection id
+    that contains ``#`` is written with each ``#`` doubled (``breaker._display``). A ``#model:``
+    whose ``#`` is not one of a doubled pair is the marker. A connection id that merely contains
+    that text is not model scope.
+    """
 
     detail = result.get("detail")
-    return "model" if isinstance(detail, str) and "#model:" in detail else "connection"
+    if isinstance(detail, str) and _has_model_marker(detail):
+        return "model"
+    return "connection"
+
+
+def _has_model_marker(detail: str) -> bool:
+    i = 0
+    while True:
+        j = detail.find("#", i)
+        if j < 0:
+            return False
+        k = j
+        while k < len(detail) and detail[k] == "#":
+            k += 1
+        if (k - j) % 2 == 1 and detail.startswith("model:", k):
+            return True
+        i = k

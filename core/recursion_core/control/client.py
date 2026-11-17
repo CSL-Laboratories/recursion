@@ -80,3 +80,7 @@ class SocketAPI:
         code = error.get("code") if isinstance(error, dict) else None
         # The daemon saw the request and refused it before the control API (scope, bad op).
         return {"code": UNAVAILABLE, "delivered": True, "detail": f"daemon:{code if isinstance(code, str) else 'invalid_reply'}"}
+
+
+# Names the remote lane's product code imports from this module.
+__all__ = ["DEFAULT_TIMEOUT_S", "socket_path"]

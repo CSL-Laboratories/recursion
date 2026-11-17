@@ -91,3 +91,7 @@ def read_frame(
 
 def write_frame(sock: socket.socket, message: dict[str, Any], *, max_bytes: int = MAX_FRAME_BYTES) -> None:
     sock.sendall(encode_frame(message, max_bytes=max_bytes))
+
+
+# Names the remote lane's product code imports from this module.
+__all__ = ["HEADER", "MAX_FRAME_BYTES", "decode_body", "encode_frame"]

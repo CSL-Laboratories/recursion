@@ -35,7 +35,9 @@ the plugin-security breaker store under the daemon's state directory and survive
 Not here: custody (an API-key route has no credential source and refuses; a route that brings
 its own credential, ``key_source: api_key_helper`` or ``passthrough``, is refused before launch,
 see ``route_unsupported``), the O7 interventions, bar evidence for any route (every route reads
-BETA), scopes on the socket beyond the uid check, and the Control MCP transport.
+BETA), and the Control MCP transport. A plugin effect on this socket is answered only when the
+owner's peer presents the device token. A launch that names a minted plugin is bound to that
+plugin; every other launch stays on the host binding.
 """
 from __future__ import annotations
 
@@ -65,7 +67,7 @@ from . import RUN_ID, TERMINAL
 from .breaker import DurableRouteBreaker, open_breaker_store, store_probe_lease_s
 from .launcher import (EngineUnitManager, ProductionLauncher, RunContext, UnitKillTree, bound_run,
                        private_dir, require_launcher_platform)
-from .plugins import PluginHost
+from .plugins import OwnerSocketPeer, PluginHost, PluginRefused
 
 log = logging.getLogger(__name__)
 
@@ -326,10 +328,16 @@ class RouteStarter:
         if unbindable is not None:
             # No run on this route could be bound in the breaker store: refuse before the route service is asked.
             raise self._refuse(run_id, *unbindable)
+        principal = self._plugin_principal(params)
         request = {'contract': route_contract.CONTRACT_VERSION, 'request_id': run_id,
                    'tenant': params['tenant'], 'prompt': params['prompt'],
                    'deadline_s': entry['deadline_s'], 'route': json.loads(json.dumps(entry['route']))}
         ctx = RunContext(run_id, breaker=self._breaker)
+        if principal is not None:
+            # DurableRouteBreaker.bind_run records host. The launcher uses this principal and this
+            # host so the run is bound through start_plugin_run instead.
+            ctx.plugin_principal = principal
+            ctx.plugin_host = getattr(self, '_plugin_host', None)
         with self._lock:
             in_flight = run_id in self._active
             if not in_flight:
@@ -350,6 +358,26 @@ class RouteStarter:
                 return {'cgroup': ctx.cgroup}  # published as the wait ran out: the run started
             raise self._refuse(run_id, 'launch_timeout', '')
         raise self._refuse(run_id, str(result.get('code') or 'engine_exited'), str(result.get('detail') or ''))
+
+    def _plugin_principal(self, params):
+        """The minted principal a start names, or None when the start is the operator's.
+
+        A start that names a plugin is refused before a launch when that plugin was not minted
+        here. The operator's start names no plugin and stays on the host binding.
+        """
+        if 'plugin_id' not in params:
+            return None
+        plugin_id = params.get('plugin_id')
+        run_id = params['run_id']
+        if type(plugin_id) is not str or not plugin_id:
+            raise self._refuse(run_id, 'request_invalid', 'plugin_id')
+        host = getattr(self, '_plugin_host', None)
+        if host is None or not callable(getattr(host, 'principal', None)):
+            raise self._refuse(run_id, 'unavailable', 'no plugin host is composed')
+        principal = host.principal(plugin_id)
+        if principal is None:
+            raise self._refuse(run_id, 'scope_refused', 'plugin')
+        return principal
 
     def _refuse(self, run_id, code, detail):
         with self._lock:
@@ -447,7 +475,15 @@ class DaemonControl:
             answer = self.api.call(method, dict(params or {}))
         else:
             # The API writes the launch intent before the starter knows the run. reconcile() must not
-            # read that gap as a start that never reached a unit (ADV1-8).
+            # read that gap as a start that never reached a unit (ADV1-8). A start that names a plugin
+            # reads the host from the starter; the host is attached here because the starter is built
+            # before the host is.
+            starter = self.starter
+            if starter is not None:
+                try:
+                    starter._plugin_host = self.plugins
+                except AttributeError:
+                    pass
             with self._starts_lock:
                 self._starts_in_flight += 1
             try:
@@ -691,9 +727,82 @@ class DaemonControl:
             # scopes exist (D3), a peer inside a run unit, or one whose cgroup cannot be read, gets
             # no control at all.
             return {'ok': False, 'error': {'code': 'scope_refused', 'detail': 'peer is inside a run unit'}}
+        if method == 'plugin.effect.answer':
+            return {'ok': True, 'result': self._plugin_effect_answer(params, conn.peer)}
+        if method == 'plugin.order':
+            return {'ok': True, 'result': self._plugin_order(params, conn.peer)}
         # The transport echoes the request's "id" in the reply frame; a run.list page leaves room for it.
         reserved = _wire_size(message['id']) + len(',"id":') if 'id' in message else 0
         return {'ok': True, 'result': self._answer(method, params, reserved)}
+
+    def _plugin_effect_answer(self, params, peer):
+        """Answer one plugin effect. The socket sends the peer and the device token together.
+
+        Both are required. A missing token is ``request_invalid``. A stranger peer or a token
+        that does not match is ``scope_refused`` and the effect stays pending. An interruption
+        is not turned into an answer.
+        """
+        from recursion_core.approvals.model import ApprovalRefused
+        if self.plugins is None or not hasattr(self.plugins, 'answer_plugin_effect'):
+            return {'code': 'unavailable', 'detail': 'no plugin host is composed'}
+        if not isinstance(params, dict):
+            return {'code': 'request_invalid', 'detail': 'params'}
+        approval_id = params.get('approval_id')
+        effect = params.get('effect')
+        if type(approval_id) is not str or not approval_id:
+            return {'code': 'request_invalid', 'detail': 'approval_id'}
+        if type(effect) is not dict:
+            return {'code': 'request_invalid', 'detail': 'effect'}
+        answer = params.get('answer', 'approve')
+        if answer not in ('approve', 'deny'):
+            return {'code': 'request_invalid', 'detail': 'answer'}
+        authority = params.get('authority')
+        if authority is not None and type(authority) is not dict:
+            return {'code': 'request_invalid', 'detail': 'authority'}
+        try:
+            return self.plugins.answer_plugin_effect(
+                OwnerSocketPeer(getattr(peer, 'uid', None), getattr(peer, 'pid', None)),
+                approval_id, effect, authority=authority, answer=answer,
+                device_token=params.get('device_token'))
+        except PluginRefused as exc:
+            return {'code': exc.code, 'detail': exc.detail}
+        except Refused as exc:
+            return {'code': exc.code, 'detail': exc.detail}
+        except ApprovalRefused as exc:
+            return {'code': exc.code}
+
+    def _plugin_order(self, params, peer):
+        """Cite an order for a plugin this daemon minted. The caller does not supply the principal."""
+        if self.plugins is None or not hasattr(self.plugins, 'cite_plugin_order'):
+            return {'code': 'unavailable', 'detail': 'no plugin host is composed'}
+        if not isinstance(params, dict):
+            return {'code': 'request_invalid', 'detail': 'params'}
+        if not self._socket_owner(peer):
+            return {'code': 'scope_refused', 'detail': 'approve'}
+        plugin_id = params.get('plugin_id')
+        effect = params.get('effect')
+        if type(plugin_id) is not str or not plugin_id:
+            return {'code': 'request_invalid', 'detail': 'plugin_id'}
+        if type(effect) is not dict:
+            return {'code': 'request_invalid', 'detail': 'effect'}
+        principal = self.plugins.principal(plugin_id) if hasattr(self.plugins, 'principal') else None
+        if principal is None:
+            return {'code': 'scope_refused', 'detail': 'plugin'}
+        try:
+            approval_id = self.plugins.cite_plugin_order(principal, effect)
+        except PluginRefused as exc:
+            return {'code': exc.code, 'detail': exc.detail}
+        except Refused as exc:
+            return {'code': exc.code, 'detail': exc.detail}
+        return {'code': 'ok', 'approval_id': approval_id}
+
+    def _socket_owner(self, peer):
+        """True when this socket peer is the daemon owner and is not inside a run unit."""
+        host = self.plugins
+        uid = getattr(peer, 'uid', None)
+        if host is None or type(uid) is not int or uid != getattr(host, '_owner_uid', None):
+            return False
+        return not peer_is_engine(getattr(peer, 'pid', None))
 
     # -- GUI -----------------------------------------------------------------------------------
     def gui_transport(self, method, path, body):

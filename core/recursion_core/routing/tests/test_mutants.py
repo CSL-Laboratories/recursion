@@ -339,9 +339,9 @@ MUTANTS = {
         {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
     "M58 a non-mapping connection accepted": (
         ROUTER,
-        'not isinstance(connection, Mapping) or any(conn[key] is _MISSING for key in ("kind", "id"))',
-        'connection is None or any(conn[key] is _MISSING for key in ("kind", "id"))',
-        {"test_a_null_attempts_list_and_a_decision_in_name_only"}),
+        "                or not isinstance(connection, Mapping)):\n",
+        "                or connection is None):\n",
+        {"test_a_null_attempts_list_and_a_decision_in_name_only", "test_a_connection_that_is_not_a_mapping_is_never_walked"}),
     "M59 connection kind missing from a routed decision accepted": (
         ROUTER,
         'any(conn[key] is _MISSING for key in ("kind", "id"))',
@@ -802,6 +802,29 @@ MUTANTS = {
         '(reason == "config" and type(rule) is not str)',
         '(reason == "config" and not isinstance(rule, str))',
         {"test_a_rule_that_is_a_str_subclass_gets_no_entry"}),
+    # The ninth DeepSeek read (a65df75d): its F2, the two shapes it found unpinned (its G2 and G4).
+    "M114 every member's presence asked before any value is read": (
+        ROUTER,
+        '        read = {key: decision[key] if key in decision else _MISSING for key in ("engine", "model", "reason", "rule")}\n',
+        '        present = {key: key in decision for key in ("engine", "model", "reason", "rule")}; '
+        'read = {key: decision[key] if present[key] else _MISSING for key in present}\n',
+        {"test_each_members_value_is_read_where_its_presence_is_asked"}),
+    "M115 the connection's presence asked again for each member": (
+        ROUTER,
+        'conn = {key: connection[key] if key in names else _MISSING for key in ("kind", "id")}',
+        'conn = {key: connection[key] if key in connection else _MISSING for key in ("kind", "id")}',
+        {"test_the_connections_members_are_read_from_its_one_walk"}),
+    # The Grok read of round 10 (3a0236af): its R1.
+    "M116 a listed route the daemon refuses before launch switched to": (
+        ROUTER,
+        "            if why is not None:\n"
+        '                skipped.append({"place": place, **route_limits.describe(route),\n'
+        '                                "skipped": why if type(why) is str else "detection_source_failed"})\n'
+        "                continue\n"
+        "        return {",
+        "        return {",
+        {"test_a_listed_route_the_daemon_refuses_is_passed_over_for_the_next",
+         "test_a_refusal_source_that_raises_passes_the_route_over"}),
 }
 
 # Removals from the published schema, each caught by the schema tests (which need jsonschema: hosted CI and

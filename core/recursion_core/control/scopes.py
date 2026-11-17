@@ -114,6 +114,15 @@ def _get(mapping, key):
         return None
 
 
+def _exact(value):
+    """``value`` if it is exactly a ``str``, else None. A principal's kind and id decide what it holds, so a
+    ``str`` subclass, whose own comparison or hash could answer anything, counts as no kind and no id (the
+    round-5 read of #385 by DeepSeek: F1, a kind comparing equal to ``owner`` held all four scopes; F2, an id
+    comparing equal to ``page`` held the page's)."""
+
+    return value if type(value) is str else None
+
+
 def _attr(principal, name: str, default):
     """A principal's attribute; ``default`` when it is missing or reading it raises (it then counts as unknown)."""
 
@@ -192,7 +201,7 @@ class Authorizer:
         One direct call reads kind and id once. ``__call__`` does that read itself and shares the pair,
         so the Stop rule cannot see a later pair."""
 
-        kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
+        kind, pid = _exact(_attr(principal, "kind", None)), _exact(_attr(principal, "id", None))
         return self._held_for(principal, kind, pid)
 
     def _held_for(self, principal, kind, pid) -> frozenset[str]:
@@ -243,7 +252,7 @@ class Authorizer:
             return (SCOPE_REFUSED, "peer is inside a run unit")
         # One pair for the scope calculation and for Stop. A second read let a principal answer plugin
         # to the first and device to the second, and Stop then allowed another plugin's run.
-        kind, pid = _attr(principal, "kind", None), _attr(principal, "id", None)
+        kind, pid = _exact(_attr(principal, "kind", None)), _exact(_attr(principal, "id", None))
         try:
             held = self._held_for(principal, kind, pid)
         except Exception:  # noqa: BLE001 - a credential store that cannot be read refuses; it never lets through

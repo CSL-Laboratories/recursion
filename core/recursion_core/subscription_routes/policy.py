@@ -323,8 +323,8 @@ def check_route(
         if HERMES_ADOPT_EXTERNAL_LOGINS not in profile:
             raise SubscriptionRouteRefused(engine, "hermes_adopt_external_logins_not_off", "missing")
         if profile[HERMES_ADOPT_EXTERNAL_LOGINS] is not False:
-            raise SubscriptionRouteRefused(engine, "hermes_adopt_external_logins_not_off",
-                                           repr(profile[HERMES_ADOPT_EXTERNAL_LOGINS])[:32])
+            # The caller's value is not echoed: it can be a secret or a control character.
+            raise SubscriptionRouteRefused(engine, "hermes_adopt_external_logins_not_off", "not_false")
         engine_config = ((HERMES_ADOPT_EXTERNAL_LOGINS, False),)
     if isinstance(profile.get("auth"), str) and _norm(profile["auth"]) == "subscription":
         return _check_subscription(engine, spec, profile, child_env, route_home, parent_env, operator_home,
@@ -345,7 +345,9 @@ def check_route(
     if auth != "api_key":
         raise SubscriptionRouteRefused(engine, "auth_not_api_key", auth)
     if provider not in spec.providers:
-        raise SubscriptionRouteRefused(engine, "provider_not_allowed", provider)
+        # A one-line provider stays in the detail. A newline, return or NUL would forge a second line.
+        shown = "" if any(ch in provider for ch in "\n\r\x00") else provider
+        raise SubscriptionRouteRefused(engine, "provider_not_allowed", shown)
     stored_model = ""
     if model is not None:
         stored_model = _require_model_name(engine, model)

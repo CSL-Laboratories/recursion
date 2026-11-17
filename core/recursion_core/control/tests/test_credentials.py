@@ -1042,6 +1042,31 @@ class PeerRefusalTest(unittest.TestCase):
             store.verify(token, peer=self.HashRaises())
         self.assertEqual(caught.exception.detail, "peer_invalid")
 
+    @NEEDS_POSIX
+    def test_verify_refuses_an_unhashable_peer_before_a_permissive_limiter(self) -> None:
+        """The hash guard runs before the limiter. A limiter that accepts every peer must not be asked."""
+
+        class OpenLimit:
+            def blocked(self, peer):
+                return False
+
+            def failed(self, peer):
+                return False
+
+        class HashRaises:
+            def __hash__(self):
+                raise RuntimeError("unhashable on purpose")
+
+        base = tempfile.mkdtemp(prefix="creds-peer-")
+        self.addCleanup(shutil.rmtree, base, True)
+        store = CredentialStore(os.path.join(base, "state", "credentials.json"), limit=OpenLimit())
+        token, _ = store.mint("device", "d1", ["read"])
+        for peer in (["x"], HashRaises()):
+            with self.subTest(peer=type(peer).__name__):
+                with self.assertRaises(CredentialRefused) as caught:
+                    store.verify(token, peer=peer)
+                self.assertEqual(caught.exception.detail, "peer_invalid")
+
 
 @NEEDS_POSIX
 class TwoStoresTest(unittest.TestCase):
@@ -1573,6 +1598,55 @@ class ClockInsideTheLockTest(unittest.TestCase):
     def test_held_judges_expiry_when_the_lock_is_taken(self):
         self.assertEqual(self._judged_after_a_wait(lambda store, grant: store.held("plugin", "synthetic")),
                          [frozenset()])
+
+    def test_expiry_is_judged_after_the_reload(self):
+        """A reload that outlasts the grant must not answer scopes read from the clock before that reload.
+
+        ``verify`` already reads the clock after ``_refresh``. ``grant_scopes`` and ``held`` must do the same,
+        and the authorizer must refuse both a token plugin and a host-attributed plugin.
+        """
+        from recursion_core.control.scopes import Authorizer
+
+        class Principal:
+            def __init__(self, kind, principal_id, grant=None):
+                self.kind, self.id, self.in_run_unit, self.grant = kind, principal_id, False, grant
+
+        with tempfile.TemporaryDirectory() as folder:
+            now = [1000]
+            store = CredentialStore(os.path.join(folder, "synthetic.json"), wall=lambda: now[0])
+            token, grant = store.mint("plugin", "synthetic", ["read"], expires_at=1100)
+            real_refresh = store._refresh
+
+            def reload_then_the_clock_moves():
+                real_refresh()
+                now[0] = 2000
+
+            store._refresh = reload_then_the_clock_moves
+            auth = Authorizer(scope_of=lambda method: "read", credentials=store)
+
+            def ask(call):
+                now[0] = 1000
+                return call()
+
+            self.assertEqual(ask(lambda: store.grant_scopes(grant.token_id, "plugin", "synthetic")), frozenset())
+            self.assertEqual(ask(lambda: store.held("plugin", "synthetic")), frozenset())
+            with self.assertRaises(CredentialRefused) as caught:
+                ask(lambda: store.verify(token, peer="peer"))
+            self.assertEqual(caught.exception.detail, "token_expired")
+            refused = ("scope_refused", "needs_read")
+            self.assertEqual(ask(lambda: auth(Principal("plugin", "synthetic", grant.token_id), "plugin.list", {})),
+                             refused)
+            self.assertEqual(ask(lambda: auth(Principal("plugin", "synthetic"), "plugin.list", {})), refused)
+
+    def test_the_clock_sentences_match_the_code(self):
+        init = CredentialStore.__init__.__doc__ or ""
+        self.assertIn("lock held", init)
+        self.assertIn("promptly", init)
+        revoke = CredentialStore._revoke_here.__doc__ or ""
+        self.assertIn("CredentialStoreError", revoke)
+        self.assertNotIn("cannot be read does not undo", revoke)
+        for method in (CredentialStore.grant_scopes, CredentialStore.held):
+            self.assertIn("CredentialStoreError", method.__doc__ or "")
 
     def test_a_clock_that_raises_inside_the_lock_leaves_it_free_and_the_store_unchanged(self):
         with tempfile.TemporaryDirectory() as folder:

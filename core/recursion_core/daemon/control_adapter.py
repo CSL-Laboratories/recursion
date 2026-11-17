@@ -390,6 +390,11 @@ class RouteStarter:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, path)
+            folder = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fsync(folder)  # the rename is not crash-durable until its folder is synced (E32)
+            finally:
+                os.close(folder)
         except (OSError, TypeError, ValueError):
             log.exception('route result for %s was not written', run_id)
             with self._lock:

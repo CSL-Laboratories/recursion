@@ -271,8 +271,32 @@ _RUNS_TABLE = (
     'unit TEXT UNIQUE NOT NULL, stop INTEGER NOT NULL, '
     'state TEXT NOT NULL, boot_id TEXT, detail TEXT NOT NULL, '
     'created REAL NOT NULL, updated REAL NOT NULL)')
+_RUNS_COLUMNS = frozenset(('run_id', 'unit', 'stop', 'state', 'boot_id', 'detail', 'created', 'updated'))
 _CONTROL_TABLE = ('CREATE TABLE IF NOT EXISTS control_runs '
                   '(run_id TEXT PRIMARY KEY, record TEXT NOT NULL)')
+
+
+def _take_owner(directory: Path):
+    """The state folder's one-writer lease: a flock held on ``owner.lock`` for as long as the registry is open.
+
+    ``UserLock`` is keyed on the runtime folder and the registry on the state folder, and the two are chosen
+    apart: a second daemon with another runtime folder over the same state folder would publish its own copy
+    of the file over a Stop the first had committed (E14). A second owner of the folder, in this process or in
+    another, is refused.
+    """
+    fd = os.open(directory / 'owner.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise PermissionError('Registry owner lock must be a regular file owned by the operator')
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException as exc:
+        os.close(fd)
+        if isinstance(exc, BlockingIOError):
+            raise AlreadyRunning('One registry writer per state folder') from exc
+        raise
+    return os.fdopen(fd, 'rb')
 
 
 class Registry:
@@ -299,22 +323,27 @@ class Registry:
         self.db = None
         self._open_error = None
         self._dir_durable = False
-        self._sweep_stale_temps()
+        self._owner = _take_owner(directory)
         try:
-            self.path.lstat()
-        except FileNotFoundError:
-            self._publish_new()
-        else:
-            self._assert_sound(self.path)
-            # The name already on disk is not acknowledged until its directory
-            # entry is durable.
-            _sync_directory(self.directory)
-        self._dir_durable = True
-        try:
-            self._reopen()
-        except sqlite3.Error as exc:
-            raise RegistryIntegrityError('registry is not open') from exc
-        self._seal_files()
+            self._sweep_stale_temps()
+            try:
+                self.path.lstat()
+            except FileNotFoundError:
+                self._publish_new()
+            else:
+                self._assert_sound(self.path)
+                # The name already on disk is not acknowledged until its directory
+                # entry is durable.
+                _sync_directory(self.directory)
+            self._dir_durable = True
+            try:
+                self._reopen()
+            except sqlite3.Error as exc:
+                raise RegistryIntegrityError('registry is not open') from exc
+            self._seal_files()
+        except BaseException:
+            self._owner.close()
+            raise
 
     def _temp_path(self):
         return self.directory / f'.runs.sqlite3.tmp-{os.getpid()}-{threading.get_ident()}'
@@ -392,7 +421,15 @@ class Registry:
         failure there must not discard bytes the rename already published.
         """
         _fsync_file(tmp)
-        os.replace(tmp, self.path)
+        durable = self._dir_durable
+        # From the rename until the directory fsync returns, the name is not crash-durable: an interrupt
+        # between the two must leave it owed, or a later sweep would act on a Stop that can still be lost (E12).
+        self._dir_durable = False
+        try:
+            os.replace(tmp, self.path)
+        except OSError:
+            self._dir_durable = durable  # the rename is atomic: an error means it did not happen
+            raise
 
     def _require_dir_durable(self):
         """Retry a directory fsync that an earlier publish left unfinished.
@@ -471,6 +508,9 @@ class Registry:
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'").fetchone()
             if table is None:
                 raise RegistryIntegrityError('torn or partial registry')
+            # A runs table that lacks a column opens, and then every read raises a raw OperationalError (E15).
+            if not _RUNS_COLUMNS <= {row[1] for row in conn.execute('PRAGMA table_info(runs)')}:
+                raise RegistryIntegrityError('torn or partial registry')
         finally:
             conn.close()
 
@@ -492,10 +532,17 @@ class Registry:
         return True
 
     def _restore_open(self):
-        """Reopen the file that is still live. A failed reopen stays typed."""
+        """Reopen the file that is still live. A failed reopen stays typed.
+
+        The directory barrier is not taken here: a publish that an interrupt cut short leaves it owed, and the
+        next call pays it (E12).
+        """
         if self.closed or self.db is not None:
             return
-        self._ensure_open()
+        try:
+            self._reopen()
+        except sqlite3.Error as exc:
+            raise RegistryIntegrityError('registry is not open') from exc
 
     def _checkpoint_and_drop_journals(self):
         """Checkpoint the live database and remove its journals before rename.
@@ -734,6 +781,7 @@ class Registry:
                 if self.db is not None:
                     self.db.close()
                     self.db = None
+                self._owner.close()
 
 
 class UnitNotLoaded(subprocess.SubprocessError):
@@ -870,6 +918,13 @@ class Daemon:
                 # The last request failed and its wait is not over: only look, and keep saying why.
                 detail = detail or run.detail
             observation = self.manager.observe(run.unit)
+            if observation == 'empty':
+                # systemd prunes the cgroup of an inactive unit, so a blank ControlGroup says nothing about a
+                # process an older user manager left in the cgroup the run was recorded with (E11). A recorded
+                # Stop walks that cgroup as it does for a gone unit; a read only looks and signals nothing.
+                if self._recorded_cgroup_alive(run, cgroup, kill=stopped or not_loaded):
+                    observation = 'running'
+                    detail = detail or 'unit ended; the recorded cgroup still holds a process'
             # A gone (not-found) unit is terminated only with a recorded Stop and either
             # this reconcile's stop returning (systemctl stop waits for inactive, then
             # systemd garbage-collects the unit) or systemd answering that stop with "not
@@ -937,6 +992,29 @@ class Daemon:
         if not paths:
             return (None, CGROUP_UNRECORDED) if recorded else (True, '')
         return self._walk_cgroups(run, paths), CGROUP_UNREAD
+
+    def _recorded_cgroup_alive(self, run, cgroup, *, kill):
+        """True when a process is alive in a cgroup recorded for ``run``; False when that is not so or not known.
+
+        ``kill`` is a recorded Stop's walk, which ends what it finds. Otherwise the cgroups are only read.
+        """
+        try:
+            _, group = self.registry.control_identity(run.run_id)
+        except ValueError:
+            return False
+        paths = [path for path in dict.fromkeys((group, cgroup)) if path is not None]
+        if not paths:
+            return False
+        if kill:
+            return self._walk_cgroups(run, paths) is False
+        look = getattr(self.manager, 'recorded_cgroup_live', None)
+        if not callable(look):
+            return False
+        try:
+            return any(look(run.unit, path) is True for path in paths)
+        except Exception:
+            log.exception('read of the recorded cgroup of %s failed', run.run_id)
+            return False
 
     def _walk_cgroups(self, run, paths):
         """The manager's walk over each of ``paths``: False if any holds a live process, else
@@ -1199,10 +1277,9 @@ class SystemdUserManager:
         otherwise SIGKILL by pidfd to each pid of ``cgroup.procs`` that /proc still places
         in this cgroup. The subtree is then re-read until it is empty or the wait runs out.
         """
-        if (not isinstance(group, str) or not group.startswith('/') or '..' in Path(group).parts
-                or not UNIT.fullmatch(unit) or Path(group).name != unit):
+        directory = self._recorded_cgroup_path(unit, group)
+        if directory is None:
             return None
-        directory = self.cgroup_root / group.lstrip('/')
         live = self._recorded_cgroup_live(directory, group)
         if live is not True or not self._kill_recorded_cgroup(directory, group):
             return None if live is None else not live
@@ -1214,6 +1291,21 @@ class SystemdUserManager:
             if time.monotonic() >= deadline:
                 return None if live is None else False
             time.sleep(0.05)
+
+    def _recorded_cgroup_path(self, unit, group):
+        if (not isinstance(group, str) or not group.startswith('/') or '..' in Path(group).parts
+                or not UNIT.fullmatch(unit) or Path(group).name != unit):
+            return None
+        return self.cgroup_root / group.lstrip('/')
+
+    def recorded_cgroup_live(self, unit, group):
+        """Read, and never signal, the cgroup a run was recorded with.
+
+        True: a process is alive there. False: none is. None: that cannot be told, or ``group`` does not
+        name this unit.
+        """
+        directory = self._recorded_cgroup_path(unit, group)
+        return None if directory is None else self._recorded_cgroup_live(directory, group)
 
     def _recorded_cgroup_live(self, directory, group):
         try:

@@ -159,11 +159,12 @@ class SocketAttackTest(ComposedBase):
         # composes twice. The second compose fails at the socket lock; it used to have rewritten and then
         # unlinked the token file the live daemon's GUI depends on. The file is now written only after
         # server.start() succeeds, and a door removes only the file it wrote.
-        _, first = self.boot()
+        daemon, first = self.boot()
         token_file = self.runtime / 'recursion' / 'gui-device-token'
         live = token_file.read_text().strip()
+        # Over the same daemon: a second registry over the state folder is refused earlier, by its owner lock (E14).
         with self.assertRaises(InsecureSocketPath):
-            self.boot()
+            adapter.compose_control(daemon, self.state, environ=self.environ, routes=self.routes)
         self.assertTrue(first.door({'HTTP_AUTHORIZATION': 'Bearer ' + live}))  # in-memory token unchanged
         self.assertEqual(token_file.read_text().strip(), live, 'the losing composition left the live token file')
         self.assertEqual(os.listdir(token_file.parent).count('gui-device-token.tmp'), 0)

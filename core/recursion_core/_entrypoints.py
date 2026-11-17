@@ -4,13 +4,16 @@
     recursiond provision                        unit, stores and the route homes' custody root
     recursiond doctor [--json]                  report this machine; no daemon is required
     recursiond up                               start the user unit and print the GUI address
+    recursiond mcp-config --client NAME         print the Control MCP snippet; write nothing
     recursiond serve [daemon options]           run the daemon in the foreground
 
 Linux only: on any other system every command refuses with ``platform_unsupported`` (exit 1)
 before anything else is imported; ``--help`` still prints. install, upgrade, uninstall and
 provision each print one JSON object. ``doctor --json`` prints one report; without ``--json``
-it prints one line per check. ``up`` prints one JSON object. 0 is ok, 1 a refusal, a report
-that has a fail, or a socket that did not answer, 2 a usage error.
+it prints one line per check. ``up`` prints one JSON object. ``mcp-config`` prints the
+Control MCP snippet for ``--client codex`` (TOML), ``claude`` or ``cursor`` (one JSON object)
+and writes no file. 0 is ok, 1 a refusal, a report that has a fail, or a socket that did not
+answer, 2 a usage error.
 
 ``serve`` checks the build before it imports anything of the daemon's: the daemon needs
 free-threaded CPython 3.14 (``build_not_free_threaded`` otherwise). It then replaces this process
@@ -34,7 +37,8 @@ DAEMON_MODULE = "recursion_core.daemon"
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
 _DESCRIPTION = ("Recursion's per-user daemon and its installer. Linux only. "
                 "install, upgrade, uninstall and provision each print one JSON object. "
-                "doctor prints a report. up prints one JSON object.")
+                "doctor prints a report. up prints one JSON object. "
+                "mcp-config prints the Control MCP snippet for one client and writes nothing.")
 
 
 def _configure_doctor(parser) -> None:
@@ -69,6 +73,34 @@ def _handle_up(_args) -> int:
     return up.command()
 
 
+# #395's stdio server (``python -m recursion_core.control.mcp``) takes no arguments.
+# ``control.mcp.server`` names it ``recursion-control``. This command only prints that launch.
+_MCP_CLIENTS = ("codex", "claude", "cursor")
+_MCP_SERVER_ID = "recursion-control"
+_MCP_ARGS = ["-m", "recursion_core.control.mcp"]
+
+
+def _configure_mcp_config(parser) -> None:
+    parser.add_argument("--client", required=True, choices=_MCP_CLIENTS,
+                        help="codex (TOML), claude or cursor (one JSON object); the snippet is printed, not written")
+
+
+def _handle_mcp_config(args) -> int:
+    """Print one client's Control MCP snippet. Write nothing. A second call prints it again."""
+
+    command = sys.executable
+    if not command or not os.path.isabs(command):
+        return _refuse("interpreter_unknown", "this interpreter does not know its own path")
+    if args.client == "codex":
+        import recursion_core.control.codex_config as codex_config
+
+        sys.stdout.write(codex_config.codex_operator_snippet(_MCP_SERVER_ID, command, _MCP_ARGS))
+        return EXIT_OK
+    snippet = {"mcpServers": {_MCP_SERVER_ID: {"command": command, "args": list(_MCP_ARGS)}}}
+    print(json.dumps(snippet, sort_keys=True))
+    return EXIT_OK
+
+
 # Later cogs append a row: (name, help, configure, handle). configure adds that command's options.
 SUBCOMMANDS = (
     ("doctor", "report what is ok, warn, fail or unknown on this machine",
@@ -77,6 +109,8 @@ SUBCOMMANDS = (
      _configure_plain, _handle_provision),
     ("up", "start the per-user unit and print the GUI address when the socket answers",
      _configure_plain, _handle_up),
+    ("mcp-config", "print the Control MCP snippet for codex, claude or cursor",
+     _configure_mcp_config, _handle_mcp_config),
 )
 
 

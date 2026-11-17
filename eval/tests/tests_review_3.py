@@ -189,7 +189,11 @@ class CleanupReportedAtOnceTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt) as caught:
                 arms.run_process(["synthetic"], cwd=Path(os.environ.get("TMPDIR", "/tmp")), env={}, stdin=None,
                                  timeout_s=1)
-        kill.assert_called_once_with(987654323)
+        # The session id is still the only positional argument. The leader object is passed so a reused
+        # session number is not signalled; the patched cleanup still raises and the interruption remains.
+        self.assertEqual(kill.call_args.args, (987654323,))
+        self.assertIs(kill.call_args.kwargs["leader"].pid, 987654323)
+        self.assertEqual(kill.call_count, 1)
         self.assertIn("cleanup after the interruption", " ".join(getattr(caught.exception, "__notes__", [])))
 
 

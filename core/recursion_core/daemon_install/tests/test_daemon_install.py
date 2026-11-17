@@ -327,8 +327,9 @@ class InstallTests(unittest.TestCase):
         os.makedirs(self.unit_dir, 0o700)
         elsewhere = os.path.join(self.case, "elsewhere")
         cases = (
-            ("[Service]\nEnvironment=XDG_STATE_HOME=/a\0b\nExecStart=/old\n", "sets XDG_STATE_HOME=/a\0b"),
-            ("[Service]\nEnvironment=HOME=/a\0b\nExecStart=/old\n", "sets HOME=/a\0b"),
+            # a NUL ends the line, as in systemd 255 (Grok R1 of round 11): the value is /a
+            ("[Service]\nEnvironment=XDG_STATE_HOME=/a\0b\nExecStart=/old\n", "sets XDG_STATE_HOME=/a:"),
+            ("[Service]\nEnvironment=HOME=/a\0b\nExecStart=/old\n", "sets HOME=/a, so"),
             (f"[Service]\nEnvironment=HOME={elsewhere}\nExecStart=/old\n",
              f"sets HOME={elsewhere}, so the daemon's default state folder is under it"),
             (f"[Service]\nEnvironment=XDG_STATE_HOME=%h/x HOME={elsewhere}\nUnsetEnvironment=XDG_STATE_HOME\nExecStart=/old\n",
@@ -402,6 +403,84 @@ class InstallTests(unittest.TestCase):
                             f"sets XDG_STATE_HOME={elsewhere}"))
             # and "A=1<end>Environment=..." as one assignment too: no XDG_STATE_HOME is set
             replaced.append(f"Environment=A=1{end}Environment=XDG_STATE_HOME={elsewhere}\n")
+        for service, said in refused:
+            with self.subTest(service=service):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(f"[Service]\n{service}ExecStart=/old\n")
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    upgrade(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
+                self.assertIn(said, caught.exception.detail)
+                self.assertEqual(_tree(self.home), before)  # the unit as it was
+        for service in replaced:
+            with self.subTest(service=service):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(f"[Service]\n{service}ExecStart=/old\n")
+                self.assertTrue(upgrade(self.roots, EXEC).changed)
+                self.assertEqual(_read(self.unit), render_unit(EXEC))
+
+    # DeepSeek's round 11 on #382 (1e2c139e). F11-1: a directive line with no '=' was read as an empty one, dropping the
+    # values before it; systemd ignores such a line. F11-2: a comment line inside a continuation was joined as text, so a
+    # line after it was read as a directive systemd never applies (systemd skips the comment and joins the next line).
+    # The same parser: a comment line ending in a backslash is not continued, and an even run of trailing backslashes
+    # is escaped backslashes, not a continuation.
+    def test_lines_without_an_equals_sign_and_comments_in_continuations_are_read_as_systemd_reads_them(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        elsewhere = os.path.join(self.case, "elsewhere")
+        refused = [
+            (f"Environment=XDG_STATE_HOME={elsewhere}\nEnvironment\n", f"sets XDG_STATE_HOME={elsewhere}"),
+            (f"Environment=XDG_STATE_HOME={elsewhere}\n  Environment  \n", f"sets XDG_STATE_HOME={elsewhere}"),
+            ("PassEnvironment=XDG_STATE_HOME\nPassEnvironment\n", "passes the user manager's own XDG_STATE_HOME"),
+            ("EnvironmentFile=/etc/recursion.env\nEnvironmentFile\n", "reads EnvironmentFile=/etc/recursion.env"),
+            (f"Environment=HOME={elsewhere} A=1 \\\n# a comment\nUnsetEnvironment=HOME\n", f"sets HOME={elsewhere}"),
+            (f"Environment=HOME={elsewhere} A=1 \\\n; a comment\n  # another\nUnsetEnvironment=HOME\n", f"sets HOME={elsewhere}"),
+            (f"# a comment \\\nEnvironment=XDG_STATE_HOME={elsewhere}\n", f"sets XDG_STATE_HOME={elsewhere}"),
+            (f"Environment=A=b\\\\\nEnvironment=XDG_STATE_HOME={elsewhere}\n", f"sets XDG_STATE_HOME={elsewhere}"),
+        ]
+        replaced = [
+            f"Environment=HOME={elsewhere}\nUnsetEnvironment=HOME\nUnsetEnvironment\n",  # the bare line drops nothing
+            "Environment=A=1 \\\n# a comment\nXDG_STATE_HOME=%h/.local/state\n",  # joined: this unit's own folder
+            f"Environment=A=b\\\\\\\nXDG_STATE_HOME={elsewhere}\nUnsetEnvironment=XDG_STATE_HOME\n",  # an odd run continues
+        ]
+        for service, said in refused:
+            with self.subTest(service=service):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(f"[Service]\n{service}ExecStart=/old\n")
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    upgrade(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
+                self.assertIn(said, caught.exception.detail)
+                self.assertEqual(_tree(self.home), before)  # the unit as it was
+        for service in replaced:
+            with self.subTest(service=service):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(f"[Service]\n{service}ExecStart=/old\n")
+                self.assertTrue(upgrade(self.roots, EXEC).changed)
+                self.assertEqual(_read(self.unit), render_unit(EXEC))
+
+    # Grok's round 11 on #382 (1e2c139e). R1: systemd 255 ends a line at a NUL byte too, so "Environment=A=1<NUL>
+    # Environment=XDG_STATE_HOME=..." sets the folder, and the check read one line. R3: systemd decodes C escapes by its
+    # own table in these settings, quotes or none (\x45 is E, \105 is E, \s a space), where shlex made them letters, so
+    # an escaped name was not seen. An escape this check does not follow is refused, as is one systemd refuses.
+    def test_a_nul_ends_a_line_and_escapes_are_read_by_systemds_table(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        elsewhere = os.path.join(self.case, "elsewhere")
+        refused = [
+            (f"Environment=A=1\0Environment=XDG_STATE_HOME={elsewhere}\n", f"sets XDG_STATE_HOME={elsewhere}:"),
+            ("Environment=XDG_STATE_HOM" + "\\x45" + f"={elsewhere}\n", f"sets XDG_STATE_HOME={elsewhere}:"),
+            ("Environment='XDG_STATE_HOM" + "\\105" + f"={elsewhere}'\n", f"sets XDG_STATE_HOME={elsewhere}:"),
+            ("Environment=\"HOM" + "\\u0045" + f"={elsewhere}\"\n", f"sets HOME={elsewhere}, so"),
+            ("Environment=XDG_STATE_HOME=/a" + "\\q" + "b\n", "which cannot be read"),  # not in systemd's table
+            ("Environment=XDG_STATE_HOME=" + "\\x00" + "\n", "which cannot be read"),  # systemd refuses a NUL
+            ("Environment=XDG_STATE_HOME=/a" + "\\xe9" + "\n", "which cannot be read"),  # a byte above 0x7f
+        ]
+        replaced = [
+            "Environment=XDG_STATE_HOME=%h/.local/stat" + "\\x65" + "\n",  # this unit's own folder, spelled with an escape
+            f"Environment=HOME={elsewhere}\nUnsetEnvironment=HOM" + "\\x45" + "\n",  # HOME dropped
+            "Environment=A=1" + "\\s" + "XDG_STATE_HOME=/elsewhere\n",  # an escaped space does not end the word
+        ]
         for service, said in refused:
             with self.subTest(service=service):
                 with open(self.unit, "w", encoding="utf-8") as handle:

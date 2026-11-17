@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 
 from .errors import InstallRefused
 
@@ -29,8 +28,15 @@ STOP_TIMEOUT_S = 90  # systemd's own default, stated: finite, and long enough fo
 MAX_ARGS = 16
 MAX_ARG_LEN = 256
 _ARG = re.compile(r"[A-Za-z0-9_./:%@=+-]+")
-_LINE_END = re.compile(r"\r\n|\r|\n")  # systemd's; str.splitlines also ends lines at \v, \f, \x1c-\x1e, \x85, \u2028, \u2029
+# systemd 255's line ends, a NUL among them (Grok R1 on #382); str.splitlines also ends lines at \v, \f, \x1c-\x1e,
+# \x85, \u2028 and \u2029, which systemd reads within a line (Grok R3 of round 10)
+_LINE_END = re.compile(r"\r\n|\r|\n|\x00")
 _BLANKS = " \t\r\n"  # what systemd strips around a line, a key and a value
+_ESCAPES = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "\"": "\"",
+            "'": "'", "s": " "}  # systemd's C escapes (cunescape_one); \x, \u, \U and three octal digits below
+_HEX_ESCAPES = {"x": 2, "u": 4, "U": 8}
+_HEX_DIGITS = "0123456789abcdefABCDEF"
+_OCTAL_DIGITS = "01234567"
 
 
 def daemon_exec_args(interpreter: str) -> tuple[str, ...]:
@@ -110,8 +116,9 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
     drops it), under ``$HOME``: the daemon's default is ``Path.home()``, which reads
     ``HOME``, so a unit's own ``HOME`` (or an ``EnvironmentFile``, which can set it) moves the state too,
     unless it names ``home`` or ``UnsetEnvironment`` drops it. A byte order mark before the first line is
-    skipped, as systemd skips it, and a value with a NUL byte names no folder. Lines end where systemd ends
-    them, at ``\\r\\n``, ``\\r`` or ``\\n`` only, and an empty ``XDG_STATE_HOME`` is the daemon's default, as the
+    skipped, as systemd skips it. Lines end where systemd ends
+    them, at ``\\r\\n``, ``\\r``, ``\\n`` or a NUL byte only, and words are split and C escapes decoded by systemd's
+    table (``_words``), and an empty ``XDG_STATE_HOME`` is the daemon's default, as the
     daemon reads it (``os.environ.get('XDG_STATE_HOME') or ...``). A unit that cannot be read
     so is answered too: then where it keeps the state cannot be told. A value only in the user manager's own
     environment
@@ -134,15 +141,24 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
     while i < len(lines):
         line = lines[i].strip(_BLANKS)
         i += 1
-        while line.endswith("\\") and i < len(lines):  # a continued line
-            line = line[:-1] + " " + lines[i].strip(_BLANKS)
+        if not line or line[0] in "#;":  # a comment line is skipped whole, a backslash at its end too
+            continue
+        # A line continues on an odd run of backslashes at its end (an even run is escaped backslashes), and comment
+        # lines inside a continuation are skipped, as systemd's parser skips them (DeepSeek F11-2 on #382).
+        while _continues(line) and i < len(lines):
+            following = lines[i].strip(_BLANKS)
             i += 1
-        if not line or line[0] in "#;":
+            if following[:1] in ("#", ";"):
+                continue
+            line = line[:-1] + " " + following
+        if not line:
             continue
         if line.startswith("[") and line.endswith("]"):
             section = line[1:-1]
             continue
-        key, _, value = line.partition("=")
+        key, sep, value = line.partition("=")
+        if not sep:  # no '=': systemd ignores the line, it is not an empty directive (DeepSeek F11-1 on #382)
+            continue
         key, value = key.strip(_BLANKS), value.strip(_BLANKS)
         if section != "Service" or key not in ("Environment", "EnvironmentFile", "PassEnvironment",
                                                 "UnsetEnvironment"):
@@ -150,9 +166,8 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
         if key == "EnvironmentFile":
             files = files + [value] if value else []
             continue
-        try:
-            words = shlex.split(value)
-        except ValueError:
+        words = _words(value)
+        if words is None:
             return f"has {key}={value}, which cannot be read, so where it keeps the daemon's state cannot be told"
         if key == "Environment":
             if not words:
@@ -189,14 +204,93 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
     return None
 
 
+def _words(value: str) -> list[str] | None:
+    """``value`` split as systemd splits ``Environment=``, ``PassEnvironment=`` and ``UnsetEnvironment=``
+    (``extract_first_word`` with ``EXTRACT_UNQUOTE`` and ``EXTRACT_CUNESCAPE``): words between blanks, quotes
+    taken away wherever they stand, and C escapes decoded by systemd's table, inside quotes too (Grok R3 on #382:
+    ``shlex.split`` made ``\\s`` an ``s`` and ``\\x45`` an ``x45``). ``None`` when systemd would not read it, or when an
+    escape gives a character this check does not follow: an unknown escape, a NUL, a byte above 0x7f, a quote left
+    open or a backslash at the end. Then where the unit keeps the state cannot be told, and it is refused."""
+
+    words: list[str] = []
+    word: list[str] = []
+    quote = ""
+    started = False
+    i = 0
+    while i < len(value):
+        c = value[i]
+        if c == "\\":
+            decoded, i = _escape(value, i)
+            if decoded is None:
+                return None
+            word.append(decoded)
+            started = True
+        elif quote:
+            if c == quote:
+                quote = ""
+            else:
+                word.append(c)
+            i += 1
+        elif c in "\"'":
+            quote, started = c, True
+            i += 1
+        elif c in _BLANKS:
+            if started:
+                words.append("".join(word))
+                word, started = [], False
+            i += 1
+        else:
+            word.append(c)
+            started = True
+            i += 1
+    if quote:
+        return None
+    if started:
+        words.append("".join(word))
+    return words
+
+
+def _escape(value: str, i: int) -> tuple[str | None, int]:
+    """The character the C escape at ``value[i]`` (a backslash) stands for, by systemd's table, and the index after
+    it; ``None`` for one this check does not follow."""
+
+    if i + 1 >= len(value):
+        return None, i + 1
+    e = value[i + 1]
+    if e in _ESCAPES:
+        return _ESCAPES[e], i + 2
+    if e in _HEX_ESCAPES:
+        size = _HEX_ESCAPES[e]
+        digits = value[i + 2:i + 2 + size]
+        if len(digits) != size or not all(d in _HEX_DIGITS for d in digits):
+            return None, i + 2
+        code = int(digits, 16)
+        limit = 0x7F if e == "x" else 0x10FFFF
+        if code == 0 or code > limit or 0xD800 <= code <= 0xDFFF:
+            return None, i + 2
+        return chr(code), i + 2 + size
+    if e in _OCTAL_DIGITS:
+        digits = value[i + 1:i + 4]
+        if len(digits) != 3 or not all(d in _OCTAL_DIGITS for d in digits):
+            return None, i + 1
+        code = int(digits, 8)
+        if code == 0 or code > 0x7F:
+            return None, i + 1
+        return chr(code), i + 4
+    return None, i + 2  # an escape systemd's table does not have: systemd refuses the rest of the line
+
+
+def _continues(line: str) -> bool:
+    """Whether ``line`` ends in a backslash that is not itself escaped: an odd run of them."""
+
+    return (len(line) - len(line.rstrip("\\"))) % 2 == 1
+
+
 def _names(value: str, folder: str, home: str) -> bool:
     """Whether a unit's ``value`` (``%h`` is ``home``) names ``folder``, links followed."""
 
-    named = home + value[2:] if value.startswith("%h") else value
-    try:
-        return os.path.isabs(named) and os.path.realpath(named) == os.path.realpath(folder)
-    except ValueError:  # a NUL byte, which realpath refuses: no folder (DeepSeek H9-1)
-        return False
+    named = home + value[2:] if value.startswith("%h") else value  # no NUL: it ends the line (DeepSeek H9-1, Grok R1)
+    return os.path.isabs(named) and os.path.realpath(named) == os.path.realpath(folder)
 
 
 def service_fields(unit: str) -> dict[str, str]:

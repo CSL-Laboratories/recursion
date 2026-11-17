@@ -337,7 +337,7 @@ class CommandTests(unittest.TestCase):
             handle.write("[Service]\nEnvironment=XDG_STATE_HOME=/a\0b\nExecStart=/old\n")
         code, answer = self.run_action("upgrade")
         self.assertEqual((code, answer["code"]), (1, "unit_state_elsewhere"))
-        self.assertIn("sets XDG_STATE_HOME=/a\0b", answer["detail"])
+        self.assertIn("sets XDG_STATE_HOME=/a:", answer["detail"])  # the NUL ends the line (Grok R1 of round 11)
 
     # The Liaison's item 4 (Nov 16): a password lookup that fails (CPython raises KeyError for no entry and for a
     # failed lookup alike) ended `recursiond install` with a traceback; it is the JSON refusal home_unknown.

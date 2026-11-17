@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import platform
 import random
@@ -43,6 +44,7 @@ from eval import gitutil, heldout
 from eval import record as record_mod
 from eval import scratch as scratch_mod
 from eval import suite as suite_mod
+from eval import tasks as task_mod
 from eval import validate as validate_mod
 
 DEV_SUITE = PACKAGE_ROOT / "devset" / "suite.json"
@@ -610,7 +612,8 @@ def main(argv=None) -> int:
         outcome = run(suite, arms, k=args.k, attempts=args.attempts, replacements=args.replacements,
                       label=args.label or default_label(suite, args.engine), seed=args.seed, jobs=args.jobs,
                       out_dir=args.out, artifacts=args.artifacts, tmp_base=args.tmp_base, xdg_base=args.xdg_base)
-    except (RunRefused, heldout.HeldOutDenied, suite_mod.SuiteError, scratch_mod.ScratchError) as exc:
+    except (RunRefused, heldout.HeldOutDenied, suite_mod.SuiteError, scratch_mod.ScratchError,
+            task_mod.TaskError, json.JSONDecodeError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     if outcome.interrupted:

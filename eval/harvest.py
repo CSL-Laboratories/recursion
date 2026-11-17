@@ -97,12 +97,15 @@ def load_repos(path: Path) -> tuple:
         raise HarvestError(f"{path}: repos must be a non-empty list")
     names = set()
     for repo in repos:
+        if not isinstance(repo, dict):
+            raise HarvestError(f"{path}: a repository entry must be an object")
         for key in ("name", "path", "branch", "test_globs", "test_command"):
             if key not in repo:
                 raise HarvestError(f"{path}: a repository entry lacks {key!r}")
-        if not task_mod.TASK_ID.match(repo["name"]) or repo["name"] in names:
-            raise HarvestError(f"{path}: bad or duplicate repository name {repo['name']!r}")
-        names.add(repo["name"])
+        name = repo["name"]
+        if not isinstance(name, str) or not task_mod.TASK_ID.match(name) or name in names:
+            raise HarvestError(f"{path}: bad or duplicate repository name {name!r}")
+        names.add(name)
         try:   # the same rules a task's own task.json is held to (eval/tasks.py), checked once, here
             task_mod._meta(repo["name"], {"id": repo["name"], **{k: repo[k] for k in GRADING_FIELDS if k in repo}})
         except task_mod.TaskError as exc:
@@ -130,7 +133,11 @@ def candidate_commits(repo: Path, branch: str, not_before: str) -> list:
     ``rev-list --since`` stops walking at the first older commit, so where committer dates run backward
     it left eligible commits out. (``--since-as-filter`` filters too, but only from git 2.37; this needs
     no particular git.)"""
-    since = int(datetime.strptime(not_before, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+    try:
+        parsed = datetime.strptime(not_before, "%Y-%m-%d")
+    except ValueError:
+        raise HarvestError("--not-before is a date, YYYY-MM-DD") from None
+    since = int(parsed.replace(tzinfo=timezone.utc).timestamp())
     out = _git(repo, "rev-list", "--first-parent", "--reverse", "--timestamp", branch)
     commits = []
     for line in out.decode().splitlines():
@@ -255,6 +262,10 @@ def harvest(repos_path: Path, not_before: str, out: Path, *, suite_id: str, vers
             log=print) -> dict:
     if not DATE.match(not_before):
         raise HarvestError("--not-before is a date, YYYY-MM-DD")
+    try:  # 2026-02-30 matches the shape and is not a calendar day; refuse it before any folder is created
+        datetime.strptime(not_before, "%Y-%m-%d")
+    except ValueError:
+        raise HarvestError("--not-before is a date, YYYY-MM-DD") from None
     if not task_mod.TASK_ID.match(suite_id):
         raise HarvestError(f"bad suite id {suite_id!r}")
     # What would be refused for every candidate alike is the caller's, so it ends the run here, before

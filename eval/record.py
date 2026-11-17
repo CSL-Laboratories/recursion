@@ -80,9 +80,27 @@ def _is_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _hashable(value) -> bool:
+    """True when ``value`` can be a dict key. A list or dict id is already an error; membership must not raise."""
+    try:
+        hash(value)
+    except TypeError:
+        return False
+    return True
+
+
 def _is_number(value) -> bool:
-    """A finite int or float; NaN and infinity are not measurements."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    """A finite int or float; NaN and infinity are not measurements.
+
+    An int that does not fit in a float (``10**400``) makes ``math.isfinite`` raise OverflowError.
+    That is a bad measurement, reported by the caller, not a crash of validation.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _object(errors: _Errors, where: str, value, required: tuple, optional: tuple = ()) -> bool:
@@ -170,7 +188,7 @@ def _trial(errors: _Errors, where: str, trial) -> None:
             errors.add(f"{where}.error", "tier none carries no class")
         if tier != "none" and cls is None:
             errors.add(f"{where}.error", f"tier {tier} needs a class")
-        if cls is not None and cls in CLASS_TIER and CLASS_TIER[cls] != tier:
+        if cls is not None and isinstance(cls, str) and cls in CLASS_TIER and CLASS_TIER[cls] != tier:
             errors.add(f"{where}.error", f"class {cls} belongs to tier {CLASS_TIER[cls]}, not {tier}")
 
     if isinstance(grade, dict) and isinstance(error, dict):
@@ -295,9 +313,11 @@ def validate(record) -> list:
                     _str(errors, f"{where}.cluster", task["cluster"], nullable=True)
                     _str(errors, f"{where}.task_sha256", task["task_sha256"], pattern=SHA256)
                     _str(errors, f"{where}.created_at", task["created_at"], nullable=True)
-                    if task["id"] in planned_tasks:
-                        errors.add(where, f"duplicate task id {task['id']!r}")
-                    planned_tasks[task["id"]] = task
+                    if _hashable(task["id"]):
+                        if task["id"] in planned_tasks:
+                            errors.add(where, f"duplicate task id {task['id']!r}")
+                        else:
+                            planned_tasks[task["id"]] = task
         if _is_int(plan.get("k")) and _is_int(plan.get("attempts_per_task")) and plan["attempts_per_task"] < plan["k"]:
             errors.add("record.plan", "attempts_per_task below k: pass^k would be not estimable for every task")
         if not errors.items:
@@ -327,10 +347,11 @@ def validate(record) -> list:
         if not isinstance(trial, dict):
             continue
         tid = trial.get("trial_id")
-        if tid in by_id:
-            errors.add(where, f"duplicate trial_id {tid!r}")
-        else:
-            by_id[tid] = trial
+        if _hashable(tid):
+            if tid in by_id:
+                errors.add(where, f"duplicate trial_id {tid!r}")
+            else:
+                by_id[tid] = trial
         task_id = trial.get("task_id")
         if planned_tasks and task_id not in planned_tasks:
             errors.add(where, f"task {task_id!r} is not in the plan")
@@ -339,11 +360,21 @@ def validate(record) -> list:
             planned_index.setdefault(task_id, []).append(attempt.get("index"))
     _replacements(errors, trials, by_id, plan)
     if isinstance(plan, dict) and _is_int(plan.get("attempts_per_task")):
-        expected = list(range(1, plan["attempts_per_task"] + 1))
+        # ``list(range(1, n + 1))`` raises OverflowError, or allocates the whole plan, when n is
+        # astronomical (``10**100``, ``10**400``). The indexes on hand are enough to see the mismatch.
+        n = plan["attempts_per_task"]
+        bounded = 1 <= n <= 10000
+        expected = list(range(1, n + 1)) if bounded else None
         for task_id in planned_tasks:
             got = sorted(i for i in planned_index.get(task_id, []) if _is_int(i))
-            if got != expected:
-                errors.add("record.trials", f"task {task_id!r} has planned attempts {got}, the plan says {expected}")
+            if bounded:
+                mismatch = got != expected
+                shown = expected
+            else:
+                mismatch = len(got) != n or got != list(range(1, len(got) + 1))
+                shown = f"1..{n}"
+            if mismatch:
+                errors.add("record.trials", f"task {task_id!r} has planned attempts {got}, the plan says {shown}")
     return errors.items
 
 

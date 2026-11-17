@@ -450,7 +450,14 @@ def parse_stream_json(stdout: bytes, *, cost_basis: str) -> dict:
             "source": "engine_output",
         })
     cost = result.get("total_cost_usd")
-    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:
+    finite_cost = False
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        try:
+            # A 401-digit integer is a JSON number. math.isfinite converts it to float and raises.
+            finite_cost = math.isfinite(cost) and cost >= 0
+        except OverflowError:
+            finite_cost = False
+    if finite_cost:
         usage.update({"cost": float(cost), "cost_unit": "USD", "cost_basis": cost_basis, "source": "engine_output"})
     if result.get("subtype") == "success" and result.get("is_error") is not True:
         return {"has_result": True, "claimed_done": True, "failure": None, "detail": None, "usage": usage}

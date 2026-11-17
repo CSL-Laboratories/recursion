@@ -1,0 +1,14 @@
+{
+  "schema": "gui.theme/1",
+  "name": "compact",
+  "title": "Compact",
+  "tokens": {
+    "bg": "#101418",
+    "fg": "#f2f4f7",
+    "muted": "#b8c0cc",
+    "accent": "#7cc4ff",
+    "border": "#3a4450",
+    "density": "compact",
+    "radius": 2
+  }
+}

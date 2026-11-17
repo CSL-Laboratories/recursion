@@ -34,6 +34,9 @@ PAIRED_REPEATS = 3
 PAIRED_ROUND_S = 0.05
 PAIRED_WARMUP_S = 0.02
 PAIRED_DEADLINE_S = 40
+# A finite duration above this never returns from warmup, and a round this long
+# cannot be turned into an iteration count. The paired deadline default is 40s.
+MAX_DURATION_S = 60
 DAG_NODES = 32
 REPLAY_EVENTS = 24
 _BENCH_GENESIS = {
@@ -295,15 +298,21 @@ def _positive_median(samples: list[float]) -> float:
         median = ordered[count // 2]
     else:
         median = (ordered[count // 2 - 1] + ordered[count // 2]) / 2.0
-    if median <= 0:
+    if not math.isfinite(median) or median <= 0:
         raise BenchError("median sample was not positive")
     return median
 
 
 def _require_finite_duration(name: str, value: float, *, allow_zero: bool) -> None:
-    """Refuse a duration that is not a finite number of seconds before any timed call."""
+    """Refuse a duration that is not a finite number of seconds before any timed call.
+
+    A finite value above MAX_DURATION_S is refused too: warmup would not return,
+    and a round that long cannot become an iteration count.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
         raise BenchError(f"{name} must be a finite number of seconds")
+    if float(value) > MAX_DURATION_S:
+        raise BenchError(f"{name} must be at most {MAX_DURATION_S} seconds")
     if allow_zero:
         if value < 0:
             raise BenchError(f"{name} must be >= 0")
@@ -340,7 +349,7 @@ def _timed_call(fn, iterations: int) -> float:
 
 def measure(fn, *, rounds: int, round_s: float, warmup_s: float) -> dict:
     """Median seconds per call. Warmup and GC pauses sit outside the samples."""
-    if rounds < 1:
+    if type(rounds) is not int or rounds < 1:
         raise BenchError("rounds must be >= 1")
     _require_finite_duration("round_s", round_s, allow_zero=False)
     _require_finite_duration("warmup_s", warmup_s, allow_zero=True)
@@ -381,7 +390,7 @@ def measure_pair(
     repeats: int = PAIRED_REPEATS,
 ) -> tuple[dict, dict]:
     """Interleave both sides. The reported time is the median of repeat medians."""
-    if rounds < 2 or rounds % 2:
+    if type(rounds) is not int or rounds < 2 or rounds % 2:
         raise BenchError("paired rounds must be an even number >= 2")
     if repeats < 1:
         raise BenchError("repeats must be >= 1")
@@ -462,6 +471,7 @@ def run_paired(
     Separate processes on a noisy host false-flag identical code. Alternating
     rounds keeps both kernels on the same CPU window.
     """
+    _require_finite_duration("deadline_s", deadline_s, allow_zero=False)
     install_network_guard()
     started = time.perf_counter()
     baseline_root = baseline_root.resolve()

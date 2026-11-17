@@ -33,7 +33,8 @@ answer even if writing it back fails, with ``"recorded": false``. A write refuse
 the record moved under the Stop, so the decision is applied to a fresh read, at most ``STALE_RETRIES``
 times, and from that stale write until a write of the run lands an empty result answers ``pending``,
 never ``stopped``. A write refused as unattested is different again: the registry rejected the stopped
-row because a member is alive or the process table errored during the proof. That Stop answers
+row. The pending reason is the one that refusal carries (a live member, a process-table ``Exception``,
+or an attestation mismatch). It is not a second look at the process table. That Stop answers
 ``pending``, never ``stopped``, and the refused row is not what the registry keeps.
 
 Start writes a launch intent first: the API picks the run id, records the run as ``starting`` (with its
@@ -331,8 +332,8 @@ class ControlAPI:
         """``ok``, ``stale``, ``unattested``, or raise ``_RegistryError``.
 
         A stale write leaves the registry untouched. ``unattested`` is a stopped row the registry
-        refused (``StopUnattested``): a member is alive, or the process table errored while the proof
-        was checked. That is not a failed disk, and the row was not stored.
+        refused (``StopUnattested``). The reason is the one the refusal carries, not a second look
+        at the process table. That is not a failed disk, and the row was not stored.
 
         On success ``rec`` becomes the snapshot this put stored, not a later read. A registry that does
         not return that snapshot is refreshed in full, so a newer generation is never paired with an
@@ -342,7 +343,9 @@ class ControlAPI:
             stored = self._registry.put(dict(rec))
         except StaleGeneration:
             return "stale"
-        except StopUnattested:
+        except StopUnattested as err:
+            reason = getattr(err, "reason", None)
+            self._local.unattested_reason = reason if isinstance(reason, str) and reason else None
             return "unattested"
         except Exception as err:
             raise _RegistryError(f"put:{type(err).__name__}") from err
@@ -638,11 +641,15 @@ class ControlAPI:
     def _refused_attestation(self, rec: dict) -> dict:
         """Answer pending after the registry refused a stopped row.
 
-        The check this attempt already counted stays. The reason is a live member, or the
-        process-table error ``_block_stop`` names. The pending row is what gets written; the
-        refused stopped row is not.
+        The check this attempt already counted stays. The reason is the one the refusal
+        carries. It is not a second look at the process table, and a refusal that names
+        nothing is not reported as a live member. The pending row is what gets written; the
+        refused stopped row is not. ``stop`` is filled in when the row has none: the Stop
+        path sets it, and this only keeps a bare row from raising.
         """
-        reason = self._block_stop(rec) or "member_alive"
+        reason = getattr(self._local, "unattested_reason", None)
+        if not isinstance(reason, str) or not reason:
+            reason = "cgroup_changed"
         rec["state"] = "stop_pending"
         rec["stop_attestation"] = None
         if not isinstance(rec.get("stop"), dict):

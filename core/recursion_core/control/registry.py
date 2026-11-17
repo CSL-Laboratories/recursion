@@ -47,10 +47,16 @@ class StaleGeneration(Exception):
 
 
 class StopUnattested(Exception):
-    """``stopped`` was written without proof that every current member is gone."""
+    """``stopped`` was written without proof that every current member is gone.
 
-    def __init__(self, run_id: str) -> None:
+    ``reason``, when the registry knows it, is the pending reason for that refusal:
+    ``member_alive``, ``cleanup_error:<type>`` for a process-table ``Exception``, or
+    ``cgroup_changed`` for an attestation mismatch. Callers that omit it leave ``None``.
+    """
+
+    def __init__(self, run_id: str, reason: str | None = None) -> None:
         self.run_id = run_id
+        self.reason = reason
         super().__init__(run_id)
 
 
@@ -175,6 +181,7 @@ class InMemoryRunRegistry:
         self.locks = OwnerLockTable()
         self._processes = processes
         self._marker = 0
+        self._member_refusal: str | None = None
         self.commit_gate: Callable[[dict], None] | None = None
         self._runs: dict[str, dict] = {}
         self._starts: dict[tuple[str, str], list[str]] = {}  # (tenant, client_key) -> run ids, first seen first
@@ -188,8 +195,10 @@ class InMemoryRunRegistry:
 
         A cgroup without a marker is given one. A stopped snapshot is rejected when its attestation
         names another cgroup, a generation newer than the record, or a membership that still lists
-        someone the proof does not cover or who is still alive. A proof older than the record, naming
-        members the row has already dropped, is kept.
+        someone the proof does not cover or who is still alive. A process-table ``Exception`` is not
+        proof a member is gone: that snapshot is refused with ``StopUnattested`` too, and the
+        exception does not leave ``__init__``. A proof older than the record, naming members the row
+        has already dropped, is kept.
         """
         rec.setdefault("generation", 1)
         rec.setdefault("members", [])
@@ -204,25 +213,30 @@ class InMemoryRunRegistry:
         run_id = str(rec.get("run_id") or "")
         if (not isinstance(attestation, dict) or attestation.get("proof") != "empty"
                 or attestation.get("cgroup") != rec.get("cgroup")):
-            raise StopUnattested(run_id)
+            raise StopUnattested(run_id, "cgroup_changed")
         marker = attestation.get("cgroup_marker")
         if marker is None:
             attestation["cgroup_marker"] = rec.get("cgroup_marker")
         elif marker != rec.get("cgroup_marker"):
-            raise StopUnattested(run_id)
+            raise StopUnattested(run_id, "cgroup_changed")
         proof_gen = attestation.get("generation")
         record_gen = rec.get("generation")
         if not isinstance(proof_gen, int) or not isinstance(record_gen, int) or proof_gen > record_gen:
-            raise StopUnattested(run_id)
+            raise StopUnattested(run_id, "cgroup_changed")
         member_ids = attestation.get("member_ids")
         if not isinstance(member_ids, list):
-            raise StopUnattested(run_id)
+            raise StopUnattested(run_id, "cgroup_changed")
         proved = set(member_ids)
+        checked: list[dict] = []
         for member in rec.get("members") or []:
-            # A member still on the row must be one the proof named, and must no longer be alive.
-            # A proof may name members the row has already dropped; that history stays valid.
-            if not isinstance(member, dict) or member.get("member_id") not in proved or self.process_alive(member.get("pid")):
-                raise StopUnattested(run_id)
+            # A member still on the row must be one the proof named. A proof may name members the
+            # row has already dropped; that history stays valid. Liveness goes through the same
+            # proof ``put`` uses, so a process-table Exception is a refusal, not an escape.
+            if not isinstance(member, dict) or member.get("member_id") not in proved:
+                raise StopUnattested(run_id, "cgroup_changed")
+            checked.append(member)
+        if not self._members_proved_gone(checked):
+            raise StopUnattested(run_id, self._member_refusal or "cgroup_changed")
 
     def process_alive(self, pid: int | None) -> bool:
         """True when ``pid`` is a member we cannot show is gone."""
@@ -282,8 +296,9 @@ class InMemoryRunRegistry:
         An update that omits ``generation``, carries an older one, or would leave ``stopped``,
         raises ``StaleGeneration`` and leaves the stored record unchanged. A transition to
         ``stopped`` raises ``StopUnattested`` unless the attestation names this generation, the
-        cgroup path and its marker, and every current member is gone. An error from the process
-        table is not proof a member is gone. Returns the stored copy.
+        cgroup path and its marker, and every current member is gone. An ``Exception`` from the
+        process table is not proof a member is gone, on ``put`` or when a stopped snapshot is
+        loaded. Returns the stored copy.
         """
         if self.commit_gate is None:
             with self._lock:
@@ -404,15 +419,15 @@ class InMemoryRunRegistry:
         stored.pop("generation", None)
         if current is not None and current.get("state") == "stopped":
             if stored.get("cgroup") != current.get("cgroup"):
-                raise StopUnattested(stored["run_id"])
+                raise StopUnattested(stored["run_id"], "cgroup_changed")
             supplied = stored.get("cgroup_marker")
             if supplied not in (None, current.get("cgroup_marker")):
-                raise StopUnattested(stored["run_id"])
+                raise StopUnattested(stored["run_id"], "cgroup_changed")
             attestation = current.get("stop_attestation")
             if (not isinstance(attestation, dict) or attestation.get("proof") != "empty"
                     or attestation.get("cgroup") != current.get("cgroup")
                     or attestation.get("cgroup_marker") != current.get("cgroup_marker")):
-                raise StopUnattested(stored["run_id"])
+                raise StopUnattested(stored["run_id"], "cgroup_changed")
             stored["cgroup"] = current["cgroup"]
             stored["cgroup_marker"] = current["cgroup_marker"]
             stored["stop_attestation"] = copy.deepcopy(attestation)
@@ -432,7 +447,7 @@ class InMemoryRunRegistry:
                 attestation["cgroup_marker"] = stored.get("cgroup_marker")
                 stored["stop_attestation"] = attestation
             if not self._attestation_ok(stored, members, expected):
-                raise StopUnattested(stored.get("run_id", ""))
+                raise StopUnattested(stored.get("run_id", ""), self._member_refusal or "cgroup_changed")
             stored["members"] = []  # proved gone; a stopped run does not keep member rows
         else:
             stored["members"] = members
@@ -441,6 +456,7 @@ class InMemoryRunRegistry:
         return stored
 
     def _attestation_ok(self, record: dict, members: list[dict], expected: int) -> bool:
+        self._member_refusal = None
         attestation = record.get("stop_attestation")
         if not isinstance(attestation, dict) or attestation.get("proof") != "empty":
             return False
@@ -456,15 +472,20 @@ class InMemoryRunRegistry:
     def _members_proved_gone(self, members: list[dict]) -> bool:
         """True when every member's process is shown to be gone.
 
-        A process-table error is not that proof. The stopped write is then refused with
-        ``StopUnattested`` instead of letting the table's exception leave ``put``.
+        A process-table ``Exception`` is not that proof. ``put`` and ``_load_record`` then
+        refuse with ``StopUnattested`` instead of letting that exception leave. The pending
+        reason is left on ``_member_refusal``: ``member_alive``, or ``cleanup_error:<type>``
+        when the table raised. An interruption still propagates.
         """
+        self._member_refusal = None
         for member in members:
             try:
                 alive = self.process_alive(member.get("pid"))
-            except Exception:
+            except Exception as err:
+                self._member_refusal = f"cleanup_error:{type(err).__name__}"
                 return False
             if alive:
+                self._member_refusal = "member_alive"
                 return False
         return True
 

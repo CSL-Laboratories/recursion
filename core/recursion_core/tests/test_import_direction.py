@@ -10,7 +10,8 @@ today; ``cgroup_leaf`` is part of that core and is not a lane to move out). ``ro
 The one exception is a ``find_spec``-guarded import in ``control/hooks.py`` of a module named
 in ``REGISTRANTS``. ``control/cli.py`` and ``control/tui.py`` already import ``tui``; that
 ceiling is data here and is not widened. The engine table (``EngineTable`` and its catalogue)
-is core. An adapter module under ``routes.engines`` is an optional lane.
+is core. An adapter module under ``routes.engines`` is an optional lane. The package module
+``recursion_core/__init__.py`` is core product code and is scanned with the packages.
 
 ``__all__`` on the four modules the remote package imports is exactly the names its product
 sources import on branch ``csl-238-remote-relay-20261114``. When ``remote/`` is present, its
@@ -287,6 +288,9 @@ def _product_packages(core: Path) -> set[str]:
 
 
 def _core_files(core: Path):
+    # The package module sits beside the packages. A forbidden import there is still core product code.
+    for path in sorted(p for p in core.glob("*.py") if p.is_file()):
+        yield path.relative_to(core).as_posix(), path
     for pkg in sorted(CORE_PACKAGES):
         base = core / pkg
         if not base.is_dir():
@@ -334,6 +338,10 @@ class ImportDirectionTests(unittest.TestCase):
         for name in OPTIONAL_PACKAGES:
             self.assertIn(f"recursion_core.{name}", OPTIONAL_ROOTS)
         self.assertEqual(_product_packages(_core_dir()), CORE_PACKAGES | OPTIONAL_PACKAGES)
+
+    def test_the_core_package_module_is_scanned(self) -> None:
+        rels = [rel for rel, _path in _core_files(_core_dir())]
+        self.assertIn("__init__.py", rels)
 
     def test_core_product_code_does_not_import_an_optional_lane(self) -> None:
         core = _core_dir()

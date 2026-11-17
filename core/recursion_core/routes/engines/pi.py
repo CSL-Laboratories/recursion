@@ -86,6 +86,7 @@ import hashlib
 import json
 import math
 import re
+import threading
 from dataclasses import dataclass
 
 from recursion_core.routes.contract import ENGINE_ERROR, SHORT_FAULT, sounds_like_quota
@@ -351,8 +352,12 @@ class PiStream:
     within it: every stream starts at ``e8-1``. So the caller must feed a stream only the stdout of the
     worker it wrote to; a response read from an earlier worker's output would match the same token.
 
+    Several writer threads may call ``prompt`` and ``command`` together. The mint and the pending
+    entry are one step under a lock, so two writers never share a token and a delivery is not
+    overwritten. One reader calls ``feed``; the lock is the writers' step, and the stream holds no process.
+
     ``feed(line)`` reads one record and returns its drafts. ``signals`` collects the facts that are not
-    events. Nothing here holds a lock or writes to a process; the driver writes the lines it is given.
+    events. The driver writes the lines it is given.
     """
 
     def __init__(self, mode: str, *, connection_id: str) -> None:
@@ -373,6 +378,7 @@ class PiStream:
         self.other_types: dict[str, int] = {}
         self._pending: dict[str, _Pending] = {}
         self._minted = 0
+        self._write_lock = threading.Lock()
         self._argv_registered = False
         self._calls: set[str] = set()
         self._results: set[str] = set()
@@ -383,6 +389,14 @@ class PiStream:
     def _mint(self) -> str:
         self._minted += 1
         return f"e8-{self._minted}"
+
+    def _mint_pending(self, pending: _Pending) -> str:
+        """Mint a token and store its pending entry as one step, so two writers cannot share either."""
+
+        with self._write_lock:
+            token = self._mint()
+            self._pending[token] = pending
+            return token
 
     def _line(self, record: dict) -> str:
         # One record, no LF: EngineProcess.send adds it. ASCII, so U+2028 and U+2029 travel as escapes.
@@ -404,11 +418,10 @@ class PiStream:
             raise ValueError("turn_id")
         if how not in ("new_turn", "mid_turn"):
             raise ValueError("how")
-        token = self._mint()
+        token = self._mint_pending(_Pending("prompt", delivery_id, turn_id, how, text))
         record = {"id": token, "type": "prompt", "message": text}
         if how == "mid_turn":
             record["streamingBehavior"] = "steer"
-        self._pending[token] = _Pending("prompt", delivery_id, turn_id, how, text)
         return token, self._line(record)
 
     def command(self, kind: str) -> tuple[str, str]:
@@ -416,8 +429,7 @@ class PiStream:
         self._need("rpc")
         if kind not in ("abort", "get_state"):
             raise ValueError(kind)
-        token = self._mint()
-        self._pending[token] = _Pending(kind)
+        token = self._mint_pending(_Pending(kind))
         return token, self._line({"id": token, "type": kind})
 
     def cancel_dialog(self, request_id: str) -> str:

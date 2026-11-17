@@ -7,6 +7,7 @@ Run by dotted name: PYTHONPATH=core <python> -m unittest recursion_core.routes.e
 
 import hashlib
 import json
+import sys
 import unittest
 
 from recursion_core.routes.engines import pi
@@ -602,6 +603,9 @@ class RpcModeTest(unittest.TestCase):
     def test_each_record_is_one_line_through_the_launchers_own_send(self):
         # The production EngineProcess.send (daemon/launcher.py) writes the text and one LF. Its send is run
         # here on an anonymous pipe, its constructor bypassed: no daemon, unit or process is started.
+        # On native Windows that send raises OSError WinError 10093. Linux only; the assertions are unchanged.
+        if sys.platform != "linux":
+            self.skipTest("Linux launcher pipe; native Windows raises WinError 10093")
         import os
         import threading
 
@@ -622,6 +626,44 @@ class RpcModeTest(unittest.TestCase):
                     os.close(write_fd)
                 self.assertEqual(wire, record.encode("utf-8") + b"\n")
                 self.assertEqual(pi.records_of(wire), [record])          # one record, not an empty second
+
+    def test_the_launcher_pipe_check_skips_when_the_platform_is_not_linux(self):
+        # Simulated nt: this machine is Linux, so the native WinError 10093 is not run here.
+        from unittest import mock
+        case = RpcModeTest("test_each_record_is_one_line_through_the_launchers_own_send")
+        result = unittest.TestResult()
+        with mock.patch.object(sys, "platform", "win32"):
+            case.run(result)
+        self.assertEqual(result.testsRun, 1)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.failures, [])
+        self.assertEqual(len(result.skipped), 1)
+
+    def test_two_writers_mint_unique_tokens_and_keep_every_delivery(self):
+        # Eight threads, 300 prompts each: the load that minted one token twice and lost deliveries.
+        import threading
+        stream = pi.PiStream("rpc", connection_id="api_key:openai-key-1")
+        found = []
+        guard = threading.Lock()
+
+        def writer(base):
+            local = []
+            for i in range(300):
+                n = base + i
+                token, _line = stream.prompt(
+                    "p", delivery_id=f"dlv-{n}", turn_id="turn-1", how="new_turn")
+                local.append(token)
+            with guard:
+                found.extend(local)
+
+        threads = [threading.Thread(target=writer, args=(i * 300 + 1,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(found), 2400)
+        self.assertEqual(len(set(found)), 2400)
+        self.assertEqual(len(stream.pending_deliveries()), 2400)
 
     def test_the_writers_refuse_malformed_arguments(self):
         for kwargs in ({"delivery_id": "x", "turn_id": "turn-1", "how": "new_turn"},

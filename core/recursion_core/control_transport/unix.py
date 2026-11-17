@@ -328,9 +328,15 @@ class UnixControlServer:
                 raise RuntimeError("server already closed")
             ensure_private_dir(self.directory)
             lock_fd = _acquire_lock(self._path + ".lock")
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock: socket.socket | None = None
+            thread: threading.Thread | None = None
             bound = False
             try:
+                # Everything after the lock is taken is inside this try, so a start that fails at any step gives
+                # back what it took: a socket that cannot be made (EMFILE) no longer keeps the fd holding the
+                # lock (sweep s7 D04), and an accept thread that cannot start no longer leaves the bound path,
+                # the listener and the lock behind for a close() that then raised (s7 D05).
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 _clear_stale_socket(self._path)
                 # The 0700 directory already keeps other uids out of the bind-to-chmod window;
                 # chmod rather than umask because umask is process-wide and racy across threads.
@@ -342,8 +348,23 @@ class UnixControlServer:
                     raise InsecureSocketPath(f"{self._path} changed under us after bind")
                 sock.listen(socket.SOMAXCONN)
                 sock.settimeout(_ACCEPT_POLL_S)
+                self._sock = sock
+                self._lock_fd = lock_fd
+                self._bound = (st.st_dev, st.st_ino)
+                thread = threading.Thread(target=self._accept_loop, name="control-transport-accept", daemon=True)
+                self._thread = thread
+                thread.start()
             except BaseException:
-                sock.close()
+                self._sock = None
+                self._lock_fd = None
+                self._bound = None
+                self._thread = None
+                if thread is not None and thread.ident is not None:
+                    # Only an interrupt raised after the thread began can land here: stop its loop before
+                    # the socket it polls is closed.
+                    self._stop.set()
+                if sock is not None:
+                    sock.close()
                 if bound:
                     try:
                         os.unlink(self._path)
@@ -351,17 +372,21 @@ class UnixControlServer:
                         pass
                 os.close(lock_fd)
                 raise
-            self._sock = sock
-            self._lock_fd = lock_fd
-            self._bound = (st.st_dev, st.st_ino)
-            self._thread = threading.Thread(target=self._accept_loop, name="control-transport-accept", daemon=True)
-            self._thread.start()
 
     def close(self) -> None:
+        """Stop accepting, wait for every handler that has begun, then give up the path and the lock.
+
+        close() drains: it returns only when the accept thread and every started connection worker have
+        ended, so no handler of this server runs after it returns, and the socket path and the lock are
+        released only then (sweep s7 D06: a timed join let close return, and the next owner take the lock,
+        while a handler could still write). Each open connection is shut first, so a worker waiting for its
+        peer ends at once; a handler that never returns keeps close() waiting. A close() called from one of
+        this server's own threads does not wait for that thread.
+        """
         self._stop.set()
         thread = self._thread
-        if thread is not None:
-            thread.join(timeout=5.0)
+        if thread is not None and thread.ident is not None and thread is not threading.current_thread():
+            thread.join()
         with self._lock:
             workers = list(self._workers)
             conns = list(self._conns)
@@ -376,7 +401,7 @@ class UnixControlServer:
             # (the round-2 read of #407 by DeepSeek, F2; the same on master). Its connection was shut above.
             if worker.ident is None or worker is threading.current_thread():
                 continue
-            worker.join(timeout=self._idle_timeout_s + 1.0)
+            worker.join()
         with self._lock:
             sock, self._sock = self._sock, None
             lock_fd, self._lock_fd = self._lock_fd, None

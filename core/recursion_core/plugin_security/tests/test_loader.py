@@ -59,7 +59,8 @@ class SignatureTests(unittest.TestCase):
         }
         for name, sig in bad_signatures.items():
             with self.subTest(name):
-                loader = _loader(self.dev, Grant("demo.plugin", DIGEST, None, ALL))
+                loader = _loader(self.dev, Grant("demo.plugin", DIGEST, None, ALL,
+                                                developer_key_id=_kid(self.dev)))
                 loaded = loader.load(self.raw, sig, PLUGIN_SOURCE)
                 self.assertEqual(loaded.trust, "unsigned")
                 self.assertEqual(loaded.permissions, ("read", "propose"))
@@ -68,7 +69,8 @@ class SignatureTests(unittest.TestCase):
     def test_untrusted_valid_signer_installs_as_unsigned(self) -> None:
         stranger = Key()
         raw = manifest_bytes(stranger.public)
-        loaded = _loader(self.dev, Grant("demo.plugin", DIGEST, None, ("read",))).load(
+        loaded = _loader(self.dev, Grant("demo.plugin", DIGEST, None, ("read",),
+                                        developer_key_id=_kid(stranger))).load(
             raw, stranger.sign(raw), PLUGIN_SOURCE)
         self.assertEqual((loaded.trust, loaded.permissions), ("unsigned", ("read",)))
         self.assertIn("signer_not_on_trusted_list", _codes(loaded.findings))
@@ -124,7 +126,8 @@ class GrantTests(unittest.TestCase):
 
     def _load(self, requested, granted, signed=True, ack=False):
         raw = manifest_bytes(self.dev.public, permissions=requested)
-        grant = Grant("demo.plugin", DIGEST, _kid(self.dev) if signed else None, granted, ack)
+        grant = Grant("demo.plugin", DIGEST, _kid(self.dev) if signed else None, granted, ack,
+                      developer_key_id=None if signed else _kid(self.dev))
         return _loader(self.dev if signed else None, grant).load(raw, self.dev.sign(raw), PLUGIN_SOURCE)
 
     def test_intersection_narrows_in_canonical_order(self) -> None:

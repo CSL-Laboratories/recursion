@@ -217,8 +217,9 @@ class PortAndAddressTests(unittest.TestCase):
                 self.assertFalse(destination_in_normal_form("api.example.org:" + port))
 
     def test_one_expression_decides_a_destination_and_one_a_reserved_host(self) -> None:
-        # The marketplace checker and the plugin schema copy these two patterns; the predicates are
-        # exactly them, so a copy that matches the pattern agrees with the parser.
+        # The marketplace checker copies these two patterns; the predicates are exactly them, so a
+        # copy that matches the pattern agrees with the parser. The plugin schema (manifest.v1.json,
+        # SPINE's) does not copy them yet: it still accepts ports the parser refuses.
         from recursion_core.plugin_security import manifest as m
         for value in ("api.example.org", "api.example.org:443", "a.b", "127.0.0.1", "api.example.org:0",
                       "API.example.org", "a" * 64 + ".org", "api.example.org.", "x.y:65535", "x.y:65536"):
@@ -409,6 +410,43 @@ class ManualGrantIdentityTests(unittest.TestCase):
         regranted = Grant("demo.plugin", DIGEST, None, ALL, unsigned_order_acknowledged=True,
                           developer_key_id=key_id(replacement.public))
         self.assertEqual(self.reload(changed_manifest, regranted).permissions, ALL)
+
+
+@unittest.skipUnless(__import__("os").name == "posix", "the install reader uses POSIX file checks")
+class InstallReaderBindingTests(unittest.TestCase):
+    """The integration read of #374 against master ff3f8071, F1: master's install reader refused a
+    manual grant's developer_key_id, so the binding this draft requires could not be installed."""
+
+    def _read(self, entry):
+        import json
+        import tempfile
+        from pathlib import Path
+        from recursion_core.daemon.plugins import read_install
+        with tempfile.TemporaryDirectory(prefix="r4-6-reader-") as directory:
+            path = Path(directory) / "install.json"
+            path.write_text(json.dumps({"grants": [entry]}), encoding="utf-8")
+            path.chmod(0o600)
+            return read_install(directory)["grants"]
+
+    def test_the_install_reader_keeps_a_manual_grant_bound_to_its_developer_key(self) -> None:
+        from recursion_core.plugin_security.manifest import effective_permissions, parse_manifest
+        from recursion_core.plugin_security.signing import key_id
+        from recursion_core.plugin_security.tests.support import manifest_bytes
+        public = "11" * 32
+        manifest = parse_manifest(manifest_bytes(public, permissions=("read", "panel")))
+        grant = self._read({"plugin_id": manifest.plugin_id, "artifact_sha256": manifest.artifact_sha256,
+                            "signer_key_id": None, "permissions": ["read", "panel"],
+                            "developer_key_id": key_id(public)})[manifest.plugin_id]
+        self.assertEqual(grant.developer_key_id, key_id(public))
+        self.assertEqual(effective_permissions(manifest, "unsigned", None, grant), (("read", "panel"), []))
+
+    def test_the_install_reader_refuses_a_developer_key_that_is_not_text(self) -> None:
+        from recursion_core.daemon.plugins import PluginRefused
+        with self.assertRaises(PluginRefused) as caught:
+            self._read({"plugin_id": "demo.plugin", "artifact_sha256": "0" * 64, "signer_key_id": None,
+                        "permissions": ["read"], "developer_key_id": 5})
+        self.assertEqual((caught.exception.code, caught.exception.detail),
+                         ("plugin_install_config_invalid", "grant value"))
 
 
 if __name__ == "__main__":

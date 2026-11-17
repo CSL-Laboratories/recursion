@@ -84,7 +84,7 @@ EFFECT_PERMISSIONS = {'order': 'order'}
 AUTHORITY_REQUIRED = frozenset({'order'})
 _INSTALL_KEYS = frozenset({'trusted_keys', 'grants', 'reserved', 'authority_anchor'})
 _GRANT_KEYS = frozenset({'plugin_id', 'artifact_sha256', 'signer_key_id', 'permissions', 'unsigned_order_acknowledged',
-                         'order_after_revoked_key', 'order_after_revocation_generation'})
+                         'order_after_revoked_key', 'order_after_revocation_generation', 'developer_key_id'})
 _SAFE_ID = re.compile(r'[^A-Za-z0-9_.-]')
 # O7 reads (ADV2-3). Uncalibrated defaults: a plugin call that has not answered by its deadline is
 # answered 504 and the plugin is marked degraded; a read that finds another one running waits this
@@ -194,11 +194,13 @@ def read_install(directory):
                 or type(item.get('unsigned_order_acknowledged', False)) is not bool
                 or not (item.get('order_after_revoked_key') is None or isinstance(item['order_after_revoked_key'], str))
                 or not (generation is None or type(generation) is int)
+                or not (item.get('developer_key_id') is None or isinstance(item['developer_key_id'], str))
                 or item['plugin_id'] in grants):
             raise PluginRefused('plugin_install_config_invalid', 'grant value')
         grants[item['plugin_id']] = Grant(item['plugin_id'], item['artifact_sha256'], signer, tuple(perms),
                                           item.get('unsigned_order_acknowledged', False),
-                                          item.get('order_after_revoked_key'), generation)
+                                          item.get('order_after_revoked_key'), generation,
+                                          developer_key_id=item.get('developer_key_id'))
     reserved = data.get('reserved', {})
     hosts = reserved.get('hosts', []) if isinstance(reserved, dict) else None
     prefixes = reserved.get('credential_prefixes', []) if isinstance(reserved, dict) else None

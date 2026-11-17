@@ -243,6 +243,8 @@ class UnixControlServer:
     when the ordinary ones are all taken: each serves one request, within
     ``reserved_timeout_s``, and only if ``priority`` says so; any other request gets the
     ``busy`` frame, not delivered. The handler still sees every request it is given.
+    At a configured cap, a request whose id could not ride the longest refusal is refused
+    before the handler, even when that request's own answer would have fit.
     """
 
     def __init__(
@@ -264,8 +266,10 @@ class UnixControlServer:
         if not name or "/" in name or name in (".", ".."):
             raise InsecureSocketPath("socket name must be a single path component")
         if type(max_frame_bytes) is not int or max_frame_bytes < _MIN_FRAME_BYTES:
-            # A cap that cannot carry the server's own fallback reply is refused before startup (sweep s7 D19:
-            # at a cap of 32 the 50-byte fallback was written anyway).
+            # A cap that cannot carry the server's own fallback, or the id_too_large refusal,
+            # is refused before startup. A smaller cap would drop that reply and the peer
+            # would see the connection end instead of a typed answer. At a cap of 32 the
+            # 50-byte fallback was written anyway (sweep s7 D19).
             raise ValueError(f"max_frame_bytes must be an int of at least {_MIN_FRAME_BYTES}")
         # Counts are exact ints (sweep s7 D08: 1.5, NaN and infinity passed, and a 1.5 semaphore granted eight
         # slots); a bool is not a count.
@@ -473,8 +477,7 @@ class UnixControlServer:
                     # longest fallback could not carry it within the frame cap is refused here, before any
                     # handler acts, so no answer of a handled request is ever over the cap or without its id
                     # (the integration read of #385, F3; the P3 of the same read on #377).
-                    _send_quietly(conn, {"ok": False, "error": {"code": "bad_frame", "detail": "id_too_large"}},
-                                  max_bytes=self._max_frame_bytes)
+                    _send_quietly(conn, _ID_TOO_LARGE_REPLY, max_bytes=self._max_frame_bytes)
                     return
                 try:
                     response = self._handler(request, connection)
@@ -558,8 +561,13 @@ def _is_busy(response: Message) -> bool:
 # The longest answer _serve writes for a request a handler has seen; with the request's id it must fit the cap.
 _LONGEST_FALLBACK: Message = {"ok": False, "error": {"code": "response_too_large"}}
 _INTERNAL_ERROR: Message = {"ok": False, "error": {"code": "internal_error"}}
-# The smallest frame cap a server takes: its fallbacks, without an id, must fit (an id is checked per request).
-_MIN_FRAME_BYTES = max(len(encode_frame(m)) - HEADER.size for m in (_LONGEST_FALLBACK, _INTERNAL_ERROR))
+# Sent when that fallback could not carry the id. The floor is the longest of this
+# refusal and the two id-less fallbacks: below it one of those replies would be dropped.
+_ID_TOO_LARGE_REPLY: Message = {"ok": False, "error": {"code": "bad_frame", "detail": "id_too_large"}}
+_MIN_FRAME_BYTES = max(
+    len(encode_frame(m)) - HEADER.size
+    for m in (_LONGEST_FALLBACK, _INTERNAL_ERROR, _ID_TOO_LARGE_REPLY)
+)
 
 
 def _fits(message: Message, request_id: object, max_bytes: int) -> bool:

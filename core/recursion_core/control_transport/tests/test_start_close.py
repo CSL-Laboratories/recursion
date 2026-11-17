@@ -13,6 +13,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -94,6 +95,43 @@ class StartRollbackTests(ScratchCase):
             self.assertEqual(client.request({"op": "ping"})["op"], "pong")
         self.assertTrue(os.path.exists(nxt.path))
 
+    def test_accept_loop_returns_when_the_listener_is_already_cleared(self):
+        """The accept thread's first read can see a listener the rollback already cleared.
+
+        An assertion there kills the thread. Returning leaves the thread with no exception,
+        including when the assertion would have been skipped and the next use of None would raise.
+        """
+        srv = ct.UnixControlServer(self.directory, ct.with_ping_health())
+        self.addCleanup(self.force_close, srv)
+        try:
+            srv._accept_loop()
+        except Exception as exc:
+            self.fail(f"accept loop raised {type(exc).__name__} when the listener was already cleared")
+
+    def test_an_interrupted_start_stops_the_loop_before_clearing_the_listener(self):
+        """Rollback must mark the loop stopped before it clears the listener the thread reads."""
+        seen = {}
+
+        class Watched(ct.UnixControlServer):
+            def __setattr__(self, name, value):
+                # Assignment looks up __setattr__ on the class, so the watch has to live here.
+                if name == "_sock" and value is None and getattr(self, "_armed", False) and "stop_first" not in seen:
+                    seen["stop_first"] = self._stop.is_set()
+                object.__setattr__(self, name, value)
+
+        srv = Watched(self.directory, ct.with_ping_health())
+        self.addCleanup(self.force_close, srv)
+        srv._armed = True
+
+        def pretend(thread):
+            thread._ident = 1
+            raise KeyboardInterrupt("injected once the accept thread has begun")
+
+        with mock.patch.object(threading.Thread, "start", pretend):
+            with self.assertRaises(KeyboardInterrupt):
+                srv.start()
+        self.assertIs(seen.get("stop_first"), True)
+
 
 class CloseDrainsTests(ScratchCase):
     def test_close_retains_ownership_while_handler_can_still_write(self):
@@ -169,6 +207,98 @@ class CloseDrainsTests(ScratchCase):
                 closer.join(5)
         self.assertFalse(closer.is_alive())
         self.assertFalse(os.path.exists(srv.path))
+
+    def test_shutdown_bounds_each_join(self):
+        """The accept thread and a handler still running are both joined with the one named bound."""
+        seen = []
+        real_join = threading.Thread.join
+        entered = threading.Event()
+        release = threading.Event()
+
+        def record(thread, timeout=None):
+            seen.append(timeout)
+            if len(seen) >= 2:
+                release.set()
+            return real_join(thread, timeout)
+
+        def handler(message, connection):
+            entered.set()
+            release.wait(5)
+            return {"ok": True}
+
+        srv = self.server(handler, idle_timeout_s=0.01)
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(raw.close)
+        raw.settimeout(2)
+        raw.connect(srv.path)
+        raw.sendall(framing.encode_frame({"op": "ordinary"}))
+        self.assertTrue(entered.wait(2))
+        closer = threading.Thread(target=srv.close, daemon=True)
+        with mock.patch.object(threading.Thread, "join", record):
+            closer.start()
+            deadline = time.monotonic() + 5
+            while closer.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertFalse(closer.is_alive())
+        self.assertGreaterEqual(len(seen), 2, seen)
+        self.assertTrue(all(item == unix.SHUTDOWN_DRAIN_BOUND_S for item in seen), seen)
+
+    def test_two_handlers_may_shut_the_server_down_together(self):
+        """Two handlers that both shut the server down both return, and a fresh server can take the path.
+
+        Each would join the other. An unbounded join never returns, so this test stops waiting and fails.
+        """
+        arrived = threading.Barrier(2)
+        done: list = []
+        errors: list = []
+        holder: dict = {}
+
+        def handler(message, connection):
+            try:
+                arrived.wait(5)
+                holder["srv"].close()
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+            finally:
+                done.append(1)
+
+        srv = ct.UnixControlServer(self.directory, handler, idle_timeout_s=0.01)
+        holder["srv"] = srv
+
+        def abandon():
+            srv._stop.set()
+            with srv._lock:
+                srv._workers.clear()
+                srv._thread = None
+            try:
+                srv.close()
+            except Exception:
+                pass
+
+        self.addCleanup(abandon)
+        srv.start()
+        raws = []
+        try:
+            for _ in range(2):
+                raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                raw.settimeout(2)
+                raw.connect(srv.path)
+                raw.sendall(framing.encode_frame({"op": "ordinary"}))
+                raws.append(raw)
+            deadline = time.monotonic() + unix.SHUTDOWN_DRAIN_BOUND_S + 5.0
+            while len(done) < 2 and time.monotonic() < deadline:
+                time.sleep(0.05)
+        finally:
+            for raw in raws:
+                raw.close()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(done), 2, "both shutdowns must return within the drain bound")
+        self.assertFalse(os.path.exists(srv.path))
+        self.assertIsNone(srv._sock)
+        self.assertIsNone(srv._lock_fd)
+        nxt = self.server()
+        with ct.UnixControlClient(nxt.path) as client:
+            self.assertEqual(client.request({"op": "ping"})["op"], "pong")
 
 
 if __name__ == "__main__":

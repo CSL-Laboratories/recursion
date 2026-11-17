@@ -62,6 +62,10 @@ NOT_ADMITTED_FRAME = encode_frame(
 # A connection on a reserved slot must send its one priority request within this long.
 RESERVED_TIMEOUT_S = 2.0
 _ACCEPT_POLL_S = 0.1
+# How long shutdown waits for the accept thread and for each handler. Long enough that a handler
+# still inside a request keeps the path and the lock (the drain tests wait several seconds), and
+# short enough that two handlers waiting on each other both return. One name, both joins.
+SHUTDOWN_DRAIN_BOUND_S = 15.0
 # Linux sun_path is 108 bytes including the trailing NUL.
 _MAX_SUN_PATH = 107
 _URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
@@ -355,14 +359,14 @@ class UnixControlServer:
                 self._thread = thread
                 thread.start()
             except BaseException:
+                if thread is not None and thread.ident is not None:
+                    # Only an interrupt raised after the thread began can land here. Stop the loop
+                    # before clearing the listener it reads, or its first line sees None.
+                    self._stop.set()
                 self._sock = None
                 self._lock_fd = None
                 self._bound = None
                 self._thread = None
-                if thread is not None and thread.ident is not None:
-                    # Only an interrupt raised after the thread began can land here: stop its loop before
-                    # the socket it polls is closed.
-                    self._stop.set()
                 if sock is not None:
                     sock.close()
                 if bound:
@@ -374,19 +378,21 @@ class UnixControlServer:
                 raise
 
     def close(self) -> None:
-        """Stop accepting, wait for every handler that has begun, then give up the path and the lock.
+        """Stop accepting, wait for handlers that have begun, then give up the path and the lock.
 
-        close() drains: it returns only when the accept thread and every started connection worker have
-        ended, so no handler of this server runs after it returns, and the socket path and the lock are
-        released only then (sweep s7 D06: a timed join let close return, and the next owner take the lock,
-        while a handler could still write). Each open connection is shut first, so a worker waiting for its
-        peer ends at once; a handler that never returns keeps close() waiting. A close() called from one of
-        this server's own threads does not wait for that thread.
+        Shutdown waits up to ``SHUTDOWN_DRAIN_BOUND_S`` for the accept thread and for each started
+        connection worker. A handler still running inside that bound keeps this call from giving up
+        the path and the lock (sweep s7 D06: a short timed join returned, and the next owner took the
+        lock, while a handler could still write). Each open connection is shut first, so a worker
+        waiting for its peer ends at once. After the bound, this call returns and gives up the path
+        and the lock even if a handler has not returned, so two handlers each waiting on the other
+        both return. Whether an incomplete drain should be reported is not decided here. A call from
+        one of this server's own threads does not wait for that thread.
         """
         self._stop.set()
         thread = self._thread
         if thread is not None and thread.ident is not None and thread is not threading.current_thread():
-            thread.join()
+            thread.join(timeout=SHUTDOWN_DRAIN_BOUND_S)
         with self._lock:
             workers = list(self._workers)
             conns = list(self._conns)
@@ -401,7 +407,7 @@ class UnixControlServer:
             # (the round-2 read of #407 by DeepSeek, F2; the same on master). Its connection was shut above.
             if worker.ident is None or worker is threading.current_thread():
                 continue
-            worker.join()
+            worker.join(timeout=SHUTDOWN_DRAIN_BOUND_S)
         with self._lock:
             sock, self._sock = self._sock, None
             lock_fd, self._lock_fd = self._lock_fd, None
@@ -435,7 +441,10 @@ class UnixControlServer:
 
     def _accept_loop(self) -> None:
         sock = self._sock
-        assert sock is not None
+        # Rollback can clear the listener before this thread runs. Returning is the stop; an
+        # assertion here kills the thread, and under -O the next use of None would too.
+        if sock is None:
+            return
         while not self._stop.is_set():
             try:
                 conn, _ = sock.accept()

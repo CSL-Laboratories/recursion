@@ -64,6 +64,8 @@ What this gives, and what it does not. Replay of the log reaches the registry's 
 run not listed in ``unlogged``: the last image logged for a run equals what the registry holds once the
 reader has caught up, with one reader per store. ``start`` holds to that: another reader's ``start`` or ``bind`` on
 a started reader's store is refused, and a started reader's own ``bind`` cannot move it to another registry or store.
+A start remembers the store before it claims it, and claims and binds in one step with ``bind``'s check (the
+reader's own lock), so no ``bind`` lands between them and an interrupted start leaves no claim ``stop`` cannot find.
 ``bind`` alone takes no claim (it is the tests' stand-in for a restart), so two
 readers that are only bound to one store can leave a run's last image behind the registry's until its next read.
 Changes between two reads appear as the last image: the log does NOT claim every
@@ -250,7 +252,8 @@ class ChangeReader:
         self._registry = self._store = None
         self._stopping = threading.Event()   # the current start's stop signal; each start makes its own
         self._thread = None                   # the current start's thread, from before it is started to its join
-        self._claimed = None                  # the store the current start claimed, until its stop
+        self._claimed = None                  # the store the current start claimed, until its stop: the started mark
+        self._binding = threading.Lock()      # bind's check and change, and start's claim and binding: one step each
         self._reset()
 
     def _reset(self) -> None:
@@ -290,24 +293,40 @@ class ChangeReader:
         """The two things the reader reads and writes. ``start`` binds them from the service context. A store
         another reader's ``start`` holds (until its ``stop``) is refused. ``bind`` alone takes no claim: the tests
         bind a second reader on one store to stand for a restart. A started reader (from its ``start`` until its
-        ``stop``, a start that raised included) cannot be bound to another registry or store: that is refused, and
-        binding the same two changes nothing. So its thread reads and writes only what it was started with, on the
-        store its claim holds."""
-        if self._thread is not None and (registry is not self._registry or store is not self._store):
-            raise RuntimeError('the change reader is started: bind cannot change its registry or store until stop')
+        ``stop``, a start that raised after it took the claim included) cannot be bound to another registry or
+        store: that is refused, and binding the same two changes nothing. The check and the change are one step with
+        ``start``'s claim and binding (the reader's own lock), so a ``bind`` on another thread cannot land between
+        them. So its thread reads and writes only what it was started with, on the store its claim holds."""
+        with self._binding:
+            if self._claimed is not None and (registry is not self._registry or store is not self._store):
+                raise RuntimeError('the change reader is started: bind cannot change its registry or store until stop')
+            self._bind(registry, store)
+
+    def _bind(self, registry, store) -> None:
         _claim(store, self, take=False)
         self._registry, self._store = registry, store
 
     def start(self, context) -> None:
         """Claims the context's store for this reader (another reader's start or bind on it is refused until
-        this reader's ``stop``), binds, and starts the thread."""
+        this reader's ``stop``), binds, and starts the thread. The store is remembered before it is claimed, and
+        the claim and the binding are one step with ``bind``'s check. A start that raises before it took the claim,
+        or while it binds, gives the claim back at once. One that raises after that (its thread is owned, or about
+        to be) holds the claim until ``stop``."""
         if self._thread is not None:
             raise RuntimeError('the change reader is already started')
         if context.store is None:
             raise RuntimeError('the change reader needs the event store')
-        _claim(context.store, self, take=True)
-        self._claimed = context.store
-        self.bind(context.registry, context.store)
+        with self._binding:
+            if self._claimed is not None:     # a start that raised after its claim, with no stop since
+                raise RuntimeError('the change reader is already started')
+            self._claimed = context.store     # remembered first: an interruption after the claim leaves it findable
+            try:
+                _claim(context.store, self, take=True)
+                self._bind(context.registry, context.store)
+            except BaseException:
+                _release(context.store, self)  # gives up only a claim this reader holds
+                self._claimed = None
+                raise
         self._reset()
         stopping = self._stopping = threading.Event()
         thread = threading.Thread(target=self._run, args=(stopping,), name='events-change-reader', daemon=True)
@@ -318,17 +337,18 @@ class ChangeReader:
 
     def stop(self, context) -> None:
         """Ends the current start's thread, joins it, and gives up the claim that start took, on the store it was
-        started with (while it is started, ``bind`` cannot move it to another). A thread whose start raised
-        before it began is not joined: when it runs, it reads its own stop signal, set here, before anything else,
-        and does nothing."""
+        started with (while it is started, ``bind`` cannot move it to another; an interrupted start's claim
+        included). A thread whose start raised before it began is not joined: when it runs, it reads its own stop
+        signal, set here, before anything else, and does nothing."""
         self._stopping.set()
         thread = self._thread
         if thread is not None:
             if thread.is_alive():
                 thread.join()
             self._thread = None
-        _release(self._claimed, self)
-        self._claimed = None
+        with self._binding:
+            _release(self._claimed, self)     # given up before the mark is cleared: never a claim with no mark
+            self._claimed = None
 
     def _run(self, stopping=None) -> None:
         stopping = self._stopping if stopping is None else stopping

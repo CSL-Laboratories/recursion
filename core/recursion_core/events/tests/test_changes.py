@@ -1368,6 +1368,104 @@ class ChangeReaderTest(unittest.TestCase):
         second.stop(context)
         first.bind(self.registry, other)                        # stopped: bind may change both again
 
+    def test_an_interruption_right_after_start_takes_the_claim_gives_it_back(self) -> None:
+        # DeepSeek r5 LOW-2 (changes.py:308-309, 330 at 1ff2ee1a): an interruption between the claim and remembering it
+        # left the store claimed with nothing to release it, and every later start on it was refused.
+        reader, later = C.ChangeReader(self.marker), C.ChangeReader(H.ChangeMarker())
+        reader._run = later._run = lambda stopping=None: None
+        context, real = self.context(), C._claim
+
+        def claim_then_interrupted(store, who, *, take):
+            real(store, who, take=take)
+            if take and who is reader:
+                raise KeyboardInterrupt
+        with mock.patch.object(C, '_claim', claim_then_interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                reader.start(context)
+        self.assertIsNone(reader._claimed)
+        later.start(context)                                    # the store is free: no stop was needed
+        later.stop(context)
+        reader.stop(context)                                    # and a stop after it is safe
+
+    def test_a_start_that_fails_while_it_binds_gives_the_claim_back(self) -> None:
+        # DeepSeek r5 LOW-2: the same promise at the binding, the next step after the claim.
+        reader, later = C.ChangeReader(self.marker), C.ChangeReader(H.ChangeMarker())
+        reader._run = later._run = lambda stopping=None: None
+        context, real = self.context(), C._claim
+
+        def refused_when_binding(store, who, *, take):
+            if not take and who is reader:
+                raise KeyboardInterrupt
+            real(store, who, take=take)
+        with mock.patch.object(C, '_claim', refused_when_binding):
+            with self.assertRaises(KeyboardInterrupt):
+                reader.start(context)
+        later.start(context)
+        later.stop(context)
+        reader.bind(self.registry, self.other_store())          # not started: bind may change both
+
+    def test_a_bind_on_another_thread_while_start_is_under_way_is_refused(self) -> None:
+        # DeepSeek r5 LOW-1 (changes.py:296-297 vs 309 at 1ff2ee1a): a bind that landed after start's claim and binding
+        # but before its thread was owned moved the started reader to a store whose claim it did not hold.
+        reader, other = C.ChangeReader(self.marker), self.other_store()
+        reader._run = lambda stopping=None: None
+        context, reset = self.context(), reader._reset
+        paused, go, outcome = threading.Event(), threading.Event(), []
+
+        def slow_reset():
+            paused.set()
+            go.wait(BOUND_S)
+            reset()
+        reader._reset = slow_reset
+        starter = threading.Thread(target=reader.start, args=(context,))
+        starter.start()
+        self.addCleanup(starter.join, BOUND_S)
+        self.assertTrue(paused.wait(BOUND_S))
+        try:
+            reader.bind(self.registry, other)
+            outcome.append('moved')
+        except RuntimeError as exc:
+            outcome.append(str(exc))
+        go.set()
+        starter.join(BOUND_S)
+        self.assertEqual(outcome, ['the change reader is started: bind cannot change its registry or store until stop'])
+        self.assertIs(reader._store, self.store)
+        later = C.ChangeReader(H.ChangeMarker())
+        later._run = lambda stopping=None: None
+        later.start(mock.Mock(registry=self.registry, store=other))   # other was never this reader's
+        later.stop(mock.Mock(registry=self.registry, store=other))
+        reader.stop(context)
+
+    def test_a_bind_under_way_when_start_begins_is_finished_first(self) -> None:
+        # DeepSeek r5 LOW-1, the other order: a bind that passed its check before start began must not land after
+        # start's binding. Start waits for it, then binds last.
+        reader, other = C.ChangeReader(self.marker), self.other_store()
+        reader._run = lambda stopping=None: None
+        context, real, calls = self.context(), reader._bind, []
+        entered, go = threading.Event(), threading.Event()
+
+        def slow_first_bind(registry, store):
+            calls.append(store)
+            if len(calls) == 1:
+                entered.set()
+                go.wait(BOUND_S)
+            real(registry, store)
+        reader._bind = slow_first_bind
+        binder = threading.Thread(target=reader.bind, args=(self.registry, other))
+        binder.start()
+        self.addCleanup(binder.join, BOUND_S)
+        self.assertTrue(entered.wait(BOUND_S), 'bind goes through _bind')
+        starter = threading.Thread(target=reader.start, args=(context,))
+        starter.start()
+        self.addCleanup(starter.join, BOUND_S)
+        time.sleep(NOT_YET_S)
+        self.assertEqual(len(calls), 1, 'start waits for the bind under way')
+        go.set()
+        binder.join(BOUND_S)
+        starter.join(BOUND_S)
+        self.assertIs(reader._store, self.store, 'the start binds last')
+        reader.stop(context)
+
     def test_a_start_whose_thread_never_started_refuses_a_rebind_until_its_stop(self) -> None:
         # Sol, round 3, required 1: the refusal holds from start to stop, a start that raised included.
         context, service, other = self.context(), C.ChangeReader(self.marker), self.other_store()

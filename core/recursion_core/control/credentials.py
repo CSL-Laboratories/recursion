@@ -1,23 +1,26 @@
 """Control API credentials: principal kinds, the scopes each may hold, and tokens the daemon mints.
 
 Lane CONTROL, frontier plan v3.3, step 2. The authorizer in ``scopes.py``, registered into seam S5, holds
-every principal to ``CEILING``. The store itself is read only by the scopes service (seam S13), which is
-built but not registered yet, so the daemon honours no token today.
+every principal to ``CEILING``. The daemon attaches this store to that authorizer when the store opens.
+``ScopesService`` (seam S13) stays unregistered, so the admission gate stays off. A frame with no device
+token is not a token principal.
 
-SCOPES are the four of the method table (``schemas/control/v1/methods.v1.json``, ``$defs/scope``):
-``read`` looks, ``run`` starts, steers and stops work, ``approve`` shows and answers approvals, and
-``manage`` changes the install.
+SCOPES are ``read``, ``run``, ``approve``, ``manage`` and ``stop``. ``read`` looks, ``run`` starts and
+steers, ``stop`` stops work, ``approve`` shows and answers approvals, and ``manage`` changes the install.
+The frozen method table's scope column does not name ``stop``; ``run.stop`` stays a ``run`` row, and the
+authorizer also accepts a held ``stop``.
 
 PRINCIPAL KINDS and the most each may ever hold (``CEILING``). A grant above the ceiling is refused at
 mint, and the authorizer intersects with the ceiling again on every call, so a record that somehow
 names more is still held to it.
 
-    owner     read run approve manage   the user on the owner-only socket; never a bearer token
-    internal  read run approve manage   the daemon's own code, by name; never a bearer token
-    device    read run approve          the page and paired devices: pairing never grants manage (O34)
-    plugin    read run                  a loaded plugin: never approve (PRODUCT.md 1169-1171), never manage
-    session   read run                  an engine's own session: never approve or manage (session.token.v1)
-    agent     read run                  the MCP face: never approve, never manage
+    owner     read run approve manage stop   the user on the owner-only socket; never a bearer token
+    internal  read run approve manage stop   the daemon's own code, by name; never a bearer token
+    device    read run approve stop          the page and paired devices: pairing never grants manage (O34).
+                                             A pairing with no passkey mints only read and stop.
+    plugin    read run                       a loaded plugin: never approve, never stop, never manage
+    session   read run                       an engine's own session: never approve or manage (session.token.v1)
+    agent     read run                       the MCP face: never approve, never manage
 
 ``owner`` and ``internal`` come from the way a request arrives, never from a token, so they cannot be
 minted. ``agent`` is a credential kind with no principal kind in ``common.v1`` yet; how its calls are
@@ -84,6 +87,7 @@ import base64
 import collections
 import contextlib
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -102,13 +106,13 @@ except ImportError:   # not POSIX: the store refuses to open (the end of the mod
 
 log = logging.getLogger(__name__)
 
-SCOPES = ("read", "run", "approve", "manage")
+SCOPES = ("read", "run", "approve", "manage", "stop")
 ALL_SCOPES = frozenset(SCOPES)
 KINDS = ("owner", "internal", "device", "plugin", "session", "agent")
 CEILING: dict[str, frozenset[str]] = {
     "owner": ALL_SCOPES,
     "internal": ALL_SCOPES,
-    "device": frozenset({"read", "run", "approve"}),
+    "device": frozenset({"read", "run", "approve", "stop"}),
     "plugin": frozenset({"read", "run"}),
     "session": frozenset({"read", "run"}),
     "agent": frozenset({"read", "run"}),
@@ -179,11 +183,21 @@ def check_grant(kind: object, scopes: object) -> frozenset[str]:
         raise CredentialRefused("manage_never_granted")
     if "approve" in wanted and "approve" not in CEILING[kind]:
         raise CredentialRefused("approve_never_granted")
+    if not wanted <= CEILING[kind]:
+        raise CredentialRefused("scope_above_ceiling")
     return wanted
 
 
 def _digest(token: str) -> str:
     return hashlib.sha256(str.encode(token, "ascii")).hexdigest()   # str's own encode, never a subclass's
+
+
+def _same_digest(stored: object, digest: str) -> bool:
+    """The stored hash matches ``digest``. Lengths differ, or the stored value is not text: it does not."""
+
+    if type(stored) is not str or len(stored) != len(digest):
+        return False
+    return hmac.compare_digest(stored, digest)
 
 
 def _text(value: object) -> str | None:
@@ -722,8 +736,13 @@ class CredentialStore:
                 except CredentialStoreError as exc:   # not the peer's failure: not counted against it
                     log.error("credential check refused for peer %r: %s", peer, exc)
                     raise CredentialRefused("store_unavailable") from None
-                token_id = self._by_digest.get(_digest(token))
+                digest = _digest(token)
+                token_id = self._by_digest.get(digest)
                 record = self._grants.get(token_id) if token_id is not None else None
+                # The lookup is by the hash. Compare the stored hash again so a row filed under the
+                # wrong digest is not a live token.
+                if record is not None and not _same_digest(record.get("token_sha256"), digest):
+                    record = None
                 if record is None:
                     reason = "token_unknown"
                 elif record["revoked_at"] is not None:

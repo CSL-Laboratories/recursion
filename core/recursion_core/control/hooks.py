@@ -236,11 +236,13 @@ class Principal:
     origin checks. ``internal``: the daemon's own components, by name. ``plugin``: a loaded plugin, by its
     id, set by the plugin host. ``session``: a delegated session, by its id. A socket principal also
     carries today's predicate, ``in_run_unit``: true when the peer is inside a run's unit, or its cgroup
-    cannot be read.
+    cannot be read. ``grant`` is the verified token's id when the caller presented a device credential,
+    and None when it did not. It is not part of ``public()``.
     """
     kind: str
     id: str | None = None
     in_run_unit: bool = False
+    grant: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in PRINCIPAL_KINDS:
@@ -252,7 +254,7 @@ class Principal:
 
 
 OWNER = Principal('owner', 'local')      # the owner-only socket, and an in-process call made for the owner
-DEVICE = Principal('device', 'page')     # the page; a principal per paired device is a later lane's
+DEVICE = Principal('device', 'page')     # the page. A paired device is another device principal, with its grant.
 
 
 @dataclass(frozen=True)

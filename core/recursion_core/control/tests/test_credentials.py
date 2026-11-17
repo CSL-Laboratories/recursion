@@ -33,9 +33,9 @@ class Clock:
 class CeilingTest(unittest.TestCase):
     def test_the_ceiling_per_kind(self) -> None:
         self.assertEqual({k: sorted(v) for k, v in CEILING.items()}, {
-            "owner": ["approve", "manage", "read", "run"],
-            "internal": ["approve", "manage", "read", "run"],
-            "device": ["approve", "read", "run"],
+            "owner": ["approve", "manage", "read", "run", "stop"],
+            "internal": ["approve", "manage", "read", "run", "stop"],
+            "device": ["approve", "read", "run", "stop"],
             "plugin": ["read", "run"],
             "session": ["read", "run"],
             "agent": ["read", "run"],

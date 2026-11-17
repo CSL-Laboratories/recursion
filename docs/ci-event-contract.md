@@ -230,7 +230,7 @@ Tests are discovered by the gate glob `tools/test_*.py` (`tools/ci_gate.py:53-54
 
 None of these start CI test runners themselves. They spend model or tool usage through secrets or external apps. [SRC]
 
-Their side effects, and a person's pushes, do start CI (free runners since CSL-408):
+A person's pushes start CI (free runners since CSL-408); the workload in the table below does not:
 
 - Since v3 no workflow pushes to a PR branch (the fixer and conflict-resolver writers are retired), so a `synchronize` (E3) comes from a person's push to a **non-draft** PR branch: one full Linux test run after settle, plus windows and macos on a same-repository PR (or with `ci:full` on a fork PR). The exceptions are pushes GitHub suppresses: a head commit with a skip annotation (E18) or a head that is still conflicted (E19) gets no run, so no test runner starts and the required check stays missing on that head. Earlier commits in a multi-commit push get no run of their own; only the pushed head does. [OBS] History, before v3: fixer pushes started `CI` with actor `claude[bot]` about 8-16 s after the commit: 39499885497 (#254 `8087e7f6`), 39386432470 (#249 `919f52e7`), 39352829266 (#241 `b1eb6ac8`), 39016885558 (#229 `0e1888fa`). The credential those pushes used was never read from a job log (gap 16).
 - Since v3 no workflow applies `ci:full`; a person adds it (a fork PR's route to windows and macos). A `ci:full` added by a person is never removed automatically. The fixer's `revoke_owned_ci` (`scripts/ci/claude_fixer_receipts.py:686`) removes only a label event with a gate ownership receipt, and the removed gate was the only writer of those receipts.

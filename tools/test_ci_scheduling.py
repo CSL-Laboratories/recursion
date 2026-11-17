@@ -688,6 +688,15 @@ class RetiredReviewAutomationTests(unittest.TestCase):
         for needle in ("scripts/ci/claude_fixer_publish.py", "git push", "git  push"):
             self.assertTrue(PUBLISHER_OR_PUSH.search(needle), needle)
 
+    def test_the_review_scan_sees_each_needle_inside_a_workflow_line(self) -> None:
+        # CSL-238: the scan reads whole workflow files, so every needle must be found in the middle
+        # of a line, in a comment or in a step. A pattern anchored to the whole string still matches
+        # the bare needles pinned above while it sees none of them inside a workflow.
+        for needle in ("anthropics/claude-code", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "@codex review",
+                       "CODEX_TRIGGER_PAT", "stuck_thread_watch", "codex_gate"):
+            for line in (f"# probe line: {needle}", f"        run: echo {needle} tail"):
+                self.assertTrue(REVIEW_AUTOMATION.search(line), line)
+
 
 class ContractJobsCellTests(unittest.TestCase):
     """CSL-238: the contract's E1 and E7 rows must say windows and macos run on a same-repository PR."""

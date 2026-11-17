@@ -149,6 +149,29 @@ class DeviceTests(unittest.TestCase):
                 self.assertEqual(self.book.connect(device_id, "conn_x").code, "device_unknown")
         self.assertEqual([row["device_id"] for row in self.book.list()], ["dev_one"])
 
+    def test_a_plain_str_subclass_is_not_the_device_id_it_spells(self) -> None:
+        class PlainSub(str):
+            pass
+
+        self.assertTrue(self.book.connect("dev_one", "keep").ok)
+        look = PlainSub("dev_one")
+        with self.assertRaises(PairingRefused) as caught:
+            self.book.add(grant(look), expires_at=self.clock.now + 60)
+        self.assertEqual(caught.exception.code, "grant_invalid")
+        with self.assertRaises(PairingRefused) as caught:
+            self.book.revoke(look)
+        self.assertEqual(caught.exception.code, "device_unknown")
+        self.assertEqual(self.book.admit(look, "read").code, "device_unknown")
+        self.assertEqual(self.book.connect(look, "conn_look").code, "device_unknown")
+        self.assertTrue(self.book.admit("dev_one", "read").ok)
+        self.assertTrue(self.book.check_connection("keep", "read").ok)
+        novel = PlainSub("dev_novel")
+        with self.assertRaises(PairingRefused) as caught:
+            self.book.add(grant(novel), expires_at=self.clock.now + 60)
+        self.assertEqual(caught.exception.code, "grant_invalid")
+        self.assertEqual([row["device_id"] for row in self.book.list()], ["dev_one"])
+        self.assertTrue(all(type(row["device_id"]) is str for row in self.book.list()))
+
     def test_the_list_shows_state_and_no_secret(self) -> None:
         self.book.add(grant("dev_two", scopes=("read",), label="tablet"), expires_at=self.clock.now + 10)
         self.book.revoke("dev_one")

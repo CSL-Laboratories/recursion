@@ -75,6 +75,8 @@ is never created by the daemon; without it an order effect refuses ``authority_u
 from __future__ import annotations
 
 import collections
+import errno
+import fcntl
 import json
 import logging
 import os
@@ -436,9 +438,13 @@ class PluginHost:
         if not trusted:
             self._refuse_all(sources, 'plugin_directory_untrusted', CONFIG_UNTRUSTED)
             return
+        store_fd = None
         try:
             install = read_install(self._config)
-            trust = TrustStore(install['trusted_keys'], revocation_store=self._revocation_store())
+            # The descriptor stays open through the connect, so the inode that was checked is the
+            # inode SQLite opens. It is shut once that connect has returned.
+            store_path, store_fd = self._revocation_store()
+            trust = TrustStore(install['trusted_keys'], revocation_store=store_path)
         except (PluginRefused, Refused) as exc:
             log.error('no plugin can load: %s', exc)
             self._refuse_all(sources, exc.code, exc.detail)
@@ -447,6 +453,9 @@ class PluginHost:
             log.error('no plugin can load: revocation_store_invalid: %s', type(exc).__name__)
             self._refuse_all(sources, 'revocation_store_invalid', type(exc).__name__)
             return
+        finally:
+            if store_fd is not None:
+                os.close(store_fd)
         if not self._own('_trust', trust):
             return  # close() ran while the store was opening: it is closed again and nothing loads
         self.loader = PluginLoader(trust, install['grants'], install['reserved'], self.health, self._gil)
@@ -490,16 +499,52 @@ class PluginHost:
                            'detail': detail, 'findings': [_finding(code, 'refuse', detail)]})
 
     def _revocation_store(self):
+        """``(path for SQLite, fd)``. The fd is the inode the checks read; the caller shuts it after connect.
+
+        ``O_NOFOLLOW`` refuses a symlink (``ELOOP``). ``O_NONBLOCK`` keeps a fifo from stalling the open;
+        a directory or a fifo then fails the regular-file check. Two creators share an exclusive lock
+        around the create, because a lost ``O_EXCL`` otherwise opens a file whose schema is not written
+        yet. ``FileExistsError`` still falls through to the same checks.
+        """
         path = private_dir(self._state / STORE_DIR) / REVOCATION_FILE
-        if not os.path.lexists(path):
-            create_revocation_store(str(path))
-        # The directory check does not cover this file. A symlink would be followed by the
-        # store open, including a link to a 0666 file in a shared directory (E21).
-        info = os.lstat(path)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022):
-            raise PluginRefused('revocation_store_untrusted',
-                                'must be an operator-owned regular file, not a symlink and not group/other writable')
-        return str(path)
+        try:
+            lock_fd = os.open(str(path.parent / (REVOCATION_FILE + '.lock')),
+                              os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise PluginRefused(
+                    'revocation_store_untrusted',
+                    'must be an operator-owned regular file, not a symlink and not group/other writable') from exc
+            raise
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if not os.path.lexists(path):
+                try:
+                    create_revocation_store(str(path))
+                except FileExistsError:
+                    pass
+            try:
+                fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise PluginRefused(
+                        'revocation_store_untrusted',
+                        'must be an operator-owned regular file, not a symlink and not group/other writable') from exc
+                raise
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022):
+                    raise PluginRefused(
+                        'revocation_store_untrusted',
+                        'must be an operator-owned regular file, not a symlink and not group/other writable')
+                # SQLite opens this descriptor's inode, not the path a racer can replace.
+                return f'/proc/self/fd/{fd}', fd
+            except BaseException:
+                os.close(fd)
+                raise
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
     def _compose_core(self, install, breaker):
         """The approval gate, the authority profile and the core service. False if close() ran meanwhile."""

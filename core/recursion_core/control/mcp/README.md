@@ -43,14 +43,15 @@ as package data) and asks the daemon `methods.list`:
   `{"code": "tools_unavailable", "reason": ..., "detail": ...}`, nothing to stdout, and exits 1. An exit or
   an interrupt while choosing is not a refusal.
 
-`isError` follows CONTROL's mapping (`control.api.SUCCESS_CODES`): today a stop's or an interrupt's
-`pending`, and a stop's `ended`, read as errors though they are truthful answers; the structured answer
-carries the code, and CONTROL is to change the mapping. The published `run.start` leaves `engine` optional;
-a daemon without a routing start registrant answers a start without one `request_invalid`, and nothing runs.
+`isError` follows CONTROL's mapping (`mcp_tools.is_error`): a stop's `pending` or `ended`, and an
+interrupt's `pending`, are not errors. The structured answer carries the code. The published `run.start`
+leaves `engine` optional; a daemon without a routing start registrant answers a start without one
+`request_invalid`, and nothing runs.
 
 Exit statuses: 0 when the client ends stdin (once the answers owed have been read) or stdout fails; 1 when
 the socket check fails or no tools can be chosen (`tools_unavailable`); 2 for an argument; 3 for an
-unexpected error while serving (one JSON line, `internal_error`); 130 when interrupted. An answer is never
+unexpected error while serving (one JSON line, `internal_error`); 130 when interrupted once serving has
+begun (after the imports and the usage check). An answer is never
 dropped, so a client that ends stdin and stops reading stdout without shutting it keeps the process until it
 reads again or stdout fails.
 Ending stdin never stops a run: admitted calls finish and are answered, and the runs go on. The process

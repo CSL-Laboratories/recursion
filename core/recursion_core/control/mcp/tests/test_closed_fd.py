@@ -73,6 +73,8 @@ class ClosedFdTest(unittest.TestCase):
         def handle(message, _connection):
             seen.append(message)
             method = message.get("method")
+            if method == "methods.list":  # a daemon from before the method table: the legacy four
+                return {"ok": True, "result": {"code": "method_unknown", "detail": "methods.list"}}
             if method == "run.stop":
                 held.set()
                 self.assertTrue(noted.wait(HANG_GUARD_S), "the test never finished looking at the open socket")
@@ -161,6 +163,8 @@ class ClosedFdTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, runtime, True)
 
         def handle(message, _connection):
+            if message.get("method") == "methods.list":  # a daemon from before the method table: the legacy four
+                return {"ok": True, "result": {"code": "method_unknown", "detail": "methods.list"}}
             return {"ok": True, "result": {"code": "ok", "runs": []}}
 
         server = UnixControlServer(os.path.join(runtime, "recursion"), handle)

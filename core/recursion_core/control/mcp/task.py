@@ -59,6 +59,7 @@ distinct, non-empty strings, as ``mcp.task.v1`` requires (the rule does not chec
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -77,6 +78,12 @@ class TaskUnavailable(ValueError):
     def __init__(self, reason: str, detail: str = "") -> None:
         super().__init__(f"{reason}: {detail}" if detail else reason)
         self.reason, self.detail = reason, detail
+
+
+def _code_word(value: object) -> bool:
+    """A result code of mcp.task.v1: a code_word (common.v1), not merely any string."""
+
+    return isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value) is not None
 
 
 def _member(record: Any, key: str, what: str) -> Any:
@@ -157,8 +164,12 @@ def task_of_run(view: Mapping, events: Iterable[Mapping] = (), pending_approval_
         task["status"] = "cancelled"
     elif state == "ended" and result is not None:
         code = _member(result, "code", "a run's result")
+        if code is not None and not _code_word(code):
+            raise TaskUnavailable("source", "a run's result code is not a code word")
         ok = code is None and _member(result, "status", "a run's result whose code is null") == "ok"
         detail = _member(result, "detail", "a run's result")
+        if detail is not None and not isinstance(detail, str):
+            raise TaskUnavailable("source", "a run's result detail is not a string")
         task["status"] = "completed" if ok else "failed"
         task["result"] = {"code": None if ok else (code or "result_invalid"), "detail": detail, "result_ref": run_id}
     elif state == "ended":
@@ -166,9 +177,11 @@ def task_of_run(view: Mapping, events: Iterable[Mapping] = (), pending_approval_
         task["result"] = {"code": "result_unavailable", "detail": None, "result_ref": None}
     elif state == "start_failed":
         kept = view.get("start_error")  # none kept, or kept empty: the reason is not known, and none is invented
+        detail = _member(kept, "code", "a kept start_error") if kept else None
+        if detail is not None and not isinstance(detail, str):
+            raise TaskUnavailable("source", "a kept start_error code is not a string")
         task["status"] = "failed"
-        task["result"] = {"code": "start_failed", "detail": _member(kept, "code", "a kept start_error") if kept else None,
-                          "result_ref": None}
+        task["result"] = {"code": "start_failed", "detail": detail, "result_ref": None}
     elif state == "lost_reboot":
         task["status"] = "failed"
         task["result"] = {"code": "lost_reboot", "detail": None, "result_ref": None}

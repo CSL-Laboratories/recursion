@@ -121,6 +121,26 @@ class RunTest(unittest.TestCase):
         kept = task_of_run(dict(self.VIEW, state="start_failed", start_error={"code": "route_not_configured", "detail": "x"}))
         self.assertEqual({"code": "start_failed", "detail": "route_not_configured", "result_ref": None}, kept["result"])
 
+    def test_a_result_not_of_its_shape_is_refused(self) -> None:
+        # mcp.task.v1: a run result's code is null or a code word, its detail is a string or null, and a kept
+        # start_error code copied into the detail is a string. A member not of that shape is source, not a Task.
+        ended = dict(self.VIEW, state="ended")
+        for result in ({"status": "error", "code": 7, "detail": "x"},
+                       {"status": "error", "code": 0, "detail": "x"},
+                       {"status": "error", "code": "OK", "detail": "x"},
+                       {"status": "error", "code": "", "detail": "x"},
+                       {"status": "error", "code": "plan_limit", "detail": {"why": "x"}},
+                       {"status": "error", "code": "plan_limit", "detail": 1}):
+            with self.subTest(result=result):
+                with self.assertRaises(TaskUnavailable) as caught:
+                    task_of_run(dict(ended, result=result))
+                self.assertEqual("source", caught.exception.reason)
+        for code in (7, 0, {"code": "route"}, ["route"], True):
+            with self.subTest(start_error=code):
+                with self.assertRaises(TaskUnavailable) as caught:
+                    task_of_run(dict(self.VIEW, state="start_failed", start_error={"code": code}))
+                self.assertEqual("source", caught.exception.reason)
+
     def test_approvals_pending(self) -> None:
         task = task_of_run(self.VIEW, pending_approval_ids=["apr-1", "apr-2"])
         self.assertEqual(("input_required", ["apr-1", "apr-2"]), (task["status"], task["pending_approval_ids"]))

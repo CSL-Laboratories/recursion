@@ -86,9 +86,9 @@ class PublishedTableTest(unittest.TestCase):
         self.assertEqual("arguments.command_id is required",
                          check_arguments(session, {"session_id": "ses-1", "expected_turn_id": "turn-1"}))
 
-    def test_a_stops_pending_and_ended_read_as_errors_until_controls_mapping_changes(self) -> None:
-        # The Liaison's ruling of Nov 15 on the lane's Q2: isError follows CONTROL's mapping (SUCCESS_CODES), and this
-        # face builds none of its own. This pins TODAY's behaviour; it is to change with CONTROL's mapping.
+    def test_a_stops_pending_and_ended_are_not_errors(self) -> None:
+        # isError is mcp_tools.is_error. A stop's pending or ended, and an interrupt's pending, are truthful
+        # answers. The structured code stays the answer's code.
         by_method = {t.method: t for t in project(PUBLISHED, listing(PUBLISHED))}
         codes = {row["name"]: row["codes"] for row in PUBLISHED.rows}
 
@@ -104,7 +104,7 @@ class PublishedTableTest(unittest.TestCase):
             with self.subTest(method=method, code=code):
                 self.assertIn(code, codes[method])
                 result = tools.forward(Answering(code), by_method[method], {})
-                self.assertEqual((True, code), (result["isError"], result["structuredContent"]["code"]))
+                self.assertEqual((False, code), (result["isError"], result["structuredContent"]["code"]))
         self.assertFalse(tools.forward(Answering("stopped"), by_method["run.stop"], {})["isError"])
 
 

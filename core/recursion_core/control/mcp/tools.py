@@ -11,12 +11,10 @@ Two tables can be served:
   implements, with their published names, annotations and parameter schemas.
 
 ``forward`` sends a call to the control API and answers as ``control/mcp_tools.call_tool`` does: the API's
-answer as ``structuredContent``, the same JSON as text, and ``isError`` unless the code is ``started``,
-``ok`` or ``stopped`` (``control.api.SUCCESS_CODES``). The MCP face adds nothing and has no Stop path of
-its own. ``isError`` follows CONTROL's mapping, and this face builds none of its own: today a stop's or an
-interrupt's ``pending``, and a stop's ``ended``, read as errors although they are truthful answers (a Stop
-under way, a run or session already over); the structured answer carries the code. CONTROL is to change
-the mapping in its next slice (the Liaison's ruling of Nov 15 on the lane's Q2), and a test pins today's.
+answer as ``structuredContent``, the same JSON as text, and ``isError`` from ``mcp_tools.is_error``. The MCP
+face adds nothing and has no Stop path of its own. ``isError`` follows CONTROL's mapping, and this face
+builds none of its own: a stop's ``pending`` or ``ended``, and an interrupt's ``pending``, are not errors
+(a Stop under way, a run or session already over). The structured answer carries the code.
 
 ``check_arguments`` checks a call's arguments against the tool's own ``inputSchema`` before anything is
 sent: 2025-06-18 answers invalid arguments as a protocol error (``-32602``), and a call that does not
@@ -48,7 +46,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from recursion_core.control import mcp_tools
-from recursion_core.control.api import SUCCESS_CODES
 
 # Calls to these methods may use the reserved slots (server.RESERVED_STOP): a Stop or an interrupt must not
 # wait behind slow starts.
@@ -286,9 +283,9 @@ def forward(api: Any, tool: Tool, arguments: dict) -> dict:
 
     answer = api.call(tool.method, arguments or {})
     # An answer that is not an object, or that JSON cannot write, raises here, and the session answers that
-    # call as an outcome it does not know. isError follows CONTROL's mapping (SUCCESS_CODES, as
-    # control/mcp_tools.call_tool sets it), and this face builds none of its own: a stop's or an interrupt's
-    # pending, and a stop's ended, read as errors today although they are truthful answers, and
-    # structuredContent carries the code. To change with CONTROL's mapping (the Liaison's ruling on Q2).
-    return {"content": [{"type": "text", "text": json.dumps(answer, sort_keys=True)}],
-            "structuredContent": answer, "isError": answer.get("code") not in SUCCESS_CODES}
+    # call as an outcome it does not know. The .get is that refusal (a non-object has none). isError is
+    # mcp_tools.is_error: a stop's pending or ended, and an interrupt's pending, are not errors.
+    text = json.dumps(answer, sort_keys=True)
+    answer.get("code")
+    return {"content": [{"type": "text", "text": text}],
+            "structuredContent": answer, "isError": mcp_tools.is_error(tool.method, answer)}

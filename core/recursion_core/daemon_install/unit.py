@@ -115,8 +115,10 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
     naming it leaves the default (a ``NAME=value`` there drops only that exact assignment, as systemd
     drops it), under ``$HOME``: the daemon's default is ``Path.home()``, which reads
     ``HOME``, so a unit's own ``HOME`` (or an ``EnvironmentFile``, which can set it) moves the state too,
-    unless it names ``home`` or ``UnsetEnvironment`` drops it. A byte order mark before the first line is
-    skipped, as systemd skips it. Lines end where systemd ends
+    unless it names ``home`` or ``UnsetEnvironment`` drops it. The first column-0 byte order mark in the
+    file is skipped and that line is read (one at byte 0 already counts); a later column-0 mark stays on
+    the key. A backslash then a space or a tab ends the line and that assignment is left unused. A ``\\u``
+    or ``\\U`` escape of a noncharacter is not followed. Lines end where systemd ends
     them, at ``\\r\\n``, ``\\r``, ``\\n`` or a NUL byte only, and words are split and C escapes decoded by systemd's
     table (``_words``), and an empty ``XDG_STATE_HOME`` is the daemon's default, as the
     daemon reads it (``os.environ.get('XDG_STATE_HOME') or ...``). A unit that cannot be read
@@ -137,24 +139,23 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
     unset: set[str] = set()  # names UnsetEnvironment drops whatever their value
     unset_pairs: set[str] = set()  # NAME=value assignments it drops, only those exactly
     lines = _LINE_END.split(text)  # not str.splitlines, whose other line ends systemd reads within a line (Grok R3)
-    # systemd skips the first byte order mark it finds at the start of a line, wherever that line is; one there after
-    # the decode above, which takes the one at byte 0 away, is refused rather than guessed at (Grok R1 of round 12).
-    if any(raw.startswith("\ufeff") for raw in lines):
-        return "has a byte order mark at the start of a line, so where it keeps the daemon's state cannot be told"
+    # systemd skips one column-0 mark in the file and reads that line. utf-8-sig already took a mark at byte 0,
+    # so that one counts; a later column-0 mark stays on the key (Grok R1 of review 13).
+    bom_skipped = unit.startswith(b"\xef\xbb\xbf")
     i = 0
     while i < len(lines):
-        raw = lines[i]
-        line = raw.strip(_BLANKS)
+        raw, bom_skipped = _one_mark(lines[i], bom_skipped)
         i += 1
+        line = raw.strip(_BLANKS)
         if not line or line[0] in "#;":  # a comment line is skipped whole, a backslash at its end too
             continue
         # A line continues on an odd run of backslashes at its very end, as read (a blank after the backslash ends it,
         # Grok R2 of round 12; an even run is escaped backslashes), and comment lines inside a continuation are
         # skipped, as systemd's parser skips them (DeepSeek F11-2 on #382).
         while _continues(raw) and i < len(lines):
-            raw = lines[i]
-            following = raw.strip(_BLANKS)
+            raw, bom_skipped = _one_mark(lines[i], bom_skipped)
             i += 1
+            following = raw.strip(_BLANKS)
             if following[:1] in ("#", ";"):
                 raw = line  # a skipped comment leaves the line continuing
                 continue
@@ -176,6 +177,10 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
             continue
         words = _words(value)
         if words is None:
+            # A backslash then a space or a tab ends the line. systemd ignores that assignment and keeps reading
+            # (Grok R2 of review 13). Any other value this check cannot read refuses the unit.
+            if _ends_backslash_blank(raw):
+                continue
             return f"has {key}={value}, which cannot be read, so where it keeps the daemon's state cannot be told"
         if key == "Environment":
             if not words:
@@ -217,8 +222,8 @@ def _words(value: str) -> list[str] | None:
     (``extract_first_word`` with ``EXTRACT_UNQUOTE`` and ``EXTRACT_CUNESCAPE``): words between blanks, quotes
     taken away wherever they stand, and C escapes decoded by systemd's table, inside quotes too (Grok R3 on #382:
     ``shlex.split`` made ``\\s`` an ``s`` and ``\\x45`` an ``x45``). ``None`` when systemd would not read it, or when an
-    escape gives a character this check does not follow: an unknown escape, a NUL, a byte above 0x7f, a quote left
-    open or a backslash at the end. Then where the unit keeps the state cannot be told, and it is refused."""
+    escape gives a character this check does not follow: an unknown escape, a NUL, a byte above 0x7f, a noncharacter,
+    a quote left open or a backslash at the end. Then where the unit keeps the state cannot be told, and it is refused."""
 
     words: list[str] = []
     word: list[str] = []
@@ -274,7 +279,7 @@ def _escape(value: str, i: int) -> tuple[str | None, int]:
             return None, i + 2
         code = int(digits, 16)
         limit = 0x7F if e == "x" else 0x10FFFF
-        if code == 0 or code > limit or 0xD800 <= code <= 0xDFFF:
+        if code == 0 or code > limit or 0xD800 <= code <= 0xDFFF or _noncharacter(code):
             return None, i + 2
         return chr(code), i + 2 + size
     if e in _OCTAL_DIGITS:
@@ -286,6 +291,31 @@ def _escape(value: str, i: int) -> tuple[str | None, int]:
             return None, i + 1
         return chr(code), i + 4
     return None, i + 2  # an escape systemd's table does not have: systemd refuses the rest of the line
+
+
+def _one_mark(raw: str, skipped: bool) -> tuple[str, bool]:
+    """Drop one column-0 U+FEFF. A later one stays, so the key is not the name systemd would read."""
+
+    if not skipped and raw.startswith("\ufeff"):
+        return raw[1:], True
+    return raw, skipped
+
+
+def _ends_backslash_blank(raw: str) -> bool:
+    """Whether ``raw`` ends in a backslash and then a space or a tab. systemd ends the line there and ignores
+    the assignment; once the blank is stripped the value still ends in a backslash."""
+
+    i = len(raw)
+    while i and raw[i - 1] in " \t":
+        i -= 1
+    return i < len(raw) and i > 0 and raw[i - 1] == "\\"
+
+
+def _noncharacter(code: int) -> bool:
+    """Whether ``code`` is a Unicode noncharacter. systemd's ``unichar_is_valid`` rejects these, so the
+    assignment is ignored and an earlier folder stays."""
+
+    return 0xFDD0 <= code <= 0xFDEF or (code & 0xFFFF) in (0xFFFE, 0xFFFF)
 
 
 def _continues(line: str) -> bool:

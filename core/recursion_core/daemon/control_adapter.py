@@ -853,8 +853,10 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
 
     Operator plugins under ``$XDG_CONFIG_HOME/recursion/plugins`` and in ``plugin_dirs`` are
     loaded through ``plugins.PluginHost``; one that is refused is kept in the inventory with its
-    finding and the daemon runs without it. ``plugin_options`` are ``PluginHost`` keyword
-    arguments for tests (a simulated GIL probe on a GIL build, a missing verification backend).
+    finding and the daemon runs without it. With the default ``load=False``, plugins load after
+    the socket serves, and ``run.start`` answers unavailable with detail composing until the load
+    returns. ``plugin_options`` are ``PluginHost`` keyword arguments for tests (a simulated GIL
+    probe on a GIL build, a missing verification backend).
     """
     require_launcher_platform()  # Windows: typed PlatformUnsupported; no socket, token file or state is made
     environ = dict(os.environ if environ is None else environ)

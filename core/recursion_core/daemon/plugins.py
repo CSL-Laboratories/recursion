@@ -28,9 +28,10 @@ Loading can wait. ``PluginHost(..., load=False)`` is a host with nothing loaded 
 and ``start_loading()`` does it on a thread of its own (``state == 'loading'`` until ``'ready'``).
 Every read (the inventory, the GUI rows, an O7 read) answers while a plugin is still importing,
 from what has been published so far, and a plugin is published only whole: its record, its panels
-and its reader together. This is what will let the control socket and Stop come up before any
-plugin code runs (decision D1) once ``compose_control`` builds the host with ``load=False`` (lane
-STOP's reorder; today it still loads in the constructor). A plugin that hangs while loading cannot
+and its reader together. The composed daemon loads after the socket serves: ``compose_control``
+builds the host with ``load=False`` and calls ``load_installed()`` only after the socket is
+serving, so the control socket and Stop are up before any plugin code runs (decision D1).
+A plugin that hangs while loading cannot
 be stopped in-process; it holds back only the plugins after it. After the host's shutdown an O7 read
 answers 503 and no plugin code is called; the inventory still shows the last state.
 

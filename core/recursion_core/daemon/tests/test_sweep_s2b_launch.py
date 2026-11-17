@@ -111,6 +111,65 @@ class S2bRegressions(unittest.TestCase):
         engine_user.refuse_session_launch(['/opt/engine/bin/claude', '--print'])
 
 
+class SessionAndSigninAnswers(unittest.TestCase):
+    """A string argv and a bad uid are refusals. These do not need a Linux runtime."""
+
+    def test_a_string_argv_is_refused(self):
+        for argv in ('sudo -i', 'su -', 'sudo'):
+            with self.subTest(argv=argv):
+                with self.assertRaises(engine_user.SessionLaunchRefused):
+                    engine_user.refuse_session_launch(argv)
+
+    def test_a_list_of_strings_is_unchanged(self):
+        with self.assertRaises(engine_user.SessionLaunchRefused):
+            engine_user.refuse_session_launch(['sudo', '-i'])
+        engine_user.refuse_session_launch(['/opt/engine/bin/claude', '--print'])
+        with self.assertRaises(engine_user.SessionLaunchRefused):
+            engine_user.refuse_session_launch(('sudo', '-i'))
+
+    def test_a_trailing_slash_does_not_hide_a_launcher(self):
+        for argv in (['su/', '-'], ['sudo/', '-i'], ['su//', '-'], ['/usr/bin/su/', '-']):
+            with self.subTest(argv=argv):
+                with self.assertRaises(engine_user.SessionLaunchRefused):
+                    engine_user.refuse_session_launch(argv)
+
+    def test_signin_uid_must_be_a_positive_int(self):
+        tmp = tempfile.TemporaryDirectory(prefix='s2b-uid-')
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        bad = ('', 0, True, False, -1, '../run/12345', '12345', '1\x00', float('nan'), float('inf'))
+        for uid in bad:
+            with self.subTest(uid=repr(uid)):
+                with self.assertRaises(ValueError) as caught:
+                    engine_user.signin_without_session_bus({}, uid, runtime_root=root)
+                self.assertIn('positive int', str(caught.exception))
+        evidence = engine_user.signin_without_session_bus({}, 12345, runtime_root=root)
+        self.assertEqual('pending', evidence['verdict'])
+        self.assertEqual('absent from engine env', evidence['session_bus'])
+
+    def test_inactive_exit_must_be_an_int(self):
+        def call(argv, **kwargs):
+            if argv[0] == 'loginctl':
+                return subprocess.CompletedProcess(argv, 0, 'no', '')
+            return subprocess.CompletedProcess(argv, 3.0, 'inactive', '')
+
+        tmp = tempfile.TemporaryDirectory(prefix='s2b-rc-')
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        with self.assertRaises(engine_user.EngineManagerPresent):
+            engine_user.check_engine_no_user_manager(
+                'csl-engine', 12345, operator_uid=1, call=call, runtime_root=root)
+
+        def call_int(argv, **kwargs):
+            if argv[0] == 'loginctl':
+                return subprocess.CompletedProcess(argv, 0, 'no', '')
+            return subprocess.CompletedProcess(argv, 3, 'inactive', '')
+
+        evidence = engine_user.check_engine_no_user_manager(
+            'csl-engine', 12345, operator_uid=1, call=call_int, runtime_root=root)
+        self.assertEqual('inactive', evidence['user_manager'])
+
+
 if __name__ == '__main__':
     print(f'Python={sys.version.split()[0]} GIL={getattr(sys, "_is_gil_enabled", lambda: "n/a")()}', flush=True)
     unittest.main(verbosity=2)

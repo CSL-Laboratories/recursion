@@ -163,12 +163,14 @@ def _runtime_path_present(path: Path) -> bool:
 def refuse_session_launch(argv):
     """Refuse argv whose executable is a known session launcher (su, runuser -l, ...) or systemd-run with a PAM property.
 
-    Wrappers such as env are not inspected: the check uses the base name of argv[0] only, so ``env su -`` is not a session launcher here.
+    Wrappers such as env are not inspected: the check uses the base name of argv[0] only, after a trailing slash is stripped, so ``env su -`` is not a session launcher here.
     For the later cross-uid engine spawn (B7, CSL-734), not for same-uid operator runs.
     """
-    if not argv or not all(isinstance(a, str) for a in argv):
+    if (not isinstance(argv, (list, tuple)) or not argv
+            or not all(isinstance(a, str) for a in argv)):
         raise SessionLaunchRefused('argv must be a non-empty list of strings')
-    name = os.path.basename(argv[0])
+    # A trailing slash is not part of the launcher name (`su/` is `su`).
+    name = os.path.basename(argv[0].rstrip('/\\'))
     if name in SESSION_LAUNCHERS:
         raise SessionLaunchRefused(f'{name} opens a PAM/logind session; refused')
     if name == 'systemd-run':
@@ -222,9 +224,11 @@ def check_engine_no_user_manager(user, uid, *, operator_uid=None, call=subproces
     # `systemctl is-active` prints inactive and exits 3. A probe killed by a
     # signal (returncode -9, or 137 when a wrapper stores 128+signal) can leave
     # the same text and must not attest that the manager is absent.
-    if state != 'inactive' or active.returncode != 3:
+    rc = active.returncode
+    # 3.0 == 3, and bool is an int, so only a real int 3 attests inactive.
+    if state != 'inactive' or type(rc) is not int or rc != 3:
         raise EngineManagerPresent(
-            f'user@{uid}.service is {state[:40]!r} (exit {active.returncode}), not inactive (exit 3)')
+            f'user@{uid}.service is {state[:40]!r} (exit {rc}), not inactive (exit 3)')
     evidence['user_manager'] = 'inactive'
 
     socket = Path(runtime_root) / str(uid) / 'systemd' / 'private'
@@ -263,6 +267,8 @@ def signin_without_session_bus(engine_env, uid, runtime_root=Path('/run/user')):
     is at best `pending`, because only a founder-attended signed-in run of each engine
     can confirm that its login still works with the bus absent.
     """
+    if isinstance(uid, bool) or not isinstance(uid, int) or uid <= 0:
+        raise ValueError('engine uid must be a positive int (never root)')
     leaked = sorted(name for name in SESSION_BUS_NAMES if name in engine_env)
     if leaked:
         raise EngineManagerPresent(f'engine env names a session bus: {", ".join(leaked)}')

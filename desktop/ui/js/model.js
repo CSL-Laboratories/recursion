@@ -44,7 +44,11 @@ export function keyedConditions(answer) {
   const code = get(answer, "code", null);
   const found = [];
   if (code === UNAVAILABLE) {
-    found.push(["UNAVAILABLE", "api", `control API unavailable: ${field(get(answer, "detail", "no answer"))}`]);
+    let text = `control API unavailable: ${field(get(answer, "detail", "no answer"))}`;
+    if (answer.delivered === "unknown") {
+      text += "; delivery unknown: the command may already have been carried out";
+    }
+    found.push(["UNAVAILABLE", "api", text]);
   } else if (UNCERTAIN_CODES.has(code)) {
     found.push(["UNCERTAIN", `run=${pyStr(get(answer, "run_id", null))}`,
       `stop not confirmed for run=${field(get(answer, "run_id", null))}: ` +

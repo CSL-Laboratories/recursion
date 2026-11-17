@@ -360,12 +360,13 @@ class ClosingTest(unittest.TestCase):
         loop._threads.append(worker)
         worker.start()
         try:
-            entered.wait()
+            self.assertTrue(entered.wait(10.0), f"worker never entered append; errors={errors!r}")
             self.assertFalse(loop.shutdown())
             app.close()  # returns although the worker is still inside its append
         finally:
             release.set()
-            worker.join()
+            worker.join(10.0)
+        self.assertFalse(worker.is_alive(), "append worker did not end after release")
         self.assertEqual(errors, [])
         self.assertEqual(list(app.log)[-1].event_type, "close", [e.event_type for e in app.log])
 

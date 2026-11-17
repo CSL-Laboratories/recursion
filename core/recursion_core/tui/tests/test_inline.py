@@ -12,11 +12,12 @@ import contextlib
 import io
 import os
 import re
+import threading
 import time
 import unittest
 
 from recursion_core.tui import term
-from recursion_core.tui.app import TuiApp
+from recursion_core.tui.app import Loop, TuiApp
 from recursion_core.tui.events import speech_lines
 from recursion_core.tui.tests.fakes import Clock, FakeDriver
 from recursion_core.tui.view import InlinePainter
@@ -26,11 +27,15 @@ CURSOR_HOME = "\x1b[H"
 
 
 class FakeTerminal:
-    """Scripted keys, one per read, with a short pause so the loop thread handles each in turn."""
+    """Scripted keys, one per read, after the loop has applied the previous key and answers."""
 
     def __init__(self, keys: list[str], columns: int = 100, lines: int = 30) -> None:
         self.keys, self.columns, self.lines = list(keys), columns, lines
         self.raw = False
+        self.changed = threading.Condition()
+        self.submitted = self.settled = 0
+        self.ready = False
+        self.paced = False  # only run_tui's observed loop sets this; other callers keep the short pause
 
     def size(self) -> os.terminal_size:
         return os.terminal_size((self.columns, self.lines))
@@ -44,7 +49,14 @@ class FakeTerminal:
             self.raw = False
 
     def read_key(self, timeout: float) -> str | None:
-        time.sleep(0.03)
+        if self.paced:
+            with self.changed:
+                if not self.changed.wait_for(
+                    lambda: self.ready and self.settled >= self.submitted, 10.0
+                ):
+                    raise AssertionError('TUI did not settle before the next key')
+        else:
+            time.sleep(0.03)
         return self.keys.pop(0) if self.keys else None
 
 
@@ -66,17 +78,38 @@ def typed(command: str) -> list[str]:
 def run_tui(argv: list[str], keys: list[str], driver: FakeDriver) -> tuple[str, TuiApp]:
     out, apps = TtyOut(), []
     terminal = FakeTerminal(keys + ["q"])
+    terminal.paced = True
     original = term.interactive
+    original_loop = term.Loop
+
+    class ObservedLoop(Loop):
+        def press(self, key, *, burst=False):
+            with terminal.changed:
+                super().press(key, burst=burst)
+                terminal.submitted += 1
+
+        def tick(self):
+            with terminal.changed:
+                target = terminal.submitted
+            super().tick()
+            with terminal.changed:
+                if not any(self.app.in_flight.values()):
+                    terminal.ready = True
+                    terminal.settled = max(terminal.settled, target)
+                    terminal.changed.notify_all()
+
 
     def capture(*args, **kwargs):
         return original(*args, **kwargs, on_app=apps.append)
 
     term.interactive = capture
+    term.Loop = ObservedLoop
     try:
         code = term.main(argv, lambda: driver.api, stdin=TtyOut(), stdout=out, environ={"NO_COLOR": "1"},
                          terminal=terminal)
     finally:
         term.interactive = original
+        term.Loop = original_loop
     assert code == 0 and not terminal.raw
     return out.getvalue(), apps[0]
 

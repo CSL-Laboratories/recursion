@@ -48,7 +48,7 @@
         [
           "UNAVAILABLE",
           "api",
-          "control API unavailable: request:ConnectionError"
+          "control API unavailable: request:ConnectionError; delivery unknown: the command may already have been carried out"
         ]
       ]
     },

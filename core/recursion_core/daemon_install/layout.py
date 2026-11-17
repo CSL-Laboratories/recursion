@@ -15,6 +15,7 @@ import errno
 import os
 import secrets
 import stat
+import sys
 from dataclasses import dataclass
 
 from .errors import InstallRefused
@@ -49,6 +50,21 @@ def owned_paths(roots: Roots) -> Owned:
     )
 
 
+def _refuse_without_geteuid() -> None:
+    """A platform with no ``os.geteuid`` cannot take the owner check.
+
+    ``install`` and ``upgrade`` answer this before they read or write a path. One line, and it names
+    the platform (``sys.platform``). The kind is the command family's ``platform_unsupported``.
+    """
+
+    if hasattr(os, "geteuid"):
+        return
+    raise InstallRefused(
+        "platform_unsupported",
+        f"the per-user installer needs os.geteuid, which {sys.platform} does not provide",
+    )
+
+
 def _directory_root(path: object) -> str:
     """The home, resolved, after checking that no other user can change what it names.
 
@@ -56,9 +72,10 @@ def _directory_root(path: object) -> str:
     ``_MAX_LINKS``): each must be root's or ours and not writable by group or world unless sticky,
     and each link on the way root's or ours (``folder_untrusted``). The home itself must be ours and
     not writable by group or world at all. The rule ``plugin_security.stores`` holds a store's
-    folders to.
+    folders to. Where ``os.geteuid`` is absent the walk is not started: ``platform_unsupported``.
     """
 
+    _refuse_without_geteuid()
     if type(path) is not str or not os.path.isabs(path):
         raise InstallRefused("relative_path", "a root is an absolute path")
     trusted = (0, os.geteuid())

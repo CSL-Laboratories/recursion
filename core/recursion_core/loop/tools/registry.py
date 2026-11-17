@@ -34,10 +34,12 @@ from __future__ import annotations
 import copy
 import json
 import re
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from recursion_core.loop import permissions as perm
 from recursion_core.loop.providers import base as b
 from recursion_core.loop.tools.workspace import ToolError, Workspace
 
@@ -53,6 +55,9 @@ OK, ERROR, DENIED, CANCELLED = "ok", "error", "denied", "cancelled"
 STATUSES = (OK, ERROR, DENIED, CANCELLED)
 MARKER_OPEN = "[output truncated:"
 QUOTED_OPEN = "(output truncated:"  # what the tool's own text shows instead: the same length, so sizes hold
+UNBOUND = object()  # ToolContext.approved_facts outside the run of an approved call
+CHANGED_SINCE_APPROVAL = ("not run: what the call would change is no longer what the permission request showed "
+                          "(a path now leads to a different file); make the call again to ask again")
 
 
 @dataclass(frozen=True)
@@ -65,6 +70,39 @@ class ToolOutput:
         return self.status != OK
 
 
+class _ApprovedSlot:
+    """``approved_facts`` for one context, kept per thread.
+
+    A field on the shared context lets a second dispatch save the unbound marker and write it back while the
+    first dispatch is still inside its tool (DeepSeek R4-2). Each context holds one ``threading.local``, so
+    each thread has its own value and a restore stays on the thread that saved it. A read before this thread
+    has set the value is ``UNBOUND``. The local lives on the instance, not in a table keyed by the context:
+    a context compares equal to another and is not a dict key.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def _local(self, obj: object) -> threading.local:
+        local = obj.__dict__.get("_approved_local")
+        if local is not None:
+            return local
+        with self._lock:
+            local = obj.__dict__.get("_approved_local")
+            if local is None:
+                local = threading.local()
+                obj.__dict__["_approved_local"] = local
+            return local
+
+    def __get__(self, obj: object | None, owner: type | None = None) -> Any:
+        if obj is None:
+            return self
+        return getattr(self._local(obj), "value", UNBOUND)
+
+    def __set__(self, obj: object, value: Any) -> None:
+        self._local(obj).value = value
+
+
 @dataclass
 class ToolContext:
     workspace: Workspace
@@ -74,9 +112,17 @@ class ToolContext:
     # a caller puts here is replaced, and a context shared by two registries carries the one that ran last.
     max_bytes: int = DEFAULT_MAX_BYTES
     max_lines: int = DEFAULT_MAX_LINES
+    # approve(call) -> permissions.Decision; None when nothing can be asked (then such tools are refused).
+    approve: Callable[[b.ToolCall], Any] | None = None
+    # What the tool's precheck said the request should show beside the input (``resolved_path``); dispatch sets
+    # it for the one approve call and clears it after. An approve function may pass it on to the request.
+    request_facts: Mapping[str, Any] | None = None
+    # Not a dataclass field: the descriptor below stores it per thread. See _ApprovedSlot.
+    approved_facts = _ApprovedSlot()
 
 
 ToolFn = Callable[[Mapping[str, Any], ToolContext], ToolOutput]
+CheckFn = Callable[[Mapping[str, Any], ToolContext], Any]
 
 
 @dataclass(frozen=True)
@@ -84,6 +130,12 @@ class Tool:
     spec: b.ToolSpec
     run: ToolFn
     needs_approval: bool = False
+    # Run before a permission request, without side effects; raises ToolError so that a call that would fail
+    # (a stale edit, an anchor that is not unique) is refused without asking anyone. ``run`` checks again. It may
+    # return a mapping of facts for the request (``resolved_path``; permissions.check_facts refuses other names
+    # and values that are not JSON, and the call is not asked for); anything else it returns is ignored. After an
+    # approval it runs again on the approved input, and facts that differ from the approved ones stop the call.
+    precheck: CheckFn | None = None
 
     def __post_init__(self) -> None:
         # The approval rule reads this flag: 0, "" or None must not quietly mean "runs without approval".
@@ -325,17 +377,64 @@ class ToolRegistry:
             return self._finish(call, ToolOutput(json.dumps(answer, ensure_ascii=False), ERROR), ctx)
         if not isinstance(call.input, Mapping):
             return self._finish(call, ToolOutput("invalid input: the input must be a JSON object", ERROR), ctx)
-        args = dict(call.input)  # one copy: what is checked is what runs
+        # One copy, all the way down and shared with nobody: what is checked is what is asked for, and what runs
+        # (sol R5). The precheck and the request each get a copy of it, so neither can change it.
+        args = perm.snapshot(dict(call.input))
         try:
             validate(tool.spec.input_schema, args)
         except ToolError as exc:
             return self._finish(call, ToolOutput(f"invalid input: {exc}", ERROR), ctx)
-        if tool.needs_approval is not False:  # fails closed: anything but False (a subclass may skip the check) asks
-            # The approval path arrives with write, edit and shell (second pull request). Until then a tool that
-            # needs approval is refused, never run without it.
-            return self._finish(call, ToolOutput("refused: this tool needs an approval and none can be asked yet",
-                                                 DENIED), ctx)
         ctx.max_bytes, ctx.max_lines = self.max_bytes, self.max_lines
+        # This thread's binding. A nested call on this same thread saves it and gives it back. Another thread
+        # has its own slot, so its restore cannot clear this one (DeepSeek R4-2).
+        outer_facts = ctx.approved_facts
+        if tool.needs_approval is not False:  # fails closed: anything but False (a subclass may skip the check) asks
+            facts = None
+            if tool.precheck is not None:
+                try:
+                    facts = tool.precheck(perm.snapshot(args), ctx)
+                except ToolError as exc:
+                    return self._finish(call, ToolOutput(str(exc), ERROR), ctx)
+            if ctx.approve is None:
+                # Never run without an answer: with no way to ask, such a tool is refused.
+                return self._finish(call, ToolOutput("refused: this tool needs an approval and none can be asked",
+                                                     DENIED), ctx)
+            try:
+                facts = perm.check_facts(facts)  # before anything is asked (DeepSeek N2)
+            except ValueError as exc:
+                return self._finish(call, ToolOutput(f"the call could not be asked for: {exc}", ERROR), ctx)
+            asked = b.ToolCall(call.call_id, call.name, perm.snapshot(args), call.raw_input, call.input_error)
+            ctx.request_facts = facts
+            try:
+                decision = ctx.approve(asked)
+            finally:
+                ctx.request_facts = None
+            if not decision.approved:
+                status = CANCELLED if decision.outcome == perm.CANCELLED else DENIED
+                return self._finish(call, ToolOutput(perm.REFUSALS.get(decision.outcome, "denied"), status), ctx)
+            if ctx.cancel.cancelled:
+                # Approved, but the turn was interrupted meanwhile: an interrupt is final (sol R2).
+                return self._finish(call, ToolOutput(perm.REFUSALS[perm.CANCELLED], CANCELLED), ctx)
+            args = perm.snapshot(dict(decision.input))
+            try:
+                validate(tool.spec.input_schema, args)  # what runs is the bound input; it is checked as well
+            except ToolError as exc:
+                return self._finish(call, ToolOutput(f"invalid approved input: {exc}", ERROR), ctx)
+            if tool.precheck is not None:
+                # What was approved is what changes (sol 1): the precheck runs again on the approved input, and
+                # facts that are no longer the ones the request showed (a link that now leads elsewhere) stop it.
+                try:
+                    again = perm.check_facts(tool.precheck(perm.snapshot(args), ctx))
+                except ToolError as exc:
+                    return self._finish(call, ToolOutput(str(exc), ERROR), ctx)
+                except ValueError as exc:
+                    return self._finish(call, ToolOutput(f"the call could not be run: {exc}", ERROR), ctx)
+                if again != facts:
+                    return self._finish(call, ToolOutput(CHANGED_SINCE_APPROVAL, ERROR), ctx)
+            if ctx.cancel.cancelled:
+                # Interrupted while the precheck ran again: nothing has run, and an interrupt is final (sol 4).
+                return self._finish(call, ToolOutput(perm.REFUSALS[perm.CANCELLED], CANCELLED), ctx)
+            ctx.approved_facts = facts
         try:
             output = tool.run(args, ctx)
         except b.Cancelled:
@@ -346,6 +445,8 @@ class ToolRegistry:
             raise  # the process is being interrupted (SIGINT): that stops the loop, not one call
         except BaseException as exc:  # noqa: BLE001 - a tool's failure (a library's sys.exit too) is the model's to see
             output = ToolOutput(f"the tool failed: {type(exc).__name__}: {exc}", ERROR)
+        finally:
+            ctx.approved_facts = outer_facts
         if not isinstance(output, ToolOutput) or not isinstance(output.text, str) or output.status not in STATUSES:
             output = ToolOutput("the tool failed: it returned no text", ERROR)
         return self._finish(call, output, ctx)

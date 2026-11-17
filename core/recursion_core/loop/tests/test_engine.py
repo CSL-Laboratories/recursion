@@ -67,7 +67,15 @@ class Turns(unittest.TestCase):
         h.feed(msg("turn-1", "What does src/a.py do?", "dlv-1"))
         docs = h.finish()
         self.assertEqual(kinds(docs), ["input_accepted", "usage", "text", "tool_call", "tool_result", "usage", "text",
-                                       "turn_ended", "closed"])
+                                       "usage", "usage", "turn_ended", "closed"])
+        turn, total = docs[7], docs[8]
+        self.assertEqual((turn["span"], total["span"]), ("turn", "session_total"))
+        self.assertEqual(turn["input_tokens"], {"value": 240, "quality": "known", "provenance": "observed"})
+        self.assertEqual(turn["cache_read_tokens"], {"value": 90, "quality": "lower_bound", "provenance": "observed"},
+                         "one call did not report it: the sum is a lower bound, not a guess")
+        self.assertEqual(turn["reasoning_tokens"]["quality"], "unknown")
+        self.assertEqual(total["input_tokens"]["value"], 240)
+        docs = docs[:7] + docs[9:]
         self.assertEqual(docs[0], {"type": "input_accepted", "delivery_id": "dlv-1", "turn_id": "turn-1",
                                    "how": "new_turn"})
         self.assertEqual(docs[3], {"type": "tool_call", "turn_id": "turn-1", "call_id": "toolu_1", "name": "read",
@@ -174,7 +182,7 @@ class Endings(unittest.TestCase):
         self.assertEqual((end["outcome"], end["reason"]), ("paused", "limit"))
         self.assertIsNone(end["result"]["code"])
         # The failed call still has its one usage line: all unknown (it measured nothing), never a made-up 0.
-        usage = [d for d in docs if d["type"] == "usage"]
+        usage = [d for d in docs if d["type"] == "usage" and d["span"] == "call"]
         self.assertEqual(len(usage), 1)
         self.assertEqual({k: usage[0][k] for k in b.USAGE_FIELDS}, b.Usage().to_wire())
         self.assertLess(kinds(docs).index("usage"), kinds(docs).index("limit"))
@@ -221,7 +229,7 @@ class Endings(unittest.TestCase):
 
     def test_an_approval_answer_with_nothing_waiting_is_refused(self) -> None:
         h = Harness(self, [])
-        h.feed(b'{"kind":"approval_answer","approval_id":"apr-1","decision":"approve"}')
+        h.feed(b'{"kind":"approval_answer","approval_id":"apr-1","decision":"approve","request_id":"perm-1"}')
         docs = h.finish()
         self.assertEqual(docs[0]["code"], "no_pending_request")
 

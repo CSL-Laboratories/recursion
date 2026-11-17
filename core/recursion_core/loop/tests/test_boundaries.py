@@ -184,7 +184,7 @@ class ConversationSecrets(unittest.TestCase):
         (note,) = session.messages[1].parts  # only the harness note: nothing of the refused reply
         self.assertTrue(note.text.startswith("[harness] The turn ended before a reply was kept"))
         self.assertEqual(lines.of("text"), [])
-        self.assertEqual(len(lines.of("usage")), 1)
+        self.assertEqual(len([u for u in lines.of("usage") if u["span"] == "call"]), 1)
 
     def test_a_loop_error_diagnostic_is_scrubbed(self) -> None:
         def broken(request):
@@ -208,7 +208,7 @@ class FailedCallUsage(unittest.TestCase):
     def test_a_cut_off_stream_reports_what_it_had_measured(self) -> None:
         session, lines = _session(self, _Replay((FIXTURES / "anthropic" / "cut_off.sse").read_bytes()))
         session.run_turn("turn-1", "go", b.CancelToken())
-        (usage,) = lines.of("usage")
+        (usage,) = [u for u in lines.of("usage") if u["span"] == "call"]
         self.assertEqual(usage["model"], "claude-opus-5-5")
         self.assertEqual(usage["input_tokens"], b.observed(30).to_wire())
         self.assertEqual(usage["output_tokens"], b.at_least(1).to_wire())
@@ -218,7 +218,7 @@ class FailedCallUsage(unittest.TestCase):
     def test_a_call_refused_before_it_streamed_has_one_unknown_usage_line(self) -> None:
         session, lines = _session(self, FakeProvider([b.AuthError("HTTP 401")]))
         session.run_turn("turn-1", "go", b.CancelToken())
-        (usage,) = lines.of("usage")
+        (usage,) = [u for u in lines.of("usage") if u["span"] == "call"]
         self.assertEqual({k: usage[k] for k in b.USAGE_FIELDS}, b.Usage().to_wire())
         self.assertIsNone(usage["model"])
 
@@ -235,13 +235,17 @@ class FailedCallUsage(unittest.TestCase):
         stopped.usage = b.Usage(input_tokens=b.observed(7))
         session, lines = _session(self, FakeProvider([stopped]))
         session.run_turn("turn-1", "go", b.CancelToken())
-        self.assertEqual([u["input_tokens"]["value"] for u in lines.of("usage")], [7])
+        calls = [u for u in lines.of("usage") if u["span"] == "call"]
+        self.assertEqual([u["input_tokens"]["value"] for u in calls], [7])
         self.assertEqual(lines.of("turn_ended")[0]["outcome"], "interrupted")
 
     def test_a_provider_bug_still_leaves_one_usage_line(self) -> None:
         session, lines = _session(self, FakeProvider([RuntimeError("a bug")]))
         docs = _serve(session, lines, MSG)
-        self.assertEqual([d["type"] for d in docs], ["input_accepted", "usage", "turn_ended", "closed"])
+        # #417 round 1 (astra R5): a loop error writes the turn's total and the session's before turn_ended too.
+        self.assertEqual([(d["type"], d.get("span")) for d in docs],
+                         [("input_accepted", None), ("usage", "call"), ("usage", "turn"), ("usage", "session_total"),
+                          ("turn_ended", None), ("closed", None)])
 
     def test_a_scripted_reply_the_wire_refuses_fails_as_a_protocol_error(self) -> None:
         provider = FakeProvider([{"tool_calls": [{"id": "c" * 129, "name": "read", "input": {"path": "a"}}]}])
@@ -289,7 +293,8 @@ class Inputs(unittest.TestCase):
                                    [{"kind": []}, json.loads(MSG), {"kind": "close"}], folder)
         self.assertEqual(code, 0)
         self.assertEqual([d["type"] for d in docs],
-                         ["ready", "protocol_error", "input_accepted", "usage", "text", "turn_ended", "closed"])
+                         ["ready", "protocol_error", "input_accepted", "usage", "text", "usage", "usage",
+                          "turn_ended", "closed"])
 
 
 def _emit(case, text: str, max_bytes: int = 1201, max_lines: int = 3, spill_error: str | None = None) -> r.Outcome:

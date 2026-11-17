@@ -152,7 +152,7 @@ class DeliveredInterrupts(unittest.TestCase):
     def test_a_limit_after_a_delivered_interrupt_still_ends_interrupted(self) -> None:
         lines = self._run(b.LimitError("rate limited", retry_after_s=30, reset_at="2026-11-14T12:00:00.000Z"))
         self.assertEqual(len(lines.of("limit")), 1)
-        self.assertEqual(len(lines.of("usage")), 1)
+        self.assertEqual(len([u for u in lines.of("usage") if u["span"] == "call"]), 1)
         self.assertEqual(lines.of("turn_ended")[0]["outcome"], "interrupted")
 
     def test_a_failure_after_a_delivered_interrupt_still_ends_interrupted(self) -> None:

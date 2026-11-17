@@ -14,8 +14,11 @@ class Inputs(unittest.TestCase):
     def test_the_four_kinds(self) -> None:
         self.assertEqual(p.parse_input('{"kind":"user_message","turn_id":"turn-000c","text":"Fix it.",'
                                        '"delivery_id":"dlv-0007"}'), p.UserMessage("turn-000c", "Fix it.", "dlv-0007"))
-        self.assertEqual(p.parse_input(b'{"kind":"approval_answer","approval_id":"apr-00c4","decision":"deny"}'),
-                         p.ApprovalAnswer("apr-00c4", "deny"))
+        self.assertEqual(p.parse_input(b'{"kind":"approval_answer","approval_id":"apr-00c4","decision":"deny",'
+                                       b'"request_id":"perm-3"}'), p.ApprovalAnswer("apr-00c4", "deny", "perm-3"))
+        self.assertEqual(p.parse_input('{"kind":"approval_answer","approval_id":"apr-00c4","decision":"approve",'
+                                       '"request_id":"perm-3","input":{"path":"a.py"}}'),
+                         p.ApprovalAnswer("apr-00c4", "approve", "perm-3", {"path": "a.py"}))
         self.assertEqual(p.parse_input('{"kind":"interrupt","turn_id":"turn-000c"}'), p.Interrupt("turn-000c"))
         self.assertEqual(p.parse_input('{"kind":"close"}'), p.Close())
 
@@ -27,11 +30,21 @@ class Inputs(unittest.TestCase):
             '{"kind":"user_message","turn_id":"t1","text":"t","delivery_id":"dlv-1"}': "bad_turn_id",
             '{"kind":"user_message","turn_id":"turn-1","text":"t","delivery_id":"d-1"}': "bad_delivery_id",
             '{"kind":"user_message","turn_id":"turn-1","text":"","delivery_id":"dlv-1"}': "bad_text",
-            '{"kind":"approval_answer","approval_id":"apr-1","decision":"maybe"}': "bad_decision",
-            '{"kind":"approval_answer","approval_id":"x-1","decision":"approve"}': "bad_approval_id",
+            '{"kind":"approval_answer","approval_id":"apr-1","decision":"maybe","request_id":"perm-1"}': "bad_decision",
+            '{"kind":"approval_answer","approval_id":"x-1","decision":"approve","request_id":"perm-1"}':
+                "bad_approval_id",
+            '{"kind":"approval_answer","approval_id":"apr-1","decision":"approve"}': "missing_field",
+            '{"kind":"approval_answer","approval_id":"apr-1","decision":"approve","request_id":""}': "bad_request_id",
+            '{"kind":"approval_answer","approval_id":"apr-1","decision":"approve","request_id":"perm-1\\n"}':
+                "bad_request_id",
+            '{"kind":"approval_answer","approval_id":"apr-1","decision":"approve","request_id":"perm-1",'
+            '"input":"x"}': "bad_input",
+            '{"kind":"approval_answer","approval_id":"apr-1","decision":"approve","request_id":"perm-1","why":1}':
+                "unknown_field",
             '{"kind":"user_message","turn_id":"turn-1\\n","text":"t","delivery_id":"dlv-1"}': "bad_turn_id",
             '{"kind":"user_message","turn_id":"turn-1","text":"t","delivery_id":"dlv-1\\n"}': "bad_delivery_id",
-            '{"kind":"approval_answer","approval_id":"apr-1\\n","decision":"approve"}': "bad_approval_id",
+            '{"kind":"approval_answer","approval_id":"apr-1\\n","decision":"approve","request_id":"perm-1"}':
+                "bad_approval_id",
             '{"kind":"interrupt","turn_id":"turn-1\\n"}': "bad_turn_id",
         }
         for line, code in cases.items():

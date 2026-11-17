@@ -2,12 +2,15 @@
 
 In (one object per line; the shapes of driver.v2's inputs, plus interrupt):
     {"kind": "user_message", "turn_id": "turn-...", "text": "...", "delivery_id": "dlv-..."}
-    {"kind": "approval_answer", "approval_id": "apr-...", "decision": "approve" | "deny"}
+    {"kind": "approval_answer", "approval_id": "apr-...", "decision": "approve" | "deny",
+     "request_id": "<the loop's own id>", "input": {...}}             input optional (the bound input)
     {"kind": "interrupt", "turn_id": "turn-..."}
     {"kind": "close"}
 A blank line is skipped. Any other line that is not one of these (a ``user_message`` whose text holds a lone
 surrogate, which no request could carry, included) gets a ``protocol_error`` line and changes nothing, whatever
-it holds, and reading goes on.
+it holds, and reading goes on. ``approval_answer`` carries one field more than driver.v2's: the loop's request
+id, which the driver takes from approval.v1's private binding (``engine_request_id``), so the answer reaches the
+request it belongs to.
 
 Out (one object per line; standard output carries nothing else, diagnostics go to standard error):
     ready           once, at start: protocol version, provider, model, tool names
@@ -17,8 +20,20 @@ Out (one object per line; standard output carries nothing else, diagnostics go t
     tool_call       {turn_id, call_id, name, input}
     tool_result     {turn_id, call_id, status, text, output_ref, truncated, spill}
     usage           {turn_id, span: "call", model, input_tokens, ...}: one per model call, a failed or
-                    interrupted one included (what it had measured; unknown, never 0, where nothing was)
+                    interrupted one included (what it had measured; unknown, never 0, where nothing was);
+                    then, before every turn_ended, span "turn" (the turn's sum; a known 0 when it made no
+                    call) and span "session_total" (the running total, never added up). If the turn's own
+                    finaliser raises, those two spans are still written from the sums already held, or as
+                    unknown when that write itself fails, and the end line follows. A sum keeps the
+                    weakest provenance of its counts (engine.py)
     limit           {turn_id, scope, kind, model, bucket, reset_at, retry_after_s}
+    permission_request  {turn_id, request_id, call_id, tool, cwd, input, profile, deadline_s, resolved_path?}:
+                    write, edit and shell ask before they run (permissions.py); resolved_path, only when the
+                    path leads elsewhere through a link, names the file that would change; deadline_s is absent
+                    under full_access; permission_expired {turn_id, request_id} when the deadline passes
+                    unanswered (the call is denied, and an answer after it is refused)
+    acceptance      {turn_id, command, exit_code, passed, timed_out, text}: the harness's acceptance check
+                    (done.py)
     turn_ended      {turn_id, outcome, result, reason}
     interrupt       {turn_id, delivered}: delivered when that turn was running or waiting; such a line always
                     comes before the turn's turn_ended, which is interrupted unless the model had already
@@ -84,6 +99,8 @@ class UserMessage:
 class ApprovalAnswer:
     approval_id: str
     decision: str
+    request_id: str
+    input: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -100,10 +117,11 @@ Input = UserMessage | ApprovalAnswer | Interrupt | Close
 
 _FIELDS = {
     "user_message": {"kind", "turn_id", "text", "delivery_id"},
-    "approval_answer": {"kind", "approval_id", "decision"},
+    "approval_answer": {"kind", "approval_id", "decision", "request_id"},
     "interrupt": {"kind", "turn_id"},
     "close": {"kind"},
 }
+_OPTIONAL = {"approval_answer": {"input"}}
 
 
 def parse_input(line: bytes | str) -> Input:
@@ -123,7 +141,7 @@ def parse_input(line: bytes | str) -> Input:
     kind = doc.get("kind")
     if not isinstance(kind, str) or kind not in _FIELDS:
         raise InputError("unknown_kind", f"kind {kind!r} is not one of {sorted(_FIELDS)}")
-    extra = sorted(set(doc) - _FIELDS[kind])
+    extra = sorted(set(doc) - _FIELDS[kind] - _OPTIONAL.get(kind, set()))
     missing = sorted(_FIELDS[kind] - set(doc))
     if extra:
         raise InputError("unknown_field", f"{kind} has unknown field(s): {', '.join(extra)}")
@@ -147,7 +165,13 @@ def parse_input(line: bytes | str) -> Input:
             raise InputError("bad_approval_id", "approval_id")
         if doc["decision"] not in ("approve", "deny"):
             raise InputError("bad_decision", "decision must be approve or deny")
-        return ApprovalAnswer(doc["approval_id"], doc["decision"])
+        rid = doc["request_id"]
+        if not isinstance(rid, str) or not 1 <= len(rid) <= 256 or "\r" in rid or "\n" in rid:
+            raise InputError("bad_request_id", "request_id: 1 to 256 characters, no line break")
+        bound = doc.get("input")
+        if "input" in doc and not isinstance(bound, dict):
+            raise InputError("bad_input", "input, when present, is the bound input object")
+        return ApprovalAnswer(doc["approval_id"], doc["decision"], rid, bound)
     if kind == "interrupt":
         if not isinstance(doc["turn_id"], str) or not _TURN.fullmatch(doc["turn_id"]):
             raise InputError("bad_turn_id", "turn_id")

@@ -60,10 +60,11 @@ class FakeProviderProcess(unittest.TestCase):
                                      [user("turn-1", "What is in notes.txt?", "dlv-1"), {"kind": "close"}], ws)
         self.assertEqual(code, 0, log)
         self.assertEqual([d["type"] for d in docs], ["ready", "input_accepted", "usage", "tool_call", "tool_result",
-                                                     "usage", "text", "turn_ended", "closed"])
-        self.assertEqual(docs[0]["tools"], ["read", "search"])
+                                                     "usage", "text", "usage", "usage", "turn_ended", "closed"])
+        self.assertEqual(docs[0]["tools"], ["edit", "read", "search", "shell", "write"])
+        self.assertEqual((docs[0]["permissions"], docs[0]["acceptance"], docs[0]["instructions"]), ("ask", None, []))
         self.assertEqual(docs[4]["text"], "     1\talpha\n     2\tbeta\n")
-        self.assertEqual(docs[7]["outcome"], "candidate_done")
+        self.assertEqual(docs[9]["outcome"], "candidate_done")
         self.assertEqual(oct(os.stat(home).st_mode & 0o777), "0o700", "the engine home is created private")
 
     def test_a_key_in_the_environment_never_reaches_stdout_or_stderr(self) -> None:
@@ -93,6 +94,26 @@ class FakeProviderProcess(unittest.TestCase):
         for path in (home / "spill").rglob("*") if (home / "spill").exists() else ():
             if path.is_file():
                 self.assertNotIn(FAKE_KEY, path.read_text(encoding="utf-8"))
+
+    def test_full_access_needs_its_acknowledgement_and_instructions_are_listed(self) -> None:
+        ws = private_dir(self, "loop-ws-")
+        (ws / "AGENTS.md").write_text("Run the tests with make test.\n", encoding="utf-8")
+        home = private_dir(self, "loop-home-")
+        script = ws.parent / f"{ws.name}-script.json"
+        script.write_text("[]", encoding="utf-8")
+        self.addCleanup(script.unlink)
+        base = ["--provider", "fake", "--fake-script", str(script), "--home", str(home)]
+        docs, log, code = run_engine(self, base + ["--permissions", "full_access"], [], ws)
+        self.assertNotEqual(code, 0)
+        self.assertIn("needs --acknowledge-full-access", log)
+        self.assertEqual(docs, [])
+        docs, log, code = run_engine(self, base + ["--permissions", "full_access", "--acknowledge-full-access",
+                                                   "--acceptance", "make test"], [{"kind": "close"}], ws)
+        self.assertEqual(code, 0, log)
+        self.assertEqual((docs[0]["permissions"], docs[0]["acceptance"]), ("full_access", "make test"))
+        self.assertEqual(docs[0]["instructions"], [{"path": "AGENTS.md", "bytes": 30, "cut": False, "skipped": None}])
+        docs, _, _ = run_engine(self, base + ["--no-project-instructions"], [{"kind": "close"}], ws)
+        self.assertEqual(docs[0]["instructions"], [])
 
     def test_a_missing_model_or_a_shared_home_is_refused_before_anything_runs(self) -> None:
         ws = private_dir(self, "loop-ws-")
@@ -127,14 +148,15 @@ class AnthropicReplayProcess(unittest.TestCase):
         self.assertEqual(code, 0, log)
         self.assertNotIn(FAKE_KEY, log)
         self.assertEqual([d["type"] for d in docs], ["ready", "input_accepted", "usage", "text", "tool_call",
-                                                     "tool_result", "usage", "text", "turn_ended", "closed"])
+                                                     "tool_result", "usage", "text", "usage", "usage", "turn_ended",
+                                                     "closed"])
         self.assertEqual(docs[1], {"type": "input_accepted", "delivery_id": "dlv-7", "turn_id": "turn-1",
                                    "how": "new_turn"})
         self.assertEqual(docs[2]["model"], "claude-opus-5-5")
         self.assertEqual(docs[2]["cache_write_tokens"]["value"], 1500)
         self.assertEqual(docs[4]["input"], {"path": "tests/test_io.py", "limit": 50})
         self.assertTrue(docs[5]["text"].startswith("     1\timport io\n"))
-        self.assertEqual(docs[8]["outcome"], "candidate_done")
+        self.assertEqual(docs[10]["outcome"], "candidate_done")
         # What reached the server: the key in its header only, the thinking block sent back unchanged.
         self.assertEqual([r["headers"]["x-api-key"] for r in lb.requests], [FAKE_KEY, FAKE_KEY])
         for got in lb.requests:

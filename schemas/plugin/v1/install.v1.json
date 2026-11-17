@@ -3,7 +3,7 @@
   "$id": "install.v1.json",
   "title": "install.v1: the plugin install file, install.json",
   "x-version": "1.0-draft.3",
-  "description": "The file '$XDG_CONFIG_HOME/recursion/plugins/install.json' as the daemon reads it today (core/recursion_core/daemon/plugins.py, read_install): this install's trusted developer keys, the grants its user made, the destinations and credential names reserved for effect owners, the installer's key for the authority ledger, and the registry label the installer recorded for each manifest. A file written to this schema is read by today's daemon; it has no version field because today's reader refuses a field it does not know. Every top-level field may be left out; a missing file means no trusted key, no grant and no label, so nothing gets a permission and every plugin is shown unlisted. The file is owner-only and is written by the install commands, never by a plugin. A grant is bound to one artifact digest and one signing key: a grant for another digest or key grants nothing. The registry label is not a permission and not a grant. Rules the reader enforces that a schema cannot write: no two grants name the same plugin_id; the file must be a regular file of the operator's that no one else can write; and a label applies only when its key is the SHA-256 of the manifest.json bytes now installed.",
+  "description": "The file '$XDG_CONFIG_HOME/recursion/plugins/install.json' as the daemon reads it today (core/recursion_core/daemon/plugins.py, read_install): this install's trusted developer keys, the grants its user made, the destinations and credential names reserved for effect owners, the installer's key for the authority ledger, and the registry label the installer recorded for each manifest. The reader takes developer_key_id as null or a key id, so a file written to this schema is read by today's daemon. The reader does not apply that member as a second binding: a grant stays bound to the artifact digest and the signing key. It has no version field because today's reader refuses a field it does not know. Every top-level field may be left out; a missing file means no trusted key, no grant and no label, so nothing gets a permission and every plugin is shown unlisted. The file is owner-only and is written by the install commands, never by a plugin. A grant is bound to one artifact digest and one signing key: a grant for another digest or key grants nothing. The registry label is not a permission and not a grant. Rules the reader enforces that a schema cannot write: no two grants name the same plugin_id; the file must be a regular file of the operator's that no one else can write; and a label applies only when its key is the SHA-256 of the manifest.json bytes now installed.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -49,7 +49,7 @@
       "not": {"pattern": "[\\r\\n]"}
     },
     "grant": {
-      "description": "What the user granted one plugin. signer_key_id is the key the grant is bound to, or null for a manual grant to an unsigned plugin. unsigned_order_acknowledged records that the user granted 'order' to an unsigned plugin behind the warning. order_after_revoked_key and order_after_revocation_generation record that the user turned 'order' back on after that key was revoked, at that generation of the revoked-key list.",
+      "description": "What the user granted one plugin. signer_key_id is the key the grant is bound to, or null for a manual grant to an unsigned plugin. unsigned_order_acknowledged records that the user granted 'order' to an unsigned plugin behind the warning. order_after_revoked_key and order_after_revocation_generation record that the user turned 'order' back on after that key was revoked, at that generation of the revoked-key list. developer_key_id is null, or a key id in the same grammar as signer_key_id. It does not by itself bind the grant: the contract binds a grant to the artifact digest and the signing key.",
       "type": "object",
       "additionalProperties": false,
       "required": ["plugin_id", "artifact_sha256", "permissions"],
@@ -64,7 +64,8 @@
         },
         "unsigned_order_acknowledged": {"type": "boolean"},
         "order_after_revoked_key": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/key_id"}]},
-        "order_after_revocation_generation": {"type": ["integer", "null"]}
+        "order_after_revocation_generation": {"type": ["integer", "null"]},
+        "developer_key_id": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/key_id"}]}
       }
     }
   }

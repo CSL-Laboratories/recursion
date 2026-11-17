@@ -122,6 +122,11 @@ class CheckedRelease:
     signature: bytes | None
     signature_text: str | None
     declared_signature: bool
+    source_commit: str | None = None
+    source_path: str | None = None
+    source_repository: str | None = None
+    manifest_sha256: str | None = None
+    artifact_sha256: str | None = None
 
 
 @dataclass
@@ -247,6 +252,21 @@ def _check_source(source: object) -> str | None:
         return "commit must be 40 lowercase hex"
     if not _is_relative_path(inner):
         return "path must be a relative path"
+    return None
+
+
+def _source_part(release: dict, name: str) -> str | None:
+    """The source field when the release source is well formed, else None."""
+    source = release.get("source")
+    if _check_source(source) is not None:
+        return None
+    value = source[name]
+    return value if type(value) is str else None
+
+
+def _hex64_or_none(value: object) -> str | None:
+    if type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None:
+        return value
     return None
 
 
@@ -629,7 +649,9 @@ def _check_release_directory(report: Report, tree: _Tree, release_dir: str, entr
             release["status"] if type(release.get("status")) is str else "",
             release["label"] if type(release.get("label")) is str else "",
             raw, artifact_bytes, signature_bytes, signature_text if signature_ok else None,
-            declared is not None))
+            declared is not None, _source_part(release, "commit"), _source_part(release, "path"),
+            _source_part(release, "repository"), _hex64_or_none(release.get("manifest_sha256")),
+            _hex64_or_none(release.get("artifact_sha256"))))
 
 
 def _verify_developer_signature(report: Report, path: str, developer_key: str, signature: str | None,

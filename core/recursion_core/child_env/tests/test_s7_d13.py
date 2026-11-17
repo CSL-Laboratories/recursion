@@ -94,6 +94,31 @@ class Fixture(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertTrue(fired)
 
+def run_methods_under_nt(module_vars, cls_name, methods, source):
+    """Run ``methods`` with class and method decorators re-evaluated at ``os.name == 'nt'``.
+
+    Method decorators are applied when the module is imported. On this host that is
+    POSIX, so a ``skipIf(os.name == 'nt')`` on a method is not wrapped yet. Re-apply
+    each listed method's own decorators in the nt namespace before dispatch.
+    """
+    node = next(item for item in ast.parse(source).body if isinstance(item, ast.ClassDef) and item.name == cls_name)
+    scope = dict(module_vars, os=SimpleNamespace(name="nt"))
+    method_nodes = {item.name: item for item in node.body if isinstance(item, ast.FunctionDef)}
+    namespace = {}
+    owner = module_vars[cls_name]
+    for method in methods:
+        wrapped = owner.__dict__[method]
+        for decorator in reversed(method_nodes[method].decorator_list):
+            wrapped = eval(compile(ast.Expression(decorator), "<real test decorator>", "eval"), scope)(wrapped)
+        namespace[method] = wrapped
+    selected = type(cls_name + "Selected", (owner,), namespace)
+    for decorator in reversed(node.decorator_list):
+        selected = eval(compile(ast.Expression(decorator), "<real test decorator>", "eval"), scope)(selected)
+    result = unittest.TestResult()
+    unittest.TestSuite(selected(method) for method in methods).run(result)
+    return result
+
+
 class Defects(Fixture):
     def test_D13_portable_test_skips(self):
             specs={
@@ -106,20 +131,31 @@ class Defects(Fixture):
             for name,classes in specs.items():
                 m=importlib.import_module('recursion_core.child_env.tests.'+name)
                 source=inspect.getsource(m)
-                # Re-evaluate actual decorators with nt selected, then exercise unittest dispatch.
-                # os.name itself stays POSIX; this is a skip audit, not native Windows evidence.
+                # Re-evaluate class and method decorators with nt selected, then exercise
+                # unittest dispatch. os.name itself stays POSIX; this is a skip audit,
+                # not native Windows evidence.
                 for cls,methods in classes.items():
-                    node=next(n for n in ast.parse(source).body if isinstance(n,ast.ClassDef) and n.name==cls)
-                    selected=type(cls+'Selected',(getattr(m,cls),),{})
-                    scope=dict(vars(m),os=SimpleNamespace(name='nt'))
-                    for decorator in reversed(node.decorator_list):
-                        selected=eval(compile(ast.Expression(decorator),'<real test decorator>','eval'),scope)(selected)
-                    result=unittest.TestResult()
-                    unittest.TestSuite(selected(method) for method in methods).run(result)
+                    result=run_methods_under_nt(vars(m), cls, methods, source)
                     with self.subTest(test_class=cls):
                         self.assertEqual(result.errors,[])
                         self.assertEqual(result.failures,[])
                         self.assertEqual(result.skipped,[],'portable assertions never entered under Windows decorators')
+
+    def test_a_method_level_nt_skip_is_visible(self):
+        source = (
+            "import os\n"
+            "import unittest\n"
+            "class Demo(unittest.TestCase):\n"
+            "    @unittest.skipIf(os.name == 'nt', 'POSIX rules')\n"
+            "    def test_portable(self):\n"
+            "        raise AssertionError('ran')\n"
+        )
+        module_vars = {}
+        exec(compile(source, "<method-skip>", "exec"), module_vars)
+        result = run_methods_under_nt(module_vars, "Demo", ["test_portable"], source)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.failures, [])
+        self.assertEqual(len(result.skipped), 1)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -94,6 +94,19 @@ class Fixture(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertTrue(fired)
 
+def _gate_run_timeout() -> int:
+    """The per-file limit the gate charges, read from its source. The gate is not run."""
+    root = Path(__file__).resolve().parents[4]
+    tree = ast.parse((root / "tools" / "ci_gate.py").read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "RUN_TIMEOUT" and isinstance(node.value, ast.Constant):
+                return int(node.value.value)
+    raise AssertionError("RUN_TIMEOUT is not assigned in tools/ci_gate.py")
+
+
 class Defects(Fixture):
     def test_D08_retry_budget(self):
             module=importlib.import_module('recursion_core.child_env.tests.test_no_proxy_readings')
@@ -103,6 +116,10 @@ class Defects(Fixture):
             hostile=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='test_hostile_values_are_decided_in_bounded_time')
             cases=next(n for n in ast.walk(hostile) if isinstance(n,ast.For) and isinstance(n.iter,ast.Tuple))
             count=len(cases.iter.elts)
+            self.assertEqual(module.SECONDS, 10.0)
+            self.assertEqual(module.GROWTH, 3.0)
+            self.assertEqual(module.GROWTH_FLOOR_S, 0.05)
+            limit = _gate_run_timeout()
             class Clock:
                 now=0.0
                 start=True
@@ -122,7 +139,7 @@ class Defects(Fixture):
                 _, half=ns['_timed'](None,lambda:None)
                 self.assertLess(full,module.SECONDS)
                 self.assertLess(full,module.GROWTH*max(half,module.GROWTH_FLOOR_S))
-            self.assertLessEqual(clock.now,180, f'{count} passing pairs charge {clock.now:.1f} logical seconds to one file')
+            self.assertLessEqual(clock.now, limit, f'{count} passing pairs charge {clock.now:.1f} logical seconds to one file')
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

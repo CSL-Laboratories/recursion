@@ -47,9 +47,23 @@ class CommandError(ValueError):
     pass
 
 
+def _usage_without_values(message: str) -> str:
+    """Keep flag names in an unrecognized-arguments line and drop the values.
+
+    A rejected ``--api-key`` or ``--token=`` value is private text. The flag name stays so a usage
+    error is still a usage error. Any other message is unchanged."""
+
+    marker = "unrecognized arguments:"
+    head, sep, rest = message.partition(marker)
+    if not sep:
+        return message
+    names = [token.split("=", 1)[0] for token in rest.split() if token.startswith("-")]
+    return f"{head}{marker} {' '.join(names)}".rstrip()
+
+
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str):
-        raise CommandError(message)
+        raise CommandError(_usage_without_values(message))
 
     def exit(self, status: int = 0, message: str | None = None):
         raise CommandError(message or "help is not a command")
@@ -75,6 +89,8 @@ def parse_command(line: str) -> tuple[str, dict]:
 
     ``conditions`` parses to ``("conditions", {})``, which is not a control API method."""
 
+    if not isinstance(line, str):
+        raise CommandError("command must be text")
     try:
         argv = shlex.split(line)
     except ValueError as exc:
@@ -128,8 +144,11 @@ def keyed_conditions(answer: Mapping) -> list[tuple[str, str, str]]:
             return [(UNAVAILABLE_LABEL, "answer",
                      f"control API unavailable: code is a {type(code).__name__}, not text")]
     if code == UNAVAILABLE:
-        found.append((UNAVAILABLE_LABEL, "api",
-                      f"control API unavailable: {field(answer.get('detail', 'no answer'))}"))
+        text = f"control API unavailable: {field(answer.get('detail', 'no answer'))}"
+        # delivered "unknown" means the command may already have been carried out. False means it was not.
+        if answer.get("delivered") == "unknown":
+            text += "; delivery unknown: the command may already have been carried out"
+        found.append((UNAVAILABLE_LABEL, "api", text))
     elif code in UNCERTAIN_CODES:
         found.append((UNCERTAIN, f"run={answer.get('run_id')}",
                       f"stop not confirmed for run={field(answer.get('run_id'))}: "
@@ -162,13 +181,32 @@ def answer_conditions(answer: Mapping) -> list[tuple[str, str]]:
     return [(label, text) for label, _, text in keyed_conditions(answer)]
 
 
+def _list_page_fault(answer: Mapping) -> str | None:
+    """Why one page is not a complete list, or None when every run has its own id."""
+
+    page = answer.get("runs")
+    if not isinstance(page, list):
+        return "runs_not_a_list"
+    seen: set[str] = set()
+    for run in page:
+        run_id = run.get("run_id") if isinstance(run, dict) else None
+        if not isinstance(run_id, str):
+            return "run_without_id"
+        if run_id in seen:
+            return f"run_listed_twice:{run_id}"
+        seen.add(run_id)
+    return None
+
+
 def list_all_runs(call: Callable[[str, dict], dict], params: Mapping | None = None) -> dict:
     """Read every run: ``run.list``, then ``run.list {"after": next_after}`` until a page has no ``next_after``.
 
     ``call`` is any ``call(method, params) -> dict`` (the in-process API, ``SocketAPI``). An answer with no
-    ``next_after`` is returned as it came, so a list that fits one page reads exactly as before. Otherwise
-    the pages are joined into one ``ok`` answer (the first page's other fields, ``stale`` if any page was
-    stale). A later page that is not ``ok`` is returned as it came: what was read before it is not shown
+    ``next_after`` whose runs are a list of distinct ids is returned as it came, so a valid list that fits
+    one page reads exactly as before. A one-page answer whose runs are not that shape answers
+    ``list_incomplete``. Otherwise the pages are joined into one ``ok`` answer (the first page's other
+    fields, ``stale`` if any page was stale, and ``reconciliation`` unreconciled if any page was). A later
+    page that is not ``ok`` is returned as it came: what was read before it is not shown
     as the list. A cursor that is not the page's last run or does not move forward, a run listed twice,
     or more than ``LIST_FOLLOW_MAX_PAGES`` pages answers ``list_incomplete`` with a ``detail``, never a
     short list. Runs started during a walk whose id sorts before the cursor show on the next walk.
@@ -176,7 +214,14 @@ def list_all_runs(call: Callable[[str, dict], dict], params: Mapping | None = No
 
     base = dict(params or {})
     answer = call("run.list", dict(base))
-    if not isinstance(answer, dict) or answer.get("code") != "ok" or "next_after" not in answer:
+    if not isinstance(answer, dict) or answer.get("code") != "ok":
+        return answer
+    # A page with no next_after is the whole list, and it is checked the same way a later page is.
+    # A valid one is returned as it came.
+    if "next_after" not in answer:
+        fault = _list_page_fault(answer)
+        if fault is not None:
+            return {"code": LIST_INCOMPLETE, "detail": fault, "pages": 1}
         return answer
     joined = {k: v for k, v in answer.items() if k != "next_after"}
     runs: list = []
@@ -196,6 +241,8 @@ def list_all_runs(call: Callable[[str, dict], dict], params: Mapping | None = No
             runs.append(run)
         if answer.get("stale") is True:
             joined["stale"] = True
+        if answer.get("reconciliation") == "unreconciled":
+            joined["reconciliation"] = "unreconciled"
         if "next_after" not in answer:
             joined["runs"] = runs
             return joined

@@ -280,7 +280,7 @@ class TuiApp:
 
     @property
     def transcript(self) -> list[str]:
-        """Every logged line except engine output, in order (append-only)."""
+        """The retained non-output lines, in order; the log is bounded, so the oldest lines drop out."""
 
         return [e.text for e in self.log if e.event_type != "output"]
 
@@ -307,6 +307,9 @@ class TuiApp:
         self.request("run.list", {})
 
     def attach(self, run_id: str) -> None:
+        with self._lock:
+            if self.closed:
+                return
         self._attach_view(run_id)
         self._emit("attach", "operator", f"attach run={field(run_id)}: reads run.status; starts nothing")
         self.request("run.status", {"run_id": run_id})
@@ -971,6 +974,9 @@ class TuiApp:
         ``/`` is accepted (slash commands), and ``runs`` is another name for ``list``. ``sessions`` reads
         ``session.list`` and ``transcript SESSION`` reads that session's transcript (``events.read``)."""
 
+        with self._lock:
+            if self.closed:
+                return
         line = line.strip()
         if line.startswith("/"):
             line = line[1:]
@@ -1008,6 +1014,9 @@ class TuiApp:
         self.request(method, params)
 
     def stop(self, run_id: str) -> None:
+        with self._lock:
+            if self.closed:
+                return
         self._notice(f"stop requested for {field(run_id)}; waiting for the control API answer")
         self.request("run.stop", {"run_id": run_id})
 
@@ -1115,12 +1124,13 @@ class TuiApp:
         """One full-screen frame of exactly ``self.height`` rows, none wider than ``self.width`` cells.
 
         It first logs any condition edge (one may appear with time alone). Every current condition stays
-        on screen, and a condition's text or run id is wrapped onto more rows, never cut at the width:
-        each condition in full when they fit; else one row per label with its subjects (run ids) named
-        whole on the rows below it; else, when even those rows outnumber the terminal's, every label's row
-        with as many names as fit (UNCERTAIN first) and a row saying how many are not named; else (a
-        terminal only a few rows tall) one row naming every label. Runs, output, the notice, the header
-        and the status row give up their rows first; conditions, the error row and the prompt last."""
+        on screen when the terminal has room; on a two-row terminal an active error and the prompt win
+        and conditions stay in the log. A condition's text or run id is wrapped onto more rows, never cut
+        at the width: each condition in full when they fit; else one row per label with its subjects (run
+        ids) named whole on the rows below it; else, when even those rows outnumber the terminal's, every
+        label's row with as many names as fit (UNCERTAIN first) and a row saying how many are not named;
+        else (a terminal only a few rows tall) one row naming every label. Runs, output, the notice, the
+        header and the status row give up their rows first."""
 
         self.sync_conditions()
         w, h = self.width, self.height
@@ -1467,6 +1477,7 @@ class Loop:
         self._wake = threading.Event()
         self._halt = threading.Event()
         self._paint_lock = threading.Lock()  # a paint and shutdown() never overlap; none starts after it
+        self._started = False  # a second start() must not add another lane worker
         self.join_timeout_s = 5.0
         self._lanes = {"stop": queue.SimpleQueue(), "other": queue.SimpleQueue()}
         self._threads: list[threading.Thread] = []
@@ -1507,6 +1518,10 @@ class Loop:
             self._wake.set()
 
     def start(self) -> None:
+        with self._paint_lock:
+            if self._started:
+                return
+            self._started = True
         for lane in self._lanes.values():
             t = threading.Thread(target=self._lane, args=(lane,), daemon=True)
             t.start()

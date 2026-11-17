@@ -43,8 +43,10 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   ANSI repaint, or through `InlinePainter`. Colour is only decoration and is off under `NO_COLOR`.
 - `term.py`: the terminal driver. Its three modes all read the same log:
   - default on a TTY: full screen on the alternate screen. The terminal size is polled every tick, so a
-    resize repaints at the new size; there is no minimum size. Every current condition stays on screen,
-    and a condition's text or run id wraps onto more rows instead of being cut at the width: each
+    resize repaints at the new size; there is no minimum size. Every current condition stays on screen
+    when the terminal has room; on a two-row terminal an active error and the prompt win and conditions
+    stay in the log. When they fit, a condition's text or run id wraps onto more rows instead of being
+    cut at the width: each
     condition in full when they fit, else one row per label with every subject (run id) named whole on
     the rows below it, else every label's row with as many names as fit (UNCERTAIN first) and a row
     saying how many are not named, else one row naming every label. Output, runs, the notice, the
@@ -283,7 +285,7 @@ raises, and a Stop with no answer is never shown as stopped.
 
 ## Tests
 
-Fake driver only; no terminal, process, network or provider. From the repository root:
+Fake engines only; some tests open private PTYs and start local Python subprocesses; no network or provider. From the repository root:
 
 ```
 # CPython with the GIL

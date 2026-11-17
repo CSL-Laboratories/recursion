@@ -472,6 +472,9 @@ class InstallCommandTests(ProfileCase):
         self.write_registry(key=signer, signature="real", permissions=("read", "order"))
         from recursion_core.daemon.tests import plugin_fixture as fx
         fx.write_install(self.config, trusted={"developer": signer.public})
+        # An install record is already on disk, so this is not a first install.
+        # The store has to exist or the command refuses and writes nothing.
+        fx.ensure_revocation_store(self.state)
         result = self.install()
         self.assertEqual(result["trust"], "signed")
         self.assertEqual(result["signature"], "signature_valid_trusted_key")
@@ -655,13 +658,15 @@ class InstallCommandTests(ProfileCase):
         return body["grants"]
 
     def _daemon_home(self):
-        """Start this tree's plugin host and the loopback GUI the daemon serves, then GET ``/``."""
+        """Start this tree's plugin host and the loopback GUI the daemon serves, then GET ``/``.
+
+        The store is whatever the shipped install command left under the state
+        directory. This path does not call the test fixture that creates one.
+        """
         from recursion_core.daemon.gui import LoopbackGUI
         from recursion_core.daemon.plugins import PluginHost
-        from recursion_core.daemon.tests.plugin_fixture import ensure_revocation_store
         from recursion_core.gui.client import ControlClient
 
-        ensure_revocation_store(self.state)
         host = PluginHost(self.config, self.state, gil_probe=FakeGilProbe())
         self.addCleanup(host.close)
 
@@ -720,6 +725,136 @@ class InstallCommandTests(ProfileCase):
             # before a panel can be drawn. The grant is still the one written above.
             self.assertEqual(record["code"], "plugin_verification_unavailable", record)
             self.assertNotIn("Host health", page)
+        self._assert_store_owner_only()
+
+    def _store_path(self):
+        return self.state / "plugin-security" / "revoked.sqlite3"
+
+    def _assert_store_owner_only(self):
+        """The file and its folder match the mode the fixture's caller expects."""
+        store = self._store_path()
+        self.assertTrue(store.is_file(), store)
+        self.assertFalse(store.is_symlink())
+        self.assertEqual(stat.S_IMODE(store.stat().st_mode), 0o600)
+        self.assertEqual(store.stat().st_uid, os.geteuid())
+        directory = store.parent
+        self.assertTrue(directory.is_dir())
+        self.assertFalse(directory.is_symlink())
+        self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+        self.assertEqual(directory.stat().st_uid, os.geteuid())
+
+    def test_a_second_install_keeps_the_store_the_first_one_created(self):
+        self._host_health_registry()
+        status, _out, err = self._run_cli(flags=("--yes",))
+        self.assertEqual(status, 0, err)
+        store = self._store_path()
+        self._assert_store_owner_only()
+        inode = store.stat().st_ino
+        status, _out, err = self._run_cli(flags=("--no-grant",))
+        self.assertEqual(status, 0, err)
+        self.assertEqual(store.stat().st_ino, inode)
+        self.assertEqual(stat.S_IMODE(store.stat().st_mode), 0o600)
+
+    def test_a_store_removed_after_the_first_install_is_not_created_again(self):
+        """After a first install, a missing store refuses every plugin and a later install."""
+        self._host_health_registry()
+        status, _out, err = self._run_cli(flags=("--yes",))
+        self.assertEqual(status, 0, err)
+        store = self._store_path()
+        self.assertTrue(store.is_file())
+        store.unlink()
+        for suffix in ("-wal", "-shm"):
+            leftover = Path(str(store) + suffix)
+            if leftover.exists() or leftover.is_symlink():
+                leftover.unlink()
+        status, page, host = self._daemon_home()
+        self.assertEqual(status, 200)
+        self.assertNotIn("Host health", page)
+        self.assertTrue(host.records)
+        self.assertTrue(all(record["state"] == "refused" for record in host.records))
+        if backend_available():
+            self.assertTrue(all(record["code"] == "revocation_store_missing" for record in host.records))
+        else:
+            # This interpreter never reaches the store: verification refuses first.
+            # The same host, with verification reported available, still refuses the
+            # missing store and does not create the file.
+            self.assertTrue(
+                all(record["code"] == "plugin_verification_unavailable" for record in host.records))
+            from recursion_core.daemon.plugins import PluginHost
+            with self.assertLogs("recursion_core.daemon.plugins", level="ERROR"):
+                probed = PluginHost(
+                    self.config, self.state, gil_probe=FakeGilProbe(),
+                    verification_available=lambda: True)
+            self.addCleanup(probed.close)
+            self.assertTrue(probed.records)
+            self.assertTrue(all(record["state"] == "refused" for record in probed.records))
+            self.assertTrue(
+                all(record["code"] == "revocation_store_missing" for record in probed.records))
+        self.assertFalse(store.exists())
+        status, _out, err = self._run_cli(flags=("--yes",))
+        self.assertEqual(status, 1)
+        self.assertIn("refused: revocation_store_missing", err)
+        self.assertFalse(store.exists())
+        from recursion_core.plugin_security.install import InstallRefused
+        with self.assertRaises(InstallRefused) as caught:
+            self.install(HOST_HEALTH_ID, write_grant=True)
+        self.assertEqual(caught.exception.code, "revocation_store_missing")
+        self.assertIn("plugin-generations", caught.exception.detail)
+        self.assertIn("install.json", caught.exception.detail)
+        self.assertFalse(store.exists())
+        self.assertTrue((self.config / "plugins" / HOST_HEALTH_ID / "plugin.py").is_file())
+        # The refused install did not publish another generation.
+        current = int((self.config / "plugin-generations" / "current").read_text())
+        self.assertEqual(current, 1)
+
+    def test_a_generations_folder_and_no_store_is_refused(self):
+        self._host_health_registry()
+        self.config.mkdir(parents=True, mode=0o700)
+        os.chmod(self.config, 0o700)
+        generations = self.config / "plugin-generations"
+        generations.mkdir(mode=0o700)
+        os.chmod(generations, 0o700)
+        status, _out, err = self._run_cli(flags=("--yes",))
+        self.assertEqual(status, 1)
+        self.assertIn("refused: revocation_store_missing", err)
+        store = self._store_path()
+        self.assertFalse(store.exists())
+        self.assertFalse((self.config / "plugins").exists())
+        from recursion_core.plugin_security.install import InstallRefused
+        with self.assertRaises(InstallRefused) as caught:
+            self.install(HOST_HEALTH_ID, write_grant=True)
+        self.assertEqual(caught.exception.code, "revocation_store_missing")
+        self.assertIn("plugin-generations", caught.exception.detail)
+        self.assertFalse(store.exists())
+        self.assertFalse((self.config / "plugin-generations" / "current").exists())
+
+    def test_an_install_record_and_no_store_is_refused(self):
+        self.write_registry()
+        from recursion_core.daemon.tests import plugin_fixture as fx
+        fx.write_install(self.config)
+        from recursion_core.plugin_security.install import InstallRefused
+        with self.assertRaises(InstallRefused) as caught:
+            self.install()
+        self.assertEqual(caught.exception.code, "revocation_store_missing")
+        self.assertIn("install.json", caught.exception.detail)
+        self.assertNotIn("plugin-generations", caught.exception.detail)
+        self.assertFalse(self._store_path().exists())
+        self.assertFalse((self.config / "plugin-generations").exists())
+
+    def test_a_group_writable_store_folder_on_a_fresh_profile_is_not_written(self):
+        self.write_registry()
+        self.state.mkdir(parents=True, mode=0o700)
+        os.chmod(self.state, 0o700)
+        directory = self.state / "plugin-security"
+        directory.mkdir(mode=0o700)
+        os.chmod(directory, 0o770)
+        from recursion_core.plugin_security.install import InstallRefused
+        with self.assertRaises(InstallRefused) as caught:
+            self.install()
+        self.assertEqual(caught.exception.code, "revocation_store_invalid")
+        self.assertFalse((directory / "revoked.sqlite3").exists())
+        self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o770)
+        self.assertFalse((self.config / "plugin-generations").exists())
 
     def test_no_grant_leaves_no_grant(self):
         self._host_health_registry()
@@ -822,6 +957,8 @@ class InstallCommandTests(ProfileCase):
         self._host_health_registry(source, key=signer, signature="real")
         from recursion_core.daemon.tests import plugin_fixture as fx
         fx.write_install(self.config, trusted={"developer": signer.public})
+        # An install record is already on disk, so this is not a first install.
+        fx.ensure_revocation_store(self.state)
         status, out, err = self._run_cli(flags=("--yes",))
         self.assertEqual(status, 0, err)
         result = json.loads(out)

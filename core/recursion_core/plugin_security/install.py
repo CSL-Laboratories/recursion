@@ -43,6 +43,13 @@ release is unsigned. ``order`` stays its own flow: by hand behind a warning
 when unsigned, asked once when signed, and it is not part of this grant.
 ``--no-grant`` writes no grant. A run with no terminal and no explicit yes
 writes no grant. This command does not add a trusted key.
+
+On a first install this command creates ``<state>/plugin-security/revoked.sqlite3``
+through the public ``create_revocation_store``. A first install means that file
+is absent, ``plugin-generations`` is absent, and ``plugins/install.json`` is
+absent. In every other state an absent store is refused
+``revocation_store_missing`` and is not created. No command in this module
+creates a store that has gone.
 """
 
 from __future__ import annotations
@@ -348,7 +355,7 @@ def _install_locked(config: Path, chosen, plugin_id: str, state, artifact: bytes
     signature_text = chosen.signature_text
     snapshot = _load_snapshot(config)
     trust_name, reason, grants, findings = _admit(snapshot, manifest, signature_text, artifact,
-                                                   chosen.label, state, write_grant, confirm)
+                                                   chosen.label, config, state, write_grant, confirm)
     refused = [item for item in findings if item.get("severity") == "refuse"]
     if refused:
         raise InstallRefused(refused[0]["code"], [item["code"] for item in refused])
@@ -377,15 +384,15 @@ def _install_locked(config: Path, chosen, plugin_id: str, state, artifact: bytes
     return result
 
 
-def _admit(snapshot: Snapshot, manifest, signature_text, artifact: bytes, label: str, state,
-           write_grant: bool | None, confirm):
+def _admit(snapshot: Snapshot, manifest, signature_text, artifact: bytes, label: str, config: Path,
+           state, write_grant: bool | None, confirm):
     """Classify and run doctor. A grant for another digest or signer is dropped.
 
     A yes writes one new grant for this release: requested permissions except
     ``order``, bound to the artifact digest and the signer key id. Anything
     short of an explicit yes writes no new grant.
     """
-    path = _revocation_store(state)
+    path = _revocation_store(config, state)
     try:
         trust = TrustStore(dict(snapshot.trusted_keys), revocation_store=path)
     except Refused as exc:
@@ -433,16 +440,111 @@ def _grants_kept(grants: dict, manifest, signer: str | None) -> dict:
     return kept
 
 
-def _revocation_store(state) -> str | None:
-    """Open a store only when it already exists. This command does not create one."""
+def _revocation_store(config: Path, state) -> str | None:
+    """Return the revocation store, creating it only on a first install.
+
+    A first install is all three of: the store file absent, no
+    ``plugin-generations`` folder, and no ``plugins/install.json``. Creation
+    goes through the public ``create_revocation_store`` (mode 0600) after the
+    same folder checks the test fixture applies: a symlink, a non-directory,
+    any group or other bit, or a directory that cannot be written is refused
+    and the file is not created. The folder, when created, is mode 0700.
+
+    Any other absent store is refused ``revocation_store_missing``. The detail
+    names the profile state that blocks a new file. A symlink, or anything
+    else that is not a regular file, at the store path is
+    ``revocation_store_invalid``. Called under the profile lock. ``state``
+    None has no directory to create into and does not create one.
+    """
     if state is None:
         return None
     path = Path(state) / "plugin-security" / "revoked.sqlite3"
-    if path.is_symlink():
-        raise InstallRefused("revocation_store_invalid")
-    if not path.is_file():
-        return None
+    try:
+        if path.is_symlink():
+            raise InstallRefused("revocation_store_invalid")
+        if path.is_file():
+            return str(path)
+        if _lexists(path):
+            raise InstallRefused("revocation_store_invalid")
+    except InstallRefused:
+        raise
+    except OSError as exc:
+        raise InstallRefused("revocation_store_invalid", detail=type(exc).__name__) from None
+    if not _first_install(config, path):
+        raise InstallRefused("revocation_store_missing", detail=_blocked_store_state(config, path))
+    _create_first_store(path)
     return str(path)
+
+
+def _first_install(config: Path, store: Path) -> bool:
+    """True only when this profile has never had a store, a generation, or an install record."""
+    if _lexists(store):
+        return False
+    for suffix in ("-wal", "-shm"):
+        if _lexists(Path(str(store) + suffix)):
+            return False
+    if _lexists(config / "plugin-generations"):
+        return False
+    if _lexists(config / "plugins" / "install.json"):
+        return False
+    return True
+
+
+def _blocked_store_state(config: Path, store: Path) -> str:
+    """Name the profile facts that make an absent store a refusal, not a first install."""
+    names = []
+    if _lexists(config / "plugin-generations"):
+        names.append("plugin-generations")
+    if _lexists(config / "plugins" / "install.json"):
+        names.append("install.json")
+    if _lexists(store):
+        names.append("revoked.sqlite3")
+    for suffix in ("-wal", "-shm"):
+        if _lexists(Path(str(store) + suffix)):
+            names.append("revoked.sqlite3" + suffix)
+    if not names:
+        names.append("plugin-security/revoked.sqlite3")
+    return " ".join(names)
+
+
+def _create_first_store(path: Path) -> None:
+    """Create ``path`` for a first install, or refuse and leave the file absent.
+
+    The checks and the modes are the ones ``ensure_revocation_store`` applies
+    before it calls ``create_revocation_store``: the directory is 0700 and
+    writable, and the file is the public create at 0600.
+    """
+    import sqlite3
+
+    directory = path.parent
+    try:
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise InstallRefused("revocation_store_invalid")
+        if directory.exists():
+            info = directory.stat()
+            if stat.S_IMODE(info.st_mode) & 0o077 or not os.access(directory, os.W_OK | os.X_OK):
+                raise InstallRefused("revocation_store_invalid")
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+        info = os.lstat(directory)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise InstallRefused("revocation_store_invalid")
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise InstallRefused("revocation_store_invalid")
+        from recursion_core.plugin_security import create_revocation_store
+        create_revocation_store(str(path))
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            os.fchmod(fd, 0o600)
+            file_info = os.fstat(fd)
+        finally:
+            os.close(fd)
+        if not stat.S_ISREG(file_info.st_mode) or stat.S_IMODE(file_info.st_mode) != 0o600:
+            raise InstallRefused("revocation_store_invalid")
+    except InstallRefused:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise InstallRefused("revocation_store_invalid", detail=type(exc).__name__) from None
 
 
 def _labels_for(previous: dict, plugins: dict) -> dict:

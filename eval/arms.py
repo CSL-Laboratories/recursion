@@ -577,20 +577,156 @@ def _count(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(authorization|password|passwd|secret|api_key|apikey|access_token|refresh_token|token)\s*=\s*\S+"
+# A credential name, as a suffix, so a prefix (ANTHROPIC_API_KEY) still matches. The whole
+# identifier is kept; only the value is dropped. ``token`` does not match ``tokens``.
+_CREDENTIAL_NAME = re.compile(
+    r"(?i)(?:access_token|refresh_token|authorization|password|passwd|secret|api[_-]?key|token)$"
 )
 
 
-def redact_detail(text):
-    """Drop assignment values for names that carry a credential.
+def _next_sep(text, start):
+    """Index of the next ``=`` or ``:``, or -1."""
+    equals = text.find("=", start)
+    colon = text.find(":", start)
+    if equals < 0:
+        return colon
+    if colon < 0:
+        return equals
+    return equals if equals < colon else colon
 
-    The engine's own error text is copied into the record. A value after one of these names is replaced
-    so the record keeps the failure and not the value.
+
+def _scheme_value_start(text, start):
+    """Index of the token after a Bearer or Basic scheme, or None when the text has no scheme there."""
+    for word in ("bearer", "basic"):
+        end = start + len(word)
+        if end < len(text) and text[start:end].lower() == word and text[end].isspace():
+            index = end + 1
+            while index < len(text) and text[index].isspace():
+                index += 1
+            return index
+    return None
+
+
+def _credential_value_end(text, start):
+    """End index of one credential value, or None when there is no value.
+
+    A quoted value runs to its closing quote (a backslash keeps the next character). An unquoted
+    value is one token. A Bearer or Basic scheme in front of that token is part of the value, so
+    ``authorization=Bearer <value>`` does not keep the value after the scheme word.
     """
-    if not isinstance(text, str):
+    length = len(text)
+    if start >= length or text[start].isspace():
+        return None
+    if text[start] in "\"'":
+        quote = text[start]
+        index = start + 1
+        while index < length:
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == quote:
+                return index + 1
+            index += 1
+        return length
+    scheme = _scheme_value_start(text, start)
+    index = start
+    if scheme is not None and scheme < length and not text[scheme].isspace():
+        index = scheme
+    while index < length and not text[index].isspace():
+        index += 1
+    return index if index > start else None
+
+
+def _name_ending_at(text, sep):
+    """The identifier immediately before a separator, skipping spaces and one quote. Or None."""
+    index = sep
+    while index > 0 and text[index - 1].isspace():
+        index -= 1
+    if index > 0 and text[index - 1] in "\"'":
+        index -= 1
+    end = index
+    while index > 0 and (text[index - 1].isalnum() or text[index - 1] in "_.-"):
+        index -= 1
+    if index == end:
+        return None
+    return index, text[index:end]
+
+
+def _flag_at(text, start):
+    """A ``--name value`` or ``--name=value`` flag when the name carries a credential. Or None."""
+    if not text.startswith("--", start):
+        return None
+    length = len(text)
+    index = start + 2
+    name_at = index
+    while index < length and (text[index].isalnum() or text[index] in "_.-"):
+        index += 1
+    name = text[name_at:index]
+    if not name or _CREDENTIAL_NAME.search(name) is None:
+        return None
+    if index < length and text[index] == "=":
+        value_at = index + 1
+    elif index < length and text[index].isspace():
+        value_at = index
+    else:
+        return None
+    while value_at < length and text[value_at].isspace():
+        value_at += 1
+    value_end = _credential_value_end(text, value_at)
+    if value_end is None:
+        return None
+    return "--" + name, value_end
+
+
+def redact_detail(text):
+    """Drop values for names that carry a credential.
+
+    The engine's own error text is copied into the record. A value after one of these names is
+    replaced so the record keeps the failure and not the value. The separator may be ``=`` or
+    ``:``, the name may carry a prefix, the value may be quoted, and a Bearer or Basic scheme is
+    part of the value. A flag of the form ``--api-key <value>`` is the same. One pass, with no
+    shared state, so a second caller cannot see this caller's text.
+    """
+    if not isinstance(text, str) or not text:
         return text
-    return _SECRET_ASSIGNMENT.sub(lambda match: match.group(1) + "=[redacted]", text)
+    parts = []
+    index = 0
+    length = len(text)
+    while index < length:
+        sep = _next_sep(text, index)
+        flag = text.find("--", index)
+        if sep < 0 and flag < 0:
+            parts.append(text[index:])
+            break
+        if flag >= 0 and (sep < 0 or flag <= sep):
+            found = _flag_at(text, flag)
+            if found is None:
+                parts.append(text[index:flag + 2])
+                index = flag + 2
+                continue
+            shown, value_end = found
+            parts.append(text[index:flag])
+            parts.append(shown + "=[redacted]")
+            index = value_end
+            continue
+        named = _name_ending_at(text, sep)
+        if named is None or _CREDENTIAL_NAME.search(named[1]) is None:
+            parts.append(text[index:sep + 1])
+            index = sep + 1
+            continue
+        name_at, name = named
+        value_at = sep + 1
+        while value_at < length and text[value_at].isspace():
+            value_at += 1
+        value_end = _credential_value_end(text, value_at)
+        if value_end is None:
+            parts.append(text[index:sep + 1])
+            index = sep + 1
+            continue
+        parts.append(text[index:name_at])
+        parts.append(name + "=[redacted]")
+        index = value_end
+    return "".join(parts)
 
 
 def _json_loads(line: bytes):

@@ -90,15 +90,20 @@ class Task:
 
     def start_file(self, name: str) -> bytes | None:
         """The bytes of the start tree's file ``name`` (a relative path), None when the start tree has no entry
-        there; TaskError when the entry is not a regular file or the start tree cannot be read."""
+        there; TaskError when the entry is not a regular file or the start tree cannot be read.
+
+        ``name`` is normalised the same way as a member name, so ``src/./value.txt`` is the entry
+        ``src/value.txt`` when that entry is in the tree.
+        """
+        wanted = _posix_normpath(name)
         if self.start_files is not None:
-            return self.start_files.get(name)
+            return self.start_files.get(wanted)
         if self.start_tar is None:
             raise TaskError(f"task {self.id}: no start tree")
         try:
             with tarfile.open(self.start_tar) as archive:
                 for member in archive.getmembers():
-                    if _posix_normpath(member.name) != name:
+                    if _posix_normpath(member.name) != wanted:
                         continue
                     if not member.isfile():
                         raise TaskError(f"task {self.id}: {name} in the start tree is not a regular file")
@@ -166,8 +171,10 @@ def _plan_file(data, mode):
     if text is not None and mode in (None, 0o644):
         return text
     import base64
-    return {"encoding": "base64", "data": base64.b64encode(data).decode("ascii"),
-            "mode": "100755" if mode == 0o755 else "100644"}
+    # Any mode the task carries, not only 0755. 0644 is the string form above. A third mode used to
+    # be written back as 0644, so the stand-in and the reference disagreed.
+    mode_text = "100644" if mode is None else f"100{mode:03o}"
+    return {"encoding": "base64", "data": base64.b64encode(data).decode("ascii"), "mode": mode_text}
 
 
 def _remove(path: Path) -> None:
@@ -441,7 +448,10 @@ def dir_digest(root: Path) -> str:
             # A newline in a name must not become another row. Ordinary names are unchanged.
             shown = rel.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
             lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {shown}\n")
-    return hashlib.sha256("".join(sorted(lines)).encode("utf-8")).hexdigest()
+    # surrogateescape keeps a name that is not UTF-8 in the digest. Backslash, newline and CR are
+    # already escaped above, so two different names still cannot share a row. Callers get a digest,
+    # not UnicodeEncodeError.
+    return hashlib.sha256("".join(sorted(lines)).encode("utf-8", "surrogateescape")).hexdigest()
 
 
 def load_dir(path: Path) -> Task:

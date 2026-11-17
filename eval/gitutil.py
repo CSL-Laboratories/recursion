@@ -48,6 +48,14 @@ def git(args: list, cwd: Path, *, input: bytes | None = None, check: bool = True
                                 env=git_env(), check=False, timeout=GIT_TIMEOUT_S)
     except subprocess.TimeoutExpired as exc:
         raise GitError(f"git {' '.join(args[:3])} did not finish within {GIT_TIMEOUT_S:g} s") from exc
+    except NotADirectoryError as exc:
+        raise GitError(f"git {' '.join(args[:3])} cannot run in {cwd}: {exc}") from exc
+    except FileNotFoundError as exc:
+        # A missing work folder raises FileNotFoundError from the process call. A missing git binary
+        # raises the same type while the folder is present, and that one stays FileNotFoundError.
+        if not Path(cwd).is_dir():
+            raise GitError(f"git {' '.join(args[:3])} cannot run in {cwd}: {exc}") from exc
+        raise
     if check and result.returncode != 0:
         raise GitError(f"git {' '.join(args[:3])} failed ({result.returncode}): "
                        f"{result.stderr.decode('utf-8', 'replace').strip()[:500]}")

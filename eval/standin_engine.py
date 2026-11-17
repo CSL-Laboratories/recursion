@@ -26,6 +26,7 @@ number is EVAL_STANDIN_TRIAL (1-based). The plan's ``outcomes`` list picks the b
 unknown (null), never 0.
 """
 import base64
+import binascii
 import json
 import os
 import posixpath
@@ -65,15 +66,30 @@ def _material(content):
     """Bytes to write, and a mode when the plan names one.
 
     A plain string is the ordinary plan entry. A base64 object carries bytes that are not text, or a
-    mode the string form cannot name.
+    mode the string form cannot name. Missing data is not an empty file. ``validate=True`` refuses
+    characters outside the alphabet instead of ignoring them. A value that is not base64 text raises
+    ValueError or binascii.Error; the caller turns that into a bad-file event.
     """
     if isinstance(content, str):
         return content.encode("utf-8"), None
     if isinstance(content, dict) and content.get("encoding") == "base64":
-        raw = base64.b64decode(content.get("data") or "")
-        mode = {"100644": 0o644, "100755": 0o755}.get(content.get("mode"))
+        data = content.get("data")
+        if not isinstance(data, str):
+            return None, None
+        raw = base64.b64decode(data, validate=True)
+        mode = _mode_from_plan(content.get("mode"))
         return raw, mode
     return None, None
+
+
+def _mode_from_plan(mode):
+    """The low three octal digits of a plan mode (``100755`` -> 0o755), or None when it is absent."""
+    if not isinstance(mode, str) or len(mode) < 3:
+        return None
+    try:
+        return int(mode[-3:], 8)
+    except ValueError:
+        return None
 
 
 def write_files(files):
@@ -98,7 +114,10 @@ def write_files(files):
                 _remove(above)
         if os.path.islink(name) or os.path.isdir(name):
             _remove(name)
-        raw, mode = _material(content)
+        try:
+            raw, mode = _material(content)
+        except (ValueError, binascii.Error, TypeError):
+            raw, mode = None, None
         if raw is None:
             emit(type="system", subtype="stand_in_bad_file", path=name)
             continue

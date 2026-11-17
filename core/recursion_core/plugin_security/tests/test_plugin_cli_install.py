@@ -14,6 +14,7 @@ to a marketplace checkout to refuse that tree's ``fixtures/registries/invalid`` 
 from __future__ import annotations
 
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -43,6 +44,23 @@ DEVELOPER_PHRASES = (
     "a label, not a gate",
     "loads as unsigned",
 )
+
+# Shaped like a host-health panel: one registry() and one read-only health panel.
+# The id is the fixture's own. It is not a copy of another repository's plugin.
+HOST_HEALTH_ID = "csl.host-health"
+HOST_HEALTH_SOURCE = (
+    b"def registry():\n"
+    b"    return {\"panels\": [{\"id\": \"csl.host-health\", \"title\": \"Host health\",\n"
+    b"                          \"reads\": [\"operator.health.inspect\"]}]}\n"
+)
+HOST_HEALTH_PERMISSIONS = ("read", "panel", "order")
+
+
+class _Terminal(io.StringIO):
+    """A stand-in terminal. ``isatty`` is true so the command may ask."""
+
+    def isatty(self) -> bool:
+        return True
 
 
 def _sha(data: bytes) -> str:
@@ -616,6 +634,204 @@ class InstallCommandTests(ProfileCase):
         status = main(["plugin"], out, err)
         self.assertEqual(status, 2)
         self.assertIn("usage", err.getvalue())
+
+    def _host_health_registry(self, source=HOST_HEALTH_SOURCE, **kwargs):
+        self.write_registry(
+            HOST_HEALTH_ID, source=source, permissions=HOST_HEALTH_PERMISSIONS, **kwargs)
+
+    def _run_cli(self, plugin_id=HOST_HEALTH_ID, flags=(), stdin=None):
+        from recursion_core.plugin_security._entrypoints import main
+
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["plugin", "install", "--registry", str(self.registry), "--plugin", plugin_id,
+                "--config", str(self.config), "--state", str(self.state), *flags]
+        status = main(argv, out, err, stdin=stdin)
+        return status, out.getvalue(), err.getvalue()
+
+    def _generation_grant(self):
+        """The one grant in the new generation's install.json, or the whole list."""
+        current = int((self.config / "plugin-generations" / "current").read_text())
+        body = json.loads((self.config / "plugin-generations" / str(current) / "install.json").read_text())
+        return body["grants"]
+
+    def _daemon_home(self):
+        """Start this tree's plugin host and the loopback GUI the daemon serves, then GET ``/``."""
+        from recursion_core.daemon.gui import LoopbackGUI
+        from recursion_core.daemon.plugins import PluginHost
+        from recursion_core.daemon.tests.plugin_fixture import ensure_revocation_store
+        from recursion_core.gui.client import ControlClient
+
+        ensure_revocation_store(self.state)
+        host = PluginHost(self.config, self.state, gil_probe=FakeGilProbe())
+        self.addCleanup(host.close)
+
+        def transport(method, path, body):
+            del body
+            if method == "GET" and path == "/v1/routes":
+                return 200, b'{"routes":[]}'
+            return 503, b'{"error":"unavailable"}'
+
+        client = ControlClient(transport)
+        with LoopbackGUI(client, lambda _env: True, plugins=host.registries, port=0) as gui:
+            connection = http.client.HTTPConnection(*gui.address, timeout=5)
+            try:
+                connection.request("GET", "/")
+                response = connection.getresponse()
+                status, page = response.status, response.read().decode()
+            finally:
+                connection.close()
+        return status, page, host
+
+    def test_yes_installs_host_health_and_the_daemon_shows_the_panel(self):
+        """A yes writes one grant, and this tree's daemon draws the panel on ``/``."""
+        source = HOST_HEALTH_SOURCE
+        self._host_health_registry(source)
+        status, out, err = self._run_cli(flags=("--yes",))
+        self.assertEqual(status, 0, err)
+        result = json.loads(out)
+        self.assertEqual(result["requested_permissions"], list(HOST_HEALTH_PERMISSIONS))
+        text = "\n".join(result["developer_checks"])
+        for phrase in DEVELOPER_PHRASES:
+            self.assertIn(phrase, text)
+        self.assertIn("by hand", text)
+        self.assertIn("warning", text)
+        self.assertIn("asked once", text)
+        grants = self._generation_grant()
+        self.assertEqual(len(grants), 1)
+        grant = grants[0]
+        self.assertEqual(grant["plugin_id"], HOST_HEALTH_ID)
+        self.assertEqual(grant["artifact_sha256"], _sha(source))
+        self.assertIsNone(grant["signer_key_id"])
+        self.assertEqual(grant["permissions"], ["read", "panel"])
+        self.assertNotIn("order", grant["permissions"])
+        self.assertNotIn("no_grant", [item["code"] for item in result["findings"]])
+        self.assertIn("order", [item["detail"] for item in result["findings"] if item["code"] == "not_granted"])
+        status, page, host = self._daemon_home()
+        self.assertEqual(status, 200)
+        record = host.records[0]
+        from recursion_core.plugin_security.signing import backend_available
+        if backend_available():
+            self.assertEqual(record["state"], "loaded", record)
+            self.assertEqual(record["permissions"], ["read", "panel"])
+            self.assertIn("Host health", page)
+            self.assertIn('href="/panel?id=csl.host-health"', page)
+        else:
+            # This interpreter has no signature backend. The daemon refuses every plugin
+            # before a panel can be drawn. The grant is still the one written above.
+            self.assertEqual(record["code"], "plugin_verification_unavailable", record)
+            self.assertNotIn("Host health", page)
+
+    def test_no_grant_leaves_no_grant(self):
+        self._host_health_registry()
+        status, out, err = self._run_cli(flags=("--no-grant",))
+        self.assertEqual(status, 0, err)
+        result = json.loads(out)
+        self.assertEqual(self._generation_grant(), [])
+        self.assertIn("no_grant", [item["code"] for item in result["findings"]])
+        status, page, host = self._daemon_home()
+        self.assertEqual(status, 200)
+        self.assertNotIn("Host health", page)
+        record = host.records[0]
+        from recursion_core.plugin_security.signing import backend_available
+        if backend_available():
+            self.assertEqual(record["state"], "loaded", record)
+            self.assertEqual(record["permissions"], [])
+            self.assertIn("no_grant", [item["code"] for item in record["findings"]])
+        else:
+            self.assertEqual(record["code"], "plugin_verification_unavailable", record)
+
+    def test_a_changed_artifact_digest_loses_the_grant(self):
+        source = HOST_HEALTH_SOURCE
+        self._host_health_registry(source)
+        status, _out, err = self._run_cli(flags=("--yes",))
+        self.assertEqual(status, 0, err)
+        self.assertEqual(self._generation_grant()[0]["artifact_sha256"], _sha(source))
+        changed = source + b"\nVALUE = 2\n"
+        directory = self.config / "plugins" / HOST_HEALTH_ID
+        developer = json.loads((directory / "manifest.json").read_text())["developer_key"]
+        manifest = _manifest(
+            changed, HOST_HEALTH_ID, developer_key=developer, permissions=HOST_HEALTH_PERMISSIONS)
+        (directory / "manifest.json").write_bytes(manifest)
+        (directory / "plugin.py").write_bytes(changed)
+        os.chmod(directory / "manifest.json", 0o600)
+        os.chmod(directory / "plugin.py", 0o600)
+        # The grant line still names the old digest. It no longer applies.
+        self.assertEqual(self._generation_grant()[0]["artifact_sha256"], _sha(source))
+        self.assertNotEqual(_sha(changed), _sha(source))
+        from recursion_core.daemon.plugins import read_install
+        from recursion_core.plugin_security import CoreHealth, PluginLoader, TrustStore
+
+        install = read_install(self.config / "plugins")
+        trust = TrustStore(dict(install["trusted_keys"]))
+        self.addCleanup(trust.close)
+        findings = PluginLoader(
+            trust, install["grants"], install["reserved"], CoreHealth()).doctor(
+                manifest, None, changed)
+        self.assertIn("grant_artifact_mismatch", [item["code"] for item in findings])
+        self.assertNotIn("no_grant", [item["code"] for item in findings])
+        status, page, host = self._daemon_home()
+        self.assertEqual(status, 200)
+        self.assertNotIn("Host health", page)
+        from recursion_core.plugin_security.signing import backend_available
+        if backend_available():
+            record = host.records[0]
+            self.assertEqual(record["state"], "loaded", record)
+            self.assertEqual(record["permissions"], [])
+            self.assertIn("grant_artifact_mismatch", [item["code"] for item in record["findings"]])
+
+    def test_no_terminal_and_no_yes_writes_no_grant(self):
+        self._host_health_registry()
+        stdin = io.StringIO("yes\n")
+        self.assertFalse(stdin.isatty())
+        status, _out, err = self._run_cli(stdin=stdin)
+        self.assertEqual(status, 0, err)
+        self.assertEqual(self._generation_grant(), [])
+        self.assertNotIn("Grant the requested permissions", err)
+
+    def test_a_terminal_yes_writes_one_grant_and_any_other_answer_does_not(self):
+        self._host_health_registry()
+        status, _out, err = self._run_cli(stdin=_Terminal("yes\n"))
+        self.assertEqual(status, 0, err)
+        self.assertIn("Requested permissions: read, panel, order", err)
+        self.assertIn("by hand", err)
+        self.assertIn("Grant the requested permissions except order?", err)
+        self.assertEqual(len(self._generation_grant()), 1)
+        self.assertEqual(self._generation_grant()[0]["permissions"], ["read", "panel"])
+        for answer in ("\n", "n\n", "no\n", "YES please\n"):
+            with self.subTest(answer=answer):
+                root = self.tmp / ("no-" + str(abs(hash(answer))))
+                self.config = root / "config"
+                self.state = root / "state"
+                self.registry = root / "registry"
+                self._host_health_registry()
+                status, _out, err = self._run_cli(stdin=_Terminal(answer))
+                self.assertEqual(status, 0, err)
+                self.assertEqual(self._generation_grant(), [])
+
+    def test_yes_and_no_grant_together_are_refused_and_write_nothing(self):
+        self._host_health_registry()
+        status, _out, err = self._run_cli(flags=("--yes", "--no-grant"))
+        self.assertEqual(status, 2)
+        self.assertIn("usage", err)
+        self.assertFalse((self.config / "plugins").exists())
+
+    @needs_crypto
+    def test_a_signed_yes_binds_the_signer_key_id_and_still_leaves_order_out(self):
+        signer = Key()
+        source = HOST_HEALTH_SOURCE
+        self._host_health_registry(source, key=signer, signature="real")
+        from recursion_core.daemon.tests import plugin_fixture as fx
+        fx.write_install(self.config, trusted={"developer": signer.public})
+        status, out, err = self._run_cli(flags=("--yes",))
+        self.assertEqual(status, 0, err)
+        result = json.loads(out)
+        self.assertEqual(result["trust"], "signed")
+        self.assertEqual(result["signature"], "signature_valid_trusted_key")
+        grant = self._generation_grant()[0]
+        self.assertEqual(grant["signer_key_id"], key_id(signer.public))
+        self.assertEqual(grant["artifact_sha256"], _sha(source))
+        self.assertEqual(grant["permissions"], ["read", "panel"])
+        self.assertNotIn("order", grant["permissions"])
 
 
 if __name__ == "__main__":

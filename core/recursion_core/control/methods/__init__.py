@@ -293,7 +293,8 @@ class Context:
             owner.callbacks.append((self._scope, fn))
 
     def call(self, method: str, params=None) -> dict:
-        """Params left out, or None, mean an empty mapping when the method is one of this table's."""
+        """Params left out, or None, become an empty mapping when the call is to a read of this table that is not
+        a built-in; a built-in, or a name with no row, receives what the caller passed."""
         return self._call(method, params)
 
 

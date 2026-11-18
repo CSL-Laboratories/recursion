@@ -39,7 +39,7 @@ DEVELOPER_PHRASES = (
     "stall other work",
     "GIL",
     "untrusted plugin config folder refuses every plugin",
-    "revocation store that goes missing after first install fails closed",
+    "missing revocation store reads as empty",
     "a label, not a gate",
     "loads as unsigned",
 )
@@ -378,6 +378,7 @@ class InstallCommandTests(ProfileCase):
         text = "\n".join(result["developer_checks"])
         for phrase in DEVELOPER_PHRASES:
             self.assertIn(phrase, text)
+        self.assertIn("A missing revocation store reads as empty: no key counts as revoked.", result["developer_checks"])
         self.assertIn("by hand", text)
         self.assertIn("warning", text)
         shown = self.listed()

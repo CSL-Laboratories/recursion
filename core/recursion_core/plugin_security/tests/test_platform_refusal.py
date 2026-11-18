@@ -2,7 +2,7 @@
 
 Windows CPython has no ``fcntl``, no ``os.O_NOFOLLOW`` and no ``os.O_DIRECTORY``. There the
 install module still imports, the plugin commands refuse ``platform_unsupported`` with the
-command's refusal exit and no traceback, and ``check_registry`` reports ``platform_unsupported``,
+command's refusal exit and no traceback, and ``check_registry`` reports ``root_unavailable``,
 each before any file is opened or made: the form ``daemon/plugins.py`` already gives. No
 Windows read path is built here.
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -69,6 +70,65 @@ def _opens_recorded():
 
     with mock.patch.object(os, "open", record):
         yield calls
+
+
+# Past the three names the guard tested at 6dc16a70, the commands also call these.
+LATER_NAMES = ("O_CLOEXEC", "geteuid", "fchmod", "dir_fd", "listdir")
+# Linux values, set only where a host lacks the name, so that the three first names are present.
+_LINUX_FLAGS = {"O_NOFOLLOW": 0o400000, "O_DIRECTORY": 0o200000}
+
+
+class _Fcntl:
+    LOCK_EX, LOCK_NB = 2, 4
+
+    @staticmethod
+    def flock(_fd, _flags):
+        return None
+
+
+def _without_dir_fd(real):
+    def call(*args, dir_fd=None, **kwargs):
+        if dir_fd is not None:
+            raise NotImplementedError("dir_fd unavailable on this platform")
+        return real(*args, **kwargs)
+
+    return call
+
+
+@contextlib.contextmanager
+def _posix_without(name):
+    """A POSIX platform that has fcntl, O_NOFOLLOW and O_DIRECTORY but lacks ``name``, for the call."""
+    from recursion_core.plugin_security import install
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.object(os, "name", "posix"))
+        if install.fcntl is None:
+            stack.enter_context(mock.patch.object(install, "fcntl", _Fcntl()))
+        for flag, value in _LINUX_FLAGS.items():
+            if not hasattr(os, flag):
+                setattr(os, flag, value)
+                stack.callback(delattr, os, flag)
+        if name == "dir_fd":
+            kept = {item for item in os.supports_dir_fd if item.__name__ not in ("open", "stat")}
+            stack.enter_context(mock.patch.object(os, "supports_dir_fd", kept))
+            stack.enter_context(mock.patch.object(os, "open", _without_dir_fd(os.open)))
+            stack.enter_context(mock.patch.object(os, "stat", _without_dir_fd(os.stat)))
+        elif name == "listdir":
+            real = os.listdir
+
+            def listdir(path="."):
+                if isinstance(path, int):
+                    raise TypeError("listdir: path should be string, bytes, os.PathLike or None, not int")
+                return real(path)
+
+            kept = {item for item in os.supports_fd if item.__name__ != "listdir"}
+            stack.enter_context(mock.patch.object(os, "supports_fd", kept))
+            stack.enter_context(mock.patch.object(os, "listdir", listdir))
+        elif hasattr(os, name):
+            value = getattr(os, name)
+            delattr(os, name)
+            stack.callback(setattr, os, name, value)
+        yield
 
 
 class PlatformRefusalTests(unittest.TestCase):
@@ -149,10 +209,55 @@ class PlatformRefusalTests(unittest.TestCase):
             with self.subTest(missing=missing):
                 with _platform_without(*missing), _opens_recorded() as opens:
                     report = check_registry(self.registry)
-                self.assertEqual(["platform_unsupported"], report.codes())
+                self.assertEqual(["root_unavailable"], report.codes())
                 self.assertEqual(["."], [item.path for item in report.errors])
                 self.assertEqual([], report.checked)
                 self.assertEqual([], opens)
+
+    def _valid_registry(self):
+        from recursion_core.plugin_security.tests.test_plugin_cli_install import ProfileCase
+
+        ProfileCase.write_registry(self)
+
+    def _clear_profile(self):
+        for path in (self.tmp / "config", self.state):
+            if path.exists():
+                shutil.rmtree(path)
+
+    def test_every_command_refuses_before_any_open_when_a_later_name_is_missing(self):
+        from recursion_core.plugin_security._entrypoints import main
+
+        self._valid_registry()
+        for missing in LATER_NAMES:
+            for command, argv in self._commands().items():
+                with self.subTest(missing=missing, command=command):
+                    self._clear_profile()
+                    out, err = io.StringIO(), io.StringIO()
+                    with _posix_without(missing), _opens_recorded() as opens:
+                        status = main(argv, out, err)
+                    self.assertEqual((1, REFUSED, ""), (status, err.getvalue(), out.getvalue()))
+                    self.assertEqual([], opens)
+                    self.assertFalse(self.config.exists())
+                    self.assertFalse(self.state.exists())
+
+    def test_check_registry_reports_root_unavailable_before_any_open_when_a_read_it_needs_is_missing(self):
+        from recursion_core.plugin_security.registry import check_registry
+
+        self._valid_registry()
+        for missing in ("O_CLOEXEC", "dir_fd", "listdir"):
+            with self.subTest(missing=missing):
+                with _posix_without(missing), _opens_recorded() as opens:
+                    report = check_registry(self.registry)
+                self.assertEqual(["root_unavailable"], report.codes())
+                self.assertEqual(["."], [item.path for item in report.errors])
+                self.assertEqual([], report.checked)
+                self.assertEqual([], opens)
+
+    def test_the_registry_rule_set_holds_only_the_marketplace_codes_for_this_case(self):
+        from recursion_core.plugin_security import registry
+
+        self.assertIn("root_unavailable", registry._RULES)
+        self.assertNotIn("platform_unsupported", registry._RULES)
 
 
 if __name__ == "__main__":

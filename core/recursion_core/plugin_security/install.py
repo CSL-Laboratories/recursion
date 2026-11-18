@@ -38,7 +38,7 @@ from pathlib import Path
 from .errors import Refused
 from .loader import CoreHealth, PluginLoader
 from .manifest import PERMISSIONS, Grant, ReservedEffects, TrustStore, parse_manifest
-from .registry import check_registry
+from .registry import check_registry, platform_gap
 
 try:
     import fcntl
@@ -50,11 +50,14 @@ __all__ = ["InstallRefused", "install_plugin", "list_plugins", "remove_plugin"]
 _PLUGIN_ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
 _CURRENT = re.compile(r"[1-9][0-9]*\n")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_KEY_ID = re.compile(r"ed25519:[0-9a-f]{32}")
+# Names the profile itself uses inside a generation and inside plugins/: never a plugin id.
+_PROFILE_NAMES = frozenset({"install.json"})
 _LABELS = frozenset({"verified", "non_verified"})
 _INSTALL_KEYS = frozenset({"trusted_keys", "grants", "reserved", "authority_anchor", "registry_labels"})
 _GRANT_KEYS = frozenset({
     "plugin_id", "artifact_sha256", "signer_key_id", "permissions", "unsigned_order_acknowledged",
-    "order_after_revoked_key", "order_after_revocation_generation",
+    "order_after_revoked_key", "order_after_revocation_generation", "developer_key_id",
 })
 _MAX_MANIFEST = 64 * 1024
 _MAX_ARTIFACT = 8 * 1024 * 1024
@@ -65,7 +68,7 @@ _DEVELOPER_CHECKS = (
     "In-process plugin code can stall other work.",
     "The loader reads the GIL after every load.",
     "An untrusted plugin config folder refuses every plugin.",
-    "A revocation store that goes missing after first install fails closed.",
+    "A missing revocation store reads as empty: no key counts as revoked.",
     "The registry label is a label, not a gate.",
     "A signature that fails this install's trusted-key check loads as unsigned.",
     "Signed order is asked once. This command does not grant it.",
@@ -99,6 +102,8 @@ class Snapshot:
     anchor: str | None = None
     labels: dict = field(default_factory=dict)
     plugins: dict = field(default_factory=dict)
+    # A grant's developer_key_id as it was read, by plugin id; written back unchanged.
+    developer_key_ids: dict = field(default_factory=dict)
 
     def reserved(self) -> ReservedEffects:
         return ReservedEffects(frozenset(self.hosts), tuple(self.prefixes))
@@ -117,7 +122,7 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
     # whole install. Unknown must not read as valid, and nothing is written.
     if any(item.code == "signature_unchecked" for item in report.notes):
         raise InstallRefused("signature_backend_unavailable")
-    if not _plugin_id_ok(plugin_id):
+    if not _plugin_id_ok(plugin_id) or plugin_id in _PROFILE_NAMES:
         raise InstallRefused("plugin_not_in_registry")
     if version is not None and type(version) is not str:
         raise InstallRefused("release_not_in_registry")
@@ -162,7 +167,7 @@ def remove_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLi
         grants = dict(snapshot.grants)
         grants.pop(plugin_id, None)
         kept = Snapshot(snapshot.trusted_keys, grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
-                        _labels_for(snapshot.labels, plugins), plugins)
+                        _labels_for(snapshot.labels, plugins), plugins, snapshot.developer_key_ids)
         generation = _commit(config_path, kept)
         return {"command": "remove", "plugin_id": plugin_id, "generation": generation, "plugins": _rows(kept)}
     finally:
@@ -173,9 +178,14 @@ def _require_platform() -> None:
     # Same shape as daemon/plugins.py _read_owned: a typed refusal before any file is opened or made.
     # Windows has no fcntl, O_NOFOLLOW or O_DIRECTORY; a no-follow read for it is not built, so every
     # command refuses instead of dropping the guard (no default of 0, no open without it).
-    if os.name == "nt" or fcntl is None or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
-        raise InstallRefused("platform_unsupported",
-                             detail="fcntl, O_NOFOLLOW or O_DIRECTORY is missing; no plugin file is opened")
+    # The guard names every POSIX call the commands make: the registry's reads, fcntl, geteuid, fchmod.
+    missing = platform_gap()
+    if missing is None and fcntl is None:
+        missing = "fcntl"
+    if missing is None:
+        missing = next((name for name in ("geteuid", "fchmod") if not hasattr(os, name)), None)
+    if missing is not None:
+        raise InstallRefused("platform_unsupported", detail=f"{missing} is missing; no plugin file is opened")
 
 
 def _lexists(path: Path) -> bool:
@@ -189,7 +199,8 @@ def _plugin_id_ok(value: object) -> bool:
 
 
 def _select(report, plugin_id: str, version: str | None):
-    matches = [item for item in report.checked if item.plugin_id == plugin_id]
+    # Only releases under registry/ can be chosen. examples/ is checked, never indexed or installed.
+    matches = [item for item in report.checked if item.plugin_id == plugin_id and not item.in_examples]
     if not matches:
         raise InstallRefused("plugin_not_in_registry")
     if version is None:
@@ -221,17 +232,21 @@ def _install_locked(config: Path, chosen, plugin_id: str, state) -> dict:
     labels = _labels_for(snapshot.labels, plugins)
     labels[hashlib.sha256(chosen.manifest).hexdigest()] = chosen.label
     updated = Snapshot(dict(snapshot.trusted_keys), grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
-                       labels, plugins)
+                       labels, plugins, snapshot.developer_key_ids)
     generation = _commit(config, updated)
+    # What the written install.json gives this plugin, as the loader's admit step computed it from those grants.
+    effective = next((item["detail"] for item in findings if item.get("code") == "effective_permissions"), "")
     return {
         "command": "install",
         "plugin_id": manifest.plugin_id,
         "version": manifest.version,
+        "status": chosen.status,
+        "status_reason": chosen.status_reason,
         "registry_label": chosen.label,
         "trust": trust_name,
         "signature": reason,
         "generation": generation,
-        "order": "not granted",
+        "order": "granted" if "order" in effective.split(",") else "not granted",
         "developer_checks": list(_DEVELOPER_CHECKS),
         "findings": findings,
         "requested_permissions": list(manifest.permissions),
@@ -482,11 +497,12 @@ def _read_profile(directory: Path, *, missing_install_ok: bool) -> Snapshot:
             raise InstallRefused("plugin_directory_untrusted")
         plugins[name] = _read_plugin(path)
     return Snapshot(parsed["trusted_keys"], parsed["grants"], parsed["hosts"], parsed["prefixes"],
-                    parsed["anchor"], parsed["labels"], plugins)
+                    parsed["anchor"], parsed["labels"], plugins, parsed["developer_key_ids"])
 
 
 def _empty_install() -> dict:
-    return {"trusted_keys": {}, "grants": {}, "hosts": (), "prefixes": (), "anchor": None, "labels": {}}
+    return {"trusted_keys": {}, "grants": {}, "hosts": (), "prefixes": (), "anchor": None, "labels": {},
+            "developer_key_ids": {}}
 
 
 def _read_plugin(directory: Path) -> StoredPlugin:
@@ -518,17 +534,21 @@ def _parse_install(raw: bytes) -> dict:
         raise InstallRefused("install_unreadable")
     keys = data.get("trusted_keys", {})
     if not isinstance(keys, dict) or not all(isinstance(key, str) and isinstance(value, str)
+                                             and _SHA256.fullmatch(value) is not None
                                              for key, value in keys.items()):
         raise InstallRefused("install_unreadable")
     listed = data.get("grants", [])
     if not isinstance(listed, list):
         raise InstallRefused("install_unreadable")
     grants = {}
+    developer_key_ids = {}
     for item in listed:
         grant = _parse_grant(item)
         if grant.plugin_id in grants:
             raise InstallRefused("install_unreadable")
         grants[grant.plugin_id] = grant
+        if "developer_key_id" in item:
+            developer_key_ids[grant.plugin_id] = item["developer_key_id"]
     reserved = data.get("reserved", {})
     hosts = reserved.get("hosts", []) if isinstance(reserved, dict) else None
     prefixes = reserved.get("credential_prefixes", []) if isinstance(reserved, dict) else None
@@ -549,7 +569,7 @@ def _parse_install(raw: bytes) -> dict:
             raise InstallRefused("install_unreadable")
         kept_labels[digest] = label
     return {"trusted_keys": dict(keys), "grants": grants, "hosts": tuple(hosts), "prefixes": tuple(prefixes),
-            "anchor": anchor, "labels": kept_labels}
+            "anchor": anchor, "labels": kept_labels, "developer_key_ids": developer_key_ids}
 
 
 def _parse_grant(item: object) -> Grant:
@@ -558,9 +578,11 @@ def _parse_grant(item: object) -> Grant:
         raise InstallRefused("install_unreadable")
     perms, signer = item["permissions"], item.get("signer_key_id")
     generation = item.get("order_after_revocation_generation")
+    developer = item.get("developer_key_id")
     if (not isinstance(item["plugin_id"], str) or not isinstance(item["artifact_sha256"], str)
             or not isinstance(perms, list) or any(perm not in PERMISSIONS for perm in perms)
-            or not (signer is None or isinstance(signer, str))
+            or not (signer is None or (isinstance(signer, str) and _KEY_ID.fullmatch(signer) is not None))
+            or not (developer is None or (isinstance(developer, str) and _KEY_ID.fullmatch(developer) is not None))
             or type(item.get("unsigned_order_acknowledged", False)) is not bool
             or not (item.get("order_after_revoked_key") is None or isinstance(item.get("order_after_revoked_key"), str))
             or not (generation is None or type(generation) is int)
@@ -588,7 +610,8 @@ def _write_profile(directory: Path, snapshot: Snapshot) -> None:
 def _dump_install(snapshot: Snapshot) -> bytes:
     payload = {
         "authority_anchor": snapshot.anchor,
-        "grants": [_grant_json(snapshot.grants[plugin_id]) for plugin_id in sorted(snapshot.grants)],
+        "grants": [_grant_json(snapshot.grants[plugin_id], snapshot.developer_key_ids)
+                   for plugin_id in sorted(snapshot.grants)],
         "registry_labels": snapshot.labels,
         "reserved": {"credential_prefixes": list(snapshot.prefixes), "hosts": list(snapshot.hosts)},
         "trusted_keys": snapshot.trusted_keys,
@@ -596,8 +619,8 @@ def _dump_install(snapshot: Snapshot) -> bytes:
     return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
-def _grant_json(grant: Grant) -> dict:
-    return {
+def _grant_json(grant: Grant, developer_key_ids: dict) -> dict:
+    data = {
         "plugin_id": grant.plugin_id,
         "artifact_sha256": grant.artifact_sha256,
         "signer_key_id": grant.signer_key_id,
@@ -606,6 +629,9 @@ def _grant_json(grant: Grant) -> dict:
         "order_after_revoked_key": grant.order_after_revoked_key,
         "order_after_revocation_generation": grant.order_after_revocation_generation,
     }
+    if grant.plugin_id in developer_key_ids:
+        data["developer_key_id"] = developer_key_ids[grant.plugin_id]
+    return data
 
 
 def _write_file(path: Path, data: bytes) -> None:

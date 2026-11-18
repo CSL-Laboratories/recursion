@@ -1,0 +1,8 @@
+{
+  "method": "run.start",
+  "params": {
+    "engine": "claude_code",
+    "prompt": "Summarise the repository.",
+    "client_key": "k-1"
+  }
+}

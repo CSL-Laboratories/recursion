@@ -1,0 +1,100 @@
+{
+  "item": {
+    "item_id": "qi-0001",
+    "session_id": "ses-7f3a9c2e51d04b6a",
+    "order": 1,
+    "text": "When the tests pass, also update the changelog.",
+    "revision": 1,
+    "delivery": "next_turn",
+    "state": "queued",
+    "delivery_id": null,
+    "turn_id": null,
+    "created_at": "2026-11-13T07:34:20.000Z"
+  },
+  "steps": [
+    {
+      "what": "An edit that names neither the text nor the delivery.",
+      "happening": "edit",
+      "facts": {},
+      "refused": "edit"
+    },
+    {
+      "what": "An edit to an empty text.",
+      "happening": "edit",
+      "facts": {
+        "text": ""
+      },
+      "refused": "edit"
+    },
+    {
+      "what": "An edit to a delivery nobody defined.",
+      "happening": "edit",
+      "facts": {
+        "delivery": "now"
+      },
+      "refused": "edit"
+    },
+    {
+      "what": "An edit of the text: revision 2.",
+      "happening": "edit",
+      "facts": {
+        "text": "When the tests pass, update the changelog and the version."
+      },
+      "item": {
+        "item_id": "qi-0001",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 1,
+        "text": "When the tests pass, update the changelog and the version.",
+        "revision": 2,
+        "delivery": "next_turn",
+        "state": "queued",
+        "delivery_id": null,
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    },
+    {
+      "what": "The end of a turn that names no turn.",
+      "happening": "turn_ended",
+      "facts": {},
+      "refused": "turn"
+    },
+    {
+      "what": "Delivering and the binding are committed.",
+      "happening": "begin",
+      "facts": {
+        "delivery_id": "dlv-0007",
+        "item_id": "qi-0001",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "worker_incarnation": "wrk-5b1f0c2d.1",
+        "target_turn_id": "turn-000d",
+        "how": "new_turn"
+      },
+      "item": {
+        "item_id": "qi-0001",
+        "session_id": "ses-7f3a9c2e51d04b6a",
+        "order": 1,
+        "text": "When the tests pass, update the changelog and the version.",
+        "revision": 2,
+        "delivery": "next_turn",
+        "state": "delivering",
+        "delivery_id": "dlv-0007",
+        "turn_id": null,
+        "created_at": "2026-11-13T07:34:20.000Z"
+      }
+    },
+    {
+      "what": "A write that names no delivery is not this binding's write.",
+      "happening": "written",
+      "facts": {},
+      "refused": "delivery_mismatch"
+    },
+    {
+      "what": "The end of a turn that names no turn, again: refused, and the item is still delivering.",
+      "happening": "turn_ended",
+      "facts": {},
+      "refused": "turn"
+    }
+  ]
+}

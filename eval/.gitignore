@@ -1,0 +1,4 @@
+# Nothing a run writes is committed by default (questions.md Q7: publishing any record is Lucas's call).
+results/
+# Trial artifacts (diffs, test logs, engine output) are never committed.
+artifacts/

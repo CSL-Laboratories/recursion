@@ -9,8 +9,10 @@
 It only registers: it opens nothing, starts no thread and reads no state; the store is first read when an
 API-key route asks for its key or a client calls ``key.list``.
 
-Until SPINE's seams pull request lands, nothing calls this function and nothing is registered: today's daemon
-still hands both engine adapters ``no_custody``, and every API-key route still refuses "no credential".
+``control.hooks.compose()`` calls it, and SPINE's seams are on master, but nothing outside them calls ``compose()``
+yet: until the daemon and ``recursion-control`` call the composed hooks, the daemon still hands both engine
+adapters ``no_custody``, every API-key route still refuses "no credential", and ``recursion-control`` has no
+``key`` command.
 """
 from __future__ import annotations
 

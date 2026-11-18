@@ -62,8 +62,9 @@ never returns None or an empty string. It is the ONE place a value leaves the st
 and a backend's ``get`` apply none of these checks and must never feed an environment. The
 index is read and the value fetched under the folder's SHARED lock, which every writer takes exclusively, so
 the authorization and the value come from one state of the store: a key removed and added again meanwhile is
-never handed out under the old one's variable name or opt-in. Lane KEYS' ``hooks.py`` registers it into S7 when
-SPINE's seams land; until then a test passes it where the daemon passes ``no_custody``.
+never handed out under the old one's variable name or opt-in. Lane KEYS' ``hooks.py`` registers it into S7 at
+composition (SPINE's seams); until the daemon calls the composed hooks, which master's does not yet, a test
+passes it where the daemon passes ``no_custody``.
 
 ORDER OF WRITES, and what a failure leaves. Every write holds the folder's exclusive lock. An add first writes
 the index with a PENDING entry for the id (the intent, before anything outside the folder happens), then saves

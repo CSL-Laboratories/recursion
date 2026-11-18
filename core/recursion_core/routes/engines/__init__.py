@@ -84,5 +84,10 @@ class EngineTable:
         """``(name, factory)`` in the same order."""
         return iter(tuple(self._factories.items()))
 
+    def registered(self) -> tuple:
+        """The engines a lane registered a factory for, in the same order: a seeded one that was replaced, by
+        whatever factory, and every one that was added. Empty for a new table."""
+        return tuple(name for name in self._factories if name in self._replaced or name not in SEEDED)
+
     def __contains__(self, name) -> bool:
         return name in self._factories

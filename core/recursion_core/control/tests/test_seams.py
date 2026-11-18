@@ -48,12 +48,14 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import copy
 import dis
 import hashlib
 import importlib
 import importlib.util
 import inspect
 import io
+import itertools
 import json
 import logging
 import os
@@ -61,6 +63,7 @@ import pathlib
 import shutil
 import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -69,7 +72,9 @@ import unittest
 import weakref
 from unittest import mock
 
-from recursion_core.control import commands, hooks as H, methods
+from recursion_core.control import api as A, cli, commands, hooks as H, methods
+from recursion_core.control.registry import InMemoryRunRegistry
+from recursion_core.control.tests.fakes import FakeKillTree, run_ids
 from recursion_core.routes import ClaudeCodeAdapter, CodexAdapter, engines
 
 REPO = pathlib.Path(__file__).resolve().parents[4]
@@ -719,6 +724,28 @@ class RegistrationTest(unittest.TestCase):
             self.assertIn(sentence, text)
 
     def test_a_registrant_whose_parent_package_is_absent_is_skipped(self) -> None:
+        """Whatever lanes this tree has, now or later: the absence is made for the test. Where the composition
+        asks whether a package or a module outside the core is there, it is told no. Each registrant is then
+        asked for once, at the outermost thing it needs that is not part of the core, and no further; nothing
+        of it is imported; and nothing registers. (It used to rely on one lane's package not being in the
+        tree, which stops being true the day that lane lands.)"""
+        find_spec, asked = importlib.util.find_spec, []
+
+        def absent(name, package=None):
+            asked.append(name)
+            return find_spec(name, package) if name in CORE_PACKAGES else None
+        before = set(sys.modules)
+        with mock.patch.object(importlib.util, 'find_spec', absent):
+            composed = H.compose()
+        outermost = []
+        for name in H.REGISTRANTS:
+            parts = name.split('.')
+            above = ['.'.join(parts[:depth]) for depth in range(1, len(parts) + 1)]
+            outermost.append(next(item for item in above if item not in CORE_PACKAGES))
+        self.assertEqual(asked, outermost, 'absent is decided at the first thing that is not there, before any import')
+        self.assertEqual(set(sys.modules) - before, set(), 'nothing was imported for a registrant that is not there')
+        self.assertEqual((composed.methods.registered(), composed.commands.names(), composed.engines.names()),
+                         ((), (), ('claude_code', 'codex')))
         """Whatever lanes this tree has, now or later. The keys package's absence is made for the test, as the
         real finder shows it: asked for the package, it says None; asked for anything below it, it raises
         ModuleNotFoundError naming the package. Whatever of the package is already imported is set aside for the
@@ -767,6 +794,7 @@ class RegistrationTest(unittest.TestCase):
         self.assertIn('ModuleNotFoundError', str(caught.exception))
         self.assertIn('recursion_core.keys.hooks', str(caught.exception))
         self.assertIsInstance(caught.exception.__cause__, ModuleNotFoundError)
+        self.assertEqual(caught.exception.registrant, 'recursion_core.keys.hooks', 'and it is told beside the text')
 
     def test_a_hooks_module_that_raises_on_import_fails_composition(self) -> None:
         self.fake.lane('keys', hooks='raise RuntimeError("at import")\n')
@@ -823,6 +851,39 @@ class RegistrationTest(unittest.TestCase):
         with self.assertRaises(H.HookError) as caught:
             H.compose()
         self.assertIn('authorize', str(caught.exception))
+        # An error of the hooks' own keeps its text; the registrant composition stopped at is told beside it.
+        self.assertEqual((caught.exception.registrant, str(caught.exception)),
+                         ('recursion_core.events.hooks', "hook 'authorize' already has a registrant"))
+
+    def test_an_error_that_takes_no_attribute_leaves_composition_as_the_lane_raised_it(self) -> None:
+        """A lane's own error class may refuse an attribute. Composition then raises the lane's error as it was
+        raised, the same object, and no registrant is told beside it: the name is an aid to the CLI's line and
+        never worth another exception in the error's place. (An eighth read: the note itself had raised.)"""
+        package = self.fake.lane('keys', hooks=(
+            'from recursion_core.control import hooks as H\n\n\n'
+            'class Locked(H.HookError):\n'
+            '    def __setattr__(self, key, value):\n'
+            '        if not key.startswith("__"):       # (what Python and unittest themselves set on an error stays settable)\n'
+            '            raise RuntimeError("this error takes no attribute")\n'
+            '        super().__setattr__(key, value)\n\n\n'
+            'REFUSAL = Locked("the refusal of the lane itself")\n\n\n'
+            'def register(hooks):\n'
+            '    raise REFUSAL\n'))
+        with self.assertRaises(H.HookError) as caught:
+            H.compose()
+        self.assertIs(caught.exception, sys.modules[f'{package}.hooks'].REFUSAL)
+        self.assertEqual((str(caught.exception), caught.exception.registrant), ('the refusal of the lane itself', None))
+
+    def test_what_fails_after_the_last_registrant_names_no_registrant(self) -> None:
+        """The check that is made when the tables close is no one registrant's, and neither is an error that no
+        composition raised: each names none. (The CLI's line then says only that the registrants could not be
+        composed.)"""
+        nobodys = H.HookError("method 'session.list' needs the service 'sessions', which nobody registered")
+        self.assertIsNone(nobodys.registrant)
+        with mock.patch.object(H.Hooks, 'freeze', side_effect=nobodys), self.assertRaises(H.HookError) as caught:
+            H.compose()
+        self.assertIs(caught.exception, nobodys)
+        self.assertIsNone(caught.exception.registrant)
 
     def test_two_registrants_for_one_method_fail_composition(self) -> None:
         text = 'def register(hooks):\n    hooks.methods.register("session.list", lambda ctx, params: {"code": "ok"})\n'
@@ -1504,7 +1565,7 @@ class CommandTableTest(unittest.TestCase):
                 with self.assertRaises(commands.CommandTableError):
                     table.register((name,), lambda sub: None, lambda args, client: 0)
         table.register(('session',), lambda sub: sub.add_parser('session'), lambda args, client: 0)
-        for names in (('session',), ('queue', 'session'), ('a', 'a'), (), 'session', ('',)):
+        for names in (('session',), ('queue', 'session'), ('a', 'a'), (), 'session', ('',), (' ',), ('\n',), ('queue', ' ')):
             with self.subTest(names=names):
                 with self.assertRaises(commands.CommandTableError):
                     table.register(names, lambda sub: None, lambda args, client: 0)
@@ -1584,6 +1645,15 @@ class EngineTableTest(unittest.TestCase):
             table.register('claude_code', factory, replace=True)
         with self.assertRaises(engines.EngineTableError):
             table.register('hermes', 'not a function')
+
+    def test_the_table_says_which_engines_a_lane_registered(self) -> None:
+        table, factory = engines.EngineTable(), lambda *a, **k: None
+        self.assertEqual(table.registered(), (), 'a new table: its two factories are nobody\'s registration')
+        table.register('pi', factory)
+        self.assertEqual(table.registered(), ('pi',))
+        table.register('codex', CodexAdapter, replace=True)
+        self.assertEqual(table.registered(), ('codex', 'pi'), 'a seeded factory replaced, by itself even, is a registration')
+        self.assertEqual(engines.EngineTable().registered(), (), 'and another table knows nothing of it')
 
     def test_two_compositions_do_not_share_a_table(self) -> None:
         one, two = H.bare(), H.bare()
@@ -1764,10 +1834,174 @@ class AdmissionTest(unittest.TestCase):
             register(made)
             made.freeze()
             self.assertTrue(made.gate.enabled)
-        made = H.Hooks()
-        made.set('authorize', lambda principal, method, params: None)
-        made.freeze()
-        self.assertFalse(made.gate.enabled, 'a hook that holds no resource does not need the gate')
+
+    # Every way there is to register something into the hooks, each as a lane would do it and nothing else.
+    REGISTRATIONS = {
+        **{f'the single hook {name}': (lambda made, name=name: made.set(name, lambda *args: None)) for name in H.SINGLE},
+        'a start registrant': lambda made: made.start_registrant('routing', (), (), lambda principal, request: {}),
+        'a service': lambda made: made.service(Service('events')),
+        'the change marker': lambda made: made.enable_changes(),
+        'a method handler': lambda made: made.methods.register('session.list', lambda ctx, params: {'code': 'ok'}),
+        'a command family': lambda made: made.commands.register(('x',), lambda sub: None, lambda args, client: 0),
+        'an engine factory': lambda made: made.engines.register('pi', lambda *a, **k: None),
+        'a seeded engine factory, replaced': lambda made: made.engines.register('codex', lambda *a, **k: None, replace=True),
+        'a seeded engine factory, replaced by itself': lambda made: made.engines.register('claude_code', ClaudeCodeAdapter, replace=True),
+    }
+
+    def test_the_gate_is_on_when_anything_at_all_is_registered_and_off_only_for_the_bare_composition(self) -> None:
+        """ONE RULE, with no exemption (``Hooks.anything_registered``). Three rounds of reads each found another
+        set of hooks that left the gate off. This holds the rule for every way of registering there is, each
+        alone and each pair: with any of them the gate is on, admits a call, and once closing has begun admits
+        none and does no work that was to be done while it is open. With nothing registered it is off, and a
+        call is admitted and the work is done after closing has begun, as before the seams.
+
+        The list of ways is held against the code, so that one which is added later and forgotten here fails
+        this test: every name of ``SINGLE``; every method of ``Hooks`` that registers (each asks whether the
+        hooks are frozen); every table the hooks carry; and in each table every method that refuses once the
+        table is closed, which is one, ``register``."""
+        kinds = self.REGISTRATIONS
+        self.assertEqual(len(kinds), 16)
+        self.assertEqual([name for name in H.SINGLE if f'the single hook {name}' not in kinds], [])
+        registering = sorted(name for name, function in vars(H.Hooks).items()
+                             if inspect.isfunction(function) and 'self._open(' in inspect.getsource(function) and name != '_open')
+        self.assertEqual(registering, ['enable_changes', 'service', 'set', 'start_registrant'], 'the methods of Hooks that register')
+        looked_at = H.Hooks()
+        looked_at.engines                 # the engine table is made on first use
+        tables = {name: value for name, value in vars(looked_at).items() if callable(getattr(value, 'register', None))}
+        self.assertEqual(sorted(tables), ['_engines', 'commands', 'methods'], 'the tables a lane registers into')
+        for name, table in tables.items():
+            refusing = sorted(method for method, function in vars(type(table)).items()
+                              if inspect.isfunction(function) and 'if self._frozen' in inspect.getsource(function))
+            self.assertEqual(refusing, ['register'], f'{name}: the methods that refuse once the table is closed')
+        self.assertEqual((looked_at.methods.registered(), looked_at.commands.names(), looked_at.engines.registered()), ((), (), ()))
+        for made, what in ((H.Hooks(), 'nothing registered'), (looked_at, 'tables that were only looked at')):
+            done = []
+            made.freeze()
+            self.assertEqual((made.anything_registered(), made.gate.enabled), (False, False), what)
+            made.begin_close()
+            self.assertEqual((made.gate.enter(), made.gate.while_open(lambda: done.append(1)), done), (True, True, [1]),
+                             f'{what}: a call is admitted and the work is done, as before the seams')
+        for names in itertools.chain(itertools.combinations(kinds, 1), itertools.combinations(kinds, 2)):
+            with self.subTest(registered=names):
+                made, done = H.Hooks(), []
+                for name in names:
+                    kinds[name](made)
+                made.freeze()
+                self.assertEqual((made.anything_registered(), made.gate.enabled), (True, True))
+                self.assertTrue(made.gate.enter())
+                made.gate.leave()
+                made.begin_close()
+                self.assertEqual((made.gate.enter(), made.gate.while_open(lambda: done.append(1)), done), (False, False, []),
+                                 'once closing has begun nothing is admitted and nothing is done while_open')
+
+    @quiet
+    def test_an_interrupted_rollback_changes_the_admitted_count_once(self) -> None:
+        """Asked for by both round-4 reads of the scopes lane's draft (#385), which stands on these files. A call
+        is admitted and then interrupted, so ``enter`` steps back out of the count. Stepping back is interrupted
+        too, inside ``notify_all``, and the region goes round again. The count it steps back from is the one it
+        read the first time round (``back``), so the second time takes nothing more away: 0, and not -1."""
+        gate = H.Admission()
+        gate.enabled = True
+        first, second = KeyboardInterrupt('while taking the gate'), KeyboardInterrupt('while waking the drain')
+        take, notify, counts = H.take_once, gate._changed.notify_all, []
+
+        def interrupted_take(lock, errors):
+            take(lock, errors)
+            errors.append(first)
+
+        def interrupted_notify():
+            counts.append(gate._admitted)
+            if len(counts) == 1:
+                raise second
+            notify()
+        with mock.patch.object(H, 'take_once', interrupted_take), mock.patch.object(gate._changed, 'notify_all', interrupted_notify):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                gate.enter()
+        self.assertIs(caught.exception, first)
+        self.assertEqual(counts, [0, 0], 'going round again takes no second admission away')
+        self.assertEqual((gate.admitted, gate._lock._is_owned()), (0, False))
+        self.assertTrue(gate.enter(), 'and the gate still admits')
+        gate.leave()
+        self.assertEqual(gate.admitted, 0)
+
+    def test_while_open_does_its_work_with_the_gate_held_open_and_a_close_that_begins_then_waits_for_it(self) -> None:
+        """To ask whether the gate is closed and then to act is two steps, and a close can begin between them.
+        ``while_open`` makes them one step for ``close``: the work is inside when a close begins, the close finds
+        the gate's condition taken and WAITS, and the gate is open from the work's first moment to its last.
+        Nothing is traced: the condition itself says whether the closing thread found it free, which no schedule
+        decides once the work is inside. Once the gate is closed the work is not done at all."""
+        gate, inside, leave, moved = H.Admission(), threading.Event(), threading.Event(), threading.Event()
+        gate.enabled = True
+        seen, found_taken, answers = [], [], []
+        self.addCleanup(leave.set)
+        condition = gate._lock
+
+        class Asked:
+            """The gate's condition's lock, writing down whether the closing thread found it taken."""
+
+            def acquire(inner, *how):
+                if threading.current_thread().name == 'the close' and not how:
+                    free = condition.acquire(False)
+                    found_taken.append(not free)
+                    moved.set()
+                    if free:
+                        return True
+                return condition.acquire(*how)
+
+            def release(inner) -> None:
+                condition.release()
+
+            def _is_owned(inner) -> bool:
+                return condition._is_owned()
+        gate._lock = Asked()
+
+        def work() -> None:
+            seen.append(gate.closed)
+            inside.set()
+            leave.wait(BOUND_S)
+            seen.append(gate.closed)
+        working = threading.Thread(target=lambda: answers.append(gate.while_open(work)), daemon=True)
+        close = threading.Thread(target=gate.close, name='the close', daemon=True)
+        working.start()
+        self.assertTrue(inside.wait(BOUND_S), 'the work is inside')
+        close.start()
+        self.assertTrue(moved.wait(BOUND_S), 'the close asked for the gate')
+        self.assertEqual((found_taken, gate.closed), ([True], False), 'the close WAITS, with the gate still open')
+        leave.set()
+        working.join(BOUND_S)
+        close.join(BOUND_S)
+        self.assertEqual((answers, seen, gate.closed), ([True], [False, False], True))
+        self.assertEqual((gate.while_open(lambda: seen.append('late')), seen), (False, [False, False]), 'closed: nothing is done')
+
+    def test_while_open_with_the_gate_off_simply_does_its_work(self) -> None:
+        """With nothing registered the gate is off, and what asks it is what it was before the seams: a close
+        of the composition, which shuts that gate all the same, does not keep the work from being done."""
+        gate, done = H.Admission(), []
+        gate.close()
+        self.assertEqual((gate.enabled, gate.closed, gate.while_open(lambda: done.append(1)), done), (False, True, True, [1]))
+
+    def test_what_ends_the_work_of_while_open_is_raised_with_the_gate_free_again(self) -> None:
+        """A failure of the work is raised and the work is not asked again. An interruption may have landed
+        before the work began, which nothing can tell from outside it: the work is asked once more, and what ends
+        that second asking is final, so a piece of work that is interrupted every time is not asked for ever."""
+        for ending, times in ((ValueError('the work failed'), 1), (KeyboardInterrupt('the work was interrupted'), 2)):
+            with self.subTest(ending=type(ending).__name__):
+                gate, asked = H.Admission(), []
+                gate.enabled = True
+
+                def work(gate=gate, asked=asked, ending=ending) -> None:
+                    asked.append(gate._lock._is_owned())
+                    if len(asked) < 6:      # so that a gate which asked for ever would fail here, and not hang
+                        raise ending
+                with self.assertRaises(type(ending)) as caught:
+                    gate.while_open(work)
+                self.assertIs(caught.exception, ending)
+                self.assertEqual((asked, gate._lock._is_owned(), gate.closed), ([True] * times, False, False),
+                                 'asked holding the condition; the condition is free again and the gate is open')
+                self.assertTrue(gate.enter(), 'the gate goes on admitting')
+                gate.leave()
+                gate.close()
+                self.assertTrue(gate.closed)
 
     def test_no_call_is_admitted_after_closing_began(self) -> None:
         gate = H.Admission()
@@ -3557,6 +3791,8 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         'Admission.leave': (lambda self: self.leaving(), lambda gate: gate.leave(), lambda gate: gate._lock,
                             lambda gate: gate.admitted == 0),
         'Admission.close': (lambda self: self.gate(), lambda gate: gate.close(), lambda gate: gate._lock, lambda gate: gate.closed),
+        'Admission.while_open': (lambda self: (self.gate(), []), lambda pair: pair[0].while_open(lambda: pair[1].append('done')),
+                                 lambda pair: pair[0]._lock, lambda pair: len(pair[1]) >= 1),
         'Admission.drain': (lambda self: self.draining(), lambda gate: gate.drain(), lambda gate: gate._lock,
                             lambda gate: gate.admitted == 0),
         'Hooks.stop_services': (lambda self: self.lifecycle(), lambda pair: pair[0].stop_services(H.ServiceContext()),
@@ -3575,6 +3811,7 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         'Admission.enter': lambda gate: (gate.closed, gate.admitted),
         'Admission.leave': lambda gate: (gate.closed, gate.admitted),
         'Admission.close': lambda gate: (gate.closed, gate.admitted),
+        'Admission.while_open': lambda pair: (pair[0].closed, pair[0].admitted, len(pair[1])),
         'Admission.drain': lambda gate: (gate.closed, gate.admitted),
         'Hooks.stop_services': _teardown_touches,
         'Hooks.finish_close': _teardown_touches,
@@ -3585,7 +3822,7 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
 
     def test_the_regions_have_no_loop_no_try_and_no_with_written_in_them(self) -> None:
         for owner, name in (('Admission', 'enter'), ('Admission', 'leave'), ('Admission', 'close'), ('Admission', 'drain'),
-                            ('Hooks', 'stop_services'), ('Hooks', 'finish_close')):
+                            ('Admission', 'while_open'), ('Hooks', 'stop_services'), ('Hooks', 'finish_close')):
             with self.subTest(region=f'{owner}.{name}'):
                 self.straight(H, owner, name)
 
@@ -3623,6 +3860,13 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
         self.walk('Admission.drain', self.EVENTS)
 
     @quiet
+    def test_work_done_while_the_gate_is_held_open_at_every_event(self) -> None:
+        """The work is the caller's, here one line of the test's own, which is not walked: every point of the
+        region around it is. An interruption that lands as the work has just returned has it done a second time,
+        which is why the work is something that may be done twice; "done" is read as at least once."""
+        self.walk('Admission.while_open', self.EVENTS)
+
+    @quiet
     def test_stopping_the_services_at_every_event(self) -> None:
         self.walk('Hooks.stop_services', self.EVENTS)
 
@@ -3649,6 +3893,10 @@ class OwnershipRegionTest(RegionWalk, unittest.TestCase):
     @quiet
     def test_the_gates_drain_at_every_instruction(self) -> None:
         self.by_instruction('Admission.drain')
+
+    @quiet
+    def test_work_done_while_the_gate_is_held_open_at_every_instruction(self) -> None:
+        self.by_instruction('Admission.while_open')
 
     @quiet
     def test_stopping_the_services_at_every_instruction(self) -> None:
@@ -4468,6 +4716,680 @@ class AncestorDiscoveryTest(unittest.TestCase):
         fake.lane('control.mcp', init='raise RuntimeError("this package does not import")\n')
         with self.assertRaises(H.HookError):
             H.compose()
+
+
+# ======================================================================================================
+# The calls that control/api.py and control/cli.py make into the seams (S1, S2, S6). With nothing
+# registered both files answer as they did before; that is shown here against the control API built
+# the old way, and for every existing test by the suite itself.
+
+def control_api(registry=None, starter=None, *, table=None, start_hooks=None, ids=None, launchable=None):
+    registry = InMemoryRunRegistry() if registry is None else registry
+    starter = Recorder() if starter is None else starter
+    made = A.ControlAPI(registry, FakeKillTree(), starter, clock=lambda: 1000.0, new_run_id=ids or run_ids(),
+                        methods=table, start_hooks=start_hooks, launchable=launchable)
+    return made, registry, starter
+
+
+class Recorder:
+    """A starter that keeps what it was called with: ``(params,)`` on the base's path, ``(params, record)`` on
+    the versioned one. The first ``fail`` launches raise; with ``cgroup`` False a launch hands back no cgroup."""
+
+    def __init__(self, fail: int = 0, cgroup: bool = True) -> None:
+        self.calls, self.fail, self.cgroup = [], fail, cgroup
+
+    def __call__(self, *args) -> dict:
+        self.calls.append(copy.deepcopy(args))
+        if self.fail:
+            self.fail -= 1
+            raise RuntimeError('refused')
+        return {'cgroup': f"/sys/fs/cgroup/fake/{args[0]['run_id']}"} if self.cgroup else {}
+
+
+class ApiMethodSeamTest(unittest.TestCase):
+    """Seam S1 at the control API: a method that is not ``run.*`` is answered by the table's dispatcher."""
+
+    def test_a_method_that_is_not_a_run_method_goes_to_the_table_with_its_params_and_the_principal(self) -> None:
+        seen = []
+
+        def table(method, params, principal):
+            seen.append((method, params, principal))
+            return {'code': 'ok', 'from': 'the table'}
+        api, _, _ = control_api(table=table)
+        self.assertEqual(api.call('session.create', {'title': 'x'}, H.DEVICE), {'code': 'ok', 'from': 'the table'})
+        self.assertEqual(api.call('methods.list'), {'code': 'ok', 'from': 'the table'})
+        self.assertEqual(seen, [('session.create', {'title': 'x'}, H.DEVICE), ('methods.list', {}, None)])
+
+    def test_no_run_method_reaches_the_table(self) -> None:
+        seen = []
+        api, _, starter = control_api(table=lambda *call: seen.append(call) or {'code': 'ok'})
+        for method in ('run.kill', 'run.', 'run.events', 'run.interrupt'):
+            self.assertEqual(api.call(method, {}, H.DEVICE), {'code': 'method_unknown', 'detail': method})
+        self.assertEqual(api.call('run.start', {'tenant': 't1', 'engine': 'codex', 'prompt': 'p'}, H.DEVICE)['code'], 'started')
+        self.assertEqual(api.call('run.status', {'run_id': 'run-1'}, H.DEVICE)['code'], 'ok')
+        self.assertEqual(api.call('run.list', {}, H.DEVICE)['code'], 'ok')
+        self.assertEqual(api.call('run.stop', {'run_id': 'run-9'}, H.DEVICE)['code'], 'run_unknown')
+        self.assertEqual(seen, [])
+        self.assertEqual(len(starter.calls[0]), 1, 'with the versioned path off the starter is called as before')
+
+    def test_without_a_table_every_other_method_is_unknown_as_before(self) -> None:
+        api, _, _ = control_api()
+        for method in ('session.create', 'methods.list', 'route.list', None, 7):
+            self.assertEqual(api.call(method), {'code': 'method_unknown', 'detail': str(method)})
+
+    def test_through_the_real_table_with_nothing_registered(self) -> None:
+        made = H.bare()
+        api, _, _ = control_api(table=lambda method, params, principal: made.methods.dispatch(
+            method, params, principal, lambda inner, inner_params=None: api.call(inner, inner_params, principal)))
+        listed = api.call('methods.list', {}, H.OWNER)
+        self.assertEqual((listed['code'], listed['table_version']), ('ok', methods.TABLE_VERSION))
+        unbuilt = next(name for name in methods.METHODS if name not in methods.MANDATORY)
+        self.assertEqual(api.call(unbuilt, {}, H.OWNER), {'code': 'unsupported', 'detail': 'not_implemented'})
+        # A name the published table does not have stays unknown, and so do the two the control object answers.
+        for method in ('nope.method', 'route.list', 'plugin.list'):
+            self.assertEqual(api.call(method, {}, H.OWNER), {'code': 'method_unknown', 'detail': method})
+
+
+class Client:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def call(self, method, params=None) -> dict:
+        self.calls.append((method, params))
+        return {'code': 'ok', 'runs': []}
+
+
+class CliSeamTest(unittest.TestCase):
+    """Seam S2 at the CLI: a registered command is dispatched; everything else is what it was."""
+
+    def table(self, seen, status=3):
+        def add(sub):
+            sub.add_parser('session').add_argument('session_id')
+
+        def dispatch(args, client):
+            seen.append((args.command, args.session_id, client, args.out, args.err))
+            print('{"code": "ok"}', file=args.out)
+            return status
+        made = commands.CommandTable()
+        made.register(('session',), add, dispatch)
+        made.freeze()
+        return made
+
+    def run_main(self, argv, table):
+        client, out, err = Client(), io.StringIO(), io.StringIO()
+        return cli.main(argv, client, out, err, commands=table), out.getvalue(), err.getvalue(), client.calls
+
+    def test_a_registered_command_is_dispatched_with_its_arguments_the_client_and_the_streams(self) -> None:
+        seen, client, out, err = [], Client(), io.StringIO(), io.StringIO()
+        self.assertEqual(cli.main(['session', 'ses-1'], client, out, err, commands=self.table(seen)), 3)
+        self.assertEqual(seen, [('session', 'ses-1', client, out, err)])
+        self.assertEqual((client.calls, out.getvalue(), err.getvalue()), ([], '{"code": "ok"}\n', ''))
+
+    def test_a_name_nobody_registered_is_a_usage_error_and_never_a_start(self) -> None:
+        for table in (None, commands.CommandTable(), self.table([])):
+            with self.subTest(table=table):
+                status, out, err, calls = self.run_main(['sesion', 'ses-1'], table)
+                self.assertEqual((status, out, calls), (cli.EXIT_USAGE, '', []))
+                self.assertTrue(err.startswith('usage error: '), err)
+
+    def test_the_five_commands_answer_the_same_with_a_table_and_without(self) -> None:
+        for argv in (['list'], ['status', 'run-1'], ['stop', 'run-1'], ['conditions'], ['start'], ['list', 'extra'], [],
+                     ['start', '--tenant', 't', '--engine', 'codex', '--prompt', 'p', '--client-key', 'k'],
+                     ['start', '--tenant', 't', '--engine', 'codex', '--prompt', 'p', '--workspace', '/a']):
+            with self.subTest(argv=argv):
+                base = self.run_main(argv, None)
+                self.assertEqual(self.run_main(argv, commands.CommandTable()), base)
+                self.assertEqual(self.run_main(argv, self.table([])), base)
+        # With no family registered, a wrong name is refused in the base's own words.
+        self.assertEqual(self.run_main(['bogus'], commands.CommandTable()), self.run_main(['bogus'], None))
+
+    def test_a_family_that_breaks_the_tables_rules_stops_the_cli_before_any_command_runs(self) -> None:
+        def add(sub):
+            sub.add_parser('workspace')
+            sub.choices['start'].add_argument('--workspace')
+        made = commands.CommandTable()
+        made.register(('workspace',), add, lambda args, client: 0)
+        made.freeze()
+        for argv in (['list'], ['workspace'], ['start', '--tenant', 't', '--engine', 'codex', '--prompt', 'p', '--workspace', '/a']):
+            with self.subTest(argv=argv):
+                status, out, err, calls = self.run_main(argv, made)
+                self.assertEqual((status, calls, err), (cli.EXIT_ERROR, [], ''))
+                answer = json.loads(out)
+                self.assertEqual(answer['code'], 'control_api_unavailable')
+                self.assertTrue(answer['detail'].startswith('commands:'), answer)
+        status, out, _, calls = self.run_main(['session', 'ses-1'], self.table([], status='done'))
+        self.assertEqual((status, calls), (cli.EXIT_ERROR, []))
+        self.assertEqual(json.loads(out.splitlines()[-1])['code'], 'control_api_unavailable')
+
+    def test_run_composes_the_hooks_and_dispatches_what_a_lane_registered(self) -> None:
+        seen = []
+        made = H.Hooks()
+        made.commands.register(('session',), lambda sub: sub.add_parser('session').add_argument('session_id'),
+                               lambda args, client: seen.append((args.command, args.session_id, client)) or 0)
+        made.freeze()
+        client = Client()
+        with mock.patch.object(H, 'compose', lambda: made):
+            self.assertEqual(cli.run(['session', 'ses-1'], lambda: client), 0)
+        self.assertEqual(seen, [('session', 'ses-1', client)])
+
+    def test_the_five_commands_never_compose_and_a_broken_registrant_stops_only_a_command_that_is_not_one_of_them(self) -> None:
+        client = Client()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cli.run(['list'], lambda: client), cli.EXIT_OK)
+        status, base_out, _, base_calls = self.run_main(['list'], None)
+        self.assertEqual((cli.EXIT_OK, out.getvalue(), client.calls), (status, base_out, base_calls))
+        # A registrant that is installed and broken. The CLI's own five commands answer what they answer with no
+        # table at all, and the composition is not asked: nothing of a lane is discovered or imported for them.
+        five = (['list'], ['status', 'run-1'], ['stop', 'run-1'],
+                ['start', '--tenant', 't', '--engine', 'codex', '--prompt', 'p'], ['conditions'])
+        self.assertEqual(tuple(argv[0] for argv in five), commands.BUILT_IN)
+        self.assertEqual(cli.BUILT_IN, commands.BUILT_IN, "the CLI's own five are the names no family may register")
+        for argv in five:
+            with self.subTest(argv=argv):
+                client = Client()
+                with mock.patch.object(H, 'compose', side_effect=H.HookError('registrant x: ImportError: boom')) as compose, \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    status = cli.run(argv, lambda: client)
+                base_status, base_out, _, base_calls = self.run_main(argv, None)
+                self.assertEqual((status, out.getvalue(), client.calls), (base_status, base_out, base_calls))
+                self.assertNotEqual(client.calls, [], 'the command reached the client')
+                compose.assert_not_called()
+        # A NAMED command that is not one of the five needs the families, and then the broken registrant stops it,
+        # loudly, before the client: a registered name, and a name nobody could tell from one.
+        for argv in (['session', 'ses-1'], ['bogus']):
+            with self.subTest(argv=argv):
+                client = Client()
+                with mock.patch.object(H, 'compose', side_effect=H.HookError('registrant x: ImportError: boom')), \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(cli.run(argv, lambda: client), cli.EXIT_ERROR)
+                self.assertEqual(json.loads(out.getvalue()), {'code': 'control_api_unavailable', 'detail': 'hooks:HookError'})
+                self.assertEqual(client.calls, [])
+
+    def test_a_broken_registrant_does_not_take_away_the_clis_own_help_or_its_own_usage_error(self) -> None:
+        """An argv that names no command is the CLI's own business: help, or its own usage error. With a
+        registrant that is installed and broken both are answered exactly as with no table at all, after one line
+        on stderr which says that a registrant is broken, and which, so that the help is never taken for the whole
+        of it. The registrants here are composed, not stood in for: one whose import fails, two that claim one
+        hook (the second is where composition stops), and a failure that is no one registrant's, which names
+        none. (A seventh read; before it help and the usage error were stopped too.)"""
+        claims = 'def register(hooks):\n    hooks.set("authorize", lambda principal, method, params: None)\n'
+        for lanes, what in (({'keys': 'raise RuntimeError("at import")\n'}, 'registrant recursion_core.keys.hooks is broken'),
+                            ({'keys': claims, 'events': claims}, 'registrant recursion_core.events.hooks is broken'),
+                            ({}, 'the registrants could not be composed')):
+            fake = FakeLanes(self)
+            fake.stand_in_for_the_installed()
+            for lane, text in lanes.items():
+                fake.lane(lane, hooks=text)
+            note = f"{what} (hooks:HookError): registered commands are missing, these are only the CLI's own\n"
+            # (An eighth read: an empty word and a blank one name no command either, and no family can register one.)
+            for argv in ([], [''], [' '], ['\n'], ['--help'], ['-h'], ['--no-such-option']):
+                with self.subTest(lanes=sorted(lanes), argv=argv):
+                    answers = []
+                    for composed in (False, True):  # the CLI with no table; then the same argv, composed
+                        client, out, err = Client(), io.StringIO(), io.StringIO()
+                        # With no lane installed, what fails is the check made after the last registrant.
+                        fails = mock.patch.object(H.Hooks, 'freeze', side_effect=H.HookError('of no one registrant'))
+                        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                            try:
+                                if not composed:
+                                    status = cli.main(argv, client)
+                                else:
+                                    with contextlib.nullcontext() if lanes else fails:
+                                        status = cli.run(argv, lambda: client)
+                            except SystemExit as left:  # argparse prints its help and leaves
+                                status = ('left', left.code)
+                        answers.append((status, out.getvalue(), err.getvalue(), client.calls))
+                    (status, out, err, calls), under_the_broken_one = answers
+                    self.assertEqual(under_the_broken_one, (status, out, note + err, calls))
+                    self.assertEqual(calls, [], 'no command was named, so the client is not asked')
+                    self.assertIn(status, (('left', 0), cli.EXIT_USAGE))
+            self.doCleanups()       # this case's lanes are gone before the next case installs its own
+
+
+class CliImportTest(unittest.TestCase):
+    """What importing the CLI loads, in a process of its own: the five commands cost what they cost before the
+    seams, so none of the seam modules is loaded for them. (It is told in a fresh process because this one has
+    them all loaded already.)"""
+
+    SEAM_MODULES = {'recursion_core.control.hooks', 'recursion_core.control.methods', 'recursion_core.control.commands',
+                    'recursion_core.routes.engines'}
+    CODE = (
+        "import contextlib, io, json, sys\n"
+        "from recursion_core.control import cli\n"
+        "class Client:\n"
+        "    def call(self, method, params=None):\n"
+        "        return {'code': 'ok', 'runs': []}\n"
+        "loaded = {'import': sorted(name for name in sys.modules if name.startswith('recursion_core'))}\n"
+        "statuses = []\n"
+        "for argv in (['list'], ['status', 'run-1'], ['stop', 'run-1'],\n"
+        "             ['start', '--tenant', 't', '--engine', 'codex', '--prompt', 'p'], ['conditions']):\n"
+        "    with contextlib.redirect_stdout(io.StringIO()):\n"
+        "        statuses.append(cli.run(argv, Client))\n"
+        "loaded['five'] = sorted(name for name in sys.modules if name.startswith('recursion_core'))\n"
+        "with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):\n"
+        "    statuses.append(cli.run(['session', 'ses-1'], Client))\n"
+        "loaded['other'] = sorted(name for name in sys.modules if name.startswith('recursion_core'))\n"
+        "print(json.dumps({'loaded': loaded, 'statuses': statuses}))\n")
+
+    def test_the_cli_and_its_five_commands_load_none_of_the_seam_modules(self) -> None:
+        core = str(pathlib.Path(H.__file__).resolve().parents[2])
+        done = subprocess.run([sys.executable, '-B', '-c', self.CODE], capture_output=True, text=True, check=False,
+                              env={**os.environ, 'PYTHONPATH': core})
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        told = json.loads(done.stdout)
+        self.assertEqual(told['statuses'][:5], [cli.EXIT_OK] * 5, 'each of the five ran')
+        for when in ('import', 'five'):
+            self.assertEqual(self.SEAM_MODULES & set(told['loaded'][when]), set(), f'after {when}')
+        self.assertIn('recursion_core.control.cli', told['loaded']['import'])
+        # Anything else needs the families: only then are the seam modules brought in.
+        self.assertEqual(told['statuses'][5], cli.EXIT_USAGE, 'a name nobody registered, with nothing installed')
+        self.assertLessEqual({'recursion_core.control.hooks', 'recursion_core.control.commands'}, set(told['loaded']['other']))
+
+
+KEYED = {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'client_key': 'k1'}
+P_SHA = hashlib.sha256(b'p').hexdigest()
+# What a client might add to a start. Today's start ignores every one of them.
+EXTRA = {'workspace': {'path': '/home/dev/projects/atlas'}, 'hand_pick': {'engine': 'codex'}, 'containment_level': 'contained',
+         'principal': {'kind': 'plugin', 'id': 'notes.search'}, 'owner': 'notes.search', 'budget': {'cap_usd': 99},
+         'session_id': 'ses-forged', 'turn_id': 'turn-forged', 'labels': {'team': 'x'}}
+
+
+def stored(registry) -> str:
+    return json.dumps(registry.list(), sort_keys=True)
+
+
+class StartPathOffTest(unittest.TestCase):
+    """Seam S6 with no start registrant: start, _start and _retry are the base's."""
+
+    def variants(self):
+        """The control API built as before the seams; with hooks nobody registered into; and with hooks that carry
+        other lanes' registrations but no start registrant."""
+        other = H.Hooks()
+        other.set('authorize', lambda principal, method, params: None)
+        other.set('launch_check', lambda ctx, executable: None)
+        other.freeze()
+        return {'no hooks': None, 'nothing registered': H.bare(), 'no start registrant': other}
+
+    def test_the_stored_record_its_start_key_and_what_the_starter_gets_are_the_bases(self) -> None:
+        seen = {}
+        for name, made in self.variants().items():
+            api, registry, starter = control_api(start_hooks=made)
+            unkeyed = api.call('run.start', {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', **EXTRA}, H.DEVICE)
+            keyed = api.call('run.start', {**KEYED, **EXTRA}, H.DEVICE)
+            seen[name] = (unkeyed, keyed, stored(registry), starter.calls)
+            one, two = registry.get('run-1'), registry.get('run-2')
+            self.assertIn('start_key', one, 'an unkeyed record has the member, and it is null')
+            self.assertIsNone(one['start_key'])
+            self.assertEqual(two['start_key'], {'client_key': 'k1', 'engine': 'codex', 'prompt_sha256': P_SHA})
+            for record in (one, two):
+                self.assertEqual(set(record) & {'principal', 'launch', *EXTRA}, set(), name)
+            # The starter is called with one argument: the request as it came, and the run id.
+            self.assertEqual(starter.calls, [({'tenant': 't1', 'engine': 'codex', 'prompt': 'p', **EXTRA, 'run_id': 'run-1'},),
+                                             ({**KEYED, **EXTRA, 'run_id': 'run-2'},)])
+        self.assertEqual(seen['nothing registered'], seen['no hooks'])
+        self.assertEqual(seen['no start registrant'], seen['no hooks'])
+
+    def scenario(self, made) -> list:
+        """Every branch of a retry, as a list of answers and of what is stored after each."""
+        out = []
+
+        def step(api, registry, params, principal=None):
+            out.append(api.call('run.start', params, principal))
+            out.append(stored(registry))
+            return out[-2]
+        # A started run: the same key is a duplicate, with or without fields today's start ignores; another
+        # prompt, another engine and a missing engine are not this start.
+        api, registry, starter = control_api(start_hooks=made)
+        step(api, registry, KEYED)
+        self.assertEqual((step(api, registry, KEYED)['code'], out[-2]['duplicate']), ('started', True))
+        self.assertEqual((step(api, registry, {**KEYED, **EXTRA}, H.DEVICE)['code'], out[-2]['duplicate']), ('started', True))
+        self.assertEqual(step(api, registry, {**KEYED, 'prompt': 'q'}), {'code': 'request_invalid', 'detail': 'client_key_reused'})
+        self.assertEqual(step(api, registry, {**KEYED, 'engine': 'claude_code'}), {'code': 'request_invalid', 'detail': 'client_key_reused'})
+        self.assertEqual(step(api, registry, {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'}), {'code': 'request_invalid', 'detail': 'engine'})
+        out.append(starter.calls)
+        self.assertEqual(len(starter.calls), 1)
+        # A start the starter refused is relaunched under its run id, unless a Stop was asked for it.
+        api, registry, starter = control_api(starter=Recorder(fail=1), start_hooks=made)
+        self.assertEqual(step(api, registry, KEYED), {'code': 'start_failed', 'run_id': 'run-1', 'detail': 'RuntimeError', 'recorded': True})
+        again = step(api, registry, {**KEYED, **EXTRA})
+        self.assertEqual((again['code'], again['run']['run_id'], again['duplicate']), ('started', 'run-1', False))
+        out.append(starter.calls)
+        api, registry, starter = control_api(starter=Recorder(fail=2), start_hooks=made)
+        step(api, registry, KEYED)
+        out.append(api.call('run.stop', {'run_id': 'run-1'}))
+        self.assertEqual(step(api, registry, KEYED), {'code': 'start_failed', 'run_id': 'run-1', 'detail': 'stop_requested', 'duplicate': True})
+        self.assertEqual(len(starter.calls), 1)
+        # A launch that handed back no cgroup is unconfirmed, and so is its retry: nothing is launched again.
+        api, registry, starter = control_api(starter=Recorder(cgroup=False), start_hooks=made)
+        self.assertEqual((step(api, registry, KEYED)['code'], out[-2]['detail']), ('start_unconfirmed', 'starter_handle_invalid'))
+        retry = step(api, registry, KEYED)
+        self.assertEqual((retry['code'], retry['detail'], retry['duplicate']), ('start_unconfirmed', 'launch_unconfirmed', True))
+        self.assertEqual(len(starter.calls), 1)
+        return out
+
+    def test_every_branch_of_a_retry_answers_as_the_base(self) -> None:
+        variants = self.variants()
+        base = self.scenario(variants.pop('no hooks'))
+        for name, made in variants.items():
+            with self.subTest(hooks=name):
+                self.assertEqual(self.scenario(made), base)
+
+
+def entry(engine: str) -> dict:
+    """A route entry as load_routes gives it to the starter for one engine."""
+    return {'route': {'engine': engine, 'model': 'm-1', 'connection': {'kind': 'subscription', 'id': 'plus'}},
+            'deadline_s': 600.0, 'binary': None}
+
+
+class StartPathOnTest(unittest.TestCase):
+    """Seam S6 with fake registrants: the versioned start path."""
+
+    def setUp(self) -> None:
+        self.log, self.default, self.registry = [], ['codex'], InMemoryRunRegistry()
+
+    def routing(self, principal, request):
+        self.log.append(('routing', principal, request, self.registry.list()))
+        engine = (request.get('hand_pick') or {}).get('engine') or request.get('engine') or self.default[0]
+        if engine == 'none':
+            return {}
+        return {'route_entry': entry(engine) if engine != 'malformed' else {'route': {}},
+                'route_decision': {'chosen': engine, 'reason': 'default', 'candidates': [engine], 'hand_pick': request.get('hand_pick')}}
+
+    def workspace(self, principal, request):
+        self.log.append(('workspace', principal, request, self.registry.list()))
+        asked = request.get('workspace')
+        if asked is None:
+            return {}
+        if not isinstance(asked, dict) or not isinstance(asked.get('path'), str):
+            return H.Refusal('request_invalid', 'workspace')
+        if asked['path'] == '/breaks':
+            raise OSError('cannot stat')
+        return {'workspace': {'mode': 'worktree', 'source_path': asked['path'], 'base_ref': 'refs/heads/main', 'worktree_path': None}}
+
+    def hooks(self, routing=True):
+        made = H.Hooks()
+        if routing:
+            made.start_registrant('routing', ('hand_pick',), ('route_entry', 'route_decision'), self.routing, chooses_engine=True)
+        made.start_registrant('workspace', ('workspace',), ('workspace',), self.workspace)
+        made.freeze()
+        return made
+
+    def api(self, starter=None, routing=True, ids=None, comparator=lambda entry: True):
+        """``comparator`` stands in for the composition's own word that it would launch exactly the entry a
+        registrant chose (PROVISIONAL: the binary rule). These tests are about the start path, so theirs says yes
+        to every entry; a control API that is given none refuses every chosen entry, which has a test of its own."""
+        return control_api(self.registry, starter, start_hooks=self.hooks(routing), ids=ids, launchable=comparator)
+
+    def ran(self) -> list:
+        return [name for name, *_ in self.log]
+
+    def test_a_new_start_stores_the_servers_principal_the_launch_object_and_the_intent(self) -> None:
+        api, registry, starter = self.api()
+        request = {**KEYED, 'workspace': {'path': '/home/dev/projects/atlas'}}
+        answer = api.call('run.start', request, H.DEVICE)
+        self.assertEqual((answer['code'], answer['duplicate']), ('started', False))
+        record = registry.get('run-1')
+        self.assertEqual(record['principal'], {'kind': 'device', 'id': 'page'})
+        self.assertEqual(set(record['launch']), set(H.LAUNCH_KEYS))
+        self.assertEqual(record['launch']['route_entry'], entry('codex'))
+        self.assertEqual(record['launch']['workspace'], {'mode': 'worktree', 'source_path': '/home/dev/projects/atlas',
+                                                         'base_ref': 'refs/heads/main', 'worktree_path': None})
+        text = '{"engine":"codex","prompt_sha256":"%s","workspace":{"path":"/home/dev/projects/atlas"}}' % P_SHA
+        self.assertEqual(record['start_key'], {'client_key': 'k1', 'engine': 'codex', 'prompt_sha256': P_SHA, 'intent_version': 1,
+                                               'intent_sha256': hashlib.sha256(text.encode()).hexdigest()})
+        self.assertEqual((record['engine'], record['state'], record['tenant']), ('codex', 'running', 't1'))
+        # The registrants ran once, in order, with the principal and the request, before anything was recorded.
+        self.assertEqual([(name, principal, asked, before) for name, principal, asked, before in self.log],
+                         [('routing', H.DEVICE, request, []), ('workspace', H.DEVICE, request, [])])
+        # The starter gets the four members it reads, and the stored record: the launch context is built from it.
+        (params, handed), = starter.calls
+        self.assertEqual(params, {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'run_id': 'run-1'})
+        self.assertEqual((handed['launch'], handed['principal'], handed['state']), (record['launch'], record['principal'], 'starting'))
+        context = H.LaunchContext.from_record(handed)
+        self.assertEqual((context.principal, context.workspace['source_path'], context.owner), (H.DEVICE, '/home/dev/projects/atlas', 'host'))
+        # An unkeyed start stores no identity, as today, and the same two objects. A call with no principal is the owner's.
+        api.call('run.start', {'tenant': 't1', 'engine': 'codex', 'prompt': 'p'})
+        second = registry.get('run-2')
+        self.assertIn('start_key', second)
+        self.assertIsNone(second['start_key'])
+        self.assertEqual((second['principal'], set(second['launch'])), ({'kind': 'owner', 'id': 'local'}, set(H.LAUNCH_KEYS)))
+
+    def test_params_that_carry_a_principal_an_owner_a_budget_a_session_or_a_turn_store_none_of_them(self) -> None:
+        api, registry, starter = self.api()
+        self.assertEqual(api.call('run.start', {**KEYED, **EXTRA}, H.Principal('session', 'ses-1'))['code'], 'started')
+        record = registry.get('run-1')
+        self.assertEqual(record['principal'], {'kind': 'session', 'id': 'ses-1'})
+        launch = record['launch']
+        self.assertEqual((launch['owner'], launch['budget'], launch['session_id'], launch['turn_id'], launch['containment_level']),
+                         ('host', {'cap_usd': 0}, None, None, None))
+        self.assertEqual(set(record) & {'owner', 'budget', 'session_id', 'turn_id', 'containment_level', 'workspace', 'hand_pick', 'labels'}, set())
+        self.assertEqual(set(starter.calls[0][0]), {'tenant', 'engine', 'prompt', 'run_id'})
+        # Only what was DECLARED and present is in the identity: session_id, turn_id and the rest are not.
+        text = '{"engine":"codex","hand_pick":{"engine":"codex"},"prompt_sha256":"%s","workspace":{"path":"/home/dev/projects/atlas"}}' % P_SHA
+        self.assertEqual(record['start_key']['intent_sha256'], hashlib.sha256(text.encode()).hexdigest())
+        # A plugin's own start is owned by that plugin, and only then.
+        api.call('run.start', {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'owner': 'host'}, H.Principal('plugin', 'notes.search'))
+        self.assertEqual(registry.get('run-2')['launch']['owner'], 'notes.search')
+
+    def test_the_same_key_with_another_declared_field_is_a_reused_key(self) -> None:
+        api, registry, starter = self.api()
+        first = {**KEYED, 'workspace': {'path': '/a'}}
+        self.assertEqual(api.call('run.start', first)['code'], 'started')
+        before = stored(registry)
+        for other in ({**KEYED, 'workspace': {'path': '/b'}}, dict(KEYED), {**first, 'hand_pick': {'engine': 'codex'}},
+                      {**first, 'prompt': 'q'}, {**first, 'engine': 'claude_code'}, {k: v for k, v in first.items() if k != 'engine'}):
+            with self.subTest(request=other):
+                self.assertEqual(api.call('run.start', other), {'code': 'request_invalid', 'detail': 'client_key_reused'})
+        # A field nobody declared, a null one and a missing one are the same request: a duplicate.
+        for same in (first, {**first, 'labels': {'team': 'x'}, 'containment_level': 'contained'}, {**first, 'hand_pick': None}):
+            with self.subTest(request=same):
+                answer = api.call('run.start', same)
+                self.assertEqual((answer['code'], answer['duplicate'], answer['run']['run_id']), ('started', True, 'run-1'))
+        self.assertEqual((len(starter.calls), self.ran(), stored(registry)), (1, ['routing', 'workspace'], before))
+
+    def test_the_same_raw_request_after_the_routing_default_changed_is_a_retry(self) -> None:
+        api, registry, starter = self.api()
+        request = {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'}     # names no engine: the router chooses
+        self.assertEqual(api.call('run.start', request)['run']['engine'], 'codex')
+        self.default[0] = 'claude_code'
+        answer = api.call('run.start', request)
+        self.assertEqual((answer['code'], answer['duplicate'], answer['run']['run_id'], answer['run']['engine']),
+                         ('started', True, 'run-1', 'codex'))
+        self.assertEqual((len(starter.calls), self.ran()), (1, ['routing', 'workspace']), 'a duplicate launches nothing and runs no registrant')
+
+    def test_a_request_that_names_no_engine_is_started_on_the_engine_the_router_chose(self) -> None:
+        api, registry, starter = self.api()
+        self.assertEqual(api.call('run.start', {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'})['code'], 'started')
+        record = registry.get('run-1')
+        self.assertEqual((record['engine'], record['start_key']['engine'], starter.calls[0][0]['engine']), ('codex', None, 'codex'))
+        self.assertEqual(record['start_key']['intent_sha256'],
+                         hashlib.sha256(('{"engine":null,"prompt_sha256":"%s"}' % P_SHA).encode()).hexdigest())
+        # Nobody chose: there is nothing to launch, and nothing is stored.
+        for request, answer in (({'tenant': 't1', 'prompt': 'p', 'hand_pick': {'engine': 'none'}}, {'code': 'request_invalid', 'detail': 'engine'}),
+                                ({'tenant': 't1', 'prompt': 'p', 'hand_pick': {'engine': 'malformed'}}, {'code': 'unavailable', 'detail': 'start_registrant_failed'}),
+                                # A request that names an engine gets that engine or nothing.
+                                ({'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'hand_pick': {'engine': 'claude_code'}},
+                                 {'code': 'unavailable', 'detail': 'start_registrant_failed'}),
+                                ({'tenant': 't1', 'engine': '', 'prompt': 'p'}, {'code': 'request_invalid', 'detail': 'engine'}),
+                                ({'tenant': 't1', 'engine': 7, 'prompt': 'p'}, {'code': 'request_invalid', 'detail': 'engine'})):
+            with self.subTest(request=request):
+                self.assertEqual(api.call('run.start', request), answer)
+        self.assertEqual((len(registry.list()), len(starter.calls)), (1, 1))
+
+    def test_a_chosen_entry_the_composition_would_not_launch_as_it_is_refused_before_anything_is_stored(self) -> None:
+        asked = []
+
+        def launchable(chosen):
+            asked.append(chosen)
+            return chosen['route']['engine'] == 'codex'      # say the composed adapter of the other engine differs
+        api, registry, starter = control_api(self.registry, start_hooks=self.hooks(), launchable=launchable)
+        self.assertEqual(api.call('run.start', {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1', 'hand_pick': {'engine': 'claude_code'}}),
+                         {'code': 'unavailable', 'detail': 'start_registrant_failed'})
+        self.assertEqual((asked, registry.list(), starter.calls), ([entry('claude_code')], [], []),
+                         'invalid registrant output: no run, no launch record, nothing launched')
+        # The key is free, and an entry the composition launches as it is goes through; with no entry chosen nobody is asked.
+        self.assertEqual(api.call('run.start', {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'})['code'], 'started')
+        self.assertEqual(asked[1:], [entry('codex')])
+        api.call('run.start', {'tenant': 't1', 'prompt': 'p', 'hand_pick': {'engine': 'none'}})
+        self.assertEqual(len(asked), 2)
+
+    def test_with_no_registrant_that_chooses_a_start_names_its_engine_as_today(self) -> None:
+        api, registry, starter = self.api(routing=False)
+        looked_up = []
+        find_start = registry.find_start
+        registry.find_start = lambda tenant, key: looked_up.append(key) or find_start(tenant, key)
+        for request in ({'tenant': 't1', 'prompt': 'p'}, {'tenant': 't1', 'prompt': 'p', 'client_key': 'k9'},
+                        {'tenant': 't1', 'prompt': 'p', 'workspace': {'path': '/a'}}, {'tenant': 't1', 'engine': None, 'prompt': 'p'}):
+            self.assertEqual(api.call('run.start', request), {'code': 'request_invalid', 'detail': 'engine'})
+        # Refused at validation, as today: no key is looked up and no registrant is asked.
+        self.assertEqual((looked_up, self.log, registry.list()), ([], [], []))
+        self.assertEqual(api.call('run.start', KEYED)['code'], 'started')
+        record = registry.get('run-1')
+        self.assertIsNone(record['launch']['route_entry'], 'no registrant chose an entry: the starter looks it up, as today')
+        self.assertEqual((record['engine'], record['start_key']['intent_version']), ('codex', 1))
+
+    @quiet
+    def test_a_registrants_refusal_comes_before_any_record(self) -> None:
+        api, registry, starter = self.api()
+        for request, answer in (({**KEYED, 'workspace': 'here'}, {'code': 'request_invalid', 'detail': 'workspace'}),
+                                ({**KEYED, 'workspace': {'path': '/breaks'}}, {'code': 'unavailable', 'detail': 'start_registrant_failed'})):
+            self.assertEqual(api.call('run.start', request), answer)
+        self.assertEqual((registry.list(), starter.calls), ([], []))
+        # The key is still free: the refused request left nothing behind.
+        self.assertEqual(api.call('run.start', KEYED)['code'], 'started')
+
+    def test_a_declared_field_with_no_canonical_text_is_refused_by_name(self) -> None:
+        api, registry, starter = self.api()
+        self.assertEqual(api.call('run.start', {**KEYED, 'workspace': {'path': '/a', 'depth': 2**60}}),
+                         {'code': 'request_invalid', 'detail': 'workspace'})
+        self.assertEqual((registry.list(), starter.calls, self.log), ([], [], []))
+
+    def test_a_failed_start_relaunches_under_its_run_id_from_the_stored_record(self) -> None:
+        api, registry, starter = self.api(Recorder(fail=1))
+        request = {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1', 'workspace': {'path': '/a'}}
+        self.assertEqual(api.call('run.start', request, H.DEVICE),
+                         {'code': 'start_failed', 'run_id': 'run-1', 'detail': 'RuntimeError', 'recorded': True})
+        kept = registry.get('run-1')
+        self.default[0] = 'claude_code'      # the router would choose otherwise now; a relaunch does not ask it
+        answer = api.call('run.start', request, H.OWNER)
+        self.assertEqual((answer['code'], answer['duplicate'], answer['run']['run_id']), ('started', False, 'run-1'))
+        self.assertEqual(self.ran(), ['routing', 'workspace'], 'no registrant runs for a relaunch')
+        first, second = starter.calls
+        self.assertEqual(first[0], second[0])
+        self.assertEqual((second[1]['launch'], second[1]['principal'], second[1]['start_key'], second[1]['engine']),
+                         (kept['launch'], {'kind': 'device', 'id': 'page'}, kept['start_key'], 'codex'))
+        after = registry.get('run-1')
+        self.assertEqual((after['launch'], after['principal'], after['start_key']), (kept['launch'], kept['principal'], kept['start_key']))
+        self.assertEqual(len(registry.list()), 1)
+
+    def test_with_nobody_to_compare_a_chosen_entry_is_refused_on_a_new_start_and_on_a_relaunch(self) -> None:
+        """PROVISIONAL, with the binary rule. A control API that was given no comparator cannot say that the
+        composition would launch exactly the entry a registrant chose, so it lets none through unchecked: a new
+        start stores nothing, and a relaunch writes no new starting intent and reaches no starter."""
+        request = {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'}
+        refused = {'code': 'unavailable', 'detail': 'start_registrant_failed'}
+        api, registry, starter = self.api(comparator=None)
+        self.assertEqual(api.call('run.start', request), refused)
+        self.assertEqual((registry.list(), starter.calls), ([], []))
+        # A record made while there was a comparator, whose start failed. Its retry comes to an API with none.
+        api, registry, starter = self.api(Recorder(fail=1))
+        self.assertEqual(api.call('run.start', request)['code'], 'start_failed')
+        kept = registry.get('run-1')
+        self.assertEqual(kept['launch']['route_entry'], entry('codex'))
+        later = Recorder()
+        with_none, _, _ = control_api(registry, later, start_hooks=self.hooks(), ids=iter(("run-2",)).__next__)
+        self.assertEqual(with_none.call('run.start', request), refused)
+        self.assertEqual((registry.get('run-1'), later.calls, self.ran()), (kept, [], ['routing', 'workspace'] * 2),
+                         'the stored record is as it was, nothing was launched and no registrant ran again')
+        # A start for which no registrant chose an entry has nothing to compare, and needs nobody.
+        named = {'tenant': 't1', 'engine': 'codex', 'prompt': 'p', 'hand_pick': {'engine': 'none'}}
+        self.assertEqual(with_none.call('run.start', named)['code'], 'started')
+
+    def test_a_stored_entry_of_another_shape_is_refused_on_a_relaunch_and_never_reaches_the_comparator(self) -> None:
+        """A seventh read. The comparator the composition gives reads the engine out of an entry, so it is handed
+        only an entry of the shape a new start accepts, and of the engine its record launches. A stored record may
+        hold another (an earlier composition wrote it, or a lane that holds the control registry): its retry is
+        refused as a chosen entry of that kind is on a new start, the record is left as it was, and nothing is
+        launched. It was an exception out of the call, or a launch of one engine under another's entry."""
+        request = {'tenant': 't1', 'prompt': 'p', 'client_key': 'k1'}
+        api, registry, starter = self.api(Recorder(fail=1))
+        self.assertEqual(api.call('run.start', request)['code'], 'start_failed')
+        kept = registry.get('run-1')
+        self.assertEqual((kept['engine'], kept['launch']['route_entry']), ('codex', entry('codex')))
+        seen = []
+
+        def reads_the_engine(chosen):       # as the composition's own comparator does, and it has both engines
+            seen.append(chosen)
+            return chosen['route']['engine'] in ('codex', 'claude_code')
+        other = entry('claude_code')        # well formed, and launchable here: but it is not this record's engine
+        stored = [('codex', shape) for shape in ({'route': 'codex'}, {'binary': None}, {'route': ['codex']}, 'codex',
+                                                 {'route': {}}, {'route': {'engine': ''}}, {'route': {'engine': 7}}, 7, other)]
+        # A record whose own engine is not a name agrees with an entry that has none: that is refused all the same.
+        stored += [(None, {'route': {}}), ('', {'route': {'engine': ''}}), (7, {'route': {'engine': 7}})]
+        for engine, shape in stored:
+            with self.subTest(engine=engine, stored=shape):
+                record = copy.deepcopy(kept)
+                record['engine'], record['launch']['route_entry'] = engine, shape
+                self.registry = InMemoryRunRegistry([record])
+                before = self.registry.get('run-1')
+                later, ran = Recorder(), len(self.log)
+                retried, _, _ = self.api(later, comparator=reads_the_engine)
+                self.assertEqual(retried.call('run.start', request), {'code': 'unavailable', 'detail': 'start_registrant_failed'})
+                self.assertEqual((self.registry.get('run-1'), later.calls, seen, len(self.log)), (before, [], [], ran),
+                                 'the record is as it was, nothing was launched, the comparator and the registrants were not asked')
+        # The control: the same record with its entry as it was written is relaunched, and the comparator is asked.
+        self.registry = InMemoryRunRegistry([copy.deepcopy(kept)])
+        retried, _, later = self.api(Recorder(), comparator=reads_the_engine)
+        self.assertEqual(retried.call('run.start', request)['code'], 'started')
+        self.assertEqual((seen, len(later.calls)), ([entry('codex')], 1))
+
+    def test_a_failed_start_that_was_stopped_and_an_unconfirmed_one_are_answered_as_the_base_answers_them(self) -> None:
+        api, registry, starter = self.api(Recorder(fail=2))
+        api.call('run.start', KEYED)
+        api.call('run.stop', {'run_id': 'run-1'})
+        self.assertEqual(api.call('run.start', KEYED), {'code': 'start_failed', 'run_id': 'run-1', 'detail': 'stop_requested', 'duplicate': True})
+        self.assertEqual(len(starter.calls), 1)
+        self.registry = InMemoryRunRegistry()
+        api, registry, starter = self.api(Recorder(cgroup=False))
+        self.assertEqual(api.call('run.start', KEYED)['detail'], 'starter_handle_invalid')
+        retry = api.call('run.start', KEYED)
+        self.assertEqual((retry['code'], retry['detail'], retry['duplicate']), ('start_unconfirmed', 'launch_unconfirmed', True))
+        self.assertEqual(len(starter.calls), 1)
+
+    def test_a_legacy_key_dedupes_as_before_and_is_refused_with_a_declared_field(self) -> None:
+        legacy, registry, old = control_api(self.registry)
+        self.assertEqual(legacy.call('run.start', KEYED)['code'], 'started')
+        before = stored(registry)
+        api, _, starter = self.api(ids=iter(['run-new-1', 'run-new-2']).__next__)
+        for same in (KEYED, {**KEYED, 'labels': {'team': 'x'}, 'session_id': 'ses-1'}, {**KEYED, 'workspace': None}):
+            with self.subTest(request=same):
+                answer = api.call('run.start', same)
+                self.assertEqual((answer['code'], answer['duplicate'], answer['run']['run_id']), ('started', True, 'run-1'))
+        for other in ({**KEYED, 'workspace': {'path': '/a'}}, {**KEYED, 'hand_pick': {'engine': 'codex'}},
+                      {k: v for k, v in KEYED.items() if k != 'engine'}, {**KEYED, 'prompt': 'q'}):
+            with self.subTest(request=other):
+                self.assertEqual(api.call('run.start', other), {'code': 'request_invalid', 'detail': 'client_key_reused'})
+        self.assertEqual((starter.calls, self.log, stored(registry)), ([], [], before))
+
+    def test_a_failed_legacy_start_is_relaunched_as_a_legacy_one(self) -> None:
+        legacy, registry, old = control_api(self.registry, Recorder(fail=1))
+        self.assertEqual(legacy.call('run.start', KEYED)['code'], 'start_failed')
+        api, _, starter = self.api()
+        answer = api.call('run.start', KEYED)
+        self.assertEqual((answer['code'], answer['duplicate'], answer['run']['run_id']), ('started', False, 'run-1'))
+        record = registry.get('run-1')
+        self.assertEqual(record['start_key'], {'client_key': 'k1', 'engine': 'codex', 'prompt_sha256': P_SHA})
+        self.assertEqual(set(record) & {'principal', 'launch'}, set())
+        self.assertIsNone(H.LaunchContext.from_record(starter.calls[0][1]), 'a legacy record gives the run no launch context')
+        self.assertEqual(self.log, [])
+
+    def test_a_record_of_the_versioned_path_is_never_a_retry_where_the_path_is_off(self) -> None:
+        api, registry, _ = self.api()
+        self.assertEqual(api.call('run.start', KEYED)['code'], 'started')
+        before = stored(registry)
+        off, _, starter = control_api(registry)
+        self.assertEqual(off.call('run.start', KEYED), {'code': 'request_invalid', 'detail': 'client_key_reused'})
+        self.assertEqual((starter.calls, stored(registry)), ([], before))
 
 
 if __name__ == "__main__":

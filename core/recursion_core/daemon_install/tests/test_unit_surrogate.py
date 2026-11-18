@@ -122,5 +122,34 @@ class NoGeteuidRefusalTests(unittest.TestCase):
         self.assertEqual(_tree(home), before)
 
 
+class InstallWithoutGeteuidTests(unittest.TestCase):
+    def test_install_refuses_platform_unsupported_and_creates_no_breaker_store_or_custody_root(self) -> None:
+        # NoGeteuidRefusalTests runs only where os.geteuid is already absent. This host has it, so the
+        # attribute is taken away for the call and put back. install must refuse before it makes the
+        # breaker store or the route homes' custody root.
+        tmp = tempfile.TemporaryDirectory(prefix="install-")
+        self.addCleanup(tmp.cleanup)
+        home = os.path.join(tmp.name, "home")
+        os.mkdir(home, 0o700)
+        state = os.path.join(home, ".local", "state", "recursion")
+        breaker = os.path.join(state, "plugin-security", "breaker.sqlite3")
+        custody = os.path.join(state, "homes")
+        before = _tree(home)
+        roots = Roots(home=home)
+        saved = getattr(os, "geteuid", None)
+        try:
+            if saved is not None:
+                del os.geteuid
+            with self.assertRaises(InstallRefused) as caught:
+                install(roots, EXEC)
+        finally:
+            if saved is not None:
+                os.geteuid = saved
+        self.assertEqual(caught.exception.kind, "platform_unsupported")
+        self.assertFalse(os.path.lexists(breaker))
+        self.assertFalse(os.path.lexists(custody))
+        self.assertEqual(_tree(home), before)
+
+
 if __name__ == "__main__":
     unittest.main()

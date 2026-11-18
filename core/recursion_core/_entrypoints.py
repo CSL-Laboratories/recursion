@@ -2,7 +2,6 @@
 
     recursiond install | upgrade | uninstall    the per-user systemd unit (control/commands/setup.py)
     recursiond serve [daemon options]           run the daemon in the foreground
-    recursiond observe                          local tool setup, owner-only record
 
 Linux only: on any other system every command refuses with ``platform_unsupported`` (exit 1)
 before anything else is imported; ``--help`` still prints. Output is one JSON object per command;
@@ -28,11 +27,6 @@ import sysconfig
 PROG = "recursiond"
 DAEMON_MODULE = "recursion_core.daemon"
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
-# The doctor-command draft adds this table too. It is not on the doctor-core base, so this
-# draft adds the minimal table. The two drafts conflict on this name. This row is observe.
-SUBCOMMANDS = (
-    ("observe", "report local tool setup into an owner-only record; secret values stay out"),
-)
 _DESCRIPTION = ("Recursion's per-user daemon and its installer. Linux only. "
                 "Each command prints one JSON object; \"code\": \"ok\" is success.")
 
@@ -57,8 +51,6 @@ def main(argv=None) -> int:
     parser = _Parser(prog=PROG, description=_DESCRIPTION)
     commands = parser.add_subparsers(dest="command", metavar="command")
     setup.parser(commands)
-    for name, help_text in SUBCOMMANDS:
-        commands.add_parser(name, help=help_text)
     commands.add_parser("serve", help="run the daemon in the foreground; options after it go to the daemon",
                         add_help=False)
     try:
@@ -73,19 +65,7 @@ def main(argv=None) -> int:
         print("usage error: a command is required", file=sys.stderr)
         return EXIT_USAGE
     args.out, args.err = sys.stdout, sys.stderr
-    if args.command in {name for name, _help in SUBCOMMANDS}:
-        return _dispatch_subcommand(args)
     return setup.dispatch(args, None)
-
-
-def _dispatch_subcommand(args) -> int:
-    import importlib
-
-    if args.command == "observe":
-        module = importlib.import_module("recursion_core.setup.observe")
-        return module.command(out=args.out, err=args.err)
-    print(f"usage error: {args.command}", file=sys.stderr)
-    return EXIT_USAGE
 
 
 def serve(args) -> int:

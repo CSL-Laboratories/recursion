@@ -4,11 +4,17 @@ The program name is ``recursion``. A refusal prints ``refused: CODE`` on stderr
 and returns 1. A usage error returns 2. ``install --git`` reads one local bare
 repository. The entry URL is not fetched. Nothing from the fetched tree is
 executed. ``enable``, ``disable`` and ``rollback`` are one command each.
+
+``install --yes`` writes one grant for the requested permissions except
+``order``. ``install --no-grant`` writes none. With neither flag, a terminal
+is asked once and only the answer ``y`` or ``yes`` grants; any other answer,
+and a run that is not a terminal, writes no grant.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -62,6 +68,9 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument("--git", help="local bare repository")
     install.add_argument("--config")
     install.add_argument("--state")
+    install.add_argument("--yes", action="store_true",
+                         help="write one grant for the requested permissions except order")
+    install.add_argument("--no-grant", action="store_true", help="write no grant")
 
     listed = commands.add_parser("list")
     listed.error = _error  # type: ignore[method-assign]
@@ -93,10 +102,35 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None, out=None, err=None) -> int:
+def _confirm_grant(stdin, err):
+    """Ask on a terminal. Only ``y`` or ``yes`` returns True. Anything else is no."""
+
+    def confirm(requested, checks):
+        if not getattr(stdin, "isatty", lambda: False)():
+            return False
+        err.write("Requested permissions: %s\n" % ", ".join(requested))
+        for line in checks:
+            err.write("%s\n" % line)
+        err.write("Grant the requested permissions except order? [y/N] ")
+        err.flush()
+        line = stdin.readline()
+        if type(line) is not str:
+            return False
+        return line.strip().lower() in {"y", "yes"}
+
+    return confirm
+
+
+def main(argv: list[str] | None = None, out=None, err=None, stdin=None) -> int:
     """Run one plugin command. Returns 0, 1 (refused) or 2 (usage)."""
+    # A caller that supplies streams is not the operator's terminal. Do not
+    # read the process stdin unless that caller passes one: a captured run
+    # must not block, and it must not take a silent yes.
+    embedded = out is not None or err is not None or stdin is not None
     out = sys.stdout if out is None else out
     err = sys.stderr if err is None else err
+    if stdin is None:
+        stdin = io.StringIO("") if embedded else sys.stdin
     if argv is None:
         argv = sys.argv[1:]
     try:
@@ -106,9 +140,19 @@ def main(argv: list[str] | None = None, out=None, err=None) -> int:
         return 2
     try:
         if args.command == "install":
+            if args.yes and args.no_grant:
+                err.write("usage: recursion plugin install (--yes and --no-grant)\n")
+                return 2
+            if args.no_grant:
+                write_grant, confirm = False, None
+            elif args.yes:
+                write_grant, confirm = True, None
+            else:
+                write_grant, confirm = None, _confirm_grant(stdin, err)
             result = install_plugin(_config_dir(args.config), args.registry, args.plugin,
                                     version=args.version, state=_state_dir(args.state),
-                                    git_repository=args.git)
+                                    git_repository=args.git, write_grant=write_grant,
+                                    confirm=confirm)
         elif args.command == "list":
             result = list_plugins(_config_dir(args.config), state=_state_dir(args.state))
         elif args.command == "remove":

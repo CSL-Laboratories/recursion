@@ -43,7 +43,15 @@ checked on every install. When this interpreter cannot verify one, the install
 is refused and nothing is written. A signature that does not verify against
 the manifest's own key refuses the registry. A signature that verifies, but
 whose key is not on this install's trusted list, still installs and loads as
-unsigned. This command does not grant permissions and does not add a trusted key.
+unsigned.
+
+On an explicit yes, this command writes one grant into the new generation for
+the requested permissions except ``order``. The grant is bound to that
+release's artifact SHA-256 and to the signer key id, which is null when the
+release is unsigned. ``order`` stays its own flow: by hand behind a warning
+when unsigned, asked once when signed, and it is not part of this grant.
+``--no-grant`` writes no grant. A run with no terminal and no explicit yes
+writes no grant. This command does not add a trusted key.
 """
 
 from __future__ import annotations
@@ -96,6 +104,8 @@ _DEVELOPER_CHECKS = (
     "A signature that fails this install's trusted-key check loads as unsigned.",
     "Signed order is asked once. This command does not grant it.",
     "Unsigned order is by hand, behind a warning. This command does not grant it.",
+    "A yes writes one grant for the requested permissions except order, "
+    "bound to the artifact digest and the signer key id.",
 )
 
 
@@ -133,13 +143,23 @@ class Snapshot:
 
 def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, plugin_id: str, *,
                    version: str | None = None, state: os.PathLike | str | None = None, wait: bool = True,
-                   git_repository: str | None = None) -> dict:
+                   git_repository: str | None = None, write_grant: bool | None = None,
+                   confirm=None) -> dict:
     """Check ``registry_root``, then write the release as the next generation.
 
     ``git_repository`` is a local bare path. The fetch, and every refusal of
     that fetch, finishes before the profile lock. A refusal does not fall
     back to a vendored ``plugin.py``.
+
+    ``write_grant`` True writes one grant (the user's yes). False writes none
+    (``--no-grant``). None asks ``confirm`` when that callable is set, and
+    otherwise writes none. ``confirm(requested, checks)`` must return True to
+    grant. Any other return writes none. A grant never includes ``order``.
     """
+    if write_grant is not None and type(write_grant) is not bool:
+        raise InstallRefused("grant_flag")
+    if confirm is not None and not callable(confirm):
+        raise InstallRefused("grant_flag")
     config_path = Path(config)
     report = check_registry(registry_root)
     codes = report.codes()
@@ -168,7 +188,8 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
         raise InstallRefused("source_digest_mismatch" if fetched else "artifact_digest_mismatch")
     fd = _lock(config_path, wait=wait)
     try:
-        return _install_locked(config_path, chosen, plugin_id, state, artifact, fetched)
+        return _install_locked(config_path, chosen, plugin_id, state, artifact, fetched,
+                               write_grant, confirm)
     finally:
         os.close(fd)
 
@@ -334,7 +355,8 @@ def _select(report, plugin_id: str, version: str | None):
     raise InstallRefused("release_not_in_registry")
 
 
-def _install_locked(config: Path, chosen, plugin_id: str, state, artifact: bytes, fetched: bool) -> dict:
+def _install_locked(config: Path, chosen, plugin_id: str, state, artifact: bytes, fetched: bool,
+                    write_grant: bool | None, confirm) -> dict:
     manifest = parse_manifest(chosen.manifest)
     if manifest.plugin_id != plugin_id or not _plugin_id_ok(manifest.plugin_id):
         raise InstallRefused("release_plugin_id_mismatch")
@@ -345,7 +367,7 @@ def _install_locked(config: Path, chosen, plugin_id: str, state, artifact: bytes
     signature_text = chosen.signature_text
     snapshot = _load_snapshot(config)
     trust_name, reason, grants, findings = _admit(snapshot, manifest, signature_text, artifact,
-                                                   chosen.label, state)
+                                                   chosen.label, state, write_grant, confirm)
     refused = [item for item in findings if item.get("severity") == "refuse"]
     if refused:
         raise InstallRefused(refused[0]["code"], [item["code"] for item in refused])
@@ -374,8 +396,14 @@ def _install_locked(config: Path, chosen, plugin_id: str, state, artifact: bytes
     return result
 
 
-def _admit(snapshot: Snapshot, manifest, signature_text, artifact: bytes, label: str, state):
-    """Classify and run doctor. A grant for another digest or signer is dropped. Nothing is granted."""
+def _admit(snapshot: Snapshot, manifest, signature_text, artifact: bytes, label: str, state,
+           write_grant: bool | None, confirm):
+    """Classify and run doctor. A grant for another digest or signer is dropped.
+
+    A yes writes one new grant for this release: requested permissions except
+    ``order``, bound to the artifact digest and the signer key id. Anything
+    short of an explicit yes writes no new grant.
+    """
     path = _revocation_store(state)
     try:
         trust = TrustStore(dict(snapshot.trusted_keys), revocation_store=path)
@@ -387,11 +415,30 @@ def _admit(snapshot: Snapshot, manifest, signature_text, artifact: bytes, label:
         except Refused as exc:
             raise InstallRefused(exc.code, detail=exc.detail) from None
         grants = _grants_kept(snapshot.grants, manifest, signer)
+        if _wants_grant(write_grant, confirm, manifest):
+            grants = dict(grants)
+            grants[manifest.plugin_id] = _grant_for_release(manifest, signer)
         loader = PluginLoader(trust, grants, snapshot.reserved(), CoreHealth())
         findings = loader.doctor(manifest.raw, signature_text, artifact, label)
     finally:
         trust.close()
     return trust_name, reason, grants, findings
+
+
+def _wants_grant(write_grant: bool | None, confirm, manifest) -> bool:
+    """True only for an explicit yes. A missing answer, or any answer but yes, is no."""
+    if write_grant is True:
+        return True
+    if write_grant is False or confirm is None:
+        return False
+    answer = confirm(list(manifest.permissions), list(_DEVELOPER_CHECKS))
+    return answer is True
+
+
+def _grant_for_release(manifest, signer: str | None) -> Grant:
+    """One grant: requested permissions except ``order``, bound to digest and signer."""
+    permissions = tuple(perm for perm in manifest.permissions if perm != "order")
+    return Grant(manifest.plugin_id, manifest.artifact_sha256, signer, permissions)
 
 
 def _grants_kept(grants: dict, manifest, signer: str | None) -> dict:

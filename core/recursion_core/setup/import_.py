@@ -13,9 +13,13 @@ the tool marks a folder trusted.
 Sign-in stores named by ``deny.py`` are never opened, including through a symlink or a
 hard link. ``~/.claude.json`` is not opened either: it can hold a sign-in beside
 settings. A settings file is read only to copy an allow-listed model string and the
-paths of named project folders. Environment values, header values, command arguments,
-hooks and MCP commands are not copied. A file mode without the owner-read bit is left
-unread.
+paths of named project folders. A model is copied only when it has a model-name shape
+(letters, digits and ``.`` ``_`` ``:`` ``/`` ``-``, 64 characters at most) and no other
+string value in that file, under any key, of 4 characters or more, is equal to it or
+contained in it. Environment values, header values, command arguments, hooks and MCP
+commands are not copied. A file mode without the owner-read bit is left unread.
+An alias (more than one link, or an inode that changes between the look and the read)
+is not read. The real path must stay inside the home.
 """
 
 from __future__ import annotations
@@ -27,13 +31,18 @@ import stat
 import tomllib
 
 from recursion_core.setup.deny import denied_paths, is_denied
+from recursion_core.setup.open_guard import inside_root, read_regular_file
 
 _MAX_BYTES = 1024 * 1024
 _PATH_CAP = 4096
 _FOLDER_CAP = 64
-_MODEL = re.compile(r"^[\x21-\x7e]{1,128}$")
-# Values stored under these keys are never copied, and a picked string that contains
-# one of those values is dropped. Compared after case folding.
+_VALUE_FLOOR = 4
+_MODEL = re.compile(r"^[A-Za-z0-9._:/-]{1,64}$")
+# The model field does not consult _SECRET_KEYS. It is dropped unless it matches
+# _MODEL and no other string value of _VALUE_FLOOR characters or more is equal to
+# it or contained in it.
+# Folder paths still refuse a value stored under one of these keys. Compared after
+# case folding.
 _SECRET_KEYS = frozenset({
     "access_token", "api_key", "apikey", "args", "arguments", "auth", "authorization",
     "credentials", "env", "headers", "hook", "hooks", "http_headers", "id_token",
@@ -139,7 +148,7 @@ def _load(path: str, home: str, denied_ids: set, kind: str):
         return None
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         return None
-    if (info.st_dev, info.st_ino) in denied_ids or not _inside(path, home):
+    if (info.st_dev, info.st_ino) in denied_ids or not inside_root(path, home):
         return None
     if (info.st_mode & 0o400) == 0 or info.st_size > _MAX_BYTES:
         return None
@@ -153,33 +162,11 @@ def _load(path: str, home: str, denied_ids: set, kind: str):
 
 
 def _read_bytes(path: str, home: str, denied_ids: set) -> bytes:
-    info = os.lstat(path)
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise PermissionError(path)
-    if (info.st_dev, info.st_ino) in denied_ids or _blocked(path, home, denied_ids):
-        raise PermissionError(path)
-    if not _inside(path, home) or (info.st_mode & 0o400) == 0 or info.st_size > _MAX_BYTES:
-        raise PermissionError(path)
-    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
-    try:
-        held = os.fstat(fd)
-        if (not stat.S_ISREG(held.st_mode) or (held.st_dev, held.st_ino) in denied_ids
-                or held.st_size > _MAX_BYTES):
-            raise PermissionError(path)
-        chunks = []
-        total = 0
-        while True:
-            block = os.read(fd, 65536)
-            if not block:
-                break
-            total += len(block)
-            if total > _MAX_BYTES:
-                raise OSError("file is too large")
-            chunks.append(block)
-        return b"".join(chunks)
-    finally:
-        os.close(fd)
+    """Read through the shared gate. A refusal raises and the caller copies nothing."""
+
+    return read_regular_file(
+        path, root=home, home=home, max_bytes=_MAX_BYTES, denied_ids=denied_ids,
+    )
 
 
 def _parse(data: bytes, kind: str):
@@ -205,7 +192,7 @@ def _pick(parsed: dict) -> dict:
     _collect_secrets(parsed, False, secrets)
     found = {}
     model = parsed.get("model")
-    if type(model) is str and _MODEL.fullmatch(model) and not _tainted(model, secrets):
+    if type(model) is str and not _model_blocked(parsed, model):
         found["model"] = model
     projects = parsed.get("projects")
     folders = []
@@ -233,6 +220,38 @@ def _collect_secrets(node, secret: bool, found: set) -> None:
         return
     if secret and type(node) is str and node:
         found.add(node)
+
+
+def _model_blocked(parsed: dict, model: str) -> bool:
+    """True when ``model`` is not a model name, or another string value sits inside it.
+
+    ``_SECRET_KEYS`` is not consulted. The model's own value is not an other value.
+    A string shorter than ``_VALUE_FLOOR`` does not block it.
+    """
+
+    if _MODEL.fullmatch(model) is None:
+        return True
+    others: list = []
+    _other_strings(parsed, others)
+    for value in others:
+        if len(value) >= _VALUE_FLOOR and (value == model or value in model):
+            return True
+    return False
+
+
+def _other_strings(node, found: list, *, at_top: bool = True) -> None:
+    if type(node) is dict:
+        for key, value in node.items():
+            if at_top and key == "model" and type(value) is str:
+                continue
+            _other_strings(value, found, at_top=False)
+        return
+    if type(node) is list:
+        for item in node:
+            _other_strings(item, found, at_top=False)
+        return
+    if type(node) is str and node:
+        found.append(node)
 
 
 def _tainted(text: str, secrets: set) -> bool:
@@ -264,18 +283,6 @@ def _blocked(path: str, home: str, denied_ids: set) -> bool:
     except (OSError, ValueError):
         return True
     return is_denied(real, home) or os.path.basename(real) == ".claude.json"
-
-
-def _inside(path: str, home: str) -> bool:
-    try:
-        real_home = os.path.realpath(home)
-        real = os.path.realpath(path)
-    except (OSError, ValueError):
-        return False
-    if real == real_home:
-        return False
-    prefix = real_home if real_home.endswith(os.sep) else real_home + os.sep
-    return real.startswith(prefix)
 
 
 def _denied_ids(home: str) -> set:

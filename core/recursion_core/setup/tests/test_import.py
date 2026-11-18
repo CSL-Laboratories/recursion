@@ -167,9 +167,10 @@ def _tree_hash(root: str) -> str:
 
 
 def _clean(blob: str) -> None:
+    # The failure text stays plain: it must not repeat a planted marker.
     for canary in _CANARIES:
         if canary in blob:
-            raise AssertionError(f"canary reached the output: {canary}")
+            raise AssertionError("canary reached the output")
 
 
 def _walk_strings(node, found: list) -> None:
@@ -463,6 +464,164 @@ class ImportDryRunTests(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("--from", text)
         self.assertIn("--dry-run", text)
+
+    def _claude(self):
+        module = _proposal_module()
+        _watch_opens()
+        mark = len(_OPENED)
+        out = io.StringIO()
+        code = module.command(out, source="claude", dry_run=True, home=self.home, environ=self._environ())
+        return code, out.getvalue(), _OPENED[mark:]
+
+    def _replace_settings(self, payload: dict) -> str:
+        path = os.path.join(self.home, ".claude", "settings.json")
+        _write(path, json.dumps(payload), 0o600)
+        return path
+
+    def _assert_model_dropped(self, text: str) -> None:
+        _clean(text)
+        answer = json.loads(text)
+        self.assertIs("model" in answer["proposal"], False, "model was not dropped")
+        self.assertEqual(answer["proposal"]["default_engine"], "claude_code")
+        self.assertEqual(answer["proposal"]["folder_trust"], "user_choice")
+
+    def test_a_hard_link_into_a_denied_directory_is_not_opened(self):
+        # Witness import-hardlink-denied-dir: OPENED.
+        hermes = os.path.join(self.home, ".hermes")
+        os.remove(hermes)
+        os.mkdir(hermes, 0o700)
+        cred = os.path.join(hermes, "cred.json")
+        _write(cred, json.dumps({
+            "model": "model-from-link",
+            "env": {"TOKEN": _CANARY_ENV},
+        }), 0o600)
+        settings = os.path.join(self.home, ".claude", "settings.json")
+        os.unlink(settings)
+        os.link(cred, settings)
+        before = _tree_hash(self.root)
+        code, text, opened = self._claude()
+        self.assertEqual(code, 0)
+        self._assert_model_dropped(text)
+        self.assertIs("model-from-link" in text, False, "a model was copied from an alias")
+        shown = _under_home(opened, self.home)
+        self.assertFalse(any(path.endswith("settings.json") for path in shown), "settings file was opened")
+        self.assertFalse(any(path.endswith("cred.json") for path in shown), "denied file was opened")
+        self.assertEqual(_tree_hash(self.root), before)
+
+    def test_a_hard_link_into_a_denied_directory_behind_a_symlink_is_not_opened(self):
+        # Witness import-hardlink-denied-dir with the denied directory itself a symlink.
+        store = os.path.join(self.root, "store")
+        os.mkdir(store, 0o700)
+        cred = os.path.join(store, "cred.json")
+        _write(cred, json.dumps({
+            "model": "model-from-link",
+            "env": {"TOKEN": _CANARY_ENV},
+        }), 0o600)
+        hermes = os.path.join(self.home, ".hermes")
+        os.remove(hermes)
+        os.symlink(store, hermes)
+        settings = os.path.join(self.home, ".claude", "settings.json")
+        os.unlink(settings)
+        os.link(cred, settings)
+        before = _tree_hash(self.root)
+        code, text, opened = self._claude()
+        self.assertEqual(code, 0)
+        self._assert_model_dropped(text)
+        self.assertIs("model-from-link" in text, False, "a model was copied from an alias")
+        shown = _under_home(opened, self.home)
+        self.assertFalse(any(path.endswith("settings.json") for path in shown), "settings file was opened")
+        self.assertEqual(_tree_hash(self.root), before)
+
+    def test_any_other_hard_link_is_not_opened(self):
+        settings = self._replace_settings({
+            "model": "model-from-link",
+            "env": {"TOKEN": _CANARY_ENV},
+        })
+        other = os.path.join(self.home, "notes", "copy.json")
+        os.makedirs(os.path.dirname(other), mode=0o700, exist_ok=True)
+        os.link(settings, other)
+        before = _tree_hash(self.root)
+        code, text, opened = self._claude()
+        self.assertEqual(code, 0)
+        self._assert_model_dropped(text)
+        self.assertIs("model-from-link" in text, False, "a model was copied from an alias")
+        shown = _under_home(opened, self.home)
+        self.assertFalse(any(path.endswith("settings.json") for path in shown), "settings file was opened")
+        self.assertEqual(_tree_hash(self.root), before)
+
+    def test_a_descriptor_whose_inode_changes_is_not_read(self):
+        self._replace_settings({"model": "haiku-import", "env": {"TOKEN": _CANARY_ENV}})
+        module = _proposal_module()
+        real_fstat = os.fstat
+
+        class _Shifted:
+            def __init__(self, info):
+                self._info = info
+
+            def __getattr__(self, name):
+                if name == "st_ino":
+                    return self._info.st_ino + 1
+                return getattr(self._info, name)
+
+        def fstat(fd):
+            info = real_fstat(fd)
+            if stat.S_ISREG(info.st_mode) and info.st_size < 100000:
+                return _Shifted(info)
+            return info
+
+        out = io.StringIO()
+        with mock.patch("os.fstat", fstat):
+            code = module.command(out, source="claude", dry_run=True, home=self.home, environ=self._environ())
+        text = out.getvalue()
+        self.assertEqual(code, 0)
+        self._assert_model_dropped(text)
+
+    def test_a_short_secret_inside_model_is_dropped(self):
+        # Witness import-short-secret-in-model: LEAK. Ends DROPPED.
+        self._replace_settings({"model": "pre-SEKRET99-post", "api_key": "SEKRET99"})
+        code, text, _opened = self._claude()
+        self.assertEqual(code, 0)
+        self._assert_model_dropped(text)
+        self.assertIs("SEKRET99" in text, False, "a short value was copied")
+
+    def test_a_command_equal_to_model_is_dropped(self):
+        # Witness import-command-equals-model: LEAK. Ends DROPPED.
+        self._replace_settings({
+            "model": "map-tool",
+            "mcpServers": {"maps": {"command": "map-tool"}},
+        })
+        code, text, _opened = self._claude()
+        self.assertEqual(code, 0)
+        self._assert_model_dropped(text)
+        self.assertIs("map-tool" in text, False, "a command was copied as the model")
+
+    def test_an_unlisted_key_equal_to_model_is_dropped(self):
+        # Witness import-unlisted-key-equals-model: LEAK. Ends DROPPED.
+        self._replace_settings({"model": "gpt-4o", "OPENAI_API_KEY": "gpt-4o"})
+        code, text, _opened = self._claude()
+        self.assertEqual(code, 0)
+        self._assert_model_dropped(text)
+        self.assertIs("gpt-4o" in text, False, "an unlisted value was copied as the model")
+
+    def test_a_model_outside_the_name_shape_is_dropped(self):
+        self._replace_settings({"model": "name!extra"})
+        code, text, _opened = self._claude()
+        self.assertEqual(code, 0)
+        self._assert_model_dropped(text)
+
+    def test_a_value_shorter_than_four_characters_does_not_drop_the_model(self):
+        self._replace_settings({"model": "abc-tool", "note": "abc"})
+        code, text, _opened = self._claude()
+        self.assertEqual(code, 0, text)
+        _clean(text)
+        answer = json.loads(text)
+        self.assertEqual(answer["proposal"]["model"], "abc-tool")
+
+    def test_a_four_character_value_inside_model_is_dropped(self):
+        self._replace_settings({"model": "abcd-tool", "note": "abcd"})
+        code, text, _opened = self._claude()
+        self.assertEqual(code, 0)
+        self._assert_model_dropped(text)
 
 
 if __name__ == "__main__":

@@ -312,6 +312,32 @@ class StartPathTest(unittest.TestCase):
         self.assertLessEqual(adapter._wire_size(shown), adapter.RESULT_STATUS_BYTES)
         self.assertTrue(result_fits(shown), shown)
 
+    def test_a_force_cut_keeps_a_short_detail_a_text_head_and_a_fitting_limit(self):
+        """Two large members must not throw away a short detail, a text head or a limit that fit."""
+        one = contract.event('text', 'vendor', {'n': 1})
+        detail = 'route failure: RuntimeError'
+        limit = contract.limit_signal('connection', 'probe', reset_at=10.0)
+        text = 'x' * (1 << 20)
+        events = [one] * 20000
+        result = contract.result('run-one', None, text=text, events=events, detail=detail, limit=limit)
+        self.assertGreater(adapter._wire_size(result), adapter.RESULT_STATUS_BYTES)
+        shown = adapter._status_result(result)
+        self.assertEqual(shown['detail'], detail)
+        self.assertEqual(shown['limit'], limit)
+        self.assertGreaterEqual(len(shown['text']), 64)
+        self.assertEqual(shown['text'], text[:len(shown['text'])])
+        self.assertLess(len(shown['text']), len(text))
+        self.assertLess(len(shown['events']), len(events))
+        self.assertGreater(len(shown['events']), 0)
+        self.assertTrue(all(event == one for event in shown['events']))
+        self.assertLessEqual(adapter._wire_size(shown), adapter.RESULT_STATUS_BYTES)
+        self.assertTrue(result_fits(shown), shown)
+        self.assertNotIn('truncated', shown)
+        self.assertEqual(result['detail'], detail)
+        self.assertEqual(result['text'], text)
+        self.assertEqual(result['limit'], limit)
+        self.assertEqual(len(result['events']), 20000)
+
     # -- an interrupt one step after the callback still fences the published child -------------------
     def test_an_interrupt_while_recording_the_result_still_fences_the_child(self):
         ctx, process, daemon = self.published_run()

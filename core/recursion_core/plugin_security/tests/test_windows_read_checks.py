@@ -316,11 +316,40 @@ class PurityTests(unittest.TestCase):
         self.assertFalse(called & {"open", "__import__", "exec", "eval", "compile"})
 
     def test_nothing_imports_the_module(self):
-        core = self.MODULE.parents[1]
-        users = [p.relative_to(core).as_posix() for p in core.rglob("*.py")
-                 if p != self.MODULE and p.name != "test_windows_read_checks.py"
-                 and "windows_read_checks" in p.read_text(encoding="utf-8", errors="replace")]
-        self.assertEqual(users, [])
+        NAME = "windows_read_checks"
+        def imports(node, name):
+            if isinstance(node, ast.Import):
+                dotted = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                dotted = [node.module or ""] + [alias.name for alias in node.names]
+            elif (isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant)
+                  and isinstance(node.args[0].value, str)
+                  and getattr(node.func, "attr", getattr(node.func, "id", None)) in ("import_module", "__import__")):
+                dotted = [node.args[0].value]
+            else:
+                return False
+            return any(name in part.split(".") for part in dotted)
+
+        # Every .py file of the repository, hidden and cache folders skipped; real imports only, not text.
+        repo = Path(__file__).resolve().parents[4]
+        users = []
+        for path in sorted(repo.rglob("*.py")):
+            relative = path.relative_to(repo)
+            if path == Path(__file__).resolve() or any(
+                    part.startswith(".") or part == "__pycache__" for part in relative.parts[:-1]):
+                continue
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                if NAME in text:  # a file ast cannot read counts when it names the module at all
+                    users.append(relative.as_posix())
+                continue
+            if any(imports(node, NAME) for node in ast.walk(tree)):
+                users.append(relative.as_posix())
+        # Its one user is the Windows handle reader, which nothing calls (and that reader's own test).
+        self.assertEqual(users, ["core/recursion_core/plugin_security/tests/test_windows_handle_reader.py",
+                                 "core/recursion_core/plugin_security/windows_handle_reader.py"])
 
 
 if __name__ == "__main__":

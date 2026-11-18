@@ -1,0 +1,20 @@
+{
+  "schema": "csl-plugin-manifest/1",
+  "plugin_id": "notes.search",
+  "version": "0.3.0",
+  "artifact_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "dependency_lock_sha256": null,
+  "install_scripts": [],
+  "developer_key": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+  "permissions": [
+    "read",
+    "panel"
+  ],
+  "network_destinations": [],
+  "credential_refs": [],
+  "runtime": "python-inprocess/1",
+  "interface": "csl-plugin-api/1",
+  "files": {
+    "plugin.py": "SHA256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7"
+  }
+}

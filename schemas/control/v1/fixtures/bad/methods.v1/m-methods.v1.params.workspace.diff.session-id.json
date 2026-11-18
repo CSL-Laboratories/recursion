@@ -1,0 +1,6 @@
+{
+  "method": "workspace.diff",
+  "params": {
+    "turn_id": "turn-000b"
+  }
+}

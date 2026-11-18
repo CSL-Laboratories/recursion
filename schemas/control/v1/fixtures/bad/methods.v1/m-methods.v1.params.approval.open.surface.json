@@ -1,0 +1,7 @@
+{
+  "method": "approval.open",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "approval_id": "apr-00c4"
+  }
+}

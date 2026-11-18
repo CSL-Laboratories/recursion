@@ -1,0 +1,223 @@
+{
+  "about": "Frame vectors for every codec of the control socket's wire (the desktop's Rust proxy is the next one). A frame is a 4-byte big-endian unsigned length, then that many bytes of UTF-8 JSON holding one object (core/recursion_core/control_transport/framing.py at master_head). Bodies are written with no spaces (separators ',' and ':'), non-ASCII as UTF-8, keys in the order given, and no NaN or Infinity. Every vector here is checked against that module by desktop/tests/check_codec.py. The desktop sends integers only, so no vector pins how a float is written. 'generated' bodies are described, not stored: '{\"op\":\"control\",\"method\":\"run.start\",\"params\":{\"prompt\":\"' + 'a' * n + '\"}}' with n chosen so the body has exactly body_bytes bytes.",
+  "master_head": "fb578e31a2c0469457a23dbcaa4030bdd24cef64",
+  "max_frame_bytes": 1048576,
+  "encode": [
+    {
+      "name": "a run.list request",
+      "message": {
+        "op": "control",
+        "method": "run.list",
+        "params": {}
+      },
+      "frame_hex": "000000307b226f70223a22636f6e74726f6c222c226d6574686f64223a2272756e2e6c697374222c22706172616d73223a7b7d7d"
+    },
+    {
+      "name": "a start, keys in the order the CLI builds them",
+      "message": {
+        "op": "control",
+        "method": "run.start",
+        "params": {
+          "tenant": "t1",
+          "engine": "codex",
+          "prompt": "hi"
+        }
+      },
+      "frame_hex": "0000005d7b226f70223a22636f6e74726f6c222c226d6574686f64223a2272756e2e7374617274222c22706172616d73223a7b2274656e616e74223a227431222c22656e67696e65223a22636f646578222c2270726f6d7074223a226869227d7d"
+    },
+    {
+      "name": "non-ASCII text stays UTF-8, not escaped",
+      "message": {
+        "op": "control",
+        "method": "run.start",
+        "params": {
+          "tenant": "t1",
+          "engine": "codex",
+          "prompt": "caf\u00e9 \u2615 \u00fcber \u4e2d\u6587"
+        }
+      },
+      "frame_hex": "000000717b226f70223a22636f6e74726f6c222c226d6574686f64223a2272756e2e7374617274222c22706172616d73223a7b2274656e616e74223a227431222c22656e67696e65223a22636f646578222c2270726f6d7074223a22636166c3a920e2989520c3bc62657220e4b8ade69687227d7d"
+    },
+    {
+      "name": "characters JSON must escape",
+      "message": {
+        "op": "control",
+        "method": "run.start",
+        "params": {
+          "tenant": "t1",
+          "engine": "codex",
+          "prompt": "quote \" backslash \\ newline \n tab \t bell \u0007 del \u007f"
+        }
+      },
+      "frame_hex": "000000947b226f70223a22636f6e74726f6c222c226d6574686f64223a2272756e2e7374617274222c22706172616d73223a7b2274656e616e74223a227431222c22656e67696e65223a22636f646578222c2270726f6d7074223a2271756f7465205c22206261636b736c617368205c5c206e65776c696e65205c6e20746162205c742062656c6c205c75303030372064656c207f227d7d"
+    },
+    {
+      "name": "a nested cursor and integers",
+      "message": {
+        "op": "control",
+        "method": "events.follow",
+        "params": {
+          "cursor": {
+            "epoch": 3,
+            "session_id": "ses-7f3a9c2e51d04b6a",
+            "seq": 42
+          },
+          "projection": "transcript",
+          "wait_ms": 20000
+        }
+      },
+      "frame_hex": "000000a07b226f70223a22636f6e74726f6c222c226d6574686f64223a226576656e74732e666f6c6c6f77222c22706172616d73223a7b22637572736f72223a7b2265706f6368223a332c2273657373696f6e5f6964223a227365732d37663361396332653531643034623661222c22736571223a34327d2c2270726f6a656374696f6e223a227472616e736372697074222c22776169745f6d73223a32303030307d7d"
+    },
+    {
+      "name": "a ping",
+      "message": {
+        "op": "ping"
+      },
+      "frame_hex": "0000000d7b226f70223a2270696e67227d"
+    }
+  ],
+  "encode_generated": [
+    {
+      "name": "a body of exactly the cap is sent",
+      "body_bytes": 1048576,
+      "result": "ok"
+    },
+    {
+      "name": "a body one byte over the cap is refused before anything is written",
+      "body_bytes": 1048577,
+      "error": "frame_too_large"
+    }
+  ],
+  "encode_refused": [
+    {
+      "name": "a list is not a frame",
+      "message": [],
+      "error": "frame_not_object"
+    },
+    {
+      "name": "a string is not a frame",
+      "message": "run.list",
+      "error": "frame_not_object"
+    }
+  ],
+  "decode": [
+    {
+      "name": "a clean close between frames",
+      "bytes_hex": "",
+      "result": null
+    },
+    {
+      "name": "a close inside the header",
+      "bytes_hex": "0000",
+      "error": "frame_truncated"
+    },
+    {
+      "name": "a close inside the body",
+      "bytes_hex": "0000000a7b7d",
+      "error": "frame_truncated"
+    },
+    {
+      "name": "a header with no body at all",
+      "bytes_hex": "00000002",
+      "error": "frame_truncated"
+    },
+    {
+      "name": "an empty body is not JSON",
+      "bytes_hex": "00000000",
+      "error": "frame_not_json"
+    },
+    {
+      "name": "a length one over the cap is refused before the body is read",
+      "bytes_hex": "00100001",
+      "error": "frame_too_large"
+    },
+    {
+      "name": "the largest length is refused before the body is read",
+      "bytes_hex": "ffffffff",
+      "error": "frame_too_large"
+    },
+    {
+      "name": "text that is not JSON",
+      "bytes_hex": "000000046e6f7065",
+      "error": "frame_not_json"
+    },
+    {
+      "name": "bytes that are not UTF-8",
+      "bytes_hex": "000000047b22c328",
+      "error": "frame_not_json"
+    },
+    {
+      "name": "a byte-order mark before the JSON",
+      "bytes_hex": "00000005efbbbf7b7d",
+      "error": "frame_not_json"
+    },
+    {
+      "name": "a JSON list is not an object",
+      "bytes_hex": "000000025b5d",
+      "error": "frame_not_object"
+    },
+    {
+      "name": "a JSON string is not an object",
+      "bytes_hex": "000000022222",
+      "error": "frame_not_object"
+    },
+    {
+      "name": "spaces around the object are allowed",
+      "bytes_hex": "0000000a207b2261223a20317d20",
+      "result": {
+        "a": 1
+      }
+    },
+    {
+      "name": "a repeated key keeps its last value",
+      "bytes_hex": "0000000d7b2261223a312c2261223a327d",
+      "result": {
+        "a": 2
+      }
+    },
+    {
+      "name": "two frames back to back are read one at a time",
+      "bytes_hex": "000000027b7d000000027b7d",
+      "result": {}
+    }
+  ],
+  "decode_generated": [
+    {
+      "name": "a body of exactly the cap is read",
+      "body_bytes": 1048576,
+      "result": "ok"
+    },
+    {
+      "name": "nesting deeper than the decoder allows is a frame error, not a crash",
+      "nested_lists": 100000,
+      "error": "frame_too_deep"
+    }
+  ],
+  "transport_frames": {
+    "about": "Sent by the server without reading anything. A client reads either one, exactly, as 'not delivered' (the CLI answers control_api_unavailable with delivered false). A handler can never send either: the server rewrites a handler error that claims the transport layer.",
+    "busy": {
+      "message": {
+        "ok": false,
+        "error": {
+          "code": "busy",
+          "layer": "transport",
+          "delivered": false,
+          "retryable": true
+        }
+      },
+      "frame_hex": "0000005b7b226f6b223a66616c73652c226572726f72223a7b22636f6465223a2262757379222c226c61796572223a227472616e73706f7274222c2264656c697665726564223a66616c73652c22726574727961626c65223a747275657d7d"
+    },
+    "not_admitted": {
+      "message": {
+        "ok": false,
+        "error": {
+          "code": "scope_refused",
+          "layer": "transport",
+          "delivered": false,
+          "retryable": false
+        }
+      },
+      "frame_hex": "000000657b226f6b223a66616c73652c226572726f72223a7b22636f6465223a2273636f70655f72656675736564222c226c61796572223a227472616e73706f7274222c2264656c697665726564223a66616c73652c22726574727961626c65223a66616c73657d7d"
+    }
+  }
+}

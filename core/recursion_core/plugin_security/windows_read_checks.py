@@ -14,7 +14,9 @@ answers ``plugin_file_unreadable`` or ``plugin_file_untrusted``; a directory ste
 ``plugin_directory_untrusted``, the cause the daemon gives a directory it will not use:
 
 * an expected name that cannot be judged (empty for a file; an empty part, ``.`` or ``..``; a
-  ``:``; a ``/``; a part ending in a dot or a space): ``plugin_file_unreadable``;
+  ``:``; a ``/``; a part ending in a dot or a space; a device name such as ``CON`` or ``COM1.py``
+  in any letter case; a reserved character ``< > " | ? *``; a control character):
+  ``plugin_file_unreadable``;
 * one handle fact that could not be read (``None``), or a link count of 0: ``plugin_file_unreadable``;
 * any reparse attribute or tag: ``plugin_file_unreadable``;
 * final path not equal, exact case, to the root final path joined with the expected name:
@@ -63,6 +65,10 @@ PLUGIN_DIRECTORY_UNTRUSTED = "plugin_directory_untrusted"
 CAUSES = (PLATFORM_UNSUPPORTED, PLUGIN_FILE_UNREADABLE, PLUGIN_FILE_UNTRUSTED, PLUGIN_DIRECTORY_UNTRUSTED)
 
 _SEPARATOR = "\\"
+# Names Windows opens as a device in any folder, with or without an extension, in any letter case.
+_DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+                          | {f"{prefix}{n}" for prefix in ("COM", "LPT") for n in range(1, 10)})
+_RESERVED_CHARACTERS = frozenset('<>"|?*:/')
 # The facts one query of the handle gives; ``None`` in one of them means that query failed.
 _HANDLE_FACTS = ("attributes", "reparse_tag", "link_count", "file_type", "final_path", "owner_ok")
 
@@ -120,14 +126,21 @@ def _plain_name(name: str, kind: str) -> bool:
         return kind == KIND_DIRECTORY  # the pinned root itself
     for part in name.split(_SEPARATOR):
         # A part ending in a dot covers "." and ".." as well.
-        if not part or ":" in part or "/" in part or part[-1] in ". ":
+        if not part or part[-1] in ". ":
+            return False
+        if any(char in _RESERVED_CHARACTERS or ord(char) < 32 for char in part):
+            return False
+        if part.split(".", 1)[0].rstrip(" ").upper() in _DEVICE_NAMES:
             return False
     return True
 
 
-def _expected_final_path(facts: WindowsHandleFacts) -> str:
+def _final_path_matches(facts: WindowsHandleFacts) -> bool:
     root = facts.root_final_path.rstrip(_SEPARATOR)
-    return root + _SEPARATOR + facts.expected_name if facts.expected_name else facts.root_final_path
+    if not facts.expected_name:
+        # The pinned root itself: a trailing separator is taken off both sides alike.
+        return facts.final_path.rstrip(_SEPARATOR) == root
+    return facts.final_path == root + _SEPARATOR + facts.expected_name
 
 
 def judge_handle(facts: WindowsHandleFacts, kind: str) -> str | None:
@@ -145,7 +158,7 @@ def judge_handle(facts: WindowsHandleFacts, kind: str) -> str | None:
         return unreadable
     if facts.reparse_tag != 0 or facts.attributes & FILE_ATTRIBUTE_REPARSE_POINT:
         return unreadable
-    if facts.final_path != _expected_final_path(facts):
+    if not _final_path_matches(facts):
         return unreadable
     is_directory = bool(facts.attributes & FILE_ATTRIBUTE_DIRECTORY)
     if facts.file_type != FILE_TYPE_DISK or is_directory != directory:

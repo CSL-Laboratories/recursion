@@ -106,6 +106,16 @@ class FinalPathRowTests(unittest.TestCase):
         top = file_facts(final_path=VOLUME_A + "\\" + NAME, root_final_path=VOLUME_A + "\\")
         self.assertIsNone(w.judge_handle(top, w.KIND_FILE))
 
+    def test_root_trailing_separator_is_handled_alike_on_both_sides(self):
+        # The pinned root itself (empty name): a trailing separator on either side does not decide.
+        for root, final in ((ROOT + "\\", ROOT), (ROOT, ROOT + "\\"), (ROOT + "\\", ROOT + "\\"),
+                            (VOLUME_A + "\\", VOLUME_A), (VOLUME_A, VOLUME_A + "\\")):
+            with self.subTest(root=root, final=final):
+                step = dir_facts(expected_name="", root_final_path=root, final_path=final)
+                self.assertIsNone(w.judge_handle(step, w.KIND_DIRECTORY))
+        moved = dir_facts(expected_name="", root_final_path=ROOT + "\\", final_path=VOLUME_B + "\\Op\\")
+        self.assertEqual(w.judge_handle(moved, w.KIND_DIRECTORY), "plugin_directory_untrusted")
+
     def test_sibling_sharing_the_root_prefix_is_refused(self):
         sibling = file_facts(final_path=ROOT + "Evil\\" + NAME)
         self.assertEqual(w.judge_handle(sibling, w.KIND_FILE), "plugin_file_unreadable")
@@ -133,6 +143,31 @@ class NameRuleTests(unittest.TestCase):
         root_as_file = file_facts(expected_name="", final_path=ROOT)
         self.assertEqual(w.judge_handle(root_as_file, w.KIND_FILE), "plugin_file_unreadable")
         self.assertIsNone(w.judge_handle(dir_facts(expected_name="", final_path=ROOT), w.KIND_DIRECTORY))
+
+    def test_device_names_are_refused(self):
+        for part in ("CON", "con", "Prn", "aux", "NUL", "nul.txt", "COM1", "com9.py", "LPT1", "lpt9.json",
+                     "CONIN$", "conout$", "CON.tar.gz", "NUL .txt"):
+            for name in (part, "alpha\\" + part, part + "\\plugin.py"):
+                with self.subTest(name=name):
+                    joined = file_facts(expected_name=name, final_path=ROOT + "\\" + name)
+                    self.assertEqual(w.judge_handle(joined, w.KIND_FILE), "plugin_file_unreadable")
+                    step = dir_facts(expected_name=name, final_path=ROOT + "\\" + name)
+                    self.assertEqual(w.judge_handle(step, w.KIND_DIRECTORY), "plugin_directory_untrusted")
+
+    def test_names_near_a_device_name_pass(self):
+        for name in ("CONSOLE\\plugin.py", "alpha\\COM10.py", "alpha\\LPT0.py", "alpha\\nul_plugin.py", "COM\\x.py"):
+            with self.subTest(name=name):
+                self.assertIsNone(w.judge_handle(file_facts(expected_name=name, final_path=ROOT + "\\" + name),
+                                                 w.KIND_FILE))
+
+    def test_reserved_and_control_characters_are_refused(self):
+        for char in '<>"|?*' + "".join(chr(code) for code in range(32)):
+            for name in (f"alpha\\plu{char}gin.py", f"al{char}pha\\plugin.py"):
+                with self.subTest(char=ord(char), name=name):
+                    joined = file_facts(expected_name=name, final_path=ROOT + "\\" + name)
+                    self.assertEqual(w.judge_handle(joined, w.KIND_FILE), "plugin_file_unreadable")
+                    step = dir_facts(expected_name=name, final_path=ROOT + "\\" + name)
+                    self.assertEqual(w.judge_handle(step, w.KIND_DIRECTORY), "plugin_directory_untrusted")
 
 
 class HandleRowTests(unittest.TestCase):
@@ -174,6 +209,11 @@ class FailedQueryTests(unittest.TestCase):
                 self.assertEqual(w.judge_handle(file_facts(**{name: None}), w.KIND_FILE), "plugin_file_unreadable")
                 self.assertEqual(w.judge_handle(dir_facts(**{name: None}), w.KIND_DIRECTORY),
                                  "plugin_directory_untrusted")
+
+    def test_final_path_none_alone_is_unreadable(self):
+        # The pinned root step: here only the None rule stands between a missing final path and the compare.
+        root_step = dir_facts(expected_name="", final_path=None)
+        self.assertEqual(w.judge_handle(root_step, w.KIND_DIRECTORY), "plugin_directory_untrusted")
 
     def test_link_count_zero_is_unreadable(self):
         self.assertEqual(w.judge_handle(file_facts(link_count=0), w.KIND_FILE), "plugin_file_unreadable")
@@ -220,13 +260,23 @@ class RevocationAndUnusableFactsTests(unittest.TestCase):
         self.assertEqual(answers, {"platform_unsupported", "plugin_file_unreadable", "plugin_file_untrusted",
                                    "plugin_directory_untrusted"})
         self.assertEqual(answers, set(w.CAUSES))
-        # Each is a refusal code master's own code already gives, outside this module and outside tests.
+        # Each is a cause master's own code already refuses with: a string handed to a refusal
+        # constructor (PluginRefused, EnvRefused, Refused, ...) outside this module and outside tests.
         core = Path(w.__file__).parents[1]
-        sources = [p.read_text(encoding="utf-8", errors="replace") for p in core.rglob("*.py")
-                   if "tests" not in p.relative_to(core).parts and p.name != "windows_read_checks.py"]
+        causes = set()
+        for path in core.rglob("*.py"):
+            if "tests" in path.relative_to(core).parts or path.name == "windows_read_checks.py":
+                continue
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8", errors="replace"))):
+                if not isinstance(node, ast.Call):
+                    continue
+                callee = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+                if callee.endswith("Refused"):
+                    causes.update(arg.value for arg in node.args
+                                  if isinstance(arg, ast.Constant) and isinstance(arg.value, str))
         for cause in answers:
             with self.subTest(cause):
-                self.assertTrue(any(f"'{cause}'" in text or f'"{cause}"' in text for text in sources))
+                self.assertIn(cause, causes)
 
 
 class PurityTests(unittest.TestCase):

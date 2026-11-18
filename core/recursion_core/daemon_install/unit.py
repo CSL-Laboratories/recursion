@@ -331,7 +331,12 @@ def _noncharacter(code: int) -> bool:
 
 
 def _unicode_noncharacter(value: str, i: int) -> str:
-    """``'u'`` or ``'U'`` when the escape at ``value[i]`` is a noncharacter, else ``''``."""
+    """``'u'`` or ``'U'`` when the escape at ``value[i]`` is a noncharacter, else ``''``.
+
+    A ``\\u`` surrogate is also ``'u'``. ``cunescape_one`` decodes ``\\u`` without
+    ``unichar_is_valid``, so that word is dropped and the line goes on. A ``\\U`` surrogate
+    fails ``unichar_is_valid`` and stays ``''``, which stops the line.
+    """
 
     if i + 1 >= len(value) or value[i] != "\\":
         return ""
@@ -343,6 +348,8 @@ def _unicode_noncharacter(value: str, i: int) -> str:
     if len(digits) != size or any(d not in _HEX_DIGITS for d in digits):
         return ""
     code = int(digits, 16)
+    if letter == "u" and 0xD800 <= code <= 0xDFFF:
+        return "u"
     if code == 0 or code > 0x10FFFF or 0xD800 <= code <= 0xDFFF or not _noncharacter(code):
         return ""
     return letter

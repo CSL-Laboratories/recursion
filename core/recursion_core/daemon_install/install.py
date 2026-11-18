@@ -103,7 +103,9 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     its bytes and then its path last (``still_holds``, then ``still_names``): one removed, replaced or rewritten
     in place meanwhile is ``unit_missing`` or ``unit_changed``. A refusal
     after the stores are begun (that, or a store refused after the other was made) leaves what was
-    made; each store made is a whole, valid store, and the command run again finds it."""
+    made; each store made is a whole, valid store, and the command run again finds it. A platform
+    with no ``os.geteuid`` is refused ``platform_unsupported`` (one line naming the platform) before
+    any path is read or written."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args).encode()
@@ -142,7 +144,8 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     written again unless
     another user could change the file; a unit kept is held open until the answer and checked
     against its bytes and then its path last, as in ``install``, whose words on a refusal after the stores
-    apply."""
+    apply. A platform with no ``os.geteuid`` is refused
+    ``platform_unsupported`` (one line naming the platform) before any path is read or written."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args).encode()

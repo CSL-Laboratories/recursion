@@ -214,6 +214,7 @@ class Policy(_Base):
                            parent_env=self.parent(), operator_home=str(self.operator))
 
     # SR-06: an unreadable own-store subtree is silently skipped, so an outside link passes.
+    @unittest.skipIf(os.name == "nt", "POSIX home checks")
     def test_sr06_unreadable_store_subtree_refuses(self):
         outside = self.root / "outside"
         outside.mkdir()
@@ -239,6 +240,7 @@ class Policy(_Base):
         self.assertNotIn("Errno", text)
 
     # F1: an ancestor that cannot be searched is not "the store is absent".
+    @unittest.skipIf(os.name == "nt", "POSIX home checks")
     def test_sr06_unreadable_ancestor_is_not_an_absent_store(self):
         if os.geteuid() == 0:
             self.skipTest("root ignores directory mode bits")
@@ -291,6 +293,7 @@ class Policy(_Base):
                 operator_home=str(self.operator), wrapper=self.wrapper))
 
     # F2: a directory that can be listed but not searched must not hide a link.
+    @unittest.skipIf(os.name == "nt", "POSIX home checks")
     def test_sr06_listable_unsearchable_directory_hides_no_link(self):
         if os.geteuid() == 0:
             self.skipTest("root ignores directory mode bits")
@@ -318,6 +321,11 @@ class Policy(_Base):
 
     # F6: a name that disappears during the walk is not reported as unreadable.
     def test_sr06_walk_enoent_is_its_own_cause(self):
+        if os.name == "nt":
+            with self.assertRaises(SubscriptionRouteRefused) as caught:
+                self.chatgpt()
+            self.assertEqual(caught.exception.cause, "platform_unsupported")
+            return
         store = self.home / ".config" / "opencode"
         store.mkdir(parents=True)
 
@@ -335,6 +343,11 @@ class Policy(_Base):
 
     # SR-07: ordinary directories consume none of the store-walk budget.
     def test_sr07_walk_budget_counts_directories(self):
+        if os.name == "nt":
+            with self.assertRaises(SubscriptionRouteRefused) as caught:
+                self.chatgpt()
+            self.assertEqual(caught.exception.cause, "platform_unsupported")
+            return
         store = self.home / ".config" / "opencode"
         for i in range(3):
             (store / f"d{i}").mkdir(parents=True)
@@ -413,7 +426,13 @@ class Policy(_Base):
 
     # SR-04: a null child env, a non-string name, or a non-string value is a typed refusal.
     def test_sr04_malformed_env_is_a_refusal(self):
-        self.opencode_api(PATH="/usr/bin:/bin", HOME=str(self.home), OPENAI_API_KEY=FAKE_KEY)  # control
+        if os.name == "nt":
+            # A well-formed env still reaches the home check, which refuses before a launch.
+            with self.assertRaises(SubscriptionRouteRefused) as caught:
+                self.opencode_api(PATH="/usr/bin:/bin", HOME=str(self.home), OPENAI_API_KEY=FAKE_KEY)
+            self.assertEqual(caught.exception.cause, "platform_unsupported")
+        else:
+            self.opencode_api(PATH="/usr/bin:/bin", HOME=str(self.home), OPENAI_API_KEY=FAKE_KEY)  # control
         for name, env in {"none": None, "int_value": {"HOME": str(self.home), "OPENAI_API_KEY": 7},
                           "int_name": {"HOME": str(self.home), "OPENAI_API_KEY": FAKE_KEY, 7: "x"}}.items():
             with self.subTest(name):
@@ -448,6 +467,7 @@ class Policy(_Base):
         self.call(self._try_refused, self._hermes_spawn)
 
     # SR-09: publishing the switch does not replace an empty .hermes another writer holds open.
+    @unittest.skipIf(os.name == "nt", "POSIX home checks")
     def test_sr09_held_empty_hermes_dir_is_not_replaced(self):
         parent = self.home / ".hermes"
         parent.mkdir(mode=0o700)
@@ -478,6 +498,7 @@ class WrapperPin(_Base):
                     self.fail(f"untyped exception: {type(exc).__name__}")
 
     # SR-11: a regular file swapped for a FIFO between check and open blocks hashing forever.
+    @unittest.skipIf(os.name == "nt", "POSIX home checks")
     def test_sr11_fifo_swap_does_not_block(self):
         lib = str(self.install / "lib.js")
         real_isfile = os.path.isfile
@@ -513,6 +534,7 @@ class WrapperPin(_Base):
         self.assertEqual(outcome, ["WrapperPinRefused"])
 
     # F4: a symlink swapped in at the regular-file check must not be hashed.
+    @unittest.skipIf(os.name == "nt", "POSIX home checks")
     def test_sr11_symlink_swap_is_not_followed(self):
         lib = str(self.install / "lib.js")
         outside = self.root / "outside.txt"
@@ -533,6 +555,7 @@ class WrapperPin(_Base):
         self.assertNotIn("outside-bytes", str(caught.exception))
 
     # F4: a FIFO swapped in at the same step is not pinned as an empty file.
+    @unittest.skipIf(os.name == "nt", "POSIX home checks")
     def test_sr11_fifo_swap_is_not_a_regular_file(self):
         lib = str(self.install / "lib.js")
         real_isfile = os.path.isfile

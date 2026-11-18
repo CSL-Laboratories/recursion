@@ -5,6 +5,7 @@ The launcher's typed route error must come back as a result. Other route finding
 
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 import unittest
@@ -32,7 +33,10 @@ class TypedBoundary(unittest.TestCase):
         home.mkdir(mode=0o700)
         clock = FakeClock()
 
+        launched = []
+
         def launcher(argv, **kw):
+            launched.append(argv)
             raise c.RouteError(c.LAUNCH_REFUSED, "synthetic policy refusal")
 
         adapters = profile_adapters(launcher, clock, lambda cid, name: "fake-key-not-a-credential",
@@ -45,7 +49,13 @@ class TypedBoundary(unittest.TestCase):
                       profile={"provider": "openai", "auth": "api_key", "credential_env": "OPENAI_API_KEY",
                                "model": "openai/m"})
         res = self._handle(svc, req)
-        self.assertEqual(res["code"], c.LAUNCH_REFUSED)
+        if os.name == "nt":
+            # The home check refuses before any launch. WindowsRefusalTests pins the same result.
+            self.assertEqual((res["code"], res["detail"]),
+                             (c.SUBSCRIPTION_ROUTE_REFUSED, "platform_unsupported"))
+            self.assertEqual(launched, [])
+        else:
+            self.assertEqual(res["code"], c.LAUNCH_REFUSED)
 
 
 if __name__ == "__main__":

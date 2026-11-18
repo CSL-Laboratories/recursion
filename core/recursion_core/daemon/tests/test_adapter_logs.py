@@ -13,6 +13,7 @@ import queue
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -390,6 +391,71 @@ class AdapterLogTest(unittest.TestCase):
         daemon = SimpleNamespace(registry=mock.Mock())
         daemon.registry.get.side_effect = KeyError('run-one')
         return adapter.DaemonControl(api, None, daemon, starter, self.root)
+
+    def test_two_keys_that_differ_only_in_lone_surrogates_both_stay_on_the_answer(self):
+        """Keys that frame to one text keep every member: a rewritten key that meets a taken name is counted."""
+        cases = (
+            ({'\ud800': 1, '\udc00': 2}, {'\ufffd': 1, '\ufffd~2': 2}),
+            ({'\ufffd': 'clean', '\ud800': 'lone'}, {'\ufffd': 'clean', '\ufffd~2': 'lone'}),
+            ({'\ud800': 'lone', '\ufffd': 'clean'}, {'\ufffd~2': 'lone', '\ufffd': 'clean'}),
+            ({'\ud800': 1, '\udc00': 2, '\ufffd~2': 3}, {'\ufffd': 1, '\ufffd~3': 2, '\ufffd~2': 3}),
+        )
+        for detail, expected in cases:
+            payload = {'status': 'error', 'code': 'engine_error', 'detail': detail}
+            snapshot = json.dumps(payload)
+            for in_memory in (True, False):
+                with self.subTest(detail=snapshot, in_memory=in_memory):
+                    stored = json.loads(snapshot)
+                    control = self._control(stored, in_memory=in_memory)
+                    listed = control.call('run.list')
+                    self._framed(listed)
+                    self.assertEqual(listed['runs'][0]['result']['detail'], expected)
+                    status = control.call('run.status')
+                    self._framed(status)
+                    self.assertEqual(status['run']['result']['detail'], expected)
+                    self.assertEqual(json.dumps(stored), snapshot)
+
+    def test_a_lone_surrogate_in_text_or_detail_still_answers_status_and_stop(self):
+        """The point P1 of the read of #455: a lone surrogate in the route result does not lose an answer."""
+        from recursion_core.control.api import ControlAPI
+        from recursion_core.control.client import SocketAPI
+        from recursion_core.control.registry import EMPTY, InMemoryRunRegistry
+        from recursion_core.control_transport import UnixControlServer
+
+        for field in ('text', 'detail'):
+            with self.subTest(field=field):
+                result = contract.result('run-one', None, text='done', detail='x')
+                result[field] = 'a\udc80b'
+                registry = InMemoryRunRegistry()
+                registry.put({'run_id': 'run-one', 'tenant': 't', 'engine': 'claude_code',
+                              'state': 'running', 'cgroup': '/slice/recursion-run-run-one.service',
+                              'started_at': 1.0, 'stop': None, 'start_key': None})
+                kill = SimpleNamespace(request_stop=lambda group: None, confirm=lambda group, timeout: EMPTY)
+                api = ControlAPI(registry, kill, mock.Mock(), time.time)
+                unit_registry = mock.Mock()
+                unit_registry.get.side_effect = KeyError('no unit row')
+                control = adapter.DaemonControl(
+                    api, mock.Mock(), SimpleNamespace(registry=unit_registry),
+                    SimpleNamespace(results={'run-one': result}, failures={}), self.root)
+                folder = self.root / field
+                folder.mkdir()
+                server = UnixControlServer(folder / 'socket', control.handle)
+                server.start()
+                self.addCleanup(server.close)
+                client = SocketAPI(str(server.path), timeout_s=3)
+                status = client.call('run.status', {'run_id': 'run-one'})
+                self.assertEqual(status['code'], 'ok', status)
+                self.assertEqual(status['run']['result'][field], 'a\ufffdb')
+                stopped = client.call('run.stop', {'run_id': 'run-one'})
+                self.assertEqual(stopped['code'], 'stopped', stopped)
+                self.assertEqual(registry.get('run-one')['state'], 'stopped')
+                code, body = control.gui_transport('POST', '/v1/runs/stop', b'{"run_id": "run-one"}')
+                self.assertEqual(code, 200)
+                self.assertEqual(json.loads(body)['code'], 'stopped')
+                status = client.call('run.status', {'run_id': 'run-one'})
+                self.assertEqual(status['code'], 'ok', status)
+                self.assertEqual(status['run']['result'][field], 'a\ufffdb')
+                self.assertEqual(result[field], 'a\udc80b')
 
 
 if __name__ == '__main__':

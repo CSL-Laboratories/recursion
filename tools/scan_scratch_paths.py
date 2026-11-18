@@ -7,7 +7,10 @@ paths on its command line and prints ``file:line`` for every line that holds the
 path form of such a folder (under /var/tmp or /tmp, named after the engine). A
 bare engine name such as an engine id is not a hit; only the path form is, and
 only where a path starts: a tmp folder nested inside another path (a
-repository's own tmp folder, a nested var/tmp) is not a hit.
+repository's own tmp folder, a nested var/tmp) is not a hit. A path also starts
+right after a written escape of a line break, carriage return or tab (a
+backslash and n, r or t, as JSON and logs write them) and right after the host
+of a file URL (file://localhost, file://<host>).
 
 A line that carries the marker ``scratch-path: allowed`` is not reported.
 
@@ -33,6 +36,22 @@ MARKER = "scratch-path: " + "allowed"
 # the like). After a letter, digit, "_", ".", "~" or "-" the tmp folder sits
 # inside another path (a repository's own tmp, a nested var/tmp) and is no hit.
 _PATTERN = re.compile(r"(?<![\w.~-])(?:" + "|".join(re.escape(form) for form in FORMS) + ")")
+# Where the character before a form is one of those, the form still starts a path
+# when the text before it ends in a written escape (an odd run of backslashes
+# then n, r or t) or in the scheme and host of a file URL.
+_FORM = re.compile("|".join(re.escape(form) for form in FORMS))
+_ESCAPED_SPACE = re.compile(r"(?<!\\)(?:\\\\)*\\[nrt]$")
+_FILE_HOST = re.compile(r"(?:^|[^\w+.-])file://[^/\s]*$", re.IGNORECASE)
+
+
+def _names_scratch_path(line: str) -> bool:
+    if _PATTERN.search(line):
+        return True
+    for match in _FORM.finditer(line):
+        before = line[:match.start()]
+        if _ESCAPED_SPACE.search(before) or _FILE_HOST.search(before):
+            return True
+    return False
 
 
 def hit_lines(text: str) -> list[int]:
@@ -41,7 +60,7 @@ def hit_lines(text: str) -> list[int]:
     for number, line in enumerate(text.split("\n"), start=1):
         if MARKER in line:
             continue
-        if _PATTERN.search(line):
+        if _names_scratch_path(line):
             out.append(number)
     return out
 

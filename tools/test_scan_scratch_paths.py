@@ -141,6 +141,42 @@ class ScanScratchPathsTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(out.splitlines(), [f"{path}:{n}" for n in range(1, len(lines) + 1)])
 
+    def test_a_form_after_an_escaped_whitespace_or_a_file_host_is_a_hit(self) -> None:
+        # In JSON or log text a path can follow a written escape (a backslash and
+        # n, r or t) or the host of a file URL; it still starts a path there.
+        bs = chr(92)
+        lines = (
+            '{"output":"scratch folder:' + bs + "n" + TMP_FORM + 'build"}',
+            '{"output":"cols' + bs + "t" + VAR_FORM + 'a"}',
+            '{"output":"line' + bs + "r" + TMP_FORM + 'b"}',
+            "x" + bs * 3 + "n" + TMP_FORM + "c",
+            bs + "n" + VAR_FORM + "d",
+            '{"uri":"file://localhost' + TMP_FORM + 'e"}',
+            "see file://build-host" + VAR_FORM + "f",
+            "FILE://LOCALHOST" + TMP_FORM + "g",
+            '{"p":' + bs + '"' + TMP_FORM + "h" + bs + '"}',
+            "cd " + TMP_FORM,
+        )
+        path = self.write("n.json", "\n".join(lines) + "\n")
+        code, out, _ = self.run_main(path)
+        self.assertEqual(code, 1)
+        self.assertEqual(out.splitlines(), [f"{path}:{n}" for n in range(1, len(lines) + 1)])
+
+    def test_a_form_nested_after_an_escape_or_a_url_path_is_not_a_hit(self) -> None:
+        # An escaped backslash before "n", a letter after the escape, a folder
+        # after the file host, another scheme or a web URL keep the tmp folder
+        # inside another path: no hit.
+        bs = chr(92)
+        lines = (
+            '"C:' + bs * 2 + "n" + TMP_FORM + 'a"',
+            "a" + bs + "nb" + TMP_FORM + "b",
+            "file://host/srv" + TMP_FORM + "c",
+            "profile://host" + TMP_FORM + "d",
+            "http://localhost" + VAR_FORM + "e",
+        )
+        path = self.write("o.json", "\n".join(lines) + "\n")
+        self.assertEqual(self.run_main(path), (0, "", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

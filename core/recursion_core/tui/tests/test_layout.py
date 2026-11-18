@@ -258,10 +258,6 @@ class NoColorFlagTest(unittest.TestCase):
         self.assertEqual(err.getvalue(), "")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LeftoverBotFindingsTest(unittest.TestCase):
     """Bot review findings left open after the round-3 stop (t1430u X1c)."""
 
@@ -344,3 +340,7 @@ class LeftoverBotFindingsTest(unittest.TestCase):
         text = "\n".join(block_rows(screen(app), p.UNRECONCILED))
         self.assertTrue(all(i in text for i in ids), text)
         self.assertNotIn("not named", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

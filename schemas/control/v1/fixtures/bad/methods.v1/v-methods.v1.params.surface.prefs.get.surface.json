@@ -1,0 +1,6 @@
+{
+  "method": "surface.prefs.get",
+  "params": {
+    "surface": "x-nobody-defined-this"
+  }
+}

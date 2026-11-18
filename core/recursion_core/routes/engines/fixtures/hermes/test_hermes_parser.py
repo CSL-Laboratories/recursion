@@ -548,6 +548,7 @@ class StreamTest(unittest.TestCase):
     def test_a_lone_surrogate_anywhere_makes_the_line_raw_and_changes_no_state(self):
         lone = 'x' + chr(0xD800)
         # Recognisable unnamed calls: counted open and uncertain, so the next result is not e9n-1.
+        # Recognisable unnamed calls stay open, so the next result is not given to the next call.
         rejected_unnamed = (
             {'type': 'tool_use', 'name': 't', 'input': {lone: 1}},
             {'type': 'tool_use', 'name': 't', 'input': {'k': [lone]}},
@@ -690,6 +691,194 @@ class StreamTest(unittest.TestCase):
                                                                      'input': nested}) + '\n')], ['engine.output'],
                          'deeper than RFC 8785 text is made for here: no digest, so the line stays raw')
         self.assertEqual(of_type(parser.parse(deep + '\n'), 'tool.call')[0]['input'], {'a': [[[[[[]]]]]]})
+
+    def test_an_integer_outside_the_exact_json_range_makes_the_line_raw(self):
+        # 2**53 - 1 is the last whole number canonical text keeps. 2**53 is a finite float and still
+        # has no RFC 8785 text, so it is raw here too, as is a 401-digit integer and its negative.
+        kept = 2**53 - 1
+        parser = HermesStreamParser(CONNECTION)
+        line = json.dumps({'type': 'result', 'session_id': 's', 'exit_code': 0, 'text': '',
+                           'tokens': {'output': kept}}) + '\n'
+        self.assertEqual(of_type(parser.parse(line), 'usage')[0]['output_tokens'], known(kept))
+        huge = 10**400
+        records = [
+            {'type': 'result', 'session_id': 's', 'exit_code': 0, 'text': '', 'tokens': {'output': huge}},
+            {'type': 'result', 'session_id': 's', 'exit_code': 0, 'text': '', 'tokens': {'output': 1},
+             'duration_ms': huge},
+            {'type': 'result', 'session_id': 's', 'exit_code': huge, 'text': '', 'tokens': {'output': 1}},
+            {'type': 'result', 'session_id': 's', 'exit_code': 0, 'text': '', 'tokens': {'output': 2**53}},
+            {'type': 'result', 'session_id': 's', 'exit_code': 0, 'text': '', 'tokens': {'output': 1},
+             'duration_ms': -(2**53)},
+            {'type': 'tool_use', 'name': 't', 'input': {'n': huge}},
+        ]
+        for record in records:
+            parser = HermesStreamParser(CONNECTION)
+            with self.subTest(record=record.get('type'), marker=record.get('duration_ms', record.get('exit_code'))):
+                self.assertEqual([d['type'] for d in parser.parse(json.dumps(record) + '\n')], ['engine.output'])
+                self.assertFalse(parser.result_seen)
+                self.assertEqual(parser.uncarried_inputs, 0)
+
+    def test_a_byte_that_is_not_utf8_keeps_the_real_offset_and_storable_text(self):
+        bad = '{"type": "text", "text": "' + chr(0xDCFF) + '"}\n'
+        real = len(bad.encode('utf-8', 'surrogateescape'))
+        self.assertLess(real, len(bad.encode('utf-8', 'surrogatepass')))
+        parser = HermesStreamParser(CONNECTION)
+        draft = parser.parse(bad)[0]
+        self.assertEqual(draft['type'], 'engine.output')
+        self.assertEqual((draft['payload']['offset_start'], draft['payload']['offset_end']), (0, real))
+        draft['payload']['text'].encode('utf-8')
+        self.assertIn('\ufffd', draft['payload']['text'])
+        self.assertNotIn(chr(0xDCFF), draft['payload']['text'])
+        nxt = parser.parse('{"type": "text", "text": "z"}\n')[0]
+        self.assertEqual(nxt['payload']['offset_start'], real)
+        err = 'bad ' + chr(0xDC80) + '\n'
+        err_real = len(err.encode('utf-8', 'surrogateescape'))
+        stderr = parser.parse_stderr(err)[0]
+        self.assertEqual(stderr['payload']['offset_end'], err_real)
+        stderr['payload']['text'].encode('utf-8')
+        self.assertNotIn(chr(0xDC80), stderr['payload']['text'])
+
+    def test_an_id_less_result_does_not_pair_while_an_id_ed_call_of_that_name_is_open(self):
+        unnamed = json.dumps({'type': 'tool_use', 'name': 'n', 'input': {}}) + '\n'
+        named = json.dumps({'type': 'tool_use', 'name': 'n', 'tool_call_id': 'c1', 'input': {}}) + '\n'
+        loose = json.dumps({'type': 'tool_result', 'name': 'n', 'output': 'which', 'is_error': False}) + '\n'
+        tied = json.dumps({'type': 'tool_result', 'name': 'n', 'tool_call_id': 'c1', 'output': 'named',
+                           'is_error': False}) + '\n'
+        other = json.dumps({'type': 'tool_use', 'name': 'other', 'tool_call_id': 'c9', 'input': {}}) + '\n'
+
+        parser = HermesStreamParser(CONNECTION)
+        first_call = parser.parse(unnamed)[0]['payload']['call_id']
+        self.assertEqual(parser.parse(named)[0]['payload']['call_id'], 'c1')
+        self.assertNotEqual(parser.parse(loose)[0]['payload']['call_id'], first_call)
+
+        parser = HermesStreamParser(CONNECTION)
+        self.assertEqual(parser.parse(named)[0]['payload']['call_id'], 'c1')
+        second_call = parser.parse(unnamed)[0]['payload']['call_id']
+        self.assertNotEqual(parser.parse(loose)[0]['payload']['call_id'], second_call)
+
+        parser = HermesStreamParser(CONNECTION)
+        held = parser.parse(unnamed)[0]['payload']['call_id']
+        parser.parse(named)
+        self.assertNotEqual(parser.parse(loose)[0]['payload']['call_id'], held)
+        self.assertEqual(parser.parse(tied)[0]['payload']['call_id'], 'c1')
+        fresh = parser.parse(unnamed)[0]['payload']['call_id']
+        self.assertEqual(parser.parse(loose)[0]['payload']['call_id'], fresh)
+
+        parser = HermesStreamParser(CONNECTION)
+        only = parser.parse(unnamed)[0]['payload']['call_id']
+        parser.parse(other)
+        self.assertEqual(parser.parse(loose)[0]['payload']['call_id'], only)
+
+        # A recognisable id-ed call whose line stayed raw is still open under that name.
+        parser = HermesStreamParser(CONNECTION)
+        rejected = json.dumps({'type': 'tool_use', 'name': 'n', 'tool_call_id': 'c1',
+                               'input': {'path': chr(0xD800)}}) + '\n'
+        self.assertEqual(parser.parse(rejected)[0]['type'], 'engine.output')
+        blocked = parser.parse(unnamed)[0]['payload']['call_id']
+        self.assertNotEqual(parser.parse(loose)[0]['payload']['call_id'], blocked)
+        self.assertEqual(parser.parse(tied)[0]['payload']['call_id'], 'c1')
+        again = parser.parse(unnamed)[0]['payload']['call_id']
+        self.assertEqual(parser.parse(loose)[0]['payload']['call_id'], again)
+
+    def test_a_rejected_id_less_call_stays_open_so_its_result_is_not_given_to_the_next_call(self):
+        valid = json.dumps({'type': 'tool_use', 'name': 'read_file', 'input': {'path': 'b'}}) + '\n'
+        done = lambda text, is_error: json.dumps({'type': 'tool_result', 'name': 'read_file', 'output': text,  # noqa: E731
+                                                  'is_error': is_error}) + '\n'
+        cases = {
+            'surrogate': json.dumps({'type': 'tool_use', 'name': 'read_file',
+                                     'input': {'path': 'a' + chr(0xD800)}}) + '\n',
+            'nan': '{"type": "tool_use", "name": "read_file", "input": {"path": "a"}, "duration_ms": NaN}\n',
+        }
+        for label, rejected in cases.items():
+            parser = HermesStreamParser(CONNECTION)
+            with self.subTest(label=label):
+                self.assertEqual(parser.parse(rejected)[0]['type'], 'engine.output')
+                valid_id = parser.parse(valid)[0]['payload']['call_id']
+                results = [parser.parse(done(text, is_error))[0]['payload']['call_id']
+                           for text, is_error in (("the first call's failure", True), ('contents', False))]
+                self.assertNotIn(valid_id, results)
+                fresh = parser.parse(valid)[0]['payload']['call_id']
+                self.assertEqual(parser.parse(done('b', False))[0]['payload']['call_id'], fresh)
+
+    def test_a_vertical_tab_or_form_feed_line_is_kept_raw(self):
+        parser = HermesStreamParser(CONNECTION)
+        self.assertEqual(parser.parse('\n'), [])
+        self.assertEqual(parser.parse('  \n'), [])
+        self.assertEqual(parser.parse('\t\n'), [])
+        kept = []
+        for line in ('\x0b\n', '\x0c\n'):
+            drafts = parser.parse(line)
+            self.assertEqual([d['type'] for d in drafts], ['engine.output'], repr(line))
+            self.assertEqual(drafts[0]['payload']['text'], line)
+            kept.append(drafts[0]['payload'])
+        self.assertEqual((kept[0]['offset_start'], kept[0]['offset_end']), (6, 8))
+        self.assertEqual((kept[1]['offset_start'], kept[1]['offset_end']), (8, 10))
+
+    def test_a_canonical_writer_failure_keeps_the_line_and_counts_the_call(self):
+        line = json.dumps({'type': 'tool_use', 'name': 'n', 'input': {'a': 1}}) + '\n'
+        valid = json.dumps({'type': 'tool_use', 'name': 'n', 'input': {}}) + '\n'
+        done = json.dumps({'type': 'tool_result', 'name': 'n', 'output': 'x', 'is_error': False}) + '\n'
+
+        def install(kind):
+            def canonical():
+                if kind == 'import':
+                    raise ImportError('simulated')
+
+                def canonical_text(value):
+                    if kind == 'bytes':
+                        return b'not-text'
+                    raise ValueError('a bug in the writer')
+
+                return canonical_text, ValueError
+            return canonical
+
+        for kind in ('value', 'import', 'bytes'):
+            parser = HermesStreamParser(CONNECTION)
+            original = hermes._canonical
+            hermes._canonical = install(kind)
+            try:
+                drafts = parser.parse(line)
+            finally:
+                hermes._canonical = original
+            with self.subTest(kind=kind):
+                self.assertEqual([d['type'] for d in drafts], ['engine.output'])
+                self.assertEqual(parser.raw_lines, 1)
+                self.assertEqual(drafts[0]['payload']['offset_end'], len(line.encode('utf-8')))
+                valid_id = parser.parse(valid)[0]['payload']['call_id']
+                first = parser.parse(done)[0]['payload']['call_id']
+                second = parser.parse(done)[0]['payload']['call_id']
+                self.assertNotIn(valid_id, (first, second))
+
+    def test_finish_and_exit_agrees_refuse_a_status_that_is_not_an_int(self):
+        record = json.dumps({'type': 'result', 'session_id': 's', 'exit_code': 0, 'text': '',
+                             'tokens': {'output': 1}}) + '\n'
+        parser = HermesStreamParser(CONNECTION)
+        parser.parse(record)
+        for bad in ('0', 0.0, False, True):
+            with self.subTest(where='exit_agrees', bad=bad):
+                with self.assertRaises(HermesParseError):
+                    parser.exit_agrees(bad)
+        self.assertIs(parser.exit_agrees(0), True)
+        self.assertIs(parser.exit_agrees(1), False)
+        fresh = HermesStreamParser(CONNECTION)
+        for bad in ('0', 0.0, False, True):
+            with self.subTest(where='finish', bad=bad):
+                with self.assertRaises(HermesParseError):
+                    fresh.finish(bad)
+        self.assertFalse(fresh.result_seen)
+        self.assertIn('(no exit status)', fresh.finish(None)[0]['payload']['detail'])
+        self.assertEqual(fresh.finish(0), [])
+
+    def test_an_engine_session_id_of_256_characters_is_kept(self):
+        self.assertEqual(hermes.ENGINE_SESSION_ID_LIMIT, 256)
+        parser = HermesStreamParser(CONNECTION)
+        session = 's' * 256
+        parser.parse(json.dumps({'type': 'system', 'subtype': 'init', 'model': 'm', 'session_id': session}) + '\n')
+        self.assertEqual(parser.engine_session_id, session)
+        longer = HermesStreamParser(CONNECTION)
+        longer.parse(json.dumps({'type': 'system', 'subtype': 'init', 'model': 'm',
+                                 'session_id': 's' * 257}) + '\n')
+        self.assertIsNone(longer.engine_session_id)
 
 
 if __name__ == '__main__':

@@ -78,6 +78,13 @@ A lane registers a handler from its registrant module's ``register(hooks)``::
 WHO OWNS THE TRANSACTION. For a method keyed by ``command_id`` the dispatcher does this, in order:
 
 1. With no event store composed, it answers ``unsupported``, detail ``store_absent``, and calls nothing.
+   A ``command_id`` that is not common.v1's (8 to 128 of ``A-Z a-z 0-9 . _ : -``, matched whole) answers
+   ``request_invalid``, detail ``command_id``, before the payload digest, the tenant and the store: no
+   transaction is opened and nothing is read, kept or changed. So an id shorter than 8 characters is
+   refused: an id made from a counter is padded (``cmd-0001``, never ``cmd-1``). Params that are not a
+   mapping answer ``request_invalid``, detail ``params``, after the store-absent answer and before the id.
+   A read is held to that same params rule before its handler is asked, so those params are a refusal
+   there too and not an unavailable answer from the handler.
 2. It takes the command's slot: commands with the same ``(tenant, method, command_id)`` run one at a
    time in this process, so two identical commands sent at once run the handler once.
 3. It opens the store's transaction and looks the receipt up IN it. A receipt with the same payload
@@ -168,8 +175,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
+import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import NamedTuple
 
 log = logging.getLogger(__name__)
@@ -285,6 +293,8 @@ class Context:
             owner.callbacks.append((self._scope, fn))
 
     def call(self, method: str, params=None) -> dict:
+        """Params left out, or None, become an empty mapping when the call is to a read of this table that is not
+        a built-in; a built-in, or a name with no row, receives what the caller passed."""
         return self._call(method, params)
 
 
@@ -356,6 +366,12 @@ def canonical_text(value, depth: int = 0) -> str:
         keys = sorted(value, key=lambda key: key.encode('utf-16-be', 'surrogatepass'))
         return '{' + ','.join(_string(key) + ':' + canonical_text(value[key], depth + 1) for key in keys) + '}'
     raise NoCanonicalText('type')
+
+
+# The command_id of SPINE's control records (``common.v1.json``, ``$defs/command_id``, in the schema drafts that
+# are not on master yet), and the grammar the event store checks for a receipt key (events/db.py): a test holds
+# the two copies equal. ASCII only and matched whole, so no line end, NUL or DEL passes.
+_COMMAND_ID = re.compile(r'[A-Za-z0-9._:-]{8,128}')
 
 
 def payload_digest(params: dict) -> str:
@@ -523,6 +539,10 @@ class MethodTable:
                 return {'code': 'request_invalid', 'detail': 'nested_command'}
             if _command_of(scope) is not None and inner_row is not None and inner_row.mutating:
                 return {'code': 'request_invalid', 'detail': 'nested_effect'}
+            # Params left out by ``ctx.call`` reach a method of this table as an empty mapping; any other value
+            # goes on as it is. A built-in, or a name with no row, is the caller's to answer, as before.
+            if inner_params is None and inner_row is not None and inner not in BUILT_IN:
+                inner_params = {}
             # The scope travels with the call, whichever thread makes it, so that the dispatch it reaches is
             # nested in this one and a command -> read -> built-in chain keeps the command's restriction.
             before = getattr(self._active, 'scope', None)
@@ -543,6 +563,8 @@ class MethodTable:
                 scope.ended = True
 
     def _read(self, method, params, principal, handler, nested, scope) -> dict:
+        if not isinstance(params, Mapping):
+            return {'code': 'request_invalid', 'detail': 'params'}
         enclosing = scope.command   # the command this read is nested in, whose transaction is open; or None
         owner = enclosing if enclosing is not None else scope
         ctx = Context(principal, None, self.closing, nested, scope, owner)
@@ -577,8 +599,10 @@ class MethodTable:
         store = self.store
         if store is None:
             return {'code': 'unsupported', 'detail': 'store_absent'}
+        if not isinstance(params, Mapping):
+            return {'code': 'request_invalid', 'detail': 'params'}
         command_id = params.get('command_id')
-        if not isinstance(command_id, str) or not command_id:
+        if not isinstance(command_id, str) or not _COMMAND_ID.fullmatch(command_id):
             return {'code': 'request_invalid', 'detail': 'command_id'}
         try:
             digest = payload_digest(params)

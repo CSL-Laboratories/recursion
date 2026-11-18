@@ -1,0 +1,7 @@
+{"type":"step_start","timestamp":1794614400100,"sessionID":"ses_synthv1noise000000000001","part":{"id":"prt_synth_s1","sessionID":"ses_synthv1noise000000000001","messageID":"msg_synth_e1","type":"step-start"}}
+! agent "review" not found. Falling back to default agent
+{"type":"reasoning","timestamp":1794614400400,"sessionID":"ses_synthv1noise000000000001","part":{"id":"prt_synth_r1","sessionID":"ses_synthv1noise000000000001","messageID":"msg_synth_e1","type":"reasoning","text":"Reading the file first.","time":{"start":1794614400150,"end":1794614400400}}}
+[1,2,3]
+{"type":"share_url","timestamp":1794614400450,"sessionID":"ses_synthv1noise000000000001","url":"https://example.invalid/s/abc"}
+{"type":"text","timestamp":1794614400800,"sessionID":"ses_synthv1noise000000000001","part":{"id":"prt_synth_t1","sessionID":"ses_synthv1noise000000000001","messageID":"msg_synth_e1","type":"text","text":"Done.","time":{"start":1794614400500,"end":1794614400800}}}
+{"type":"step_finish","timestamp":1794614400900,"sessionID":"ses_synthv1noise000000000001","part":{"id":"prt_synth_f1","sessionID":"ses_synthv1noise000000000001","messageID":"msg_synth_e1","type":"step-finish","reason":"stop","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}

@@ -41,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -381,6 +382,23 @@ class SimulatedWindowsTests(unittest.TestCase):
                           if isinstance(node, ast.ClassDef) for dec in node.decorator_list
                           if isinstance(dec, ast.Call) and ast.unparse(dec.func) == "unittest.skipIf" and dec.args]
                 self.assertEqual(["os.name == 'nt'"], guards)
+
+    def test_the_other_core_suites_have_no_error_or_failure_on_simulated_windows(self) -> None:
+        others = sorted(path for path in CORE.glob("recursion_core/*/tests/test_*.py")
+                        if path.parent != HERE and path.name != "test_windows_refusal.py")
+        self.assertGreater(len(others), len(REFUSAL_AREAS))
+        self.assertLessEqual(set(HOST_LIMITED), {path.relative_to(CORE).as_posix() for path in others})
+        # The gate gives this whole file 180 s. Each child costs about 0.8 s of interpreter start, so the children
+        # run four at a time; each has its own scratch folder, and each is still checked in its own subTest below.
+        with ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as pool:
+            futures = {path: pool.submit(simulate, str(path)) for path in others}
+        for path in others:
+            suite = path.relative_to(CORE).as_posix()
+            with self.subTest(suite=suite):
+                result = futures[path].result()
+                for kind in ("errors", "failures"):
+                    result[kind] = [row for row in result[kind] if row["test"] not in HOST_LIMITED.get(suite, {})]
+                self._assert_clean(result)
 
     def test_every_gated_area_has_a_windows_refusal_file(self) -> None:
         found = sorted(path.parents[1].name for path in CORE.glob("recursion_core/*/tests/test_windows_refusal.py"))

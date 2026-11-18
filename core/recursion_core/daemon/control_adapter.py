@@ -118,6 +118,11 @@ def _frame_scalar(value):
     A list, a tuple or an object is walked. When nothing needs that, ``value`` is returned
     as it stands, so a clean result stays the same object.
 
+    Two object keys can frame to one text (two keys that differ only in lone surrogates, or
+    a lone surrogate and a key that already holds U+FFFD). Every member stays on the answer: a key
+    that was not rewritten keeps its name, and a rewritten key that meets a name already
+    taken gets a counted mark, ``~2``, then ``~3``, until the name is free.
+
     The walk is an explicit stack. A call per nesting level raised ``RecursionError``
     out of ``run.list`` on a result the frame encoder can send.
     """
@@ -179,8 +184,14 @@ def _frame_scalar(value):
                 framed[id(node)] = node
                 continue
             out = {}
+            kept = {key for key in node if isinstance(key, str) and framed[id(key)] is key}
             for key, item in node.items():
                 new_key = framed[id(key)] if isinstance(key, str) else key
+                if new_key is not key:
+                    base, count = new_key, 1
+                    while new_key in out or new_key in kept:
+                        count += 1
+                        new_key = f'{base}~{count}'
                 out[new_key] = framed[id(item)]
             framed[id(node)] = out
         else:

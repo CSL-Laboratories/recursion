@@ -65,6 +65,7 @@ import errno
 import os
 import secrets
 import stat
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -268,6 +269,17 @@ class RouteDecision:
     pin_version: str = ""  # Antigravity pin only; empty for every other route
 
 
+_LINE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _public_detail(value: str) -> str:
+    """Caller text safe to put in a refusal. Empty when it could forge another line."""
+
+    if any(unicodedata.category(ch) in _LINE_CATEGORIES for ch in value):
+        return ""
+    return value
+
+
 def check_route(
     engine: str,
     profile: Mapping[str, object],
@@ -315,7 +327,7 @@ def check_route(
         known.add(HERMES_ADOPT_EXTERNAL_LOGINS)
     unknown = sorted(str(key) for key in set(profile) - known)
     if unknown:
-        raise SubscriptionRouteRefused(engine, "profile_unknown_field", ",".join(unknown))
+        raise SubscriptionRouteRefused(engine, "profile_unknown_field", _public_detail(",".join(unknown)))
     engine_config: tuple[tuple[str, object], ...] = ()
     if engine == "hermes":
         # Hermes "will use Claude Code's credential store directly when available", and on macOS that store
@@ -323,8 +335,8 @@ def check_route(
         if HERMES_ADOPT_EXTERNAL_LOGINS not in profile:
             raise SubscriptionRouteRefused(engine, "hermes_adopt_external_logins_not_off", "missing")
         if profile[HERMES_ADOPT_EXTERNAL_LOGINS] is not False:
-            raise SubscriptionRouteRefused(engine, "hermes_adopt_external_logins_not_off",
-                                           repr(profile[HERMES_ADOPT_EXTERNAL_LOGINS])[:32])
+            # The caller's value is not echoed: it can be a secret or a control character.
+            raise SubscriptionRouteRefused(engine, "hermes_adopt_external_logins_not_off", "not_false")
         engine_config = ((HERMES_ADOPT_EXTERNAL_LOGINS, False),)
     if isinstance(profile.get("auth"), str) and _norm(profile["auth"]) == "subscription":
         return _check_subscription(engine, spec, profile, child_env, route_home, parent_env, operator_home,
@@ -339,23 +351,24 @@ def check_route(
             raise SubscriptionRouteRefused(engine, f"{name}_missing")
     provider = provider.strip().lower()
     if provider in spec.subscription_providers or _looks_like_claude_login(provider):
-        raise SubscriptionRouteRefused(engine, "claude_subscription_provider", provider)
+        raise SubscriptionRouteRefused(engine, "claude_subscription_provider", _public_detail(provider))
     if auth.strip().lower() in spec.subscription_auth:
-        raise SubscriptionRouteRefused(engine, "claude_subscription_auth" if provider == "anthropic" else "subscription_auth", auth)
+        raise SubscriptionRouteRefused(engine, "claude_subscription_auth" if provider == "anthropic" else "subscription_auth", _public_detail(auth))
     if auth != "api_key":
-        raise SubscriptionRouteRefused(engine, "auth_not_api_key", auth)
+        raise SubscriptionRouteRefused(engine, "auth_not_api_key", _public_detail(auth))
     if provider not in spec.providers:
-        raise SubscriptionRouteRefused(engine, "provider_not_allowed", provider)
+        # A one-line provider stays in the detail. A line or terminal control would forge a second line.
+        raise SubscriptionRouteRefused(engine, "provider_not_allowed", _public_detail(provider))
     stored_model = ""
     if model is not None:
         stored_model = _require_model_name(engine, model)
         model_provider = stored_model.split("/", 1)[0].strip().lower()
         if model_provider in spec.subscription_providers or _looks_like_claude_login(model_provider):
-            raise SubscriptionRouteRefused(engine, "claude_subscription_provider", model_provider)
+            raise SubscriptionRouteRefused(engine, "claude_subscription_provider", _public_detail(model_provider))
         if model_provider != provider:
-            raise SubscriptionRouteRefused(engine, "model_provider_mismatch", model_provider)
+            raise SubscriptionRouteRefused(engine, "model_provider_mismatch", _public_detail(model_provider))
     if credential not in spec.providers[provider].credential_env:
-        raise SubscriptionRouteRefused(engine, "credential_env_not_allowed", credential)
+        raise SubscriptionRouteRefused(engine, "credential_env_not_allowed", _public_detail(credential))
 
     env = dict(child_env)
     present = sorted(name for name in CLAUDE_SUBSCRIPTION_ENV if name in env)

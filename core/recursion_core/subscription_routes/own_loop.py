@@ -29,10 +29,11 @@ from __future__ import annotations
 
 import ipaddress
 import subprocess
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import unicodedata
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from recursion_core.child_env import build_child_env, spawn
 from recursion_core.child_env.policy import (
@@ -74,6 +75,26 @@ _TOKEN_HINTS = ("token", "key", "secret", "bearer", "password", "credential", "a
 # Proxy settings would send a loopback-bound request to another host (proxy-aware clients honour them).
 _PROXY_ENV = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "SOCKS_PROXY", "SOCKS5_PROXY"})
 _MODEL_MAX = 128
+# Same ceiling as the store walk. Past this the doctor reports the host as unknown.
+_NAME_CAP = 10_000
+_LINE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _line_controls(value: str) -> bool:
+    """True when ``value`` carries a line or terminal control (C0, C1, format, line or paragraph separator)."""
+
+    return any(unicodedata.category(ch) in _LINE_CATEGORIES for ch in value)
+
+
+def _stripped(value: object) -> str | None:
+    """``strip`` of a string, or None when the value is not a string or ``strip`` itself fails."""
+
+    if not isinstance(value, str):
+        return None
+    try:
+        return value.strip()
+    except Exception:
+        return None
 
 
 def _ambient_secret(name: str) -> bool:
@@ -193,17 +214,51 @@ def check_copilot_own_loop(
     return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
 
 
-def _loopback_url(base_url: object) -> str:
-    if not isinstance(base_url, str) or not base_url.strip():
-        raise OwnLoopRouteRefused("nous", "proxy_address_missing")
+def _address_without_userinfo(base_url: object) -> str:
+    """A proxy address a refusal may report. The caller's string is never returned.
+
+    Empty when the value is not a string, ``strip`` fails, the URL cannot be parsed,
+    userinfo is present, or there is no host. Otherwise the scheme and host[:port]
+    only, so a secret in the path, the query or the fragment cannot come back.
+    """
+
+    text = _stripped(base_url)
+    if not text:
+        return ""
     try:
-        parts = urlsplit(base_url.strip())
+        parts = urlsplit(text)
+        host = parts.hostname
+        port = parts.port
+    except (ValueError, UnicodeError):
+        return ""
+    if parts.username or parts.password is not None or not host:
+        return ""
+    if _line_controls(parts.scheme) or _line_controls(host):
+        return ""
+    host_text = f"[{host}]" if ":" in host else host
+    netloc = host_text if port is None else f"{host_text}:{port}"
+    return urlunsplit((parts.scheme, netloc, "", "", ""))
+
+
+def _loopback_url(base_url: object) -> str:
+    if not isinstance(base_url, str):
+        raise OwnLoopRouteRefused("nous", "proxy_address_missing")
+    text = _stripped(base_url)
+    if text is None:
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", "unparseable")
+    if not text:
+        raise OwnLoopRouteRefused("nous", "proxy_address_missing")
+    if _line_controls(text):
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", "control_character")
+    try:
+        parts = urlsplit(text)
         host = parts.hostname
         parts.port  # noqa: B018 - raises on a bad port
-    except ValueError as exc:
-        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", str(exc)) from None
+    except ValueError:
+        # The parser text can contain the URL, including a password. Do not echo it.
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", "unparseable") from None
     if parts.scheme not in _NOUS_SCHEMES or not host:
-        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", base_url)
+        raise OwnLoopRouteRefused("nous", "proxy_address_malformed", "bad_scheme_or_host")
     if parts.username or parts.password:
         raise OwnLoopRouteRefused("nous", "recursion_holds_no_token", "credentials in proxy URL")
     try:
@@ -215,7 +270,7 @@ def _loopback_url(base_url: object) -> str:
         addr = addr.ipv4_mapped
     if not addr.is_loopback:
         raise OwnLoopRouteRefused("nous", "proxy_not_loopback", host)
-    return base_url.strip()
+    return text
 
 
 def _adapters(value: object) -> tuple[str, ...]:
@@ -237,7 +292,24 @@ HOST_USERS_UNKNOWN = ("host users unknown: interactive_users was not given, so o
 
 
 def _other_users(current_user: str | None, interactive_users: Iterable[str]) -> tuple[str, ...]:
-    return tuple(sorted({u for u in interactive_users if u and u != current_user}))
+    # A string is iterable, but its characters are not account names. A non-string entry is not either.
+    # A one-shot iterator is not a collection, so it cannot be read on a second call. Reporting it
+    # as unusable keeps that second call from looking like a clean host. Names are materialised here.
+    if isinstance(interactive_users, (str, bytes)) or not isinstance(interactive_users, Collection):
+        raise TypeError("interactive_users")
+    names: list[str] = []
+    seen = 0
+    for user in interactive_users:
+        seen += 1
+        if seen > _NAME_CAP:
+            raise ValueError("interactive_users")
+        if not isinstance(user, str):
+            raise TypeError("interactive_users")
+        if _line_controls(user):
+            raise ValueError("interactive_users")
+        if user and user != current_user:
+            names.append(user)
+    return tuple(sorted(set(names)))
 
 
 def nous_proxy_doctor(
@@ -249,15 +321,17 @@ def nous_proxy_doctor(
     """Doctor line for the Hermes proxy: report the address, refuse non-loopback, warn on shared hosts.
 
     Never raises; returns ``{"ok", "address", "cause", "warnings"}``. ``interactive_users`` is the
-    caller's list of interactive accounts on this host; nothing is probed here. Without it the doctor
-    warns that the host's users are unknown rather than reporting a clean host.
+    caller's collection of interactive accounts on this host; nothing is probed here. Without it,
+    or when the collection cannot be read, is not a collection, or is longer than the name ceiling,
+    the doctor warns that the host's users are unknown rather than reporting a clean host.
+    ``KeyboardInterrupt`` still propagates. A refusal address is scheme and host only, or empty.
     """
 
     warnings = _shared_host_warning(current_user, interactive_users)
     try:
         url = _loopback_url(base_url)
     except OwnLoopRouteRefused as exc:
-        return {"ok": False, "address": base_url if isinstance(base_url, str) else "", "cause": exc.cause,
+        return {"ok": False, "address": _address_without_userinfo(base_url), "cause": exc.cause,
                 "warnings": warnings}
     return {"ok": True, "address": url, "cause": "", "warnings": warnings}
 
@@ -265,7 +339,12 @@ def nous_proxy_doctor(
 def _shared_host_warning(current_user: str | None, interactive_users: Iterable[str] | None) -> tuple[str, ...]:
     if interactive_users is None:  # "not checked" must not read as "nobody else is here"
         return (HOST_USERS_UNKNOWN,)
-    others = _other_users(current_user, interactive_users)
+    try:
+        others = _other_users(current_user, interactive_users)
+    except Exception:
+        # The doctor promises it never raises. A malformed inventory is "not checked", not a crash.
+        # KeyboardInterrupt is a BaseException and still propagates.
+        return (HOST_USERS_UNKNOWN,)
     if not others:
         return ()
     return (f"other interactive users on this host can reach the loopback proxy: {', '.join(others)}",)
@@ -314,6 +393,11 @@ def _is_provider_credential(name: str) -> bool:
 def _spawn_checked(argv: Sequence[str], decision: OwnLoopDecision, home: str, cwd: str | None) -> subprocess.Popen:
     """Rebuild the checked child through ``build_child_env`` and start it. ``Popen`` is read at the call."""
 
+    # ``list("copilot")`` is the characters of the string, and the first one is then the executable.
+    # An empty command and a NUL in an argument are the same refusal, before spawn sees them.
+    if isinstance(argv, (str, bytes)) or not isinstance(argv, Sequence) or not argv or any(
+            not isinstance(item, str) or "\x00" in item for item in argv):
+        raise OwnLoopRouteRefused(decision.engine, "argv_malformed")
     parent = {name: value for name, value in decision.child_env.items() if name != "HOME"}
     validated = build_child_env("codex", home=home, auth_mode="subscription", parent=parent)
     return spawn(list(argv), validated, cwd=cwd, popen=subprocess.Popen)

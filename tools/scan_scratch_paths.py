@@ -5,7 +5,9 @@ A builder runs its tests with TMPDIR set to a scratch folder; that folder's path
 must never be written into a file of the repository. This script takes file
 paths on its command line and prints ``file:line`` for every line that holds the
 path form of such a folder (under /var/tmp or /tmp, named after the engine). A
-bare engine name such as an engine id is not a hit; only the path form is.
+bare engine name such as an engine id is not a hit; only the path form is, and
+only where a path starts: a tmp folder nested inside another path (a
+repository's own tmp folder, a nested var/tmp) is not a hit.
 
 A line that carries the marker ``scratch-path: allowed`` is not reported.
 
@@ -16,6 +18,7 @@ read. It reads only the files it is given; it does not walk the repository.
 """
 from __future__ import annotations
 
+import re
 import sys
 
 # Built from pieces so that this file holds none of the forms it looks for.
@@ -25,6 +28,11 @@ FORMS = (
     "/" + "tmp" + "/" + _ENGINE + "-",
 )
 MARKER = "scratch-path: " + "allowed"
+# A form counts only where a path starts: at the line start, or after a
+# character that cannot be inside a path name (a quote, a space, "=", ":" and
+# the like). After a letter, digit, "_", ".", "~" or "-" the tmp folder sits
+# inside another path (a repository's own tmp, a nested var/tmp) and is no hit.
+_PATTERN = re.compile(r"(?<![\w.~-])(?:" + "|".join(re.escape(form) for form in FORMS) + ")")
 
 
 def hit_lines(text: str) -> list[int]:
@@ -33,7 +41,7 @@ def hit_lines(text: str) -> list[int]:
     for number, line in enumerate(text.split("\n"), start=1):
         if MARKER in line:
             continue
-        if any(form in line for form in FORMS):
+        if _PATTERN.search(line):
             out.append(number)
     return out
 

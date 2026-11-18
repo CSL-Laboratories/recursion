@@ -113,6 +113,34 @@ class ScanScratchPathsTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, want, proc.stderr)
 
+    def test_nested_tmp_and_var_tmp_paths_are_not_hits(self) -> None:
+        # A tmp folder inside another path is not a scratch root: no hit, exit 0.
+        repo = "/" + "/".join(("home", "u", "repos", "recursion"))
+        lines = (
+            "a = '" + repo + TMP_FORM + "build'",
+            "b = '" + "/" + "srv" + VAR_FORM + "y'",
+            "c = '" + "~" + TMP_FORM + "z'",
+            "d = '" + "." + TMP_FORM + "a'",
+            "e = " + repo + VAR_FORM + "b",
+        )
+        path = self.write("l.py", "\n".join(lines) + "\n")
+        self.assertEqual(self.run_main(path), (0, "", ""))
+
+    def test_a_form_at_the_start_of_a_path_token_is_still_a_hit(self) -> None:
+        lines = (
+            VAR_FORM + "a",
+            "TMPDIR=" + TMP_FORM + "b",
+            'path = "' + VAR_FORM + 'c"',
+            "run --dir " + TMP_FORM + "d",
+            "PATH=x:" + TMP_FORM + "e",
+            "url = file://" + TMP_FORM + "f",
+            "(" + VAR_FORM + "g)",
+        )
+        path = self.write("m.py", "\n".join(lines) + "\n")
+        code, out, _ = self.run_main(path)
+        self.assertEqual(code, 1)
+        self.assertEqual(out.splitlines(), [f"{path}:{n}" for n in range(1, len(lines) + 1)])
+
 
 if __name__ == "__main__":
     unittest.main()

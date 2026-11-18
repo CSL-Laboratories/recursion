@@ -21,8 +21,11 @@ spellings above it, as the draft orders name them.
 Matching ignores capitals and treats any run of spaces and line breaks inside a
 paragraph as one space, so a phrase that Markdown wraps across lines still
 fails; a blank line ends a paragraph, and words on either side of it are not
-joined. A hit names the line where the phrase starts. Each subject also has
-exactly one row.
+joined. A heading line (up to three spaces, then one to six # and a space or
+the line end) is a block of its own: it is not joined to the line above or
+below it. A hit names the line where the phrase starts. Each subject also has
+exactly one row: every table line counts, indented by up to three spaces (it
+still renders as a row) and whatever its module cell holds.
 """
 from __future__ import annotations
 
@@ -85,6 +88,10 @@ PHRASES = (
 # A slash is required so a prose mention of the suffix alone is not a citation.
 _PY_PATH = re.compile(r"`([^`\n]*/[^`\n]*\.py)`")
 
+# A Markdown ATX heading line, and a table line; four spaces would be code.
+_HEADING = re.compile(r" {0,3}#{1,6}(?:[ \t]|$)")
+_TABLE_LINE = re.compile(r" {0,3}\|")
+
 
 def _cell(cell: str) -> str:
     text = cell.strip()
@@ -93,10 +100,11 @@ def _cell(cell: str) -> str:
     return text.strip("`").strip()
 
 
-def _rows(text: str) -> list[tuple[str, str, str]]:
-    found: list[tuple[str, str, str]] = []
+def _table_rows(text: str) -> list[tuple[str, str, str, bool]]:
+    """Every table row with a subject: subject, module, telemetry, flush left."""
+    found: list[tuple[str, str, str, bool]] = []
     for line in text.splitlines():
-        if not line.startswith("|"):
+        if not _TABLE_LINE.match(line):
             continue
         cells = [part.strip() for part in line.strip().strip("|").split("|")]
         if len(cells) < 5:
@@ -108,10 +116,21 @@ def _rows(text: str) -> list[tuple[str, str, str]]:
             continue
         if subject.lower() == "subject":
             continue
-        if not module.endswith(".py"):
-            continue
-        found.append((subject, module, telemetry))
+        found.append((subject, module, telemetry, line.startswith("|")))
     return found
+
+
+def _rows(text: str) -> list[tuple[str, str, str]]:
+    return [
+        (subject, module, telemetry)
+        for subject, module, telemetry, flush in _table_rows(text)
+        if flush and module.endswith(".py")
+    ]
+
+
+def _row_subjects(text: str) -> list[str]:
+    """The subject of every table row, for the one-row-per-subject count."""
+    return [subject for subject, _module, _telemetry, _flush in _table_rows(text)]
 
 
 def _module_file(root: Path, rel: str) -> bool:
@@ -147,18 +166,26 @@ def _flat(text: str) -> tuple[str, list[int]]:
     """Lower-case text with each whitespace run (line breaks included) as one space.
 
     A blank line ends a paragraph and becomes a newline, which no phrase holds, so
-    words on either side of it never join. The list gives each character's line.
+    words on either side of it never join. A heading line is a block of its own,
+    so a run ends before it and after it. The list gives each character's line.
     """
     chars: list[str] = []
     numbers: list[int] = []
+
+    def end_run(number: int) -> None:
+        if chars and chars[-1] == " ":
+            chars[-1] = "\n"
+        elif chars and chars[-1] != "\n":
+            chars.append("\n")
+            numbers.append(number)
+
     for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
-            if chars and chars[-1] == " ":
-                chars[-1] = "\n"
-            elif chars and chars[-1] != "\n":
-                chars.append("\n")
-                numbers.append(number)
+            end_run(number)
             continue
+        heading = _HEADING.match(line) is not None
+        if heading:
+            end_run(number)
         for ch in line + " ":
             if ch.isspace():
                 if not chars or chars[-1] in " \n":
@@ -167,6 +194,8 @@ def _flat(text: str) -> tuple[str, list[int]]:
             for low in ch.lower():
                 chars.append(low)
                 numbers.append(number)
+        if heading:
+            end_run(number)
     return "".join(chars), numbers
 
 
@@ -199,11 +228,13 @@ class TransparencyTests(unittest.TestCase):
 
     def test_one_row_per_engine_route_and_daemon_feature(self) -> None:
         self.assertTrue(PAGE.is_file(), "docs/TRANSPARENCY.md is absent")
-        rows = _rows(PAGE.read_text(encoding="utf-8"))
+        text = PAGE.read_text(encoding="utf-8")
+        rows = _rows(text)
         subjects = [subject for subject, _module, _telemetry in rows]
         missing = [subject for subject in REQUIRED_SUBJECTS if subject not in subjects]
         self.assertEqual(missing, [], "a required route or feature has no row")
-        repeated = sorted({subject for subject in subjects if subjects.count(subject) > 1})
+        every = _row_subjects(text)
+        repeated = sorted({subject for subject in every if every.count(subject) > 1})
         self.assertEqual(repeated, [], "a route or feature has more than one row")
         for subject, module, telemetry in rows:
             self.assertTrue(_module_file(ROOT, module), f"{subject} cites a missing module {module}")
@@ -283,6 +314,55 @@ class TransparencyTests(unittest.TestCase):
                     check.test_one_row_per_engine_route_and_daemon_feature()
                 self.assertIn("codex", str(caught.exception))
 
+    def test_a_heading_ends_the_run_of_lines_around_it(self) -> None:
+        # A heading is its own block: it never joins the line above or below it.
+        cases = (
+            ("## How records are verified\nSafe defaults apply to new workspaces.\n", []),
+            ("It was verified\n# Safe area\n", []),
+            ("   ### Checked and verified\nsafe copy follows.\n", []),
+            ("## It is verified safe\n", ["README.md:1: verified safe"]),
+            ("# Title\nIt is verified\nsafe.\n", ["README.md:2: verified safe"]),
+            ("#verified\nsafe.\n", ["README.md:1: verified safe"]),
+            ("    ## verified\nsafe.\n", ["README.md:1: verified safe"]),
+        )
+        for body, expected in cases:
+            with self.subTest(body=body):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    (root / "README.md").write_text(body, encoding="utf-8")
+                    self.assertEqual(phrase_hits(root), expected)
+
+    def test_an_indented_or_non_module_second_row_fails(self) -> None:
+        # Up to three leading spaces still render as a table row, and a row
+        # whose module cell is not a .py path is still a row for its subject.
+        def page(extra: str) -> str:
+            rows = "".join(
+                f"| `{subject}` | `pkg/mod.py` | a | b | `none` |\n" for subject in REQUIRED_SUBJECTS
+            )
+            return "| Subject | Module | Leaves | Recorded | Telemetry |\n|---|---|---|---|---|\n" + rows + extra
+
+        check = TransparencyTests("test_one_row_per_engine_route_and_daemon_feature")
+        extras = (
+            "  | `codex` | `pkg/mod.py` | c | d | `none` |\n",
+            "   | `codex` | `pkg/mod.py` | c | d | `none` |\n",
+            "| `codex` | none | c | d | `none` |\n",
+            "| `codex` | `pkg/mod.txt` | c | d | `none` |\n",
+        )
+        for extra in extras:
+            with self.subTest(extra=extra):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    (root / "pkg").mkdir()
+                    (root / "pkg" / "mod.py").write_text("", encoding="utf-8")
+                    fixture = root / "page.md"
+                    with mock.patch.dict(globals(), {"ROOT": root, "PAGE": fixture}):
+                        fixture.write_text(page(""), encoding="utf-8")
+                        check.test_one_row_per_engine_route_and_daemon_feature()
+                        fixture.write_text(page(extra), encoding="utf-8")
+                        with self.assertRaises(AssertionError) as caught:
+                            check.test_one_row_per_engine_route_and_daemon_feature()
+                        self.assertIn("codex", str(caught.exception))
+                        self.assertIn("more than one row", str(caught.exception))
 
 if __name__ == "__main__":
     unittest.main()

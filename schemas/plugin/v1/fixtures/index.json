@@ -553,12 +553,21 @@
       }
     },
     {
-      "file": "bad/install.v1/b09-a-label-the-reader-does-not-know.json",
+      "file": "bad/install.v1/b10-a-label-the-reader-does-not-know.json",
       "schema": "install.v1.json",
       "rule": "A registry label is verified or non_verified. Any other value is refused, and the label is not a grant.",
       "expect": {
         "keyword": "enum",
         "at": "/registry_labels/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "file": "bad/install.v1/b09-a-developer-key-that-is-not-a-key-id.json",
+      "schema": "install.v1.json",
+      "rule": "A developer key on a grant is 'ed25519:' and 32 lower-case hex digits, or null.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/grants/0/developer_key_id"
       }
     },
     {

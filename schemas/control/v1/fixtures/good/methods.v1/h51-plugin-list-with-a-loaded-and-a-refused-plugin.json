@@ -1,0 +1,57 @@
+{
+  "method": "plugin.list",
+  "params": {},
+  "answer": {
+    "code": "ok",
+    "plugins": [
+      {
+        "source": "/home/dev/.config/recursion/plugins/notes-search",
+        "plugin_id": "notes.search",
+        "state": "loaded",
+        "code": null,
+        "detail": "",
+        "trust": "signed",
+        "signer_key_id": "ed25519:5f1d3e2a9b8c7d6e5f4a3b2c1d0e9f8a",
+        "registry_label": null,
+        "permissions": [
+          "read",
+          "panel"
+        ],
+        "artifact_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provides": [
+          "panels"
+        ],
+        "containment": "in process, same uid: not contained",
+        "findings": [
+          {
+            "stage": "verify",
+            "code": "manifest_ok",
+            "severity": "info",
+            "detail": "notes.search"
+          }
+        ]
+      },
+      {
+        "source": "/home/dev/.config/recursion/plugins/old-thing",
+        "plugin_id": null,
+        "state": "refused",
+        "code": "plugin_file_missing",
+        "detail": "manifest.json",
+        "findings": [
+          {
+            "stage": "daemon",
+            "code": "plugin_file_missing",
+            "severity": "refuse",
+            "detail": "manifest.json"
+          }
+        ]
+      }
+    ],
+    "verification": "available",
+    "core_poisoned": null,
+    "authority_profile": "not configured",
+    "approvals_drawn": 0,
+    "approval_surface": "none: no surface can approve or veto yet, so no effect is authorized",
+    "containment": "none: plugins run in the daemon process and uid"
+  }
+}

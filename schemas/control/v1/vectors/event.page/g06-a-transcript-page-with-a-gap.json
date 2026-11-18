@@ -1,0 +1,47 @@
+{
+  "method": "events.read",
+  "params": {
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 2
+    },
+    "projection": "transcript"
+  },
+  "page": {
+    "code": "ok",
+    "projection": "transcript",
+    "lines": [
+      {
+        "seq": 9,
+        "time_rel_ms": 0,
+        "event_type": "replay.gap",
+        "source": "core",
+        "trust": "trusted",
+        "state": null,
+        "text": "events 3 to 9 are not available (retention)",
+        "speech": "some earlier events are not available",
+        "focus": null
+      },
+      {
+        "seq": 10,
+        "time_rel_ms": 2074,
+        "event_type": "engine.output",
+        "source": "engine",
+        "trust": "untrusted",
+        "state": null,
+        "text": "line 10\n",
+        "speech": null,
+        "focus": null
+      }
+    ],
+    "cursor": {
+      "epoch": 3,
+      "session_id": "ses-7f3a9c2e51d04b6a",
+      "seq": 10
+    },
+    "more": false,
+    "epoch_advanced": false
+  },
+  "expect": []
+}

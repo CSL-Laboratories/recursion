@@ -453,6 +453,36 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, "catalog_conflict")
 
 
+class _NoGeteuid:
+    """``os`` as a platform without an owner check (Windows) shows it to the reader: no ``geteuid``."""
+
+    def __getattr__(self, name):
+        if name == "geteuid":
+            raise AttributeError(name)
+        return getattr(os, name)
+
+
+class NoOwnerCheckTests(unittest.TestCase):
+    """Where the platform gives no owner check (no ``os.geteuid``: Windows), a routing file that is present is
+    refused as unreadable before it is opened or parsed, whatever it holds. So the reader's own rules (its owner,
+    a present null, a member named twice) cannot change an answer there, and the mutants of those rules are judged
+    only where the check exists (test_mutants, NEEDS_OWNER_CHECK). This runs on every platform."""
+
+    def test_without_an_owner_check_a_present_file_is_refused_before_it_is_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "routing.json"
+            for content in ("null", json.dumps(CONFIG), '{"version": 1, "version": 1}'):
+                path.write_text(content, encoding="utf-8")
+                no_uid = _NoGeteuid()
+                with self.subTest(content=content[:20]), mock.patch.object(rc, "os", no_uid), \
+                        mock.patch.object(no_uid, "open", side_effect=AssertionError("opened"), create=True) as opened, \
+                        mock.patch.object(rc.json, "loads", side_effect=AssertionError("parsed")) as parsed:
+                    with self.assertRaises(rc.RoutingUnreadable):
+                        rc.read_routing_file(path)
+                    opened.assert_not_called()  # refused before it is opened (astra r1's later note), and so
+                    parsed.assert_not_called()  # before it is parsed
+
+
 @unittest.skipUnless(POSIX_OWNER, "the routing file's owner check needs a POSIX uid")
 class RoutingFileTests(unittest.TestCase):
     def setUp(self) -> None:

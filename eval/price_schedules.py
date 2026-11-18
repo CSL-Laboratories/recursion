@@ -37,8 +37,11 @@ then what its figures are:
   reason (an unknown cost, the tasks that ran differ, no route solved a task, one route only). A route
   that solved no task is never the cheaper one. Routes are compared only when the same tasks ran on
   each (at least one trial of the task not ``not_run``); a route with a task that never ran is not
-  called cheaper or dearer than one where it ran. The figures of a schedule are printed with as many
-  places as it takes (6 at least) for different figures per solved task to print differently;
+  called cheaper or dearer than one where it ran, and the same holds per trial (task and trial index):
+  a route that did not run a trial another route ran is not compared either. The figures of a schedule
+  are printed with as many places as it takes (6 at least) for different figures per solved task to
+  print differently; when 60 places do not separate them, every figure of that schedule prints as an
+  exact fraction (``n/d``);
 * ``flips`` (``modelled, not billed``), once when two or more routes are priced under two or more
   schedules: ``flips=yes`` when the cheapest routes are not the same under every schedule whose
   answer is known, ``flips=unknown`` when they agree but some answer is unknown, else ``flips=no``,
@@ -180,20 +183,24 @@ def _decimal(value: Fraction, places: int) -> str:
     return f"{digits[:-places]}.{digits[-places:]}"
 
 
-def places_for(values: list) -> int:
-    """The fewest places, at least 6, at which different values print differently."""
+def places_for(values: list):
+    """The fewest places, at least 6, at which different values print differently; None when 60 places
+    do not separate them (the figures then print as exact fractions)."""
     distinct = set(values)
     places = MIN_PLACES
-    while places < MAX_PLACES and len({_decimal(v, places) for v in distinct}) < len(distinct):
+    while len({_decimal(v, places) for v in distinct}) < len(distinct):
+        if places >= MAX_PLACES:
+            return None
         places += 1
     return places
 
 
-def _amount(value, unit, places: int = MIN_PLACES) -> str:
-    return f"{_decimal(value, places)}{'' if unit is None else ' ' + unit}"
+def _amount(value, unit, places=MIN_PLACES) -> str:
+    text = str(Fraction(value)) if places is None else _decimal(value, places)
+    return f"{text}{'' if unit is None else ' ' + unit}"
 
 
-def _figure(value, count: int, unit, none_word: str, places: int = MIN_PLACES) -> str:
+def _figure(value, count: int, unit, none_word: str, places=MIN_PLACES) -> str:
     if not count:
         return none_word
     return UNKNOWN if value is None else _amount(value, unit, places)
@@ -261,6 +268,12 @@ def cheaper(records: list, schedule: dict) -> dict:
              if tasks != every]
     if short:
         return {"result": "UNKNOWN", "reason": "the tasks that ran differ: " + "; ".join(short)}
+    ran_trials = {_rt(record): {(t["task_id"], t["attempt"]["index"]) for t in _ran(record)} for record in records}
+    every_trial = set().union(*ran_trials.values())
+    short = [f"{route} did not run " + ", ".join(f"{task} trial {index}" for task, index in sorted(every_trial - run))
+             for route, run in ran_trials.items() if run != every_trial]
+    if short:
+        return {"result": "UNKNOWN", "reason": "the trials that ran differ: " + "; ".join(short)}
     best, best_routes, unknown_routes = None, [], []
     for record in records:
         figures = modelled(record, schedule)

@@ -6,6 +6,7 @@ import io
 import json
 import tempfile
 import unittest
+from fractions import Fraction
 from pathlib import Path
 
 from eval import price_schedules
@@ -406,6 +407,42 @@ class ThirdRoundTests(unittest.TestCase):
         legend = " ".join(price_schedules.__doc__.split())
         self.assertIn("none-ran, none-passed and none-solved count as unknown in a comparison", legend)
         self.assertIn("compared exactly as recorded", legend)
+
+
+class FourthRoundTests(unittest.TestCase):
+    """The read of d889b174 (work/reads/read-prices-b7e3258e.md, section Third commit), order line 179."""
+
+    def test_routes_whose_run_trials_differ_are_not_compared(self):
+        # The reader's case: C ran both trials of each task, D one (the other not_run), all passing.
+        # Per solved task C 2 x 8.00 = 16.00 and D 1 x 8.00 = 8.00 would call D cheaper.
+        c = route_record("model-c", {"t-1": ["pass", "pass"], "t-2": ["pass", "pass"]}, tokens(**A_TOKENS),
+                         record_id="rc")
+        d = route_record("model-d", {"t-1": ["pass", "not_run"], "t-2": ["pass", "not_run"]}, tokens(**A_TOKENS),
+                         record_id="rd")
+        code, out, err = run([c, d])
+        self.assertEqual(code, 0, err)
+        cheaper = lines_of(out, "cheaper")
+        self.assertEqual(len(cheaper), 2)
+        for f in cheaper:
+            self.assertEqual(f["result"], "UNKNOWN", f)
+            self.assertEqual(f["reason"], f"the trials that ran differ: {R('model-d')} did not run t-1 trial 2, "
+                                          "t-2 trial 2")
+
+    def test_figures_that_60_places_do_not_separate_print_as_exact_fractions(self):
+        schedules = {"schedules": [{"name": "far", "unit": "usd",
+                                    "per_million": {"uncached_input": 0, "cache_write": 0, "cache_read": 1e-60,
+                                                    "output": 1e-50}}]}
+        # Per trial: A 1 output token = 10^-56; B adds 1 cache read = 10^-66. 4 trials, 2 tasks solved.
+        a = route_record("model-a", OUTCOMES, tokens(output=1), record_id="ra")
+        b = route_record("model-b", OUTCOMES, tokens(output=1, cache_read=1), record_id="rb")
+        code, out, err = run([a, b], schedules)
+        self.assertEqual(code, 0, err)
+        cheaper = lines_of(out, "cheaper")
+        self.assertEqual((cheaper[0]["result"], cheaper[0]["route"]), ("CHEAPER", R("model-a")))
+        figures = {f["route"]: f["per_solved_task"] for f in lines_of(out, "cost")}
+        expected_a = Fraction(2, 10 ** 56)
+        expected_b = Fraction(2, 10 ** 56) + Fraction(2, 10 ** 66)
+        self.assertEqual(figures, {R("model-a"): f"{expected_a} usd", R("model-b"): f"{expected_b} usd"})
 
 
 class RefusalTests(unittest.TestCase):

@@ -14,7 +14,17 @@ It is written only after generation ``n`` is complete. The live ``plugins/``
 tree is published after that. The next list, install or remove publishes
 ``current`` again when that publish did not finish. Older generations stay on
 disk so a later command can point ``current`` at one and publish it. This
-module does not do that.
+module does not do that. A generation that ``current`` does not name (a stop
+between its rename and the pointer) is left as it is; the next command takes
+the number after every generation on disk.
+
+Every check of the live ``plugins/`` path runs before a generation is written,
+so a refused command leaves ``current`` and the generations as they were. The
+publish moves ``install.json`` in first, by one rename over the old file, then
+moves each old plugin directory out whole and each new one in whole: at every
+step the live tree holds the whole old or the whole new ``install.json``. Each
+written file and its directory are synced before the rename that publishes
+them, and ``current`` is synced after its rename.
 
 The registry is checked before any profile file is created. A signature is
 checked on every install. When this interpreter cannot verify one, the install
@@ -49,6 +59,7 @@ __all__ = ["InstallRefused", "install_plugin", "list_plugins", "remove_plugin"]
 
 _PLUGIN_ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
 _CURRENT = re.compile(r"[1-9][0-9]*\n")
+_GENERATION = re.compile(r"[1-9][0-9]{0,17}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _KEY_ID = re.compile(r"ed25519:[0-9a-f]{32}")
 # Names the profile itself uses inside a generation and inside plugins/: never a plugin id.
@@ -339,13 +350,21 @@ def _lock(config: Path, wait: bool = True) -> int:
 
 
 def _require_config(config: Path) -> None:
-    config.mkdir(parents=True, mode=0o700, exist_ok=True)
-    os.chmod(config, 0o700)
-    info = os.lstat(config)
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise InstallRefused("plugin_directory_untrusted")
-    if info.st_uid != os.geteuid() or info.st_mode & 0o022:
-        raise InstallRefused("plugin_directory_untrusted")
+    # lstat first: a link, a non-directory, another owner or group or other write refuses, and nothing
+    # is changed. Only a directory this call created gets its mode set.
+    if not _lexists(config):
+        config.parent.mkdir(parents=True, exist_ok=True)
+        _make_dir(config)
+    _require_owned_dir(config)
+
+
+def _make_dir(path: Path) -> None:
+    """Make ``path`` owner-only. A name that is already there is left as it is for the caller's check."""
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        return
+    os.chmod(path, 0o700)
 
 
 def _publish_current(config: Path) -> None:
@@ -376,12 +395,14 @@ def _read_current(config: Path) -> int | None:
 
 
 def _commit(config: Path, snapshot: Snapshot) -> int:
+    # The live plugins/ path is checked before any generation is written or the pointer moves.
+    _check_live(config)
     root = config / "plugin-generations"
-    root.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(root, 0o700)
+    if not _lexists(root):
+        _make_dir(root)
     _require_owned_dir(root)
     current = _read_current(config)
-    number = 1 if current is None else current + 1
+    number = _next_number(root, current)
     dest = root / str(number)
     if _lexists(dest):
         raise InstallRefused("generation_exists")
@@ -393,6 +414,7 @@ def _commit(config: Path, snapshot: Snapshot) -> int:
     try:
         _write_profile(partial, snapshot)
         os.rename(partial, dest)
+        _sync_dir(root)
         _write_pointer(root, number)
         # The pointer names a complete generation before the live tree is touched.
         # If publishing raises, the next command publishes this generation.
@@ -402,6 +424,16 @@ def _commit(config: Path, snapshot: Snapshot) -> int:
             _remove_at(partial)
         raise
     return number
+
+
+def _next_number(root: Path, current: int | None) -> int:
+    """The number after ``current`` and after every generation on disk.
+
+    A generation that ``current`` does not name is left from a stop between its rename and the
+    pointer write. It is no obstacle: it stays on disk and the next number is taken.
+    """
+    taken = [int(name) for name in os.listdir(root) if _GENERATION.fullmatch(name)]
+    return max([current or 0, *taken]) + 1
 
 
 def _write_pointer(root: Path, number: int) -> None:
@@ -419,37 +451,62 @@ def _copy_generation_to_live(config: Path, generation: int) -> None:
     if not _lexists(source):
         raise InstallRefused("generation_missing")
     _require_owned_dir(source, "generation_missing")
+    _check_live(config)
     stage = config / "plugin-generations" / ".stage"
-    if _lexists(stage):
-        _remove_at(stage)
+    old = config / "plugin-generations" / ".old"
+    for leftover in (stage, old):
+        if _lexists(leftover):
+            _remove_at(leftover)
     stage.mkdir(mode=0o700)
     os.chmod(stage, 0o700)
     try:
         snapshot = _read_profile(source, missing_install_ok=False)
         _write_profile(stage, snapshot)
         plugins = config / "plugins"
-        if _lexists(plugins):
-            if plugins.is_symlink():
-                raise InstallRefused("plugin_directory_untrusted")
-            _require_owned_dir(plugins)
-        else:
+        if not _lexists(plugins):
             plugins.mkdir(mode=0o700)
             os.chmod(plugins, 0o700)
-        _swap_into(plugins, stage)
+            _sync_dir(config)
+        old.mkdir(mode=0o700)
+        os.chmod(old, 0o700)
+        _swap_into(plugins, stage, old)
     finally:
-        if _lexists(stage):
-            _remove_at(stage)
+        for leftover in (stage, old):
+            if _lexists(leftover):
+                _remove_at(leftover)
 
 
-def _swap_into(plugins: Path, stage: Path) -> None:
-    staged = set(os.listdir(stage))
-    for name in list(os.listdir(plugins)):
+def _check_live(config: Path) -> None:
+    """The checks of the live ``plugins/`` path. They run before anything is written."""
+    plugins = config / "plugins"
+    if _lexists(plugins):
+        if plugins.is_symlink():
+            raise InstallRefused("plugin_directory_untrusted")
+        _require_owned_dir(plugins)
+
+
+def _swap_into(plugins: Path, stage: Path, old: Path) -> None:
+    """Publish ``stage`` into ``plugins/``. Nothing is deleted from the live tree piece by piece.
+
+    install.json goes in first, by one rename over the old file, and is never removed first. Then each
+    old entry is moved out whole into ``old`` and each new plugin directory moved in whole.
+    """
+    staged = sorted(name for name in os.listdir(stage) if name != "install.json")
+    live_install = plugins / "install.json"
+    if _lexists(live_install) and stat.S_ISDIR(os.lstat(live_install).st_mode):
+        os.rename(live_install, old / "install.json")
+    os.rename(stage / "install.json", live_install)
+    _sync_dir(plugins)
+    for name in sorted(os.listdir(plugins)):
+        if name == "install.json":
+            continue
         path = plugins / name
         info = os.lstat(path)
-        if name == "install.json" or name in staged or stat.S_ISLNK(info.st_mode) or stat.S_ISDIR(info.st_mode):
-            _remove_at(path)
-    for name in os.listdir(stage):
+        if name in staged or stat.S_ISLNK(info.st_mode) or stat.S_ISDIR(info.st_mode):
+            os.rename(path, old / name)
+    for name in staged:
         os.rename(stage / name, plugins / name)
+    _sync_dir(plugins)
 
 
 def _load_snapshot(config: Path) -> Snapshot:
@@ -605,6 +662,8 @@ def _write_profile(directory: Path, snapshot: Snapshot) -> None:
         _write_file(plugin_dir / "plugin.py", plugin.artifact)
         if plugin.signature is not None:
             _write_file(plugin_dir / "manifest.sig", plugin.signature)
+        _sync_dir(plugin_dir)
+    _sync_dir(directory)
 
 
 def _dump_install(snapshot: Snapshot) -> bytes:
@@ -641,6 +700,16 @@ def _write_file(path: Path, data: bytes) -> None:
         while view:
             view = view[os.write(fd, view):]
         os.fchmod(fd, 0o600)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _sync_dir(path: Path) -> None:
+    """Sync a directory, so the names written or renamed in it are on disk."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
     finally:
         os.close(fd)
 
@@ -651,6 +720,7 @@ def _atomic_replace(directory: Path, name: str, data: bytes) -> None:
         _remove_at(temporary)
     _write_file(temporary, data)
     os.rename(temporary, directory / name)
+    _sync_dir(directory)
 
 
 def _read_file(path: Path, limit: int) -> bytes:

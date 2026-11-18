@@ -20,9 +20,11 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from recursion_core.daemon.plugins import PluginHost
 from recursion_core.plugin_security import Authority, Refused, TrustStore, canonical, create_ledger, parse_manifest
+from recursion_core.plugin_security import package as package_module
 from recursion_core.plugin_security.manifest import ENTRY_FILE, MANIFEST_SCHEMA_V1
 from recursion_core.plugin_security.package import VerifiedPackage, verify_package
 from recursion_core.plugin_security.tests.support import (
@@ -271,6 +273,11 @@ class VerifyPackageTests(unittest.TestCase):
         self.plugin = self.root / "plugins" / "demo"
         self.trust = TrustStore({"dev": self.key.public})
         self.addCleanup(self.trust.close)
+        if not package_module._posix_reads():
+            # Without dir_fd, O_DIRECTORY and O_NOFOLLOW (the simulated-Windows child deletes the last two),
+            # verify_package refuses typed before it opens anything; the POSIX reads below cannot run there.
+            self.assertEqual(_code(lambda: verify_package(self.plugin, self.trust)), "package_platform_unsupported")
+            self.skipTest("verify_package reads a package only with dir_fd, O_DIRECTORY and O_NOFOLLOW (POSIX)")
 
     def test_an_intact_package_is_signed_and_returns_every_listed_file(self) -> None:
         result = verify_package(self.plugin, self.trust)
@@ -315,6 +322,27 @@ class VerifyPackageTests(unittest.TestCase):
         _write(self.plugin, "manifest.sig", (b"00" * 64) + b"\n")
         result = verify_package(self.plugin, self.trust)
         self.assertEqual((result.intact, result.trust, result.reason), (True, "unsigned", "signature_invalid"))
+
+
+class PlatformRefusalTests(unittest.TestCase):
+    """Without the POSIX reads, ``verify_package`` refuses typed and opens nothing. Runs on every platform."""
+
+    def test_without_posix_reads_the_refusal_comes_before_any_open(self) -> None:
+        root = _tree(self)
+        trust = TrustStore({})
+        self.addCleanup(trust.close)
+        opened: list = []
+        real_open = os.open
+
+        def recording_open(*args, **kwargs):
+            opened.append(args[:1])
+            return real_open(*args, **kwargs)
+
+        with mock.patch.object(package_module, "_posix_reads", return_value=False):
+            with mock.patch.object(package_module.os, "open", side_effect=recording_open):
+                code = _code(lambda: verify_package(root, trust))
+        self.assertEqual(code, "package_platform_unsupported")
+        self.assertEqual(opened, [])
 
 
 @unittest.skipUnless(LINUX, "the plugin install path checks ownership by uid")

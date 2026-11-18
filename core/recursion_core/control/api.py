@@ -490,11 +490,31 @@ class ControlAPI:
             return False
         return info.st_dev == dev and info.st_ino == ino
 
-    def _level_populated(self, directory: Path) -> bool | None:
-        """True when this directory lists a pid or says populated. False when it was read clear.
+    def _listed_pid_alive(self, pid: int) -> bool | None:
+        """True when alive, False when gone, None when the read did not say.
 
-        A missing ``cgroup.procs`` or ``cgroup.events`` is an empty level. Any other read
-        error is doubt.
+        Same answers as the daemon walk's ``pid_alive``. Only ENOENT and ESRCH mean the
+        process is gone. A zombie is gone. Any other error is unknown and is not death.
+        """
+        try:
+            text = Path(f"/proc/{pid}/stat").read_text()
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ESRCH):
+                return False
+            return None
+        try:
+            state = text[text.rindex(")") + 2:].split()[0]
+        except (ValueError, IndexError):
+            return True
+        return state not in ("Z", "X")
+
+    def _level_populated(self, directory: Path) -> bool | None:
+        """True when this directory lists a live pid or says populated. False when it was read clear.
+
+        A missing ``cgroup.procs`` or ``cgroup.events`` is an empty level. A positive pid is
+        a live member only when ``_listed_pid_alive`` says so. A pid that check calls gone
+        is not a live member. A pid whose read did not say is doubt. Any other read error
+        is doubt.
         """
         try:
             text = (directory / "cgroup.procs").read_text()
@@ -504,10 +524,17 @@ class ControlAPI:
             text = ""
         except (ValueError, TypeError):
             return None
+        unknown = False
         for token in text.split():
             if not token.isdigit() or int(token) <= 0:
                 return None
-            return True
+            alive = self._listed_pid_alive(int(token))
+            if alive is True:
+                return True
+            if alive is None:
+                unknown = True
+        if unknown:
+            return None
         try:
             events = (directory / "cgroup.events").read_text()
         except OSError as exc:
@@ -528,14 +555,20 @@ class ControlAPI:
         return False
 
     def _subtree_populated(self, directory: Path) -> bool | None:
-        """True when a re-read shows a process, False when the subtree was read clear, None on doubt."""
+        """True when a re-read shows a process, False when the subtree was read clear, None on doubt.
+
+        The depth and node bounds are the daemon walk's two constants, read at the call so a
+        second copy of the numbers cannot drift. Past either bound the re-read is doubt.
+        """
+        from recursion_core.daemon import CGROUP_WALK_MAX_DEPTH, CGROUP_WALK_MAX_NODES
+        max_depth, max_nodes = CGROUP_WALK_MAX_DEPTH, CGROUP_WALK_MAX_NODES
         stack = [(directory, 0)]
         seen: set[tuple[int, int]] = set()
         nodes = 0
         while stack:
             current, depth = stack.pop()
             nodes += 1
-            if depth > 8 or nodes > 64:
+            if depth > max_depth or nodes > max_nodes:
                 return None
             try:
                 info = current.lstat()
@@ -615,15 +648,62 @@ class ControlAPI:
             return None
         return directory
 
+    def _open_nofollow(self, root: Path, parts: tuple[str, ...]) -> int:
+        """An fd for ``root / parts``. Each component is opened with ``O_DIRECTORY|O_NOFOLLOW``.
+
+        The caller releases the fd. A symlink at any component raises ``OSError`` and every fd
+        opened on the way is released here.
+        """
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory_flag = getattr(os, "O_DIRECTORY", 0)
+        if not nofollow or not directory_flag:
+            raise OSError(errno.ELOOP, "directory open would follow a link")
+        flags = os.O_RDONLY | directory_flag | nofollow | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(root, flags)
+        try:
+            for part in parts:
+                nxt = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = nxt
+            held = fd
+            fd = -1
+            return held
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def _opened_parent_matches(self, root: Path, parts: tuple[str, ...], parent_fd: int) -> bool:
+        """True when the path still names the directory the fd has open."""
+        try:
+            info = root.lstat() if not parts else root.joinpath(*parts).lstat()
+        except OSError:
+            return False
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return False
+        opened = os.fstat(parent_fd)
+        return info.st_dev == opened.st_dev and info.st_ino == opened.st_ino
+
+    def _path_names_a_directory(self, directory: Path) -> bool:
+        """True unless ``lstat`` says the leaf path is gone."""
+        try:
+            directory.lstat()
+        except OSError as exc:
+            return exc.errno != errno.ENOENT
+        return True
+
     def _remove_recorded_cgroup(self, rec: dict) -> str:
         """Remove this run's cgroup directory only when the path is proved.
 
-        ``removed``: this call's ``rmdir`` succeeded.
+        ``removed``: this call's ``rmdir`` of the checked inode succeeded, and the path no
+        longer names a directory.
         ``absent``: the proved directory was already gone. This call did not remove it.
-        ``populated``: a re-read shows a process, or the re-read itself failed.
-        ``empty``: the directory stays. Every doubt is this word, and so is an empty
-        child cgroup that makes ``rmdir`` answer ``EBUSY``.
-        A symlink is not followed and is not removed. Entries inside the directory are not unlinked.
+        ``populated``: a re-read shows a process, the re-read itself failed, or the path
+        still names a directory after the removal call.
+        ``empty``: the directory stays. Every doubt is this word, and so is a clear re-read
+        after ``rmdir`` answers anything other than ``ENOENT``.
+        The parent is opened with ``O_DIRECTORY|O_NOFOLLOW`` and the leaf name is removed
+        relative to that fd, so a symlink swapped in for a parent is not followed.
+        A symlink is not removed. Entries inside the directory are not unlinked.
         """
         found = self._proved_cgroup_directory(rec)
         if found is None:
@@ -631,30 +711,51 @@ class ControlAPI:
         if found == "absent":
             return "absent"
         directory = found
-        try:
-            info = directory.lstat()
-        except OSError as exc:
-            return "absent" if exc.errno == errno.ENOENT else "empty"
-        except (ValueError, TypeError):
-            return "empty"
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            return "empty"
-        if not self._identity_matches(info, rec.get("cgroup_identity")):
+        root = self._known_cgroup_root()
+        if root is None:
             return "empty"
         try:
-            os.rmdir(directory)
-        except OSError as exc:
-            if exc.errno == errno.ENOENT:
-                return "absent"
-            if exc.errno == errno.EBUSY:
+            parents = directory.relative_to(root).parts[:-1]
+        except ValueError:
+            return "empty"
+        parent_fd: int | None = None
+        try:
+            try:
+                parent_fd = self._open_nofollow(root, parents)
+            except OSError as exc:
+                return "absent" if exc.errno == errno.ENOENT else "empty"
+            if not self._opened_parent_matches(root, parents, parent_fd):
+                return "empty"
+            try:
+                info = os.stat(directory.name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as exc:
+                return "absent" if exc.errno == errno.ENOENT else "empty"
+            except (ValueError, TypeError):
+                return "empty"
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                return "empty"
+            if not self._identity_matches(info, rec.get("cgroup_identity")):
+                return "empty"
+            try:
+                os.rmdir(directory.name, dir_fd=parent_fd)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    return "absent"
+                # ENOENT is the only rmdir error that means the directory is gone.
+                # Every other error, including EBUSY and ENOTEMPTY, is re-read.
+                # Only a finished clear re-read is empty. Anything else is not proved.
                 live = self._subtree_populated(directory)
                 if live is False:
                     return "empty"
                 return "populated"
-            return "empty"
-        except (ValueError, TypeError):
-            return "empty"
-        return "removed"
+            except (ValueError, TypeError):
+                return "empty"
+            if self._path_names_a_directory(directory):
+                return "populated"
+            return "removed"
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
 
     def _enter_owner(self) -> None:
         depth = getattr(self._local, "depth", 0)

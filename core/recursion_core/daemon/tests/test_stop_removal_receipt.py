@@ -118,7 +118,7 @@ class ManagerRemovalReceiptTest(unittest.TestCase):
         directory = self.root / 'app.slice' / unit
         directory.mkdir(parents=True)
 
-        def vanish(path):
+        def vanish(path, dir_fd=None):
             raise OSError(errno.ENOENT, 'gone')
 
         api = self._api(self._forgotten())
@@ -141,7 +141,7 @@ class ManagerRemovalReceiptTest(unittest.TestCase):
         (child / 'cgroup.procs').write_text('')
         (child / 'cgroup.events').write_text('populated 0\n')
 
-        def busy(path):
+        def busy(path, dir_fd=None):
             raise OSError(errno.EBUSY, 'Device or resource busy')
 
         api = self._api(self._forgotten())
@@ -195,6 +195,61 @@ class ManagerRemovalReceiptTest(unittest.TestCase):
         self.assertNotEqual(outcome, 'removed')
         self.assertEqual(outcome, 'empty')
         self.assertTrue(directory.is_dir())
+
+    def test_a_parent_swapped_between_the_check_and_rmdir_is_not_followed(self):
+        """R2. The slice directory becomes a symlink in the rmdir call. The outside unit stays.
+
+        The swap sits in the rmdir the product calls. The real removal runs with the
+        arguments the product passed. The stored proof is not removed.
+        """
+        unit = 'recursion-run-run-x.service'
+        directory = self.root / 'app.slice' / unit
+        directory.mkdir(parents=True)
+        outside = self.tmp / 'outside-swap'
+        victim = outside / unit
+        victim.mkdir(parents=True)
+        real_rmdir = os.rmdir
+        swapped = {'done': False}
+
+        def attack(path, dir_fd=None):
+            slice_dir = self.root / 'app.slice'
+            if not swapped['done'] and slice_dir.is_dir() and not slice_dir.is_symlink():
+                swapped['done'] = True
+                slice_dir.rename(self.root / 'app.slice.held')
+                slice_dir.symlink_to(outside, target_is_directory=True)
+            if dir_fd is None:
+                return real_rmdir(path)
+            return real_rmdir(path, dir_fd=dir_fd)
+
+        api = self._api(self._forgotten())
+        with mock.patch('recursion_core.daemon.os.rmdir', attack), \
+                mock.patch('recursion_core.control.api.os.rmdir', attack):
+            answer = api.call('run.stop', {'run_id': 'run-x'})
+        status = api.call('run.status', {'run_id': 'run-x'})['run']
+        proof = status.get('stop_attestation') or {}
+        self.assertTrue(victim.is_dir(), 'a directory outside the unit was removed')
+        self.assertNotEqual(proof.get('proof'), 'removed', proof)
+        self.assertNotEqual(answer['code'], 'stopped', answer)
+        self.assertTrue(swapped['done'])
+
+    def test_enotempty_with_an_unfinished_reread_is_not_empty(self):
+        """R3. A child symlink makes the re-read unfinished. That result is not empty.
+
+        rmdir of a directory that holds an entry answers ENOTEMPTY on this host. The
+        remover used to report empty when that re-read could not be finished.
+        """
+        unit = 'recursion-run-run-x.service'
+        directory = self.root / 'app.slice' / unit
+        directory.mkdir(parents=True)
+        (directory / 'cgroup.procs').write_text('')
+        (directory / 'cgroup.events').write_text('populated 0\n')
+        target = self.tmp / 'link-target'
+        target.mkdir()
+        (directory / 'child').symlink_to(target, target_is_directory=True)
+        outcome = self._forgotten().remove_cleared_cgroup(unit, GROUP, marker='cg-unread')
+        self.assertEqual(outcome, 'populated', outcome)
+        self.assertTrue(directory.is_dir())
+        self.assertTrue(target.is_dir())
 
     def test_evidence_stop_check_agrees_with_a_removed_proof(self):
         source = Path(__file__).resolve().parents[1].joinpath('evidence_e2e.py').read_text()

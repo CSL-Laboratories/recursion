@@ -49,6 +49,7 @@ TERMINAL = frozenset({'terminated', 'lost_reboot'})
 SCHEMA_VERSION = 1
 # A delegated unit cgroup is shallow. Past either bound the walk is not a
 # positive empty result: callers treat None as unknown, never as terminated.
+# The control API's removal re-read imports these two names. They are the one bound.
 CGROUP_WALK_MAX_DEPTH = 64
 CGROUP_WALK_MAX_NODES = 4096
 # How long to re-read a recorded cgroup after its processes were sent SIGKILL.
@@ -1325,15 +1326,62 @@ class SystemdUserManager:
             return None
         return directory
 
+    def _open_nofollow(self, root, parts):
+        """An fd for ``root / parts``. Each component is opened with ``O_DIRECTORY|O_NOFOLLOW``.
+
+        The caller releases the fd. A symlink at any component raises ``OSError`` and every fd
+        opened on the way is released here.
+        """
+        nofollow = getattr(os, 'O_NOFOLLOW', 0)
+        directory_flag = getattr(os, 'O_DIRECTORY', 0)
+        if not nofollow or not directory_flag:
+            raise OSError(errno.ELOOP, 'directory open would follow a link')
+        flags = os.O_RDONLY | directory_flag | nofollow | getattr(os, 'O_CLOEXEC', 0)
+        fd = os.open(root, flags)
+        try:
+            for part in parts:
+                nxt = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = nxt
+            held = fd
+            fd = -1
+            return held
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def _opened_parent_matches(self, root, parts, parent_fd):
+        """True when the path still names the directory the fd has open."""
+        try:
+            info = root.lstat() if not parts else root.joinpath(*parts).lstat()
+        except OSError:
+            return False
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return False
+        opened = os.fstat(parent_fd)
+        return info.st_dev == opened.st_dev and info.st_ino == opened.st_ino
+
+    def _path_names_a_directory(self, directory):
+        """True unless ``lstat`` says the leaf path is gone."""
+        try:
+            directory.lstat()
+        except OSError as exc:
+            return exc.errno != errno.ENOENT
+        return True
+
     def remove_cleared_cgroup(self, unit, group, *, marker=None, identity=None):
         """Remove the recorded cgroup directory after a walk found it empty.
 
-        ``removed`` only when this call's ``rmdir`` succeeded.
+        ``removed`` only when this call's ``rmdir`` of the checked inode succeeded and the
+        path no longer names a directory.
         ``absent`` when the proved directory was already gone. This call did not remove it.
-        ``populated`` when a re-read shows a live process, or the re-read failed.
-        ``empty`` when the directory stays, including every doubt and an ``EBUSY`` from
-        empty child cgroups after a clear re-read.
-        A symlink is not followed and is not removed. Entries inside the directory are not unlinked.
+        ``populated`` when a re-read shows a live process, the re-read failed, or the path
+        still names a directory after the removal call.
+        ``empty`` when the directory stays, including every doubt and a clear re-read after
+        ``rmdir`` answers anything other than ``ENOENT``.
+        The parent is opened with ``O_DIRECTORY|O_NOFOLLOW`` and the leaf name is removed
+        relative to that fd, so a symlink swapped in for a parent is not followed.
+        A symlink is not removed. Entries inside the directory are not unlinked.
         """
         if not isinstance(marker, str) or not marker:
             return 'empty'
@@ -1343,35 +1391,53 @@ class SystemdUserManager:
         if found == 'absent':
             return 'absent'
         directory = found
+        root = self.cgroup_root
+        if not isinstance(root, Path):
+            try:
+                root = Path(root)
+            except TypeError:
+                return 'empty'
         try:
-            info = directory.lstat()
-        except OSError as exc:
-            return 'absent' if exc.errno == errno.ENOENT else 'empty'
-        except (ValueError, TypeError):
+            parents = directory.relative_to(root).parts[:-1]
+        except ValueError:
             return 'empty'
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            return 'empty'
-        if not self._identity_matches(info, identity):
-            return 'empty'
+        parent_fd = None
         try:
-            os.rmdir(directory)
-        except OSError as exc:
-            if exc.errno == errno.ENOENT:
-                return 'absent'
-            if exc.errno == errno.EBUSY:
+            try:
+                parent_fd = self._open_nofollow(root, parents)
+            except OSError as exc:
+                return 'absent' if exc.errno == errno.ENOENT else 'empty'
+            if not self._opened_parent_matches(root, parents, parent_fd):
+                return 'empty'
+            try:
+                info = os.stat(directory.name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as exc:
+                return 'absent' if exc.errno == errno.ENOENT else 'empty'
+            except (ValueError, TypeError):
+                return 'empty'
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                return 'empty'
+            if not self._identity_matches(info, identity):
+                return 'empty'
+            try:
+                os.rmdir(directory.name, dir_fd=parent_fd)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    return 'absent'
+                # ENOENT is the only rmdir error that means the directory is gone.
+                # Every other error is re-read. Only a finished clear re-read is empty.
                 live = self._recorded_cgroup_live(directory, group)
                 if live is False:
                     return 'empty'
                 return 'populated'
-            if exc.errno == errno.ENOTEMPTY:
-                live = self._recorded_cgroup_live(directory, group)
-                if live is True:
-                    return 'populated'
+            except (ValueError, TypeError):
                 return 'empty'
-            return 'empty'
-        except (ValueError, TypeError):
-            return 'empty'
-        return 'removed'
+            if self._path_names_a_directory(directory):
+                return 'populated'
+            return 'removed'
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
 
     def _recorded_cgroup_live(self, directory, group):
         try:

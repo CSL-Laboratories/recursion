@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -138,7 +139,7 @@ class RemovalReceiptTest(unittest.TestCase):
             holder["directory"] = directory
             return {"cgroup": f"/app.slice/{unit}"}
 
-        def vanish(path: object) -> None:
+        def vanish(path: object, dir_fd: int | None = None) -> None:
             raise OSError(errno.ENOENT, "gone")
 
         kill = FakeKillTree([EMPTY])
@@ -158,7 +159,7 @@ class RemovalReceiptTest(unittest.TestCase):
         leaf = self.tmp / "raced"
         leaf.mkdir()
 
-        def vanish(path: object) -> None:
+        def vanish(path: object, dir_fd: int | None = None) -> None:
             raise OSError(errno.ENOENT, "gone")
 
         with mock.patch("recursion_core.control.api.os.rmdir", vanish):
@@ -188,7 +189,7 @@ class RemovalReceiptTest(unittest.TestCase):
             holder["child"] = child
             return {"cgroup": f"/app.slice/{unit}"}
 
-        def busy(path: object) -> None:
+        def busy(path: object, dir_fd: int | None = None) -> None:
             raise OSError(errno.EBUSY, "Device or resource busy")
 
         kill = FakeKillTree([EMPTY])
@@ -253,7 +254,7 @@ class RemovalReceiptTest(unittest.TestCase):
             holder["directory"] = directory
             return {"cgroup": f"/app.slice/{unit}"}
 
-        def refuse(path: object) -> None:
+        def refuse(path: object, dir_fd: int | None = None) -> None:
             raise OSError(errno.EBUSY, "Device or resource busy")
 
         kill = FakeKillTree([EMPTY])
@@ -363,6 +364,273 @@ class RemovalReceiptTest(unittest.TestCase):
         reg._runs[run_id]["cgroup_marker"] = ""
         api.call("run.stop", {"run_id": run_id})
         self.assertTrue(holder["directory"].is_dir())
+
+    def _proved_unit(self, root_name: str):
+        """A proved unit under ``app.slice``. The caller fills the directory."""
+        root = self.tmp / root_name
+        root.mkdir()
+        holder: dict = {}
+
+        def starter(params: dict) -> dict:
+            unit = f"recursion-run-{params['run_id']}.service"
+            directory = root / "app.slice" / unit
+            directory.mkdir(parents=True)
+            holder["root"] = root
+            holder["directory"] = directory
+            holder["unit"] = unit
+            return {"cgroup": f"/app.slice/{unit}"}
+
+        kill = FakeKillTree([EMPTY])
+        kill.cgroup_root = root
+        api, reg, _, _ = make_api(kill, starter=starter)
+        started = api.call("run.start", {"tenant": "t", "engine": "e", "prompt": "p"})
+        return api, reg, started["run"]["run_id"], holder
+
+    def _nest(self, directory: Path, depth: int) -> None:
+        """``depth`` child levels under ``directory``. Each level reads clear."""
+        current = directory
+        (current / "cgroup.procs").write_text("")
+        (current / "cgroup.events").write_text("populated 0\n")
+        for index in range(depth):
+            current = current / f"n{index}"
+            current.mkdir()
+            (current / "cgroup.procs").write_text("")
+            (current / "cgroup.events").write_text("populated 0\n")
+
+    def test_enotempty_with_a_live_pid_is_not_stored_as_empty(self) -> None:
+        """R3. A child makes rmdir answer ENOTEMPTY here. That is not an empty unit.
+
+        No rmdir stand-in. ``cgroup.procs`` names this process as text. Nothing is signalled.
+        Confirm already said empty, which is the path that used to store proof empty.
+        """
+        api, reg, run_id, holder = self._proved_unit("cg-enotempty")
+        directory = holder["directory"]
+        (directory / "cgroup.procs").write_text(f"{os.getpid()}\n")
+        (directory / "cgroup.events").write_text("populated 1\n")
+        child = directory / "child"
+        child.mkdir()
+        (child / "cgroup.procs").write_text(f"{os.getpid()}\n")
+        (child / "cgroup.events").write_text("populated 1\n")
+        answer = api.call("run.stop", {"run_id": run_id})
+        stored = reg.get(run_id)
+        self.assertEqual((answer["code"], answer.get("reason")), ("pending", "cgroup_populated"), answer)
+        self.assertNotEqual((stored or {}).get("state"), "stopped")
+        self.assertIsNone((stored or {}).get("stop_attestation"))
+        self.assertTrue(directory.is_dir())
+        self.assertTrue(child.is_dir())
+
+    def test_an_rmdir_error_other_than_enoent_with_a_live_pid_is_not_empty(self) -> None:
+        """R3. Any rmdir error other than ENOENT is re-read. EIO is not proof empty."""
+        api, reg, run_id, holder = self._proved_unit("cg-eio")
+        directory = holder["directory"]
+        (directory / "cgroup.procs").write_text(f"{os.getpid()}\n")
+        (directory / "cgroup.events").write_text("populated 1\n")
+
+        def refuse(path: object, dir_fd: int | None = None) -> None:
+            raise OSError(errno.EIO, "Input/output error")
+
+        with mock.patch("recursion_core.control.api.os.rmdir", refuse):
+            answer = api.call("run.stop", {"run_id": run_id})
+        stored = reg.get(run_id)
+        self.assertEqual((answer["code"], answer.get("reason")), ("pending", "cgroup_populated"), answer)
+        self.assertNotEqual((stored or {}).get("state"), "stopped")
+        self.assertIsNone((stored or {}).get("stop_attestation"))
+        self.assertTrue(directory.is_dir())
+
+    def test_enotempty_with_a_dead_pid_is_proof_empty(self) -> None:
+        """A pid that is already gone, with populated 0, is a clear re-read.
+
+        The child is the only reason rmdir answers ENOTEMPTY. The pid is a process this
+        test created and has already waited on. Nothing else is signalled.
+        """
+        child_proc = subprocess.Popen(["sleep", "60"])
+        child_proc.kill()
+        child_proc.wait()
+        api, reg, run_id, holder = self._proved_unit("cg-dead-pid")
+        directory = holder["directory"]
+        (directory / "cgroup.procs").write_text(f"{child_proc.pid}\n")
+        (directory / "cgroup.events").write_text("populated 0\n")
+        child = directory / "child"
+        child.mkdir()
+        (child / "cgroup.procs").write_text("")
+        (child / "cgroup.events").write_text("populated 0\n")
+        answer = api.call("run.stop", {"run_id": run_id})
+        stored = reg.get(run_id)
+        proof = (stored or {}).get("stop_attestation") or {}
+        self.assertEqual(answer["code"], "stopped", answer)
+        self.assertNotEqual(answer.get("reason"), "cgroup_populated", answer)
+        self.assertEqual(proof.get("proof"), "empty", proof)
+        self.assertTrue(directory.is_dir())
+        self.assertTrue(child.is_dir())
+
+    def test_a_pid_whose_proc_read_does_not_say_is_not_proof_empty(self) -> None:
+        """An unfinished /proc read is doubt. That rmdir error is not stored as proof empty."""
+        api, reg, run_id, holder = self._proved_unit("cg-proc-unread")
+        directory = holder["directory"]
+        (directory / "cgroup.procs").write_text("424242\n")
+        (directory / "cgroup.events").write_text("populated 0\n")
+        child = directory / "child"
+        child.mkdir()
+        real_read = Path.read_text
+
+        def read_text(path: Path, *args: object, **kwargs: object) -> str:
+            if str(path).startswith("/proc/"):
+                raise OSError(errno.EIO, "Input/output error")
+            return real_read(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", read_text):
+            answer = api.call("run.stop", {"run_id": run_id})
+        stored = reg.get(run_id)
+        self.assertEqual((answer["code"], answer.get("reason")), ("pending", "cgroup_populated"), answer)
+        self.assertNotEqual((stored or {}).get("state"), "stopped")
+        self.assertIsNone((stored or {}).get("stop_attestation"))
+        self.assertTrue(directory.is_dir())
+
+    def test_enotempty_after_a_clear_reread_keeps_proof_empty(self) -> None:
+        """A clear child directory stays. Real rmdir is ENOTEMPTY on this host, and the re-read is clear."""
+        api, reg, run_id, holder = self._proved_unit("cg-enotempty-clear")
+        directory = holder["directory"]
+        (directory / "cgroup.procs").write_text("")
+        (directory / "cgroup.events").write_text("populated 0\n")
+        child = directory / "child"
+        child.mkdir()
+        (child / "cgroup.procs").write_text("")
+        (child / "cgroup.events").write_text("populated 0\n")
+        answer = api.call("run.stop", {"run_id": run_id})
+        stored = reg.get(run_id)
+        proof = (stored or {}).get("stop_attestation") or {}
+        self.assertEqual(answer["code"], "stopped", answer)
+        self.assertNotEqual(answer.get("reason"), "cgroup_populated", answer)
+        self.assertEqual(proof.get("proof"), "empty", proof)
+        self.assertTrue(directory.is_dir())
+        self.assertTrue(child.is_dir())
+
+    def test_a_parent_swapped_between_the_check_and_rmdir_is_not_followed(self) -> None:
+        """R2. The parent becomes a symlink in the rmdir call. The outside directory stays.
+
+        The swap sits in the rmdir the product calls, after the path was checked. The real
+        removal then runs with the arguments the product passed.
+        """
+        api, reg, run_id, holder = self._proved_unit("cg-swap")
+        root = holder["root"]
+        unit = holder["unit"]
+        outside = self.tmp / "outside-swap"
+        victim = outside / unit
+        victim.mkdir(parents=True)
+        real_rmdir = os.rmdir
+        swapped = {"done": False}
+
+        def attack(path: object, dir_fd: int | None = None) -> None:
+            slice_dir = root / "app.slice"
+            if not swapped["done"] and slice_dir.is_dir() and not slice_dir.is_symlink():
+                swapped["done"] = True
+                slice_dir.rename(root / "app.slice.held")
+                slice_dir.symlink_to(outside, target_is_directory=True)
+            if dir_fd is None:
+                real_rmdir(path)
+            else:
+                real_rmdir(path, dir_fd=dir_fd)
+
+        with mock.patch("recursion_core.control.api.os.rmdir", attack):
+            answer = api.call("run.stop", {"run_id": run_id})
+        stored = reg.get(run_id)
+        proof = (stored or {}).get("stop_attestation") or {}
+        self.assertTrue(victim.is_dir(), "a directory outside the unit was removed")
+        self.assertNotEqual(proof.get("proof"), "removed", proof)
+        self.assertNotEqual(answer["code"], "stopped", answer)
+        self.assertTrue(swapped["done"])
+
+    def test_a_clear_ebusy_nest_between_the_old_depth_bounds_is_stopped(self) -> None:
+        """R1. Depth 9 sits between the old re-read bound of 8 and the walk bound of 64.
+
+        rmdir answers EBUSY. The nest is clear, so the Stop is stopped and the directories stay.
+        A second Stop of that same tree is stopped as well.
+        """
+        api, reg, run_id, holder = self._proved_unit("cg-depth")
+        directory = holder["directory"]
+        self._nest(directory, 9)
+
+        def busy(path: object, dir_fd: int | None = None) -> None:
+            raise OSError(errno.EBUSY, "Device or resource busy")
+
+        with mock.patch("recursion_core.control.api.os.rmdir", busy):
+            answer = api.call("run.stop", {"run_id": run_id})
+            again = api.call("run.stop", {"run_id": run_id})
+        stored = reg.get(run_id)
+        proof = (stored or {}).get("stop_attestation") or {}
+        self.assertEqual(answer["code"], "stopped", answer)
+        self.assertEqual(proof.get("proof"), "empty", proof)
+        self.assertEqual(again["code"], "stopped", again)
+        self.assertTrue(directory.is_dir())
+        self.assertTrue((directory / "n0").is_dir())
+
+    def test_a_clear_ebusy_nest_past_the_old_node_bound_is_stopped(self) -> None:
+        """R1. 64 child directories are 65 nodes, past the old re-read bound and under the walk bound."""
+        api, reg, run_id, holder = self._proved_unit("cg-wide")
+        directory = holder["directory"]
+        (directory / "cgroup.procs").write_text("")
+        (directory / "cgroup.events").write_text("populated 0\n")
+        for index in range(64):
+            child = directory / f"c{index}"
+            child.mkdir()
+            (child / "cgroup.procs").write_text("")
+            (child / "cgroup.events").write_text("populated 0\n")
+
+        def busy(path: object, dir_fd: int | None = None) -> None:
+            raise OSError(errno.EBUSY, "Device or resource busy")
+
+        with mock.patch("recursion_core.control.api.os.rmdir", busy):
+            answer = api.call("run.stop", {"run_id": run_id})
+        stored = reg.get(run_id)
+        proof = (stored or {}).get("stop_attestation") or {}
+        self.assertEqual(answer["code"], "stopped", answer)
+        self.assertEqual(proof.get("proof"), "empty", proof)
+        self.assertTrue((directory / "c0").is_dir())
+        self.assertTrue((directory / "c63").is_dir())
+
+    def test_a_live_pid_past_the_old_node_bound_stays_pending(self) -> None:
+        """R1. The same wide tree with a pid in one child is not stored stopped."""
+        api, reg, run_id, holder = self._proved_unit("cg-wide-pid")
+        directory = holder["directory"]
+        (directory / "cgroup.procs").write_text("")
+        (directory / "cgroup.events").write_text("populated 0\n")
+        for index in range(64):
+            child = directory / f"c{index}"
+            child.mkdir()
+            text = f"{os.getpid()}\n" if index == 0 else ""
+            events = "populated 1\n" if index == 0 else "populated 0\n"
+            (child / "cgroup.procs").write_text(text)
+            (child / "cgroup.events").write_text(events)
+
+        def busy(path: object, dir_fd: int | None = None) -> None:
+            raise OSError(errno.EBUSY, "Device or resource busy")
+
+        with mock.patch("recursion_core.control.api.os.rmdir", busy):
+            answer = api.call("run.stop", {"run_id": run_id})
+        stored = reg.get(run_id)
+        self.assertEqual((answer["code"], answer.get("reason")), ("pending", "cgroup_populated"), answer)
+        self.assertNotEqual((stored or {}).get("state"), "stopped")
+        self.assertIsNone((stored or {}).get("stop_attestation"))
+
+    def test_the_ebusy_reread_uses_the_one_walk_bound(self) -> None:
+        """R1. The re-read bound is the walk's own constant, not a second copy of the numbers.
+
+        Depth 3 is inside the old re-read bound. Lowering the shared constant to 2 must
+        make this Stop unproved. A private copy of the old numbers would still stop it.
+        """
+        api, reg, run_id, holder = self._proved_unit("cg-bound")
+        self._nest(holder["directory"], 3)
+
+        def busy(path: object, dir_fd: int | None = None) -> None:
+            raise OSError(errno.EBUSY, "Device or resource busy")
+
+        with mock.patch("recursion_core.daemon.CGROUP_WALK_MAX_DEPTH", 2), \
+                mock.patch("recursion_core.control.api.os.rmdir", busy):
+            answer = api.call("run.stop", {"run_id": run_id})
+        stored = reg.get(run_id)
+        self.assertEqual((answer["code"], answer.get("reason")), ("pending", "cgroup_populated"), answer)
+        self.assertNotEqual((stored or {}).get("state"), "stopped")
+        self.assertIsNone((stored or {}).get("stop_attestation"))
 
 
 class StaleRemovalProofTest(unittest.TestCase):

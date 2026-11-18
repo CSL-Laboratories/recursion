@@ -80,6 +80,31 @@ _LABELS = {
 }
 
 
+# The only registry-label phrases the core draws. Membership is exact, so the
+# shorter word verified is not read out of non-verified. No colour stands in for them.
+_REGISTRY_LABEL_MARK = "; registry label: "
+_REGISTRY_LABEL_PHRASES = (
+    "non-verified; a label, not a gate",
+    "verified; a label, not a gate",
+    "unlisted; a label, not a gate",
+)
+
+
+def _registry_label_text(row: dict) -> str:
+    """Text the core draws for a plugin row's registry label. Empty for any other row.
+
+    The last mark wins, so a plugin that placed the same words earlier in the row
+    cannot replace the core's phrase. A plugin row with no core phrase is unlisted.
+    """
+    if row.get("class") != "plugin":
+        return ""
+    blocker = row.get("blocker") if type(row.get("blocker")) is str else ""
+    shown = blocker.rsplit(_REGISTRY_LABEL_MARK, 1)[-1] if _REGISTRY_LABEL_MARK in blocker else ""
+    if shown in _REGISTRY_LABEL_PHRASES:
+        return shown
+    return "unlisted; a label, not a gate"
+
+
 def _sign_in_cell(value: object) -> str:
     """Sign-in column. A string is escaped; any other type is the fixed rejection.
 
@@ -254,17 +279,21 @@ class Application:
         rows = [assess(r) for r in records] + coverage_gaps(records, self._required)
         body = "".join(
             "<tr><th scope=\"row\">%s</th><td>%s</td><td>%s</td><td>%s</td><td><span class=\"badge\">%s</span>"
-            " %s</td><td>%s</td><td>%s</td></tr>" % (
+            " %s</td><td>%s</td><td>%s</td><td class=\"registry-label\">%s</td></tr>" % (
                 escape(r["id"]), escape(r["class"]), escape(r["subject"]), _sign_in_cell(r["sign_in"]),
                 project(r, "gui"), escape(" ".join((["(beta tag)"] if r["beta_tag"] else [])
                                                + ([] if r["claim"] == "ok" else ["(" + r["claim"] + ")"]))),
-                escape(", ".join(r["failed_bars"]) or "none"), escape(r["blocker"] or "-"))
+                escape(", ".join(r["failed_bars"]) or "none"), escape(r["blocker"] or "-"),
+                escape(_registry_label_text(r) or "-"))
             for r in rows)
         return ('<section aria-labelledby="routes-h"><h2 id="routes-h">Routes</h2><table><caption>'
-                "Routes from the control API plus required routes it did not report. Bars: %s.</caption>"
+                "Routes from the control API plus required routes it did not report. Bars: %s. "
+                "A plugin row's registry label is text the core draws: verified, non-verified or "
+                "unlisted; a label, not a gate.</caption>"
                 '<thead><tr><th scope="col">Route</th><th scope="col">Class</th><th scope="col">Covers</th>'
                 '<th scope="col">Sign-in</th><th scope="col">Maturity</th><th scope="col">Failed bars</th>'
-                '<th scope="col">Blocker</th></tr></thead><tbody>%s</tbody></table></section>'
+                '<th scope="col">Blocker</th><th scope="col">Registry label</th></tr></thead>'
+                '<tbody>%s</tbody></table></section>'
                 % (escape(", ".join(BARS)), body))
 
     def _home(self, env: dict) -> tuple[str, str]:

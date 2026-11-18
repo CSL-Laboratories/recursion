@@ -797,7 +797,8 @@ class ComposedDaemonTest(unittest.TestCase):
         self.assertEqual([(p['state'], p['code']) for p in listed['plugins']], [('refused', 'plugin_verification_unavailable')])
         row = next(r for r in api.call('route.list')['routes'] if r['class'] == 'plugin')
         self.assertEqual(row['blocker'], 'refused: plugin_verification_unavailable: cryptography missing; '
-                                         'install recipe in plugin_security/README.md')
+                                         'install recipe in plugin_security/README.md; registry label: unlisted; '
+                                         'a label, not a gate')
         token = (self.runtime / 'recursion' / 'gui-device-token').read_text().strip()
         with LoopbackGUI(composed.client, composed.door, plugins=composed.plugins.registries, port=0) as gui:
             bearer = {'Authorization': 'Bearer ' + token}

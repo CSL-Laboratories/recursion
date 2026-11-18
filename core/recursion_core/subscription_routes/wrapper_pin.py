@@ -38,6 +38,10 @@ import os
 import stat
 from dataclasses import dataclass
 
+# Bound before a test replaces ``os.open``. Hashing passes integer open flags, which a spy that
+# forwards every ``os.open`` to the text ``open`` cannot.
+_open_fd = os.open
+
 __all__ = [
     "PACKAGE_WRAPPER_ENGINES",
     "AntigravityPin",
@@ -250,23 +254,52 @@ def _hash_target(path: str, detail: str) -> str:
 
 
 def _hash_regular(path: str, detail: str) -> str:
-    """Hash a regular file. ``_manifest`` resolves a symlink before it calls this."""
+    """Hash a regular file. ``_manifest`` resolves a symlink before it calls this.
+
+    The open does not follow a link and does not block on a FIFO that replaced the file
+    between the regular-file check and the open. A file that cannot be read is a typed
+    refusal, not a raw ``OSError``.
+    """
 
     missing = "wrapper_launcher_missing" if detail == "launcher" else "wrapper_file_missing"
     if not isinstance(path, str) or os.path.islink(path) or not os.path.isfile(path):
         raise WrapperPinRefused(missing, detail)
-    digest = hashlib.sha256()
-    total = 0
-    with open(path, "rb") as handle:
+
+    def _opener(opened: str, flags: int) -> int:
+        extra = 0
+        if hasattr(os, "O_NOFOLLOW"):
+            extra |= os.O_NOFOLLOW
+        if hasattr(os, "O_NONBLOCK"):
+            extra |= os.O_NONBLOCK
+        return _open_fd(opened, flags | extra)
+
+    try:
+        handle = open(path, "rb", opener=_opener)
+    except OSError:
+        raise WrapperPinRefused("wrapper_file_unreadable", detail) from None
+    try:
+        try:
+            mode = os.fstat(handle.fileno()).st_mode
+        except OSError:
+            raise WrapperPinRefused("wrapper_file_unreadable", detail) from None
+        if not stat.S_ISREG(mode):
+            raise WrapperPinRefused("wrapper_package_not_a_file", detail)
+        digest = hashlib.sha256()
+        total = 0
         while True:
-            chunk = handle.read(1024 * 1024)
+            try:
+                chunk = handle.read(1024 * 1024)
+            except OSError:
+                raise WrapperPinRefused("wrapper_file_unreadable", detail) from None
             if not chunk:
                 break
             total += len(chunk)
             if total > _MAX_FILE_BYTES:
                 raise WrapperPinRefused("wrapper_file_too_large", detail)
             digest.update(chunk)
-    return digest.hexdigest()
+        return digest.hexdigest()
+    finally:
+        handle.close()
 
 
 def _require_owned_path(path: str, *, directory: bool, detail: str) -> None:
@@ -308,7 +341,10 @@ def _manifest(install_root: str, allowed: tuple[str, ...], full_access: bool,
             count += 1
             if count > _MAX_FILES:
                 raise WrapperPinRefused("wrapper_tree_too_large", str(count))
-            mode = os.lstat(path).st_mode
+            try:
+                mode = os.lstat(path).st_mode
+            except OSError:
+                raise WrapperPinRefused("wrapper_tree_unreadable", rel) from None
             if stat.S_ISDIR(mode):
                 pending.append((path, rel + "/", above + (os.path.realpath(path),)))
             elif stat.S_ISREG(mode):
@@ -316,7 +352,11 @@ def _manifest(install_root: str, allowed: tuple[str, ...], full_access: bool,
                     _require_owned_path(path, directory=False, detail=rel)
                 rows.append((rel, _hash_regular(path, rel)))
             elif stat.S_ISLNK(mode):
-                real = os.path.realpath(path)
+                # 3.12 realpath reads the link itself, so a vanished link raises here.
+                try:
+                    real = os.path.realpath(path)
+                except OSError:
+                    raise WrapperPinRefused("wrapper_tree_unreadable", rel) from None
                 try:
                     target_mode = os.stat(real).st_mode
                 except OSError:  # nothing there, or a link loop
@@ -327,7 +367,11 @@ def _manifest(install_root: str, allowed: tuple[str, ...], full_access: bool,
                 # The link itself: its text and where it resolves. Retargeting it changes the pin
                 # even when the new target holds the same bytes.
                 where = "in:" + os.path.relpath(real, real_root) if inside else "out:" + real
-                link = os.fsencode(os.readlink(path)) + b"\x00" + os.fsencode(where)
+                try:
+                    link_text = os.readlink(path)
+                except OSError:
+                    raise WrapperPinRefused("wrapper_tree_unreadable", rel) from None
+                link = os.fsencode(link_text) + b"\x00" + os.fsencode(where)
                 if stat.S_ISDIR(target_mode):
                     if require_owned:
                         _require_owned_path(path, directory=True, detail=rel)

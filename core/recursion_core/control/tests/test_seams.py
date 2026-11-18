@@ -3011,6 +3011,55 @@ class NestedDispatchTest(unittest.TestCase):
                          'the command\'s restriction went with the call to the other thread, and on through the read')
         self.assertEqual((self.asked, ran), ([], ['the handler goes on', 1]), 'and that read\'s callback waited for the commit')
 
+    def passing(self, table):
+        """A composition that hands params on exactly as the nested call gave them (``composed`` puts ``{}`` in place
+        of a missing one itself, so it cannot show what the dispatcher's own nested callback does)."""
+        def call(method, params=None):
+            if method in methods.BUILT_IN:
+                return self.built_in(method, params)
+            return table.dispatch(method, params, H.OWNER, call)
+        return call
+
+    def nested_without_params(self, outer, outer_params) -> None:
+        """The review thread at methods/__init__.py:561, "Nested read without params is refused". ``ctx.call`` lets a
+        handler leave params out; the read it reaches gets an empty mapping in their place, and so does one given
+        None. A list or a string is still refused as params before the handler, and a nested command is still
+        ``nested_command`` whatever its params: only a missing params is replaced, nothing else."""
+        seen, turns = [], []
+
+        def listing(ctx, params):
+            seen.append(params)
+            return {'code': 'ok', 'sessions': []}
+
+        def queued(ctx, params):
+            turns.append(params)
+            return {'code': 'ok'}
+
+        def asking(ctx, params):
+            return {'code': 'ok',
+                    'reads': [ctx.call('session.list'), ctx.call('session.list', None),
+                              ctx.call('session.list', []), ctx.call('session.list', 'x')],
+                    'commands': [ctx.call('session.queue'), ctx.call('session.queue', None),
+                                 ctx.call('session.queue', []), ctx.call('session.queue', 'x')]}
+        table = table_with(self.store, **{outer: asking, 'session.list': listing, 'session.queue': queued})
+        answer = table.dispatch(outer, outer_params, H.OWNER, self.passing(table))
+        listed, refused = {'code': 'ok', 'sessions': []}, {'code': 'request_invalid', 'detail': 'params'}
+        self.assertEqual(answer['reads'], [listed, listed, refused, refused],
+                         'params left out or None reach the read; a list and a string are refused as params')
+        self.assertEqual(seen, [{}, {}])
+        self.assertTrue(all(isinstance(params, Mapping) for params in seen), 'the handler is given a mapping')
+        self.assertIsNot(seen[0], seen[1], 'each call gets a mapping of its own')
+        nested_command = {'code': 'request_invalid', 'detail': 'nested_command'}
+        self.assertEqual((answer['commands'], turns), ([nested_command] * 4, []),
+                         'a nested command is refused whatever its params, and its handler is not asked')
+
+    def test_a_read_that_calls_another_without_params_gives_it_an_empty_mapping(self) -> None:
+        self.nested_without_params('session.status', {})
+
+    def test_a_command_that_calls_a_read_without_params_gives_it_an_empty_mapping(self) -> None:
+        self.nested_without_params('session.turn', dict(TURN))
+        self.assertEqual(self.store.commits, 1, 'the command around the nested calls committed')
+
 
 class CallbackOwnershipTest(unittest.TestCase):
     """The second reads' B1: a callback belongs to the dispatch that registered it, not to a place in a list."""

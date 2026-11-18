@@ -293,6 +293,7 @@ class Context:
             owner.callbacks.append((self._scope, fn))
 
     def call(self, method: str, params=None) -> dict:
+        """Params left out, or None, mean an empty mapping when the method is one of this table's."""
         return self._call(method, params)
 
 
@@ -537,6 +538,10 @@ class MethodTable:
                 return {'code': 'request_invalid', 'detail': 'nested_command'}
             if _command_of(scope) is not None and inner_row is not None and inner_row.mutating:
                 return {'code': 'request_invalid', 'detail': 'nested_effect'}
+            # Params left out by ``ctx.call`` reach a method of this table as an empty mapping; any other value
+            # goes on as it is. A built-in, or a name with no row, is the caller's to answer, as before.
+            if inner_params is None and inner_row is not None and inner not in BUILT_IN:
+                inner_params = {}
             # The scope travels with the call, whichever thread makes it, so that the dispatch it reaches is
             # nested in this one and a command -> read -> built-in chain keeps the command's restriction.
             before = getattr(self._active, 'scope', None)

@@ -238,7 +238,8 @@ class TrustStore:
         of the same key advances the generation again. The in-memory generation is
         updated even when the durable write fails or there is no store, and then
         ``revocation_not_durable`` is raised. A ``sqlite3`` error is that refusal; it
-        does not escape the method.
+        does not escape the method. After that refusal the handle answers no less than
+        the stored row whenever the row can still be read as an integer.
 
         The generation returned is one past the stored row, and never below this
         handle's own next number (a failed write leaves memory ahead of the row), so
@@ -258,11 +259,30 @@ class TrustStore:
             try:
                 stored = self._advance(kid, generation)
             except sqlite3.Error:
+                self._take_up_stored(kid)
                 raise Refused("revocation_not_durable", kid) from None
             if stored is None:
+                self._take_up_stored(kid)
                 raise Refused("revocation_not_durable", kid)
             self._remember(kid, stored)
             return stored
+
+    def _take_up_stored(self, kid: str) -> None:
+        """After a refused write, never answer a generation below the stored row.
+
+        Another handle on the same store may have moved the row past this handle's own
+        number; memory takes the larger of the two. Best effort: a read that fails, or a
+        row that is not an integer, leaves memory as it was.
+        """
+        db = self._db
+        if db is None:
+            return
+        try:
+            row = db.execute("SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+        except sqlite3.Error:
+            return
+        if row is not None and type(row[0]) is int and row[0] > self._generation.get(kid, 0):
+            self._remember(kid, row[0])
 
     def _remember(self, kid: str, generation: int) -> None:
         updated = dict(self._generation)

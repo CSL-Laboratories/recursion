@@ -91,18 +91,16 @@ class PriceScheduleTests(unittest.TestCase):
         costs = {(f["schedule"], f["route"]): f for _, kind, _, f in map(parse, out) if kind == "cost"}
         self.assertEqual(len(costs), 4)
         # 4 trials, 3 of them passing.
-        self.assertEqual(costs[("list-80", "direct:standin/model-a/-/-")]["per_trial_ran"], "8.000000 usd")
-        self.assertEqual(costs[("list-80", "direct:standin/model-a/-/-")]["per_passing_trial"], "10.666667 usd")
-        self.assertEqual(costs[("list-80", "direct:standin/model-b/-/-")]["per_trial_ran"], "2.800000 usd")
-        self.assertEqual(costs[("list-12", "direct:standin/model-a/-/-")]["per_trial_ran"], "6.000000 usd")
-        self.assertEqual(costs[("list-12", "direct:standin/model-b/-/-")]["per_trial_ran"], "10.600000 usd")
+        self.assertEqual(costs[("list-80", R("model-a"))]["per_trial_ran"], "8.000000 usd")
+        self.assertEqual(costs[("list-80", R("model-a"))]["per_passing_trial"], "10.666667 usd")
+        self.assertEqual(costs[("list-80", R("model-b"))]["per_trial_ran"], "2.800000 usd")
+        self.assertEqual(costs[("list-12", R("model-a"))]["per_trial_ran"], "6.000000 usd")
+        self.assertEqual(costs[("list-12", R("model-b"))]["per_trial_ran"], "10.600000 usd")
         cheaper = {f["schedule"]: f["route"] for _, kind, _, f in map(parse, out) if kind == "cheaper"}
-        self.assertEqual(cheaper, {"list-80": "direct:standin/model-b/-/-", "list-12": "direct:standin/model-a/-/-"})
+        self.assertEqual(cheaper, {"list-80": R("model-b"), "list-12": R("model-a")})
         flips = [f for _, kind, _, f in map(parse, out) if kind == "flips"]
-        self.assertEqual(len(flips), 1)
-        self.assertEqual(flips[0]["flips"], "yes")
-        self.assertEqual((flips[0]["list-80"], flips[0]["list-12"]),
-                         ("direct:standin/model-b/-/-", "direct:standin/model-a/-/-"))
+        self.assertEqual(flips, [{"flips": "yes", "cheaper": "2", "ties": "0", "unknowns": "0",
+                                  "list-80": R("model-b"), "list-12": R("model-a")}])
 
     def test_flips_is_no_when_one_route_is_cheaper_under_every_schedule(self):
         a = route_record("model-a", OUTCOMES, tokens(output=1_000_000), record_id="ra")
@@ -121,6 +119,7 @@ class PriceScheduleTests(unittest.TestCase):
         for _, kind, _, f in map(parse, out):
             if kind == "cost":
                 self.assertEqual(f["per_trial_ran"], "unknown", f)
+                self.assertEqual(f["per_passing_trial"], "unknown", f)
                 self.assertEqual(f["per_solved_task"], "unknown", f)
             if kind == "cheaper":
                 self.assertEqual(f["result"], "UNKNOWN", f)
@@ -140,7 +139,7 @@ class PriceScheduleTests(unittest.TestCase):
             self.assertNotEqual(f["per_passing_trial"], recorded[0]["per_passing_trial"])
         self.assertEqual({f["per_passing_trial"] for f in costs}, {"10.666667 usd", "8.000000 usd"})
 
-    def test_a_pilot_label_and_the_modelled_mark_are_on_every_line(self):
+    def test_a_pilot_label_is_on_every_line_and_the_modelled_mark_on_every_line_but_recorded(self):
         outcomes = {"t-1": ["pass"] * 5, "t-2": ["fail"] * 5}
         a = pilot(route_record("model-a", outcomes, tokens(output=1_000_000), record_id="ra", k=5))
         b = pilot(route_record("model-b", outcomes, tokens(output=100_000, cache_read=20_000_000),
@@ -205,7 +204,7 @@ class AnswerRoundTests(unittest.TestCase):
         code, out, err = run([direct, recursion])
         self.assertEqual(code, 0, err)
         routes = {f["route"] for f in lines_of(out, "cost")}
-        self.assertEqual(routes, {"direct:standin/model-a/-/-", "recursion:standin/model-a/-/-"})
+        self.assertEqual(routes, {R("model-a"), R("model-a", arm="recursion")})
         notes = lines_of(out, "note")
         self.assertEqual(len(notes), 1)
         self.assertEqual(notes[0]["arms"], "direct,recursion")
@@ -236,7 +235,7 @@ class AnswerRoundTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         for f in lines_of(out, "cheaper"):
             self.assertEqual(f["result"], "TIE", f)
-            self.assertEqual(f["routes"], "direct:standin/model-a/-/-,direct:standin/model-b/-/-")
+            self.assertEqual(f["routes"], "[" + R("model-a") + "," + R("model-b") + "]")
         flips = lines_of(out, "flips")
         self.assertEqual(len(flips), 1)
         self.assertEqual((flips[0]["flips"], flips[0]["ties"], flips[0]["unknowns"]), ("no", "2", "0"))
@@ -284,10 +283,10 @@ class AnswerRoundTests(unittest.TestCase):
         code, out, err = run([none, b])
         self.assertEqual(code, 0, err)
         cost = {(f["schedule"], f["route"]): f for f in lines_of(out, "cost")}
-        self.assertEqual(cost[("list-80", "direct:standin/model-a/-/-")]["per_solved_task"], "none-solved")
-        self.assertEqual(cost[("list-80", "direct:standin/model-a/-/-")]["per_passing_trial"], "none-passed")
+        self.assertEqual(cost[("list-80", R("model-a"))]["per_solved_task"], "none-solved")
+        self.assertEqual(cost[("list-80", R("model-a"))]["per_passing_trial"], "none-passed")
         for f in lines_of(out, "cheaper"):
-            self.assertEqual((f["result"], f["route"]), ("CHEAPER", "direct:standin/model-b/-/-"), f)
+            self.assertEqual((f["result"], f["route"]), ("CHEAPER", R("model-b")), f)
 
     def test_no_route_solving_a_task_is_unknown_in_words(self):
         fails = {"t-1": ["fail", "fail"], "t-2": ["fail", "fail"]}
@@ -325,6 +324,90 @@ class AnswerRoundTests(unittest.TestCase):
         self.assertEqual((f["per_passing_trial"], f["per_solved_task"]), ("unknown", "unknown"))
 
 
+def R(model, *, arm="direct", engine="standin", route=None, effort=None):
+    """A route as the output prints it: its parts as recorded, a JSON array (null where none)."""
+    return json.dumps([arm, engine, model, route, effort], separators=(",", ":"))
+
+
+def tiny_schedule():
+    return {"schedules": [{"name": "fine", "unit": "usd",
+                           "per_million": {"uncached_input": 0, "cache_write": 0, "cache_read": 0.01, "output": 1}}]}
+
+
+class ThirdRoundTests(unittest.TestCase):
+    """The read of ac0621eb (work/reads/read-prices-b7e3258e.md, section Answer round), order line 177."""
+
+    def test_names_holding_a_slash_or_a_dash_are_distinct_routes(self):
+        a = route_record("x/y", OUTCOMES, tokens(**A_TOKENS), record_id="ra")
+        a["arm"]["effort"] = "z"
+        b = route_record("x", OUTCOMES, tokens(**B_TOKENS), record_id="rb")
+        b["arm"].update(route="y/-", effort="z")
+        c = route_record("-", OUTCOMES, tokens(**A_TOKENS), record_id="rc")
+        d = route_record(None, OUTCOMES, tokens(**B_TOKENS), record_id="rd")
+        code, out, err = run([a, b, c, d])
+        self.assertEqual(code, 0, err)
+        routes = {f["route"] for f in lines_of(out, "cost")}
+        self.assertEqual(routes, {R("x/y", effort="z"), R("x", route="y/-", effort="z"), R("-"), R(None)})
+
+    def test_names_are_compared_exactly_as_recorded(self):
+        a = route_record("Model-A", OUTCOMES, tokens(**A_TOKENS), record_id="ra")
+        b = route_record("model-a", OUTCOMES, tokens(**B_TOKENS), record_id="rb")
+        code, out, err = run([a, b])
+        self.assertEqual(code, 0, err)
+        self.assertEqual({f["route"] for f in lines_of(out, "cost")}, {R("Model-A"), R("model-a")})
+
+    def test_cheaper_never_stands_beside_two_figures_that_print_the_same(self):
+        # Per trial: A 1 output token = 0.000001; B 1 output + 1 cache read = 0.00000101.
+        # 4 trials, 2 tasks solved: per solved task A 0.000002, B 0.00000202 (equal at 6 places).
+        a = route_record("model-a", OUTCOMES, tokens(output=1), record_id="ra")
+        b = route_record("model-b", OUTCOMES, tokens(output=1, cache_read=1), record_id="rb")
+        code, out, err = run([a, b], tiny_schedule())
+        self.assertEqual(code, 0, err)
+        cheaper = lines_of(out, "cheaper")
+        self.assertEqual((cheaper[0]["result"], cheaper[0]["route"]), ("CHEAPER", R("model-a")))
+        figures = {f["route"]: f["per_solved_task"] for f in lines_of(out, "cost")}
+        self.assertEqual(figures, {R("model-a"): "0.00000200 usd", R("model-b"): "0.00000202 usd"})
+
+    def test_different_k_is_refused_naming_it(self):
+        a = route_record("model-a", OUTCOMES, tokens(**A_TOKENS), record_id="ra", k=1)
+        b = route_record("model-b", OUTCOMES, tokens(**B_TOKENS), record_id="rb", k=2)
+        code, out, err = run([a, b])
+        self.assertEqual(code, 2, err)
+        self.assertEqual(out, [])
+        self.assertIn("k 1 against 2", err)
+
+    def test_a_task_that_never_ran_on_one_route_makes_the_comparison_unknown(self):
+        a = route_record("model-a", OUTCOMES, tokens(**A_TOKENS), record_id="ra")
+        b = route_record("model-b", {"t-1": ["pass", "pass"], "t-2": ["not_run", "not_run"]}, tokens(**B_TOKENS),
+                         record_id="rb")
+        code, out, err = run([a, b])
+        self.assertEqual(code, 0, err)
+        cost = {(f["schedule"], f["route"]): f for f in lines_of(out, "cost")}
+        self.assertEqual(cost[("list-80", R("model-b"))]["trials"], "2")
+        for f in lines_of(out, "cheaper"):
+            self.assertEqual(f["result"], "UNKNOWN", f)
+            self.assertEqual(f["reason"], f"the tasks that ran differ: {R('model-b')} ran no trial of t-2")
+
+    def test_a_route_where_nothing_ran_prints_none_ran_and_is_not_compared(self):
+        a = route_record("model-a", OUTCOMES, tokens(**A_TOKENS), record_id="ra")
+        b = route_record("model-b", {"t-1": ["not_run", "not_run"], "t-2": ["not_run", "not_run"]},
+                         tokens(**B_TOKENS), record_id="rb")
+        code, out, err = run([a, b])
+        self.assertEqual(code, 0, err)
+        cost = {(f["schedule"], f["route"]): f for f in lines_of(out, "cost")}
+        f = cost[("list-80", R("model-b"))]
+        self.assertEqual((f["trials"], f["per_trial_ran"], f["per_passing_trial"], f["per_solved_task"]),
+                         ("0", "none-ran", "none-passed", "none-solved"))
+        for f in lines_of(out, "cheaper"):
+            self.assertEqual(f["result"], "UNKNOWN", f)
+            self.assertEqual(f["reason"], f"the tasks that ran differ: {R('model-b')} ran no trial of t-1, t-2")
+
+    def test_the_legend_says_the_none_words_count_as_unknown_and_names_are_exact(self):
+        legend = " ".join(price_schedules.__doc__.split())
+        self.assertIn("none-ran, none-passed and none-solved count as unknown in a comparison", legend)
+        self.assertIn("compared exactly as recorded", legend)
+
+
 class RefusalTests(unittest.TestCase):
     def assertRefused(self, records, schedules_text, words):
         code, out, err = write_and_run(records, schedules_text)
@@ -347,7 +430,7 @@ class RefusalTests(unittest.TestCase):
     def test_the_same_arm_and_route_twice_is_refused(self):
         a = route_record("model-a", OUTCOMES, tokens(output=1), record_id="r1", arm="recursion")
         b = route_record("model-a", OUTCOMES, tokens(output=2), record_id="r2", arm="recursion")
-        self.assertRefused([a, b], json.dumps(SCHEDULES), ["recursion:standin/model-a/-/-", "one record per route"])
+        self.assertRefused([a, b], json.dumps(SCHEDULES), [R("model-a", arm="recursion"), "one record per route"])
 
     def test_an_invalid_record_is_refused(self):
         a = route_record("model-a", OUTCOMES, tokens(output=1), record_id="ra")

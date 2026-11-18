@@ -10,11 +10,14 @@ JSON file of named price schedules:
     {"schedules": [{"name": "list-a", "unit": "usd",
                     "per_million": {"uncached_input": 1, "cache_write": 1, "cache_read": 0.1, "output": 8}}]}
 
-A route is the arm and its settings: ``<arm>:<engine>/<model>/<route>/<effort>`` (``-`` where the
-record has none), so the direct arm and the recursion arm of one comparison are two routes. When the
-records come from more than one arm, a ``note`` line says so: the table compares them as routes, not
-as the protocol's paired arm comparison (eval/analyze.py does that). Records must share the suite
-(id, version, manifest) and the task set; otherwise nothing is compared and the refusal names the
+A route is the arm and its settings, five parts kept apart: arm, engine, model, route and effort,
+printed as a JSON array (``null`` where the record has none). The names are compared exactly as
+recorded: no part is joined to another, trimmed or folded to one case, so a model ``x/y`` with no route
+and a model ``x`` with route ``y/-`` are two routes, and a model named ``-`` is not the same as no
+model. The direct arm and the recursion arm of one comparison are two routes. When the records come
+from more than one arm, a ``note`` line says so: the table compares them as routes, not as the
+protocol's paired arm comparison (eval/analyze.py does that). Records must share the suite (id,
+version, manifest), the task set and k; otherwise nothing is compared and the refusal names the
 difference.
 
 Every line is tab-separated and starts with the record's label (dev, shakedown, screen, pilot, full;
@@ -31,15 +34,19 @@ then what its figures are:
   be added together;
 * ``cheaper`` (``modelled, not billed``), one per schedule, by modelled cost per solved task:
   ``result=CHEAPER`` with the route, ``result=TIE`` with the routes, or ``result=UNKNOWN`` with the
-  reason (an unknown cost, no route solved a task, one route only). A route that solved no task is
-  never the cheaper one;
+  reason (an unknown cost, the tasks that ran differ, no route solved a task, one route only). A route
+  that solved no task is never the cheaper one. Routes are compared only when the same tasks ran on
+  each (at least one trial of the task not ``not_run``); a route with a task that never ran is not
+  called cheaper or dearer than one where it ran. The figures of a schedule are printed with as many
+  places as it takes (6 at least) for different figures per solved task to print differently;
 * ``flips`` (``modelled, not billed``), once when two or more routes are priced under two or more
   schedules: ``flips=yes`` when the cheapest routes are not the same under every schedule whose
   answer is known, ``flips=unknown`` when they agree but some answer is unknown, else ``flips=no``,
   with the count of CHEAPER, TIE and UNKNOWN answers and each schedule's answer.
 
 A null token class makes that trial's modelled cost, and every figure built on it, ``unknown``,
-never 0. Nothing is spent, no engine is started and nothing is written; the schedules are whatever
+never 0. A figure with nothing to divide by prints ``none-ran``, ``none-passed`` or ``none-solved``,
+never 0; none-ran, none-passed and none-solved count as unknown in a comparison, never as a cost. Nothing is spent, no engine is started and nothing is written; the schedules are whatever
 the file says, not a vendor's bill.
 """
 from __future__ import annotations
@@ -58,11 +65,21 @@ PER = 1_000_000
 PASSING = "resolved"   # the schema's verdict value for a passing trial (eval/record.py VERDICTS)
 
 
-def route_of(record: dict) -> str:
-    """The route of a record: its arm, then engine/model/route/effort, '-' where the record has none."""
-    arm = record["arm"]
-    settings = "/".join(arm[key] if arm[key] is not None else "-" for key in ("engine", "model", "route", "effort"))
-    return f"{arm['name']}:{settings}"
+ROUTE_PARTS = ("name", "engine", "model", "route", "effort")
+
+
+def route_of(record: dict) -> tuple:
+    """The route of a record: its arm, engine, model, route and effort, exactly as recorded (None where none)."""
+    return tuple(record["arm"][key] for key in ROUTE_PARTS)
+
+
+def route_text(route: tuple) -> str:
+    """A route as printed: a JSON array of its parts, so no two routes print alike."""
+    return json.dumps(list(route), separators=(",", ":"))
+
+
+def _rt(record: dict) -> str:
+    return route_text(route_of(record))
 
 
 def _price(value, where: str) -> Fraction:
@@ -154,16 +171,32 @@ def modelled(record: dict, schedule: dict) -> dict:
             "per_solved": _per(total, solved)}
 
 
-def _amount(value, unit) -> str:
-    if isinstance(value, Fraction):
-        value = float(value)
-    return f"{value:.6f}{'' if unit is None else ' ' + unit}"
+MIN_PLACES, MAX_PLACES = 6, 60
 
 
-def _figure(value, count: int, unit, none_word: str) -> str:
+def _decimal(value: Fraction, places: int) -> str:
+    """An exact non-negative Fraction rounded to the given places (half to even)."""
+    digits = str(round(Fraction(value) * 10 ** places)).rjust(places + 1, "0")
+    return f"{digits[:-places]}.{digits[-places:]}"
+
+
+def places_for(values: list) -> int:
+    """The fewest places, at least 6, at which different values print differently."""
+    distinct = set(values)
+    places = MIN_PLACES
+    while places < MAX_PLACES and len({_decimal(v, places) for v in distinct}) < len(distinct):
+        places += 1
+    return places
+
+
+def _amount(value, unit, places: int = MIN_PLACES) -> str:
+    return f"{_decimal(value, places)}{'' if unit is None else ' ' + unit}"
+
+
+def _figure(value, count: int, unit, none_word: str, places: int = MIN_PLACES) -> str:
     if not count:
         return none_word
-    return UNKNOWN if value is None else _amount(value, unit)
+    return UNKNOWN if value is None else _amount(value, unit, places)
 
 
 def recorded(record: dict) -> dict:
@@ -192,7 +225,7 @@ def check(records: list) -> None:
         record_mod.require_valid(record)
         route = route_of(record)
         if route in seen:
-            raise ValueError(f"records {seen[route]} and {record['record_id']} are both route {route}: "
+            raise ValueError(f"records {seen[route]} and {record['record_id']} are both route {route_text(route)}: "
                              "give one record per route")
         seen[route] = record["record_id"]
     first = records[0]
@@ -204,6 +237,10 @@ def check(records: list) -> None:
                                  "no route is called cheaper across suites")
         tasks_a = {t["id"]: t["task_sha256"] for t in first["plan"]["tasks"]}
         tasks_b = {t["id"]: t["task_sha256"] for t in record["plan"]["tasks"]}
+        if record["plan"]["k"] != first["plan"]["k"]:
+            raise ValueError(f"records {first['record_id']} and {record['record_id']} have different k "
+                             f"(k {first['plan']['k']} against {record['plan']['k']}): "
+                             "no route is called cheaper across k")
         if tasks_a != tasks_b:
             only_a = sorted(set(tasks_a) - set(tasks_b))
             only_b = sorted(set(tasks_b) - set(tasks_a))
@@ -218,31 +255,37 @@ def cheaper(records: list, schedule: dict) -> dict:
     """The cheaper route by modelled cost per solved task: {'result': CHEAPER|TIE|UNKNOWN, ...}."""
     if len(records) < 2:
         return {"result": "UNKNOWN", "reason": "one route only, nothing to compare"}
+    ran = {_rt(record): {t["task_id"] for t in _ran(record)} for record in records}
+    every = set().union(*ran.values())
+    short = [f"{route} ran no trial of {', '.join(sorted(every - tasks))}" for route, tasks in ran.items()
+             if tasks != every]
+    if short:
+        return {"result": "UNKNOWN", "reason": "the tasks that ran differ: " + "; ".join(short)}
     best, best_routes, unknown_routes = None, [], []
     for record in records:
         figures = modelled(record, schedule)
         if not figures["solved"]:
             continue   # never the cheaper one per solved task, whatever its cost
         if figures["per_solved"] is None:
-            unknown_routes.append(route_of(record))
+            unknown_routes.append(_rt(record))
         elif best is None or figures["per_solved"] < best:
-            best, best_routes = figures["per_solved"], [route_of(record)]
+            best, best_routes = figures["per_solved"], [_rt(record)]
         elif figures["per_solved"] == best:
-            best_routes.append(route_of(record))
+            best_routes.append(_rt(record))
     if unknown_routes:
-        return {"result": "UNKNOWN", "reason": "a cost is unknown for " + ",".join(unknown_routes)}
+        return {"result": "UNKNOWN", "reason": "a cost is unknown for " + ", ".join(unknown_routes)}
     if not best_routes:
         return {"result": "UNKNOWN", "reason": "no route solved a task"}
     if len(best_routes) == 1:
         return {"result": "CHEAPER", "route": best_routes[0]}
-    return {"result": "TIE", "routes": ",".join(best_routes)}
+    return {"result": "TIE", "routes": "[" + ",".join(best_routes) + "]"}
 
 
 def _answer(answer: dict) -> str:
     if answer["result"] == "CHEAPER":
         return answer["route"]
     if answer["result"] == "TIE":
-        return "TIE(" + answer["routes"] + ")"
+        return "TIE" + answer["routes"]
     return "UNKNOWN"
 
 
@@ -256,17 +299,18 @@ def lines(records: list, schedules: list) -> list:
                    "than one arm; they are compared as routes, not as the paired arm comparison of the protocol")
     for schedule in schedules:
         unit = schedule["unit"]
-        for record in records:
-            f = modelled(record, schedule)
-            out.append(f"{record['label']}\tcost\t{MARK}\tschedule={schedule['name']}\troute={route_of(record)}\t"
+        figures = [modelled(record, schedule) for record in records]
+        places = places_for([f["per_solved"] for f in figures if f["per_solved"] is not None])
+        for record, f in zip(records, figures):
+            out.append(f"{record['label']}\tcost\t{MARK}\tschedule={schedule['name']}\troute={_rt(record)}\t"
                        f"record={record['record_id']}\ttrials={f['trials']}\tunknown={f['unknown']}\t"
                        f"passing_trials={f['passing']}\tsolved_tasks={f['solved']}\t"
-                       f"per_trial_ran={_figure(f['per_trial'], f['trials'], unit, 'none-ran')}\t"
-                       f"per_passing_trial={_figure(f['per_passing'], f['passing'], unit, 'none-passed')}\t"
-                       f"per_solved_task={_figure(f['per_solved'], f['solved'], unit, 'none-solved')}")
+                       f"per_trial_ran={_figure(f['per_trial'], f['trials'], unit, 'none-ran', places)}\t"
+                       f"per_passing_trial={_figure(f['per_passing'], f['passing'], unit, 'none-passed', places)}\t"
+                       f"per_solved_task={_figure(f['per_solved'], f['solved'], unit, 'none-solved', places)}")
     for record in records:
         r = recorded(record)
-        out.append(f"{record['label']}\trecorded\trecorded, {r['basis']}\troute={route_of(record)}\t"
+        out.append(f"{record['label']}\trecorded\trecorded, {r['basis']}\troute={_rt(record)}\t"
                    f"record={record['record_id']}\tbasis={r['basis']}\tper_passing_trial={r['per_passing']}\t"
                    f"per_solved_task={r['per_solved']}")
     answers = {}

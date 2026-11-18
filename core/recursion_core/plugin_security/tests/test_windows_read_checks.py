@@ -399,6 +399,7 @@ class PurityTests(unittest.TestCase):
 
     def test_nothing_imports_the_module(self):
         NAME = "windows_read_checks"
+        MENTION_OK = ()
         def imports(node, name):
             if isinstance(node, ast.Import):
                 dotted = [alias.name for alias in node.names]
@@ -412,23 +413,46 @@ class PurityTests(unittest.TestCase):
                 return False
             return any(name in part.split(".") for part in dotted)
 
-        # Every .py file of the repository, hidden and cache folders skipped; real imports only, not text.
+        def docstrings(tree):
+            found = set()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+                    first = node.body[0]
+                    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                        found.add(id(first.value))
+            return found
+
+        def names_it(tree, name):
+            # A real import statement, or any string constant outside a docstring that holds the name: this
+            # also catches import_module(name=...), "." + name, __import__(fromlist=[...]), runpy, pkgutil,
+            # spec_from_file_location with the file's path, and exec("...").
+            if any(imports(node, name) for node in ast.walk(tree)):
+                return "import"
+            skip = docstrings(tree)
+            if any(isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip
+                   and name in node.value for node in ast.walk(tree)):
+                return "string"
+            return None
+
+        # Every .py and .pyw file of the repository. Hidden folders count; only .git and cache folders are
+        # skipped. A file ast cannot read counts when it names the module at all.
         repo = Path(__file__).resolve().parents[4]
         users = []
-        for path in sorted(repo.rglob("*.py")):
-            relative = path.relative_to(repo)
-            if path == Path(__file__).resolve() or any(
-                    part.startswith(".") or part == "__pycache__" for part in relative.parts[:-1]):
-                continue
-            text = path.read_text(encoding="utf-8-sig", errors="replace")
-            try:
-                tree = ast.parse(text)
-            except SyntaxError:
-                if NAME in text:  # a file ast cannot read counts when it names the module at all
-                    users.append(relative.as_posix())
-                continue
-            if any(imports(node, NAME) for node in ast.walk(tree)):
-                users.append(relative.as_posix())
+        for folder, subfolders, files in repo.walk():
+            subfolders[:] = sorted(d for d in subfolders if d not in (".git", "__pycache__"))
+            for file in sorted(files):
+                path = folder / file
+                if path.suffix not in (".py", ".pyw") or path == Path(__file__).resolve():
+                    continue
+                relative = path.relative_to(repo).as_posix()
+                text = path.read_text(encoding="utf-8-sig", errors="replace")
+                try:
+                    kind = names_it(ast.parse(text), NAME)
+                except SyntaxError:
+                    kind = "string" if NAME in text else None
+                if kind == "import" or (kind == "string" and relative not in MENTION_OK):
+                    users.append(relative)
+        users.sort()
         # Its one user is the Windows handle reader, which nothing calls (and that reader's own test).
         self.assertEqual(users, ["core/recursion_core/plugin_security/tests/test_windows_handle_reader.py",
                                  "core/recursion_core/plugin_security/windows_handle_reader.py"])

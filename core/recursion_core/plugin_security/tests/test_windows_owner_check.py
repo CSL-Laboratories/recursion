@@ -133,6 +133,35 @@ class AccessEntryTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertFalse(judge(entries=bad))
 
+    def test_only_exact_entries_in_an_exact_tuple_or_list_are_judged(self):
+        # A subclass could answer "allow" at the type check and "deny" afterwards (first read P3).
+        reads = []
+
+        class Shifty(o.AccessEntry):
+            def __getattribute__(self, name):
+                value = object.__getattribute__(self, name)
+                if name == "ace_type":
+                    reads.append(name)
+                    return o.ACCESS_ALLOWED_ACE_TYPE if len(reads) == 1 else o.ACCESS_DENIED_ACE_TYPE
+                return value
+
+        self.assertFalse(judge(entries=MKDTEMP + (Shifty(0, 0, FULL, EVERYONE),)))
+        self.assertFalse(judge(entries=MKDTEMP + (allow(EVERYONE),)))
+
+        class Plain(o.AccessEntry):
+            pass
+
+        # Exact type only: even a subclass whose values would pass is not judged.
+        self.assertFalse(judge(entries=MKDTEMP + (Plain(0, 0, READ_EXECUTE, EVERYONE),)))
+        self.assertTrue(judge(entries=MKDTEMP + (allow(EVERYONE, READ_EXECUTE),)))
+
+        class Entries(tuple):
+            pass
+
+        self.assertFalse(judge(entries=Entries(MKDTEMP)))
+        self.assertTrue(judge(entries=tuple(MKDTEMP)))
+        self.assertTrue(judge(entries=list(MKDTEMP)))
+
     def test_entries_are_frozen(self):
         with self.assertRaises(dataclasses.FrozenInstanceError):
             allow(USER).mask = 0
@@ -153,6 +182,7 @@ class PurityTests(unittest.TestCase):
 
     def test_only_the_handle_reader_imports_the_module(self):
         NAME = "windows_owner_check"
+        MENTION_OK = ()
         def imports(node, name):
             if isinstance(node, ast.Import):
                 dotted = [alias.name for alias in node.names]
@@ -166,23 +196,46 @@ class PurityTests(unittest.TestCase):
                 return False
             return any(name in part.split(".") for part in dotted)
 
-        # Every .py file of the repository, hidden and cache folders skipped; real imports only, not text.
+        def docstrings(tree):
+            found = set()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+                    first = node.body[0]
+                    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                        found.add(id(first.value))
+            return found
+
+        def names_it(tree, name):
+            # A real import statement, or any string constant outside a docstring that holds the name: this
+            # also catches import_module(name=...), "." + name, __import__(fromlist=[...]), runpy, pkgutil,
+            # spec_from_file_location with the file's path, and exec("...").
+            if any(imports(node, name) for node in ast.walk(tree)):
+                return "import"
+            skip = docstrings(tree)
+            if any(isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip
+                   and name in node.value for node in ast.walk(tree)):
+                return "string"
+            return None
+
+        # Every .py and .pyw file of the repository. Hidden folders count; only .git and cache folders are
+        # skipped. A file ast cannot read counts when it names the module at all.
         repo = Path(__file__).resolve().parents[4]
         users = []
-        for path in sorted(repo.rglob("*.py")):
-            relative = path.relative_to(repo)
-            if path == Path(__file__).resolve() or any(
-                    part.startswith(".") or part == "__pycache__" for part in relative.parts[:-1]):
-                continue
-            text = path.read_text(encoding="utf-8-sig", errors="replace")
-            try:
-                tree = ast.parse(text)
-            except SyntaxError:
-                if NAME in text:  # a file ast cannot read counts when it names the module at all
-                    users.append(relative.as_posix())
-                continue
-            if any(imports(node, NAME) for node in ast.walk(tree)):
-                users.append(relative.as_posix())
+        for folder, subfolders, files in repo.walk():
+            subfolders[:] = sorted(d for d in subfolders if d not in (".git", "__pycache__"))
+            for file in sorted(files):
+                path = folder / file
+                if path.suffix not in (".py", ".pyw") or path == Path(__file__).resolve():
+                    continue
+                relative = path.relative_to(repo).as_posix()
+                text = path.read_text(encoding="utf-8-sig", errors="replace")
+                try:
+                    kind = names_it(ast.parse(text), NAME)
+                except SyntaxError:
+                    kind = "string" if NAME in text else None
+                if kind == "import" or (kind == "string" and relative not in MENTION_OK):
+                    users.append(relative)
+        users.sort()
         self.assertEqual(users, ["core/recursion_core/plugin_security/tests/test_windows_handle_reader.py",
                                  "core/recursion_core/plugin_security/windows_handle_reader.py"])
 

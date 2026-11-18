@@ -4,15 +4,17 @@ Pure: no file is opened and no OS call is made; nothing in the product calls thi
 mirrors (daemon/plugins.py ``_read_owned`` / ``_owned_directory``) has two halves: the owner is the operator,
 and no group or other may write. Here:
 
-* the owner SID is the process user's SID, SYSTEM or Administrators (root and an administrator can write any
-  POSIX file too, so accepting them is parity, not a widening);
+* the owner SID is the process user's SID, SYSTEM or Administrators. This half is WIDER than POSIX, which
+  refuses any file the operator does not own, root's included (``st_uid != os.geteuid()``); it is the
+  default because files installed from an administrator shell are owned by Administrators;
 * every allow entry that applies to this object (not inherit-only) and grants a write-class right names one
   of those three, or OWNER RIGHTS (S-1-3-4), which is whoever owns the object and so is the owner already
   judged above. CPython 3.12.4+ makes ``mkdir(mode=0o700)`` folders (``tempfile`` among them) with exactly
   SYSTEM, Administrators and OWNER RIGHTS, and no entry for the user's own SID;
 * deny entries are ignored (they only take rights away); an entry of any other type, an absent access list
   (a NULL DACL grants everyone everything; FAT and exFAT keep none), an owner or process identity that could
-  not be read, or a fact of the wrong type: not ok.
+  not be read, or a fact of the wrong type (exactly a tuple or list of exactly ``AccessEntry``; each
+  entry's fields are read once): not ok.
 
 SIDs are compared in their string form (``S-1-...``, as ConvertSidToStringSidW writes them).
 """
@@ -68,20 +70,22 @@ def owner_ok(owner_sid: object, process_sid: object, entries: object, *, directo
     trusted = {process_sid, SYSTEM, ADMINISTRATORS}
     if owner_sid not in trusted:
         return False
-    if not isinstance(entries, (tuple, list)):
+    if type(entries) not in (tuple, list):
         return False
     writers = trusted | {OWNER_RIGHTS}
     write = _WRITE_CLASS | (_FILE_DELETE_CHILD if directory else 0)
-    for entry in entries:
-        if not isinstance(entry, AccessEntry) or not all(
-                _is_u32(value) for value in (entry.ace_type, entry.flags, entry.mask)):
+    for entry in tuple(entries):
+        if type(entry) is not AccessEntry:
             return False
-        if entry.ace_type == ACCESS_DENIED_ACE_TYPE:
-            continue
-        if entry.ace_type != ACCESS_ALLOWED_ACE_TYPE or not _is_sid(entry.sid):
+        ace_type, flags, mask, sid = entry.ace_type, entry.flags, entry.mask, entry.sid
+        if not all(_is_u32(value) for value in (ace_type, flags, mask)):
             return False
-        if entry.flags & INHERIT_ONLY_ACE:
+        if ace_type == ACCESS_DENIED_ACE_TYPE:
             continue
-        if entry.mask & write and entry.sid not in writers:
+        if ace_type != ACCESS_ALLOWED_ACE_TYPE or not _is_sid(sid):
+            return False
+        if flags & INHERIT_ONLY_ACE:
+            continue
+        if mask & write and sid not in writers:
             return False
     return True

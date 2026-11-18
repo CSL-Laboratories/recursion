@@ -9,7 +9,11 @@ too large, a bounded read) and ``_owned_directory`` for each folder on the way:
 1. The name is judged first (``windows_read_checks``' name rule: no ``:``, ``/``, ``.``/``..``, trailing dot
    or space, device name, reserved or control character); a name that fails opens nothing.
 2. The root is opened as the operator gave it (followed once, so a root reached through a junction is pinned
-   by its target) and its own final path, in volume GUID form, becomes the pinned root.
+   by its target) and its own final path, in volume GUID form, becomes the pinned root. Win32 name rewriting
+   DOES apply to the root as typed (a trailing dot or space dropped, ``/`` taken as a separator, ``.`` and ``..`` parts
+   folded, a relative root taken from the current folder); only a root holding a control
+   character (a NUL would cut the name ctypes hands Windows) is refused before the open. The root's
+   ancestors are never judged, as on POSIX (``_owned_directory`` judges the folder itself only).
 3. Each folder step and then the file are opened as ``\\\\?\\`` + that pinned root + the code's own names
    (no Win32 name rewriting, and no drive letter that SUBST or a remap could move), with
    FILE_FLAG_OPEN_REPARSE_POINT (the last name is opened as itself, never followed), FILE_SHARE_READ only
@@ -23,8 +27,11 @@ too large, a bounded read) and ``_owned_directory`` for each folder on the way:
    failed volume or remote query is passed as a failed final path. Every failed query is passed as ``None``.
 5. ``windows_read_checks.judge_handle`` decides each handle (kind directory for the root and each step, kind
    file for the leaf). On a refusal every handle is closed unread and ``Refused(cause, name)`` is raised.
-6. The file's size is checked before the read (end of file) and after it (bytes read); at most limit + 1
-   bytes are read, by ReadFile on the same handle. Every handle is closed in ``finally``.
+6. The file's size is checked before the read (end of file) and after it (bytes read). The read asks for at
+   most min(end of file, limit) + 1 bytes, by ReadFile on the same handle in chunks of at most 1 MiB (never
+   one allocation of limit + 1, never a size ReadFile's 32-bit count could cut); a file that yields more
+   or fewer bytes than its end of file is refused unreadable (no writer can exist while it is held). A
+   limit above ``MAX_LIMIT`` is a caller error. Every handle is closed in ``finally``.
 
 Not protected here: the open still walks through an ancestor junction before its final path shows it (the
 compare then refuses, nothing is read); the per-name walk with the parent handle is the next slice.
@@ -40,14 +47,19 @@ from . import windows_read_checks as checks
 from .errors import Refused
 from .windows_owner_check import AccessEntry, owner_ok
 
-__all__ = ["ERROR_FILE_NOT_FOUND", "ERROR_PATH_NOT_FOUND", "read_plugin_file"]
+__all__ = ["ERROR_FILE_NOT_FOUND", "ERROR_PATH_NOT_FOUND", "MAX_LIMIT", "read_plugin_file"]
 
 ERROR_FILE_NOT_FOUND = 2
 ERROR_PATH_NOT_FOUND = 3
 _MISSING = (ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND)
-_ERROR_NAMES = {5: "ERROR_ACCESS_DENIED", 32: "ERROR_SHARING_VIOLATION", 87: "ERROR_INVALID_PARAMETER",
-                123: "ERROR_INVALID_NAME", 1920: "ERROR_CANT_ACCESS_FILE"}
+_ERROR_NAMES = {2: "ERROR_FILE_NOT_FOUND", 3: "ERROR_PATH_NOT_FOUND", 5: "ERROR_ACCESS_DENIED",
+                32: "ERROR_SHARING_VIOLATION", 87: "ERROR_INVALID_PARAMETER", 123: "ERROR_INVALID_NAME",
+                1920: "ERROR_CANT_ACCESS_FILE"}
 _SEPARATOR = "\\"
+# The largest limit a caller may ask for: far above the daemon's own (64 KiB, 8 MiB, 1 MiB) and far below
+# what ReadFile's 32-bit byte count can carry. A larger limit is a caller error, never a cut-off read.
+MAX_LIMIT = 1 << 30
+_CHUNK = 1 << 20
 
 PLUGIN_FILE_MISSING = "plugin_file_missing"
 PLUGIN_FILE_TOO_LARGE = "plugin_file_too_large"
@@ -58,12 +70,13 @@ def read_plugin_file(root: str, name: str, limit: int, *, missing_ok: bool = Fal
 
     ``name`` is the code's own relative name below ``root``, parts joined by a backslash. ``native`` is the
     OS layer; tests pass a fake one. Raises ``Refused`` with an existing cause on every other outcome."""
-    if type(limit) is not int or limit < 0:
-        raise ValueError("limit must be a non-negative int")
+    if type(limit) is not int or not 0 <= limit <= MAX_LIMIT:
+        raise ValueError("limit must be an int from 0 to MAX_LIMIT")
     if native is None:
         native = _load_native()
-    if type(root) is not str or not root:
+    if type(root) is not str or not root or any(ord(char) < 32 for char in root):
         raise Refused(checks.PLUGIN_DIRECTORY_UNTRUSTED, "root")
+    # windows_read_checks' own name rule (private there; a public name is #576's to add).
     if type(name) is not str or not checks._plain_name(name, checks.KIND_FILE):
         raise Refused(checks.PLUGIN_FILE_UNREADABLE, "name")
     parts = name.split(_SEPARATOR)
@@ -104,9 +117,11 @@ def read_plugin_file(root: str, name: str, limit: int, *, missing_ok: bool = Fal
             raise Refused(checks.PLUGIN_FILE_UNREADABLE, parts[-1])
         if size > limit:
             raise Refused(PLUGIN_FILE_TOO_LARGE, parts[-1])
-        data = _read(native, held[-1], limit + 1, parts[-1])
+        data = _read(native, held[-1], min(size, limit) + 1, parts[-1])
         if len(data) > limit:
             raise Refused(PLUGIN_FILE_TOO_LARGE, parts[-1])
+        if len(data) != size:
+            raise Refused(checks.PLUGIN_FILE_UNREADABLE, f"{parts[-1]}: {len(data)} bytes read, end of file {size}")
         return data
     finally:
         for handle in reversed(held):
@@ -120,7 +135,7 @@ def _error_name(error) -> str:
 def _read(native, handle, wanted: int, part: str) -> bytes:
     chunks, total = [], 0
     while total < wanted:
-        chunk = native.read(handle, wanted - total)
+        chunk = native.read(handle, min(_CHUNK, wanted - total))
         if chunk is None:
             raise Refused(checks.PLUGIN_FILE_UNREADABLE, f"{part}: read")
         if not chunk:
@@ -175,6 +190,8 @@ class _Native:
     _READ_DATA, _READ_ATTRIBUTES, _READ_CONTROL, _SYNCHRONIZE = 0x1, 0x80, 0x20000, 0x100000
     _SHARE_READ, _OPEN_EXISTING = 0x1, 3
     _BACKUP_SEMANTICS, _OPEN_REPARSE_POINT = 0x02000000, 0x00200000
+    # SECURITY_SQOS_PRESENT and FILE_FLAG_OPEN_NO_RECALL are ONE bit, 0x00100000 (the SDK's documented
+    # values): every open here also asks for no recall. Adding or removing either changes both.
     _SQOS_PRESENT, _SQOS_ANONYMOUS = 0x00100000, 0x0
     _ATTRIBUTE_TAG_INFO, _STANDARD_INFO, _REMOTE_PROTOCOL_INFO, _ID_INFO = 9, 1, 13, 18
     _NORMALIZED_GUID = 0x0 | 0x1  # FILE_NAME_NORMALIZED | VOLUME_NAME_GUID
@@ -345,6 +362,8 @@ class _Native:
             self.k32.CloseHandle(token)
 
     def read(self, handle, size):
+        if not 0 < size <= _CHUNK:
+            raise ValueError("one ReadFile asks for 1 byte to _CHUNK bytes")
         buffer = self.ctypes.create_string_buffer(size)
         got = self.ctypes.c_uint32()
         if not self.k32.ReadFile(handle, buffer, size, self.ctypes.byref(got), None):

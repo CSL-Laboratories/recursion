@@ -57,9 +57,13 @@ class TxtarLineEndingTests(unittest.TestCase):
         self.assertEqual(txtar.parse(text), ("", {"a": "-- b\r --\nrest\n"}))
 
     def test_a_crlf_round_trip_through_format(self):
-        comment, files = txtar.parse(crlf(LF_ARCHIVE))
-        again = txtar.parse(txtar.format(comment, files))
-        self.assertEqual(again, (comment, files))
+        expected = ("a comment\r\n", {"task.json": '{"id": "t"}\r\n', "prompt.md": "Say hello.\r\n",
+                                      "hidden/test_x.py": "assert True\r\n"})
+        parsed = txtar.parse(crlf(LF_ARCHIVE))
+        self.assertEqual(parsed, expected)
+        again = txtar.parse(txtar.format(*parsed))
+        self.assertEqual(again, expected)
+        self.assertEqual(list(again[1]), ["task.json", "prompt.md", "hidden/test_x.py"])
 
 
 if __name__ == "__main__":

@@ -455,15 +455,19 @@ class PluginHost:
     def status(self, plugin_id):
         """One installed plugin, the same row ``inventory`` carries, or a typed refusal.
 
+        For an id the loader holds active the answer is the loaded row, whatever the directory
+        order; a refused row is answered only when no loaded row carries that id.
         The registry label on that row is what the installer recorded for this manifest.
-        It is ``unlisted`` when the install recorded none, or recorded one for other bytes.
+        On a loaded row it is ``unlisted`` when the install recorded none, or one for other bytes.
         """
         if not isinstance(plugin_id, str) or not plugin_id:
             return {'code': 'request_invalid', 'detail': 'plugin_id'}
-        for item in self.inventory()['plugins']:
-            if item.get('plugin_id') == plugin_id:
-                return {'code': 'ok', 'plugin': item}
-        return {'code': 'plugin_unknown', 'detail': plugin_id}
+        rows = [item for item in self.inventory()['plugins'] if item.get('plugin_id') == plugin_id]
+        if not rows:
+            return {'code': 'plugin_unknown', 'detail': plugin_id}
+        # A refused row carries the id its own, unverified manifest claims: it never hides a loaded one.
+        row = next((item for item in rows if item['state'] == 'loaded'), rows[0])
+        return {'code': 'ok', 'plugin': row}
 
     def inventory(self):
         """Every installed plugin, loaded or refused, with its findings. Plain JSON values."""

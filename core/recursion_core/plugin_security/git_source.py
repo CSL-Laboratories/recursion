@@ -27,6 +27,7 @@ from pathlib import Path
 import posixpath
 import re
 import secrets
+import shlex
 import signal
 import stat
 import subprocess
@@ -190,7 +191,11 @@ def _fetch(scratch: Path, bare: Path, commit: str, path: str, expected: str, ins
     bare_text = _git(scratch, "--git-dir", str(bare), "rev-parse", "--is-bare-repository")
     if bare_text != b"true\n":
         raise SourceRefused("source_not_local")
-    upload = f"{_GIT} -c core.hooksPath={hooks} -c core.fsmonitor= -c core.sshCommand= upload-pack"
+    # git runs --upload-pack through a shell. Every part is quoted, so a hooks
+    # path that contains a semicolon, a space, a quote or a dollar sign stays data.
+    upload = " ".join(shlex.quote(part) for part in (
+        _GIT, "-c", f"core.hooksPath={hooks}", "-c", "core.fsmonitor=",
+        "-c", "core.sshCommand=", "upload-pack"))
     _git(scratch, "fetch", "--upload-pack", upload, "--no-tags", "--no-recurse-submodules", "--", str(bare), commit)
     fetched = _git(scratch, "rev-parse", "--verify", "FETCH_HEAD")
     if fetched != (commit + "\n").encode("ascii"):

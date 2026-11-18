@@ -5,5 +5,8 @@
   "repeat": false,
   "fence": {
     "state": "fenced"
-  }
+  },
+  "admission_closed": true,
+  "local_scope_empty": true,
+  "external_effects": "none_known"
 }

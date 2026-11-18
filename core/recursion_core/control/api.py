@@ -113,10 +113,19 @@ def _new_run_id() -> str:
 
 class ControlAPI:
     def __init__(self, registry: RunRegistry, kill_tree: KillTree, starter: Starter, clock: Callable[[], float],
-                 *, confirm_timeout_s: float = 5.0, new_run_id: Callable[[], str] = _new_run_id) -> None:
+                 *, confirm_timeout_s: float = 5.0, new_run_id: Callable[[], str] = _new_run_id,
+                 events=None) -> None:
         self._registry, self._kill, self._starter, self._clock = registry, kill_tree, starter, clock
         self._new_run_id = new_run_id
         self._confirm_timeout_s = confirm_timeout_s
+        # Optional event store the workspace ledger writes through. The daemon composition does not
+        # pass one yet: with none, admission still shuts, the effects word is unresolved (no log was
+        # read), and the answer does not name workspace.revoke.
+        self._events = events
+        self._admission_lock = threading.Lock()
+        self._admission: set[str] = set()
+        self._effects: dict[str, str] = {}
+        self._ledger_declared = False
         self._locks_lock = threading.Lock()
         # Exclusion is the registry's owner lock table when it has one, so two ControlAPIs over the same
         # registry take the same locks. The owner is a token minted for the in-flight call, not a thread
@@ -153,6 +162,8 @@ class ControlAPI:
             return self.list_runs(params)
         if method == "run.start":
             return self.start(params)
+        # run.dispatch is not a wire method: it is in no methods file and its old answer code is
+        # outside CODES. The admission check stays internal (_dispatch_refused).
         handler = {"run.status": self.status, "run.stop": self.stop}.get(method)
         if handler is None:
             return {"code": METHOD_UNKNOWN, "detail": str(method)}
@@ -277,6 +288,8 @@ class ControlAPI:
             self._launched[run_id] = dict(current)
             if current.get("stop") is not None or run_id in self._stop_wanted:
                 # A Stop arrived during the launch and answered pending; act on it now (red-team r3 finding 2).
+                # That accept ran before the starter recorded the grant, so record the revoke now.
+                self._record_revoke(run_id)
                 stop = self._stop(current)
                 code = START_UNCONFIRMED if stop.get("recorded") is False else STARTED
                 return {"code": code, "run": current, "duplicate": False, "stop": stop}
@@ -387,6 +400,8 @@ class ControlAPI:
                 rec.clear()
                 rec.update(fresh)
                 return True
+            # The stop may have been accepted before this attempt recorded its grant.
+            self._record_revoke(rec["run_id"])
             stop = self._stop(fresh)
             rec.clear()
             rec.update(fresh)
@@ -432,7 +447,8 @@ class ControlAPI:
         members = rec.get("members") or []
         return {"proof": "empty", "cgroup": rec.get("cgroup"), "cgroup_marker": rec.get("cgroup_marker"),
                 "member_ids": sorted(member["member_id"] for member in members),
-                "generation": rec["generation"]}
+                "generation": rec["generation"], "admission_closed": True, "local_scope_empty": True,
+                "external_effects": self._effects_for(rec["run_id"]), "dispatch_fence_confirmed": False}
 
     def _enter_owner(self) -> None:
         depth = getattr(self._local, "depth", 0)
@@ -461,6 +477,12 @@ class ControlAPI:
         try:
             if self._stop_target(run_id) is None:  # no lock is kept for ids that name no run
                 return {"code": RUN_UNKNOWN, "run_id": run_id}
+            # Admission and the workspace revoke happen before the run lock and before the kill.
+            # An exception here must not skip the kill. The effects word is read again with the answer.
+            try:
+                self._accept_stop(run_id)
+            except Exception:
+                pass
             with self._run_lock(run_id):
                 rec = self._stop_target(run_id)
                 if rec is None:
@@ -468,6 +490,120 @@ class ControlAPI:
                 return self._stop(rec)
         finally:
             self._exit_owner()
+
+    def _dispatch_refused(self, run_id: str, rec: dict) -> bool:
+        with self._admission_lock:
+            if run_id in self._admission:
+                return True
+        if rec.get("state") in ("stopped", "stop_pending"):
+            return True
+        return isinstance(rec.get("stop"), dict)
+
+    def _accept_stop(self, run_id: str) -> None:
+        """Shut admission and append workspace.revoke while no run lock is held. A ledger error does not skip the kill."""
+        with self._admission_lock:
+            self._admission.add(run_id)
+        word = self._read_effects(run_id)
+        if word == "unresolved":  # none_known is not cached: a later unknown effect must still be seen
+            self._remember_effects(run_id, word)
+        self._record_revoke(run_id)
+
+    def _remember_effects(self, run_id: str, value: str) -> None:
+        with self._admission_lock:
+            self._effects[run_id] = value
+
+    def _effects_for(self, run_id: str) -> str:
+        """Re-read at attestation and stamp time. Only unresolved may be cached."""
+        with self._admission_lock:
+            cached = self._effects.get(run_id)
+        if cached == "unresolved":
+            return "unresolved"
+        value = self._read_effects(run_id)
+        if value == "unresolved":
+            self._remember_effects(run_id, value)
+        return value
+
+    def _revoke_named(self, run_id: str) -> bool:
+        """True only when the ledger shows this run's grant revoked and no later grant standing."""
+        store = self._events
+        if store is None:
+            return False
+        try:
+            return self._grant_is_revoked(store, run_id)
+        except Exception:
+            return False
+
+    def _grant_is_revoked(self, store, run_id: str) -> bool:
+        with store.transaction() as tx:
+            rows = tx.execute(
+                "SELECT revoked_seq FROM workspace_grant WHERE run_id = ?", (run_id,))
+        return bool(rows) and rows[0][0] is not None
+
+    def _read_effects(self, run_id: str) -> str:
+        """none_known only after the log was read and holds no effect.outcome_unknown for the run.
+
+        No store, or a log that cannot be read (including a raise while iterating, or a store
+        with no events listing), is unresolved. The revoke path does not use that listing.
+        """
+        store = self._events
+        if store is None:
+            return "unresolved"
+        try:
+            for event in store.events:
+                if (isinstance(event, dict) and event.get("type") == "effect.outcome_unknown"
+                        and event.get("run_id") == run_id):
+                    return "unresolved"
+        except Exception:
+            return "unresolved"
+        return "none_known"
+
+    def _ledger(self):
+        try:
+            from recursion_core.workspace.grant import Ledger
+        except ImportError:
+            return None
+        return Ledger
+
+    def _record_revoke(self, run_id: str) -> None:
+        """Append workspace.revoke for the grant that stands. A ledger error does not skip the kill.
+
+        An earlier revoke in the log is not a reason to return: a grant recorded after it stands
+        until Ledger.revoked runs. The log is not read through store.events.
+        """
+        store = self._events
+        if store is None:
+            return
+        try:
+            ledger = self._ledger()
+            if ledger is None:
+                return
+            if not self._ledger_declared:
+                try:
+                    ledger.declare(store)
+                except RuntimeError:
+                    pass
+                self._ledger_declared = True
+            with store.transaction() as tx:
+                ledger.revoked(tx, run_id)
+        except Exception:
+            return
+
+    def _stamp(self, answer: dict, run_id: str) -> dict:
+        """Put acceptance, the fence fact, the cleanup fact and the effects word on a Stop answer.
+
+        Name workspace.revoke only when the ledger row shows the grant revoked and none standing.
+        An earlier event in the log is not enough. The fence is false until a path
+        that really dispatches consults the admission set.
+        """
+        if not isinstance(answer, dict) or answer.get("code") == RUN_UNKNOWN:
+            return answer
+        answer["admission_closed"] = True
+        answer["dispatch_fence_confirmed"] = False
+        answer["local_scope_empty"] = answer.get("code") == STOPPED
+        answer["external_effects"] = self._effects_for(run_id)
+        if self._revoke_named(run_id):
+            answer["workspace.revoke"] = True
+        return answer
 
     def _stop_target(self, run_id: str) -> dict | None:
         """The registry's record, or, when the registry cannot be read, the record this process kept for a
@@ -535,19 +671,21 @@ class ControlAPI:
         while True:
             adopted = self._adopt_unrecorded_launch(rec)
             if adopted is not None:
-                return adopted
+                return self._stamp(adopted, rec["run_id"])
             run_id = rec["run_id"]
             if rec["state"] == "stopped":
                 res = {"code": STOPPED, "run_id": run_id, "state": "stopped", "repeat": True}
                 # A stopped launch this process still holds was never written: try again now.
-                return self._recorded(res, rec) if run_id in self._launched else res
+                if run_id in self._launched:
+                    res = self._recorded(res, rec)
+                return self._stamp(res, run_id)
             result = self._stop_attempt(rec, reconfirm=reconfirms_left > 0)
             if not result.pop("_reconfirm", False):
-                return result
+                return self._stamp(result, run_id)
             reconfirms_left -= 1
             if reconfirms_left < 0:  # the attempt above already consumed the one reconfirm
-                return {"code": PENDING, "run_id": run_id, "state": "pending", "reason": "cgroup_changed",
-                        "recorded": False}
+                return self._stamp({"code": PENDING, "run_id": run_id, "state": "pending",
+                                    "reason": "cgroup_changed", "recorded": False}, run_id)
 
     def _stop_attempt(self, rec: dict, *, reconfirm: bool) -> dict:
         """Request and confirm the cgroup on ``rec``, then record that decision. No recursion."""

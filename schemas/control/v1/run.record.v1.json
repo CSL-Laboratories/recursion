@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "run.record.v1.json",
   "title": "run.record.v1: the run record as the registry stores it",
-  "x-version": "1.0-draft.4",
+  "x-version": "1.0-draft.5",
   "description": "STORAGE record. This is the JSON document the daemon's registry keeps for one run (core/recursion_core/control/registry.py). The twelve required fields are exactly what is stored today and none of them changes in version 1, including 'start_key' and 'stop_attestation' in today's shapes. The other fields are optional additions: each is either absent or carries a value, and null is not used for them. 'principal' and 'launch' are written together by the start path once a lane has registered on it, and this schema refuses one without the other; 'launch' is the ONE typed launch snapshot (route entry, route decision, workspace, containment level, session and turn, owner, budget) and the principal is its trusted sibling, never inside it. NONE of this is ever copied from a request's params. 'start_error' is reserved for the lane that owns Stop and is absent until it writes it. RESERVED, and refused by this schema until the lane that owns Stop defines them: a 'launch_manifest' field, and a stored attestation whose proof is 'removed'. What a client reads from run.status and run.list is a different record, run.view.v1.",
   "type": "object",
   "additionalProperties": false,
@@ -98,7 +98,7 @@
       "then": {"required": ["intent_version"]}
     },
     "stop_attestation": {
-      "description": "null unless the run is stopped. The stored proof is today's and only today's: 'empty', which says that the cgroup named here was read empty and every member listed was gone, at this generation of the record. A stored proof of 'removed' is RESERVED: the lane that owns Stop adds it together with the registry's own proof checks, and until then this schema refuses it. A reader that meets a proof it does not know treats the run as NOT stopped.",
+      "description": "null unless the run is stopped. The stored proof is today's and only today's: 'empty', which says that the cgroup named here was read empty and every member listed was gone, at this generation of the record. It may also carry admission_closed, local_scope_empty, external_effects and dispatch_fence_confirmed. external_effects is none_known or unresolved. Those fields are optional on a stored row, so a row written before them still loads. admission_closed is acceptance only; dispatch_fence_confirmed is a separate fact and is false until a real dispatch path consults the admission set. A stored proof of 'removed' is RESERVED: the lane that owns Stop adds it together with the registry's own proof checks, and until then this schema refuses it. A reader that meets a proof it does not know treats the run as NOT stopped.",
       "type": ["object", "null"],
       "additionalProperties": false,
       "required": ["proof", "cgroup", "cgroup_marker", "member_ids", "generation"],
@@ -107,7 +107,11 @@
         "cgroup": {"type": "string", "minLength": 1},
         "cgroup_marker": {"type": "string", "minLength": 1},
         "member_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
-        "generation": {"type": "integer", "minimum": 1}
+        "generation": {"type": "integer", "minimum": 1},
+        "admission_closed": {"type": "boolean"},
+        "local_scope_empty": {"type": "boolean"},
+        "external_effects": {"enum": ["none_known", "unresolved"]},
+        "dispatch_fence_confirmed": {"type": "boolean"}
       }
     },
     "launch": {

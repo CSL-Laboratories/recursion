@@ -10,12 +10,20 @@
       "st_dev": 27,
       "st_ino": 18446
     },
-    "time": "2026-11-13T07:41:02.118Z"
+    "time": "2026-11-13T07:41:02.118Z",
+    "admission_closed": true,
+    "local_scope_empty": true,
+    "external_effects": "unresolved",
+    "dispatch_fence_confirmed": false
   },
   "containment_level": "host_integrated",
   "claim": "cgroup_removed_whole_run_unverified",
   "fence": {
     "state": "fenced",
     "incarnation": 1
-  }
+  },
+  "admission_closed": true,
+  "local_scope_empty": true,
+  "external_effects": "unresolved",
+  "dispatch_fence_confirmed": false
 }

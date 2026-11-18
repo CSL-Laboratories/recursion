@@ -11,7 +11,8 @@ control API only sees these two interfaces, and tests fake them. A run record is
      "generation": <int>,
      "cgroup_marker": None | "<inode-like identity of that cgroup>",
      "members": [{"member_id", "pid"}],
-     "stop_attestation": None | {"proof": "empty", "cgroup", "cgroup_marker", "member_ids", "generation"}}
+     "stop_attestation": None | {"proof": "empty", "cgroup", "cgroup_marker", "member_ids", "generation",
+         "admission_closed", "local_scope_empty", "external_effects"}}
 
 ``start_key`` is stored with the record so start dedupe survives a daemon restart: a durable registry
 must persist it and answer ``find_start`` from what it persisted. A ``starting`` record is the launch

@@ -19,7 +19,7 @@ from recursion_core.routes import contract as c
 from recursion_core.routes import driver as d
 from recursion_core.routes.claude_code import ClaudeCodeAdapter, _classify_result
 from recursion_core.routes.driver import Declaration, DriverInputError, Flags, one_turn
-from recursion_core.routes.tests.fakes import request
+from recursion_core.routes.tests.fakes import request, runs_adapter
 from recursion_core.routes.tests.test_routes_claude import Harness
 
 # The fail-closed value PRODUCT.md 11.6 names. The adapter publishes the same spelling.
@@ -46,6 +46,7 @@ def _confirmed(**extra):
     return _init(hooks_applied=True, hook_on_failure_supported=True, **extra)
 
 
+@runs_adapter
 class PermissionModeTest(unittest.TestCase):
     def test_argv_passes_the_fail_closed_permission_mode(self) -> None:
         adapter = ClaudeCodeAdapter(lambda argv, **kwargs: None, lambda: 0.0, lambda *a: "", {})
@@ -100,6 +101,7 @@ class PermissionModeTest(unittest.TestCase):
         self.assertEqual((res["status"], res["text"]), ("ok", "full"))
 
 
+@runs_adapter
 class PermissionBridgeAndClassifyTest(unittest.TestCase):
     def test_success_after_a_permission_denial_or_error_is_not_success(self) -> None:
         denial = {"type": "system", "subtype": "permission_denial", "tool": "Bash"}

@@ -15,8 +15,14 @@ under docs/ (the page included). Those files may not contain:
   one router"
 
 The design file that was present holds that phrase on the B3-25.7 line. It does
-not hold a separate enumerated list, so this check uses that phrase and the two
-words the draft order names.
+not hold a separate enumerated list, so this check uses that phrase and the five
+spellings above it, as the draft orders name them.
+
+Matching ignores capitals and treats any run of spaces and line breaks inside a
+paragraph as one space, so a phrase that Markdown wraps across lines still
+fails; a blank line ends a paragraph, and words on either side of it are not
+joined. A hit names the line where the phrase starts. Each subject also has
+exactly one row.
 """
 from __future__ import annotations
 
@@ -25,6 +31,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 PAGE = ROOT / "docs" / "TRANSPARENCY.md"
@@ -136,18 +143,50 @@ def _copy_files(root: Path) -> list[Path]:
     return files
 
 
+def _flat(text: str) -> tuple[str, list[int]]:
+    """Lower-case text with each whitespace run (line breaks included) as one space.
+
+    A blank line ends a paragraph and becomes a newline, which no phrase holds, so
+    words on either side of it never join. The list gives each character's line.
+    """
+    chars: list[str] = []
+    numbers: list[int] = []
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            if chars and chars[-1] == " ":
+                chars[-1] = "\n"
+            elif chars and chars[-1] != "\n":
+                chars.append("\n")
+                numbers.append(number)
+            continue
+        for ch in line + " ":
+            if ch.isspace():
+                if not chars or chars[-1] in " \n":
+                    continue
+                ch = " "
+            for low in ch.lower():
+                chars.append(low)
+                numbers.append(number)
+    return "".join(chars), numbers
+
+
 def phrase_hits(root: Path) -> list[str]:
+    """Each refused phrase once per line it starts on, also when prose wraps it."""
     hits: list[str] = []
     for path in _copy_files(root):
         try:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
-        for number, line in enumerate(text.splitlines(), 1):
-            low = line.lower()
-            for phrase in PHRASES:
-                if phrase in low:
-                    hits.append(f"{path.relative_to(root)}:{number}: {phrase}")
+        flat, numbers = _flat(text)
+        found: set[tuple[int, int]] = set()
+        for index, phrase in enumerate(PHRASES):
+            start = flat.find(phrase)
+            while start != -1:
+                found.add((numbers[start], index))
+                start = flat.find(phrase, start + 1)
+        for number, index in sorted(found):
+            hits.append(f"{path.relative_to(root)}:{number}: {PHRASES[index]}")
     return hits
 
 
@@ -164,6 +203,8 @@ class TransparencyTests(unittest.TestCase):
         subjects = [subject for subject, _module, _telemetry in rows]
         missing = [subject for subject in REQUIRED_SUBJECTS if subject not in subjects]
         self.assertEqual(missing, [], "a required route or feature has no row")
+        repeated = sorted({subject for subject in subjects if subjects.count(subject) > 1})
+        self.assertEqual(repeated, [], "a route or feature has more than one row")
         for subject, module, telemetry in rows:
             self.assertTrue(_module_file(ROOT, module), f"{subject} cites a missing module {module}")
             self.assertEqual(telemetry, "none", f"{subject} telemetry is not none")
@@ -188,11 +229,59 @@ class TransparencyTests(unittest.TestCase):
                         [f"{Path('docs') / 'page.md'}:2: {phrase}"],
                     )
 
-    def test_public_copy_fixture_without_the_phrases_passes(self) -> None:
+    def test_public_copy_fixture_with_a_wrapped_phrase_fails(self) -> None:
+        # Markdown prose wraps; the rendered claim is the same, so the check is too.
+        wrapped = (
+            ("You can use your Claude subscription\nthrough one router.\n",
+             "use your claude subscription through one router"),
+            ("It is tamper\n   evident.\n", "tamper evident"),
+            ("It is verified\r\nsafe.\n", "verified safe"),
+        )
+        for body, phrase in wrapped:
+            with self.subTest(phrase=phrase):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    (root / "README.md").write_text("Plain copy.\n", encoding="utf-8")
+                    (root / "docs").mkdir()
+                    (root / "docs" / "page.md").write_bytes(
+                        ("Line one.\n" + body).encode("utf-8")
+                    )
+                    self.assertEqual(
+                        phrase_hits(root),
+                        [f"{Path('docs') / 'page.md'}:2: {phrase}"],
+                    )
+
+    def test_words_split_by_a_blank_line_are_not_one_phrase(self) -> None:
+        # A blank line ends a paragraph; words on either side of it are not one claim.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "README.md").write_text("Each entry can be checked.\n", encoding="utf-8")
+            (root / "README.md").write_text(
+                "Each entry can be checked. Nobody may tamper\n\nevident errors are logged.\n"
+                "It was verified\n  \nsafe defaults stay.\n",
+                encoding="utf-8",
+            )
             self.assertEqual(phrase_hits(root), [])
+
+    def test_a_second_row_for_one_subject_fails(self) -> None:
+        def page(extra: str) -> str:
+            rows = "".join(
+                f"| `{subject}` | `pkg/mod.py` | a | b | `none` |\n" for subject in REQUIRED_SUBJECTS
+            )
+            return "| Subject | Module | Leaves | Recorded | Telemetry |\n|---|---|---|---|---|\n" + rows + extra
+
+        check = TransparencyTests("test_one_row_per_engine_route_and_daemon_feature")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pkg").mkdir()
+            (root / "pkg" / "mod.py").write_text("", encoding="utf-8")
+            fixture = root / "page.md"
+            with mock.patch.dict(globals(), {"ROOT": root, "PAGE": fixture}):
+                fixture.write_text(page(""), encoding="utf-8")
+                check.test_one_row_per_engine_route_and_daemon_feature()
+                fixture.write_text(page("| `codex` | `pkg/mod.py` | c | d | `none` |\n"), encoding="utf-8")
+                with self.assertRaises(AssertionError) as caught:
+                    check.test_one_row_per_engine_route_and_daemon_feature()
+                self.assertIn("codex", str(caught.exception))
 
 
 if __name__ == "__main__":

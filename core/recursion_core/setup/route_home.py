@@ -5,14 +5,20 @@ A route home is the folder the launcher sets as an engine's HOME (``<state>/home
 be able to read it or change what its path names, and it must never be the operator's own home,
 whose logins and keys belong to the operator, not to a route (F6).
 
-FROZEN INTERFACE (lane INSTALL, Nov 14, 2026). Lane STOP calls ``check`` in the launcher before
-``private_dir`` makes the folder; a change to a name, a parameter or a code below is a request to the
-keeper of this file:
+FROZEN INTERFACE (lane INSTALL, Nov 14, 2026; the keyword added Nov 15). Lane STOP calls ``check``
+in the launcher before ``private_dir`` makes the folder; a change to a name, a parameter or a code
+below is a request to the keeper of this file:
 
-    check(path, root) -> None        refuses with RouteHomeRefused, or returns
+    check(path, root, *, allow_inside_operator_home=True) -> None
+                                     refuses with RouteHomeRefused, or returns
     RouteHomeRefused(code, detail)   .code is one of the codes below; .detail is never secret
 
-    route_home_untrusted         path or root is not an absolute str, holds a NUL character or a
+``allow_inside_operator_home`` is the containment setting (``setup/containment.py``: ``True`` for
+``inside_operator_home``, the default; ``False`` for ``outside_operator_home``), read once by the
+caller and passed as given; ``path`` and ``root`` stay positional as before.
+
+    route_home_untrusted         allow_inside_operator_home is not True or False; or
+                                 path or root is not an absolute str, holds a NUL character or a
                                  ``..`` name, or cannot be written as a file name; the root or a name
                                  between it and path is a link, not a folder, not ours, or open to
                                  group or world at all (any bit of 0o077), or cannot be looked up; a
@@ -32,7 +38,9 @@ An operator of a container with an arbitrary user id gives the user a passwd ent
     route_home_outside_root      path is the root itself, or not below it (a root of / has nothing below
                                  it: it is root's, never the operator's custodied root)
     route_home_is_operator_home  path, or the root, is the operator's own home (the password
-                                 database's, or ``$HOME``), compared after links are followed
+                                 database's, or ``$HOME``), compared after links are followed; with
+                                 allow_inside_operator_home=False, also path or the root inside the
+                                 operator's home, or path holding it
     route_home_missing           the root, a folder between it and path's parent, or a link above
                                  the root (removed while it was being followed) does not exist; or a
                                  link on the way to path, the root or the operator's home was removed
@@ -45,9 +53,14 @@ A route home that does not exist yet is accepted when everything above it passes
 itself must already exist (a missing root is ``route_home_missing``): it is made once, owner-only,
 before the first launch, not by the check's caller on the way. ``recursiond install`` makes it from
 lane INSTALL's second slice on, with the daemon's stores; the installer this module stands on writes
-only the service unit, so until then nothing makes it. A route home inside the operator's home is
-accepted (the daemon's state folder is ``~/.local/state/recursion``), only the home itself is
-refused. The three identities (path, root, the operator's home) are compared after links are
+only the service unit, so until then nothing makes it. By
+default a route home inside the operator's home is accepted (the daemon's state folder is
+``~/.local/state/recursion``) and only the home itself is refused: the engines run as the operator
+and can reach the home anyway, which ``containment.OPERATOR_WORDS`` tells the operator. With
+``allow_inside_operator_home=False`` a route home inside the operator's home is refused as well,
+compared as ``subscription_routes/policy.py`` compares it (a home of ``/`` holds only ``/``), and so
+is one that holds the operator's home.
+The three identities (path, root, the operator's home) are compared after links are
 followed; a name in them that does not exist is compared as written and the names after it are
 still followed (``os.path.realpath(strict=ALLOW_MISSING)``'s reading), so a ``..`` after it, a link
 or a folder that cannot be searched further on counts. Nothing is created or opened: the file
@@ -77,17 +90,23 @@ class RouteHomeRefused(Exception):
         self.detail = detail
 
 
-def check(path, root) -> None:
+def check(path, root, *, allow_inside_operator_home=True) -> None:
     """Refuse ``path`` unless it is (or may become) an owner-only folder below ``root``, reached
-    without a link, that is not the operator's own home. See the module docstring for the codes."""
+    without a link, that is not the operator's own home (nor, with ``allow_inside_operator_home``
+    False, inside it or holding it). See the module docstring for the codes."""
 
+    if allow_inside_operator_home is not True and allow_inside_operator_home is not False:
+        raise RouteHomeRefused("route_home_untrusted", "allow_inside_operator_home is not True or False")
     path, root = _text(path, "path"), _text(root, "root")
     if not path.startswith(root + "/"):  # the root itself is not below it either; nor is anything below "/"
         raise RouteHomeRefused("route_home_outside_root", f"{path} is not below {root}")
     _check_above(root)
     homes = _operator_homes()
-    if _resolve(root) in homes:
+    real_root = _resolve(root)
+    if real_root in homes:
         raise RouteHomeRefused("route_home_is_operator_home", "the root is the operator's home")
+    if not allow_inside_operator_home and any(_holds(home, real_root) for home in homes):
+        raise RouteHomeRefused("route_home_is_operator_home", "the root is inside the operator's home")
     _owner_only(root, _lstat(root, missing_ok=False))
     names = path[len(root) + 1:].split("/")
     current = root
@@ -97,14 +116,30 @@ def check(path, root) -> None:
         if info is None:
             break  # the route home itself, not made yet
         _owner_only(current, info)
-    if _resolve(path) in homes:
+    real = _resolve(path)
+    if real in homes:
         raise RouteHomeRefused("route_home_is_operator_home", path)
+    if not allow_inside_operator_home:
+        for home in sorted(homes):
+            if _holds(home, real):
+                raise RouteHomeRefused("route_home_is_operator_home", f"{path} is inside the operator's home")
+            if _holds(real, home):
+                raise RouteHomeRefused("route_home_is_operator_home", f"{path} holds the operator's home")
+
+
+def _holds(folder: str, real: str) -> bool:
+    """True when ``real`` is ``folder`` or below it. Both are resolved, so a prefix that ends at a ``/``
+    is a containment. A ``folder`` of ``/`` holds only ``/`` (no resolved path begins with ``//``), as
+    ``subscription_routes/policy.py``'s ``_operator_contains`` reads it: a container whose home is
+    ``/`` must not hold every route home."""
+
+    return real == folder or real.startswith(folder + "/")
 
 
 def _text(value: object, what: str) -> str:
     try:
         text = os.fspath(value)
-    except TypeError:
+    except Exception:  # not a path, or a path-like whose __fspath__ fails (DeepSeek F6 on #428)
         raise RouteHomeRefused("route_home_untrusted", f"the {what} is not a file-system path") from None
     if type(text) is not str or not text.startswith("/"):
         raise RouteHomeRefused("route_home_untrusted", f"the {what} is not absolute")

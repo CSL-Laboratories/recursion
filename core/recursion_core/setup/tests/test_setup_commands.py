@@ -1,4 +1,5 @@
-"""``recursiond install | upgrade | uninstall``: what each prints, and the interpreter checks."""
+"""``recursiond install | upgrade | uninstall`` and ``setup containment``: what each prints, and the interpreter
+checks."""
 
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ import recursion_core
 from recursion_core import _entrypoints as entry
 from recursion_core.control.commands import setup
 from recursion_core.daemon_install import UNIT_NAME, Roots, service_fields
+from recursion_core.setup import containment
 
 PY = "/opt/recursion/venv/bin/python3.14t"
 PY_NEXT = "/opt/recursion/venv-2/bin/python3.14t"
@@ -344,7 +346,9 @@ class CommandTests(unittest.TestCase):
     def test_a_password_lookup_that_fails_is_a_json_refusal(self):
         # DeepSeek F10-2 on #382: an OSError from the lookup is held to the same refusal (CPython raises KeyError).
         failures = (KeyError(f"getpwuid(): uid not found: {os.geteuid()}"), OSError(5, "Input/output error"))
-        for failed, action in ((failed, action) for failed in failures for action in setup.NAMES):
+        # setup answers before the lookup. install, upgrade, and uninstall still refuse home_unknown.
+        home_actions = tuple(name for name in setup.NAMES if name != "setup")
+        for failed, action in ((failed, action) for failed in failures for action in home_actions):
             with self.subTest(action=action, failed=type(failed).__name__):
                 out = io.StringIO()
                 with mock.patch.object(setup.sys, "platform", "linux"), mock.patch("pwd.getpwuid", side_effect=failed), \
@@ -416,11 +420,116 @@ class RealProbeTests(unittest.TestCase):
             self.assertEqual(os.listdir(home), [])
 
 
+@unittest.skipUnless(os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0,
+                     "Linux file owners and modes, and a non-root uid")
+class SetupContainmentTests(unittest.TestCase):
+    """``recursiond setup containment [<value>]`` (Q17, Nov 15): the setting, set before any daemon runs."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="setup-ct-")
+        self.addCleanup(self._tmp.cleanup)
+        base = os.path.realpath(self._tmp.name)
+        os.chmod(base, 0o700)
+        home = os.path.join(base, "home")  # the password database's home for this user, here (Q19)
+        os.mkdir(home, 0o700)
+        self.config = os.path.join(home, ".config")
+        self.file = os.path.join(self.config, "recursion", "containment.json")
+        passwd = mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=home))
+        passwd.start()
+        self.addCleanup(passwd.stop)
+        env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": os.path.join(base, "xdg")})  # not where it is read
+        env.start()
+        self.addCleanup(env.stop)
+
+    def main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = entry.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def answer(self, *argv, code=0):
+        got, out, _ = self.main(*argv)
+        self.assertEqual(got, code, out)
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        return json.loads(lines[0])
+
+    def test_without_a_value_the_setting_is_shown_with_the_operators_words_and_nothing_is_made(self):
+        self.assertEqual(self.answer("setup", "containment"), {
+            "code": "ok", "action": "setup containment", "changed": False, "engine_homes": "inside_operator_home",
+            "source": "default", "level": "same_user", "file": self.file, "notice": containment.OPERATOR_WORDS})
+        self.assertFalse(os.path.lexists(self.config))
+
+    def test_the_default_is_set_once_and_shown_from_the_file(self):
+        first = self.answer("setup", "containment", "inside_operator_home")
+        self.assertEqual((first["changed"], first["source"], first["notice"]),
+                         (True, "file", containment.OPERATOR_WORDS))
+        self.assertEqual(os.stat(self.file).st_mode & 0o777, 0o600)
+        self.assertFalse(self.answer("setup", "containment", "inside_operator_home")["changed"])
+        self.assertEqual(self.answer("setup", "containment")["source"], "file")
+
+    def test_outside_is_refused_without_an_engine_user_and_set_with_one(self):
+        self.assertEqual(self.answer("setup", "containment", "outside_operator_home", code=1), {
+            "code": "containment_needs_engine_user", "action": "setup containment",
+            "detail": "outside_operator_home needs the engine user, which this machine does not have"})
+        self.assertFalse(os.path.lexists(self.config))
+        with mock.patch.object(containment, "engine_user", return_value="recursion-engines"):
+            answer = self.answer("setup", "containment", "outside_operator_home")
+        self.assertEqual((answer["changed"], answer["engine_homes"], answer["level"]),
+                         (True, "outside_operator_home", "engine_user"))
+        self.assertNotIn("notice", answer)  # the words describe the default only
+
+    def test_an_untrusted_file_is_refused_and_a_disk_error_is_named(self):
+        os.makedirs(os.path.dirname(self.file), 0o700)
+        os.symlink(os.path.join(self.config, "elsewhere.json"), self.file)
+        for argv in (("setup", "containment"), ("setup", "containment", "inside_operator_home")):
+            with self.subTest(argv=argv):
+                answer = self.answer(*argv, code=1)
+                self.assertEqual((answer["code"], answer["detail"]),
+                                 ("containment_untrusted", f"{self.file} is a link"))
+        self.assertTrue(os.path.islink(self.file))
+        os.unlink(self.file)
+        with mock.patch.object(containment, "write", side_effect=OSError(28, "No space left on device")):
+            answer = self.answer("setup", "containment", "inside_operator_home", code=1)
+        self.assertEqual(answer["code"], "filesystem_error")
+        self.assertTrue(answer["detail"].endswith(f"(in {os.path.dirname(self.file)})"), answer["detail"])
+
+    def test_a_missing_setting_or_an_unknown_value_is_a_usage_error(self):
+        for argv in (("setup",), ("setup", "containment", "sideways"), ("setup", "sandbox"),
+                     ("setup", "containment", "inside_operator_home", "again")):
+            with self.subTest(argv=argv):
+                code, out, err = self.main(*argv)
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn("usage error", err)
+        self.assertFalse(os.path.lexists(self.config))
+
+    def test_off_linux_the_setting_is_refused_before_anything_is_read(self):
+        out = io.StringIO()
+        with mock.patch.object(setup.sys, "platform", "win32"), mock.patch.object(containment, "read") as read:
+            args = mock.Mock(command="setup", setting="containment", value=None, out=out)
+            self.assertEqual(setup.dispatch(args, None), 1)
+        self.assertEqual(json.loads(out.getvalue())["code"], "platform_unsupported")
+        read.assert_not_called()
+
+    def test_setup_containment_answers_while_the_password_lookup_fails(self):
+        # The setup branch returns before the lookup. install still answers the lookup's refusal.
+        lookup = setup.InstallRefused(
+            "home_unknown",
+            "the password database gives no entry for this user (none, or the lookup failed), so the "
+            "user manager's %h is not known")
+        with mock.patch.object(setup, "default_roots", side_effect=lookup):
+            shown = self.answer("setup", "containment")
+            self.assertEqual((shown["code"], shown["action"]), ("ok", "setup containment"))
+            refused = self.answer("install", code=1)
+            self.assertEqual((refused["code"], refused["action"], refused["detail"]),
+                             (lookup.kind, "install", lookup.detail))
+
+
 class CommandFamilyShapeTests(unittest.TestCase):
     """The family has seam S2's shape (``control/commands/__init__.py`` on #369), so it can be registered as is."""
 
     def test_names_parser_and_dispatch(self):
-        self.assertEqual(setup.NAMES, ("install", "upgrade", "uninstall"))
+        self.assertEqual(setup.NAMES, ("install", "upgrade", "uninstall", "setup"))
         added = []
 
         class Family:

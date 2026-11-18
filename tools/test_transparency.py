@@ -10,6 +10,7 @@ under docs/ (the page included). Those files may not contain:
 
 - sandboxed (no containment probe is in this tree, so the word stays refused)
 - tamper-proof
+- tamper-evident, tamper evident, verified safe
 - the one phrase adoption B3-25.7 names: "use your Claude subscription through
   one router"
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -67,6 +69,9 @@ REQUIRED_SUBJECTS = (
 PHRASES = (
     "sandboxed",
     "tamper-proof",
+    "tamper-evident",
+    "tamper evident",
+    "verified safe",
     "use your claude subscription through one router",
 )
 
@@ -166,6 +171,28 @@ class TransparencyTests(unittest.TestCase):
     def test_public_copy_refuses_unearned_claims(self) -> None:
         self.assertTrue(PAGE.is_file(), "docs/TRANSPARENCY.md is absent")
         self.assertEqual(phrase_hits(ROOT), [])
+
+    def test_public_copy_fixture_holding_each_new_phrase_fails(self) -> None:
+        for phrase in ("tamper-evident", "tamper evident", "verified safe"):
+            with self.subTest(phrase=phrase):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    (root / "README.md").write_text("Plain copy.\n", encoding="utf-8")
+                    (root / "docs").mkdir()
+                    (root / "docs" / "page.md").write_text(
+                        f"Line one.\nThis record is {phrase.upper()} today.\n",
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(
+                        phrase_hits(root),
+                        [f"{Path('docs') / 'page.md'}:2: {phrase}"],
+                    )
+
+    def test_public_copy_fixture_without_the_phrases_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "README.md").write_text("Each entry can be checked.\n", encoding="utf-8")
+            self.assertEqual(phrase_hits(root), [])
 
 
 if __name__ == "__main__":

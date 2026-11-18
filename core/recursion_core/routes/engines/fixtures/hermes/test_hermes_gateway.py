@@ -30,6 +30,54 @@ FAKE = HERE / 'fake_gateway.py'
 RUN_ID = 'run-e9gateway'
 PROFILE = 'run-e9'
 
+# A process the test starts. It stays in the foreground and writes no turn record.
+_SLEEPER = (
+    'import signal, sys, time\n'
+    'def _end(_signum, _frame):\n'
+    '    raise SystemExit(0)\n'
+    'signal.signal(signal.SIGINT, _end)\n'
+    'signal.signal(signal.SIGTERM, _end)\n'
+    'while True:\n'
+    '    time.sleep(0.05)\n'
+)
+
+# A process the test starts. It forks a child that leaves the launch group and stays in the session.
+# The child ends when the flag path (argv 1) appears, or after a short bound so a crashed test cannot leave it.
+_SESSION_CHILD = (
+    'import json, os, signal, sys, time\n'
+    'flag = sys.argv[1]\n'
+    'turn = os.environ["RECURSION_E9_GATEWAY_TURN"]\n'
+    'ended = False\n'
+    'def _end(_signum, _frame):\n'
+    '    global ended\n'
+    '    ended = True\n'
+    'signal.signal(signal.SIGINT, _end)\n'
+    'signal.signal(signal.SIGTERM, _end)\n'
+    'pid = os.fork()\n'
+    'if pid == 0:\n'
+    '    os.setpgid(0, 0)\n'
+    '    signal.signal(signal.SIGHUP, signal.SIG_IGN)\n'
+    '    signal.signal(signal.SIGINT, signal.SIG_IGN)\n'
+    '    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+    '    deadline = time.monotonic() + 15\n'
+    '    while time.monotonic() < deadline:\n'
+    '        if os.path.exists(flag):\n'
+    '            os._exit(0)\n'
+    '        time.sleep(0.05)\n'
+    '    os._exit(0)\n'
+    'tmp = turn + ".tmp"\n'
+    'with open(tmp, "w", encoding="utf-8") as handle:\n'
+    '    json.dump({"alive": True, "pid": os.getpid(), "pgrp": os.getpgrp()}, handle)\n'
+    '    handle.flush()\n'
+    '    os.fsync(handle.fileno())\n'
+    'os.replace(tmp, turn)\n'
+    'while not ended:\n'
+    '    try:\n'
+    '        time.sleep(0.05)\n'
+    '    except InterruptedError:\n'
+    '        continue\n'
+)
+
 
 def _pid_alive(pid: int) -> bool:
     try:
@@ -71,31 +119,36 @@ class _Parked:
         return _pid_alive(self.pid)
 
 
+@unittest.skipUnless(os.path.isdir('/proc'), 'the session scan reads /proc; without it Stop stays pending')
 class HermesGatewayOwnershipTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix='e9-gw-')
         self.addCleanup(self.tmp.cleanup)
         self.home = os.path.join(self.tmp.name, 'home')
         os.mkdir(self.home, 0o700)
-        self.turn_path = os.path.join(self.home, '.gateway-turn')
+        self.turn_path = os.path.join(self.home, 'profiles', PROFILE, '.gateway-turn')
         self._extra: list[int] = []
+        self._drives: list = []
         self.addCleanup(self._reap)
         os.chmod(FAKE, 0o700)
         self.drive = None
 
     def _reap(self) -> None:
-        drive = self.drive
-        if drive is not None and getattr(drive, 'pgid', None):
-            try:
-                os.killpg(drive.pgid, signal.SIGKILL)
-            except OSError:
-                pass
-            proc = getattr(drive, '_proc', None)
-            if proc is not None and proc.poll() is None:
+        drives = list(self._drives)
+        if self.drive is not None and self.drive not in drives:
+            drives.append(self.drive)
+        for drive in drives:
+            if getattr(drive, 'pgid', None):
                 try:
-                    proc.wait(timeout=2)
-                except Exception:
+                    os.killpg(drive.pgid, signal.SIGKILL)
+                except OSError:
                     pass
+                proc = getattr(drive, '_proc', None)
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
         for pid in self._extra:
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -136,8 +189,15 @@ class HermesGatewayOwnershipTest(unittest.TestCase):
         if cls is None:
             self._today_leaves_the_gateway_alive()
         drive = cls(str(FAKE), profile=kw.pop('profile', PROFILE), home=self.home, run_id=RUN_ID, **kw)
+        self._drives.append(drive)
         self.drive = drive
         return drive
+
+    def _script(self, name: str, source: str) -> str:
+        path = os.path.join(self.tmp.name, name)
+        with open(path, 'w', encoding='utf-8') as handle:
+            handle.write(source)
+        return path
 
     def test_stopping_the_unit_ends_the_owned_gateway(self) -> None:
         # B1-2.1: the long-lived drive owns the gateway inside the unit. Stop ends it.
@@ -281,6 +341,133 @@ class HermesGatewayOwnershipTest(unittest.TestCase):
         self.assertEqual(answer['code'], 'pending')
         self.assertEqual(answer['reason'], 'cgroup_changed')
         self.assertFalse(drive.confirmed)
+
+    def test_stop_stays_pending_while_a_session_member_in_another_group_is_alive(self) -> None:
+        # R1. A child that left the launch group and stayed in the session is still the unit.
+        flag = os.path.join(self.tmp.name, 'child-gone')
+
+        def _release() -> None:
+            with open(flag, 'w', encoding='ascii') as handle:
+                handle.write('1\n')
+            time.sleep(0.3)
+
+        self.addCleanup(_release)
+        drive = self._drive(timeout=0.3)
+        drive.argv = [sys.executable, '-B', self._script('session_child.py', _SESSION_CHILD), flag]
+        drive.launch()
+        answer = drive.stop()
+        self.assertNotEqual(answer['code'], 'stopped')
+        self.assertTrue(drive.member_alive())
+        _release()
+        deadline = time.monotonic() + 3
+        while drive.member_alive() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(drive.member_alive())
+        again = drive.stop()
+        self.assertEqual(again['code'], 'stopped')
+
+    def test_a_foreground_process_without_a_turn_file_is_the_owned_unit(self) -> None:
+        # R2. Readiness is the foreground session leader, not a private turn file.
+        drive = self._drive(timeout=0.3)
+        drive.argv = [sys.executable, '-B', self._script('sleeper.py', _SLEEPER)]
+        drive.launch()
+        self.assertTrue(drive._launched)
+        self.assertTrue(drive.member_alive())
+        self.assertFalse(os.path.exists(drive._turn_path))
+        answer = drive.stop()
+        self.assertEqual(answer['code'], 'stopped')
+        self.assertFalse(drive.member_alive())
+
+    def test_an_interrupted_launch_is_ended_by_stop_and_is_not_stuck(self) -> None:
+        # R3. KeyboardInterrupt after Popen must not leave a process Stop will not signal.
+        drive = self._drive(timeout=0.4)
+        drive.argv = [sys.executable, '-B', self._script('sleeper.py', _SLEEPER)]
+
+        def _interrupt() -> bool:
+            raise KeyboardInterrupt
+
+        drive._wait_until_owned = _interrupt  # type: ignore[method-assign]
+        with self.assertRaises(KeyboardInterrupt):
+            drive.launch()
+        pid = drive.pgid
+        self.assertIsNotNone(pid)
+        assert pid is not None
+        self.assertTrue(_pid_alive(pid))
+        drive.stop()
+        self.assertFalse(_pid_alive(pid))
+        try:
+            drive.launch()
+        except hermes.HermesOwnershipRefused as err:
+            self.assertNotEqual(err.cause, 'already_launched')
+        else:
+            drive.stop()
+
+    def test_profile_root_is_refused(self) -> None:
+        # R4. The shared name root stays refused. Dropping it from the set makes this red.
+        with self.assertRaises(hermes.HermesOwnershipRefused) as caught:
+            hermes.gateway_argv(str(FAKE), profile='root')
+        self.assertEqual(caught.exception.cause, 'profile')
+
+    def test_two_profiles_on_one_home_keep_separate_turn_records(self) -> None:
+        # R5. One profile's turn pid must not keep the other profile's Stop pending.
+        with open(os.path.join(self.home, 'ignore-int'), 'w', encoding='ascii') as handle:
+            handle.write('1\n')
+        first = self._drive(profile='run-a', timeout=0.3)
+        second = self._drive(profile='run-b', timeout=0.3)
+        first.launch()
+        second.launch()
+        self.assertNotEqual(first.pgid, second.pgid)
+        os.killpg(first.pgid, signal.SIGKILL)
+        with open(first._turn_path, 'w', encoding='utf-8') as handle:
+            json.dump({'alive': True, 'pid': second.pgid}, handle)
+        answer = first.stop()
+        self.assertEqual(answer['code'], 'stopped')
+        self.assertTrue(second.member_alive())
+        self.assertNotEqual(first._turn_path, second._turn_path)
+        self.assertTrue(first._turn_path.endswith(os.path.join('profiles', 'run-a', '.gateway-turn')))
+        self.assertTrue(second._turn_path.endswith(os.path.join('profiles', 'run-b', '.gateway-turn')))
+
+    def test_stop_does_not_signal_a_pgid_whose_start_time_changed(self) -> None:
+        # R6. A populated scan of a pgid that is no longer the launched process is not a signal.
+        drive = self._drive(timeout=0.3)
+        drive.launch()
+        first = drive.stop()
+        self.assertEqual(first['code'], 'stopped')
+        calls: list[tuple] = []
+
+        def _record(pgid: int, sig: int) -> None:
+            calls.append((pgid, sig))
+            raise ProcessLookupError
+
+        real_killpg = hermes.os.killpg
+        real_scan = hermes._group_populated
+        hermes.os.killpg = _record  # type: ignore[assignment]
+        hermes._group_populated = lambda _pgid: True  # type: ignore[assignment]
+        try:
+            drive._launch_start = (getattr(drive, '_launch_start', None) or 0) + 1
+            second = drive.stop()
+        finally:
+            hermes.os.killpg = real_killpg
+            hermes._group_populated = real_scan
+        self.assertEqual(calls, [])
+        self.assertNotEqual(second['code'], 'stopped')
+
+    def test_an_unreadable_proc_stat_is_not_a_dead_pid(self) -> None:
+        # R7. Signal 0 succeeded and the stat file could not be opened: that is not death.
+        real_open = hermes.os.open
+
+        def _open(path, flags, *args):
+            text = path.decode('utf-8', 'replace') if isinstance(path, bytes) else path
+            if isinstance(text, str) and text.startswith('/proc/') and text.endswith('/stat'):
+                raise OSError('stat unreadable')
+            return real_open(path, flags, *args)
+
+        hermes.os.open = _open  # type: ignore[assignment]
+        try:
+            result = hermes._pid_alive(os.getpid())
+        finally:
+            hermes.os.open = real_open
+        self.assertIsNot(result, False)
 
 
 if __name__ == '__main__':

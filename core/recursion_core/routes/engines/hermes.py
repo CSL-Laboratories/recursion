@@ -605,61 +605,83 @@ def _owned_directory(path: str, cause: str):
     return info
 
 
-def _pid_alive(pid: int) -> bool:
-    """True when ``pid`` is a live process. A zombie is not live: it is already ending."""
+def _proc_identity(pid: int):
+    """``(state, pgrp, session, start)`` from ``/proc/<pid>/stat``, or None when it cannot be read.
+
+    ``start`` is the kernel start-time field. A later read with a different start time is a
+    reused pid, not the process that had this pid before.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        fd = os.open(f'/proc/{pid}/stat', os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    except OSError:
+        return None
+    try:
+        data = os.read(fd, 4096)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    cut = data.rfind(b')')
+    if cut < 0:
+        return None
+    rest = data[cut + 2:].split()
+    if len(rest) < 20:
+        return None
+    try:
+        pgrp = int(rest[2])
+        session = int(rest[3])
+        start = int(rest[19])
+    except ValueError:
+        return None
+    return rest[0], pgrp, session, start
+
+
+def _pid_alive(pid: int):
+    """True when ``pid`` is live, False when it is gone or a zombie, None when that is unknown.
+
+    None means a signal-0 probe found the pid and ``/proc/<pid>/stat`` still could not be read.
+    That is not death: a caller must not treat the process as ended.
+    """
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # probe only: signal 0 does not terminate
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
-    try:
-        fd = os.open(f'/proc/{pid}/stat', os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
-    except OSError:
-        return False
-    try:
-        data = os.read(fd, 4096)
-    finally:
-        os.close(fd)
-    cut = data.rfind(b')')
-    if cut < 0 or cut + 2 >= len(data):
-        return True
-    state = data[cut + 2:].split(None, 1)[0]
-    return state not in (b'Z', b'X')
+    ident = _proc_identity(pid)
+    if ident is None:
+        return None
+    return ident[0] not in (b'Z', b'X')
 
 
 def _group_populated(pgid: int) -> bool:
-    """True when any live process is in ``pgid``. Unreadable ``/proc`` counts as populated."""
+    """True when any live process is in the session ``pgid`` names, or ``/proc`` cannot be listed.
+
+    ``pgid`` is the launch group's id. The child is a new session, so that id is the session id
+    too. A member that has moved to another group of the same session still counts. A missing
+    listing is unknown, so the caller must not answer stopped. A pid whose stat disappeared
+    between the listing and the read is skipped.
+    """
     try:
         names = os.listdir('/proc')
     except OSError:
         return True
+    if not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 0:
+        return True
     for name in names:
         if not name.isdigit():
             continue
-        try:
-            fd = os.open(f'/proc/{name}/stat', os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
-        except OSError:
+        ident = _proc_identity(int(name))
+        if ident is None:
             continue
-        try:
-            data = os.read(fd, 4096)
-        except OSError:
+        state, _pgrp, session, _start = ident
+        if state in (b'Z', b'X'):
             continue
-        finally:
-            os.close(fd)
-        cut = data.rfind(b')')
-        if cut < 0:
-            continue
-        rest = data[cut + 2:].split()
-        if len(rest) < 3 or rest[0] in (b'Z', b'X'):
-            continue
-        try:
-            pgrp = int(rest[2])
-        except ValueError:
-            continue
-        if pgrp == pgid:
+        if session == pgid:
             return True
     return False
 
@@ -667,10 +689,12 @@ def _group_populated(pgid: int) -> bool:
 class HermesGatewayDrive:
     """Launches and owns ``hermes gateway run`` inside the run's unit.
 
-    The unit is the gateway process's session. Stop signals that session (SIGINT, then SIGKILL
-    after ``timeout``, the same order as the #916 unit properties) and answers stopped only when
-    the session is empty and no parked turn pid is still alive. A chat viewer exiting 3 is not
-    that answer. A second caller receives the same confirmation with ``repeat`` true.
+    The unit is the gateway process's session. Stop signals the launch group (SIGINT, then
+    SIGKILL after ``timeout``, the same order as the #916 unit properties) and answers stopped
+    only when that session has no live member and this profile's turn record does not name one.
+    A member in another group of the same session keeps the answer pending: this drive does not
+    signal that group. A chat viewer exiting 3 is not that answer. A second caller receives the
+    same confirmation with ``repeat`` true.
     """
 
     def __init__(self, binary: str | None, *, profile: str, home: str, run_id: str, timeout: float = 2.0) -> None:
@@ -688,7 +712,9 @@ class HermesGatewayDrive:
         self.timeout = float(timeout)
         self.pgid: int | None = None
         self._proc: subprocess.Popen | None = None
-        self._turn_path = os.path.join(home, '.gateway-turn')
+        # One record per dedicated profile. Two profiles on one home do not share it.
+        self._turn_path = os.path.join(home, 'profiles', profile, '.gateway-turn')
+        self._launch_start: int | None = None
         self._identity: tuple | None = None
         self._launched = False
         self._confirmed = False
@@ -715,11 +741,15 @@ class HermesGatewayDrive:
                 self._proc = None
                 raise
             self.pgid = self._proc.pid
+            self._capture_launch_identity()
+            # KeyboardInterrupt here leaves pgid set and _launched false. stop() signals
+            # that group and clears it, so a later launch is not stuck behind the child.
             if not self._wait_until_owned():
                 self._signal(signal.SIGKILL)
                 self._reap()
                 self.pgid = None
                 self._proc = None
+                self._launch_start = None
                 raise HermesOwnershipRefused('gateway_exited')
             self._launched = True
 
@@ -814,9 +844,9 @@ class HermesGatewayDrive:
     def _stop_locked(self) -> dict:
         if self._confirmed and not self._blocks():
             return self._stopped(True)
-        if not self._launched or self.pgid is None:
+        if self.pgid is None:
             return self._pending('cgroup_unknown')
-        if not self._profile_still_ours():
+        if self._launched and not self._profile_still_ours():
             self._end_group()
             return self._pending('cgroup_changed')
         self._signal(signal.SIGINT)
@@ -826,19 +856,34 @@ class HermesGatewayDrive:
                 return self._pending('member_alive' if self._blocks() else 'confirm_timeout')
         if self._blocks():
             return self._pending('member_alive')
+        if not self._launched:
+            # Popen returned and ownership did not. The child is gone; do not leave it blocking launch.
+            self._reap()
+            self.pgid = None
+            self._proc = None
+            self._launch_start = None
+            return self._pending('cgroup_unknown')
         self._confirmed = True
         return self._stopped(False)
 
     def _wait_until_owned(self) -> bool:
+        """True when the process we started is still the foreground leader of its session.
+
+        A turn record that names that pid can confirm it early. The record is not required:
+        a process that never writes one, and is still in the foreground at the deadline, is
+        the owned unit.
+        """
         deadline = time.monotonic() + self.timeout
-        while time.monotonic() < deadline:
-            if self._proc is not None and self._proc.poll() is not None:
+        while True:
+            if self._proc is None or self._proc.poll() is not None:
                 return False
             record = self._read_turn()
-            if isinstance(record, dict) and record.get('alive') is True and record.get('pid') == self.pgid:
+            if isinstance(record, dict) and record.get('alive') is True and record.get('pid') == self.pgid \
+                    and self._foreground_leader():
                 return True
+            if time.monotonic() >= deadline:
+                return self._foreground_leader()
             time.sleep(0.02)
-        return False
 
     def _wait_dead(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -866,7 +911,18 @@ class HermesGatewayDrive:
         pid = record.get('pid')
         if not isinstance(pid, int) or isinstance(pid, bool):
             return True
-        return _pid_alive(pid)
+        alive = _pid_alive(pid)
+        if alive is None:
+            return True
+        if not alive:
+            return False
+        # A live pid from another profile's session is not this drive's member.
+        if self.pgid is None:
+            return True
+        ident = _proc_identity(pid)
+        if ident is None:
+            return True
+        return ident[2] == self.pgid
 
     def _read_turn(self):
         path = self._turn_path
@@ -893,8 +949,44 @@ class HermesGatewayDrive:
             return _TURN_UNKNOWN
         return value if isinstance(value, dict) else _TURN_UNKNOWN
 
-    def _signal(self, sig: int) -> None:
+    def _capture_launch_identity(self) -> None:
+        """Remember the launch leader's start time, so a reused pgid is not signalled later."""
+        self._launch_start = None
         if self.pgid is None:
+            return
+        deadline = time.monotonic() + 0.2
+        while True:
+            ident = _proc_identity(self.pgid)
+            if ident is not None and ident[0] not in (b'Z', b'X'):
+                self._launch_start = ident[3]
+                return
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.01)
+
+    def _foreground_leader(self) -> bool:
+        """True when the process we started is still the foreground leader of its session."""
+        proc = self._proc
+        if proc is None or self.pgid is None or proc.poll() is not None or proc.pid != self.pgid:
+            return False
+        ident = _proc_identity(self.pgid)
+        if ident is None:
+            return True
+        state, pgrp, session, _start = ident
+        if state in (b'Z', b'X'):
+            return False
+        return pgrp == self.pgid and session == self.pgid
+
+    def _signal(self, sig: int) -> None:
+        """Signal the launch group when its leader is still the process started at launch.
+
+        Other groups in the session are not signalled. A pgid whose start time is missing
+        or different is not this process, so it is not signalled either.
+        """
+        if self.pgid is None or self._launch_start is None:
+            return
+        ident = _proc_identity(self.pgid)
+        if ident is None or ident[3] != self._launch_start:
             return
         try:
             os.killpg(self.pgid, sig)

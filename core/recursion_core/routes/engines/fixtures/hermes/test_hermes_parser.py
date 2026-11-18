@@ -880,6 +880,42 @@ class StreamTest(unittest.TestCase):
                                  'session_id': 's' * 257}) + '\n')
         self.assertIsNone(longer.engine_session_id)
 
+    def test_a_rejected_call_with_an_engine_id_is_held_named_and_one_without_is_ambiguous(self):
+        # Both shapes in one parser. The rejected call that carries an engine id stays open
+        # under that name. The rejected call with no id makes its name uncertain. Each result
+        # takes a fresh id.
+        parser = HermesStreamParser(CONNECTION)
+        lone = chr(0xD800)
+        rejected_named = json.dumps({'type': 'tool_use', 'name': 'held', 'tool_call_id': 'c1',
+                                     'input': {'path': lone}}) + '\n'
+        rejected_unnamed = json.dumps({'type': 'tool_use', 'name': 'loose',
+                                       'input': {'path': lone}}) + '\n'
+        self.assertEqual(parser.parse(rejected_named)[0]['type'], 'engine.output')
+        self.assertEqual(parser.parse(rejected_unnamed)[0]['type'], 'engine.output')
+        held_id = parser.parse(json.dumps({'type': 'tool_use', 'name': 'held', 'input': {}}) + '\n'
+                               )[0]['payload']['call_id']
+        loose_id = parser.parse(json.dumps({'type': 'tool_use', 'name': 'loose', 'input': {}}) + '\n'
+                                )[0]['payload']['call_id']
+        self.assertEqual(held_id, 'e9n-1', 'the rejected lines minted no id')
+        self.assertEqual(loose_id, 'e9n-2')
+
+        def result(name, text, engine_id=None):
+            record = {'type': 'tool_result', 'name': name, 'output': text, 'is_error': False}
+            if engine_id is not None:
+                record['tool_call_id'] = engine_id
+            return json.dumps(record) + '\n'
+
+        held_result = parser.parse(result('held', 'from the raw named call'))[0]['payload']['call_id']
+        loose_result = parser.parse(result('loose', 'from the raw unnamed call'))[0]['payload']['call_id']
+        self.assertEqual(held_result, 'e9n-3', 'the named hold keeps the id-less result fresh')
+        self.assertEqual(loose_result, 'e9n-4', 'the unnamed rejected call keeps its result fresh')
+        self.assertNotEqual(held_result, held_id)
+        self.assertNotEqual(loose_result, loose_id)
+        self.assertEqual(parser.parse(result('held', 'the engine id', 'c1'))[0]['payload']['call_id'], 'c1')
+        again = parser.parse(json.dumps({'type': 'tool_use', 'name': 'held', 'input': {}}) + '\n'
+                             )[0]['payload']['call_id']
+        self.assertEqual(parser.parse(result('held', 'pairs once the hold ends'))[0]['payload']['call_id'], again)
+
 
 if __name__ == '__main__':
     unittest.main()

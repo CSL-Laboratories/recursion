@@ -11,6 +11,7 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -96,11 +97,12 @@ class OwnerAndModeTests(_Layout, unittest.TestCase):
     def test_a_group_or_world_writable_file_is_refused_before_the_open(self):
         _root, home, settings = self._layout()
         _watch_opens()
-        for mode in (0o620, 0o602, 0o660, 0o666):
+        for mode, word in ((0o620, "group_writable"), (0o602, "world_writable"),
+                           (0o660, "group_writable"), (0o666, "world_writable")):
             with self.subTest(mode=oct(mode)):
                 os.chmod(settings, mode)
                 before = len(_OPENED)
-                self.assertEqual(self._refused(settings, home), "writable")
+                self.assertEqual(self._refused(settings, home), word)
                 opened = _names(_OPENED[before:])
                 self.assertFalse(any(name.endswith("settings.json") for name in opened), "the file was opened")
         os.chmod(settings, 0o644)
@@ -130,7 +132,8 @@ class OwnerAndModeTests(_Layout, unittest.TestCase):
                 return getattr(self._info, name)
 
         for field, value, reason in (
-            ("st_mode", stat.S_IFREG | 0o622, "writable"),
+            ("st_mode", stat.S_IFREG | 0o622, "world_writable"),
+            ("st_mode", stat.S_IFREG | 0o620, "group_writable"),
             ("st_uid", os.geteuid() + 1, "not_owner"),
         ):
             def fstat(fd, field=field, value=value):
@@ -183,6 +186,92 @@ class WalkedOpenTests(_Layout, unittest.TestCase):
     def test_a_plain_file_is_still_read(self):
         _root, home, settings = self._layout()
         self.assertTrue(_MARKER.encode() in self._read(settings, home), "a plain file was not read")
+
+
+class MissingNameTests(_Layout, unittest.TestCase):
+    """Each name the walk needs, when missing, refuses before any open (read 533-c2e98377, P4)."""
+
+    def _without(self, name):
+        saved = getattr(os, name, None)
+        if saved is not None:
+            delattr(os, name)
+        return saved
+
+    def _assert_refused_unopened(self, settings, home):
+        _watch_opens()
+        before = len(_OPENED)
+        self.assertEqual(self._refused(settings, home), "platform_unsupported")
+        opened = _names(_OPENED[before:])
+        self.assertFalse(any(name.endswith("settings.json") for name in opened), "the file was opened")
+
+    def test_a_missing_directory_no_block_or_euid_name_refuses_before_any_open(self):
+        _root, home, settings = self._layout()
+        for name in ("O_DIRECTORY", "O_NONBLOCK", "geteuid"):
+            with self.subTest(name=name):
+                saved = self._without(name)
+                try:
+                    self._assert_refused_unopened(settings, home)
+                finally:
+                    if saved is not None:
+                        setattr(os, name, saved)
+
+    def test_an_open_without_dir_fd_refuses_before_any_open(self):
+        _root, home, settings = self._layout()
+        with mock.patch.object(open_guard.os, "supports_dir_fd", frozenset()):
+            self._assert_refused_unopened(settings, home)
+
+    @unittest.skipUnless(
+        all(hasattr(os, name) for name in ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK", "geteuid")),
+        "the gate refuses here before the open",
+    )
+    def test_the_walk_flags_carry_no_follow_directory_and_no_block(self):
+        dir_flags, file_flags = open_guard._walk_flags()
+        self.assertEqual(dir_flags & (os.O_NOFOLLOW | os.O_DIRECTORY), os.O_NOFOLLOW | os.O_DIRECTORY)
+        self.assertEqual(file_flags & (os.O_NOFOLLOW | os.O_NONBLOCK), os.O_NOFOLLOW | os.O_NONBLOCK)
+        self.assertEqual(file_flags & os.O_DIRECTORY, 0)
+
+
+@unittest.skipUnless(
+    hasattr(os, "mkfifo") and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and hasattr(os, "geteuid"),
+    "the gate refuses here before the open",
+)
+class FifoSwapTests(_Layout, unittest.TestCase):
+    """A FIFO put at the file's name after lstat cannot hang the read (read 533-c2e98377, P5)."""
+
+    def test_a_fifo_swapped_in_at_the_name_cannot_hang_the_read(self):
+        _root, home, settings = self._layout()
+        fifo = os.path.join(home, ".claude", "pipe.json")
+        os.mkfifo(fifo, 0o600)
+        plain = os.lstat(settings)
+        real_lstat = os.lstat
+
+        def lstat(target, *args, **kwargs):
+            # lstat sees a plain one-link file; the open then meets the FIFO.
+            if target == fifo:
+                return plain
+            return real_lstat(target, *args, **kwargs)
+
+        result = {}
+
+        def read():
+            try:
+                result["bytes"] = open_guard.read_regular_file(fifo, root=home, home=home, max_bytes=65536)
+            except open_guard.GateRefused as refused:
+                result["reason"] = refused.reason
+            except Exception as exc:  # reported below by type only
+                result["error"] = type(exc).__name__
+
+        with mock.patch.object(open_guard.os, "lstat", lstat):
+            worker = threading.Thread(target=read, daemon=True)
+            worker.start()
+            worker.join(5)
+            hung = worker.is_alive()
+            if hung:
+                # Let the blocked open go on, so the test process does not stay blocked.
+                os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+                worker.join(5)
+        self.assertFalse(hung, "the read blocked on a FIFO")
+        self.assertEqual(result, {"reason": "aliased"})
 
 
 if __name__ == "__main__":

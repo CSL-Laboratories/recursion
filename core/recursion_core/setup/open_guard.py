@@ -7,13 +7,17 @@ when lstat before the open and fstat on the same descriptor both say one link
 and the same inode. Otherwise no byte is returned.
 
 The file is owned by the calling user and has no group- or world-write bit,
-checked on lstat before the open and again on the held descriptor.
+checked on lstat before the open and again on the held descriptor. The refusal
+names the rule: ``not_owner``, ``world_writable`` or ``group_writable``.
 
 The read walks the checked real path from the root, one directory descriptor
 per part, each opened with ``O_NOFOLLOW`` and ``O_DIRECTORY``, and opens the
 file relative to its parent's descriptor. The file opened is the file checked.
-Where ``O_NOFOLLOW``, ``O_DIRECTORY`` or a ``dir_fd`` open is missing, the read
-is refused (``platform_unsupported``) before any open. The check is not dropped.
+The file is opened with ``O_NONBLOCK``, so a FIFO swapped in at its name cannot
+block the open; fstat then refuses it as not a regular file.
+Where ``O_NOFOLLOW``, ``O_DIRECTORY``, ``O_NONBLOCK``, ``geteuid`` or a ``dir_fd``
+open is missing, the read is refused (``platform_unsupported``) before any open.
+The check is not dropped.
 """
 
 from __future__ import annotations
@@ -37,10 +41,12 @@ def _walk_flags():
 
     if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY") or not hasattr(os, "geteuid"):
         return None
+    if not hasattr(os, "O_NONBLOCK"):
+        return None
     if os.open not in os.supports_dir_fd:
         return None
     base = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-    return base | os.O_DIRECTORY, base
+    return base | os.O_DIRECTORY, base | os.O_NONBLOCK
 
 
 def _foreign(info) -> str | None:
@@ -48,8 +54,11 @@ def _foreign(info) -> str | None:
 
     if info.st_uid != os.geteuid():
         return "not_owner"
-    if stat.S_IMODE(info.st_mode) & 0o022:
-        return "writable"
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o002:
+        return "world_writable"
+    if mode & 0o020:
+        return "group_writable"
     return None
 
 

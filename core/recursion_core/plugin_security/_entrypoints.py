@@ -87,14 +87,25 @@ def main(argv: list[str] | None = None, out=None, err=None) -> int:
     except _Usage as exc:
         err.write(f"usage: recursion plugin install|list|remove ({exc})\n")
         return 2
+    said = []
+
+    def report(line):
+        # A kept place is named the moment it is made, before any later step can fail.
+        err.write(f"{line}\n")
+        flush = getattr(err, "flush", None)
+        if flush is not None:
+            flush()
+        said.append(line)
+
     try:
         if args.command == "install":
             result = install_plugin(_config_dir(args.config), args.registry, args.plugin,
-                                    version=args.version, state=_state_dir(args.state))
+                                    version=args.version, state=_state_dir(args.state), report_kept=report)
         elif args.command == "list":
             result = list_plugins(_config_dir(args.config), state=_state_dir(args.state))
         else:
-            result = remove_plugin(_config_dir(args.config), args.plugin, state=_state_dir(args.state))
+            result = remove_plugin(_config_dir(args.config), args.plugin, state=_state_dir(args.state),
+                                   report_kept=report)
     except InstallRefused as exc:
         for code in exc.codes:
             err.write(f"refused: {code}\n")
@@ -106,8 +117,12 @@ def main(argv: list[str] | None = None, out=None, err=None) -> int:
         # command finishes or drops the stopped publish.
         err.write("refused: filesystem_refused\n")
         err.write(f"The system refused a file read or write: {exc}\n")
+        for line in getattr(exc, "kept", ()):
+            if line not in said:
+                err.write(f"{line}\n")
         return 1
     for line in result.get("kept", ()):
-        err.write(f"{line}\n")
+        if line not in said:
+            err.write(f"{line}\n")
     out.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return 0

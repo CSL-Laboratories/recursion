@@ -425,8 +425,9 @@ class Registry:
         """Read the published file. Do not take the writer lease, create, or seal modes.
 
         A reader can run while a writer holds the directory lease. It does not publish.
+        The directory barrier stays unpaid until a directory fsync succeeds, so a Stop
+        the writer will not read is not readable here either.
         """
-        self._dir_durable = True
         try:
             info = self.directory.lstat()
         except FileNotFoundError as exc:
@@ -702,22 +703,47 @@ class Registry:
             raise
         self.db = conn
         self._open_error = None
+        self._opened_identity = None
+        try:
+            info = os.stat(self.path)
+        except OSError as exc:
+            conn.close()
+            self.db = None
+            self._open_error = exc
+            raise sqlite3.OperationalError('registry name could not be read') from exc
+        self._opened_identity = (info.st_dev, info.st_ino)
 
     def _ensure_open(self):
         """Return with a live connection, or raise RegistryIntegrityError.
 
         A publish whose directory fsync has not finished is not readable yet.
         Reopening the file without that fsync would let a sweep act on a Stop
-        that is not crash-durable.
+        that is not crash-durable. A read-only connection is the inode it
+        opened. When the directory entry names another inode, reopen before
+        the read, or a held reader keeps the file the writer replaced.
         """
         if self.closed:
             raise RuntimeError('Registry closed')
+        if self.read_only and self.db is not None and self._published_inode_moved():
+            try:
+                self.db.close()
+            except sqlite3.Error:
+                pass
+            self.db = None
         if self.db is None:
             try:
                 self._reopen()
             except sqlite3.Error as exc:
                 raise RegistryIntegrityError('registry is not open') from exc
         self._require_dir_durable()
+
+    def _published_inode_moved(self):
+        held = getattr(self, '_opened_identity', None)
+        try:
+            info = os.stat(self.path)
+        except OSError:
+            return True
+        return (info.st_dev, info.st_ino) != held
 
     @contextmanager
     def _write(self):

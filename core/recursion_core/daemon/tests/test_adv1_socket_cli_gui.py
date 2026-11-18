@@ -177,6 +177,21 @@ class SocketAttackTest(ComposedBase):
         other.close()
         self.assertFalse(token_file.exists())
 
+    def test_a_second_compose_on_the_same_daemon_meets_the_socket_lock(self):
+        # ADV1-12, the same-daemon compose. A second boot() is refused by the
+        # folder lease and never reaches this call. compose_control on the daemon
+        # that already holds the socket must still be refused there, and the live
+        # token file must stay byte for byte.
+        daemon, first = self.boot()
+        token_file = self.runtime / 'recursion' / 'gui-device-token'
+        live_bytes = token_file.read_bytes()
+        with self.assertRaises(InsecureSocketPath):
+            adapter.compose_control(daemon, self.state, environ=self.environ, routes=self.routes)
+        self.assertEqual(token_file.read_bytes(), live_bytes,
+                         'the losing composition left the live token file')
+        live = live_bytes.decode().strip()
+        self.assertTrue(first.door({'HTTP_AUTHORIZATION': 'Bearer ' + live}))
+
     def test_garbage_and_oversized_frames_are_typed_and_the_daemon_keeps_serving(self):
         _, composed = self.boot()
         path = composed.server.path

@@ -963,18 +963,26 @@ class Daemon:
             if boot is None:
                 raise RuntimeError('boot_id unreadable; refusing a run that reboot could not reconcile')
             run = self.registry.add(run_id, boot)
+            launch_error = None
             try:
                 self.manager.start(run.unit, argv)
             except BaseException as exc:
-                # Keep the original launch error; the record says unknown, never terminated.
-                # The launch error is still active context, and its text is the argv, so
-                # this record names the reconcile error's type and nothing else.
+                launch_error = exc
+            if launch_error is not None:
+                # The row is whatever reconcile observed: unknown when that cannot
+                # be told, terminated when the manager attests the unit ended and
+                # nothing was left to walk, and still starting when reconcile
+                # itself did not finish. Reconcile runs outside the launch handler
+                # so a nested record does not chain the launch argv. The original
+                # launch error is what leaves this call.
                 try:
-                    self._reconcile(self.registry.get(run_id), f'launch error: {type(exc).__name__}')
+                    self._reconcile(self.registry.get(run_id),
+                                    f'launch error: {type(launch_error).__name__}')
                 except Exception as reconcile_exc:
                     log.error('reconcile after launch failure of %s failed: %s',
                               run_id, type(reconcile_exc).__name__)
-                raise
+                finally:
+                    raise launch_error
             self._reconcile(self.registry.get(run_id))
             return self.registry.get(run_id)
 

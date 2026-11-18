@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import collections
 import contextlib
 import copy
 import dis
@@ -70,6 +71,8 @@ import threading
 import time
 import unittest
 import weakref
+from collections.abc import Mapping
+from types import MappingProxyType
 from unittest import mock
 
 from recursion_core.control import api as A, cli, commands, hooks as H, methods
@@ -1159,7 +1162,7 @@ def table_with(store=None, tenant=methods.INSTALL_TENANT, **handlers):
     return table
 
 
-TURN = {'command_id': 'cmd-1', 'session_id': 'ses-1', 'expected_revision': 3, 'text': 'go on'}
+TURN = {'command_id': 'cmd-0001', 'session_id': 'ses-1', 'expected_revision': 3, 'text': 'go on'}
 
 
 class MethodTableTest(unittest.TestCase):
@@ -1258,14 +1261,14 @@ class MethodTableTest(unittest.TestCase):
         handlers, store = Handlers(), work_store()
         table = table_with(store, **{'session.turn': handlers.turn})
         answer = table.dispatch('session.turn', dict(TURN), H.OWNER, None)
-        self.assertEqual(answer, {'code': 'ok', 'turn_id': 'turn-cmd-1'})
+        self.assertEqual(answer, {'code': 'ok', 'turn_id': 'turn-cmd-0001'})
         self.assertEqual(handlers.calls, [(H.OWNER, True, TURN)])
         self.assertEqual((store.commits, store.rollbacks), (1, 0))
         digest = hashlib.sha256(b'{"expected_revision":3,"session_id":"ses-1","text":"go on"}').hexdigest()
-        self.assertEqual(store.receipts, {('install', 'session.turn', 'cmd-1'): (digest, answer)})
-        self.assertEqual(store.rows, {('work', 'cmd-1'): {'operation_id': 'op-cmd-1', 'state': 'pending'}},
+        self.assertEqual(store.receipts, {('install', 'session.turn', 'cmd-0001'): (digest, answer)})
+        self.assertEqual(store.rows, {('work', 'cmd-0001'): {'operation_id': 'op-cmd-0001', 'state': 'pending'}},
                          'the work intent is in the same commit as the receipt')
-        self.assertEqual(handlers.callbacks, [('wake', 'cmd-1')])
+        self.assertEqual(handlers.callbacks, [('wake', 'cmd-0001')])
 
     def test_the_same_command_again_returns_the_first_answer_and_runs_nothing(self) -> None:
         handlers, store = Handlers(), work_store()
@@ -1274,7 +1277,7 @@ class MethodTableTest(unittest.TestCase):
         again = table.dispatch('session.turn', dict(TURN), H.OWNER, None)
         self.assertEqual(again, first)
         self.assertEqual(len(handlers.calls), 1)
-        self.assertEqual(handlers.callbacks, [('wake', 'cmd-1')], 'a replay stages no callback')
+        self.assertEqual(handlers.callbacks, [('wake', 'cmd-0001')], 'a replay stages no callback')
         self.assertEqual(len(store.rows), 1, 'and no second work intent')
 
     def test_the_same_id_with_another_payload_is_a_conflict(self) -> None:
@@ -1296,8 +1299,8 @@ class MethodTableTest(unittest.TestCase):
         table.dispatch('session.turn', dict(TURN), H.OWNER, None)
         table.dispatch('session.queue', dict(TURN), H.OWNER, None)
         table.dispatch('session.turn', dict(TURN, session_id='ses-2'), H.DEVICE, None)
-        self.assertEqual(sorted(store.receipts), [('t1', 'session.queue', 'cmd-1'), ('t1', 'session.turn', 'cmd-1'),
-                                                  ('t2', 'session.turn', 'cmd-1')])
+        self.assertEqual(sorted(store.receipts), [('t1', 'session.queue', 'cmd-0001'), ('t1', 'session.turn', 'cmd-0001'),
+                                                  ('t2', 'session.turn', 'cmd-0001')])
         self.assertEqual(len(handlers.calls), 3)
         self.assertEqual(asked[-1], (H.DEVICE, 'ses-2'))
         # A tenant the params name is not the target's tenant: it changes the payload, never the namespace.
@@ -1305,7 +1308,7 @@ class MethodTableTest(unittest.TestCase):
                          {'code': 'conflict', 'detail': 'command_id_reused'})
         self.assertNotIn('t9', [tenant for tenant, _, _ in store.receipts])
         # The principal is not part of the key: the same command from another caller is the same command.
-        self.assertEqual(table.dispatch('session.turn', dict(TURN), H.DEVICE, None), {'code': 'ok', 'turn_id': 'turn-cmd-1'})
+        self.assertEqual(table.dispatch('session.turn', dict(TURN), H.DEVICE, None), {'code': 'ok', 'turn_id': 'turn-cmd-0001'})
         self.assertEqual(len(handlers.calls), 3)
 
     @quiet
@@ -1361,7 +1364,7 @@ class MethodTableTest(unittest.TestCase):
         threads[0].start()
         self.assertTrue(handlers.entered.wait(BOUND_S), 'the first command reached its handler')
         threads[1].start()
-        key = ('install', 'session.turn', 'cmd-1')
+        key = ('install', 'session.turn', 'cmd-0001')
         waiting = lambda: table._slots.get(key, (None, 0))[1]   # noqa: E731
         deadline = time.monotonic() + BOUND_S
         while waiting() < 2 and time.monotonic() < deadline:
@@ -1372,8 +1375,8 @@ class MethodTableTest(unittest.TestCase):
         for thread in threads:
             thread.join(BOUND_S)
         self.assertEqual(len(handlers.calls), 1)
-        self.assertEqual(answers, [{'code': 'ok', 'turn_id': 'turn-cmd-1'}] * 2)
-        self.assertEqual(handlers.callbacks, [('wake', 'cmd-1')])
+        self.assertEqual(answers, [{'code': 'ok', 'turn_id': 'turn-cmd-0001'}] * 2)
+        self.assertEqual(handlers.callbacks, [('wake', 'cmd-0001')])
         self.assertEqual(store.commits, 2, 'the second commit is the replay\'s own, with nothing in it')
         self.assertEqual(table._slots, {}, 'the slot goes when nobody waits on it')
 
@@ -1434,7 +1437,7 @@ class MethodTableTest(unittest.TestCase):
         table = table_with(store, **{'session.turn': turn})
         self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, None), {'code': 'ok'})
         self.assertEqual(ran, ['first', 'third'])
-        self.assertEqual(list(store.receipts), [('install', 'session.turn', 'cmd-1')])
+        self.assertEqual(list(store.receipts), [('install', 'session.turn', 'cmd-0001')])
 
     def test_callbacks_run_after_the_commit_and_outside_the_commands_slot(self) -> None:
         seen, store = [], work_store()
@@ -1462,12 +1465,12 @@ class MethodTableTest(unittest.TestCase):
         with self.assertRaises(Cut):
             table.dispatch('session.turn', dict(TURN), H.OWNER, None)
         self.assertEqual(woken, [], 'the callback that would have woken the worker never ran')
-        self.assertEqual(store.rows, {('work', 'cmd-1'): {'operation_id': 'op-1', 'state': 'pending'}},
+        self.assertEqual(store.rows, {('work', 'cmd-0001'): {'operation_id': 'op-1', 'state': 'pending'}},
                          'the intent is committed: a service that scans for pending work finds it')
-        self.assertIn(('install', 'session.turn', 'cmd-1'), store.receipts)
+        self.assertIn(('install', 'session.turn', 'cmd-0001'), store.receipts)
         # The client retries after the restart: the receipt answers, and the work is not staged again.
         self.assertEqual(table.dispatch('session.turn', dict(TURN), H.OWNER, None), {'code': 'ok', 'accepted': True})
-        self.assertEqual(handlers.calls, ['cmd-1'])
+        self.assertEqual(handlers.calls, ['cmd-0001'])
         self.assertEqual(woken, [])
         self.assertEqual(len(store.rows), 1)
 
@@ -1528,6 +1531,340 @@ class MethodTableTest(unittest.TestCase):
         one = methods.payload_digest({'command_id': 'a', 'n': 1.0, 'text': 'x'})
         self.assertEqual(one, methods.payload_digest({'text': 'x', 'n': 1, 'command_id': 'another id'}))
         self.assertNotEqual(one, methods.payload_digest({'text': 'x', 'n': 2}))
+
+
+class CommandIdGrammarTest(unittest.TestCase):
+    """A command id is common.v1's ``command_id``: 8 to 128 of A-Z a-z 0-9 . _ : -, matched whole, for EVERY method
+    keyed by one. Anything else is answered request_invalid / command_id before the payload digest, the tenant and the
+    store: no transaction is opened, no receipt is read or kept, no handler or tenant function is asked. (Until
+    Nov 15, 2026 the dispatcher checked only for a non-empty string, so a short id, an illegal character, NUL or
+    DEL reached ``receipt_get``; with EVENTS' store that raised TypeError and the caller got 'unavailable', as both
+    round-5 Codex reads of lane APPROVALS's draft showed.) A valid id at either bound is kept and replayed as before.
+    """
+
+    BAD = ('short', 'cmd-001', 'z' * 129, 'cmd 0001', 'cmd-0001/x', 'cmd-0001\r', 'cmd-0001\n', 'cmd-0001\t',
+           'cmd-12' + chr(0) + 'x', 'cmd-12' + chr(0x7F) + 'x', 'cmd-0001' + chr(0xE9), 'cmd-000' + chr(0x661),
+           '', b'cmd-0001', 'cmd-000' + '\ud800')
+    GOOD = ('A._:-012', 'Z' * 128)
+
+    class Store:
+        """Opens transactions and keeps receipts, and writes down every use."""
+
+        def __init__(self) -> None:
+            self.kept, self.used, self.opened = {}, [], 0
+
+        @contextlib.contextmanager
+        def transaction(self):
+            self.opened += 1
+            store = self
+
+            class Tx:
+                def receipt_get(self, tenant, method, command_id):
+                    store.used.append(('get', method, command_id))
+                    return store.kept.get((tenant, method, command_id))
+
+                def receipt_put(self, tenant, method, command_id, digest, answer):
+                    store.used.append(('put', method, command_id))
+                    store.kept[(tenant, method, command_id)] = (digest, answer)
+            yield Tx()
+
+    def keyed_tables(self):
+        """For every method keyed by command_id, a table with it registered under each tenant kind there is (a
+        function of the registrant's, and the install's constant), with what each handler and function was asked."""
+        for name, row in methods.METHODS.items():
+            if row.idempotency != 'command_id' or name in methods.MANDATORY or name.startswith('run.'):
+                continue                # the daemon's own methods are not registered by a lane
+            for kind in ('function', 'install'):
+                asked = []
+
+                def tenant_of(principal, params, asked=asked):
+                    asked.append(('tenant', params.get('command_id')))
+                    return 't1'
+
+                def handler(ctx, params, asked=asked):
+                    asked.append(('handler', params.get('command_id')))
+                    return {'code': 'ok'}
+                table = methods.MethodTable()
+                table.register(name, handler, service=row.service,
+                               tenant=tenant_of if kind == 'function' else methods.INSTALL_TENANT)
+                table.store = self.Store()
+                yield name, kind, table, asked
+
+    def test_an_id_outside_the_grammar_is_refused_before_the_receipt_for_every_command_method(self) -> None:
+        seen = 0
+        for name, kind, table, asked in self.keyed_tables():
+            for command_id in self.BAD:
+                with self.subTest(method=name, tenant=kind, command_id=command_id):
+                    answer = table.dispatch(name, {'command_id': command_id, 'text': 'x'}, H.OWNER, None)
+                    self.assertEqual(answer, {'code': 'request_invalid', 'detail': 'command_id'})
+            with self.subTest(method=name, tenant=kind):
+                self.assertEqual((table.store.opened, table.store.used, table.store.kept, asked), (0, [], {}, []),
+                                 'nothing is read, kept or asked for an id outside the grammar')
+            seen += 1
+        self.assertEqual(seen, 34, 'the 17 keyed rows, each under both tenant kinds')
+
+    def test_a_valid_id_at_either_bound_is_kept_and_replayed_as_before(self) -> None:
+        for name, kind, table, asked in self.keyed_tables():
+            for command_id in self.GOOD:
+                with self.subTest(method=name, tenant=kind, command_id=command_id):
+                    params = {'command_id': command_id, 'text': 'x'}
+                    self.assertEqual(table.dispatch(name, dict(params), H.OWNER, None), {'code': 'ok'})
+                    self.assertEqual(table.dispatch(name, dict(params), H.OWNER, None), {'code': 'ok'})
+                    self.assertEqual([what for what in asked if what[1] == command_id and what[0] == 'handler'],
+                                     [('handler', command_id)], 'the replay answers from the receipt')
+                    self.assertEqual([use for use in table.store.used if use[2] == command_id],
+                                     [('get', name, command_id), ('put', name, command_id), ('get', name, command_id)])
+
+    def one_table(self, store=None):
+        """One keyed method (session.turn, the install's tenant) on a counting store, and the ids its handler saw."""
+        asked = []
+
+        def handler(ctx, params):
+            asked.append(params.get('command_id'))
+            return {'code': 'ok'}
+        table = methods.MethodTable()
+        table.register('session.turn', handler, service=methods.METHODS['session.turn'].service, tenant=methods.INSTALL_TENANT)
+        table.store = self.Store() if store is None else store
+        return table, asked
+
+    def test_exactly_the_grammars_characters_are_taken_at_every_place_in_an_id(self) -> None:
+        """Every ASCII character and some lookalikes, at the end, the start and the middle of an 8-character id:
+        the 66 of A-Z a-z 0-9 . _ : - are kept, every other one is refused before the store. A class widened by
+        one character (DeepSeek's round-1 MEDIUM 1), an emoji included, turns this red."""
+        allowed = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-')
+        self.assertEqual(len(allowed), 66)
+        others = (0x85, 0xA0, 0xE9, 0x130, 0x212A, 0x660, 0x2028, 0xFEFF, 0xFF10, 0xFF41, 0x1F600)
+        for code in (*range(0x80), *others):
+            ch = chr(code)
+            for command_id in ('cmd-000' + ch, ch + 'cmd-000', 'cmd' + ch + '0000'):
+                with self.subTest(code=hex(code), command_id=command_id):
+                    table, asked = self.one_table()
+                    answer = table.dispatch('session.turn', {'command_id': command_id, 'text': 'x'}, H.OWNER, None)
+                    if ch in allowed:
+                        self.assertEqual((answer, asked), ({'code': 'ok'}, [command_id]))
+                    else:
+                        self.assertEqual((answer, table.store.opened, asked),
+                                         ({'code': 'request_invalid', 'detail': 'command_id'}, 0, []))
+
+    def test_the_dispatcher_and_the_event_store_keep_one_grammar(self) -> None:
+        """The event store refuses a receipt key outside the same grammar by raising; if the two copies drifted, an
+        id the dispatcher took would come back unavailable / store:TypeError, the failure this check exists to end."""
+        try:
+            from recursion_core.events import db as event_db
+        except ImportError as exc:
+            self.skipTest(f'the event store cannot be imported here: {exc}')
+        self.assertEqual(methods._COMMAND_ID.pattern, event_db._COMMAND_ID.pattern)
+
+    def test_a_bad_id_is_answered_before_the_payload_digest_and_a_good_one_reaches_it(self) -> None:
+        """With the digest made to refuse, a bad id is still answered for its id and the digest is never computed;
+        a good id reaches the digest (and is answered for its params). DeepSeek's round-1 MEDIUM 2."""
+        for command_id, wanted, digests in (('short', {'code': 'request_invalid', 'detail': 'command_id'}, 0),
+                                            ('cmd-0001\n', {'code': 'request_invalid', 'detail': 'command_id'}, 0),
+                                            ('cmd-0001', {'code': 'request_invalid', 'detail': 'params'}, 1)):
+            with self.subTest(command_id=command_id):
+                table, asked = self.one_table()
+                with mock.patch.object(methods, 'payload_digest', side_effect=ValueError('stand-in')) as digest:
+                    answer = table.dispatch('session.turn', {'command_id': command_id, 'text': 'x'}, H.OWNER, None)
+                self.assertEqual((answer, digest.call_count, table.store.opened, asked), (wanted, digests, 0, []))
+
+    def test_with_no_store_the_answer_is_store_absent_whatever_the_id_or_the_params(self) -> None:
+        """The store-absent answer comes first (DeepSeek's round-1 LOW 3)."""
+        for params in ({'command_id': 'short'}, {'command_id': 'cmd-0001'}, {}, None, []):
+            with self.subTest(params=params):
+                table, asked = self.one_table()
+                table.store = None
+                self.assertEqual(table.dispatch('session.turn', params, H.OWNER, None),
+                                 {'code': 'unsupported', 'detail': 'store_absent'})
+                self.assertEqual(asked, [])
+
+    def test_params_that_are_not_an_object_are_refused_and_never_raise(self) -> None:
+        """A command's params that are not an object answered nothing: ``params.get`` raised out of the dispatch
+        (DeepSeek's round-1 LOW 5). Now they are request_invalid / params, before the id and the store."""
+        for params in (None, [], ['command_id'], 'cmd-0001', 7, ('command_id', 'cmd-0001')):
+            with self.subTest(params=params):
+                table, asked = self.one_table()
+                self.assertEqual(table.dispatch('session.turn', params, H.OWNER, None),
+                                 {'code': 'request_invalid', 'detail': 'params'})
+                self.assertEqual((table.store.opened, table.store.used, asked), (0, [], []))
+
+    @quiet
+    def test_a_mapping_that_is_not_a_dict_is_accepted_and_a_bad_id_is_refused_before_the_store(self) -> None:
+        """DeepSeek's round 2, finding 1. A mapping that is not a dict was refused as ``params``.
+
+        A mapping is params: the handler runs, a receipt is kept, and a second caller with the same id
+        is answered from the receipt. The door stays strict for every one of these ids, on a dict and on
+        every other mapping, before the store is opened: empty, over-length, non-ASCII, a NUL, a lone
+        surrogate, and bytes. A handler that raises keeps nothing and answers unavailable. An
+        interruption still propagates and keeps nothing.
+        """
+        class Bag(Mapping):
+            def __init__(self, data):
+                self._data = dict(data)
+
+            def __getitem__(self, key):
+                return self._data[key]
+
+            def __iter__(self):
+                return iter(self._data)
+
+            def __len__(self):
+                return len(self._data)
+
+        def make(shape, payload):
+            data = dict(payload)
+            if shape == 'dict':
+                return data
+            if shape == 'proxy':
+                return MappingProxyType(data)
+            if shape == 'userdict':
+                return collections.UserDict(data)
+            return Bag(data)
+
+        offending = (
+            ('empty', ''),
+            ('over-length', 'z' * 129),
+            ('non-ascii', 'cmd-000' + '\u00e9'),
+            ('nul', 'cmd-12' + '\x00' + 'x'),
+            ('lone-surrogate', 'cmd-000' + '\ud800'),
+            ('bytes', b'cmd-0001'),
+        )
+        for shape in ('dict', 'proxy', 'userdict', 'subclass'):
+            table, asked = self.one_table()
+            for label, command_id in offending:
+                with self.subTest(shape=shape, command_id=label):
+                    params = make(shape, {'command_id': command_id, 'text': 'x'})
+                    answer = table.dispatch('session.turn', params, H.OWNER, None)
+                    self.assertEqual(answer, {'code': 'request_invalid', 'detail': 'command_id'})
+                    self.assertEqual((table.store.opened, asked), (0, []))
+            self.assertEqual((table.store.opened, table.store.used, table.store.kept, asked),
+                             (0, [], {}, []))
+            with self.subTest(shape=shape, command_id='good'):
+                params = make(shape, {'command_id': 'cmd-0001', 'text': 'x'})
+                self.assertEqual(table.dispatch('session.turn', params, H.OWNER, None), {'code': 'ok'})
+                self.assertEqual(
+                    table.dispatch('session.turn', {'command_id': 'cmd-0001', 'text': 'x'}, H.OWNER, None),
+                    {'code': 'ok'})
+                self.assertEqual(asked, ['cmd-0001'])
+                self.assertEqual(table.store.used, [
+                    ('get', 'session.turn', 'cmd-0001'),
+                    ('put', 'session.turn', 'cmd-0001'),
+                    ('get', 'session.turn', 'cmd-0001'),
+                ])
+                self.assertEqual(list(table._slots), [])
+
+        def raising(ctx, params):
+            raise RuntimeError('stand-in')
+
+        table = methods.MethodTable()
+        table.register('session.turn', raising, tenant=methods.INSTALL_TENANT)
+        table.store = self.Store()
+        proxy = MappingProxyType({'command_id': 'cmd-0001', 'text': 'x'})
+        self.assertEqual(table.dispatch('session.turn', proxy, H.OWNER, None),
+                         {'code': 'unavailable', 'detail': 'handler:RuntimeError'})
+        self.assertEqual((table.store.opened, table.store.kept, list(table._slots)), (1, {}, []))
+
+        def interrupted(ctx, params):
+            raise KeyboardInterrupt
+
+        table = methods.MethodTable()
+        table.register('session.turn', interrupted, tenant=methods.INSTALL_TENANT)
+        table.store = self.Store()
+        with self.assertRaises(KeyboardInterrupt):
+            table.dispatch('session.turn', proxy, H.OWNER, None)
+        self.assertEqual((table.store.opened, table.store.kept, list(table._slots)), (1, {}, []))
+
+    @quiet
+    def test_a_read_whose_params_are_not_a_mapping_is_refused_before_the_handler(self) -> None:
+        """DeepSeek's round 2, finding 2. None, a list, a string or a number on a read was
+        ``unavailable`` / ``handler:AttributeError``. The same params rule as a command applies before
+        the handler: ``request_invalid`` / ``params``, and the handler is not asked. A dict and a
+        mapping that is not a dict still reach the handler, a second call included. A handler that
+        raises is still unavailable, and an interruption still propagates.
+        """
+        def read_table(handler):
+            asked = []
+
+            def wrapped(ctx, params, asked=asked):
+                return handler(ctx, params, asked)
+
+            table = methods.MethodTable()
+            table.register('session.list', wrapped)
+            return table, asked
+
+        def taking(ctx, params, asked):
+            asked.append('called')
+            return {'code': 'ok', 'limit': params.get('limit')}
+
+        for params in (None, [], 'x', 7):
+            with self.subTest(params=type(params).__name__):
+                table, asked = read_table(taking)
+                answer = table.dispatch('session.list', params, H.OWNER, None)
+                self.assertEqual((answer, asked), ({'code': 'request_invalid', 'detail': 'params'}, []))
+
+        class Bag(Mapping):
+            def __init__(self, data):
+                self._data = dict(data)
+
+            def __getitem__(self, key):
+                return self._data[key]
+
+            def __iter__(self):
+                return iter(self._data)
+
+            def __len__(self):
+                return len(self._data)
+
+        table, asked = read_table(taking)
+        shapes = (
+            {'limit': 3},
+            MappingProxyType({'limit': 4}),
+            collections.UserDict({'limit': 5}),
+            Bag({'limit': 6}),
+        )
+        for params in shapes:
+            self.assertEqual(table.dispatch('session.list', params, H.OWNER, None),
+                             {'code': 'ok', 'limit': params.get('limit')})
+        self.assertEqual(asked, ['called', 'called', 'called', 'called'])
+
+        def raising(ctx, params, asked):
+            raise RuntimeError('stand-in')
+
+        table, asked = read_table(raising)
+        self.assertEqual(table.dispatch('session.list', {'limit': 1}, H.OWNER, None),
+                         {'code': 'unavailable', 'detail': 'handler:RuntimeError'})
+
+        def interrupted(ctx, params, asked):
+            raise KeyboardInterrupt
+
+        table, asked = read_table(interrupted)
+        with self.assertRaises(KeyboardInterrupt):
+            table.dispatch('session.list', {'limit': 1}, H.OWNER, None)
+
+    def test_the_event_stores_own_file_keeps_no_receipt_for_an_id_outside_the_grammar(self) -> None:
+        """The same promise measured a second way, on EVENTS' real store and its file: the bad ids keep nothing and
+        a good one keeps exactly its receipt (DeepSeek's round-1 LOW 4)."""
+        if os.name != 'posix':
+            self.skipTest('the event store is POSIX only')
+        try:
+            from recursion_core.events import db as event_db
+        except ImportError as exc:
+            self.skipTest(f'the event store cannot be imported here: {exc}')
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, 'events.sqlite3')
+        store = event_db.EventStore(path)
+        try:
+            table, asked = self.one_table(store)
+            for command_id in self.BAD:
+                with self.subTest(command_id=command_id):
+                    self.assertEqual(table.dispatch('session.turn', {'command_id': command_id, 'text': 'x'}, H.OWNER, None),
+                                     {'code': 'request_invalid', 'detail': 'command_id'})
+            self.assertEqual(table.dispatch('session.turn', {'command_id': 'cmd-0001', 'text': 'x'}, H.OWNER, None), {'code': 'ok'})
+        finally:
+            store.close()
+        with contextlib.closing(sqlite3.connect(path)) as db:
+            kept = db.execute('SELECT tenant, method, command_id FROM receipts').fetchall()
+        self.assertEqual((kept, asked), ([(methods.INSTALL_TENANT, 'session.turn', 'cmd-0001')], ['cmd-0001']))
 
 
 class CommandTableTest(unittest.TestCase):
@@ -2911,6 +3248,55 @@ class NestedDispatchTest(unittest.TestCase):
                          'the command\'s restriction went with the call to the other thread, and on through the read')
         self.assertEqual((self.asked, ran), ([], ['the handler goes on', 1]), 'and that read\'s callback waited for the commit')
 
+    def passing(self, table):
+        """A composition that hands params on exactly as the nested call gave them (``composed`` puts ``{}`` in place
+        of a missing one itself, so it cannot show what the dispatcher's own nested callback does)."""
+        def call(method, params=None):
+            if method in methods.BUILT_IN:
+                return self.built_in(method, params)
+            return table.dispatch(method, params, H.OWNER, call)
+        return call
+
+    def nested_without_params(self, outer, outer_params) -> None:
+        """The review thread at methods/__init__.py:561, "Nested read without params is refused". ``ctx.call`` lets a
+        handler leave params out; the read it reaches gets an empty mapping in their place, and so does one given
+        None. A list or a string is still refused as params before the handler, and a nested command is still
+        ``nested_command`` whatever its params: only a missing params is replaced, nothing else."""
+        seen, turns = [], []
+
+        def listing(ctx, params):
+            seen.append(params)
+            return {'code': 'ok', 'sessions': []}
+
+        def queued(ctx, params):
+            turns.append(params)
+            return {'code': 'ok'}
+
+        def asking(ctx, params):
+            return {'code': 'ok',
+                    'reads': [ctx.call('session.list'), ctx.call('session.list', None),
+                              ctx.call('session.list', []), ctx.call('session.list', 'x')],
+                    'commands': [ctx.call('session.queue'), ctx.call('session.queue', None),
+                                 ctx.call('session.queue', []), ctx.call('session.queue', 'x')]}
+        table = table_with(self.store, **{outer: asking, 'session.list': listing, 'session.queue': queued})
+        answer = table.dispatch(outer, outer_params, H.OWNER, self.passing(table))
+        listed, refused = {'code': 'ok', 'sessions': []}, {'code': 'request_invalid', 'detail': 'params'}
+        self.assertEqual(answer['reads'], [listed, listed, refused, refused],
+                         'params left out or None reach the read; a list and a string are refused as params')
+        self.assertEqual(seen, [{}, {}])
+        self.assertTrue(all(isinstance(params, Mapping) for params in seen), 'the handler is given a mapping')
+        self.assertIsNot(seen[0], seen[1], 'each call gets a mapping of its own')
+        nested_command = {'code': 'request_invalid', 'detail': 'nested_command'}
+        self.assertEqual((answer['commands'], turns), ([nested_command] * 4, []),
+                         'a nested command is refused whatever its params, and its handler is not asked')
+
+    def test_a_read_that_calls_another_without_params_gives_it_an_empty_mapping(self) -> None:
+        self.nested_without_params('session.status', {})
+
+    def test_a_command_that_calls_a_read_without_params_gives_it_an_empty_mapping(self) -> None:
+        self.nested_without_params('session.turn', dict(TURN))
+        self.assertEqual(self.store.commits, 1, 'the command around the nested calls committed')
+
 
 class CallbackOwnershipTest(unittest.TestCase):
     """The second reads' B1: a callback belongs to the dispatch that registered it, not to a place in a list."""
@@ -3084,7 +3470,7 @@ class OwnedAnswerTest(unittest.TestCase):
         expected = {'code': 'ok', 'revision': 1, 'items': ['a']}
         first = table.dispatch('session.turn', dict(TURN), H.OWNER, None)
         self.assertEqual(first, expected, 'the first caller gets what was committed')
-        self.assertEqual(store.receipts[('install', 'session.turn', 'cmd-1')][1], expected)
+        self.assertEqual(store.receipts[('install', 'session.turn', 'cmd-0001')][1], expected)
         first['items'].append('changed by the first caller')
         replay = table.dispatch('session.turn', dict(TURN), H.OWNER, None)
         self.assertEqual(replay, expected)

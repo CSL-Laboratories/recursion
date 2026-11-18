@@ -70,7 +70,7 @@ from recursion_core.gui.client import ACTIONS, READS
 from recursion_core.gui.panels import panel_registry
 from recursion_core.plugin_security import (ApprovalGate, Authority, CoreHealth, CoreService, GilProbe, Grant,
                                             PERMISSIONS, PluginLoader, Refused, ReservedEffects, TrustStore,
-                                            create_revocation_store)
+                                            create_revocation_store, parse_manifest)
 from recursion_core.plugin_security.signing import backend_available
 
 from .breaker import STORE_DIR
@@ -381,6 +381,17 @@ class PluginHost:
             manifest_ok = next((f for f in findings if f.get('code') == 'manifest_ok'), None)
             if manifest_ok is not None:
                 record['plugin_id'] = manifest_ok.get('detail')
+            elif isinstance(exc, Refused) and exc.code == 'core_poisoned_restart_required':
+                # This directory's own id, and the label recorded for its bytes, from its manifest
+                # alone: parsed, never loaded, so no plugin code runs. A manifest that does not parse
+                # (an id outside the grammar included) leaves the row without an id.
+                try:
+                    record['plugin_id'] = parse_manifest(manifest).plugin_id
+                except (Refused, ValueError, RecursionError):
+                    pass
+                else:
+                    if label in _LABELS:
+                        record['registry_label'] = label
             log.error('plugin at %s refused: %s; the daemon runs without it', source, exc)
             return record
         record.update(plugin_id=loaded.plugin_id, state='loaded', code=None, trust=loaded.trust,

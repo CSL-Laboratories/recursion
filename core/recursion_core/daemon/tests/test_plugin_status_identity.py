@@ -25,9 +25,9 @@ from recursion_core.plugin_security.tests.support import FakeGilProbe
 SOURCE = b'VALUE = 1\n'
 
 
-def _manifest(plugin_id):
+def _manifest(plugin_id, source=SOURCE):
     return canonical({'schema': 'csl-plugin-manifest/vNext', 'plugin_id': plugin_id, 'version': '1.0.0',
-                      'artifact_sha256': hashlib.sha256(SOURCE).hexdigest(), 'dependency_lock_sha256': '0' * 64,
+                      'artifact_sha256': hashlib.sha256(source).hexdigest(), 'dependency_lock_sha256': '0' * 64,
                       'install_scripts': [], 'developer_key': '33' * 32, 'permissions': ['read'],
                       'network_destinations': [], 'credential_refs': []})
 
@@ -100,6 +100,82 @@ class PoisonedCoreRowTests(unittest.TestCase):
         self.assertEqual((answer['code'], answer['plugin']['source']), ('ok', str(self.dir_a)))
         self.assertEqual([row['source'] for row in rows.inventory()['plugins'] if row['plugin_id'] == 'plugin.a'],
                          [str(self.dir_a)])
+
+    def _poisoned_host(self):
+        host = plugins.PluginHost.__new__(plugins.PluginHost)
+        health = CoreHealth()
+        # SIMULATED: the GIL reads on from the first read, so plugin.a's load poisons the core.
+        host.loader = PluginLoader(TrustStore({}), {}, ReservedEffects(), health, FakeGilProbe([True]))
+        host._labels = {}
+        return host, health
+
+    def test_a_refusal_after_a_poison_carries_its_own_id_and_label(self):
+        host, health = self._poisoned_host()
+        dir_c = self.dir_a.parent / 'c'
+        self.files[dir_c / plugins.MANIFEST] = _manifest('plugin.c')
+        self.files[dir_c / plugins.ARTIFACT] = SOURCE
+        # No plugin code runs after the poison: b's artifact would end the test process if it ran.
+        ran = b'raise SystemExit("plugin.b ran")\n'
+        self.files[self.dir_b / plugins.ARTIFACT] = ran
+        self.files[self.dir_b / plugins.MANIFEST] = _manifest('plugin.b', ran)
+        host._labels = {hashlib.sha256(self.files[self.dir_a / plugins.MANIFEST]).hexdigest(): 'verified',
+                        hashlib.sha256(self.files[self.dir_b / plugins.MANIFEST]).hexdigest(): 'non_verified'}
+        with mock.patch.object(plugins, '_owned_directory', lambda path: True), \
+                mock.patch.object(plugins, '_read_owned', self._read), \
+                self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            row_a = host._load(self.dir_a)
+            row_b = host._load(self.dir_b)
+            row_c = host._load(dir_c)
+        self.assertIsNotNone(health.poisoned)
+        self.assertEqual(row_a['plugin_id'], 'plugin.a')
+        for row, plugin_id in ((row_b, 'plugin.b'), (row_c, 'plugin.c')):
+            with self.subTest(plugin_id=plugin_id):
+                self.assertEqual((row['state'], row['code'], row['plugin_id']),
+                                 ('refused', 'core_poisoned_restart_required', plugin_id))
+        # The label the install recorded for b's manifest bytes; none recorded for c's, so none on its row.
+        self.assertEqual(row_b['registry_label'], 'non_verified')
+        self.assertNotIn('registry_label', row_c)
+        rows = _Rows([row_a, row_b, row_c])
+        for row, plugin_id in ((row_b, 'plugin.b'), (row_c, 'plugin.c')):
+            with self.subTest(status=plugin_id):
+                answer = plugins.PluginHost.status(rows, plugin_id)
+                self.assertEqual((answer['code'], answer['plugin']['source'], answer['plugin']['code']),
+                                 ('ok', row['source'], 'core_poisoned_restart_required'))
+
+    def test_after_a_poison_a_manifest_without_a_readable_id_gives_no_id(self):
+        cases = {
+            'unreadable': plugins.PluginRefused('plugin_file_unreadable', 'manifest.json: PermissionError'),
+            'not a regular file': plugins.PluginRefused(
+                'plugin_file_untrusted', 'manifest.json: must be an operator-owned regular file, not group/other '
+                                         'writable'),
+            'id outside the grammar': _manifest('Plugin.B'),
+            'id too short': _manifest('b'),
+            'not canonical': _manifest('plugin.b') + b' ',
+        }
+        for name, manifest in cases.items():
+            with self.subTest(case=name):
+                host, _ = self._poisoned_host()
+                files = dict(self.files)
+                files[self.dir_b / plugins.MANIFEST] = manifest
+                host._labels = {} if isinstance(manifest, Exception) else {
+                    hashlib.sha256(manifest).hexdigest(): 'verified'}
+
+                def read(path, limit, *, missing_ok=False, files=files):
+                    data = files.get(Path(path))
+                    if isinstance(data, Exception):
+                        raise data
+                    return None if data is None and missing_ok else data
+
+                with mock.patch.object(plugins, '_owned_directory', lambda path: True), \
+                        mock.patch.object(plugins, '_read_owned', read), \
+                        self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+                    row_a = host._load(self.dir_a)
+                    row_b = host._load(self.dir_b)
+                expected = manifest.code if isinstance(manifest, Exception) else 'core_poisoned_restart_required'
+                self.assertEqual((row_b['state'], row_b['code'], row_b['plugin_id']), ('refused', expected, None))
+                self.assertNotIn('registry_label', row_b)
+                self.assertEqual(plugins.PluginHost.status(_Rows([row_a, row_b]), 'plugin.b'),
+                                 {'code': 'plugin_unknown', 'detail': 'plugin.b'})
 
 
 if __name__ == '__main__':

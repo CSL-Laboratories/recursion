@@ -98,6 +98,8 @@ _GRANT_KEYS = frozenset({'plugin_id', 'artifact_sha256', 'signer_key_id', 'permi
 # before a newline, and a value that is not this whole text is refused.
 _INSTALL_KEY_ID = re.compile(r'ed25519:[0-9a-f]{32}')
 _SAFE_ID = re.compile(r'[^A-Za-z0-9_.-]')
+# The request's plugin_id (schemas/control/v1/methods.v1.json), the manifest's own grammar.
+_PLUGIN_ID = re.compile(r'[a-z][a-z0-9_.-]{1,63}')
 # O7 reads (ADV2-3). Uncalibrated defaults: a plugin call that has not answered by its deadline is
 # answered 504 and the plugin is marked degraded; a read that finds another one running waits this
 # long for its turn, then answers busy. A timed-out call cannot be stopped in-process, so while it
@@ -369,7 +371,10 @@ class PluginHost:
             label = self._labels.get(hashlib.sha256(manifest).hexdigest())
             loaded = self.loader.load(manifest, signature, artifact, registry_label=label)
         except (PluginRefused, Refused) as exc:
-            findings = list(self.loader.last_findings) if isinstance(exc, Refused) else []
+            # After a poison the loader refuses before it reads this manifest, and last_findings
+            # still holds the poisoning plugin's: they are not this directory's id or label.
+            own = isinstance(exc, Refused) and exc.code != 'core_poisoned_restart_required'
+            findings = list(self.loader.last_findings) if own else []
             record.update(code=exc.code, detail=exc.detail,
                           findings=findings + self._import_findings(before)
                           + [_finding(exc.code, 'refuse', exc.detail)])
@@ -460,7 +465,7 @@ class PluginHost:
         The registry label on that row is what the installer recorded for this manifest.
         On a loaded row it is ``unlisted`` when the install recorded none, or one for other bytes.
         """
-        if not isinstance(plugin_id, str) or not plugin_id:
+        if not isinstance(plugin_id, str) or _PLUGIN_ID.fullmatch(plugin_id) is None:
             return {'code': 'request_invalid', 'detail': 'plugin_id'}
         rows = [item for item in self.inventory()['plugins'] if item.get('plugin_id') == plugin_id]
         if not rows:

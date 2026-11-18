@@ -17,10 +17,21 @@ generation ``current`` named before it, when there was one. It is written and
 synced before that generation is renamed into place, so before any live folder
 changes, and removed once the live tree holds it whole. The next list, install
 or remove finishes that publish when ``.publishing`` names ``current``, and
-drops ``.publishing`` when it does not. It finishes it only when every live
-plugin folder is a whole copy from one of the two generations the record names:
-a folder or a link that is not refuses ``plugin_directory_untrusted`` with the
-steps that end the refusal, and nothing is moved or deleted. Older
+drops ``.publishing`` when it does not. A ``.publishing`` that is not in that
+form refuses with the steps that end the refusal.
+
+No publish, and no finish of a stopped one, removes a live entry it has not
+proven is its own: every live entry the swap would move (a folder, a file, a
+link or anything else under a name the generation writes, and every folder and
+link) must be a whole copy, file for file and byte for byte, of the entry of
+that name in one of the two generations the record names. One that is not
+refuses ``plugin_directory_untrusted`` with the steps that end the refusal, and
+nothing is moved or deleted. A plugin folder that holds anything its generation
+does not hold is not a whole copy. The swap moves each replaced entry into
+``plugin-generations/.old``, proves it again there and only then removes it.
+An entry that is not proven there (one put in place between the check and the
+swap) is kept under ``plugin-generations/.kept-<n>``, and the command says
+where and exits non-zero. Mode bits are not part of the proof. Older
 generations stay on disk so a later command can point ``current`` at one and
 publish it. This module does not do that. A generation that ``current`` does
 not name (a stop between its rename and the pointer) is left as it is; the next
@@ -399,43 +410,73 @@ def _finish_publish(config: Path) -> None:
     Without ``.publishing`` the live tree is as the last command left it, or as the user edited it,
     and nothing here touches it.
     """
-    record = _read_pointer(config, _PUBLISHING, _RECORD)
+    record = _read_record(config)
     if record is None:
         return
     publishing = int(record.group(1))
     root = config / "plugin-generations"
+    kept = []
     if publishing == _read_current(config):
         replaced = int(record.group(2)) if record.group(2) else None
-        _check_stopped_publish(config, (publishing, replaced))
-        _copy_generation_to_live(config, publishing)
+        sources = [root / str(number) for number in (publishing, replaced) if number is not None]
+        published = sources[0]
+        staged = set(os.listdir(published)) if os.path.isdir(published) else set()
+        _check_publish(config, sources, staged - _PROFILE_NAMES)
+        kept = _copy_generation_to_live(config, publishing, sources)
     _clear_marker(root)
+    _refuse_kept(kept)
 
 
-def _check_stopped_publish(config: Path, generations: tuple) -> None:
-    """Before a stopped publish is finished, prove every live plugin folder is the installer's.
+def _read_record(config: Path):
+    """The ``.publishing`` record. One this command cannot read refuses with the steps that end the refusal."""
+    try:
+        return _read_pointer(config, _PUBLISHING, _RECORD)
+    except InstallRefused as exc:
+        if exc.code not in ("generation_unreadable", "plugin_file_untrusted", "plugin_file_too_large"):
+            raise
+        path = config / "plugin-generations" / _PUBLISHING
+        raise InstallRefused(exc.code, detail=(f"The file {path} is not a publish record this command wrote. "
+                                               f"Move it out of {path.parent}; then run the command again."),
+                             show_detail=True) from None
 
-    A live folder is the installer's when it is a whole copy, file for file and byte for byte, of the
-    folder of that name in the generation being published or in the one it replaces: the two the
-    record names. Anything else, a link included, was placed by someone else: the command refuses with
-    the steps that end the refusal and nothing is moved or deleted.
+
+def _check_publish(config: Path, sources: list, staged: set) -> None:
+    """Before a publish changes the live tree, prove every live entry the swap would move is the installer's.
+
+    The swap moves every live entry under a name the generation writes, of any kind, and every folder and
+    link. Each must be a whole copy, file for file and byte for byte, of the entry of that name in one of
+    ``sources``: the generation being published and the one it replaces, the two the record names. A
+    folder that holds anything more, a file, a link or a FIFO is not: the command refuses with the steps
+    that end the refusal and nothing is moved or deleted. Nothing here opens an entry that is not a
+    regular file.
     """
     live = config / "plugins"
     if not _lexists(live):
         return
-    sources = [config / "plugin-generations" / str(number) for number in generations if number is not None]
     for name in sorted(os.listdir(live)):
         if name == "install.json":
             continue
         path = live / name
         info = os.lstat(path)
-        if not (stat.S_ISLNK(info.st_mode) or stat.S_ISDIR(info.st_mode)):
-            continue
-        if stat.S_ISLNK(info.st_mode) or not any(_same_tree(path, source / name) for source in sources):
+        if name not in staged and not (stat.S_ISLNK(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+            continue  # the swap leaves it where it is
+        if not any(_same_tree(path, source / name) for source in sources):
             raise _way_out(path)
 
 
+def _refuse_kept(kept: list) -> None:
+    """After a publish: say, in one line, where each entry the swap could not prove again is kept."""
+    if kept:
+        detail = " ".join(f"{live} was put in place while this command ran and was not deleted: it is kept at "
+                          f"{place}. Move it back or delete it yourself." for live, place in kept)
+        raise InstallRefused("plugin_directory_untrusted", detail=detail, show_detail=True)
+
+
 def _same_tree(live: Path, written: Path) -> bool:
-    """True when ``live`` holds the same folders and files, with the same bytes, as ``written``. No link."""
+    """True when ``live`` holds the same folders and files, with the same bytes, as ``written``. No link.
+
+    Only names, kinds and bytes are compared: mode bits are not part of the proof.
+    """
     try:
         seen, kept = os.lstat(live), os.lstat(written)
     except FileNotFoundError:
@@ -445,13 +486,17 @@ def _same_tree(live: Path, written: Path) -> bool:
         return names == sorted(os.listdir(written)) and all(_same_tree(live / name, written / name)
                                                             for name in names)
     if stat.S_ISREG(seen.st_mode) and stat.S_ISREG(kept.st_mode) and seen.st_size == kept.st_size:
-        return _bytes_of(live, seen.st_size) == _bytes_of(written, kept.st_size)
+        mine = _bytes_of(live, seen.st_size)
+        return mine is not None and mine == _bytes_of(written, kept.st_size)
     return False
 
 
-def _bytes_of(path: Path, size: int) -> bytes:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+def _bytes_of(path: Path, size: int) -> bytes | None:
+    """The bytes of a regular file; None when what is opened there is not one. The open never blocks."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | getattr(os, "O_NONBLOCK", 0))
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
         return _read_all(fd, size)
     finally:
         os.close(fd)
@@ -513,6 +558,9 @@ def _commit(config: Path, snapshot: Snapshot) -> int:
     os.chmod(partial, 0o700)
     try:
         _write_profile(partial, snapshot)
+        # Every live entry the swap would move is proven the installer's before anything is published.
+        sources = [partial] + ([root / str(current)] if current is not None else [])
+        _check_publish(config, sources, set(snapshot.plugins))
         # The record names this generation and the one it replaces, synced before any live folder changes.
         record = f"{number}\n" if current is None else f"{number}\n{current}\n"
         _atomic_replace(root, _PUBLISHING, record.encode("ascii"))
@@ -521,12 +569,13 @@ def _commit(config: Path, snapshot: Snapshot) -> int:
         _write_pointer(root, number)
         # The pointer names a complete generation before the live tree is touched.
         # If publishing raises, the next command publishes this generation: .publishing names it.
-        _copy_generation_to_live(config, number)
+        kept = _copy_generation_to_live(config, number, [dest] + sources[1:])
         _clear_marker(root)
     except Exception:
         if _lexists(partial) and not _lexists(dest):
             _remove_at(partial)
         raise
+    _refuse_kept(kept)
     return number
 
 
@@ -544,11 +593,13 @@ def _write_pointer(root: Path, number: int) -> None:
     _atomic_replace(root, "current", f"{number}\n".encode("ascii"))
 
 
-def _copy_generation_to_live(config: Path, generation: int) -> None:
+def _copy_generation_to_live(config: Path, generation: int, sources: list) -> list:
     """Replace the live ``plugins/`` tree with generation ``generation``.
 
     The stage directory is ``plugin-generations/.stage``, not a child of
-    ``plugins/``. A dot directory under ``plugins/`` would be loaded.
+    ``plugins/``. A dot directory under ``plugins/`` would be loaded. Each
+    replaced entry is removed only once it is proven again against ``sources``;
+    the rest is kept. Returns (live path, kept path) for each entry kept.
     """
     config = Path(config)
     source = config / "plugin-generations" / str(generation)
@@ -558,9 +609,12 @@ def _copy_generation_to_live(config: Path, generation: int) -> None:
     _check_live(config)
     stage = config / "plugin-generations" / ".stage"
     old = config / "plugin-generations" / ".old"
-    for leftover in (stage, old):
+    kept = []
+    for leftover in (stage, config / "plugin-generations" / ".proven"):
         if _lexists(leftover):
             _remove_at(leftover)
+    if _lexists(old):
+        kept += _settle(config, old, sources, generation)
     stage.mkdir(mode=0o700)
     os.chmod(stage, 0o700)
     try:
@@ -574,10 +628,72 @@ def _copy_generation_to_live(config: Path, generation: int) -> None:
         old.mkdir(mode=0o700)
         os.chmod(old, 0o700)
         _swap_into(plugins, stage, old)
+        kept += _settle(config, old, sources, generation)
+    except Exception:
+        # A failure part way: what the swap moved out is still proven before it is removed, and a
+        # kept entry is named. A stop of the process leaves .old for the next command to settle.
+        if _lexists(old):
+            _refuse_kept(kept + _settle(config, old, sources, generation))
+        raise
     finally:
-        for leftover in (stage, old):
-            if _lexists(leftover):
-                _remove_at(leftover)
+        if _lexists(stage):
+            _remove_at(stage)
+    return kept
+
+
+def _settle(config: Path, old: Path, sources: list, generation: int) -> list:
+    """Remove each entry the swap moved into ``old`` once it is proven again; keep the rest.
+
+    What is not a whole copy of its entry in ``sources`` was put in place after the check: ``old`` is
+    renamed, with it, to ``plugin-generations/.kept-<generation>`` (or the first free ``-<k>`` after it),
+    which no command removes. Returns (live path, kept path) for each entry kept.
+    """
+    names = sorted(os.listdir(old))
+    kept = [name for name in names if not any(_same_tree(old / name, source / name) for source in sources)]
+    # A proven entry is renamed whole into .proven before it is removed: a stop part way through a removal
+    # leaves only proven bytes there, which the next command removes without a second proof.
+    proven = old.parent / ".proven"
+    if _lexists(proven):
+        _remove_at(proven)
+    if len(kept) < len(names):
+        proven.mkdir(mode=0o700)
+        os.chmod(proven, 0o700)
+        for name in names:
+            if name not in kept:
+                _sync_tree(old / name)
+                os.rename(old / name, proven / name)
+        _sync_dir(proven)
+        _remove_at(proven)
+    if not kept:
+        os.rmdir(old)
+        return []
+    place = old.parent / f".kept-{generation}"
+    count = 1
+    while _lexists(place):
+        count += 1
+        place = old.parent / f".kept-{generation}-{count}"
+    _sync_tree(old)
+    os.rename(old, place)
+    _sync_dir(old.parent)
+    return [(config / "plugins" / name, place / name) for name in kept]
+
+
+def _sync_tree(path: Path) -> None:
+    """Sync every folder and regular file at and under ``path``, so a rename of it moves what is on disk.
+
+    Nothing else is opened: a link, a FIFO or a device is left as it is.
+    """
+    info = os.lstat(path)
+    if stat.S_ISDIR(info.st_mode):
+        for name in sorted(os.listdir(path)):
+            _sync_tree(path / name)
+        _sync_dir(path)
+    elif stat.S_ISREG(info.st_mode):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | getattr(os, "O_NONBLOCK", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def _check_live(config: Path) -> None:
@@ -868,7 +984,8 @@ def _atomic_replace(directory: Path, name: str, data: bytes) -> None:
 
 def _read_file(path: Path, limit: int) -> bytes:
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        # O_NONBLOCK: a FIFO opens at once and is refused below, so no command waits on one holding the lock.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | getattr(os, "O_NONBLOCK", 0))
     except OSError as exc:
         raise InstallRefused("plugin_file_untrusted", detail=type(exc).__name__) from None
     try:

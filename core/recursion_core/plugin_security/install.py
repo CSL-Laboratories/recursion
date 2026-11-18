@@ -11,12 +11,25 @@ plugin, including a dot directory.
 
 ``current`` is an ASCII integer and a newline, matching ``^[1-9][0-9]*\\n$``.
 It is written only after generation ``n`` is complete. The live ``plugins/``
-tree is published after that. The next list, install or remove publishes
-``current`` again when that publish did not finish. Older generations stay on
-disk so a later command can point ``current`` at one and publish it. This
-module does not do that. A generation that ``current`` does not name (a stop
-between its rename and the pointer) is left as it is; the next command takes
-the number after every generation on disk.
+tree is published after that. ``plugin-generations/.publishing`` names, in the
+same form, the generation a command publishes: it is written before that
+generation is renamed into place and removed once the live tree holds it whole.
+The next list, install or remove finishes that publish when ``.publishing``
+names ``current``, and drops ``.publishing`` when it does not. Older
+generations stay on disk so a later command can point ``current`` at one and
+publish it. This module does not do that. A generation that ``current`` does
+not name (a stop between its rename and the pointer) is left as it is; the next
+command takes the number after every generation on disk.
+
+The live ``plugins/`` tree is the truth. Every command reads the trusted keys,
+grants, reserved names and labels from the live ``install.json`` the daemon
+reads and carries them unchanged into the next generation: a key or a grant
+taken out by hand stays out, and one put in by hand stays in. A plugin folder
+taken out by hand stays out. Once a generation is current, every live plugin
+folder must be the copy this module wrote there. A folder it did not write, or
+a folder whose name is not its manifest's plugin id, refuses
+``plugin_directory_untrusted``, names the folder and the id and says the steps
+that end the refusal; nothing is written and nothing is renamed.
 
 Every check of the live ``plugins/`` path runs before a generation is written,
 so a refused command leaves ``current`` and the generations as they were. The
@@ -62,6 +75,8 @@ _CURRENT = re.compile(r"[1-9][0-9]*\n")
 _GENERATION = re.compile(r"[1-9][0-9]{0,17}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _KEY_ID = re.compile(r"ed25519:[0-9a-f]{32}")
+# Names the generation a command publishes, until the live tree holds it whole.
+_PUBLISHING = ".publishing"
 # Names the profile itself uses inside a generation and inside plugins/: never a plugin id.
 _PROFILE_NAMES = frozenset({"install.json"})
 _LABELS = frozenset({"verified", "non_verified"})
@@ -90,11 +105,14 @@ _DEVELOPER_CHECKS = (
 class InstallRefused(Exception):
     """The install, list or remove did not change the profile. ``code`` is stable."""
 
-    def __init__(self, code: str, codes: list[str] | None = None, detail: str = "") -> None:
+    def __init__(self, code: str, codes: list[str] | None = None, detail: str = "", *,
+                 show_detail: bool = False) -> None:
         super().__init__(code if not detail else f"{code}: {detail}")
         self.code = code
         self.codes = list(codes) if codes else [code]
         self.detail = detail
+        # The command line prints the detail under the code: it tells the user how to end the refusal.
+        self.show_detail = show_detail
 
 
 @dataclass
@@ -154,7 +172,7 @@ def list_plugins(config: os.PathLike | str, *, state: os.PathLike | str | None =
     config_path = Path(config)
     fd = _lock(config_path, wait=wait)
     try:
-        _publish_current(config_path)
+        _finish_publish(config_path)
         return {"command": "list", "plugins": _rows(_load_snapshot(config_path))}
     finally:
         os.close(fd)
@@ -170,6 +188,7 @@ def remove_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLi
         raise InstallRefused("plugin_not_installed")
     fd = _lock(config_path, wait=wait)
     try:
+        _finish_publish(config_path)
         snapshot = _load_snapshot(config_path)
         if plugin_id not in snapshot.plugins:
             raise InstallRefused("plugin_not_installed")
@@ -232,6 +251,7 @@ def _install_locked(config: Path, chosen, plugin_id: str, state) -> dict:
     if chosen.label not in _LABELS:
         raise InstallRefused("release_label")
     signature_text = chosen.signature_text
+    _finish_publish(config)
     snapshot = _load_snapshot(config)
     trust_name, reason, grants, findings = _admit(snapshot, manifest, signature_text, chosen.artifact,
                                                    chosen.label, state)
@@ -367,19 +387,36 @@ def _make_dir(path: Path) -> None:
     os.chmod(path, 0o700)
 
 
-def _publish_current(config: Path) -> None:
-    current = _read_current(config)
-    if current is None:
+def _finish_publish(config: Path) -> None:
+    """Finish a publish that stopped, or drop the marker of one that never reached the pointer.
+
+    Without ``.publishing`` the live tree is as the last command left it, or as the user edited it,
+    and nothing here touches it.
+    """
+    publishing = _read_number(config, _PUBLISHING)
+    if publishing is None:
         return
-    _copy_generation_to_live(config, current)
+    root = config / "plugin-generations"
+    if publishing == _read_current(config):
+        _copy_generation_to_live(config, publishing)
+    _clear_marker(root)
+
+
+def _clear_marker(root: Path) -> None:
+    os.unlink(root / _PUBLISHING)
+    _sync_dir(root)
 
 
 def _read_current(config: Path) -> int | None:
+    return _read_number(config, "current")
+
+
+def _read_number(config: Path, name: str) -> int | None:
     root = config / "plugin-generations"
     if not _lexists(root):
         return None
     _require_owned_dir(root)
-    pointer = root / "current"
+    pointer = root / name
     if not _lexists(pointer):
         return None
     if pointer.is_symlink():
@@ -413,12 +450,14 @@ def _commit(config: Path, snapshot: Snapshot) -> int:
     os.chmod(partial, 0o700)
     try:
         _write_profile(partial, snapshot)
+        _atomic_replace(root, _PUBLISHING, f"{number}\n".encode("ascii"))
         os.rename(partial, dest)
         _sync_dir(root)
         _write_pointer(root, number)
         # The pointer names a complete generation before the live tree is touched.
-        # If publishing raises, the next command publishes this generation.
+        # If publishing raises, the next command publishes this generation: .publishing names it.
         _copy_generation_to_live(config, number)
+        _clear_marker(root)
     except Exception:
         if _lexists(partial) and not _lexists(dest):
             _remove_at(partial)
@@ -510,21 +549,39 @@ def _swap_into(plugins: Path, stage: Path, old: Path) -> None:
 
 
 def _load_snapshot(config: Path) -> Snapshot:
+    """The live ``plugins/`` tree: its install.json and its plugin folders.
+
+    Once a generation is current, each live plugin folder must be the copy written into it.
+    """
     current = _read_current(config)
-    if current is None:
-        live = config / "plugins"
-        if not _lexists(live):
-            return Snapshot()
-        if live.is_symlink():
-            raise InstallRefused("plugin_directory_untrusted")
-        return _read_profile(live, missing_install_ok=True)
-    path = config / "plugin-generations" / str(current)
-    if not _lexists(path):
-        raise InstallRefused("generation_missing")
-    return _read_profile(path, missing_install_ok=False)
+    written = None
+    if current is not None:
+        path = config / "plugin-generations" / str(current)
+        if not _lexists(path):
+            raise InstallRefused("generation_missing")
+        written = _read_profile(path, missing_install_ok=False).plugins
+    live = config / "plugins"
+    if not _lexists(live):
+        return Snapshot()
+    if live.is_symlink():
+        raise InstallRefused("plugin_directory_untrusted")
+    return _read_profile(live, missing_install_ok=True, written=written)
 
 
-def _read_profile(directory: Path, *, missing_install_ok: bool) -> Snapshot:
+def _way_out(path: Path, plugin_id: str | None = None) -> InstallRefused:
+    """The refusal of a live plugin folder this module did not write, with the steps that end it."""
+    if plugin_id is not None and plugin_id != path.name:
+        detail = (f"The folder {path} holds the plugin {plugin_id}. Rename the folder to {plugin_id}, "
+                  f"or move it out of the plugins directory; then run the command again.")
+    else:
+        detail = (f"The folder {path} is not a plugin this command installed. "
+                  f"Move it out of the plugins directory; then run the command again.")
+    return InstallRefused("plugin_directory_untrusted", detail=detail, show_detail=True)
+
+
+def _read_profile(directory: Path, *, missing_install_ok: bool, written: dict | None = None) -> Snapshot:
+    # missing_install_ok is True for the live plugins/ tree only. ``written`` holds the current
+    # generation's plugins, against which each live folder is checked.
     _require_owned_dir(directory, "generation_unreadable" if not missing_install_ok else "plugin_directory_untrusted")
     install_path = directory / "install.json"
     if not _lexists(install_path):
@@ -552,7 +609,15 @@ def _read_profile(directory: Path, *, missing_install_ok: bool) -> Snapshot:
             continue
         if not _plugin_id_ok(name):
             raise InstallRefused("plugin_directory_untrusted")
-        plugins[name] = _read_plugin(path)
+        try:
+            plugin = _read_plugin(path, live=missing_install_ok)
+        except InstallRefused as exc:
+            if written is None or name in written or exc.show_detail:
+                raise
+            raise _way_out(path) from None
+        if written is not None and plugin != written.get(name):
+            raise _way_out(path)
+        plugins[name] = plugin
     return Snapshot(parsed["trusted_keys"], parsed["grants"], parsed["hosts"], parsed["prefixes"],
                     parsed["anchor"], parsed["labels"], plugins, parsed["developer_key_ids"])
 
@@ -562,7 +627,7 @@ def _empty_install() -> dict:
             "developer_key_ids": {}}
 
 
-def _read_plugin(directory: Path) -> StoredPlugin:
+def _read_plugin(directory: Path, *, live: bool = False) -> StoredPlugin:
     _require_owned_dir(directory)
     manifest = _read_file(directory / "manifest.json", _MAX_MANIFEST)
     artifact = _read_file(directory / "plugin.py", _MAX_ARTIFACT)
@@ -577,6 +642,8 @@ def _read_plugin(directory: Path) -> StoredPlugin:
     except Refused as exc:
         raise InstallRefused("generation_unreadable", detail=exc.code) from None
     if parsed.plugin_id != directory.name:
+        if live:
+            raise _way_out(directory, parsed.plugin_id)
         raise InstallRefused("generation_unreadable")
     return StoredPlugin(manifest, artifact, signature)
 

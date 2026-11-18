@@ -1,7 +1,11 @@
 """Command line for ``recursion plugin install``, ``list`` and ``remove``.
 
 The program name is ``recursion``. A refusal prints ``refused: CODE`` on stderr
-and returns 1. A usage error returns 2. Nothing here fetches.
+and returns 1; a refusal that says how to end it prints that sentence on the
+next line. A read or write the system refuses (a full or read-only disk, no
+permission, a path that is not a folder) prints ``refused: filesystem_refused``
+and the system's message, with no traceback, and returns 1. A usage error
+returns 2. Nothing here fetches.
 """
 
 from __future__ import annotations
@@ -92,6 +96,14 @@ def main(argv: list[str] | None = None, out=None, err=None) -> int:
     except InstallRefused as exc:
         for code in exc.codes:
             err.write(f"refused: {code}\n")
+        if exc.show_detail:
+            err.write(f"{exc.detail}\n")
+        return 1
+    except OSError as exc:
+        # The installer's own code. What was written stays as after a stop of the process: the next
+        # command finishes or drops the stopped publish.
+        err.write("refused: filesystem_refused\n")
+        err.write(f"The system refused a file read or write: {exc}\n")
         return 1
     out.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return 0

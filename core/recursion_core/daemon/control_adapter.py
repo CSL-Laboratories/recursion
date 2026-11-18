@@ -381,12 +381,14 @@ class RouteStarter:
                 self._active.pop(ctx.run_id, None)
 
     def _record_result(self, run_id, result):
+        path = self._state / 'runs' / run_id / 'result.json'
+        tmp = path.with_name('result.json.tmp')
         try:
-            path = self._state / 'runs' / run_id / 'result.json'
-            tmp = path.with_name('result.json.tmp')
             fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-                json.dump(result, handle, sort_keys=True)
+                # Non-finite numbers are not JSON. A value that cannot be serialised raises here,
+                # before the rename, and the temp name is removed below.
+                json.dump(result, handle, sort_keys=True, allow_nan=False)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, path)
@@ -396,6 +398,10 @@ class RouteStarter:
             finally:
                 os.close(folder)
         except (OSError, TypeError, ValueError):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             log.exception('route result for %s was not written', run_id)
             with self._lock:
                 self.results[run_id] = result

@@ -1,8 +1,11 @@
 """The registry refuses a file it cannot read, has one writer, and books no end it did not see.
 
-Red tests of the sweep triage of daemon (STOP, CSL-238), entries E15, E14, E11, E12 and E32: each fails on
-master without the change in ``daemon/__init__.py`` and ``control_adapter.py`` and passes with it. Every
-fixture is synthetic and lies below a temporary folder; the host manager is replaced and no process is signalled.
+Defect tests of the sweep triage of daemon (STOP, CSL-238), entries E15, E14, E11, E12 and E32, fail on
+master without the change in ``daemon/__init__.py`` and ``control_adapter.py`` and pass with it. Four
+controls pass on master as well: a complete registry still opens, the folder is free once its registry
+is released, a failed rename leaves no owed directory sync, and an ended unit whose recorded cgroup
+walked empty is still terminated. Every fixture is synthetic and lies below a temporary folder; the host
+manager is replaced and no process is signalled.
 """
 from contextlib import closing
 import errno
@@ -74,7 +77,7 @@ class RegistryWriterTest(unittest.TestCase):
             db.execute('PRAGMA user_version=1')
             db.commit()
         before = target.read_bytes()
-        refused = []  # kept, so the refused registries stay alive: only a close, not a garbage collection, frees the lock
+        refused = []  # two refusals; a refused open has already released its descriptor
         for _ in range(2):
             try:
                 self.store(partial)
@@ -235,6 +238,259 @@ class RegistryWriterTest(unittest.TestCase):
         with mock.patch.object(adapter.os, 'fsync', refuse_folder):
             starter._record_result('run-one', {'status': 'ok', 'code': None})
         self.assertEqual(starter.results['run-one'], {'status': 'ok', 'code': None})
+
+    # -- answers: column order and types, the directory lease, an unfinished walk, a reader -----------
+    _CANON = (
+        'run_id TEXT PRIMARY KEY, unit TEXT UNIQUE NOT NULL, stop INTEGER NOT NULL, '
+        'state TEXT NOT NULL, boot_id TEXT, detail TEXT NOT NULL, created REAL NOT NULL, '
+        'updated REAL NOT NULL')
+
+    def plant_runs(self, name, columns):
+        directory = self.root / name
+        directory.mkdir(mode=0o700)
+        target = directory / 'runs.sqlite3'
+        with closing(sqlite3.connect(target)) as db:
+            db.execute(f'CREATE TABLE runs ({columns})')
+            db.execute('PRAGMA user_version=1')
+            db.commit()
+        os.chmod(target, 0o600)
+        return directory
+
+    def test_a_reordered_runs_table_is_refused_at_open(self):
+        directory = self.plant_runs('reordered', (
+            'unit TEXT UNIQUE NOT NULL, run_id TEXT PRIMARY KEY, stop INTEGER NOT NULL, '
+            'state TEXT NOT NULL, boot_id TEXT, detail TEXT NOT NULL, created REAL NOT NULL, '
+            'updated REAL NOT NULL'))
+        with self.assertRaises(core.RegistryIntegrityError):
+            self.store(directory)
+
+    def test_an_extra_runs_column_is_refused_at_open(self):
+        directory = self.plant_runs('extra', self._CANON + ', extra TEXT')
+        with self.assertRaises(core.RegistryIntegrityError):
+            self.store(directory)
+
+    def test_a_text_stop_column_is_refused_at_open(self):
+        directory = self.plant_runs('stoptext', self._CANON.replace(
+            'stop INTEGER NOT NULL', 'stop TEXT NOT NULL', 1))
+        with self.assertRaises(core.RegistryIntegrityError):
+            self.store(directory)
+
+    def test_removing_the_owner_file_does_not_admit_a_second_writer(self):
+        first = self.store()
+        first.add('target', 'boot-a')
+        first.request_stop('target')
+        os.unlink(first.directory / 'owner.lock')
+        with self.assertRaises(core.AlreadyRunning):
+            self.store(first.directory)
+        with closing(sqlite3.connect(first.path)) as db:
+            row = db.execute("SELECT stop, state FROM runs WHERE run_id='target'").fetchone()
+        self.assertEqual(row, (1, 'stopping'))
+
+    def test_the_writer_refusal_is_the_folder_lease(self):
+        first = self.store()
+        with self.assertRaises(core.RegistryAlreadyRunning) as caught:
+            core.Registry(first.directory)
+        self.assertIsInstance(caught.exception, core.AlreadyRunning)
+        self.assertIsNot(type(caught.exception), core.AlreadyRunning)
+
+    def test_a_read_only_registry_reads_beside_the_writer(self):
+        first = self.store()
+        first.add('one', 'boot-a')
+        reader = core.Registry(first.directory, read_only=True)
+        self.addCleanup(reader.close)
+        self.assertEqual([run.run_id for run in reader.all()], ['one'])
+        self.assertFalse(reader.read_only is False)
+        with self.assertRaises(RuntimeError):
+            reader.add('two', 'boot-a')
+        self.assertEqual([run.run_id for run in first.all()], ['one'])
+
+    def test_an_existing_owner_file_is_made_private(self):
+        directory = self.root / 'wide'
+        directory.mkdir(mode=0o700)
+        lock = directory / 'owner.lock'
+        lock.write_bytes(b'')
+        os.chmod(lock, 0o644)
+        self.store(directory)
+        self.assertEqual(stat.S_IMODE(lock.lstat().st_mode), 0o600)
+
+    def test_a_symlinked_owner_file_is_refused(self):
+        directory = self.root / 'linked'
+        directory.mkdir(mode=0o700)
+        other = self.root / 'elsewhere'
+        other.write_bytes(b'secret')
+        (directory / 'owner.lock').symlink_to(other)
+        with self.assertRaises(OSError):
+            self.store(directory)
+        self.assertEqual(other.read_bytes(), b'secret')
+
+    def test_a_fifo_owner_file_is_refused(self):
+        directory = self.root / 'fifo'
+        directory.mkdir(mode=0o700)
+        os.mkfifo(directory / 'owner.lock', 0o600)
+        with self.assertRaises(OSError):
+            self.store(directory)
+
+    def ended_with_record(self, document, manager=None, *, cgroup_root=None):
+        directory = self.root / f'state-{len(list(self.root.glob("state-*")))}'
+        store = self.store(directory)
+        store.add('one', 'boot-a')
+        if document is not None:
+            store.control_put('one', document)
+        if manager is None:
+            manager = core.SystemdUserManager(cgroup_root or (self.root / 'cgroups'))
+            manager._call = mock.Mock(return_value=(
+                'LoadState=loaded\nActiveState=inactive\nSubState=dead\n'
+                'ControlGroup=\nInvocationID=abc\nJob=0\nMainPID=0\n'
+                'ExecMainStartTimestampMonotonic=1\n'))
+            manager._kill_recorded_cgroup = mock.Mock(return_value=False)
+        return core.Daemon(store, manager, lambda: 'boot-a'), manager
+
+    def test_an_unwalkable_recorded_cgroup_stays_unknown(self):
+        unit = 'recursion-run-one.service'
+        group = '/old-manager/' + unit
+        root = self.root / 'cgroups' / 'old-manager' / unit
+        root.mkdir(parents=True)
+        (root / 'cgroup.procs').write_text('')
+        (root / 'cgroup.events').write_text('populated 0\n')
+        nested = root
+        for index in range(70):
+            nested = nested / str(index)
+            nested.mkdir()
+            (nested / 'cgroup.procs').write_text('')
+            (nested / 'cgroup.events').write_text('populated 0\n')
+        daemon, manager = self.ended_with_record(json.dumps({'cgroup': group}))
+        run = daemon.reconcile('one')
+        self.assertEqual(run.state, 'unknown')
+        self.assertNotIn(run.state, core.TERMINAL)
+        self.assertIn(core.CGROUP_UNREAD, run.detail)
+        manager._kill_recorded_cgroup.assert_not_called()
+
+        link_root = self.root / 'cgroups-link'
+        real = link_root / 'real'
+        real.mkdir(parents=True)
+        (real / 'cgroup.procs').write_text(str(os.getpid()) + '\n')
+        (real / 'cgroup.events').write_text('populated 1\n')
+        parent = link_root / 'old-manager'
+        parent.mkdir()
+        (parent / unit).symlink_to(real, target_is_directory=True)
+        daemon, manager = self.ended_with_record(json.dumps({'cgroup': group}), cgroup_root=link_root)
+        run = daemon.reconcile('one')
+        self.assertEqual(run.state, 'unknown', 'a symlink is not a walked cgroup')
+        manager._kill_recorded_cgroup.assert_not_called()
+
+        file_root = self.root / 'cgroups-file'
+        file_parent = file_root / 'old-manager'
+        file_parent.mkdir(parents=True)
+        (file_parent / unit).write_text('not a directory')
+        daemon, _manager = self.ended_with_record(json.dumps({'cgroup': group}), cgroup_root=file_root)
+        self.assertEqual(daemon.reconcile('one').state, 'unknown')
+
+        daemon, _manager = self.ended_with_record('not-json')
+        run = daemon.reconcile('one')
+        self.assertEqual(run.state, 'unknown')
+        self.assertIn(core.CGROUP_UNREAD, run.detail)
+
+        class Raiser:
+            def stop(self, _unit):
+                return None
+
+            def observe(self, _unit):
+                return 'empty'
+
+            def processes_gone(self, _unit):
+                return True
+
+            def owned_units(self):
+                return set()
+
+            def recorded_cgroup_live(self, _unit, _group):
+                raise PermissionError('unread')
+
+        daemon, _manager = self.ended_with_record(json.dumps({'cgroup': group}), Raiser())
+        self.assertEqual(daemon.reconcile('one').state, 'unknown')
+
+        class NoLook:
+            def stop(self, _unit):
+                return None
+
+            def observe(self, _unit):
+                return 'empty'
+
+            def processes_gone(self, _unit):
+                return True
+
+            def owned_units(self):
+                return set()
+
+        daemon, _manager = self.ended_with_record(json.dumps({'cgroup': group}), NoLook())
+        self.assertEqual(daemon.reconcile('one').state, 'unknown')
+
+    def test_a_truthy_cgroup_read_is_not_treated_as_alive(self):
+        class Odd:
+            def stop(self, _unit):
+                return None
+
+            def observe(self, _unit):
+                return 'empty'
+
+            def processes_gone(self, _unit):
+                return True
+
+            def owned_units(self):
+                return set()
+
+            def recorded_cgroup_live(self, _unit, _group):
+                return 1
+
+        unit = 'recursion-run-one.service'
+        daemon, manager = self.ended_with_record(json.dumps({'cgroup': '/old/' + unit}), Odd())
+        run = daemon.reconcile('one')
+        self.assertEqual(run.state, 'unknown')
+        self.assertNotEqual(run.state, 'running')
+        self.assertIs(manager.recorded_cgroup_live(unit, '/old/' + unit), 1)
+
+    def test_a_recorded_cgroup_for_another_unit_is_not_walked(self):
+        unit = 'recursion-run-two.service'
+        group = '/old-manager/' + unit
+        directory = self.root / 'cgroups' / group.lstrip('/')
+        directory.mkdir(parents=True)
+        (directory / 'cgroup.procs').write_text('')
+        (directory / 'cgroup.events').write_text('populated 0\n')
+        daemon, manager = self.ended_with_record(json.dumps({'cgroup': group}))
+        run = daemon.reconcile('one')
+        self.assertEqual(run.state, 'unknown')
+        self.assertIn(core.CGROUP_UNREAD, run.detail)
+        manager._kill_recorded_cgroup.assert_not_called()
+        self.assertIsNone(manager.recorded_cgroup_live('recursion-run-one.service', group))
+
+    def test_a_recorded_cgroup_path_with_a_parent_dot_is_not_walked(self):
+        unit = 'recursion-run-one.service'
+        group = '/a/../' + unit
+        daemon, manager = self.ended_with_record(json.dumps({'cgroup': group}))
+        run = daemon.reconcile('one')
+        self.assertEqual(run.state, 'unknown')
+        manager._kill_recorded_cgroup.assert_not_called()
+        self.assertIsNone(manager.recorded_cgroup_live(unit, group))
+
+    def test_a_non_finite_result_is_kept_and_leaves_no_temp(self):
+        folder = self.root / 'runs' / 'run-one'
+        folder.mkdir(parents=True, mode=0o700)
+        starter = adapter.RouteStarter(None, {}, None, self.root)
+        for value in (float('nan'), float('inf')):
+            starter.results.clear()
+            starter._record_result('run-one', {'status': 'ok', 'value': value})
+            self.assertIn('run-one', starter.results)
+            self.assertFalse((folder / 'result.json').exists(), value)
+            self.assertFalse((folder / 'result.json.tmp').exists(), value)
+
+    def test_an_unserialisable_result_leaves_no_temp(self):
+        folder = self.root / 'runs' / 'run-one'
+        folder.mkdir(parents=True, mode=0o700)
+        starter = adapter.RouteStarter(None, {}, None, self.root)
+        starter._record_result('run-one', {'status': 'ok', 'value': {1, 2}})
+        self.assertEqual(starter.results['run-one']['value'], {1, 2})
+        self.assertFalse((folder / 'result.json').exists())
+        self.assertFalse((folder / 'result.json.tmp').exists())
 
 
 if __name__ == '__main__':

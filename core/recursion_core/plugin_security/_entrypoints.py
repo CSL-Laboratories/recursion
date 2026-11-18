@@ -1,7 +1,9 @@
-"""Command line for ``recursion plugin install``, ``list`` and ``remove``.
+"""Command line for ``recursion plugin``.
 
 The program name is ``recursion``. A refusal prints ``refused: CODE`` on stderr
-and returns 1. A usage error returns 2. Nothing here fetches.
+and returns 1. A usage error returns 2. ``install --git`` reads one local bare
+repository. The entry URL is not fetched. Nothing from the fetched tree is
+executed. ``enable``, ``disable`` and ``rollback`` are one command each.
 """
 
 from __future__ import annotations
@@ -12,7 +14,10 @@ import os
 import sys
 from pathlib import Path
 
-from .install import InstallRefused, install_plugin, list_plugins, remove_plugin
+from .install import (
+    InstallRefused, disable_plugin, enable_plugin, install_plugin, list_plugins, remove_plugin,
+    rollback_generation,
+)
 
 __all__ = ["main"]
 
@@ -54,6 +59,7 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument("--registry", required=True)
     install.add_argument("--plugin", required=True)
     install.add_argument("--version")
+    install.add_argument("--git", help="local bare repository")
     install.add_argument("--config")
     install.add_argument("--state")
 
@@ -67,6 +73,23 @@ def _parser() -> argparse.ArgumentParser:
     remove.add_argument("--plugin", required=True)
     remove.add_argument("--config")
     remove.add_argument("--state")
+
+    enable = commands.add_parser("enable")
+    enable.error = _error  # type: ignore[method-assign]
+    enable.add_argument("--plugin", required=True)
+    enable.add_argument("--config")
+    enable.add_argument("--state")
+
+    disable = commands.add_parser("disable")
+    disable.error = _error  # type: ignore[method-assign]
+    disable.add_argument("--plugin", required=True)
+    disable.add_argument("--config")
+    disable.add_argument("--state")
+
+    rollback = commands.add_parser("rollback")
+    rollback.error = _error  # type: ignore[method-assign]
+    rollback.add_argument("--config")
+    rollback.add_argument("--state")
     return parser
 
 
@@ -79,16 +102,23 @@ def main(argv: list[str] | None = None, out=None, err=None) -> int:
     try:
         args = _parser().parse_args(argv)
     except _Usage as exc:
-        err.write(f"usage: recursion plugin install|list|remove ({exc})\n")
+        err.write(f"usage: recursion plugin install|list|remove|enable|disable|rollback ({exc})\n")
         return 2
     try:
         if args.command == "install":
             result = install_plugin(_config_dir(args.config), args.registry, args.plugin,
-                                    version=args.version, state=_state_dir(args.state))
+                                    version=args.version, state=_state_dir(args.state),
+                                    git_repository=args.git)
         elif args.command == "list":
             result = list_plugins(_config_dir(args.config), state=_state_dir(args.state))
-        else:
+        elif args.command == "remove":
             result = remove_plugin(_config_dir(args.config), args.plugin, state=_state_dir(args.state))
+        elif args.command == "enable":
+            result = enable_plugin(_config_dir(args.config), args.plugin, state=_state_dir(args.state))
+        elif args.command == "disable":
+            result = disable_plugin(_config_dir(args.config), args.plugin, state=_state_dir(args.state))
+        else:
+            result = rollback_generation(_config_dir(args.config), state=_state_dir(args.state))
     except InstallRefused as exc:
         for code in exc.codes:
             err.write(f"refused: {code}\n")

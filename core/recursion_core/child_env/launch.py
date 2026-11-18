@@ -37,7 +37,11 @@ def spawn(
     popen: Callable[..., subprocess.Popen] = subprocess.Popen,
     **popen_kwargs: object,
 ) -> subprocess.Popen:
-    """Start one engine child with exactly ``env``. Raises ``TypeError`` or ``EnvRefused`` before any spawn."""
+    """Start one engine child with exactly ``env``. Raises ``TypeError`` or ``EnvRefused`` before any spawn.
+
+    When the caller does not pass ``stdin``, the child gets ``subprocess.DEVNULL``. An explicit
+    ``stdin``, including ``subprocess.PIPE``, is passed through.
+    """
 
     if not _posix_supported():
         raise EnvRefused(None, "platform_unsupported")
@@ -56,6 +60,9 @@ def spawn(
     kwargs.update(env=child_env, cwd=cwd, close_fds=True, shell=False)
     if os.name != "nt":
         kwargs["start_new_session"] = True
+    if "stdin" not in kwargs:
+        # A missing stdin must not inherit the caller's terminal. An explicit value stays.
+        kwargs["stdin"] = subprocess.DEVNULL
     return popen([executable, *argv[1:]], **kwargs)
 
 

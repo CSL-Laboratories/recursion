@@ -239,8 +239,12 @@ class TrustStore:
         updated even when the durable write fails or there is no store, and then
         ``revocation_not_durable`` is raised. A ``sqlite3`` error is that refusal; it
         does not escape the method. After that refusal the handle answers at least one
-        past the stored row whenever the row can still be read as an integer, as a
-        written revoke would, so a grant citing the row's generation does not apply.
+        past the row as it read the row just after the refusal, whenever that read
+        succeeds and gives an integer, as a written revoke would, so a grant citing that
+        row's generation does not apply. That read is one snapshot outside a
+        transaction: a revoke another handle commits after it is not seen, the same as
+        on the success path, and the handle may then answer that later revocation's
+        generation until its own next revoke reads the row again.
 
         The generation returned is one past the stored row, and never below this
         handle's own next number (a failed write leaves memory ahead of the row), so
@@ -269,8 +273,10 @@ class TrustStore:
             return stored
 
     def _take_up_stored(self, kid: str) -> None:
-        """After a refused write, answer at least one past the stored row.
+        """After a refused write, answer at least one past the row as read here.
 
+        The row is read once, after the refusal and outside a transaction: a revoke
+        another handle commits after that read is not seen (see ``revoke``).
         Another handle on the same store may have moved the row past this handle's own
         number; memory takes the larger of its own number and the row + 1, the way
         ``_advance`` takes the next generation, and is never lowered. Best effort: a read

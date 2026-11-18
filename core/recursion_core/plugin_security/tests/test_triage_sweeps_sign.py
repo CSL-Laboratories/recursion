@@ -521,5 +521,42 @@ class RefusedWriteTakesUpTheRowTests(unittest.TestCase):
                 self.assertEqual(b.generation(KID), 1)
                 self.assertIn(KID, b.revoked)  # the key stays revoked in memory
 
+    def test_the_loader_answers_as_the_helper_when_the_manifests_own_key_was_refused(self):
+        # The loader's own lookup, which the helper does not exercise: PluginLoader derives the
+        # key id from the manifest's developer key and asks the trust store for its generation.
+        # Here that key id is the one A revoked five times and B's refused write revoked again.
+        source = b"VALUE = 1\n"
+        developer_key = "33" * 32
+        dev_kid = key_id(developer_key)
+        path = _store(self)
+        a = TrustStore({}, revocation_store=path)
+        b = TrustStore({}, revocation_store=path)  # opened before A revokes
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        self.assertEqual([a.revoke(dev_kid) for _ in range(5)], [1, 2, 3, 4, 5])
+        b._db.execute("PRAGMA query_only=ON")  # the INSERT fails; the SELECT before it ran
+        with self.assertRaises(Refused) as caught:
+            b.revoke(dev_kid)
+        self.assertEqual(caught.exception.code, "revocation_not_durable")
+        self.assertEqual(b.generation(dev_kid), 6)
+        manifest = canonical({
+            "schema": "csl-plugin-manifest/vNext", "plugin_id": "demo.plugin", "version": "1.0.0",
+            "artifact_sha256": hashlib.sha256(source).hexdigest(), "dependency_lock_sha256": "0" * 64,
+            "install_scripts": [], "developer_key": developer_key, "permissions": ["read", "propose", "order"],
+            "network_destinations": [], "credential_refs": []})
+        for cited, order in ((5, False), (6, True)):
+            with self.subTest(cited=cited):
+                grant = Grant("demo.plugin", hashlib.sha256(source).hexdigest(), None,
+                              ("read", "propose", "order"), unsigned_order_acknowledged=True,
+                              order_after_revoked_key=dev_kid, order_after_revocation_generation=cited)
+                loader = PluginLoader(b, {"demo.plugin": grant}, ReservedEffects(), CoreHealth())
+                findings = loader.doctor(manifest, None, source)
+                codes = [f["code"] for f in findings]
+                effective = [f["detail"] for f in findings if f["code"] == "effective_permissions"]
+                self.assertEqual(effective, ["read,propose,order" if order else "read,propose"])
+                self.assertEqual("signer_key_revoked_order_off" in codes, not order)
+                # the same answer as the helper gives for the generation B answers
+                self.assertEqual(self._order_for_a_grant_citing(cited, b.generation(dev_kid)), order)
+
 if __name__ == "__main__":
     unittest.main()

@@ -368,5 +368,72 @@ class SelfTests(unittest.TestCase):
         self.assertTrue(cc.read_cutoff(ROOT / "tools" / "comment_cutoff.json"))
 
 
+class ThreadAnswerTests(Base):
+    def test_a_clean_file_with_a_space_in_its_name_passes(self):
+        self.assertPasses(self.add("x = 1\n", "tools/local helper.py"))
+
+    def test_a_comment_in_a_file_with_a_space_in_its_name_is_refused(self):
+        lines = self.assertRefuses(self.add("x = 1  # new\n", "tools/local helper.py"), 1)
+        self.assertIn("tools/local helper.py:1: comment: '# new'", lines)
+
+    def test_a_comment_is_refused_when_git_drops_the_diff_prefixes(self):
+        self.repo.git("config", "diff.noprefix", "true")
+        lines = self.assertRefuses(self.add("# a new comment\nx = 1\n"), 1)
+        self.assertIn("pkg/new.py:1: comment: '# a new comment'", lines)
+
+    def test_a_python_file_git_calls_binary_is_refused_naming_it(self):
+        target = self.repo.root / "pkg" / "u16.py"
+        target.write_bytes("# a comment\nx = 1\n".encode("utf-16"))
+        self.repo.git("add", "pkg/u16.py")
+        self.repo.git("commit", "-q", "-m", "u16")
+        code, lines = self.repo.check(self.base)
+        self.assertEqual(code, 1, lines)
+        self.assertTrue(lines[0].startswith("FAIL: cannot read pkg/u16.py at HEAD:"), lines)
+
+    def test_a_class_body_read_of_doc_allows_that_class_docstring(self):
+        self.assertPasses(self.add('class Command:\n    """Help."""\n    help_text = __doc__\n'))
+
+    def test_a_class_body_read_of_doc_does_not_allow_the_module_docstring(self):
+        lines = self.assertRefuses(self.add('"""Module."""\n\n\nclass Command:\n    """Help."""\n    help_text = __doc__\n'), 1)
+        self.assertIn("pkg/new.py:1: docstring of module (lines 1-1)", lines)
+
+    def test_a_read_of_doc_inside_a_method_allows_the_module_docstring(self):
+        self.assertPasses(self.add('"""Module."""\n\n\nclass C:\n    def run(self):\n        return __doc__\n'))
+
+    def test_assigning_doc_allows_no_module_docstring(self):
+        lines = self.assertRefuses(self.add('"""Module doc."""\n__doc__ = "replacement"\n'), 1)
+        self.assertIn("pkg/new.py:1: docstring of module (lines 1-1)", lines)
+
+    def test_assigning_an_object_doc_allows_no_docstring(self):
+        lines = self.assertRefuses(self.add('class A:\n    """A."""\n\n\nA.__doc__ = "replacement"\n'), 1)
+        self.assertIn("pkg/new.py:2: docstring of class 'A' (lines 2-2)", lines)
+
+    def test_an_aliased_plugin_api_export_allows_the_source_definition(self):
+        pkg = "core/recursion_core/plugin_security/"
+        self.repo.commit({
+            pkg + "__init__.py": '"""Plugin API."""\nfrom .thing import Thing as PublicThing\n\n__all__ = ["PublicThing"]\n',
+            pkg + "thing.py": (
+                'class Thing:\n    """Doc."""\n\n    def run(self):\n        """Run."""\n\n'
+                '    def _hidden(self):\n        """Hidden."""\n'),
+        })
+        lines = self.assertRefuses(self.repo.check(self.base), 1)
+        self.assertIn(f"{pkg}thing.py:8: docstring of function 'Thing._hidden' (lines 8-8)", lines)
+
+    def test_a_trailing_interpreter_mark_on_line_one_is_refused(self):
+        lines = self.assertRefuses(self.add("value = 1  #! temporary note\n"), 1)
+        self.assertIn("pkg/new.py:1: comment: '#! temporary note'", lines)
+
+    def test_an_encoding_line_after_code_on_line_one_is_refused(self):
+        lines = self.assertRefuses(self.add("value = 1\n# coding: utf-8\n"), 1)
+        self.assertIn("pkg/new.py:2: comment: '# coding: utf-8'", lines)
+
+    def test_a_trailing_encoding_comment_on_line_one_is_refused(self):
+        lines = self.assertRefuses(self.add("value = 1  # coding: utf-8\n"), 1)
+        self.assertIn("pkg/new.py:1: comment: '# coding: utf-8'", lines)
+
+    def test_an_encoding_line_after_a_blank_first_line_passes(self):
+        self.assertPasses(self.add("\n# coding: utf-8\nx = 1\n"))
+
+
 if __name__ == "__main__":
     unittest.main()

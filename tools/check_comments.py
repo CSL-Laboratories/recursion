@@ -82,6 +82,7 @@ CODING = re.compile(r"#\s*(?:-\*-\s*)?(?:en)?coding[:=]\s*[-\w.]+(?:\s*-\*-)?\s*
 SPDX = re.compile(r"# SPDX-License-Identifier: [A-Za-z0-9.+:()\- ]+\Z")
 POINTER = re.compile(r"# (CSLR-(?:D|I)-[0-9]{3,})\Z")
 POINTER_LIKE = re.compile(r"#\s*CSLR", re.IGNORECASE)
+OPEN_FIRST_LINE = re.compile(rb"[ \t\f]*(?:#|\r?\Z)")
 
 COMMENT_ADVICE = (
     "  delete it. A rule worth keeping: write a test that fails without it; if no test can hold it, "
@@ -126,10 +127,11 @@ def git(root: Path, *args: str, stdin: bytes | None = None, check: bool = True) 
     return result
 
 
-def classify_comment(text: str, line: int) -> tuple[str, str | None]:
-    if line == 1 and text.startswith("#!"):
+def classify_comment(text: str, line: int, prefix: str, first_line_open: bool) -> tuple[str, str | None]:
+    if line == 1 and not prefix and text.startswith("#!"):
         return "allowed", None
-    if line <= 2 and CODING.match(text):
+    own_line = not prefix.strip(" \t\f")
+    if own_line and (line == 1 or (line == 2 and first_line_open)) and CODING.match(text):
         return "allowed", None
     if line <= 3 and SPDX.match(text):
         return "allowed", None
@@ -183,10 +185,11 @@ def doc_readers(tree: ast.Module) -> set[str]:
     top = {node.name for node in tree.body
            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))}
     allowed: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id == "__doc__":
-            allowed.add("")
-        elif isinstance(node, ast.Attribute) and node.attr == "__doc__":
+
+    def visit(node: ast.AST, path: str, scope: str) -> None:
+        if isinstance(node, ast.Name) and node.id == "__doc__" and isinstance(node.ctx, ast.Load):
+            allowed.add(scope)
+        elif isinstance(node, ast.Attribute) and node.attr == "__doc__" and isinstance(node.ctx, ast.Load):
             parts = []
             value = node.value
             while isinstance(value, ast.Attribute):
@@ -194,6 +197,31 @@ def doc_readers(tree: ast.Module) -> set[str]:
                 value = value.value
             if isinstance(value, ast.Name) and value.id in top and len(parts) <= 1:
                 allowed.add(".".join([value.id, *reversed(parts)]))
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            inner = f"{path}.{node.name}" if path else node.name
+            body = {id(child) for child in node.body}
+            own = inner if isinstance(node, ast.ClassDef) else ""
+            for child in ast.iter_child_nodes(node):
+                if id(child) in body:
+                    visit(child, inner, own)
+                else:
+                    visit(child, path, scope)
+        elif isinstance(node, ast.Lambda):
+            visit(node.args, path, scope)
+            visit(node.body, path, "")
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            first = node.generators[0]
+            for child in ast.iter_child_nodes(node):
+                if child is first:
+                    for part in ast.iter_child_nodes(child):
+                        visit(part, path, scope if part is first.iter else "")
+                else:
+                    visit(child, path, "")
+        else:
+            for child in ast.iter_child_nodes(node):
+                visit(child, path, scope)
+
+    visit(tree, "", "")
     return allowed
 
 
@@ -205,7 +233,7 @@ def plugin_api(source: bytes | None) -> dict[str, set[str]]:
     except (SyntaxError, ValueError):
         return {}
     exported: set[str] = set()
-    origin: dict[str, str] = {}
+    origin: dict[str, tuple[str, str]] = {}
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets):
             if isinstance(node.value, (ast.List, ast.Tuple)):
@@ -213,12 +241,12 @@ def plugin_api(source: bytes | None) -> dict[str, set[str]]:
                              if isinstance(e, ast.Constant) and isinstance(e.value, str)}
         elif isinstance(node, ast.ImportFrom) and node.level == 1 and node.module and "." not in node.module:
             for alias in node.names:
-                origin[alias.asname or alias.name] = node.module
+                origin[alias.asname or alias.name] = (node.module, alias.name)
     api: dict[str, set[str]] = {PLUGIN_API: {""}}
     for name in exported:
-        module = origin.get(name)
+        module, defined = origin.get(name, (None, name))
         path = f"{PLUGIN_DIR}{module}.py" if module else PLUGIN_API
-        api.setdefault(path, set()).add(name)
+        api.setdefault(path, set()).add(defined)
     return api
 
 
@@ -238,11 +266,16 @@ def candidates(path: str, source: bytes, api: dict[str, set[str]]) -> list[dict]
         tree = ast.parse(source)
     except (tokenize.TokenError, SyntaxError, ValueError, UnicodeDecodeError) as exc:
         raise CheckError(f"cannot read {path} at HEAD: {exc}") from exc
+    first_line = source.split(b"\n", 1)[0]
+    if first_line.startswith(codecs.BOM_UTF8):
+        first_line = first_line[len(codecs.BOM_UTF8):]
+    first_line_open = OPEN_FIRST_LINE.match(first_line) is not None
     out = []
     for token in tokens:
         if token.type != tokenize.COMMENT:
             continue
-        verdict, extra = classify_comment(token.string, token.start[0])
+        verdict, extra = classify_comment(token.string, token.start[0], token.line[: token.start[1]],
+                                          first_line_open)
         if verdict != "allowed":
             out.append({"kind": verdict, "first": token.start[0], "last": token.start[0],
                         "text": token.string, "extra": extra})
@@ -261,27 +294,24 @@ def candidates(path: str, source: bytes, api: dict[str, set[str]]) -> list[dict]
     return out
 
 
-def _unquote(path: str) -> str:
-    if path.startswith('"') and path.endswith('"'):
-        raw = codecs.escape_decode(path[1:-1].encode("utf-8"))[0]
-        return raw.decode("utf-8", "replace")
-    return path
-
-
 def added_lines(root: Path, merge_base: str, head: str) -> dict[str, set[int]]:
-    diff = git(root, "diff", "-U0", "--no-color", "--no-ext-diff", "--no-renames", "--diff-filter=AM",
-               merge_base, head, "--", "*.py").stdout.decode("utf-8", "replace")
+    spec = ("--no-color", "--no-ext-diff", "--no-renames", "--diff-filter=AM", merge_base, head, "--", "*.py")
+    names = [name for name in git(root, "diff", "--name-only", "-z", *spec).stdout.decode("utf-8", "replace")
+             .split("\0") if name]
+    diff = git(root, "diff", "-U0", *spec).stdout.decode("utf-8", "replace")
+    sections = re.split(r"^diff --git [^\n]*\n?", diff, flags=re.MULTILINE)[1:]
+    if len(sections) != len(names):
+        raise CheckError(f"git diff gave {len(sections)} file sections for {len(names)} changed paths")
     added: dict[str, set[int]] = {}
-    path = None
-    for line in diff.splitlines():
-        if line.startswith("+++ "):
-            name = _unquote(line[4:])
-            path = name[2:] if name.startswith("b/") else None
-        elif line.startswith("@@") and path is not None:
-            match = re.search(r"\+(\d+)(?:,(\d+))?", line)
-            start, count = int(match.group(1)), int(match.group(2) or 1)
-            if count:
-                added.setdefault(path, set()).update(range(start, start + count))
+    for path, section in zip(names, sections):
+        for line in section.splitlines():
+            if line.startswith(("Binary files ", "GIT binary patch")):
+                raise CheckError(f"cannot read {path} at HEAD: git diff treats it as binary")
+            if line.startswith("@@"):
+                match = re.search(r"\+(\d+)(?:,(\d+))?", line)
+                start, count = int(match.group(1)), int(match.group(2) or 1)
+                if count:
+                    added.setdefault(path, set()).update(range(start, start + count))
     return added
 
 

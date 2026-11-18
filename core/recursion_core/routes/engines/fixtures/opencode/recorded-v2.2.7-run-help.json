@@ -1,0 +1,11 @@
+{
+  "recorded": "the installed binary on the builder's Windows laptop, Wed Nov 18 2026 (PST); standard output and standard error together, exit 0; text kept byte for byte (LF line ends)",
+  "binary": "opencode v2.2.7",
+  "argv": [
+    "opencode",
+    "run",
+    "--help"
+  ],
+  "exit_code": 0,
+  "output": "DESCRIPTION\n  Run OpenCode with a message\n\nUSAGE\n  opencode run [flags] [<message...>]\n\nARGUMENTS\n  message... string    Message to send (optional)\n\nFLAGS\n  --continue, -c            Continue the last session\n  --session, -s string      Session ID to continue, or to create if it does not exist\n  --fork                    Fork the session before continuing\n  --worktree, -w [=name]    Start a new session in a new git worktree, optionally with this name\n  --model, -m string        Model to use in the format provider/model#variant\n  --agent string            Agent to use\n  --format choice           Output format (choices: default, json)\n  --file, -f string         File to attach to the message\n  --title string            Session title\n  --archived                Create the session archived so it stays out of session lists (useful for scripted or CI runs)\n  --thinking                Show thinking blocks\n  --auto                    Auto-approve permissions that are not explicitly denied\n\nGLOBAL FLAGS\n  --help, -h                                                          Show help information\n  --version, -v                                                       Show version information\n  --wizard                                                            Start wizard mode for a command\n  --completions <bash|zsh|fish|powershell|sh|pwsh>                    Print shell completion script (choices: bash, zsh, fish, powershell, sh, pwsh)\n  --log-level <all|trace|debug|info|warn|warning|error|fatal|none>    Sets the minimum log level (choices: all, trace, debug, info, warn, warning, error, fatal, none)\n  --print-logs                                                        Print logs to stderr (server logs require --standalone)\n  --standalone                                                        Run with a private server instead of the background service\n  --server string                                                     Connect to a server URL instead of the background service\n"
+}

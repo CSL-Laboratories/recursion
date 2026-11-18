@@ -24,7 +24,10 @@ lines differ in two shapes, and the parser tells them apart on each line from th
               2.x: ``{"type", "message", "status"?, "response"?, "retryAfterMs"?}``
                    (packages/core/src/session/to-session-error.ts:132-143)
 
-Every fixture beside this module is SYNTHETIC: written by hand from those source reads, not captured from a run.
+Every stdout fixture beside this module is SYNTHETIC: written by hand from those source reads, not captured from a
+run. The three ``recorded-v2.2.7-*.json`` files are not stdout of a run: they are what an installed v2.2.7 binary
+printed for ``--version``, ``run --help`` and ``serve --help``, recorded once, and the serve drive's argv is built
+from them.
 
 WHAT A LINE GIVES. Every line gives one ``engine.output`` draft first: the line as UTF-8 text (a byte that is not
 UTF-8 is written U+FFFD, so only then does the text differ from what was printed), with its exact byte offsets in the
@@ -85,8 +88,9 @@ envelope's text sounds like a quota and ``engine_error`` otherwise; else ``ok`` 
 (then ``ok``). ``detail`` names the typed error only when it is one of the error
 names OpenCode's source defines (``KNOWN_ERRORS``), and says ``error`` otherwise: never the engine's own words.
 
-``ServeDriver`` (the third slice) drives ``opencode serve`` with one ``opencode run --attach`` per turn, against
-fakes: interrupt and resume are there. What is NOT here: the permission bridge, the 2.x drive, and any registration
+``ServeDriver`` (the third slice) drives OpenCode v2 (``SERVE_MAJOR``): ``opencode serve`` and one
+``opencode run --server <url>`` per turn, against fakes: interrupt and resume are there. What is NOT here: the
+permission bridge, a 1.x serve drive (1.x's ``run --attach`` is not in v2), and any registration
 (later slices; a registration will state ``default_executable='opencode'``). The guard and the child environment
 are other lanes' files.
 """
@@ -595,10 +599,38 @@ class OpenCodeDriver(Driver):
 SERVE_FLAGS = MappingProxyType({"multi_turn": True, "mid_turn_input": False, "interrupt": True, "resume": True,
                                 "fork": False, "permission_bridge": False, "typed_limits": True, "usage": True})
 LOOPBACK = "127.0.0.1"
-# The server's readiness line (1.x ``opencode serve``), and the only server a turn may attach to: this machine's
-# loopback address and a port from 1 to 65535, written without a leading zero.
+# The one major of OpenCode the serve drive drives. v1 and v2 are two packages, and v2 has no ``attach`` command
+# and no ``run --attach`` (RPrompt151). The turn's argv and the server's are the ones the recorded ``run --help``
+# and ``serve --help`` of v2.2.7 show (``recorded-v2.2.7-*.json`` beside the tests). Any other major, or a binary
+# whose version was not given, is refused (``MajorRefused``) before any argv is built.
+SERVE_MAJOR = 2
+MAJOR_UNSUPPORTED = "opencode_major_unsupported"
+# What ``opencode --version`` prints, whole: v2 ``opencode v2.2.7``, 1.x the bare number (RPrompt151's census),
+# with at most one line end. Numbers without a leading zero.
+_VERSION = re.compile(r"(?:opencode )?v?(0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})(?:\r?\n)?")
+# The server's readiness line, and the only server a turn may connect to: this machine's loopback address and a
+# port from 1 to 65535, written without a leading zero. The line is read from 1.x's source; v2.2.7's recorded
+# ``serve --help`` does not show it, so for v2 it is not verified.
 _LISTENING = re.compile(r"opencode server listening on (http://127\.0\.0\.1:[1-9][0-9]{0,4})[ \t]*\r?\n?")
 _LOOPBACK_URL = re.compile(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})")
+
+
+def version_major(text: object) -> int | None:
+    """The major of the version text ``opencode --version`` printed, or None when it is not one (``_VERSION``)."""
+    match = _VERSION.fullmatch(text) if type(text) is str else None
+    return int(match.group(1)) if match is not None else None
+
+
+class MajorRefused(DriverStateError):
+    """The serve drive refused an OpenCode binary that is not of ``SERVE_MAJOR``, or whose version it was not
+    given. Raised by ``start`` and ``resume`` before any argv is built: no port is picked and nothing is spawned."""
+
+    code = MAJOR_UNSUPPORTED
+
+    def __init__(self, major: int | None) -> None:
+        found = "no version given" if major is None else f"major {major}"
+        super().__init__(f"{MAJOR_UNSUPPORTED}: the serve drive drives OpenCode {SERVE_MAJOR}.x only ({found})")
+        self.major = major
 
 
 def serve_declaration() -> dict:
@@ -651,11 +683,25 @@ def listening_url(text: object, port: int) -> str | None:
 
 
 def attach_argv(url: str, model: str | None, *, session: str | None = None, binary: str | None = None) -> list[str]:
-    """argv for one turn through the server: ``opencode run --format json [--model m] --attach <url>``, and
-    ``--session <id>`` to continue OpenCode's own conversation. Only the loopback server is ever attached."""
+    """The 1.x form of a turn through the server: ``opencode run --format json [--model m] --attach <url>``, and
+    ``--session <id>``. Kept for the 1.x record only: no driver builds it (v2 has no ``--attach``; ``server_argv``)."""
     if not _loopback_url_ok(url):
         raise ValueError("url")
     argv = build_argv(model, binary=binary) + ["--attach", url]
+    if session is not None:
+        if not _session_ok(session):
+            raise ValueError("session")
+        argv += ["--session", session]
+    return argv
+
+
+def server_argv(url: str, model: str | None, *, session: str | None = None, binary: str | None = None) -> list[str]:
+    """argv for one turn through the server, the v2 form the recorded ``run --help`` of v2.2.7 shows:
+    ``opencode run --format json [--model m] --server <url>``, and ``--session <id>`` to continue OpenCode's own
+    conversation. Only the loopback server is ever named."""
+    if not _loopback_url_ok(url):
+        raise ValueError("url")
+    argv = build_argv(model, binary=binary) + ["--server", url]
     if session is not None:
         if not _session_ok(session):
             raise ValueError("session")
@@ -701,7 +747,11 @@ def http_abort(url: str, session: str, *, timeout: float = 5.0) -> bool:
 
 class ServeDriver(Driver):
     """driver.v2 for the serve drive: one ``opencode serve`` per handle on the loopback address, and one
-    ``opencode run --attach`` per turn (the 1.x line; 2.x's ``--server`` is not built). Built against fakes.
+    ``opencode run --server <url>`` per turn, of OpenCode v2 (``SERVE_MAJOR``). Built against fakes.
+
+    ``version`` is the text ``opencode --version`` printed for the binary, which the caller fills from the
+    detection that already runs; the driver spawns nothing to learn it. With no version, or one of another major,
+    ``start`` and ``resume`` raise ``MajorRefused`` (code ``opencode_major_unsupported``) before any argv is built.
 
     ``spawn(argv, env) -> process`` starts a process; the launch path behind it (the guard, the child environment,
     the unit) is the caller's. A process has ``send(text)``, ``close_stdin()``, ``read_line(timeout)`` (a line, or
@@ -714,7 +764,7 @@ class ServeDriver(Driver):
     interruption anywhere) terminates the server, and a termination that fails then is noted on the exception that
     leaves, not raised in its place, and keeps the server owed in the driver's table. ``resume`` continues OpenCode's own session id: every turn of that handle passes ``--session <id>``.
 
-    A turn: the ``user_message`` is spawned as ``run --attach`` with its text on standard input, which is then
+    A turn: the ``user_message`` is spawned as ``run --server`` with its text on standard input, which is then
     ended; ``parse`` reads that turn's stdout; the first well-formed ``step_start`` of the turn's own session
     accepts the message (``new_turn``) once its write has returned (a write that raised is never accepted);
     ``finish_turn(handle, exit_code)`` drafts the turn's result once its process has exited, and ends the turn. A
@@ -723,7 +773,7 @@ class ServeDriver(Driver):
     entered and before its process is registered ends that turn at once and leaves. The ``try`` line itself is
     before that region, so nothing has been published yet. A process the spawn gave back is terminated even when
     it has not yet been appended to the live list. A session id the turn reports that a later turn could not pass as
-    ``--session`` (``attach_argv``'s rule) is not adopted: it is recorded in the turn parser's ``anomalies``
+    ``--session`` (``server_argv``'s rule) is not adopted: it is recorded in the turn parser's ``anomalies``
     (``session_id_unusable``). A turn that reports another session id than the conversation's is recorded there too
     (``conversation_changed``).
 
@@ -751,10 +801,11 @@ class ServeDriver(Driver):
     def __init__(self, spawn: Callable[[list, dict], object], *, binary: str | None = None,
                  port: Callable[[], int] = pick_port, abort: Callable[[str, str], bool] = http_abort,
                  ready_s: float = 30.0, wall: Callable[[], float] = time.time,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic, version: object = None) -> None:
         if not all(callable(f) for f in (spawn, port, abort, wall, clock)):
             raise ValueError("callable")
         _check_binary(binary)
+        self._major = version_major(version)   # refused at start and resume, before any argv, unless SERVE_MAJOR
         if type(ready_s) not in (int, float) or not math.isfinite(ready_s) or ready_s <= 0:
             raise ValueError("ready_s")
         self._spawn, self._binary, self._port, self._abort = spawn, binary, port, abort
@@ -804,6 +855,8 @@ class ServeDriver(Driver):
         return worker
 
     def _start(self, handle, request: dict, env: dict) -> None:
+        if self._major != SERVE_MAJOR:   # first: no argv is built and no port picked for a binary not driven
+            raise MajorRefused(self._major)
         route = request["route"]
         _refuse_what_is_not_run(request)   # another engine's route, or a workspace the spawn cannot honour
         connection = f"{route['connection']['kind']}:{route['connection']['id']}"
@@ -942,7 +995,7 @@ class ServeDriver(Driver):
 
     def _turn_argv(self, worker: dict, session: str | None) -> list[str]:
         try:
-            return attach_argv(worker["url"], worker["model"], session=session, binary=self._binary)
+            return server_argv(worker["url"], worker["model"], session=session, binary=self._binary)
         except ValueError:
             raise DriverStateError("the conversation id cannot be passed to a turn") from None
 

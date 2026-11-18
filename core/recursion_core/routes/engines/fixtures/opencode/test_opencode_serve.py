@@ -12,7 +12,9 @@ from __future__ import annotations
 import dis
 import http.server
 import inspect
+import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -31,6 +33,10 @@ ENV = {"PATH": "/usr/bin:/bin", "HOME": "/var/lib/recursion/homes/opencode", "OP
 PORT = 41234
 URL = "http://127.0.0.1:41234"
 READY = "opencode server listening on http://127.0.0.1:41234\n"
+# What the installed binary printed, recorded once (ADDITIONS lines 229 and 232); never written by hand.
+RECORDED = {kind: json.loads((HERE / f"recorded-v2.2.7-{kind}.json").read_text("utf-8"))
+            for kind in ("version", "run-help", "serve-help")}
+VERSION = RECORDED["version"]["output"]   # what the caller fills from the detection that already runs
 
 
 class Process:
@@ -120,6 +126,7 @@ class Base(unittest.TestCase):
         kwargs.setdefault("port", lambda: PORT)
         kwargs.setdefault("wall", lambda: 1794614400.0)
         kwargs.setdefault("clock", Clock())
+        kwargs.setdefault("version", VERSION)
         return oc.ServeDriver(self.spy, **kwargs)
 
     def replay(self, driver, handle, name: str) -> list[dict]:
@@ -272,7 +279,7 @@ class TurnTests(Base):
         handle = driver.start(session(), None, ENV)
         driver.send(handle, message())
         self.assertEqual(self.turn_argv(1), ["opencode", "run", "--format", "json", "--model", "openai/gpt-5.5",
-                                             "--attach", URL])
+                                             "--server", URL])
         self.assertEqual(self.spy.spawns[1][1], ENV)
         first = self.spy.processes[1]
         self.assertEqual((first.sent, first.closes), (["Run the tests."], 1))
@@ -286,7 +293,7 @@ class TurnTests(Base):
         self.assertEqual(result, {"type": "result", "payload": {"code": None, "detail": ""}})
         self.assertIsNone(handle.live_turn)
         driver.send(handle, message(turn="turn-2", delivery="dlv-2", text="And the docs."))
-        self.assertEqual(self.turn_argv(2)[-4:], ["--attach", URL, "--session", sid])
+        self.assertEqual(self.turn_argv(2)[-4:], ["--server", URL, "--session", sid])
         self.assertEqual(self.spy.processes[2].sent, ["And the docs."])
         drafts = self.replay(driver, handle, "synthetic-v1-tool-use.jsonl")
         accepted = [d["payload"] for d in drafts if d["type"] == "input.accepted"]
@@ -352,14 +359,14 @@ class TurnTests(Base):
         with self.assertRaises(DriverStateError):
             driver.interrupt(handle, "turn-1")
         driver.send(handle, message(turn="turn-2", delivery="dlv-2"))   # still the first turn that ran
-        self.assertEqual(spy.spawns[1][0][-2:], ["--attach", URL])
+        self.assertEqual(spy.spawns[1][0][-2:], ["--server", URL])
 
     def test_a_resumed_handle_passes_the_session_on_its_first_turn(self):
         driver = self.make()
         handle = driver.resume("ses_abc", session(model=None), None, ENV)
         self.assertEqual(handle.engine_session_id, "ses_abc")
         driver.send(handle, message())
-        self.assertEqual(self.turn_argv(1), ["opencode", "run", "--format", "json", "--attach", URL,
+        self.assertEqual(self.turn_argv(1), ["opencode", "run", "--format", "json", "--server", URL,
                                              "--session", "ses_abc"])
 
     def test_a_resume_with_an_id_that_cannot_be_an_argv_value_starts_nothing(self):
@@ -512,7 +519,7 @@ class InterruptAndCloseTests(Base):
         driver.release(one)
         self.assertEqual((self.spy.processes[0].terminated, self.spy.processes[1].terminated), (1, 0))
         driver.send(two, message())
-        self.assertEqual(self.turn_argv(2)[-2:], ["--attach", URL])
+        self.assertEqual(self.turn_argv(2)[-2:], ["--server", URL])
 
 
 class Recorder(http.server.BaseHTTPRequestHandler):
@@ -832,7 +839,7 @@ class ReleaseAndRaceTests(Base):
             with self.subTest(raised=raised):
                 driver = self.make()
                 handle = driver.start(session(), None, ENV)
-                with mock.patch.object(oc, "attach_argv", side_effect=raised):
+                with mock.patch.object(oc, "server_argv", side_effect=raised):
                     with self.assertRaises(expected):
                         driver.send(handle, message())
                 self.assertIsNone(handle.live_turn)
@@ -1046,7 +1053,7 @@ class ServeRoundTwoTests(unittest.TestCase):
 
     def make(self, spawn=None, **kw):
         spy = spawn or Spy()
-        return oc.ServeDriver(spy, port=lambda: PORT, **kw), spy
+        return oc.ServeDriver(spy, port=lambda: PORT, **{"version": VERSION, **kw}), spy
 
     def begun(self, **kw):
         driver, spy = self.make(**kw)
@@ -1302,7 +1309,7 @@ class ServeReviewThreadTests(unittest.TestCase):
         replier.join(5)
 
     def test_a_process_appended_while_a_cleaner_removes_another_stays_owned(self):
-        driver = oc.ServeDriver(Spy(), port=lambda: PORT)
+        driver = oc.ServeDriver(Spy(), port=lambda: PORT, version=VERSION)
         handle = driver.start(session(), None, ENV)
         driver.send(handle, message())
         worker = driver._workers[id(handle)]
@@ -1338,7 +1345,7 @@ class ServeReviewThreadTests(unittest.TestCase):
             with self.subTest(field=field):
                 spy = Spy()
                 with self.assertRaises(DriverInputError) as caught:
-                    oc.ServeDriver(spy, port=lambda: PORT).start(start, ws, ENV)
+                    oc.ServeDriver(spy, port=lambda: PORT, version=VERSION).start(start, ws, ENV)
                 self.assertEqual((caught.exception.field, spy.processes), (field, []))
 
 
@@ -1545,7 +1552,7 @@ class ServeRoundFiveTests(unittest.TestCase):
                 if inst.opname in ("STORE_FAST", "STORE_DEREF") and inst.argrepr == "process":
                     continue
                 spy = Spy()
-                driver = oc.ServeDriver(spy, port=lambda: PORT)
+                driver = oc.ServeDriver(spy, port=lambda: PORT, version=VERSION)
                 handle = driver.start(session(), None, ENV)
                 fired = []
 
@@ -1605,7 +1612,7 @@ class ServeRoundFiveTests(unittest.TestCase):
                 process.send = send
             return process
 
-        driver = oc.ServeDriver(spy, port=lambda: PORT)
+        driver = oc.ServeDriver(spy, port=lambda: PORT, version=VERSION)
         driver._spawn = spawn
         handle = driver.start(session(), None, ENV)
         box: dict = {}
@@ -1636,6 +1643,74 @@ class ServeRoundFiveTests(unittest.TestCase):
 
     def test_the_abort_text_says_the_status_line_decides(self):
         self.assertIn("The status line decides", oc.http_abort.__doc__)
+
+
+class RecordedV2Tests(Base):
+    """The serve drive drives OpenCode v2 (ADDITIONS lines 229 and 232, RPrompt151): each turn is the argv the
+    recorded ``opencode run --help`` of v2.2.7 shows (``--server``; v2 has no ``--attach``), the server the argv its
+    recorded ``opencode serve --help`` shows, and any other major, or none, is refused before any argv is built."""
+
+    @staticmethod
+    def flags(kind: str) -> set:
+        return set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", RECORDED[kind]["output"]))
+
+    def test_the_recordings_are_of_the_one_major_the_serve_drive_drives(self):
+        self.assertEqual([RECORDED[k]["argv"] for k in ("version", "run-help", "serve-help")],
+                         [["opencode", "--version"], ["opencode", "run", "--help"], ["opencode", "serve", "--help"]])
+        self.assertEqual(oc.SERVE_MAJOR, 2)
+        self.assertEqual(oc.version_major(VERSION), oc.SERVE_MAJOR)
+        self.assertEqual(oc.version_major("1.19.6\n"), 1)   # 1.x prints the bare number (RPrompt151's census)
+
+    def test_each_turn_is_the_v2_argv_the_recorded_run_help_shows(self):
+        flags = self.flags("run-help")
+        self.assertNotIn("--attach", flags)
+        self.assertTrue({"--format", "--model", "--session", "--server"} <= flags)
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        self.assertEqual(self.turn_argv(1), ["opencode", "run", "--format", "json", "--model", "openai/gpt-5.5",
+                                             "--server", URL])
+        driver.finish_turn(handle, 0)
+        resumed = driver.resume("ses_abc", session(model=None), None, ENV)
+        driver.send(resumed, message(turn="turn-9", delivery="dlv-9"))
+        self.assertEqual(self.spy.spawns[3][0], ["opencode", "run", "--format", "json", "--server", URL,
+                                                 "--session", "ses_abc"])
+        for argv, _ in self.spy.spawns:
+            with self.subTest(argv=argv):
+                self.assertNotIn("--attach", argv)
+                if argv[1] == "run":
+                    self.assertLessEqual({a for a in argv if a.startswith("--")}, flags)
+
+    def test_the_server_is_the_argv_the_recorded_serve_help_shows(self):
+        self.assertIn("opencode serve [flags]", RECORDED["serve-help"]["output"])
+        driver = self.make()
+        driver.start(session(), None, ENV)
+        argv = self.spy.spawns[0][0]
+        self.assertEqual(argv, ["opencode", "serve", "--hostname", "127.0.0.1", "--port", "41234"])
+        self.assertLessEqual({a for a in argv if a.startswith("--")}, self.flags("serve-help"))
+
+    def test_no_version_or_another_major_is_refused_before_any_argv_is_built(self):
+        for version in (None, "1.19.6", "1.19.6\n", "opencode v1.19.5", "opencode v3.0.0", "v2", "2", "",
+                        "opencode v2.2.7 and more", "opencode v02.2.7", 2, b"opencode v2.2.7"):
+            with self.subTest(version=version):
+                picked = []
+                driver = self.make(version=version, port=lambda: picked.append(PORT) or PORT)
+                with mock.patch.object(oc, "serve_argv", wraps=oc.serve_argv) as built:
+                    with self.assertRaises(oc.MajorRefused) as caught:
+                        driver.start(session(), None, ENV)
+                    with self.assertRaises(oc.MajorRefused):
+                        driver.resume("ses_abc", session(), None, ENV)
+                self.assertEqual(caught.exception.code, "opencode_major_unsupported")
+                self.assertIsInstance(caught.exception, DriverStateError)
+                self.assertEqual((self.spy.spawns, picked, built.call_count), ([], [], 0))
+
+    def test_a_version_of_the_driven_major_is_taken_in_each_form_it_is_printed(self):
+        for version in ("opencode v2.2.7", "opencode v2.2.7\n", "opencode v2.3.2\r\n", "2.0.0", "v2.10.1"):
+            with self.subTest(version=version):
+                driver = self.make(version=version)
+                driver.start(session(), None, ENV)
+                self.assertEqual(self.spy.spawns[0][0][1], "serve")
+
 
 
 if __name__ == "__main__":

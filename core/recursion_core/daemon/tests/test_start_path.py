@@ -312,6 +312,32 @@ class StartPathTest(unittest.TestCase):
         self.assertLessEqual(adapter._wire_size(shown), adapter.RESULT_STATUS_BYTES)
         self.assertTrue(result_fits(shown), shown)
 
+    def test_a_force_cut_keeps_a_short_detail_a_text_head_and_a_fitting_limit(self):
+        """Two large members must not throw away a short detail, a text head or a limit that fit."""
+        one = contract.event('text', 'vendor', {'n': 1})
+        detail = 'route failure: RuntimeError'
+        limit = contract.limit_signal('connection', 'probe', reset_at=10.0)
+        text = 'x' * (1 << 20)
+        events = [one] * 20000
+        result = contract.result('run-one', None, text=text, events=events, detail=detail, limit=limit)
+        self.assertGreater(adapter._wire_size(result), adapter.RESULT_STATUS_BYTES)
+        shown = adapter._status_result(result)
+        self.assertEqual(shown['detail'], detail)
+        self.assertEqual(shown['limit'], limit)
+        self.assertGreaterEqual(len(shown['text']), 64)
+        self.assertEqual(shown['text'], text[:len(shown['text'])])
+        self.assertLess(len(shown['text']), len(text))
+        self.assertLess(len(shown['events']), len(events))
+        self.assertGreater(len(shown['events']), 0)
+        self.assertTrue(all(event == one for event in shown['events']))
+        self.assertLessEqual(adapter._wire_size(shown), adapter.RESULT_STATUS_BYTES)
+        self.assertTrue(result_fits(shown), shown)
+        self.assertNotIn('truncated', shown)
+        self.assertEqual(result['detail'], detail)
+        self.assertEqual(result['text'], text)
+        self.assertEqual(result['limit'], limit)
+        self.assertEqual(len(result['events']), 20000)
+
     # -- an interrupt one step after the callback still fences the published child -------------------
     def test_an_interrupt_while_recording_the_result_still_fences_the_child(self):
         ctx, process, daemon = self.published_run()
@@ -399,6 +425,46 @@ class StartPathTest(unittest.TestCase):
         daemon.stop.assert_called_once_with(ctx.run_id)
         self.assertIsNone(process._out)
         self.assertIsNone(process._pidfd)
+        self.assertFalse(starter.active(ctx.run_id))
+
+    def test_an_interrupt_inside_stop_ends_the_published_child(self):
+        """A stop that raises before it returns has not ended the child: the retry does."""
+        sleeper = subprocess.Popen(['/bin/sleep', '30'], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def finish():
+            if sleeper.poll() is None:
+                sleeper.kill()
+            sleeper.wait(timeout=5)
+        self.addCleanup(finish)
+        (self.root / 'runs' / 'run-witness').mkdir(parents=True, mode=0o700)
+        out = self.root / 'stdout.jsonl'
+        out.touch()
+        calls = []
+
+        def stop(run_id):
+            calls.append(run_id)
+            if len(calls) == 1:
+                raise KeyboardInterrupt('stop')
+            if sleeper.poll() is None:
+                sleeper.kill()
+            sleeper.wait(timeout=5)
+
+        daemon = SimpleNamespace(stop=stop, closed=False,
+                                 reconcile=mock.Mock(return_value=SimpleNamespace(state='running')))
+        process = launcher.UnitEngineProcess(daemon, 'run-witness', None, out, os.pidfd_open(sleeper.pid))
+        self.addCleanup(process.close)
+        ctx = launcher.RunContext('run-witness')
+        ctx.launched('/test/recursion-run-run-witness.service', process)
+        service = SimpleNamespace(handle=mock.Mock(return_value=contract.result(ctx.run_id, None, text='ok')))
+        starter = adapter.RouteStarter(service, {}, daemon, self.root, exit_grace_s=0)
+        starter._active[ctx.run_id] = ctx
+        with self.assertRaises(KeyboardInterrupt):
+            starter._drive(ctx, {})
+        self.assertEqual(calls, ['run-witness', 'run-witness'])
+        self.assertIsNotNone(sleeper.poll(), 'the published child is still running')
+        self.assertIsNone(process._pidfd)
+        self.assertIsNone(process._out)
         self.assertFalse(starter.active(ctx.run_id))
 
     # -- a failed start does not label the attempt that takes the id next ---------------------------

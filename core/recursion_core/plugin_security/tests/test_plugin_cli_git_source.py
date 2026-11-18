@@ -10,9 +10,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import unittest
 
@@ -500,47 +500,142 @@ class EnableDisableRollbackTests(GitCase):
     def test_a_scratch_path_with_shell_metacharacters_runs_only_the_fetch(self):
         """TMPDIR holds a semicolon, a space, a quote and a dollar sign.
 
+        The repository, that directory, the marker and the git config for the
+        repository all live under one temporary directory this test creates.
         The fetch returns the same bytes as a plain TMPDIR. The semicolon does
-        not run touch. Git's --upload-pack string is the only shell the fetch builds.
+        not run touch. Exactly one fetch runs. Git's --upload-pack string is
+        the only shell the fetch builds.
         """
-        bare, commit = self.make_bare({"plugin.py": _GOOD})
-        plain = self.fetch(bare, commit, "plugin.py")
-        self.assertEqual(plain, _GOOD)
-        self.assert_no_scratch()
-        base = Path("/var/tmp/grok-plugin-host-13/upload-pack-meta")
-        if base.exists():
-            shutil.rmtree(base)
-        base.mkdir(parents=True, mode=0o700)
-        marker = base / "marker"
-        # Unquoted, the semicolon runs touch. The quote is paired so the
-        # shell parses the line and does not abort before that command.
-        weird = Path(f"{base}/pre; touch {marker}; echo 'x' $FOO")
-        weird.mkdir(parents=True, mode=0o700)
-        for part in (";", " ", "'", "$"):
-            self.assertIn(part, str(weird))
-        old = os.environ.get("TMPDIR")
-        try:
-            os.environ["TMPDIR"] = str(weird)
-            refused = None
-            got = None
+        with tempfile.TemporaryDirectory(prefix="rc-upload-pack-") as raw:
+            root = Path(raw)
+            os.chmod(root, 0o700)
+            home = root / "home"
+            plain = root / "plain"
+            git_tmp = root / "git-tmp"
+            hooks = root / "hooks"
+            template = root / "template"
+            work = root / "work"
+            for path in (home, plain, git_tmp, hooks, template, work):
+                path.mkdir(mode=0o700)
+                os.chmod(path, 0o700)
+            git_global = root / "global.gitconfig"
+            git_system = root / "system.gitconfig"
+            for path in (git_global, git_system):
+                path.write_bytes(b"")
+                os.chmod(path, 0o600)
+            git_env = {
+                "PATH": os.defpath,
+                "HOME": str(home),
+                "TMPDIR": str(git_tmp),
+                "GIT_CONFIG_GLOBAL": str(git_global),
+                "GIT_CONFIG_SYSTEM": str(git_system),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_COUNT": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_NO_LAZY_FETCH": "1",
+                "LC_ALL": "C",
+                "LANG": "C",
+            }
+
+            def git(args):
+                proc = subprocess.run(
+                    ["git", *args], check=False, capture_output=True,
+                    text=True, env=git_env)
+                if proc.returncode != 0:
+                    self.fail(f"git {args!r} exited {proc.returncode}: {proc.stderr[-500:]}")
+                return proc.stdout
+
+            hook_arg = f"core.hooksPath={hooks}"
+            git(["-c", hook_arg, "init", "-q", "--template", str(template), "-b", "main", str(work)])
+            (work / "plugin.py").write_bytes(_GOOD)
+            git(["-C", str(work), "-c", hook_arg, "add", "-A"])
+            git(["-C", str(work), "-c", hook_arg, "-c", "user.name=plugin-fixture",
+                 "-c", "user.email=plugin-fixture@example.invalid", "commit", "-q", "-m", "plugin"])
+            commit = git(["-C", str(work), "-c", hook_arg, "rev-parse", "HEAD"]).strip()
+            self.assertEqual(len(commit), 40)
+            bare = root / "bare.git"
+            git(["-c", hook_arg, "clone", "--bare", "-q", "--template", str(template),
+                 str(work), str(bare)])
+            git(["-C", str(bare), "-c", hook_arg, "remote", "remove", "origin"])
+            self.assertEqual(git(["-C", str(bare), "-c", hook_arg, "remote"]).strip(), "")
+            self.assertEqual(git_global.read_bytes(), b"")
+            self.assertEqual(git_system.read_bytes(), b"")
+            bare_hooks = bare / "hooks"
+            self.assertEqual(list(bare_hooks.iterdir()) if bare_hooks.is_dir() else [], [])
+            for path in (home, git_global, git_system, git_tmp, bare, work):
+                path.resolve().relative_to(root.resolve())
+
+            # Unquoted, the semicolon runs touch. The quote is paired so the
+            # shell parses the line and does not abort before that command.
+            # The touch target is the marker, a child of root, so a shell that
+            # ran the path would create only that file.
+            marker = root / "marker"
+            hostile = Path(f"{root}/pre; touch {marker}; echo 'x' $FOO")
+            hostile.resolve().relative_to(root.resolve())
+            self.assertIn(f"; touch {marker};", str(hostile))
+            self.assertEqual(marker, root / "marker")
+            hostile.mkdir(parents=True, mode=0o700)
+            for part in (";", " ", "'", "$"):
+                self.assertIn(part, str(hostile))
+
+            self.assert_no_scratch()
+            old = os.environ.get("TMPDIR")
+
+            def restore_tmpdir():
+                if old is None:
+                    os.environ.pop("TMPDIR", None)
+                else:
+                    os.environ["TMPDIR"] = old
+
+            self.addCleanup(restore_tmpdir)
+            real_popen = subprocess.Popen
+            self.addCleanup(setattr, subprocess, "Popen", real_popen)
             try:
-                got = self.fetch(bare, commit, "plugin.py")
-            except Exception as exc:  # noqa: BLE001 - the refusal is the assertion below
-                refused = exc
-            self.assertIsNone(
-                refused,
-                f"marker={marker.exists()} refusal={getattr(refused, 'code', refused)!r}")
-            self.assertFalse(marker.exists(), "a metacharacter in TMPDIR ran a command")
-            self.assertEqual(got, plain)
-            left = [path.name for path in weird.iterdir() if path.name.startswith("plugin-fetch-")]
-            self.assertEqual(left, [])
-        finally:
-            if old is None:
-                os.environ.pop("TMPDIR", None)
-            else:
-                os.environ["TMPDIR"] = old
-            shutil.rmtree(base, ignore_errors=True)
-        self.assert_no_scratch()
+                os.environ["TMPDIR"] = str(plain)
+                control = self.fetch(bare, commit, "plugin.py")
+                self.assertEqual(control, _GOOD)
+                self.assertEqual(
+                    [path.name for path in plain.iterdir() if path.name.startswith("plugin-fetch-")],
+                    [])
+                fetches = []
+                child_envs = []
+
+                def spying(*args, **kwargs):
+                    argv = args[0] if args else kwargs.get("args")
+                    if isinstance(argv, (list, tuple)) and "fetch" in argv:
+                        fetches.append(list(argv))
+                    child_envs.append(kwargs.get("env"))
+                    return real_popen(*args, **kwargs)
+
+                subprocess.Popen = spying
+                os.environ["TMPDIR"] = str(hostile)
+                refused = None
+                got = None
+                try:
+                    got = self.fetch(bare, commit, "plugin.py")
+                except Exception as exc:  # noqa: BLE001 - the refusal is the assertion below
+                    refused = exc
+                finally:
+                    subprocess.Popen = real_popen
+                self.assertIsNone(
+                    refused,
+                    f"marker={marker.exists()} fetches={len(fetches)} "
+                    f"refusal={getattr(refused, 'code', refused)!r}")
+                self.assertFalse(marker.exists(), "a metacharacter in TMPDIR ran a command")
+                self.assertEqual(got, control)
+                self.assertEqual(len(fetches), 1, fetches)
+                self.assertEqual(
+                    [path.name for path in hostile.iterdir() if path.name.startswith("plugin-fetch-")],
+                    [])
+                self.assertTrue(child_envs)
+                for env in child_envs:
+                    self.assertIsInstance(env, dict)
+                    for key in ("TMPDIR", "HOME"):
+                        self.assertIn(key, env)
+                        Path(env[key]).resolve().relative_to(root.resolve())
+            finally:
+                restore_tmpdir()
+            self.assert_no_scratch()
 
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)

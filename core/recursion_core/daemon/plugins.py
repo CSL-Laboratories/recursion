@@ -147,6 +147,11 @@ def _first_imports(before, own=None):
 
 def _read_owned(path, limit, *, missing_ok=False):
     """Bytes of an operator-owned regular file nobody else can write, or a typed refusal."""
+    # Same shape as subscription_routes.policy._check_home: a typed refusal before any
+    # file is opened. Windows has no O_NOFOLLOW; a no-follow open for it is not this round,
+    # so install refuses instead of dropping the guard (no default of 0, no open without it).
+    if os.name == 'nt' or not hasattr(os, 'O_NOFOLLOW'):
+        raise PluginRefused('platform_unsupported', 'O_NOFOLLOW is missing; no plugin file is read')
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:

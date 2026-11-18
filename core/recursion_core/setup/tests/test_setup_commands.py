@@ -509,6 +509,19 @@ class SetupContainmentTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["code"], "platform_unsupported")
         read.assert_not_called()
 
+    def test_setup_containment_answers_while_the_password_lookup_fails(self):
+        # The setup branch returns before the lookup. install still answers the lookup's refusal.
+        lookup = setup.InstallRefused(
+            "home_unknown",
+            "the password database gives no entry for this user (none, or the lookup failed), so the "
+            "user manager's %h is not known")
+        with mock.patch.object(setup, "default_roots", side_effect=lookup):
+            shown = self.answer("setup", "containment")
+            self.assertEqual((shown["code"], shown["action"]), ("ok", "setup containment"))
+            refused = self.answer("install", code=1)
+            self.assertEqual((refused["code"], refused["action"], refused["detail"]),
+                             (lookup.kind, "install", lookup.detail))
+
 
 class CommandFamilyShapeTests(unittest.TestCase):
     """The family has seam S2's shape (``control/commands/__init__.py`` on #369), so it can be registered as is."""

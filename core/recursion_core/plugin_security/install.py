@@ -5,7 +5,8 @@ Generations live beside ``plugins/``, never inside it: the daemon treats every
 directory there as a plugin, including a dot directory.
 
     <config>/plugin-generations/<n>/install.json
-    <config>/plugin-generations/<n>/disabled
+    <config>/plugin-generations/<n>/.disabled
+    <config>/plugin-generations/<n>/.parent
     <config>/plugin-generations/<n>/<plugin_id>/{manifest.json,plugin.py,manifest.sig?}
     <config>/plugin-generations/current
 
@@ -13,14 +14,22 @@ directory there as a plugin, including a dot directory.
 It is written only after generation ``n`` is complete. The live ``plugins/``
 tree is published after that. The next list, install, remove, enable, disable
 or rollback publishes ``current`` again when that publish did not finish.
-Older generations stay on disk. Rollback points ``current`` at the previous
-generation and publishes it. The next generation number is one past the
-highest generation directory, so a later install does not reuse a number.
+Older generations stay on disk. ``.parent`` is the generation that was current
+when this one was written, or absent for the first. Rollback publishes that
+generation, never one a rollback already left. The next generation number is
+one past the highest generation directory, so a later install does not reuse
+a number.
 
-``disabled``, when present, is sorted plugin ids, one per line. It lives in
-the generation only. Publish omits those plugin directories from ``plugins/``
-and does not copy the file. Grants and labels stay in ``install.json``.
-A disabled plugin stays listed. Enable and disable each write one generation.
+``.disabled``, when present, is sorted plugin ids, one per line. The name
+starts with a dot, so it is not a plugin id: a plugin may be named
+``disabled``. A generation that still has the older regular file ``disabled``
+is read the same way. A directory of that name is the plugin, not the list.
+The list lives in the generation only. Publish omits those plugin directories
+from ``plugins/`` and does not copy the file. Grants and labels stay in
+``install.json``. ``install.json`` matches the plugin-id grammar and is the
+record the daemon reads, so that id is refused before a generation is
+published. A disabled plugin stays listed. Enable and disable each write one
+generation.
 
 A local bare git repository is read only when ``git_repository`` is passed.
 The entry's https repository is a name. This module does not fetch it. The
@@ -73,6 +82,10 @@ _CURRENT = re.compile(r"[1-9][0-9]*\n")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _LABELS = frozenset({"verified", "non_verified"})
 _INSTALL_KEYS = frozenset({"trusted_keys", "grants", "reserved", "authority_anchor", "registry_labels"})
+# Names this store writes beside plugin directories that also match a plugin id.
+# install.json stays: the daemon reads it by this name. The disabled-id list
+# does not: it is ".disabled", which cannot be a plugin id.
+_STORE_RESERVED_IDS = frozenset({"install.json"})
 _GRANT_KEYS = frozenset({
     "plugin_id", "artifact_sha256", "signer_key_id", "permissions", "unsigned_order_acknowledged",
     "order_after_revoked_key", "order_after_revocation_generation",
@@ -156,6 +169,8 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
     # whole install. Unknown must not read as valid, and nothing is written.
     if any(item.code == "signature_unchecked" for item in report.notes):
         raise InstallRefused("signature_backend_unavailable")
+    if type(plugin_id) is str and plugin_id in _STORE_RESERVED_IDS:
+        raise InstallRefused("plugin_id_reserved")
     if not _plugin_id_ok(plugin_id):
         raise InstallRefused("plugin_not_in_registry")
     if version is not None and type(version) is not str:
@@ -229,12 +244,13 @@ def disable_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathL
 
 def rollback_generation(config: os.PathLike | str, *, state: os.PathLike | str | None = None,
                         wait: bool = True) -> dict:
-    """Point ``current`` at the previous generation and publish it.
+    """Point ``current`` at the generation that was current when this one was written.
 
     The first generation, and a profile with no generation, refuse
-    ``rollback_unavailable`` and write nothing. A missing previous directory
+    ``rollback_unavailable`` and write nothing. A missing parent directory
     refuses ``generation_missing`` before the pointer moves. If publishing
     raises after the pointer is written, the next list publishes that generation.
+    A generation a rollback already left stays on disk and is not published again.
     """
     del state
     config_path = Path(config)
@@ -244,15 +260,17 @@ def rollback_generation(config: os.PathLike | str, *, state: os.PathLike | str |
         if current is None or current < 2:
             raise InstallRefused("rollback_unavailable")
         root = config_path / "plugin-generations"
-        previous = current - 1
-        dest = root / str(previous)
+        parent = _read_parent(root / str(current))
+        if parent is None or parent >= current:
+            raise InstallRefused("generation_missing" if parent is None else "generation_unreadable")
+        dest = root / str(parent)
         if not _lexists(dest):
             raise InstallRefused("generation_missing")
         _require_owned_dir(dest, "generation_missing")
         snapshot = _read_profile(dest, missing_install_ok=False)
-        _write_pointer(root, previous)
-        _copy_generation_to_live(config_path, previous)
-        return {"command": "rollback", "generation": previous, "plugins": _rows(snapshot)}
+        _write_pointer(root, parent)
+        _copy_generation_to_live(config_path, parent)
+        return {"command": "rollback", "generation": parent, "plugins": _rows(snapshot)}
     finally:
         os.close(fd)
 
@@ -318,6 +336,7 @@ def _lexists(path: Path) -> bool:
 
 def _plugin_id_ok(value: object) -> bool:
     return (type(value) is str and _PLUGIN_ID.fullmatch(value) is not None and value != "host"
+            and value not in _STORE_RESERVED_IDS
             and value not in (".", "..") and "/" not in value and "\\" not in value)
 
 
@@ -532,7 +551,7 @@ def _commit(config: Path, snapshot: Snapshot) -> int:
     root.mkdir(mode=0o700, exist_ok=True)
     os.chmod(root, 0o700)
     _require_owned_dir(root)
-    _read_current(config)
+    current = _read_current(config)
     number = _next_generation(root)
     dest = root / str(number)
     if _lexists(dest):
@@ -544,6 +563,7 @@ def _commit(config: Path, snapshot: Snapshot) -> int:
     os.chmod(partial, 0o700)
     try:
         _write_profile(partial, snapshot)
+        _write_parent(partial, current)
         os.rename(partial, dest)
         _write_pointer(root, number)
         # The pointer names a complete generation before the live tree is touched.
@@ -569,6 +589,27 @@ def _next_generation(root: Path) -> int:
 
 def _write_pointer(root: Path, number: int) -> None:
     _atomic_replace(root, "current", f"{number}\n".encode("ascii"))
+
+
+def _write_parent(directory: Path, parent: int | None) -> None:
+    """Record the generation that was current when this directory was written."""
+    if parent is None:
+        return
+    _write_file(directory / ".parent", f"{parent}\n".encode("ascii"))
+
+
+def _read_parent(directory: Path) -> int | None:
+    path = directory / ".parent"
+    if not _lexists(path):
+        return None
+    raw = _read_file(path, 64)
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        raise InstallRefused("generation_unreadable") from None
+    if _CURRENT.fullmatch(text) is None:
+        raise InstallRefused("generation_unreadable")
+    return int(text)
 
 
 def _copy_generation_to_live(config: Path, generation: int) -> None:
@@ -668,10 +709,27 @@ def _read_profile(directory: Path, *, missing_install_ok: bool) -> Snapshot:
                     parsed["anchor"], parsed["labels"], plugins, disabled)
 
 
+def _disabled_list_path(directory: Path) -> Path | None:
+    """The disabled-id list, if this generation has one.
+
+    ``.disabled`` is not a plugin id. An older generation may name the same
+    list ``disabled``. A directory of that name is a plugin, not the list.
+    """
+    modern = directory / ".disabled"
+    if _lexists(modern):
+        return modern
+    legacy = directory / "disabled"
+    if not _lexists(legacy):
+        return None
+    if stat.S_ISDIR(os.lstat(legacy).st_mode):
+        return None
+    return legacy
+
+
 def _read_disabled(directory: Path, plugins: dict, *, missing_install_ok: bool) -> frozenset:
-    """Read the generation ``disabled`` file. A missing file means none are disabled."""
-    path = directory / "disabled"
-    if not _lexists(path):
+    """Read the generation's disabled-id list. A missing file means none are disabled."""
+    path = _disabled_list_path(directory)
+    if path is None:
         return frozenset()
     raw = _read_file(path, _MAX_INSTALL)
     code = "install_unreadable" if missing_install_ok else "generation_unreadable"
@@ -789,7 +847,7 @@ def _write_profile(directory: Path, snapshot: Snapshot) -> None:
         if plugin.signature is not None:
             _write_file(plugin_dir / "manifest.sig", plugin.signature)
     if snapshot.disabled:
-        _write_file(directory / "disabled", _disabled_bytes(snapshot.disabled))
+        _write_file(directory / ".disabled", _disabled_bytes(snapshot.disabled))
 
 
 def _disabled_bytes(disabled: frozenset) -> bytes:

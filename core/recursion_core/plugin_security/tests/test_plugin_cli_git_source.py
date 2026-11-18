@@ -12,8 +12,10 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from recursion_core.plugin_security.signing import backend_available
 from recursion_core.plugin_security.tests.support import FakeGilProbe
@@ -102,7 +104,11 @@ class GitCase(ProfileCase):
         self.assertFalse((self.config / "plugin-install.lock").exists())
 
     def assert_no_scratch(self):
-        root = Path(os.environ.get("TMPDIR", "/tmp"))
+        # List only the directory TMPDIR names. There is no shared fallback.
+        raw = os.environ.get("TMPDIR")
+        if not raw:
+            return
+        root = Path(raw)
         if not root.is_dir():
             return
         left = [path for path in root.iterdir() if path.name.startswith("plugin-fetch-")]
@@ -163,6 +169,26 @@ class GitRefusalTests(GitCase):
         self.assertFalse(marker.exists())
         self.assert_profile_untouched()
         self.assert_no_scratch()
+
+    def test_a_missing_install_script_name_is_refused_before_scratch(self):
+        """A non-empty install_scripts list refuses before a scratch directory exists.
+
+        The name is not in the tree. The refusal is the list itself, not a
+        basename that happens to sit in the commit. TMPDIR points at a
+        temporary directory this test creates, and the listing reads only
+        that directory.
+        """
+        bare, commit = self.make_bare({"plugin.py": _GOOD})
+        with tempfile.TemporaryDirectory(prefix="rc-before-scratch-") as raw:
+            root = Path(raw)
+            os.chmod(root, 0o700)
+            with patch.dict(os.environ, {"TMPDIR": str(root)}):
+                before = {path.name for path in root.iterdir() if path.name.startswith("plugin-fetch-")}
+                code = self.refused(lambda: self.fetch(bare, commit, "plugin.py", scripts=("missing.sh",)))
+                self.assertEqual(code, "source_install_script")
+                after = {path.name for path in root.iterdir() if path.name.startswith("plugin-fetch-")}
+                self.assertEqual(after, before)
+                self.assert_no_scratch()
 
     def test_a_commit_that_differs_by_one_byte_is_refused_before_copy(self):
         bare, commit = self.make_bare({"plugin.py": _BAD})
@@ -486,6 +512,280 @@ class EnableDisableRollbackTests(GitCase):
                        "--state", str(self.state)], out, err)
         self.assertEqual(status, 1)
         self.assertIn("refused: source_network_refused", err.getvalue())
+
+    def test_a_scratch_path_with_shell_metacharacters_runs_only_the_fetch(self):
+        """TMPDIR holds a semicolon, a space, a quote and a dollar sign.
+
+        The repository, that directory, the marker and the git config for the
+        repository all live under one temporary directory this test creates.
+        The fetch returns the same bytes as a plain TMPDIR. The semicolon does
+        not run touch. Exactly one fetch runs. Git's --upload-pack string is
+        the only shell the fetch builds.
+        """
+        with tempfile.TemporaryDirectory(prefix="rc-upload-pack-") as raw:
+            root = Path(raw)
+            os.chmod(root, 0o700)
+            home = root / "home"
+            plain = root / "plain"
+            git_tmp = root / "git-tmp"
+            hooks = root / "hooks"
+            template = root / "template"
+            work = root / "work"
+            for path in (home, plain, git_tmp, hooks, template, work):
+                path.mkdir(mode=0o700)
+                os.chmod(path, 0o700)
+            git_global = root / "global.gitconfig"
+            git_system = root / "system.gitconfig"
+            for path in (git_global, git_system):
+                path.write_bytes(b"")
+                os.chmod(path, 0o600)
+            git_env = {
+                "PATH": os.defpath,
+                "HOME": str(home),
+                "TMPDIR": str(git_tmp),
+                "GIT_CONFIG_GLOBAL": str(git_global),
+                "GIT_CONFIG_SYSTEM": str(git_system),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_COUNT": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_NO_LAZY_FETCH": "1",
+                "LC_ALL": "C",
+                "LANG": "C",
+            }
+
+            def git(args):
+                proc = subprocess.run(
+                    ["git", *args], check=False, capture_output=True,
+                    text=True, env=git_env)
+                if proc.returncode != 0:
+                    self.fail(f"git {args!r} exited {proc.returncode}: {proc.stderr[-500:]}")
+                return proc.stdout
+
+            hook_arg = f"core.hooksPath={hooks}"
+            git(["-c", hook_arg, "init", "-q", "--template", str(template), "-b", "main", str(work)])
+            (work / "plugin.py").write_bytes(_GOOD)
+            git(["-C", str(work), "-c", hook_arg, "add", "-A"])
+            git(["-C", str(work), "-c", hook_arg, "-c", "user.name=plugin-fixture",
+                 "-c", "user.email=plugin-fixture@example.invalid", "commit", "-q", "-m", "plugin"])
+            commit = git(["-C", str(work), "-c", hook_arg, "rev-parse", "HEAD"]).strip()
+            self.assertEqual(len(commit), 40)
+            bare = root / "bare.git"
+            git(["-c", hook_arg, "clone", "--bare", "-q", "--template", str(template),
+                 str(work), str(bare)])
+            git(["-C", str(bare), "-c", hook_arg, "remote", "remove", "origin"])
+            self.assertEqual(git(["-C", str(bare), "-c", hook_arg, "remote"]).strip(), "")
+            self.assertEqual(git_global.read_bytes(), b"")
+            self.assertEqual(git_system.read_bytes(), b"")
+            bare_hooks = bare / "hooks"
+            self.assertEqual(list(bare_hooks.iterdir()) if bare_hooks.is_dir() else [], [])
+            for path in (home, git_global, git_system, git_tmp, bare, work):
+                path.resolve().relative_to(root.resolve())
+
+            # Unquoted, the semicolon runs touch. The quote is paired so the
+            # shell parses the line and does not abort before that command.
+            # The touch target is the marker, a child of root, so a shell that
+            # ran the path would create only that file.
+            marker = root / "marker"
+            hostile = Path(f"{root}/pre; touch {marker}; echo 'x' $FOO")
+            hostile.resolve().relative_to(root.resolve())
+            self.assertIn(f"; touch {marker};", str(hostile))
+            self.assertEqual(marker, root / "marker")
+            hostile.mkdir(parents=True, mode=0o700)
+            for part in (";", " ", "'", "$"):
+                self.assertIn(part, str(hostile))
+
+            self.assert_no_scratch()
+            old = os.environ.get("TMPDIR")
+
+            def restore_tmpdir():
+                if old is None:
+                    os.environ.pop("TMPDIR", None)
+                else:
+                    os.environ["TMPDIR"] = old
+
+            self.addCleanup(restore_tmpdir)
+            real_popen = subprocess.Popen
+            self.addCleanup(setattr, subprocess, "Popen", real_popen)
+            try:
+                os.environ["TMPDIR"] = str(plain)
+                control = self.fetch(bare, commit, "plugin.py")
+                self.assertEqual(control, _GOOD)
+                self.assertEqual(
+                    [path.name for path in plain.iterdir() if path.name.startswith("plugin-fetch-")],
+                    [])
+                fetches = []
+                child_envs = []
+
+                def spying(*args, **kwargs):
+                    argv = args[0] if args else kwargs.get("args")
+                    if isinstance(argv, (list, tuple)) and "fetch" in argv:
+                        fetches.append(list(argv))
+                    child_envs.append(kwargs.get("env"))
+                    return real_popen(*args, **kwargs)
+
+                subprocess.Popen = spying
+                os.environ["TMPDIR"] = str(hostile)
+                refused = None
+                got = None
+                try:
+                    got = self.fetch(bare, commit, "plugin.py")
+                except Exception as exc:  # noqa: BLE001 - the refusal is the assertion below
+                    refused = exc
+                finally:
+                    subprocess.Popen = real_popen
+                self.assertIsNone(
+                    refused,
+                    f"marker={marker.exists()} fetches={len(fetches)} "
+                    f"refusal={getattr(refused, 'code', refused)!r}")
+                self.assertFalse(marker.exists(), "a metacharacter in TMPDIR ran a command")
+                self.assertEqual(got, control)
+                self.assertEqual(len(fetches), 1, fetches)
+                self.assertEqual(
+                    [path.name for path in hostile.iterdir() if path.name.startswith("plugin-fetch-")],
+                    [])
+                self.assertTrue(child_envs)
+                for env in child_envs:
+                    self.assertIsInstance(env, dict)
+                    for key in ("TMPDIR", "HOME"):
+                        self.assertIn(key, env)
+                        Path(env[key]).resolve().relative_to(root.resolve())
+            finally:
+                restore_tmpdir()
+            self.assert_no_scratch()
+
+
+@unittest.skipUnless(LINUX, LINUX_ONLY)
+class StoreNameAndRollbackTests(ProfileCase):
+    """Store entry names and rollback across a generation that was already left."""
+
+    def _profile_untouched(self):
+        self.assertFalse((self.config / "plugins").exists())
+        self.assertFalse((self.config / "plugin-generations").exists())
+        self.assertFalse((self.config / "plugin-install.lock").exists())
+
+    def test_plugin_id_disabled_installs_and_reads_back(self):
+        source = b"VALUE = 1\n"
+        other = b"OTHER = 1\n"
+        self.write_registry(plugin_id="disabled", source=source)
+        result = self.install("disabled")
+        self.assertEqual(result["plugin_id"], "disabled")
+        self.assertEqual(result["generation"], 1)
+        self.assertEqual((self.config / "plugin-generations" / "current").read_text(), "1\n")
+        self.assertEqual((self.config / "plugins" / "disabled" / "plugin.py").read_bytes(), source)
+        self.assertEqual(self.listed()["plugins"], [{
+            "plugin_id": "disabled", "version": "1.0.0", "registry_label": "non_verified",
+        }])
+        saved = self.registry
+        self.registry = self.tmp / "other-root"
+        self.write_registry(plugin_id="fixture.other", source=other)
+        second = self.install("fixture.other")
+        self.assertEqual(second["generation"], 2)
+        self.assertEqual(
+            [row["plugin_id"] for row in self.listed()["plugins"]],
+            ["disabled", "fixture.other"])
+        from recursion_core.plugin_security.install import (
+            InstallRefused, disable_plugin, enable_plugin, rollback_generation)
+        rolled = rollback_generation(self.config, state=self.state)
+        self.assertEqual(rolled["generation"], 1)
+        self.assertEqual([row["plugin_id"] for row in self.listed()["plugins"]], ["disabled"])
+        self.assertEqual((self.config / "plugins" / "disabled" / "plugin.py").read_bytes(), source)
+        with self.assertRaises(InstallRefused) as caught:
+            rollback_generation(self.config, state=self.state)
+        self.assertEqual(caught.exception.code, "rollback_unavailable")
+        self.assertEqual((self.config / "plugin-generations" / "current").read_text(), "1\n")
+        hidden = disable_plugin(self.config, "disabled", state=self.state)
+        self.assertEqual(hidden["generation"], 3)
+        generation = self.config / "plugin-generations" / "3"
+        # The plugin directory keeps the id. The list file is not that directory.
+        self.assertEqual((generation / "disabled" / "plugin.py").read_bytes(), source)
+        self.assertTrue((generation / ".disabled").is_file())
+        self.assertFalse((self.config / "plugins" / "disabled").exists())
+        self.assertEqual(self.listed()["plugins"], [{
+            "plugin_id": "disabled", "version": "1.0.0", "registry_label": "non_verified",
+            "enabled": False,
+        }])
+        shown = enable_plugin(self.config, "disabled", state=self.state)
+        self.assertEqual(shown["generation"], 4)
+        self.assertEqual((self.config / "plugins" / "disabled" / "plugin.py").read_bytes(), source)
+        self.assertEqual([row["plugin_id"] for row in self.listed()["plugins"]], ["disabled"])
+        self.registry = saved
+
+    def test_install_json_is_refused_before_a_generation_is_published(self):
+        """install.json is the one store name that still matches a plugin id.
+
+        The daemon reads that file by this name. The id is refused before
+        current exists. disabled is not in this set: it installs.
+        """
+        self.write_registry(plugin_id="install.json", source=b"X = 1\n")
+        from recursion_core.plugin_security.install import InstallRefused
+        with self.assertRaises(InstallRefused) as caught:
+            self.install("install.json")
+        self.assertEqual(caught.exception.code, "plugin_id_reserved")
+        self._profile_untouched()
+        from recursion_core.plugin_security import install as install_mod
+        self.assertEqual(set(install_mod._STORE_RESERVED_IDS), {"install.json"})
+        self.assertNotIn("disabled", install_mod._STORE_RESERVED_IDS)
+        self.assertTrue(install_mod._plugin_id_ok("disabled"))
+        self.assertTrue(install_mod._plugin_id_ok("current"))
+        self.assertFalse(install_mod._plugin_id_ok("host"))
+        self.assertFalse(install_mod._plugin_id_ok("install.json"))
+
+    def test_an_older_generation_file_named_disabled_still_hides_the_plugin(self):
+        source = b"VALUE = 1\n"
+        self.write_registry(source=source)
+        self.install()
+        from recursion_core.plugin_security.install import disable_plugin
+        disable_plugin(self.config, "fixture.unsigned", state=self.state)
+        generation = self.config / "plugin-generations" / "2"
+        modern = generation / ".disabled"
+        legacy = generation / "disabled"
+        legacy.write_bytes(modern.read_bytes())
+        os.chmod(legacy, 0o600)
+        modern.unlink()
+        self.assertEqual(self.listed()["plugins"], [{
+            "plugin_id": "fixture.unsigned", "version": "1.0.0", "registry_label": "non_verified",
+            "enabled": False,
+        }])
+        self.assertFalse((self.config / "plugins" / "fixture.unsigned").exists())
+        self.assertEqual(
+            (generation / "fixture.unsigned" / "plugin.py").read_bytes(), source)
+
+    def test_two_rollbacks_in_a_row_do_not_publish_a_generation_already_left(self):
+        """Install, install, roll back, install, then two rollbacks in a row.
+
+        The generation the first rollback left stays on disk and does not
+        become current again. The second rollback of the pair has nothing
+        older than that parent.
+        """
+        alpha, beta, gamma = b"A=1\n", b"B=1\n", b"G=1\n"
+        self.write_registry(plugin_id="fixture.alpha", source=alpha)
+        self.install("fixture.alpha")
+        self.registry = self.tmp / "beta-root"
+        self.write_registry(plugin_id="fixture.beta", source=beta)
+        self.install("fixture.beta")
+        from recursion_core.plugin_security.install import InstallRefused, rollback_generation
+        first = rollback_generation(self.config, state=self.state)
+        self.assertEqual(first["generation"], 1)
+        self.assertEqual([row["plugin_id"] for row in first["plugins"]], ["fixture.alpha"])
+        self.registry = self.tmp / "gamma-root"
+        self.write_registry(plugin_id="fixture.gamma", source=gamma)
+        installed = self.install("fixture.gamma")
+        self.assertEqual(installed["generation"], 3)
+        again = rollback_generation(self.config, state=self.state)
+        self.assertEqual(again["generation"], 1)
+        self.assertEqual([row["plugin_id"] for row in again["plugins"]], ["fixture.alpha"])
+        self.assertEqual((self.config / "plugins" / "fixture.alpha" / "plugin.py").read_bytes(), alpha)
+        self.assertFalse((self.config / "plugins" / "fixture.beta").exists())
+        self.assertFalse((self.config / "plugins" / "fixture.gamma").exists())
+        self.assertEqual((self.config / "plugin-generations" / "current").read_text(), "1\n")
+        self.assertEqual(
+            (self.config / "plugin-generations" / "2" / "fixture.beta" / "plugin.py").read_bytes(), beta)
+        with self.assertRaises(InstallRefused) as caught:
+            rollback_generation(self.config, state=self.state)
+        self.assertEqual(caught.exception.code, "rollback_unavailable")
+        self.assertEqual((self.config / "plugin-generations" / "current").read_text(), "1\n")
+        self.assertEqual((self.config / "plugins" / "fixture.alpha" / "plugin.py").read_bytes(), alpha)
+        self.assertFalse((self.config / "plugins" / "fixture.beta").exists())
 
 
 if __name__ == "__main__":

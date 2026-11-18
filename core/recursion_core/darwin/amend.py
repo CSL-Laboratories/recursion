@@ -11,6 +11,7 @@ change. The cookie is read from the pipe, not from argv.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -56,6 +57,77 @@ def _read_env(path: str) -> dict:
     return env
 
 
+def _start_ticks(pid: int) -> int | None:
+    """Field 22 of ``/proc/<pid>/stat``, or None when this host has no such row."""
+
+    try:
+        raw = open('/proc/%d/stat' % pid, 'r', encoding='ascii', errors='replace').read()
+    except OSError:
+        return None
+    try:
+        rest = raw[raw.rindex(')') + 2:].split()
+        return int(rest[19])
+    except (ValueError, IndexError, OSError):
+        return None
+
+
+def _spawn_writer(path: str, payload: bytes) -> tuple[int, int | None]:
+    """Write ``payload`` from a grandchild. Return its pid and start ticks.
+
+    The intermediate child forks the writer and exits. This process reaps
+    that child before it execs, so the writer is reparented and is not a
+    child of the engine. The engine does not keep the writer's zombie.
+    """
+
+    read_fd, write_fd = os.pipe()
+    intermediate = os.fork()
+    if intermediate == 0:
+        os.close(read_fd)
+        try:
+            writer = os.fork()
+        except OSError:
+            os.close(write_fd)
+            os._exit(127)
+        if writer == 0:
+            os.close(write_fd)
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CLOEXEC)
+                data = ('%d\n' % len(payload)).encode('ascii') + payload
+                while data:
+                    wrote = os.write(fd, data)
+                    if wrote <= 0:
+                        raise OSError('short write')
+                    data = data[wrote:]
+                os.close(fd)
+            except Exception:
+                os._exit(127)
+            os._exit(0)
+        start = _start_ticks(writer)
+        token = ('%d %s\n' % (writer, '' if start is None else start)).encode('ascii')
+        try:
+            os.write(write_fd, token)
+        except Exception:
+            os.close(write_fd)
+            os._exit(127)
+        os.close(write_fd)
+        os._exit(0)
+    os.close(write_fd)
+    try:
+        while True:
+            try:
+                os.waitpid(intermediate, 0)
+                break
+            except OSError as exc:
+                if exc.errno != errno.EINTR:
+                    raise
+        raw = _read_all(read_fd, 64)
+    finally:
+        os.close(read_fd)
+    text = raw.decode('ascii', errors='replace').strip()
+    pid_text, _, start_text = text.partition(' ')
+    return int(pid_text), int(start_text) if start_text else None
+
+
 def _env_name(name: str) -> str:
     if not name or '=' in name or '\0' in name or not name.isascii() or not name.replace('_', '').isalnum():
         raise OSError('cookie name')
@@ -84,30 +156,21 @@ def main(argv: list[str]) -> None:
     amended = fifo + '.cookie'
     os.mkfifo(amended, 0o600)
     os.chmod(amended, 0o600)
-    writer = os.fork()
-    if writer == 0:
-        try:
-            fd = os.open(amended, os.O_WRONLY | os.O_CLOEXEC)
-            data = ('%d\n' % len(payload)).encode('ascii') + payload
-            while data:
-                wrote = os.write(fd, data)
-                if wrote <= 0:
-                    raise OSError('short write')
-                data = data[wrote:]
-            os.close(fd)
-        except Exception:
-            os._exit(127)
-        os._exit(0)
+    writer, writer_start = _spawn_writer(amended, payload)
     command = list(command)
     command[dash - 1] = amended
     try:
         os.execv(command[0], command)
     except OSError:
         pass
-    try:
-        os.kill(writer, 9)
-    except OSError:
-        pass
+    # The writer is no longer our child. Signal it only when the start
+    # ticks still name the process we forked. A reused pid is left alone,
+    # and a host with no proc row is not signalled.
+    if writer_start is not None and _start_ticks(writer) == writer_start:
+        try:
+            os.kill(writer, 9)
+        except OSError:
+            pass
     os._exit(127)
 
 

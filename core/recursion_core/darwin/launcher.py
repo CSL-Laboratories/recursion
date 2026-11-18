@@ -16,6 +16,7 @@ accepts the pid only when the process table still reports that start time.
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -115,11 +116,12 @@ def _boundary(unit: str) -> str:
 class DarwinRunManager:
     """The service manager a Darwin daemon would hand to ``ProductionLauncher``.
 
-    ``stop`` signals the leader's process group when the start time still
-    matches. It does not scan for the cookie and it does not answer empty:
-    that attestation is a later draft. ``open_main_pidfd`` returns the kqueue
-    fd from ``start``, or None when the pid's start time no longer matches,
-    which is the polling path ``UnitEngineProcess`` already has.
+    ``stop`` signals the leader's process group only when that pid is a live
+    session leader above 1, not this process's own group, and the live start
+    time still matches. It does not scan for the cookie and it does not
+    answer empty: that attestation is a later draft. ``open_main_pidfd``
+    returns a duplicate of the exit fd from ``start``, or None when the
+    pid's start time no longer matches. The kqueue keeps its own fd.
     """
 
     def __init__(self, registry, *, kqueue=None, processes=None):
@@ -172,6 +174,7 @@ class DarwinRunManager:
                 raise OSError(errno.EINVAL, 'stdio not prepared')
             self._starting.add(unit)
         proc = None
+        recorded_start = None
         try:
             fifo = _env_fifo(argv)
             if fifo is None:
@@ -179,6 +182,7 @@ class DarwinRunManager:
             cookie = secrets.token_hex(16)
             proc = self._spawn(list(argv), pending, cookie)
             info = self._await_leader(proc)
+            recorded_start = info['start_time']
             try:
                 kq_fd = self._kqueue.watch_exit(proc.pid)
             except Exception as exc:
@@ -207,9 +211,17 @@ class DarwinRunManager:
                 self._runs[unit] = leader
                 self._by_pid[proc.pid] = leader
             proc = None  # owned by the leader record; the except path must not kill it
+            self._reap_when_exited(leader.popen)
         except BaseException:
             if proc is not None:
-                self._stop_spawned(proc, proc.pid)
+                recorded = recorded_start
+                if recorded is None:
+                    live = self._processes.read(proc.pid)
+                    if isinstance(live, dict):
+                        start = live.get('start_time')
+                        if isinstance(start, int) and not isinstance(start, bool):
+                            recorded = start
+                self._stop_spawned(proc, proc.pid, recorded)
             raise
         finally:
             with self._lock:
@@ -224,7 +236,11 @@ class DarwinRunManager:
         return leader.group, leader.pid
 
     def open_main_pidfd(self, group, pid):
-        """The leader's exit fd, or None when this pid is no longer that leader."""
+        """A duplicate of the leader's exit fd, or None when this pid is no longer that leader.
+
+        The caller owns the duplicate. The kqueue keeps the original, so
+        shutting one does not shut the other, and a second call is a new fd.
+        """
 
         _gate()
         with self._lock:
@@ -234,7 +250,7 @@ class DarwinRunManager:
             start, fd = leader.start_time, leader.kq_fd
         if self._processes.start_time(pid) != start:
             return None
-        return fd
+        return fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 0)
 
     def adopt(self, unit):
         """Take a run back after a restart. A different start time is ``pid_reused``."""
@@ -267,10 +283,12 @@ class DarwinRunManager:
         return group, pid
 
     def stop(self, unit):
-        """Signal the leader's group when the start time still matches.
+        """Signal the leader's group when it is still a session this stop may reach.
 
         This is not the attested Stop. A cookie scan and an empty answer are
         a later draft. An unknown unit is ``UnitNotLoaded``, as systemd is.
+        Pid 1 and this process's own group are refused before any signal:
+        ``killpg(1)`` is ``kill(-1)``.
         """
 
         _gate()
@@ -281,7 +299,9 @@ class DarwinRunManager:
             raise UnitNotLoaded(unit)
         if self._processes.start_time(leader.pid) != leader.start_time:
             raise refused('pid_reused')
-        self._stop_spawned(leader.popen, leader.pid)
+        if not self._may_signal(leader.pid, leader.start_time):
+            raise refused('pid_unreachable')
+        self._stop_spawned(leader.popen, leader.pid, leader.start_time)
         leader.stopped = True
 
     def observe(self, unit):
@@ -334,6 +354,11 @@ class DarwinRunManager:
             write_fd = -1
             nofollow = os.O_NOFOLLOW | os.O_CLOEXEC
             stdin_fd = os.open(stdio['stdin'], os.O_RDONLY | os.O_NONBLOCK | nofollow)
+            # NONBLOCK lets this open return when the FIFO has no writer.
+            # The child inherits the open-file description, so clear the
+            # flag before the spawn or the engine's fd 0 stays nonblocking.
+            status = fcntl.fcntl(stdin_fd, fcntl.F_GETFL)
+            fcntl.fcntl(stdin_fd, fcntl.F_SETFL, status & ~os.O_NONBLOCK)
             stdout_fd = os.open(stdio['stdout'], os.O_WRONLY | os.O_APPEND | nofollow)
             stderr_fd = os.open(stdio['stderr'], os.O_WRONLY | os.O_APPEND | nofollow)
             command = [sys.executable, '-I', '-S', str(_AMEND), str(read_fd), RUN_COOKIE, *argv]
@@ -390,8 +415,54 @@ class DarwinRunManager:
             return parsed
         return {}
 
-    def _stop_spawned(self, popen, pid):
+    def _reap_when_exited(self, popen) -> None:
+        """Wait a leader this manager spawned, after that leader has exited.
+
+        Waiting collects a zombie. It does not signal.
+        """
+
+        if popen is None:
+            return
+
+        def _wait() -> None:
+            try:
+                popen.wait()
+            except Exception:
+                pass
+
+        threading.Thread(target=_wait, daemon=True).start()
+
+    def _may_signal(self, pid, recorded) -> bool:
+        """True only for a live session leader this stop may signal.
+
+        Pid 1 is refused because ``killpg(1)`` is ``kill(-1)``. This
+        process's own group is refused. The live group and session must
+        both be that pid, and the live start time must be the recorded one.
+        """
+
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+            return False
+        if isinstance(recorded, bool) or not isinstance(recorded, int):
+            return False
         try:
+            if pid == os.getpgrp():
+                return False
+        except OSError:
+            return False
+        info = self._processes.read(pid)
+        if not isinstance(info, dict):
+            return False
+        if info.get('pgid') != pid or info.get('sid') != pid:
+            return False
+        start = info.get('start_time')
+        if isinstance(start, bool) or not isinstance(start, int) or start != recorded:
+            return False
+        return True
+
+    def _stop_spawned(self, popen, pid, recorded=None):
+        try:
+            if not self._may_signal(pid, recorded):
+                raise OSError(errno.EPERM, 'stop will not signal this pid')
             os.killpg(pid, signal.SIGKILL)
         except OSError:
             if popen is not None:

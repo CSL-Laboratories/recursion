@@ -13,9 +13,12 @@ leader's start time. A pid whose start time changed is not adopted.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import sysconfig
@@ -25,8 +28,10 @@ import unittest
 from pathlib import Path
 
 _FLAG = '--simulate-darwin-launch'
+_ANSWER = '--simulate-darwin-answer'
 _MARK = 'SIMULATED_DARWIN_LAUNCH '
 _SCRATCH = Path('/var/tmp/grok-darwin-launcher')
+_ANSWER_SCRATCH = Path('/var/tmp/grok-darwin-launcher-2')
 _LAUNCHER = (
     'platform_unsupported: the engine launcher needs Linux '
     '(FIFO stdio, FIONREAD, pidfd, systemd user units)'
@@ -224,6 +229,443 @@ def simulate() -> dict:
     return json.loads(line[len(_MARK):])
 
 
+def _proc_state(pid: int) -> str:
+    try:
+        text = Path('/proc/%d/stat' % pid).read_text()
+    except OSError as exc:
+        return 'gone:%s' % exc.errno
+    try:
+        return text[text.rindex(')') + 2:].split()[0]
+    except (ValueError, IndexError):
+        return 'bad'
+
+
+def _child_pids(pid: int) -> list[dict]:
+    path = Path('/proc/%d/task/%d/children' % (pid, pid))
+    try:
+        raw = path.read_text().split()
+    except OSError as exc:
+        return [{'error': exc.errno}]
+    found = []
+    for item in raw:
+        try:
+            cpid = int(item)
+        except ValueError:
+            continue
+        found.append({'pid': cpid, 'state': _proc_state(cpid)})
+    return found
+
+
+def _fd_open(fd: int) -> bool:
+    try:
+        fcntl.fcntl(fd, fcntl.F_GETFD)
+    except OSError:
+        return False
+    return True
+
+
+class _Held:
+    """One simulated launch. ``close`` reaps only the child this launch created."""
+
+    def __init__(self) -> None:
+        self.scratch: Path | None = None
+        self.popen = None
+        self.kqueue = None
+        self.fds: list[int] = []
+
+    def close(self) -> None:
+        for fd in self.fds:
+            if _fd_open(fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.fds.clear()
+        popen = self.popen
+        if popen is not None:
+            if popen.poll() is None:
+                popen.kill()
+            try:
+                popen.wait(timeout=2)
+            except Exception:
+                pass
+        if self.scratch is not None:
+            shutil.rmtree(self.scratch, ignore_errors=True)
+
+
+def _bind() -> tuple:
+    """Open the gate in this process only, the same way the launch test does."""
+
+    _apply()
+    import recursion_core.daemon.launcher as gate_mod
+    import recursion_core.darwin.launcher as launcher_mod
+    from recursion_core.daemon import Registry, engine_exec
+    from recursion_core.darwin.kq import FakeKqueue
+    from recursion_core.darwin.launcher import RUN_COOKIE, DarwinRunManager
+    from recursion_core.darwin.proc import ProcTable
+
+    gate_mod.require_launcher_platform = lambda: None
+    return launcher_mod, Registry, engine_exec, FakeKqueue, RUN_COOKIE, DarwinRunManager, ProcTable
+
+
+def _begin(run_id: str) -> tuple:
+    launcher_mod, Registry, engine_exec, FakeKqueue, RUN_COOKIE, DarwinRunManager, ProcTable = _bind()
+    held = _Held()
+    _ANSWER_SCRATCH.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(_ANSWER_SCRATCH, 0o700)
+    held.scratch = Path(tempfile.mkdtemp(prefix='ans-', dir=str(_ANSWER_SCRATCH)))
+    os.chmod(held.scratch, 0o700)
+    scratch = held.scratch
+    stdin, stdout, stderr = scratch / 'stdin.fifo', scratch / 'stdout.log', scratch / 'stderr.log'
+    envfifo = scratch / 'env.fifo'
+    os.mkfifo(envfifo, 0o600)
+    registry = Registry(scratch / 'state')
+    kqueue = FakeKqueue()
+    held.kqueue = kqueue
+    manager = DarwinRunManager(registry, kqueue=kqueue, processes=ProcTable())
+    unit = 'recursion-run-%s.service' % run_id
+    manager.prepare(unit, properties=(
+        'StandardInput=file:' + str(stdin),
+        'StandardOutput=append:' + str(stdout),
+        'StandardError=append:' + str(stderr),
+    ))
+    return held, manager, unit, envfifo, registry, RUN_COOKIE, engine_exec, launcher_mod
+
+
+def _publish_env(path: Path) -> None:
+    payload = json.dumps({'PATH': '/usr/bin:/bin'}).encode()
+    blob = ('%d\n' % len(payload)).encode() + payload
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError as exc:
+            if exc.errno == errno.ENXIO and time.monotonic() < deadline:
+                time.sleep(0.02)
+                continue
+            raise
+        break
+    try:
+        while blob:
+            wrote = os.write(fd, blob)
+            if wrote <= 0:
+                raise OSError(errno.EIO, 'short env write')
+            blob = blob[wrote:]
+    finally:
+        os.close(fd)
+
+
+def _wait_path(path: Path, popen, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while not path.exists():
+        if popen is not None and popen.poll() is not None:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def _standin(scratch: Path, body: str) -> Path:
+    path = scratch / 'standin.py'
+    path.write_text('#!' + sys.executable + '\n' + body)
+    os.chmod(path, 0o700)
+    return path
+
+
+def _argv(engine_exec, envfifo: Path, standin: Path, args: list[str]) -> list[str]:
+    return [sys.executable, '-I', '-S', str(Path(engine_exec.__file__)), str(envfifo),
+            '--', str(standin), *args]
+
+
+def _answer_stdin() -> dict:
+    held, manager, unit, envfifo, registry, cookie_name, engine_exec, _launcher = _begin('stdin1')
+    try:
+        out = held.scratch / 'child.json'
+        ready = held.scratch / 'ready'
+        standin = _standin(held.scratch, (
+            'import fcntl, json, os, sys\n'
+            'out, ready = sys.argv[1], sys.argv[2]\n'
+            'flags = fcntl.fcntl(0, fcntl.F_GETFL)\n'
+            'fdinfo = open("/proc/self/fdinfo/0").read()\n'
+            'line = ""\n'
+            'for item in fdinfo.splitlines():\n'
+            '    if item.startswith("flags:"):\n'
+            '        line = item\n'
+            'json.dump({"nonblock": bool(flags & os.O_NONBLOCK), "flags": flags,\n'
+            '           "fdinfo_flags": line}, open(out, "w"))\n'
+            'open(ready, "w").close()\n'
+        ))
+        manager.start(unit, _argv(engine_exec, envfifo, standin, [str(out), str(ready)]))
+        leader = manager._runs[unit]
+        held.popen = leader.popen
+        _publish_env(envfifo)
+        if not _wait_path(ready, held.popen, 5):
+            return {'ok': False, 'message': 'stdin child did not report',
+                    'state': _proc_state(leader.pid), 'code': held.popen.returncode}
+        child = json.loads(out.read_text())
+        child['ok'] = True
+        return child
+    finally:
+        held.close()
+
+
+def _answer_exitfd() -> dict:
+    held, manager, unit, envfifo, _registry, _cookie, engine_exec, _launcher = _begin('exitfd1')
+    try:
+        standin = _standin(held.scratch, 'import time\ntime.sleep(30)\n')
+        manager.start(unit, _argv(engine_exec, envfifo, standin, []))
+        leader = manager._runs[unit]
+        held.popen = leader.popen
+        group, pid = manager.unit_identity(unit)
+        fd_a = manager.open_main_pidfd(group, pid)
+        fd_b = manager.open_main_pidfd(group, pid)
+        kq = held.kqueue.watches[0]['fd']
+        held.fds.extend(fd for fd in (fd_a, fd_b) if isinstance(fd, int))
+        distinct = isinstance(fd_a, int) and isinstance(fd_b, int) and fd_a != fd_b and fd_a != kq and fd_b != kq
+        if isinstance(fd_a, int):
+            os.close(fd_a)
+            held.fds.remove(fd_a)
+        other_alive = isinstance(fd_b, int) and _fd_open(fd_b)
+        kq_alive = _fd_open(kq)
+        marker = None
+        marker_alive = False
+        if isinstance(fd_a, int):
+            held_null = os.open('/dev/null', os.O_RDONLY | os.O_CLOEXEC)
+            if held_null == fd_a:
+                marker = held_null
+            else:
+                os.dup2(held_null, fd_a)
+                os.close(held_null)
+                marker = fd_a
+            held.fds.append(marker)
+            held.kqueue.close()
+            held.kqueue = None
+            marker_alive = _fd_open(marker)
+        return {
+            'ok': True,
+            'distinct': distinct,
+            'other_alive': other_alive,
+            'kq_alive': kq_alive,
+            'marker_alive': marker_alive,
+        }
+    finally:
+        held.close()
+
+
+def _answer_stop() -> dict:
+    held, manager, unit, envfifo, _registry, cookie_name, engine_exec, launcher_mod = _begin('ours1')
+    calls: list[list[int]] = []
+    real = launcher_mod.os.killpg
+
+    def record(pid, sig):
+        calls.append([int(pid), int(sig)])
+        raise OSError(errno.EPERM, 'recorded, not sent')
+
+    launcher_mod.os.killpg = record
+    try:
+        def adopt_stop(run_id: str, target: int) -> dict:
+            from recursion_core.daemon import Registry
+            from recursion_core.darwin.kq import FakeKqueue
+            from recursion_core.darwin.launcher import DarwinRunManager
+            from recursion_core.darwin.proc import ProcTable
+
+            reg = Registry(held.scratch / run_id)
+            table = ProcTable()
+            mgr = DarwinRunManager(reg, kqueue=FakeKqueue(), processes=table)
+            start = table.start_time(target)
+            body = {
+                'run_id': run_id,
+                cookie_name: 'ab' * 16,
+                'cgroup': '/darwin-pgid/recursion-run-%s.service' % run_id,
+                'leader_pid': target,
+                'leader_start_time': start,
+            }
+            reg.control_put(run_id, json.dumps(body))
+            before = len(calls)
+            adopted = None
+            detail = None
+            try:
+                adopted = mgr.adopt('recursion-run-%s.service' % run_id)
+                mgr.stop('recursion-run-%s.service' % run_id)
+            except Exception as exc:  # noqa: BLE001 - the refusal is the result
+                detail = getattr(exc, 'detail', None) or type(exc).__name__
+            return {
+                'target': target,
+                'start': start,
+                'adopted': list(adopted) if adopted else None,
+                'detail': detail,
+                'calls': calls[before:],
+            }
+
+        pid1 = adopt_stop('pidone', 1)
+        pgrp_id = os.getpgrp()
+        pgrp = adopt_stop('pgroup', pgrp_id)
+        standin = _standin(held.scratch, 'import time\ntime.sleep(30)\n')
+        manager.start(unit, _argv(engine_exec, envfifo, standin, []))
+        leader = manager._runs[unit]
+        held.popen = leader.popen
+        before = len(calls)
+        own_detail = None
+        try:
+            manager.stop(unit)
+        except Exception as exc:  # noqa: BLE001 - a refusal here is the result
+            own_detail = getattr(exc, 'detail', None) or type(exc).__name__
+        return {
+            'ok': True,
+            'pid1': pid1,
+            'pgrp': pgrp,
+            'own_pid': leader.pid,
+            'own_pgrp': pgrp_id,
+            'own_detail': own_detail,
+            'own_calls': calls[before:],
+        }
+    finally:
+        launcher_mod.os.killpg = real
+        held.close()
+
+
+def _answer_reap() -> dict:
+    held, manager, unit, envfifo, _registry, _cookie, engine_exec, _launcher = _begin('reap1')
+    try:
+        ready = held.scratch / 'ready'
+        release = held.scratch / 'release'
+        standin = _standin(held.scratch, (
+            'import os, sys, time\n'
+            'ready, release = sys.argv[1], sys.argv[2]\n'
+            'open(ready, "w").close()\n'
+            'deadline = time.time() + 15\n'
+            'while not os.path.exists(release):\n'
+            '    if time.time() > deadline:\n'
+            '        break\n'
+            '    time.sleep(0.02)\n'
+        ))
+        manager.start(unit, _argv(engine_exec, envfifo, standin, [str(ready), str(release)]))
+        leader = manager._runs[unit]
+        held.popen = leader.popen
+        _publish_env(envfifo)
+        if not _wait_path(ready, held.popen, 5):
+            return {'ok': False, 'message': 'reap child did not become ready',
+                    'state': _proc_state(leader.pid), 'code': held.popen.returncode}
+        kids = _child_pids(leader.pid)
+        zombies = [item for item in kids if item.get('state') == 'Z']
+        release.write_text('go')
+        deadline = time.monotonic() + 1.0
+        state = _proc_state(leader.pid)
+        code = held.popen.returncode
+        while time.monotonic() < deadline:
+            state = _proc_state(leader.pid)
+            code = held.popen.returncode
+            if code is not None and state != 'Z':
+                break
+            time.sleep(0.02)
+        return {
+            'ok': True,
+            'zombie_children': zombies,
+            'leader_state': state,
+            'returncode': code,
+            'observe_after': manager.observe(unit),
+        }
+    finally:
+        held.close()
+
+
+def _answer_rules() -> dict:
+    held, manager, unit, envfifo, registry, cookie_name, engine_exec, _launcher = _begin('rules1')
+    try:
+        out = held.scratch / 'child.json'
+        ready = held.scratch / 'ready'
+        release = held.scratch / 'release'
+        standin = _standin(held.scratch, (
+            'import json, os, sys, time\n'
+            'out, ready, release = sys.argv[1:4]\n'
+            'cmd = open("/proc/self/cmdline", "rb").read().decode("latin1")\n'
+            'json.dump({"cmd": cmd}, open(out, "w"))\n'
+            'open(ready, "w").close()\n'
+            'deadline = time.time() + 15\n'
+            'while not os.path.exists(release):\n'
+            '    if time.time() > deadline:\n'
+            '        break\n'
+            '    time.sleep(0.02)\n'
+        ))
+        manager.start(unit, _argv(engine_exec, envfifo, standin, [str(out), str(ready), str(release)]))
+        leader = manager._runs[unit]
+        held.popen = leader.popen
+        amend_cmd = Path('/proc/%d/cmdline' % leader.pid).read_bytes()
+        rows = dict(registry.control_all())
+        record = json.loads(rows['rules1'])
+        cookie = record.get(cookie_name)
+        _publish_env(envfifo)
+        if not _wait_path(ready, held.popen, 5):
+            return {'ok': False, 'message': 'rules child did not become ready',
+                    'state': _proc_state(leader.pid)}
+        child = json.loads(out.read_text())
+        group, _pid = manager.unit_identity(unit)
+        # Sample while the leader is still alive. A later wait must not
+        # change what these rules said about the live run.
+        gone = manager.processes_gone(unit)
+        clear = manager.recorded_cgroup_clear(unit, group)
+        observed = manager.observe(unit)
+        cookie_bytes = cookie.encode('ascii') if isinstance(cookie, str) else b'\x00none'
+        release.write_text('go')
+        return {
+            'ok': True,
+            'gone': gone,
+            'clear': clear,
+            'observe': observed,
+            'cookie_len': len(cookie) if isinstance(cookie, str) else None,
+            'cookie_on_amend': isinstance(cookie, str) and cookie_bytes in amend_cmd,
+            'cookie_on_engine': isinstance(cookie, str) and cookie in child.get('cmd', ''),
+        }
+    finally:
+        held.close()
+
+
+def _answer(mode: str) -> dict:
+    modes = {
+        'stdin': _answer_stdin,
+        'exitfd': _answer_exitfd,
+        'stop': _answer_stop,
+        'reap': _answer_reap,
+        'rules': _answer_rules,
+    }
+    fn = modes.get(mode)
+    if fn is None:
+        return {'ok': False, 'message': 'unknown mode'}
+    return fn()
+
+
+def _answer_main() -> int:
+    mode = sys.argv[2] if len(sys.argv) > 2 else ''
+    _ANSWER_SCRATCH.mkdir(mode=0o700, exist_ok=True)
+    try:
+        payload = _answer(mode)
+    except Exception as exc:  # noqa: BLE001 - the child reports the failure
+        import traceback
+        payload = {'ok': False, 'exc_type': type(exc).__name__, 'message': str(exc),
+                   'trace': traceback.format_exc()[-2500:]}
+    sys.stdout.write('\n' + _MARK + json.dumps(payload) + '\n')
+    return 0
+
+
+def run_answer(mode: str) -> dict:
+    _ANSWER_SCRATCH.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(_ANSWER_SCRATCH, 0o700)
+    env = os.environ.copy()
+    env['PYTHONDONTWRITEBYTECODE'] = '1'
+    env['TMPDIR'] = str(_ANSWER_SCRATCH)
+    proc = subprocess.run(
+        [sys.executable, '-B', str(Path(__file__).resolve()), _ANSWER, mode],
+        capture_output=True, text=True, timeout=40, env=env, check=False,
+    )
+    line = next((item for item in reversed(proc.stdout.splitlines()) if item.startswith(_MARK)), None)
+    if line is None:
+        raise AssertionError(
+            'simulated-darwin answer %s gave no result (exit %s):\n%s\n%s'
+            % (mode, proc.returncode, proc.stdout[-2000:], proc.stderr[-4000:]))
+    return json.loads(line[len(_MARK):])
+
+
 class DarwinLauncherTests(unittest.TestCase):
     def test_a_launch_records_the_session_the_fifos_the_cookie_and_the_start_time(self) -> None:
         result = simulate()
@@ -256,8 +698,53 @@ class DarwinLauncherTests(unittest.TestCase):
         self.assertEqual('kqueue_unavailable', result['kqueue_detail'])
         self.assertFalse(result['real_kqueue'])
 
+    def test_stdin_of_the_engine_is_blocking(self) -> None:
+        result = run_answer('stdin')
+        self.assertTrue(result['ok'], result)
+        self.assertFalse(result['nonblock'], result)
+
+    def test_exit_fd_is_a_duplicate_the_caller_owns(self) -> None:
+        result = run_answer('exitfd')
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(result['distinct'], result)
+        self.assertTrue(result['other_alive'], result)
+        self.assertTrue(result['kq_alive'], result)
+        self.assertTrue(result['marker_alive'], result)
+
+    def test_stop_refuses_pid_one_and_this_group(self) -> None:
+        result = run_answer('stop')
+        self.assertTrue(result['ok'], result)
+        self.assertEqual([], result['pid1']['calls'], result)
+        self.assertEqual('pid_unreachable', result['pid1']['detail'], result)
+        self.assertEqual([], result['pgrp']['calls'], result)
+        self.assertEqual('pid_unreachable', result['pgrp']['detail'], result)
+        self.assertGreater(result['own_pid'], 1)
+        self.assertNotEqual(result['own_pgrp'], result['own_pid'])
+        self.assertEqual([[result['own_pid'], signal.SIGKILL]], result['own_calls'], result)
+        self.assertIsNone(result['own_detail'], result)
+
+    def test_finished_leader_is_waited_and_writer_is_not_its_child(self) -> None:
+        result = run_answer('reap')
+        self.assertTrue(result['ok'], result)
+        self.assertEqual([], result['zombie_children'], result)
+        self.assertNotEqual('Z', result['leader_state'], result)
+        self.assertIsNotNone(result['returncode'], result)
+        self.assertEqual('unknown', result['observe_after'], result)
+
+    def test_stated_rules_have_a_witness(self) -> None:
+        result = run_answer('rules')
+        self.assertTrue(result['ok'], result)
+        self.assertIs(result['gone'], False, result)
+        self.assertIsNone(result['clear'], result)
+        self.assertEqual('running', result['observe'], result)
+        self.assertEqual(32, result['cookie_len'], result)
+        self.assertFalse(result['cookie_on_amend'], result)
+        self.assertFalse(result['cookie_on_engine'], result)
+
 
 if __name__ == '__main__':
     if sys.argv[1:2] == [_FLAG]:
         raise SystemExit(_child_main())
+    if sys.argv[1:2] == [_ANSWER]:
+        raise SystemExit(_answer_main())
     unittest.main()

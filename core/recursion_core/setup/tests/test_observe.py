@@ -10,6 +10,7 @@ the record, when the audit hook sees a sign-in store opened, or when a mode-000
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -17,6 +18,7 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -38,10 +40,13 @@ _CANARY_AGENTS = "CANARY-AGENTS-7c1e9a4b-DO-NOT-LEAK"
 _CANARY_CLAUDE_MD = "CANARY-CLAUDEMD-7c1e9a4b-DO-NOT-LEAK"
 _CANARY_SEALED = "CANARY-SEALED-7c1e9a4b-DO-NOT-LEAK"
 _CANARY_RUNNER = "CANARY-RUNNER-7c1e9a4b-DO-NOT-LEAK"
+_CANARY_CMD = "CANARY-CMD-7c1e9a4b-DO-NOT-LEAK"
+_CANARY_LINK = "CANARY-LINK-7c1e9a4b-DO-NOT-LEAK"
 _CANARIES = (
     _CANARY_AUTH, _CANARY_CRED, _CANARY_ENV, _CANARY_MCP_ENV, _CANARY_MCP_HDR, _CANARY_ARGS,
     _CANARY_CODEX, _CANARY_CURSOR_ENV, _CANARY_CURSOR_HDR, _CANARY_GIT_NAME, _CANARY_GIT_MAIL,
     _CANARY_GIT_URL, _CANARY_AGENTS, _CANARY_CLAUDE_MD, _CANARY_SEALED, _CANARY_RUNNER,
+    _CANARY_CMD, _CANARY_LINK,
 )
 _OPENED: list = []
 _HOOKED = False
@@ -115,9 +120,18 @@ def _by_path(report, path):
 
 
 def _clean(blob):
+    # The failure text stays plain: it must not repeat a planted marker.
     for canary in _CANARIES:
         if canary in blob:
-            raise AssertionError(f"canary reached the output: {canary}")
+            raise AssertionError("canary reached the output")
+
+
+def _opened_names(opened):
+    return [os.fsdecode(raw) if isinstance(raw, bytes) else str(raw) for raw in opened]
+
+
+def _ends(opened, suffix):
+    return any(name.endswith(suffix) for name in _opened_names(opened))
 
 
 @contextlib.contextmanager
@@ -351,8 +365,10 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(code, 0, text)
         self._assert_private(home, opened, text, disk)
         row = _by_path(json.loads(text), config)
-        self.assertEqual(row["state"], "unknown")
+        # A second name is an alias: one plain state, no hash and no field.
+        self.assertEqual(row["state"], "aliased")
         self.assertIsNone(row["sha256"])
+        self.assertNotIn("allow", row)
         shown = [os.fsdecode(raw) if isinstance(raw, bytes) else str(raw) for raw in opened]
         self.assertFalse(any(path.endswith("config.toml") or path.endswith("auth.json") for path in shown), shown)
 
@@ -449,13 +465,24 @@ class ObserveTests(unittest.TestCase):
 
     def test_observe_is_the_subcommand_row_and_refuses_off_linux(self):
         _observe()
-        names = [name for name, _help in entry.SUBCOMMANDS]
-        self.assertEqual(names, ["observe"])
+        names = [row[0] for row in entry.SUBCOMMANDS]
+        self.assertEqual(names.count("observe"), 1)
+        self.assertEqual(names.count("doctor"), 1)
+        self.assertEqual(len(names), len(set(names)))
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = entry.main(["--help"])
         self.assertEqual(code, 0)
-        self.assertIn("observe", out.getvalue())
+        help_text = out.getvalue()
+        self.assertEqual(help_text.count("\n    observe "), 1)
+        self.assertEqual(help_text.count("\n    doctor "), 1)
+
+        with mock.patch.object(entry, "_linux", return_value=True):
+            with contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = entry.main(["observe", "--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("--json", out.getvalue())
 
         home, project, state = self._layout()
         _plant_denied(home)
@@ -480,6 +507,387 @@ class ObserveTests(unittest.TestCase):
         _clean(out.getvalue())
         with open(record, encoding="ascii") as handle:
             _clean(handle.read())
+
+        with mock.patch.object(entry, "_linux", return_value=True), \
+                mock.patch.dict(os.environ, {"HOME": home, "XDG_STATE_HOME": state, "PATH": ""}, clear=False), \
+                contextlib.chdir(project):
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+                code = entry.main(["observe", "--json"])
+        self.assertEqual(code, 0, out.getvalue())
+        again = json.loads(out.getvalue())
+        self.assertEqual(again["code"], "ok")
+        _clean(out.getvalue())
+        with open(record, encoding="ascii") as handle:
+            _clean(handle.read())
+
+    def _linked_payload(self, model):
+        return json.dumps({
+            "model": model,
+            "env": {"TOKEN": _CANARY_LINK},
+            "mcpServers": {
+                "maps": {"command": f"/usr/lib/map-tool --token {_CANARY_CMD}"},
+            },
+        })
+
+    def _assert_aliased_unread(self, home, project, state, path):
+        code, text, _record, disk, opened = self._run(home, project, state)
+        self.assertEqual(code, 0)
+        _clean(text)
+        _clean(disk.decode("utf-8", "replace"))
+        self.assertFalse(_ends(opened, "settings.json"), "settings file was opened")
+        self.assertFalse(_ends(opened, "cred.json"), "denied file was opened")
+        row = _by_path(json.loads(text), path)
+        self.assertEqual(row["state"], "aliased")
+        self.assertIsNone(row["sha256"])
+        self.assertNotIn("allow", row)
+        self.assertIs("model-from-link" in text, False, "a model was copied from an alias")
+
+    def test_a_hard_link_into_a_denied_directory_is_not_opened(self):
+        # Witness observe-hardlink-denied-dir: OPENED.
+        home, project, state = self._layout()
+        cred = os.path.join(home, ".hermes", "cred.json")
+        _write(cred, self._linked_payload("model-from-link"), 0o600)
+        settings = os.path.join(home, ".claude", "settings.json")
+        os.makedirs(os.path.dirname(settings), mode=0o700, exist_ok=True)
+        os.link(cred, settings)
+        self._assert_aliased_unread(home, project, state, settings)
+
+    def test_a_hard_link_into_a_denied_directory_behind_a_symlink_is_not_opened(self):
+        # Witness observe-hardlink-symlink-store: OPENED. The denied directory is a symlink.
+        root = tempfile.TemporaryDirectory(prefix="observe-")
+        self.addCleanup(root.cleanup)
+        home = os.path.join(root.name, "home")
+        project = os.path.join(root.name, "project")
+        state = os.path.join(root.name, "state")
+        store = os.path.join(root.name, "store")
+        os.mkdir(home, 0o700)
+        os.mkdir(project, 0o700)
+        os.mkdir(state, 0o700)
+        os.mkdir(store, 0o700)
+        cred = os.path.join(store, "cred.json")
+        _write(cred, self._linked_payload("model-from-link"), 0o600)
+        os.symlink(store, os.path.join(home, ".hermes"))
+        settings = os.path.join(home, ".claude", "settings.json")
+        os.makedirs(os.path.dirname(settings), mode=0o700, exist_ok=True)
+        os.link(cred, settings)
+        self._assert_aliased_unread(home, project, state, settings)
+
+    def test_any_other_hard_link_is_not_opened(self):
+        home, project, state = self._layout()
+        settings = os.path.join(home, ".claude", "settings.json")
+        _write(settings, self._linked_payload("model-from-link"), 0o600)
+        other = os.path.join(home, "notes", "copy.json")
+        os.makedirs(os.path.dirname(other), mode=0o700, exist_ok=True)
+        os.link(settings, other)
+        self._assert_aliased_unread(home, project, state, settings)
+
+    def test_a_descriptor_whose_inode_changes_is_not_hashed(self):
+        # lstat said one link; fstat on the same descriptor must say the same inode.
+        home, project, state = self._layout()
+        settings = os.path.join(home, ".claude", "settings.json")
+        _write(settings, json.dumps({"model": _CANARY_LINK}), 0o600)
+        observe = _observe()
+        real_fstat = os.fstat
+
+        class _Shifted:
+            def __init__(self, info):
+                self._info = info
+
+            def __getattr__(self, name):
+                if name == "st_ino":
+                    return self._info.st_ino + 1
+                return getattr(self._info, name)
+
+        def fstat(fd):
+            info = real_fstat(fd)
+            if stat.S_ISREG(info.st_mode) and info.st_size < 100000:
+                return _Shifted(info)
+            return info
+
+        out = io.StringIO()
+        with mock.patch("os.fstat", fstat):
+            code = observe.command(out, home=home, project=project, state_home=state, runner=_login_ok)
+        text = out.getvalue()
+        self.assertEqual(code, 0)
+        _clean(text)
+        row = _by_path(json.loads(text), settings)
+        self.assertEqual(row["state"], "aliased")
+        self.assertIsNone(row["sha256"])
+        self.assertNotIn("allow", row)
+
+    def test_an_ancestor_symlink_outside_the_home_is_not_read(self):
+        # Witness observe-parent-symlink: READ.
+        root = tempfile.TemporaryDirectory(prefix="observe-")
+        self.addCleanup(root.cleanup)
+        home = os.path.join(root.name, "home")
+        project = os.path.join(root.name, "project")
+        state = os.path.join(root.name, "state")
+        outside = os.path.join(root.name, "outside")
+        os.mkdir(home, 0o700)
+        os.mkdir(project, 0o700)
+        os.mkdir(state, 0o700)
+        os.mkdir(outside, 0o700)
+        _write(
+            os.path.join(outside, "settings.json"),
+            self._linked_payload("model-from-outside"),
+            0o600,
+        )
+        os.symlink(outside, os.path.join(home, ".claude"))
+        code, text, _record, disk, opened = self._run(home, project, state)
+        self.assertEqual(code, 0)
+        _clean(text)
+        _clean(disk.decode("utf-8", "replace"))
+        row = _by_path(json.loads(text), os.path.join(home, ".claude", "settings.json"))
+        self.assertNotEqual(row["state"], "ok")
+        self.assertIsNone(row["sha256"])
+        self.assertNotIn("allow", row)
+        self.assertIs("model-from-outside" in text, False, "a model from outside the home was copied")
+        self.assertFalse(_ends(opened, "settings.json"), "settings file was opened")
+
+    def test_an_ancestor_symlink_outside_the_project_is_not_read(self):
+        root = tempfile.TemporaryDirectory(prefix="observe-")
+        self.addCleanup(root.cleanup)
+        home = os.path.join(root.name, "home")
+        project = os.path.join(root.name, "project")
+        state = os.path.join(root.name, "state")
+        outside = os.path.join(root.name, "outside")
+        os.mkdir(home, 0o700)
+        os.mkdir(project, 0o700)
+        os.mkdir(state, 0o700)
+        os.mkdir(outside, 0o700)
+        _write(
+            os.path.join(outside, "settings.json"),
+            self._linked_payload("model-from-outside"),
+            0o600,
+        )
+        os.symlink(outside, os.path.join(project, ".claude"))
+        code, text, _record, disk, opened = self._run(home, project, state)
+        self.assertEqual(code, 0)
+        _clean(text)
+        _clean(disk.decode("utf-8", "replace"))
+        row = _by_path(json.loads(text), os.path.join(project, ".claude", "settings.json"))
+        self.assertNotEqual(row["state"], "ok")
+        self.assertIsNone(row["sha256"])
+        self.assertNotIn("allow", row)
+        self.assertIs("model-from-outside" in text, False, "a model from outside the project was copied")
+        self.assertFalse(_ends(opened, "settings.json"), "settings file was opened")
+
+    def test_an_ancestor_symlink_into_a_denied_directory_is_not_read(self):
+        # The real path stays inside the home and lands under a denied directory.
+        home, project, state = self._layout()
+        store = os.path.join(home, "secretstore")
+        os.mkdir(store, 0o700)
+        _write(os.path.join(store, "settings.json"), self._linked_payload("model-from-denied"), 0o600)
+        os.symlink(store, os.path.join(home, ".hermes"))
+        os.symlink(store, os.path.join(home, ".claude"))
+        code, text, _record, disk, opened = self._run(home, project, state)
+        self.assertEqual(code, 0)
+        _clean(text)
+        _clean(disk.decode("utf-8", "replace"))
+        row = _by_path(json.loads(text), os.path.join(home, ".claude", "settings.json"))
+        self.assertNotEqual(row["state"], "ok")
+        self.assertIsNone(row["sha256"])
+        self.assertNotIn("allow", row)
+        self.assertIs("model-from-denied" in text, False, "a model from a denied directory was copied")
+        self.assertFalse(_ends(opened, "settings.json"), "settings file was opened")
+
+    def test_an_ancestor_symlink_that_stays_inside_the_home_is_read(self):
+        # Assumption: a real path that stays in the root and is not denied is read.
+        home, project, state = self._layout()
+        alt = os.path.join(home, "alt-claude")
+        os.mkdir(alt, 0o700)
+        settings_real = os.path.join(alt, "settings.json")
+        body = json.dumps({"model": "haiku-inside"})
+        _write(settings_real, body, 0o600)
+        os.symlink(alt, os.path.join(home, ".claude"))
+        code, text, _record, disk, opened = self._run(home, project, state)
+        self.assertEqual(code, 0, text)
+        _clean(text)
+        _clean(disk.decode("utf-8", "replace"))
+        row = _by_path(json.loads(text), os.path.join(home, ".claude", "settings.json"))
+        self.assertEqual(row["state"], "ok")
+        self.assertEqual(row["allow"]["model"], "haiku-inside")
+        self.assertEqual(row["sha256"], hashlib.sha256(body.encode()).hexdigest())
+
+    def test_a_home_without_local_or_xdg_state_home_gets_a_record(self):
+        # Witness observe-fresh-home: NO-RECORD.
+        home, project, _state = self._layout()
+        self.assertFalse(os.path.exists(os.path.join(home, ".local")))
+        out = io.StringIO()
+        with _umask_open():
+            code = _observe().command(
+                out, home=home, project=project, state_home=None, runner=_login_ok, environ={},
+            )
+        text = out.getvalue()
+        self.assertEqual(code, 0, text)
+        record = os.path.join(home, ".local", "state", "recursion", "observe", "record.json")
+        self.assertTrue(os.path.isfile(record))
+        self.assertFalse(os.path.islink(os.path.join(home, ".local")))
+        self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(home, ".local")).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(home, ".local", "state")).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.lstat(os.path.dirname(record)).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.lstat(record).st_mode), 0o600)
+        report = json.loads(text)
+        self.assertEqual(report["code"], "ok")
+        self.assertEqual(report["record"], record)
+        with open(record, encoding="ascii") as handle:
+            self.assertEqual(handle.read(), text)
+
+    def test_a_symlink_at_local_refuses_and_writes_nothing(self):
+        root = tempfile.TemporaryDirectory(prefix="observe-")
+        self.addCleanup(root.cleanup)
+        home = os.path.join(root.name, "home")
+        project = os.path.join(root.name, "project")
+        outside = os.path.join(root.name, "outside")
+        os.mkdir(home, 0o700)
+        os.mkdir(project, 0o700)
+        os.mkdir(outside, 0o700)
+        os.symlink(outside, os.path.join(home, ".local"))
+        out = io.StringIO()
+        code = _observe().command(
+            out, home=home, project=project, state_home=None, runner=_login_ok, environ={},
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out.getvalue())["code"], "filesystem_error")
+        self.assertFalse(os.path.exists(os.path.join(outside, "state")))
+        for _dirpath, _dirs, files in os.walk(outside):
+            self.assertNotIn("record.json", files)
+
+    def test_mkdir_tolerates_the_other_caller(self):
+        # Witness observe-concurrent-mkdir: FAIL (FileExistsError beside ok).
+        home, project, state = self._layout()
+        observe_dir = os.path.join(state, "recursion", "observe")
+        real_mkdir = os.mkdir
+
+        def mkdir(path, mode=0o777, *, dir_fd=None):
+            if dir_fd is None:
+                real_mkdir(path, mode)
+            else:
+                real_mkdir(path, mode, dir_fd=dir_fd)
+            if os.path.abspath(path) == observe_dir:
+                raise FileExistsError(errno.EEXIST, "File exists", path)
+
+        out = io.StringIO()
+        with mock.patch("os.mkdir", mkdir):
+            code = _observe().command(
+                out, home=home, project=project, state_home=state, runner=_login_ok,
+            )
+        self.assertEqual(code, 0, "mkdir from the other caller was not tolerated")
+        record = os.path.join(observe_dir, "record.json")
+        self.assertTrue(os.path.isfile(record))
+        self.assertEqual(stat.S_IMODE(os.lstat(record).st_mode), 0o600)
+        self.assertEqual(json.loads(out.getvalue())["code"], "ok")
+
+    def test_a_writer_does_not_share_one_temp_name(self):
+        # Witness observe-shared-tmp-race: MISMATCH. The shared name is record.json.tmp.
+        home, project, state = self._layout()
+        opened = []
+        real_open = os.open
+
+        def open_hook(path, flags, mode=0o777, *, dir_fd=None):
+            if isinstance(path, str) and "record.json" in os.path.basename(path):
+                opened.append(os.path.basename(path))
+            if dir_fd is None:
+                return real_open(path, flags, mode)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch("os.open", open_hook):
+            code, text, record, disk, _opened = self._run(home, project, state)
+        self.assertEqual(code, 0, text)
+        temps = [name for name in opened if name != "record.json"]
+        self.assertTrue(temps, "a record temp name was not opened")
+        self.assertFalse(any(name == "record.json.tmp" for name in temps), "writers share one temp name")
+        self.assertEqual(disk.decode("ascii"), text)
+
+    def test_two_callers_at_once_each_print_a_whole_record(self):
+        home, project, state = self._layout()
+        _write(
+            os.path.join(home, ".claude", "settings.json"),
+            json.dumps({"model": "haiku-observe"}),
+            0o600,
+        )
+        observe = _observe()
+        results = []
+        barrier = threading.Barrier(2)
+
+        def call():
+            out = io.StringIO()
+            barrier.wait(timeout=5)
+            code = observe.command(out, home=home, project=project, state_home=state, runner=_login_ok)
+            results.append((code, out.getvalue()))
+
+        threads = [threading.Thread(target=call), threading.Thread(target=call)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(results), 2)
+        texts = []
+        for code, text in results:
+            self.assertEqual(code, 0, text)
+            report = json.loads(text)
+            self.assertEqual(report["code"], "ok")
+            self.assertIn("\n", text)
+            texts.append(text)
+        record = os.path.join(state, "recursion", "observe", "record.json")
+        with open(record, encoding="ascii") as handle:
+            final = handle.read()
+        self.assertIn(final, texts)
+        json.loads(final)
+
+    def test_an_mcp_command_keeps_the_program_name_only(self):
+        home, project, state = self._layout()
+        settings = {
+            "model": "haiku-observe",
+            "mcpServers": {
+                "maps": {"command": f"/usr/lib/map-tool --token {_CANARY_CMD} extra"},
+            },
+        }
+        path = os.path.join(home, ".claude", "settings.json")
+        _write(path, json.dumps(settings), 0o600)
+        code, text, _record, disk, _opened = self._run(home, project, state)
+        self.assertEqual(code, 0)
+        _clean(text)
+        _clean(disk.decode("utf-8", "replace"))
+        row = _by_path(json.loads(text), path)
+        servers = row["allow"]["mcp_servers"]
+        self.assertEqual(len(servers), 1)
+        self.assertEqual(servers[0]["name"], "maps")
+        self.assertIs(servers[0]["command"] == "map-tool", True, "mcp command is not the program name")
+
+    def test_a_git_section_header_may_end_with_a_comment(self):
+        # Witness observe-git-parser: DIFF. A trailing comment still names the section.
+        home, project, state = self._layout()
+        include = os.path.join(home, "included-git-config")
+        _write(include, f"[user]\n    name = {_CANARY_GIT_URL}\n", 0o644)
+        gitconfig = (
+            "[user] # trailing comment\n"
+            f"    name = {_CANARY_GIT_NAME}\n"
+            f"    email = {_CANARY_GIT_MAIL}\n"
+            "[include]\n"
+            f"    path = {include}\n"
+        )
+        git_path = os.path.join(home, ".gitconfig")
+        _write(git_path, gitconfig, 0o644)
+        xdg = (
+            "[user] ; semicolon comment\n"
+            f"    name = {_CANARY_GIT_NAME}\n"
+            f"    email = {_CANARY_GIT_MAIL}\n"
+        )
+        xdg_path = os.path.join(home, ".config", "git", "config")
+        _write(xdg_path, xdg, 0o644)
+        code, text, _record, disk, opened = self._run(home, project, state)
+        self.assertEqual(code, 0)
+        _clean(text)
+        _clean(disk.decode("utf-8", "replace"))
+        self.assertFalse(any(include == name or name.endswith("included-git-config") for name in _opened_names(opened)))
+        git_row = _by_path(json.loads(text), git_path)
+        self.assertEqual(git_row["state"], "ok")
+        self.assertIs(git_row["allow"]["user_name_present"], True)
+        self.assertIs(git_row["allow"]["user_email_present"], True)
+        xdg_row = _by_path(json.loads(text), xdg_path)
+        self.assertIs(xdg_row["allow"]["user_name_present"], True)
+        self.assertIs(xdg_row["allow"]["user_email_present"], True)
 
 
 if __name__ == "__main__":

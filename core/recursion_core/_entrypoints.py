@@ -1,14 +1,18 @@
 """The ``recursiond`` console script (distribution ``csl-recursion``). Standard library only.
 
     recursiond install | upgrade | uninstall    the per-user systemd unit (control/commands/setup.py)
-    recursiond serve [daemon options]           run the daemon in the foreground
-    recursiond observe                          local tool setup, owner-only record
+    recursiond doctor [--json]                  report this machine; no daemon is required
+    recursiond observe [--json]                 local tool setup, owner-only record
     recursiond import --from codex|claude|cursor --dry-run
                                                 print a proposed config and write nothing
+    recursiond serve [daemon options]           run the daemon in the foreground
 
 Linux only: on any other system every command refuses with ``platform_unsupported`` (exit 1)
-before anything else is imported; ``--help`` still prints. Output is one JSON object per command;
-0 is ok, 1 a refusal, 2 a usage error.
+before anything else is imported; ``--help`` still prints. install, upgrade and uninstall print
+one JSON object. ``doctor --json`` prints one report; without ``--json`` it prints one line per
+check. ``observe`` prints one JSON object with or without ``--json``; secret values stay out.
+``import`` prints one JSON object and writes nothing.
+0 is ok, 1 a refusal or a report that has a fail, 2 a usage error.
 
 ``serve`` checks the build before it imports anything of the daemon's: the daemon needs
 free-threaded CPython 3.14 (``build_not_free_threaded`` otherwise). It then replaces this process
@@ -30,18 +34,73 @@ import sysconfig
 PROG = "recursiond"
 DAEMON_MODULE = "recursion_core.daemon"
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
-# The doctor-command draft adds this table too. It is not on the doctor-core base, so this
-# draft adds the minimal table. The two drafts conflict on this name. This row is observe.
-SUBCOMMANDS = (
-    ("observe", "report local tool setup into an owner-only record; secret values stay out"),
-)
-# A separate row from SUBCOMMANDS. import only prints a proposal; it writes nothing.
-IMPORT_SUBCOMMANDS = (
-    ("import", "print a proposed Recursion config and write nothing"),
-)
 _IMPORT_SOURCES = ("codex", "claude", "cursor")
 _DESCRIPTION = ("Recursion's per-user daemon and its installer. Linux only. "
-                "Each command prints one JSON object; \"code\": \"ok\" is success.")
+                "install, upgrade and uninstall each print one JSON object. "
+                "doctor prints a report. observe prints one JSON object. "
+                "import prints a proposal and writes nothing.")
+
+
+def _configure_doctor(parser) -> None:
+    parser.add_argument("--json", action="store_true",
+                        help="print one doctor report; without this, print one line per check")
+
+
+def _handle_doctor(args) -> int:
+    import recursion_core.setup.doctor as doctor
+
+    report = doctor.run(None)
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        sys.stdout.write(doctor.text(report))
+    return doctor.exit_code(report)
+
+
+def _configure_observe(parser) -> None:
+    parser.add_argument("--json", action="store_true",
+                        help="print one observe report")
+
+
+def _handle_observe(args) -> int:
+    import recursion_core.setup.observe as observe
+
+    # One object either way. The flag is on the row so --help and --json agree.
+    if args.json not in (True, False):
+        print("usage error: --json", file=sys.stderr)
+        return EXIT_USAGE
+    return observe.command(sys.stdout, sys.stderr)
+
+
+def _configure_import(parser) -> None:
+    parser.add_argument("--from", dest="source", required=True, choices=_IMPORT_SOURCES,
+                        help="local tool to read: codex, claude or cursor")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true",
+                        help="print the proposal and write nothing")
+
+
+def _handle_import(args) -> int:
+    import recursion_core.setup.import_ as import_
+
+    return import_.command(
+        sys.stdout, sys.stderr, source=args.source, dry_run=args.dry_run is True,
+    )
+
+
+# Later cogs append a row: (name, help, configure, handle). configure adds that command's options.
+# This is the one SUBCOMMANDS table. Doctor owns it; a later draft appends its row here.
+# The doctor-command draft adds this table too. It is not on the doctor-core base, so this
+# draft adds the minimal table. The two drafts conflict on this name. This row is observe.
+# A separate row from SUBCOMMANDS. import only prints a proposal; it writes nothing.
+# import's entry is in this same table, beside doctor and observe.
+SUBCOMMANDS = (
+    ("doctor", "report what is ok, warn, fail or unknown on this machine",
+     _configure_doctor, _handle_doctor),
+    ("observe", "report local tool setup into an owner-only record; secret values stay out",
+     _configure_observe, _handle_observe),
+    ("import", "print a proposed Recursion config and write nothing",
+     _configure_import, _handle_import),
+)
 
 
 class _Usage(Exception):
@@ -64,10 +123,13 @@ def main(argv=None) -> int:
     parser = _Parser(prog=PROG, description=_DESCRIPTION)
     commands = parser.add_subparsers(dest="command", metavar="command")
     setup.parser(commands)
-    _add_subcommands(commands, SUBCOMMANDS)
-    _add_subcommands(commands, IMPORT_SUBCOMMANDS)
     commands.add_parser("serve", help="run the daemon in the foreground; options after it go to the daemon",
                         add_help=False)
+    handlers = {}
+    for name, help_text, configure, handle in SUBCOMMANDS:
+        sub = commands.add_parser(name, help=help_text)
+        configure(sub)
+        handlers[name] = handle
     try:
         args = parser.parse_args(argv)
     except _Usage as exc:
@@ -79,37 +141,10 @@ def main(argv=None) -> int:
         parser.print_usage(sys.stderr)
         print("usage error: a command is required", file=sys.stderr)
         return EXIT_USAGE
+    if args.command in handlers:
+        return handlers[args.command](args)
     args.out, args.err = sys.stdout, sys.stderr
-    known = {name for name, _help in (*SUBCOMMANDS, *IMPORT_SUBCOMMANDS)}
-    if args.command in known:
-        return _dispatch_subcommand(args)
     return setup.dispatch(args, None)
-
-
-def _add_subcommands(commands, rows) -> None:
-    for name, help_text in rows:
-        sub = commands.add_parser(name, help=help_text)
-        if name != "import":
-            continue
-        sub.add_argument("--from", dest="source", required=True, choices=_IMPORT_SOURCES,
-                         help="local tool to read: codex, claude or cursor")
-        sub.add_argument("--dry-run", dest="dry_run", action="store_true",
-                         help="print the proposal and write nothing")
-
-
-def _dispatch_subcommand(args) -> int:
-    import importlib
-
-    if args.command == "observe":
-        module = importlib.import_module("recursion_core.setup.observe")
-        return module.command(out=args.out, err=args.err)
-    if args.command == "import":
-        module = importlib.import_module("recursion_core.setup.import_")
-        return module.command(
-            out=args.out, err=args.err, source=args.source, dry_run=args.dry_run is True,
-        )
-    print(f"usage error: {args.command}", file=sys.stderr)
-    return EXIT_USAGE
 
 
 def serve(args) -> int:

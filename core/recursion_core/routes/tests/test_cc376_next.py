@@ -5,8 +5,9 @@ B3-2.4 with B3-13.3, B3-28.3 and B3-40.3: ``ClaudeCodeAdapter.argv`` names
 ``--permission-mode`` with the fail-closed value, and a ``system/init`` that reports any
 other mode ends the run refused. B1-8.6: a final ``result/success`` after a permission
 denial or an error event in the same turn is not success, and a route that asks for the
-permission bridge requires PreToolUse to be confirmed at init. B2-15.3: a declaration
-that leaves out the sub-agent flags is refused, and the route label shows them.
+permission bridge requires PreToolUse to be confirmed at init. B2-15.3: the route label
+shows the sub-agent flags. The published record stays the eight flags driver.v2 names; a
+record of those eight loads, and the three flags are not in it.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from recursion_core.routes import claude_code as cc
 from recursion_core.routes import contract as c
 from recursion_core.routes import driver as d
 from recursion_core.routes.claude_code import ClaudeCodeAdapter, _classify_result
-from recursion_core.routes.driver import Declaration, DriverInputError, Flags, one_turn
+from recursion_core.routes.driver import Declaration, Flags, one_turn
 from recursion_core.routes.tests.fakes import request, runs_adapter
 from recursion_core.routes.tests.test_routes_claude import Harness
 
@@ -183,12 +184,13 @@ def _init_and_success():
 
 
 class SubagentFlagsTest(unittest.TestCase):
-    def test_a_record_with_no_subagent_flags_is_refused(self) -> None:
+    def test_a_schema_record_without_the_subagent_flags_loads(self) -> None:
         record = {"engine": "claude_code", "driver": 2, "input_ack": False,
                   "flags": {name: False for name in _OLD_FLAGS}}
-        with self.assertRaises(DriverInputError) as caught:
-            Declaration.from_record(record)
-        self.assertEqual(caught.exception.field, "flags")
+        loaded = Declaration.from_record(record)
+        self.assertEqual(set(loaded.as_record()["flags"]), set(_OLD_FLAGS))
+        for name in _SUBAGENT_FLAGS:
+            self.assertNotIn(name, loaded.as_record()["flags"])
 
     def test_the_new_flags_default_false_and_round_trip(self) -> None:
         declared = one_turn("claude_code")

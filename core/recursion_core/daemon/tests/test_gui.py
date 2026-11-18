@@ -190,6 +190,7 @@ class LoopbackTests(TestCase):
         config = tmp / "config" / "recursion"
         fx.write_install(config, grants=[fx.grant_for(source, plugin_id="cross.repo", permissions=("panel",))])
         fx.write_plugin(tmp / "cross", source, plugin_id="cross.repo", permissions=("panel",))
+        fx.ensure_revocation_store(tmp / "state")
         from recursion_core.plugin_security.tests.support import FakeGilProbe
         # SIMULATED GIL state (off): this suite also runs on GIL builds, where the real probe poisons the core.
         host = plugin_host.PluginHost(config, tmp / "state", plugin_dirs=(tmp / "cross",), gil_probe=FakeGilProbe())

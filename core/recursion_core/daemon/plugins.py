@@ -69,8 +69,7 @@ import time
 from recursion_core.gui.client import ACTIONS, READS
 from recursion_core.gui.panels import panel_registry
 from recursion_core.plugin_security import (ApprovalGate, Authority, CoreHealth, CoreService, GilProbe, Grant,
-                                            PERMISSIONS, PluginLoader, Refused, ReservedEffects, TrustStore,
-                                            create_revocation_store)
+                                            PERMISSIONS, PluginLoader, Refused, ReservedEffects, TrustStore)
 from recursion_core.plugin_security.signing import backend_available
 
 from .breaker import STORE_DIR
@@ -311,14 +310,20 @@ class PluginHost:
     # -- discovery ------------------------------------------------------------------------------
     def _sources(self, plugin_dirs):
         found = []
+        explicit = [Path(p) for p in plugin_dirs]
         if self._config.is_dir():
             if not _owned_directory(self._config):
-                log.error('plugin directory %s is not operator-owned or is group/other writable; ignored', self._config)
+                # DL-50 D4: an untrusted plugin config folder refuses every plugin,
+                # including folders named with --plugin. Skipping only this folder
+                # would still load those.
+                log.error('plugin directory %s is not operator-owned or is group/other writable; every plugin is refused',
+                          self._config)
                 self.records.append({'source': str(self._config), 'plugin_id': None, 'state': 'refused',
                                      'code': 'plugin_directory_untrusted', 'detail': 'install directory', 'findings': []})
-            else:
-                found += sorted(p for p in self._config.iterdir() if p.is_dir() or p.is_symlink())
-        return found + [Path(p) for p in plugin_dirs]
+                self._refuse_all(explicit, 'plugin_directory_untrusted', 'install directory')
+                return []
+            found += sorted(p for p in self._config.iterdir() if p.is_dir() or p.is_symlink())
+        return found + explicit
 
     def _refuse_all(self, sources, code, detail):
         for source in sources:
@@ -327,8 +332,14 @@ class PluginHost:
 
     def _revocation_store(self):
         path = private_dir(self._state / STORE_DIR) / REVOCATION_FILE
-        if not os.path.lexists(path):
-            create_revocation_store(str(path))
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            # The installer creates this file. A new empty file here would drop
+            # every key the missing file had revoked, and those plugins would load.
+            # PermissionError is not this case: os.path.lexists hides it, and an
+            # unusable folder must still refuse as the operating system's error.
+            raise Refused('revocation_store_missing') from None
         return str(path)
 
     def _compose_core(self, install, breaker):

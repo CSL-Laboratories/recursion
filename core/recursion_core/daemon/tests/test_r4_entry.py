@@ -40,6 +40,7 @@ class RealEntryTests(unittest.TestCase):
         config = tmp / 'config' / 'recursion'
         fx.write_install(config, grants=[fx.grant_for(fx.OPERATOR_SOURCE)])
         fx.write_plugin(config / 'plugins' / 'fixture')
+        fx.ensure_revocation_store(tmp / 'state' / 'recursion')
         runtime = tmp / 'runtime'
         runtime.mkdir(mode=0o700)
         env = {'PATH': str(bins), 'HOME': str(tmp), 'XDG_RUNTIME_DIR': str(runtime),

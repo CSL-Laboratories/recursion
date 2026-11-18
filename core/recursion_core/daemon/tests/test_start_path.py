@@ -401,6 +401,46 @@ class StartPathTest(unittest.TestCase):
         self.assertIsNone(process._pidfd)
         self.assertFalse(starter.active(ctx.run_id))
 
+    def test_an_interrupt_inside_stop_ends_the_published_child(self):
+        """A stop that raises before it returns has not ended the child: the retry does."""
+        sleeper = subprocess.Popen(['/bin/sleep', '30'], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def finish():
+            if sleeper.poll() is None:
+                sleeper.kill()
+            sleeper.wait(timeout=5)
+        self.addCleanup(finish)
+        (self.root / 'runs' / 'run-witness').mkdir(parents=True, mode=0o700)
+        out = self.root / 'stdout.jsonl'
+        out.touch()
+        calls = []
+
+        def stop(run_id):
+            calls.append(run_id)
+            if len(calls) == 1:
+                raise KeyboardInterrupt('stop')
+            if sleeper.poll() is None:
+                sleeper.kill()
+            sleeper.wait(timeout=5)
+
+        daemon = SimpleNamespace(stop=stop, closed=False,
+                                 reconcile=mock.Mock(return_value=SimpleNamespace(state='running')))
+        process = launcher.UnitEngineProcess(daemon, 'run-witness', None, out, os.pidfd_open(sleeper.pid))
+        self.addCleanup(process.close)
+        ctx = launcher.RunContext('run-witness')
+        ctx.launched('/test/recursion-run-run-witness.service', process)
+        service = SimpleNamespace(handle=mock.Mock(return_value=contract.result(ctx.run_id, None, text='ok')))
+        starter = adapter.RouteStarter(service, {}, daemon, self.root, exit_grace_s=0)
+        starter._active[ctx.run_id] = ctx
+        with self.assertRaises(KeyboardInterrupt):
+            starter._drive(ctx, {})
+        self.assertEqual(calls, ['run-witness', 'run-witness'])
+        self.assertIsNotNone(sleeper.poll(), 'the published child is still running')
+        self.assertIsNone(process._pidfd)
+        self.assertIsNone(process._out)
+        self.assertFalse(starter.active(ctx.run_id))
+
     # -- a failed start does not label the attempt that takes the id next ---------------------------
     def test_a_failed_worker_start_does_not_label_the_next_attempt(self):
         routes = {'claude_code': {'deadline_s': 1, 'route': {}, 'binary': None}}

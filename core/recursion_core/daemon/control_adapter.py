@@ -588,8 +588,10 @@ class RouteStarter:
         if process is None:
             return
         try:
-            if closing or process.fenced:
-                # A fence that already ran asked the daemon to stop the child. Only the handles remain.
+            # `fence` records its reason before `stop` returns, so a non-empty `fenced` is not
+            # proof the child was stopped. An interrupt inside `stop` leaves that list set and
+            # the child running; only a fence call that returned is done.
+            if closing or getattr(process, '_stop_returned', False):
                 process.close()
             else:
                 self._settle(ctx, grace_s=0.0, reason='route_interrupted')
@@ -634,6 +636,9 @@ class RouteStarter:
                     break
                 time.sleep(0.2)
             process.fence(reason)
+            # Set only after `fence` returns. `stop` raising BaseException skips this, and the
+            # recovery above asks for the stop again.
+            process._stop_returned = True
         finally:
             process.close()
 

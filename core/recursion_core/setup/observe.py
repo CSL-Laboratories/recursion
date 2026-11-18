@@ -237,9 +237,12 @@ def _inspect(path: str, kind: str, home: str, project: str, denied_ids: set) -> 
             row["state"] = "aliased"
             return row
         row["state"] = "unknown"
+        if refused.reason in {"not_owner", "world_writable", "group_writable"}:
+            row["detail"] = refused.reason
+            return row
         row["detail"] = "not_followed" if refused.reason == "not_followed" else (
             "not_opened" if refused.reason in {
-                "outside", "denied", "posix", "platform_unsupported", "not_owner", "writable",
+                "outside", "denied", "posix", "platform_unsupported",
             } else "unreadable"
         )
         return row
@@ -344,7 +347,7 @@ def _allow_mapping(parsed: dict) -> dict:
     allow = {}
     model = parsed.get("model")
     if type(model) is str and model:
-        others = value_rule.string_values(parsed, skip="model")
+        others = value_rule.model_others(parsed, model)
         allow["model"] = value_rule.model_value(model, others)
     approval = _first_str(parsed, ("approval_policy", "approval_mode", "approval"))
     if approval is not None:

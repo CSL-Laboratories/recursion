@@ -1062,5 +1062,165 @@ class StateHomeTests(unittest.TestCase):
         self.assertTrue(observe._text_under(os.path.join(home, "inside"), home + os.sep))
 
 
+_MIXED = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+_HEX = "0123456789abcdef"
+
+
+def _filler(alphabet, length, seed):
+    # Made-up filler built at run time from a set seed: letters and digits in no word order.
+    # It is never a real key, and no test file holds a whole key-shaped string.
+    out = []
+    state = seed
+    for _ in range(length):
+        state = (state * 1103515245 + 12345) % 2147483648
+        out.append(alphabet[(state >> 16) % len(alphabet)])
+    return "".join(out)
+
+
+_PLAIN_FILLER = "fake" + "filler" + "donotleak" + "marker"  # one letter class: only a leading mark withholds it
+_NEW_MARKS = (
+    "xai-", "gsk_", "r8_", "pplx-", "nvapi-", "SG.", "ya29.", "glsa_", "dop_v1_", "shpat_", "whsec_",
+    "xapp-", "xoxe",
+)
+
+
+class KeyShapeTests(unittest.TestCase):
+    """A key-shaped value is withheld by its shape, not only by a list (read 533-c2e98377, P1 and P2)."""
+
+    def _allow(self, parsed):
+        return _observe()._allow_json(json.dumps(parsed).encode("utf-8"))
+
+    def _model_withheld(self, value, secret):
+        allow = self._allow({"model": value})
+        self.assertFalse(secret in json.dumps(allow), "a key-shaped model was copied")
+        self.assertTrue(allow.get("model") == "withheld", "a key-shaped model is not withheld")
+
+    def _names_withheld(self, name, program, secret):
+        allow = self._allow({"mcpServers": {name: {"command": "/usr/bin/" + program + " --flag"}}})
+        self.assertFalse(secret in json.dumps(allow), "a key-shaped name was copied")
+        self.assertEqual(allow["mcp_servers"], [{"command": "withheld", "name": "withheld"}])
+
+    def test_a_bare_hex_or_base64url_run_as_a_model_is_withheld(self):
+        cases = {
+            "hex-40": _filler(_HEX, 40, 11),
+            "hex-32": _filler(_HEX, 32, 12),
+            "base64url-43": _filler(_MIXED, 20, 13) + "-" + _filler(_MIXED, 22, 14),
+            "mixed-24": _filler(_MIXED, 24, 15),
+        }
+        for name, value in cases.items():
+            with self.subTest(case=name):
+                self._model_withheld(value, value)
+
+    def test_a_three_part_dotted_token_as_a_model_is_withheld(self):
+        parts = (_filler(_MIXED, 18, 21), _filler(_MIXED, 24, 22), _filler(_MIXED, 18, 23))
+        self._model_withheld(".".join(parts), parts[1])
+
+    def test_a_random_run_in_a_url_path_of_a_model_is_withheld(self):
+        secret = _filler(_MIXED, 32, 31)
+        self._model_withheld("https://api.example.test/v1/" + secret, secret)
+
+    def test_a_listed_mark_at_the_start_of_a_url_part_is_withheld(self):
+        secret = "sk-" + _PLAIN_FILLER
+        self._model_withheld("https://api.example.test/v1/" + secret, _PLAIN_FILLER)
+
+    def test_a_leading_mark_missing_from_the_old_list_is_withheld(self):
+        for mark in _NEW_MARKS:
+            with self.subTest(mark=mark):
+                self._model_withheld(mark + _PLAIN_FILLER, _PLAIN_FILLER)
+                self._names_withheld(mark + _PLAIN_FILLER, mark + _PLAIN_FILLER, _PLAIN_FILLER)
+
+    def test_a_bare_key_run_as_a_server_or_program_name_is_withheld(self):
+        name = _filler(_HEX, 40, 41)
+        program = _filler(_MIXED, 32, 42)
+        allow = self._allow({"mcpServers": {name: {"command": "/usr/bin/" + program}}})
+        shown = json.dumps(allow)
+        self.assertFalse(name in shown or program in shown, "a key-shaped name was copied")
+        self.assertEqual(allow["mcp_servers"], [{"command": "withheld", "name": "withheld"}])
+
+    def test_a_pem_block_a_url_with_user_and_password_and_a_padded_base64_value_stay_withheld(self):
+        body = _filler(_MIXED, 40, 51)
+        cases = {
+            "pem": "-----BEGIN " + "FAKE KEY-----\n" + body + "\n-----END " + "FAKE KEY-----",
+            "user-password-url": "https://fakeuser:" + body + "@host.example.test/v1",
+            "padded-base64": body[:20] + "+" + body[20:] + "/=",
+        }
+        for name, value in cases.items():
+            with self.subTest(case=name):
+                self._model_withheld(value, body[:20])
+
+    def test_harmless_models_versions_paths_urls_and_short_words_still_show(self):
+        models = (
+            "gpt-5.1-codex-max", "claude-opus-4-5-20251101", "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "meta-llama/Llama-3.3-70B-Instruct", "accounts/fireworks/models/llama-v3p1-405b-instruct",
+            "DeepSeek-R1-Distill-Llama-70B", "gemini-2.5-flash-preview-04-17", "Qwen/Qwen2.5-Coder-32B-Instruct",
+            "2026.11.17", "1.2.3", "/opt/models/llama-3.1-8b-instruct-q4_k_m.gguf",
+            "https://api.example.test/v1/models", "o3", "sonnet",
+        )
+        for model in models:
+            with self.subTest(model=model):
+                self.assertEqual(self._allow({"model": model})["model"], model)
+        servers = {
+            "filesystem": "/usr/local/bin/mcp-server-filesystem",
+            "sequential-thinking": "npx",
+            "GitHubCopilotServer": "python3.12",
+            "mcp-server-filesystem-tools": "uvx",
+        }
+        rows = self._allow({"mcpServers": {name: {"command": cmd} for name, cmd in servers.items()}})["mcp_servers"]
+        self.assertEqual(sorted((row["name"], row["command"]) for row in rows), sorted([
+            ("filesystem", "mcp-server-filesystem"), ("sequential-thinking", "npx"),
+            ("GitHubCopilotServer", "python3.12"), ("mcp-server-filesystem-tools", "uvx"),
+        ]))
+
+    def test_a_codex_profile_repeating_the_model_shows_the_model(self):
+        toml = (
+            'model = "gpt-5-codex"\n'
+            'approval_policy = "on-request"\n'
+            "\n"
+            "[profiles.deep]\n"
+            'model = "gpt-5-codex"\n'
+            'model_reasoning_effort = "high"\n'
+        )
+        allow = _observe()._allow_toml(toml.encode("utf-8"))
+        self.assertEqual(allow["model"], "gpt-5-codex")
+        shared = "FAKEtok-7c1e9a4b"
+        held = _observe()._allow_toml(
+            ('model = "haiku-' + shared + '"\n[profiles.deep]\nnote = "' + shared + '"\n').encode("utf-8")
+        )
+        self.assertTrue(held["model"] == "withheld", "a model holding another value is not withheld")
+
+
+@unittest.skipUnless(hasattr(os, "O_NOFOLLOW") and hasattr(os, "geteuid"), "the settings-file gate refuses here before the open")
+class RefusalWordTests(unittest.TestCase):
+    """A file refused for its owner or its write bits says which rule refused (read 533-c2e98377, P3)."""
+
+    _layout = ObserveTests._layout
+    _run = ObserveTests._run
+
+    def _detail(self, mode, euid=None):
+        home, project, state = self._layout()
+        path = os.path.join(home, ".claude", "settings.json")
+        _write(path, json.dumps({"model": "haiku-observe"}), mode)
+        if euid is None:
+            code, text, _record, _disk, _opened = self._run(home, project, state)
+        else:
+            from recursion_core.setup import open_guard
+
+            with mock.patch.object(open_guard.os, "geteuid", return_value=euid):
+                code, text, _record, _disk, _opened = self._run(home, project, state)
+        self.assertEqual(code, 0, text)
+        row = _by_path(json.loads(text), path)
+        self.assertEqual(row["state"], "unknown")
+        self.assertIsNone(row["sha256"])
+        self.assertNotIn("allow", row)
+        return row["detail"]
+
+    def test_a_group_or_world_writable_or_foreign_file_names_its_rule(self):
+        for mode, word in ((0o620, "group_writable"), (0o660, "group_writable"),
+                           (0o602, "world_writable"), (0o666, "world_writable")):
+            with self.subTest(mode=oct(mode)):
+                self.assertEqual(self._detail(mode), word)
+        self.assertEqual(self._detail(0o600, euid=os.geteuid() + 1), "not_owner")
+
+
 if __name__ == "__main__":
     unittest.main()

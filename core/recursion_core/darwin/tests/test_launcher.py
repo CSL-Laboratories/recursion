@@ -14,7 +14,10 @@ leader's start time. A pid whose start time changed is not adopted.
 from __future__ import annotations
 
 import errno
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows: the simulated Darwin launch needs POSIX calls, and its tests skip
+    fcntl = None
 import json
 import os
 import shutil
@@ -113,6 +116,9 @@ def _launch() -> dict:
                 return {'ok': False, 'exc_type': 'Timeout', 'message': 'child did not write its environment'}
             time.sleep(0.05)
         child = json.loads(out.read_text())
+        run_dir = state / 'runs' / _RUN_ID
+        run_dir_fifos = sorted(name for name in os.listdir(run_dir)
+                               if stat.S_ISFIFO(os.lstat(run_dir / name).st_mode))
         rows = dict(registry.control_all())
         record = json.loads(rows[_RUN_ID])
         launch = processes.launches[0]
@@ -191,6 +197,7 @@ def _launch() -> dict:
             'second_detail': second_detail,
             'kqueue_detail': kqueue_detail,
             'real_kqueue': hasattr(__import__('select'), 'kqueue'),
+            'run_dir_fifos': run_dir_fifos,
         }
     except Exception as exc:  # noqa: BLE001 - the child reports the failure instead of a traceback alone
         import traceback
@@ -209,9 +216,21 @@ def _child_main() -> int:
     return 0
 
 
+def _unit_safe_or_skip(scratch: str) -> None:
+    """Skip, with the reason, when ProductionLauncher would refuse state under ``scratch``."""
+
+    from recursion_core.daemon.launcher import _unit_path_ok
+
+    for path in (scratch, os.path.realpath(scratch)):
+        if not _unit_path_ok(path):
+            raise unittest.SkipTest('the scratch root %r is not unit-safe: the launcher refuses state there'
+                                    % path)
+
+
 def simulate() -> dict:
     # The child makes every path with tempfile under this directory, which it gets as TMPDIR.
     with tempfile.TemporaryDirectory(prefix='dl-') as scratch:
+        _unit_safe_or_skip(scratch)
         env = os.environ.copy()
         env['PYTHONDONTWRITEBYTECODE'] = '1'
         env['TMPDIR'] = scratch
@@ -758,6 +777,214 @@ def _answer_watch_refused() -> dict:
     }
 
 
+class _Forgetful:
+    """A process table that loses every row once the exit watch is asked: the leader was reaped since its check."""
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.forgot = False
+
+    def read(self, pid: int):
+        return None if self.forgot else self.inner.read(pid)
+
+    def start_time(self, pid: int):
+        got = self.read(pid)
+        return got.get('start_time') if got else None
+
+    def record_launch(self, **fields) -> None:
+        pass
+
+
+class _ForgetThenEsrch(_WatchRefused):
+    """ESRCH from a watch asked after the start-time check, with the table's row gone by then."""
+
+    def __init__(self, table) -> None:
+        super().__init__(errno.ESRCH)
+        self.table = table
+
+    def watch_exit(self, pid: int) -> int:
+        self.table.forgot = True
+        return super().watch_exit(pid)
+
+
+class _ExitsThenEsrch(_WatchRefused):
+    """A leader that exits before the watch is asked: this test ends its own child, then ESRCH is XNU's answer."""
+
+    def __init__(self) -> None:
+        super().__init__(errno.ESRCH)
+
+    def watch_exit(self, pid: int) -> int:
+        os.kill(pid, signal.SIGKILL)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            state = _proc_state(pid)
+            if state == 'Z' or state.startswith('gone'):
+                break
+            time.sleep(0.01)
+        return super().watch_exit(pid)
+
+
+def _answer_esrch_forgotten() -> dict:
+    _launcher_mod, _registry, _exec, _fake, _cookie, _manager, ProcTable = _bind()
+    table = _Forgetful(ProcTable())
+    result = _start_with('forgot1', _ForgetThenEsrch(table), processes=table)
+    result['ok'] = True
+    result['forgot'] = table.forgot
+    return result
+
+
+def _answer_esrch_owner() -> dict:
+    import gc
+
+    _launcher_mod, Registry, _exec, _fake, cookie_name, DarwinRunManager, ProcTable = _bind()
+    scratch = Path(tempfile.mkdtemp(prefix='own-'))
+    target = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+    try:
+        table = ProcTable()
+        start = table.start_time(target.pid)
+        run_id = 'owned1'
+        unit = 'recursion-run-%s.service' % run_id
+        reg = Registry(scratch / run_id)
+        reg.control_put(run_id, json.dumps({
+            'run_id': run_id,
+            cookie_name: 'ef' * 16,
+            'cgroup': '/darwin-pgid/%s' % unit,
+            'leader_pid': target.pid,
+            'leader_start_time': start,
+        }))
+        mgr = DarwinRunManager(reg, kqueue=_WatchRefused(errno.ESRCH), processes=table)
+        group, pid = mgr.adopt(unit)
+        original = mgr._runs[unit].kq_fd
+        dup = mgr.open_main_pidfd(group, pid)
+        before = _readable(original) and _readable(dup)
+        del mgr
+        gc.collect()
+        try:
+            os.fstat(original)
+        except OSError as exc:
+            original_shut = exc.errno == errno.EBADF
+        else:
+            original_shut = False
+        dup_readable = _readable(dup)
+        if isinstance(dup, int):
+            os.close(dup)
+        return {
+            'ok': True,
+            'before': before,
+            'distinct': isinstance(dup, int) and dup != original,
+            'original_shut': original_shut,
+            'dup_readable': dup_readable,
+        }
+    finally:
+        target.kill()
+        try:
+            target.wait(timeout=2)
+        except Exception:
+            pass
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _answer_stop_survivors() -> dict:
+    held, manager, unit, envfifo, _registry, _cookie, engine_exec, _launcher = _begin('surv1')
+    survivor = None
+    try:
+        out = held.scratch / 'survivor'
+        standin = _standin(held.scratch, (
+            'import os, subprocess, sys\n'
+            'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"])\n'
+            'with open(sys.argv[1] + ".part", "w") as handle:\n'
+            '    handle.write(str(child.pid))\n'
+            'os.replace(sys.argv[1] + ".part", sys.argv[1])\n'
+        ))
+        manager.start(unit, _argv(engine_exec, envfifo, standin, [str(out)]))
+        leader = manager._runs[unit]
+        held.popen = leader.popen
+        _publish_env(envfifo)
+        if not _wait_path(out, None, 5):
+            return {'ok': False, 'message': 'the leader did not name its child', 'state': _proc_state(leader.pid)}
+        survivor = int(out.read_text())
+        deadline = time.monotonic() + 5
+        while not _proc_state(leader.pid).startswith('gone') and time.monotonic() < deadline:
+            time.sleep(0.02)
+        leader_state = _proc_state(leader.pid)
+        before = _proc_state(survivor)
+        detail = None
+        try:
+            manager.stop(unit)
+        except Exception as exc:  # noqa: BLE001 - a refusal is the result
+            detail = getattr(exc, 'detail', None) or type(exc).__name__
+        deadline = time.monotonic() + 3
+        after = _proc_state(survivor)
+        while not (after == 'Z' or after.startswith('gone')) and time.monotonic() < deadline:
+            time.sleep(0.02)
+            after = _proc_state(survivor)
+        return {
+            'ok': True,
+            'leader_state': leader_state,
+            'before': before,
+            'detail': detail,
+            'after': after,
+            'observe': manager.observe(unit),
+        }
+    finally:
+        # The survivor is this test's own grandchild: end it if the stop did not.
+        if survivor is not None and not _proc_state(survivor).startswith('gone'):
+            try:
+                os.kill(survivor, signal.SIGKILL)
+            except OSError:
+                pass
+        held.close()
+
+
+def _answer_esrch_launch() -> dict:
+    _apply()
+    from recursion_core.daemon import Daemon, Registry
+    from recursion_core.daemon.launcher import ProductionLauncher, RunContext, bound_run
+    import recursion_core.daemon.launcher as gate_mod
+    from recursion_core.darwin.launcher import DarwinRunManager
+    from recursion_core.darwin.proc import FakeProcessTable
+
+    gate_mod.require_launcher_platform = lambda: None
+    scratch = Path(tempfile.mkdtemp(prefix='esl'))
+    os.chmod(scratch, 0o700)
+    state = scratch / 'state'
+    standin = _standin(scratch, 'import time\ntime.sleep(30)\n')
+    kqueue = _ExitsThenEsrch()
+    daemon = process = None
+    run_id = 'esrchl1'
+    try:
+        registry = Registry(state)
+        manager = DarwinRunManager(registry, kqueue=kqueue, processes=FakeProcessTable())
+        daemon = Daemon(registry, manager, boot_id=lambda: 'boot-darwin')
+        ctx = RunContext(run_id)
+        detail = None
+        began = time.monotonic()
+        try:
+            with bound_run(ctx):
+                process = ProductionLauncher(
+                    'claude_code', daemon, manager, state, start_timeout_s=1,
+                )([str(standin)], env={'PATH': '/usr/bin:/bin'})
+        except Exception as exc:  # noqa: BLE001 - the refusal is the result
+            detail = '%s: %s' % (type(exc).__name__, getattr(exc, 'detail', None) or exc)
+        elapsed = time.monotonic() - began
+        leader = kqueue.calls[0] if kqueue.calls else None
+        return {
+            'ok': True,
+            'launched': process is not None,
+            'detail': detail,
+            'elapsed': elapsed,
+            'calls': list(kqueue.calls),
+            'leader_state': _proc_state(leader) if isinstance(leader, int) else None,
+            'observe': manager.observe('recursion-run-%s.service' % run_id),
+        }
+    finally:
+        if process is not None:
+            process.close()
+        if daemon is not None:
+            daemon.close()
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def _answer(mode: str) -> dict:
     modes = {
         'stdin': _answer_stdin,
@@ -768,6 +995,10 @@ def _answer(mode: str) -> dict:
         'esrch_start': _answer_esrch_start,
         'esrch_adopt': _answer_esrch_adopt,
         'watch_refused': _answer_watch_refused,
+        'esrch_forgotten': _answer_esrch_forgotten,
+        'esrch_owner': _answer_esrch_owner,
+        'stop_survivors': _answer_stop_survivors,
+        'esrch_launch': _answer_esrch_launch,
     }
     fn = modes.get(mode)
     if fn is None:
@@ -790,6 +1021,7 @@ def _answer_main() -> int:
 def run_answer(mode: str) -> dict:
     # The child makes every path with tempfile under this directory, which it gets as TMPDIR.
     with tempfile.TemporaryDirectory(prefix='ans-') as scratch:
+        _unit_safe_or_skip(scratch)
         env = os.environ.copy()
         env['PYTHONDONTWRITEBYTECODE'] = '1'
         env['TMPDIR'] = scratch
@@ -805,6 +1037,8 @@ def run_answer(mode: str) -> dict:
     return json.loads(line[len(_MARK):])
 
 
+@unittest.skipUnless(fcntl is not None and Path('/proc/self/stat').exists(),
+                     'the simulated Darwin launch runs on a Linux host: it needs fcntl and /proc')
 class DarwinLauncherTests(unittest.TestCase):
     def test_a_launch_records_the_session_the_fifos_the_cookie_and_the_start_time(self) -> None:
         result = simulate()
@@ -926,6 +1160,63 @@ class DarwinLauncherTests(unittest.TestCase):
         self.assertEqual('start_time_unreadable', unchecked['detail'], result)
         self.assertEqual([], unchecked['calls'], result)
         self.assertEqual([], unchecked['owned'], result)
+
+    def test_cookie_fifo_name_is_gone_once_the_engine_has_its_environment(self) -> None:
+        # The same launch as the first test; this one reads only the run directory.
+        result = simulate()
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(result['cookie_in_child'], result)
+        self.assertEqual(['stdin.fifo'], result['run_dir_fifos'], result)
+
+    def test_a_scratch_root_the_launcher_refuses_is_a_skip_with_its_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            spaced = Path(root) / 'my dir'
+            spaced.mkdir()
+            saved = tempfile.tempdir
+            tempfile.tempdir = str(spaced)
+            try:
+                with self.assertRaises(unittest.SkipTest) as caught:
+                    simulate()
+            finally:
+                tempfile.tempdir = saved
+        self.assertIn('not unit-safe', str(caught.exception))
+
+    def test_stop_after_the_leader_was_reaped_ends_its_surviving_group(self) -> None:
+        result = run_answer('stop_survivors')
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(result['leader_state'].startswith('gone'), result)
+        self.assertFalse(result['before'] == 'Z' or result['before'].startswith('gone'), result)
+        self.assertIsNone(result['detail'], result)
+        self.assertTrue(result['after'] == 'Z' or result['after'].startswith('gone'), result)
+        self.assertEqual('unknown', result['observe'], result)
+
+    def test_esrch_exit_reaches_the_caller_after_the_row_is_gone(self) -> None:
+        result = run_answer('esrch_forgotten')
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(result['forgot'], result)
+        self.assertIsNone(result['detail'], result)
+        self.assertEqual([result['pid']], result['calls'], result)
+        self.assertTrue(result['exit_delivered'], result)
+
+    def test_esrch_exit_fd_is_shut_with_its_manager_and_duplicates_stay(self) -> None:
+        result = run_answer('esrch_owner')
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(result['before'], result)
+        self.assertTrue(result['distinct'], result)
+        self.assertTrue(result['original_shut'], result)
+        self.assertTrue(result['dup_readable'], result)
+
+    def test_esrch_leader_gone_before_its_environment_times_out_and_is_fenced(self) -> None:
+        # Pinned: the launcher waits its whole start timeout (1 s here) on the env FIFO, then refuses.
+        result = run_answer('esrch_launch')
+        self.assertTrue(result['ok'], result)
+        self.assertFalse(result['launched'], result)
+        self.assertEqual(1, len(result['calls']), result)
+        self.assertTrue(result['detail'].startswith('TimeoutError'), result)
+        self.assertGreaterEqual(result['elapsed'], 1.0, result)
+        self.assertLess(result['elapsed'], 15.0, result)
+        self.assertTrue(result['leader_state'] == 'Z' or result['leader_state'].startswith('gone'), result)
+        self.assertEqual('unknown', result['observe'], result)
 
 
 if __name__ == '__main__':

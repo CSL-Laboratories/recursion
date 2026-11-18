@@ -51,6 +51,34 @@ class ProcTable:
             return None
         return got.get('start_time')
 
+    def group_members(self, pgid: int, name: str, cookie: str) -> list[int]:
+        """Live pids in process group ``pgid`` whose environment holds ``name=cookie``.
+
+        A Mac has no ``/proc``: nothing is found there.
+        """
+
+        if isinstance(pgid, bool) or not isinstance(pgid, int) or pgid <= 1:
+            return []
+        needle = ('%s=%s' % (name, cookie)).encode()
+        try:
+            entries = os.listdir('/proc')
+        except OSError:
+            return []
+        found = []
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                if os.getpgid(pid) != pgid:
+                    continue
+                environ = Path('/proc/%d/environ' % pid).read_bytes()
+            except OSError:
+                continue
+            if needle in environ.split(b'\0'):
+                found.append(pid)
+        return found
+
     def record_launch(self, **info: object) -> None:
         self.launches.append(dict(info))
 
@@ -84,6 +112,9 @@ class FakeProcessTable:
         if not got:
             return None
         return got.get('start_time')
+
+    def group_members(self, pgid: int, name: str, cookie: str) -> list[int]:
+        return self.inner.group_members(pgid, name, cookie)
 
     def record_launch(self, **info: object) -> None:
         self.launches.append(dict(info))

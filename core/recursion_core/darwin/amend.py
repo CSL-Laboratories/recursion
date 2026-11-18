@@ -92,6 +92,11 @@ def _spawn_writer(path: str, payload: bytes) -> tuple[int, int | None]:
             os.close(write_fd)
             try:
                 fd = os.open(path, os.O_WRONLY | os.O_CLOEXEC)
+                # The reader has the FIFO open, so its name is no longer needed.
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
                 data = ('%d\n' % len(payload)).encode('ascii') + payload
                 while data:
                     wrote = os.write(fd, data)

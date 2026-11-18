@@ -37,10 +37,12 @@ _BOUNDARY = '/darwin-pgid/'
 
 
 class _Leader:
-    def __init__(self, unit, pid, group, start_time, cookie, kq_fd, popen, stdio):
+    def __init__(self, unit, pid, group, start_time, cookie, kq_fd, popen, stdio, delivered=None):
         self.unit, self.pid, self.group = unit, pid, group
         self.start_time, self.cookie = start_time, cookie
         self.kq_fd, self.popen, self.stdio = kq_fd, popen, stdio
+        # Set when the watch answered ESRCH: the owner of an exit already delivered.
+        self.delivered = delivered
         self.stopped = False
 
 
@@ -132,15 +134,39 @@ def _exit_delivered() -> int:
     return read_fd
 
 
+class _DeliveredExit:
+    """Owns the fd from ``_exit_delivered``, as ``XnuKqueue`` keeps a kqueue's fd.
+
+    The fd is shut when the run's record is dropped: the manager torn down,
+    or a start refused after the watch. Callers hold duplicates of their own.
+    """
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+
+    def release(self) -> None:
+        fd, self.fd = self.fd, -1
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __del__(self) -> None:
+        self.release()
+
+
 class DarwinRunManager:
     """The service manager a Darwin daemon would hand to ``ProductionLauncher``.
 
     ``stop`` signals the leader's process group only when that pid is a live
     session leader above 1, not this process's own group, and the live start
-    time still matches. It does not scan for the cookie and it does not
-    answer empty: that attestation is a later draft. ``open_main_pidfd``
-    returns a duplicate of the exit fd from ``start``, or None when the
-    pid's start time no longer matches. The kqueue keeps its own fd.
+    time still matches. A leader that has exited and been reaped has no row:
+    its group is signalled only when a cookie scan finds live members of it.
+    It does not answer empty: that attestation is a later draft.
+    ``open_main_pidfd`` returns a duplicate of the exit fd from ``start``, or
+    None when the pid's start time no longer matches while the watch is live.
+    The kqueue keeps its own fd.
     """
 
     def __init__(self, registry, *, kqueue=None, processes=None):
@@ -202,7 +228,7 @@ class DarwinRunManager:
             proc = self._spawn(list(argv), pending, cookie)
             info = self._await_leader(proc)
             recorded_start = info['start_time']
-            kq_fd = self._watch_exit(proc.pid)
+            kq_fd, delivered = self._watch_exit(proc.pid)
             stdio = dict(pending['stdio'])
             stdio['env'] = fifo
             # The launcher removes the env FIFO once the leader has read it.
@@ -222,7 +248,7 @@ class DarwinRunManager:
                 start_time=info['start_time'], cookie=cookie, stdio=stdio,
                 env_is_fifo=env_is_fifo, stdin_is_fifo=stdin_is_fifo,
             )
-            leader = _Leader(unit, proc.pid, group, info['start_time'], cookie, kq_fd, proc, stdio)
+            leader = _Leader(unit, proc.pid, group, info['start_time'], cookie, kq_fd, proc, stdio, delivered)
             with self._lock:
                 self._runs[unit] = leader
                 self._by_pid[proc.pid] = leader
@@ -256,6 +282,8 @@ class DarwinRunManager:
 
         The caller owns the duplicate. The kqueue keeps the original, so
         shutting one does not shut the other, and a second call is a new fd.
+        An exit already delivered (ESRCH) needs no row in the process table:
+        that fd only says the leader is gone.
         """
 
         _gate()
@@ -263,8 +291,8 @@ class DarwinRunManager:
             leader = self._by_pid.get(pid)
             if leader is None or leader.group != group:
                 return None
-            start, fd = leader.start_time, leader.kq_fd
-        if self._processes.start_time(pid) != start:
+            start, fd, delivered = leader.start_time, leader.kq_fd, leader.delivered
+        if delivered is None and self._processes.start_time(pid) != start:
             return None
         return fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 0)
 
@@ -287,9 +315,9 @@ class DarwinRunManager:
             raise refused('pid_reused')
         if self._kqueue is None:
             raise refused('kqueue_unavailable')
-        kq_fd = self._watch_exit(pid)
+        kq_fd, delivered = self._watch_exit(pid)
         group = record.get('cgroup') if isinstance(record.get('cgroup'), str) else _boundary(unit)
-        leader = _Leader(unit, pid, group, recorded, cookie, kq_fd, None, {})
+        leader = _Leader(unit, pid, group, recorded, cookie, kq_fd, None, {}, delivered)
         with self._lock:
             self._runs[unit] = leader
             self._by_pid[pid] = leader
@@ -298,10 +326,12 @@ class DarwinRunManager:
     def stop(self, unit):
         """Signal the leader's group when it is still a session this stop may reach.
 
-        This is not the attested Stop. A cookie scan and an empty answer are
-        a later draft. An unknown unit is ``UnitNotLoaded``, as systemd is.
-        Pid 1 and this process's own group are refused before any signal:
-        ``killpg(1)`` is ``kill(-1)``.
+        This is not the attested Stop: an empty answer is a later draft. An
+        unknown unit is ``UnitNotLoaded``, as systemd is. Pid 1 and this
+        process's own group are refused before any signal: ``killpg(1)`` is
+        ``kill(-1)``. A leader with no row (exited and reaped) reaches its
+        group only through the cookie scan; a pid that shows a different
+        start time is ``pid_reused``.
         """
 
         _gate()
@@ -310,8 +340,12 @@ class DarwinRunManager:
             leader = self._runs.get(unit)
         if leader is None:
             raise UnitNotLoaded(unit)
-        if self._processes.start_time(leader.pid) != leader.start_time:
-            raise refused('pid_reused')
+        live = self._processes.start_time(leader.pid)
+        if live != leader.start_time:
+            if live is not None or not self._stop_survivors(leader):
+                raise refused('pid_reused')
+            leader.stopped = True
+            return
         if not self._may_signal(leader.pid, leader.start_time):
             raise refused('pid_unreachable')
         self._stop_spawned(leader.popen, leader.pid, leader.start_time)
@@ -343,7 +377,7 @@ class DarwinRunManager:
             return set(self._runs)
 
     def _watch_exit(self, pid):
-        """The leader's exit fd. Called only after the start-time check has passed.
+        """The leader's exit fd and, for ESRCH, its owner. Called only after the start-time check.
 
         ``ESRCH`` means the leader has already exited: the run is not refused,
         the exit is delivered at once. ``start`` still records and checks the
@@ -351,13 +385,40 @@ class DarwinRunManager:
         """
 
         try:
-            return self._kqueue.watch_exit(pid)
+            return self._kqueue.watch_exit(pid), None
         except OSError as exc:
             if exc.errno != errno.ESRCH:
                 raise refused('kqueue_unavailable') from exc
         except Exception as exc:
             raise refused('kqueue_unavailable') from exc
-        return _exit_delivered()
+        owner = _DeliveredExit(_exit_delivered())
+        return owner.fd, owner
+
+    def _stop_survivors(self, leader) -> bool:
+        """Signal the group of a leader that exited and was reaped, when a cookie scan finds members.
+
+        Only live members of the leader's process group that hold this run's
+        cookie count. While one lives, the group id is not reused. Pid 1 and
+        this process's own group are refused as for a live leader.
+        """
+
+        pid = leader.pid
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+            return False
+        try:
+            if pid == os.getpgrp():
+                return False
+        except OSError:
+            return False
+        scan = getattr(self._processes, 'group_members', None)
+        if scan is None or not scan(pid, RUN_COOKIE, leader.cookie):
+            return False
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError as exc:
+            if exc.errno != errno.ESRCH:  # ESRCH: the members exited after the scan
+                raise refused('pid_unreachable') from exc
+        return True
 
     def _await_leader(self, proc):
         deadline = time.monotonic() + 2.0

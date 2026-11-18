@@ -19,16 +19,19 @@ folder. ``plugin.revocation`` is the revocation store (``check_store``, which do
 open it). ``plugin.installed`` is one row per installed plugin: its id, version, trust,
 key id, registry label and the loader's developer checks (``PluginLoader.doctor``).
 No plugin code runs. A plugin config folder that is not the operator's, or that group
-or world can write, reports every plugin refused. A revocation store that is gone
-after its folder exists reports every plugin refused, and this report does not create
-a replacement store. The report adds no key to ``install.json`` and no manifest field,
-and it does not change the daemon.
+or world can write, reports every plugin refused. A revocation store is reported lost
+only when a side file of ``revoked.sqlite3`` remains; the breaker directory alone is
+not that signal, and this report does not create a replacement store. A legacy
+revocation store is reported ``revocation_store_legacy`` and is not rewritten. A
+symlinked ``plugin-security`` directory is refused. The report adds no key to
+``install.json`` and no manifest field, and it does not change the daemon.
 
 Recursion installs no engine. A missing engine binary is unknown, not ok.
 """
 
 from __future__ import annotations
 
+import contextvars
 import datetime as dt
 import os
 import shutil
@@ -38,6 +41,10 @@ import sys
 import sysconfig
 import tempfile
 from pathlib import Path
+
+# None: today's account probes. A string: those probes read this directory and
+# do not ask the password database, loginctl or systemctl.
+_ROOT = contextvars.ContextVar("recursion_doctor_root", default=None)
 
 _IDS = (
     "platform.linux",
@@ -81,13 +88,28 @@ _STORE_STEP = "restore the revocation store; a missing store after install refus
 _VERIFY_STEP = "install the signature backend named in plugin_security/README.md"
 
 
-def run(probes=None) -> dict:
+def run(probes=None, *, root=None) -> dict:
     """Build a doctor report. ``probes`` replaces every live check; None runs them.
 
     The plugin checks run only when ``probes`` is None. They report the live host and
     do not run plugin code.
+
+    ``root`` is an optional absolute directory the live account probes read. None
+    keeps today's probes: the unit file comes from the password database, and linger
+    and the user manager ask this account. A root confines those three probes to
+    that directory.
     """
 
+    if root is None:
+        return _collect(probes)
+    token = _ROOT.set(root)
+    try:
+        return _collect(probes)
+    finally:
+        _ROOT.reset(token)
+
+
+def _collect(probes) -> dict:
     checks = []
     for check_id in _IDS:
         checks.extend(_invoke(check_id, probes))
@@ -95,6 +117,20 @@ def run(probes=None) -> dict:
         for check_id in _PLUGIN_IDS:
             checks.extend(_invoke(check_id, None))
     return {"generated_at": _now(), "checks": checks}
+
+
+def _injected_home():
+    """``(asked, home)``. ``asked`` is true when ``run`` was given a root.
+
+    A root that is not an absolute path does not fall through to the account.
+    """
+
+    root = _ROOT.get()
+    if root is None:
+        return False, None
+    if type(root) is not str or not os.path.isabs(root):
+        return True, None
+    return True, root
 
 
 def exit_code(report: dict) -> int:
@@ -200,6 +236,18 @@ def _probe_interpreter():
 
 
 def _probe_user_manager():
+    asked, home = _injected_home()
+    if asked:
+        if home is None:
+            return _body("unknown", "the doctor root is not an absolute path")
+        path = os.path.join(home, ".config", "systemd", "user")
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return _body("unknown", "systemd user manager is not in the doctor root")
+        except OSError as exc:
+            return _body("unknown", f"{type(exc).__name__}: {exc}")
+        return _body("unknown", "systemd user manager was not asked; the doctor root is set")
     try:
         done = subprocess.run(
             ["systemctl", "--user", "is-system-running"],
@@ -229,6 +277,15 @@ def _probe_user_manager():
 
 
 def _probe_linger():
+    asked, home = _injected_home()
+    if asked:
+        if home is None:
+            return _body("unknown", "the doctor root is not an absolute path")
+        try:
+            os.lstat(home)
+        except OSError as exc:
+            return _body("unknown", f"{type(exc).__name__}: {exc}")
+        return _body("unknown", "linger was not asked; the doctor root is set")
     import getpass
 
     from recursion_core.daemon import check_operator_linger
@@ -262,9 +319,14 @@ def _account_home():
 
 
 def _probe_unit():
-    home = _account_home()
-    if home is None:
-        return _body("unknown", "the password database gives no home for this user")
+    asked, home = _injected_home()
+    if asked:
+        if home is None:
+            return _body("unknown", "the doctor root is not an absolute path")
+    else:
+        home = _account_home()
+        if home is None:
+            return _body("unknown", "the password database gives no home for this user")
     path = os.path.join(home, ".config", "systemd", "user", _UNIT_NAME)
     try:
         info = os.lstat(path)
@@ -447,28 +509,73 @@ def _folder_status():
     return "ok", folder, folder, None, names
 
 
+_REVOCATION_FILE = "revoked.sqlite3"
+# The same suffixes ``stores._SIDE_FILES`` checks beside a store. A leftover one is
+# evidence the revocation file itself existed. ``breaker.sqlite3`` is not.
+_REVOCATION_SIDES = ("-wal", "-shm", "-journal")
+
+
+def _revocation_side_present(folder) -> bool:
+    for suffix in _REVOCATION_SIDES:
+        side = os.path.join(folder, _REVOCATION_FILE + suffix)
+        try:
+            if os.path.lexists(side):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _legacy_refusal(path):
+    """The legacy refusal, or None when this open is not that case.
+
+    Read-only. A store that is merely unreadable is left to the plugin rows,
+    which already report that refusal. This never migrates and never creates.
+    """
+
+    from recursion_core.plugin_security.errors import Refused
+    from recursion_core.plugin_security.manifest import TrustStore
+
+    try:
+        trust = TrustStore({}, revocation_store=path, read_only=True)
+    except Refused as exc:
+        if exc.code == "revocation_store_legacy":
+            return exc
+        return None
+    trust.close()
+    return None
+
+
 def _revocation():
     """``(path or None, state, detail, step)`` for the revocation store.
 
-    ``path`` is set only when ``check_store`` passes. ``fail`` means the store folder
-    exists and the store does not pass, so every installed plugin is reported refused.
-    ``unknown`` means the store was never created; classification then uses no revoked keys.
+    ``path`` is set only when the store can be classified. ``fail`` means every
+    installed plugin is reported refused: the directory is a symlink, a side file
+    shows the revocation file is gone, the store is legacy, or ``check_store``
+    refused it. ``unknown`` means the revocation file was never there. The doctor
+    does not create a store and does not migrate one.
     """
 
     folder = _state_store_dir()
     if folder is None:
         return None, "unknown", "XDG_STATE_HOME is not an absolute path", None
-    path = os.path.join(folder, "revoked.sqlite3")
+    path = os.path.join(folder, _REVOCATION_FILE)
     if _denied(folder) or _denied(path):
         return None, "unknown", "the revocation store is not read", None
     if not os.path.lexists(path):
         try:
-            present = os.path.isdir(folder) and not os.path.islink(folder)
+            info = os.lstat(folder)
+        except FileNotFoundError:
+            return None, "unknown", "revocation store is not there yet", None
         except OSError as exc:
             return None, "unknown", f"{type(exc).__name__}: {exc}", None
-        if present:
+        if stat.S_ISLNK(info.st_mode):
             return (None, "fail",
-                    "revocation_store_missing: the store is gone after its folder was installed",
+                    "revocation_store_untrusted: plugin-security is a symlink",
+                    _STORE_STEP)
+        if stat.S_ISDIR(info.st_mode) and _revocation_side_present(folder):
+            return (None, "fail",
+                    "revocation_store_missing: revoked.sqlite3 is gone and a side file of it remains",
                     _STORE_STEP)
         return None, "unknown", "revocation store is not there yet", None
     from recursion_core.plugin_security.errors import Refused
@@ -481,6 +588,10 @@ def _revocation():
         return None, "fail", detail, _STORE_STEP
     except Exception as exc:
         return None, "unknown", f"{type(exc).__name__}: {exc}", None
+    legacy = _legacy_refusal(path)
+    if legacy is not None:
+        detail = legacy.code if not legacy.detail else f"{legacy.code}: {legacy.detail}"
+        return None, "fail", detail, _STORE_STEP
     return path, "ok", path, None
 
 
@@ -590,8 +701,8 @@ def _probe_plugins():
     """One row per installed plugin. Reads manifests and calls ``PluginLoader.doctor``.
 
     Plugin code is not run. An untrusted config folder, or a revocation store that does
-    not pass after its folder exists, reports every plugin refused and does not read
-    the plugin files.
+    not pass, reports every plugin refused and does not read the plugin files. The
+    revocation store is opened read-only.
     """
 
     kind, folder, detail, step, names = _folder_status()
@@ -627,7 +738,7 @@ def _probe_plugins():
         shown = exc.code if not exc.detail else f"{exc.code}: {exc.detail}"
         return _refused_rows(names, f"refused: {shown}", _FILE_STEP)
     try:
-        trust = TrustStore(install["trusted_keys"], revocation_store=rev_path)
+        trust = TrustStore(install["trusted_keys"], revocation_store=rev_path, read_only=True)
     except Refused as exc:
         shown = exc.code if not exc.detail else f"{exc.code}: {exc.detail}"
         return _refused_rows(names, f"refused: {shown}", _STORE_STEP)

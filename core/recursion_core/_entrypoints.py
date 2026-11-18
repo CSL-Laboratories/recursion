@@ -2,12 +2,14 @@
 
     recursiond install | upgrade | uninstall    the per-user systemd unit (control/commands/setup.py)
     recursiond doctor [--json]                  report this machine; no daemon is required
+    recursiond observe [--json]                 local tool setup, owner-only record
     recursiond serve [daemon options]           run the daemon in the foreground
 
 Linux only: on any other system every command refuses with ``platform_unsupported`` (exit 1)
 before anything else is imported; ``--help`` still prints. install, upgrade and uninstall print
 one JSON object. ``doctor --json`` prints one report; without ``--json`` it prints one line per
-check. 0 is ok, 1 a refusal or a report that has a fail, 2 a usage error.
+check. ``observe`` prints one JSON object with or without ``--json``; secret values stay out.
+0 is ok, 1 a refusal or a report that has a fail, 2 a usage error.
 
 ``serve`` checks the build before it imports anything of the daemon's: the daemon needs
 free-threaded CPython 3.14 (``build_not_free_threaded`` otherwise). It then replaces this process
@@ -31,7 +33,7 @@ DAEMON_MODULE = "recursion_core.daemon"
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
 _DESCRIPTION = ("Recursion's per-user daemon and its installer. Linux only. "
                 "install, upgrade and uninstall each print one JSON object. "
-                "doctor prints a report.")
+                "doctor prints a report. observe prints one JSON object.")
 
 
 def _configure_doctor(parser) -> None:
@@ -50,10 +52,28 @@ def _handle_doctor(args) -> int:
     return doctor.exit_code(report)
 
 
+def _configure_observe(parser) -> None:
+    parser.add_argument("--json", action="store_true",
+                        help="print one observe report")
+
+
+def _handle_observe(args) -> int:
+    import recursion_core.setup.observe as observe
+
+    # One object either way. The flag is on the row so --help and --json agree.
+    if args.json not in (True, False):
+        print("usage error: --json", file=sys.stderr)
+        return EXIT_USAGE
+    return observe.command(sys.stdout, sys.stderr)
+
+
 # Later cogs append a row: (name, help, configure, handle). configure adds that command's options.
+# This is the one SUBCOMMANDS table. Doctor owns it; a later draft appends its row here.
 SUBCOMMANDS = (
     ("doctor", "report what is ok, warn, fail or unknown on this machine",
      _configure_doctor, _handle_doctor),
+    ("observe", "report local tool setup into an owner-only record; secret values stay out",
+     _configure_observe, _handle_observe),
 )
 
 

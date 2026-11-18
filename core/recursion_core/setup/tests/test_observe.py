@@ -448,13 +448,61 @@ class ObserveTests(unittest.TestCase):
         self.assertFalse(any(item.endswith("settings.json") for item in shown), shown)
 
     def test_observe_is_the_subcommand_row_and_refuses_off_linux(self):
-        # The entry point module is put back to the doctor report's copy so the
-        # doctor command's one table can come in by a plain merge. Observe is not
-        # a row again until that table is on this branch.
         _observe()
-        table = getattr(entry, "SUBCOMMANDS", ())
-        names = [row[0] for row in table]
-        self.assertEqual(names.count("observe"), 0)
+        names = [row[0] for row in entry.SUBCOMMANDS]
+        self.assertEqual(names.count("observe"), 1)
+        self.assertEqual(names.count("doctor"), 1)
+        self.assertEqual(len(names), len(set(names)))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = entry.main(["--help"])
+        self.assertEqual(code, 0)
+        help_text = out.getvalue()
+        self.assertEqual(help_text.count("\n    observe "), 1)
+        self.assertEqual(help_text.count("\n    doctor "), 1)
+
+        with mock.patch.object(entry, "_linux", return_value=True):
+            with contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = entry.main(["observe", "--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("--json", out.getvalue())
+
+        home, project, state = self._layout()
+        _plant_denied(home)
+        with mock.patch.object(entry, "_linux", return_value=False), \
+                mock.patch.dict(os.environ, {"HOME": home, "XDG_STATE_HOME": state, "PATH": ""}, clear=False):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = entry.main(["observe"])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out.getvalue())["code"], "platform_unsupported")
+        self.assertFalse(os.path.exists(os.path.join(state, "recursion", "observe", "record.json")))
+
+        with mock.patch.object(entry, "_linux", return_value=True), \
+                mock.patch.dict(os.environ, {"HOME": home, "XDG_STATE_HOME": state, "PATH": ""}, clear=False), \
+                contextlib.chdir(project):
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+                code = entry.main(["observe"])
+        self.assertEqual(code, 0, out.getvalue())
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["code"], "ok")
+        record = os.path.join(state, "recursion", "observe", "record.json")
+        self.assertEqual(stat.S_IMODE(os.stat(record).st_mode), 0o600)
+        _clean(out.getvalue())
+        with open(record, encoding="ascii") as handle:
+            _clean(handle.read())
+
+        with mock.patch.object(entry, "_linux", return_value=True), \
+                mock.patch.dict(os.environ, {"HOME": home, "XDG_STATE_HOME": state, "PATH": ""}, clear=False), \
+                contextlib.chdir(project):
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+                code = entry.main(["observe", "--json"])
+        self.assertEqual(code, 0, out.getvalue())
+        again = json.loads(out.getvalue())
+        self.assertEqual(again["code"], "ok")
+        _clean(out.getvalue())
+        with open(record, encoding="ascii") as handle:
+            _clean(handle.read())
 
 
 if __name__ == "__main__":

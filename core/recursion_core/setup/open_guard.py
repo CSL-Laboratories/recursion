@@ -6,9 +6,14 @@ including when the denied directory itself is a symlink. A file is read only
 when lstat before the open and fstat on the same descriptor both say one link
 and the same inode. Otherwise no byte is returned.
 
-``O_NOFOLLOW`` is included when the interpreter has that name. When the name is
-absent the one-link and same-inode checks still run before any byte is returned.
-A file whose link count cannot be read is refused. The check is not skipped.
+The file is owned by the calling user and has no group- or world-write bit,
+checked on lstat before the open and again on the held descriptor.
+
+The read walks the checked real path from the root, one directory descriptor
+per part, each opened with ``O_NOFOLLOW`` and ``O_DIRECTORY``, and opens the
+file relative to its parent's descriptor. The file opened is the file checked.
+Where ``O_NOFOLLOW``, ``O_DIRECTORY`` or a ``dir_fd`` open is missing, the read
+is refused (``platform_unsupported``) before any open. The check is not dropped.
 """
 
 from __future__ import annotations
@@ -27,11 +32,25 @@ class GateRefused(Exception):
         self.reason = reason
 
 
-def _nofollow() -> int:
-    """The no-follow flag when this interpreter has it. Never a substitute for the link check."""
+def _walk_flags():
+    """The directory and file flags of the walk, or None where this platform lacks them."""
 
-    flag = getattr(os, "O_NOFOLLOW", 0)
-    return flag if isinstance(flag, int) else 0
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY") or not hasattr(os, "geteuid"):
+        return None
+    if os.open not in os.supports_dir_fd:
+        return None
+    base = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    return base | os.O_DIRECTORY, base
+
+
+def _foreign(info) -> str | None:
+    """A refusal word when the file is not the caller's own or others may write it."""
+
+    if info.st_uid != os.geteuid():
+        return "not_owner"
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        return "writable"
+    return None
 
 
 def read_regular_file(path: str, *, root: str, home: str, max_bytes: int, denied_ids=None) -> bytes:
@@ -39,10 +58,11 @@ def read_regular_file(path: str, *, root: str, home: str, max_bytes: int, denied
 
     ``denied_ids`` is the optional inode set of denied paths. It does not replace
     the one-link rule: a hard link is refused because its link count is not one.
-    The link count and the inode identity are checked even when ``O_NOFOLLOW`` is
-    absent. A missing flag does not skip them, and no byte is returned on a miss.
     """
 
+    flags = _walk_flags()
+    if flags is None:
+        raise GateRefused("platform_unsupported")
     if type(path) is not str or type(root) is not str or not os.path.isabs(root):
         raise GateRefused("outside")
     if type(home) is not str or not home:
@@ -64,15 +84,18 @@ def read_regular_file(path: str, *, root: str, home: str, max_bytes: int, denied
         raise GateRefused("posix") from None
     if nlink != 1:
         raise GateRefused("aliased")
-    if not inside_root(path, root):
+    real = _real(path)
+    if real is None or not _inside_real(real, root):
         raise GateRefused("outside")
-    if _real_denied(path, home) or (denied_ids and (info.st_dev, info.st_ino) in denied_ids):
+    if _real_denied(path, home, real) or (denied_ids and (info.st_dev, info.st_ino) in denied_ids):
         raise GateRefused("denied")
+    refused = _foreign(info)
+    if refused is not None:
+        raise GateRefused(refused)
     if (info.st_mode & 0o400) == 0 or info.st_size > max_bytes:
         raise GateRefused("unreadable")
-    flags = os.O_RDONLY | os.O_CLOEXEC | _nofollow()
     try:
-        fd = os.open(path, flags)
+        fd = _open_walk(real, *flags)
     except OSError:
         raise GateRefused("unreadable") from None
     try:
@@ -89,6 +112,9 @@ def read_regular_file(path: str, *, root: str, home: str, max_bytes: int, denied
             raise GateRefused("aliased")
         if denied_ids and (held.st_dev, held.st_ino) in denied_ids:
             raise GateRefused("denied")
+        refused = _foreign(held)
+        if refused is not None:
+            raise GateRefused(refused)
         if held.st_size > max_bytes:
             raise GateRefused("unreadable")
         chunks = []
@@ -109,15 +135,46 @@ def read_regular_file(path: str, *, root: str, home: str, max_bytes: int, denied
         os.close(fd)
 
 
+def _open_walk(real: str, dir_flags: int, file_flags: int) -> int:
+    """Open ``real`` from the root, one no-follow directory descriptor per part."""
+
+    parts = [part for part in real.split(os.sep) if part]
+    if not parts or any(part in {".", ".."} for part in parts):
+        raise OSError("not a plain absolute path")
+    current = os.open(os.sep, dir_flags)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, dir_flags, dir_fd=current)
+            os.close(current)
+            current = child
+        return os.open(parts[-1], file_flags, dir_fd=current)
+    finally:
+        os.close(current)
+
+
+def _real(path: str) -> str | None:
+    try:
+        real = os.path.realpath(path)
+    except (OSError, ValueError):
+        return None
+    if type(real) is not str or not os.path.isabs(real):
+        return None
+    return real
+
+
 def inside_root(path: str, root: str) -> bool:
     """True when the real path of ``path`` is strictly inside the real path of ``root``.
 
     An ancestor symlink that leaves ``root`` is false. This is #564's ``_inside``.
     """
 
+    real = _real(path)
+    return real is not None and _inside_real(real, root)
+
+
+def _inside_real(real: str, root: str) -> bool:
     try:
         real_root = os.path.realpath(root)
-        real = os.path.realpath(path)
     except (OSError, ValueError):
         return False
     if type(real) is not str or type(real_root) is not str or not real_root:
@@ -128,7 +185,7 @@ def inside_root(path: str, root: str) -> bool:
     return real.startswith(prefix)
 
 
-def _real_denied(path: str, home: str) -> bool:
+def _real_denied(path: str, home: str, real: str | None) -> bool:
     """Denied-directory check on the path text and on the real path.
 
     A denied directory that is a symlink denies its target as well, so a file
@@ -137,10 +194,6 @@ def _real_denied(path: str, home: str) -> bool:
     """
 
     if is_denied(path, home):
-        return True
-    try:
-        real = os.path.realpath(path)
-    except (OSError, ValueError):
         return True
     if type(real) is not str:
         return True

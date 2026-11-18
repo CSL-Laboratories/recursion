@@ -181,6 +181,25 @@ class ObserveTests(unittest.TestCase):
             self.assertFalse(shown.endswith("auth.json"), shown)
             self.assertFalse(shown.endswith(".credentials.json"), shown)
 
+    def _assert_typed_refusal(self, home, project, state, path):
+        # Where O_NOFOLLOW is missing (the simulated-Windows step) the gate refuses, typed,
+        # before any open, and the row carries no hash and no field.
+        from recursion_core.setup import open_guard
+
+        root = project if path.startswith(project + os.sep) else home
+        with self.assertRaises(open_guard.GateRefused) as caught:
+            open_guard.read_regular_file(path, root=root, home=home, max_bytes=1024 * 1024)
+        self.assertEqual(caught.exception.reason, "platform_unsupported")
+        code, text, _record, disk, _opened = self._run(home, project, state)
+        self.assertEqual(code, 0)
+        _clean(text)
+        _clean(disk.decode("utf-8", "replace"))
+        row = _by_path(json.loads(text), path)
+        self.assertEqual(row["state"], "unknown")
+        self.assertEqual(row["detail"], "not_opened")
+        self.assertIsNone(row["sha256"])
+        self.assertNotIn("allow", row)
+
     def test_canaries_stay_out_and_a_mode_000_config_is_unknown(self):
         observe = _observe()
         home, project, state = self._layout()
@@ -231,6 +250,9 @@ class ObserveTests(unittest.TestCase):
         _write(os.path.join(project, "AGENTS.md"), agents, 0o644)
         _write(os.path.join(project, "CLAUDE.md"), claude_md, 0o644)
 
+        if not hasattr(os, "O_NOFOLLOW"):
+            self._assert_typed_refusal(home, project, state, settings_path)
+            return
         code, text, record, disk, opened = self._run(home, project, state)
         self.assertEqual(code, 0, text)
         self._assert_private(home, opened, text, disk)
@@ -332,6 +354,9 @@ class ObserveTests(unittest.TestCase):
         )
         config_path = os.path.join(home, ".codex", "config.toml")
         _write(config_path, toml, 0o600)
+        if not hasattr(os, "O_NOFOLLOW"):
+            self._assert_typed_refusal(home, project, state, config_path)
+            return
         code, text, _record, disk, opened = self._run(home, project, state)
         self.assertEqual(code, 0, text)
         self._assert_private(home, opened, text, disk)
@@ -413,6 +438,9 @@ class ObserveTests(unittest.TestCase):
             observe.command(io.StringIO(), home=home, project=project, state_home=state, runner=leave)
         self.assertFalse(os.path.exists(record))
 
+        if not hasattr(os, "O_NOFOLLOW"):
+            self._assert_typed_refusal(home, project, state, os.path.join(home, ".claude", "settings.json"))
+            return
         first_out = io.StringIO()
         second_out = io.StringIO()
         self.assertEqual(observe.command(first_out, home=home, project=project, state_home=state, runner=_login_ok), 0)
@@ -604,6 +632,9 @@ class ObserveTests(unittest.TestCase):
                 return _Shifted(info)
             return info
 
+        if not hasattr(os, "O_NOFOLLOW"):
+            self._assert_typed_refusal(home, project, state, settings)
+            return
         out = io.StringIO()
         with mock.patch("os.fstat", fstat):
             code = observe.command(out, home=home, project=project, state_home=state, runner=_login_ok)
@@ -700,6 +731,9 @@ class ObserveTests(unittest.TestCase):
         body = json.dumps({"model": "haiku-inside"})
         _write(settings_real, body, 0o600)
         os.symlink(alt, os.path.join(home, ".claude"))
+        if not hasattr(os, "O_NOFOLLOW"):
+            self._assert_typed_refusal(home, project, state, os.path.join(home, ".claude", "settings.json"))
+            return
         code, text, _record, disk, opened = self._run(home, project, state)
         self.assertEqual(code, 0, text)
         _clean(text)
@@ -845,6 +879,9 @@ class ObserveTests(unittest.TestCase):
         }
         path = os.path.join(home, ".claude", "settings.json")
         _write(path, json.dumps(settings), 0o600)
+        if not hasattr(os, "O_NOFOLLOW"):
+            self._assert_typed_refusal(home, project, state, path)
+            return
         code, text, _record, disk, _opened = self._run(home, project, state)
         self.assertEqual(code, 0)
         _clean(text)
@@ -876,6 +913,9 @@ class ObserveTests(unittest.TestCase):
         )
         xdg_path = os.path.join(home, ".config", "git", "config")
         _write(xdg_path, xdg, 0o644)
+        if not hasattr(os, "O_NOFOLLOW"):
+            self._assert_typed_refusal(home, project, state, git_path)
+            return
         code, text, _record, disk, opened = self._run(home, project, state)
         self.assertEqual(code, 0)
         _clean(text)
@@ -888,6 +928,138 @@ class ObserveTests(unittest.TestCase):
         xdg_row = _by_path(json.loads(text), xdg_path)
         self.assertIs(xdg_row["allow"]["user_name_present"], True)
         self.assertIs(xdg_row["allow"]["user_email_present"], True)
+
+
+def _fake_key(prefix):
+    # Built at run time from a credential prefix and the word FAKE: never a real key.
+    return prefix + "FAKE-7c1e9a4b-DO-NOT-LEAK"
+
+
+_FAKE_PART = "FAKE-7c1e9a4b"
+
+
+class ValueRuleTests(unittest.TestCase):
+    """Strings copied from a settings file pass one value rule (read a4a, item 1)."""
+
+    _layout = ObserveTests._layout
+    _run = ObserveTests._run
+
+    def _allow(self, parsed):
+        return _observe()._allow_json(json.dumps(parsed).encode("utf-8"))
+
+    def test_a_model_starting_with_a_credential_prefix_is_withheld(self):
+        for prefix in ("sk-", "ghp_", "AIza"):
+            key = _fake_key(prefix)
+            with self.subTest(prefix=prefix):
+                allow = self._allow({"model": key})
+                shown = json.dumps(allow)
+                self.assertFalse(_FAKE_PART in shown, "a key-shaped model was copied")
+                self.assertTrue(allow.get("model") == "withheld", "a key-shaped model is not withheld")
+
+    def test_a_model_out_of_shape_or_holding_another_value_is_withheld(self):
+        shared = "FAKEtok-7c1e9a4b"
+        cases = {
+            "contains": {"model": "haiku-" + shared, "env": {"TOKEN": shared}},
+            "equals": {"model": shared, "mcpServers": {"maps": {"args": [shared]}}},
+            "shape": {"model": "haiku observe " + _FAKE_PART},
+            "long": {"model": "m" * 65},
+        }
+        for name, parsed in cases.items():
+            with self.subTest(case=name):
+                allow = self._allow(parsed)
+                shown = json.dumps(allow)
+                self.assertFalse(shared in shown or _FAKE_PART in shown, "a model value was copied")
+                self.assertTrue(allow.get("model") == "withheld", "the model is not withheld")
+        self.assertEqual(self._allow({"model": "haiku-observe", "note": "abc"})["model"], "haiku-observe")
+
+    def test_an_approval_or_sandbox_outside_the_product_list_is_unknown(self):
+        parsed = {"approval_policy": "FAKE-approval-7c1e9a4b", "sandbox_mode": _fake_key("sk-")}
+        allow = self._allow(parsed)
+        shown = json.dumps(allow)
+        self.assertFalse(_FAKE_PART in shown, "an approval or sandbox value was copied")
+        self.assertTrue(allow.get("approval") == "unknown", "approval is not unknown")
+        self.assertTrue(allow.get("sandbox") == "unknown", "sandbox is not unknown")
+        kept = self._allow({"approval_policy": "never", "sandbox_mode": "read-only"})
+        self.assertEqual((kept["approval"], kept["sandbox"]), ("never", "read-only"))
+
+    def test_a_server_name_or_program_name_out_of_shape_or_key_shaped_is_withheld(self):
+        parsed = {
+            "mcpServers": {
+                _fake_key("ghp_"): {"command": "ok-tool"},
+                "name with " + _FAKE_PART: {"command": "ok-tool"},
+                "docs": {"command": _fake_key("sk-") + " --flag"},
+                "draw": {"command": "/opt/" + "x" * 65},
+            }
+        }
+        allow = self._allow(parsed)
+        shown = json.dumps(allow)
+        self.assertFalse(_FAKE_PART in shown, "a server or program name was copied")
+        rows = sorted((row["name"], row["command"]) for row in allow["mcp_servers"])
+        self.assertEqual(rows, [
+            ("docs", "withheld"), ("draw", "withheld"), ("withheld", "ok-tool"), ("withheld", "ok-tool"),
+        ])
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "the settings-file gate refuses here before the open")
+    def test_the_record_and_the_output_carry_no_key_shaped_value(self):
+        home, project, state = self._layout()
+        settings = {
+            "model": _fake_key("sk-"),
+            "approval_mode": _fake_key("sk_"),
+            "mcpServers": {_fake_key("ghp_"): {"command": _fake_key("xoxb-")}},
+        }
+        path = os.path.join(home, ".claude", "settings.json")
+        _write(path, json.dumps(settings), 0o600)
+        code, text, _record, disk, _opened = self._run(home, project, state)
+        self.assertEqual(code, 0)
+        self.assertFalse(_FAKE_PART in text, "a key-shaped value reached the output")
+        self.assertFalse(_FAKE_PART in disk.decode("utf-8", "replace"), "a key-shaped value reached the record")
+        row = _by_path(json.loads(text), path)
+        self.assertEqual(row["state"], "ok")
+        self.assertEqual(row["allow"], {
+            "approval": "unknown",
+            "mcp_servers": [{"command": "withheld", "name": "withheld"}],
+            "model": "withheld",
+        })
+
+
+class StateHomeTests(unittest.TestCase):
+    """A state folder with a '.' or '..' part is refused before any directory is made (read a4a, item 3)."""
+
+    _layout = ObserveTests._layout
+
+    def test_a_state_home_with_a_dot_or_dot_dot_part_is_refused_before_any_mkdir(self):
+        home, project, _state = self._layout()
+        top = os.path.dirname(home)
+        made = []
+        real_mkdir = os.mkdir
+
+        def mkdir(path, mode=0o777, *, dir_fd=None):
+            made.append(path)
+            if dir_fd is None:
+                return real_mkdir(path, mode)
+            return real_mkdir(path, mode, dir_fd=dir_fd)
+
+        for parts in ((home, "..", "escape", "state"), (home, ".", "state-dot")):
+            chosen = os.path.join(*parts)
+            with self.subTest(state_home=parts[1:]):
+                out = io.StringIO()
+                with mock.patch("os.mkdir", mkdir):
+                    code = _observe().command(
+                        out, home=home, project=project, state_home=chosen, runner=_login_ok,
+                    )
+                self.assertEqual(code, 1)
+                self.assertEqual(json.loads(out.getvalue())["code"], "state_home_unknown")
+                self.assertEqual(made, [])
+        self.assertFalse(os.path.exists(os.path.join(top, "escape")))
+        self.assertFalse(os.path.exists(os.path.join(home, "state-dot")))
+
+    def test_the_under_the_home_test_compares_normalised_paths(self):
+        home, _project, _state = self._layout()
+        observe = _observe()
+        self.assertFalse(observe._text_under(os.path.join(home, "..", "outside"), home))
+        self.assertFalse(observe._text_under(os.path.join(home, "sub", "..", "..", "outside"), home))
+        self.assertTrue(observe._text_under(os.path.join(home, ".", "inside"), home))
+        self.assertTrue(observe._text_under(os.path.join(home, "inside"), home + os.sep))
 
 
 if __name__ == "__main__":

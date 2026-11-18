@@ -27,7 +27,6 @@ unsigned. This command does not grant permissions and does not add a trusted key
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -40,6 +39,11 @@ from .errors import Refused
 from .loader import CoreHealth, PluginLoader
 from .manifest import PERMISSIONS, Grant, ReservedEffects, TrustStore, parse_manifest
 from .registry import check_registry
+
+try:
+    import fcntl
+except ImportError:  # Windows: every command refuses platform_unsupported before it opens a file
+    fcntl = None
 
 __all__ = ["InstallRefused", "install_plugin", "list_plugins", "remove_plugin"]
 
@@ -103,6 +107,7 @@ class Snapshot:
 def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, plugin_id: str, *,
                    version: str | None = None, state: os.PathLike | str | None = None, wait: bool = True) -> dict:
     """Check ``registry_root``, then write the release as the next generation."""
+    _require_platform()
     config_path = Path(config)
     report = check_registry(registry_root)
     codes = report.codes()
@@ -128,6 +133,7 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
 
 def list_plugins(config: os.PathLike | str, *, state: os.PathLike | str | None = None, wait: bool = True) -> dict:
     """Publish the current generation if a publish stopped early, then list what it holds."""
+    _require_platform()
     del state  # list does not open the revocation store and does not create one
     config_path = Path(config)
     fd = _lock(config_path, wait=wait)
@@ -141,6 +147,7 @@ def list_plugins(config: os.PathLike | str, *, state: os.PathLike | str | None =
 def remove_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLike | str | None = None,
                   wait: bool = True) -> dict:
     """Drop one plugin into a new generation. An unknown id writes nothing."""
+    _require_platform()
     del state
     config_path = Path(config)
     if not _plugin_id_ok(plugin_id):
@@ -160,6 +167,15 @@ def remove_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLi
         return {"command": "remove", "plugin_id": plugin_id, "generation": generation, "plugins": _rows(kept)}
     finally:
         os.close(fd)
+
+
+def _require_platform() -> None:
+    # Same shape as daemon/plugins.py _read_owned: a typed refusal before any file is opened or made.
+    # Windows has no fcntl, O_NOFOLLOW or O_DIRECTORY; a no-follow read for it is not built, so every
+    # command refuses instead of dropping the guard (no default of 0, no open without it).
+    if os.name == "nt" or fcntl is None or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise InstallRefused("platform_unsupported",
+                             detail="fcntl, O_NOFOLLOW or O_DIRECTORY is missing; no plugin file is opened")
 
 
 def _lexists(path: Path) -> bool:

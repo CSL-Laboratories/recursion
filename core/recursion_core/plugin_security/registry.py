@@ -76,7 +76,7 @@ _WINDOWS_DEVICES = frozenset(
     {"con", "prn", "aux", "nul"} | {f"com{n}" for n in range(10)} | {f"lpt{n}" for n in range(10)})
 _RESERVED_PLUGIN_IDS = frozenset({"host"})
 _RULES = frozenset({
-    "root_unavailable", "registry_missing", "registry_symlink", "registry_unexpected_file",
+    "platform_unsupported", "root_unavailable", "registry_missing", "registry_symlink", "registry_unexpected_file",
     "entry_missing", "entry_too_large", "entry_not_json", "entry_fields", "entry_schema",
     "entry_plugin_id", "entry_directory_name", "entry_text", "entry_publisher",
     "entry_reserved_field", "entry_example_flag", "entry_releases", "entry_unexpected_file",
@@ -783,6 +783,11 @@ def _check_index(report: Report, tree: _Tree, registry: str, entries: list) -> N
 def check_registry(root: str | os.PathLike) -> Report:
     """Check ``root`` (the folder that contains ``registry/``) and return the report."""
     text = os.fspath(root)
+    # Same shape as daemon/plugins.py _read_owned: a typed refusal before the root or any child is opened.
+    if os.name == "nt" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        report = Report(os.path.abspath(text))
+        report.error(".", "platform_unsupported", "O_NOFOLLOW or O_DIRECTORY is missing; no registry file is opened")
+        return report
     try:
         tree = _Tree(text)
     except _RootUnavailable as exc:

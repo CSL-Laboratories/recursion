@@ -9,6 +9,7 @@ name:
 
 from __future__ import annotations
 
+import base64
 import dis
 import http.server
 import inspect
@@ -18,6 +19,7 @@ import re
 import socket
 import sys
 import threading
+import traceback
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -116,7 +118,7 @@ class Base(unittest.TestCase):
         self.aborts: list[tuple[str, str]] = []
         answer = kwargs.pop("abort_answer", True)
 
-        def abort(url, sid):
+        def abort(url, sid, *, password=None):   # the handle's password is the driver's to give
             self.aborts.append((url, sid))
             if isinstance(answer, BaseException):
                 raise answer
@@ -212,7 +214,8 @@ class StartTests(Base):
         spy = Spy(["starting\n", "opencode server listening on http://127.0.0.1:41235\n", READY])
         driver = self.make(spy)
         handle = driver.start(session(), None, ENV)
-        self.assertEqual(spy.spawns, [(["opencode", "serve", "--hostname", "127.0.0.1", "--port", "41234"], ENV)])
+        self.assertEqual(spy.spawns, [(["opencode", "serve", "--hostname", "127.0.0.1", "--port", "41234"],
+                                       {**ENV, oc.PASSWORD_ENV: driver._worker(handle)["password"]})])
         self.assertEqual(spy.processes[0].terminated, 0)
         self.assertIsNone(handle.engine_session_id)
         self.assertIsNone(handle.live_turn)
@@ -280,7 +283,7 @@ class TurnTests(Base):
         driver.send(handle, message())
         self.assertEqual(self.turn_argv(1), ["opencode", "run", "--format", "json", "--model", "openai/gpt-5.5",
                                              "--server", URL])
-        self.assertEqual(self.spy.spawns[1][1], ENV)
+        self.assertEqual(self.spy.spawns[1][1], {**ENV, oc.PASSWORD_ENV: driver._worker(handle)["password"]})
         first = self.spy.processes[1]
         self.assertEqual((first.sent, first.closes), (["Run the tests."], 1))
         drafts = self.replay(driver, handle, "synthetic-v1-tool-use.jsonl")
@@ -1188,7 +1191,7 @@ class ServeRoundTwoTests(unittest.TestCase):
             with self.subTest(cleanup=type(cleanup).__name__):
                 original = KeyboardInterrupt("synthetic abort cancellation")
 
-                def abort(url, sid, original=original):
+                def abort(url, sid, *, password=None, original=original):
                     raise original
 
                 driver, spy = self.make(abort=abort)
@@ -1711,6 +1714,263 @@ class RecordedV2Tests(Base):
                 driver.start(session(), None, ENV)
                 self.assertEqual(self.spy.spawns[0][0][1], "serve")
 
+
+# The readiness line OpenCode 2.2.7 prints: ``server listening on ${url}`` in its server-process.ts at the tag
+# v2.2.7, as the check of #421's threads quotes it (read from the tagged source; the binary was not run in serve
+# mode, since that prints its password).
+READY_V2 = "server listening on http://127.0.0.1:41234\n"
+
+
+class Resisting(Process):
+    """A turn process whose terminate() raises while ``resist`` is set (each call is counted)."""
+
+    resist = False
+
+    def terminate(self) -> None:
+        self.terminated += 1
+        if self.resist:
+            raise OSError("synthetic: the process resists termination")
+
+
+class ResistingSpy(Spy):
+    def __init__(self, resist: bool) -> None:
+        super().__init__()
+        self.resist = resist
+
+    def __call__(self, argv: list, env: dict) -> Process:
+        self.spawns.append((list(argv), dict(env)))
+        process = Resisting(self.server_lines if argv[1] == "serve" else ())
+        process.resist = self.resist and argv[1] != "serve"
+        self.processes.append(process)
+        return process
+
+
+class ServeThreadAnswerTests(Base):
+    """The eight bot threads of #421 at fbf8ad86 (work CHECK-421-565-583): the v2 readiness line, the server's own
+    password in the children's environment only, and the turn process a concurrent release could leave unowned or
+    end twice. Every process is a fake; no OpenCode binary runs."""
+
+    # -- thread JudE (opencode.py:614): the readiness line of v2.2.7 --------------------------------------------
+
+    def test_the_v2_readiness_line_counts_as_the_older_form_does(self):
+        self.assertEqual(oc.listening_url(READY_V2, PORT), URL)
+        self.assertEqual(oc.listening_url(READY_V2.rstrip("\n"), PORT), URL)
+        self.assertEqual(oc.listening_url(READY_V2.rstrip("\n") + "\r\n", PORT), URL)
+        self.assertEqual(oc.listening_url(READY, PORT), URL)
+        for text in ("server listening on http://0.0.0.0:41234\n", "server listening on http://localhost:41234\n",
+                     "server listening on http://127.0.0.1:41235\n", "server listening on http://127.0.0.1:041234\n",
+                     "server listening on https://127.0.0.1:41234\n", "server listening on http://127.0.0.1:41234/x\n",
+                     "note: server listening on http://127.0.0.1:41234\n", " server listening on " + URL + "\n",
+                     "SERVER LISTENING ON " + URL + "\n", "v2 server listening on " + URL + "\n"):
+            with self.subTest(text=text):
+                self.assertIsNone(oc.listening_url(text, PORT))
+
+    def test_start_and_resume_take_the_v2_readiness_line(self):
+        driver = self.make(Spy(["starting\n", READY_V2]))
+        handle = driver.start(session(), None, ENV)
+        self.assertEqual(self.spy.processes[0].terminated, 0)
+        driver.send(handle, message())
+        self.assertEqual(self.turn_argv(1)[-2:], ["--server", URL])
+        driver = self.make(Spy([READY_V2]))
+        resumed = driver.resume("ses_abc", session(), None, ENV)
+        self.assertEqual(resumed.engine_session_id, "ses_abc")
+        self.assertEqual(self.spy.processes[0].terminated, 0)
+
+    # -- thread Jufh (opencode.py:704): the server's own password ------------------------------------------------
+
+    def password_of(self, env: dict) -> str:
+        self.assertIn(oc.PASSWORD_ENV, env)
+        return env[oc.PASSWORD_ENV]
+
+    def test_each_handle_gives_its_own_password_to_its_server_and_every_turn_through_the_environment_only(self):
+        self.assertEqual(oc.PASSWORD_ENV, "OPENCODE_PASSWORD")
+        made = []
+
+        def token(n):
+            made.append(n)
+            return f"made-by-secrets-{len(made)}"
+
+        with mock.patch.object(oc.secrets, "token_urlsafe", side_effect=token):
+            driver = self.make()
+            handle = driver.resume("ses_abc", session(), None, {**ENV, "OPENCODE_PASSWORD": "the caller's own"})
+            driver.send(handle, message())
+            driver.finish_turn(handle, 0)
+            driver.send(handle, message(turn="turn-2", delivery="dlv-2"))
+            other = driver.start(session(), None, ENV)
+        self.assertEqual(made, [32, 32])   # 32 bytes from secrets for each handle
+        (server, _), (first, _), (second, _), (other_server, _) = [(env, argv) for argv, env in self.spy.spawns]
+        self.assertEqual(server, {**ENV, "OPENCODE_PASSWORD": "made-by-secrets-1"})
+        self.assertEqual(first, server)
+        self.assertEqual(second, server)
+        self.assertEqual(other_server, {**ENV, "OPENCODE_PASSWORD": "made-by-secrets-2"})
+        for argv, _ in self.spy.spawns:
+            with self.subTest(argv=argv):
+                self.assertFalse(any("made-by-secrets" in a or "OPENCODE_PASSWORD" in a for a in argv))
+
+    def test_a_real_password_is_long_and_differs_per_handle(self):
+        driver = self.make()
+        driver.start(session(), None, ENV)
+        driver.start(session(), None, ENV)
+        one, two = (self.password_of(env) for _, env in self.spy.spawns)
+        self.assertNotEqual(one, two)
+        self.assertGreaterEqual(min(len(one), len(two)), 43)   # token_urlsafe(32)
+
+    def test_the_driver_asks_the_abort_with_the_handles_password(self):
+        passwords = []
+
+        def abort(url, sid, *, password):
+            passwords.append((url, sid, password))
+            return True
+
+        driver = self.make(abort=abort)
+        handle = driver.resume("ses_abc", session(), None, ENV)
+        driver.send(handle, message())
+        driver.interrupt(handle, "turn-1")
+        self.assertEqual(passwords, [(URL, "ses_abc", self.password_of(self.spy.spawns[0][1]))])
+        self.assertEqual(self.spy.processes[1].terminated, 0)
+
+    def test_the_password_is_in_no_draft_error_text_or_repr(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        password = self.password_of(self.spy.spawns[0][1])
+        driver.send(handle, message())
+        texts = [json.dumps(d) for d in self.replay(driver, handle, "synthetic-v1-tool-use.jsonl")]
+        texts += [json.dumps(d) for d in driver.finish_turn(handle, 0)]
+        self.spy.processes[0].terminate = lambda: (_ for _ in ()).throw(OSError("synthetic"))
+        with self.assertRaises(OSError) as caught:
+            driver.release(handle)
+        texts.append("".join(traceback.format_exception(caught.exception)))
+        with self.assertRaises(DriverStateError) as refused:
+            driver.send(handle, message(turn="turn-2", delivery="dlv-2"))
+        texts.append("".join(traceback.format_exception(refused.exception)))
+        texts += [repr(driver), repr(handle)]
+        for text in texts:
+            with self.subTest(text=text[:60]):
+                self.assertNotIn(password, text)
+
+    def test_the_password_ends_with_the_handle(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        worker = driver._worker(handle)
+        self.assertEqual(worker["password"], self.password_of(self.spy.spawns[0][1]))
+        driver.release(handle)
+        self.assertNotIn(id(handle), driver._workers)
+        self.assertIsNone(worker["password"])
+
+    # -- thread Q6wv (opencode.py:975) and Q6xz (:982): a release during an interrupted turn start ----------------
+
+    def cut_with_release(self, lineno: int, resist: bool, when: str):
+        """An interruption just before ``lineno`` of ``_send``, and a release of the handle landing just ``before``
+        or ``after`` the first table step that follows it (a concurrent release, deterministically placed)."""
+        spy = ResistingSpy(resist)
+        driver = self.make(spy)
+        handle = driver.start(session(), None, ENV)
+        trace, fired = _interrupt_before(oc.ServeDriver._send, lineno)
+        original, injected = driver._under, []
+
+        def release():
+            injected.append(1)
+            try:
+                driver.release(handle)
+            except OSError:
+                pass   # the resisting turn process: it stays owed
+
+        def under(step):
+            if fired and not injected and when == "before":
+                release()
+            value = original(step)
+            if fired and not injected and when == "after":
+                release()
+            return value
+
+        driver._under = under
+        sys.settrace(trace)
+        try:
+            driver.send(handle, message())
+        except (KeyboardInterrupt, DriverStateError, OSError):
+            pass
+        finally:
+            sys.settrace(None)
+            driver._under = original
+        self.assertEqual(injected, [1])
+        return driver, handle, spy, fired
+
+    def spawned_window(self) -> list:
+        lines, first = inspect.getsourcelines(oc.ServeDriver._send)
+        start = next(first + i for i, t in enumerate(lines) if t.strip().startswith("process = self._spawn("))
+        end = next(first + i for i, t in enumerate(lines) if t.strip() == 'with turn["write"]:')
+        return [n for n in _cut_each_line(oc.ServeDriver._send) if start < n < end]
+
+    def test_a_turn_process_whose_termination_fails_stays_owed_through_a_concurrent_release(self):
+        window = self.spawned_window()
+        self.assertGreaterEqual(len(window), 2)
+        for lineno, when in [(n, w) for n in window for w in ("before", "after")]:
+            with self.subTest(line=lineno, release=when):
+                driver, handle, spy, fired = self.cut_with_release(lineno, True, when)
+                self.assertEqual(fired, [lineno])
+                turn = spy.processes[1]
+                tried = turn.terminated
+                self.assertGreaterEqual(tried, 1)
+                self.assertIn(id(handle), driver._workers)   # owed: the handle is kept until it is terminated
+                self.assertTrue(any(turn is q for q in driver._workers[id(handle)]["live"]))
+                with self.assertRaises(OSError):
+                    driver.release(handle)
+                self.assertEqual(turn.terminated, tried + 1)   # the later release tries it again
+                turn.resist = False
+                driver.release(handle)
+                self.assertEqual(turn.terminated, tried + 2)
+                self.assertNotIn(id(handle), driver._workers)
+
+    def test_a_turn_process_another_cleaner_ended_is_never_ended_again(self):
+        for lineno, when in [(n, w) for n in self.spawned_window() for w in ("before", "after")]:
+            with self.subTest(line=lineno, release=when):
+                driver, handle, spy, fired = self.cut_with_release(lineno, False, when)
+                self.assertEqual(fired, [lineno])
+                self.assertEqual([p.terminated for p in spy.processes], [1, 1])
+                self.assertNotIn(id(handle), driver._workers)
+                driver.release(handle)
+                self.assertEqual([p.terminated for p in spy.processes], [1, 1])
+
+
+class HttpAbortPasswordTests(unittest.TestCase):
+    """The driver's own HTTP call sends the handle's password (thread Jufh), as basic authentication only."""
+
+    def serve(self) -> tuple[str, list]:
+        seen: list = []
+
+        class Handler(Recorder):
+            def do_POST(self):  # noqa: N802 (the handler's own name)
+                seen.append((self.path, self.headers.get_all("Authorization")))
+                super().do_POST()
+
+        Handler.seen = []
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop():
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+        self.addCleanup(stop)
+        return f"http://127.0.0.1:{server.server_address[1]}", seen
+
+    def test_the_abort_carries_the_password_as_basic_authentication(self):
+        url, seen = self.serve()
+        self.assertTrue(oc.http_abort(url, "ses_x", password="made-in-this-test"))
+        expected = "Basic " + base64.b64encode(b"opencode:made-in-this-test").decode("ascii")
+        self.assertEqual(seen, [("/session/ses_x/abort", [expected])])
+        self.assertTrue(oc.http_abort(url, "ses_x"))
+        self.assertEqual(seen[1], ("/session/ses_x/abort", None))   # no password, no header
+
+    def test_a_password_that_is_not_one_header_value_is_refused_before_anything_is_sent(self):
+        url, seen = self.serve()
+        for password in ("", "a\nb", "a\rb", 5, b"pw", "a" + chr(0xD800)):
+            with self.subTest(password=password):
+                with self.assertRaises(ValueError):
+                    oc.http_abort(url, "ses_x", password=password)
+        self.assertEqual(seen, [])
 
 
 if __name__ == "__main__":

@@ -104,6 +104,7 @@ import http.client
 import json
 import math
 import re
+import secrets
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -609,10 +610,19 @@ MAJOR_UNSUPPORTED = "opencode_major_unsupported"
 # with at most one line end. Numbers without a leading zero.
 _VERSION = re.compile(r"(?:opencode )?v?(0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})(?:\r?\n)?")
 # The server's readiness line, and the only server a turn may connect to: this machine's loopback address and a
-# port from 1 to 65535, written without a leading zero. The line is read from 1.x's source; v2.2.7's recorded
-# ``serve --help`` does not show it, so for v2 it is not verified.
-_LISTENING = re.compile(r"opencode server listening on (http://127\.0\.0\.1:[1-9][0-9]{0,4})[ \t]*\r?\n?")
+# port from 1 to 65535, written without a leading zero. v2.2.7 prints ``server listening on <url>`` (its
+# server-process.ts at the tag v2.2.7, read, not run: serve mode prints its password); 1.x prints the same line
+# after ``opencode ``. Both forms count, and nothing else on the line.
+_LISTENING = re.compile(r"(?:opencode )?server listening on (http://127\.0\.0\.1:[1-9][0-9]{0,4})[ \t]*\r?\n?")
 _LOOPBACK_URL = re.compile(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})")
+# The server's password. v2 makes one of its own when its environment names none, and its clients send basic
+# authentication only with a password from the environment, under this name (v2.2.7's server-process.ts and
+# services/server-connection.ts, read). So each handle makes its own (``secrets``) and gives it to the server and
+# to every turn in the child's environment only: never in argv, an event, an error text or a repr. It is held in
+# the worker in memory and dropped when the worker leaves the table.
+PASSWORD_ENV = "OPENCODE_PASSWORD"
+# The user name of the driver's own HTTP calls' basic authentication (the 1.x server's default; not verified for v2).
+PASSWORD_USER = "opencode"
 
 
 def version_major(text: object) -> int | None:
@@ -719,20 +729,28 @@ def pick_port() -> int:
         return probe.getsockname()[1]
 
 
-def http_abort(url: str, session: str, *, timeout: float = 5.0) -> bool:
+def http_abort(url: str, session: str, *, password: str | None = None, timeout: float = 5.0) -> bool:
     """OpenCode's own abort of the session's running turn: ``POST <url>/session/<id>/abort`` on the loopback server,
     never through a proxy and never following a redirect. True when the server answered 2xx; False when it
     answered otherwise or not at all. The status line decides: a reply that ends immediately after a 2xx
-    status line is still True."""
+    status line is still True. With ``password`` (the handle's server password) the request carries basic
+    authentication as ``PASSWORD_USER``; the password is in that header only."""
     if not _loopback_url_ok(url):
         raise ValueError("url")
     if not _session_ok(session):
         raise ValueError("session")
+    if password is not None and (not isinstance(password, str) or not password or _CONTROL.search(password)
+                                 or _SURROGATE.search(password)):
+        raise ValueError("password")
+    import base64
     import urllib.parse
     import urllib.request
 
     request = urllib.request.Request(f"{url}/session/{urllib.parse.quote(session, safe='')}/abort", data=b"",
                                      method="POST")
+    if password is not None:
+        token = base64.b64encode(f"{PASSWORD_USER}:{password}".encode("utf-8")).decode("ascii")
+        request.add_unredirected_header("Authorization", f"Basic {token}")
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *args, **kwargs):   # a 3xx stays an HTTPError: nothing is followed
             return None
@@ -748,6 +766,10 @@ def http_abort(url: str, session: str, *, timeout: float = 5.0) -> bool:
 class ServeDriver(Driver):
     """driver.v2 for the serve drive: one ``opencode serve`` per handle on the loopback address, and one
     ``opencode run --server <url>`` per turn, of OpenCode v2 (``SERVE_MAJOR``). Built against fakes.
+
+    Each handle makes its own server password (``PASSWORD_ENV``, from ``secrets``): the server and every turn of
+    the handle get it in their environment, which is otherwise the ``env`` given; it is in no argv, event, error
+    text or repr, and it is dropped when the handle's worker leaves the table. ``abort`` is called with it.
 
     ``version`` is the text ``opencode --version`` printed for the binary, which the caller fills from the
     detection that already runs; the driver spawns nothing to learn it. With no version, or one of another major,
@@ -777,8 +799,8 @@ class ServeDriver(Driver):
     (``session_id_unusable``). A turn that reports another session id than the conversation's is recorded there too
     (``conversation_changed``).
 
-    ``interrupt`` asks the server to abort the session's running turn (``abort(url, session_id)``, OpenCode's own
-    abort); when no id is known yet, or the server does not answer 2xx, or the ask raises, the turn's process is
+    ``interrupt`` asks the server to abort the session's running turn (``abort(url, session_id, password=...)``,
+    OpenCode's own abort, with the handle's password); when no id is known yet, or the server does not answer 2xx, or the ask raises, the turn's process is
     terminated instead. An ask cut short by a ``BaseException`` (a Stop, an exit) also terminates the process, and
     then the same exception leaves, a failing termination (``BaseException`` included) noted on it. Either way the turn ends through ``finish_turn``, one finisher per turn.
     ``close`` ends the handle's input: the server is stopped then, or once the turn in progress is finished.
@@ -867,14 +889,15 @@ class ServeDriver(Driver):
             raise DriverInputError("engine_session_id")
         port = self._port()
         argv = serve_argv(port, binary=self._binary)
+        password = secrets.token_urlsafe(32)   # this handle's own; in the children's environment only
         # OWNERSHIP: "live" holds every process this driver started for the handle and has not yet terminated. A
         # process enters it in the very statement its spawn returns in, and leaves it only once its terminate()
         # returned, so no transfer between two lists can be lost to an interruption.
         worker = {"handle": handle, "server": None, "url": None, "env": dict(env), "model": model,
                   "connection": connection, "turn": None, "turns": 0, "closed": False, "released": False,
-                  "started": False, "spawning": 0, "live": [], "busy": []}
+                  "started": False, "spawning": 0, "live": [], "busy": [], "ended": [], "password": password}
         try:   # the server is in the worker's live list from the statement its spawn returns in
-            worker["live"].append(server := self._spawn(argv, dict(env)))
+            worker["live"].append(server := self._spawn(argv, {**env, PASSWORD_ENV: password}))
             url = self._await_ready(server, port)
             if url is None:
                 raise DriverStateError("opencode serve gave no readiness line for its loopback address")
@@ -942,17 +965,19 @@ class ServeDriver(Driver):
             turn = {"id": turn_id, "delivery": None, "process": None, "parser": parser, "accepted": False,
                     "finishing": False, "write": threading.RLock()}   # re-entrant: a release from the writer
 
-            def publish() -> None:
+            def publish() -> dict:
                 if worker["released"]:
                     raise DriverStateError("this handle has no server (released, or never started)")
                 # One store each. A cut between them leaves the flag clear, so the handler cannot
                 # count down past it, and it cannot leave the flag set without the handler seeing it.
+                worker["ended"] = []   # what a cleaner ends from here on, while this turn starts
                 worker["turn"] = turn
                 worker["spawning"] = True
+                return {**worker["env"], PASSWORD_ENV: worker["password"]}
 
-            self._under(publish)
+            child_env = self._under(publish)
             # Stored before it joins "live", so a cut at the append still names the process.
-            process = self._spawn(argv, dict(worker["env"]))
+            process = self._spawn(argv, child_env)
             worker["live"].append(process)
             turn["process"], worker["turns"] = process, worker["turns"] + 1   # a turn that started a process
             self._under(lambda: worker.__setitem__("spawning", False))
@@ -971,15 +996,21 @@ class ServeDriver(Driver):
             here = locals()   # an interruption on the first line leaves the names below unbound
             turn_id, worker, turn, process = item["turn_id"], here.get("worker"), here.get("turn"), here.get("process")
             written = here.get("written", False)
-            if worker is not None and worker.get("spawning"):
-                self._under(lambda: worker.__setitem__("spawning", False))
             # A spawn that returned, has not joined "live", and is not yet this turn's process is
-            # still owed. Put it there, then the cleaner terminates it. One already stored on the
-            # turn and later taken out of "live" was ended by whoever took it out: putting it back
-            # would end it a second time. Setting the flag false is idempotent, so a second clear stays false.
-            if worker is not None and process is not None and (turn is None or turn.get("process") is not process) \
-                    and not any(process is q for q in worker["live"]):
-                self._under(lambda process=process: worker["live"].append(process))
+            # still owed. It joins "live" in the same table step that clears the spawn flag, so no
+            # release in between can forget the worker while the process is owed; the cleaner then
+            # terminates it. One another cleaner already ended ("ended"), or one stored on the turn
+            # and later taken out of "live", is not put back: that would end it a second time.
+            # Setting the flag false is idempotent, so a second clear stays false.
+            if worker is not None:
+                def settle(process=process) -> None:
+                    if process is not None and (turn is None or turn.get("process") is not process) \
+                            and not any(process is q for q in worker["live"]) \
+                            and not any(process is q for q in worker["ended"]):
+                        worker["live"].append(process)
+                    worker["spawning"] = False
+
+                self._under(settle)
             if worker is not None and turn is not None and not written:
                 def clear() -> None:
                     if worker["turn"] is turn:
@@ -1079,7 +1110,7 @@ class ServeDriver(Driver):
         session = handle.engine_session_id
         if session is not None:
             try:
-                if self._abort(worker["url"], session) is True:
+                if self._abort(worker["url"], session, password=worker["password"]) is True:
                     return
             except Exception:   # an ask that fails is no abort: the process is ended instead
                 pass
@@ -1146,7 +1177,12 @@ class ServeDriver(Driver):
                 if not self._under(claim):
                     continue
                 process.terminate()
-                self._under(lambda process=process: _drop(worker["live"], process))
+
+                def ended(process=process) -> None:   # ownership and its end, in one table step
+                    _drop(worker["live"], process)
+                    worker["ended"].append(process)
+
+                self._under(ended)
             except Exception as error:
                 errors.append(error)
             except BaseException as error:
@@ -1162,6 +1198,7 @@ class ServeDriver(Driver):
             if worker["released"] and not worker["live"] and not worker["spawning"] \
                     and self._workers.get(key) is worker:
                 del self._workers[key]
+                worker["password"] = None   # the password ends with the handle
 
         self._under(forget)
         if not errors:

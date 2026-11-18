@@ -5,7 +5,9 @@ files. Each file row is path, exists, size, sha256, an owner-only flag and a sta
 ``ok``, ``unknown``, ``absent`` or ``aliased``. Allow-listed keys are the model, the
 approval mode, the sandbox mode, and MCP server names. An MCP command contributes only
 the program name, the base name of its first word, never the rest of the string.
-Environment values, header values and command arguments are not copied.
+Environment values, header values and command arguments are not copied. Each of those
+strings passes ``value_rule`` first; a value it withholds is the word ``withheld``, and an
+approval or sandbox mode outside the product's list is ``unknown``.
 
 Sign-in stores named by ``deny.py`` are never opened, including through a symlink or a
 hard link. A settings file is read only when lstat before the open and fstat on the
@@ -23,7 +25,8 @@ path is not established.
 
 The record is one JSON object, mode 0600, at
 ``$XDG_STATE_HOME/recursion/observe/record.json`` (``$HOME/.local/state`` when the
-variable is unset). Missing parents of that default directory are created under the
+variable is unset). A state folder with a ``.`` or ``..`` part is refused before any
+directory is made. Missing parents of that default directory are created under the
 home, mode 0700. A symlink at any component is refused and nothing is written. Each
 writer uses its own temp name and puts the record in place by an atomic replace.
 ``run`` builds the report and writes nothing. ``command`` writes the record and
@@ -42,6 +45,7 @@ import stat
 import subprocess
 import tomllib
 
+from recursion_core.setup import value_rule
 from recursion_core.setup.deny import denied_paths, is_denied
 from recursion_core.setup.open_guard import GateRefused, inside_root, read_regular_file
 
@@ -126,6 +130,11 @@ def _require(home, project, state_home) -> None:
         raise ObserveRefused(
             "state_home_unknown",
             "XDG_STATE_HOME is not an absolute path, so no record was written",
+        )
+    if any(part in {".", ".."} for part in state_home.split(os.sep)):
+        raise ObserveRefused(
+            "state_home_unknown",
+            "XDG_STATE_HOME holds a '.' or '..' part, so no record was written",
         )
     record = os.path.join(state_home, "recursion", "observe", _RECORD_NAME)
     if is_denied(state_home, home) or is_denied(record, home):
@@ -229,7 +238,9 @@ def _inspect(path: str, kind: str, home: str, project: str, denied_ids: set) -> 
             return row
         row["state"] = "unknown"
         row["detail"] = "not_followed" if refused.reason == "not_followed" else (
-            "not_opened" if refused.reason in {"outside", "denied", "posix"} else "unreadable"
+            "not_opened" if refused.reason in {
+                "outside", "denied", "posix", "platform_unsupported", "not_owner", "writable",
+            } else "unreadable"
         )
         return row
     except (KeyboardInterrupt, SystemExit):
@@ -264,7 +275,9 @@ def _root_of(path: str, home: str, project: str) -> str:
 def _text_under(path: str, root: str) -> bool:
     if type(path) is not str or type(root) is not str or not root:
         return False
-    return path == root or path.startswith(root + os.sep)
+    path = os.path.normpath(path)
+    root = os.path.normpath(root)
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
 def _path_blocked(path: str, home: str, project: str) -> bool:
@@ -330,14 +343,15 @@ def _allow_toml(data: bytes):
 def _allow_mapping(parsed: dict) -> dict:
     allow = {}
     model = parsed.get("model")
-    if type(model) is str and model and len(model) <= _NAME_CAP:
-        allow["model"] = model
+    if type(model) is str and model:
+        others = value_rule.string_values(parsed, skip="model")
+        allow["model"] = value_rule.model_value(model, others)
     approval = _first_str(parsed, ("approval_policy", "approval_mode", "approval"))
     if approval is not None:
-        allow["approval"] = approval
+        allow["approval"] = value_rule.mode_value(approval, value_rule.APPROVAL_WORDS)
     sandbox = _first_str(parsed, ("sandbox_mode", "sandbox"))
     if sandbox is not None:
-        allow["sandbox"] = sandbox
+        allow["sandbox"] = value_rule.mode_value(sandbox, value_rule.SANDBOX_WORDS)
     servers = _servers(parsed.get("mcpServers"))
     if not servers:
         servers = _servers(parsed.get("mcp_servers"))
@@ -356,7 +370,9 @@ def _servers(raw) -> list:
         cfg = raw[name]
         if type(cfg) is dict:
             command = _program_name(cfg.get("command"))
-        rows.append({"command": command, "name": name})
+        if command is not None:
+            command = value_rule.name_value(command)
+        rows.append({"command": command, "name": value_rule.name_value(name)})
     return rows
 
 

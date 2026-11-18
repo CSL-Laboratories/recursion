@@ -7,6 +7,7 @@ tree, an install script, and a commit whose file differs by one byte.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -780,6 +781,110 @@ class StoreNameAndRollbackTests(ProfileCase):
         self.assertEqual((self.config / "plugin-generations" / "current").read_text(), "1\n")
         self.assertEqual((self.config / "plugins" / "fixture.alpha" / "plugin.py").read_bytes(), alpha)
         self.assertFalse((self.config / "plugins" / "fixture.beta").exists())
+
+
+class GitPathOSErrorTests(unittest.TestCase):
+    """An OSError on the git path refuses typed, on every host. No git program runs.
+
+    The scratch parent, the repository and every other path live in one temporary
+    directory this test makes. The child process is a stand-in; no group is signalled.
+    """
+
+    def setUp(self):
+        from recursion_core.plugin_security import git_source
+
+        self.gs = git_source
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.tmp = Path(holder.name)
+        self.parent = self.tmp / "scratch-parent"
+        self.parent.mkdir()
+        self.bare = self.tmp / "bare.git"
+        self.bare.mkdir()
+        for started in (patch.dict(os.environ, {"TMPDIR": str(self.parent)}),
+                        patch.object(git_source, "_require_local", return_value=self.bare)):
+            started.start()
+            self.addCleanup(started.stop)
+
+    def fetch(self):
+        return self.gs.fetch_plugin_source(
+            str(self.bare), "a" * 40, "plugin.py", expected_sha256="0" * 64)
+
+    def child(self, *outcomes):
+        """A stand-in for the git child whose ``communicate`` gives ``outcomes`` in turn."""
+        proc = unittest.mock.Mock(pid=object(), returncode=None)
+        proc.communicate.side_effect = list(outcomes)
+        return proc
+
+    def no_group_signal(self, **kwargs):
+        """Stand-ins for ``os.killpg`` and ``SIGKILL``, also where the host has neither."""
+        kill = patch.object(self.gs.os, "killpg", create=True, **kwargs)
+        sig = patch.object(self.gs.signal, "SIGKILL", 9, create=True)
+        sig.start()
+        self.addCleanup(sig.stop)
+        mocked = kill.start()
+        self.addCleanup(kill.stop)
+        return mocked
+
+    def test_a_scratch_folder_that_cannot_be_made_refuses_typed(self):
+        with patch.object(self.gs.os, "mkdir", side_effect=PermissionError(errno.EACCES, "Permission denied")),                 patch.object(self.gs.subprocess, "Popen") as popen:
+            with self.assertRaises(self.gs.SourceRefused) as caught:
+                self.fetch()
+        self.assertEqual(caught.exception.code, "source_unavailable")
+        popen.assert_not_called()
+        self.assertEqual(os.listdir(self.parent), [])
+
+    def test_a_scratch_child_that_cannot_be_made_refuses_and_leaves_nothing(self):
+        real_mkdir = os.mkdir
+        calls = []
+
+        def mkdir(path, mode=0o777):
+            calls.append(path)
+            if len(calls) == 3:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_mkdir(path, mode)
+
+        with patch.object(self.gs.os, "mkdir", side_effect=mkdir),                 patch.object(self.gs.subprocess, "Popen") as popen:
+            with self.assertRaises(self.gs.SourceRefused) as caught:
+                self.fetch()
+        self.assertEqual(caught.exception.code, "source_unavailable")
+        self.assertEqual(len(calls), 3)
+        popen.assert_not_called()
+        self.assertEqual(os.listdir(self.parent), [])
+
+    def test_a_pipe_error_from_the_git_child_refuses_typed(self):
+        proc = self.child(OSError(errno.EIO, "Input/output error"), OSError(errno.EIO, "Input/output error"))
+        killpg = self.no_group_signal()
+        with patch.object(self.gs.subprocess, "Popen", return_value=proc):
+            with self.assertRaises(self.gs.SourceRefused) as caught:
+                self.fetch()
+        self.assertEqual(caught.exception.code, "source_unavailable")
+        killpg.assert_called_once_with(proc.pid, 9)
+        self.assertEqual(os.listdir(self.parent), [])
+
+    def test_a_group_kill_that_fails_after_a_timeout_refuses_typed(self):
+        proc = self.child(subprocess.TimeoutExpired("git", 30), (b"", b""))
+        killpg = self.no_group_signal(side_effect=OSError(errno.EIO, "Input/output error"))
+        with patch.object(self.gs.subprocess, "Popen", return_value=proc):
+            with self.assertRaises(self.gs.SourceRefused) as caught:
+                self.fetch()
+        self.assertEqual(caught.exception.code, "source_unavailable")
+        killpg.assert_called_once_with(proc.pid, 9)
+        self.assertEqual(os.listdir(self.parent), [])
+
+    def test_a_scratch_removal_that_fails_keeps_the_first_refusal(self):
+        refusal = self.gs.SourceRefused("source_commit_mismatch")
+        with patch.object(self.gs, "_fetch", side_effect=refusal),                 patch.object(self.gs.os, "rmdir", side_effect=OSError(errno.EBUSY, "Device or resource busy")):
+            with self.assertRaises(self.gs.SourceRefused) as caught:
+                self.fetch()
+        self.assertIs(caught.exception, refusal)
+        self.assertEqual(caught.exception.code, "source_commit_mismatch")
+
+    def test_a_scratch_removal_that_fails_after_a_good_fetch_refuses_typed(self):
+        with patch.object(self.gs, "_fetch", return_value=_GOOD),                 patch.object(self.gs.os, "rmdir", side_effect=OSError(errno.EBUSY, "Device or resource busy")):
+            with self.assertRaises(self.gs.SourceRefused) as caught:
+                self.fetch()
+        self.assertEqual(caught.exception.code, "source_unavailable")
 
 
 if __name__ == "__main__":

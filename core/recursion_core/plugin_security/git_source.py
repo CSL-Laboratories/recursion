@@ -71,10 +71,18 @@ def fetch_plugin_source(repository: str, commit: str, path: str, *, expected_sha
     if type(expected_sha256) is not str or _SHA256.fullmatch(expected_sha256) is None:
         raise SourceRefused("source_digest_mismatch")
     scratch = _make_scratch()
+    fetched = False
     try:
-        return _fetch(scratch, bare, commit, path, expected_sha256, install_scripts)
+        blob = _fetch(scratch, bare, commit, path, expected_sha256, install_scripts)
+        fetched = True
     finally:
-        _remove_tree(scratch)
+        # A removal that fails while a refusal is being raised never replaces it.
+        try:
+            _remove_tree(scratch)
+        except OSError:
+            if fetched:
+                raise SourceRefused("source_unavailable") from None
+    return blob
 
 
 def _require_commit(commit: object) -> None:
@@ -121,12 +129,22 @@ def _make_scratch() -> Path:
     if parent.is_symlink() or not parent.is_dir():
         raise SourceRefused("source_unavailable")
     path = parent / f"plugin-fetch-{secrets.token_hex(8)}"
-    os.mkdir(path, 0o700)
-    os.chmod(path, 0o700)
-    for name in ("home", "hooks", "template", "tmp", "repo"):
-        child = path / name
-        os.mkdir(child, 0o700)
-        os.chmod(child, 0o700)
+    try:
+        os.mkdir(path, 0o700)
+    except OSError:
+        raise SourceRefused("source_unavailable") from None
+    try:
+        os.chmod(path, 0o700)
+        for name in ("home", "hooks", "template", "tmp", "repo"):
+            child = path / name
+            os.mkdir(child, 0o700)
+            os.chmod(child, 0o700)
+    except OSError:
+        try:
+            _remove_tree(path)
+        except OSError:
+            pass
+        raise SourceRefused("source_unavailable") from None
     return path
 
 
@@ -157,7 +175,7 @@ def _run(args: list[str], scratch: Path, *, cwd: Path | None = None, limit: int 
         raise SourceRefused("source_unavailable") from None
     try:
         out, err = proc.communicate(timeout=30)
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError):
         _kill(proc)
         raise SourceRefused("source_unavailable") from None
     if proc.returncode != 0 or len(err) > _MAX_STDERR or len(out) > limit:
@@ -168,11 +186,11 @@ def _run(args: list[str], scratch: Path, *, cwd: Path | None = None, limit: int 
 def _kill(proc: subprocess.Popen) -> None:
     try:
         os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
+    except OSError:
         pass
     try:
         proc.communicate(timeout=5)
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError):
         pass
 
 

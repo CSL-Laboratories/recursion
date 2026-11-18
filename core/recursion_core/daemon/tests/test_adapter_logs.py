@@ -20,8 +20,18 @@ from unittest import mock
 from recursion_core.control_transport.framing import encode_frame
 from recursion_core.daemon import control_adapter as adapter
 from recursion_core.daemon import launcher
+from recursion_core.routes import contract
 
 LINUX = sys.platform.startswith('linux')
+
+
+def result_fits(value):
+    """Whether ``value`` matches a branch of the public ``run.view.v1`` result."""
+    root = Path(__file__).resolve().parents[4]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from conformance.rules import fits
+    return fits('run.view.v1.json#/$defs/result', value)
 
 
 @unittest.skipUnless(LINUX, 'the daemon is Linux only')
@@ -241,6 +251,145 @@ class AdapterLogTest(unittest.TestCase):
         got = [box.get_nowait() for _ in threads]
         self.assertEqual(got, ['m\ufffd', 'm\ufffd'])
         self.assertEqual(json.dumps(stored), snapshot)
+
+    def test_a_repeated_member_names_no_key(self):
+        """A repeated key is its own refusal, and the message does not carry the key."""
+        marker = 'SYNTHETIC-ROUTE-KEY'
+        path = self.root / 'routes.json'
+        path.write_text('{"routes":{"codex":{"%s":1,"%s":2}}}' % (marker, marker))
+        os.chmod(path, 0o600)
+        with self.assertRaises(adapter.RoutesUnreadable) as caught:
+            adapter.load_routes(path)
+        self.assertEqual(str(caught.exception), 'routes file has a repeated member')
+        self.assertNotIn(marker, str(caught.exception))
+
+    def test_a_deeply_nested_routes_file_is_a_typed_refusal(self):
+        """json.loads RecursionError on a very deep routes file stays inside RoutesUnreadable."""
+        path = self.root / 'routes.json'
+        depth = 100000
+        path.write_text('[' * depth + '1' + ']' * depth, encoding='utf-8')
+        os.chmod(path, 0o600)
+        with self.assertRaises(adapter.RoutesUnreadable) as caught:
+            adapter.load_routes(path)
+        self.assertEqual(str(caught.exception), 'routes file unreadable: RecursionError')
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_an_unreadable_routes_file_suppresses_the_parser_cause(self):
+        """The routes refusal does not chain the parser error."""
+        path = self.root / 'routes.json'
+        path.write_text('{', encoding='utf-8')
+        os.chmod(path, 0o600)
+        with self.assertRaises(adapter.RoutesUnreadable) as caught:
+            adapter.load_routes(path)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertEqual(str(caught.exception), 'routes file unreadable: JSONDecodeError')
+
+    def test_a_deep_surrogate_result_frames_on_list_and_status(self):
+        """A nest encode_frame can send must not raise out of run.list or run.status."""
+        depth = 1100
+        leaf = '\ud800'
+        node = leaf
+        for _ in range(depth):
+            node = {'d': node}
+        stored = {'status': 'error', 'code': 'engine_error', 'detail': node}
+        snapshot = json.dumps(stored)
+        control = self._control(stored, in_memory=True)
+        listed = control.call('run.list')
+        self.assertEqual(listed['code'], 'ok')
+        self._framed(listed)
+        cur = listed['runs'][0]['result']['detail']
+        for _ in range(depth):
+            cur = cur['d']
+        self.assertEqual(cur, '\ufffd')
+        status = control.call('run.status')
+        self.assertEqual(status['code'], 'ok')
+        self._framed(status)
+        cur = status['run']['result']['detail']
+        for _ in range(depth):
+            cur = cur['d']
+        self.assertEqual(cur, '\ufffd')
+        self.assertEqual(json.dumps(stored), snapshot)
+        cur = stored['detail']
+        for _ in range(depth):
+            cur = cur['d']
+        self.assertEqual(cur, leaf)
+
+    def test_a_surrogate_object_key_is_framed_and_stored_unchanged(self):
+        """A lone surrogate in an object key is U+FFFD on the answer, and the stored key stays."""
+        key = '\ud800'
+        payload = {'status': 'error', 'code': 'engine_error', 'detail': {key: 'x'}}
+        snapshot = json.dumps(payload)
+        for in_memory in (True, False):
+            with self.subTest(in_memory=in_memory):
+                stored = json.loads(snapshot)
+                control = self._control(stored, in_memory=in_memory)
+                listed = control.call('run.list')
+                self._framed(listed)
+                status = control.call('run.status')
+                self._framed(status)
+                shown = status['run']['result']['detail']
+                self.assertEqual(list(shown), ['\ufffd'])
+                self.assertEqual(shown['\ufffd'], 'x')
+                if in_memory:
+                    self.assertEqual(list(stored['detail']), [key])
+                    self.assertEqual(json.dumps(stored), snapshot)
+                else:
+                    raw = json.loads(
+                        (self.root / 'runs' / 'run-one' / 'result.json').read_text(encoding='utf-8'))
+                    self.assertEqual(list(raw['detail']), [key])
+
+    def test_list_and_status_leave_the_result_file_bytes_and_mtime(self):
+        """Reading a result does not rewrite result.json with the framed value."""
+        payload = {'status': 'error', 'code': 'engine_error', 'detail': 'seen-' + '\ud800'}
+        control = self._control(payload)
+        path = self.root / 'runs' / 'run-one' / 'result.json'
+        before = path.read_bytes()
+        stamp = path.stat().st_mtime_ns
+        listed = control.call('run.list')
+        self._framed(listed)
+        status = control.call('run.status')
+        self._framed(status)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(path.stat().st_mtime_ns, stamp)
+
+    def test_a_long_route_text_stays_whole_in_the_result_file(self):
+        """result.json keeps the route text. run.status carries a shorter head that still fits."""
+        run_id = 'run-one'
+        folder = self.root / 'runs' / run_id
+        folder.mkdir(parents=True)
+        detail = 'keep-me'
+        text = 'y' * (adapter.RESULT_STATUS_BYTES + 64)
+        result = contract.result('run-one', None, text=text, detail=detail)
+        starter = adapter.RouteStarter(mock.Mock(), {}, SimpleNamespace(closed=False), self.root)
+        starter._record_result(run_id, result)
+        self.assertNotIn(run_id, starter.results)
+        stored = json.loads((folder / 'result.json').read_text(encoding='utf-8'))
+        self.assertEqual(len(stored['text']), len(text))
+        self.assertEqual(stored['detail'], detail)
+        control = self._control_over_disk()
+        status = control.call('run.status')
+        shown = status['run']['result']
+        self.assertLess(len(shown['text']), len(text))
+        self.assertEqual(shown['detail'], detail)
+        self.assertTrue(result_fits(shown), shown)
+        self.assertEqual(len(stored['text']), len(text))
+
+    def _control_over_disk(self):
+        starter = SimpleNamespace(results={})
+        api = mock.Mock()
+
+        def call(method, _params=None, **_kwargs):
+            row = {'run_id': 'run-one', 'state': 'running'}
+            if method == 'run.status':
+                return {'code': 'ok', 'run': dict(row)}
+            raise AssertionError(method)
+
+        api.call.side_effect = call
+        daemon = SimpleNamespace(registry=mock.Mock())
+        daemon.registry.get.side_effect = KeyError('run-one')
+        return adapter.DaemonControl(api, None, daemon, starter, self.root)
 
 
 if __name__ == '__main__':

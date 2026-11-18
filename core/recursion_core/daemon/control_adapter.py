@@ -117,37 +117,83 @@ def _frame_scalar(value):
     A lone surrogate code point becomes one U+FFFD. A non-finite float becomes None.
     A list, a tuple or an object is walked. When nothing needs that, ``value`` is returned
     as it stands, so a clean result stays the same object.
+
+    The walk is an explicit stack. A call per nesting level raised ``RecursionError``
+    out of ``run.list`` on a result the frame encoder can send.
     """
+    def frame_text(text):
+        if any('\ud800' <= char <= '\udfff' for char in text):
+            return ''.join('\ufffd' if '\ud800' <= char <= '\udfff' else char for char in text)
+        return text
+
     if isinstance(value, str):
-        if any('\ud800' <= char <= '\udfff' for char in value):
-            return ''.join('\ufffd' if '\ud800' <= char <= '\udfff' else char for char in value)
-        return value
+        return frame_text(value)
     if isinstance(value, float):
         return value if math.isfinite(value) else None
-    if isinstance(value, dict):
-        rebuilt = None
-        for key, item in value.items():
-            new_key = _frame_scalar(key) if isinstance(key, str) else key
-            new_item = _frame_scalar(item)
-            if rebuilt is None and (new_key is not key or new_item is not item):
-                rebuilt = dict(value)
-            if rebuilt is not None:
-                if new_key is not key:
-                    rebuilt.pop(key, None)
-                rebuilt[new_key] = new_item
-        return value if rebuilt is None else rebuilt
-    if isinstance(value, (list, tuple)):
-        rebuilt = None
-        for index, item in enumerate(value):
-            new_item = _frame_scalar(item)
-            if rebuilt is None and new_item is not item:
-                rebuilt = list(value)
-            if rebuilt is not None:
-                rebuilt[index] = new_item
-        if rebuilt is None:
-            return value
-        return type(value)(rebuilt)
-    return value
+    if not isinstance(value, (dict, list, tuple)):
+        return value
+
+    # ``pending`` stops a cyclic object from walking forever. A repeated object is left as it is.
+    framed = {}
+    pending = set()
+    stack = [('visit', value)]
+    while stack:
+        kind, node = stack.pop()
+        if kind == 'visit':
+            if id(node) in framed:
+                continue
+            if isinstance(node, str):
+                framed[id(node)] = frame_text(node)
+            elif isinstance(node, float):
+                framed[id(node)] = node if math.isfinite(node) else None
+            elif isinstance(node, dict):
+                if id(node) in pending:
+                    framed[id(node)] = node
+                    continue
+                pending.add(id(node))
+                stack.append(('dict', node))
+                for key, item in node.items():
+                    stack.append(('visit', item))
+                    if isinstance(key, str):
+                        stack.append(('visit', key))
+            elif isinstance(node, (list, tuple)):
+                if id(node) in pending:
+                    framed[id(node)] = node
+                    continue
+                pending.add(id(node))
+                stack.append(('seq', node))
+                for item in node:
+                    stack.append(('visit', item))
+            else:
+                framed[id(node)] = node
+        elif kind == 'dict':
+            pending.discard(id(node))
+            changed = False
+            for key, item in node.items():
+                new_key = framed[id(key)] if isinstance(key, str) else key
+                new_item = framed[id(item)]
+                if new_key is not key or new_item is not item:
+                    changed = True
+                    break
+            if not changed:
+                framed[id(node)] = node
+                continue
+            out = {}
+            for key, item in node.items():
+                new_key = framed[id(key)] if isinstance(key, str) else key
+                out[new_key] = framed[id(item)]
+            framed[id(node)] = out
+        else:
+            pending.discard(id(node))
+            changed = False
+            built = []
+            for item in node:
+                new_item = framed[id(item)]
+                if new_item is not item:
+                    changed = True
+                built.append(new_item)
+            framed[id(node)] = node if not changed else type(node)(built)
+    return framed[id(value)]
 
 
 def _fit_chars(short, key, *, force=False):
@@ -356,7 +402,7 @@ def _json_object(pairs):
     obj = {}
     for key, value in pairs:
         if key in obj:
-            raise ValueError('repeated key')
+            raise RoutesUnreadable('routes file has a repeated member')
         obj[key] = value
     return obj
 
@@ -379,7 +425,7 @@ def load_routes(path):
         raise RoutesUnreadable('routes file must be an operator-owned regular file, not group/other writable')
     try:
         data = json.loads(path.read_text(encoding='utf-8'), object_pairs_hook=_json_object)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise RoutesUnreadable(f'routes file unreadable: {type(exc).__name__}') from None
     routes = data.get('routes') if isinstance(data, dict) else None
     if not isinstance(routes, dict):

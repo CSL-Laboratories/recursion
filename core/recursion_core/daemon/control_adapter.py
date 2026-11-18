@@ -229,16 +229,39 @@ def _status_result(result):
     _drop_if_that_fits(short, 'limit')
     _fit_chars(short, 'detail')
     if _wire_size(short) > RESULT_STATUS_BYTES:
-        # More than one member is large. Detail gives way first, then text, then the lists and objects.
-        _fit_chars(short, 'detail', force=True)
-        _fit_chars(short, 'text', force=True)
-        _fit_items(short, 'events', force=True)
+        # More than one member is large, so each non-force cut restored the member
+        # it tried. Take the detail from the original first, then the limit when
+        # that still fits, then a text head. The event list is shortened last and
+        # keeps whatever budget remains. The head is at most an eighth of the
+        # status budget: the rest stays an event prefix, not more text.
+        saved_detail = result.get('detail') if isinstance(result.get('detail'), str) else ''
+        saved_text = result.get('text') if isinstance(result.get('text'), str) else ''
+        saved_limit = result.get('limit')
+        saved_events = result.get('events') if isinstance(result.get('events'), list) else []
         if 'limit_notice' in short:
             short['limit_notice'] = None
+        short['detail'] = ''
+        short['text'] = ''
+        short['events'] = []
         if 'limit' in short:
             short['limit'] = None
-        _fit_chars(short, 'detail', force=True)
-        _fit_chars(short, 'text', force=True)
+        if saved_detail:
+            short['detail'] = saved_detail
+            if _wire_size(short) > RESULT_STATUS_BYTES:
+                _fit_chars(short, 'detail', force=True)
+        if 'limit' in short:
+            short['limit'] = saved_limit
+            if _wire_size(short) > RESULT_STATUS_BYTES:
+                short['limit'] = None
+        if saved_text:
+            head = RESULT_STATUS_BYTES // 8
+            short['text'] = saved_text if len(saved_text) <= head else saved_text[:head]
+            if _wire_size(short) > RESULT_STATUS_BYTES:
+                _fit_chars(short, 'text', force=True)
+        if saved_events:
+            short['events'] = saved_events
+            if _wire_size(short) > RESULT_STATUS_BYTES:
+                _fit_items(short, 'events', force=True)
     return short
 
 
@@ -644,8 +667,10 @@ class RouteStarter:
         if process is None:
             return
         try:
-            if closing or process.fenced:
-                # A fence that already ran asked the daemon to stop the child. Only the handles remain.
+            # `fence` records its reason before `stop` returns, so a non-empty `fenced` is not
+            # proof the child was stopped. An interrupt inside `stop` leaves that list set and
+            # the child running; only a fence call that returned is done.
+            if closing or getattr(process, '_stop_returned', False):
                 process.close()
             else:
                 self._settle(ctx, grace_s=0.0, reason='route_interrupted')
@@ -690,6 +715,9 @@ class RouteStarter:
                     break
                 time.sleep(0.2)
             process.fence(reason)
+            # Set only after `fence` returns. `stop` raising BaseException skips this, and the
+            # recovery above asks for the stop again.
+            process._stop_returned = True
         finally:
             process.close()
 

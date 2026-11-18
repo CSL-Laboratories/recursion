@@ -23,6 +23,8 @@ PKG = pathlib.Path(__file__).resolve().parents[1]
 NOT_POSIX = os.name == "nt" or not hasattr(os, "geteuid")
 POSIX_ONLY = ("POSIX-only: the route home owner check needs os.geteuid; subscription_routes refuses "
               "platform_unsupported on Windows; covered by WindowsRefusalTests")
+# Pi is detected, not routed in this release: every Pi run start refuses this before anything is launched.
+NOT_ROUTED = ("engine_not_routed", "detected, not routed in this release")
 
 
 class CodexUpdaterTest(unittest.TestCase):
@@ -107,8 +109,8 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
         service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
         res = service.handle(self.req("pi", {"provider": "anthropic", "auth": "api_key",
                                               "credential_env": "ANTHROPIC_API_KEY"}, wrapper=self.pin()))
-        self.assertEqual(res["code"], c.DEADLINE_EXCEEDED)
-        self.assertEqual(self.launcher.processes[-1].fenced, ["deadline"])
+        self.assertEqual((res["code"], res["detail"]), NOT_ROUTED)
+        self.assertEqual((self.launcher.calls, self.launcher.processes), ([], []))
 
     def test_claude_subscription_provider_is_refused_and_never_launched(self) -> None:
         cases = [("pi", {"provider": "claude-pro", "auth": "oauth", "credential_env": "ANTHROPIC_API_KEY"}),
@@ -117,6 +119,9 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
                  ("opencode", {"provider": "claude-agent", "auth": "subscription", "credential_env": "ANTHROPIC_API_KEY"})]
         for engine, profile in cases:
             res = self.service.handle(self.req(engine, profile))
+            if engine == "pi":
+                self.assertEqual((res["code"], res["detail"]), NOT_ROUTED, engine)
+                continue
             self.assertEqual(res["code"], c.SUBSCRIPTION_ROUTE_REFUSED, engine)
             self.assertEqual(res["detail"], "claude_subscription_provider")
         self.assertEqual(self.launcher.calls, [])
@@ -125,16 +130,15 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
     def test_pi_without_a_wrapper_pin_refuses_before_launch(self) -> None:
         profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}
         res = self.service.handle(self.req("pi", profile))
-        self.assertEqual((res["code"], res["detail"]), (c.SUBSCRIPTION_ROUTE_REFUSED, "wrapper_pin_missing"))
+        self.assertEqual((res["code"], res["detail"]), NOT_ROUTED)
         self.assertEqual(self.launcher.calls, [])
 
     @unittest.skipIf(NOT_POSIX, POSIX_ONLY)
     def test_api_key_profile_passes_the_guard_then_launches(self) -> None:
         profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}
         res = self.service.handle(self.req("pi", profile, wrapper=self.pin()))
-        self.assertEqual((res["status"], res["text"]), ("ok", "driven"))
-        env = self.launcher.calls[0]["env"]
-        self.assertEqual(env, {"PATH": "/usr/bin", "HOME": self.home, "ANTHROPIC_API_KEY": "sk-test"})
+        self.assertEqual((res["status"], res["code"], res["detail"]), ("error", *NOT_ROUTED))
+        self.assertEqual(self.launcher.calls, [])
 
     @unittest.skipIf(NOT_POSIX, POSIX_ONLY)
     def test_pinned_route_with_a_bare_argv0_refuses_before_launch(self) -> None:
@@ -144,7 +148,7 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
         service = RouteService(adapters, ConnectionBreaker(self.clock), self.clock)
         profile = {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"}
         res = service.handle(self.req("pi", profile, wrapper=self.pin()))
-        self.assertEqual((res["code"], res["detail"]), (c.SUBSCRIPTION_ROUTE_REFUSED, "argv0_not_pinned"))
+        self.assertEqual((res["code"], res["detail"]), NOT_ROUTED)
         self.assertEqual(self.launcher.calls, [])
 
     def test_missing_custody_key_refuses_instead_of_launching_keyless(self) -> None:
@@ -154,7 +158,8 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
             req = request(engine=engine, model="m", kind="api_key", conn_id="no-such-key",
                           credential_env="OPENAI_API_KEY", profile=prof, home=self.home)
             res = self.service.handle(req)
-            self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, "no credential for no-such-key"), engine)
+            want = NOT_ROUTED if engine == "pi" else (c.LAUNCH_REFUSED, "no credential for no-such-key")
+            self.assertEqual((res["code"], res["detail"]), want, engine)
         self.assertEqual(self.launcher.calls, [])
 
     def test_unlisted_or_mismatched_credential_env_refuses_before_custody(self) -> None:
@@ -167,7 +172,8 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
         for name in ("SECRET_THING", "OPENAI_API_KEY"):  # not listed for pi; listed but not the profile's
             req = request(engine="pi", model="m", kind="api_key", conn_id="k1", credential_env=name,
                           profile=profile, home=self.home)
-            self.assertEqual(service.handle(req)["code"], c.LAUNCH_REFUSED, name)
+            res = service.handle(req)
+            self.assertEqual((res["code"], res["detail"]), NOT_ROUTED, name)
         self.assertEqual((asked, self.launcher.calls), ([], []))
 
     def test_reuses_subscription_routes_not_a_copy(self) -> None:

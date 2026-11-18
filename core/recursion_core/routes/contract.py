@@ -47,6 +47,8 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping
 
+from recursion_core.routes.engines import DETECTED_NOT_ROUTED, NOT_ROUTED_DETAIL
+
 CONTRACT_VERSION = "recursion.route/v0"
 
 OK = "ok"
@@ -66,6 +68,7 @@ LAUNCH_REFUSED = "launch_refused"  # e.g. a Codex config that would enable the u
 REQUEST_INVALID = "request_invalid"
 ENGINE_UNKNOWN = "engine_unknown"
 ROUTE_CHOICE_REQUIRED = "route_choice_required"  # the user must pick (e.g. apiKeyHelper outranks sign-in)
+ENGINE_NOT_ROUTED = "engine_not_routed"  # an engine in routes.engines.DETECTED_NOT_ROUTED: refused before launch
 
 CODES = frozenset(
     {
@@ -83,6 +86,7 @@ CODES = frozenset(
         REQUEST_INVALID,
         ENGINE_UNKNOWN,
         ROUTE_CHOICE_REQUIRED,
+        ENGINE_NOT_ROUTED,
     }
 )
 # Codes that come from the engine run itself (as opposed to a refusal before launch).
@@ -119,6 +123,8 @@ def validate_request(request: object) -> dict:
     if not isinstance(route, Mapping):
         raise RouteError(REQUEST_INVALID, "route")
     engine = route.get("engine")
+    if engine in DETECTED_NOT_ROUTED:
+        raise RouteError(ENGINE_NOT_ROUTED, NOT_ROUTED_DETAIL)
     if engine not in ENGINES:
         raise RouteError(ENGINE_UNKNOWN, str(engine))
     if not isinstance(route.get("model"), str) or not route["model"]:

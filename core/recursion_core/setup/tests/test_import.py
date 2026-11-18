@@ -200,6 +200,33 @@ def _under_home(opened, home: str) -> list:
     return rows
 
 
+def _off_posix() -> bool:
+    # The simulated-Windows step takes O_NOFOLLOW away (and says win32): the gate and the entry point refuse.
+    return not hasattr(os, "O_NOFOLLOW")
+
+
+def _leaves(opened) -> list:
+    """The names a run opened, as text. The gate opens the file by its leaf name from its parent."""
+
+    rows = []
+    for raw in opened:
+        if isinstance(raw, bytes):
+            raw = os.fsdecode(raw)
+        if isinstance(raw, str):
+            rows.append(os.path.basename(raw))
+    return rows
+
+
+def _key_shape(prefix: str) -> str:
+    # Built at run time from a prefix and the word FAKE: obviously fake, never a real key.
+    return prefix + "FAKE"
+
+
+def _random_run(length: int) -> str:
+    # A run that changes character class every character or two, the shape of a hex key.
+    return "".join("0123456789abcdef"[(index * 7 + 3) % 16] for index in range(length))
+
+
 class ImportDryRunTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="import-propose-")
@@ -259,6 +286,12 @@ class ImportDryRunTests(unittest.TestCase):
                         self.assertNotIn(canary, text, path)
 
     def test_dry_run_prints_a_proposal_and_writes_nothing(self):
+        if _off_posix():
+            # Simulated Windows: the entry point refuses before any read.
+            for source in ("codex", "claude", "cursor"):
+                with self.subTest(source=source):
+                    self._assert_cli_refused(["import", "--from", source, "--dry-run"])
+            return
         before = _tree_hash(self.root)
         expected = {
             "codex": ("codex", "gpt-import", "/work/codex-app", os.path.join(self.home, ".codex", "config.toml")),
@@ -296,7 +329,10 @@ class ImportDryRunTests(unittest.TestCase):
                 else:
                     self.assertEqual(proposal["folders"], [{"path": folder, "trust": "user_choice"}])
                 home_opens = _under_home(opened, self.home)
-                self.assertEqual(home_opens, [settings_path], home_opens)
+                # The shared gate (merged from #533) walks to the file by directory descriptors and
+                # opens it by its leaf name: no absolute path under the home, the leaf once.
+                self.assertEqual(home_opens, [], home_opens)
+                self.assertEqual(_leaves(opened).count(os.path.basename(settings_path)), 1)
                 self._assert_silent(before, out, err, opened)
                 self.assertFalse(os.path.exists(os.path.join(self.config, "recursion", "routing.json")))
                 self.assertFalse(os.path.exists(os.path.join(self.state, "recursion")))
@@ -316,6 +352,10 @@ class ImportDryRunTests(unittest.TestCase):
         self.assertEqual(first["proposal"]["folder_trust"], "user_choice")
 
     def test_without_dry_run_and_with_apply_write_nothing(self):
+        if _off_posix():
+            self._assert_cli_refused(["import", "--from", "codex"])
+            self._assert_cli_refused(["import", "--from", "codex", "--apply"])
+            return
         before = _tree_hash(self.root)
         code, out, err, opened = self._cli(["import", "--from", "codex"])
         self.assertEqual(code, 1, (out, err))
@@ -332,6 +372,9 @@ class ImportDryRunTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.config, "recursion", "routing.json")))
 
     def test_a_bad_source_or_a_relative_home_writes_nothing(self):
+        if _off_posix():
+            self._assert_cli_refused(["import", "--from", "git", "--dry-run"])
+            return
         before = _tree_hash(self.root)
         code, out, err, opened = self._cli(["import", "--from", "git", "--dry-run"])
         self.assertEqual(code, 2, (out, err))
@@ -417,6 +460,9 @@ class ImportDryRunTests(unittest.TestCase):
         self.assertEqual(_tree_hash(self.root), before)
 
     def test_a_mode_000_settings_file_is_not_opened(self):
+        if _off_posix():
+            self._assert_gate_refused(os.path.join(self.home, ".codex", "config.toml"))
+            return
         module = _proposal_module()
         path = os.path.join(self.home, ".codex", "config.toml")
         os.chmod(path, 0o000)
@@ -610,6 +656,9 @@ class ImportDryRunTests(unittest.TestCase):
         self._assert_model_dropped(text)
 
     def test_a_value_shorter_than_four_characters_does_not_drop_the_model(self):
+        if _off_posix():
+            self._assert_gate_refused(os.path.join(self.home, ".claude", "settings.json"))
+            return
         self._replace_settings({"model": "abc-tool", "note": "abc"})
         code, text, _opened = self._claude()
         self.assertEqual(code, 0, text)
@@ -622,6 +671,124 @@ class ImportDryRunTests(unittest.TestCase):
         code, text, _opened = self._claude()
         self.assertEqual(code, 0)
         self._assert_model_dropped(text)
+
+    # The answer round on the read a4b: the model and the folder paths pass the shared value
+    # rule (setup/value_rule.py), and the merged gate refuses a foreign-owned or writable file.
+
+    def _assert_cli_refused(self, argv) -> None:
+        before = _tree_hash(self.root)
+        code, out, err, opened = self._cli(argv)
+        self.assertEqual(code, 1, err)
+        self.assertEqual(json.loads(out)["code"], "platform_unsupported")
+        self.assertEqual(_under_home(opened, self.home), [])
+        self.assertEqual(_tree_hash(self.root), before)
+
+    def _assert_gate_refused(self, path) -> None:
+        from recursion_core.setup import open_guard
+
+        with self.assertRaises(open_guard.GateRefused) as caught:
+            open_guard.read_regular_file(path, root=self.home, home=self.home, max_bytes=1 << 20)
+        self.assertEqual(caught.exception.reason, "platform_unsupported")
+
+    def _proposal(self, source):
+        module = _proposal_module()
+        _watch_opens()
+        mark = len(_OPENED)
+        out = io.StringIO()
+        code = module.command(out, source=source, dry_run=True, home=self.home, environ=self._environ())
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        _clean(text)
+        return json.loads(text)["proposal"], text, _OPENED[mark:]
+
+    def test_a_model_with_a_credential_prefix_is_dropped(self):
+        from recursion_core.setup import value_rule
+
+        for prefix in value_rule.CREDENTIAL_PREFIXES:
+            marker = _key_shape(prefix) + "model"
+            with self.subTest(prefix=prefix):
+                self._replace_settings({"model": marker})
+                code, text, _opened = self._claude()
+                self.assertEqual(code, 0)
+                self._assert_model_dropped(text)
+                self.assertIs(marker in text, False, "a key-shaped model was copied")
+
+    def test_a_model_holding_a_random_run_is_dropped(self):
+        marker = _key_shape("") + "-" + _random_run(24)
+        self._replace_settings({"model": marker})
+        code, text, _opened = self._claude()
+        self.assertEqual(code, 0)
+        self._assert_model_dropped(text)
+        self.assertIs(marker in text, False, "a random-run model was copied")
+
+    def test_a_model_with_a_key_inside_a_url_path_is_dropped(self):
+        marker = "https://models.example/v1/" + _key_shape("sk-") + "keyinsidetheurlpath"
+        self._replace_settings({"model": marker})
+        code, text, _opened = self._claude()
+        self.assertEqual(code, 0)
+        self._assert_model_dropped(text)
+        self.assertIs(marker in text, False, "a key inside a model path was copied")
+
+    def test_harmless_models_are_still_shown(self):
+        path = os.path.join(self.home, ".claude", "settings.json")
+        if _off_posix():
+            self._assert_gate_refused(path)
+            return
+        for model in ("gpt-5-codex", "claude-sonnet-4-5-20250929", "o3-mini",
+                      "anthropic/claude-3.5-sonnet:beta", "llama3.1:8b"):
+            with self.subTest(model=model):
+                self._replace_settings({"model": model})
+                proposal, _text, _opened = self._proposal("claude")
+                self.assertEqual(proposal.get("model"), model)
+
+    def test_a_codex_profile_that_repeats_the_model_still_shows_it(self):
+        path = os.path.join(self.home, ".codex", "config.toml")
+        _write(path, 'model = "gpt-5-codex"\n\n[profiles.fast]\nmodel = "gpt-5-codex"\n', 0o600)
+        if _off_posix():
+            self._assert_gate_refused(path)
+            return
+        proposal, _text, _opened = self._proposal("codex")
+        self.assertEqual(proposal.get("model"), "gpt-5-codex")
+
+    def test_a_key_shaped_folder_path_is_dropped(self):
+        prefixed = "/work/" + _key_shape("ghp_") + "0123456789abcdef"
+        random_path = "/work/" + _random_run(24)
+        plain = "/work/plain-app"
+        path = self._replace_settings({"projects": {prefixed: {}, random_path: {}, plain: {}}})
+        if _off_posix():
+            self._assert_gate_refused(path)
+            return
+        proposal, text, _opened = self._proposal("claude")
+        folders = [row["path"] for row in proposal.get("folders", [])]
+        self.assertIs(prefixed in text, False, "a prefixed folder path was copied")
+        self.assertIs(random_path in text, False, "a random-run folder path was copied")
+        self.assertIs(folders == [plain], True, "the plain folder path is not the one kept")
+
+    def _assert_proposes_nothing(self, source, path) -> None:
+        proposal, _text, opened = self._proposal(source)
+        self.assertIs("model" in proposal, False, "a model was copied")
+        self.assertIs("folders" in proposal, False, "a folder was copied")
+        self.assertNotIn(os.path.basename(path), _leaves(opened))
+
+    def test_a_foreign_owned_settings_file_proposes_nothing(self):
+        path = os.path.join(self.home, ".codex", "config.toml")
+        if _off_posix():
+            self._assert_gate_refused(path)
+            return
+        uid = os.geteuid()
+        with mock.patch("os.geteuid", return_value=uid + 1):
+            self._assert_proposes_nothing("codex", path)
+
+    def test_a_group_or_world_writable_settings_file_proposes_nothing(self):
+        path = os.path.join(self.home, ".codex", "config.toml")
+        self.addCleanup(os.chmod, path, 0o600)
+        if _off_posix():
+            self._assert_gate_refused(path)
+            return
+        for mode in (0o620, 0o602, 0o660, 0o666):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(path, mode)
+                self._assert_proposes_nothing("codex", path)
 
 
 if __name__ == "__main__":

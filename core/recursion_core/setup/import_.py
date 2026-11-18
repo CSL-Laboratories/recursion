@@ -13,11 +13,15 @@ the tool marks a folder trusted.
 Sign-in stores named by ``deny.py`` are never opened, including through a symlink or a
 hard link. ``~/.claude.json`` is not opened either: it can hold a sign-in beside
 settings. A settings file is read only to copy an allow-listed model string and the
-paths of named project folders. A model is copied only when it has a model-name shape
-(letters, digits and ``.`` ``_`` ``:`` ``/`` ``-``, 64 characters at most) and no other
-string value in that file, under any key, of 4 characters or more, is equal to it or
-contained in it. Environment values, header values, command arguments, hooks and MCP
-commands are not copied. A file mode without the owner-read bit is left unread.
+paths of named project folders. The model passes the shared value rule
+(``setup/value_rule.py``): a model-name shape (letters, digits and ``.`` ``_`` ``:``
+``/`` ``-``, 64 characters at most), no other string value in that file, under any key,
+of 4 characters or more, equal to it or contained in it (a Codex profile's copy of the
+model is not counted), and no key shape (a credential prefix, a long part that starts
+with one, or a random run). A key-shaped folder path is not copied. Environment values,
+header values, command arguments, hooks and MCP commands are not copied. A file mode
+without the owner-read bit is left unread, and so is a file the caller does not own or
+that has a group- or world-write bit (the shared gate).
 An alias (more than one link, or an inode that changes between the look and the read)
 is not read. The real path must stay inside the home.
 """
@@ -26,23 +30,19 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import stat
 import tomllib
 
 from recursion_core.setup.deny import denied_paths, is_denied
+from recursion_core.setup import value_rule
 from recursion_core.setup.open_guard import inside_root, read_regular_file
 
 _MAX_BYTES = 1024 * 1024
 _PATH_CAP = 4096
 _FOLDER_CAP = 64
-_VALUE_FLOOR = 4
-_MODEL = re.compile(r"^[A-Za-z0-9._:/-]{1,64}$")
-# The model field does not consult _SECRET_KEYS. It is dropped unless it matches
-# _MODEL and no other string value of _VALUE_FLOOR characters or more is equal to
-# it or contained in it.
-# Folder paths still refuse a value stored under one of these keys. Compared after
-# case folding.
+# The model field does not consult _SECRET_KEYS: it passes the shared value rule.
+# Folder paths still refuse a value stored under one of these keys (compared after
+# case folding), and a key-shaped path.
 _SECRET_KEYS = frozenset({
     "access_token", "api_key", "apikey", "args", "arguments", "auth", "authorization",
     "credentials", "env", "headers", "hook", "hooks", "http_headers", "id_token",
@@ -198,7 +198,7 @@ def _pick(parsed: dict) -> dict:
     folders = []
     if type(projects) is dict:
         for key in sorted((key for key in projects if type(key) is str)):
-            if not _folder_path(key) or _tainted(key, secrets):
+            if not _folder_path(key) or _tainted(key, secrets) or value_rule.credential_shaped(key):
                 continue
             folders.append({"path": key, "trust": "user_choice"})
             if len(folders) == _FOLDER_CAP:
@@ -223,35 +223,14 @@ def _collect_secrets(node, secret: bool, found: set) -> None:
 
 
 def _model_blocked(parsed: dict, model: str) -> bool:
-    """True when ``model`` is not a model name, or another string value sits inside it.
+    """True when the shared value rule withholds ``model`` (``setup/value_rule.py``).
 
-    ``_SECRET_KEYS`` is not consulted. The model's own value is not an other value.
-    A string shorter than ``_VALUE_FLOOR`` does not block it.
+    ``_SECRET_KEYS`` is not consulted. The model's own value is not an other value, nor
+    is a Codex profile's copy of it. A string shorter than 4 characters does not block it.
     """
 
-    if _MODEL.fullmatch(model) is None:
-        return True
-    others: list = []
-    _other_strings(parsed, others)
-    for value in others:
-        if len(value) >= _VALUE_FLOOR and (value == model or value in model):
-            return True
-    return False
-
-
-def _other_strings(node, found: list, *, at_top: bool = True) -> None:
-    if type(node) is dict:
-        for key, value in node.items():
-            if at_top and key == "model" and type(value) is str:
-                continue
-            _other_strings(value, found, at_top=False)
-        return
-    if type(node) is list:
-        for item in node:
-            _other_strings(item, found, at_top=False)
-        return
-    if type(node) is str and node:
-        found.append(node)
+    others = value_rule.model_others(parsed, model)
+    return value_rule.model_value(model, others) == value_rule.WITHHELD
 
 
 def _tainted(text: str, secrets: set) -> bool:

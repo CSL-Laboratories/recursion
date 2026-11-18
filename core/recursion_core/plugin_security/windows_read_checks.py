@@ -29,6 +29,9 @@ answers ``plugin_file_unreadable`` or ``plugin_file_untrusted``; a directory ste
 * owner not operator-only: ``plugin_file_untrusted``;
 * the revocation store: always ``platform_unsupported`` (no checked handle can feed sqlite yet);
 * facts that cannot be judged at all, or an unknown kind: ``platform_unsupported``.
+
+``plugin_file_missing`` and ``plugin_file_too_large`` are the handle reader's to give, not this
+judge's: no fact here says that a file is missing or how large it is.
 """
 
 from __future__ import annotations
@@ -93,6 +96,10 @@ class WindowsHandleFacts:
     root's own handle; and ``expected_name``, the relative name below that root that the code itself
     typed to open this object (its last part is the name it asked for). ``expected_name`` is NEVER
     taken from ``final_path``: a name derived from the final path makes the compare always true.
+
+    The facts are a frozen snapshot the caller makes once. ``judge_handle`` judges only an object
+    whose type is exactly this class; a subclass or a look-alike gets ``platform_unsupported``, the
+    answer a wrong-typed argument gets, because its fields could change between reads or raise.
     """
 
     attributes: int | None
@@ -111,7 +118,7 @@ def _is_count(value: object) -> bool:
 
 def _judgeable(facts: object) -> bool:
     """False when the facts cannot be judged at all: then the check could not be performed."""
-    if not isinstance(facts, WindowsHandleFacts):
+    if type(facts) is not WindowsHandleFacts:
         return False
     if type(facts.root_final_path) is not str or type(facts.expected_name) is not str:
         return False

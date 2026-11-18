@@ -245,6 +245,88 @@ class FailedQueryTests(unittest.TestCase):
         self.assertEqual(w.judge_handle(nothing, w.KIND_FILE), "platform_unsupported")
 
 
+class _ChangingFacts(w.WindowsHandleFacts):
+    """A subclass whose reparse tag reads as stored once, then as 0 (a value that changes between reads)."""
+
+    def __getattribute__(self, name):
+        if name == "reparse_tag":
+            reads = object.__getattribute__(self, "__dict__").setdefault("_reads", [])
+            reads.append(1)
+            if len(reads) > 1:
+                return 0
+        return object.__getattribute__(self, name)
+
+
+class _CleanLookingFacts(w.WindowsHandleFacts):
+    """A subclass that answers clean values for every handle fact, whatever it stores."""
+
+    _CLEAN = {"attributes": w.FILE_ATTRIBUTE_ARCHIVE, "reparse_tag": 0, "link_count": 1, "owner_ok": True}
+
+    def __getattribute__(self, name):
+        clean = object.__getattribute__(self, "_CLEAN")
+        return clean[name] if name in clean else object.__getattribute__(self, name)
+
+
+class _RaisingFacts(w.WindowsHandleFacts):
+    """A subclass whose link count raises when it is read."""
+
+    @property
+    def link_count(self):
+        raise OSError("fake query error")
+
+
+def _snapshot(cls, **changes):
+    values = dataclasses.asdict(file_facts(**changes))
+    instance = object.__new__(cls)
+    object.__getattribute__(instance, "__dict__").update(values)  # also under a property of the same name
+    return instance
+
+
+class FactsSnapshotTests(unittest.TestCase):
+    """Only the exact frozen snapshot type is judged; a subclass gets the wrong-type answer."""
+
+    def test_subclass_changing_between_reads_gets_no_pass(self):
+        hostile = _snapshot(_ChangingFacts, reparse_tag=w.IO_REPARSE_TAG_SYMLINK)
+        self.assertEqual(w.judge_handle(hostile, w.KIND_FILE), "platform_unsupported")
+
+    def test_subclass_hiding_stored_values_gets_no_pass(self):
+        hostile = _snapshot(_CleanLookingFacts, reparse_tag=w.IO_REPARSE_TAG_SYMLINK, link_count=2, owner_ok=False)
+        self.assertEqual(w.judge_handle(hostile, w.KIND_FILE), "platform_unsupported")
+
+    def test_subclass_whose_attribute_raises_gets_an_answer(self):
+        raising = _snapshot(_RaisingFacts)
+        self.assertEqual(w.judge_handle(raising, w.KIND_FILE), "platform_unsupported")
+        self.assertEqual(w.judge_handle(raising, w.KIND_DIRECTORY), "platform_unsupported")
+
+    def test_exact_type_is_still_judged(self):
+        self.assertIs(type(file_facts()), w.WindowsHandleFacts)
+        self.assertIsNone(w.judge_handle(file_facts(), w.KIND_FILE))
+        self.assertEqual(w.judge_handle(file_facts(link_count=2), w.KIND_FILE), "plugin_file_untrusted")
+
+
+class CauseSetTests(unittest.TestCase):
+    def test_causes_are_exactly_what_the_judge_can_return(self):
+        answers = set()
+        variations = ({}, {"reparse_tag": 1}, {"attributes": w.FILE_ATTRIBUTE_REPARSE_POINT}, {"link_count": 2},
+                      {"link_count": 0}, {"owner_ok": False}, {"owner_ok": None}, {"file_type": 2},
+                      {"final_path": None}, {"final_path": ROOT + "\\x"}, {"expected_name": ".."},
+                      {"expected_name": "CON"}, {"expected_name": ""}, {"attributes": w.FILE_ATTRIBUTE_OFFLINE},
+                      {"attributes": w.FILE_ATTRIBUTE_DIRECTORY}, {"root_final_path": ""}, {"link_count": True})
+        for kind in (w.KIND_FILE, w.KIND_DIRECTORY, w.KIND_REVOCATION_STORE, "other", None):
+            for changes in variations:
+                answers.add(w.judge_handle(file_facts(**changes), kind))
+                answers.add(w.judge_handle(dir_facts(**changes), kind))
+            answers.add(w.judge_handle(object(), kind))
+        answers.discard(None)
+        self.assertEqual(answers, set(w.CAUSES))
+        self.assertEqual(len(w.CAUSES), len(set(w.CAUSES)))
+        # The handle reader, not this judge, answers a missing file and a file over its size limit.
+        for reader_cause in ("plugin_file_missing", "plugin_file_too_large"):
+            with self.subTest(reader_cause):
+                self.assertNotIn(reader_cause, w.CAUSES)
+                self.assertIn(reader_cause, (w.__doc__ or ""))
+
+
 class RevocationAndUnusableFactsTests(unittest.TestCase):
     def test_revocation_store_is_always_platform_unsupported(self):
         store = file_facts(final_path=ROOT + "\\revoked.sqlite3", expected_name="revoked.sqlite3")

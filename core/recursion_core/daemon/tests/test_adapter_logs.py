@@ -26,6 +26,22 @@ from recursion_core.routes import contract
 LINUX = sys.platform.startswith('linux')
 
 
+def encodes_nest(depth):
+    """Whether this interpreter's ``json.dumps`` encodes a dict nest ``depth`` levels deep.
+
+    Before Python 3.12 the C encoder counts each level against the recursion limit (1,000 by
+    default), so a nest deeper than that raises RecursionError there.
+    """
+    node = None
+    for _ in range(depth):
+        node = {'d': node}
+    try:
+        json.dumps(node)
+    except RecursionError:
+        return False
+    return True
+
+
 def result_fits(value):
     """Whether ``value`` matches a branch of the public ``run.view.v1`` result."""
     root = Path(__file__).resolve().parents[4]
@@ -253,6 +269,50 @@ class AdapterLogTest(unittest.TestCase):
         self.assertEqual(got, ['m\ufffd', 'm\ufffd'])
         self.assertEqual(json.dumps(stored), snapshot)
 
+    def test_run_list_does_not_walk_the_parts_of_a_result_it_drops(self):
+        """run.list keeps status, code and detail: the text and the events it drops are not walked."""
+        walked = []
+
+        class WalkedText(str):
+            def __iter__(self):
+                walked.append('text')
+                return super().__iter__()
+
+        class WalkedEvents(list):
+            def __iter__(self):
+                walked.append('events')
+                return super().__iter__()
+
+        stored = {'status': 'error', 'code': 'engine_error', 'detail': 'a\udc80b',
+                  'text': WalkedText('x' * 64), 'events': WalkedEvents([{'kind': 'note'}])}
+        control = self._control(stored, in_memory=True)
+        listed = control.call('run.list')
+        self.assertEqual(listed['code'], 'ok')
+        self._framed(listed)
+        self.assertEqual(listed['runs'][0]['result'],
+                         {'status': 'error', 'code': 'engine_error', 'detail': 'a\ufffdb'})
+        self.assertEqual(walked, [])
+        # run.status still frames the whole result, so the probe sees both parts walked there.
+        status = control.call('run.status')
+        self.assertEqual(status['code'], 'ok')
+        self.assertIn('text', walked)
+        self.assertIn('events', walked)
+
+    def test_a_list_row_keeps_the_three_fields_of_the_whole_frame(self):
+        """A run.list row holds status, code and detail as framing the whole result gives them."""
+        for detail, shown in (('plain detail', 'plain detail'), ('a\udc80b', 'a\ufffdb')):
+            with self.subTest(detail=shown):
+                stored = {'status': 'error', 'code': 'engine_error', 'detail': detail,
+                          'text': 'out' + chr(0xD800), 'events': [{'kind': 'note'}]}
+                whole = adapter._frame_scalar(stored)
+                expected = {k: whole.get(k) for k in ('status', 'code', 'detail')}
+                self.assertEqual(expected, {'status': 'error', 'code': 'engine_error', 'detail': shown})
+                control = self._control(stored, in_memory=True)
+                listed = control.call('run.list')
+                self.assertEqual(listed['code'], 'ok')
+                self._framed(listed)
+                self.assertEqual(listed['runs'][0]['result'], expected)
+
     def test_a_repeated_member_names_no_key(self):
         """A repeated key is its own refusal, and the message does not carry the key."""
         marker = 'SYNTHETIC-ROUTE-KEY'
@@ -290,6 +350,10 @@ class AdapterLogTest(unittest.TestCase):
     def test_a_deep_surrogate_result_frames_on_list_and_status(self):
         """A nest encode_frame can send must not raise out of run.list or run.status."""
         depth = 1100
+        if not encodes_nest(depth):
+            self.skipTest(f'json.dumps on Python {sys.version_info[0]}.{sys.version_info[1]} cannot encode '
+                          f'a {depth}-deep nest (before 3.12 its C encoder counts each level against the '
+                          'recursion limit), and this test builds its input and its snapshot with it')
         leaf = '\ud800'
         node = leaf
         for _ in range(depth):
@@ -481,7 +545,7 @@ class AdapterLogTest(unittest.TestCase):
                 control = adapter.DaemonControl(
                     api, mock.Mock(), SimpleNamespace(registry=unit_registry),
                     SimpleNamespace(results={'run-one': result}, failures={}), self.root)
-                folder = self.root / ('gui-first-' + field)
+                folder = self.root / field
                 folder.mkdir()
                 server = UnixControlServer(folder / 'socket', control.handle)
                 server.start()
@@ -492,7 +556,7 @@ class AdapterLogTest(unittest.TestCase):
                 self.assertEqual(status['run']['result'][field], 'a�b')
                 self.assertEqual(registry.get('run-one')['state'], 'running')
                 self.assertEqual(requested, [])
-                with self.assertNoLogs(adapter.log, 'ERROR'):
+                with self.assertNoLogs(adapter.log, 'WARNING'):
                     code, body = control.gui_transport('POST', '/v1/runs/stop', b'{"run_id": "run-one"}')
                 self.assertEqual(code, 200)
                 answer = json.loads(body)
@@ -501,7 +565,8 @@ class AdapterLogTest(unittest.TestCase):
                 self.assertIs(answer['repeat'], False)
                 self.assertEqual(requested, [cgroup])
                 self.assertEqual(registry.get('run-one')['state'], 'stopped')
-                stopped = client.call('run.stop', {'run_id': 'run-one'})
+                with self.assertNoLogs(adapter.log, 'WARNING'):
+                    stopped = client.call('run.stop', {'run_id': 'run-one'})
                 self.assertEqual(stopped['code'], 'stopped', stopped)
                 self.assertIs(stopped['repeat'], True)
                 self.assertEqual(requested, [cgroup])

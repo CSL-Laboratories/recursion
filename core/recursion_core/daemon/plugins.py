@@ -475,7 +475,20 @@ class PluginHost:
                 'containment': 'none: plugins run in the daemon process and uid'}
 
     def route_records(self):
-        """The plugin rows of the GUI's inventory: what loaded, what was refused and why."""
+        """The plugin rows of the GUI's inventory: what loaded, what was refused and why.
+
+        Each row names the registry label as text: verified, non-verified or unlisted,
+        and says it is a label, not a gate. The core writes that text. The label is
+        not a permission and does not decide whether the plugin loaded.
+        """
+        # When verification is unavailable the install file was not read, so the
+        # labels are not on the host yet. Read them for this display only.
+        labels = self._labels
+        if not labels and self.verification != 'available':
+            try:
+                labels = read_install(self._config)['registry_labels']
+            except PluginRefused:
+                labels = {}
         rows = []
         for record in self.records:
             name = record['plugin_id'] or Path(record['source']).name
@@ -488,6 +501,27 @@ class PluginHost:
                     note += '; degraded: ' + degraded['degraded']
             else:
                 note = 'refused: %s%s' % (record['code'], ': ' + record['detail'] if record['detail'] else '')
+            stored = record.get('registry_label')
+            if stored not in ('verified', 'non_verified', 'unlisted'):
+                # A refused row does not carry the loader's label. The words still
+                # come from the installer's map for these manifest bytes, not from
+                # the plugin. The last phrase on the row is the one the page draws.
+                stored = None
+                source = record.get('source')
+                if labels and isinstance(source, str):
+                    try:
+                        manifest = _read_owned(Path(source) / MANIFEST, MAX_MANIFEST_BYTES)
+                    except PluginRefused:
+                        manifest = None
+                    if manifest is not None:
+                        stored = labels.get(hashlib.sha256(manifest).hexdigest())
+            if stored == 'verified':
+                shown = 'verified'
+            elif stored == 'non_verified':
+                shown = 'non-verified'
+            else:
+                shown = 'unlisted'
+            note += '; registry label: %s; a label, not a gate' % shown
             rows.append({'id': 'plugin:' + _SAFE_ID.sub('_', name)[:80], 'class': 'plugin', 'sign_in': '',
                          'configured': record['state'] == 'loaded', 'maturity': 'beta', 'beta': True, 'bars': {},
                          'blocker': note})

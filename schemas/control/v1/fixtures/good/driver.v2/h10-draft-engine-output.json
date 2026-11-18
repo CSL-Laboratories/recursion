@@ -1,0 +1,9 @@
+{
+  "type": "engine.output",
+  "payload": {
+    "stream": "stdout",
+    "text": "ok\n",
+    "offset_start": 0,
+    "offset_end": 3
+  }
+}

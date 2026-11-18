@@ -1,0 +1,8 @@
+{
+  "tool": "Bash",
+  "cwd": null,
+  "input_text": "{\"\\udc00\": 1}",
+  "expect": {
+    "refused": "lone_surrogate"
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "method": "route.explain",
+  "params": {
+    "hand_pick": {
+      "engine": "codex",
+      "model": null
+    },
+    "task_kind": "code_edit"
+  },
+  "answer": {
+    "code": "ok",
+    "decision": {
+      "chosen": {
+        "engine": "claude_code",
+        "model": "claude-sonnet-5-5",
+        "connection": {
+          "kind": "subscription",
+          "id": "personal-max"
+        }
+      },
+      "reason": "config",
+      "candidates": [
+        {
+          "engine": "codex",
+          "model": null,
+          "skipped": "breaker_open"
+        },
+        {
+          "engine": "claude_code",
+          "model": "claude-sonnet-5-5",
+          "skipped": null
+        }
+      ],
+      "hand_pick": null
+    },
+    "x-nobody-defined-this": true
+  }
+}

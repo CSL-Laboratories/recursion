@@ -1,0 +1,12 @@
+{
+  "answer": {
+    "code": "stopped",
+    "repeat": true,
+    "run_id": "run-fd416edb7381434a8f809a30a2800e94",
+    "state": "stopped"
+  },
+  "method": "run.stop",
+  "params": {
+    "run_id": "run-fd416edb7381434a8f809a30a2800e94"
+  }
+}

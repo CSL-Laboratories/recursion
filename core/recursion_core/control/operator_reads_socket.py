@@ -85,6 +85,19 @@ _REFUSAL_MAX_BYTES = 16384
 _LOCK_ATTEMPTS = 3
 
 
+def _frame_code(data: bytes) -> str | None:
+    """The ``code`` of one JSON line, or None when the line is not that shape."""
+
+    try:
+        body = json.loads(data)
+    except (ValueError, UnicodeError):
+        return None
+    if type(body) is not dict:
+        return None
+    code = body.get("code")
+    return code if type(code) is str else None
+
+
 class PlatformNotSupported(RuntimeError):
     """This platform lacks AF_UNIX, SO_PEERCRED or uids, so the owner-only rule cannot be enforced."""
 
@@ -413,8 +426,10 @@ class OperatorReadsServer:
         """
         profile = None if code == PEER_REFUSED else self._reads.profile
         data = self._encode(refusal(code, profile=profile))
-        if len(data) > _REFUSAL_MAX_BYTES:
-            # One non-blocking send must carry the refusal whole; a host profile too large for that is left out.
+        # One non-blocking send must carry the original code whole. A host profile too large for that
+        # send is left out. A profile large enough that the reply cap substitutes a short
+        # reply_too_large is left out the same way, and the original code is what is written.
+        if len(data) > _REFUSAL_MAX_BYTES or _frame_code(data) != code:
             data = self._encode(refusal(code, profile=None))
         try:
             conn.setblocking(False)
@@ -479,7 +494,10 @@ class OperatorReadsServer:
         except (TypeError, ValueError, RecursionError):
             data = b""
         if not data or len(data) > MAX_REPLY_BYTES:
+            # The host profile that made the answer too large must not ride along in the fallback.
             data = json.dumps(self._refuse(REPLY_TOO_LARGE), separators=(",", ":")).encode("ascii") + b"\n"
+            if len(data) > MAX_REPLY_BYTES:
+                data = json.dumps(refusal(REPLY_TOO_LARGE), separators=(",", ":")).encode("ascii") + b"\n"
         return data
 
 
@@ -529,7 +547,8 @@ class OperatorReadsClient:
                 conn.connect(path)
                 if _peer_uid(conn) != uid:
                     return _local(CONTROL_API_UNAVAILABLE, False, "server_not_this_user")
-            except (OSError, ValueError, TypeError, struct.error) as exc:
+            except (OSError, ValueError, TypeError, struct.error, OverflowError) as exc:
+                # settimeout can raise OverflowError before connect. Nothing was contacted.
                 return _local(CONTROL_API_UNAVAILABLE, False, f"connect_failed: {type(exc).__name__}")
             try:
                 conn.sendall(line)
@@ -540,11 +559,13 @@ class OperatorReadsClient:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return _local(CONTROL_API_UNAVAILABLE, "unknown", "reply_timeout")
-                if len(buf) > MAX_REPLY_BYTES:
+                # A buffer already at the cap has no room for the newline that would finish a legal reply.
+                if len(buf) >= MAX_REPLY_BYTES:
                     return _local(CONTROL_API_UNAVAILABLE, "unknown", "reply_too_large")
                 conn.settimeout(remaining)
                 try:
-                    chunk = conn.recv(65536)
+                    room = MAX_REPLY_BYTES + 1 - len(buf)
+                    chunk = conn.recv(min(65536, room))
                 except TimeoutError:
                     return _local(CONTROL_API_UNAVAILABLE, "unknown", "reply_timeout")
                 except OSError:
@@ -552,6 +573,12 @@ class OperatorReadsClient:
                 if not chunk:
                     return _local(CONTROL_API_UNAVAILABLE, "unknown", "no_complete_reply")
                 buf += chunk
+                # The recv that carries the newline is held to the same cap. Count through the newline,
+                # so bytes after a short line in the same chunk are not part of the frame.
+                cut = buf.find(b"\n")
+                measured = (cut + 1) if cut >= 0 else len(buf)
+                if measured > MAX_REPLY_BYTES:
+                    return _local(CONTROL_API_UNAVAILABLE, "unknown", "reply_too_large")
         finally:
             conn.close()
         try:

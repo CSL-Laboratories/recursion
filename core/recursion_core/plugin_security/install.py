@@ -27,11 +27,21 @@ link) must be a whole copy, file for file and byte for byte, of the entry of
 that name in one of the two generations the record names. One that is not
 refuses ``plugin_directory_untrusted`` with the steps that end the refusal, and
 nothing is moved or deleted. A plugin folder that holds anything its generation
-does not hold is not a whole copy. The swap moves each replaced entry into
+does not hold is not a whole copy, with one exception when no stopped publish is
+being finished: a folder of a plugin the current generation holds, whose own
+files are each that generation's copy byte for byte. Its other entries are moved
+into ``plugin-generations/.kept-<n>/<plugin_id>``, the command says in one line
+which plugin and where, and it goes on. The finishing of a stopped publish
+proves the live ``install.json`` too: it is replaced only when it is absent or
+byte for byte the copy of one of the two generations the record names; one
+changed by hand refuses with the steps that end the refusal. The swap moves each replaced entry into
 ``plugin-generations/.old``, proves it again there and only then removes it.
 An entry that is not proven there (one put in place between the check and the
 swap) is kept under ``plugin-generations/.kept-<n>``, and the command says
-where and exits non-zero. Mode bits are not part of the proof. Older
+where and exits non-zero. The swap of one name is two renames: an empty folder,
+or an ``install.json``, put at that name by another process between them is
+replaced; anything else there fails the rename and is left in place. Mode bits
+are not part of the proof. Older
 generations stay on disk so a later command can point ``current`` at one and
 publish it. This module does not do that. A generation that ``current`` does
 not name (a stop between its rename and the pointer) is left as it is; the next
@@ -43,9 +53,9 @@ reads and carries them unchanged into the next generation: a key or a grant
 taken out by hand stays out, and one put in by hand stays in. A plugin folder
 taken out by hand stays out. Once a generation is current, every live plugin
 folder must be the copy this module wrote there. A folder it did not write, or
-a folder whose name is not its manifest's plugin id, refuses
-``plugin_directory_untrusted``, names the folder and the id and says the steps
-that end the refusal; nothing is written and nothing is renamed.
+a folder whose name is not its manifest's plugin id, or a link under a plugin's
+name, refuses ``plugin_directory_untrusted``, names the folder and the id and
+says the steps that end the refusal; nothing is written and nothing is renamed.
 
 Every check of the live ``plugins/`` path runs before a generation is written,
 so a refused command leaves ``current`` and the generations as they were. The
@@ -215,8 +225,10 @@ def remove_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLi
         grants.pop(plugin_id, None)
         kept = Snapshot(snapshot.trusted_keys, grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
                         _labels_for(snapshot.labels, plugins), plugins, snapshot.developer_key_ids)
-        generation = _commit(config_path, kept)
-        return {"command": "remove", "plugin_id": plugin_id, "generation": generation, "plugins": _rows(kept)}
+        notes = []
+        generation = _commit(config_path, kept, notes)
+        result = {"command": "remove", "plugin_id": plugin_id, "generation": generation, "plugins": _rows(kept)}
+        return _with_notes(result, notes)
     finally:
         os.close(fd)
 
@@ -281,10 +293,11 @@ def _install_locked(config: Path, chosen, plugin_id: str, state) -> dict:
     labels[hashlib.sha256(chosen.manifest).hexdigest()] = chosen.label
     updated = Snapshot(dict(snapshot.trusted_keys), grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
                        labels, plugins, snapshot.developer_key_ids)
-    generation = _commit(config, updated)
+    notes = []
+    generation = _commit(config, updated, notes)
     # What the written install.json gives this plugin, as the loader's admit step computed it from those grants.
     effective = next((item["detail"] for item in findings if item.get("code") == "effective_permissions"), "")
-    return {
+    return _with_notes({
         "command": "install",
         "plugin_id": manifest.plugin_id,
         "version": manifest.version,
@@ -298,7 +311,14 @@ def _install_locked(config: Path, chosen, plugin_id: str, state) -> dict:
         "developer_checks": list(_DEVELOPER_CHECKS),
         "findings": findings,
         "requested_permissions": list(manifest.permissions),
-    }
+    }, notes)
+
+
+def _with_notes(result: dict, notes: list) -> dict:
+    """``kept``: one line for each plugin whose extra entries the command kept aside. Absent when none."""
+    if notes:
+        result["kept"] = list(notes)
+    return result
 
 
 def _admit(snapshot: Snapshot, manifest, signature_text, artifact: bytes, label: str, state):
@@ -421,26 +441,44 @@ def _finish_publish(config: Path) -> None:
         sources = [root / str(number) for number in (publishing, replaced) if number is not None]
         published = sources[0]
         staged = set(os.listdir(published)) if os.path.isdir(published) else set()
+        _check_install_file(config, sources)
         _check_publish(config, sources, staged - _PROFILE_NAMES)
         kept = _copy_generation_to_live(config, publishing, sources)
     _clear_marker(root)
     _refuse_kept(kept)
 
 
+def _check_install_file(config: Path, sources: list) -> None:
+    """Before a stopped publish is finished: the live install.json is absent or one of ``sources``' copies."""
+    path = config / "plugins" / "install.json"
+    copies = [source / "install.json" for source in sources]
+    if not _lexists(path) or any(_same_tree(path, copy) for copy in copies):
+        return
+    if len(copies) == 1:
+        where = f"The copy it recorded is {copies[0]}. Save the changed file elsewhere and put that copy in its place"
+    else:
+        where = (f"The two copies it recorded are {copies[0]} and {copies[1]}. Save the changed file elsewhere "
+                 f"and put either copy in its place")
+    raise InstallRefused("plugin_directory_untrusted", detail=(f"The file {path} was changed after a command "
+                                                               f"stopped part way. {where}; then run the command "
+                                                               f"again."), show_detail=True)
+
+
 def _read_record(config: Path):
-    """The ``.publishing`` record. One this command cannot read refuses with the steps that end the refusal."""
+    """The ``.publishing`` record. One this command cannot read, or a link, refuses with the steps that end it."""
+    path = config / "plugin-generations" / _PUBLISHING
     try:
         return _read_pointer(config, _PUBLISHING, _RECORD)
     except InstallRefused as exc:
-        if exc.code not in ("generation_unreadable", "plugin_file_untrusted", "plugin_file_too_large"):
+        link = exc.code == "plugin_directory_untrusted" and _owned_dir(path.parent) and path.is_symlink()
+        if not link and exc.code not in ("generation_unreadable", "plugin_file_untrusted", "plugin_file_too_large"):
             raise
-        path = config / "plugin-generations" / _PUBLISHING
         raise InstallRefused(exc.code, detail=(f"The file {path} is not a publish record this command wrote. "
                                                f"Move it out of {path.parent}; then run the command again."),
                              show_detail=True) from None
 
 
-def _check_publish(config: Path, sources: list, staged: set) -> None:
+def _check_publish(config: Path, sources: list, staged: set, installed: Path | None = None) -> list:
     """Before a publish changes the live tree, prove every live entry the swap would move is the installer's.
 
     The swap moves every live entry under a name the generation writes, of any kind, and every folder and
@@ -449,10 +487,15 @@ def _check_publish(config: Path, sources: list, staged: set) -> None:
     folder that holds anything more, a file, a link or a FIFO is not: the command refuses with the steps
     that end the refusal and nothing is moved or deleted. Nothing here opens an entry that is not a
     regular file.
+
+    ``installed`` is the current generation when no stopped publish is being finished. A folder of a
+    plugin it holds, whose own files are each its copy byte for byte, does not refuse for entries it holds
+    besides them: those are returned, as (plugin id, extra names), for the caller to keep aside.
     """
     live = config / "plugins"
+    extras = []
     if not _lexists(live):
-        return
+        return extras
     for name in sorted(os.listdir(live)):
         if name == "install.json":
             continue
@@ -460,15 +503,70 @@ def _check_publish(config: Path, sources: list, staged: set) -> None:
         info = os.lstat(path)
         if name not in staged and not (stat.S_ISLNK(info.st_mode) or stat.S_ISDIR(info.st_mode)):
             continue  # the swap leaves it where it is
-        if not any(_same_tree(path, source / name) for source in sources):
+        if any(_same_tree(path, source / name) for source in sources):
+            continue
+        more = _extra_entries(path, installed / name) if installed is not None else None
+        if not more:
             raise _way_out(path)
+        extras.append((name, more))
+    return extras
 
 
-def _refuse_kept(kept: list) -> None:
+def _extra_entries(live: Path, written: Path) -> list | None:
+    """The names in the live folder ``live`` that ``written`` does not hold, when every entry of ``written``
+    is in ``live`` byte for byte; None when one is changed or missing, or either is not a folder."""
+    try:
+        seen, kept = os.lstat(live), os.lstat(written)
+    except FileNotFoundError:
+        return None
+    if not (stat.S_ISDIR(seen.st_mode) and stat.S_ISDIR(kept.st_mode)):
+        return None
+    own, names = set(os.listdir(written)), set(os.listdir(live))
+    if not own <= names or not all(_same_tree(live / name, written / name) for name in sorted(own)):
+        return None
+    return sorted(names - own) or None
+
+
+def _keep_extras(config: Path, number: int, extras: list) -> list:
+    """Move each extra entry into ``plugin-generations/.kept-<number>/<plugin id>``. One line for each plugin."""
+    if not extras:
+        return []
+    root = config / "plugin-generations"
+    place = _kept_place(root, number)
+    place.mkdir(mode=0o700)
+    os.chmod(place, 0o700)
+    notes = []
+    for name, more in extras:
+        folder = config / "plugins" / name
+        kept = place / name
+        kept.mkdir(mode=0o700)
+        os.chmod(kept, 0o700)
+        for entry in more:
+            os.rename(folder / entry, kept / entry)
+        _sync_dir(kept)
+        _sync_dir(folder)
+        notes.append(f"The folder {folder} held entries the plugin {name} was not installed with: "
+                     f"they are kept at {kept}.")
+    _sync_dir(place)
+    _sync_dir(root)
+    return notes
+
+
+def _kept_place(root: Path, generation: int) -> Path:
+    """``root/.kept-<generation>``, or the first free ``-<k>`` after it. No command removes one."""
+    place = root / f".kept-{generation}"
+    count = 1
+    while _lexists(place):
+        count += 1
+        place = root / f".kept-{generation}-{count}"
+    return place
+
+
+def _refuse_kept(kept: list, notes: list = ()) -> None:
     """After a publish: say, in one line, where each entry the swap could not prove again is kept."""
     if kept:
-        detail = " ".join(f"{live} was put in place while this command ran and was not deleted: it is kept at "
-                          f"{place}. Move it back or delete it yourself." for live, place in kept)
+        detail = " ".join([*notes, *(f"{live} was put in place while this command ran and was not deleted: it is "
+                                     f"kept at {place}. Move it back or delete it yourself." for live, place in kept)])
         raise InstallRefused("plugin_directory_untrusted", detail=detail, show_detail=True)
 
 
@@ -537,7 +635,7 @@ def _read_pointer(config: Path, name: str, form: re.Pattern):
     return match
 
 
-def _commit(config: Path, snapshot: Snapshot) -> int:
+def _commit(config: Path, snapshot: Snapshot, notes: list | None = None) -> int:
     # The live plugins/ path is checked before any generation is written or the pointer moves.
     _check_live(config)
     root = config / "plugin-generations"
@@ -560,7 +658,12 @@ def _commit(config: Path, snapshot: Snapshot) -> int:
         _write_profile(partial, snapshot)
         # Every live entry the swap would move is proven the installer's before anything is published.
         sources = [partial] + ([root / str(current)] if current is not None else [])
-        _check_publish(config, sources, set(snapshot.plugins))
+        installed = root / str(current) if current is not None else None
+        extras = _check_publish(config, sources, set(snapshot.plugins), installed)
+        # Extra entries of a proven installed plugin folder are kept aside, never deleted, and named.
+        lines = _keep_extras(config, number, extras)
+        if notes is not None:
+            notes.extend(lines)
         # The record names this generation and the one it replaces, synced before any live folder changes.
         record = f"{number}\n" if current is None else f"{number}\n{current}\n"
         _atomic_replace(root, _PUBLISHING, record.encode("ascii"))
@@ -575,7 +678,7 @@ def _commit(config: Path, snapshot: Snapshot) -> int:
         if _lexists(partial) and not _lexists(dest):
             _remove_at(partial)
         raise
-    _refuse_kept(kept)
+    _refuse_kept(kept, lines)
     return number
 
 
@@ -667,11 +770,7 @@ def _settle(config: Path, old: Path, sources: list, generation: int) -> list:
     if not kept:
         os.rmdir(old)
         return []
-    place = old.parent / f".kept-{generation}"
-    count = 1
-    while _lexists(place):
-        count += 1
-        place = old.parent / f".kept-{generation}-{count}"
+    place = _kept_place(old.parent, generation)
     _sync_tree(old)
     os.rename(old, place)
     _sync_dir(old.parent)
@@ -794,6 +893,8 @@ def _read_profile(directory: Path, *, missing_install_ok: bool, written: dict | 
         path = directory / name
         info = os.lstat(path)
         if stat.S_ISLNK(info.st_mode):
+            if missing_install_ok:
+                raise _way_out(path)
             raise InstallRefused("plugin_directory_untrusted")
         if not stat.S_ISDIR(info.st_mode):
             continue
@@ -1023,6 +1124,14 @@ def _require_owned_dir(path: Path, code: str = "plugin_directory_untrusted") -> 
         raise InstallRefused(code)
     if info.st_uid != os.geteuid() or info.st_mode & 0o022:
         raise InstallRefused(code)
+
+
+def _owned_dir(path: Path) -> bool:
+    try:
+        _require_owned_dir(path)
+    except InstallRefused:
+        return False
+    return True
 
 
 def _remove_at(path: Path) -> None:

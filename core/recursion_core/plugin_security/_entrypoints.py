@@ -2,8 +2,10 @@
 
 The program name is ``recursion``. A refusal prints ``refused: CODE`` on stderr
 and returns 1; a refusal that says how to end it prints that sentence on the
-next line. A read or write the system refuses (a full or read-only disk, no
-permission, a path that is not a folder) prints ``refused: filesystem_refused``
+next line. A command that completes after keeping a plugin's extra entries aside
+prints one line on stderr for each plugin, saying which and where. A read or
+write the system refuses (a full or read-only disk, no permission, a path that
+is not a folder) prints ``refused: filesystem_refused``
 and the system's message, with no traceback, and returns 1. A usage error
 returns 2. Nothing here fetches.
 """
@@ -105,5 +107,7 @@ def main(argv: list[str] | None = None, out=None, err=None) -> int:
         err.write("refused: filesystem_refused\n")
         err.write(f"The system refused a file read or write: {exc}\n")
         return 1
+    for line in result.get("kept", ()):
+        err.write(f"{line}\n")
     out.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return 0

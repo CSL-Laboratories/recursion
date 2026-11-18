@@ -4,16 +4,25 @@
 proven byte for byte equal to its copy in one of the two generations the record names: a folder, a regular
 file, a link, a FIFO, any kind of entry under a published name. An entry that is not proven is never
 removed: the command refuses ``plugin_directory_untrusted`` with the way out, and nothing is moved.
-(B) The same for a publish that runs to its end: a live plugin folder that holds anything its generation
-does not hold (a settings file, a data folder) refuses with the way out; nothing is deleted.
+(B) The same for a publish that runs to its end, with one exception (slice 6): an installed plugin's folder
+whose own files are each its generation's copy byte for byte, and which holds more (a settings file, a data
+folder), does not refuse. The extra entries are moved into a kept place under ``plugin-generations``, the
+command names the plugin and the place in one line, and install, update and remove complete. A folder with a
+changed or missing file of its own, a folder no install wrote, and every case while a stopped publish is being
+finished, refuse with the way out; nothing is deleted.
 (C) A replaced entry is moved into a place of the publish's own under ``plugin-generations``, proven again
 there and only then removed. What was put in its place between the check and the swap stays there: the
 command says where in one line and exits non-zero.
 (D) A file the installer reads that is not a regular file refuses without an open that can block.
-(E) A broken, cut or empty ``.publishing`` record refuses with the way out printed.
+(E) A broken, cut or empty ``.publishing`` record refuses with the way out printed; so does a record that is a
+link, and a link under a plugin's name in the live tree with no stopped publish (slice 6).
+(F, slice 6) After a publish that stopped, the live ``install.json`` is replaced only when it is absent or byte
+for byte the copy of one of the two generations the record names. One changed by hand is never overwritten:
+every command refuses with the way out and changes nothing.
 """
 from __future__ import annotations
 
+import json
 import os
 import stat
 import threading
@@ -35,6 +44,20 @@ def _kept_at(path, kept):
 def _record_way_out(path):
     return (f"The file {path} is not a publish record this command wrote. "
             f"Move it out of {path.parent}; then run the command again.")
+
+
+def _install_file_way_out(path, copies):
+    if len(copies) == 1:
+        where = f"The copy it recorded is {copies[0]}. Save the changed file elsewhere and put that copy in its place"
+    else:
+        where = (f"The two copies it recorded are {copies[0]} and {copies[1]}. Save the changed file elsewhere "
+                 f"and put either copy in its place")
+    return f"The file {path} was changed after a command stopped part way. {where}; then run the command again."
+
+
+def _extras_kept(folder, plugin_id, kept):
+    return (f"The folder {folder} held entries the plugin {plugin_id} was not installed with: "
+            f"they are kept at {kept}.")
 
 
 def entries(path):
@@ -191,7 +214,7 @@ class EveryKindUnderAPublishedNameTests(_Case):
 
 
 class ExtraInAPluginFolderTests(_Case):
-    """(B, the owner's point) A publish that runs to its end never deletes what a user keeps in a plugin folder."""
+    """(B) A publish that runs to its end never deletes what a user keeps in a plugin folder: it keeps it aside."""
 
     EXTRAS = {
         "settings": {"settings.json": b"{}\n"},
@@ -199,25 +222,118 @@ class ExtraInAPluginFolderTests(_Case):
         "empty folder": {"empty/": None},
     }
 
-    def test_a_plugin_folder_holding_more_than_its_generation_refuses_install_and_remove_with_the_way_out(self):
+    def _with_extras(self, extra):
+        folder = self.live() / "fixture.unsigned"
+        for name, data in extra.items():
+            if data is None:
+                (folder / name).mkdir(mode=0o700)
+                continue
+            (folder / name).parent.mkdir(mode=0o700, exist_ok=True)
+            (folder / name).write_bytes(data)
+            os.chmod(folder / name, 0o600)
+        return folder
+
+    def _kept_places(self):
+        return [path for path in sorted(self.gens().iterdir()) if path.name.startswith(".kept-")]
+
+    def test_extra_entries_in_a_proven_plugin_folder_are_kept_aside_and_install_update_and_remove_complete(self):
+        # Slice 6 (order lines 239-240): this replaces slice 5's refusal of install and remove.
+        argvs = {
+            "install": lambda: self.argv("install", self.roots["beta"], "fixture.beta"),
+            "update": lambda: self.argv("install", self.roots["new"]),
+            "remove": lambda: self.argv("remove"),
+        }
+        listed = {"install": ["fixture.beta", "fixture.unsigned"], "update": ["fixture.unsigned"], "remove": []}
         for kind, extra in self.EXTRAS.items():
-            with self.subTest(kind=kind):
-                self.use(f"extra-{kind.replace(' ', '-')}")
-                self.install_from(self.roots["a"])
-                folder = self.live() / "fixture.unsigned"
-                for name, data in extra.items():
-                    if data is None:
-                        (folder / name).mkdir(mode=0o700)
-                        continue
-                    (folder / name).parent.mkdir(mode=0o700, exist_ok=True)
-                    (folder / name).write_bytes(data)
-                    os.chmod(folder / name, 0o600)
-                # install of another plugin, remove of this one and of another: each would replace the folder.
-                self.refused_keeping(_move_out(folder), folder, commands=("install", "remove"))
-                self.assertEqual(["fixture.unsigned"], self.listed_ids())
-                os.rename(folder, self.tmp / f"mine-{kind.replace(' ', '-')}")
-                self.install_from(self.roots["beta"], "fixture.beta")
-                self.assertEqual(["fixture.beta"], self.listed_ids())
+            for command, argv in argvs.items():
+                with self.subTest(kind=kind, command=command):
+                    self.use(f"extra-{kind.replace(' ', '-')}-{command}")
+                    self.install_from(self.roots["a"])
+                    folder = self._with_extras(extra)
+                    own = entries(self.gens() / "1" / "fixture.unsigned")
+                    mine = {name: kept for name, kept in entries(folder).items() if name not in own}
+                    status, err, out = self.main(argv())
+                    places = self._kept_places()
+                    self.assertEqual(1, len(places))
+                    kept = places[0] / "fixture.unsigned"
+                    line = _extras_kept(folder, "fixture.unsigned", kept)
+                    self.assertEqual((0, f"{line}\n"), (status, err))
+                    self.assertEqual([line], json.loads(out)["kept"])
+                    self.assertEqual({".": ("dir",), **mine}, entries(kept))
+                    self.assertEqual("2\n", self.current())
+                    self.assertEqual(entries(self.gens() / "2"), entries(self.live()))
+                    self.assertFalse(os.path.lexists(self.gens() / ".publishing"))
+                    self.assertEqual(listed[command], self.listed_ids())
+
+    def test_remove_returns_the_kept_place_and_a_command_with_nothing_kept_says_nothing(self):
+        self.install_from(self.roots["a"])
+        result = self.install_from(self.roots["beta"], "fixture.beta")
+        self.assertNotIn("kept", result)
+        folder = self._with_extras({"settings.json": b"{}\n"})
+        result = self.remove("fixture.unsigned")
+        kept = self._kept_places()[0] / "fixture.unsigned"
+        self.assertEqual([_extras_kept(folder, "fixture.unsigned", kept)], result["kept"])
+        self.assertEqual({".": ("dir",), "./settings.json": ("file", b"{}\n")}, entries(kept))
+        self.assertEqual((0, ""), self.main(self.argv("remove", plugin_id="fixture.beta"))[:2])
+        self.assertEqual([], self.listed_ids())
+
+    def test_extra_entries_while_a_stopped_publish_is_finished_still_refuse_with_the_way_out(self):
+        for stop in ("before the swap", "with the live tree whole"):
+            with self.subTest(stop=stop):
+                self.use(f"extra-stop-{stop[:6]}")
+                if stop == "before the swap":
+                    self.stopped_before_the_swap()
+                else:
+                    self.stopped_with_live_whole()
+                folder = self._with_extras({"settings.json": b"{}\n"})
+                self.refused_keeping(_move_out(folder), folder)
+                self.assertEqual([], self._kept_places())
+                self.assertTrue(os.path.lexists(self.gens() / ".publishing"))
+
+    def test_a_command_that_keeps_extra_entries_and_meets_a_folder_put_in_place_names_both(self):
+        from recursion_core.plugin_security import install as install_mod
+
+        self.install_from(self.roots["a"])
+        folder = self._with_extras({"settings.json": b"{}\n"})
+        hand = self.live() / "hand.made"
+        real = install_mod._swap_into
+
+        def swap(plugins, stage, old):
+            hand.mkdir(mode=0o700)
+            (hand / "notes.txt").write_bytes(b"mine\n")
+            return real(plugins, stage, old)
+
+        install_mod._swap_into = swap
+        self.addCleanup(setattr, install_mod, "_swap_into", real)
+        refusal = self.refused(lambda: self.install_from(self.roots["beta"], "fixture.beta"))
+        extras_place, hand_place = self._kept_places()
+        line = _extras_kept(folder, "fixture.unsigned", extras_place / "fixture.unsigned")
+        self.assertEqual(("plugin_directory_untrusted", f"{line} {_kept_at(hand, hand_place / 'hand.made')}"),
+                         (refusal.code, refusal.detail))
+        self.assertEqual(("file", b"{}\n"), entries(extras_place / "fixture.unsigned")["./settings.json"])
+        self.assertEqual(("file", b"mine\n"), entries(hand_place / "hand.made")["./notes.txt"])
+        self.assertEqual(entries(self.gens() / "2"), entries(self.live()))
+
+    def test_an_own_file_changed_after_the_folder_was_read_refuses_and_nothing_is_moved(self):
+        from recursion_core.plugin_security import install as install_mod
+
+        self.install_from(self.roots["a"])
+        folder = self._with_extras({"settings.json": b"{}\n"})
+        real = install_mod._write_profile
+
+        def write(directory, snapshot):
+            real(directory, snapshot)
+            if directory.name.startswith(".partial-"):
+                (folder / "plugin.py").write_bytes(b"CHANGED = True\n")
+
+        install_mod._write_profile = write
+        self.addCleanup(setattr, install_mod, "_write_profile", real)
+        refusal = self.refused(lambda: self.remove("fixture.unsigned"))
+        held = entries(folder)
+        self.assertEqual(("plugin_directory_untrusted", _move_out(folder)), (refusal.code, refusal.detail))
+        self.assertEqual(("file", b"{}\n"), held["./settings.json"])
+        self.assertEqual([], self._kept_places())
+        self.assertEqual("1\n", self.current())
 
     def test_a_folder_with_more_than_its_generation_placed_before_the_first_install_is_kept(self):
         self.write_live({})
@@ -437,6 +553,104 @@ class BrokenRecordTests(_Case):
         done = self._within(self.listed)
         self.assertEqual(("plugin_file_untrusted", _record_way_out(record)),
                          (done["error"].code, done["error"].detail))
+
+
+class InstallFileProvenTests(_Case):
+    """(F) After a stopped publish, a live install.json changed by hand is never overwritten."""
+
+    def _stop(self, stop):
+        if stop == "before the swap":
+            self.stopped_before_the_swap()
+        else:
+            self.stopped_with_live_whole()
+
+    def test_a_hand_edit_of_the_live_install_file_after_a_stopped_publish_refuses_and_is_kept(self):
+        for stop in ("before the swap", "with the live tree whole"):
+            with self.subTest(stop=stop):
+                self.use(f"install-file-{stop[:6]}")
+                self._stop(stop)
+                path = self.live() / "install.json"
+                data = self.read_live()
+                data["reserved"]["hosts"].append("mine.example")
+                self.write_live(data)
+                mine = path.read_bytes()
+                copies = [self.gens() / "2" / "install.json", self.gens() / "1" / "install.json"]
+                self.refused_keeping(_install_file_way_out(path, copies), path)
+                self.assertTrue(os.path.lexists(self.gens() / ".publishing"))
+                # The way out: the changed file saved elsewhere, either recorded copy in its place.
+                saved = self.tmp / f"saved-{stop[:6]}"
+                os.rename(path, saved)
+                path.write_bytes(copies[1 if stop == "before the swap" else 0].read_bytes())
+                os.chmod(path, 0o600)
+                self.assertEqual(["fixture.beta", "fixture.unsigned"], self.listed_ids())
+                self.assertFalse(os.path.lexists(self.gens() / ".publishing"))
+                self.assertEqual(entries(self.gens() / "2"), entries(self.live()))
+                self.assertEqual(mine, saved.read_bytes())
+
+    def test_with_one_recorded_copy_the_way_out_names_that_copy(self):
+        from recursion_core.plugin_security import install as install_mod
+
+        self._fail_first_install(install_mod)
+        path = self.live() / "install.json"
+        data = self.read_live()
+        data["reserved"]["hosts"].append("mine.example")
+        self.write_live(data)
+        self.refused_keeping(_install_file_way_out(path, [self.gens() / "1" / "install.json"]), path)
+
+    def _fail_first_install(self, module):
+        real = module._clear_marker
+
+        def stop(*_args, **_kwargs):
+            raise OSError("stopped")
+
+        module._clear_marker = stop
+        try:
+            with self.assertRaises(OSError):
+                self.install_from(self.roots["a"])
+        finally:
+            module._clear_marker = real
+        self.assertEqual("1\n", (self.gens() / ".publishing").read_text())
+
+    def test_a_live_install_file_taken_out_after_a_stopped_publish_lets_the_publish_finish(self):
+        self.stopped_before_the_swap()
+        os.rename(self.live() / "install.json", self.tmp / "taken-out")
+        self.assertEqual(["fixture.beta", "fixture.unsigned"], self.listed_ids())
+        self.assertEqual(entries(self.gens() / "2"), entries(self.live()))
+
+
+class LinkWayOutTests(_Case):
+    """(E, slice 6) A link at the record, or under a plugin's name with no stopped publish, prints the way out."""
+
+    def test_a_record_that_is_a_link_refuses_in_every_command_with_the_way_out(self):
+        for index, target in enumerate(("a good record", "nothing")):
+            with self.subTest(target=target):
+                self.use(f"record-link-{index}")
+                self.stopped_before_the_swap()
+                record = self.gens() / ".publishing"
+                copy = self.tmp / f"record-copy-{index}"
+                if target == "a good record":
+                    copy.write_bytes(record.read_bytes())
+                os.unlink(record)
+                record.symlink_to(copy)
+                self.refused_keeping(_record_way_out(record), record)
+                os.rename(record, self.tmp / f"moved-record-link-{index}")
+                self.assertEqual(["fixture.unsigned"], self.listed_ids())
+
+    def test_a_link_under_a_plugin_name_with_no_stopped_publish_refuses_with_the_way_out(self):
+        for where in ("inside", "outside"):
+            with self.subTest(where=where):
+                self.use(f"live-link-{where}")
+                self.install_from(self.roots["a"])
+                target = (self.config if where == "inside" else self.tmp) / f"elsewhere-{where}"
+                target.mkdir(mode=0o700)
+                (target / "notes.txt").write_bytes(b"mine\n")
+                link = self.live() / "fixture.beta"
+                link.symlink_to(target, target_is_directory=True)
+                self.refused_keeping(_move_out(link), link)
+                os.rename(link, self.tmp / f"moved-link-{where}")
+                self.install_from(self.roots["beta"], "fixture.beta")
+                self.assertEqual(["fixture.beta", "fixture.unsigned"], self.listed_ids())
+                self.assertEqual(b"mine\n", (target / "notes.txt").read_bytes())
 
 
 if __name__ == "__main__":

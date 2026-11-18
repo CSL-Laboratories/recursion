@@ -140,6 +140,34 @@ class CgroupReadTests(unittest.TestCase):
             self.assertEqual(got[name]['certainty'], 'unknown', name)
             self.assertIsNone(got[name]['value'], name)
 
+    # The third commit (the read of bf71c0f0): a known figure never passes 2**64 - 1, and io.stat
+    # input a real kernel never writes reads as unknown rather than as a wrong known figure.
+    def io(self, text):
+        from recursion_core.measures import read_leaf
+        return by_name(read_leaf(self.leaf({'io.stat': text})))
+
+    def assert_io_unknown(self, text, names=('io.rbytes', 'io.wbytes')):
+        got = self.io(text)
+        for name in names:
+            self.assertEqual(got[name]['certainty'], 'unknown', name)
+            self.assertIsNone(got[name]['value'], name)
+
+    def test_an_io_stat_sum_past_two_to_the_sixty_four_reads_unknown(self):
+        top = 2 ** 64 - 1
+        self.assert_io_unknown(f'8:0 rbytes={top} wbytes=1\n259:0 rbytes=1 wbytes=1\n', ('io.rbytes',))
+        got = self.io(f'8:0 rbytes={top - 1} wbytes=1\n259:0 rbytes=1 wbytes=1\n')
+        self.assertEqual(got['io.rbytes']['value'], top)
+        self.assertEqual(got['io.wbytes']['value'], 2)
+
+    def test_an_io_stat_token_without_equals_makes_the_whole_file_unknown(self):
+        self.assert_io_unknown('8:0 rbytes=1 wbytes=2 dios\n')
+
+    def test_a_key_repeated_inside_one_io_stat_line_makes_the_file_unknown(self):
+        self.assert_io_unknown('8:0 rbytes=1 rbytes=5 wbytes=2\n')
+
+    def test_two_io_stat_lines_for_one_device_make_the_file_unknown(self):
+        self.assert_io_unknown('8:0 rbytes=1 wbytes=2\n8:0 rbytes=3 wbytes=4\n')
+
 
 class PayloadRefusalTests(unittest.TestCase):
     MEASURE = {'class': 'memory', 'name': 'memory.peak', 'value': 1, 'unit': 'bytes',
@@ -172,6 +200,29 @@ class PayloadRefusalTests(unittest.TestCase):
     def test_an_unknown_with_any_value_but_null_is_refused(self):
         self.refused(certainty='unknown', value=5)
         self.refused(certainty='unknown', value='unknown')
+
+    def test_a_known_number_above_two_to_the_sixty_four_minus_one_is_refused(self):
+        self.refused(value=2 ** 64)
+        self.refused(value=10 ** 5000)
+        self.refused(value=float(2 ** 65))
+
+    def test_a_missing_field_is_refused(self):
+        from recursion_core.measures import MeasureRefused, build_measure_payload
+        for field in self.MEASURE:
+            measure = {k: v for k, v in self.MEASURE.items() if k != field}
+            with self.assertRaises(MeasureRefused, msg=field):
+                build_measure_payload('run-1', '2026-11-17T20:30:00Z', [measure])
+
+    def test_an_extra_field_is_refused(self):
+        self.refused(note='extra')
+
+    def test_empty_strings_are_refused(self):
+        from recursion_core.measures import MeasureRefused, build_measure_payload
+        for field in ('class', 'name', 'unit'):
+            self.refused(**{field: ''})
+        for run_id, at in (('', '2026-11-17T20:30:00Z'), ('run-1', '')):
+            with self.assertRaises(MeasureRefused):
+                build_measure_payload(run_id, at, [dict(self.MEASURE)])
 
     def test_a_known_zero_and_a_finite_float_are_accepted(self):
         from recursion_core.measures import build_measure_payload

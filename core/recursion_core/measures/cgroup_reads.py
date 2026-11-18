@@ -79,29 +79,34 @@ def _io_sums(text):
 
     The kernel prints a line only for a device that did io, so a readable empty file means no
     device counted io for this leaf: a known 0 (block io only; page-cache hits are not counted).
-    A line whose first token is not MAJ:MIN, or a token without '=', makes the whole file
-    unknown; a device line without the key, or a bad value, makes that key unknown.
+    A line whose first token is not MAJ:MIN, a token without '=', a key repeated inside one
+    line, or a second line for the same device makes the whole file unknown: a real kernel
+    writes none of them, and a wrong known figure is worse than the word unknown. A device line
+    without the key, a bad value, or a sum past 2**64 - 1 makes that key unknown.
     """
     if text is None:
         return dict.fromkeys(IO_KEYS)
     sums = dict.fromkeys(IO_KEYS, 0)
+    devices = set()
     for line in text.splitlines():
         parts = line.split()
         if not parts:
             continue
-        if not DEVICE.fullmatch(parts[0]):
+        if not DEVICE.fullmatch(parts[0]) or parts[0] in devices:
             return dict.fromkeys(IO_KEYS)
+        devices.add(parts[0])
         fields = {}
         for token in parts[1:]:
             key, sep, value = token.partition('=')
-            if not sep:
+            if not sep or key in fields:
                 return dict.fromkeys(IO_KEYS)
             fields[key] = value
         for key in IO_KEYS:
             if sums[key] is None:
                 continue
             value = _count(fields.get(key, ''))
-            sums[key] = None if value is None else sums[key] + value
+            total = None if value is None else sums[key] + value
+            sums[key] = total if total is not None and total <= U64_MAX else None
     return sums
 
 

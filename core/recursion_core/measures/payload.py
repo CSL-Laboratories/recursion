@@ -1,13 +1,16 @@
 """The measure payload: run_id, at and a list of measures, each with class, name, value, unit,
 source (daemon, engine or estimate) and certainty (known or unknown).
 
-An unknown has value None, never 0; a known has a finite number of zero or more, never a bool
-(NaN, infinity and a negative number are refused). Anything else is refused. No event is written
-here and no schema is touched: the event type that will carry this payload is a later slice.
+An unknown has value None, never 0; a known has a finite number from 0 to 2**64 - 1, never a
+bool (NaN, infinity, a negative number and a larger one are refused). A measure has exactly the
+six fields, and run_id, at, class, name and unit are non-empty strings. Anything else is refused.
+No event is written here and no schema is touched: the event type that will carry this payload is
+a later slice.
 """
 import math
 import numbers
 
+U64_MAX = 2 ** 64 - 1  # no figure this payload carries can honestly be larger
 SOURCES = ('daemon', 'engine', 'estimate')
 CERTAINTIES = ('known', 'unknown')
 FIELDS = ('class', 'name', 'value', 'unit', 'source', 'certainty')
@@ -28,7 +31,7 @@ def _finite_non_negative(value):
         return False
     if not isinstance(value, numbers.Integral) and not math.isfinite(value):
         return False  # an int is always finite; math.isfinite would overflow on a huge one
-    return value >= 0
+    return 0 <= value <= U64_MAX
 
 
 def _checked(measure):

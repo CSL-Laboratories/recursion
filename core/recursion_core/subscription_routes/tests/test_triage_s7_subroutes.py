@@ -50,6 +50,7 @@ class _Base(unittest.TestCase):
         return {"PATH": "/usr/bin:/bin", "HOME": str(self.operator)}
 
 
+@unittest.skipIf(os.name == "nt", "Linux-only calls (os.geteuid, os.mkfifo, symlinks) and POSIX modes")
 class Policy(_Base):
     def chatgpt(self):
         return check_route("opencode", {"provider": "chatgpt", "auth": "subscription",
@@ -188,6 +189,7 @@ class Policy(_Base):
         self.assertEqual(caught.exception.cause, "own_store_too_large")
 
 
+@unittest.skipIf(os.name == "nt", "Linux-only calls (os.geteuid, os.mkfifo, symlinks) and POSIX modes")
 class WrapperPin(_Base):
     # SR-10: an unreadable package file escapes measurement/verification as PermissionError.
     def test_sr10_unreadable_file_is_a_refusal(self):

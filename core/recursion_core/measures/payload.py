@@ -1,14 +1,15 @@
 """The measure payload: run_id, at and a list of measures, each with class, name, value, unit,
 source (daemon, engine or estimate) and certainty (known or unknown).
 
-An unknown has value None, never 0; a known has a finite number from 0 to 2**64 - 1, never a
-bool (NaN, infinity, a negative number and a larger one are refused). A measure has exactly the
-six fields, and run_id, at, class, name and unit are non-empty strings. Anything else is refused.
+An unknown has value None, never 0; a known has an int or a finite float from 0 to 2**64 - 1,
+never a bool (NaN, infinity, a negative number, a larger one and any other number type, such as
+a Fraction or a Decimal, are refused), so every accepted value can be written as JSON. A measure
+has exactly the six fields, and run_id, at, class, name and unit are non-empty strings. Anything
+else is refused.
 No event is written here and no schema is touched: the event type that will carry this payload is
 a later slice.
 """
 import math
-import numbers
 
 U64_MAX = 2 ** 64 - 1  # no figure this payload carries can honestly be larger
 SOURCES = ('daemon', 'engine', 'estimate')
@@ -27,10 +28,12 @@ def _text(value, what):
 
 
 def _finite_non_negative(value):
-    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+    # Only an int or a float: JSON can write every one of them in range, and no other Real
+    # (a Fraction, say) reaches math.isfinite or the payload.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    if not isinstance(value, numbers.Integral) and not math.isfinite(value):
-        return False  # an int is always finite; math.isfinite would overflow on a huge one
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
     return 0 <= value <= U64_MAX
 
 

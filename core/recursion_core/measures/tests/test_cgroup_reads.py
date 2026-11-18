@@ -168,6 +168,28 @@ class CgroupReadTests(unittest.TestCase):
     def test_two_io_stat_lines_for_one_device_make_the_file_unknown(self):
         self.assert_io_unknown('8:0 rbytes=1 wbytes=2\n8:0 rbytes=3 wbytes=4\n')
 
+    # The fourth commit (the first read of a836b0b2): the 1 MiB bound and the cpu.stat rule each
+    # have a test that goes red when the rule is taken out.
+    def test_a_file_over_one_mib_reads_unknown(self):
+        from recursion_core.measures import read_leaf
+        from recursion_core.measures.cgroup_reads import MAX_BYTES
+        at_bound = '5' + ' ' * (MAX_BYTES - 1)
+        got = by_name(read_leaf(self.leaf({'memory.peak': at_bound})))['memory.peak']
+        self.assertEqual(got['value'], 5)
+        self.assertEqual(got['certainty'], 'known')
+        self.assert_memory_peak_unknown(at_bound + ' ')
+        line = '8:0 rbytes=1 wbytes=2\n'
+        self.assert_io_unknown(line + '\n' * (MAX_BYTES + 1 - len(line)))
+
+    def test_a_malformed_cpu_stat_line_makes_every_cpu_key_unknown(self):
+        from recursion_core.measures import read_leaf
+        for text in ('usage_usec 5\nuser_usec 1 x\nsystem_usec 1\n',
+                     'usage_usec 5\nuser_usec\nsystem_usec 1\n'):
+            got = by_name(read_leaf(self.leaf({'cpu.stat': text})))
+            for name in ('cpu.usage_usec', 'cpu.user_usec', 'cpu.system_usec'):
+                self.assertEqual(got[name]['certainty'], 'unknown', (text, name))
+                self.assertIsNone(got[name]['value'], (text, name))
+
 
 class PayloadRefusalTests(unittest.TestCase):
     MEASURE = {'class': 'memory', 'name': 'memory.peak', 'value': 1, 'unit': 'bytes',
@@ -230,6 +252,18 @@ class PayloadRefusalTests(unittest.TestCase):
             payload = build_measure_payload('run-1', '2026-11-17T20:30:00Z',
                                             [dict(self.MEASURE, value=value)])
             self.assertEqual(payload['measures'][0]['value'], value)
+
+    def test_a_known_that_json_cannot_write_is_refused_and_every_accepted_one_writes(self):
+        from decimal import Decimal
+        from fractions import Fraction
+        import json
+        for value in (Fraction(1, 3), Fraction(10 ** 400), Fraction(5), Decimal(1)):
+            self.refused(value=value)
+        from recursion_core.measures import build_measure_payload
+        for value in (0, 0.0, 2.5, 2 ** 64 - 1):
+            payload = build_measure_payload('run-1', '2026-11-17T20:30:00Z',
+                                            [dict(self.MEASURE, value=value)])
+            self.assertEqual(json.loads(json.dumps(payload, allow_nan=False)), payload)
 
 
 if __name__ == '__main__':

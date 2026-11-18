@@ -10,9 +10,12 @@ here reads ``os.environ`` or the process's home folder; the caller passes the ro
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import os
 import secrets
 import stat
+import sys
 from dataclasses import dataclass
 
 from .errors import InstallRefused
@@ -47,6 +50,21 @@ def owned_paths(roots: Roots) -> Owned:
     )
 
 
+def _refuse_without_geteuid() -> None:
+    """A platform with no ``os.geteuid`` cannot take the owner check.
+
+    ``install`` and ``upgrade`` answer this before they read or write a path. One line, and it names
+    the platform (``sys.platform``). The kind is the command family's ``platform_unsupported``.
+    """
+
+    if hasattr(os, "geteuid"):
+        return
+    raise InstallRefused(
+        "platform_unsupported",
+        f"the per-user installer needs os.geteuid, which {sys.platform} does not provide",
+    )
+
+
 def _directory_root(path: object) -> str:
     """The home, resolved, after checking that no other user can change what it names.
 
@@ -54,9 +72,10 @@ def _directory_root(path: object) -> str:
     ``_MAX_LINKS``): each must be root's or ours and not writable by group or world unless sticky,
     and each link on the way root's or ours (``folder_untrusted``). The home itself must be ours and
     not writable by group or world at all. The rule ``plugin_security.stores`` holds a store's
-    folders to.
+    folders to. Where ``os.geteuid`` is absent the walk is not started: ``platform_unsupported``.
     """
 
+    _refuse_without_geteuid()
     if type(path) is not str or not os.path.isabs(path):
         raise InstallRefused("relative_path", "a root is an absolute path")
     trusted = (0, os.geteuid())
@@ -173,12 +192,43 @@ def read_regular(path: str) -> bytes:
     the type check after it instead of holding the command at the open. Regular files ignore the flag.
     """
 
+    return read_regular_and_stat(path)[0]
+
+
+def read_regular_and_stat(path: str) -> tuple[bytes, os.stat_result]:
+    """``read_regular``, with the ``fstat`` of the descriptor the bytes were read through: the owner
+    and mode of the very file that was read. Before that descriptor is closed the path is looked up
+    again and must still name the file read (``still_names``): while the descriptor is open its inode
+    cannot be given to another file, so the comparison holds (after the close, a file made again at
+    the path could take the freed number). A file not there at the open is ``unit_missing`` (the
+    installer's code, as for every refusal here), not a file of the wrong type. The ``fstat`` returned
+    is for ``file_untrusted``; a caller that must compare the path again uses ``held_regular``."""
+
+    with held_regular(path) as read:
+        return read
+
+
+@contextlib.contextmanager
+def held_regular(path: str):
+    """``read_regular_and_stat``'s read, yielding ``(bytes, fstat)`` with the descriptor still open, after
+    ``still_names`` has passed. What the caller then does by name inside the block (``uninstall`` removes
+    the unit) meets the file read unless another file was put at the name since that lookup: no
+    call by name can close that last window, which this keeps to the few statements in the block."""
+
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:  # not there (a concurrent uninstall removed it since the caller looked)
+        raise InstallRefused("unit_missing", f"{path} is not there; run the command again") from None
     except OSError as exc:
-        raise InstallRefused("not_regular", path) from exc
+        # A link at the name (O_NOFOLLOW) or a socket there (the non-blocking open takes a FIFO, not a
+        # socket) is the file's type; any other error (too many open files, an I/O error) is the error
+        # itself, which setup.run answers as filesystem_error with the error and the path.
+        if exc.errno in (errno.ELOOP, errno.ENXIO):
+            raise InstallRefused("not_regular", path) from exc
+        raise
     try:
-        if not _is_reg(os.fstat(fd).st_mode):
+        info = os.fstat(fd)
+        if not _is_reg(info.st_mode):
             raise InstallRefused("not_regular", path)
         chunks, size = [], 0
         while True:
@@ -189,17 +239,34 @@ def read_regular(path: str) -> bytes:
             if size > 1 << 20:
                 raise InstallRefused("too_large", path)
             chunks.append(block)
-        return b"".join(chunks)
+        still_names(path, info)  # while the descriptor is open: the inode is not free to be reused
+        yield b"".join(chunks), info
     finally:
         os.close(fd)
 
 
-def file_untrusted(path: str) -> str:
-    """Why another user could change the file at ``path``: it is another user's, or group or world can
-    write it. ``""`` when only we can. The folder rule above, held for a file this package accepts
-    as it is (the unit ``install`` finds already in place)."""
+def still_names(path: str, info: os.stat_result) -> None:
+    """Refuse unless ``path`` still names the file ``info`` describes (the same device and inode): removed
+    meanwhile (a concurrent ``uninstall``) is ``unit_missing``, replaced is ``unit_changed``; nothing is
+    written either way, and the command run again reads what is there then. Sound only while a
+    descriptor of that file is open, which is why ``held_regular`` calls it before the close."""
 
-    info = os.lstat(path)
+    try:
+        now = os.lstat(path)
+    except FileNotFoundError:
+        raise InstallRefused("unit_missing", f"{path} was removed while it was read; run the command again") from None
+    if (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
+        raise InstallRefused("unit_changed", f"{path} was replaced while it was read; run the command again")
+
+
+def file_untrusted(path: str, info: os.stat_result) -> str:
+    """Why another user could change the file ``info`` describes (take it from
+    ``read_regular_and_stat``, so it is the file that was read; ``path`` only names it): it is
+    another user's, or group or world can write it. ``""`` when only we can. The folder rule above,
+    held for a file this package accepts as it is (the unit ``install`` finds already in place). Owner
+    and mode bits only: POSIX ACLs are not read, as for the folders and the stores. No lookup, so it
+    raises nothing."""
+
     if info.st_uid != os.geteuid():
         return f"{path} is owned by another user"
     if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
@@ -221,9 +288,15 @@ def write_exclusive(path: str, data: bytes, mode: int) -> None:
 
 
 def replace_regular(path: str, data: bytes, mode: int) -> None:
-    """Replace a regular file with ``data``. A link at ``path`` is refused, not followed."""
+    """Replace a regular file with ``data``. One lookup decides: nothing there (a concurrent
+    ``uninstall``) is ``unit_missing``; a link (refused, not followed) or anything but a regular file
+    is ``not_regular``; a regular file is replaced (one removed after the lookup is written anew)."""
 
-    if os.path.islink(path) or not os.path.isfile(path):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        raise InstallRefused("unit_missing", f"{path} is not there; run the command again") from None
+    if not stat.S_ISREG(info.st_mode):
         raise InstallRefused("not_regular", path)
     tmp = _write_temp(path, data, mode)
     try:
@@ -235,13 +308,19 @@ def replace_regular(path: str, data: bytes, mode: int) -> None:
 
 
 def unlink_regular(path: str) -> bool:
-    """Remove the regular file at ``path``. Missing is not an error (False); a link or folder is refused."""
+    """Remove the regular file at ``path``. Missing is not an error (False), also when another caller
+    removed it between this function's one lookup and its unlink; a link or folder is refused."""
 
-    if not os.path.lexists(path):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
         return False
-    if os.path.islink(path) or not os.path.isfile(path):
+    if not stat.S_ISREG(info.st_mode):
         raise InstallRefused("not_regular", path)
-    os.unlink(path)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:  # removed by another caller since the lookup above
+        return False
     _fsync_dir(os.path.dirname(path))
     return True
 

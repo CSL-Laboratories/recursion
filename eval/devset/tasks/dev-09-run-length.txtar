@@ -1,0 +1,80 @@
+Dev task 09: run-length encoding and decoding.
+-- task.json --
+{"id": "dev-09-run-length", "cluster": "dev", "created_at": null,
+ "test_command": ["{python}", "-B", "-m", "unittest", "{hidden_modules}"],
+ "timeout_s": 900, "grading_timeout_s": 120}
+-- prompt.md --
+Implement `encode(text)` and `decode(text)` in `rle/codec.py`.
+
+- `encode("aaabcc")` is `"3a1b2c"`: each run of one character becomes its length followed by the character. Counts may be larger than 9 (`"12x"`).
+- `encode` raises `ValueError` if the text contains a decimal digit.
+- `decode` reverses `encode`, and raises `ValueError` on malformed input: a character with no count before it, a count of 0, or a count at the end with no character.
+- The empty string encodes and decodes to the empty string.
+-- start/rle/__init__.py --
+"""Run-length coding."""
+-- start/rle/codec.py --
+def encode(text):
+    raise NotImplementedError
+
+
+def decode(text):
+    raise NotImplementedError
+-- hidden/test_codec.py --
+import unittest
+
+from rle.codec import decode, encode
+
+
+class CodecTests(unittest.TestCase):
+    def test_encode(self):
+        self.assertEqual(encode("aaabcc"), "3a1b2c")
+        self.assertEqual(encode("x" * 12), "12x")
+
+    def test_decode(self):
+        self.assertEqual(decode("3a1b2c"), "aaabcc")
+        self.assertEqual(decode("12x"), "x" * 12)
+
+    def test_round_trip(self):
+        for text in ("", "a", "abba", "zzzzzzzzzzzzzzzzzzzzzzzz y", "  !!"):
+            self.assertEqual(decode(encode(text)), text)
+
+    def test_digits_refused(self):
+        with self.assertRaises(ValueError):
+            encode("a1")
+
+    def test_malformed(self):
+        for text in ("a", "3", "0a", "2a3"):
+            with self.assertRaises(ValueError):
+                decode(text)
+-- solution/rle/codec.py --
+import re
+
+_PAIR = re.compile(r"([1-9][0-9]*)(\D)", re.DOTALL)
+
+
+def encode(text):
+    if any(ch.isdecimal() for ch in text):
+        raise ValueError("text contains a digit")
+    out = []
+    i = 0
+    while i < len(text):
+        j = i
+        while j < len(text) and text[j] == text[i]:
+            j += 1
+        out.append(f"{j - i}{text[i]}")
+        i = j
+    return "".join(out)
+
+
+def decode(text):
+    out = []
+    pos = 0
+    while pos < len(text):
+        match = _PAIR.match(text, pos)
+        if not match:
+            raise ValueError(f"malformed at position {pos}: {text!r}")
+        out.append(match.group(2) * int(match.group(1)))
+        pos = match.end()
+    return "".join(out)
+-- standin.json --
+{"outcomes": ["solve", "solve", "solve", "solve", "give_up"]}

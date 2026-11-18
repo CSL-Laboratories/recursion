@@ -15,9 +15,9 @@ import os
 from dataclasses import dataclass
 
 from .errors import InstallRefused
-from .layout import (Owned, Roots, check_dirs, ensure_dir, file_untrusted, owned_paths, read_regular, replace_regular,
-                     unlink_regular, write_exclusive)
-from .unit import MARKER, UNIT_NAME, render_unit
+from .layout import (Owned, Roots, check_dirs, ensure_dir, file_untrusted, held_regular, owned_paths,
+                     read_regular_and_stat, replace_regular, unlink_regular, write_exclusive)
+from .unit import MARKER, UNIT_NAME, render_unit, state_elsewhere
 
 _UNIT_MODE = 0o644
 _DIR_MODE = 0o700
@@ -50,15 +50,18 @@ def plan_commands(action: str) -> tuple[tuple[str, ...], ...]:
 
 def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     """Write the unit. The same bytes already there change nothing; other bytes are refused, and so
-    is a unit another user could change (another user's, or writable by group or world)."""
+    is a unit another user could change (another user's, or writable by group or world). A platform
+    with no ``os.geteuid`` is refused ``platform_unsupported`` (one line naming the platform) before
+    any path is read or written."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args).encode()
     check_dirs(paths.home, paths.unit_dir)
     if os.path.lexists(paths.unit):
-        if read_regular(paths.unit) != unit:
+        current, info = read_regular_and_stat(paths.unit)  # the file read, checked against the path while open
+        if current != unit:
             raise InstallRefused("unit_differs", f"{paths.unit} holds another unit; `recursiond upgrade` replaces it")
-        why = file_untrusted(paths.unit)
+        why = file_untrusted(paths.unit, info)
         if why:
             raise InstallRefused("unit_untrusted", f"{why}; `recursiond upgrade` writes it again, ours and 0644")
         return _plan("install", False, paths)
@@ -69,32 +72,53 @@ def install(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
 
 def upgrade(roots: Roots, exec_args: tuple[str, ...]) -> Plan:
     """Rewrite the unit to what ``install`` would write now. A missing unit is refused. The same
-    bytes change nothing unless another user could change the file; then it is written again."""
+    bytes change nothing unless another user could change the file; then it is written again. A unit
+    whose daemon may keep its state in another folder (``state_elsewhere``: its own ``XDG_STATE_HOME``,
+    an ``EnvironmentFile``, the manager's value passed through) is refused ``unit_state_elsewhere``,
+    left as it is: replacing it would point the daemon at another state folder, without the revocations
+    and breaker trips kept in its own. A platform with no ``os.geteuid`` is refused
+    ``platform_unsupported`` (one line naming the platform) before any path is read or written."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args).encode()
     check_dirs(paths.home, paths.unit_dir)
     if not os.path.lexists(paths.unit):
         raise InstallRefused("unit_missing", f"no unit at {paths.unit}; `recursiond install` writes it")
-    if read_regular(paths.unit) == unit and not file_untrusted(paths.unit):
+    current, info = read_regular_and_stat(paths.unit)  # the file read, checked against the path while open
+    if current == unit and not file_untrusted(paths.unit, info):
         return _plan("upgrade", False, paths)
+    why = None if current == unit else state_elsewhere(current, paths.home)
+    if why:  # the S6 sweep's F1 on #410, reachable here too: the unit left as it is
+        state = os.path.join(paths.home, ".local", "state", "recursion")
+        raise InstallRefused(
+            "unit_state_elsewhere",
+            f"{paths.unit} {why}: the daemon it starts may keep its state (the revocation and breaker "
+            f"stores, the run registry) there, and the unit `recursiond upgrade` writes leaves it in "
+            f"{state}, the daemon's default. Stop the daemon, move that state folder to {state}, take the "
+            "line out of the unit, then run `recursiond upgrade` again")
     replace_regular(paths.unit, unit, _UNIT_MODE)
     return _plan("upgrade", True, paths)
 
 
 def uninstall(roots: Roots) -> Plan:
-    """Remove the unit this installer wrote. Refused while it is enabled, or if another wrote it."""
+    """Remove the unit this installer wrote. Refused while it is enabled, or if another wrote it. The unit
+    is removed while the file read is still held open, after the path was checked to name it."""
 
     paths = owned_paths(roots)
     check_dirs(paths.home, paths.unit_dir)
     if os.path.lexists(paths.enabled):
         raise InstallRefused("unit_enabled", f"run `systemctl --user disable --now {UNIT_NAME}` first")
-    if os.path.lexists(paths.unit):
-        first = read_regular(paths.unit).split(b"\n", 1)[0]
-        if first != MARKER.encode():
-            raise InstallRefused("unit_not_ours", f"{paths.unit} was not written by `recursiond install`; it is left as it is")
-    removed = unlink_regular(paths.unit)
-    return _plan("uninstall", removed, paths)
+    if not os.path.lexists(paths.unit):
+        return _plan("uninstall", False, paths)
+    try:
+        with held_regular(paths.unit) as (data, _):  # checked against the path while held; removed while held
+            if data.split(b"\n", 1)[0] != MARKER.encode():
+                raise InstallRefused("unit_not_ours", f"{paths.unit} was not written by `recursiond install`; it is left as it is")
+            return _plan("uninstall", unlink_regular(paths.unit), paths)
+    except InstallRefused as refusal:
+        if refusal.kind != "unit_missing":
+            raise
+        return _plan("uninstall", False, paths)  # removed since the lexists above: nothing is left to remove
 
 
 def leftovers(roots: Roots) -> tuple[str, ...]:

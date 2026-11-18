@@ -14,6 +14,16 @@ files written before it stay written, so the answer does not say that nothing ch
 the family refuses ``platform_unsupported`` before it reads anything (``recursiond`` refuses there
 first; this holds the same once the family is registered in the control CLI).
 
+``XDG_CONFIG_HOME`` naming another folder than ``~/.config`` is refused ``config_home_elsewhere``,
+before anything is read: a user manager started with it reads its units from there, not from
+``~/.config/systemd/user`` where these commands write. ``XDG_STATE_HOME`` naming another folder than
+``~/.local/state`` is refused ``state_home_elsewhere`` by ``install`` and ``upgrade``: a daemon started
+with it keeps its state there, and the unit leaves it in ``~/.local/state/recursion`` (the S6 sweep's F2
+and F1 on #410, reachable here too). Both are read from this command's own environment, the nearest
+this package gets to the user manager's (it starts no process to ask it); each refusal says how to
+run the command without the variable. A password database that gives no entry for this user (none,
+or a failed lookup: CPython raises ``KeyError`` for both) is ``home_unknown``, before anything is read.
+
 ``install`` and ``upgrade`` point the unit at the interpreter running this command, and first ask
 that interpreter, started as the unit will start it (``-I``, from ``/``), what it is: it must be
 free-threaded CPython 3.14 (``interpreter_not_free_threaded``), and it must import this same
@@ -85,7 +95,12 @@ def dispatch(args, client) -> int:
         return EXIT_REFUSED
     if args.command == "setup":
         return run_setting(args.setting, getattr(args, "value", None), out=out)
-    return run(args.command, out=out, roots=default_roots(), interpreter=sys.executable,
+    try:
+        roots = default_roots()
+    except InstallRefused as exc:  # no password entry for this user, or the lookup failed
+        _print(out, {"code": exc.kind, "action": args.command, "detail": exc.detail})
+        return EXIT_REFUSED
+    return run(args.command, out=out, roots=roots, interpreter=sys.executable,
                package=recursion_core.__file__)
 
 
@@ -122,12 +137,21 @@ def default_roots() -> Roots:
 
     import pwd  # POSIX only; ``recursiond`` refuses every command elsewhere before this runs
 
-    return Roots(home=pwd.getpwuid(os.geteuid()).pw_dir)
-
-
-def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe=None) -> int:
-    probe = probe_interpreter if probe is None else probe
     try:
+        home = pwd.getpwuid(os.geteuid()).pw_dir
+    # CPython 3.12 and 3.14 raise KeyError for no entry and for a lookup that failed (NSS, LDAP) alike
+    # (Modules/pwdmodule.c); an OSError, from another implementation, is held to the same refusal (DeepSeek F10-2).
+    except (KeyError, OSError):
+        raise InstallRefused("home_unknown", "the password database gives no entry for this user (none, or "
+                             "the lookup failed), so the user manager's %h is not known") from None
+    return Roots(home=home)
+
+
+def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe=None, environ=None) -> int:
+    probe = probe_interpreter if probe is None else probe
+    environ = os.environ if environ is None else environ
+    try:
+        refuse_elsewhere(action, environ, roots)
         if action == "uninstall":
             plan = uninstall(roots)
         elif action in ("install", "upgrade"):
@@ -150,13 +174,44 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
     return EXIT_OK
 
 
+def refuse_elsewhere(action: str, environ, roots: Roots) -> None:
+    """Refuse an ``XDG_CONFIG_HOME`` (every command) or ``XDG_STATE_HOME`` (``install``, ``upgrade``) that
+    names another folder than the default under the home. Unset or empty is the default; a relative value
+    names no folder for sure, so it is refused too."""
+
+    checks = [("XDG_CONFIG_HOME", ".config", "config_home_elsewhere")]
+    if action in ("install", "upgrade"):
+        checks.append(("XDG_STATE_HOME", ".local/state", "state_home_elsewhere"))
+    for name, default, code in checks:
+        value = environ.get(name) or ""
+        if not value:
+            continue
+        home = roots.home if type(roots) is Roots and type(roots.home) is str else ""
+        expected = os.path.join(home, *default.split("/"))
+        if home and os.path.isabs(value) and os.path.realpath(value) == os.path.realpath(expected):
+            continue
+        if code == "config_home_elsewhere":
+            detail = (f"XDG_CONFIG_HOME is {value}: a user manager started with it reads its units from "
+                      f"{value}/systemd/user, and this command writes ~/.config/systemd/user. If "
+                      f"`systemctl --user show-environment` does not list XDG_CONFIG_HOME, run "
+                      f"`env -u XDG_CONFIG_HOME recursiond {action}`; if it does, the unit cannot be installed "
+                      "for that user manager yet")
+        else:
+            detail = (f"XDG_STATE_HOME is {value}: a daemon started with it keeps its state (the revocation and "
+                      f"breaker stores, the run registry) in {value}/recursion, and the unit puts it in "
+                      "~/.local/state/recursion. Stop that daemon and move the folder there first; if no daemon "
+                      f"ran with it, run `env -u XDG_STATE_HOME recursiond {action}`")
+        raise InstallRefused(code, detail)
+
+
 def _filesystem_detail(exc: OSError, roots: Roots) -> str:
     """The error and the path. A call on an open file or folder (``fsync``, ``read``, ``write``) names
-    no path, so the unit's folder, where every file these commands write or remove is, is named."""
+    no path, so the unit's folder, where every file these commands write or remove is, is named, under
+    the home resolved as every other message names it."""
 
     detail = f"{type(exc).__name__}: {exc}"
     if exc.filename is None:
-        detail += f" (in {os.path.join(roots.home, '.config', 'systemd', 'user')})"
+        detail += f" (in {os.path.join(os.path.realpath(roots.home), '.config', 'systemd', 'user')})"
     return detail
 
 

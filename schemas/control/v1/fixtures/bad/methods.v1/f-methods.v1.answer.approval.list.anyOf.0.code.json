@@ -1,0 +1,10 @@
+{
+  "method": "approval.list",
+  "params": {
+    "state": "pending"
+  },
+  "answer": {
+    "code": "x-nobody-defined-this",
+    "detail": "not_implemented"
+  }
+}

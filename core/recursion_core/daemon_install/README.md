@@ -8,11 +8,18 @@ The per-user daemon's systemd user unit: `recursiond install`, `upgrade` and `un
 ## What it writes
 
 Under the home folder the caller passes (the password database's, which is what the user manager
-calls `%h`; never `$HOME`, never `os.environ`):
+calls `%h`; never `$HOME`; a password database that gives no entry for this user, none or a failed
+lookup, refuses `home_unknown`). The command layer reads `XDG_CONFIG_HOME` and `XDG_STATE_HOME` from its
+environment only to refuse, before anything is read, a value naming another folder than `~/.config`
+(`config_home_elsewhere`: a user manager started with it reads its units from there) or, for install
+and upgrade, than `~/.local/state` (`state_home_elsewhere`: a daemon started with it keeps its state
+there); each refusal says how to run the command without the variable. A value only in the user
+manager's own environment (`environment.d`, `systemctl --user set-environment`) is not seen: this
+package starts no process to ask it:
 
 | path | install | upgrade | uninstall |
 | --- | --- | --- | --- |
-| `~/.config/systemd/user/recursion-daemon.service` | creates it (0644); the same bytes already there change nothing; other bytes refuse `unit_differs`; a unit another user owns or that group or world can write refuses `unit_untrusted` | rewrites it (also when its bytes are current but another user could change it); missing refuses `unit_missing` | removes it if its first line is this installer's marker (`unit_not_ours` otherwise); refuses `unit_enabled` while `default.target.wants/` links it |
+| `~/.config/systemd/user/recursion-daemon.service` | creates it (0644); the same bytes already there change nothing; other bytes refuse `unit_differs`; a unit another user owns or that group or world can write refuses `unit_untrusted` (owner and mode bits of the file read; POSIX ACLs are not read); a unit removed while it is read refuses `unit_missing`, and one replaced then `unit_changed` (run the command again; the path is checked while the file read is still open) | rewrites it (also when its bytes are current but another user could change it); missing refuses `unit_missing`; a unit whose `[Service]` section sets `XDG_STATE_HOME` to another folder, reads an `EnvironmentFile`, passes the user manager's `XDG_STATE_HOME`, or cannot be read so, refuses `unit_state_elsewhere` and is left as it is (replacing it would point the daemon at another state folder, without its revocations and breaker trips) | removes it if its first line is this installer's marker (`unit_not_ours` otherwise), while it holds the file it read and after the path was checked to name it (`unit_changed` if it was replaced meanwhile; the removal itself is by name, so a file put there in the few statements after that check is the one removed; one already gone counts as removed by the other caller); refuses `unit_enabled` while `default.target.wants/` links it |
 | `~/.config`, `~/.config/systemd`, `~/.config/systemd/user` | creates the missing ones (0700); existing ones stay as they are | - | stay: other units share them |
 | the daemon's state folder (`$XDG_STATE_HOME/recursion`: the run registry, and from slice 2 the stores) | - | - | stays |
 
@@ -22,8 +29,9 @@ followed, and so is a folder there that another user owns or that group or world
 link above the home (`/home` -> `/var/home`) is resolved. Every write goes to a fresh
 temporary name, is fsynced, and is linked (new file) or renamed (replacement) into place; the
 folder is fsynced after it. The unit is read with a non-blocking open of at most 1 MiB, so a FIFO
-or a device in its place is refused (`not_regular`) instead of holding the command. A file-system
-error on the way (a folder the user cannot write, a full disk) is the command's refusal
+or a device in its place is refused (`not_regular`) instead of holding the command, and so is a socket. A
+file-system error on the way (a folder the user cannot write, a full disk, a unit that cannot be
+opened for want of a descriptor or for an I/O error) is the command's refusal
 `filesystem_error`, naming the error and the path (the unit's folder when the failing call, an
 `fsync` or a `read` on an open file, names none).
 

@@ -18,6 +18,16 @@ from unittest import mock
 from recursion_core.setup import route_home
 from recursion_core.setup.route_home import RouteHomeRefused, check
 
+# The sentence in the refusal message and in the documentation that ships.
+_CONTAINER_OPERATOR = (
+    "An operator of a container with an arbitrary user id gives the user a passwd entry, "
+    "or runs as a named user."
+)
+_NO_ENTRY = (
+    "the operator's home is unknown: the password database gives no entry "
+    "for this user (none, or the lookup failed)"
+)
+
 _real_lstat = os.lstat
 
 
@@ -356,10 +366,104 @@ class RouteHomeTests(unittest.TestCase):
             with self.subTest(HOME=home), mock.patch.dict(os.environ, {"HOME": home}), \
                     mock.patch("pwd.getpwuid", side_effect=failed):
                 error = self.refused("route_home_untrusted", self.path)
-            self.assertEqual(error.detail, "the operator's home is unknown: the password database gives no entry "
-                                           "for this user (none, or the lookup failed)")
+            self.assertEqual(error.detail, _NO_ENTRY + ". " + _CONTAINER_OPERATOR)
         with mock.patch.dict(os.environ, {"HOME": self.base}):
             check(self.path, self.root)  # control: the same check passes when the lookup answers
+
+    def test_the_refusal_message_names_what_an_operator_of_a_container_does(self):
+        # The message of a user id with no passwd entry carries this sentence, and the module
+        # docstring and the _operator_homes docstring carry the same sentence.
+        failed = KeyError(f"getpwuid(): uid not found: {os.geteuid()}")
+        with mock.patch("pwd.getpwuid", side_effect=failed), mock.patch.dict(os.environ, {"HOME": self.base}):
+            error = self.refused("route_home_untrusted", self.path)
+        self.assertIn(_CONTAINER_OPERATOR, error.detail)
+        self.assertEqual(error.detail.count(_CONTAINER_OPERATOR), 1)
+        self.assertIn(_CONTAINER_OPERATOR, route_home.__doc__)
+        self.assertEqual(route_home.__doc__.count(_CONTAINER_OPERATOR), 1)
+        self.assertIn(_CONTAINER_OPERATOR, route_home._operator_homes.__doc__)
+        self.assertEqual(route_home._operator_homes.__doc__.count(_CONTAINER_OPERATOR), 1)
+
+    def test_a_user_id_with_no_passwd_entry_is_still_refused_on_the_same_path(self):
+        # The refusal is kept. A KeyError from the password lookup (no entry, or a lookup that
+        # failed) still leaves through route_home_untrusted, before $HOME is compared, whatever
+        # $HOME says. The detail still names that no-entry exit, not the other unknown-home exit.
+        failed = KeyError(f"getpwuid(): uid not found: {os.geteuid()}")
+        homes = (self.base, self.state, "/", os.environ["HOME"])
+        for home in homes:
+            with self.subTest(HOME=home), mock.patch.dict(os.environ, {"HOME": home}), \
+                    mock.patch("pwd.getpwuid", side_effect=failed):
+                error = self.refused("route_home_untrusted", self.path)
+                self.assertTrue(error.detail.startswith(_NO_ENTRY), error.detail)
+                self.assertNotIn("no absolute HOME", error.detail)
+                self.assertIsNone(error.__cause__)
+        with mock.patch.dict(os.environ), mock.patch("pwd.getpwuid", side_effect=failed):
+            os.environ.pop("HOME", None)
+            error = self.refused("route_home_untrusted", self.path)
+        self.assertTrue(error.detail.startswith(_NO_ENTRY), error.detail)
+        self.assertIsNone(error.__cause__)
+        with mock.patch.dict(os.environ, {"HOME": "relative/home"}), \
+                mock.patch("pwd.getpwuid", side_effect=failed):
+            error = self.refused("route_home_untrusted", self.path)
+        self.assertTrue(error.detail.startswith(_NO_ENTRY), error.detail)
+        self.assertIsNone(error.__cause__)
+
+    # Review 5 of #401 (Claude Fable 5.2), R1: since 3905b856 a KeyError is refused one step earlier, so the test below no
+    # longer reached the refusal for no absolute home; removing it, changing its code or dropping the startswith("/")
+    # filter left every test green. The lookup that answers with no absolute home reaches it (the read's test_r1.py).
+    def test_an_entry_that_names_no_absolute_home_is_refused_unless_HOME_names_one(self):
+        for pw_dir in ("", "relative/home"):
+            entry = mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=pw_dir))
+            with self.subTest(pw_dir=pw_dir), entry:
+                with mock.patch.dict(os.environ):
+                    os.environ.pop("HOME", None)
+                    error = self.refused("route_home_untrusted", self.path)
+                    self.assertEqual(error.detail, "the operator's home is unknown: no absolute HOME and "
+                                                   "no absolute home in the password entry")
+                with mock.patch.dict(os.environ, {"HOME": "relative/home"}):
+                    self.refused("route_home_untrusted", self.path)  # a relative HOME names no home
+                with mock.patch.dict(os.environ, {"HOME": self.root}):
+                    self.refused("route_home_is_operator_home", self.path)  # HOME alone still names the home
+                with mock.patch.dict(os.environ, {"HOME": self.base}):
+                    check(self.path, self.root)  # control
+
+    # Grok's pre-read of #401 (g1, 3905b856), R2 to R4: three rules whose removal left every test green.
+    def test_the_password_home_is_followed_through_its_links_too(self):
+        # R2: the password database's home is compared after links are followed, as $HOME is. Spelled through a link
+        # to the root, it names the route home, which is refused; compared as text, it would not be.
+        os.mkdir(self.path, 0o700)
+        link = os.path.join(self.base, "homes-link")
+        os.symlink(self.root, link)
+        spelled = os.path.join(link, "claude_code")
+        with mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=spelled)):
+            self.refused("route_home_is_operator_home", self.path)  # $HOME is the fixture's other folder
+
+    def test_dot_dot_in_a_home_goes_up_from_where_the_resolution_is_not_from_the_text(self):
+        # R3: "link/../homes/claude_code", where link points at the root, is the route home for the kernel (the link
+        # first, then its parent); read as text, ".." would take the link away and name base/homes/claude_code.
+        os.mkdir(self.path, 0o700)
+        link = os.path.join(self.base, "to-homes")
+        os.symlink(self.root, link)
+        spelled = os.path.join(link, "..", "homes", "claude_code")
+        self.assertNotEqual(os.path.normpath(spelled), self.path)  # the text alone names another folder
+        self.assertEqual(os.path.realpath(spelled), self.path)
+        with mock.patch("pwd.getpwuid", return_value=mock.Mock(pw_dir=spelled)):
+            self.refused("route_home_is_operator_home", self.path)
+        with mock.patch.dict(os.environ, {"HOME": spelled}):
+            self.refused("route_home_is_operator_home", self.path)
+
+    def test_a_sticky_bit_does_not_excuse_a_group_or_world_bit_below_the_root(self):
+        # R4: below the root, any bit of 0o077 is refused, sticky or not (above it, a sticky folder may be writable):
+        # another user could make a name in a sticky world-writable route home before private_dir does.
+        os.mkdir(self.path, 0o700)
+        for mode in (0o1777, 0o1770, 0o1702):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.path, mode)
+                error = self.refused("route_home_untrusted", self.path)
+                self.assertEqual(error.detail, f"{self.path} is open to group or world")
+        for mode in (0o1700, 0o2700):  # control: sticky or setgid with no group or world bit
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.path, mode)
+                check(self.path, self.root)
 
     def test_with_no_operators_home_known_the_check_refuses_rather_than_passes(self):
         # DeepSeek F4: an empty set of homes would let any path through the operator's-home rule.

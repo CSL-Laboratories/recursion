@@ -64,34 +64,43 @@ def read(root: Path = Path('/'), environ: Mapping[str, str] = os.environ) -> Rec
     if environ is None:
         environ = os.environ
     root = Path(root)
-    key = (_root_key(root), _env_key(environ))
+    # One directory for the key and for every open: the directory the
+    # filesystem reads, captured on this call. Symlinks are followed here,
+    # so a later open does not walk a different parent.
+    resolved = _root_key(root)
+    env_key = _env_key(environ)
+    key = (resolved, env_key)
     with _LOCK:
         cached = _CACHE.get(key)
     if cached is not None:
         return cached
-    record = _probe(root, environ)
+    record, stable = _probe(Path(resolved), environ, env_key[0])
+    if not stable:
+        return record
     with _LOCK:
         return _CACHE.setdefault(key, record)
 
 
 def _root_key(root: Path) -> str:
-    return os.path.abspath(os.path.normpath(str(root)))
+    return os.path.realpath(root)
 
 
 def _env_key(environ: Mapping[str, str]) -> tuple:
-    # Membership is checked again while probing, so a mapping that fails on a
-    # later check cannot leave a stored record for this key.
+    # One sample of WSL_INTEROP for the key and for the stored field.
+    # Membership is checked again while probing, so a mapping that fails on
+    # that later check cannot leave a stored record for this key. A later
+    # answer that disagrees is not stored under this key.
     if 'WSL_INTEROP' not in environ:
         return (False, None)
     return (True, environ.get('WSL_INTEROP'))
 
 
-def _probe(root: Path, environ: Mapping[str, str]) -> Record:
+def _probe(root: Path, environ: Mapping[str, str], present: bool) -> tuple[Record, bool]:
     kind = _kind(root)
     systemd_pid1 = _systemd_pid1(root)
-    interop = _interop(root, environ)
+    interop, stable = _interop(root, environ, present)
     wslconf_interop, wslconf_systemd, automount_root = _wslconf(root)
-    return Record(kind, systemd_pid1, interop, wslconf_interop, wslconf_systemd, automount_root)
+    return Record(kind, systemd_pid1, interop, wslconf_interop, wslconf_systemd, automount_root), stable
 
 
 def _read_text(path: Path):
@@ -137,7 +146,7 @@ def _systemd_pid1(root: Path) -> bool | None:
     return got.replace('\x00', '').strip() == 'systemd'
 
 
-def _interop(root: Path, environ: Mapping[str, str]) -> str:
+def _interop(root: Path, environ: Mapping[str, str], present: bool) -> tuple[str, bool]:
     states = []
     binfmt = root / 'proc' / 'sys' / 'fs' / 'binfmt_misc'
     for name in ('WSLInterop', 'WSLInterop-late'):
@@ -157,15 +166,17 @@ def _interop(root: Path, environ: Mapping[str, str]) -> str:
         states.append('unknown')
     else:
         states.append('on')
-    if 'WSL_INTEROP' in environ:
-        states.append('on')
-    else:
-        states.append('off')
+    # The second membership test can still raise, and then nothing is stored.
+    # The field itself is the sample already taken for the key.
+    again = 'WSL_INTEROP' in environ
+    states.append('on' if present else 'off')
     if 'on' in states:
-        return 'on'
-    if 'unknown' in states:
-        return 'unknown'
-    return 'off'
+        interop = 'on'
+    elif 'unknown' in states:
+        interop = 'unknown'
+    else:
+        interop = 'off'
+    return interop, again == present
 
 
 def _enabled(text: str) -> bool:

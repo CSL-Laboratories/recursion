@@ -103,6 +103,18 @@ class _Env(dict):
         return False
 
 
+class _Flip(dict):
+    """WSL_INTEROP is absent on the first membership test and present after that."""
+
+    def __init__(self):
+        super().__init__()
+        self.n = 0
+
+    def __contains__(self, key: object) -> bool:
+        self.n += 1
+        return key == 'WSL_INTEROP' and self.n >= 2
+
+
 class ProbeCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -519,6 +531,53 @@ class CacheTests(ProbeCase):
         self.assertEqual(len(found), 2)
         self.assertIs(found[0], found[1])
         self.assertEqual(found[0].interop, 'on')
+
+
+class CacheKeyTests(ProbeCase):
+    """R1: the cache key is the directory the open reads, taken once."""
+
+    def test_symlink_dotdot_is_cached_as_the_directory_opened(self):
+        tree = self.root
+        usr = tree / 'usr'
+        (usr / 'bin').mkdir(parents=True)
+        (tree / 'bin').symlink_to('usr/bin', target_is_directory=True)
+        self.wsl2()
+        _plant(tree, 'proc/sys/fs/binfmt_misc/WSLInterop', 'enabled\n')
+        _plant(usr, 'proc/sys/kernel/osrelease', UBUNTU_OSRELEASE)
+        _plant(usr, 'proc/version', UBUNTU_VERSION)
+        _plant(usr, 'proc/1/comm', 'init\n')
+        via = read(tree / 'bin' / '..', {})
+        direct = read(tree, {})
+        self.assertEqual(via.kind, 'none')
+        self.assertFalse(via.systemd_pid1)
+        self.assertEqual(via.interop, 'off')
+        self.assertEqual(direct.kind, 'wsl2')
+        self.assertTrue(direct.systemd_pid1)
+        self.assertEqual(direct.interop, 'on')
+        self.assertIsNot(via, direct)
+
+    def test_missing_component_dotdot_does_not_drop_the_root(self):
+        self.wsl2()
+        _plant(self.root, 'proc/sys/fs/binfmt_misc/WSLInterop', 'enabled\n')
+        via = read(self.root / 'nope' / '..', {})
+        direct = read(self.root, {})
+        self.assertEqual(direct.kind, 'wsl2')
+        self.assertEqual(direct.interop, 'on')
+        self.assertTrue(direct.systemd_pid1)
+        self.assertIs(via, direct)
+
+
+class InteropSampleTests(ProbeCase):
+    """R2: one WSL_INTEROP sample is the stored field and the cache key."""
+
+    def test_a_second_membership_answer_is_not_stored_under_the_first_key(self):
+        self.wsl2()
+        _plant(self.root, 'proc/sys/fs/binfmt_misc/WSLInterop', 'disabled\n')
+        first = read(self.root, _Flip())
+        second = read(self.root, {})
+        self.assertEqual(first.interop, 'off')
+        self.assertEqual(second.interop, 'off')
+        self.assertIsNot(first, second)
 
 
 @unittest.skipUnless(_host_is_wsl(), 'wsl_live: skipped off WSL')

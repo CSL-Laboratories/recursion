@@ -240,6 +240,10 @@ class RouteTableTests(unittest.TestCase):
         for label, _, f in map(fields, out):
             if "route" in f:
                 self.assertEqual(label, "pilot" if f["route"] == route_name("model-p", "claude_code") else "dev")
+        # A legend line names no route: it belongs to the route line that follows it, and carries that
+        # record's label.
+        kinds = [(label, kind) for label, kind, _ in map(fields, out) if kind in ("legend", "route")]
+        self.assertEqual(kinds, [("dev", "legend"), ("dev", "route"), ("pilot", "legend"), ("pilot", "route")])
 
     def test_a_model_name_with_a_slash_keeps_its_route(self):
         a = standin_record("vendor/model", {"t-1": ["pass", "pass"]}, record_id="r1")

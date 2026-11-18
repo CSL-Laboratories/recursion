@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from recursion_core.plugin_security.signing import backend_available
 from recursion_core.plugin_security.tests.support import FakeGilProbe
@@ -103,7 +104,11 @@ class GitCase(ProfileCase):
         self.assertFalse((self.config / "plugin-install.lock").exists())
 
     def assert_no_scratch(self):
-        root = Path(os.environ.get("TMPDIR", "/tmp"))
+        # List only the directory TMPDIR names. There is no shared fallback.
+        raw = os.environ.get("TMPDIR")
+        if not raw:
+            return
+        root = Path(raw)
         if not root.is_dir():
             return
         left = [path for path in root.iterdir() if path.name.startswith("plugin-fetch-")]
@@ -169,16 +174,21 @@ class GitRefusalTests(GitCase):
         """A non-empty install_scripts list refuses before a scratch directory exists.
 
         The name is not in the tree. The refusal is the list itself, not a
-        basename that happens to sit in the commit.
+        basename that happens to sit in the commit. TMPDIR points at a
+        temporary directory this test creates, and the listing reads only
+        that directory.
         """
         bare, commit = self.make_bare({"plugin.py": _GOOD})
-        root = Path(os.environ.get("TMPDIR") or "/tmp")
-        before = {path.name for path in root.iterdir() if path.name.startswith("plugin-fetch-")}
-        code = self.refused(lambda: self.fetch(bare, commit, "plugin.py", scripts=("missing.sh",)))
-        self.assertEqual(code, "source_install_script")
-        after = {path.name for path in root.iterdir() if path.name.startswith("plugin-fetch-")}
-        self.assertEqual(after, before)
-        self.assert_no_scratch()
+        with tempfile.TemporaryDirectory(prefix="rc-before-scratch-") as raw:
+            root = Path(raw)
+            os.chmod(root, 0o700)
+            with patch.dict(os.environ, {"TMPDIR": str(root)}):
+                before = {path.name for path in root.iterdir() if path.name.startswith("plugin-fetch-")}
+                code = self.refused(lambda: self.fetch(bare, commit, "plugin.py", scripts=("missing.sh",)))
+                self.assertEqual(code, "source_install_script")
+                after = {path.name for path in root.iterdir() if path.name.startswith("plugin-fetch-")}
+                self.assertEqual(after, before)
+                self.assert_no_scratch()
 
     def test_a_commit_that_differs_by_one_byte_is_refused_before_copy(self):
         bare, commit = self.make_bare({"plugin.py": _BAD})

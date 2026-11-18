@@ -1,0 +1,19 @@
+{
+  "method": "methods.list",
+  "params": {},
+  "answer": {
+    "code": "ok",
+    "methods": [
+      {
+        "name": "run.stop",
+        "implemented": true,
+        "beta": false
+      },
+      {
+        "name": "session.turn",
+        "implemented": false,
+        "beta": true
+      }
+    ]
+  }
+}

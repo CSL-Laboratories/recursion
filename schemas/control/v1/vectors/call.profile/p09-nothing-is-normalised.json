@@ -1,0 +1,8 @@
+{
+  "tool": "T",
+  "cwd": null,
+  "input_text": "{\"a\": \"\\u00e9\", \"b\": \"e\\u0301\"}",
+  "expect": {
+    "call_text": "{\"cwd\":null,\"input\":{\"a\":\"\u00e9\",\"b\":\"e\u0301\"},\"tool\":\"T\"}"
+  }
+}

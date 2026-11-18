@@ -960,8 +960,11 @@ class DaemonControl:
         if result is not None:
             # Counted surrogates still sit in the answer. The frame encode refuses them, and a
             # non-finite float, and the socket worker does not turn that into an error reply.
-            result = _frame_scalar(result)
-            run['result'] = _status_result(result) if full else {k: result.get(k) for k in ('status', 'code', 'detail')}
+            # run.list keeps three fields of the result, so only those three are framed.
+            if full:
+                run['result'] = _status_result(_frame_scalar(result))
+            else:
+                run['result'] = _frame_scalar({k: result.get(k) for k in _LIST_RESULT_KEYS})
         if full and isinstance(run_id, str):
             # run.status carries the tail of the engine's stdout, so every surface that can read a
             # status can watch output arrive without a second method (the CLI and TUI share one

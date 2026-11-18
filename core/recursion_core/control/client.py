@@ -24,6 +24,7 @@ from pathlib import Path
 
 from recursion_core.control_transport import (PeerNotAdmitted, PlatformNotSupported, TransportBusy, TransportRefused,
                                               UnixControlClient)
+from recursion_core.hostos import select
 
 SOCKET_DIR = "recursion"  # $XDG_RUNTIME_DIR/recursion/control.sock
 UNAVAILABLE = "control_api_unavailable"
@@ -38,7 +39,7 @@ def socket_directory(environ=None) -> str:
         raise PlatformNotSupported(
             "platform_unsupported: the daemon's control socket needs POSIX (AF_UNIX under the user's runtime directory)"
         )
-    runtime = environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    runtime = select().runtime_dir(environ)
     return str(Path(runtime) / SOCKET_DIR)
 
 

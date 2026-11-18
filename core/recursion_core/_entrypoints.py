@@ -3,12 +3,15 @@
     recursiond install | upgrade | uninstall    the per-user systemd unit (control/commands/setup.py)
     recursiond doctor [--json]                  report this machine; no daemon is required
     recursiond observe [--json]                 local tool setup, owner-only record
+    recursiond import --from codex|claude|cursor --dry-run
+                                                print a proposed config and write nothing
     recursiond serve [daemon options]           run the daemon in the foreground
 
 Linux only: on any other system every command refuses with ``platform_unsupported`` (exit 1)
 before anything else is imported; ``--help`` still prints. install, upgrade and uninstall print
 one JSON object. ``doctor --json`` prints one report; without ``--json`` it prints one line per
 check. ``observe`` prints one JSON object with or without ``--json``; secret values stay out.
+``import`` prints one JSON object and writes nothing.
 0 is ok, 1 a refusal or a report that has a fail, 2 a usage error.
 
 ``serve`` checks the build before it imports anything of the daemon's: the daemon needs
@@ -31,9 +34,11 @@ import sysconfig
 PROG = "recursiond"
 DAEMON_MODULE = "recursion_core.daemon"
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
+_IMPORT_SOURCES = ("codex", "claude", "cursor")
 _DESCRIPTION = ("Recursion's per-user daemon and its installer. Linux only. "
                 "install, upgrade and uninstall each print one JSON object. "
-                "doctor prints a report. observe prints one JSON object.")
+                "doctor prints a report. observe prints one JSON object. "
+                "import prints a proposal and writes nothing.")
 
 
 def _configure_doctor(parser) -> None:
@@ -67,13 +72,34 @@ def _handle_observe(args) -> int:
     return observe.command(sys.stdout, sys.stderr)
 
 
+def _configure_import(parser) -> None:
+    parser.add_argument("--from", dest="source", required=True, choices=_IMPORT_SOURCES,
+                        help="local tool to read: codex, claude or cursor")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true",
+                        help="print the proposal and write nothing")
+
+
+def _handle_import(args) -> int:
+    import recursion_core.setup.import_ as import_
+
+    return import_.command(
+        sys.stdout, sys.stderr, source=args.source, dry_run=args.dry_run is True,
+    )
+
+
 # Later cogs append a row: (name, help, configure, handle). configure adds that command's options.
 # This is the one SUBCOMMANDS table. Doctor owns it; a later draft appends its row here.
+# The doctor-command draft adds this table too. It is not on the doctor-core base, so this
+# draft adds the minimal table. The two drafts conflict on this name. This row is observe.
+# A separate row from SUBCOMMANDS. import only prints a proposal; it writes nothing.
+# import's entry is in this same table, beside doctor and observe.
 SUBCOMMANDS = (
     ("doctor", "report what is ok, warn, fail or unknown on this machine",
      _configure_doctor, _handle_doctor),
     ("observe", "report local tool setup into an owner-only record; secret values stay out",
      _configure_observe, _handle_observe),
+    ("import", "print a proposed Recursion config and write nothing",
+     _configure_import, _handle_import),
 )
 
 

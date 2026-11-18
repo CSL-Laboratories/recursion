@@ -1,10 +1,11 @@
 """The measure payload: run_id, at and a list of measures, each with class, name, value, unit,
 source (daemon, engine or estimate) and certainty (known or unknown).
 
-An unknown has value None, never 0; a known has a number. Anything else is refused. No event is
-written here and no schema is touched: the event type that will carry this payload is a later
-slice.
+An unknown has value None, never 0; a known has a finite number of zero or more, never a bool
+(NaN, infinity and a negative number are refused). Anything else is refused. No event is written
+here and no schema is touched: the event type that will carry this payload is a later slice.
 """
+import math
 import numbers
 
 SOURCES = ('daemon', 'engine', 'estimate')
@@ -22,6 +23,14 @@ def _text(value, what):
     return value
 
 
+def _finite_non_negative(value):
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return False
+    if not isinstance(value, numbers.Integral) and not math.isfinite(value):
+        return False  # an int is always finite; math.isfinite would overflow on a huge one
+    return value >= 0
+
+
 def _checked(measure):
     if not isinstance(measure, dict) or set(measure) != set(FIELDS):
         raise MeasureRefused(f'measure_refused: a measure has exactly the fields {", ".join(FIELDS)}')
@@ -35,8 +44,8 @@ def _checked(measure):
         raise MeasureRefused(f'measure_refused: certainty {certainty!r} is not known or unknown')
     if certainty == 'unknown' and value is not None:
         raise MeasureRefused('measure_refused: an unknown measure has value None, never a number')
-    if certainty == 'known' and (isinstance(value, bool) or not isinstance(value, numbers.Real)):
-        raise MeasureRefused('measure_refused: a known measure has a number')
+    if certainty == 'known' and not _finite_non_negative(value):
+        raise MeasureRefused('measure_refused: a known measure has a finite number of zero or more')
     return {key: measure[key] for key in FIELDS}
 
 

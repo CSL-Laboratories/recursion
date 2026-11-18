@@ -25,7 +25,10 @@ class CgroupReadTests(unittest.TestCase):
         leaf = Path(temp.name) / 'run.leaf'
         leaf.mkdir()
         for name, text in files.items():
-            (leaf / name).write_text(text, encoding='utf-8')
+            if isinstance(text, bytes):
+                (leaf / name).write_bytes(text)
+            else:
+                (leaf / name).write_text(text, encoding='utf-8')
         return leaf
 
     def test_memory_peak_reads_as_known_bytes(self):
@@ -90,6 +93,92 @@ class CgroupReadTests(unittest.TestCase):
         zero_unknown = dict(measures[0], value=0)
         with self.assertRaises(MeasureRefused):
             build_measure_payload('run-1', '2026-11-17T20:30:00Z', [zero_unknown])
+
+    # The answer round of the read on 2978019b: no file content makes read_leaf raise, and a
+    # counter the kernel cannot print (more than 20 digits, above 2**64 - 1, negative, not text)
+    # reads as unknown.
+    def assert_memory_peak_unknown(self, content):
+        from recursion_core.measures import read_leaf
+        got = by_name(read_leaf(self.leaf({'memory.peak': content})))['memory.peak']
+        self.assertEqual(got['certainty'], 'unknown')
+        self.assertIsNone(got['value'])
+
+    def test_a_five_thousand_digit_counter_reads_unknown(self):
+        self.assert_memory_peak_unknown('9' * 5000 + '\n')
+        from recursion_core.measures import read_leaf
+        got = by_name(read_leaf(self.leaf({'cpu.stat': 'usage_usec ' + '9' * 5000 + '\n',
+                                           'io.stat': '8:0 rbytes=' + '9' * 5000 + ' wbytes=1\n'})))
+        self.assertIsNone(got['cpu.usage_usec']['value'])
+        self.assertIsNone(got['io.rbytes']['value'])
+
+    def test_two_to_the_sixty_four_reads_unknown(self):
+        self.assert_memory_peak_unknown(f'{2 ** 64}\n')
+        from recursion_core.measures import read_leaf
+        got = by_name(read_leaf(self.leaf({'memory.peak': f'{2 ** 64 - 1}\n'})))['memory.peak']
+        self.assertEqual(got['value'], 2 ** 64 - 1)
+        self.assertEqual(got['certainty'], 'known')
+
+    def test_a_negative_counter_reads_unknown(self):
+        self.assert_memory_peak_unknown('-1\n')
+
+    def test_bytes_that_do_not_decode_read_unknown(self):
+        self.assert_memory_peak_unknown(b'\xff\xfe\x00\x01')
+
+    def test_a_readable_empty_io_stat_reads_known_zero(self):
+        # The kernel prints an io.stat line only for a device that did io, so a readable empty
+        # file means no device counted io for this leaf: a known 0. A missing file stays unknown.
+        from recursion_core.measures import read_leaf
+        got = by_name(read_leaf(self.leaf({'io.stat': ''})))
+        for name in ('io.rbytes', 'io.wbytes'):
+            self.assertEqual(got[name]['value'], 0, name)
+            self.assertEqual(got[name]['certainty'], 'known', name)
+
+    def test_an_io_stat_line_without_a_device_makes_the_whole_file_unknown(self):
+        from recursion_core.measures import read_leaf
+        got = by_name(read_leaf(self.leaf({'io.stat': '8:0 rbytes=1 wbytes=2\nrbytes=5 wbytes=6\n'})))
+        for name in ('io.rbytes', 'io.wbytes'):
+            self.assertEqual(got[name]['certainty'], 'unknown', name)
+            self.assertIsNone(got[name]['value'], name)
+
+
+class PayloadRefusalTests(unittest.TestCase):
+    MEASURE = {'class': 'memory', 'name': 'memory.peak', 'value': 1, 'unit': 'bytes',
+               'source': 'daemon', 'certainty': 'known'}
+
+    def refused(self, **change):
+        from recursion_core.measures import MeasureRefused, build_measure_payload
+        with self.assertRaises(MeasureRefused):
+            build_measure_payload('run-1', '2026-11-17T20:30:00Z', [dict(self.MEASURE, **change)])
+
+    def test_a_known_nan_is_refused(self):
+        self.refused(value=float('nan'))
+
+    def test_a_known_infinity_is_refused(self):
+        self.refused(value=float('inf'))
+
+    def test_a_known_negative_number_is_refused(self):
+        self.refused(value=-1)
+
+    def test_a_known_bool_is_refused(self):
+        self.refused(value=True)
+
+    def test_a_certainty_outside_known_and_unknown_is_refused(self):
+        self.refused(certainty='maybe')
+
+    def test_a_known_without_a_number_is_refused(self):
+        self.refused(value=None)
+        self.refused(value='1')
+
+    def test_an_unknown_with_any_value_but_null_is_refused(self):
+        self.refused(certainty='unknown', value=5)
+        self.refused(certainty='unknown', value='unknown')
+
+    def test_a_known_zero_and_a_finite_float_are_accepted(self):
+        from recursion_core.measures import build_measure_payload
+        for value in (0, 0.0, 2.5, 2 ** 64 - 1):
+            payload = build_measure_payload('run-1', '2026-11-17T20:30:00Z',
+                                            [dict(self.MEASURE, value=value)])
+            self.assertEqual(payload['measures'][0]['value'], value)
 
 
 if __name__ == '__main__':

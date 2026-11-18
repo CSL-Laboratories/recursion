@@ -1,13 +1,20 @@
 """A pure reader of ONE cgroup v2 leaf directory: memory.peak, cpu.stat, pids.peak, io.stat.
 
-It reads only the four named files directly inside the directory it is given: no walk upward,
-no other path, no write, no Linux-only call (it never calls require_linux_calls), so it runs the
+It opens only the four names directly inside the directory it is given: no walk upward, no
+other name, no write, no Linux-only call (it never calls require_linux_calls), so it runs the
 same against a fake leaf on any platform. A missing, unreadable or malformed file gives
-certainty "unknown" and value None, never 0 (PRODUCT bar 7, pillar P10).
+certainty "unknown" and value None, never 0 (PRODUCT bar 7, pillar P10); no file content makes
+it raise. A counter the kernel cannot print (not plain decimal digits, more than 20 digits, or
+above 2**64 - 1) is malformed. Not guarded here: a link or a FIFO under one of the four names
+(a real cgroupfs holds neither) is opened as given.
 """
 import os
+import re
 
 MAX_BYTES = 1 << 20  # a cgroup file is small; never read an unbounded file
+U64_MAX = 2 ** 64 - 1  # the kernel prints these counters as u64
+U64_DIGITS = len(str(U64_MAX))  # 20, checked before int() so a huge token never reaches it
+DEVICE = re.compile(r'[0-9]+:[0-9]+')
 
 CPU_KEYS = ('usage_usec', 'user_usec', 'system_usec')
 IO_KEYS = ('rbytes', 'wbytes')
@@ -34,10 +41,11 @@ def _read(leaf, name):
 
 
 def _count(token):
-    """A non-negative decimal integer, or None."""
-    if not token.isascii() or not token.isdigit():
+    """A u64 written in plain decimal digits, or None."""
+    if not token.isascii() or not token.isdigit() or len(token) > U64_DIGITS:
         return None
-    return int(token)
+    value = int(token)
+    return value if value <= U64_MAX else None
 
 
 def _single(text):
@@ -69,8 +77,10 @@ def _flat_keyed(text, keys):
 def _io_sums(text):
     """io.stat: ``MAJ:MIN key=value ...`` per device, summed over devices.
 
-    A readable empty file is the kernel saying no device had any io: a known 0. A malformed line,
-    or a device line without the key, makes that key unknown.
+    The kernel prints a line only for a device that did io, so a readable empty file means no
+    device counted io for this leaf: a known 0 (block io only; page-cache hits are not counted).
+    A line whose first token is not MAJ:MIN, or a token without '=', makes the whole file
+    unknown; a device line without the key, or a bad value, makes that key unknown.
     """
     if text is None:
         return dict.fromkeys(IO_KEYS)
@@ -79,6 +89,8 @@ def _io_sums(text):
         parts = line.split()
         if not parts:
             continue
+        if not DEVICE.fullmatch(parts[0]):
+            return dict.fromkeys(IO_KEYS)
         fields = {}
         for token in parts[1:]:
             key, sep, value = token.partition('=')

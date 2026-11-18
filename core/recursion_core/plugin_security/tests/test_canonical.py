@@ -65,6 +65,17 @@ class ControlCharacterTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assert_control_refusal(parse, raw)
 
+    def test_parse_refuses_delete_as_the_raw_byte(self) -> None:
+        # The raw byte 0x7F is how RFC 8785 itself writes the character.
+        for raw in (b'"\x7f"', b'{"a":"x\x7fy"}', b'{"a\x7fb":1}'):
+            with self.subTest(raw=raw):
+                self.assert_control_refusal(parse, raw)
+
+    def test_parse_refuses_delete_as_an_upper_case_escape(self) -> None:
+        for raw in (b'"\\u007F"', b'{"a":"x\\u007Fy"}', b'{"\\u007F":1}'):
+            with self.subTest(raw=raw):
+                self.assert_control_refusal(parse, raw)
+
     def test_every_ascii_character_is_written_as_rfc_8785_writes_it_or_refused(self) -> None:
         # Every C0 control takes its RFC 8785 escape, the solidus stays bare, and DEL (which
         # RFC 8785 writes raw and json.dumps escapes) is refused rather than written differently.

@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Scratch-path scan: report lines that name a builder's scratch folder by path.
+
+A builder runs its tests with TMPDIR set to a scratch folder; that folder's path
+must never be written into a file of the repository. This script takes file
+paths on its command line and prints ``file:line`` for every line that holds the
+path form of such a folder (under /var/tmp or /tmp, named after the engine). A
+bare engine name such as an engine id is not a hit; only the path form is.
+
+A line that carries the marker ``scratch-path: allowed`` is not reported.
+
+    python -X utf8 -B tools/scan_scratch_paths.py <file> [<file> ...]
+
+Exit 0 when no line is reported, 1 when any line is, 2 when a file cannot be
+read. It reads only the files it is given; it does not walk the repository.
+"""
+from __future__ import annotations
+
+import sys
+
+# Built from pieces so that this file holds none of the forms it looks for.
+_ENGINE = "grok"
+FORMS = (
+    "/" + "var" + "/" + "tmp" + "/" + _ENGINE + "-",
+    "/" + "tmp" + "/" + _ENGINE + "-",
+)
+MARKER = "scratch-path: " + "allowed"
+
+
+def hit_lines(text: str) -> list[int]:
+    """Return the 1-based numbers of the lines that name a scratch path."""
+    out = []
+    for number, line in enumerate(text.split("\n"), start=1):
+        if MARKER in line:
+            continue
+        if any(form in line for form in FORMS):
+            out.append(number)
+    return out
+
+
+def main(argv: list[str]) -> int:
+    found = False
+    unreadable = False
+    for path in argv:
+        try:
+            with open(path, "rb") as handle:
+                text = handle.read().decode("utf-8", "replace")
+        except OSError as exc:
+            print(f"{path}: cannot read: {exc.strerror or exc}", file=sys.stderr)
+            unreadable = True
+            continue
+        for number in hit_lines(text):
+            print(f"{path}:{number}")
+            found = True
+    if unreadable:
+        return 2
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

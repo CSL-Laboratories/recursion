@@ -154,8 +154,28 @@ class NameRuleTests(unittest.TestCase):
                     step = dir_facts(expected_name=name, final_path=ROOT + "\\" + name)
                     self.assertEqual(w.judge_handle(step, w.KIND_DIRECTORY), "plugin_directory_untrusted")
 
+    def test_zero_device_names_are_refused(self):
+        for part in ("COM0", "com0", "LPT0", "lpt0", "LPT0.py", "Com0.txt", "LPT0 .py"):
+            for name in (part, "alpha\\" + part, part + "\\plugin.py"):
+                with self.subTest(name=name):
+                    joined = file_facts(expected_name=name, final_path=ROOT + "\\" + name)
+                    self.assertEqual(w.judge_handle(joined, w.KIND_FILE), "plugin_file_unreadable")
+                    step = dir_facts(expected_name=name, final_path=ROOT + "\\" + name)
+                    self.assertEqual(w.judge_handle(step, w.KIND_DIRECTORY), "plugin_directory_untrusted")
+
+    def test_superscript_device_names_are_refused(self):
+        for prefix in ("COM", "com", "LPT", "Lpt"):
+            for digit in ("\u00b9", "\u00b2", "\u00b3"):
+                for part in (prefix + digit, prefix + digit + ".py"):
+                    for name in (part, "alpha\\" + part):
+                        with self.subTest(name=name):
+                            joined = file_facts(expected_name=name, final_path=ROOT + "\\" + name)
+                            self.assertEqual(w.judge_handle(joined, w.KIND_FILE), "plugin_file_unreadable")
+                            step = dir_facts(expected_name=name, final_path=ROOT + "\\" + name)
+                            self.assertEqual(w.judge_handle(step, w.KIND_DIRECTORY), "plugin_directory_untrusted")
+
     def test_names_near_a_device_name_pass(self):
-        for name in ("CONSOLE\\plugin.py", "alpha\\COM10.py", "alpha\\LPT0.py", "alpha\\nul_plugin.py", "COM\\x.py"):
+        for name in ("CONSOLE\\plugin.py", "alpha\\COM10.py", "alpha\\nul_plugin.py", "COM\\x.py"):
             with self.subTest(name=name):
                 self.assertIsNone(w.judge_handle(file_facts(expected_name=name, final_path=ROOT + "\\" + name),
                                                  w.KIND_FILE))

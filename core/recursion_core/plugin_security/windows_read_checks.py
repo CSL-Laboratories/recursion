@@ -15,7 +15,8 @@ answers ``plugin_file_unreadable`` or ``plugin_file_untrusted``; a directory ste
 
 * an expected name that cannot be judged (empty for a file; an empty part, ``.`` or ``..``; a
   ``:``; a ``/``; a part ending in a dot or a space; a device name such as ``CON`` or ``COM1.py``
-  in any letter case; a reserved character ``< > " | ? *``; a control character):
+  in any letter case, ``COM0``, ``LPT0`` and the superscript-digit forms included; a reserved
+  character ``< > " | ? *``; a control character):
   ``plugin_file_unreadable``;
 * one handle fact that could not be read (``None``), or a link count of 0: ``plugin_file_unreadable``;
 * any reparse attribute or tag: ``plugin_file_unreadable``;
@@ -68,6 +69,12 @@ _SEPARATOR = "\\"
 # Names Windows opens as a device in any folder, with or without an extension, in any letter case.
 _DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
                           | {f"{prefix}{n}" for prefix in ("COM", "LPT") for n in range(1, 10)})
+# COM0 and LPT0, which Microsoft's file naming page lists as reserved (CPython's list does not).
+_DEVICE_NAMES_ZERO = frozenset({"COM0", "LPT0"})
+# COM and LPT followed by a superscript one, two or three, which Windows also reserves.
+_DEVICE_NAMES_SUPERSCRIPT = frozenset(f"{prefix}{digit}" for prefix in ("COM", "LPT")
+                                      for digit in ("\u00b9", "\u00b2", "\u00b3"))
+_ALL_DEVICE_NAMES = _DEVICE_NAMES | _DEVICE_NAMES_ZERO | _DEVICE_NAMES_SUPERSCRIPT
 _RESERVED_CHARACTERS = frozenset('<>"|?*:/')
 # The facts one query of the handle gives; ``None`` in one of them means that query failed.
 _HANDLE_FACTS = ("attributes", "reparse_tag", "link_count", "file_type", "final_path", "owner_ok")
@@ -130,7 +137,7 @@ def _plain_name(name: str, kind: str) -> bool:
             return False
         if any(char in _RESERVED_CHARACTERS or ord(char) < 32 for char in part):
             return False
-        if part.split(".", 1)[0].rstrip(" ").upper() in _DEVICE_NAMES:
+        if part.split(".", 1)[0].rstrip(" ").upper() in _ALL_DEVICE_NAMES:
             return False
     return True
 

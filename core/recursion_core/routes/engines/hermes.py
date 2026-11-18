@@ -1,11 +1,17 @@
-"""Hermes (upstream Hermes Agent, NousResearch/hermes-agent): the one-shot stream parser and its argv.
+"""Hermes (upstream Hermes Agent, NousResearch/hermes-agent): the one-shot stream parser, its argv,
+and the long-lived gateway owner.
 
 WHAT THIS IS. The parser half of the Hermes one-shot driver: it reads the JSONL stream that
 ``hermes chat --query-file - --format stream-json`` writes on stdout and turns each line into driver.v2
-event drafts (``schemas/control/v1/driver.v2.json``, ``$defs/event_draft``). It starts nothing, writes
-nothing to an engine, registers nothing and reads no file. The driver that launches Hermes, and its
-registration in the engine table, come in later slices; this module is written so that both can use it
-unchanged (one ``HermesStreamParser`` per run's stream, fed by one reader thread).
+event drafts (``schemas/control/v1/driver.v2.json``, ``$defs/event_draft``). The parser starts nothing,
+writes nothing to an engine, registers nothing and reads no file (one ``HermesStreamParser`` per run's
+stream, fed by one reader thread). Registration in the engine table is a later slice.
+
+THE LONG-LIVED OWNER. Chat and ACP are viewers of a profile gateway that keeps the turn after they
+exit (a chat viewer can exit 3 while that turn is still running). ``HermesGatewayDrive`` launches
+``hermes gateway run --no-supervise --external-supervisor`` on a dedicated profile as the foreground
+process of the run's unit, which here is that process's own session. A viewer exit is not Stop.
+``route_stop`` answers stopped only after that gateway's work has ended, and pending otherwise.
 
 THE PROTOCOL, as the pinned upstream source writes it (``hermes_cli/stream_json.py``,
 ``StreamJsonEmitter``, at NousResearch/hermes-agent 2f7e62bad99052055d1db9213b81eaab26174bc4). Every
@@ -84,14 +90,23 @@ THE ARGV. ``one_shot_argv`` gives what a registration with ``default_executable=
 argv[0] is the binary the route entry names when composition gave one, else ``hermes``, and nothing
 else. The prompt goes on standard input (``--query-file -``), never on the command line, where every
 user of the host can read it and its length is bounded; the core writes it and closes stdin, as on
-today's one-turn path.
+today's one-turn path. ``gateway_argv`` is the long-lived owner: the same binary, then
+``gateway run --no-supervise --external-supervisor --profile <name>``. The profile is dedicated to the
+run. The shared names ``default`` and ``root`` are refused, and so is a profile directory reached
+through a symlink (a new-looking path can alias another gateway).
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import math
+import os
 import re
+import signal
+import stat
+import subprocess
+import threading
+import time
 
 from recursion_core.routes.contract import ENGINE_ERROR, ENGINE_EXITED
 
@@ -108,6 +123,8 @@ def _canonical():
 ENGINE = 'hermes'
 DEFAULT_EXECUTABLE = 'hermes'     # the one command name the engine-table registration will state
 ONE_SHOT_ARGS = ('chat', '--query-file', '-', '--format', 'stream-json')
+# Foreground owner of the profile gateway. Chat and ACP attach to it; they are not the unit.
+GATEWAY_ARGS = ('gateway', 'run', '--no-supervise', '--external-supervisor')
 UPSTREAM_PIN = 'NousResearch/hermes-agent@2f7e62bad99052055d1db9213b81eaab26174bc4'
 
 # driver.v2's declaration of the one-shot driver. Usage is read from the result record's typed token
@@ -136,6 +153,10 @@ _CALL_ID = re.compile(r'[^\r\n]{1,128}')
 _NAME = re.compile(r'[^\r\n]{1,256}')
 _MODEL = re.compile(r'[^\r\n]{1,256}')
 _CONNECTION = re.compile(r'(subscription|api_key|passthrough):[^\r\n]+')
+_PROFILE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
+_RUN_ID = re.compile(r'[A-Za-z0-9_-]{1,64}')
+_SHARED_PROFILES = frozenset({'default', 'root'})
+_TURN_UNKNOWN = object()
 _SURROGATE = re.compile('[%s-%s]' % (chr(0xD800), chr(0xDFFF)))   # a lone surrogate after JSON decoding
 _TOKEN_KEYS = (('input_tokens', 'input'), ('output_tokens', 'output'),
                ('cache_read_tokens', 'cache_read'), ('cache_write_tokens', 'cache_write'))
@@ -154,15 +175,32 @@ class HermesParseError(ValueError):
     """A caller error: a line that is not text, or a parser built with a bad connection id."""
 
 
+class HermesOwnershipRefused(Exception):
+    """The gateway was not taken as this run's. A Stop after this is pending, never stopped."""
+
+    def __init__(self, cause: str) -> None:
+        self.cause = cause
+        super().__init__(cause)
+
+
+def _executable(binary: str | None) -> str:
+    if binary is None:
+        return DEFAULT_EXECUTABLE
+    if isinstance(binary, str) and binary.startswith('/') and '\0' not in binary and '\n' not in binary:
+        return binary
+    raise HermesParseError('binary: an absolute path, or None for the default executable')
+
+
 def one_shot_argv(binary: str | None = None) -> list[str]:
     """The one-shot command. ``binary`` is the absolute path a route entry names, when it names one."""
-    if binary is None:
-        executable = DEFAULT_EXECUTABLE
-    elif isinstance(binary, str) and binary.startswith('/') and '\0' not in binary and '\n' not in binary:
-        executable = binary
-    else:
-        raise HermesParseError('binary: an absolute path, or None for the default executable')
-    return [executable, *ONE_SHOT_ARGS]
+    return [_executable(binary), *ONE_SHOT_ARGS]
+
+
+def gateway_argv(binary: str | None = None, *, profile: str) -> list[str]:
+    """The foreground gateway the run's unit must hold. ``profile`` is dedicated to this run."""
+    if not isinstance(profile, str) or _PROFILE.fullmatch(profile) is None or profile in _SHARED_PROFILES:
+        raise HermesOwnershipRefused('profile')
+    return [_executable(binary), *GATEWAY_ARGS, '--profile', profile]
 
 
 def _no_duplicate_keys(pairs: list) -> dict:
@@ -549,5 +587,440 @@ def declaration() -> dict:
     return json.loads(json.dumps(DECLARATION))
 
 
-__all__ = ['DECLARATION', 'DEFAULT_EXECUTABLE', 'ENGINE', 'HermesParseError', 'HermesStreamParser',
-           'ONE_SHOT_ARGS', 'TOOL_OUTPUT_CAP', 'UPSTREAM_PIN', 'declaration', 'input_digest', 'one_shot_argv']
+def _directory_flags() -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, 'O_NOFOLLOW'):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _owned_directory(path: str, cause: str):
+    """The lstat of a real directory we own. A symlink is ``cause``, never followed."""
+    try:
+        info = os.lstat(path)
+    except OSError as err:
+        raise HermesOwnershipRefused(cause) from err
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise HermesOwnershipRefused(cause)
+    return info
+
+
+def _proc_identity(pid: int):
+    """``(state, pgrp, session, start)`` from ``/proc/<pid>/stat``, or None when it cannot be read.
+
+    ``start`` is the kernel start-time field. A later read with a different start time is a
+    reused pid, not the process that had this pid before.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        fd = os.open(f'/proc/{pid}/stat', os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    except OSError:
+        return None
+    try:
+        data = os.read(fd, 4096)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    cut = data.rfind(b')')
+    if cut < 0:
+        return None
+    rest = data[cut + 2:].split()
+    if len(rest) < 20:
+        return None
+    try:
+        pgrp = int(rest[2])
+        session = int(rest[3])
+        start = int(rest[19])
+    except ValueError:
+        return None
+    return rest[0], pgrp, session, start
+
+
+def _pid_alive(pid: int):
+    """True when ``pid`` is live, False when it is gone or a zombie, None when that is unknown.
+
+    None means a signal-0 probe found the pid and ``/proc/<pid>/stat`` still could not be read.
+    That is not death: a caller must not treat the process as ended.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)  # probe only: signal 0 does not terminate
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    ident = _proc_identity(pid)
+    if ident is None:
+        return None
+    return ident[0] not in (b'Z', b'X')
+
+
+def _group_populated(pgid: int) -> bool:
+    """True when any live process is in the session ``pgid`` names, or ``/proc`` cannot be listed.
+
+    ``pgid`` is the launch group's id. The child is a new session, so that id is the session id
+    too. A member that has moved to another group of the same session still counts. A missing
+    listing is unknown, so the caller must not answer stopped. A pid whose stat disappeared
+    between the listing and the read is skipped.
+    """
+    try:
+        names = os.listdir('/proc')
+    except OSError:
+        return True
+    if not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 0:
+        return True
+    for name in names:
+        if not name.isdigit():
+            continue
+        ident = _proc_identity(int(name))
+        if ident is None:
+            continue
+        state, _pgrp, session, _start = ident
+        if state in (b'Z', b'X'):
+            continue
+        if session == pgid:
+            return True
+    return False
+
+
+class HermesGatewayDrive:
+    """Launches and owns ``hermes gateway run`` inside the run's unit.
+
+    The unit is the gateway process's session. Stop signals the launch group (SIGINT, then
+    SIGKILL after ``timeout``, the same order as the #916 unit properties) and answers stopped
+    only when that session has no live member and this profile's turn record does not name one.
+    A member in another group of the same session keeps the answer pending: this drive does not
+    signal that group. A chat viewer exiting 3 is not that answer. A second caller receives the
+    same confirmation with ``repeat`` true.
+    """
+
+    def __init__(self, binary: str | None, *, profile: str, home: str, run_id: str, timeout: float = 2.0) -> None:
+        if not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None:
+            raise HermesOwnershipRefused('run_id')
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) \
+                or timeout <= 0:
+            raise HermesOwnershipRefused('timeout')
+        if not isinstance(home, str) or not home.startswith('/') or any(ch in home for ch in '\0\n\r'):
+            raise HermesOwnershipRefused('home')
+        self.argv = gateway_argv(binary, profile=profile)
+        self.profile = profile
+        self.home = home
+        self.run_id = run_id
+        self.timeout = float(timeout)
+        self.pgid: int | None = None
+        self._proc: subprocess.Popen | None = None
+        # One record per dedicated profile. Two profiles on one home do not share it.
+        self._turn_path = os.path.join(home, 'profiles', profile, '.gateway-turn')
+        self._launch_start: int | None = None
+        self._identity: tuple | None = None
+        self._launched = False
+        self._confirmed = False
+        self._lock = threading.Lock()
+
+    @property
+    def confirmed(self) -> bool:
+        with self._lock:
+            return self._confirmed
+
+    def launch(self) -> None:
+        """Start the gateway in its own session. Refuses a profile this run did not just create."""
+        with self._lock:
+            if self._launched or self._proc is not None:
+                raise HermesOwnershipRefused('already_launched')
+            self._prepare_profile()
+            env = {'PATH': '/usr/bin:/bin', 'HOME': self.home, 'HERMES_HOME': self.home,
+                   'RECURSION_E9_GATEWAY_TURN': self._turn_path}
+            try:
+                self._proc = subprocess.Popen(
+                    self.argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, cwd=self.home, start_new_session=True)
+            except OSError:
+                self._proc = None
+                raise
+            self.pgid = self._proc.pid
+            self._capture_launch_identity()
+            # KeyboardInterrupt here leaves pgid set and _launched false. stop() signals
+            # that group and clears it, so a later launch is not stuck behind the child.
+            if not self._wait_until_owned():
+                self._signal(signal.SIGKILL)
+                self._reap()
+                self.pgid = None
+                self._proc = None
+                self._launch_start = None
+                raise HermesOwnershipRefused('gateway_exited')
+            self._launched = True
+
+    def viewer_exit(self) -> int:
+        """Run the chat viewer. Its exit, including 3, does not end the owned gateway and is not Stop."""
+        if not self._launched:
+            raise HermesOwnershipRefused('not_launched')
+        argv = [self.argv[0], *ONE_SHOT_ARGS]
+        env = {'PATH': '/usr/bin:/bin', 'HOME': self.home, 'HERMES_HOME': self.home,
+               'RECURSION_E9_GATEWAY_TURN': self._turn_path}
+        done = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=self.timeout + 5, check=False)
+        return done.returncode
+
+    def stop(self) -> dict:
+        """End the owned gateway's work. Pending whenever that work is not shown to have ended."""
+        with self._lock:
+            try:
+                return self._stop_locked()
+            except KeyboardInterrupt:
+                raise
+            except Exception as err:
+                name = type(err).__name__
+                if not name.isidentifier() or len(name) > 128:
+                    name = 'Exception'
+                return self._pending('cleanup_error:' + name)
+
+    def turn_alive(self) -> bool:
+        """True when the turn record names a process that is still alive."""
+        with self._lock:
+            return self._turn_blocks()
+
+    def member_alive(self) -> bool:
+        """True when the gateway session still has a live member."""
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return True
+            return self.pgid is not None and _group_populated(self.pgid)
+
+    def _prepare_profile(self) -> None:
+        info = _owned_directory(self.home, 'home')
+        if info.st_mode & 0o077:
+            raise HermesOwnershipRefused('home_writable')
+        parent = os.path.join(self.home, 'profiles')
+        if not os.path.lexists(parent):
+            try:
+                os.mkdir(parent, 0o700)
+            except FileExistsError:
+                pass
+        _owned_directory(parent, 'profile_alias')
+        if stat.S_IMODE(_owned_directory(parent, 'profile_alias').st_mode) & 0o077:
+            raise HermesOwnershipRefused('profile_alias')
+        dest = os.path.join(parent, self.profile)
+        if os.path.lexists(dest):
+            try:
+                st = os.lstat(dest)
+            except OSError as err:
+                raise HermesOwnershipRefused('profile_alias') from err
+            if stat.S_ISLNK(st.st_mode):
+                raise HermesOwnershipRefused('profile_alias')
+            raise HermesOwnershipRefused('profile_not_dedicated')
+        os.mkdir(dest, 0o700)
+        fd = os.open(dest, _directory_flags())
+        try:
+            st = os.fstat(fd)
+        finally:
+            os.close(fd)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+            raise HermesOwnershipRefused('profile_owner')
+        self._identity = (st.st_dev, st.st_ino, st.st_uid)
+
+    def _profile_still_ours(self) -> bool:
+        if self._identity is None:
+            return False
+        dest = os.path.join(self.home, 'profiles', self.profile)
+        try:
+            info = os.lstat(dest)
+        except OSError:
+            return False
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return False
+        try:
+            fd = os.open(dest, _directory_flags())
+        except OSError:
+            return False
+        try:
+            st = os.fstat(fd)
+        finally:
+            os.close(fd)
+        return (st.st_dev, st.st_ino, st.st_uid) == self._identity
+
+    def _stop_locked(self) -> dict:
+        if self._confirmed and not self._blocks():
+            return self._stopped(True)
+        if self.pgid is None:
+            return self._pending('cgroup_unknown')
+        if self._launched and not self._profile_still_ours():
+            self._end_group()
+            return self._pending('cgroup_changed')
+        self._signal(signal.SIGINT)
+        if not self._wait_dead(self.timeout):
+            self._signal(signal.SIGKILL)
+            if not self._wait_dead(self.timeout):
+                return self._pending('member_alive' if self._blocks() else 'confirm_timeout')
+        if self._blocks():
+            return self._pending('member_alive')
+        if not self._launched:
+            # Popen returned and ownership did not. The child is gone; do not leave it blocking launch.
+            self._reap()
+            self.pgid = None
+            self._proc = None
+            self._launch_start = None
+            return self._pending('cgroup_unknown')
+        self._confirmed = True
+        return self._stopped(False)
+
+    def _wait_until_owned(self) -> bool:
+        """True when the process we started is still the foreground leader of its session.
+
+        A turn record that names that pid can confirm it early. The record is not required:
+        a process that never writes one, and is still in the foreground at the deadline, is
+        the owned unit.
+        """
+        deadline = time.monotonic() + self.timeout
+        while True:
+            if self._proc is None or self._proc.poll() is not None:
+                return False
+            record = self._read_turn()
+            if isinstance(record, dict) and record.get('alive') is True and record.get('pid') == self.pgid \
+                    and self._foreground_leader():
+                return True
+            if time.monotonic() >= deadline:
+                return self._foreground_leader()
+            time.sleep(0.02)
+
+    def _wait_dead(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._blocks():
+                return True
+            time.sleep(0.02)
+        return not self._blocks()
+
+    def _blocks(self) -> bool:
+        if self._proc is not None and self._proc.poll() is None:
+            return True
+        if self.pgid is not None and _group_populated(self.pgid):
+            return True
+        return self._turn_blocks()
+
+    def _turn_blocks(self) -> bool:
+        record = self._read_turn()
+        if record is None:
+            return False
+        if record is _TURN_UNKNOWN:
+            return True
+        if record.get('alive') is not True:
+            return False
+        pid = record.get('pid')
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            return True
+        alive = _pid_alive(pid)
+        if alive is None:
+            return True
+        if not alive:
+            return False
+        # A live pid from another profile's session is not this drive's member.
+        if self.pgid is None:
+            return True
+        ident = _proc_identity(pid)
+        if ident is None:
+            return True
+        return ident[2] == self.pgid
+
+    def _read_turn(self):
+        path = self._turn_path
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return _TURN_UNKNOWN
+        try:
+            chunks = []
+            while True:
+                piece = os.read(fd, 65536)
+                if not piece:
+                    break
+                chunks.append(piece)
+                if sum(len(item) for item in chunks) > 65536:
+                    return _TURN_UNKNOWN
+        finally:
+            os.close(fd)
+        try:
+            value = json.loads(b''.join(chunks).decode('utf-8'))
+        except (UnicodeError, ValueError):
+            return _TURN_UNKNOWN
+        return value if isinstance(value, dict) else _TURN_UNKNOWN
+
+    def _capture_launch_identity(self) -> None:
+        """Remember the launch leader's start time, so a reused pgid is not signalled later."""
+        self._launch_start = None
+        if self.pgid is None:
+            return
+        deadline = time.monotonic() + 0.2
+        while True:
+            ident = _proc_identity(self.pgid)
+            if ident is not None and ident[0] not in (b'Z', b'X'):
+                self._launch_start = ident[3]
+                return
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.01)
+
+    def _foreground_leader(self) -> bool:
+        """True when the process we started is still the foreground leader of its session."""
+        proc = self._proc
+        if proc is None or self.pgid is None or proc.poll() is not None or proc.pid != self.pgid:
+            return False
+        ident = _proc_identity(self.pgid)
+        if ident is None:
+            return True
+        state, pgrp, session, _start = ident
+        if state in (b'Z', b'X'):
+            return False
+        return pgrp == self.pgid and session == self.pgid
+
+    def _signal(self, sig: int) -> None:
+        """Signal the launch group when its leader is still the process started at launch.
+
+        Other groups in the session are not signalled. A pgid whose start time is missing
+        or different is not this process, so it is not signalled either.
+        """
+        if self.pgid is None or self._launch_start is None:
+            return
+        ident = _proc_identity(self.pgid)
+        if ident is None or ident[3] != self._launch_start:
+            return
+        try:
+            os.killpg(self.pgid, sig)
+        except ProcessLookupError:
+            return
+
+    def _end_group(self) -> None:
+        self._signal(signal.SIGKILL)
+        self._reap()
+
+    def _reap(self) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            proc.wait(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            return
+
+    def _pending(self, reason: str) -> dict:
+        return {'code': 'pending', 'run_id': self.run_id, 'state': 'pending', 'reason': reason}
+
+    def _stopped(self, repeat: bool) -> dict:
+        return {'code': 'stopped', 'run_id': self.run_id, 'state': 'stopped', 'repeat': repeat}
+
+
+def route_stop(drive: HermesGatewayDrive) -> dict:
+    """The Stop answer a Hermes route may give. It is never stopped while the gateway's work is alive."""
+    if not isinstance(drive, HermesGatewayDrive):
+        raise HermesOwnershipRefused('drive')
+    return drive.stop()
+
+
+__all__ = ['DECLARATION', 'DEFAULT_EXECUTABLE', 'ENGINE', 'GATEWAY_ARGS', 'HermesGatewayDrive',
+           'HermesOwnershipRefused', 'HermesParseError', 'HermesStreamParser', 'ONE_SHOT_ARGS',
+           'TOOL_OUTPUT_CAP', 'UPSTREAM_PIN', 'declaration', 'gateway_argv', 'input_digest',
+           'one_shot_argv', 'route_stop']

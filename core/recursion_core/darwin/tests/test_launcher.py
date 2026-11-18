@@ -30,8 +30,6 @@ from pathlib import Path
 _FLAG = '--simulate-darwin-launch'
 _ANSWER = '--simulate-darwin-answer'
 _MARK = 'SIMULATED_DARWIN_LAUNCH '
-_SCRATCH = Path('/var/tmp/grok-darwin-launcher')
-_ANSWER_SCRATCH = Path('/var/tmp/grok-darwin-launcher-2')
 _LAUNCHER = (
     'platform_unsupported: the engine launcher needs Linux '
     '(FIFO stdio, FIONREAD, pidfd, systemd user units)'
@@ -75,7 +73,7 @@ def _launch() -> dict:
     )
     import recursion_core.daemon.launcher as launcher_mod
 
-    scratch = Path(tempfile.mkdtemp(prefix='dl', dir=str(_SCRATCH)))
+    scratch = Path(tempfile.mkdtemp(prefix='dl'))
     os.chmod(scratch, 0o700)
     state = scratch / 'state'
     out = scratch / 'child.json'
@@ -207,20 +205,20 @@ def _launch() -> dict:
 
 
 def _child_main() -> int:
-    _SCRATCH.mkdir(mode=0o700, exist_ok=True)
     sys.stdout.write('\n' + _MARK + json.dumps(_launch()) + '\n')
     return 0
 
 
 def simulate() -> dict:
-    _SCRATCH.mkdir(mode=0o700, exist_ok=True)
-    env = os.environ.copy()
-    env['PYTHONDONTWRITEBYTECODE'] = '1'
-    env['TMPDIR'] = str(_SCRATCH)
-    proc = subprocess.run(
-        [sys.executable, '-B', str(Path(__file__).resolve()), _FLAG],
-        capture_output=True, text=True, timeout=40, env=env, check=False,
-    )
+    # The child makes every path with tempfile under this directory, which it gets as TMPDIR.
+    with tempfile.TemporaryDirectory(prefix='dl-') as scratch:
+        env = os.environ.copy()
+        env['PYTHONDONTWRITEBYTECODE'] = '1'
+        env['TMPDIR'] = scratch
+        proc = subprocess.run(
+            [sys.executable, '-B', str(Path(__file__).resolve()), _FLAG],
+            capture_output=True, text=True, timeout=40, env=env, check=False,
+        )
     line = next((item for item in reversed(proc.stdout.splitlines()) if item.startswith(_MARK)), None)
     if line is None:
         raise AssertionError(
@@ -308,21 +306,21 @@ def _bind() -> tuple:
     return launcher_mod, Registry, engine_exec, FakeKqueue, RUN_COOKIE, DarwinRunManager, ProcTable
 
 
-def _begin(run_id: str) -> tuple:
+def _begin(run_id: str, kqueue=None, processes=None) -> tuple:
     launcher_mod, Registry, engine_exec, FakeKqueue, RUN_COOKIE, DarwinRunManager, ProcTable = _bind()
     held = _Held()
-    _ANSWER_SCRATCH.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(_ANSWER_SCRATCH, 0o700)
-    held.scratch = Path(tempfile.mkdtemp(prefix='ans-', dir=str(_ANSWER_SCRATCH)))
+    held.scratch = Path(tempfile.mkdtemp(prefix='ans-'))
     os.chmod(held.scratch, 0o700)
     scratch = held.scratch
     stdin, stdout, stderr = scratch / 'stdin.fifo', scratch / 'stdout.log', scratch / 'stderr.log'
     envfifo = scratch / 'env.fifo'
     os.mkfifo(envfifo, 0o600)
     registry = Registry(scratch / 'state')
-    kqueue = FakeKqueue()
+    if kqueue is None:
+        kqueue = FakeKqueue()
     held.kqueue = kqueue
-    manager = DarwinRunManager(registry, kqueue=kqueue, processes=ProcTable())
+    manager = DarwinRunManager(registry, kqueue=kqueue,
+                               processes=ProcTable() if processes is None else processes)
     unit = 'recursion-run-%s.service' % run_id
     manager.prepare(unit, properties=(
         'StandardInput=file:' + str(stdin),
@@ -621,6 +619,145 @@ def _answer_rules() -> dict:
         held.close()
 
 
+class _WatchRefused:
+    """A kqueue whose watch fails. ``OSError(ESRCH)`` is XNU's answer for a pid that already exited."""
+
+    def __init__(self, err) -> None:
+        self.err = err
+        self.calls: list[int] = []
+
+    def watch_exit(self, pid: int) -> int:
+        self.calls.append(pid)
+        if self.err is None:
+            raise RuntimeError('watch failed')
+        raise OSError(self.err, os.strerror(self.err))
+
+
+class _BlindTable:
+    """A process table that cannot read the leader: the start-time check never passes."""
+
+    def read(self, pid: int):
+        return None
+
+    def start_time(self, pid: int):
+        return None
+
+    def record_launch(self, **fields) -> None:
+        raise AssertionError('recorded a launch the start-time check did not pass')
+
+
+def _readable(fd) -> bool:
+    import select
+
+    return isinstance(fd, int) and bool(select.select([fd], [], [], 0)[0])
+
+
+def _start_with(run_id: str, kqueue, processes=None) -> dict:
+    """Start one sleeping leader through ``kqueue``; what a caller of the manager sees."""
+
+    held, manager, unit, envfifo, registry, cookie_name, engine_exec, _launcher = _begin(
+        run_id, kqueue=kqueue, processes=processes)
+    try:
+        standin = _standin(held.scratch, 'import time\ntime.sleep(30)\n')
+        detail = None
+        try:
+            manager.start(unit, _argv(engine_exec, envfifo, standin, []))
+        except Exception as exc:  # noqa: BLE001 - a refusal is the result
+            detail = getattr(exc, 'detail', None) or type(exc).__name__
+        leader = manager._runs.get(unit)
+        if leader is not None:
+            held.popen = leader.popen
+        group, pid = manager.unit_identity(unit)
+        fd = manager.open_main_pidfd(group, pid) if pid else None
+        if isinstance(fd, int):
+            held.fds.append(fd)
+        record = json.loads(dict(registry.control_all()).get(run_id, '{}'))
+        cookie = record.get(cookie_name)
+        spawned = kqueue.calls[0] if kqueue.calls else None
+        return {
+            'detail': detail,
+            'calls': list(kqueue.calls),
+            'pid': pid,
+            'group': group,
+            'exit_delivered': _readable(fd),
+            'cookie_recorded': isinstance(cookie, str) and len(cookie) == 32,
+            'start_recorded': leader is not None and record.get('leader_pid') == pid
+            and record.get('leader_start_time') == leader.start_time,
+            'owned': sorted(manager.owned_units()),
+            'spawned_state': _proc_state(spawned) if isinstance(spawned, int) else None,
+        }
+    finally:
+        held.close()
+
+
+def _answer_esrch_start() -> dict:
+    result = _start_with('esrch1', _WatchRefused(errno.ESRCH))
+    result['ok'] = True
+    return result
+
+
+def _answer_esrch_adopt() -> dict:
+    _launcher_mod, Registry, _exec, _fake, cookie_name, DarwinRunManager, ProcTable = _bind()
+    scratch = Path(tempfile.mkdtemp(prefix='adopt-'))
+    target = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+    try:
+        table = ProcTable()
+        start = table.start_time(target.pid)
+
+        def adopt(run_id: str, err, recorded, cookie=True) -> dict:
+            reg = Registry(scratch / run_id)
+            body = {
+                'run_id': run_id,
+                'cgroup': '/darwin-pgid/recursion-run-%s.service' % run_id,
+                'leader_pid': target.pid,
+                'leader_start_time': recorded,
+            }
+            if cookie:
+                body[cookie_name] = 'cd' * 16
+            reg.control_put(run_id, json.dumps(body))
+            kq = _WatchRefused(err)
+            mgr = DarwinRunManager(reg, kqueue=kq, processes=table)
+            adopted = detail = None
+            try:
+                adopted = mgr.adopt('recursion-run-%s.service' % run_id)
+            except Exception as exc:  # noqa: BLE001 - the refusal is the result
+                detail = getattr(exc, 'detail', None) or type(exc).__name__
+            fd = mgr.open_main_pidfd(*adopted) if adopted else None
+            delivered = _readable(fd)
+            if isinstance(fd, int):
+                os.close(fd)
+            return {'adopted': list(adopted) if adopted else None, 'detail': detail,
+                    'calls': list(kq.calls), 'exit_delivered': delivered}
+
+        later = start + 1 if isinstance(start, int) else 1
+        return {
+            'ok': True,
+            'pid': target.pid,
+            'start': start,
+            'esrch': adopt('gone1', errno.ESRCH, start),
+            'esrch_reused': adopt('gone2', errno.ESRCH, later),
+            'esrch_no_cookie': adopt('gone3', errno.ESRCH, start, cookie=False),
+            'eperm': adopt('gone4', errno.EPERM, start),
+            'other': adopt('gone5', None, start),
+        }
+    finally:
+        target.kill()
+        try:
+            target.wait(timeout=2)
+        except Exception:
+            pass
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _answer_watch_refused() -> dict:
+    return {
+        'ok': True,
+        'eperm': _start_with('eperm1', _WatchRefused(errno.EPERM)),
+        'other': _start_with('other1', _WatchRefused(None)),
+        'esrch_unchecked': _start_with('blind1', _WatchRefused(errno.ESRCH), processes=_BlindTable()),
+    }
+
+
 def _answer(mode: str) -> dict:
     modes = {
         'stdin': _answer_stdin,
@@ -628,6 +765,9 @@ def _answer(mode: str) -> dict:
         'stop': _answer_stop,
         'reap': _answer_reap,
         'rules': _answer_rules,
+        'esrch_start': _answer_esrch_start,
+        'esrch_adopt': _answer_esrch_adopt,
+        'watch_refused': _answer_watch_refused,
     }
     fn = modes.get(mode)
     if fn is None:
@@ -637,7 +777,6 @@ def _answer(mode: str) -> dict:
 
 def _answer_main() -> int:
     mode = sys.argv[2] if len(sys.argv) > 2 else ''
-    _ANSWER_SCRATCH.mkdir(mode=0o700, exist_ok=True)
     try:
         payload = _answer(mode)
     except Exception as exc:  # noqa: BLE001 - the child reports the failure
@@ -649,15 +788,15 @@ def _answer_main() -> int:
 
 
 def run_answer(mode: str) -> dict:
-    _ANSWER_SCRATCH.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(_ANSWER_SCRATCH, 0o700)
-    env = os.environ.copy()
-    env['PYTHONDONTWRITEBYTECODE'] = '1'
-    env['TMPDIR'] = str(_ANSWER_SCRATCH)
-    proc = subprocess.run(
-        [sys.executable, '-B', str(Path(__file__).resolve()), _ANSWER, mode],
-        capture_output=True, text=True, timeout=40, env=env, check=False,
-    )
+    # The child makes every path with tempfile under this directory, which it gets as TMPDIR.
+    with tempfile.TemporaryDirectory(prefix='ans-') as scratch:
+        env = os.environ.copy()
+        env['PYTHONDONTWRITEBYTECODE'] = '1'
+        env['TMPDIR'] = scratch
+        proc = subprocess.run(
+            [sys.executable, '-B', str(Path(__file__).resolve()), _ANSWER, mode],
+            capture_output=True, text=True, timeout=40, env=env, check=False,
+        )
     line = next((item for item in reversed(proc.stdout.splitlines()) if item.startswith(_MARK)), None)
     if line is None:
         raise AssertionError(
@@ -740,6 +879,53 @@ class DarwinLauncherTests(unittest.TestCase):
         self.assertEqual(32, result['cookie_len'], result)
         self.assertFalse(result['cookie_on_amend'], result)
         self.assertFalse(result['cookie_on_engine'], result)
+
+    def test_esrch_at_start_is_an_exit_already_delivered(self) -> None:
+        result = run_answer('esrch_start')
+        self.assertTrue(result['ok'], result)
+        self.assertIsNone(result['detail'], result)
+        self.assertGreater(result['pid'], 1)
+        self.assertEqual([result['pid']], result['calls'], result)
+        self.assertEqual('/darwin-pgid/recursion-run-esrch1.service', result['group'])
+        self.assertTrue(result['exit_delivered'], result)
+        self.assertTrue(result['cookie_recorded'], result)
+        self.assertTrue(result['start_recorded'], result)
+        self.assertEqual(['recursion-run-esrch1.service'], result['owned'], result)
+
+    def test_esrch_at_adopt_is_an_exit_already_delivered(self) -> None:
+        result = run_answer('esrch_adopt')
+        self.assertTrue(result['ok'], result)
+        self.assertIsInstance(result['start'], int)
+        pid = result['pid']
+        gone = result['esrch']
+        self.assertIsNone(gone['detail'], result)
+        self.assertEqual(['/darwin-pgid/recursion-run-gone1.service', pid], gone['adopted'], result)
+        self.assertEqual([pid], gone['calls'], result)
+        self.assertTrue(gone['exit_delivered'], result)
+        # ESRCH before the start-time check or the cookie has passed is never asked for.
+        for name, detail in (('esrch_reused', 'pid_reused'), ('esrch_no_cookie', 'cookie_unrecorded')):
+            self.assertEqual(detail, result[name]['detail'], result)
+            self.assertIsNone(result[name]['adopted'], result)
+            self.assertEqual([], result[name]['calls'], result)
+        for name in ('eperm', 'other'):
+            self.assertEqual('kqueue_unavailable', result[name]['detail'], result)
+            self.assertIsNone(result[name]['adopted'], result)
+            self.assertEqual([pid], result[name]['calls'], result)
+
+    def test_other_watch_errors_still_refuse_kqueue_unavailable(self) -> None:
+        result = run_answer('watch_refused')
+        self.assertTrue(result['ok'], result)
+        for name in ('eperm', 'other'):
+            row = result[name]
+            self.assertEqual('kqueue_unavailable', row['detail'], result)
+            self.assertEqual(1, len(row['calls']), result)
+            self.assertEqual([], row['owned'], result)
+            self.assertEqual(0, row['pid'], result)
+            self.assertTrue(row['spawned_state'].startswith('gone'), result)
+        unchecked = result['esrch_unchecked']
+        self.assertEqual('start_time_unreadable', unchecked['detail'], result)
+        self.assertEqual([], unchecked['calls'], result)
+        self.assertEqual([], unchecked['owned'], result)
 
 
 if __name__ == '__main__':

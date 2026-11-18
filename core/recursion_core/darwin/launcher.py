@@ -113,6 +113,25 @@ def _boundary(unit: str) -> str:
     return _BOUNDARY + unit
 
 
+def _exit_delivered() -> int:
+    """An exit fd that is already readable, as a kqueue fd is once ``NOTE_EXIT`` fired.
+
+    XNU answers ``ESRCH`` to the watch when the pid has already exited. The
+    caller gets this fd where it would get the kqueue's, and its own exit
+    handling (a readable fd) runs unchanged.
+    """
+
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, b'\n')
+    except BaseException:
+        os.close(read_fd)
+        raise
+    finally:
+        os.close(write_fd)
+    return read_fd
+
+
 class DarwinRunManager:
     """The service manager a Darwin daemon would hand to ``ProductionLauncher``.
 
@@ -183,10 +202,7 @@ class DarwinRunManager:
             proc = self._spawn(list(argv), pending, cookie)
             info = self._await_leader(proc)
             recorded_start = info['start_time']
-            try:
-                kq_fd = self._kqueue.watch_exit(proc.pid)
-            except Exception as exc:
-                raise refused('kqueue_unavailable') from exc
+            kq_fd = self._watch_exit(proc.pid)
             stdio = dict(pending['stdio'])
             stdio['env'] = fifo
             # The launcher removes the env FIFO once the leader has read it.
@@ -271,10 +287,7 @@ class DarwinRunManager:
             raise refused('pid_reused')
         if self._kqueue is None:
             raise refused('kqueue_unavailable')
-        try:
-            kq_fd = self._kqueue.watch_exit(pid)
-        except Exception as exc:
-            raise refused('kqueue_unavailable') from exc
+        kq_fd = self._watch_exit(pid)
         group = record.get('cgroup') if isinstance(record.get('cgroup'), str) else _boundary(unit)
         leader = _Leader(unit, pid, group, recorded, cookie, kq_fd, None, {})
         with self._lock:
@@ -328,6 +341,23 @@ class DarwinRunManager:
     def owned_units(self):
         with self._lock:
             return set(self._runs)
+
+    def _watch_exit(self, pid):
+        """The leader's exit fd. Called only after the start-time check has passed.
+
+        ``ESRCH`` means the leader has already exited: the run is not refused,
+        the exit is delivered at once. ``start`` still records and checks the
+        cookie after this. Every other error refuses ``kqueue_unavailable``.
+        """
+
+        try:
+            return self._kqueue.watch_exit(pid)
+        except OSError as exc:
+            if exc.errno != errno.ESRCH:
+                raise refused('kqueue_unavailable') from exc
+        except Exception as exc:
+            raise refused('kqueue_unavailable') from exc
+        return _exit_delivered()
 
     def _await_leader(self, proc):
         deadline = time.monotonic() + 2.0

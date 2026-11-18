@@ -44,7 +44,9 @@ class ProfileFieldValidationWithoutCrypto(unittest.TestCase):
             with self.subTest(model=model):
                 with self.assertRaises(Refused) as caught:
                     self.authority._check_profile(self.envelope(model_version=model))
-                self.assertEqual(caught.exception.code, "profile_model")
+                # canonical() runs first and refuses DEL (RFC 8785 writes it raw, json.dumps escapes it).
+                expected = "profile_noncanonical" if model == "a\x7fb" else "profile_model"
+                self.assertEqual(caught.exception.code, expected)
 
     def test_provider_keeps_the_id_rule_at_the_profile_boundary(self):
         for provider in ("vendor/model@revision", "a:b-c_d.1"):

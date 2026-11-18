@@ -39,9 +39,11 @@ def check_value(value: object, depth: int = 0) -> None:
             return
         raise Refused("noncanonical_value", "integer out of range")
     if type(value) is str:
-        if value.isascii():
-            return
-        raise Refused("noncanonical_value", "non-ASCII text")
+        if not value.isascii():
+            raise Refused("noncanonical_value", "non-ASCII text")
+        if "\x7f" in value:  # RFC 8785 writes DEL raw; json.dumps escapes it.
+            raise Refused("noncanonical_value", "control character")
+        return
     if type(value) in (list, tuple):
         for item in value:
             check_value(item, depth + 1)
@@ -50,6 +52,8 @@ def check_value(value: object, depth: int = 0) -> None:
         for key, item in value.items():
             if type(key) is not str or not key.isascii():
                 raise Refused("noncanonical_value", "key")
+            if "\x7f" in key:
+                raise Refused("noncanonical_value", "control character")
             check_value(item, depth + 1)
         return
     raise Refused("noncanonical_value", type(value).__name__)

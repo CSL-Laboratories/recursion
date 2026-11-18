@@ -12,10 +12,15 @@ plugin, including a dot directory.
 ``current`` is an ASCII integer and a newline, matching ``^[1-9][0-9]*\\n$``.
 It is written only after generation ``n`` is complete. The live ``plugins/``
 tree is published after that. ``plugin-generations/.publishing`` names, in the
-same form, the generation a command publishes: it is written before that
-generation is renamed into place and removed once the live tree holds it whole.
-The next list, install or remove finishes that publish when ``.publishing``
-names ``current``, and drops ``.publishing`` when it does not. Older
+same form, the generation a command publishes, and on a second line the
+generation ``current`` named before it, when there was one. It is written and
+synced before that generation is renamed into place, so before any live folder
+changes, and removed once the live tree holds it whole. The next list, install
+or remove finishes that publish when ``.publishing`` names ``current``, and
+drops ``.publishing`` when it does not. It finishes it only when every live
+plugin folder is a whole copy from one of the two generations the record names:
+a folder or a link that is not refuses ``plugin_directory_untrusted`` with the
+steps that end the refusal, and nothing is moved or deleted. Older
 generations stay on disk so a later command can point ``current`` at one and
 publish it. This module does not do that. A generation that ``current`` does
 not name (a stop between its rename and the pointer) is left as it is; the next
@@ -75,8 +80,9 @@ _CURRENT = re.compile(r"[1-9][0-9]*\n")
 _GENERATION = re.compile(r"[1-9][0-9]{0,17}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _KEY_ID = re.compile(r"ed25519:[0-9a-f]{32}")
-# Names the generation a command publishes, until the live tree holds it whole.
+# Names the generation a command publishes, and the one it replaces, until the live tree holds it whole.
 _PUBLISHING = ".publishing"
+_RECORD = re.compile(r"([1-9][0-9]*)\n(?:([1-9][0-9]*)\n)?")
 # Names the profile itself uses inside a generation and inside plugins/: never a plugin id.
 _PROFILE_NAMES = frozenset({"install.json"})
 _LABELS = frozenset({"verified", "non_verified"})
@@ -393,13 +399,62 @@ def _finish_publish(config: Path) -> None:
     Without ``.publishing`` the live tree is as the last command left it, or as the user edited it,
     and nothing here touches it.
     """
-    publishing = _read_number(config, _PUBLISHING)
-    if publishing is None:
+    record = _read_pointer(config, _PUBLISHING, _RECORD)
+    if record is None:
         return
+    publishing = int(record.group(1))
     root = config / "plugin-generations"
     if publishing == _read_current(config):
+        replaced = int(record.group(2)) if record.group(2) else None
+        _check_stopped_publish(config, (publishing, replaced))
         _copy_generation_to_live(config, publishing)
     _clear_marker(root)
+
+
+def _check_stopped_publish(config: Path, generations: tuple) -> None:
+    """Before a stopped publish is finished, prove every live plugin folder is the installer's.
+
+    A live folder is the installer's when it is a whole copy, file for file and byte for byte, of the
+    folder of that name in the generation being published or in the one it replaces: the two the
+    record names. Anything else, a link included, was placed by someone else: the command refuses with
+    the steps that end the refusal and nothing is moved or deleted.
+    """
+    live = config / "plugins"
+    if not _lexists(live):
+        return
+    sources = [config / "plugin-generations" / str(number) for number in generations if number is not None]
+    for name in sorted(os.listdir(live)):
+        if name == "install.json":
+            continue
+        path = live / name
+        info = os.lstat(path)
+        if not (stat.S_ISLNK(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+            continue
+        if stat.S_ISLNK(info.st_mode) or not any(_same_tree(path, source / name) for source in sources):
+            raise _way_out(path)
+
+
+def _same_tree(live: Path, written: Path) -> bool:
+    """True when ``live`` holds the same folders and files, with the same bytes, as ``written``. No link."""
+    try:
+        seen, kept = os.lstat(live), os.lstat(written)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISDIR(seen.st_mode) and stat.S_ISDIR(kept.st_mode):
+        names = sorted(os.listdir(live))
+        return names == sorted(os.listdir(written)) and all(_same_tree(live / name, written / name)
+                                                            for name in names)
+    if stat.S_ISREG(seen.st_mode) and stat.S_ISREG(kept.st_mode) and seen.st_size == kept.st_size:
+        return _bytes_of(live, seen.st_size) == _bytes_of(written, kept.st_size)
+    return False
+
+
+def _bytes_of(path: Path, size: int) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        return _read_all(fd, size)
+    finally:
+        os.close(fd)
 
 
 def _clear_marker(root: Path) -> None:
@@ -412,6 +467,11 @@ def _read_current(config: Path) -> int | None:
 
 
 def _read_number(config: Path, name: str) -> int | None:
+    match = _read_pointer(config, name, _CURRENT)
+    return None if match is None else int(match.group(0))
+
+
+def _read_pointer(config: Path, name: str, form: re.Pattern):
     root = config / "plugin-generations"
     if not _lexists(root):
         return None
@@ -426,9 +486,10 @@ def _read_number(config: Path, name: str) -> int | None:
         text = raw.decode("ascii")
     except UnicodeDecodeError:
         raise InstallRefused("generation_unreadable") from None
-    if _CURRENT.fullmatch(text) is None:
+    match = form.fullmatch(text)
+    if match is None:
         raise InstallRefused("generation_unreadable")
-    return int(text)
+    return match
 
 
 def _commit(config: Path, snapshot: Snapshot) -> int:
@@ -437,6 +498,8 @@ def _commit(config: Path, snapshot: Snapshot) -> int:
     root = config / "plugin-generations"
     if not _lexists(root):
         _make_dir(root)
+        # The new name in the config directory is on disk before the generations under it are trusted.
+        _sync_dir(config)
     _require_owned_dir(root)
     current = _read_current(config)
     number = _next_number(root, current)
@@ -450,7 +513,9 @@ def _commit(config: Path, snapshot: Snapshot) -> int:
     os.chmod(partial, 0o700)
     try:
         _write_profile(partial, snapshot)
-        _atomic_replace(root, _PUBLISHING, f"{number}\n".encode("ascii"))
+        # The record names this generation and the one it replaces, synced before any live folder changes.
+        record = f"{number}\n" if current is None else f"{number}\n{current}\n"
+        _atomic_replace(root, _PUBLISHING, record.encode("ascii"))
         os.rename(partial, dest)
         _sync_dir(root)
         _write_pointer(root, number)
@@ -579,6 +644,15 @@ def _way_out(path: Path, plugin_id: str | None = None) -> InstallRefused:
     return InstallRefused("plugin_directory_untrusted", detail=detail, show_detail=True)
 
 
+def _named_way_out(path: Path) -> InstallRefused:
+    """The refusal of a live folder whose name is not a plugin id: the id its manifest holds, if it holds one."""
+    try:
+        held = parse_manifest(_read_file(path / "manifest.json", _MAX_MANIFEST)).plugin_id
+    except (InstallRefused, Refused, ValueError, UnicodeError, RecursionError):
+        held = None
+    return _way_out(path, held if _plugin_id_ok(held) else None)
+
+
 def _read_profile(directory: Path, *, missing_install_ok: bool, written: dict | None = None) -> Snapshot:
     # missing_install_ok is True for the live plugins/ tree only. ``written`` holds the current
     # generation's plugins, against which each live folder is checked.
@@ -608,6 +682,8 @@ def _read_profile(directory: Path, *, missing_install_ok: bool, written: dict | 
         if not stat.S_ISDIR(info.st_mode):
             continue
         if not _plugin_id_ok(name):
+            if missing_install_ok:
+                raise _named_way_out(path)
             raise InstallRefused("plugin_directory_untrusted")
         try:
             plugin = _read_plugin(path, live=missing_install_ok)

@@ -346,7 +346,9 @@ class CommandTests(unittest.TestCase):
     def test_a_password_lookup_that_fails_is_a_json_refusal(self):
         # DeepSeek F10-2 on #382: an OSError from the lookup is held to the same refusal (CPython raises KeyError).
         failures = (KeyError(f"getpwuid(): uid not found: {os.geteuid()}"), OSError(5, "Input/output error"))
-        for failed, action in ((failed, action) for failed in failures for action in setup.NAMES):
+        # setup answers before the lookup. install, upgrade, and uninstall still refuse home_unknown.
+        home_actions = tuple(name for name in setup.NAMES if name != "setup")
+        for failed, action in ((failed, action) for failed in failures for action in home_actions):
             with self.subTest(action=action, failed=type(failed).__name__):
                 out = io.StringIO()
                 with mock.patch.object(setup.sys, "platform", "linux"), mock.patch("pwd.getpwuid", side_effect=failed), \

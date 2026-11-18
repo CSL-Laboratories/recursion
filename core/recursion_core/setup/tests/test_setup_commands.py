@@ -427,6 +427,72 @@ class RealProbeTests(unittest.TestCase):
             self.assertIn(answer["code"], {"not_installed", "interpreter_not_free_threaded"})
             self.assertEqual(os.listdir(home), [])
 
+    def test_the_probe_argv_is_the_warning_vector_without_gil(self):
+        # Isolated, RuntimeWarning is an error, and -X gil=0 is absent: that flag would hide an
+        # extension that switches the GIL on. The vector is the whole argument list.
+        seen = {}
+
+        def capture(argv, **kwargs):
+            seen["argv"] = list(argv)
+            return mock.Mock(returncode=0, stdout=json.dumps(
+                {"implementation": "cpython", "version": [3, 14], "free_threaded_build": True, "package": None}))
+
+        interpreter = "python3.14t"
+        with mock.patch.object(setup.subprocess, "run", side_effect=capture):
+            setup.probe_interpreter(interpreter)
+        self.assertEqual(seen["argv"], [
+            interpreter, "-I", "-W", "error::RuntimeWarning", "-c", setup._PROBE])
+        self.assertNotIn("-X", seen["argv"])
+        self.assertNotIn("gil=0", seen["argv"])
+
+    def test_a_probe_script_that_emits_a_runtime_warning_is_a_typed_failure(self):
+        # The same script prints an answer after the warning. With the flag the warning fails the
+        # process first, so install is interpreter_unknown and not ok, and it writes nothing.
+        script = (
+            "import json, warnings\n"
+            "warnings.warn('extension switched the GIL on', RuntimeWarning)\n"
+            "print(json.dumps({'implementation': 'cpython', 'version': [3, 14], "
+            "'free_threaded_build': True, 'package': 'x'}))\n"
+        )
+        with mock.patch.object(setup, "_PROBE", script), tempfile.TemporaryDirectory() as home:
+            with self.assertRaises(setup.InstallRefused) as caught:
+                setup.probe_interpreter(sys.executable)
+            self.assertEqual(caught.exception.kind, "interpreter_unknown")
+            self.assertIn("exit 1", caught.exception.detail)
+            out = io.StringIO()
+            code = setup.run("install", out=out, roots=Roots(home=home), interpreter=sys.executable,
+                             package=PACKAGE, environ={})
+            answer = json.loads(out.getvalue())
+            self.assertEqual((code, answer["code"], answer["action"]), (1, "interpreter_unknown", "install"))
+            self.assertNotEqual(answer["code"], "ok")
+            self.assertEqual(os.listdir(home), [])
+
+    def test_the_real_probe_with_the_warning_flag_reports_ok(self):
+        # This interpreter, for real: the new flag is on the argument list and the probe answers.
+        recorded = {}
+        real_run = subprocess.run
+
+        def wrapped(argv, **kwargs):
+            recorded["argv"] = list(argv)
+            done = real_run(argv, **kwargs)
+            recorded["returncode"] = done.returncode
+            recorded["stderr"] = done.stderr
+            return done
+
+        with mock.patch.object(setup.subprocess, "run", side_effect=wrapped):
+            try:
+                info = setup.probe_interpreter(sys.executable)
+            except setup.InstallRefused as exc:
+                self.fail(f"{exc.kind}: {exc.detail}\n{recorded.get('stderr')}")
+        self.assertEqual(recorded["argv"], [
+            sys.executable, "-I", "-W", "error::RuntimeWarning", "-c", setup._PROBE])
+        self.assertNotIn("-X", recorded["argv"])
+        self.assertNotIn("gil=0", recorded["argv"])
+        self.assertEqual(recorded["returncode"], 0, recorded.get("stderr"))
+        self.assertEqual(info["implementation"], sys.implementation.name)
+        self.assertEqual(info["version"], list(sys.version_info[:2]))
+        self.assertEqual(info["free_threaded_build"], bool(sysconfig.get_config_var("Py_GIL_DISABLED")))
+
 
 class CommandFamilyShapeTests(unittest.TestCase):
     """The family has seam S2's shape (``control/commands/__init__.py`` on #369), so it can be registered as is."""

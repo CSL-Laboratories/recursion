@@ -35,7 +35,9 @@ run the command without the variable. A password database that gives no entry fo
 or a failed lookup: CPython raises ``KeyError`` for both) is ``home_unknown``, before anything is read.
 
 ``install`` and ``upgrade`` point the unit at the interpreter running this command, and first ask
-that interpreter, started as the unit will start it (``-I``, from ``/``), what it is: it must be
+that interpreter, isolated (``-I``, from ``/``) with ``-W error::RuntimeWarning`` and without
+``-X gil=0``, what it is. An extension that would switch the GIL on raises during that probe
+instead of loading silently. The interpreter must be
 free-threaded CPython 3.14 (``interpreter_not_free_threaded``), and it must import this same
 ``recursion_core`` with no ``PYTHONPATH`` (``not_installed``), or the daemon could not start.
 
@@ -185,11 +187,16 @@ def _filesystem_detail(exc: OSError, roots: Roots) -> str:
 
 
 def probe_interpreter(interpreter: str) -> dict:
-    """What ``interpreter`` is, asked of it as the unit will start it: ``-I``, working folder ``/``."""
+    """What ``interpreter`` is, asked with ``-I`` and ``-W error::RuntimeWarning``, from ``/``.
+
+    ``-X gil=0`` is not passed. An extension that would switch the GIL on warns, and that warning
+    is an error, so the probe refuses instead of loading the extension silently.
+    """
 
     try:
-        done = subprocess.run([interpreter, "-I", "-c", _PROBE], cwd="/", capture_output=True, text=True,
-                              timeout=120, check=False)
+        done = subprocess.run(
+            [interpreter, "-I", "-W", "error::RuntimeWarning", "-c", _PROBE],
+            cwd="/", capture_output=True, text=True, timeout=120, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         raise InstallRefused("interpreter_unknown", f"{interpreter} could not be run: {type(exc).__name__}") from None
     try:

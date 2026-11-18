@@ -304,6 +304,72 @@ class RegistryWriterTest(unittest.TestCase):
             reader.add('two', 'boot-a')
         self.assertEqual([run.run_id for run in first.all()], ['one'])
 
+    def test_a_held_read_only_registry_sees_a_later_publish(self):
+        # A reader opened once must see a later publish. The writer replaces the
+        # file, so a connection that keeps the first inode misses the new run and
+        # the Stop.
+        first = self.store()
+        first.add('one', 'boot-a')
+        reader = core.Registry(first.directory, read_only=True)
+        self.addCleanup(reader.close)
+        self.assertEqual([run.run_id for run in reader.all()], ['one'])
+        first.add('two', 'boot-b')
+        first.request_stop('one')
+        held = [(run.run_id, run.stop_requested) for run in reader.all()]
+        fresh = core.Registry(first.directory, read_only=True)
+        self.addCleanup(fresh.close)
+        again = [(run.run_id, run.stop_requested) for run in fresh.all()]
+        self.assertEqual(held, [('one', True), ('two', False)])
+        self.assertEqual(again, held)
+
+    def test_a_read_only_registry_refuses_a_stop_the_directory_barrier_has_not_paid(self):
+        # A reader must not report a Stop the writer itself will not read while
+        # the directory fsync is still failing.
+        first = self.store()
+        first.add('one', 'boot-a')
+        real = os.fsync
+
+        def refuse_directory(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, 'injected')
+            return real(fd)
+
+        with mock.patch.object(core.os, 'fsync', refuse_directory):
+            with self.assertRaises(core.RegistryDurabilityError):
+                first.request_stop('one')
+            with self.assertRaises(core.RegistryDurabilityError):
+                first.all()
+            reader = core.Registry(first.directory, read_only=True)
+            self.addCleanup(reader.close)
+            with self.assertRaises(core.RegistryDurabilityError):
+                reader.all()
+
+    def test_a_recorded_stop_on_an_unwalkable_cgroup_stays_unknown(self):
+        # A recorded Stop whose walk does not finish stays unknown. Collapsing
+        # that answer to "not alive" would book the run terminated and is what
+        # this test refuses.
+        unit = 'recursion-run-one.service'
+        group = '/old-manager/' + unit
+        root = self.root / 'cgroups-stop' / 'old-manager' / unit
+        root.mkdir(parents=True)
+        (root / 'cgroup.procs').write_text('')
+        (root / 'cgroup.events').write_text('populated 0\n')
+        nested = root
+        for index in range(70):
+            nested = nested / str(index)
+            nested.mkdir()
+            (nested / 'cgroup.procs').write_text('')
+            (nested / 'cgroup.events').write_text('populated 0\n')
+        daemon, manager = self.ended_with_record(
+            json.dumps({'cgroup': group}), cgroup_root=self.root / 'cgroups-stop')
+        daemon.registry.request_stop('one')
+        run = daemon.reconcile('one')
+        self.assertTrue(run.stop_requested)
+        self.assertEqual(run.state, 'unknown')
+        self.assertNotIn(run.state, core.TERMINAL)
+        self.assertIn(core.CGROUP_UNREAD, run.detail)
+        manager._kill_recorded_cgroup.assert_not_called()
+
     def test_an_existing_owner_file_is_made_private(self):
         directory = self.root / 'wide'
         directory.mkdir(mode=0o700)

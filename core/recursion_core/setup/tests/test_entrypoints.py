@@ -35,6 +35,52 @@ def _child_env(**extra):
     return env
 
 
+# ``recursiond doctor --json`` run as the module's own entry in a child process, with the
+# doctor's account probes given argv[1] as their root (``doctor.run(root=)``). A call that
+# asks this account (the password database, loginctl, systemctl) prints one line to stderr,
+# which the test reads as empty.
+_DOCTOR_AT_ROOT = """
+import os, runpy, subprocess, sys
+import recursion_core.daemon as daemon_module
+import recursion_core.setup.doctor as doctor
+
+root = sys.argv[1]
+
+
+def refuse(name):
+    def call(*_args, **_kwargs):
+        print(name + " was called", file=sys.stderr)
+        raise AssertionError(name + " was called")
+    return call
+
+
+real_subprocess_run = subprocess.run
+
+
+def guarded(*args, **kwargs):
+    command = args[0] if args else kwargs.get("args", ())
+    if isinstance(command, (list, tuple)) and command:
+        name = os.path.basename(str(command[0]))
+        if name in ("loginctl", "systemctl"):
+            return refuse(name)()
+    return real_subprocess_run(*args, **kwargs)
+
+
+subprocess.run = guarded
+daemon_module.check_operator_linger = refuse("check_operator_linger")
+try:
+    import pwd
+except ImportError:
+    pwd = None
+if pwd is not None:
+    pwd.getpwuid = refuse("pwd.getpwuid")
+real_run = doctor.run
+doctor.run = lambda probes=None: real_run(probes, root=root)
+sys.argv = ["recursiond", "doctor", "--json"]
+runpy.run_module("recursion_core._entrypoints", run_name="__main__", alter_sys=True)
+"""
+
+
 class HelpAndUsageTests(unittest.TestCase):
     def test_help_lists_every_command(self):
         code, out, _ = _main(["--help"])
@@ -206,15 +252,49 @@ class BootstrapHygieneTests(unittest.TestCase):
 class DoctorCommandTests(unittest.TestCase):
     """``recursiond doctor`` prints one report. No daemon has to be running."""
 
-    def _empty_runtime(self):
+    def _account_of_the_test(self):
+        """``(home, env)``: a home, a runtime folder and a temp folder in one directory this test made.
+
+        The doctor's account probes take that home as their root, so no run here reads this
+        account's unit, linger state, user manager or home.
+        """
+
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
-        return folder.name
+        home = os.path.join(folder.name, "home")
+        runtime = os.path.join(folder.name, "runtime")
+        scratch = os.path.join(folder.name, "tmp")
+        for path in (home, runtime, scratch):
+            os.mkdir(path, 0o700)
+        return home, {
+            "HOME": home,
+            "XDG_CONFIG_HOME": os.path.join(home, ".config"),
+            "XDG_STATE_HOME": os.path.join(home, ".local", "state"),
+            "XDG_RUNTIME_DIR": runtime,
+            "TMPDIR": scratch,
+        }
+
+    @contextlib.contextmanager
+    def _at_root(self, home, env, asked):
+        """The doctor in this process with ``doctor.run(root=home)``; a call that asks this account lands in ``asked``."""
+
+        import recursion_core.setup.doctor as doctor
+        from recursion_core.setup.tests.test_doctor import account_untouched
+
+        real_run = doctor.run
+
+        def run_at_root(probes=None):
+            return real_run(probes, root=home)
+
+        with mock.patch.dict(os.environ, env), mock.patch.object(tempfile, "tempdir", env["TMPDIR"]), \
+                mock.patch.object(doctor, "run", run_at_root), account_untouched(asked):
+            yield
 
     def test_doctor_json_prints_one_report_and_exits_1_when_a_check_is_fail(self):
         # Today this command is unknown: exit 2, and nothing is printed.
-        runtime = self._empty_runtime()
-        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}):
+        home, env = self._account_of_the_test()
+        asked = []
+        with self._at_root(home, env, asked):
             code, out, err = _main(["doctor", "--json"])
         self.assertNotEqual(code, 2, f"doctor is still an unknown command\n{err}\n{out}")
         self.assertEqual(err, "")
@@ -229,7 +309,7 @@ class DoctorCommandTests(unittest.TestCase):
         self.assertEqual(socket["state"], "fail")  # the runtime directory has no socket
         failed = any(check["state"] == "fail" for check in report["checks"])
         self.assertEqual(code, 1 if failed else 0)
-        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}):
+        with self._at_root(home, env, asked):
             again, again_out, again_err = _main(["doctor", "--json"])
         self.assertEqual(again_err, "")
         again_report = json.loads(again_out)
@@ -237,10 +317,12 @@ class DoctorCommandTests(unittest.TestCase):
         self.assertIsNot(again_report, report)
         again_failed = any(check["state"] == "fail" for check in again_report["checks"])
         self.assertEqual(again, 1 if again_failed else 0)
+        self.assertEqual(asked, [])
 
     def test_doctor_without_json_prints_text(self):
-        runtime = self._empty_runtime()
-        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}):
+        home, env = self._account_of_the_test()
+        asked = []
+        with self._at_root(home, env, asked):
             code, out, err = _main(["doctor"])
         self.assertNotEqual(code, 2, err or out)
         self.assertEqual(err, "")
@@ -250,6 +332,7 @@ class DoctorCommandTests(unittest.TestCase):
         self.assertTrue(out.endswith("\n"))
         with self.assertRaises(json.JSONDecodeError):
             json.loads(out)
+        self.assertEqual(asked, [])
 
     def test_help_lists_doctor(self):
         code, out, _ = _main(["--help"])
@@ -273,10 +356,11 @@ class DoctorCommandTests(unittest.TestCase):
                 _main(["doctor", "--json"])
 
     def test_doctor_json_as_a_process_prints_one_object(self):
-        with tempfile.TemporaryDirectory() as runtime, tempfile.TemporaryDirectory() as cwd:
+        home, env = self._account_of_the_test()
+        with tempfile.TemporaryDirectory() as cwd:
             done = subprocess.run(
-                [sys.executable, "-B", "-m", "recursion_core._entrypoints", "doctor", "--json"],
-                cwd=cwd, env=_child_env(XDG_RUNTIME_DIR=runtime), capture_output=True, text=True,
+                [sys.executable, "-B", "-c", _DOCTOR_AT_ROOT, home],
+                cwd=cwd, env=_child_env(**env), capture_output=True, text=True,
             )
         self.assertNotEqual(done.returncode, 2, done.stderr or done.stdout)
         self.assertEqual(done.stderr, "")

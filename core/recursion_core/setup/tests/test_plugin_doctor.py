@@ -15,7 +15,6 @@ import inspect
 import io
 import json
 import os
-import shutil
 import sqlite3
 import stat
 import tempfile
@@ -80,6 +79,7 @@ def _doctor_json(env):
     out, err = io.StringIO(), io.StringIO()
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.dict(os.environ, env, clear=False))
+        stack.enter_context(mock.patch.object(tempfile, "tempdir", env["TMPDIR"]))
         stack.enter_context(mock.patch("subprocess.run", guard_subprocess))
         stack.enter_context(mock.patch.object(daemon_module, "check_operator_linger", refuse_linger))
         if pwd_module is not None:
@@ -122,15 +122,17 @@ def _mkdir(path, mode=0o700):
 
 class PluginDoctorTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="plugin-doctor-")
-        self.addCleanup(shutil.rmtree, self.tmp, True)
+        folder = tempfile.TemporaryDirectory(prefix="plugin-doctor-", ignore_cleanup_errors=True)
+        self.addCleanup(folder.cleanup)
+        self.tmp = folder.name
         os.chmod(self.tmp, 0o700)
         self.home = os.path.join(self.tmp, "home")
         self.config_home = os.path.join(self.home, ".config")
         self.state_home = os.path.join(self.home, ".local", "state")
         self.runtime = os.path.join(self.tmp, "runtime")
         self.empty_path = os.path.join(self.tmp, "bin")
-        for path in (self.home, self.config_home, self.state_home, self.runtime, self.empty_path):
+        self.scratch = os.path.join(self.tmp, "tmp")
+        for path in (self.home, self.config_home, self.state_home, self.runtime, self.empty_path, self.scratch):
             if path == self.state_home:
                 _mkdir(os.path.join(self.home, ".local"))
             _mkdir(path)
@@ -144,6 +146,7 @@ class PluginDoctorTests(unittest.TestCase):
             "XDG_STATE_HOME": self.state_home,
             "XDG_RUNTIME_DIR": self.runtime,
             "PATH": self.empty_path,
+            "TMPDIR": self.scratch,
         }
 
     def profile(self, *, signed_key):

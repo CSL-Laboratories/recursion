@@ -7,6 +7,7 @@ never turned into ok. Nothing in a run opens a path ``deny.py`` names.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import os
@@ -122,6 +123,47 @@ def _check(report, check_id, subject=None):
     if len(found) != 1:
         raise AssertionError(f"{check_id} subject {subject!r}: {found!r}")
     return found[0]
+
+
+@contextlib.contextmanager
+def account_untouched(asked):
+    """Record, and refuse, each way a doctor run asks this account.
+
+    The unit probe asks the password database for the home, the linger probe asks
+    loginctl and the user-manager probe asks systemctl. A run given a root made by the
+    test asks none of them. Each such call is appended to ``asked`` and raises.
+    """
+
+    import subprocess
+
+    import recursion_core.daemon as daemon_module
+
+    real_subprocess_run = subprocess.run
+
+    def refuse(name):
+        def call(*_args, **_kwargs):
+            asked.append(name)
+            raise AssertionError(f"{name} was called")
+        return call
+
+    def guarded(*args, **kwargs):
+        command = args[0] if args else kwargs.get("args", ())
+        if isinstance(command, (list, tuple)) and command:
+            name = os.path.basename(str(command[0]))
+            if name in ("loginctl", "systemctl"):
+                return refuse(name)()
+        return real_subprocess_run(*args, **kwargs)
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch("subprocess.run", guarded))
+        stack.enter_context(mock.patch.object(daemon_module, "check_operator_linger", refuse("check_operator_linger")))
+        try:
+            import pwd
+        except ImportError:
+            pwd = None
+        if pwd is not None:
+            stack.enter_context(mock.patch.object(pwd, "getpwuid", refuse("pwd.getpwuid")))
+        yield asked
 
 
 class DoctorReportTests(unittest.TestCase):
@@ -241,15 +283,23 @@ class DoctorReportTests(unittest.TestCase):
                         handle.write(_CANARY)
             runtime = os.path.join(home, "run")
             os.makedirs(runtime, 0o700)
+            scratch = os.path.join(home, "tmp")
+            os.makedirs(scratch, 0o700)
             env = {
                 "HOME": home,
                 "XDG_STATE_HOME": os.path.join(home, ".local", "state"),
                 "XDG_RUNTIME_DIR": runtime,
                 "PATH": os.environ.get("PATH", ""),
+                "TMPDIR": scratch,
             }
             before = len(_OPENED)
-            with mock.patch.dict(os.environ, env, clear=False):
-                report = doctor.run(None)
+            asked = []
+            # The root is the home this test made: the unit, linger and user-manager
+            # probes read it and do not ask this account.
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(tempfile, "tempdir", scratch), account_untouched(asked):
+                report = doctor.run(None, root=home)
+            self.assertEqual(asked, [])
             for raw in _OPENED[before:]:
                 self.assertFalse(deny.is_denied(raw, home), raw)
             self.assertNotIn(_CANARY, json.dumps(report))

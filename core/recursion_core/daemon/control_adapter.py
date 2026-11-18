@@ -361,12 +361,7 @@ def _clear_result_temp(tmp):
 
 
 def _discard_opened_result_temp(tmp):
-    """Remove a result temp this write opened, after that write failed.
-
-    A regular file or a symlink is unlinked. A directory is left in place, so a
-    planted directory and its entries stay. The result stays in memory either way.
-    A failure to remove the temp does not replace that in-memory result.
-    """
+    """Unlink the regular file or symlink at the temp name; a directory is left."""
     try:
         info = os.lstat(tmp)
     except OSError:
@@ -764,8 +759,7 @@ class RouteStarter:
             tmp = path.with_name('result.json.tmp')
             # A stale or planted file is replaced: opening a FIFO here would wait for a reader.
             # An empty planted directory is removed too. The result is durable only when this write
-            # succeeds; otherwise it is kept in memory. A temp this write opened is removed on that
-            # failure when it is a regular file or a symlink. A directory at that name is left.
+            # succeeds; otherwise it is kept in memory.
             _clear_result_temp(tmp)
             fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
             opened = True

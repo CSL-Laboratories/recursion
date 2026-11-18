@@ -95,8 +95,9 @@ STARTED, OK, STOPPED, PENDING = "started", "ok", "stopped", "pending"
 RUN_UNKNOWN, REQUEST_INVALID, START_FAILED, METHOD_UNKNOWN = (
     "run_unknown", "request_invalid", "start_failed", "method_unknown")
 START_UNCONFIRMED, REGISTRY_UNAVAILABLE = "start_unconfirmed", "registry_unavailable"
+WORKSPACE_INVALID, UNAVAILABLE = "workspace_invalid", "unavailable"
 CODES = frozenset({STARTED, OK, STOPPED, PENDING, RUN_UNKNOWN, REQUEST_INVALID, START_FAILED, METHOD_UNKNOWN,
-                   START_UNCONFIRMED, REGISTRY_UNAVAILABLE})
+                   START_UNCONFIRMED, REGISTRY_UNAVAILABLE, WORKSPACE_INVALID, UNAVAILABLE})
 SUCCESS_CODES = frozenset({STARTED, OK, STOPPED})
 _PENDING_REASON = {POPULATED: "cgroup_populated", TIMEOUT: "confirm_timeout"}
 LIST_LIMIT_MAX = 1000  # the most runs one run.list page may ask for

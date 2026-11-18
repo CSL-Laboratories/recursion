@@ -16,7 +16,7 @@ import time
 import unittest
 from unittest import mock
 
-from recursion_core.control.api import ControlAPI
+from recursion_core.control.api import CODES, ControlAPI
 from recursion_core.control.hooks import compose
 from recursion_core.control.tests.fakes import FakeKillTree, FakeStarter, run_ids
 from recursion_core.daemon import Daemon, Registry
@@ -193,6 +193,74 @@ class DoorFolderTest(unittest.TestCase):
         self.assertNotIn('launch', answer['run'])
         self.assertEqual(len(starter.calls), 1)
 
+    def test_every_returned_code_is_in_the_result_list(self):
+        # The two codes this door returns that were missing from CODES, and every code a result names.
+        named = ('started', 'ok', 'stopped', 'pending', 'run_unknown', 'request_invalid', 'start_failed',
+                 'method_unknown', 'start_unconfirmed', 'registry_unavailable', 'workspace_invalid',
+                 'unavailable')
+        for code in named:
+            self.assertIn(code, CODES, code)
+        missing = self._start({'mode': 'direct'})
+        self.assertEqual((missing.get('code'), missing.get('detail')), ('request_invalid', 'workspace'))
+        self.assertIn(missing['code'], CODES)
+        self.assertEqual(self.registry.list(), [])
+        self.assertEqual(self.starter.calls, [])
+        inside = self.state / 'inside'
+        inside.mkdir()
+        refused = self._start({'path': str(inside), 'mode': 'direct'})
+        self.assertEqual((refused.get('code'), refused.get('detail')), ('workspace_invalid', 'state_directory'))
+        self.assertIn(refused['code'], CODES)
+        self.assertEqual(self.registry.list(), [])
+        self.assertEqual(self.starter.calls, [])
+        from recursion_core.workspace.start import Normalizer
+        with mock.patch.object(Normalizer, '__call__', side_effect=RuntimeError('registrant')):
+            unavailable = self._start({'path': str(self.folder), 'mode': 'direct'})
+        self.assertEqual((unavailable.get('code'), unavailable.get('detail')),
+                         ('unavailable', 'start_registrant_failed'))
+        self.assertIn(unavailable['code'], CODES)
+        self.assertEqual(self.registry.list(), [])
+        self.assertEqual(self.starter.calls, [])
+
+    def test_a_symlink_is_a_different_request_from_the_folder_it_names(self):
+        link = self.root / 'link'
+        link.symlink_to(self.folder, target_is_directory=True)
+        first = self._start({'path': str(self.folder), 'mode': 'direct'}, client_key='same')
+        self.assertEqual(first['code'], 'started', first)
+        self.assertEqual(first['run']['launch']['workspace']['source_path'], _real(self.folder))
+        second = self._start({'path': str(link), 'mode': 'direct'}, client_key='same')
+        self.assertEqual((second.get('code'), second.get('detail')), ('request_invalid', 'client_key_reused'))
+        self.assertIsNone(second.get('duplicate'))
+        self.assertEqual(len(self.starter.calls), 1)
+        self.assertEqual(len(self.registry.list()), 1)
+
+    def test_the_state_directory_variable_is_put_back(self):
+        name = 'RECURSION_STATE_DIR'
+        held = os.environ.get(name)
+
+        def restore():
+            if held is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = held
+
+        self.addCleanup(restore)
+        other = str(self.root / 'elsewhere')
+        os.environ.pop(name, None)
+        adapter._composed_hooks(self.state)
+        self.assertIsNone(os.environ.get(name))
+        os.environ[name] = other
+        adapter._composed_hooks(self.state)
+        self.assertEqual(os.environ.get(name), other)
+        with mock.patch('recursion_core.control.hooks.compose', side_effect=RuntimeError('boom')):
+            os.environ.pop(name, None)
+            with self.assertRaises(RuntimeError):
+                adapter._composed_hooks(self.state)
+            self.assertIsNone(os.environ.get(name))
+            os.environ[name] = other
+            with self.assertRaises(RuntimeError):
+                adapter._composed_hooks(self.state)
+            self.assertEqual(os.environ.get(name), other)
+
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)
 class ComposedFolderTest(unittest.TestCase):
@@ -314,6 +382,54 @@ class ComposedFolderTest(unittest.TestCase):
         self.assertIsNone(rec['launch']['workspace']['worktree_path'])
         self.assertEqual(rec['launch']['workspace']['source_path'], _real(repo))
         self.assertFalse((self.state / 'worktrees' / 'unbuilt').exists())
+
+
+@unittest.skipUnless(LINUX, LINUX_ONLY)
+class CompositionBreakerTest(unittest.TestCase):
+    """A composition that fails shuts the breaker it opened. One that returns does not."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='rc-brk-', dir=os.environ.get('TMPDIR') or None))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        os.chmod(self.tmp, 0o700)
+
+    def _pair(self, name):
+        state = self.tmp / name
+        state.mkdir(mode=0o700)
+        runtime = self.tmp / (name + '-rt')
+        runtime.mkdir(mode=0o700)
+        config = self.tmp / (name + '-config')
+        config.mkdir(mode=0o700)
+        units = Units()
+        daemon = Daemon(Registry(state), ProcessUnitManager(units), boot_id=lambda: BOOT)
+        self.addCleanup(daemon.close)
+        environ = {'PATH': '/usr/bin:/bin', 'HOME': str(self.tmp), 'LANG': 'C.UTF-8',
+                   'XDG_RUNTIME_DIR': str(runtime), 'XDG_CONFIG_HOME': str(config)}
+        return daemon, state, environ
+
+    def test_a_failed_composition_shuts_the_breaker_and_a_returned_one_does_not(self):
+        from recursion_core.daemon.breaker import DurableRouteBreaker
+        closes = []
+        real_close = DurableRouteBreaker.close
+
+        def spy(breaker):
+            closes.append(1)
+            return real_close(breaker)
+
+        daemon, state, environ = self._pair('fail')
+        with mock.patch.object(DurableRouteBreaker, 'close', spy):
+            with mock.patch('recursion_core.control.hooks.compose', side_effect=RuntimeError('boom')):
+                with self.assertRaises(RuntimeError) as caught:
+                    adapter.compose_control(daemon, state, environ=environ, routes={})
+            self.assertEqual(str(caught.exception), 'boom')
+            self.assertEqual(closes, [1])
+            closes.clear()
+            daemon2, state2, environ2 = self._pair('ok')
+            composed = adapter.compose_control(daemon2, state2, environ=environ2, routes={})
+            try:
+                self.assertEqual(closes, [])
+            finally:
+                composed.close()
 
 
 def signal_kill():

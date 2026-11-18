@@ -25,7 +25,16 @@ from unittest import mock
 from recursion_core import _entrypoints as entry
 from recursion_core.daemon.tests import plugin_fixture as fx
 from recursion_core.plugin_security.signing import backend_available
-from recursion_core.setup.tests.test_doctor import _validate
+from recursion_core.setup.tests.test_doctor import _WINDOWS_HOST, _validate
+
+
+# On a real Windows host the rest of these tests would read an accident, not the product: the
+# doctor is Linux only (``recursiond doctor`` refuses platform_unsupported before it reaches the
+# plugin checks; test_entrypoints asserts that refusal through entry.main), and the plugin config
+# folder check reads POSIX mode bits, which Windows reports as 0o777 for every folder.
+_LINUX_ONLY = ("the doctor is Linux only: recursiond doctor refuses platform_unsupported on this host before "
+               "the plugin checks, and the plugin config folder check reads POSIX mode bits, which Windows "
+               "reports as 0o777")
 
 
 def _rows(report, check_id):
@@ -210,6 +219,8 @@ class PluginDoctorTests(unittest.TestCase):
             self.assertNotIn("trust signed", json.dumps(report))
         folder = _rows(report, "plugin.config")
         self.assertEqual(len(folder), 1)
+        if _WINDOWS_HOST:
+            self.skipTest(_LINUX_ONLY)
         self.assertEqual(folder[0]["state"], "ok")
         self.assertFalse(os.path.exists(self.marker), "plugin code ran")
         self.assertEqual((plugins / "install.json").read_bytes(), self.install_bytes)
@@ -278,6 +289,8 @@ class PluginDoctorTests(unittest.TestCase):
         self.assertIn("revocation_store_missing", revocation["detail"])
         listed = _rows(gone, "plugin.installed")
         self.assertEqual(sorted(row["subject"] for row in listed), ["fixture.signed", "fixture.unsigned"])
+        if _WINDOWS_HOST:
+            self.skipTest(_LINUX_ONLY)
         for row in listed:
             self.assertEqual(row["state"], "fail")
             self.assertIn("refused", row["detail"])
@@ -349,6 +362,10 @@ class PluginDoctorTests(unittest.TestCase):
         return digest.hexdigest(), columns, sorted(os.listdir(store_dir))
 
     def assert_legacy_unchanged(self, store_dir, path, before, mode):
+        if _WINDOWS_HOST:
+            # Windows keeps one read-only flag, not POSIX modes: os.chmod(0o600) reads back 0o666 and
+            # os.chmod(0o400) reads back 0o444. Unchanged is that reading, before and after the run.
+            mode = 0o666 if mode & stat.S_IWUSR else 0o444
         after = self.store_facts(store_dir, path)
         self.assertEqual(after, before)
         self.assertEqual(stat.S_IMODE(os.lstat(path).st_mode), mode)
@@ -360,6 +377,8 @@ class PluginDoctorTests(unittest.TestCase):
         self.assertTrue(found, report["checks"])
         for row in found:
             self.assertNotIn("revocation_store_invalid", row["detail"])
+        if _WINDOWS_HOST:
+            self.skipTest(_LINUX_ONLY)
         for row in _rows(report, "plugin.installed"):
             self.assertNotIn("trust signed", row["detail"])
             self.assertIn("revocation_store_legacy", row["detail"])
@@ -412,7 +431,13 @@ class PluginDoctorTests(unittest.TestCase):
         parent = os.path.join(self.state_home, "recursion")
         _mkdir(parent)
         link = os.path.join(parent, "plugin-security")
-        os.symlink(target, link)
+        try:
+            os.symlink(target, link)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) != 1314:
+                raise
+            self.skipTest("creating a symlink needs a right a plain Windows user lacks "
+                          "(the create-symbolic-link privilege or Developer Mode; WinError 1314)")
         self.signed_plugin()
         report = _doctor_json(self.env())
         revocation = _rows(report, "plugin.revocation")[0]

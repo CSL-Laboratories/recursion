@@ -38,7 +38,9 @@ def _child_env(**extra):
 # ``recursiond doctor --json`` run as the module's own entry in a child process, with the
 # doctor's account probes given argv[1] as their root (``doctor.run(root=)``). A call that
 # asks this account (the password database, loginctl, systemctl) prints one line to stderr,
-# which the test reads as empty.
+# which the test reads as empty. It covers what test_doctor.account_untouched covers
+# (subprocess.run and subprocess.Popen with an argument list, check_operator_linger,
+# pwd.getpwuid) and, like it, not a string command, os.system, os.posix_spawn or pwd.getpwnam.
 _DOCTOR_AT_ROOT = """
 import os, runpy, subprocess, sys
 import recursion_core.daemon as daemon_module
@@ -55,18 +57,35 @@ def refuse(name):
 
 
 real_subprocess_run = subprocess.run
+real_popen = subprocess.Popen
 
 
-def guarded(*args, **kwargs):
+def account_command(args, kwargs):
     command = args[0] if args else kwargs.get("args", ())
     if isinstance(command, (list, tuple)) and command:
         name = os.path.basename(str(command[0]))
         if name in ("loginctl", "systemctl"):
-            return refuse(name)()
+            return name
+    return None
+
+
+def guarded(*args, **kwargs):
+    name = account_command(args, kwargs)
+    if name is not None:
+        return refuse(name)()
     return real_subprocess_run(*args, **kwargs)
 
 
+class GuardedPopen(real_popen):
+    def __init__(self, *args, **kwargs):
+        name = account_command(args, kwargs)
+        if name is not None:
+            refuse(name)()
+        super().__init__(*args, **kwargs)
+
+
 subprocess.run = guarded
+subprocess.Popen = GuardedPopen
 daemon_module.check_operator_linger = refuse("check_operator_linger")
 try:
     import pwd
@@ -253,10 +272,11 @@ class DoctorCommandTests(unittest.TestCase):
     """``recursiond doctor`` prints one report. No daemon has to be running."""
 
     def _account_of_the_test(self):
-        """``(home, env)``: a home, a runtime folder and a temp folder in one directory this test made.
+        """``(home, env)``: a home, runtime, temp and empty PATH folders in one directory this test made.
 
         The doctor's account probes take that home as their root, so no run here reads this
-        account's unit, linger state, user manager or home.
+        account's unit, linger state, user manager or home. PATH holds no engine binary, so the
+        engine probe runs none.
         """
 
         folder = tempfile.TemporaryDirectory()
@@ -264,10 +284,12 @@ class DoctorCommandTests(unittest.TestCase):
         home = os.path.join(folder.name, "home")
         runtime = os.path.join(folder.name, "runtime")
         scratch = os.path.join(folder.name, "tmp")
-        for path in (home, runtime, scratch):
+        empty_path = os.path.join(folder.name, "bin")
+        for path in (home, runtime, scratch, empty_path):
             os.mkdir(path, 0o700)
         return home, {
             "HOME": home,
+            "PATH": empty_path,
             "XDG_CONFIG_HOME": os.path.join(home, ".config"),
             "XDG_STATE_HOME": os.path.join(home, ".local", "state"),
             "XDG_RUNTIME_DIR": runtime,
@@ -384,6 +406,17 @@ class DoctorCommandTests(unittest.TestCase):
                 [sys.executable, "-B", "-c", _DOCTOR_AT_ROOT, home],
                 cwd=cwd, env=_child_env(**env), capture_output=True, text=True,
             )
+            # The child is a real interpreter on this host, so the branch is entry._linux() read in
+            # the child: under the simulated-Windows step this process says win32 while the child
+            # runs as Linux; on a Windows or macOS host the child refuses, typed, before the doctor.
+            linux = subprocess.run(
+                [sys.executable, "-B", "-c", "from recursion_core import _entrypoints as e; print(e._linux())"],
+                cwd=cwd, env=_child_env(**env), capture_output=True, text=True,
+            )
+        self.assertIn(linux.stdout, ("True\n", "False\n"), linux.stderr)
+        if linux.stdout == "False\n":
+            self._assert_refused_off_linux(done.returncode, done.stdout, done.stderr, [])
+            return
         self.assertNotEqual(done.returncode, 2, done.stderr or done.stdout)
         self.assertEqual(done.stderr, "")
         report = json.loads(done.stdout)

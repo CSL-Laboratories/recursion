@@ -22,6 +22,9 @@ REPO = Path(__file__).resolve().parents[4]
 SCHEMA_DIR = REPO / "schemas" / "control" / "v1"
 METHODS_PATH = SCHEMA_DIR / "methods.v1.json"
 FIXTURE_PATH = SCHEMA_DIR / "fixtures" / "good" / "methods.v1" / "h15-doctor.json"
+# A real Windows host: its path module is ntpath. The simulated-Windows step keeps this host's POSIX
+# paths and file modes (only os.name and sys.platform say Windows there), so it takes the POSIX branch.
+_WINDOWS_HOST = os.sep == "\\"
 
 _ID = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
 _TIMESTAMP = re.compile(
@@ -81,17 +84,53 @@ def _plain_report(report):
 
 
 def _local_schema(uri):
-    """A ``file:`` schema URI read from disk.
+    """A ``file:`` schema URI read from disk, and only from the schema folder.
 
     The schemas sit beside ``methods.v1.json``. Left to urllib, a ``file:`` URI goes through
     an opener whose https handler loads the host's certificate store first; under the
     simulated-Windows step that is Windows' store, which this host's ssl module does not
     have (``enum_certificates``). Reading the file keeps the full schema check there too.
+
+    On a Windows host the URI's path becomes a drive path through ``url2pathname``. Elsewhere
+    it is unquoted as before: under the simulated-Windows step ``url2pathname`` reads
+    ``os.name`` and would turn this host's POSIX path into a backslash one. A URI that names a
+    host, or a path that lands outside the schema folder, is refused before anything is read.
     """
 
     from urllib.parse import unquote, urlsplit
+    from urllib.request import url2pathname
 
-    return json.loads(Path(unquote(urlsplit(uri).path)).read_text(encoding="utf-8"))
+    parts = urlsplit(uri)
+    if parts.scheme != "file" or parts.netloc not in ("", "localhost"):
+        raise ValueError(f"schema reference is not a local file: {uri}")
+    local = url2pathname(parts.path) if _WINDOWS_HOST else unquote(parts.path)
+    path = Path(os.path.realpath(local))
+    folder = Path(os.path.realpath(SCHEMA_DIR))
+    if folder not in path.parents:
+        raise ValueError(f"schema reference outside the schema folder: {uri}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _remote_schema(uri):
+    """An ``http`` or ``https`` schema reference: refused, never fetched."""
+
+    raise ValueError(f"remote schema reference refused, not fetched: {uri}")
+
+
+_SCHEMA_HANDLERS = {"file": _local_schema, "http": _remote_schema, "https": _remote_schema}
+
+
+def _resolver(methods):
+    """A resolver for ``methods.v1.json`` that reads only the schema folder (needs jsonschema)."""
+
+    import warnings
+
+    import jsonschema
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return jsonschema.RefResolver(base_uri=METHODS_PATH.as_uri(), referrer=methods,
+                                      handlers=dict(_SCHEMA_HANDLERS))
 
 
 def _validate(report):
@@ -102,10 +141,9 @@ def _validate(report):
         return  # free-threaded 3.14 does not install jsonschema; the plain check above is what runs there
     import warnings
     methods = json.loads(METHODS_PATH.read_text(encoding="utf-8"))
+    resolver = _resolver(methods)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        resolver = jsonschema.RefResolver(base_uri=METHODS_PATH.as_uri(), referrer=methods,
-                                          handlers={"file": _local_schema})
         jsonschema.validate(instance=report, schema=methods["$defs"]["doctor_report"], resolver=resolver)
 
 
@@ -147,6 +185,13 @@ def account_untouched(asked):
     The unit probe asks the password database for the home, the linger probe asks
     loginctl and the user-manager probe asks systemctl. A run given a root made by the
     test asks none of them. Each such call is appended to ``asked`` and raises.
+
+    What it covers: ``subprocess.run`` and ``subprocess.Popen`` (so ``check_output``,
+    ``call`` and a direct ``Popen`` too) given loginctl or systemctl as the first item of
+    an argument list; ``recursion_core.daemon.check_operator_linger``; ``pwd.getpwuid``
+    where ``pwd`` imports. What it does not see: a command given as one string,
+    ``os.system``, ``os.posix_spawn``, ``pwd.getpwnam`` and ``getpass``. The doctor's probes
+    call none of those today; a probe that starts to needs a guard here first.
     """
 
     import subprocess
@@ -154,6 +199,7 @@ def account_untouched(asked):
     import recursion_core.daemon as daemon_module
 
     real_subprocess_run = subprocess.run
+    real_popen = subprocess.Popen
 
     def refuse(name):
         def call(*_args, **_kwargs):
@@ -161,16 +207,30 @@ def account_untouched(asked):
             raise AssertionError(f"{name} was called")
         return call
 
-    def guarded(*args, **kwargs):
+    def account_command(args, kwargs):
         command = args[0] if args else kwargs.get("args", ())
         if isinstance(command, (list, tuple)) and command:
             name = os.path.basename(str(command[0]))
             if name in ("loginctl", "systemctl"):
-                return refuse(name)()
+                return name
+        return None
+
+    def guarded(*args, **kwargs):
+        name = account_command(args, kwargs)
+        if name is not None:
+            return refuse(name)()
         return real_subprocess_run(*args, **kwargs)
+
+    class GuardedPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            name = account_command(args, kwargs)
+            if name is not None:
+                refuse(name)()
+            super().__init__(*args, **kwargs)
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch("subprocess.run", guarded))
+        stack.enter_context(mock.patch("subprocess.Popen", GuardedPopen))
         stack.enter_context(mock.patch.object(daemon_module, "check_operator_linger", refuse("check_operator_linger")))
         try:
             import pwd
@@ -265,6 +325,10 @@ class DoctorReportTests(unittest.TestCase):
         from recursion_core.subscription_routes.policy import ENGINE_STORE_ENTRIES
 
         home = "/home/operator"
+        if _WINDOWS_HOST:
+            # deny.denied_paths places every path under os.path.abspath(home); on Windows that
+            # path starts with the current drive and uses backslashes.
+            home = os.path.abspath(home)
         paths = set(deny.denied_paths(home))
         self.assertIn(os.path.join(home, ".claude", ".credentials.json"), paths)
         for entry in ENGINE_STORE_ENTRIES:
@@ -272,7 +336,11 @@ class DoctorReportTests(unittest.TestCase):
         for row in SIGNIN_STORES.values():
             store = row.get("store_path") or ""
             if store.startswith("~/"):
-                self.assertIn(os.path.join(home, store[2:]), paths, store)
+                if _WINDOWS_HOST:
+                    # "~/.codex/auth.json" keeps its slashes in a join; the product gives the absolute path.
+                    self.assertIn(os.path.abspath(os.path.join(home, store[2:])), paths, store)
+                else:
+                    self.assertIn(os.path.join(home, store[2:]), paths, store)
             elif store.startswith("unconfirmed"):
                 self.assertFalse(any(store in path for path in paths))
         self.assertTrue(deny.is_denied(os.path.join(home, ".pi", "agent", "auth.json"), home))
@@ -300,11 +368,14 @@ class DoctorReportTests(unittest.TestCase):
             os.makedirs(runtime, 0o700)
             scratch = os.path.join(home, "tmp")
             os.makedirs(scratch, 0o700)
+            empty_path = os.path.join(home, "bin")  # no engine binary is found, so none is run
+            os.makedirs(empty_path, 0o700)
             env = {
                 "HOME": home,
+                "XDG_CONFIG_HOME": os.path.join(home, ".config"),
                 "XDG_STATE_HOME": os.path.join(home, ".local", "state"),
                 "XDG_RUNTIME_DIR": runtime,
-                "PATH": os.environ.get("PATH", ""),
+                "PATH": empty_path,
                 "TMPDIR": scratch,
             }
             before = len(_OPENED)
@@ -322,6 +393,51 @@ class DoctorReportTests(unittest.TestCase):
             socket = _check(report, "daemon.socket")
             self.assertIn(socket["state"], ("fail", "unknown"))
             self.assertNotEqual(socket["state"], "ok")
+
+
+
+class SchemaLoaderTests(unittest.TestCase):
+    """The schema loader reads only the schema folder and fetches nothing."""
+
+    def test_a_file_uri_of_this_host_is_read_from_the_schema_folder(self):
+        target = SCHEMA_DIR / "common.v1.json"
+        uri = target.as_uri()
+        if _WINDOWS_HOST:
+            # The shape a Windows host gives: a drive letter after the third slash.
+            self.assertRegex(uri, r"^file:///[A-Za-z]:/")
+        self.assertEqual(_local_schema(uri), json.loads(target.read_text(encoding="utf-8")))
+
+    def test_a_reference_leaving_the_schema_folder_is_refused_and_not_read(self):
+        outside = Path(os.path.realpath(__file__))
+        for uri in (outside.as_uri(),
+                    SCHEMA_DIR.as_uri() + "/../../../" + outside.relative_to(REPO).as_posix(),
+                    SCHEMA_DIR.parent.as_uri() + "/v1-other/common.v1.json"):
+            with self.subTest(uri=uri), mock.patch.object(Path, "read_text") as read:
+                with self.assertRaisesRegex(ValueError, "outside"):
+                    _local_schema(uri)
+                read.assert_not_called()
+
+    def test_an_http_or_https_reference_is_refused_and_not_fetched(self):
+        with mock.patch("urllib.request.urlopen") as fetched:
+            for uri in ("http://example.invalid/common.v1.json", "https://example.invalid/common.v1.json"):
+                with self.subTest(uri=uri):
+                    with self.assertRaisesRegex(ValueError, "refused"):
+                        _SCHEMA_HANDLERS[uri.split(":", 1)[0]](uri)
+                    with self.assertRaisesRegex(ValueError, "not a local file"):
+                        _local_schema(uri)
+            try:
+                import jsonschema
+            except ImportError:
+                fetched.assert_not_called()
+                return  # no jsonschema on this interpreter: the handlers above are what _validate gives it
+            resolver = _resolver(json.loads(METHODS_PATH.read_text(encoding="utf-8")))
+            import warnings
+            with self.assertRaises(Exception) as caught, warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                jsonschema.validate(instance={}, schema={"$ref": "https://example.invalid/common.v1.json"},
+                                    resolver=resolver)
+        fetched.assert_not_called()
+        self.assertIn("refused", f"{caught.exception} {caught.exception.__cause__}")
 
 
 if __name__ == "__main__":

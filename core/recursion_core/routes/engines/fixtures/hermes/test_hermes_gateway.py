@@ -457,10 +457,8 @@ class HermesGatewayOwnershipTest(unittest.TestCase):
         real_open = hermes.os.open
 
         def _open(path, flags, *args):
-            text = path.decode('utf-8', 'replace') if isinstance(path, bytes) else path
-            if isinstance(text, str) and text.startswith('/proc/') and text.endswith('/stat'):
-                raise OSError('stat unreadable')
-            return real_open(path, flags, *args)
+            # The only open on this call is the stat file. Raising here is that open failing.
+            raise OSError('stat unreadable')
 
         hermes.os.open = _open  # type: ignore[assignment]
         try:

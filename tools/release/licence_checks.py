@@ -11,8 +11,8 @@ break:
   disk may differ from them only in line endings, which a Windows checkout changes; anywhere else
   the file on disk is held byte for byte. In a checkout where git cannot be run at all the disk is
   read alone, as outside one; a git that does not answer within GIT_TIMEOUT seconds is named.
-- NOTICE is NOTICE_TEXT, up to line endings: the copyright holder stays a placeholder until Lucas
-  names one, and no other name, address or line is added.
+- NOTICE is NOTICE_TEXT, up to line endings: its copyright line names HOLDER, the holder Lucas
+  named, and no other name, address or line is added.
 - CONTRIBUTING.md has one sign-off section, its heading a line of its own outside HTML comments
   and fenced code blocks, held word for word up to line endings (SIGN_OFF). What the rest of the
   file says is not judged.
@@ -65,9 +65,9 @@ A file larger than SIZE_LIMIT bytes is named, no more than SIZE_LIMIT + 1 bytes 
 grow after its size is taken), a missing file as missing, and one that cannot be read as such; the
 work the checks do grows in step with a file's size.
 The tests check the committed files, then break, in a scratch copy of the four files, each rule
-that they name, and check that it is named; and they check that naming the contact or the holder,
-each the edit of two files the comments below describe, leaves them green, also for a quoted
-contact and for values the tests use as ones to refuse.
+that they name, and check that it is named; and they check that naming the contact, the edit of
+two files the comments below describe, leaves them green, also for a quoted contact and for values
+the tests use as ones to refuse.
 
 The file is named *_checks.py, not test_*.py: the frozen gate (tools/ci_gate.py) fails on a
 test-named file outside its globs, and tools/release/ is not among them, so hosted CI does not run
@@ -101,9 +101,9 @@ GIT_TIMEOUT = 60  # seconds for one git call
 # bytes ship as /usr/share/common-licenses/Apache-2.0 on Ubuntu 24.04.
 APACHE_2_0_SHA256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
 
-# Until Lucas names the copyright holder (counsel item K13), NOTICE carries this placeholder and
-# no name. Naming the holder is one deliberate edit of HOLDER and of NOTICE together.
-HOLDER = "<holder: Lucas to name>"
+# The copyright holder, in the words Lucas named it on Nov 18, 2026 (counsel item K13). NOTICE holds
+# its line exactly, and a test holds that line word for word.
+HOLDER = "The Recursion Developers"
 NOTICE_TEXT = ("Recursion\n"
                f"Copyright 2026 {HOLDER}\n"
                "\n"
@@ -760,7 +760,7 @@ def notice_problems(root: Path) -> list[str]:
     if data is not None and _text(data) != NOTICE_TEXT:
         have, want = _text(data).splitlines(), NOTICE_TEXT.splitlines()
         line = next((i for i, (a, b) in enumerate(zip(have, want)) if a != b), min(len(have), len(want)))
-        found.append(f"NOTICE is not NOTICE_TEXT (from line {line + 1}): the holder stays unnamed and nothing is added")
+        found.append(f"NOTICE is not NOTICE_TEXT (from line {line + 1}): the holder is HOLDER and nothing is added")
     return found
 
 
@@ -845,8 +845,15 @@ class LicenceTests(unittest.TestCase):
     def test_license_is_the_apache_2_0_text_unmodified(self) -> None:
         self.assertEqual(license_problems(ROOT), [])
 
-    def test_notice_names_no_holder_until_lucas_does(self) -> None:
+    def test_notice_names_the_holder_lucas_named(self) -> None:
         self.assertEqual(notice_problems(ROOT), [])
+
+    def test_notice_holds_the_holder_line_lucas_named(self) -> None:
+        """Lucas named the copyright holder on Nov 18, 2026, in these words: NOTICE_TEXT and the
+        committed NOTICE each hold the line exactly."""
+        line = "Copyright 2026 The Recursion Developers"
+        self.assertEqual(NOTICE_TEXT.splitlines()[1], line)
+        self.assertEqual(_text((ROOT / "NOTICE").read_bytes()).splitlines()[1:2], [line])
 
     def test_contributing_states_the_sign_off_rule(self) -> None:
         self.assertEqual(contributing_problems(ROOT), [])
@@ -1082,7 +1089,7 @@ class BrokenRuleTests(unittest.TestCase):
 
     def test_a_git_that_does_not_answer_is_named(self) -> None:
         if os.environ.get("LICENCE_CHECKS_CHILD"):
-            self.skipTest("the parent runs it: it holds for any contact or holder")
+            self.skipTest("the parent runs it: it holds for any contact")
         stand_in = self.stand_in_git("exec /bin/sleep 5")
         with mock.patch.dict(os.environ, {"PATH": str(stand_in)}), mock.patch.dict(globals(), {"GIT_TIMEOUT": 1}):
             self.assertNamed(r"^git did not answer within 1 s, so LICENSE in the index was not read")
@@ -1122,6 +1129,17 @@ class BrokenRuleTests(unittest.TestCase):
                 saved = (self.root / "NOTICE").read_bytes()
                 self.edit("NOTICE", old, new)
                 self.assertNamed(rf"^NOTICE is not NOTICE_TEXT \(from line {line}\)")
+                (self.root / "NOTICE").write_bytes(saved)
+
+    def test_notice_without_the_holder_line_lucas_named_is_named(self) -> None:
+        line = "Copyright 2026 The Recursion Developers\n"
+        for new in ("", "Copyright 2026\n", "Copyright 2026 The Recursion Developers, Jane Doe\n",
+                    "Copyright 2025 The Recursion Developers\n", "Copyright 2026 the Recursion Developers\n",
+                    "Copyright 2026 The Recursion Developers \n"):
+            with self.subTest(new=new):
+                saved = (self.root / "NOTICE").read_bytes()
+                self.edit("NOTICE", line, new)
+                self.assertNamed(r"^NOTICE is not NOTICE_TEXT \(from line 2\)")
                 (self.root / "NOTICE").write_bytes(saved)
 
     def test_notice_that_is_not_utf_8_is_named(self) -> None:
@@ -1372,7 +1390,7 @@ class BrokenRuleTests(unittest.TestCase):
         minutes. Each shape here grows the work of a scan of that kind with the square of its size;
         the checks run as a child that must answer within 60 s."""
         if os.environ.get("LICENCE_CHECKS_CHILD"):
-            self.skipTest("the parent runs it: it holds for any contact or holder")
+            self.skipTest("the parent runs it: it holds for any contact")
         text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
         shapes = ("a." * 150000, '\\"@x' * 20000, "*" * 40000 + "x@example.invalid" + "*" * 40000,
                   "@[" * 20000, "x " + "<!--" * 20000, "a@" * 20000, '"' * 40000 + "@x", "`x``y" * 15000,
@@ -1965,18 +1983,16 @@ class BrokenRuleTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr[-3000:])
 
     def test_approved_contact_two_edits_keep_suite_green(self) -> None:
-        """Naming the contact (CONTACT and SECURITY.md) or the holder (HOLDER and NOTICE), as the
-        comments above them say, keeps this file's tests green: they run again, as a child, on a copy
-        of the four files and of this file with the two edits made."""
-        for constant, old, rel, new in (("CONTACT", CONTACT, "SECURITY.md", self.other("security@example.invalid")),
-                                        ("HOLDER", HOLDER, "NOTICE", self.other("Example Review Entity", HOLDER))):
+        """Naming the contact (CONTACT and SECURITY.md), as the comment above it says, keeps this
+        file's tests green: they run again, as a child, on a copy of the four files and of this file
+        with the two edits made. The holder is named and held word for word, so it is not renamed here."""
+        for constant, old, rel, new in (("CONTACT", CONTACT, "SECURITY.md", self.other("security@example.invalid")),):
             with self.subTest(constant=constant):
                 self.name_and_rerun(constant, old, rel, new)
 
     def test_R3_contact_may_equal_a_negative_fixture(self) -> None:
-        """So does a contact or a holder that is a value the tests refuse where it is not the one named."""
-        for constant, old, rel, new in (("CONTACT", CONTACT, "SECURITY.md", "jane.doe@example.org"),
-                                        ("HOLDER", HOLDER, "NOTICE", "Jane Doe")):
+        """So does a contact that is a value the tests refuse where it is not the one named."""
+        for constant, old, rel, new in (("CONTACT", CONTACT, "SECURITY.md", "jane.doe@example.org"),):
             with self.subTest(constant=constant):
                 self.name_and_rerun(constant, old, rel, new)
 

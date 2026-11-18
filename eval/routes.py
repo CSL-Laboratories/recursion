@@ -22,7 +22,11 @@ screen, pilot, full), so a pilot stays labelled a pilot on every line:
 A route is its engine, model, route and effort, printed as a JSON list (a model name holding "/" stays
 one name), plus the hash of the arm's shared settings (``settings``, its first 12 hex), so two records
 that differ only in permission mode or engine arguments are two routes. Two records of one route,
-an invalid record and a record of another protocol or analysis version are refused (exit 2).
+an invalid record, a record file nested too deeply to read, and a record of another protocol or analysis
+version are refused (exit 2). The table's fields are plain tokens separated by TAB, never quoted: a
+record whose record_id, task_id or cost_unit holds a TAB, a character str.isprintable() refuses (CR,
+LF, U+2028 among them) or nothing is refused (exit 2) before any line prints, the refusal naming the
+field, never the value.
 
 Costs are never added across what cannot be added: an unknown cost prints ``unknown``, never 0, and
 makes every cost figure of its route ``unknown`` (``cost_unknown`` counts those trials); costs in more
@@ -122,13 +126,36 @@ def cost_figures(record: dict) -> dict:
     return out
 
 
+def _plain(value) -> bool:
+    """A value the table may print raw: a non-empty string with no character str.isprintable() refuses. That
+    refuses TAB, the table's field separator, and CR, LF, every C0 control, U+007F, U+0085, U+2028 and U+2029."""
+    return isinstance(value, str) and value != "" and value.isprintable()
+
+
+def require_plain(record: dict, where: str) -> None:
+    """Refuse a record whose values printed raw (record_id, each task_id, each cost_unit) are not plain; the
+    refusal names the field and never the value. Label, verdict, tier and basis are choices record.py checks,
+    the settings hash a pattern, the route a JSON list (ASCII), the counts integers."""
+    if not _plain(record["record_id"]):
+        raise ValueError(f"{where}: record_id holds a tab, a character that does not print, or nothing")
+    for i, trial in enumerate(record["trials"]):
+        if not _plain(trial["task_id"]):
+            raise ValueError(f"{where}: trials[{i}].task_id holds a tab, a character that does not print, or nothing")
+        unit = trial["usage"]["cost_unit"]
+        if unit is not None and not _plain(unit):
+            raise ValueError(f"{where}: trials[{i}].usage.cost_unit holds a tab, a character that does not print, "
+                             f"or nothing")
+
+
 def check(records: list) -> None:
-    """Refuse no record, an invalid record, one of another protocol or analysis, or two records of one route."""
+    """Refuse no record, an invalid record, a value the table cannot print as one plain field, one of another
+    protocol or analysis, or two records of one route."""
     if not records:
         raise ValueError("give at least one record")
     seen: dict = {}
-    for record in records:
+    for n, record in enumerate(records, start=1):
         record_mod.require_valid(record)
+        require_plain(record, f"record {n}")
         analyze.require_supported(record)
         key = route_key(record)
         if key in seen:
@@ -175,6 +202,9 @@ def main(argv=None) -> int:
         table = lines([record_mod.load(path) for path in args.records])
     except (OSError, ValueError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    except RecursionError:
+        print("refused: a record file nests too deeply to read", file=sys.stderr)
         return 2
     for line in table:
         print(line)

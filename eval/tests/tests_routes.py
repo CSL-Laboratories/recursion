@@ -298,5 +298,87 @@ class RouteTableTests(unittest.TestCase):
             routes.lines([])
 
 
+
+def table_of_files(texts):
+    """Write each text as a record file named by its index only (an id may hold what no file name may), run the
+    command on them, return (exit, stdout text, stderr text)."""
+    with tempfile.TemporaryDirectory(prefix="eval-routes-") as folder:
+        paths = []
+        for i, text in enumerate(texts):
+            path = Path(folder) / f"{i}.json"
+            path.write_text(text, encoding="utf-8")
+            paths.append(str(path))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = routes.main(paths)
+    return code, out.getvalue(), err.getvalue()
+
+
+class PlainFieldTests(unittest.TestCase):
+    """A record file nested too deeply is refused like every other bad record file, and a value the table prints
+    raw holds neither its field separator (TAB) nor a character str.isprintable() refuses."""
+
+    def refused(self, record, field, value):
+        record_mod.require_valid(record)   # the validator accepts it, so the table itself must refuse it
+        code, out, err = table_of_files([record_mod.dumps(record)])
+        self.assertEqual(code, 2, err)
+        self.assertEqual(out, "")
+        self.assertTrue(err.startswith("refused: "), err)
+        self.assertIn(field, err)
+        self.assertNotIn(value, err)
+
+    def test_a_record_file_nested_too_deeply_is_refused(self):
+        code, out, err = table_of_files(["[" * 200000 + "]" * 200000])
+        self.assertEqual(code, 2, err)
+        self.assertEqual(out, "")
+        self.assertTrue(err.startswith("refused: "), err)
+        self.assertNotIn("Traceback", err)
+
+    def test_a_tab_in_task_id_is_refused(self):
+        task_id = "t-1\tverdict=pass\tcost=0"
+        self.refused(standin_record("model-a", {task_id: ["fail", "fail"]}, record_id="r1"), "task_id", task_id)
+
+    def test_a_newline_in_record_id_is_refused(self):
+        record_id = "rec\nok\troute\tforged=1"
+        self.refused(standin_record("model-a", {"t-1": ["fail", "fail"]}, record_id=record_id),
+                     "record_id", record_id)
+
+    def test_a_line_separator_in_record_id_is_refused(self):
+        record_id = "rec forged"
+        self.refused(standin_record("model-a", {"t-1": ["fail", "fail"]}, record_id=record_id),
+                     "record_id", record_id)
+
+    def test_every_unprintable_character_in_an_id_is_refused(self):
+        for char in ("\r", "\x00", "\x1b", "\x1f", "\x7f", "\x85", " "):
+            with self.subTest(char=hex(ord(char))):
+                self.refused(standin_record("model-a", {"t-1": ["fail", "fail"]}, record_id="rec" + char + "x"),
+                             "record_id", "rec" + char + "x")
+                self.refused(standin_record("model-a", {"t" + char + "1": ["fail", "fail"]}, record_id="r1"),
+                             "task_id", "t" + char + "1")
+
+    def test_a_tab_in_cost_unit_is_refused(self):
+        record = standin_record("model-a", {"t-1": ["pass", "fail"]}, record_id="r1", cost=0.5)
+        record["trials"][1]["usage"]["cost_unit"] = "usd\tverdict=pass"
+        self.refused(record, "cost_unit", "usd\tverdict=pass")
+
+    def test_an_empty_id_is_refused_by_the_table_itself(self):
+        # record.py refuses an empty id first; the table's own rule is pinned by calling it directly
+        record = standin_record("model-a", {"t-1": ["fail", "fail"]}, record_id="r1")
+        record["record_id"] = ""
+        with self.assertRaisesRegex(ValueError, "record 1: record_id"):
+            routes.require_plain(record, "record 1")
+        record["record_id"], record["trials"][0]["task_id"] = "r1", ""
+        with self.assertRaisesRegex(ValueError, r"record 1: trials\[0\]\.task_id"):
+            routes.require_plain(record, "record 1")
+
+    def test_printable_non_ascii_ids_still_print(self):
+        record = standin_record("model-a", {"t-é": ["pass", "pass"]}, record_id="r-é")
+        code, out, err = table_of_files([record_mod.dumps(record)])
+        self.assertEqual(code, 0, err)
+        rows = [fields(line) for line in out.split("\n") if line]
+        self.assertIn("task=t-é", out)
+        self.assertEqual([f["record"] for _, kind, f in rows if kind == "route"], ["r-é"])
+
+
 if __name__ == "__main__":
     unittest.main()

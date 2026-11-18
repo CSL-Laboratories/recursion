@@ -840,6 +840,27 @@ class Composition:
                         item.close()
 
 
+def _composed_hooks(state_dir):
+    """The hooks of this composition.
+
+    ``compose()`` takes no argument. The workspace registrant reads ``RECURSION_STATE_DIR`` while it
+    registers, so the folder check refuses this daemon's state directory and not some other one.
+    The variable is put back before this returns. A registrant that is present and broken fails
+    composition, and the daemon does not start.
+    """
+    from recursion_core.control.hooks import compose as compose_hooks
+    name = 'RECURSION_STATE_DIR'
+    held = os.environ.get(name)
+    os.environ[name] = str(state_dir)
+    try:
+        return compose_hooks()
+    finally:
+        if held is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = held
+
+
 def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.monotonic,
                     confirm_timeout_s=5.0, plugin_dirs=(), plugin_options=None):
     """Build the control API over ``daemon`` and serve it on the owner-only socket.
@@ -889,17 +910,24 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
         if created and registry.list():
             log.warning('the breaker store was missing and was created empty while run records exist: '
                         'earlier trips, run bindings and faults are not known to this daemon')
+    try:
+        hooks = _composed_hooks(state_dir)
+    except BaseException:
+        if breaker is not None:
+            breaker.close()
+        raise
     plugins = PluginHost(config_dir, state_dir, stored, plugin_dirs=plugin_dirs, **(plugin_options or {}))
     adapters = {}
     for engine, cls in (('claude_code', ClaudeCodeAdapter), ('codex', CodexAdapter)):
         entry = routes.get(engine)
-        launcher = ProductionLauncher(engine, daemon, manager, state_dir)
+        launcher = ProductionLauncher(engine, daemon, manager, state_dir, hooks=hooks)
         options = {'binary': entry['binary']} if entry and entry.get('binary') else {}
         adapters[engine] = cls(launcher, clock, no_custody, environ, **options)
     service = RouteService(adapters, breaker if breaker is not None else route_breaker, clock)
     starter = RouteStarter(service, routes, daemon, state_dir, breaker=breaker,
                            breaker_unavailable=breaker_unavailable)
-    api = ControlAPI(registry, UnitKillTree(daemon), starter, time.time, confirm_timeout_s=confirm_timeout_s)
+    api = ControlAPI(registry, UnitKillTree(daemon), starter, time.time, confirm_timeout_s=confirm_timeout_s,
+                     hooks=hooks)
     control = DaemonControl(api, registry, daemon, starter, state_dir, routes=routes, plugins=plugins,
                             breaker=breaker, breaker_store='durable' if breaker is not None
                             else f'unavailable: {breaker_unavailable}')

@@ -71,10 +71,48 @@ VERBATIM_ARGV_MIN_SYSTEMD = 254
 _PATH_SAFE = frozenset('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-+@,')
 
 _current = threading.local()
+_pending_launch = {}
+_pending_lock = threading.Lock()
 
 
 def refused(detail):
     return c.RouteError(c.LAUNCH_REFUSED, detail)
+
+
+def remember_launch(run_id, launch, hooks):
+    """Leave the stored launch where ``RunContext(run_id)`` takes it.
+
+    The starter constructs the context from the run id alone. The control door has already stored
+    the launch, and calls this before the starter, so the context the launcher sees is that record
+    and not the client's params.
+    """
+    with _pending_lock:
+        _pending_launch[run_id] = (launch, hooks)
+
+
+def drop_launch(run_id):
+    """Drop a launch the starter never took."""
+    with _pending_lock:
+        _pending_launch.pop(run_id, None)
+
+
+def _take_launch(run_id):
+    with _pending_lock:
+        return _pending_launch.pop(run_id, None)
+
+
+def _run_folder(hooks, ctx):
+    """The folder seam S4 names, or None for today's. A refusal from the seam is a launch refusal."""
+    chosen = getattr(ctx, 'hooks', None) or hooks
+    if chosen is None:
+        return None
+    from recursion_core.control.hooks import HookRefused
+    try:
+        folder = chosen.working_directory(ctx)
+    except HookRefused as exc:
+        detail = exc.code if not exc.detail else '%s:%s' % (exc.code, exc.detail)
+        raise refused(detail) from None
+    return folder
 
 
 def require_launcher_platform():
@@ -104,6 +142,14 @@ class RunContext:
         self.cancelled = False
         self.launches = 0
         self.changed = threading.Condition()
+        # The control door leaves the stored launch here. With the versioned path off, both stay None
+        # and the launcher keeps today's folder.
+        pending = _take_launch(run_id)
+        if pending is None:
+            self.launch = None
+            self.hooks = None
+        else:
+            self.launch, self.hooks = pending
 
     def launched(self, cgroup, process):
         """Publish the launch. False when the start was abandoned first: nothing is published then.
@@ -367,7 +413,7 @@ class UnitEngineProcess:
 class ProductionLauncher:
     """``launcher(argv, *, env, shell=False) -> EngineProcess`` for one engine's route adapter."""
 
-    def __init__(self, engine, daemon, manager, state_dir, *, python=None, start_timeout_s=10.0):
+    def __init__(self, engine, daemon, manager, state_dir, *, python=None, start_timeout_s=10.0, hooks=None):
         require_launcher_platform()
         if engine not in ENGINE_PROFILES:
             raise ValueError(engine)
@@ -375,6 +421,7 @@ class ProductionLauncher:
         self._state = Path(state_dir)
         self._python = python or sys.executable
         self._start_timeout_s = start_timeout_s
+        self._hooks = hooks
 
     # -- the pieces a test can check without systemd -------------------------------------------
     def child_environment(self, env):
@@ -471,7 +518,13 @@ class ProductionLauncher:
             flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
             stdin_fd = os.open(run_dir / 'stdin.fifo', flags)
             env_fd = os.open(run_dir / 'env.fifo', flags)
-            self._manager.prepare(unit, properties=self.unit_properties(run_dir), working_directory=home)
+            # Seam S4. None keeps today's folder. HOME stays the engine home computed above.
+            folder = _run_folder(self._hooks, ctx)
+            if folder is None:
+                folder = home
+            elif not _unit_path_ok(folder):
+                raise refused('working_directory_not_unit_safe')
+            self._manager.prepare(unit, properties=self.unit_properties(run_dir), working_directory=folder)
             ctx.launches += 1
             try:
                 self._daemon.start(ctx.run_id, self.unit_argv(executable, argv, run_dir / 'env.fifo'))

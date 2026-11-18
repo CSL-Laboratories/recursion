@@ -44,9 +44,9 @@ class EngineProcessTest(unittest.TestCase):
         """A process with only what ``read_line`` reads: a buffer, a number to read from and a poll interval."""
         process = object.__new__(launcher.UnitEngineProcess)
         process._buffer = b''
+        process._discarding = False
         process._out = -1
         process._poll_s = 0.05
-        process._closed = False
         process._lock = threading.Lock()
         process._ended = lambda: False
         return process
@@ -379,6 +379,26 @@ class EngineProcessTest(unittest.TestCase):
             self.assertEqual(process._buffer, b'')
             self.assertIsNone(process.read_line(0.1))
 
+    def test_the_tail_of_an_unterminated_over_long_line_is_not_a_line(self):
+        """Bound of 8: nine bytes, EMSGSIZE, then ok and a newline must not come back as ok.
+
+        The newline ends the refused line. The line after it is still read.
+        """
+        process = self.reader()
+        process._buffer = b'123456789'
+        process._ended = lambda: True
+        chunks = iter((b'ok\nnext\n', b''))
+        with patch.object(launcher, 'MAX_LINE_BYTES', 8), \
+                patch.object(launcher.os, 'read', side_effect=lambda fd, size: next(chunks)):
+            with self.assertRaises(OSError) as raised:
+                process.read_line(0.1)
+            self.assertEqual(raised.exception.errno, errno.EMSGSIZE)
+            got = process.read_line(0.1)
+            self.assertNotEqual(got, 'ok')
+            if got is None:
+                got = process.read_line(0.1)
+            self.assertEqual(got, 'next')
+
     def test_a_shut_process_with_an_empty_buffer_reads_as_ended(self):
         out = self.root / 'stdout.jsonl'
         out.write_bytes(b'later\n')
@@ -421,6 +441,63 @@ class EngineProcessTest(unittest.TestCase):
         process._daemon.reconcile.return_value = SimpleNamespace(state='running')
         self.assertFalse(process._ended())
         process._daemon.reconcile.assert_called_once_with('run-one')
+
+    def test_a_read_does_not_take_bytes_from_a_descriptor_the_shut_reused(self):
+        """A shut that reuses the stdout number during the read must not deliver that file."""
+        out = self.root / 'stdout.jsonl'
+        out.write_bytes(b'engine\n')
+        sentinel = self.root / 'sentinel'
+        sentinel.write_bytes(b'foreign\n')
+        process = launcher.UnitEngineProcess(Mock(), 'run-one', None, out, None)
+        self.addCleanup(process.close)
+        real_read, real_open, real_close = os.read, os.open, os.close
+
+        def read(fd, size):
+            if read.done:
+                return real_read(fd, size)
+            read.done = True
+            held = not process._lock.acquire(blocking=False)
+            if held:
+                return real_read(fd, size)
+            process._lock.release()
+            process.close()
+            reused = real_open(sentinel, os.O_RDONLY)
+            self.addCleanup(real_close, reused)
+            self.assertEqual(reused, fd, 'the process reused the released descriptor')
+            return real_read(fd, size)
+        read.done = False
+
+        with patch.object(launcher.os, 'read', side_effect=read):
+            self.assertEqual(process.read_line(0.2), 'engine')
+
+    def test_a_reused_pidfd_does_not_mark_the_engine_ended(self):
+        """A shut that reuses the pidfd number during the wait must not mark a live engine ended."""
+        out = self.root / 'stdout.jsonl'
+        out.write_bytes(b'')
+        process = launcher.UnitEngineProcess(Mock(), 'run-one', None, out, None)
+        self.addCleanup(process.close)
+        quiet_read, quiet_write = os.pipe()
+        self.addCleanup(os.close, quiet_write)
+        readable_read, readable_write = os.pipe()
+        self.addCleanup(os.close, readable_read)
+        self.addCleanup(os.close, readable_write)
+        os.write(readable_write, b'x')
+        process._pidfd = quiet_read
+        real_select = launcher.select.select
+
+        def select_hook(rlist, wlist, xlist, timeout=None):
+            if not select_hook.done and quiet_read in rlist:
+                select_hook.done = True
+                got = process._lock.acquire(blocking=False)
+                if got:
+                    process._lock.release()
+                    os.dup2(readable_read, quiet_read)
+            return real_select(rlist, wlist, xlist, 0 if timeout is None else timeout)
+        select_hook.done = False
+
+        process._daemon.reconcile.return_value = SimpleNamespace(state='running')
+        with patch.object(launcher.select, 'select', side_effect=select_hook):
+            self.assertFalse(process._ended())
 
     def test_a_clean_end_at_the_deadline_is_zero_bytes(self):
         now = Clock()

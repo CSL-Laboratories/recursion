@@ -80,6 +80,20 @@ def _plain_report(report):
             raise AssertionError("mend field")
 
 
+def _local_schema(uri):
+    """A ``file:`` schema URI read from disk.
+
+    The schemas sit beside ``methods.v1.json``. Left to urllib, a ``file:`` URI goes through
+    an opener whose https handler loads the host's certificate store first; under the
+    simulated-Windows step that is Windows' store, which this host's ssl module does not
+    have (``enum_certificates``). Reading the file keeps the full schema check there too.
+    """
+
+    from urllib.parse import unquote, urlsplit
+
+    return json.loads(Path(unquote(urlsplit(uri).path)).read_text(encoding="utf-8"))
+
+
 def _validate(report):
     _plain_report(report)
     try:
@@ -90,7 +104,8 @@ def _validate(report):
     methods = json.loads(METHODS_PATH.read_text(encoding="utf-8"))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        resolver = jsonschema.RefResolver(base_uri=METHODS_PATH.as_uri(), referrer=methods)
+        resolver = jsonschema.RefResolver(base_uri=METHODS_PATH.as_uri(), referrer=methods,
+                                          handlers={"file": _local_schema})
         jsonschema.validate(instance=report, schema=methods["$defs"]["doctor_report"], resolver=resolver)
 
 

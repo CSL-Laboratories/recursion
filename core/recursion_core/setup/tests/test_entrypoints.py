@@ -274,6 +274,15 @@ class DoctorCommandTests(unittest.TestCase):
             "TMPDIR": scratch,
         }
 
+    def _assert_refused_off_linux(self, code, out, err, asked):
+        """Off Linux (the simulated-Windows step) ``doctor`` refuses, typed, before the doctor runs."""
+
+        self.assertEqual((code, err), (1, ""))
+        answer = json.loads(out)
+        self.assertEqual(answer["code"], "platform_unsupported")
+        self.assertIn("Windows and macOS are not supported yet", answer["detail"])
+        self.assertEqual(asked, [])
+
     @contextlib.contextmanager
     def _at_root(self, home, env, asked):
         """The doctor in this process with ``doctor.run(root=home)``; a call that asks this account lands in ``asked``."""
@@ -296,6 +305,9 @@ class DoctorCommandTests(unittest.TestCase):
         asked = []
         with self._at_root(home, env, asked):
             code, out, err = _main(["doctor", "--json"])
+        if not entry._linux():
+            self._assert_refused_off_linux(code, out, err, asked)
+            return
         self.assertNotEqual(code, 2, f"doctor is still an unknown command\n{err}\n{out}")
         self.assertEqual(err, "")
         self.assertTrue(out.endswith("\n") and not out.endswith("\n\n"), out)
@@ -324,6 +336,9 @@ class DoctorCommandTests(unittest.TestCase):
         asked = []
         with self._at_root(home, env, asked):
             code, out, err = _main(["doctor"])
+        if not entry._linux():
+            self._assert_refused_off_linux(code, out, err, asked)
+            return
         self.assertNotEqual(code, 2, err or out)
         self.assertEqual(err, "")
         self.assertFalse(out.lstrip().startswith("{"), out)
@@ -345,6 +360,13 @@ class DoctorCommandTests(unittest.TestCase):
 
     def test_an_interruption_propagates_and_a_probe_error_is_not_swallowed(self):
         import recursion_core.setup.doctor as doctor
+        if not entry._linux():
+            # The refusal comes first, so the doctor (here one that raises) is never called.
+            with mock.patch.object(doctor, "run", side_effect=KeyboardInterrupt) as run:
+                code, out, err = _main(["doctor", "--json"])
+            run.assert_not_called()
+            self._assert_refused_off_linux(code, out, err, [])
+            return
         with mock.patch.object(doctor, "run", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 _main(["doctor", "--json"])

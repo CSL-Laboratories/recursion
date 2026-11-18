@@ -108,7 +108,7 @@
     "fallback_route": {
       "description": "A whole route, as the route contract takes it: every structural rule of recursion_core.routes.contract.validate_request is stated here; which login it may name is the loader's (fallback_not_a_login).",
       "type": "object",
-      "propertyNames": {"enum": ["engine", "model", "connection", "profile", "home", "bare", "api_key_helper", "billing_ack"]},
+      "propertyNames": {"enum": ["engine", "model", "connection", "profile", "home", "bare", "api_key_helper", "billing_ack", "wrapper"]},
       "required": ["engine", "model", "connection"],
       "properties": {
         "engine": {"$ref": "#/$defs/route_contract_engine"},

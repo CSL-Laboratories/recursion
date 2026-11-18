@@ -65,6 +65,7 @@ import errno
 import os
 import secrets
 import stat
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -284,6 +285,16 @@ def _string_child_env(engine: str, child_env: object) -> dict[str, str]:
         copied[name] = value
     return copied
 
+_LINE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
+
+def _public_detail(value: str) -> str:
+    """Caller text safe to put in a refusal. Empty when it could forge another line."""
+
+    if any(unicodedata.category(ch) in _LINE_CATEGORIES for ch in value):
+        return ""
+    return value
+
 
 def check_route(
     engine: str,
@@ -332,7 +343,7 @@ def check_route(
         known.add(HERMES_ADOPT_EXTERNAL_LOGINS)
     unknown = sorted(str(key) for key in set(profile) - known)
     if unknown:
-        raise SubscriptionRouteRefused(engine, "profile_unknown_field", ",".join(unknown))
+        raise SubscriptionRouteRefused(engine, "profile_unknown_field", _public_detail(",".join(unknown)))
     engine_config: tuple[tuple[str, object], ...] = ()
     if engine == "hermes":
         # Hermes "will use Claude Code's credential store directly when available", and on macOS that store
@@ -356,25 +367,24 @@ def check_route(
             raise SubscriptionRouteRefused(engine, f"{name}_missing")
     provider = provider.strip().lower()
     if provider in spec.subscription_providers or _looks_like_claude_login(provider):
-        raise SubscriptionRouteRefused(engine, "claude_subscription_provider", provider)
+        raise SubscriptionRouteRefused(engine, "claude_subscription_provider", _public_detail(provider))
     if auth.strip().lower() in spec.subscription_auth:
-        raise SubscriptionRouteRefused(engine, "claude_subscription_auth" if provider == "anthropic" else "subscription_auth", auth)
+        raise SubscriptionRouteRefused(engine, "claude_subscription_auth" if provider == "anthropic" else "subscription_auth", _public_detail(auth))
     if auth != "api_key":
-        raise SubscriptionRouteRefused(engine, "auth_not_api_key", auth)
+        raise SubscriptionRouteRefused(engine, "auth_not_api_key", _public_detail(auth))
     if provider not in spec.providers:
-        # A one-line provider stays in the detail. A newline, return or NUL would forge a second line.
-        shown = "" if any(ch in provider for ch in "\n\r\x00") else provider
-        raise SubscriptionRouteRefused(engine, "provider_not_allowed", shown)
+        # A one-line provider stays in the detail. A line or terminal control would forge a second line.
+        raise SubscriptionRouteRefused(engine, "provider_not_allowed", _public_detail(provider))
     stored_model = ""
     if model is not None:
         stored_model = _require_model_name(engine, model)
         model_provider = stored_model.split("/", 1)[0].strip().lower()
         if model_provider in spec.subscription_providers or _looks_like_claude_login(model_provider):
-            raise SubscriptionRouteRefused(engine, "claude_subscription_provider", model_provider)
+            raise SubscriptionRouteRefused(engine, "claude_subscription_provider", _public_detail(model_provider))
         if model_provider != provider:
-            raise SubscriptionRouteRefused(engine, "model_provider_mismatch", model_provider)
+            raise SubscriptionRouteRefused(engine, "model_provider_mismatch", _public_detail(model_provider))
     if credential not in spec.providers[provider].credential_env:
-        raise SubscriptionRouteRefused(engine, "credential_env_not_allowed", credential)
+        raise SubscriptionRouteRefused(engine, "credential_env_not_allowed", _public_detail(credential))
 
     env = _string_child_env(engine, child_env)
     present = sorted(name for name in CLAUDE_SUBSCRIPTION_ENV if name in env)
@@ -626,7 +636,12 @@ def _check_home(
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
         raise SubscriptionRouteRefused(engine, "route_home_not_private")
     for entry in CLAUDE_STORE_ENTRIES:
-        if os.path.lexists(os.path.join(route_home, entry)):  # presence only; never opened or read
+        # Presence only; never opened or read. An unsearchable parent is not "absent":
+        # lexists answers false on EACCES and would hide .config/claude.
+        presence = _entry_presence(route_home, entry)
+        if presence == "unreadable":
+            raise SubscriptionRouteRefused(engine, "own_store_unreadable", entry)
+        if presence == "present":
             raise SubscriptionRouteRefused(engine, "claude_store_in_route_home", entry)
     # Check the store's parent components even when the leaf is absent.
     # Otherwise .config -> an operator directory can expose unrelated stores.
@@ -644,11 +659,54 @@ def _check_home(
             continue  # the adopt switch an earlier launch in this home wrote, and nothing else
         if engine == "hermes" and entry == ".hermes" and _hermes_dir_is_empty(route_home):
             continue  # an empty real .hermes counts as absent on an API-key Hermes route only
-        if os.path.lexists(os.path.join(route_home, entry)):  # presence only; never opened or read
+        # Presence only; never opened or read. Same rule as the Claude entries above.
+        presence = _entry_presence(route_home, entry)
+        if presence == "unreadable":
+            raise SubscriptionRouteRefused(engine, "own_store_unreadable", entry)
+        if presence == "present":
             raise SubscriptionRouteRefused(engine, "engine_store_in_route_home", entry)
 
 
 _STORE_WALK_CAP = 10_000
+
+
+def _lstat_or_absent(path: str):
+    """The lstat of ``path``, or None when the final component is absent.
+
+    ENOENT and ENOTDIR are absence. Any other OSError propagates: the caller
+    must not treat an unreadable path as missing.
+    """
+
+    try:
+        return os.lstat(path)
+    except OSError as err:
+        if err.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None
+        raise
+
+
+def _entry_presence(route_home: str, entry: str) -> str:
+    """``absent``, ``present`` or ``unreadable``. Never opens the path.
+
+    A symlink on the way is reported as absent so the parent-link check can
+    keep its own cause. A symlink at the leaf is present: the name is there.
+    """
+
+    path = route_home
+    leaf = os.path.join(route_home, entry)
+    for part in entry.split("/"):
+        if not part:
+            continue
+        path = os.path.join(path, part)
+        try:
+            found = _lstat_or_absent(path)
+        except OSError:
+            return "unreadable"
+        if found is None:
+            return "absent"
+        if stat.S_ISLNK(found.st_mode) and path != leaf:
+            return "absent"
+    return "present"
 
 
 def _check_own_store(engine: str, route_home: str, real_home: str, entry: str) -> None:
@@ -658,9 +716,13 @@ def _check_own_store(engine: str, route_home: str, real_home: str, entry: str) -
     path, parts = route_home, entry.split("/")
     for part in parts:
         path = os.path.join(path, part)
-        if not os.path.lexists(path):
+        try:
+            found = _lstat_or_absent(path)
+        except OSError:
+            raise SubscriptionRouteRefused(engine, "own_store_unreadable", entry) from None
+        if found is None:
             return  # absent: nothing to check
-        if os.path.islink(path):
+        if stat.S_ISLNK(found.st_mode):
             raise SubscriptionRouteRefused(engine, "own_store_is_link", entry)
     if not os.path.isdir(path):
         return
@@ -670,10 +732,12 @@ def _check_own_store(engine: str, route_home: str, real_home: str, entry: str) -
     seen_dirs: set[str] = set()
     seen = 0
 
-    def _walk_error(_err: OSError) -> None:
+    def _walk_error(err: OSError) -> None:
         # An unreadable directory is not a clean tree: skipping it would hide a link
-        # out of the route home. Fail closed, and do not echo the OS text.
-        raise SubscriptionRouteRefused(engine, "own_store_unreadable", entry) from None
+        # out of the route home. A name that disappeared between the listing and the
+        # descent is a different cause. Do not echo the OS text.
+        cause = "own_store_changed" if err.errno == errno.ENOENT else "own_store_unreadable"
+        raise SubscriptionRouteRefused(engine, cause, entry) from None
 
     while pending:
         current = pending.pop()
@@ -701,7 +765,19 @@ def _check_own_store(engine: str, route_home: str, real_home: str, entry: str) -
                 if seen > _STORE_WALK_CAP:
                     raise SubscriptionRouteRefused(engine, "own_store_too_large", entry)
                 item = os.path.join(top, name)
-                if os.path.islink(item) and not _within(os.path.realpath(item), real_home):
+                # os.walk calls an entry a file when is_dir raises, and os.path.islink
+                # answers False on that same EACCES. State the name; a failure is not "no link".
+                try:
+                    item_mode = os.lstat(item).st_mode
+                except OSError as err:
+                    _walk_error(err)
+                if not stat.S_ISLNK(item_mode):
+                    continue
+                try:
+                    target = os.path.realpath(item)
+                except OSError as err:
+                    _walk_error(err)
+                if not _within(target, real_home):
                     raise SubscriptionRouteRefused(engine, "own_store_links_outside_route_home", entry)
             for item in linked_dirs:
                 seen += 1

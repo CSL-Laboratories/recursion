@@ -203,5 +203,93 @@ class BootstrapHygieneTests(unittest.TestCase):
         self.assertIn("recursiond", done.stdout)
 
 
+class DoctorCommandTests(unittest.TestCase):
+    """``recursiond doctor`` prints one report. No daemon has to be running."""
+
+    def _empty_runtime(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        return folder.name
+
+    def test_doctor_json_prints_one_report_and_exits_1_when_a_check_is_fail(self):
+        # Today this command is unknown: exit 2, and nothing is printed.
+        runtime = self._empty_runtime()
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}):
+            code, out, err = _main(["doctor", "--json"])
+        self.assertNotEqual(code, 2, f"doctor is still an unknown command\n{err}\n{out}")
+        self.assertEqual(err, "")
+        self.assertTrue(out.endswith("\n") and not out.endswith("\n\n"), out)
+        report = json.loads(out)
+        self.assertEqual(out, json.dumps(report, sort_keys=True) + "\n")
+        from recursion_core.setup.tests.test_doctor import _validate
+        _validate(report)
+        socket = next(check for check in report["checks"] if check["id"] == "daemon.socket")
+        self.assertIn(socket["state"], ("fail", "unknown"))
+        self.assertNotEqual(socket["state"], "ok")
+        self.assertEqual(socket["state"], "fail")  # the runtime directory has no socket
+        failed = any(check["state"] == "fail" for check in report["checks"])
+        self.assertEqual(code, 1 if failed else 0)
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}):
+            again, again_out, again_err = _main(["doctor", "--json"])
+        self.assertEqual(again_err, "")
+        again_report = json.loads(again_out)
+        _validate(again_report)
+        self.assertIsNot(again_report, report)
+        again_failed = any(check["state"] == "fail" for check in again_report["checks"])
+        self.assertEqual(again, 1 if again_failed else 0)
+
+    def test_doctor_without_json_prints_text(self):
+        runtime = self._empty_runtime()
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}):
+            code, out, err = _main(["doctor"])
+        self.assertNotEqual(code, 2, err or out)
+        self.assertEqual(err, "")
+        self.assertFalse(out.lstrip().startswith("{"), out)
+        self.assertIn("platform.linux", out)
+        self.assertIn("daemon.socket", out)
+        self.assertTrue(out.endswith("\n"))
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out)
+
+    def test_help_lists_doctor(self):
+        code, out, _ = _main(["--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("doctor", out)
+        with mock.patch.object(entry, "_linux", return_value=True):
+            code, out, _ = _main(["doctor", "--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("--json", out)
+
+    def test_an_interruption_propagates_and_a_probe_error_is_not_swallowed(self):
+        import recursion_core.setup.doctor as doctor
+        with mock.patch.object(doctor, "run", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                _main(["doctor", "--json"])
+        with mock.patch.object(doctor, "run", side_effect=SystemExit(3)):
+            with self.assertRaises(SystemExit):
+                _main(["doctor"])
+        with mock.patch.object(doctor, "run", side_effect=RuntimeError("probe")):
+            with self.assertRaises(RuntimeError):
+                _main(["doctor", "--json"])
+
+    def test_doctor_json_as_a_process_prints_one_object(self):
+        with tempfile.TemporaryDirectory() as runtime, tempfile.TemporaryDirectory() as cwd:
+            done = subprocess.run(
+                [sys.executable, "-B", "-m", "recursion_core._entrypoints", "doctor", "--json"],
+                cwd=cwd, env=_child_env(XDG_RUNTIME_DIR=runtime), capture_output=True, text=True,
+            )
+        self.assertNotEqual(done.returncode, 2, done.stderr or done.stdout)
+        self.assertEqual(done.stderr, "")
+        report = json.loads(done.stdout)
+        self.assertEqual(done.stdout, json.dumps(report, sort_keys=True) + "\n")
+        from recursion_core.setup.tests.test_doctor import _validate
+        _validate(report)
+        socket = next(check for check in report["checks"] if check["id"] == "daemon.socket")
+        self.assertIn(socket["state"], ("fail", "unknown"))
+        self.assertNotEqual(socket["state"], "ok")
+        failed = any(check["state"] == "fail" for check in report["checks"])
+        self.assertEqual(done.returncode, 1 if failed else 0)
+
+
 if __name__ == "__main__":
     unittest.main()

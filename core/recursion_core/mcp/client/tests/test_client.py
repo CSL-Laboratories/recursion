@@ -46,7 +46,8 @@ class ServerRequestsAreRefused(unittest.TestCase):
         open_session(self, client, stub)
         call = InThread(lambda: client.call_tool("echo", {"text": "hi"}))
         request = stub.expect(self, "tools/call")
-        self.assertEqual({"name": "echo", "arguments": {"text": "hi"}}, request["params"])
+        self.assertEqual({"name": "echo", "arguments": {"text": "hi"}, "_meta": {"progressToken": request["id"]}},
+                         request["params"])
         for number, method in enumerate(REFUSED_METHODS):
             stub.send({"jsonrpc": "2.0", "id": f"s{number}", "method": method, "params": {}})
             answer = stub.next()

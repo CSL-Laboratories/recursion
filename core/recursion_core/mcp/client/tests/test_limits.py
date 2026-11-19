@@ -123,7 +123,8 @@ class ToolResult(unittest.TestCase):
         client, stub = make_client(self)
         open_session(self, client, stub)
         call = InThread(lambda: client.call_tool("full"))
-        content = [{"type": "text", "text": "a" * (128 * KIB)}, {"type": "text", "text": "b" * (128 * KIB)}]
+        # the server's _meta, {"k":1}, is 7 bytes of the same budget
+        content = [{"type": "text", "text": "a" * (128 * KIB)}, {"type": "text", "text": "b" * (128 * KIB - 7)}]
         stub.answer(stub.expect(self, "tools/call"), {"content": content, "_meta": {"k": 1}})
         self.assertEqual({"content": content, "_meta": {"k": 1}}, call.get())
 
@@ -183,19 +184,28 @@ class CutOff(unittest.TestCase):
         stub.answer(stub.expect(self, "tools/call"), {"content": [{"type": "text", "text": "x" * 64}]})
         return call.get()
 
+    def _timed_out(self, client, stub) -> McpClientError:
+        """One call past the client's own deadline (lowered here to 0.1 s), a breach; its request is read."""
+
+        with mock.patch.object(session, "CALL_DEADLINE_S", 0.1), self.assertRaises(McpClientError) as caught:
+            InThread(lambda: client.call_tool("slow")).get()
+        stub.expect(self, "tools/call")
+        return caught.exception
+
     def test_a_third_breach_cuts_the_server_off_for_the_rest_of_the_session(self):
         records: list = []
         client, stub = make_client(self, on_record=records.append)
         open_session(self, client, stub)
-        with mock.patch.object(session, "MAX_TOOL_RESULT_TEXT_BYTES", 8):
-            for _ in range(2):
-                self._cut_result(client, stub)
-                self.assertIsNone(client.ending)
-            third = self._cut_result(client, stub)
-        self.assertIn(RESULT_CUT, third["_meta"], "the third breach still reaches its caller, typed")
+        for _ in range(2):
+            self._timed_out(client, stub)
+            stub.expect(self, "notifications/cancelled")
+            self.assertIsNone(client.ending)
+        third = self._timed_out(client, stub)
+        self.assertEqual(CALL_TIMEOUT, third.code, "the third breach still reaches its caller, typed")
         self.assertEqual(SERVER_CUT_OFF, client.ending)
-        self.assertEqual([RESULT_CUT] * 3 + [SERVER_CUT_OFF], [r["record"] for r in records])
+        self.assertEqual([CALL_TIMEOUT] * 3 + [SERVER_CUT_OFF], [r["record"] for r in records])
         self.assertEqual({"record": SERVER_CUT_OFF, "breaches": 3}, records[-1])
+        stub.expect(self, "notifications/cancelled")  # sent for the third call before the session ended
         self.assertIsNone(stub.next(), "the client shut the server's input")
         with self.assertRaises(McpSessionEnded) as caught:
             client.call_tool("after")
@@ -223,34 +233,38 @@ class CutOff(unittest.TestCase):
     def test_breaches_of_different_limits_add_up(self):
         client, stub = make_client(self)
         open_session(self, client, stub)
-        with mock.patch.object(session, "MAX_TOOL_RESULT_TEXT_BYTES", 8), \
-                mock.patch.object(session, "MAX_TOOLS", 2), mock.patch.object(session, "CALL_DEADLINE_S", 0.1):
-            self._cut_result(client, stub)
+        with mock.patch.object(session, "MAX_TOOL_RESULT_TEXT_BYTES", 8), mock.patch.object(session, "MAX_TOOLS", 2):
+            self._cut_result(client, stub)  # mended by the cut: recorded, not counted
             listing = InThread(client.list_tools)
             stub.answer(stub.expect(self, "tools/list"), {"tools": _tools(3)})
-            self.assertEqual(TOOL_LIST_CUT, listing.get().cut)
-            self.assertIsNone(client.ending)
-            with self.assertRaises(McpClientError):
-                InThread(lambda: client.call_tool("slow")).get()
+            self.assertEqual(TOOL_LIST_CUT, listing.get().cut)  # mended by the cut: recorded, not counted
+        self._timed_out(client, stub)
+        stub.expect(self, "notifications/cancelled")
+        with mock.patch.object(session, "MAX_LIST_PAGES", 1):
+            listing = InThread(client.list_tools)
+            stub.answer(stub.expect(self, "tools/list"), {"tools": [], "nextCursor": "2"})
+            self.assertEqual(TOOL_LIST_CUT, listing.get().cut)  # a listing that would not end: counted
+        self.assertIsNone(client.ending)
+        self._timed_out(client, stub)
         self.assertEqual(SERVER_CUT_OFF, client.ending)
 
     def test_a_new_session_starts_the_count_again(self):
-        with mock.patch.object(session, "MAX_TOOL_RESULT_TEXT_BYTES", 8):
-            for _ in range(2):
-                client, stub = make_client(self)
-                open_session(self, client, stub)
-                for _ in range(MAX_BREACHES - 1):
-                    self._cut_result(client, stub)
-                self.assertIsNone(client.ending)
+        for _ in range(2):
+            client, stub = make_client(self)
+            open_session(self, client, stub)
+            for _ in range(MAX_BREACHES - 1):
+                self._timed_out(client, stub)
+                stub.expect(self, "notifications/cancelled")
+            self.assertIsNone(client.ending)
 
     def test_a_cut_off_server_leaves_another_session_untouched(self):
         cut, cut_stub = make_client(self)
         other, other_stub = make_client(self)
         open_session(self, cut, cut_stub)
         open_session(self, other, other_stub)
-        with mock.patch.object(session, "MAX_TOOL_RESULT_TEXT_BYTES", 8):
-            for _ in range(MAX_BREACHES):
-                self._cut_result(cut, cut_stub)
+        for _ in range(MAX_BREACHES):
+            self._timed_out(cut, cut_stub)
+            cut_stub.expect(self, "notifications/cancelled")
         self.assertEqual(SERVER_CUT_OFF, cut.ending)
         call = InThread(lambda: other.call_tool("echo"))
         other_stub.answer(other_stub.expect(self, "tools/call"), {"content": [{"type": "text", "text": "ok"}]})

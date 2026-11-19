@@ -143,8 +143,8 @@ class UnsentAnswers(unittest.TestCase):
         self.assertEqual(CALL_TIMEOUT, caught.exception.code, "the caller's request keeps its own deadline")
         with client._cond:
             methods = [(entry[0] if isinstance(entry, tuple) else entry).get("method") for entry in client._outbox]
-        self.assertIn("tools/call", methods, "the request waits in the outbox; it was not dropped")
-        self.assertIn("notifications/cancelled", methods)
+        self.assertNotIn("tools/call", methods, "its caller gave up before it was written: it is never sent")
+        self.assertNotIn("notifications/cancelled", methods, "the server never saw it: no cancel")
 
     def _stretch(self, client, stub, gated, marker, tag: str, wait_for: int) -> None:
         """One stretch of a server that does not read: the gate shut, ten refused requests."""

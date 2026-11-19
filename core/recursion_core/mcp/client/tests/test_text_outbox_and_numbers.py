@@ -99,13 +99,13 @@ class ResultText(unittest.TestCase):
     def test_what_is_not_text_is_not_cut_here(self):
         records: list = []
         image = {"type": "image", "data": "A" * (2 * LIMIT), "mimeType": "image/png"}
-        sent = {"content": [image], "structuredContent": {"blob": "S" * (2 * LIMIT)}}  # both under one message
+        sent = {"content": [image], "structuredContent": {"blob": "S" * (LIMIT // 2)}}  # the image is not counted
         self.assertEqual(sent, _answered(self, records, sent))
         self.assertEqual([], records)
 
     def test_the_servers_own_meta_is_kept_beside_the_mark(self):
-        result = _answered(self, None, {"content": [{"type": "text", "text": "A" * (LIMIT + 1)}],
-                                        "_meta": {"k": 1}})
+        result = _answered(self, None, {"content": [{"type": "text", "text": "short"}],
+                                        "structuredContent": {"s": "S" * MIB}, "_meta": {"k": 1}})
         self.assertEqual(1, result["_meta"]["k"])
         self.assertIn(RESULT_CUT, result["_meta"])
 

@@ -75,7 +75,19 @@ checked on every install. When this interpreter cannot verify one, the install
 is refused and nothing is written. A signature that does not verify against
 the manifest's own key refuses the registry. A signature that verifies, but
 whose key is not on this install's trusted list, still installs and loads as
-unsigned. This command does not grant permissions and does not add a trusted key.
+unsigned, unless the plugin is pinned (below). This command does not grant permissions and does not add a
+trusted key.
+
+A plugin installed signed is pinned to its key: ``install.json`` holds, under ``pins``, the signing key id
+and the version for that plugin id, written by the same commit as the generation. A release of a pinned
+plugin that is unsigned, fails its check or is signed by a key not on the trusted list refuses
+``update_unsigned_over_signed``, writes nothing, and names the two ways forward. A release signed by
+another key that is on the trusted list drops the grant as before and moves the pin only after the user's
+typed yes; without it nothing is written. ``unpin`` drops the pin and every grant of one plugin after a
+typed yes; the plugin stays installed as a local unsigned plugin. A remove keeps the pin. An
+``install.json`` without ``pins`` (written before pins existed) has each installed plugin whose grant names
+a signing key pinned to that key when it is read, and nothing else changes. A file that holds no pin is written
+without ``pins``, byte for byte as before.
 
 A read or write the system refuses (a full or read-only disk, no permission) raises the typed refusal
 ``filesystem_refused``, which keeps the system's message; no caller gets a bare ``OSError``.
@@ -98,13 +110,15 @@ from .errors import Refused
 from .loader import CoreHealth, PluginLoader
 from .manifest import PERMISSIONS, Grant, ReservedEffects, TrustStore, parse_manifest
 from .registry import check_registry, platform_gap
+from .signing import key_id
 
 try:
     import fcntl
 except ImportError:  # Windows: every command refuses platform_unsupported before it opens a file
     fcntl = None
 
-__all__ = ["FilesystemRefused", "InstallRefused", "install_plugin", "list_plugins", "remove_plugin"]
+__all__ = ["FilesystemRefused", "InstallRefused", "NothingChanged", "install_plugin", "list_plugins",
+           "remove_plugin", "unpin_plugin"]
 
 _PLUGIN_ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
 _CURRENT = re.compile(r"[1-9][0-9]*\n")
@@ -119,7 +133,9 @@ _KEPT = re.compile(r"\.kept-[1-9][0-9]*(?:-[1-9][0-9]*)?")
 # Names the profile itself uses inside a generation and inside plugins/: never a plugin id.
 _PROFILE_NAMES = frozenset({"install.json"})
 _LABELS = frozenset({"verified", "non_verified"})
-_INSTALL_KEYS = frozenset({"trusted_keys", "grants", "reserved", "authority_anchor", "registry_labels"})
+_INSTALL_KEYS = frozenset({"trusted_keys", "grants", "reserved", "authority_anchor", "registry_labels", "pins"})
+# A pin: the key a plugin was installed signed by, and that release's version.
+_PIN_KEYS = frozenset({"signer_key_id", "version"})
 _GRANT_KEYS = frozenset({
     "plugin_id", "artifact_sha256", "signer_key_id", "permissions", "unsigned_order_acknowledged",
     "order_after_revoked_key", "order_after_revocation_generation", "developer_key_id",
@@ -152,6 +168,14 @@ class InstallRefused(Exception):
         self.detail = detail
         # The command line prints the detail under the code: it tells the user how to end the refusal.
         self.show_detail = show_detail
+
+
+class NothingChanged(Exception):
+    """A command that asks a typed yes did not get one, or had nothing to change. Nothing was written."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
 
 
 class FilesystemRefused(InstallRefused, OSError):
@@ -207,6 +231,8 @@ class Snapshot:
     plugins: dict = field(default_factory=dict)
     # A grant's developer_key_id as it was read, by plugin id; written back unchanged.
     developer_key_ids: dict = field(default_factory=dict)
+    # By plugin id: {"signer_key_id", "version"}. None when the file has no ``pins`` (read: derived from grants).
+    pins: dict | None = None
 
     def reserved(self) -> ReservedEffects:
         return ReservedEffects(frozenset(self.hosts), tuple(self.prefixes))
@@ -215,10 +241,12 @@ class Snapshot:
 @_typed_refusals
 def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, plugin_id: str, *,
                    version: str | None = None, state: os.PathLike | str | None = None, wait: bool = True,
-                   report_kept=None) -> dict:
+                   report_kept=None, confirm=None) -> dict:
     """Check ``registry_root``, then write the release as the next generation.
 
     ``report_kept``, when given, is called with each line that names a kept place the moment it is made.
+    ``confirm`` is asked one question and returns the user's answer; only ``yes`` moves a pin to another
+    trusted key. Without it the pin does not move and nothing is written.
     """
     _require_platform()
     config_path = Path(config)
@@ -239,7 +267,7 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
         raise InstallRefused("source_unavailable")
     fd = _lock(config_path, wait=wait)
     try:
-        return _install_locked(config_path, chosen, plugin_id, state, report_kept)
+        return _install_locked(config_path, chosen, plugin_id, state, report_kept, confirm)
     finally:
         os.close(fd)
 
@@ -279,14 +307,110 @@ def remove_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLi
         del plugins[plugin_id]
         grants = dict(snapshot.grants)
         grants.pop(plugin_id, None)
+        # The pin stays: a removed plugin installed again unsigned is refused the same way.
         kept = Snapshot(snapshot.trusted_keys, grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
-                        _labels_for(snapshot.labels, plugins), plugins, snapshot.developer_key_ids)
+                        _labels_for(snapshot.labels, plugins), plugins, snapshot.developer_key_ids,
+                        pins=snapshot.pins)
         notes = []
         generation = _commit(config_path, kept, notes, report_kept, removing=plugin_id)
         result = {"command": "remove", "plugin_id": plugin_id, "generation": generation, "plugins": _rows(kept)}
         return _with_notes(result, notes)
     finally:
         os.close(fd)
+
+
+@_typed_refusals
+def unpin_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLike | str | None = None,
+                 wait: bool = True, report_kept=None, confirm=None) -> dict:
+    """Drop the pin and every grant of one plugin, after the user's typed yes, as a new generation.
+
+    Nothing else changes: the plugin stays installed, as a local unsigned plugin. ``confirm`` is asked one
+    question; any answer but ``yes``, or no ``confirm``, writes nothing.
+    """
+    _require_platform()
+    del state
+    config_path = Path(config)
+    if not _plugin_id_ok(plugin_id):
+        raise NothingChanged("no plugin of that id is pinned; nothing was written.")
+    fd = _lock(config_path, wait=wait)
+    try:
+        _finish_publish(config_path)
+        snapshot = _load_snapshot(config_path)
+        held = snapshot.pins.get(plugin_id)
+        if held is None:
+            raise NothingChanged(f"the plugin {plugin_id} is not pinned; nothing was written.")
+        key = held["signer_key_id"]
+        question = (f"Unpin the plugin {plugin_id} from the key {key}? This drops its pin and every grant of it, "
+                    f"and it stays installed as a local unsigned plugin. Type yes to unpin it:")
+        if not _confirmed(confirm, question):
+            raise NothingChanged(f"the plugin {plugin_id} stays pinned to the key {key}: the answer was not yes, "
+                                 f"and nothing was written.")
+        pins = dict(snapshot.pins)
+        del pins[plugin_id]
+        grants = dict(snapshot.grants)
+        grants.pop(plugin_id, None)
+        updated = Snapshot(snapshot.trusted_keys, grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
+                           snapshot.labels, snapshot.plugins, snapshot.developer_key_ids, pins=pins)
+        notes = []
+        generation = _commit(config_path, updated, notes, report_kept)
+        result = {"command": "unpin", "plugin_id": plugin_id, "generation": generation, "plugins": _rows(updated)}
+        return _with_notes(result, notes)
+    finally:
+        os.close(fd)
+
+
+def _confirmed(confirm, question: str) -> bool:
+    """True only when ``confirm`` answers ``question`` with the typed word yes."""
+    if confirm is None:
+        return False
+    answer = confirm(question)
+    return type(answer) is str and answer.strip() == "yes"
+
+
+def _next_pin(snapshot: Snapshot, manifest, trust_name: str, signer, reason: str, signature_text, confirm):
+    """The pin this release leaves, or None. A pinned plugin's release that is not signed by a trusted key
+    refuses; one signed by another trusted key moves the pin only after the user's typed yes."""
+    held = snapshot.pins.get(manifest.plugin_id)
+    if held is None:
+        return {"signer_key_id": signer, "version": manifest.version} if trust_name == "signed" else None
+    if trust_name != "signed":
+        raise _update_refused(manifest, held["signer_key_id"], reason, signature_text)
+    if signer != held["signer_key_id"]:
+        question = (f"The plugin {manifest.plugin_id} is pinned to the key {held['signer_key_id']}; this release "
+                    f"is signed by {signer}, which is on this install's trusted list, and its grant is dropped. "
+                    f"Type yes to move the pin to {signer}:")
+        if not _confirmed(confirm, question):
+            raise NothingChanged(f"the plugin {manifest.plugin_id} stays pinned to the key "
+                                 f"{held['signer_key_id']}: the answer was not yes, and nothing was written.")
+    return {"signer_key_id": signer, "version": manifest.version}
+
+
+def _update_refused(manifest, key: str, reason: str, signature_text) -> InstallRefused:
+    """``update_unsigned_over_signed``: what failed, and the two ways forward."""
+    plugin_id = manifest.plugin_id
+    if signature_text is None:
+        what = "is unsigned"
+    elif reason == "signer_not_on_trusted_list":
+        what = f"is signed by the key {key_id(manifest.developer_key)}, which is not on this install's trusted list"
+    else:
+        what = f"does not pass this install's signature check ({reason})"
+    return InstallRefused("update_unsigned_over_signed", detail=(
+        f"The plugin {plugin_id} is pinned to the key {key}, and its release {manifest.version} {what}. Nothing "
+        f"was written: the installed release, its grant and its generation are as they were. Install a release "
+        f"signed by {key}, or run: recursion plugin unpin {plugin_id} (it asks a typed yes, then drops the pin "
+        f"and every grant of {plugin_id}, which stays installed as a local unsigned plugin)."), show_detail=True)
+
+
+def _pins_from_grants(snapshot: Snapshot) -> dict:
+    """For a file written before pins existed: each installed plugin whose grant names a signing key is pinned
+    to it, at the installed version. A grant whose plugin is not installed pins nothing."""
+    pins = {}
+    for plugin_id, grant in snapshot.grants.items():
+        plugin = snapshot.plugins.get(plugin_id)
+        if grant.signer_key_id is None or plugin is None:
+            continue
+        pins[plugin_id] = {"signer_key_id": grant.signer_key_id, "version": parse_manifest(plugin.manifest).version}
+    return pins
 
 
 def _require_platform() -> None:
@@ -329,7 +453,7 @@ def _select(report, plugin_id: str, version: str | None):
     raise InstallRefused("release_not_in_registry")
 
 
-def _install_locked(config: Path, chosen, plugin_id: str, state, report_kept=None) -> dict:
+def _install_locked(config: Path, chosen, plugin_id: str, state, report_kept=None, confirm=None) -> dict:
     manifest = parse_manifest(chosen.manifest)
     if manifest.plugin_id != plugin_id or not _plugin_id_ok(manifest.plugin_id):
         raise InstallRefused("release_plugin_id_mismatch")
@@ -338,17 +462,21 @@ def _install_locked(config: Path, chosen, plugin_id: str, state, report_kept=Non
     signature_text = chosen.signature_text
     _finish_publish(config)
     snapshot = _load_snapshot(config)
-    trust_name, reason, grants, findings = _admit(snapshot, manifest, signature_text, chosen.artifact,
-                                                   chosen.label, state)
+    trust_name, reason, grants, findings, signer = _admit(snapshot, manifest, signature_text, chosen.artifact,
+                                                           chosen.label, state)
     refused = [item for item in findings if item.get("severity") == "refuse"]
     if refused:
         raise InstallRefused(refused[0]["code"], [item["code"] for item in refused])
+    pins = dict(snapshot.pins)
+    pin = _next_pin(snapshot, manifest, trust_name, signer, reason, signature_text, confirm)
+    if pin is not None:
+        pins[manifest.plugin_id] = pin
     plugins = dict(snapshot.plugins)
     plugins[manifest.plugin_id] = StoredPlugin(chosen.manifest, chosen.artifact, chosen.signature)
     labels = _labels_for(snapshot.labels, plugins)
     labels[hashlib.sha256(chosen.manifest).hexdigest()] = chosen.label
     updated = Snapshot(dict(snapshot.trusted_keys), grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
-                       labels, plugins, snapshot.developer_key_ids)
+                       labels, plugins, snapshot.developer_key_ids, pins=pins)
     notes = []
     generation = _commit(config, updated, notes, report_kept)
     # What the written install.json gives this plugin, as the loader's admit step computed it from those grants.
@@ -395,7 +523,7 @@ def _admit(snapshot: Snapshot, manifest, signature_text, artifact: bytes, label:
         findings = loader.doctor(manifest.raw, signature_text, artifact, label)
     finally:
         trust.close()
-    return trust_name, reason, grants, findings
+    return trust_name, reason, grants, findings, signer
 
 
 def _grants_kept(grants: dict, manifest, signer: str | None) -> dict:
@@ -1073,10 +1201,13 @@ def _load_snapshot(config: Path, removing: str | None = None) -> Snapshot:
         written = _read_profile(path, missing_install_ok=False).plugins
     live = config / "plugins"
     if not _lexists(live):
-        return Snapshot()
+        return Snapshot(pins={})
     if live.is_symlink():
         raise _link_refusal(live, "plugin_directory_untrusted")
-    return _read_profile(live, missing_install_ok=True, written=written, removing=removing)
+    snapshot = _read_profile(live, missing_install_ok=True, written=written, removing=removing)
+    if snapshot.pins is None:
+        snapshot.pins = _pins_from_grants(snapshot)
+    return snapshot
 
 
 def _way_out(path: Path, plugin_id: str | None = None) -> InstallRefused:
@@ -1158,7 +1289,7 @@ def _read_profile(directory: Path, *, missing_install_ok: bool, written: dict | 
             raise _changed_way_out(path, plugin, written.get(name))
         plugins[name] = plugin
     return Snapshot(parsed["trusted_keys"], parsed["grants"], parsed["hosts"], parsed["prefixes"],
-                    parsed["anchor"], parsed["labels"], plugins, parsed["developer_key_ids"])
+                    parsed["anchor"], parsed["labels"], plugins, parsed["developer_key_ids"], pins=parsed["pins"])
 
 
 def _changed_way_out(path: Path, plugin: StoredPlugin, mine: StoredPlugin | None) -> InstallRefused:
@@ -1175,7 +1306,7 @@ def _changed_way_out(path: Path, plugin: StoredPlugin, mine: StoredPlugin | None
 
 def _empty_install() -> dict:
     return {"trusted_keys": {}, "grants": {}, "hosts": (), "prefixes": (), "anchor": None, "labels": {},
-            "developer_key_ids": {}}
+            "developer_key_ids": {}, "pins": None}
 
 
 def _read_plugin(directory: Path, *, live: bool = False) -> StoredPlugin:
@@ -1243,8 +1374,25 @@ def _parse_install(raw: bytes) -> dict:
                 or not isinstance(label, str) or label not in _LABELS):
             raise InstallRefused("install_unreadable")
         kept_labels[digest] = label
+    pins = _parse_pins(data["pins"]) if "pins" in data else None
     return {"trusted_keys": dict(keys), "grants": grants, "hosts": tuple(hosts), "prefixes": tuple(prefixes),
-            "anchor": anchor, "labels": kept_labels, "developer_key_ids": developer_key_ids}
+            "anchor": anchor, "labels": kept_labels, "developer_key_ids": developer_key_ids, "pins": pins}
+
+
+def _parse_pins(value: object) -> dict:
+    """``pins``: by plugin id, the signing key id and the version, and nothing else."""
+    if not isinstance(value, dict):
+        raise InstallRefused("install_unreadable")
+    pins = {}
+    for plugin_id, pin in value.items():
+        if not _plugin_id_ok(plugin_id) or not isinstance(pin, dict) or set(pin) != _PIN_KEYS:
+            raise InstallRefused("install_unreadable")
+        signer, version = pin["signer_key_id"], pin["version"]
+        if (not (isinstance(signer, str) and _KEY_ID.fullmatch(signer) is not None)
+                or not (isinstance(version, str) and 0 < len(version) <= 64)):
+            raise InstallRefused("install_unreadable")
+        pins[plugin_id] = {"signer_key_id": signer, "version": version}
+    return pins
 
 
 def _parse_grant(item: object) -> Grant:
@@ -1293,6 +1441,9 @@ def _dump_install(snapshot: Snapshot) -> bytes:
         "reserved": {"credential_prefixes": list(snapshot.prefixes), "hosts": list(snapshot.hosts)},
         "trusted_keys": snapshot.trusted_keys,
     }
+    if snapshot.pins:
+        # Written only when a plugin is pinned: a file without a pin is the bytes it was before pins existed.
+        payload["pins"] = {plugin_id: dict(snapshot.pins[plugin_id]) for plugin_id in sorted(snapshot.pins)}
     return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 

@@ -4,6 +4,10 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `install.v1.json` `1.0-draft.4`: the `pins` key (2026-11-18)
+
+The install file may carry `pins`, by plugin id the signing key id and version of a plugin installed signed (a closed object of both members); a release of a pinned plugin that is unsigned or fails its check is refused, and `plugin unpin` drops a pin; an omitted map is no pin and today's files are unchanged; one good fixture (`h06`) and one bad fixture (`b11`); the version stays `1.0-draft.4`, which a conformance test of this tree holds.
+
 ## `install.v1.json` is `1.0-draft.4` (Nov 17, 2026)
 
 The install file may carry `registry_labels`: a map from the SHA-256 of one installed manifest's bytes

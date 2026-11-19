@@ -34,6 +34,12 @@
       "type": "object",
       "propertyNames": {"$ref": "#/$defs/hex64"},
       "additionalProperties": {"enum": ["verified", "non_verified"]}
+    },
+    "pins": {
+      "description": "The key each plugin was installed signed by, written by the install commands: by plugin id, the signing key id and the version of that release. A release of a pinned plugin that is unsigned, fails its check or is signed by a key not on the trusted list is refused; 'plugin unpin' drops a pin. An omitted map is no pin; the daemon takes the map and does not read it.",
+      "type": "object",
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_.-]{1,63}$", "not": {"pattern": "[\\r\\n]"}},
+      "additionalProperties": {"$ref": "#/$defs/pin"}
     }
   },
   "$defs": {
@@ -47,6 +53,16 @@
       "type": "string",
       "pattern": "^ed25519:[0-9a-f]{32}$",
       "not": {"pattern": "[\\r\\n]"}
+    },
+    "pin": {
+      "description": "One pin: both members are present (the object is closed and holds at least two members).",
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 2,
+      "properties": {
+        "signer_key_id": {"$ref": "#/$defs/key_id"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 64}
+      }
     },
     "grant": {
       "description": "What the user granted one plugin. signer_key_id is the key the grant is bound to, or null for a manual grant to an unsigned plugin. unsigned_order_acknowledged records that the user granted 'order' to an unsigned plugin behind the warning. order_after_revoked_key and order_after_revocation_generation record that the user turned 'order' back on after that key was revoked, at that generation of the revoked-key list. developer_key_id is null, or a key id in the same grammar as signer_key_id. It does not by itself bind the grant: the contract binds a grant to the artifact digest and the signing key.",

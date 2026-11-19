@@ -14,7 +14,8 @@ It asserts only four named checks:
     record lists under "expected difference: U+007F, refused by #577";
 (d) W1 under eight threads that change the same value either refuses or gives the bytes of one
     consistent value, never others (the capture and recheck of ``canonical``; it bites on the
-    free-threaded build, and runs on every build).
+    free-threaded build, and runs on every build); any other exception in a thread fails it, and
+    every one of the eight threads must have run.
 
 Any other difference between writers is recorded, never asserted away: the record's ``differences``.
 """
@@ -76,6 +77,7 @@ class CanonicalWritersComparedTest(unittest.TestCase):
         stop = threading.Event()
         bad: list = []
         seen = {"bytes": 0, "refused": 0}
+        ran = [0] * 8                    # each worker's own count of its turns
         lock = threading.Lock()
 
         def change(step: int) -> None:
@@ -95,7 +97,8 @@ class CanonicalWritersComparedTest(unittest.TestCase):
 
         def worker(index: int) -> None:
             step = index
-            while not stop.is_set():
+            while not stop.is_set() or not ran[index]:
+                ran[index] += 1
                 try:
                     change(step)
                 except (IndexError, KeyError, RuntimeError):
@@ -107,13 +110,24 @@ class CanonicalWritersComparedTest(unittest.TestCase):
                     with lock:
                         seen["refused"] += 1
                     continue
+                except Exception as exc:         # neither a refusal nor bytes: a failure, never a silent end
+                    with lock:
+                        bad.append(("canonical", f"{type(exc).__name__}: {exc}"))
+                    stop.set()
+                    return
                 try:
                     again = cj.parse(out)        # canonical bytes of an in-form value, or not
+                    wrong = bool(set(again) - {"a", "b", "k"}) or again.get("k", "ok") != "ok" or again.get("b", 1) != 1
                 except Refused as exc:
                     with lock:
                         bad.append((out, exc.code))
                     continue
-                if set(again) - {"a", "b", "k"} or again.get("k", "ok") != "ok" or again.get("b", 1) != 1:
+                except Exception as exc:
+                    with lock:
+                        bad.append((out, f"{type(exc).__name__}: {exc}"))
+                    stop.set()
+                    return
+                if wrong:
                     with lock:
                         bad.append((out, "a value never in the form"))
                 with lock:
@@ -129,6 +143,7 @@ class CanonicalWritersComparedTest(unittest.TestCase):
         stop.set()
         self.assertFalse(any(thread.is_alive() for thread in threads), "a thread did not end")
         self.assertEqual(bad[:3], [])
+        self.assertEqual([index for index, count in enumerate(ran) if not count], [], "a worker never ran")
         self.assertGreater(seen["bytes"], 0)
 
     def test_a_fresh_run_on_this_interpreter_equals_the_record(self):
@@ -139,6 +154,36 @@ class CanonicalWritersComparedTest(unittest.TestCase):
             new = json.loads(fresh)["outcomes"]
             moved = [ident for ident in new if old.get(ident) != new[ident]][:5]
             self.fail(f"a fresh run differs from {RECORD.name} (made on 3.12 and 3.14t alike): first inputs {moved}")
+
+    def test_the_three_added_kinds_of_input_are_in_the_record(self):
+        texts = ["NaN", "Infinity", "-Infinity", "[NaN]", '{"x":-Infinity}',
+                 "[" * 33 + "0" + "]" * 33, "[" * 32 + '{"a":1}' + "]" * 32, "[" * 64 + '{"a":1}' + "]" * 64,
+                 "[" * 65 + "0" + "]" * 65, "1" + "0" * 4300, "9" * 5000]
+        by_text = {item["text"]: ident for ident, _, item in rec.corpus()}
+        idents = [by_text.get(text) for text in texts]
+        self.assertNotIn(None, idents, "an input of the three added kinds is not in the corpus")
+        recorded = json.loads(RECORD.read_text(encoding="utf-8"))
+        for ident in idents:
+            self.assertIn(ident, recorded["outcomes"])
+        # The two long integers have no value for the value writers because of the harness's own reader.
+        self.assertEqual(recorded[rec.HARNESS_LISTING], idents[-2:])
+
+    def test_an_error_is_never_taken_for_a_refusal_by_checks_a_and_b(self):
+        def raises(_):
+            raise RuntimeError("a scratch writer that raises")
+
+        table = rec.writers()
+        for name, check, raw in (("W1", "a", b'{"a":0.5}'), ("W3", "b", b"1e400")):
+            inputs = [("X", raw, None)]
+            self.assertEqual(rec.checks(rec.run_all(inputs), inputs)[check], [], "both refuse: the control")
+            saved = table[name]
+            table[name] = raises
+            try:
+                full = rec.run_all(inputs)
+            finally:
+                table[name] = saved
+            self.assertEqual(full["X"][name], "error:RuntimeError")
+            self.assertEqual(rec.checks(full, inputs)[check], ["X"], f"check ({check}) took {name}'s error for a refusal")
 
     def _show(self, idents: list, names: tuple) -> str:
         return "; ".join(f"{ident}: " + ", ".join(f"{name}={self.full[ident][name][:80]}" for name in names)

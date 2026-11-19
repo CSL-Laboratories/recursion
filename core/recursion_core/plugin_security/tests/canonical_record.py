@@ -55,6 +55,8 @@ RANDOM_DOUBLES = 2000
 RANDOM_VALUES = 20000
 ORDER = ("W3", "W4", "W1", "W1p", "W2", "W5")
 DEL_LISTING = "expected difference: U+007F, refused by #577"
+HARNESS_LISTING = ("a harness effect, not a writer's: Python's digit limit makes the harness's own json.loads give "
+                   "no_value:not_json to W1, W2, W4 and W5")
 # The two vectors research prompt 157 gives by a formula instead of input_hex, as it writes them.
 FORMULAS = {
     "b'['*150 + b'0' + b']'*150": b"[" * 150 + b"0" + b"]" * 150,
@@ -227,6 +229,15 @@ def build_corpus() -> dict:
     for index in range(RANDOM_VALUES):
         value = _random_value(rng)
         add("random_cj_v0", _text(value, True) if index % 2 else json.dumps(value, separators=(",", ":"), sort_keys=True))
+    # Added after the rest (so every earlier input keeps its place and the seed's draws are the same):
+    # the non-finite names as text, nesting from 33 to 65, and integers past Python's 4,300-digit limit.
+    for token in ("NaN", "Infinity", "-Infinity", "[NaN]", '{"x":-Infinity}'):
+        add("non_finite_text", token)
+    for token in ("[" * 33 + "0" + "]" * 33, "[" * 32 + '{"a":1}' + "]" * 32, "[" * 64 + '{"a":1}' + "]" * 64,
+                  "[" * 65 + "0" + "]" * 65):
+        add("deep_33_to_65", token)
+    for token in ("1" + "0" * 4300, "9" * 5000):
+        add("long_integers", token)
     return {"generator": "core/recursion_core/plugin_security/tests/canonical_record.py", "seed": SEED,
             "count": len(items), "inputs": items}
 
@@ -387,8 +398,17 @@ def checks(full: dict, inputs: list) -> dict:
 
 
 def _same_or_both_refuse(x: str, y: str, raw: bytes) -> bool:
+    if x.startswith("error:") or y.startswith("error:"):
+        return False                  # a writer that raises neither refuses nor gives bytes: the check fails
     bx, by = _bytes_of(x, raw), _bytes_of(y, raw)
     return bx == by
+
+
+def over_digit_limit(raw: bytes) -> bool:
+    """Whether the input is an integer longer than the interpreter lets ``int`` read from text."""
+    limit = sys.get_int_max_str_digits() if hasattr(sys, "get_int_max_str_digits") else 0
+    digits = raw.strip().lstrip(b"-")
+    return bool(limit) and digits.isdigit() and len(digits) > limit
 
 
 def differences(full: dict) -> dict:
@@ -423,6 +443,8 @@ def record(inputs: list, head: str, vectors_commit: str) -> dict:
         "checks": {"a W1 W2 same bytes or both refuse": found["a"], "b W3 W4 same bytes or both refuse": found["b"],
                    "c W1 equals W3 where W1 gives bytes, U+007F aside": found["c"]},
         DEL_LISTING: found["del_listed"],
+        HARNESS_LISTING: [ident for ident, raw, _ in inputs
+                          if full[ident]["W1"] == "no_value:not_json" and over_digit_limit(raw)],
         "differences": differences(full),
         "outcomes": {ident: abbreviated(item) for ident, item in full.items()},
     }

@@ -3,7 +3,7 @@
 DL-12: the installer creates the authority ledger and the breaker store. The breaker store
 is already created by ``install`` on this branch. The ledger stays behind ``anchor_public_key``,
 which ``recursiond install`` cannot fill until that key is decided. With no key the step
-reports ``needs the anchor key (Lucas)`` and creates nothing. A test passes a test-only key
+reports ``needs the anchor key, which recursiond install makes`` and creates nothing. A test passes a test-only key
 to show the call to ``stores.create_ledger`` (which calls ``authority.create_ledger``).
 ``install.json``'s ``authority_anchor`` is not read.
 These tests are Linux-only: on Windows install and upgrade refuse ``platform_unsupported``
@@ -25,7 +25,7 @@ from recursion_core.plugin_security.signing import key_id
 
 # A test-only public key: 32 bytes of hex, not a key this installer chooses.
 TEST_ANCHOR = "11" * 32
-NEEDS_ANCHOR = "needs the anchor key (Lucas)"
+NEEDS_ANCHOR = "needs the anchor key, which recursiond install makes"
 
 
 @unittest.skipUnless(POSIX_PATHS, "the unit's interpreter path is not absolute on this host")

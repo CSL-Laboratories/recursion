@@ -66,7 +66,7 @@ class CommandTests(unittest.TestCase):
         stores = [{"kind": "breaker_store", "path": os.path.join(store_dir, "breaker.sqlite3"), "created": True},
                   {"kind": "revocation_store", "path": os.path.join(store_dir, "revoked.sqlite3"), "created": True}]
         ledger = {"kind": "ledger", "path": os.path.join(store_dir, "ledger.sqlite3"), "created": False,
-                  "detail": "needs the anchor key (Lucas)"}
+                  "detail": "needs the anchor key, which recursiond install makes"}
         self.assertEqual(answer, {
             "code": "ok", "action": "install", "changed": True, "unit": self.unit, "interpreter": PY,
             "stores": stores, "ledger": ledger,

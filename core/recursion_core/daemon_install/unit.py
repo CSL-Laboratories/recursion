@@ -488,10 +488,13 @@ def _continues(line: str) -> bool:
 def _names(value: str, folder: str, home: str) -> bool:
     """Whether a unit's ``value`` (``%h`` is ``home``) names ``folder``, links followed."""
 
-    named = home + value[2:] if value.startswith("%h") else value  # no NUL: it ends the line (DeepSeek H9-1, Grok R1)
-    if "%" in named.replace("%%", ""):  # another specifier: what systemd makes of it is not followed here
+    own = value[2:] if value.startswith("%h") else value  # no NUL: it ends the line (DeepSeek H9-1, Grok R1)
+    # The unit's own value is read for specifiers before ``%h`` becomes the home: a ``%`` in the home's name is
+    # part of the folder, not a specifier.
+    if "%" in own.replace("%%", ""):  # another specifier: what systemd makes of it is not followed here
         return False
-    named = named.replace("%%", "%")  # systemd's literal percent, as render_unit writes one
+    own = own.replace("%%", "%")  # systemd's literal percent, as render_unit writes one
+    named = home + own if value.startswith("%h") else own
     return os.path.isabs(named) and os.path.realpath(named) == os.path.realpath(folder)
 
 

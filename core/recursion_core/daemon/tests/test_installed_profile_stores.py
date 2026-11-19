@@ -94,7 +94,7 @@ class InstalledProfileStoreTests(unittest.TestCase):
             self.assertNotIn('Traceback', text)
             self.assertNotIn('\n', text)
             self.assertIn('breaker store is missing', text)
-            self.assertIn('needs the anchor key (Lucas)', text)
+            self.assertIn('needs the anchor key, which recursiond install makes', text)
             self.assertFalse(os.path.lexists(self.breaker), text)
             self.assertFalse(os.path.lexists(self.ledger), text)
             with self.assertRaises(SystemExit) as again:  # a second caller still refuses, and still creates nothing
@@ -118,7 +118,7 @@ class InstalledProfileStoreTests(unittest.TestCase):
             self.assertNotIn('Traceback', text)
             self.assertNotIn('\n', text)
             self.assertIn('authority ledger is missing', text)
-            self.assertIn('needs the anchor key (Lucas)', text)
+            self.assertIn('needs the anchor key, which recursiond install makes', text)
             self.assertNotIn('breaker store is missing', text)
             self.assertFalse(os.path.lexists(self.ledger), text)
             self.assertEqual(os.lstat(self.breaker).st_ino, breaker_inode)

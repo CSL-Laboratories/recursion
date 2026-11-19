@@ -829,11 +829,13 @@ def _installed_profile_store_refusal(state_dir, environ=None):
 
     Installed means the user unit ``<home>/.config/systemd/user/recursion-daemon.service`` is a
     regular file whose first line is the installer's marker, and this folder is the state folder
-    it names: ``<home>/.local/state/recursion`` (the default, ``<home>`` taken from this folder's
-    own path, and only the unit's first line read), or a place the person chose with
-    ``XDG_STATE_HOME`` (the folder ``daemon_install.layout.state_home`` names, then ``<home>`` is
-    ``HOME``), when the installer's unit sets ``XDG_STATE_HOME`` to that place (the whole unit read,
-    at most ``_UNIT_MARKER_MAX`` bytes, by ``daemon_install.unit.state_elsewhere``). The unit is
+    it names; ``<home>`` is ``HOME``. The default is decided by comparing this folder with ``HOME``'s
+    default from the one resolver (``daemon_install.layout.default_state_home``), never from the shape
+    of this folder's path, so a chosen place that itself ends in ``.local/state`` is a chosen place:
+    ``<default>/recursion`` (only the unit's first line read), or a place the person chose with
+    ``XDG_STATE_HOME`` (the folder ``daemon_install.layout.state_home`` names), when the installer's unit
+    sets ``XDG_STATE_HOME`` to that place (the whole unit read, at most ``_UNIT_MARKER_MAX`` bytes, by
+    ``daemon_install.unit.state_elsewhere``). The unit is
     opened with ``O_NOFOLLOW``. A symlink, an unreadable file, a file larger than
     ``_UNIT_MARKER_MAX`` or any other first line is not an installed profile, and the caller creates
     a missing breaker store as it always has. A store that is present, including as a symlink, is
@@ -846,18 +848,14 @@ def _installed_profile_store_refusal(state_dir, environ=None):
     state = Path(state_dir)
     if state.name != STATE_FOLDER:
         return None
-    home = state.parent.parent.parent
-    if default_state_home(str(home)) == str(state.parent):  # the default under the home this path names
-        if home == state.parent.parent:  # ``.local`` has no parent folder above it
-            return None
-        unit = home / '.config' / 'systemd' / 'user' / UNIT_NAME
+    home = Path((os.environ if environ is None else environ).get('HOME') or str(Path.home()))
+    if not home.is_absolute():
+        return None
+    unit = home / '.config' / 'systemd' / 'user' / UNIT_NAME
+    if os.path.realpath(str(state.parent)) == os.path.realpath(default_state_home(str(home))):  # HOME's default
         if not _unit_first_line_is(unit, MARKER):
             return None
-    else:  # a chosen place: installed only when the installer's unit names it
-        home = Path((os.environ if environ is None else environ).get('HOME') or str(Path.home()))
-        if not home.is_absolute() or str(state.parent) == default_state_home(str(home)):
-            return None
-        unit = home / '.config' / 'systemd' / 'user' / UNIT_NAME
+    else:  # a chosen place, wherever it lies: installed only when the installer's unit names it
         data = _unit_bytes(unit)
         if (data is None or data.split(b'\n', 1)[0] != MARKER.encode()
                 or state_elsewhere(data, str(home), str(state.parent)) is not None):
@@ -871,7 +869,7 @@ def _installed_profile_store_refusal(state_dir, environ=None):
         tails.append('`recursiond install` creates the breaker store')
     if not os.path.lexists(ledger):
         missing.append(f'the authority ledger is missing ({ledger})')
-        tails.append('the ledger needs the anchor key (Lucas)')
+        tails.append('the ledger needs the anchor key, which recursiond install makes')
     if not missing:
         return None
     return (f"recursion daemon refused to start: {' and '.join(missing)}. "

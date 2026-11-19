@@ -10,7 +10,7 @@ Each command prints one JSON object on stdout. Success is ``"code": "ok"`` (exit
 ``systemctl --user`` commands that apply the change; none is run here); ``install`` and
 ``upgrade`` add ``stores``, one ``{"kind", "path", "created"}`` for the breaker store and one for
 the revocation store, and ``ledger`` (``kind``, ``path``, ``created``, ``detail``). With no anchor
-key, ``detail`` is ``needs the anchor key (Lucas)`` and the ledger file is not created. A refusal
+key, ``detail`` is ``needs the anchor key, which recursiond install makes`` and the ledger file is not created. A refusal
 is ``"code": <kind>`` with ``detail`` (exit 1). A file-system error
 on the way (a folder the user cannot write, a full disk) is the refusal ``filesystem_error``, its
 detail naming the error and the path; files written before it stay written, so the answer does not

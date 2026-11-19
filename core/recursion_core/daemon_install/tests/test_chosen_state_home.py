@@ -86,6 +86,27 @@ class ChosenStateHomeTests(unittest.TestCase):
         self.assertEqual(caught.exception.kind, kind, caught.exception.detail)
         return caught.exception
 
+    def start_daemon(self, state):
+        """Start the composed daemon on ``state`` with this test's home; a ``SystemExit`` is its refusal."""
+        from recursion_core.daemon import Daemon, Registry
+        from recursion_core.daemon import control_adapter as adapter
+        from recursion_core.daemon.tests.test_installed_profile_stores import QuietManager
+
+        runtime = os.path.join(self.case, "rt")
+        os.makedirs(runtime, 0o700, exist_ok=True)
+        environ = {"PATH": "/usr/bin:/bin", "HOME": self.home, "LANG": "C.UTF-8", "XDG_RUNTIME_DIR": runtime,
+                   "XDG_CONFIG_HOME": os.path.join(self.case, "config")}
+        daemon = Daemon(Registry(state), QuietManager(), boot_id=lambda: "test-boot")
+        daemon.sweep()
+        try:
+            composed = adapter.compose_control(daemon, state, environ=environ, routes={})
+        except BaseException:
+            daemon.close()
+            raise
+        self.addCleanup(daemon.close)
+        self.addCleanup(composed.close)
+        return composed
+
     # The place in use, the unit and the answer.
 
     def test_install_makes_the_stores_in_the_chosen_place_and_names_it(self):
@@ -268,6 +289,104 @@ class ChosenStateHomeTests(unittest.TestCase):
         with open(self.unit, "w", encoding="utf-8") as handle:
             handle.write(render_unit(EXEC))  # the installer's unit, naming the default
         self.assertIsNone(adapter._installed_profile_store_refusal(self.state, environ))
+
+    def test_a_chosen_place_ending_in_local_state_is_an_installed_profile(self):
+        # A second disk laid out as a home: the daemon decides "the default" from HOME, never from the path's shape.
+        chosen = os.path.join(self.case, "disk2", "me", ".local", "state")
+        install(Roots(home=self.home, state_home=chosen), EXEC)
+        state = os.path.join(chosen, "recursion")
+        breaker = os.path.join(state, "plugin-security", "breaker.sqlite3")
+        with self.assertRaises(SystemExit) as caught:
+            self.start_daemon(state)
+        self.assertIn("the authority ledger is missing", str(caught.exception))
+        os.unlink(breaker)  # removed by hand: the daemon refuses and makes no new store
+        with self.assertRaises(SystemExit) as caught:
+            self.start_daemon(state)
+        self.assertIn(f"the breaker store is missing ({breaker})", str(caught.exception))
+        self.assertFalse(os.path.lexists(breaker))
+
+    def test_a_home_with_a_percent_sign_upgrades_to_another_interpreter(self):
+        for name in ("ho%me", "100%%home", "%h"):
+            with self.subTest(home=name):
+                home = os.path.join(self.case, name)
+                os.mkdir(home, 0o700)
+                install(Roots(home=home), EXEC)
+                self.assertFalse(upgrade(Roots(home=home), EXEC).changed)
+                self.assertTrue(upgrade(Roots(home=home), EXEC_NEXT).changed)
+                with open(os.path.join(home, ".config", "systemd", "user", UNIT_NAME), encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), render_unit(EXEC_NEXT))
+
+    def test_the_printed_way_out_of_unit_state_elsewhere_works_when_followed(self):
+        # A default install, then a chosen place: the default's unit is kept, and the words name only ways that work.
+        code, answer = self.run_action("install", {})
+        self.assertEqual((code, answer["code"]), (0, "ok"), answer)
+        code, answer = self.run_action("upgrade", {"XDG_STATE_HOME": self.chosen})
+        self.assertEqual((code, answer["code"]), (1, "unit_state_elsewhere"), answer)
+        detail = answer["detail"]
+        self.assertNotIn("take the line out", detail)
+        self.assertNotIn("move that state folder", detail)
+        self.assertIn("To keep the state where it is, run `recursiond upgrade` again with XDG_STATE_HOME unset", detail)
+        self.assertIn(f"To start in {self.state} instead, run `recursiond uninstall`, then `recursiond install` with "
+                      f"XDG_STATE_HOME set to {self.chosen}", detail)
+        # The first way, as printed: the state stays where it is.
+        code, answer = self.run_action("upgrade", {})
+        self.assertEqual((code, answer["code"]), (0, "ok"), answer)
+        # The second way, as printed: the chosen place, the default's stores left where they are.
+        code, answer = self.run_action("uninstall", {})
+        self.assertEqual((code, answer["code"]), (0, "ok"), answer)
+        code, answer = self.run_action("install", {"XDG_STATE_HOME": self.chosen})
+        self.assertEqual((code, answer["code"], answer["state"]), (0, "ok", self.state), answer)
+        self.assertIn("stores_left", answer)
+        code, answer = self.run_action("upgrade", {"XDG_STATE_HOME": self.chosen})
+        self.assertEqual((code, answer["code"]), (0, "ok"), answer)
+        ensure_ledger(owned_paths(self.roots), TEST_ANCHOR)  # the anchor key's own step, with a test-only key
+        self.assertTrue(self.start_daemon(self.state).server.path)
+
+    def test_an_upgrade_without_the_variable_is_not_told_to_move_the_state(self):
+        code, answer = self.run_action("install", {"XDG_STATE_HOME": self.chosen})
+        self.assertEqual((code, answer["code"]), (0, "ok"), answer)
+        code, answer = self.run_action("upgrade", {})
+        self.assertEqual((code, answer["code"]), (1, "unit_state_elsewhere"), answer)
+        detail = answer["detail"]
+        self.assertNotIn("take the line out", detail)
+        self.assertNotIn("move that state folder", detail)
+        self.assertIn(f"sets XDG_STATE_HOME={self.chosen}", detail)
+        self.assertIn("To keep the state where it is, run `recursiond upgrade` again with XDG_STATE_HOME set to the "
+                      "folder that unit names", detail)
+        self.assertIn(f"To start in {self.default_state} instead, run `recursiond uninstall`, then `recursiond install` "
+                      "with XDG_STATE_HOME unset", detail)
+        code, answer = self.run_action("upgrade", {"XDG_STATE_HOME": self.chosen})  # the first way, as printed
+        self.assertEqual((code, answer["code"]), (0, "ok"), answer)
+        for action in ("uninstall", "install", "upgrade"):  # the second way, as printed
+            code, answer = self.run_action(action, {})
+            self.assertEqual((code, answer["code"]), (0, "ok"), (action, answer))
+
+    def test_a_link_another_user_owns_on_the_way_to_the_chosen_place_is_refused(self):
+        target = os.path.join(self.case, "target")
+        os.mkdir(target, 0o700)
+        link = os.path.join(self.case, "link")
+        os.symlink(target, link)
+        chosen = os.path.join(link, "state")
+        real_lstat = os.lstat
+
+        def lstat(path, *args, **kwargs):  # a stand-in owner: the link is another user's
+            info = real_lstat(path, *args, **kwargs)
+            if os.fspath(path) == link:
+                fields = list(info[:10])
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return info
+
+        with mock.patch("os.lstat", lstat):
+            error = self.refused("folder_untrusted", install, Roots(home=self.home, state_home=chosen), EXEC)
+        self.assertIn(f"{link} is a link another user owns", error.detail)
+        self.assertEqual(os.listdir(target), [])
+        self.assertFalse(os.path.lexists(self.unit))
+        # The person's own link on the way is followed, and the unit names the real folder.
+        install(Roots(home=self.home, state_home=chosen), EXEC)
+        with open(self.unit, "rb") as handle:
+            self.assertEqual(handle.read(), render_unit(EXEC, os.path.join(target, "state")).encode())
+        self.assertTrue(os.path.lexists(os.path.join(target, "state", "recursion", "plugin-security", "breaker.sqlite3")))
 
     # No store is moved or removed.
 

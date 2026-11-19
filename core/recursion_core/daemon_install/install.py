@@ -3,7 +3,7 @@
 ``install`` creates the breaker store and the revocation store where the daemon opens them, then
 writes the unit; run again, it finds both stores and the same unit bytes and changes nothing.
 The ledger step takes ``anchor_public_key``. This command cannot fill that parameter, so the step
-reports ``needs the anchor key (Lucas)`` and does not create the ledger.
+reports ``needs the anchor key, which recursiond install makes`` and does not create the ledger.
 ``upgrade`` does the same for an existing unit and rewrites it (a new interpreter, or a hand-placed
 unit from before the installer). ``uninstall`` removes the unit it wrote and nothing else: not the
 folders around it, which other units share, and not the daemon's state folder with the run
@@ -30,7 +30,7 @@ from .unit import MARKER, UNIT_NAME, render_unit, state_elsewhere
 _UNIT_MODE = 0o644
 _DIR_MODE = 0o700
 # The whole detail of a ledger step that has no anchor to bind. The installer does not choose one.
-NEEDS_ANCHOR = "needs the anchor key (Lucas)"
+NEEDS_ANCHOR = "needs the anchor key, which recursiond install makes"
 
 
 @dataclass(frozen=True)
@@ -40,8 +40,8 @@ class Plan:
     unit: str
     commands: tuple[tuple[str, ...], ...]
     stores: tuple[tuple[str, str, bool], ...] = ()  # (kind, path, created now), install and upgrade
-    # (path, created now, detail). Detail is ``needs the anchor key (Lucas)`` when the step had no key
-    # and the ledger was not there. None on uninstall, which does not touch the ledger.
+    # (path, created now, detail). Detail is ``needs the anchor key, which recursiond install makes`` when the step had no
+    # key and the ledger was not there. None on uninstall, which does not touch the ledger.
     ledger: tuple[str, bool, str] | None = None
     # install and upgrade with a chosen place: the daemon's state folder in use, and one plain sentence when
     # the default's plugin-security folder holds a store, which is left where it is and not used. "" otherwise.
@@ -114,7 +114,7 @@ def ensure_ledger(paths: Owned, anchor_public_key: str | None) -> tuple[str, boo
     ``anchor_public_key`` is the key ``authority.create_ledger`` binds the new ledger to.
     ``install`` and ``upgrade`` pass None: nothing in this command has that key, and
     ``install.json``'s ``authority_anchor`` is not read. None, or an empty string, reports
-    ``needs the anchor key (Lucas)`` when the ledger is not there and creates nothing. A
+    ``needs the anchor key, which recursiond install makes`` when the ledger is not there and creates nothing. A
     caller that has the key creates a missing ledger through ``plugin_security.stores.create_ledger``
     (that calls ``authority.create_ledger``). A ledger already there is checked with
     ``open_store`` and left as it is, whether or not a key was passed.
@@ -226,12 +226,7 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
         current = data == unit and not file_untrusted(paths.unit, info)
         why = None if data == unit else state_elsewhere(data, paths.home, paths.state_home)
         if why:  # the S6 sweep's F1 on #410: before anything is made, the unit left as it is
-            raise InstallRefused(
-                "unit_state_elsewhere",
-                f"{paths.unit} {why}: the daemon it starts may keep its state (the revocation and breaker "
-                f"stores, the run registry) there, and the unit `recursiond upgrade` writes puts it in "
-                f"{paths.state}. Stop the daemon, move that state folder to {paths.state}, take the line out "
-                "of the unit, then run `recursiond upgrade` again")
+            raise InstallRefused("unit_state_elsewhere", _elsewhere_detail(paths, data, why))
         check_state_root(paths)  # a chosen place: before anything is made
         check_private_dir(paths.state_root, paths.homes)  # before anything is made
         made = ensure_stores(paths)
@@ -244,6 +239,32 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
         else:
             replace_regular(paths.unit, unit, _UNIT_MODE)
         return _plan("upgrade", not current or _any_created(made) or homes or ledger[1], paths, made, ledger)
+
+
+def _elsewhere_detail(paths: Owned, data: bytes, why: str) -> str:
+    """The text of ``unit_state_elsewhere``: what the unit does, and only ways out that work.
+
+    With a place the person chose, or a unit this installer wrote (which names a chosen place when it is
+    refused), the two ways that work: run ``recursiond upgrade`` again with ``XDG_STATE_HOME`` naming the
+    folder the unit names (unset where the unit names the default) to keep the state where it is, or
+    ``recursiond uninstall`` then ``recursiond install`` to start in the folder this command would use, the
+    stores already made left where they are and not used (``stores_left`` names the default's). A unit
+    placed by hand, while the default applies, is still told to move the state folder and take its line
+    out: that unit has no chosen place of this installer's in it."""
+
+    said = (f"{paths.unit} {why}: the daemon it starts may keep its state (the revocation and breaker stores, the "
+            f"run registry) there, and the unit `recursiond upgrade` writes puts it in {paths.state}. ")
+    ours = data.split(b"\n", 1)[0] == MARKER.encode()
+    if not ours and not paths.chosen:
+        return said + (f"Stop the daemon, move that state folder to {paths.state}, take the line out of the unit, "
+                       "then run `recursiond upgrade` again")
+    keep = "unset" if state_elsewhere(data, paths.home) is None else "set to the folder that unit names"
+    now = f"set to {paths.state_home}" if paths.chosen else "unset"
+    start = ("run `recursiond uninstall`, then" if ours else
+             f"stop the daemon, remove {paths.unit}, which `recursiond install` did not write, then run")
+    return said + (f"To keep the state where it is, run `recursiond upgrade` again with XDG_STATE_HOME {keep}. "
+                   f"To start in {paths.state} instead, {start} `recursiond install` with XDG_STATE_HOME {now}; "
+                   "the stores already made are left where they are and not used")
 
 
 def uninstall(roots: Roots) -> Plan:

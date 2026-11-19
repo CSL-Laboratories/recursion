@@ -172,8 +172,9 @@ class CommitStopTests(PublishCase):
 
         install_mod._write_pointer = full_disk
         try:
-            with self.assertRaises(OSError):
+            with self.assertRaises(install_mod.InstallRefused) as caught:
                 action()
+            self.assertEqual("filesystem_refused", caught.exception.code)
         finally:
             install_mod._write_pointer = real
 

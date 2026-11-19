@@ -107,16 +107,12 @@ def main(argv: list[str] | None = None, out=None, err=None) -> int:
             result = remove_plugin(_config_dir(args.config), args.plugin, state=_state_dir(args.state),
                                    report_kept=report)
     except InstallRefused as exc:
+        # A read or write the system refused is the typed refusal filesystem_refused. What was written stays
+        # as after a stop of the process: the next command finishes or drops the stopped publish.
         for code in exc.codes:
             err.write(f"refused: {code}\n")
         if exc.show_detail:
             err.write(f"{exc.detail}\n")
-        return 1
-    except OSError as exc:
-        # The installer's own code. What was written stays as after a stop of the process: the next
-        # command finishes or drops the stopped publish.
-        err.write("refused: filesystem_refused\n")
-        err.write(f"The system refused a file read or write: {exc}\n")
         for line in getattr(exc, "kept", ()):
             if line not in said:
                 err.write(f"{line}\n")

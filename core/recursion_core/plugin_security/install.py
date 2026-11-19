@@ -76,11 +76,15 @@ is refused and nothing is written. A signature that does not verify against
 the manifest's own key refuses the registry. A signature that verifies, but
 whose key is not on this install's trusted list, still installs and loads as
 unsigned. This command does not grant permissions and does not add a trusted key.
+
+A read or write the system refuses (a full or read-only disk, no permission) raises the typed refusal
+``filesystem_refused``, which keeps the system's message; no caller gets a bare ``OSError``.
 """
 
 from __future__ import annotations
 
 import errno
+import functools
 import hashlib
 import json
 import os
@@ -100,7 +104,7 @@ try:
 except ImportError:  # Windows: every command refuses platform_unsupported before it opens a file
     fcntl = None
 
-__all__ = ["InstallRefused", "install_plugin", "list_plugins", "remove_plugin"]
+__all__ = ["FilesystemRefused", "InstallRefused", "install_plugin", "list_plugins", "remove_plugin"]
 
 _PLUGIN_ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
 _CURRENT = re.compile(r"[1-9][0-9]*\n")
@@ -150,6 +154,41 @@ class InstallRefused(Exception):
         self.show_detail = show_detail
 
 
+class FilesystemRefused(InstallRefused, OSError):
+    """``filesystem_refused``: the system refused a read or write (a full or read-only disk, no permission).
+
+    The system's message is in ``detail``, its ``errno``, ``strerror`` and ``filename`` are kept, and the
+    system's error is the cause. ``kept`` names what a command kept aside before the failure. It is an
+    ``OSError`` too, so a caller that catches one still catches it.
+    """
+
+    def __str__(self) -> str:
+        return BaseException.__str__(self)
+
+
+def _system_refused(error: OSError) -> FilesystemRefused:
+    refusal = FilesystemRefused("filesystem_refused", detail=f"The system refused a file read or write: {error}",
+                                show_detail=True)
+    refusal.errno, refusal.strerror, refusal.filename = error.errno, error.strerror, error.filename
+    refusal.kept = list(getattr(error, "kept", ()))
+    return refusal
+
+
+def _typed_refusals(command):
+    """Run ``command``; a read or write the system refuses leaves it as the typed refusal ``filesystem_refused``."""
+
+    @functools.wraps(command)
+    def run(*args, **kwargs):
+        try:
+            return command(*args, **kwargs)
+        except InstallRefused:
+            raise
+        except OSError as error:
+            raise _system_refused(error) from error
+
+    return run
+
+
 @dataclass
 class StoredPlugin:
     manifest: bytes
@@ -173,6 +212,7 @@ class Snapshot:
         return ReservedEffects(frozenset(self.hosts), tuple(self.prefixes))
 
 
+@_typed_refusals
 def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, plugin_id: str, *,
                    version: str | None = None, state: os.PathLike | str | None = None, wait: bool = True,
                    report_kept=None) -> dict:
@@ -204,6 +244,7 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
         os.close(fd)
 
 
+@_typed_refusals
 def list_plugins(config: os.PathLike | str, *, state: os.PathLike | str | None = None, wait: bool = True) -> dict:
     """Publish the current generation if a publish stopped early, then list what it holds."""
     _require_platform()
@@ -219,6 +260,7 @@ def list_plugins(config: os.PathLike | str, *, state: os.PathLike | str | None =
         os.close(fd)
 
 
+@_typed_refusals
 def remove_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLike | str | None = None,
                   wait: bool = True, report_kept=None) -> dict:
     """Drop one plugin into a new generation. An unknown id writes nothing."""

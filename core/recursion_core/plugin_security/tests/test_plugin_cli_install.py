@@ -504,8 +504,9 @@ class InstallCommandTests(ProfileCase):
 
         install_mod._copy_generation_to_live = boom
         try:
-            with self.assertRaises(OSError):
+            with self.assertRaises(install_mod.InstallRefused) as caught:
                 self.install()
+            self.assertEqual("filesystem_refused", caught.exception.code)
         finally:
             install_mod._copy_generation_to_live = real
         self.assertFalse((self.config / "plugins" / "fixture.unsigned").exists())

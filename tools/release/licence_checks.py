@@ -493,10 +493,11 @@ def _link_spans(text: str) -> list[tuple[int, int]]:
 def _one_tag(text: str, i: int, spans: list[tuple[int, int]], markdown: bool = False) -> int:
     """From a `<` at `i`, the index after that tag, recording each quoted attribute value. `i + 1`
     when `i` does not open a tag, so a `<script` that follows is still seen. In Markdown text the values
-    are recorded only for a tag that closes with `>`: one that does not is text there, and a quote it
-    leaves open hides nothing."""
+    are recorded only for a tag that closes with `>` and whose every attribute name is valid and follows
+    whitespace: one that does not is text there, and a quote it leaves open hides nothing."""
     values: list[tuple[int, int]] = []
     n = len(text)
+    gap = False
     j = i + 1
     if j >= n:
         return j
@@ -512,8 +513,10 @@ def _one_tag(text: str, i: int, spans: list[tuple[int, int]], markdown: bool = F
     if j >= n or text[j] not in " \t\n\r\f/>":
         return i + 1
     while j < n:
+        k = j
         while j < n and text[j] in " \t\n\r\f":
             j += 1
+        gap = gap or j > k
         if j >= n:
             break
         if text[j] == ">":
@@ -526,12 +529,26 @@ def _one_tag(text: str, i: int, spans: list[tuple[int, int]], markdown: bool = F
             if not markdown:
                 spans.extend(values)
             return j + 1
+        name = j
         while j < n and text[j] not in " \t\n\r\f=/>":
             j += 1
+        if markdown:
+            valid = gap and name < j
+            k = name
+            while valid and k < j:
+                c = text[k]
+                valid = ("A" <= c <= "Z" or "a" <= c <= "z" or c in "_:"
+                         or (k > name and ("0" <= c <= "9" or c in ".-")))
+                k += 1
+            if not valid:
+                return i + 1
+        k = j
         while j < n and text[j] in " \t\n\r\f":
             j += 1
         if j >= n or text[j] != "=":
+            gap = j > k
             continue
+        gap = False
         j += 1
         while j < n and text[j] in " \t\n\r\f":
             j += 1
@@ -2009,6 +2026,8 @@ class BrokenRuleTests(unittest.TestCase):
         in a tag that closes with `>`; a quote left open there hides no script that follows it."""
         text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
         for prefix, hidden in (('Text <a title=" <script>', True),
+                               ('Text <a title=" <script>" !>', True),
+                               ('Text <a title=" <script>"x=1>', True),
                                ('Text <a title=" <script>">', False)):
             with self.subTest(prefix=prefix):
                 (self.root / "SECURITY.md").write_text(prefix + "\n\n" + text, encoding="utf-8", newline="\n")

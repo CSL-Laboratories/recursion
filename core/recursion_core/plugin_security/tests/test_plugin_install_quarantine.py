@@ -12,6 +12,8 @@ what it requests; ``order`` is never granted this way. Nothing is accepted by a 
 (4) ``plugin quarantine drop <id>`` moves the held files aside into a kept place and names it; nothing is
 deleted.
 (5) An unpinned plugin, and the refusal of an unsigned release of a pinned plugin, are as before.
+(6) Every refusal of ``quarantine accept`` names the command that drops the held release, and a held release
+that does not read is listed as ``damaged`` with that command; ``quarantine drop`` moves it aside.
 """
 from __future__ import annotations
 
@@ -314,6 +316,87 @@ class AsBeforeTests(_QuarantineCase):
         self.assertEqual(("signed", 2), (result["trust"], result["generation"]))
         self.assertNotIn("result", result)
         self.assertFalse((self.config / "plugin-quarantine").exists())
+
+
+@unittest.skipUnless(LINUX, LINUX_ONLY)
+class WayOutTests(_QuarantineCase):
+    """Each refusal of a held release names the command that drops it, with the plugin's real id."""
+
+    drop_words = f"recursion plugin quarantine drop {PLUGIN}"
+
+    def refused_accept(self, code: str) -> str:
+        """Accept with a yes refuses ``code``, asks nothing and writes nothing, also on the command line (exit 1,
+        the code, then the detail). Returns the detail."""
+        before = _tree(self.config)
+        asked = []
+        refusal = self.refused(lambda: self.call("quarantine_accept", PLUGIN,
+                                                 confirm=lambda question: asked.append(question) or "yes"))
+        self.assertEqual((code, []), (refusal.code, asked))
+        self.assertEqual(before, _tree(self.config))
+        status, said, out = self.main(["plugin", "quarantine", "accept", PLUGIN, "--config", str(self.config),
+                                       "--state", str(self.state)], "yes\n")
+        self.assertEqual((1, ""), (status, out))
+        self.assertEqual([f"refused: {code}", refusal.detail], said.splitlines())
+        self.assertEqual(before, _tree(self.config))
+        return refusal.detail
+
+    @needs_crypto
+    def test_an_extra_file_in_the_held_folder_refuses_with_the_drop_command(self):
+        self.quarantined(Key())
+        self.install()
+        (self.held_at() / "notes.txt").write_bytes(b"left by hand\n")
+        detail = self.refused_accept("plugin_directory_untrusted")
+        self.assertIn(f"The folder {self.held_at()} is not a release this command held. Run: ", detail)
+        self.assertIn(self.drop_words, detail)
+
+    @needs_crypto
+    def test_a_partial_folder_left_beside_the_held_release_refuses_with_the_drop_command(self):
+        self.quarantined(Key())
+        self.install()
+        (self.held_at().parent / ".partial-1.1.0").mkdir(mode=0o700)
+        detail = self.refused_accept("plugin_directory_untrusted")
+        self.assertIn("holds more than one release, or an entry this command did not write. Run: ", detail)
+        self.assertIn(self.drop_words, detail)
+
+    @needs_crypto
+    def test_accept_of_a_held_release_that_does_not_read_names_the_drop_command(self):
+        self.quarantined(Key())
+        self.install()
+        plugin = self.held_at() / "plugin.py"
+        good = plugin.read_bytes()
+        plugin.write_bytes(bytes([good[0] ^ 1]) + good[1:])
+        detail = self.refused_accept("generation_unreadable")
+        self.assertTrue(detail.startswith(f"The release held at {self.held_at()} does not read as the release "
+                                          f"1.1.0 of the plugin {PLUGIN}"), detail)
+        self.assertIn(f"cannot be accepted. Run: {self.drop_words}", detail)
+        plugin.write_bytes(good)
+        (self.held_at() / "registry-label").write_bytes(b"\xff\n")
+        self.assertIn(f"cannot be accepted. Run: {self.drop_words}", self.refused_accept("generation_unreadable"))
+
+    @needs_crypto
+    def test_a_held_release_that_does_not_read_is_listed_as_damaged_and_drop_moves_it_aside(self):
+        self.quarantined(Key())
+        self.install()
+        plugin = self.held_at() / "plugin.py"
+        good = plugin.read_bytes()
+        plugin.write_bytes(bytes([good[0] ^ 1]) + good[1:])
+        listed = self.call("quarantine_list")["held"]
+        self.assertEqual([{"plugin_id", "version", "held_at", "asks", "damaged", "next"}],
+                         [set(row) for row in listed], listed)
+        self.assertEqual((PLUGIN, "1.1.0", str(self.held_at()), [], True),
+                         tuple(listed[0][key] for key in ("plugin_id", "version", "held_at", "asks", "damaged")))
+        self.assertIn(f"{self.held_at()} does not read", listed[0]["next"])
+        self.assertIn(f"Run: {self.drop_words}", listed[0]["next"])
+        status, said, out = self.main(["plugin", "quarantine", "list", "--config", str(self.config)])
+        self.assertEqual((0, ""), (status, said))
+        self.assertEqual(listed, json.loads(out)["held"])
+        result = self.call("quarantine_drop", PLUGIN)
+        self.assertTrue(result["kept"][0].startswith(f"The held release 1.1.0 of the plugin {PLUGIN} is kept at "),
+                        result)
+        place = Path(result["kept"][0].split(" is kept at ", 1)[1].split(";", 1)[0])
+        self.assertEqual(bytes([good[0] ^ 1]) + good[1:], (place / "plugin.py").read_bytes())
+        self.assertFalse(self.held_at().exists())
+        self.assertEqual([], self.call("quarantine_list")["held"])
 
 
 if __name__ == "__main__":

@@ -135,6 +135,8 @@ class PrintedWayOutRunsTests(_AnswerCase):
         self.assertEqual(1, status, said)
         command = _between(said, "Make it owner-only with: ", "; then")
         self.assertEqual(["chmod", "700", str(folder.absolute())], shlex.split(command))
+        # The path handed to the shell is inside the test's own temporary folder.
+        self.assertTrue(Path(os.path.realpath(folder)).is_relative_to(os.path.realpath(self.tmp)), folder)
         ran = self.run_sh(command)
         self.assertEqual(0, ran.returncode, ran.stderr)
         self.assertEqual(0o700, stat.S_IMODE(os.lstat(folder).st_mode))
@@ -320,7 +322,11 @@ class LockWayOutTests(_AnswerCase):
         self.assertIn("remove it while no plugin command runs", refusal.detail)
         status, said, _out = self.main(["plugin", "list", "--config", str(self.config), "--state", str(self.state)])
         self.assertEqual((1, f"refused: plugin_directory_untrusted\n{refusal.detail}\n"), (status, said))
-        ran = self.run_sh(_between(refusal.detail, "Make it writable by its owner with: ", ";"))
+        command = _between(refusal.detail, "Make it writable by its owner with: ", ";")
+        self.assertEqual(["chmod", "600", str(lock)], shlex.split(command))
+        # The path handed to the shell is inside the test's own temporary folder.
+        self.assertTrue(Path(os.path.realpath(lock)).is_relative_to(os.path.realpath(self.tmp)), lock)
+        ran = self.run_sh(command)
         self.assertEqual(0, ran.returncode, ran.stderr)
         self.assertEqual(0, self.main(["plugin", "list", "--config", str(self.config), "--state",
                                        str(self.state)])[0])

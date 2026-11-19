@@ -576,7 +576,8 @@ def _install_locked(config: Path, chosen, plugin_id: str, state, report_kept=Non
 @_typed_refusals
 def quarantine_list(config: os.PathLike | str, *, state: os.PathLike | str | None = None,
                     wait: bool = True) -> dict:
-    """Each held release: its plugin, version, place and what more it asks than the running release."""
+    """Each held release: its plugin, version, place and what more it asks than the running release. A held
+    release that does not read is a row marked ``damaged``, with no asks and the command that drops it."""
     _require_platform()
     del state
     config_path = Path(config)
@@ -596,6 +597,10 @@ def quarantine_list(config: os.PathLike | str, *, state: os.PathLike | str | Non
                     try:
                         manifest = _held_manifest(folder / version, plugin_id, _read_held(folder / version))
                     except InstallRefused:
+                        if _VERSION_DIR.fullmatch(version) is not None:
+                            rows.append({"plugin_id": plugin_id, "version": version,
+                                         "held_at": str(folder / version), "asks": [], "damaged": True,
+                                         "next": _damaged(folder / version, plugin_id)})
                         continue
                     running = snapshot.plugins.get(plugin_id)
                     rows.append({"plugin_id": plugin_id, "version": version, "held_at": str(folder / version),
@@ -798,11 +803,18 @@ def _held_manifest(held: Path, plugin_id: str, files: dict):
         manifest = parse_manifest(files["manifest.json"])
         label = files[_HELD_LABEL].decode("ascii").strip()
     except (Refused, UnicodeDecodeError):
-        raise InstallRefused("generation_unreadable") from None
+        raise InstallRefused("generation_unreadable", detail=_damaged(held, plugin_id), show_detail=True) from None
     if (manifest.plugin_id != plugin_id or manifest.version != held.name or label not in _LABELS
             or hashlib.sha256(files["plugin.py"]).hexdigest() != manifest.artifact_sha256):
-        raise InstallRefused("generation_unreadable")
+        raise InstallRefused("generation_unreadable", detail=_damaged(held, plugin_id), show_detail=True)
     return manifest
+
+
+def _damaged(held: Path, plugin_id: str) -> str:
+    """The way out for a held release whose files do not read as the release its place names."""
+    return (f"The release held at {held} does not read as the release {held.name} of the plugin {plugin_id} "
+            f"that this command held, so it cannot be accepted. Run: "
+            f"{_command(held.parents[2], 'quarantine', 'drop', plugin_id)}")
 
 
 def _set_aside(config: Path, plugin_id: str, folder: Path, names: list) -> list:

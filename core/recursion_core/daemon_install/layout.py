@@ -138,10 +138,26 @@ def chosen_state_home(home: str, value: str | None) -> str | None:
 
 
 def state_home(home: str, value: str | None) -> str:
-    """The folder the daemon's state folder is in: the chosen place (links resolved), else the default."""
+    """The folder the daemon's state folder is in: the chosen place, else the default.
+
+    The chosen place's real folder is taken from the home's own walk (``_directory_root``) at its nearest
+    folder that is there, never from ``os.path.realpath`` before it: a link another user owns on the way is
+    refused ``folder_untrusted``, and a link of the person's own is followed to the real folder."""
 
     chosen = chosen_state_home(home, value)
-    return os.path.realpath(chosen) if chosen is not None else default_state_home(home)
+    return _real_folder(chosen) if chosen is not None else default_state_home(home)
+
+
+def _real_folder(path: str) -> str:
+    """``path``'s real folder: the nearest folder of it that is there, walked as the home is walked (each link
+    on the way root's or ours), then the parts below it, which are not there yet."""
+
+    nearest = path
+    while not os.path.lexists(nearest) and os.path.dirname(nearest) != nearest:
+        nearest = os.path.dirname(nearest)
+    real = _directory_root(nearest)
+    rest = os.path.relpath(path, nearest)
+    return real if rest == "." else os.path.normpath(os.path.join(real, rest))
 
 
 def state_folder(home: str, value: str | None) -> str:

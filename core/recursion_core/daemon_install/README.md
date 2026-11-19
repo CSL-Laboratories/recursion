@@ -35,7 +35,10 @@ The unit sets `XDG_STATE_HOME=%h/.local/state` by default, or `"XDG_STATE_HOME=<
 (absolute, links resolved, in systemd's quoting), so the daemon's state folder (`daemon/__main__.py`
 takes it from the same resolver) is the one install made the stores in, whatever the user manager's own
 environment says. A unit `upgrade` would replace whose daemon may keep its state in another folder than
-the chosen one (or the default) is refused `unit_state_elsewhere`, its text naming the folder in use; a
+the chosen one (or the default) is refused `unit_state_elsewhere`, its text naming the folder in use and,
+with a chosen place or a unit the installer wrote, the two ways out that work (run the command again with
+`XDG_STATE_HOME` naming the unit's folder, or unset where it names the default; or `recursiond uninstall`
+then `recursiond install` to start in the new place, the stores already made left where they are); a
 value only in the user manager's own environment (`environment.d`, `systemctl --user set-environment`) is
 not seen, since this package starts no process to ask it. With a chosen place the answer adds `state`
 (the folder in use) and, when the default's `plugin-security` folder holds a store, `stores_left`: one
@@ -43,7 +46,7 @@ sentence saying those stores are left where they are and not used. Nothing is ev
 a store made in the default place before stays there. The daemon's installed-profile check counts a
 chosen folder as installed when the installer's unit names it. The ledger step runs in the same `install` and `upgrade`:
 the command binds the authority ledger to the install's own key (below). A caller of `install()` that passes
-neither `anchor_public_key` nor `make_anchor` gets `needs the anchor key (Lucas)` and no `ledger.sqlite3`; one
+neither `anchor_public_key` nor `make_anchor` gets `needs the anchor key, which recursiond install makes` and no `ledger.sqlite3`; one
 that passes a key creates the ledger through `plugin_security.stores.create_ledger`.
 
 ### The install's own authority key

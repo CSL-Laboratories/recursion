@@ -14,11 +14,24 @@ returns one check body, or a list of them (``engine.binary``, one per engine). A
 file) and ``engine.binary`` (``shutil.which`` and ``--version`` with a timeout, no model
 call, and an empty home so the command is not pointed at a sign-in file).
 
+On the live host only, three more checks run. ``plugin.config`` is the plugin config
+folder. ``plugin.revocation`` is the revocation store (``check_store``, which does not
+open it). ``plugin.installed`` is one row per installed plugin: its id, version, trust,
+key id, registry label and the loader's developer checks (``PluginLoader.doctor``).
+No plugin code runs. A plugin config folder that is not the operator's, or that group
+or world can write, reports every plugin refused. A revocation store is reported lost
+only when a side file of ``revoked.sqlite3`` remains; the breaker directory alone is
+not that signal, and this report does not create a replacement store. A legacy
+revocation store is reported ``revocation_store_legacy`` and is not rewritten. A
+symlinked ``plugin-security`` directory is refused. The report adds no key to
+``install.json`` and no manifest field, and it does not change the daemon.
+
 Recursion installs no engine. A missing engine binary is unknown, not ok.
 """
 
 from __future__ import annotations
 
+import contextvars
 import datetime as dt
 import os
 import shutil
@@ -28,6 +41,10 @@ import sys
 import sysconfig
 import tempfile
 from pathlib import Path
+
+# None: today's account probes. A string: those probes read this directory and
+# do not ask the password database, loginctl or systemctl.
+_ROOT = contextvars.ContextVar("recursion_doctor_root", default=None)
 
 _IDS = (
     "platform.linux",
@@ -57,15 +74,63 @@ _COMMANDS = {
     "opencode": "opencode",
 }
 _ENGINE_NEXT = "install the engine the operator configured; Recursion installs no engine"
+# Live host only. A probe map stands in for ``_IDS`` and does not invent plugin rows.
+_PLUGIN_IDS = ("plugin.config", "plugin.revocation", "plugin.installed")
+_TRUST_CODES = frozenset({
+    "signature_valid_trusted_key",
+    "signature_invalid",
+    "signer_not_on_trusted_list",
+    "signer_key_revoked",
+})
+_FOLDER_STEP = "run `chmod go-w` on the plugin config folder"
+_FILE_STEP = "the plugin file must be this user's regular file and not writable by group or world"
+_STORE_STEP = "restore the revocation store; a missing store after install refuses every plugin"
+_VERIFY_STEP = "install the signature backend named in plugin_security/README.md"
 
 
-def run(probes=None) -> dict:
-    """Build a doctor report. ``probes`` replaces every live check; None runs them."""
+def run(probes=None, *, root=None) -> dict:
+    """Build a doctor report. ``probes`` replaces every live check; None runs them.
 
+    The plugin checks run only when ``probes`` is None. They report the live host and
+    do not run plugin code.
+
+    ``root`` is an optional absolute directory the live account probes read. None
+    keeps today's probes: the unit file comes from the password database, and linger
+    and the user manager ask this account. A root confines those three probes to
+    that directory.
+    """
+
+    if root is None:
+        return _collect(probes)
+    token = _ROOT.set(root)
+    try:
+        return _collect(probes)
+    finally:
+        _ROOT.reset(token)
+
+
+def _collect(probes) -> dict:
     checks = []
     for check_id in _IDS:
         checks.extend(_invoke(check_id, probes))
+    if probes is None:
+        for check_id in _PLUGIN_IDS:
+            checks.extend(_invoke(check_id, None))
     return {"generated_at": _now(), "checks": checks}
+
+
+def _injected_home():
+    """``(asked, home)``. ``asked`` is true when ``run`` was given a root.
+
+    A root that is not an absolute path does not fall through to the account.
+    """
+
+    root = _ROOT.get()
+    if root is None:
+        return False, None
+    if type(root) is not str or not os.path.isabs(root):
+        return True, None
+    return True, root
 
 
 def exit_code(report: dict) -> int:
@@ -171,6 +236,18 @@ def _probe_interpreter():
 
 
 def _probe_user_manager():
+    asked, home = _injected_home()
+    if asked:
+        if home is None:
+            return _body("unknown", "the doctor root is not an absolute path")
+        path = os.path.join(home, ".config", "systemd", "user")
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return _body("unknown", "systemd user manager is not in the doctor root")
+        except OSError as exc:
+            return _body("unknown", f"{type(exc).__name__}: {exc}")
+        return _body("unknown", "systemd user manager was not asked; the doctor root is set")
     try:
         done = subprocess.run(
             ["systemctl", "--user", "is-system-running"],
@@ -200,6 +277,15 @@ def _probe_user_manager():
 
 
 def _probe_linger():
+    asked, home = _injected_home()
+    if asked:
+        if home is None:
+            return _body("unknown", "the doctor root is not an absolute path")
+        try:
+            os.lstat(home)
+        except OSError as exc:
+            return _body("unknown", f"{type(exc).__name__}: {exc}")
+        return _body("unknown", "linger was not asked; the doctor root is set")
     import getpass
 
     from recursion_core.daemon import check_operator_linger
@@ -233,9 +319,14 @@ def _account_home():
 
 
 def _probe_unit():
-    home = _account_home()
-    if home is None:
-        return _body("unknown", "the password database gives no home for this user")
+    asked, home = _injected_home()
+    if asked:
+        if home is None:
+            return _body("unknown", "the doctor root is not an absolute path")
+    else:
+        home = _account_home()
+        if home is None:
+            return _body("unknown", "the password database gives no home for this user")
     path = os.path.join(home, ".config", "systemd", "user", _UNIT_NAME)
     try:
         info = os.lstat(path)
@@ -328,6 +419,342 @@ def _probe_breaker():
     return _probe_store(_BREAKER_FILE, BREAKER_MAGIC)
 
 
+def _denied(path) -> bool:
+    """True when ``path`` is a sign-in path this report must not open."""
+
+    if type(path) is not str:
+        return False
+    try:
+        home = str(Path.home())
+    except (OSError, RuntimeError):
+        return False
+    from recursion_core.setup.deny import is_denied
+
+    return is_denied(path, home)
+
+
+def _config_root():
+    raw = os.environ.get("XDG_CONFIG_HOME") or ""
+    if raw:
+        if not os.path.isabs(raw):
+            return None
+        return raw
+    try:
+        base = str(Path.home() / ".config")
+    except (OSError, RuntimeError):
+        return None
+    if not os.path.isabs(base):
+        return None
+    return base
+
+
+def _child_names(folder):
+    """Directory and link names in ``folder``, or None when the folder cannot be listed.
+
+    Symlinks are names only. Their targets are not opened.
+    """
+
+    names = []
+    try:
+        with os.scandir(folder) as scan:
+            for entry in scan:
+                try:
+                    directory = entry.is_dir(follow_symlinks=False)
+                    link = entry.is_symlink()
+                except OSError:
+                    continue
+                if directory or link:
+                    names.append(entry.name)
+    except OSError:
+        return None
+    names.sort()
+    return names
+
+
+def _folder_status():
+    """The plugin config folder: absent, ok, bad (untrusted) or unknown.
+
+    Returns ``(kind, path, detail, step, names)``. ``names`` is the plugin directory
+    names when the folder itself could be listed, and None when it could not.
+    """
+
+    root = _config_root()
+    if root is None:
+        return "unknown", None, "the plugin config folder could not be named", None, None
+    folder = os.path.join(root, "recursion", "plugins")
+    if _denied(folder):
+        return "unknown", folder, "the plugin config folder is not read", None, None
+    try:
+        info = os.lstat(folder)
+    except FileNotFoundError:
+        return "absent", folder, "no plugin config folder; no plugin is installed", None, None
+    except OSError as exc:
+        return "unknown", folder, f"{type(exc).__name__}: {exc}", None, None
+    if stat.S_ISLNK(info.st_mode):
+        return ("bad", folder, "plugin_directory_untrusted: the plugin config folder is a symlink",
+                _FOLDER_STEP, None)
+    if not stat.S_ISDIR(info.st_mode):
+        return ("bad", folder, "plugin_directory_untrusted: the plugin config folder is not a directory",
+                _FOLDER_STEP, None)
+    names = _child_names(folder)
+    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+        return ("bad", folder, "plugin_directory_untrusted: the plugin config folder is owned by another user",
+                _FOLDER_STEP, names)
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return ("bad", folder,
+                "plugin_directory_untrusted: the plugin config folder is writable by group or world",
+                _FOLDER_STEP, names)
+    if names is None:
+        return "unknown", folder, "the plugin config folder could not be listed", None, None
+    return "ok", folder, folder, None, names
+
+
+_REVOCATION_FILE = "revoked.sqlite3"
+# The same suffixes ``stores._SIDE_FILES`` checks beside a store. A leftover one is
+# evidence the revocation file itself existed. ``breaker.sqlite3`` is not.
+_REVOCATION_SIDES = ("-wal", "-shm", "-journal")
+
+
+def _revocation_side_present(folder) -> bool:
+    for suffix in _REVOCATION_SIDES:
+        side = os.path.join(folder, _REVOCATION_FILE + suffix)
+        try:
+            if os.path.lexists(side):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _legacy_refusal(path):
+    """The legacy refusal, or None when this open is not that case.
+
+    Read-only. A store that is merely unreadable is left to the plugin rows,
+    which already report that refusal. This never migrates and never creates.
+    """
+
+    from recursion_core.plugin_security.errors import Refused
+    from recursion_core.plugin_security.manifest import TrustStore
+
+    try:
+        trust = TrustStore({}, revocation_store=path, read_only=True)
+    except Refused as exc:
+        if exc.code == "revocation_store_legacy":
+            return exc
+        return None
+    trust.close()
+    return None
+
+
+def _revocation():
+    """``(path or None, state, detail, step)`` for the revocation store.
+
+    ``path`` is set only when the store can be classified. ``fail`` means every
+    installed plugin is reported refused: the directory is a symlink, a side file
+    shows the revocation file is gone, the store is legacy, or ``check_store``
+    refused it. ``unknown`` means the revocation file was never there. The doctor
+    does not create a store and does not migrate one.
+    """
+
+    folder = _state_store_dir()
+    if folder is None:
+        return None, "unknown", "XDG_STATE_HOME is not an absolute path", None
+    path = os.path.join(folder, _REVOCATION_FILE)
+    if _denied(folder) or _denied(path):
+        return None, "unknown", "the revocation store is not read", None
+    if not os.path.lexists(path):
+        try:
+            info = os.lstat(folder)
+        except FileNotFoundError:
+            return None, "unknown", "revocation store is not there yet", None
+        except OSError as exc:
+            return None, "unknown", f"{type(exc).__name__}: {exc}", None
+        if stat.S_ISLNK(info.st_mode):
+            return (None, "fail",
+                    "revocation_store_untrusted: plugin-security is a symlink",
+                    _STORE_STEP)
+        if stat.S_ISDIR(info.st_mode) and _revocation_side_present(folder):
+            return (None, "fail",
+                    "revocation_store_missing: revoked.sqlite3 is gone and a side file of it remains",
+                    _STORE_STEP)
+        return None, "unknown", "revocation store is not there yet", None
+    from recursion_core.plugin_security.errors import Refused
+    from recursion_core.plugin_security.stores import REVOCATION_MAGIC, check_store
+
+    try:
+        check_store(path, REVOCATION_MAGIC)
+    except Refused as exc:
+        detail = exc.code if not exc.detail else f"{exc.code}: {exc.detail}"
+        return None, "fail", detail, _STORE_STEP
+    except Exception as exc:
+        return None, "unknown", f"{type(exc).__name__}: {exc}", None
+    legacy = _legacy_refusal(path)
+    if legacy is not None:
+        detail = legacy.code if not legacy.detail else f"{legacy.code}: {legacy.detail}"
+        return None, "fail", detail, _STORE_STEP
+    return path, "ok", path, None
+
+
+def _refused_rows(names, text, step):
+    if not names:
+        return [_body("fail", text, step, None)]
+    return [_body("fail", text, step, name) for name in names]
+
+
+def _peek_plugin(source, plugins, parse_manifest, refused):
+    """Plugin id and version from the manifest bytes, or the directory name. No code runs."""
+
+    name = os.path.basename(source)
+    try:
+        if not plugins._owned_directory(source):
+            return name, "unknown"
+        raw = plugins._read_owned(Path(source) / "manifest.json", plugins.MAX_MANIFEST_BYTES)
+        parsed = parse_manifest(raw)
+    except (OSError, refused, plugins.PluginRefused, ValueError, TypeError):
+        return name, "unknown"
+    return parsed.plugin_id, parsed.version
+
+
+def _one_plugin(loader, source, plugins, parse_manifest, refused, key_id):
+    name = os.path.basename(source)
+    try:
+        if not plugins._owned_directory(source):
+            raise plugins.PluginRefused(
+                "plugin_directory_untrusted",
+                "must be an operator-owned directory, not group or world writable")
+        if _denied(source):
+            return _body("unknown", "the plugin directory is not read", None, name)
+        manifest = plugins._read_owned(Path(source) / "manifest.json", plugins.MAX_MANIFEST_BYTES)
+        artifact = plugins._read_owned(Path(source) / "plugin.py", plugins.MAX_ARTIFACT_BYTES)
+        signature = plugins._read_owned(Path(source) / "manifest.sig", 4096, missing_ok=True)
+    except plugins.PluginRefused as exc:
+        step = _FOLDER_STEP if exc.code == "plugin_directory_untrusted" else _FILE_STEP
+        detail = exc.code if not exc.detail else f"{exc.code}: {exc.detail}"
+        return _body("fail", f"refused: {detail}", step, name)
+    signature = None if signature is None else signature.decode("ascii", "replace").strip()
+    findings = loader.doctor(manifest, signature, artifact, None)
+    version = "unknown"
+    plugin_id = name
+    developer_key = None
+    try:
+        parsed = parse_manifest(manifest)
+    except refused:
+        parsed = None
+    else:
+        version = parsed.version
+        plugin_id = parsed.plugin_id
+        developer_key = parsed.developer_key
+    trust = "unknown"
+    label = "unlisted"
+    codes = []
+    refused_code = ""
+    warned = False
+    for finding in findings:
+        if type(finding) is not dict:
+            continue
+        code = finding.get("code")
+        if type(code) is str:
+            codes.append(code)
+        severity = finding.get("severity")
+        if severity == "refuse" and type(code) is str:
+            refused_code = code
+        elif severity == "warn":
+            warned = True
+        if code == "registry_label":
+            shown = finding.get("detail")
+            if type(shown) is str and shown:
+                label = shown.split(" ", 1)[0]
+        if code in _TRUST_CODES:
+            shown = finding.get("detail")
+            if type(shown) is str and shown:
+                trust = shown
+    key = "none"
+    if trust == "signed" and type(developer_key) is str:
+        try:
+            key = key_id(developer_key)
+        except refused:
+            key = "none"
+    state = "fail" if refused_code else "warn" if warned else "ok"
+    detail = f"version {version}; trust {trust}; key_id {key}; label {label}; checks {','.join(codes)}"
+    step = None
+    if refused_code:
+        detail = f"refused: {refused_code}; {detail}"
+        step = "the loader's checks refused this plugin; no plugin code ran"
+    return _body(state, _one_line(detail, 500), step, plugin_id)
+
+
+def _probe_plugin_config():
+    kind, _path, detail, step, _names = _folder_status()
+    if kind in ("absent", "ok"):
+        return _body("ok", detail)
+    if kind == "bad":
+        return _body("fail", detail, step)
+    return _body("unknown", detail, step)
+
+
+def _probe_revocation():
+    _path, state, detail, step = _revocation()
+    return _body(state, detail, step)
+
+
+def _probe_plugins():
+    """One row per installed plugin. Reads manifests and calls ``PluginLoader.doctor``.
+
+    Plugin code is not run. An untrusted config folder, or a revocation store that does
+    not pass, reports every plugin refused and does not read the plugin files. The
+    revocation store is opened read-only.
+    """
+
+    kind, folder, detail, step, names = _folder_status()
+    if kind in ("absent", "unknown"):
+        return []
+    if kind == "bad":
+        return _refused_rows(names, f"refused: {detail}", step)
+    if not names:
+        return []
+    import recursion_core.daemon.plugins as plugins
+    from recursion_core.plugin_security import CoreHealth, PluginLoader, Refused, TrustStore, parse_manifest
+    from recursion_core.plugin_security.signing import backend_available, key_id
+
+    rev_path, rev_state, rev_detail, rev_step = _revocation()
+    if rev_state == "fail":
+        return _refused_rows(names, f"refused: {rev_detail}", rev_step)
+    sources = [os.path.join(folder, name) for name in names]
+    if not backend_available():
+        rows = []
+        for source in sources:
+            plugin_id, version = _peek_plugin(source, plugins, parse_manifest, Refused)
+            rows.append(_body(
+                "fail",
+                "refused: plugin_verification_unavailable: "
+                f"{plugins.CRYPTOGRAPHY_MISSING}; version {version}",
+                _VERIFY_STEP,
+                plugin_id,
+            ))
+        return rows
+    try:
+        install = plugins.read_install(folder)
+    except plugins.PluginRefused as exc:
+        shown = exc.code if not exc.detail else f"{exc.code}: {exc.detail}"
+        return _refused_rows(names, f"refused: {shown}", _FILE_STEP)
+    try:
+        trust = TrustStore(install["trusted_keys"], revocation_store=rev_path, read_only=True)
+    except Refused as exc:
+        shown = exc.code if not exc.detail else f"{exc.code}: {exc.detail}"
+        return _refused_rows(names, f"refused: {shown}", _STORE_STEP)
+    loader = PluginLoader(trust, install["grants"], install["reserved"], CoreHealth())
+    try:
+        rows = []
+        for source in sources:
+            try:
+                rows.append(_one_plugin(loader, source, plugins, parse_manifest, Refused, key_id))
+            except Exception as exc:
+                rows.append(_body("unknown", f"{type(exc).__name__}: {exc}", None, os.path.basename(source)))
+        return rows
+    finally:
+        trust.close()
+
+
 def _probe_engines():
     from recursion_core.routes.contract import ENGINES
 
@@ -384,4 +811,7 @@ _LIVE = {
     "store.ledger": _probe_ledger,
     "store.breaker": _probe_breaker,
     "engine.binary": _probe_engines,
+    "plugin.config": _probe_plugin_config,
+    "plugin.revocation": _probe_revocation,
+    "plugin.installed": _probe_plugins,
 }

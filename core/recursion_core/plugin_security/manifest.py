@@ -167,17 +167,21 @@ class TrustStore:
     the SQLite write fails, ``revoke`` still revokes in memory but refuses
     ``revocation_not_durable`` (the SQLite error does not escape). The same-uid limit
     in ``authority.py`` applies: in-process plugin code can rewrite this file (B17).
+
+    ``read_only`` is the doctor's open. It does not create a file and it does not
+    run ``ALTER TABLE``. The default is false, which is the daemon's open.
     """
 
     def __init__(self, trusted_keys: dict[str, str], revoked_key_ids: frozenset = frozenset(),
-                 *, revocation_store: str | None = None):
+                 *, revocation_store: str | None = None, read_only: bool = False):
         keys = {}
         for label, hex_key in trusted_keys.items():
             keys[key_id(hex_key)] = (label, hex_key)
         self._keys = MappingProxyType(keys)
         self._lock = threading.Lock()
         self._store_path = revocation_store
-        self._db = None if revocation_store is None else self._open_store(revocation_store)
+        self._db = None if revocation_store is None else self._open_store(
+            revocation_store, read_only=read_only)
         generations = {}
         if self._db is not None:
             try:
@@ -196,9 +200,11 @@ class TrustStore:
         self._revoked = frozenset(generations)
 
     @staticmethod
-    def _open_store(path: str) -> sqlite3.Connection:
+    def _open_store(path: str, *, read_only: bool = False) -> sqlite3.Connection:
         if not os.path.isfile(path):
             raise Refused("revocation_store_missing")
+        if read_only:
+            return TrustStore._open_store_readonly(path)
         db = None
         try:
             db = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=30)
@@ -221,6 +227,43 @@ class TrustStore:
             except sqlite3.Error:
                 db.close()
                 raise Refused("revocation_store_invalid") from None
+        return db
+
+    @staticmethod
+    def _open_store_readonly(path: str) -> sqlite3.Connection:
+        """Open an existing store without creating a file and without writing.
+
+        ``mode=rw`` is the URI ``stores.open_store`` already uses: a file that is
+        gone after the ``isfile`` check is an error, not a new empty database.
+        ``mode=ro`` of a WAL store creates ``-wal`` and ``-shm`` on this SQLite,
+        so this path does not use it. ``query_only`` refuses ``ALTER TABLE`` and
+        every other write. A legacy store (magic ``csl-revocation-store/v0``,
+        table ``revoked(key_id)`` only) is ``revocation_store_legacy``.
+        """
+        from pathlib import Path
+
+        uri = Path(path).as_uri() + "?mode=rw"
+        db = None
+        try:
+            db = sqlite3.connect(uri, uri=True, isolation_level=None, check_same_thread=False, timeout=30)
+            db.execute("PRAGMA query_only=ON")
+            meta = dict(db.execute("SELECT k, v FROM meta").fetchall())
+            columns = [row[1] for row in db.execute("PRAGMA table_info(revoked)")]
+        except sqlite3.Error:
+            if db is not None:
+                db.close()
+            if not os.path.lexists(path):
+                raise Refused("revocation_store_missing") from None
+            raise Refused("revocation_store_invalid") from None
+        if meta.get("magic") != _REVOCATION_MAGIC:
+            db.close()
+            raise Refused("revocation_store_invalid")
+        if columns == ["key_id"]:
+            db.close()
+            raise Refused("revocation_store_legacy", "revoked has key_id only")
+        if "generation" not in columns:
+            db.close()
+            raise Refused("revocation_store_invalid")
         return db
 
     @property

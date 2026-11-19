@@ -146,29 +146,30 @@ class StoreError(RuntimeError):
 # available for some earlier releases: 3.44.6 and 3.50.7." Every store calls ``sqlite_wal_refusal`` before it
 # connects: the event store here, the authority ledger, the breaker store and the revocation store. A store added
 # later calls it too. The table is append-only: a later backport, or a release SQLite's pages say is repaired, is a
-# row added.
+# row added. It is read per branch: a repaired patch passes only inside its own (major, minor) line, never across
+# lines, since 3.45.0 to 3.50.6 and 3.51.0 to 3.51.2 sit above repaired numbers of other lines and are not repaired.
 
 SQLITE_WAL_BUG = 'store_sqlite_wal_bug'     # the typed refusal of every store
 SQLITE_WAL_FIRST = (3, 7, 0)                 # WAL, and the bug with it, begins here
 SQLITE_WAL_REPAIRED_FROM = (3, 53, 0)        # every release from here carries the repair
-# (major, minor) -> the first patch release of that line that carries the repair; None: none of that line is said to.
+# (major, minor) -> the first patch release of that line that carries the repair; a line not in the table has none.
 SQLITE_WAL_RESET_REPAIRED = {
     (3, 44): 6,      # a backport
     (3, 50): 7,      # a backport
     (3, 51): 3,      # 3.51.3, 2026-03-13
-    # 3.52.0 (2026-03-06) is a withdrawn release: SQLite's pages mark it only as withdrawn and nowhere say it
-    # carries the repair; it came out a week before 3.51.3, and the 3.53.0 entry lists the repair as its own
-    # change. It is refused (the cautious reading; it would pass as a release above 3.51.3 only if SQLite's
-    # pages ever said it is repaired).
-    (3, 52): None,
+    # 3.52.0 (2026-03-06) was withdrawn for features that were not fully compatible, not for this bug. SQLite's
+    # news page says it holds the repair: its 3.52.0 item says the corruption bug found days before is repaired in
+    # it, and its 3.53.0 item calls 3.53.0 the first major release with the repair unless 3.52.0 is counted.
+    # SQLite's release history agrees: the repair check-in of 2026-03-03 is an ancestor of the 3.52.0 release
+    # check-in, and 3.51.3 ships the same change. So 3.52.0 passes from its patch 0.
+    (3, 52): 0,
 }
-_SQLITE_WAL_REST = ('Recursion does not open its stores with it. Use a Python whose SQLite is 3.51.3 or later (or '
-                    '3.50.7, or 3.44.6), and check it with: python3 -c "import sqlite3; print(sqlite3.sqlite_version)". '
+_SQLITE_WAL_REST = ('Recursion does not open its stores with it. Use a Python whose SQLite is 3.53.0 or later, 3.52.0, '
+                    '3.51.3 or later in 3.51, 3.50.7 or later in 3.50, or 3.44.6 or later in 3.44, and check it with: '
+                    'python3 -c "import sqlite3; print(sqlite3.sqlite_version)". '
                     'To accept the risk and go on, set stores.sqlite_wal_bug = "accept_risk" in '
                     '$XDG_CONFIG_HOME/recursion/settings.toml.')
 _SQLITE_WAL_HAS_THE_BUG = 'This Python uses SQLite {found}, which has a known bug that can damage a database in WAL mode. '
-_SQLITE_WAL_WITHDRAWN = ("This Python uses SQLite {found}, a withdrawn release that SQLite's pages do not say is "
-                         'repaired: it may have a known bug that can damage a database in WAL mode. ')
 
 
 def _sqlite_version_parts(version: str) -> tuple[int, int, int] | None:
@@ -183,8 +184,8 @@ def sqlite_wal_affected(version: str) -> bool:
     """Whether SQLite ``version`` (the text of ``sqlite3.sqlite_version``) has the WAL-reset bug, by the table.
 
     Before 3.7.0 there is no WAL and SQLite's page names no bug; from 3.53.0 every release carries the repair; in
-    between, a line in the table passes from its repaired patch (a line marked None never passes) and every other
-    line is affected. A version text that cannot be read is affected."""
+    between, a line in the table passes from its repaired patch, inside that line only, and every other line is
+    affected. A version text that cannot be read is affected."""
     parts = _sqlite_version_parts(version)
     if parts is None:
         return True
@@ -209,9 +210,7 @@ def sqlite_wal_refusal(choice: str = 'refuse') -> str | None:
         return None
     if not affected:
         return None
-    parts = _sqlite_version_parts(found)
-    withdrawn = parts is not None and parts[:2] in SQLITE_WAL_RESET_REPAIRED and SQLITE_WAL_RESET_REPAIRED[parts[:2]] is None
-    return (_SQLITE_WAL_WITHDRAWN if withdrawn else _SQLITE_WAL_HAS_THE_BUG).format(found=found) + _SQLITE_WAL_REST
+    return _SQLITE_WAL_HAS_THE_BUG.format(found=found) + _SQLITE_WAL_REST
 
 
 def _refuse_sqlite_wal_bug(choice: str) -> None:

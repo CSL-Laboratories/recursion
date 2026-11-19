@@ -85,6 +85,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -428,7 +429,22 @@ def _require_config(config: Path) -> None:
     if not _lexists(config):
         config.parent.mkdir(parents=True, exist_ok=True)
         _make_dir(config)
+    _require_owner_only_config(config)
     _require_owned_dir(config)
+
+
+def _require_owner_only_config(config: Path) -> None:
+    """A config folder of this user that group or other users may write refuses with the one command that
+    makes it owner-only. Its mode and its contents are left as they are: nothing here narrows it."""
+    try:
+        info = os.lstat(config)
+    except OSError:
+        return  # _require_owned_dir refuses it
+    if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and info.st_mode & 0o022:
+        raise InstallRefused("plugin_directory_untrusted", detail=(
+            f"The folder {config} can be written by other users, and no plugin is installed or read from such a "
+            f"folder. Make it owner-only with: chmod 700 {shlex.quote(str(config))}; then run the command again."),
+            show_detail=True)
 
 
 def _make_dir(path: Path) -> None:

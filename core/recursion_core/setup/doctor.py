@@ -83,6 +83,9 @@ _SQLITE_WAL_RESET_REPAIRED = {
     # 3.52.0 was withdrawn; SQLite's pages do not say it carries the repair (3.53.0 lists it).
     (3, 52): None,
 }
+# The first SQLite with WAL mode. An older one cannot have the WAL reset bug, and SQLite's pages
+# name none of them unaffected.
+_SQLITE_FIRST_WAL = (3, 7, 0)
 _MOUNTINFO = "/proc/self/mountinfo"
 # The WSL automount root. The base has no WSL probe module to read it from.
 _WSL_AUTOMOUNT = "/mnt/"
@@ -468,6 +471,24 @@ def _probe_sqlite():
         repaired = line > max(_SQLITE_WAL_RESET_REPAIRED)
     if repaired:
         return _body("ok", f"SQLite {found} is loaded")
+    withdrawn = _SQLITE_WAL_RESET_REPAIRED.get(line, 0) is None
+    before_wal = line + (patch,) < _SQLITE_FIRST_WAL
+    if withdrawn or before_wal:
+        # Only versions that pass, named from the table: the lines newer than every row, then each
+        # line's first repaired release; no range that holds a version this row fails.
+        top = max(_SQLITE_WAL_RESET_REPAIRED)
+        passing = [f"{top[0]}.{top[1] + 1}.0 or later"] + [
+            f"{major}.{minor}.{first} or later in {major}.{minor}"
+            for (major, minor), first in sorted(_SQLITE_WAL_RESET_REPAIRED.items(), reverse=True)
+            if first is not None]
+        way_out = f"{', '.join(passing[:-1])}, or {passing[-1]}"
+        if withdrawn:
+            reason = "a withdrawn release that SQLite's pages do not say is repaired"
+        else:
+            reason = (f"older than the first SQLite with WAL ({'.'.join(map(str, _SQLITE_FIRST_WAL))}) and older "
+                      "than every version SQLite names as unaffected")
+        return _body("fail", f"SQLite {found} is loaded and is {reason}; the event store needs {way_out}",
+                     f"run recursiond on an interpreter built with SQLite {way_out}")
     # Every repaired version, named from the table: the newest line first, then each backport.
     rows = sorted((line + (first,) for line, first in _SQLITE_WAL_RESET_REPAIRED.items() if first is not None),
                   reverse=True)

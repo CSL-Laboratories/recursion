@@ -506,8 +506,7 @@ class StoreGroundTests(unittest.TestCase):
                 self.assertEqual(row["detail"], f"SQLite {version} is loaded")
 
     def test_a_sqlite_with_the_wal_reset_bug_is_fail_naming_every_repaired_version(self):
-        # 3.6.23 is older than WAL itself; SQLite's pages do not name it unaffected, so it is fail too.
-        for version in ("3.44.5", "3.50.6", "3.45.1", "3.46.1", "3.51.2", "3.6.23"):
+        for version in ("3.44.5", "3.50.6", "3.45.1", "3.46.1", "3.51.2"):
             with self.subTest(version=version):
                 row = self._sqlite_row(version)
                 self.assertEqual(row["state"], "fail")
@@ -524,8 +523,61 @@ class StoreGroundTests(unittest.TestCase):
         # 3.52.0 was withdrawn; SQLite's pages do not say it carries the repair, so it is treated as affected.
         row = self._sqlite_row("3.52.0")
         self.assertEqual(row["state"], "fail")
-        self.assertIn("SQLite 3.52.0 is loaded and has the WAL reset bug;", row["detail"])
+        self.assertIn("SQLite 3.52.0 is loaded and is a withdrawn release that SQLite's pages do not say is repaired;",
+                      row["detail"])
         self.assertNotIn(". ", row["detail"])
+
+    # The versions that pass, as the store.sqlite row names them where no range may hold the version found.
+    _ONLY_PASSING = "3.53.0 or later, 3.51.3 or later in 3.51, 3.50.7 or later in 3.50, or 3.44.6 or later in 3.44"
+
+    def _assert_the_way_out_names_only_versions_that_pass(self, version, row):
+        way_out = row["detail"].split("; the event store needs ", 1)[1]
+        self.assertEqual(row["fix"], "run recursiond on an interpreter built with SQLite " + way_out)
+        found = tuple(int(part) for part in version.split("."))
+        ranges = re.findall(r"(\d+\.\d+\.\d+) or later(?: in (\d+\.\d+))?", way_out)
+        self.assertTrue(ranges)
+        for start, within in ranges:
+            with self.subTest(version=version, named=start):
+                self.assertEqual(self._sqlite_row(start)["state"], "ok")
+                begins = tuple(int(part) for part in start.split("."))
+                holds = found >= begins and (not within or found[:2] == begins[:2])
+                self.assertFalse(holds, f"{start} or later {within} holds {version}")
+
+    def test_the_withdrawn_3_52_0_names_only_versions_that_pass(self):
+        # "3.51.3 or later" would hold 3.52.0 itself: the way out names only versions that pass.
+        row = self._sqlite_row("3.52.0")
+        self.assertEqual(row["state"], "fail")
+        self.assertEqual(
+            row["detail"],
+            "SQLite 3.52.0 is loaded and is a withdrawn release that SQLite's pages do not say is repaired; "
+            "the event store needs " + self._ONLY_PASSING)
+        self.assertNotIn("WAL reset bug", row["detail"])
+        self.assertNotIn(". ", row["detail"])
+        self._assert_the_way_out_names_only_versions_that_pass("3.52.0", row)
+
+    def test_a_sqlite_older_than_wal_is_fail_without_the_wal_reset_sentence(self):
+        # WAL first came in 3.7.0, so an older SQLite cannot have the WAL reset bug; it still fails.
+        for version in ("3.6.0", "3.6.23"):
+            with self.subTest(version=version):
+                row = self._sqlite_row(version)
+                self.assertEqual(row["state"], "fail")
+                self.assertEqual(
+                    row["detail"],
+                    f"SQLite {version} is loaded and is older than the first SQLite with WAL (3.7.0) and older "
+                    "than every version SQLite names as unaffected; the event store needs " + self._ONLY_PASSING)
+                self.assertNotIn("WAL reset bug", row["detail"])
+                self.assertNotIn(". ", row["detail"])
+                self._assert_the_way_out_names_only_versions_that_pass(version, row)
+
+    def test_the_first_sqlite_with_wal_keeps_the_wal_reset_sentence(self):
+        row = self._sqlite_row("3.7.0")
+        self.assertEqual(row["state"], "fail")
+        self.assertEqual(
+            row["detail"],
+            "SQLite 3.7.0 is loaded and has the WAL reset bug; the event store needs 3.51.3 or later, "
+            "3.50.7 or later in 3.50, or 3.44.6 or later in 3.44")
+        self.assertEqual(
+            row["fix"], "run recursiond on an interpreter built with SQLite 3.51.3 or later, or with 3.50.7 or 3.44.6")
 
     def test_a_9p_or_overlay_mount_under_the_state_folder_is_fail(self):
         for point, kind in ((_STATE, "9p"), (_STATE, "overlay"), (_BASE, "9p"), (_BASE, "overlay")):

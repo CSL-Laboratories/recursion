@@ -12,3 +12,12 @@ class Refused(Exception):
         super().__init__(code if not detail else f"{code}: {detail}")
         self.code = code
         self.detail = detail
+
+
+def refuse_sqlite_wal_bug(choice: str) -> None:
+    """Before a plugin store connects: refuse ``store_sqlite_wal_bug`` on an SQLite with the WAL reset bug unless the
+    person's choice is 'accept_risk' (the one rule: ``recursion_core.events.db.sqlite_wal_refusal``)."""
+    from recursion_core.events.db import SQLITE_WAL_BUG, sqlite_wal_refusal
+    message = sqlite_wal_refusal(choice)
+    if message is not None:
+        raise Refused(SQLITE_WAL_BUG, message)

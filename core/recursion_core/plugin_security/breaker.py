@@ -32,7 +32,7 @@ import threading
 import time
 from typing import Callable
 
-from .errors import Refused
+from .errors import Refused, refuse_sqlite_wal_bug
 
 __all__ = ["ConnectionBreaker", "TYPED_LIMITS", "create_breaker_store"]
 
@@ -61,8 +61,9 @@ def _check_model(value: object) -> str:
     return value
 
 
-def create_breaker_store(path: str) -> None:
+def create_breaker_store(path: str, *, sqlite_wal_bug: str = "refuse") -> None:
     """Installer step: create the breaker store. Refuses if it exists."""
+    refuse_sqlite_wal_bug(sqlite_wal_bug)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(fd)
     db = sqlite3.connect(path, isolation_level=None)
@@ -80,9 +81,10 @@ def create_breaker_store(path: str) -> None:
 
 class ConnectionBreaker:
     def __init__(self, store_path: str, *, clock: Callable[[], float] = time.monotonic,
-                 probe_lease_seconds: float = 300.0) -> None:
+                 probe_lease_seconds: float = 300.0, sqlite_wal_bug: str = "refuse") -> None:
         if not os.path.isfile(store_path):
             raise Refused("breaker_store_missing")
+        refuse_sqlite_wal_bug(sqlite_wal_bug)
         self._db = None
         try:
             self._db = sqlite3.connect(store_path, isolation_level=None, check_same_thread=False,

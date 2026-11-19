@@ -105,7 +105,8 @@ class TheFileAndItsDefaults(_Folder):
         self.assertIs(loaded["plugin_host.gil_check"], False)
         self.assertEqual(settings.SOURCE_FILE, loaded.values["plugin_host.gil_check"].source)
         self.assertEqual([], self.codes(loaded))
-        self.assertEqual(["plugin_host.gil_check = false (default true; source: settings file)"],
+        self.assertEqual(["plugin_host.gil_check = false (default true; source: settings file)",
+                          "stores.sqlite_wal_bug = 'refuse' (default 'refuse'; source: default)"],
                          settings.lines(loaded))
 
     def test_a_dotted_key_is_the_same_setting(self) -> None:
@@ -342,7 +343,8 @@ class OwnerOnlyAndWrongFiles(_Folder):
                 self.put(text)
                 loaded = settings.load(self.environ)
                 self.assert_default(loaded, settings.UNKNOWN_KEY)  # one note, for a whole table too
-                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+                self.assertEqual([f"warning: note {loaded.notes[0]}"],
+                                 settings.lines(loaded)[len(settings.SETTINGS):])
 
     def test_the_command_ends_non_zero_when_a_key_or_table_was_skipped(self) -> None:
         for case, (text, _) in UNKNOWN.items():
@@ -365,7 +367,8 @@ class OwnerOnlyAndWrongFiles(_Folder):
             with self.subTest(case=self.put_broken(case)):
                 loaded = settings.load(self.environ)
                 self.assert_default(loaded, settings.UNREADABLE)
-                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+                self.assertEqual([f"warning: note {loaded.notes[0]}"],
+                                 settings.lines(loaded)[len(settings.SETTINGS):])
 
     def test_the_command_ends_non_zero_for_a_file_that_cannot_be_read_as_a_whole(self) -> None:
         for case in BROKEN:
@@ -584,6 +587,17 @@ class PublishedShape(_Folder):
         walk(schema["properties"], "")
         expect = {r.name: (kinds[r.type], r.default, r.says, r.floor, r.ceiling) for r in settings.SETTINGS}
         self.assertEqual(expect, found)
+        enums = {}
+
+        def walk_enums(props: dict, prefix: str) -> None:
+            for key, part in props.items():
+                if part.get("type") == "object":
+                    walk_enums(part["properties"], prefix + key + ".")
+                elif "enum" in part:
+                    enums[prefix + key] = tuple(part["enum"])
+
+        walk_enums(schema["properties"], "")
+        self.assertEqual({r.name: tuple(r.allowed) for r in settings.SETTINGS if r.allowed}, enums)
 
     def test_the_readme_names_each_setting(self) -> None:
         readme = (SCHEMA_DIR / "README.md").read_text(encoding="utf-8")

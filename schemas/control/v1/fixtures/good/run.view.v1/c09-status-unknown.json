@@ -1,0 +1,30 @@
+{
+  "cgroup": "/test.slice/recursion-run-run-a59c5371034f4c57896f0008599a2047.service",
+  "cgroup_marker": "cg-571fca18b59240ddbdddb5e82ca384f1",
+  "engine": "claude_code",
+  "generation": 2,
+  "members": [],
+  "observed": {
+    "detail": "",
+    "state": "unknown",
+    "stop_requested": false,
+    "unit": "recursion-run-run-a59c5371034f4c57896f0008599a2047.service"
+  },
+  "output": {
+    "bytes": 658,
+    "complete": false,
+    "lines": [
+      "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"init\", \"note\": \"stand-in engine: not Claude Code; no model, no network, no credential\", \"argv\": [\"-p\", \"--input-format\", \"stream-json\", \"--output-format\", \"stream-json\", \"--verbose\", \"--model\", \"stand-in-model\"], \"env_names\": [\"HOME\", \"LANG\", \"PATH\"], \"pid\": 196893, \"home\": \"/var/lib/recursion-capture/state/homes/claude_code\"}",
+      "{\"stand_in_engine\": true, \"type\": \"system\", \"subtype\": \"stand_in_stdin_eof\", \"note\": \"stdin closed; not treated as cancellation\"}",
+      "{\"stand_in_engine\": true, \"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"text\", \"text\": \"stand-in engine tick 1\"}]}}"
+    ]
+  },
+  "recorded_state": "running",
+  "run_id": "run-a59c5371034f4c57896f0008599a2047",
+  "start_key": null,
+  "started_at": 1794559511.7093532,
+  "state": "unknown",
+  "stop": null,
+  "stop_attestation": null,
+  "tenant": "t1"
+}

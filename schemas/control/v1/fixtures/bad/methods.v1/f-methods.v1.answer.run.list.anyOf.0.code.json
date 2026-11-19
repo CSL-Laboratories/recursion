@@ -1,0 +1,8 @@
+{
+  "method": "run.list",
+  "params": {},
+  "answer": {
+    "code": "x-nobody-defined-this",
+    "detail": "daemon_closing"
+  }
+}

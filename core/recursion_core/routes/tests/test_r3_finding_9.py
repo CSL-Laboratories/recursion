@@ -1,5 +1,6 @@
 """R3-9: malformed JSON-RPC responses must reach the existing protocol-error path."""
 import unittest
+from unittest.mock import patch
 
 from recursion_core.routes import CodexAdapter, ConnectionBreaker, RouteService
 from recursion_core.routes import contract as c
@@ -25,6 +26,11 @@ class MalformedRpcTest(unittest.TestCase):
     # which would turn every subtest into launch_refused. runs_adapter pins that host check so the
     # protocol assertions keep running (the two reviews of #376, R4). The real refusal stays in
     # test_r3_finding_7, which does not carry this marker.
+    # The test drives the adapter through a fake launcher only. DRIVER-CC's R3-7 (#376) refuses native
+    # Windows at the shared adapter boundary before the launcher, which would turn every subtest into
+    # launch_refused there; pinning the host test keeps these protocol assertions running on Windows (the
+    # two reviews of #376, R4). create=True: the boundary's name exists only once #376 has merged.
+    @patch("recursion_core.routes.base.platform_supported", lambda: True, create=True)
     def test_nonobject_error_cannot_be_interpreted_as_a_result(self):
         for error in ("FAKE-error", [], 23, None):
             for response_id in (1, 2, 4):

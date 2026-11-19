@@ -1,0 +1,10 @@
+{
+  "method": "doctor",
+  "params": {},
+  "answer": {
+    "code": "ok",
+    "report": {
+      "generated_at": "2026-11-13T07:40:00.000Z"
+    }
+  }
+}

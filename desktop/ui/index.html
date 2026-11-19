@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recursion (beta)</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="js/app.js"></script>
+</head>
+<body>
+<header class="core-bar">
+  <h1>Recursion <span class="beta">beta</span></h1>
+  <p id="link-state" role="status">Not connected: this build is inert and sends nothing to a daemon.</p>
+  <nav aria-label="Views">
+    <button type="button" data-view="runs">Runs</button>
+    <button type="button" data-view="sessions">Sessions</button>
+    <button type="button" data-view="start">Start</button>
+    <button type="button" data-view="approvals">Approvals</button>
+    <button type="button" data-view="plugins">Plugins</button>
+  </nav>
+  <p id="status-line" role="status"></p>
+  <div id="stop-confirm" role="group" aria-labelledby="stop-confirm-text" hidden>
+    <p id="stop-confirm-text"></p>
+    <button type="button" id="stop-confirm-yes" class="stop">Stop</button>
+    <button type="button" id="stop-confirm-no">Cancel</button>
+  </div>
+  <div id="stop-answers" role="status" aria-label="Stop answers, newest first" hidden>
+    <div id="stop-answers-list"></div>
+    <button type="button" id="stop-answers-clear">Clear Stop answers</button>
+  </div>
+</header>
+
+<main id="workspace" data-theme-scope>
+  <section data-view="runs" aria-labelledby="runs-title">
+    <h2 id="runs-title">Runs</h2>
+    <button type="button" id="runs-refresh">Refresh</button>
+    <div id="runs-conditions"></div>
+    <div id="runs-table"></div>
+  </section>
+
+  <section data-view="sessions" aria-labelledby="sessions-title" hidden>
+    <h2 id="sessions-title">Sessions</h2>
+    <p class="note">Sessions are rows of SPINE's draft method table; the daemon on this base does not answer them yet.</p>
+    <div id="sessions-conditions"></div>
+    <div id="sessions-list"></div>
+    <h3>Session</h3>
+    <div id="session-detail"></div>
+    <h3>Transcript</h3>
+    <ol id="transcript" class="transcript"></ol>
+  </section>
+
+  <section data-view="start" aria-labelledby="start-title" hidden>
+    <h2 id="start-title">Start a run</h2>
+    <label>Tenant <input id="start-tenant" autocomplete="off"></label>
+    <label>Engine <input id="start-engine" autocomplete="off"></label>
+    <label>Prompt <textarea id="start-prompt" rows="4"></textarea></label>
+    <label>Client key (optional) <input id="start-client-key" autocomplete="off"></label>
+    <button type="button" id="start-run">Start</button>
+    <div id="start-conditions"></div>
+    <h3>Engines</h3>
+    <ul id="routes-list"></ul>
+  </section>
+
+  <section data-view="approvals" aria-labelledby="approvals-title" hidden>
+    <h2 id="approvals-title">Approval inbox</h2>
+    <p class="note">The inbox lists requests and their deadlines. A request is drawn only in the core's region below, from the request itself.</p>
+    <div id="approvals-conditions"></div>
+    <ul id="approvals-list"></ul>
+  </section>
+
+  <section data-view="plugins" aria-labelledby="plugins-title" hidden>
+    <h2 id="plugins-title">Plugins</h2>
+    <div id="plugins-conditions"></div>
+    <ul id="plugins-list"></ul>
+  </section>
+</main>
+
+<aside id="core-approval" aria-live="assertive" aria-label="Approval request, drawn by the core"></aside>
+
+<footer class="core-bar">
+  <p>Closing this window stops nothing: runs keep going, and nothing is sent.</p>
+</footer>
+</body>
+</html>

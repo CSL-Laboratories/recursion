@@ -1,0 +1,12 @@
+{
+  "method": "run.start",
+  "params": {
+    "tenant": "t1",
+    "engine": "claude_code",
+    "prompt": "x",
+    "principal": {
+      "kind": "owner",
+      "id": "local"
+    }
+  }
+}

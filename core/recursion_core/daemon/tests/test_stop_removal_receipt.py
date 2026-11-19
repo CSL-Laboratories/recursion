@@ -26,6 +26,34 @@ from recursion_core.daemon.tests.test_adv1_stop_restart import GROUP, LINUX, Scr
 BOOT = 'boot-removal'
 
 
+def proven_on(folder):
+    """The stand-in for the mount check: a held folder on ``folder``'s file system is proven.
+
+    A temporary root is not a cgroup2 mount, so the real check answers not proven there. The
+    tests of the removal act stand this in, the way ``ScriptedManager`` stands in systemctl.
+    """
+    device = os.stat(folder).st_dev
+
+    def proven(dir_fd, mountinfo=None):
+        return os.fstat(dir_fd).st_dev == device
+
+    return proven
+
+
+def cgroup2_at(mount_point):
+    """True when this process's mountinfo lists a cgroup2 mount at ``mount_point``."""
+    try:
+        lines = Path('/proc/self/mountinfo').read_text().splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        fields = line.split()
+        if '-' in fields[6:] and fields[4] == mount_point:
+            if fields[fields.index('-', 6) + 1:][:1] == ['cgroup2']:
+                return True
+    return False
+
+
 @unittest.skipUnless(LINUX, 'the daemon is Linux only')
 class ManagerRemovalReceiptTest(unittest.TestCase):
     def setUp(self):
@@ -33,6 +61,9 @@ class ManagerRemovalReceiptTest(unittest.TestCase):
         os.chmod(self.tmp, 0o700)
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.root = self.tmp / 'cg'
+        stand_in = mock.patch('recursion_core.daemon.held_cgroup2_mount', proven_on(self.tmp))
+        stand_in.start()
+        self.addCleanup(stand_in.stop)
 
     def _api(self, manager, cgroup=GROUP, identity=None):
         daemon = Daemon(Registry(self.tmp / 'state'), manager, boot_id=lambda: BOOT)
@@ -364,6 +395,103 @@ class ManagerRemovalReceiptTest(unittest.TestCase):
         self.assertEqual((held / 'cgroup.procs').read_text().split(), [str(child.pid)])
         self.assertIsNone(child.poll(), 'the sleep child was signalled')
         self.assertTrue((decoytop / 'cg' / 'app.slice' / unit).is_dir())
+
+
+@unittest.skipUnless(LINUX, 'the daemon is Linux only')
+class ManagerMountCheckTest(unittest.TestCase):
+    """A Stop reads stopped only when the remover's held parent lies on a cgroup2 mount.
+
+    No stand-in here: the root is a temporary folder, which is not a cgroup2 mount. A leaf
+    moved out of its held parent there can hold a live process, so the Stop stays pending.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='rc-stop-mount-', dir=os.environ.get('TMPDIR')))
+        os.chmod(self.tmp, 0o700)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = self.tmp / 'cg'
+
+    _api = ManagerRemovalReceiptTest._api
+    _forgotten = ManagerRemovalReceiptTest._forgotten
+    _sleeper = ManagerRemovalReceiptTest._sleeper
+
+    def _moved(self, busy):
+        """Inside the first rmdir the leaf gains the test's live child and is moved out."""
+        unit = 'recursion-run-run-x.service'
+        leafdir = self.root / 'app.slice' / unit
+        leafdir.mkdir(parents=True)
+        moved = self.tmp / 'moved-leaf'
+        child = self._sleeper()
+        real_rmdir = os.rmdir
+        state = {'done': False}
+
+        def swap(path, dir_fd=None):
+            if not state['done']:
+                state['done'] = True
+                (leafdir / 'cgroup.procs').write_text(f'{child.pid}\n')
+                (leafdir / 'cgroup.events').write_text('populated 1\n')
+                leafdir.rename(moved)
+            if busy:
+                raise OSError(errno.EBUSY, 'Device or resource busy')
+            if dir_fd is None:
+                return real_rmdir(path)
+            return real_rmdir(path, dir_fd=dir_fd)
+
+        api = self._api(self._forgotten())
+        with mock.patch('recursion_core.daemon.os.rmdir', swap), \
+                mock.patch('recursion_core.control.api.os.rmdir', swap):
+            answer = api.call('run.stop', {'run_id': 'run-x'})
+        run = api.call('run.status', {'run_id': 'run-x'})['run']
+        self.assertTrue(state['done'])
+        self.assertEqual((moved / 'cgroup.procs').read_text().split(), [str(child.pid)])
+        # The daemon's own remover answers pending, so its word reaches the Stop.
+        self.assertEqual((answer['code'], answer.get('reason')), ('pending', 'cgroup_populated'), answer)
+        self.assertIsNone(run.get('stop_attestation'), run)
+        self.assertIsNone(child.poll(), 'the sleep child was signalled')
+        again = api.call('run.stop', {'run_id': 'run-x'})
+        run = api.call('run.status', {'run_id': 'run-x'})['run']
+        self.assertEqual(again['code'], 'pending', again)
+        self.assertIsNone(run.get('stop_attestation'), run)
+        self.assertIsNone(child.poll(), 'the sleep child was signalled')
+
+    def test_h1_a_leaf_moved_out_inside_a_refused_rmdir_stays_pending(self):
+        """H1. rmdir answers EBUSY. The leaf is gone from the held parent, not removed."""
+        self._moved(busy=True)
+
+    def test_h2_a_leaf_moved_out_before_rmdir_stays_pending(self):
+        """H2. The leaf is moved out first, so the real rmdir answers ENOENT."""
+        self._moved(busy=False)
+
+    def test_a_temporary_folder_is_not_proven(self):
+        from recursion_core.daemon import held_cgroup2_mount
+        fd = os.open(self.tmp, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, fd)
+        self.assertFalse(held_cgroup2_mount(fd))
+
+    def test_a_mountinfo_that_cannot_be_read_or_has_no_line_is_not_proven(self):
+        from recursion_core.daemon import held_cgroup2_mount
+        fd = os.open(self.tmp, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, fd)
+        device = os.fstat(fd).st_dev
+        number = f'{os.major(device)}:{os.minor(device)}'
+        listed = self.tmp / 'mountinfo-listed'
+        listed.write_text(f'30 1 {number} / {self.tmp} rw - cgroup2 cgroup2 rw\n')
+        other = self.tmp / 'mountinfo-other'
+        other.write_text(f'30 1 {os.major(device) + 1}:{os.minor(device)} / /x rw - cgroup2 cgroup2 rw\n'
+                         f'31 1 {number} / {self.tmp} rw - ext4 /dev/x rw\n')
+        self.assertTrue(held_cgroup2_mount(fd, mountinfo=listed))
+        self.assertFalse(held_cgroup2_mount(fd, mountinfo=other))
+        self.assertFalse(held_cgroup2_mount(fd, mountinfo=self.tmp / 'no-such-mountinfo'))
+        self.assertFalse(held_cgroup2_mount(fd, mountinfo=self.tmp))
+
+    def test_the_cgroup2_mount_read_only_is_proven(self):
+        """/sys/fs/cgroup is only opened for reading. Nothing is written under it."""
+        from recursion_core.daemon import held_cgroup2_mount
+        if not cgroup2_at('/sys/fs/cgroup'):
+            self.skipTest('this host does not mount cgroup2 at /sys/fs/cgroup')
+        fd = os.open('/sys/fs/cgroup', os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, fd)
+        self.assertTrue(held_cgroup2_mount(fd))
 
 
 if __name__ == '__main__':

@@ -1160,6 +1160,45 @@ def held_leaf_gone(parent_fd, name):
     return False
 
 
+CGROUP2_MOUNTINFO = '/proc/self/mountinfo'
+
+
+def held_cgroup2_mount(dir_fd, mountinfo=None):
+    """True only when the directory ``dir_fd`` holds lies on a cgroup2 file system.
+
+    The descriptor's ``st_dev`` must equal the major:minor of a line of ``mountinfo`` (this
+    process's ``/proc/self/mountinfo`` by default) whose file system type is ``cgroup2``.
+    Only that kernel removes a cgroup directory once it holds no process and refuses to move
+    one out of its parent. A folder that merely holds a ``cgroup.procs`` file is not proof.
+    A check that cannot be made (an unreadable mountinfo, no line for the device, a
+    descriptor that is not a directory, any error) answers False: not proven.
+    """
+    major_of = getattr(os, 'major', None)
+    minor_of = getattr(os, 'minor', None)
+    if major_of is None or minor_of is None:
+        return False
+    try:
+        info = os.fstat(dir_fd)
+        if not stat.S_ISDIR(info.st_mode):
+            return False
+        wanted = f'{major_of(info.st_dev)}:{minor_of(info.st_dev)}'
+        source = CGROUP2_MOUNTINFO if mountinfo is None else mountinfo
+        with open(source, encoding='utf-8', errors='replace') as handle:
+            lines = handle.read().splitlines()
+    except (OSError, ValueError, TypeError, OverflowError):
+        return False
+    for line in lines:
+        # id parent major:minor root mount-point options [optional fields] - type source options
+        fields = line.split()
+        try:
+            separator = fields.index('-', 6)
+        except ValueError:
+            continue
+        if fields[2] == wanted and len(fields) > separator + 1 and fields[separator + 1] == 'cgroup2':
+            return True
+    return False
+
+
 class SystemdUserManager:
     """Independent transient user services: no PartOf/BindsTo daemon relationship."""
     def __init__(self, cgroup_root=Path('/sys/fs/cgroup')):
@@ -1478,8 +1517,9 @@ class SystemdUserManager:
         """
         walked = read_held_cgroup(parent_fd, name, (info.st_dev, info.st_ino))
         if walked == 'absent':
-            # The kernel removes a cgroup directory only once it holds no process.
-            return False
+            # The kernel removes a cgroup directory only once it holds no process, and only
+            # on a cgroup2 mount. Elsewhere the leaf may have been moved away while in use.
+            return False if held_cgroup2_mount(parent_fd) else None
         if walked is None:
             return None
         pids, populated = walked
@@ -1502,7 +1542,9 @@ class SystemdUserManager:
         ``absent`` when the proved directory was already gone. This call did not remove it.
         ``populated`` when a re-read shows a live process, the re-read could not be made, or
         after the removal call the held parent still holds the leaf name or the recorded path
-        no longer names the held parent.
+        no longer names the held parent. Also when the leaf is gone from the held parent or was
+        removed but the held parent is not shown to lie on a cgroup2 mount: only that kernel
+        keeps a cgroup from being moved out of its parent, so without it nothing is proved.
         ``empty`` when the directory stays, including every doubt and a clear re-read after
         ``rmdir`` answers anything other than ``ENOENT``.
         The parent is opened with ``O_DIRECTORY|O_NOFOLLOW`` and the leaf name is removed
@@ -1550,7 +1592,7 @@ class SystemdUserManager:
                 os.rmdir(directory.name, dir_fd=parent_fd)
             except OSError as exc:
                 if exc.errno == errno.ENOENT:
-                    return 'absent'
+                    return 'absent' if held_cgroup2_mount(parent_fd) else 'populated'
                 # ENOENT is the only rmdir error that means the directory is gone.
                 # Every other error is re-read through the held parent fd, never by a path
                 # built again. Only a finished clear re-read is empty.
@@ -1564,6 +1606,8 @@ class SystemdUserManager:
                 return 'populated'
             if not self._opened_parent_matches(root, parents, parent_fd):
                 return 'populated'  # the removed leaf's parent is no longer at the recorded path
+            if not held_cgroup2_mount(parent_fd):
+                return 'populated'  # a removed folder that is not shown to be a cgroup proves nothing
             return 'removed'
         finally:
             if parent_fd is not None:

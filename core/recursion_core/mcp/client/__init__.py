@@ -3,7 +3,7 @@
 Standard library only. It starts no server process and ends none. Its bounds are in ``limits.py``.
 """
 
-from .limits import CALL_DEADLINE_S, MAX_MESSAGE_BYTES
+from .limits import CALL_DEADLINE_S, MAX_MESSAGE_BYTES, MAX_SERVER_TEXT_CHARS
 from .session import (
     BAD_ANSWER,
     CALL_ABANDONED,
@@ -35,6 +35,7 @@ __all__ = [
     "LATEST_PROTOCOL",
     "LEGACY_PROTOCOL",
     "MAX_MESSAGE_BYTES",
+    "MAX_SERVER_TEXT_CHARS",
     "MESSAGE_TOO_LARGE",
     "OUTPUT_FAILED",
     "PROTOCOL_UNSUPPORTED",

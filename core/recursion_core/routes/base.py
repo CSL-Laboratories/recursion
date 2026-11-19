@@ -78,6 +78,14 @@ class RouteAdapter:
                 return c.result(rid, err.code, detail=err.detail)
             except OSError as err:
                 return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
+            if self._clock() >= deadline_at:
+                # The launch spent the deadline. Do not write the prompt. The child is fenced.
+                err = Deadline()
+                done = _typed_fence(process, "deadline", err)
+                fenced = True
+                if not done:
+                    raise err
+                return c.result(rid, c.DEADLINE_EXCEEDED, detail="recursion deadline")
             events: list[dict] = []
             try:
                 return self.drive(process, request, deadline_at, events)

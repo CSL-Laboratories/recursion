@@ -87,6 +87,15 @@ class RouteService:
         admit = self._breaker.admit(connection, model, tenant, deadline_s=remaining)
         if not admit["admitted"]:
             return c.result(rid, admit["code"], detail=admit["key"], retry_at=admit["retry_at"])
+        if self._clock() >= deadline_at:
+            # Admission spent the deadline. Do not launch. A probe lease, if one was taken, proved
+            # nothing and is released; the breaker is not opened. The answer reports that effect.
+            effect = "none"
+            if admit["probe"] is not None:
+                effect = self._breaker.record(connection, model, tenant, {"code": c.DEADLINE_EXCEEDED}, admit["probe"])
+            res = c.result(rid, c.DEADLINE_EXCEEDED, detail="recursion deadline")
+            res["breaker_effect"] = effect
+            return res
         try:
             res = adapter.run(req, deadline_at)
         except BaseException:

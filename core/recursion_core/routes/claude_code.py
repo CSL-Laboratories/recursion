@@ -16,7 +16,8 @@ vendor's source):
   as rejected);
 * an envelope-level typed ``error == "rate_limit"`` on an error result.
 
-``system``/``api_retry`` is a typed ``retry`` event only. A 429 Claude is still retrying does not
+``system``/``api_retry`` is a typed ``retry`` event of the numeric fields only (attempt, max_retries,
+retry_delay_ms, error_status). The error text is not copied. A 429 Claude is still retrying does not
 open the breaker, including when that envelope carries ``rate_limit_info``. ``resetsAt`` is Unix
 epoch seconds and is translated onto the breaker clock (``vendor_reset``) before it is stored.
 ``rateLimitType`` ``seven_day_opus`` and ``seven_day_sonnet`` are that family's window (model scope);
@@ -339,8 +340,10 @@ class ClaudeCodeAdapter(RouteAdapter):
                 if bridge:
                     bridge_ok = True
             elif kind == "system" and sub == "api_retry":
+                # Codes only: a non-negative int. The error string is engine text and is not copied.
                 events.append(c.event("retry", "claude.system.api_retry", {
-                    k: scalar(msg.get(k)) for k in ("attempt", "max_retries", "retry_delay_ms", "error_status", "error")}))
+                    k: msg.get(k) for k in ("attempt", "max_retries", "retry_delay_ms", "error_status")
+                    if type(msg.get(k)) is int and msg.get(k) >= 0}))
                 # Not booked. A retry Claude is still attempting is not a rejected plan limit, even when
                 # the envelope carries rate_limit_info (11.2: a throttle is not a connection-wide limit).
             elif kind == "rate_limit_event":
@@ -398,10 +401,38 @@ def _classify_result(rid: str, msg: dict, limit: dict | None, events: list, mode
         limit = c.limit_signal("connection", "claude.result.error")
     if limit is not None:
         return c.result(rid, c.PLAN_LIMIT, limit=limit, events=events, detail="typed limit")
-    # Auth error names and api_error_status are unverified field names.
+    # Auth error names and api_error_status are unverified field names. The detail is the auth name,
+    # else the status number when that status is a non-negative int, else the code auth_failed when
+    # the status equals 401 but is not an int. Text with no status number is not an auth refusal.
+    # Arbitrary error text is not copied.
     if msg.get("error") in ("authentication_failed", "oauth_token_expired") or msg.get("api_error_status") == 401:
-        return c.result(rid, c.AUTH_FAILED, events=events, detail=str(msg.get("error") or "401"))
+        return c.result(rid, c.AUTH_FAILED, events=events, detail=_auth_detail(msg))
     text = msg.get("result")
     if c.sounds_like_quota(text) or any(c.sounds_like_quota(e) for e in msg.get("errors") or [] if isinstance(e, str)):
         return c.result(rid, c.SHORT_FAULT, events=events, detail=f"untyped quota-like text on {model}")
-    return c.result(rid, c.ENGINE_ERROR, events=events, detail=str(scalar(msg.get("subtype")) or "error"))
+    return c.result(rid, c.ENGINE_ERROR, events=events, detail=_subtype_code(msg.get("subtype")))
+
+
+def _auth_detail(msg: dict) -> str:
+    err = msg.get("error")
+    if err in ("authentication_failed", "oauth_token_expired"):
+        return err
+    status = msg.get("api_error_status")
+    if type(status) is int and status >= 0:
+        return str(status)
+    return "auth_failed"
+
+
+def _subtype_code(value: object) -> str:
+    """A lowercase token of letters, digits and underscores.
+
+    Anything else, including engine text, is the code ``error``.
+    """
+
+    if isinstance(value, str) and value and len(value) <= 64 and value[0].islower():
+        for ch in value:
+            if ch not in "abcdefghijklmnopqrstuvwxyz0123456789_":
+                break
+        else:
+            return value
+    return "error"

@@ -75,9 +75,10 @@ PERMISSIONS = ("read", "propose", "panel", "network", "credential", "process", "
 # until Lucas answers DEC F12 (schemas/plugin/v1/README.md); a vNext manifest refuses them.
 PERMISSIONS_V1 = PERMISSIONS + ("surface", "command", "subscribe", "tool", "run")
 # Runtimes, only ever appended to: a later runtime is a new name, under unchanged plugins.
-# python-sandboxed/1 runs a plugin in a sandboxed host process outside the daemon. python-inprocess/1
-# retires: read as python-sandboxed/1 in every 1.0.x release, with the finding runtime_inprocess_retiring
-# (loader.py); from 1.1.0 on it is refused.
+# python-sandboxed/1 names Python run by a host of its own outside the daemon; that host is not in this
+# build, so a plugin of either runtime runs in the daemon's own process (loader.py warns
+# runtime_not_yet_contained). python-inprocess/1 retires: accepted in every 1.0.x release and run the same
+# way, with the finding runtime_inprocess_retiring (loader.py); from 1.1.0 on it is refused.
 _RUNTIMES_V1 = frozenset({"python-sandboxed/1", "python-inprocess/1"})
 RUNTIME_INPROCESS_RETIRING = "python-inprocess/1"
 # Runtime names reserved for a later release, each with its own text. Refused runtime_reserved and never

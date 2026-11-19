@@ -592,7 +592,7 @@
     {
       "file": "good/manifest.v1/h04-a-sandboxed-runtime.json",
       "schema": "manifest.v1.json",
-      "shows": "A plugin run by 'python-sandboxed/1': in a sandboxed host process outside the daemon."
+      "shows": "A plugin that names 'python-sandboxed/1', the runtime of the host that follows; in this build it runs in the daemon's own process, as 'python-inprocess/1' does."
     },
     {
       "file": "bad/manifest.v1/b01-the-old-schema-name.json",

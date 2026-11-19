@@ -51,7 +51,7 @@ import time
 from recursion_core.child_env import ENGINE_PROFILES, ChildRoute, EnvRefused, build_child_env
 from recursion_core.child_env import policy as _env_policy
 from recursion_core.child_env.launch import _resolve_executable
-from recursion_core.control.registry import EMPTY, POPULATED, TIMEOUT, UNKNOWN
+from recursion_core.control.registry import EMPTY, POPULATED, REMOVED, TIMEOUT, UNKNOWN
 from recursion_core.routes import contract as c
 from recursion_core.routes.launch import ReadTimeout
 
@@ -563,8 +563,9 @@ class UnitKillTree:
         self._daemon.stop(self.run_id_of(cgroup), cgroup=cgroup)
 
     def confirm(self, cgroup, timeout_s):
-        """``EMPTY`` only when the run's row is ``terminated`` and ``cgroup`` itself, walked in this
-        call, is absent or empty.
+        """``REMOVED`` when this Stop removed the cgroup directory after an empty walk.
+        ``EMPTY`` when the row is ``terminated`` and the directory was already absent, or is still
+        on disk with no live process. Anything else is not an attested stop.
 
         The row alone is not enough. It ends on what was seen of the unit and of the cgroup on the
         control record, and a sweep or a fence can end it for a run whose record carries no cgroup
@@ -578,7 +579,13 @@ class UnitKillTree:
             if run.state == 'terminated':
                 clear = self._daemon.cgroup_clear(run_id, cgroup)
                 if clear is True:
-                    return EMPTY  # attested: the unit ended, and this cgroup read absent or empty just now
+                    remove = getattr(self._daemon, 'remove_cleared_cgroup', None)
+                    outcome = remove(run_id, cgroup) if callable(remove) else 'absent'
+                    if outcome == 'removed':
+                        return REMOVED
+                    if outcome == 'populated':
+                        return POPULATED
+                    return EMPTY  # absent, still on disk, or this daemon does not remove
             if run.state == 'lost_reboot':
                 return UNKNOWN  # nothing saw the tree end; the registry does not call that terminated
             if self._clock() >= deadline:

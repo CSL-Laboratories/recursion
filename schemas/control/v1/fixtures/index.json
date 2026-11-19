@@ -11098,6 +11098,11 @@
       "shows": "Captured: the stored record of a stopped run, with today's 'empty' attestation."
     },
     {
+      "file": "good/run.record.v1/h11-a-stored-removed-proof.json",
+      "schema": "run.record.v1.json",
+      "shows": "A stopped record whose cgroup this Stop removed. The stored proof is 'removed', beside the 'empty' proof a Stop records when it did not remove the directory."
+    },
+    {
       "file": "good/run.record.v1/c04-running-after-the-run-ended.json",
       "schema": "run.record.v1.json",
       "shows": "Captured: a run that finished on its own. The store still says 'running'; only the public view says 'ended'."
@@ -11178,9 +11183,9 @@
     {
       "file": "bad/run.record.v1/b03-a-proof-nobody-knows.json",
       "schema": "run.record.v1.json",
-      "rule": "The stored proof is 'empty'. Any other proof is not evidence of a stop.",
+      "rule": "The stored proof is 'empty' or 'removed'. Any other proof is not evidence of a stop.",
       "expect": {
-        "keyword": "const",
+        "keyword": "enum",
         "at": "/stop_attestation/proof"
       }
     },
@@ -11254,15 +11259,6 @@
       "expect": {
         "keyword": "pattern",
         "at": "/run_id"
-      }
-    },
-    {
-      "file": "bad/run.record.v1/b12-the-removed-proof-in-the-store-before-it-is-defined.json",
-      "schema": "run.record.v1.json",
-      "rule": "A stored proof of 'removed' is reserved for the lane that owns Stop; until it defines it, the store holds only 'empty'.",
-      "expect": {
-        "keyword": "const",
-        "at": "/stop_attestation/proof"
       }
     },
     {
@@ -12054,9 +12050,9 @@
     {
       "file": "bad/run.view.v1/b07-stopped-on-a-proof-nobody-knows.json",
       "schema": "run.view.v1.json",
-      "rule": "A view that says 'stopped' rests on a proof the schema knows.",
+      "rule": "A view that says 'stopped' rests on a proof the schema knows: 'empty' or 'removed'.",
       "expect": {
-        "keyword": "const",
+        "keyword": "enum",
         "at": "/stop_attestation/proof"
       }
     },
@@ -13257,6 +13253,11 @@
       "file": "good/stop.result.v1/h03-stopped-with-todays-proof.json",
       "schema": "stop.result.v1.json",
       "shows": "A Stop that carries today's proof, 'empty', in the answer itself."
+    },
+    {
+      "file": "good/stop.result.v1/h06-stopped-with-a-removed-proof.json",
+      "schema": "stop.result.v1.json",
+      "shows": "A Stop whose receipt is proof 'removed', beside proof 'empty'. The cgroup identity is the directory this Stop removed. No exit code, fence, or containment level is carried."
     },
     {
       "file": "good/stop.result.v1/h04-ended-before-the-stop.json",

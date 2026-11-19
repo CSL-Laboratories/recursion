@@ -447,9 +447,9 @@ class Harness:
                    json.dumps(receipt))
         self.check('Stop: engine was told to stop (SIGINT seen by the engine before it ended)',
                    tail.get('subtype') == 'stand_in_sigint', json.dumps(tail))
-        self.check('Stop: record is stopped with an empty-cgroup attestation for this cgroup',
+        self.check('Stop: record is stopped with an empty or removed cgroup attestation for this cgroup',
                    after_status.get('state') == 'stopped'
-                   and (after_status.get('stop_attestation') or {}).get('proof') == 'empty'
+                   and (after_status.get('stop_attestation') or {}).get('proof') in ('empty', 'removed')
                    and (after_status.get('stop_attestation') or {}).get('cgroup') == group1
                    and (after_status.get('observed') or {}).get('state') == 'terminated')
         self.check('Stop: took at least the SIGINT grace for the SIGINT-ignoring helper, under 10 s',

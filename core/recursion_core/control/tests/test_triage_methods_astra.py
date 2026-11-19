@@ -76,7 +76,7 @@ def slot_observation():
     the helper thread always has a chance to finish; it is never left behind.
     """
     table = make_table("session.turn", lambda ctx, params: {"code": "ok"})
-    params = {"command_id": "one", "text": "hello"}
+    params = {"command_id": "command-one", "text": "hello"}
     injected = []
     entry_return = _entry_return_code()
 
@@ -95,7 +95,7 @@ def slot_observation():
             pass
     finally:
         sys.settrace(before)
-    key = (methods.INSTALL_TENANT, "session.turn", "one")
+    key = (methods.INSTALL_TENANT, "session.turn", "command-one")
     orphan = table._slots.get(key)
     stranded = orphan is not None and orphan[0].locked()
     commits_before_retry = table.store.commits
@@ -158,7 +158,7 @@ def exception_log_observation():
         tenant = broken if failure_site == "tenant" else methods.INSTALL_TENANT
         table = make_table(method, handler, tenant=tenant)
         with captured_method_logs() as logs:
-            answer = table.dispatch(method, {"command_id": "one"}, None, None)
+            answer = table.dispatch(method, {"command_id": "command-one"}, None, None)
         observations[failure_site] = {"answer": answer, "canary_in_log": marker in logs.getvalue(),
                                       "canary_in_answer": marker in json.dumps(answer)}
     return observations
@@ -192,7 +192,7 @@ def refusal_observation():
                 raise methods.NotAccepted(invalid)
 
             table = make_table(method, handler)
-            answer = table.dispatch(method, {"command_id": "one"}, None, None)
+            answer = table.dispatch(method, {"command_id": "command-one"}, None, None)
             observations.append({"method": method, "refusal": invalid, "answer": answer,
                                  "callbacks": callbacks, "receipts": len(table.store.receipts)})
     return observations
@@ -254,7 +254,7 @@ def _lone_entry_events():
     before = sys.gettrace()
     sys.settrace(trace)
     try:
-        table.dispatch("session.turn", {"command_id": "one", "text": "hello"}, None, None)
+        table.dispatch("session.turn", {"command_id": "command-one", "text": "hello"}, None, None)
     finally:
         sys.settrace(before)
     return seen
@@ -263,7 +263,7 @@ def _lone_entry_events():
 def _interrupt_lone(nth):
     """Interrupt the nth slot-entry event of a cold dispatch. Record locks before the test clears them."""
     injected, done, count = [], [], [0]
-    params = {"command_id": "one", "text": "hello"}
+    params = {"command_id": "command-one", "text": "hello"}
 
     def handler(ctx, params):
         return {"code": "ok"}
@@ -309,7 +309,7 @@ def _interrupt_lone(nth):
 
     def other_call():
         try:
-            other.append(table.dispatch("session.queue", {"command_id": "other"}, None, None))
+            other.append(table.dispatch("session.queue", {"command_id": "command-other"}, None, None))
         except BaseException as exc:  # noqa: BLE001 - the observation is the failure mode
             other.append(type(exc).__name__)
         finally:
@@ -356,8 +356,8 @@ def _interrupt_after_acquire(nth):
 
 def _with_holder(record, nth=None):
     release, holding = threading.Event(), threading.Event()
-    params = {"command_id": "one", "text": "hello"}
-    key = (methods.INSTALL_TENANT, "session.turn", "one")
+    params = {"command_id": "command-one", "text": "hello"}
+    key = (methods.INSTALL_TENANT, "session.turn", "command-one")
 
     def handler(ctx, params):
         # The holder waits inside the handler, then leaves by interruption so it stores no receipt.
@@ -572,7 +572,7 @@ class SweepS2bRegressionTest(unittest.TestCase):
                 table.store = MemoryStore()
                 table.register("session.turn", handler, tenant=tenant_of)
                 table.freeze()
-                answer = table.dispatch("session.turn", {"command_id": "one"}, None, None)
+                answer = table.dispatch("session.turn", {"command_id": "command-one"}, None, None)
                 self.assertEqual(answer, {"code": "unavailable", "detail": "tenant:NotAccepted"})
                 self.assertEqual(called, [])
                 self.assertEqual(table.store.receipts, {})
@@ -584,7 +584,7 @@ class SweepS2bRegressionTest(unittest.TestCase):
 
         table = make_table("session.turn", lambda ctx, params: {"code": "ok"}, tenant=tenant_of)
         self.assertEqual(
-            table.dispatch("session.turn", {"command_id": "one"}, None, None),
+            table.dispatch("session.turn", {"command_id": "command-one"}, None, None),
             {"code": "no", "detail": "because"},
         )
         for invalid in ({}, {"code": 7}, {"code": ""}):
@@ -596,7 +596,7 @@ class SweepS2bRegressionTest(unittest.TestCase):
                     raise methods.NotAccepted(invalid)
 
                 table = make_table("session.turn", handler)
-                answer = table.dispatch("session.turn", {"command_id": "one"}, None, None)
+                answer = table.dispatch("session.turn", {"command_id": "command-one"}, None, None)
                 self.assertEqual(answer, {"code": "unavailable", "detail": "handler:NotAccepted"})
                 self.assertEqual(callbacks, [])
                 self.assertEqual(table.store.receipts, {})
@@ -607,7 +607,7 @@ class SweepS2bRegressionTest(unittest.TestCase):
 
         table = make_table("session.turn", handler)
         try:
-            answer = table.dispatch("session.turn", {"command_id": "one"}, None, None)
+            answer = table.dispatch("session.turn", {"command_id": "command-one"}, None, None)
         except BaseException as exc:  # noqa: BLE001 - the old dispatcher lets the copy error escape
             answer = exc
         self.assertEqual(answer, {"code": "unavailable", "detail": "handler:NotAccepted"})
@@ -621,9 +621,9 @@ class SweepS2bRegressionTest(unittest.TestCase):
                 except BaseException as exc:  # noqa: BLE001 - the old dispatcher raises AttributeError
                     answer = exc
                 self.assertEqual(answer, {"code": "request_invalid", "detail": "params"})
-        # A read with no params is the published behaviour and stays an answer, not a refusal.
+        # A read with no params is refused as well: master refuses params that are not a mapping on a read too.
         read = make_table("session.status", lambda ctx, params: {"code": "ok"})
-        self.assertEqual(read.dispatch("session.status", None, None, None), {"code": "ok"})
+        self.assertEqual(read.dispatch("session.status", None, None, None), {"code": "request_invalid", "detail": "params"})
 
 
 if __name__ == "__main__":

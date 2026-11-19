@@ -1,0 +1,1 @@
+{"type":"error","timestamp":1794614400300,"sessionID":"ses_synthv1error000000000001","error":{"name":"ProviderAuthError","data":{"providerID":"openai","message":"Invalid API key."}}}

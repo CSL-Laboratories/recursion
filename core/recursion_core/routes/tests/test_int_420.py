@@ -20,14 +20,8 @@ class IntegralJsonNumberTest(unittest.TestCase):
             '{"type":"engine.output","payload":{"stream":"stdout","text":"x",'
             '"offset_start":0.0,"offset_end":1e0}}'
         )
-        checked = d.check_draft(draft)
-        start = checked["payload"]["offset_start"]
-        end = checked["payload"]["offset_end"]
-        self.assertEqual(start, 0)
-        self.assertEqual(end, 1)
-        self.assertIs(type(start), int)
-        self.assertIs(type(end), int)
-        self.assertEqual("abcdef"[start:end], "a")
+        with self.assertRaises(d.DriverInputError):
+            d.check_draft(draft)
 
     def test_integer_valued_usage_count_is_a_token_count(self) -> None:
         measurement = json.loads('{"value":1e0,"quality":"known","provenance":"observed"}')

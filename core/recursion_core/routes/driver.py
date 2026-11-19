@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import json
 import math
 import re
 import threading
@@ -73,7 +74,14 @@ from dataclasses import dataclass, fields
 from recursion_core.control.methods import canonical_text
 
 CONTRACT = 2
-FLAGS = ("multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge", "typed_limits", "usage")
+# The published record is driver.v2's eight flags (schemas/control/v1/driver.v2.json). That schema
+# sets additionalProperties false, so the record carries these and no others. observes_subagents,
+# cancels_subagents and usage_complete say what the engine does with sub-agents and whether its
+# usage figure is complete. Each is false unless the driver sets it. They stay on Flags and the
+# route label, and they are not copied into the record.
+PUBLISHED_FLAGS = ("multi_turn", "mid_turn_input", "interrupt", "resume", "fork", "permission_bridge",
+                   "typed_limits", "usage")
+FLAGS = PUBLISHED_FLAGS + ("observes_subagents", "cancels_subagents", "usage_complete")
 INPUT_KINDS = ("user_message", "approval_answer", "close")
 UNSUPPORTED = "unsupported"
 # The calls a flag can refuse, and the flags that refuse a call (driver.v2 $defs/refusal).
@@ -161,6 +169,9 @@ class Flags:
     permission_bridge: bool = False
     typed_limits: bool = False
     usage: bool = False
+    observes_subagents: bool = False
+    cancels_subagents: bool = False
+    usage_complete: bool = False
 
     def __post_init__(self) -> None:
         for f in fields(self):
@@ -191,7 +202,8 @@ class Declaration:
             raise DriverInputError("input_ack")
 
     def as_record(self) -> dict:
-        return {"engine": self.engine, "driver": CONTRACT, "flags": self.flags.as_dict(), "input_ack": self.input_ack}
+        published = {name: getattr(self.flags, name) for name in PUBLISHED_FLAGS}
+        return {"engine": self.engine, "driver": CONTRACT, "flags": published, "input_ack": self.input_ack}
 
     @classmethod
     def from_record(cls, record: object) -> Declaration:
@@ -200,7 +212,7 @@ class Declaration:
         if record["driver"] != CONTRACT or type(record["driver"]) is not int:
             raise DriverInputError("driver")
         flags = record["flags"]
-        if not isinstance(flags, Mapping) or set(flags) != set(FLAGS):
+        if not isinstance(flags, Mapping) or set(flags) != set(PUBLISHED_FLAGS):
             raise DriverInputError("flags")
         return cls(record["engine"], Flags(**flags), record["input_ack"])
 
@@ -208,6 +220,14 @@ class Declaration:
 def one_turn(engine: str) -> Declaration:
     """Today's path (``RouteAdapter.run``: one prompt, standard input closed, read until the result)."""
     return Declaration(engine, Flags(), input_ack=False)
+
+
+def route_label(declaration: Declaration) -> str:
+    """The route's capability label: the engine and every flag, false ones included."""
+
+    flags = declaration.flags.as_dict()
+    shown = " ".join(f"{name}={str(flags[name]).lower()}" for name in FLAGS)
+    return f"{declaration.engine} {shown}"
 
 
 class Handle:
@@ -307,6 +327,8 @@ class Driver:
             raise DriverInputError("turn_id")
         with handle._write_lock:
             with handle._lock:
+                if handle._closed:
+                    raise DriverStateError("the worker's input is closed")
                 if handle._live_turn != turn_id:
                     raise DriverStateError(f"{turn_id} is not the turn in progress")
             self._interrupt(handle, turn_id)
@@ -428,11 +450,18 @@ def _whole_number(value: object, field: str, *, fraction: bool) -> int | float:
 
 
 def _count(value: object, field: str) -> int:
-    """A whole JSON number of 0 or more, stored as an int."""
-    bound = _whole_number(value, field, fraction=False)
-    if type(bound) is not int:
+    """A JSON integer of 0 or more; a bool is not one.
+
+    event.v1 names no ceiling. A value ``json.dumps`` cannot spell is refused, so ``parse`` does not
+    return a draft the log cannot write.
+    """
+    if type(value) is bool or not isinstance(value, int) or value < 0:
         raise DriverInputError(field)
-    return bound
+    try:
+        json.dumps(value)
+    except ValueError:
+        raise DriverInputError(field) from None
+    return value
 
 
 def _timestamp(value: object, field: str) -> str:
@@ -634,7 +663,8 @@ _PAYLOAD_CHECKS = {"engine.output": _check_engine_output, "tool.call": _check_to
 
 def check_draft(draft: object) -> dict:
     """One event draft: a type a driver may draft, and a payload that is that type's event.v1 payload."""
-    if not isinstance(draft, Mapping) or set(draft) != {"type", "payload"} or draft["type"] not in DRAFT_KEYS:
+    if (not isinstance(draft, Mapping) or set(draft) != {"type", "payload"}
+            or not isinstance(draft["type"], str) or draft["type"] not in DRAFT_KEYS):
         raise DriverInputError("draft.type")
     payload = draft["payload"]
     if not isinstance(payload, Mapping) or set(payload) != DRAFT_KEYS[draft["type"]]:

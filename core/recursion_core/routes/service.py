@@ -36,6 +36,13 @@ class RouteService:
                       else self._limits)
         except c.RouteError as err:
             return c.result(rid, err.code, detail=err.detail)
+        except ValueError as err:
+            # A live table can gain a name that is not an engine name after composition. The request
+            # answers a typed result. Composition still raises ValueError when the bad name is already
+            # present (engine_names). Any other ValueError still leaves.
+            if not str(err).startswith("registered engine name "):
+                raise
+            return c.result(rid, c.REQUEST_INVALID, detail="registered engine name")
         # One absolute deadline for the request, shared by every fallback. A later attempt does not
         # get a fresh deadline_s (11.2: the request stops at the deadline the caller set).
         deadline_at = self._clock() + float(req["deadline_s"])

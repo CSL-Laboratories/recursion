@@ -86,11 +86,11 @@ class StandIn(Driver):
 
 
 class DeclarationTest(unittest.TestCase):
-    def test_the_record_has_every_flag_and_driver_two(self) -> None:
+    def test_the_published_record_has_the_schema_flags_and_driver_two(self) -> None:
         record = Declaration("claude_code", Flags(multi_turn=True), input_ack=True).as_record()
         self.assertEqual(set(record), {"engine", "driver", "flags", "input_ack"})
         self.assertEqual(record["driver"], 2)
-        self.assertEqual(tuple(record["flags"]), d.FLAGS)
+        self.assertEqual(tuple(record["flags"]), d.PUBLISHED_FLAGS)
         self.assertEqual(Declaration.from_record(record).as_record(), record)
 
     def test_mid_turn_input_needs_a_worker_that_keeps_its_input_open(self) -> None:
@@ -118,7 +118,8 @@ class DeclarationTest(unittest.TestCase):
     def test_one_turn_is_todays_path_with_every_flag_false(self) -> None:
         declared = one_turn("codex")
         self.assertEqual(declared.as_record(), {"engine": "codex", "driver": 2, "input_ack": False,
-                                                "flags": {name: False for name in d.FLAGS}})
+                                                "flags": {name: False for name in d.PUBLISHED_FLAGS}})
+        self.assertTrue(all(declared.flags.as_dict()[name] is False for name in d.FLAGS))
 
 
 class FlagRefusalTest(unittest.TestCase):

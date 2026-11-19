@@ -173,7 +173,7 @@ class DraftValueTest(unittest.TestCase):
         cases = [
             ("engine.output", dict(out, text=[])), ("engine.output", dict(out, stream="stdin")),
             ("engine.output", dict(out, offset_start=-1)), ("engine.output", dict(out, offset_end=True)),
-            ("engine.output", dict(out, offset_end=1.5)),
+            ("engine.output", dict(out, offset_end=1.0)),
             ("tool.call", dict(call, call_id="")), ("tool.call", dict(call, call_id="x" * 129)),
             ("tool.call", dict(call, name="a\nb")), ("tool.call", dict(call, input_digest="not-a-digest")),
             ("tool.call", dict(call, input_digest="A" * 64)), ("tool.call", dict(call, input=[])),

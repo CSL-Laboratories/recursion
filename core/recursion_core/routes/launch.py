@@ -4,6 +4,10 @@ Adapters never start processes themselves. They call an injected ``launcher(argv
 that returns an ``EngineProcess``. The real launcher (not in this module) places the child in its own
 cgroup v2 leaf and holds a pidfd; ``EngineProcess.fence()`` asks that cleanup layer to end the run's
 whole tree. Nothing here uses ``PR_SET_PDEATHSIG`` or ``preexec_fn``. Tests use fake doubles only.
+
+A launcher that fails after it has started a child must fence that child itself before it raises (the daemon's
+does: daemon/launcher.py ends the unit's tree on any exception after the unit exists). The route boundary,
+``RouteAdapter.run``, fences only a process the launcher returned.
 """
 
 from __future__ import annotations

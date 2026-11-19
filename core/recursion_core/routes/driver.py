@@ -429,6 +429,26 @@ def _matches(value: object, pattern: re.Pattern, field: str) -> str:
     return value
 
 
+def _whole_number(value: object, field: str, *, fraction: bool) -> int | float:
+    """A JSON number of 0 or more, in the form a consumer can use.
+
+    Only a plain ``int`` or ``float``. A bool is neither, so it is refused, and a subclass
+    is not a JSON number here. When ``fraction`` is false the value must be whole, and a
+    float whose value is whole (``0.0``, ``1e0``) is returned as that ``int``. A fraction
+    is returned as the float it is. A plain ``int`` is returned as itself. The schema sets
+    no ceiling, so a huge int stays that int; the conformance reader refuses an integral
+    value beyond 2**53-1, and this gate does not.
+    """
+    if type(value) is int:
+        if value < 0:
+            raise DriverInputError(field)
+        return value
+    if (type(value) is float and math.isfinite(value) and value >= 0
+            and (fraction or value.is_integer())):
+        return value if fraction else int(value)
+    raise DriverInputError(field)
+
+
 def _count(value: object, field: str) -> int:
     """A JSON integer of 0 or more; a bool is not one.
 
@@ -547,8 +567,8 @@ def _check_engine_output(p: Mapping, f: str) -> None:
         raise DriverInputError(f"{f}.stream")
     if not isinstance(p["text"], str):
         raise DriverInputError(f"{f}.text")
-    _count(p["offset_start"], f"{f}.offset_start")
-    _count(p["offset_end"], f"{f}.offset_end")
+    p["offset_start"] = _count(p["offset_start"], f"{f}.offset_start")
+    p["offset_end"] = _count(p["offset_end"], f"{f}.offset_end")
 
 
 def _check_tool_call(p: Mapping, f: str) -> None:
@@ -664,8 +684,9 @@ def check_measurement(value: object, *, integer: bool, field: str) -> None:
         return
     if quality not in ("known", "lower_bound") or provenance not in ("observed", "modelled", "inferred"):
         raise DriverInputError(field)
-    kinds = (int,) if integer else (int, float)
-    if type(number) is bool or not isinstance(number, kinds) or number < 0:
-        raise DriverInputError(field)
-    if isinstance(number, float) and not math.isfinite(number):  # an int is never converted: no overflow
-        raise DriverInputError(field)
+    # A whole float count is stored as that int. A dollar amount is not rewritten. A plain int is
+    # not converted, so a huge int does not overflow.
+    if integer:
+        value["value"] = _whole_number(number, field, fraction=False)
+    else:
+        _whole_number(number, field, fraction=True)

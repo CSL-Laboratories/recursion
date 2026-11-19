@@ -619,6 +619,25 @@ class ControlAPI:
         opened = os.fstat(parent_fd)
         return info.st_dev == opened.st_dev and info.st_ino == opened.st_ino
 
+    def _root_on_cgroup2(self) -> bool:
+        """True when the known cgroup root, opened without following a link, is on a cgroup2 mount.
+
+        A parent missing under a root that exists is ``absent`` only then: elsewhere the parent
+        may have been moved away with the run's leaf in it.
+        """
+        root = self._known_cgroup_root()
+        if root is None:
+            return False
+        try:
+            fd = self._open_nofollow(root, ())
+        except OSError:
+            return False
+        try:
+            from recursion_core.daemon import held_cgroup2_mount
+            return held_cgroup2_mount(fd)
+        finally:
+            os.close(fd)
+
     def _remove_recorded_cgroup(self, rec: dict) -> str:
         """Remove this run's cgroup directory only when the path is proved.
 
@@ -630,6 +649,10 @@ class ControlAPI:
         names the held parent.
         ``empty``: the directory stays. Every doubt is this word, and so is a clear re-read
         after ``rmdir`` answers anything other than ``ENOENT``.
+        ``unproven``: the leaf is gone from the held parent, or was removed, or a parent is
+        missing, but the held folder is not shown to lie on a cgroup2 mount. Only that kernel
+        keeps a cgroup from being moved out of its parent, so a gone leaf proves nothing and
+        the Stop stays pending.
         The parent is opened with ``O_DIRECTORY|O_NOFOLLOW`` and the leaf name is removed
         relative to that fd, so a symlink swapped in for a parent is not followed. The re-read
         after a refused rmdir and the check after a done one go through that same fd.
@@ -639,7 +662,7 @@ class ControlAPI:
         if found is None:
             return "empty"
         if found == "absent":
-            return "absent"
+            return "absent" if self._root_on_cgroup2() else "unproven"
         directory = found
         root = self._known_cgroup_root()
         if root is None:
@@ -653,13 +676,18 @@ class ControlAPI:
             try:
                 parent_fd = self._open_nofollow(root, parents)
             except OSError as exc:
-                return "absent" if exc.errno == errno.ENOENT else "empty"
+                if exc.errno == errno.ENOENT:
+                    return "absent" if self._root_on_cgroup2() else "unproven"
+                return "empty"
             if not self._opened_parent_matches(root, parents, parent_fd):
                 return "empty"
+            from recursion_core.daemon import held_cgroup2_mount
             try:
                 info = os.stat(directory.name, dir_fd=parent_fd, follow_symlinks=False)
             except OSError as exc:
-                return "absent" if exc.errno == errno.ENOENT else "empty"
+                if exc.errno == errno.ENOENT:
+                    return "absent" if held_cgroup2_mount(parent_fd) else "unproven"
+                return "empty"
             except (ValueError, TypeError):
                 return "empty"
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
@@ -670,7 +698,7 @@ class ControlAPI:
                 os.rmdir(directory.name, dir_fd=parent_fd)
             except OSError as exc:
                 if exc.errno == errno.ENOENT:
-                    return "absent"
+                    return "absent" if held_cgroup2_mount(parent_fd) else "unproven"
                 # ENOENT is the only rmdir error that means the directory is gone.
                 # Every other error, including EBUSY and ENOTEMPTY, is re-read through the
                 # held parent fd, never by a path built again.
@@ -686,6 +714,8 @@ class ControlAPI:
                 return "populated"
             if not self._opened_parent_matches(root, parents, parent_fd):
                 return "populated"  # the removed leaf's parent is no longer at the recorded path
+            if not held_cgroup2_mount(parent_fd):
+                return "unproven"
             return "removed"
         finally:
             if parent_fd is not None:
@@ -847,6 +877,9 @@ class ControlAPI:
             removed = self._remove_recorded_cgroup(rec)
             if removed == "populated":
                 return self._pending(rec, "cgroup_populated")
+            if removed == "unproven":
+                # The root was not shown to be a cgroup2 mount: the cleanup is not confirmed.
+                return self._pending(rec, "confirm_unknown")
             proof_name = "removed" if removed == "removed" else "empty"
         proof = self._attestation(rec, proof=proof_name)
         if proof is None:  # cleanup ran, but this copy cannot name a generation: typed, not KeyError

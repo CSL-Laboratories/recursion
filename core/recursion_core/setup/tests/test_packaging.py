@@ -146,7 +146,7 @@ class BuiltWheelTests(unittest.TestCase):
         subprocess.run([sys.executable, "-m", "venv", venv], check=True, capture_output=True)
         python = os.path.join(venv, "bin", "python")
         # No PYTHON* variable, and no XDG_CONFIG_HOME or XDG_STATE_HOME of the run's own: `recursiond install` refuses
-        # one naming another folder than the default under the home (config_home_elsewhere, state_home_elsewhere).
+        # one naming another folder than ~/.config (config_home_elsewhere), and the state would go to a chosen place.
         clean = {key: value for key, value in os.environ.items()
                  if not key.startswith("PYTHON") and key not in ("XDG_CONFIG_HOME", "XDG_STATE_HOME")}
         subprocess.run([python, "-m", "pip", "install", "--no-index", "--no-deps", "--no-cache-dir", "-q", self.wheel],

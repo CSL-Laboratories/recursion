@@ -9,28 +9,44 @@ the `recursiond` command). Linux only; `recursiond` refuses every command elsewh
 
 Under the home folder the caller passes (the password database's, which is what the user manager
 calls `%h`; never `$HOME`; a password database that gives no entry for this user, none or a failed
-lookup, refuses `home_unknown`). The command layer reads `XDG_CONFIG_HOME` and `XDG_STATE_HOME` from its
-environment only to refuse, before anything is read, a value naming another folder than `~/.config`
-(`config_home_elsewhere`: a user manager started with it reads its units from there) or, for install
-and upgrade, than `~/.local/state` (`state_home_elsewhere`: a daemon started with it keeps its state
-there); each refusal says how to run the command without the variable:
+lookup, refuses `home_unknown`). The command layer reads `XDG_CONFIG_HOME` from its environment only to
+refuse, before anything is read, a value naming another folder than `~/.config` (`config_home_elsewhere`:
+a user manager started with it reads its units from there; the refusal says how to run the command
+without it). `XDG_STATE_HOME` is the person's choice of the state folder, and one resolver names it
+(`layout.state_home`): the variable's value when it is set, else `~/.local/state`, the standard's
+default, with `recursion` under it. Empty is the default; a relative value is refused
+`state_home_relative` (install, upgrade and the daemon's start alike), its text naming the value and the
+way out (an absolute path, or unset the variable). A chosen place that is there must be the person's and
+not writable by group or world, with every folder and link on the way root's or the person's
+(`folder_untrusted`, the home's own rule); one that is not there is made 0700 under its nearest folder
+that is there, which must meet the same rule. Below, `<state>` is `$XDG_STATE_HOME/recursion`, or
+`~/.local/state/recursion` by default:
 
 | path | install | upgrade | uninstall |
 | --- | --- | --- | --- |
-| `~/.local/state/recursion/plugin-security/breaker.sqlite3` and `revoked.sqlite3` (the breaker store and the revocation store, where the daemon opens them) | creates each missing one through `plugin_security.stores` (0600), before the unit; one already there must pass `stores.open_store` and is left as it is; a refusal keeps the store's code (`breaker_store_untrusted`, `revocation_store_invalid`, ...), and a store that cannot be made or put in place (a full disk, an I/O error at its final link) is `store_not_created` | the same | stay (question 3: deleting them would reset every runtime revocation) |
+| `<state>/plugin-security/breaker.sqlite3` and `revoked.sqlite3` (the breaker store and the revocation store, where the daemon opens them) | creates each missing one through `plugin_security.stores` (0600), before the unit; one already there must pass `stores.open_store` and is left as it is; a refusal keeps the store's code (`breaker_store_untrusted`, `revocation_store_invalid`, ...), and a store that cannot be made or put in place (a full disk, an I/O error at its final link) is `store_not_created` | the same | stay (question 3: deleting them would reset every runtime revocation) |
 | `~/.config/systemd/user/recursion-daemon.service` | creates it (0644); the same bytes already there change nothing; other bytes refuse `unit_differs`, and a unit another user owns or that group or world can write refuses `unit_untrusted` (owner and mode bits of the file read; POSIX ACLs are not read); a unit removed while it is read refuses `unit_missing`, and one replaced then `unit_changed` (run the command again; the path is checked while the file read is still open); all before any store is made; and a unit found that is removed, replaced or rewritten in place while the stores are made refuses `unit_missing` or `unit_changed` at the answer, with the stores already made | rewrites it (also when its bytes are current but another user could change it); missing refuses `unit_missing`, before any store is made; a unit whose `[Service]` section sets `XDG_STATE_HOME` to another folder, reads an `EnvironmentFile`, passes the user manager's `XDG_STATE_HOME`, or cannot be read so, refuses `unit_state_elsewhere`, before anything is made and with the unit left as it is (replacing it would point the daemon at another state folder, without its revocations and breaker trips); a current unit it keeps that is removed, replaced or rewritten in place while the stores are made refuses `unit_missing` or `unit_changed` at the answer | removes it if its first line is this installer's marker (`unit_not_ours` otherwise), while it holds the file it read and after the path was checked to name it (`unit_changed` if it was replaced meanwhile; the removal itself is by name, so a file put there in the few statements after that check is the one removed; one already gone counts as removed by the other caller); refuses `unit_enabled` while `default.target.wants/` links it |
-| `~/.local/state/recursion/homes` (the route homes' custody root: the launcher makes each route home in it, and `setup.route_home.check` refuses a root that is missing or not owner-only) | creates it (0700) if missing, after the stores and before the unit; one already there must be ours, open to nobody else at all, and readable, writable and searchable by its owner (`folder_untrusted`, before anything is made); the root as made, or as another caller made it meanwhile, is held to the same rule before the unit is written (a umask that takes the owner's bits, or another caller's 0755, is `folder_untrusted` and leaves no new unit) | the same | stays, with the route homes and their logins in it |
-| `~/.config`, `~/.config/systemd`, `~/.config/systemd/user`, and `~/.local`, `~/.local/state`, `~/.local/state/recursion`, `.../plugin-security` | creates the missing ones (0700); existing ones stay as they are | the same | stay: other units share them, and the state folder holds the run registry |
+| `<state>/homes` (the route homes' custody root: the launcher makes each route home in it, and `setup.route_home.check` refuses a root that is missing or not owner-only) | creates it (0700) if missing, after the stores and before the unit; one already there must be ours, open to nobody else at all, and readable, writable and searchable by its owner (`folder_untrusted`, before anything is made); the root as made, or as another caller made it meanwhile, is held to the same rule before the unit is written (a umask that takes the owner's bits, or another caller's 0755, is `folder_untrusted` and leaves no new unit) | the same | stays, with the route homes and their logins in it |
+| `~/.config`, `~/.config/systemd`, `~/.config/systemd/user`, and `~/.local`, `~/.local/state` (by default) or the chosen place, `<state>`, `.../plugin-security` | creates the missing ones (0700); existing ones stay as they are | the same | stay: other units share them, and the state folder holds the run registry |
 | anything else in the daemon's state folder (the run registry) | - | - | stays |
 
-The unit sets `XDG_STATE_HOME=%h/.local/state`, so the daemon's state folder
-(`$XDG_STATE_HOME/recursion`, `daemon/__main__.py`) is the one install made the stores in, whatever
-the user manager's own environment says. A daemon that kept its state elsewhere before is found
-only where it says so: in the unit `upgrade` would replace (`unit_state_elsewhere`) or in this
-command's environment (`state_home_elsewhere`); a value only in the user manager's own environment
-(`environment.d`, `systemctl --user set-environment`) is not seen, since this package starts no
-process to ask it. The ledger is not made yet: it is bound to the installer's
-anchor key, which is the open question for Lucas in the lane brief.
+The unit sets `XDG_STATE_HOME=%h/.local/state` by default, or `"XDG_STATE_HOME=<the chosen place>"`
+(absolute, links resolved, in systemd's quoting), so the daemon's state folder (`daemon/__main__.py`
+takes it from the same resolver) is the one install made the stores in, whatever the user manager's own
+environment says. A unit `upgrade` would replace whose daemon may keep its state in another folder than
+the chosen one (or the default) is refused `unit_state_elsewhere`, its text naming the folder in use and,
+with a chosen place or a unit the installer wrote, the two ways out that work (run the command again with
+`XDG_STATE_HOME` naming the unit's folder, or unset where it names the default; or `recursiond uninstall`
+then `recursiond install` to start in the new place, the stores already made left where they are); a
+value only in the user manager's own environment (`environment.d`, `systemctl --user set-environment`) is
+not seen, since this package starts no process to ask it. With a chosen place the answer adds `state`
+(the folder in use) and, when the default's `plugin-security` folder holds a store, `stores_left`: one
+sentence saying those stores are left where they are and not used. Nothing is ever moved or removed:
+a store made in the default place before stays there. The daemon's installed-profile check counts a
+chosen folder as installed when the installer's unit names it. The ledger step runs in the same `install` and `upgrade`, behind
+`anchor_public_key`. The command cannot fill that parameter, so the step reports
+`needs the anchor key, which recursiond install makes` and does not create `ledger.sqlite3`. A caller that
+passes the key creates it through `plugin_security.stores.create_ledger`.
 
 A link at any folder or file under the home is refused (`symlink_refused`, `not_regular`), never
 followed, and so is a folder there that another user owns or that group or world can write
@@ -52,7 +68,7 @@ will (`-I`, from `/`) and refuses unless it is free-threaded CPython 3.14
 (`interpreter_not_free_threaded`) and imports this same `recursion_core` without `PYTHONPATH`
 (`not_installed`). The unit has `Restart=on-failure`, `WantedBy=default.target`, `UMask=0077`,
 `KillMode=control-group`, `UnsetEnvironment=PYTHONPATH PYTHONHOME`,
-`Environment=XDG_STATE_HOME=%h/.local/state`, and a finite stop:
+`Environment=XDG_STATE_HOME=%h/.local/state` (or the chosen place, above), and a finite stop:
 `TimeoutStopSec=90` with `SendSIGKILL=yes`. A stop that runs past it is a daemon crash: the run
 units (their own transient `recursion-run-*.service` units) stay alive, and the daemon recovers at
 its next start (seams S1 and S13 in SPINE's brief).

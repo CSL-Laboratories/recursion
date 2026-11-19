@@ -1609,11 +1609,12 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(str(daemon_breaker.store_path(paths.state)), paths.breaker_store)
         self.assertEqual(str(Path(paths.state) / daemon_plugins.STORE_DIR / daemon_plugins.REVOCATION_FILE),
                          paths.revocation_store)
-        # The daemon's state folder is $XDG_STATE_HOME/recursion (daemon/__main__.py), and the unit sets
-        # XDG_STATE_HOME to %h/.local/state: together, paths.state.
+        # The daemon's state folder is $XDG_STATE_HOME/recursion, from the installer's one resolver
+        # (daemon/__main__.py takes it from layout.state_folder), and the unit sets XDG_STATE_HOME to
+        # %h/.local/state by default: together, paths.state.
         main = Path(importlib.util.find_spec("recursion_core.daemon.__main__").origin).read_text(encoding="utf-8")
-        self.assertIn("state = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'recursion'",
-                      main)
+        self.assertIn("    state = state_dir(os.environ)", main)
+        self.assertIn("return Path(state_folder(str(Path.home()), environ.get('XDG_STATE_HOME')))", main)
         self.assertEqual(service_fields(render_unit(EXEC))["Service.Environment"], f"XDG_STATE_HOME=%h/{STATE_HOME}")
         self.assertEqual(os.path.join(self.home, *STATE_HOME.split("/"), "recursion"), paths.state)
 

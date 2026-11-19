@@ -1,9 +1,17 @@
 """The core's MCP client of tool servers: the protocol core over a pair of byte streams (``session.py``).
 
-Standard library only. It starts no server process and ends none. Its bounds are in ``limits.py``.
+Standard library only. It starts no server process and ends none. Its limits on an outside
+server are in ``limits.py``.
 """
 
-from .limits import CALL_DEADLINE_S, MAX_MESSAGE_BYTES
+from .limits import (
+    CALL_DEADLINE_S,
+    INITIALIZE_DEADLINE_S,
+    MAX_BREACHES,
+    MAX_MESSAGE_BYTES,
+    MAX_TOOL_RESULT_TEXT_BYTES,
+    MAX_TOOLS,
+)
 from .session import (
     BAD_ANSWER,
     CALL_ABANDONED,
@@ -15,14 +23,19 @@ from .session import (
     MESSAGE_TOO_LARGE,
     OUTPUT_FAILED,
     PROTOCOL_UNSUPPORTED,
+    RESULT_CUT,
+    SERVER_CUT_OFF,
     SERVER_GONE,
     SERVER_ERROR,
     SERVER_REQUEST_REFUSED,
+    SERVER_START_TIMEOUT,
+    TOOL_LIST_CUT,
     McpClient,
     McpClientError,
     McpServerError,
     McpSessionEnded,
     ToolCall,
+    ToolList,
 )
 
 __all__ = [
@@ -31,19 +44,28 @@ __all__ = [
     "CALL_DEADLINE_S",
     "CALL_TIMEOUT",
     "CLIENT_SHUT",
+    "INITIALIZE_DEADLINE_S",
     "INITIALIZE_REFUSED",
     "LATEST_PROTOCOL",
     "LEGACY_PROTOCOL",
+    "MAX_BREACHES",
     "MAX_MESSAGE_BYTES",
+    "MAX_TOOL_RESULT_TEXT_BYTES",
+    "MAX_TOOLS",
     "MESSAGE_TOO_LARGE",
     "OUTPUT_FAILED",
     "PROTOCOL_UNSUPPORTED",
+    "RESULT_CUT",
+    "SERVER_CUT_OFF",
     "SERVER_GONE",
     "SERVER_ERROR",
     "SERVER_REQUEST_REFUSED",
+    "SERVER_START_TIMEOUT",
+    "TOOL_LIST_CUT",
     "McpClient",
     "McpClientError",
     "McpServerError",
     "McpSessionEnded",
     "ToolCall",
+    "ToolList",
 ]

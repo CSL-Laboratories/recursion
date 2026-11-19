@@ -29,9 +29,28 @@ Requests from the server
     ``{"record": SERVER_REQUEST_REFUSED, "method": ...}`` handed to ``on_record``. Reading goes on, so a call
     in progress still finishes.
 
-BOUNDS. One line longer than ``MAX_MESSAGE_BYTES`` (2 MiB, its newline included) ends the session
-(``MESSAGE_TOO_LARGE``): the client reads at most that many bytes plus one and never reads the rest. Each
-request has a deadline (``CALL_DEADLINE_S``, 60 s, unless the caller gives a shorter one).
+LIMITS. An outside server is untrusted input; every limit is one named constant in ``limits.py`` (first
+values, none measured), read here when it is checked. A limit that fires is a typed result the caller
+receives and a record ``{"record": <code>, ...}`` handed to ``on_record``; it touches only this session.
+
+* start: ``initialize`` is answered within ``INITIALIZE_DEADLINE_S`` (5 s, both requests together), else
+  the session ends ``SERVER_START_TIMEOUT``; no ``notifications/cancelled`` is sent for ``initialize``;
+* each call: a deadline (``CALL_DEADLINE_S``, 60 s, unless the caller gives a shorter one); past it the
+  call is abandoned (``notifications/cancelled``) and answers ``CALL_TIMEOUT``;
+* one message: a line longer than ``MAX_MESSAGE_BYTES`` (2 MiB, its newline included) ends the session
+  (``MESSAGE_TOO_LARGE``): the client reads at most that many bytes plus one and never reads the rest;
+* one tool result: its text (the ``text`` content items, UTF-8) is cut at ``MAX_TOOL_RESULT_TEXT_BYTES``
+  (256 KiB) on a whole character, later text items are left out, and the result's ``_meta`` holds
+  ``{RESULT_CUT: {"limit_bytes": ..., "text_bytes": <the text's whole size>}}``;
+* the tool list: listed to ``MAX_TOOLS`` (512); no page is asked for past it; ``list_tools`` returns a
+  ``ToolList`` whose ``cut`` is ``TOOL_LIST_CUT`` (``None`` for a whole list);
+* breaches: a call timeout at the client's own deadline (not a shorter one the caller asked for), a cut
+  result and a cut list each count as one breach; at ``MAX_BREACHES`` (3) in this session the server is
+  cut off: the breaching call still gets its own typed result, then the session ends ``SERVER_CUT_OFF``.
+  The count belongs to this client session; a new session starts it again.
+
+A server given up or cut off is left out by the session's own ending: the client shuts the server's input
+stream and stops reading; it starts, signals and ends no process.
 
 THREADS. Reading runs on a thread of its own and writing on another, so a server that is slow to answer,
 or slow to read, never holds the caller past the deadline: a caller only puts a message in the outbox and
@@ -60,7 +79,14 @@ from typing import Any, BinaryIO
 from recursion_core.control.mcp import jsonrpc
 from recursion_core.control.mcp.framing import FrameWriter, decode_line, encode
 
-from .limits import CALL_DEADLINE_S, MAX_MESSAGE_BYTES
+from .limits import (
+    CALL_DEADLINE_S,
+    INITIALIZE_DEADLINE_S,
+    MAX_BREACHES,
+    MAX_MESSAGE_BYTES,
+    MAX_TOOL_RESULT_TEXT_BYTES,
+    MAX_TOOLS,
+)
 
 LATEST_PROTOCOL = "2026-07-28"
 LEGACY_PROTOCOL = "2025-06-18"
@@ -76,12 +102,18 @@ OUTPUT_FAILED = "mcp_output_failed"
 CLIENT_SHUT = "mcp_client_shut"
 PROTOCOL_UNSUPPORTED = "mcp_protocol_unsupported"
 INITIALIZE_REFUSED = "mcp_initialize_refused"
+SERVER_START_TIMEOUT = "mcp_server_start_timeout"
+SERVER_CUT_OFF = "mcp_server_cut_off"
 
 # How one request fails while the session goes on (``McpClientError.code``).
 CALL_TIMEOUT = "mcp_call_timeout"
 CALL_ABANDONED = "mcp_call_abandoned"
 SERVER_ERROR = "mcp_server_error"
 BAD_ANSWER = "mcp_bad_answer"
+
+# A limit that cut what the server sent while the session goes on (a record, and in the result).
+RESULT_CUT = "mcp_result_cut"
+TOOL_LIST_CUT = "mcp_tool_list_cut"
 
 
 class McpClientError(Exception):
@@ -109,27 +141,37 @@ def _ignore(_value: Any) -> None:
     pass
 
 
-class _Pending:
-    __slots__ = ("done", "result", "failure", "on_progress")
+class ToolList(list):
+    """The tools ``list_tools`` read; ``cut`` is ``TOOL_LIST_CUT`` when the list was listed to ``MAX_TOOLS``."""
 
-    def __init__(self, on_progress: Callable[[dict], Any] | None) -> None:
+    cut: str | None = None
+
+
+class _Pending:
+    __slots__ = ("done", "result", "failure", "on_progress", "method")
+
+    def __init__(self, on_progress: Callable[[dict], Any] | None, method: str = "") -> None:
         self.done = threading.Event()
         self.result: dict | None = None
         self.failure: McpClientError | None = None
         self.on_progress = on_progress
+        self.method = method
 
 
 class ToolCall:
     """One request in flight: ``wait`` for its result, or ``abandon`` it."""
 
-    def __init__(self, client: McpClient, request_id: int, pending: _Pending, deadline: float) -> None:
+    def __init__(self, client: McpClient, request_id: int, pending: _Pending, deadline: float,
+                 at_limit: bool = False) -> None:
         self._client, self._id, self._pending, self._deadline = client, request_id, pending, deadline
+        self._at_limit = at_limit  # the deadline is the client's own limit, not a shorter one asked for
 
     def wait(self) -> dict:
         """The result object; raises ``McpClientError`` (a subclass for a server error or an ended session)."""
 
         if not self._pending.done.wait(max(0.0, self._deadline - time.monotonic())):
-            self._client._abandon(self._id, CALL_TIMEOUT)
+            if self._client._abandon(self._id, CALL_TIMEOUT) and self._at_limit:
+                self._client._breach(CALL_TIMEOUT, {"request": self._id})
         self._pending.done.wait()  # set by the answer, the abandonment or the session's end, whichever was first
         if self._pending.failure is not None:
             raise self._pending.failure
@@ -154,13 +196,14 @@ class McpClient:
         self._started = False
         self._relisting = self._relist_again = False
         self._tools: list = []
+        self._breaches = 0
         self.ending: str | None = None
         self.protocol_version: str | None = None
         self.server_capabilities: dict = {}
         self.server_info: dict = {}
 
     # -- session ----------------------------------------------------------------------------------------
-    def open(self, deadline_s: float = CALL_DEADLINE_S) -> dict:
+    def open(self, deadline_s: float = INITIALIZE_DEADLINE_S) -> dict:
         """Negotiate the session (see the module text); the server's ``initialize`` result."""
 
         with self._cond:
@@ -169,13 +212,14 @@ class McpClient:
             self._started = True
         threading.Thread(target=self._read_loop, name="mcp-client-read", daemon=True).start()
         threading.Thread(target=self._write_loop, name="mcp-client-write", daemon=True).start()
+        deadline = time.monotonic() + min(deadline_s, INITIALIZE_DEADLINE_S)
         asked = LATEST_PROTOCOL
         try:
-            result = self._request("initialize", self._init_params(asked), None, deadline_s).wait()
+            result = self._initialize(asked, deadline)
         except McpServerError:
             asked = LEGACY_PROTOCOL
             try:
-                result = self._request("initialize", self._init_params(asked), None, deadline_s).wait()
+                result = self._initialize(asked, deadline)
             except McpServerError as exc:
                 self._end(INITIALIZE_REFUSED)
                 raise McpSessionEnded(INITIALIZE_REFUSED, exc.detail) from exc
@@ -189,6 +233,16 @@ class McpClient:
         self.server_info = info if isinstance(info, dict) else {}
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         return result
+
+    def _initialize(self, version: str, deadline: float) -> dict:
+        """One ``initialize`` request within the start's budget; past it the session ends, no cancel sent."""
+
+        call = self._request("initialize", self._init_params(version), None,
+                             max(0.0, deadline - time.monotonic()))
+        if not call._pending.done.wait(max(0.0, deadline - time.monotonic())):
+            self._callback(self._on_record, {"record": SERVER_START_TIMEOUT, "limit_s": INITIALIZE_DEADLINE_S})
+            self._end(SERVER_START_TIMEOUT)
+        return call.wait()
 
     @staticmethod
     def _init_params(version: str) -> dict:
@@ -219,6 +273,19 @@ class McpClient:
             pending.failure = McpSessionEnded(ending)
             pending.done.set()
 
+    def _breach(self, code: str, detail: dict) -> None:
+        """Record a limit that fired; at ``MAX_BREACHES`` in this session the server is cut off."""
+
+        with self._cond:
+            counted = self.ending is None
+            if counted:
+                self._breaches += 1
+            breaches = self._breaches
+        self._callback(self._on_record, {"record": code, **detail})
+        if counted and breaches == MAX_BREACHES:
+            self._callback(self._on_record, {"record": SERVER_CUT_OFF, "breaches": breaches})
+            self._end(SERVER_CUT_OFF)
+
     # -- tools -------------------------------------------------------------------------------------------
     @property
     def tools(self) -> list:
@@ -227,8 +294,9 @@ class McpClient:
         with self._cond:
             return list(self._tools)
 
-    def list_tools(self, deadline_s: float = CALL_DEADLINE_S) -> list:
-        tools: list = []
+    def list_tools(self, deadline_s: float = CALL_DEADLINE_S) -> ToolList:
+        tools = ToolList()
+        listed = 0
         cursor: str | None = None
         seen: set[str] = set()
         while True:
@@ -237,6 +305,11 @@ class McpClient:
             if not isinstance(page, list):
                 raise McpClientError(BAD_ANSWER, "tools/list: tools is not a list")
             tools.extend(page)
+            listed += len(page)
+            if len(tools) > MAX_TOOLS:  # listed to the limit; no further page is asked for
+                del tools[MAX_TOOLS:]
+                tools.cut = TOOL_LIST_CUT
+                break
             cursor = result.get("nextCursor")
             if cursor is None:
                 break
@@ -246,6 +319,8 @@ class McpClient:
         with self._cond:
             self._tools = list(tools)
         self._callback(self._on_tools, list(tools))
+        if tools.cut is not None:
+            self._breach(TOOL_LIST_CUT, {"limit": MAX_TOOLS, "listed": listed})
         return tools
 
     def begin_call(self, name: str, arguments: dict | None = None, *,
@@ -261,7 +336,7 @@ class McpClient:
     def _request(self, method: str, params: dict, on_progress: Callable[[dict], Any] | None,
                  deadline_s: float) -> ToolCall:
         deadline = time.monotonic() + min(deadline_s, CALL_DEADLINE_S)
-        pending = _Pending(on_progress)
+        pending = _Pending(on_progress, method)
         with self._cond:
             if self.ending is not None:
                 raise McpSessionEnded(self.ending)
@@ -276,17 +351,18 @@ class McpClient:
             with self._cond:
                 self._pending.pop(request_id, None)
             raise
-        return ToolCall(self, request_id, pending, deadline)
+        return ToolCall(self, request_id, pending, deadline, at_limit=deadline_s >= CALL_DEADLINE_S)
 
-    def _abandon(self, request_id: int, code: str) -> None:
+    def _abandon(self, request_id: int, code: str) -> bool:
         with self._cond:
             pending = self._pending.pop(request_id, None)
         if pending is None:  # answered, abandoned or ended already
-            return
+            return False
         pending.failure = McpClientError(code, f"request {request_id}")
         pending.done.set()
         self._send({"jsonrpc": "2.0", "method": "notifications/cancelled",
                     "params": {"requestId": request_id, "reason": code}})
+        return True
 
     def _send(self, message: dict) -> bool:
         encode(message)  # a message JSON cannot hold raises here, on the caller's thread
@@ -323,6 +399,7 @@ class McpClient:
                     break
                 if len(line) > MAX_MESSAGE_BYTES:
                     ending = MESSAGE_TOO_LARGE
+                    self._callback(self._on_record, {"record": MESSAGE_TOO_LARGE, "limit_bytes": MAX_MESSAGE_BYTES})
                     break
                 frame = decode_line(line)
                 if frame is not None and frame.error is None:
@@ -361,6 +438,11 @@ class McpClient:
             pending.failure = McpServerError(error if isinstance(error, dict) else {})
         elif isinstance(message.get("result"), dict):
             pending.result = message["result"]
+            if pending.method == "tools/call":
+                cut = _cut_result(pending.result)
+                if cut is not None:  # counted before the caller is woken, so a cut-off is seen with it
+                    pending.result = cut
+                    self._breach(RESULT_CUT, dict(cut["_meta"][RESULT_CUT]))
         else:
             pending.failure = McpClientError(BAD_ANSWER, "result is not an object")
         pending.done.set()
@@ -406,3 +488,32 @@ class McpClient:
             callback(value)
         except Exception:  # noqa: BLE001 - a caller's callback never stops the reader
             pass
+
+
+def _cut_result(result: dict) -> dict | None:
+    """``result`` with its text cut at ``MAX_TOOL_RESULT_TEXT_BYTES`` and the cut marked; ``None`` if whole."""
+
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    budget, total, kept, cut = MAX_TOOL_RESULT_TEXT_BYTES, 0, [], False
+    for item in content:
+        if not (isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)):
+            kept.append(item)
+            continue
+        data = item["text"].encode("utf-8", "surrogatepass")
+        total += len(data)
+        if len(data) <= budget:
+            budget -= len(data)
+            kept.append(item)
+            continue
+        cut = True
+        if budget > 0:  # a character the limit splits is left out whole
+            kept.append({**item, "text": data[:budget].decode("utf-8", "ignore")})
+            budget = 0
+    if not cut:
+        return None
+    meta = result.get("_meta")
+    meta = dict(meta) if isinstance(meta, dict) else {}
+    meta[RESULT_CUT] = {"limit_bytes": MAX_TOOL_RESULT_TEXT_BYTES, "text_bytes": total}
+    return {**result, "content": kept, "_meta": meta}

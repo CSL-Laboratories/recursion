@@ -291,16 +291,16 @@ class UnpinTests(_PinCase):
         self.assertEqual(0, status, said)
         self.assertEqual(("unpin", 2), (json.loads(out)["command"], json.loads(out)["generation"]))
         after = self.live_json()
-        self.assertNotIn("pins", after)
+        self.assertEqual({}, after["pins"])
         self.assertEqual([], after["grants"])
         self.assertEqual({key: value for key, value in data.items() if key not in ("pins", "grants")},
-                         {key: value for key, value in after.items() if key != "grants"})
+                         {key: value for key, value in after.items() if key not in ("pins", "grants")})
         self.assertEqual(files, {name: value for name, value in self.held().items()
                                  if name.startswith(os.path.join("plugins", PLUGIN))})
         self.release("unsigned", source=b"VALUE = 7\n", version="1.1.0")
         result = self.install()
         self.assertEqual(("unsigned", 3), (result["trust"], result["generation"]))
-        self.assertNotIn("pins", self.live_json())
+        self.assertEqual({}, self.live_json()["pins"])
 
     def test_unpin_of_a_plugin_that_is_not_pinned_writes_nothing(self):
         self.release("unsigned")

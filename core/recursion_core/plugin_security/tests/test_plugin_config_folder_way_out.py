@@ -39,7 +39,7 @@ class ConfigFolderWayOutTests(LiveCase):
                     self.assertEqual((1, f"refused: plugin_directory_untrusted\n{_way_out(self.config)}\n", ""),
                                      (status, said, out))
                     self.assertIn(str(self.config), said)
-                    self.assertIn(f"chmod 700 {self.config}", said)
+                    self.assertIn(f"chmod 700 {shlex.quote(str(self.config))}", said)
                     self.assertEqual(made, stat.S_IMODE(os.lstat(self.config).st_mode))
                     self.assertEqual(held, self.tree(self.config))
                     self.assertEqual(["notes.txt"], os.listdir(self.config))

@@ -87,7 +87,8 @@ typed yes; without it nothing is written. ``unpin`` drops the pin and every gran
 typed yes; the plugin stays installed as a local unsigned plugin. A remove keeps the pin. An
 ``install.json`` without ``pins`` (written before pins existed) has each installed plugin whose grant names
 a signing key pinned to that key when it is read, and nothing else changes. A file that holds no pin is written
-without ``pins``, byte for byte as before.
+without ``pins``, byte for byte as before. Once the file has held ``pins``, every later write keeps it, as an empty
+map after the last unpin, so pins are derived from grants only for a file that never held the key.
 
 A release of a pinned plugin, signed by a trusted key, that asks for more than the running release (a
 permission, a network destination, a credential reference or an install script that release did not request)
@@ -251,6 +252,8 @@ class Snapshot:
     developer_key_ids: dict = field(default_factory=dict)
     # By plugin id: {"signer_key_id", "version"}. None when the file has no ``pins`` (read: derived from grants).
     pins: dict | None = None
+    # True when the file read held ``pins``: every later write keeps the key, also as an empty map.
+    pins_held: bool = False
 
     def reserved(self) -> ReservedEffects:
         return ReservedEffects(frozenset(self.hosts), tuple(self.prefixes))
@@ -328,7 +331,7 @@ def remove_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLi
         # The pin stays: a removed plugin installed again unsigned is refused the same way.
         kept = Snapshot(snapshot.trusted_keys, grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
                         _labels_for(snapshot.labels, plugins), plugins, snapshot.developer_key_ids,
-                        pins=snapshot.pins)
+                        pins=snapshot.pins, pins_held=snapshot.pins_held)
         notes = []
         generation = _commit(config_path, kept, notes, report_kept, removing=plugin_id)
         result = {"command": "remove", "plugin_id": plugin_id, "generation": generation, "plugins": _rows(kept)}
@@ -352,15 +355,21 @@ def unpin_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLik
         raise NothingChanged("no plugin of that id is pinned; nothing was written.")
     fd = _lock(config_path, wait=wait)
     try:
-        _finish_publish(config_path)
+        finished = _finished_note(config_path, _finish_publish(config_path))
         snapshot = _load_snapshot(config_path)
         held = snapshot.pins.get(plugin_id)
         if held is None:
+            if finished:
+                raise NothingChanged(f"the plugin {plugin_id} is not pinned. {finished} Nothing else was written.")
             raise NothingChanged(f"the plugin {plugin_id} is not pinned; nothing was written.")
         key = held["signer_key_id"]
-        question = (f"Unpin the plugin {plugin_id} from the key {key}? This drops its pin and every grant of it, "
-                    f"and it stays installed as a local unsigned plugin. Type yes to unpin it:")
+        question = " ".join([f"Unpin the plugin {plugin_id} from the key {key}?", *([finished] if finished else []),
+                             f"This drops its pin and every grant of it, and it stays installed as a local unsigned "
+                             f"plugin.", _extras_note(config_path, snapshot), "Type yes to unpin it:"])
         if not _confirmed(confirm, question):
+            if finished:
+                raise NothingChanged(f"the plugin {plugin_id} stays pinned to the key {key}: the answer was not "
+                                     f"yes. {finished} Nothing else was written.")
             raise NothingChanged(f"the plugin {plugin_id} stays pinned to the key {key}: the answer was not yes, "
                                  f"and nothing was written.")
         pins = dict(snapshot.pins)
@@ -368,13 +377,19 @@ def unpin_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLik
         grants = dict(snapshot.grants)
         grants.pop(plugin_id, None)
         updated = Snapshot(snapshot.trusted_keys, grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
-                           snapshot.labels, snapshot.plugins, snapshot.developer_key_ids, pins=pins)
+                           snapshot.labels, snapshot.plugins, snapshot.developer_key_ids, pins=pins,
+                           pins_held=snapshot.pins_held)
         notes = []
         generation = _commit(config_path, updated, notes, report_kept)
         result = {"command": "unpin", "plugin_id": plugin_id, "generation": generation, "plugins": _rows(updated)}
         return _with_notes(result, notes)
     finally:
         os.close(fd)
+
+
+def _shown(path) -> str:
+    """``path`` as an absolute path, quoted for the shell, so a printed command runs as printed."""
+    return shlex.quote(str(Path(path).absolute()))
 
 
 def _confirmed(confirm, question: str) -> bool:
@@ -385,17 +400,31 @@ def _confirmed(confirm, question: str) -> bool:
     return type(answer) is str and answer.strip() == "yes"
 
 
-def _next_pin(snapshot: Snapshot, manifest, trust_name: str, signer, reason: str, signature_text, confirm):
+def _command(config, *words: str) -> str:
+    """The command ``recursion plugin <words>`` for the profile ``config``: with ``--config`` and its absolute
+    path, unless ``config`` is the default profile."""
+    from ._entrypoints import _config_dir  # the one rule for the default profile
+
+    line = " ".join(["recursion", "plugin", *words])
+    if Path(config).absolute() == _config_dir(None).absolute():
+        return line
+    return f"{line} --config {_shown(config)}"
+
+
+def _next_pin(snapshot: Snapshot, manifest, trust_name: str, signer, reason: str, signature_text, confirm,
+              config=None, grants=None):
     """The pin this release leaves, or None. A pinned plugin's release that is not signed by a trusted key
     refuses; one signed by another trusted key moves the pin only after the user's typed yes."""
     held = snapshot.pins.get(manifest.plugin_id)
     if held is None:
         return {"signer_key_id": signer, "version": manifest.version} if trust_name == "signed" else None
     if trust_name != "signed":
-        raise _update_refused(manifest, held["signer_key_id"], reason, signature_text)
+        raise _update_refused(manifest, held["signer_key_id"], reason, signature_text, config,
+                              _trusted_ids(snapshot))
     if signer != held["signer_key_id"]:
         question = (f"The plugin {manifest.plugin_id} is pinned to the key {held['signer_key_id']}; this release "
-                    f"is signed by {signer}, which is on this install's trusted list, and its grant is dropped. "
+                    f"is signed by {signer}, which is on this install's trusted list, and "
+                    f"{_grant_after(snapshot, grants, manifest.plugin_id, signer)}. "
                     f"Type yes to move the pin to {signer}:")
         if not _confirmed(confirm, question):
             raise NothingChanged(f"the plugin {manifest.plugin_id} stays pinned to the key "
@@ -403,7 +432,20 @@ def _next_pin(snapshot: Snapshot, manifest, trust_name: str, signer, reason: str
     return {"signer_key_id": signer, "version": manifest.version}
 
 
-def _update_refused(manifest, key: str, reason: str, signature_text) -> InstallRefused:
+def _grant_after(snapshot: Snapshot, grants, plugin_id: str, signer: str) -> str:
+    """What the move leaves of the plugin's grant: kept and named, given and named, dropped, or none."""
+    before = snapshot.grants.get(plugin_id)
+    after = None if grants is None else grants.get(plugin_id)
+    if after is not None:
+        named = ", ".join(after.permissions) or "no permission"
+        verb = "is kept" if after == before else "is given"
+        return f"its grant of {named}, bound to this release and the key {signer}, {verb}"
+    if before is not None:
+        return "its grant is dropped"
+    return "it holds no grant"
+
+
+def _update_refused(manifest, key: str, reason: str, signature_text, config=None, trusted=None) -> InstallRefused:
     """``update_unsigned_over_signed``: what failed, and the two ways forward."""
     plugin_id = manifest.plugin_id
     if signature_text is None:
@@ -412,11 +454,21 @@ def _update_refused(manifest, key: str, reason: str, signature_text) -> InstallR
         what = f"is signed by the key {key_id(manifest.developer_key)}, which is not on this install's trusted list"
     else:
         what = f"does not pass this install's signature check ({reason})"
+    if trusted is None or key in trusted:
+        forward = f"Install a release signed by {key}"
+    else:
+        forward = (f"The key {key} is not on this install's trusted list: put it on the trusted list again, or "
+                   f"install a release signed by a key that is on it")
     return InstallRefused("update_unsigned_over_signed", detail=(
         f"The plugin {plugin_id} is pinned to the key {key}, and its release {manifest.version} {what}. Nothing "
-        f"was written: the installed release, its grant and its generation are as they were. Install a release "
-        f"signed by {key}, or run: recursion plugin unpin {plugin_id} (it asks a typed yes, then drops the pin "
+        f"was written: the installed release, its grant and its generation are as they were. "
+        f"{forward}, or run: {_command(config, 'unpin', plugin_id)} (it asks a typed yes, then drops the pin "
         f"and every grant of {plugin_id}, which stays installed as a local unsigned plugin)."), show_detail=True)
+
+
+def _trusted_ids(snapshot: Snapshot) -> frozenset:
+    """The key ids of this install's trusted keys."""
+    return frozenset(key_id(value) for value in snapshot.trusted_keys.values())
 
 
 def _pins_from_grants(snapshot: Snapshot) -> dict:
@@ -491,7 +543,7 @@ def _install_locked(config: Path, chosen, plugin_id: str, state, report_kept=Non
         if asks:
             return _hold(config, chosen, manifest, asks)
     pins = dict(snapshot.pins)
-    pin = _next_pin(snapshot, manifest, trust_name, signer, reason, signature_text, confirm)
+    pin = _next_pin(snapshot, manifest, trust_name, signer, reason, signature_text, confirm, config, grants)
     if pin is not None:
         pins[manifest.plugin_id] = pin
     plugins = dict(snapshot.plugins)
@@ -499,7 +551,7 @@ def _install_locked(config: Path, chosen, plugin_id: str, state, report_kept=Non
     labels = _labels_for(snapshot.labels, plugins)
     labels[hashlib.sha256(chosen.manifest).hexdigest()] = chosen.label
     updated = Snapshot(dict(snapshot.trusted_keys), grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
-                       labels, plugins, snapshot.developer_key_ids, pins=pins)
+                       labels, plugins, snapshot.developer_key_ids, pins=pins, pins_held=snapshot.pins_held)
     notes = []
     generation = _commit(config, updated, notes, report_kept)
     # What the written install.json gives this plugin, as the loader's admit step computed it from those grants.
@@ -565,18 +617,19 @@ def quarantine_accept(config: os.PathLike | str, plugin_id: str, *, state: os.Pa
     _require_platform()
     config_path = Path(config)
     if not _plugin_id_ok(plugin_id):
-        raise NothingChanged(_nothing_held(None))
+        raise NothingChanged(_nothing_held(config_path, None))
     fd = _lock(config_path, wait=wait)
     try:
         _finish_publish(config_path)
         folder = _held_folder(config_path, plugin_id, create=False)
         names = sorted(os.listdir(folder)) if folder is not None else []
         if not names:
-            raise NothingChanged(_nothing_held(plugin_id))
+            raise NothingChanged(_nothing_held(config_path, plugin_id))
         if len(names) != 1 or _VERSION_DIR.fullmatch(names[0]) is None:
             raise InstallRefused("plugin_directory_untrusted", detail=(
                 f"The folder {folder} holds more than one release, or an entry this command did not write. Run: "
-                f"recursion plugin quarantine drop {plugin_id}; then install the release again."), show_detail=True)
+                f"{_command(config_path, 'quarantine', 'drop', plugin_id)}; then install the release again."),
+                show_detail=True)
         held = folder / names[0]
         files = _read_held(held)
         manifest = _held_manifest(held, plugin_id, files)
@@ -590,7 +643,8 @@ def quarantine_accept(config: os.PathLike | str, plugin_id: str, *, state: os.Pa
         if refused:
             raise InstallRefused(refused[0]["code"], [item["code"] for item in refused])
         if plugin_id in snapshot.pins and trust_name != "signed":
-            raise _update_refused(manifest, snapshot.pins[plugin_id]["signer_key_id"], reason, signature_text)
+            raise _update_refused(manifest, snapshot.pins[plugin_id]["signer_key_id"], reason, signature_text,
+                                  config_path, _trusted_ids(snapshot))
         granted = tuple(perm for perm in manifest.permissions if perm != "order")
         running = snapshot.plugins.get(plugin_id)
         asks = _asks_for_more(None if running is None else parse_manifest(running.manifest), manifest)
@@ -600,19 +654,19 @@ def quarantine_accept(config: os.PathLike | str, plugin_id: str, *, state: os.Pa
         if not _confirmed(confirm, question):
             raise NothingChanged(f"the release {manifest.version} of the plugin {plugin_id} stays held at {held}: "
                                  f"the answer was not yes, and nothing was written.")
-        pins = dict(snapshot.pins)
-        pin = _next_pin(snapshot, manifest, trust_name, signer, reason, signature_text, confirm)
-        if pin is not None:
-            pins[plugin_id] = pin
         grants = dict(grants)
         grants[plugin_id] = Grant(plugin_id, manifest.artifact_sha256, signer, granted)
+        pins = dict(snapshot.pins)
+        pin = _next_pin(snapshot, manifest, trust_name, signer, reason, signature_text, confirm, config_path, grants)
+        if pin is not None:
+            pins[plugin_id] = pin
         developer_key_ids = {key: value for key, value in snapshot.developer_key_ids.items() if key != plugin_id}
         plugins = dict(snapshot.plugins)
         plugins[plugin_id] = StoredPlugin(files["manifest.json"], files["plugin.py"], signature)
         labels = _labels_for(snapshot.labels, plugins)
         labels[hashlib.sha256(files["manifest.json"]).hexdigest()] = label
         updated = Snapshot(dict(snapshot.trusted_keys), grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
-                           labels, plugins, developer_key_ids, pins=pins)
+                           labels, plugins, developer_key_ids, pins=pins, pins_held=snapshot.pins_held)
         notes = []
         generation = _commit(config_path, updated, notes, report_kept)
         notes.extend(_drop_held_copy(held, files))
@@ -631,23 +685,23 @@ def quarantine_drop(config: os.PathLike | str, plugin_id: str, *, state: os.Path
     del state
     config_path = Path(config)
     if not _plugin_id_ok(plugin_id):
-        raise NothingChanged(_nothing_held(None))
+        raise NothingChanged(_nothing_held(config_path, None))
     fd = _lock(config_path, wait=wait)
     try:
         folder = _held_folder(config_path, plugin_id, create=False)
         names = sorted(os.listdir(folder)) if folder is not None else []
         if not names:
-            raise NothingChanged(_nothing_held(plugin_id))
+            raise NothingChanged(_nothing_held(config_path, plugin_id))
         return _with_notes({"command": "quarantine drop", "plugin_id": plugin_id},
                            _set_aside(config_path, plugin_id, folder, names))
     finally:
         os.close(fd)
 
 
-def _nothing_held(plugin_id: str | None) -> str:
+def _nothing_held(config: Path, plugin_id: str | None) -> str:
     which = "of that id" if plugin_id is None else f"of the plugin {plugin_id}"
     return (f"no release {which} is held in quarantine; nothing was written. To see what is held run: "
-            f"recursion plugin quarantine list")
+            f"{_command(config, 'quarantine', 'list')}")
 
 
 def _asks_for_more(running, release) -> list:
@@ -699,9 +753,10 @@ def _hold(config: Path, chosen, manifest, asks: list) -> dict:
         os.rename(partial, held)
         _sync_dir(folder)
     step = (f"The release {version} of the plugin {plugin_id} was not installed: it is held at {held}, and the "
-            f"running release stays live with its grant. To install it run: recursion plugin quarantine accept "
-            f"{plugin_id} (it asks a typed yes); to drop it run: recursion plugin quarantine drop {plugin_id}; to "
-            f"see what is held run: recursion plugin quarantine list.")
+            f"running release stays live with its grant. To install it run: "
+            f"{_command(config, 'quarantine', 'accept', plugin_id)} (it asks a typed yes); to drop it run: "
+            f"{_command(config, 'quarantine', 'drop', plugin_id)}; to see what is held run: "
+            f"{_command(config, 'quarantine', 'list')}")
     return _with_notes({"command": "install", "result": "quarantined", "plugin_id": plugin_id, "version": version,
                         "trust": "signed", "held_at": str(held), "asks": list(asks), "next": step}, notes)
 
@@ -731,8 +786,9 @@ def _read_held(held: Path) -> dict:
     names = set(os.listdir(held))
     if not names <= set(_HELD_LIMITS) or not {"manifest.json", "plugin.py", _HELD_LABEL} <= names:
         raise InstallRefused("plugin_directory_untrusted", detail=(
-            f"The folder {held} is not a release this command held. Run: recursion plugin quarantine drop "
-            f"{held.parent.name}; then install the release again."), show_detail=True)
+            f"The folder {held} is not a release this command held. Run: "
+            f"{_command(held.parents[2], 'quarantine', 'drop', held.parent.name)}; then install the release again."),
+            show_detail=True)
     return {name: _read_file(held / name, _HELD_LIMITS[name]) for name in sorted(names)}
 
 
@@ -875,7 +931,10 @@ def _lock(config: Path, wait: bool = True) -> int:
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise _link_refusal(path, "plugin_directory_untrusted") from None
-        raise InstallRefused("plugin_directory_untrusted", detail=type(exc).__name__) from None
+        raise InstallRefused("plugin_directory_untrusted", detail=(
+            f"The lock file {path} cannot be opened for writing ({exc.strerror or type(exc).__name__}). Make it "
+            f"writable by its owner with: chmod 600 {_shown(path)}; or remove it while no plugin "
+            f"command runs; then run the command again."), show_detail=True) from None
     try:
         os.fchmod(fd, 0o600)
         flags = fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB
@@ -911,7 +970,7 @@ def _require_owner_only_config(config: Path) -> None:
     if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and info.st_mode & 0o022:
         raise InstallRefused("plugin_directory_untrusted", detail=(
             f"The folder {config} can be written by other users, and no plugin is installed or read from such a "
-            f"folder. Make it owner-only with: chmod 700 {shlex.quote(str(config))}; then run the command again."),
+            f"folder. Make it owner-only with: chmod 700 {_shown(config)}; then run the command again."),
             show_detail=True)
 
 
@@ -932,10 +991,11 @@ def _finish_publish(config: Path) -> None:
     """
     record = _read_record(config)
     if record is None:
-        return
+        return None
     publishing = int(record.group(1))
     root = config / "plugin-generations"
     kept = []
+    finished = None
     if publishing == _read_current(config):
         replaced = int(record.group(2)) if record.group(2) else None
         sources = [root / str(number) for number in (publishing, replaced) if number is not None]
@@ -944,8 +1004,48 @@ def _finish_publish(config: Path) -> None:
         _check_install_file(config, sources)
         _check_publish(config, sources, staged - _PROFILE_NAMES)
         kept = _copy_generation_to_live(config, publishing, sources)
+        finished = (publishing, replaced)
     _clear_marker(root)
     _refuse_kept(kept)
+    return finished
+
+
+def _finished_note(config: Path, finished) -> str:
+    """One sentence for a stopped publish a command finished first: the generation, and the plugins it changed."""
+    if finished is None:
+        return ""
+    publishing, replaced = finished
+    root = config / "plugin-generations"
+    try:
+        new = _read_profile(root / str(publishing), missing_install_ok=False).plugins
+        old = {} if replaced is None else _read_profile(root / str(replaced), missing_install_ok=False).plugins
+        changed = sorted(name for name in set(new) | set(old) if new.get(name) != old.get(name))
+    except (InstallRefused, OSError):
+        changed = []
+    which = f", which changes the plugin {', '.join(changed)}," if changed else ""
+    return (f"A publish that had stopped part way was finished first: generation {publishing}{which} is now in "
+            f"the live folder {config / 'plugins'}.")
+
+
+def _extras_note(config: Path, snapshot: Snapshot) -> str:
+    """For the question before a commit that keeps every plugin as it is: the entries it will move aside, as every
+    commit does, and the kept place, or that none will be."""
+    current = _read_current(config)
+    root = config / "plugin-generations"
+    extras = []
+    if current is not None:
+        installed = root / str(current)
+        try:
+            extras = _check_publish(config, [installed], set(snapshot.plugins), installed)
+        except (InstallRefused, OSError):
+            extras = []  # the commit refuses as before, after the answer
+    extras = [(name, more) for name, more in extras if more]
+    if not extras:
+        return "No plugin folder holds an entry its plugin was not installed with, so nothing is moved aside."
+    place = _kept_place(root, _next_number(root, current))
+    moved = "; ".join(f"{', '.join(more)} from {config / 'plugins' / name}" for name, more in extras)
+    return (f"As every change does, it also moves aside the entries plugin folders hold that their plugins were "
+            f"not installed with: {moved}; they are kept at {place}.")
 
 
 def _check_install_file(config: Path, sources: list) -> None:
@@ -1587,7 +1687,8 @@ def _read_profile(directory: Path, *, missing_install_ok: bool, written: dict | 
             raise _changed_way_out(path, plugin, written.get(name))
         plugins[name] = plugin
     return Snapshot(parsed["trusted_keys"], parsed["grants"], parsed["hosts"], parsed["prefixes"],
-                    parsed["anchor"], parsed["labels"], plugins, parsed["developer_key_ids"], pins=parsed["pins"])
+                    parsed["anchor"], parsed["labels"], plugins, parsed["developer_key_ids"], pins=parsed["pins"],
+                    pins_held=parsed["pins"] is not None)
 
 
 def _changed_way_out(path: Path, plugin: StoredPlugin, mine: StoredPlugin | None) -> InstallRefused:
@@ -1739,8 +1840,9 @@ def _dump_install(snapshot: Snapshot) -> bytes:
         "reserved": {"credential_prefixes": list(snapshot.prefixes), "hosts": list(snapshot.hosts)},
         "trusted_keys": snapshot.trusted_keys,
     }
-    if snapshot.pins:
-        # Written only when a plugin is pinned: a file without a pin is the bytes it was before pins existed.
+    if snapshot.pins or snapshot.pins_held:
+        # Written when a plugin is pinned or the file held the key: a file that never held a pin is the bytes it
+        # was before pins existed, and one that did keeps the key, so no pin is derived again after the last unpin.
         payload["pins"] = {plugin_id: dict(snapshot.pins[plugin_id]) for plugin_id in sorted(snapshot.pins)}
     return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
 

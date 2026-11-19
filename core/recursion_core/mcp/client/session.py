@@ -9,9 +9,13 @@ sorted with its ``jsonrpc`` module, both by import.
 ``open``
     Sends ``initialize`` asking for ``LATEST_PROTOCOL`` (2026-07-28), with no client capabilities. A
     server that answers ``LEGACY_PROTOCOL`` (2025-06-18) is spoken to in 2025-06-18; a server that answers
-    the request with a JSON-RPC error is asked once more, for 2025-06-18. Any other answer ends the session
-    (``PROTOCOL_UNSUPPORTED``; ``INITIALIZE_REFUSED`` when the second request is refused too). Then sends
-    ``notifications/initialized``.
+    the request with a JSON-RPC error is asked once more, for 2025-06-18. Every other way ``open`` fails
+    ends the session, once, with the code the caller is given (``McpSessionEnded``): no answer within the
+    deadline (``CALL_TIMEOUT``), a result that is not an object (``BAD_ANSWER``), a revision the client does
+    not speak (``PROTOCOL_UNSUPPORTED``), the second request refused too (``INITIALIZE_REFUSED``), or the
+    session's own ending. ``ending`` keeps that code, a later call raises ``McpSessionEnded`` with it, and the
+    server reads end of input. ``initialize`` is never cancelled: its late answer, if one comes, is dropped.
+    On success, sends ``notifications/initialized``.
 ``list_tools``
     ``tools/list`` page by page (``cursor``, ``nextCursor``) until a page has no ``nextCursor``; a cursor
     the server gives twice, or one that is not a string, is ``BAD_ANSWER``. On
@@ -21,17 +25,27 @@ sorted with its ``jsonrpc`` module, both by import.
     ``tools/call``. With ``on_progress`` the request carries a ``progressToken`` and every
     ``notifications/progress`` naming it is handed to the callback (on the reader's thread) until the call
     is over. A call abandoned (``ToolCall.abandon``, or its deadline passed) is answered at once with
-    ``CALL_ABANDONED`` or ``CALL_TIMEOUT``, ``notifications/cancelled`` is sent for it, and its late answer,
-    when it comes, is dropped.
+    ``CALL_ABANDONED`` or ``CALL_TIMEOUT``, ``notifications/cancelled`` is sent for it (never for
+    ``initialize``), and its late answer, when it comes, is dropped.
 Requests from the server
     ``ping`` is answered ``{}``. Every other request (``sampling/createMessage``, ``elicitation/create``,
     ``roots/list``, any unknown method) is refused with JSON-RPC error ``-32601`` and a client-side record
-    ``{"record": SERVER_REQUEST_REFUSED, "method": ...}`` handed to ``on_record``. Reading goes on, so a call
-    in progress still finishes.
+    ``{"record": SERVER_REQUEST_REFUSED, "method": ...}`` handed to ``on_record``. A method that is longer
+    than ``MAX_SERVER_TEXT_CHARS`` or holds a character that is not printable is kept as its excerpt (SERVER
+    TEXT below) and the record gains one key, ``method_excerpt``: ``{"length": <the server's length in
+    characters>, "cut": <whether it was cut>}``. The id echoed in the refusal is the server's own, unchanged.
+    Reading goes on, so a call in progress still finishes.
 
 BOUNDS. One line longer than ``MAX_MESSAGE_BYTES`` (2 MiB, its newline included) ends the session
 (``MESSAGE_TOO_LARGE``): the client reads at most that many bytes plus one and never reads the rest. Each
 request has a deadline (``CALL_DEADLINE_S``, 60 s, unless the caller gives a shorter one).
+
+SERVER TEXT. A server's text is untrusted: it may be long, not text at all, or shaped to mislead whoever reads
+it. ``_server_text`` makes every excerpt of it the client keeps (``McpServerError.detail``, the detail of
+``PROTOCOL_UNSUPPORTED``, the refused method in the record), and nothing else in the client prints or formats
+a server-chosen value: only a ``str`` is taken (any other value is ``(not text: <its type>)``), it is cut to
+``MAX_SERVER_TEXT_CHARS`` characters first, and only then is each character that is not printable written as
+its backslash escape (``\\x1b``, ``\\t``, ``\\udfff``). ``McpServerError.error`` keeps the error as sent.
 
 THREADS. Reading runs on a thread of its own and writing on another, so a server that is slow to answer,
 or slow to read, never holds the caller past the deadline: a caller only puts a message in the outbox and
@@ -39,8 +53,8 @@ waits for its answer with a time limit. Every shared state is changed under one 
 global interpreter lock. A callback (``on_progress``, ``on_tools``, ``on_record``) that raises is ignored.
 
 ENDING. The session ends once, for the first of: a line over the bound, end of the server's output
-(``SERVER_GONE``), a write that fails (``OUTPUT_FAILED``), ``close`` (``CLIENT_SHUT``) or a refused
-negotiation. Every call still waiting then raises ``McpSessionEnded`` with that ending as its ``code``, and
+(``SERVER_GONE``), a write that fails (``OUTPUT_FAILED``), ``close`` (``CLIENT_SHUT``) or a failed ``open``
+(its own code, see ``open``). Every call still waiting then raises ``McpSessionEnded`` with that ending as its ``code``, and
 ``ending`` keeps it. The writer sends what it already holds and then closes ``outstream``, so the server
 reads end of input; ``instream`` is left to its owner.
 
@@ -60,7 +74,7 @@ from typing import Any, BinaryIO
 from recursion_core.control.mcp import jsonrpc
 from recursion_core.control.mcp.framing import FrameWriter, decode_line, encode
 
-from .limits import CALL_DEADLINE_S, MAX_MESSAGE_BYTES
+from .limits import CALL_DEADLINE_S, MAX_MESSAGE_BYTES, MAX_SERVER_TEXT_CHARS
 
 LATEST_PROTOCOL = "2026-07-28"
 LEGACY_PROTOCOL = "2025-06-18"
@@ -77,11 +91,23 @@ CLIENT_SHUT = "mcp_client_shut"
 PROTOCOL_UNSUPPORTED = "mcp_protocol_unsupported"
 INITIALIZE_REFUSED = "mcp_initialize_refused"
 
-# How one request fails while the session goes on (``McpClientError.code``).
+# How one request fails while the session goes on (``McpClientError.code``); a failed ``open`` ends the
+# session with the same code.
 CALL_TIMEOUT = "mcp_call_timeout"
 CALL_ABANDONED = "mcp_call_abandoned"
 SERVER_ERROR = "mcp_server_error"
 BAD_ANSWER = "mcp_bad_answer"
+
+
+def _server_text(value: Any) -> str:
+    """The excerpt of a server-chosen value that the client keeps (the module text, SERVER TEXT)."""
+
+    if not isinstance(value, str):
+        return f"(not text: {'null' if value is None else type(value).__name__})"
+    cut = value[:MAX_SERVER_TEXT_CHARS]  # first: nothing longer is ever escaped or printed
+    if cut.isprintable():
+        return cut
+    return "".join(c if c.isprintable() else c.encode("unicode_escape").decode("ascii") for c in cut)
 
 
 class McpClientError(Exception):
@@ -98,10 +124,11 @@ class McpSessionEnded(McpClientError):
 
 
 class McpServerError(McpClientError):
-    """The server answered the request with a JSON-RPC error, kept as ``error``."""
+    """The server answered the request with a JSON-RPC error, kept as sent as ``error`` (nothing prints it);
+    ``detail`` is the excerpt of its ``message``."""
 
     def __init__(self, error: dict) -> None:
-        super().__init__(SERVER_ERROR, str(error.get("message", ""))[:200])
+        super().__init__(SERVER_ERROR, _server_text(error.get("message", "")))
         self.error = error
 
 
@@ -122,14 +149,16 @@ class _Pending:
 class ToolCall:
     """One request in flight: ``wait`` for its result, or ``abandon`` it."""
 
-    def __init__(self, client: McpClient, request_id: int, pending: _Pending, deadline: float) -> None:
+    def __init__(self, client: McpClient, request_id: int, pending: _Pending, deadline: float,
+                 cancel: bool = True) -> None:
         self._client, self._id, self._pending, self._deadline = client, request_id, pending, deadline
+        self._cancel = cancel  # False for initialize, which is never cancelled
 
     def wait(self) -> dict:
         """The result object; raises ``McpClientError`` (a subclass for a server error or an ended session)."""
 
         if not self._pending.done.wait(max(0.0, self._deadline - time.monotonic())):
-            self._client._abandon(self._id, CALL_TIMEOUT)
+            self._client._abandon(self._id, CALL_TIMEOUT, self._cancel)
         self._pending.done.wait()  # set by the answer, the abandonment or the session's end, whichever was first
         if self._pending.failure is not None:
             raise self._pending.failure
@@ -171,24 +200,34 @@ class McpClient:
         threading.Thread(target=self._write_loop, name="mcp-client-write", daemon=True).start()
         asked = LATEST_PROTOCOL
         try:
-            result = self._request("initialize", self._init_params(asked), None, deadline_s).wait()
-        except McpServerError:
-            asked = LEGACY_PROTOCOL
             try:
-                result = self._request("initialize", self._init_params(asked), None, deadline_s).wait()
-            except McpServerError as exc:
-                self._end(INITIALIZE_REFUSED)
-                raise McpSessionEnded(INITIALIZE_REFUSED, exc.detail) from exc
+                result = self._initialize(asked, deadline_s)
+            except McpServerError:
+                asked = LEGACY_PROTOCOL
+                try:
+                    result = self._initialize(asked, deadline_s)
+                except McpServerError as exc:
+                    self._end(INITIALIZE_REFUSED)
+                    raise McpSessionEnded(INITIALIZE_REFUSED, exc.detail) from exc
+        except McpSessionEnded:
+            raise
+        except McpClientError as exc:  # no answer within the deadline, a result that is not an object
+            self._end(exc.code)
+            raise McpSessionEnded(self.ending or exc.code, exc.detail) from exc
         version = result.get("protocolVersion")
         if not isinstance(version, str) or version not in _ACCEPTED[asked]:
             self._end(PROTOCOL_UNSUPPORTED)
-            raise McpSessionEnded(PROTOCOL_UNSUPPORTED, repr(version)[:80])
+            raise McpSessionEnded(PROTOCOL_UNSUPPORTED, _server_text(version))
         caps, info = result.get("capabilities"), result.get("serverInfo")
         self.protocol_version = version
         self.server_capabilities = caps if isinstance(caps, dict) else {}
         self.server_info = info if isinstance(info, dict) else {}
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         return result
+
+    def _initialize(self, version: str, deadline_s: float) -> dict:
+        # Never cancelled: past its deadline open ends the session instead.
+        return self._request("initialize", self._init_params(version), None, deadline_s, cancel=False).wait()
 
     @staticmethod
     def _init_params(version: str) -> dict:
@@ -259,7 +298,7 @@ class McpClient:
 
     # -- requests ----------------------------------------------------------------------------------------
     def _request(self, method: str, params: dict, on_progress: Callable[[dict], Any] | None,
-                 deadline_s: float) -> ToolCall:
+                 deadline_s: float, cancel: bool = True) -> ToolCall:
         deadline = time.monotonic() + min(deadline_s, CALL_DEADLINE_S)
         pending = _Pending(on_progress)
         with self._cond:
@@ -276,17 +315,18 @@ class McpClient:
             with self._cond:
                 self._pending.pop(request_id, None)
             raise
-        return ToolCall(self, request_id, pending, deadline)
+        return ToolCall(self, request_id, pending, deadline, cancel)
 
-    def _abandon(self, request_id: int, code: str) -> None:
+    def _abandon(self, request_id: int, code: str, cancel: bool = True) -> None:
         with self._cond:
             pending = self._pending.pop(request_id, None)
         if pending is None:  # answered, abandoned or ended already
             return
         pending.failure = McpClientError(code, f"request {request_id}")
         pending.done.set()
-        self._send({"jsonrpc": "2.0", "method": "notifications/cancelled",
-                    "params": {"requestId": request_id, "reason": code}})
+        if cancel:
+            self._send({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                        "params": {"requestId": request_id, "reason": code}})
 
     def _send(self, message: dict) -> bool:
         encode(message)  # a message JSON cannot hold raises here, on the caller's thread
@@ -339,7 +379,7 @@ class McpClient:
                 self._send(jsonrpc.result(kind.id, {}))
             else:
                 self._send(jsonrpc.error(kind.id, jsonrpc.METHOD_NOT_FOUND, "Method not found"))
-                self._callback(self._on_record, {"record": SERVER_REQUEST_REFUSED, "method": kind.method})
+                self._callback(self._on_record, self._refused_record(kind.method))
         elif isinstance(kind, jsonrpc.Notification):
             if kind.method == "notifications/progress":
                 self._progress(kind.params)
@@ -347,6 +387,15 @@ class McpClient:
                 self._schedule_relist()
         else:
             self._send(jsonrpc.error(kind.id, kind.code, kind.message))
+
+    @staticmethod
+    def _refused_record(method: Any) -> dict:
+        excerpt = _server_text(method)
+        record = {"record": SERVER_REQUEST_REFUSED, "method": excerpt}
+        if excerpt != method:  # long, escaped or not text: the reader of the record sees it is a server's, marked
+            length = len(method) if isinstance(method, str) else None
+            record["method_excerpt"] = {"length": length, "cut": length is None or length > MAX_SERVER_TEXT_CHARS}
+        return record
 
     def _response(self, message: dict) -> None:
         request_id = message.get("id")

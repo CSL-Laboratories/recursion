@@ -101,6 +101,10 @@ class ProfileRouteAdapter(RouteAdapter):
                 )
             except SubscriptionRouteRefused as err:
                 return c.result(rid, c.SUBSCRIPTION_ROUTE_REFUSED, detail=err.cause)
+            except c.RouteError as err:
+                # The launcher raised before a process was stored. Nothing was started, so the
+                # typed refusal is a result, the same as RouteAdapter.run.
+                return c.result(rid, err.code, detail=err.detail)
             except OSError as err:
                 return c.result(rid, c.ENGINE_ERROR, detail=f"launch failed: {type(err).__name__}")
             events: list[dict] = []

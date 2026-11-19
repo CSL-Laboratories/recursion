@@ -269,6 +269,22 @@ class RouteDecision:
     pin_version: str = ""  # Antigravity pin only; empty for every other route
 
 
+def _string_child_env(engine: str, child_env: object) -> dict[str, str]:
+    """A child env whose names and values are strings.
+
+    ``dict(None)`` and a non-string name or value used to escape as ``TypeError`` or
+    ``AttributeError``. The value is not echoed.
+    """
+
+    if not isinstance(child_env, Mapping):
+        raise SubscriptionRouteRefused(engine, "child_env_malformed")
+    copied: dict[str, str] = {}
+    for name, value in child_env.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise SubscriptionRouteRefused(engine, "child_env_malformed")
+        copied[name] = value
+    return copied
+
 _LINE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 
@@ -370,7 +386,7 @@ def check_route(
     if credential not in spec.providers[provider].credential_env:
         raise SubscriptionRouteRefused(engine, "credential_env_not_allowed", _public_detail(credential))
 
-    env = dict(child_env)
+    env = _string_child_env(engine, child_env)
     present = sorted(name for name in CLAUDE_SUBSCRIPTION_ENV if name in env)
     if present:
         raise SubscriptionRouteRefused(engine, "claude_subscription_env", ",".join(present))
@@ -492,7 +508,7 @@ def _check_subscription(
     if model_provider != label:
         raise SubscriptionRouteRefused(engine, "model_provider_mismatch", model_provider)
 
-    env = dict(child_env)
+    env = _string_child_env(engine, child_env)
     present = sorted(name for name in CLAUDE_SUBSCRIPTION_ENV if name in env)
     if present:
         raise SubscriptionRouteRefused(engine, "claude_subscription_env", ",".join(present))
@@ -1048,35 +1064,41 @@ def _create_adopt_switch(path: str, dir_fd: int | None = None) -> None:
 
 
 def _stage_hermes_dir(engine: str, route_home: str, parent: str) -> None:
-    """``.hermes`` is absent or empty: build it beside its place and rename it in, switch included.
+    """``.hermes`` is absent: build it beside its place and rename it in, switch included.
 
-    The rename replaces only a missing or empty directory. If something appeared in ``.hermes``
+    The rename replaces only a missing directory. If something appeared in ``.hermes``
     meanwhile (``ENOTEMPTY`` or ``EEXIST``) the launch refuses and the staging directory is removed.
+    A mkdir or write failure is a typed refusal and does not echo the OS text or the path.
     """
 
     staging = os.path.join(route_home, _HERMES_STAGING_PREFIX + secrets.token_hex(8))
-    os.mkdir(staging, 0o700)
     try:
-        staging_fd = os.open(staging, _DIR_OPEN_FLAGS)
+        os.mkdir(staging, 0o700)
         try:
-            _create_adopt_switch("config.yaml", dir_fd=staging_fd)
-            _fsync_dir(staging_fd)
-        finally:
-            os.close(staging_fd)
-        try:
-            os.rename(staging, parent)
-        except OSError as exc:
-            if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
-                raise _refuse_hermes_config(engine, ".hermes") from None
-            raise
-    except BaseException:
-        for remove, path in ((os.unlink, os.path.join(staging, "config.yaml")), (os.rmdir, staging)):
+            staging_fd = os.open(staging, _DIR_OPEN_FLAGS)
             try:
-                remove(path)
-            except OSError:
-                pass
+                _create_adopt_switch("config.yaml", dir_fd=staging_fd)
+                _fsync_dir(staging_fd)
+            finally:
+                os.close(staging_fd)
+            try:
+                os.rename(staging, parent)
+            except OSError as exc:
+                if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                    raise _refuse_hermes_config(engine, ".hermes") from None
+                raise
+        except BaseException:
+            for remove, path in ((os.unlink, os.path.join(staging, "config.yaml")), (os.rmdir, staging)):
+                try:
+                    remove(path)
+                except OSError:
+                    pass
+            raise
+        _fsync_dir(route_home)
+    except SubscriptionRouteRefused:
         raise
-    _fsync_dir(route_home)
+    except OSError:
+        raise SubscriptionRouteRefused(engine, "hermes_staging_failed") from None
 
 
 def _link_hermes_config(engine: str, route_home: str, parent: str) -> None:
@@ -1113,11 +1135,18 @@ def _apply_hermes_adopt_override(decision: RouteDecision, route_home: str) -> No
     parent = os.path.join(route_home, ".hermes")
     if _hermes_config_is_ours(decision.engine, route_home):
         return
-    if not os.path.lexists(parent) or _hermes_dir_is_empty(route_home):
+    if not os.path.lexists(parent):
         _stage_hermes_dir(decision.engine, route_home, parent)
     elif os.path.islink(parent) or not os.path.isdir(parent):
         raise _refuse_hermes_config(decision.engine, ".hermes")
     else:
+        # An empty directory stays the inode a holder already has open. It is made private, then
+        # the switch is linked in, the same end state a staged directory had.
+        if _hermes_dir_is_empty(route_home):
+            try:
+                os.chmod(parent, 0o700)
+            except OSError:
+                raise SubscriptionRouteRefused(decision.engine, "hermes_staging_failed") from None
         _link_hermes_config(decision.engine, route_home, parent)
 
 
@@ -1165,7 +1194,7 @@ def _checked_baseline(
 ) -> tuple[tuple[str, str], ...]:
     """Safe child env only: no Claude subscription name and no credential. Then the home rules."""
 
-    env = dict(child_env)
+    env = _string_child_env(engine, child_env)
     present = sorted(name for name in CLAUDE_SUBSCRIPTION_ENV if name in env)
     if present:
         raise SubscriptionRouteRefused(engine, "claude_subscription_env", ",".join(present))

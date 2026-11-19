@@ -116,12 +116,16 @@ def _proxy_value_refused(name: str, value: object) -> bool:
     return _unsafe_proxy(value, schemes) is not None
 
 
-def _project_child(parent: Mapping[str, str], blocked: Callable[[str], bool]) -> tuple[dict[str, str], tuple[str, ...]]:
+def _project_child(engine: str, parent: Mapping[str, str], blocked: Callable[[str], bool]) -> tuple[dict[str, str], tuple[str, ...]]:
     """The parent names that may reach the child, and the names that were removed."""
 
+    if not isinstance(parent, Mapping):
+        raise OwnLoopRouteRefused(engine, "parent_env_malformed")
     removed: list[str] = []
     child: dict[str, str] = {}
     for name, value in parent.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise OwnLoopRouteRefused(engine, "parent_env_malformed")
         if blocked(name) or name not in _CHILD_ALLOW or _ambient_secret(name) or _proxy_value_refused(name, value):
             removed.append(name)
         else:
@@ -210,7 +214,7 @@ def check_copilot_own_loop(
     strip = COPILOT_STRIP_ENV + _GH_FALLBACK_ENV
     # Any other provider credential (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) is not this run's either.
     # The allowlist then drops whatever the strip does not name (GH_PAT, AWS_*, GIT_CONFIG_*).
-    child, removed = _project_child(parent_env, lambda name: name in strip or _is_provider_credential(name))
+    child, removed = _project_child("copilot", parent_env, lambda name: name in strip or _is_provider_credential(name))
     return OwnLoopDecision("copilot", "copilot_cli_sign_in", MappingProxyType(child), removed, model=model)
 
 
@@ -377,7 +381,7 @@ def check_nous_own_loop(
     # Provider credentials, and proxy settings that would carry loopback traffic off the host.
     # The allowlist then drops whatever that strip does not name (GH_PAT, AWS_*, GIT_CONFIG_*).
     child, removed = _project_child(
-        parent_env, lambda name: _is_provider_credential(name) or name.upper() in _PROXY_ENV,
+        "nous", parent_env, lambda name: _is_provider_credential(name) or name.upper() in _PROXY_ENV,
     )
     return OwnLoopDecision("nous", "hermes_local_proxy", MappingProxyType(child), removed, url, adapters,
                            _shared_host_warning(current_user, interactive_users), model)

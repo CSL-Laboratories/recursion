@@ -370,10 +370,21 @@ class Grant:
 
 @dataclass(frozen=True)
 class ReservedEffects:
-    """Credentials and destinations only an effect owner may hold (injected; consumer-neutral)."""
+    """Credentials and destinations only an effect owner may hold (injected; consumer-neutral).
+
+    Each host is written in the one plain form a manifest destination's host has: lower
+    case, no trailing dot, no port. An entry in any other form would match no destination
+    and reserve nothing, so it is refused when the list is made (``reserved_host_form``,
+    naming the entry), not rewritten.
+    """
 
     hosts: frozenset = frozenset()
     credential_prefixes: tuple = ()
+
+    def __post_init__(self) -> None:
+        for host in self.hosts:
+            if type(host) is not str or ":" in host or not _HOST.fullmatch(host):
+                raise Refused("reserved_host_form", host if type(host) is str else repr(host))
 
     def host_reserved(self, destination: str) -> bool:
         host = destination.split(":", 1)[0]

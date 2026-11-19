@@ -307,5 +307,37 @@ class CompileOverflowTests(unittest.TestCase):
                 self.assertEqual(loader._active, {}, "a plugin that did not compile was made active")
 
 
+class ReservedHostFormTests(unittest.TestCase):
+    """A reserved host is written in the one plain form, or the list is refused when it is made."""
+
+    def test_an_entry_in_another_form_is_refused_naming_it(self) -> None:
+        for entry in ("Venue.Example", "venue.example.", "venue.example:443"):
+            with self.subTest(entry=entry):
+                with self.assertRaises(Refused) as ctx:
+                    ReservedEffects(frozenset({entry}), ())
+                self.assertEqual(ctx.exception.code, "reserved_host_form")
+                self.assertEqual(ctx.exception.detail, entry)
+
+    def test_one_entry_in_another_form_refuses_the_whole_list(self) -> None:
+        with self.assertRaises(Refused) as ctx:
+            ReservedEffects(frozenset({"venue.example", "Other.Example"}), ("venue:",))
+        self.assertEqual((ctx.exception.code, ctx.exception.detail), ("reserved_host_form", "Other.Example"))
+
+    def test_an_entry_that_is_not_a_string_is_refused(self) -> None:
+        with self.assertRaises(Refused) as ctx:
+            ReservedEffects(frozenset({b"venue.example"}), ())
+        self.assertEqual(ctx.exception.code, "reserved_host_form")
+
+    def test_a_plain_entry_still_reserves_its_host(self) -> None:
+        reserved = ReservedEffects(frozenset({"venue.example"}), ("venue:",))
+        for destination in ("venue.example", "api.venue.example", "api.venue.example:8443"):
+            with self.subTest(destination=destination):
+                self.assertTrue(reserved.host_reserved(destination))
+        for destination in ("othervenue.example", "venue.example.org", "docs.example.org"):
+            with self.subTest(destination=destination):
+                self.assertFalse(reserved.host_reserved(destination))
+        self.assertFalse(ReservedEffects().host_reserved("venue.example"))
+
+
 if __name__ == "__main__":
     unittest.main()

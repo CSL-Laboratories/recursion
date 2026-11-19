@@ -506,14 +506,14 @@ class MethodSeamTest(Composed):
             made.set('event_store', lambda state_dir: opened.append(state_dir) or store)
         _, composed = self.boot(hooks_of(register))
         api = self.api(composed)
-        params = {'command_id': 'c-1', 'title': 'x'}
+        params = {'command_id': 'cmd-0001', 'title': 'x'}
         first = api.call('session.start', params)
         self.assertEqual(first, {'code': 'ok', 'session_id': 'ses-1'})
         self.assertEqual(api.call('session.start', params), first)
         self.assertEqual(composed.control.call('session.start', params), first)
         self.assertEqual((calls, after), ([(H.Principal('owner', 'local'), params)], ['woken']))
         self.assertEqual(store.rows, {('sessions', 'ses-1'): {'state': 'starting'}})
-        self.assertEqual(api.call('session.start', {'command_id': 'c-1', 'title': 'y'})['code'], 'conflict')
+        self.assertEqual(api.call('session.start', {'command_id': 'cmd-0001', 'title': 'y'})['code'], 'conflict')
         self.assertEqual((opened, composed.context.store), ([self.state], store))
         self.assertFalse(store.closed)
         self.shutdown()
@@ -538,7 +538,7 @@ class MethodSeamTest(Composed):
         run_id = self.start(composed.control)
         holder.extend([composed.control, run_id])
         launched = len(self.units.started)
-        self.assertEqual(self.api(composed).call('session.start', {'command_id': 'c-1'}), {'code': 'ok'})
+        self.assertEqual(self.api(composed).call('session.start', {'command_id': 'cmd-0001'}), {'code': 'ok'})
         refused = {'code': 'request_invalid', 'detail': 'nested_effect'}
         self.assertEqual(seen, [('through ctx.call', refused), ('the object itself', refused), ('a start', refused),
                                 ('a read', 'ok'), ('after the commit', 'stopped')],
@@ -2800,7 +2800,7 @@ class ServicesSeamTest(Composed):
         made, store, events = self.registered(log, entered, leave, **kind)
         daemon, composed = self.boot(made)
         method = 'session.start' if kind.get('callback') else 'events.follow'
-        params = {'command_id': 'c-1'} if kind.get('callback') else {'session_id': 'ses-1'}
+        params = {'command_id': 'cmd-0001'} if kind.get('callback') else {'session_id': 'ses-1'}
         answers = []
         call = {'socket': lambda: self.api(composed).call(method, params),
                 'page': lambda: self.page(composed, 'POST', '/v1/control', {'method': method, 'params': params}),

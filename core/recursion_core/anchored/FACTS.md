@@ -60,3 +60,42 @@ module but its numbers are not recorded here).
 - Windows 11, real host (W1 to W4, W6, and W5's junction from the Windows side): NOT RUN. It needs a
   Windows host run.
 - macOS (M1 to M3, and L1 there): NOT RUN. There is no macOS host.
+
+## Run 2: real Windows 11, Wed Nov 18 2026, on d60dd995
+
+This section adds the real Windows rows. It does not rewrite the rows above; the line "Windows 11,
+real host ... NOT RUN" in the section above is answered here for W1 to W4 and W6. W5 is still NOT
+RUN (it is a WSL2 case and was not started).
+
+- Host: Windows 11, build `10.0.26200.9974` (`ver`), machine `AMD64`, NTFS. An ordinary account,
+  not elevated; no setting was changed for the run.
+- Interpreters: CPython 3.12.16 (`-X utf8 -B`, GIL on) and CPython 3.14.10 free-threaded
+  (`-X gil=0 -B`, GIL off, `sys._is_gil_enabled()` False). The host has no other 3.12 or 3.14t.
+- Command, run from the repository root, one process at a time:
+  `PYTHONPATH=core python -X utf8 -B -m unittest -v recursion_core.anchored.tests.test_system_facts`
+  (3.12), and the same with `-X gil=0 -B` (3.14t).
+- Result: `Ran 12 tests ... OK (skipped=8)` on both interpreters, on each of two runs. The skips are
+  L1 to L5 and W5 (not Linux) and W6 (below). Every call into the system goes through ctypes; the
+  junctions come from `_winapi.CreateJunction`.
+
+| Case | Interpreter | Result | Raw numbers |
+|---|---|---|---|
+| W1 junction in a middle part | 3.12 | asserted, holds | made by this account with no special right: `os.path.islink` False, `os.path.isjunction` True; `CreateFileW("held\a\j\c", FILE_READ_ATTRIBUTES, FILE_FLAG_OPEN_REPARSE_POINT\|FILE_FLAG_BACKUP_SEMANTICS)` opened it and `GetFinalPathNameByHandleW` gave `<tmp>\outside\c`: the flag guards the last name only and the junction in the middle was followed |
+| W1 junction in a middle part | 3.14t, GIL off | asserted, holds | the same: islink False, isjunction True, final path `<tmp>\outside\c` |
+| W2 NtCreateFile walk | 3.12 | asserted, holds | `NtCreateFile` with `RootDirectory` = the held parent, one part at a time, `FILE_OPEN_REPARSE_POINT\|FILE_DIRECTORY_FILE`: the junction part (part 1 of `a\j\c`) opened as itself, status `0x00000000`, `FILE_ATTRIBUTE_TAG_INFO` tag `0xA0000003` (mount point), so the walk refuses it; a plain part opened |
+| W2 NtCreateFile walk | 3.14t, GIL off | asserted, holds | the same: part 1, status `0x00000000`, tag `0xA0000003` |
+| W3 OBJ_DONT_REPARSE, middle junction | 3.12 | recorded | `NtCreateFile` with `RootDirectory` = the held folder, `OBJ_DONT_REPARSE\|OBJ_CASE_INSENSITIVE`, the relative name `a\j\c`: status `0xC000050B` (STATUS_REPARSE_POINT_ENCOUNTERED), nothing opened |
+| W3 OBJ_DONT_REPARSE, plain name | 3.12 | recorded | the same call with the plain relative name `a\b\c`: status `0x00000000`, opened. The Windows 10 1507 fallback is noted, not run |
+| W3 both statuses | 3.14t, GIL off | recorded | the same: middle junction `0xC000050B`, plain name `0x00000000` |
+| W4 folder held with FILE_SHARE_READ only | 3.12 | asserted, holds | held by `CreateFileW(..., FILE_SHARE_READ, FILE_FLAG_BACKUP_SEMANTICS)`; a second interpreter process: rename of the folder winerror 32, `rmdir` of the folder 32, rename of its parent 5, `shutil.rmtree` of the parent 32 (its first step, the held folder, is refused); both folders still there afterwards |
+| W4 the same | 3.14t, GIL off | asserted, holds | the same: 32, 32, 5, 32; both still there |
+| W6 symbolic link in a middle part | both | **NOT RUN** | `os.symlink(..., target_is_directory=True)` answered winerror 1314 (ERROR_PRIVILEGE_NOT_HELD): this account cannot make a symbolic link. It needs Developer Mode or the symbolic-link right, a system setting the run did not change. The test skips with this reason |
+| W5 junction through WSL2 interop | — | **NOT RUN** | a WSL2 case; not started on this host |
+
+Red first: each assert of W1, W2 and W4 (13 in all) was shown to fail with its own condition flipped
+in a scratch copy, on both interpreters, with exactly its own test red; the unchanged copy was green.
+W3 asserts nothing (both statuses are recorded) and W6 did not run.
+
+Clean-up: every junction, folder and file lives in a `tempfile.TemporaryDirectory`, every junction
+points at a folder in that same directory, and each junction is removed by its own name before the
+directory goes. The temp folder of the run held 0 entries before and after each run and each flip.

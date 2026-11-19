@@ -545,5 +545,339 @@ class W5JunctionTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(scratch))
 
 
+# -- W1 to W4, W6: real Windows ------------------------------------------------------------------
+# These run only on a real Windows interpreter (``sys.getwindowsversion`` exists only there; the
+# simulated-Windows harness sets ``os.name`` and ``sys.platform`` but has no such function) and skip
+# elsewhere with the reason. Every call into the system goes through ctypes; the junctions come from
+# ``_winapi.CreateJunction``, which needs no special right. Every junction, link, folder and file is
+# made inside one ``tempfile.TemporaryDirectory``, every junction and link points at a folder inside
+# that same directory, and each one is removed by name (the reparse point itself, never its target) in
+# a ``finally`` before the directory goes. A recorded path names the directory as ``<tmp>``.
+
+REAL_WINDOWS = os.name == "nt" and hasattr(sys, "getwindowsversion")
+NOT_REAL_WINDOWS = (f"a real Windows fact; this host is {sys.platform} (os.name {os.name}) without "
+                    "sys.getwindowsversion: the Windows rows come from a run on a real Windows host")
+IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+IO_REPARSE_TAG_SYMLINK = 0xA000000C
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+ERROR_PRIVILEGE_NOT_HELD = 1314
+
+
+def _wfact(case: str, **values: object) -> None:
+    """One recorded fact on real Windows, never asserted: the Windows build instead of a kernel."""
+    import platform
+
+    version = sys.getwindowsversion()
+    row = {"case": case, "python": sys.version.split()[0], "gil": _gil(), "machine": platform.machine(),
+           "windows_build": f"{version.major}.{version.minor}.{version.build}", **values}
+    sys.stderr.write("FACT " + json.dumps(row, sort_keys=True) + "\n")
+    sys.stderr.flush()
+
+
+def _masked(path: str, tmp: str) -> str:
+    """``path`` with the test's own directory shown as ``<tmp>`` (no host path goes into a record)."""
+    plain = path[4:] if path.startswith("\\\\?\\") else path
+    real = os.path.realpath(tmp)
+    if os.path.normcase(plain).startswith(os.path.normcase(real)):
+        return "<tmp>" + plain[len(real):]
+    return "<outside the test's directory>"
+
+
+class _Win:
+    """kernel32 and ntdll through ctypes, loaded only when a Windows case runs."""
+
+    GENERIC_READ = 0x80000000
+    FILE_READ_ATTRIBUTES = 0x80
+    FILE_LIST_DIRECTORY = 0x1
+    FILE_TRAVERSE = 0x20
+    SYNCHRONIZE = 0x100000
+    SHARE_ALL = 0x7
+    FILE_SHARE_READ = 0x1
+    OPEN_EXISTING = 3
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    FILE_OPEN = 1
+    FILE_DIRECTORY_FILE = 0x1
+    FILE_SYNCHRONOUS_IO_NONALERT = 0x20
+    FILE_OPEN_REPARSE_POINT = 0x00200000
+    OBJ_CASE_INSENSITIVE = 0x40
+    OBJ_DONT_REPARSE = 0x1000
+    FILE_ATTRIBUTE_TAG_INFO = 9
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self.ctypes, self.wintypes = ctypes, wintypes
+        self.k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.ntdll = ctypes.WinDLL("ntdll")
+        self.INVALID = wintypes.HANDLE(-1).value
+
+        class UnicodeString(ctypes.Structure):
+            _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT),
+                        ("Buffer", wintypes.LPWSTR)]
+
+        class ObjectAttributes(ctypes.Structure):
+            _fields_ = [("Length", wintypes.ULONG), ("RootDirectory", wintypes.HANDLE),
+                        ("ObjectName", ctypes.POINTER(UnicodeString)), ("Attributes", wintypes.ULONG),
+                        ("SecurityDescriptor", ctypes.c_void_p), ("SecurityQualityOfService", ctypes.c_void_p)]
+
+        class IoStatusBlock(ctypes.Structure):
+            _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+        class TagInfo(ctypes.Structure):
+            _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+
+        self.UnicodeString, self.ObjectAttributes = UnicodeString, ObjectAttributes
+        self.IoStatusBlock, self.TagInfo = IoStatusBlock, TagInfo
+        k32 = self.k32
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+        k32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+        k32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+        k32.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        self.ntdll.NtCreateFile.restype = ctypes.c_ulong  # NTSTATUS, read unsigned
+        self.ntdll.NtCreateFile.argtypes = [ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD,
+                                            ctypes.POINTER(ObjectAttributes), ctypes.POINTER(IoStatusBlock),
+                                            ctypes.c_void_p, wintypes.ULONG, wintypes.ULONG, wintypes.ULONG,
+                                            wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG]
+
+    def create_file(self, path: str, access: int, share: int, flags: int) -> int:
+        handle = self.k32.CreateFileW(path, access, share, None, self.OPEN_EXISTING, flags, None)
+        if handle is None or handle == self.INVALID:
+            code = self.ctypes.get_last_error()
+            raise OSError(None, self.ctypes.FormatError(code), path, code)
+        return handle
+
+    def close(self, handle: int) -> None:
+        self.k32.CloseHandle(handle)
+
+    def final_path(self, handle: int) -> str:
+        buffer = self.ctypes.create_unicode_buffer(32_768)
+        if not self.k32.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0):
+            code = self.ctypes.get_last_error()
+            raise OSError(None, self.ctypes.FormatError(code), None, code)
+        return buffer.value
+
+    def tag(self, handle: int) -> tuple:
+        """(attributes, reparse tag) of an open handle."""
+        info = self.TagInfo()
+        if not self.k32.GetFileInformationByHandleEx(handle, self.FILE_ATTRIBUTE_TAG_INFO,
+                                                     self.ctypes.byref(info), self.ctypes.sizeof(info)):
+            code = self.ctypes.get_last_error()
+            raise OSError(None, self.ctypes.FormatError(code), None, code)
+        return info.FileAttributes, info.ReparseTag
+
+    def nt_open(self, root: int, name: str, *, attributes: int, options: int) -> tuple:
+        """NtCreateFile of ``name`` relative to the folder handle ``root``: (status, handle or None)."""
+        ctypes, wintypes = self.ctypes, self.wintypes
+        buffer = ctypes.create_unicode_buffer(name)
+        text = self.UnicodeString(len(name) * 2, len(name) * 2 + 2, ctypes.cast(buffer, wintypes.LPWSTR))
+        objects = self.ObjectAttributes(ctypes.sizeof(self.ObjectAttributes), root, ctypes.pointer(text),
+                                        attributes, None, None)
+        handle, status_block = wintypes.HANDLE(), self.IoStatusBlock()
+        status = self.ntdll.NtCreateFile(
+            ctypes.byref(handle), self.FILE_READ_ATTRIBUTES | self.FILE_LIST_DIRECTORY | self.FILE_TRAVERSE
+            | self.SYNCHRONIZE, ctypes.byref(objects), ctypes.byref(status_block), None, 0, self.SHARE_ALL,
+            self.FILE_OPEN, options, None, 0)
+        return status, (handle.value if status < 0x80000000 else None)
+
+    def hold_folder(self, path: str, share: int | None = None) -> int:
+        return self.create_file(path, self.FILE_READ_ATTRIBUTES | self.FILE_LIST_DIRECTORY | self.FILE_TRAVERSE
+                                | self.SYNCHRONIZE, self.SHARE_ALL if share is None else share,
+                                self.FILE_FLAG_BACKUP_SEMANTICS)
+
+    def nt_walk(self, held: int, parts: tuple) -> dict:
+        """Open each part relative to the held parent with FILE_OPEN_REPARSE_POINT; refuse a reparse point.
+
+        Returns what happened: the part that refused, its status and its tag, or "opened".
+        """
+        current, owned = held, False
+        try:
+            for index, part in enumerate(parts):
+                status, handle = self.nt_open(current, part, attributes=self.OBJ_CASE_INSENSITIVE,
+                                              options=self.FILE_DIRECTORY_FILE | self.FILE_SYNCHRONOUS_IO_NONALERT
+                                              | self.FILE_OPEN_REPARSE_POINT)
+                if handle is None:
+                    return {"result": "status", "part": index, "status": f"0x{status:08X}"}
+                attributes, tag = self.tag(handle)
+                if owned:
+                    self.close(current)
+                current, owned = handle, True
+                if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+                    return {"result": "refused", "part": index, "status": f"0x{status:08X}", "tag": tag}
+            return {"result": "opened", "part": len(parts)}
+        finally:
+            if owned:
+                self.close(current)
+
+
+def _junction(target: Path, junction: Path) -> None:
+    import _winapi
+
+    _winapi.CreateJunction(str(target), str(junction))
+
+
+def _remove_reparse_point(path: Path) -> None:
+    """Remove a junction or a folder link by its own name; never follows it, never empties its target."""
+    if os.path.lexists(path):
+        os.rmdir(path)
+
+
+@unittest.skipUnless(REAL_WINDOWS, NOT_REAL_WINDOWS)
+class W1ToW4AndW6WindowsTests(unittest.TestCase):
+    def _layout(self, tmp: str) -> tuple:
+        held, outside = Path(tmp, "held"), Path(tmp, "outside")
+        (held / "a").mkdir(parents=True)
+        (outside / "c").mkdir(parents=True)
+        return held, outside
+
+    def test_w1_a_junction_is_no_link_to_islink_and_one_multi_part_open_follows_it(self) -> None:
+        win = _Win()
+        with tempfile.TemporaryDirectory() as tmp:
+            held, outside = self._layout(tmp)
+            junction = held / "a" / "j"
+            try:
+                _junction(outside, junction)
+                islink, isjunction = os.path.islink(junction), os.path.isjunction(junction)
+                handle = win.create_file(str(junction / "c"), win.FILE_READ_ATTRIBUTES, win.SHARE_ALL,
+                                         win.FILE_FLAG_OPEN_REPARSE_POINT | win.FILE_FLAG_BACKUP_SEMANTICS)
+                try:
+                    final = win.final_path(handle)
+                finally:
+                    win.close(handle)
+            finally:
+                _remove_reparse_point(junction)
+            self.assertFalse(islink)
+            self.assertTrue(isjunction)
+            self.assertEqual("<tmp>\\outside\\c", _masked(final, tmp))
+            _wfact("W1", made_by="_winapi.CreateJunction", islink=islink, isjunction=isjunction,
+                   createfile="FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS of held\\a\\j\\c",
+                   final_path=_masked(final, tmp))
+
+    def test_w2_the_nt_walk_opens_the_junction_part_as_itself_and_refuses_it_by_its_tag(self) -> None:
+        win = _Win()
+        with tempfile.TemporaryDirectory() as tmp:
+            held, outside = self._layout(tmp)
+            junction = held / "a" / "j"
+            try:
+                _junction(outside, junction)
+                anchor = win.hold_folder(str(held))
+                try:
+                    through = win.nt_walk(anchor, ("a", "j", "c"))
+                    plain = win.nt_walk(anchor, ("a",))
+                finally:
+                    win.close(anchor)
+            finally:
+                _remove_reparse_point(junction)
+            self.assertEqual("refused", through["result"])
+            self.assertEqual(1, through["part"])
+            self.assertEqual(IO_REPARSE_TAG_MOUNT_POINT, through["tag"])
+            self.assertEqual("opened", plain["result"])
+            _wfact("W2", call="NtCreateFile, RootDirectory = the held parent, one part at a time, "
+                   "FILE_OPEN_REPARSE_POINT|FILE_DIRECTORY_FILE", junction_part=through["part"],
+                   junction_status=through["status"], junction_tag=f"0x{through['tag']:08X}",
+                   plain_part="opened")
+
+    def test_w3_obj_dont_reparse_on_a_relative_multi_part_name_is_recorded(self) -> None:
+        win = _Win()
+        options = win.FILE_DIRECTORY_FILE | win.FILE_SYNCHRONOUS_IO_NONALERT
+        attributes = win.OBJ_CASE_INSENSITIVE | win.OBJ_DONT_REPARSE
+        with tempfile.TemporaryDirectory() as tmp:
+            held, outside = self._layout(tmp)
+            (held / "a" / "b" / "c").mkdir(parents=True)
+            junction = held / "a" / "j"
+            try:
+                _junction(outside, junction)
+                anchor = win.hold_folder(str(held))
+                try:
+                    through_status, through = win.nt_open(anchor, "a\\j\\c", attributes=attributes, options=options)
+                    if through is not None:
+                        through_final = _masked(win.final_path(through), tmp)
+                        win.close(through)
+                    plain_status, plain = win.nt_open(anchor, "a\\b\\c", attributes=attributes, options=options)
+                    if plain is not None:
+                        win.close(plain)
+                finally:
+                    win.close(anchor)
+            finally:
+                _remove_reparse_point(junction)
+        # Recorded, never asserted: the status for a middle junction and for a plain name on this build.
+        _wfact("W3", call="NtCreateFile, RootDirectory = the held folder, OBJ_DONT_REPARSE|OBJ_CASE_INSENSITIVE, "
+               "a relative multi-part name", middle_junction_name="a\\j\\c",
+               middle_junction_status=f"0x{through_status:08X}",
+               middle_junction_opened=through is not None and through_final,
+               plain_name="a\\b\\c", plain_status=f"0x{plain_status:08X}", plain_opened=plain is not None)
+
+    def test_w4_a_folder_held_with_share_read_only_cannot_be_renamed_or_deleted_by_another_process(self) -> None:
+        win = _Win()
+        child = (
+            "import json, os, shutil, sys\n"
+            "folder, parent = sys.argv[1], sys.argv[2]\n"
+            "out = {}\n"
+            "for key, call in (('rename_folder', lambda: os.rename(folder, folder + '.moved')),\n"
+            "                  ('delete_folder', lambda: os.rmdir(folder)),\n"
+            "                  ('rename_parent', lambda: os.rename(parent, parent + '.moved')),\n"
+            "                  ('delete_parent', lambda: shutil.rmtree(parent))):\n"
+            "    try:\n"
+            "        call(); out[key] = 'done'\n"
+            "    except OSError as exc:\n"
+            "        out[key] = getattr(exc, 'winerror', None) or exc.errno\n"
+            "print(json.dumps(out))\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp, "parent")
+            folder = parent / "held"
+            folder.mkdir(parents=True)
+            handle = win.hold_folder(str(folder), share=win.FILE_SHARE_READ)
+            try:
+                proc = subprocess.run([sys.executable, "-X", "utf8", "-B", "-I", "-c", child, str(folder), str(parent)],
+                                      capture_output=True, text=True, timeout=120, check=False)
+            finally:
+                win.close(handle)
+            still = folder.is_dir() and parent.is_dir()
+        lines = [line for line in proc.stdout.splitlines() if line.startswith("{")]
+        self.assertEqual(0, proc.returncode, proc.stderr[-2000:])
+        result = json.loads(lines[-1])
+        _wfact("W4", hold="CreateFileW FILE_SHARE_READ only, FILE_FLAG_BACKUP_SEMANTICS",
+               second_process="a new interpreter process", winerrors=result, both_still_there=still)
+        for key in ("rename_folder", "delete_folder", "rename_parent", "delete_parent"):
+            self.assertNotEqual("done", result[key], key)
+        self.assertTrue(still)
+
+    def test_w6_a_symbolic_link_in_a_middle_part_only_if_this_account_can_make_one(self) -> None:
+        win = _Win()
+        with tempfile.TemporaryDirectory() as tmp:
+            held, outside = self._layout(tmp)
+            link = held / "a" / "s"
+            try:
+                try:
+                    os.symlink(outside, link, target_is_directory=True)
+                except OSError as exc:
+                    if getattr(exc, "winerror", None) == ERROR_PRIVILEGE_NOT_HELD:
+                        _wfact("W6", not_run=True, symlink_winerror=ERROR_PRIVILEGE_NOT_HELD)
+                        raise unittest.SkipTest(
+                            "this account cannot make a symbolic link (ERROR_PRIVILEGE_NOT_HELD, 1314): it needs "
+                            "Developer Mode or the symbolic-link right, a system setting this test never changes")
+                    raise
+                islink, isjunction = os.path.islink(link), os.path.isjunction(link)
+                anchor = win.hold_folder(str(held))
+                try:
+                    through = win.nt_walk(anchor, ("a", "s", "c"))
+                finally:
+                    win.close(anchor)
+            finally:
+                _remove_reparse_point(link)
+            self.assertTrue(islink)
+            self.assertFalse(isjunction)
+            self.assertEqual("refused", through["result"])
+            self.assertEqual(IO_REPARSE_TAG_SYMLINK, through["tag"])
+            _wfact("W6", islink=islink, isjunction=isjunction, link_part=through["part"],
+                   link_tag=f"0x{through['tag']:08X}")
+
+
 if __name__ == "__main__":
     unittest.main()

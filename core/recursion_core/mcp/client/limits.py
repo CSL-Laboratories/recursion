@@ -32,3 +32,8 @@ MAX_TOOLS = 512
 # A server that breaks a limit this many times in one client session is cut off for the rest of that
 # session (``session.SERVER_CUT_OFF``); a new session starts the count again.
 MAX_BREACHES = 3
+
+# What the client keeps of a server's text (an error's ``message``, a refused request's ``method``, a revision
+# it does not speak) is cut to this many characters before anything else is done with it, and only then
+# escaped (``session._server_text``). A first value, not measured.
+MAX_SERVER_TEXT_CHARS = 200

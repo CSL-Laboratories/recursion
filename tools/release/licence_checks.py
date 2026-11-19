@@ -140,7 +140,7 @@ are not re-signed.
 
 # Naming the security contact is one edit of CONTACT and of SECURITY.md together; CONTACT may then
 # be the one address SECURITY.md holds.
-CONTACT = "<contact: Lucas to name>"
+CONTACT = "<role mailbox address on the project's domain: to be filled in before the first release>"
 SECURITY_PARTS = ("> **Draft.**", "## Reporting a vulnerability\n", "## Supported versions\n", "## Scope\n",
                   "## What the code defends, and what it does not yet\n")
 PUBLIC_ISSUE = "Please do not report a suspected vulnerability in a public issue"

@@ -216,6 +216,12 @@ class Policy(_Base):
     # SR-06: an unreadable own-store subtree is silently skipped, so an outside link passes.
     @unittest.skipIf(os.name == "nt", "POSIX home checks")
     def test_sr06_unreadable_store_subtree_refuses(self):
+        if os.name == "nt":
+            # The home check refuses before any store walk.
+            with self.assertRaises(SubscriptionRouteRefused) as caught:
+                self.chatgpt()
+            self.assertEqual(caught.exception.cause, "platform_unsupported")
+            return
         outside = self.root / "outside"
         outside.mkdir()
         sub = self.home / ".config" / "opencode" / "unreadable"
@@ -240,7 +246,7 @@ class Policy(_Base):
         self.assertNotIn("Errno", text)
 
     # F1: an ancestor that cannot be searched is not "the store is absent".
-    @unittest.skipIf(os.name == "nt", "POSIX home checks")
+    @unittest.skipIf(os.name == "nt", "os.geteuid and directory permission bits are absent on Windows")
     def test_sr06_unreadable_ancestor_is_not_an_absent_store(self):
         if os.geteuid() == 0:
             self.skipTest("root ignores directory mode bits")
@@ -293,7 +299,7 @@ class Policy(_Base):
                 operator_home=str(self.operator), wrapper=self.wrapper))
 
     # F2: a directory that can be listed but not searched must not hide a link.
-    @unittest.skipIf(os.name == "nt", "POSIX home checks")
+    @unittest.skipIf(os.name == "nt", "os.geteuid and directory permission bits are absent on Windows")
     def test_sr06_listable_unsearchable_directory_hides_no_link(self):
         if os.geteuid() == 0:
             self.skipTest("root ignores directory mode bits")
@@ -322,6 +328,7 @@ class Policy(_Base):
     # F6: a name that disappears during the walk is not reported as unreadable.
     def test_sr06_walk_enoent_is_its_own_cause(self):
         if os.name == "nt":
+            # The home check refuses before the walk, so the vanished name is not reached.
             with self.assertRaises(SubscriptionRouteRefused) as caught:
                 self.chatgpt()
             self.assertEqual(caught.exception.cause, "platform_unsupported")
@@ -344,6 +351,7 @@ class Policy(_Base):
     # SR-07: ordinary directories consume none of the store-walk budget.
     def test_sr07_walk_budget_counts_directories(self):
         if os.name == "nt":
+            # The home check refuses before the walk, so the budget is not reached.
             with self.assertRaises(SubscriptionRouteRefused) as caught:
                 self.chatgpt()
             self.assertEqual(caught.exception.cause, "platform_unsupported")
@@ -498,7 +506,7 @@ class WrapperPin(_Base):
                     self.fail(f"untyped exception: {type(exc).__name__}")
 
     # SR-11: a regular file swapped for a FIFO between check and open blocks hashing forever.
-    @unittest.skipIf(os.name == "nt", "POSIX home checks")
+    @unittest.skipIf(os.name == "nt", "os.mkfifo is absent on Windows")
     def test_sr11_fifo_swap_does_not_block(self):
         lib = str(self.install / "lib.js")
         real_isfile = os.path.isfile
@@ -534,7 +542,7 @@ class WrapperPin(_Base):
         self.assertEqual(outcome, ["WrapperPinRefused"])
 
     # F4: a symlink swapped in at the regular-file check must not be hashed.
-    @unittest.skipIf(os.name == "nt", "POSIX home checks")
+    @unittest.skipIf(os.name == "nt", "os.O_NOFOLLOW is absent on Windows")
     def test_sr11_symlink_swap_is_not_followed(self):
         lib = str(self.install / "lib.js")
         outside = self.root / "outside.txt"
@@ -555,7 +563,7 @@ class WrapperPin(_Base):
         self.assertNotIn("outside-bytes", str(caught.exception))
 
     # F4: a FIFO swapped in at the same step is not pinned as an empty file.
-    @unittest.skipIf(os.name == "nt", "POSIX home checks")
+    @unittest.skipIf(os.name == "nt", "os.mkfifo is absent on Windows")
     def test_sr11_fifo_swap_is_not_a_regular_file(self):
         lib = str(self.install / "lib.js")
         real_isfile = os.path.isfile
@@ -598,7 +606,12 @@ class WrapperPin(_Base):
                 with self.subTest(name):
                     with self.assertRaises(WrapperPinRefused) as caught:
                         fn()
-                    self.assertEqual(caught.exception.cause, "wrapper_tree_unreadable")
+                    if os.name == "nt" and name == "verify":
+                        # The owner check refuses before the vanished lstat is seen.
+                        self.assertEqual(caught.exception.cause, "wrapper_path_unsafe")
+                        self.assertEqual(caught.exception.detail, ".: owner_check_unsupported")
+                    else:
+                        self.assertEqual(caught.exception.cause, "wrapper_tree_unreadable")
                     self.assertNotIn("No such file", str(caught.exception))
 
         (self.install / "link.js").symlink_to(self.install / "lib.js")

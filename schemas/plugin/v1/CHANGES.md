@@ -4,6 +4,20 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `host.v1.json` is new, `1.0-draft.1` (2026-11-18)
+
+The channel between the daemon and a plugin host: `hello`, `load`, `call`, `core`, `result`, `refusal`
+and `bye`, framed as `control_transport/framing.py` frames. A `call` carries a name from one
+append-only list (`registry`, `operator`, `surfaces`, `surface`); a name the receiver does not know is
+refused `call_unknown`, and a later surface kind is a new name, never a schema break. A message type the
+receiver does not know is answered with a typed refusal and the channel stays up. The message names
+`event`, `guard` and `surface.update`, the call names `run.request` and `computer.open`, `.act`,
+`.observe` and `.close`, and the run-origin values `trigger`, `agent` and `packet` are reserved: named,
+answered 'reserved; not available in this release', never built here. No message carries a caller: the
+daemon sets it from the channel. What it breaks: nothing; no schema before it named these messages.
+Forty-nine fixtures prove its rules; `plugin_security/host_channel.py` is its code side and
+`plugin_security/tests/test_host_channel.py` holds the two equal.
+
 ## `revoked-keys.v1.json` is `1.0-draft.2` (Nov 15, 2026)
 
 Its `timestamp` (a list's `issued_at` and `expires_at`, and each key's `revoked_at`) is now the control

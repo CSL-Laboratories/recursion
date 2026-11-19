@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "host.v1.json",
+  "title": "host.v1: every message between the daemon and a plugin host ('csl-plugin-host/1')",
+  "x-version": "1.0-draft.1",
+  "description": "ONE channel per plugin host, and every message on it. A plugin's whole world is the messages on its one channel to the daemon: the plugin imports nothing from Recursion and shares no object with the daemon. FRAMING: the length-prefixed frames of control_transport/framing.py, reused as they are: a 4-byte big-endian length, then that many bytes of UTF-8 JSON holding one object, at most 1 MiB. Every byte string on the channel is standard base64 with padding, in a field whose name ends in '_b64'. THE MESSAGES (each in $defs): hello (each side, once, first); load (daemon to host: one plugin's id, its manifest bytes and its verified package files as bytes; load may arrive after hello at any time, even though the daemon sends it only at start in this release); call (daemon to host: a call NAME taken from the one append-only list x-call-names, with its arguments); core (host to daemon: one csl-core/v0 request, its bytes unchanged; daemon to host: the core's answer, its bytes unchanged); result (host to daemon: what a call returned); refusal (each side: a typed refusal of one message); bye (each side, last). THE CALLER: the daemon sets the caller of every core message from the channel it came in on, never from the message: no message carries a caller, and a core message that names one is refused 'caller_forged' before the core sees it. Every csl-core/v0 op stays the core's: the host relays the bytes and decides nothing, and every call still passes the core's one dispatcher. CALL NAMES: x-call-names is ONE list, append-only, never a fixed set of message types: a later surface kind is a new name on that list and never a schema break. A call whose name the receiver does not know is refused 'call_unknown' and nothing runs; a call with a reserved name is refused 'call_reserved' with the words 'reserved; not available in this release' and nothing runs. MESSAGE TYPES: a message whose type the receiver does not know is answered with a typed refusal ('message_unknown') and the channel stays up; the message names in x-reserved.message_types are reserved: named here, refused 'message_reserved' if sent in this release, never built here. x-refusal-codes lists each code this channel answers with.",
+  "x-message-types": {
+    "hello": {"from": ["daemon", "host"], "fields": ["channel", "type"]},
+    "load": {"from": ["daemon"], "fields": ["files", "manifest_b64", "plugin_id", "type"]},
+    "call": {"from": ["daemon"], "fields": ["args", "id", "name", "type"]},
+    "core": {"from": ["daemon", "host"], "fields": ["bytes_b64", "id", "type"]},
+    "result": {"from": ["host"], "fields": ["id", "type", "value"]},
+    "refusal": {"from": ["daemon", "host"], "fields": ["code", "detail", "id", "type"]},
+    "bye": {"from": ["daemon", "host"], "fields": ["reason", "type"]}
+  },
+  "x-call-names": [
+    {"name": "registry", "args": [], "plugin_function": "registry()", "permission": "panel", "about": "The plugin's panels for the page, as registry() returns them today."},
+    {"name": "operator", "args": ["command"], "plugin_function": "operator(command)", "permission": "read", "about": "One o7.operator.v0 read command; the daemon keeps its own deadline on the answer."},
+    {"name": "surfaces", "args": [], "plugin_function": "surfaces()", "permission": "surface", "about": "The surfaces a plugin offers (provisional: no host calls it on master)."},
+    {"name": "surface", "args": ["kind", "name"], "plugin_function": "surface(kind, name)", "permission": "surface", "about": "One surface by kind and name (provisional: no host calls it on master)."}
+  ],
+  "x-reserved": {
+    "about": "Names reserved for later work. Each is answered as reserved, with the words 'reserved; not available in this release', and nothing is built for it here: no handler, no permission that grants anything, no record writer. These lists are append-only. Reserved is not frozen: a reserved name may be corrected until the first build that answers it.",
+    "call_names": [
+      {"name": "run.request", "about": "A plugin asks for a run it owns; no run is started by this channel in this release."},
+      {"name": "computer.open", "about": "Opens a computer or browser session for a plugin."},
+      {"name": "computer.act", "about": "One action in an open computer or browser session."},
+      {"name": "computer.observe", "about": "What an open computer or browser session shows now."},
+      {"name": "computer.close", "about": "Ends a computer or browser session."}
+    ],
+    "message_types": [
+      {"name": "event", "about": "An event delivered to a host that subscribed to it."},
+      {"name": "guard", "about": "An ask-or-deny round trip with a deadline."},
+      {"name": "surface.update", "about": "A surface update the host starts."}
+    ],
+    "run_origin": [
+      {"name": "trigger", "about": "A run started by a scheduled task or another trigger."},
+      {"name": "agent", "about": "A run started by a persistent agent."},
+      {"name": "packet", "about": "A run started by a work packet from another node."}
+    ],
+    "run_origin_about": "Where a run came from. No message on this channel carries a run's origin yet, so no field is made for it: the three values are reserved here by name, and their refusal is placed when a field carries them."
+  },
+  "x-inventory": {
+    "about": "Every function the daemon calls on a plugin, and the one message that carries it. registry, operator and bind_core are what daemon/plugins.py calls today; surfaces and surface are the provisional ones of the themes plugin.",
+    "functions": [
+      {"function": "registry", "message": "call", "name": "registry"},
+      {"function": "operator", "message": "call", "name": "operator"},
+      {"function": "bind_core", "message": "core", "name": null},
+      {"function": "surfaces", "message": "call", "name": "surfaces"},
+      {"function": "surface", "message": "call", "name": "surface"}
+    ]
+  },
+  "x-refusal-codes": {
+    "message_invalid": "The message is not one object of a known type with exactly its fields and their forms.",
+    "message_unknown": "The receiver does not know the message type; the channel stays up.",
+    "message_reserved": "The message type is reserved; not available in this release. The channel stays up.",
+    "message_wrong_side": "The message type is known but is never sent by this side of the channel.",
+    "caller_forged": "A core message named a caller; the caller is set from the channel, so nothing reached the core.",
+    "call_unknown": "The receiver does not know the call name; nothing ran.",
+    "call_reserved": "The call name is reserved; not available in this release. Nothing ran.",
+    "call_args_invalid": "The call's arguments are not exactly the ones listed for its name; nothing ran.",
+    "call_not_offered": "The plugin does not offer this call; nothing ran.",
+    "call_failed": "The plugin's function raised; the detail names the exception's type only."
+  },
+  "$defs": {
+    "id": {
+      "description": "A message id, chosen by the side that sends the request and echoed by the answer.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "bytes": {
+      "description": "Bytes as standard base64 with padding.",
+      "type": "string",
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+    },
+    "call_name": {
+      "description": "A name on the one append-only list x-call-names, or a reserved one, or one this receiver does not know: lower-case dotted words.",
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)*$"
+    },
+    "hello": {
+      "description": "The first message each side sends, naming the channel's version.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "channel"],
+      "properties": {
+        "type": {"const": "hello"},
+        "channel": {"const": "csl-plugin-host/1"}
+      }
+    },
+    "load": {
+      "description": "Daemon to host: one plugin to load, as bytes the daemon has already verified. load may arrive after hello at any time, even though the daemon sends it only at start in this release.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "plugin_id", "manifest_b64", "files"],
+      "properties": {
+        "type": {"const": "load"},
+        "plugin_id": {"$ref": "api.v1.json#/$defs/plugin_id"},
+        "manifest_b64": {"$ref": "#/$defs/bytes"},
+        "files": {
+          "description": "Every verified file of the package: its path inside the package and its bytes.",
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 4096,
+          "propertyNames": {"pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$", "maxLength": 512, "not": {"pattern": "[\\r\\n]"}},
+          "additionalProperties": {"$ref": "#/$defs/bytes"}
+        }
+      }
+    },
+    "call": {
+      "description": "Daemon to host: one call by NAME. Which arguments a name takes is listed for it in x-call-names; the receiver refuses any other set.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "name", "args"],
+      "properties": {
+        "type": {"const": "call"},
+        "id": {"$ref": "#/$defs/id"},
+        "name": {"$ref": "#/$defs/call_name"},
+        "args": {
+          "description": "The call's arguments by name; each value is the argument's own data.",
+          "type": "object",
+          "maxProperties": 16,
+          "propertyNames": {"pattern": "^[a-z][a-z0-9_]{0,63}$"},
+          "additionalProperties": {"description": "One argument's value, as the call's name defines it."}
+        }
+      }
+    },
+    "core": {
+      "description": "One csl-core/v0 request (host to daemon) or answer (daemon to host), its bytes unchanged. It carries no caller: the daemon sets the caller from the channel.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "bytes_b64"],
+      "properties": {
+        "type": {"const": "core"},
+        "id": {"$ref": "#/$defs/id"},
+        "bytes_b64": {"$ref": "#/$defs/bytes"}
+      }
+    },
+    "result": {
+      "description": "Host to daemon: what one call returned, under the call's id.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "value"],
+      "properties": {
+        "type": {"const": "result"},
+        "id": {"$ref": "#/$defs/id"},
+        "value": {"description": "The plugin's own return value, as plain JSON."}
+      }
+    },
+    "refusal": {
+      "description": "Either side: a typed refusal of one message. id is the refused message's id, or null when it had none that could be read.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "code", "detail"],
+      "properties": {
+        "type": {"const": "refusal"},
+        "id": {"anyOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+        "code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+        "detail": {"type": "string", "maxLength": 1000}
+      }
+    },
+    "bye": {
+      "description": "Either side, last: the channel ends.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "reason"],
+      "properties": {
+        "type": {"const": "bye"},
+        "reason": {"type": "string", "maxLength": 200}
+      }
+    }
+  }
+}

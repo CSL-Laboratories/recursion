@@ -136,6 +136,14 @@ def create_revocation_store(path: str) -> None:
         db.close()
 
 
+# A key id in the form ``signing.key_id`` gives it. ``revoke`` stores nothing else, so
+# a refusal never repeats caller text and the store holds only ids a key can have.
+_KEY_ID = re.compile(r"ed25519:[0-9a-f]{32}")
+# The largest generation SQLite keeps as an INTEGER; a revoke that would pass it is
+# refused before anything is written (SQLite would turn it into a float).
+_GENERATION_MAX = 2 ** 63 - 1
+
+
 class TrustStore:
     """This install's own trusted developer keys and its revoked-key list.
 
@@ -150,7 +158,11 @@ class TrustStore:
     ``synchronous=FULL``) before it takes effect, and every key in that store is read
     back as revoked when the trust store is built. Each ``revoke`` advances that key's
     generation, including a repeat, so a grant that turned order back on after an
-    earlier revocation does not apply to the later one. The daemon never creates the
+    earlier revocation does not apply to the later one. The next generation is taken
+    from the stored row inside one write transaction, so two handles on one store never
+    write a generation that is not above the row (no roll-back to an older number whose
+    grant would apply again). A row another writer left below 1 is not a floor: the
+    revoke refuses and writes nothing. The daemon never creates the
     store; a named store that is missing or invalid refuses. Without a store, or when
     the SQLite write fails, ``revoke`` still revokes in memory but refuses
     ``revocation_not_durable`` (the SQLite error does not escape). The same-uid limit
@@ -164,6 +176,7 @@ class TrustStore:
             keys[key_id(hex_key)] = (label, hex_key)
         self._keys = MappingProxyType(keys)
         self._lock = threading.Lock()
+        self._store_path = revocation_store
         self._db = None if revocation_store is None else self._open_store(revocation_store)
         generations = {}
         if self._db is not None:
@@ -226,28 +239,98 @@ class TrustStore:
         updated even when the durable write fails or there is no store, and then
         ``revocation_not_durable`` is raised. A ``sqlite3`` error is that refusal; it
         does not escape the method.
+
+        The generation returned is one past the stored row, and never below this
+        handle's own next number (a failed write leaves memory ahead of the row), so
+        another handle opened earlier on the same store cannot write an older number.
+        A key id not in ``signing.key_id``'s form is refused ``invalid_key_id`` before
+        anything changes, and the refusal does not repeat it. A stored generation that
+        is not an integer or is below 1, or a next generation past SQLite's INTEGER
+        range, writes nothing and refuses ``revocation_not_durable``.
         """
+        if type(kid) is not str or not _KEY_ID.fullmatch(kid):
+            raise Refused("invalid_key_id")
         with self._lock:
             generation = self._generation.get(kid, 0) + 1
-            updated = dict(self._generation)
-            updated[kid] = generation
-            self._generation = MappingProxyType(updated)
-            self._revoked = frozenset(updated)
+            self._remember(kid, generation)
             if self._db is None:
                 raise Refused("revocation_not_durable", kid)
             try:
-                self._db.execute(
-                    "INSERT INTO revoked (key_id, generation) VALUES (?, ?) "
-                    "ON CONFLICT(key_id) DO UPDATE SET generation = excluded.generation",
-                    (kid, generation),
-                )
-                row = self._db.execute(
-                    "SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+                stored = self._advance(kid, generation)
             except sqlite3.Error:
                 raise Refused("revocation_not_durable", kid) from None
-            if row is None or row[0] != generation:
+            if stored is None:
                 raise Refused("revocation_not_durable", kid)
-            return generation
+            self._remember(kid, stored)
+            return stored
+
+    def _remember(self, kid: str, generation: int) -> None:
+        updated = dict(self._generation)
+        updated[kid] = generation
+        self._generation = MappingProxyType(updated)
+        self._revoked = frozenset(updated)
+
+    def _advance(self, kid: str, floor: int) -> int | None:
+        """Write ``kid``'s next generation, at least ``floor``, and return it.
+
+        The row is read and written inside ``BEGIN IMMEDIATE``: no other connection
+        writes the store between the read and the write. ``None`` when nothing was
+        written (see ``revoke``). A ``sqlite3`` error rolls back and propagates.
+        When that roll-back itself fails, the connection is dropped and the store is
+        opened again, then the original error propagates.
+        """
+        db = self._db
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            row = db.execute("SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+            stored = 0 if row is None else row[0]
+            # An absent row is a first revoke (stored stands in as 0). A row that exists
+            # and is below 1 is a damaged store, same as a value that is not an integer:
+            # writing generation 1 again would let a grant that cites generation 1 apply.
+            if row is not None and (type(stored) is not int or stored < 1):
+                db.execute("ROLLBACK")
+                return None
+            generation = max(stored + 1, floor)
+            if generation > _GENERATION_MAX:
+                db.execute("ROLLBACK")
+                return None
+            db.execute(
+                "INSERT INTO revoked (key_id, generation) VALUES (?, ?) "
+                "ON CONFLICT(key_id) DO UPDATE SET generation = excluded.generation",
+                (kid, generation),
+            )
+            row = db.execute("SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+            if row is None or row[0] != generation:
+                db.execute("ROLLBACK")
+                return None
+            db.execute("COMMIT")
+        except BaseException:
+            if db.in_transaction:
+                try:
+                    db.execute("ROLLBACK")
+                except sqlite3.Error:
+                    self._replace_store_connection(db)
+            raise
+        return generation
+
+    def _replace_store_connection(self, db) -> None:
+        """A roll-back that itself fails leaves the connection inside a transaction.
+
+        Drop that connection and open the store again so a later revoke can write.
+        """
+        try:
+            db.close()
+        except sqlite3.Error:
+            pass
+        if self._db is db:
+            self._db = None
+        path = self._store_path
+        if not path:
+            return
+        try:
+            self._db = self._open_store(path)
+        except Refused:
+            self._db = None
 
     def close(self) -> None:
         with self._lock:

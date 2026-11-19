@@ -173,6 +173,18 @@ def _core_test_files(root) -> list:
     return sorted(path for path in Path(root).glob("recursion_core/**/tests/test_*.py") if path.parent.name == "tests")
 
 
+def _windows_refusal_files(root) -> list:
+    """Each gated area's ``test_windows_refusal.py`` and every other one the collector finds, at any depth.
+
+    The other-suites run leaves these files out by name, so a refusal file missing here would be imported by the
+    import-all run and its tests would never run.
+    """
+
+    base = Path(root) / "recursion_core"
+    listed = {base / area / "tests" / "test_windows_refusal.py" for area in REFUSAL_AREAS}
+    return sorted(listed | {path for path in _core_test_files(root) if path.name == "test_windows_refusal.py"})
+
+
 def _import_all(root: str) -> dict:
     """Import every core test module, as the gate's runner does before it can run or skip anything."""
 
@@ -247,8 +259,8 @@ class SimulatedWindowsTests(unittest.TestCase):
         self.assertLess(result["skipped"], result["run"])
 
     def test_windows_refusal_tests_pass_and_skip_nothing_on_simulated_windows(self) -> None:
-        for area in REFUSAL_AREAS:
-            path = CORE / "recursion_core" / area / "tests" / "test_windows_refusal.py"
+        for path in _windows_refusal_files(CORE):
+            area = path.parents[1].relative_to(CORE / "recursion_core").as_posix()
             with self.subTest(area=area):
                 self.assertTrue(path.is_file(), path)
                 result = simulate(str(path))
@@ -296,6 +308,21 @@ class SimulatedWindowsTests(unittest.TestCase):
                         if Path(folder).name == "tests" for name in names
                         if name.startswith("test_") and name.endswith(".py"))
         self.assertEqual(walked, _core_test_files(CORE))
+
+    def test_every_windows_refusal_file_the_collector_finds_is_run(self) -> None:
+        # The other suites leave test_windows_refusal.py out by name, so the refusal runner takes every one the
+        # collector finds, a nested one too; otherwise it would be imported and its tests never run.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            made = ("recursion_core/a/tests/test_windows_refusal.py",
+                    "recursion_core/b/client/tests/test_windows_refusal.py",
+                    "recursion_core/c/d/e/tests/test_windows_refusal.py",
+                    "recursion_core/b/client/tests/test_two.py", "recursion_core/f/test_windows_refusal.py")
+            for name in made:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text("", encoding="utf-8")
+            listed = {root / "recursion_core" / area / "tests" / "test_windows_refusal.py" for area in REFUSAL_AREAS}
+            self.assertEqual(sorted(listed | {root / name for name in made[:3]}), _windows_refusal_files(root))
 
 
 if __name__ == "__main__":

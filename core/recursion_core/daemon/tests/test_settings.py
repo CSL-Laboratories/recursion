@@ -619,5 +619,60 @@ class WindowsNoOwnerCheck(_Folder):
         self.assertIn("note settings_not_read_on_this_system", "\n".join(settings.lines(loaded)))
 
 
+# The spelling the pinned-copy plan prints for a person: a table and a key under it.
+PLAN_SPELLING = 'version = 1\n\n[engines.claude_code]\npinned_version = "2.1.325"\n'
+FULL_NAME = "engines.claude_code.pinned_version"
+OTHER_SPELLINGS = {
+    "the dotted key at the top level": f'version = 1\n{FULL_NAME} = "2.1.325"\n',
+    "[engines] and a dotted key under it": 'version = 1\n\n[engines]\nclaude_code.pinned_version = "2.1.325"\n',
+}
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class ATableAndAKeyReadUnderTheFullDottedName(_Folder):
+    """A setting written as a table and a key is read under its full dotted name. The row of that name is made
+    known to the reader for each test alone; the product's table is put back after it. A known table written as a
+    table and applied with its source is test_a_value_in_the_file_is_in_force_with_its_source (OFF)."""
+
+    def with_the_row(self) -> None:
+        row = settings.Setting(FULL_NAME, str, "", "A row known to the reader for this test only.")
+        rows = (*settings.SETTINGS, row)
+        for name, value in (("SETTINGS", rows), ("DECLARED", MappingProxyType({r.name: r for r in rows}))):
+            patcher = mock.patch.object(settings, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def read(self, text: str):
+        self.put(text)
+        return settings.load(self.environ)
+
+    def test_the_plans_printed_spelling_and_the_two_others_give_the_value_under_the_full_name(self) -> None:
+        self.with_the_row()
+        for case, text in {"the plan's printed spelling": PLAN_SPELLING, **OTHER_SPELLINGS}.items():
+            with self.subTest(case=case):
+                loaded = self.read(text)
+                self.assertEqual("2.1.325", loaded[FULL_NAME])
+                self.assertEqual(settings.SOURCE_FILE, loaded.values[FULL_NAME].source)
+                self.assertEqual([], self.codes(loaded))
+                self.assertIn(f"{FULL_NAME} = '2.1.325' (default ''; source: settings file)", settings.lines(loaded))
+
+    def test_the_quoted_spelling_is_not_read_as_that_name(self) -> None:
+        self.with_the_row()
+        loaded = self.read('version = 1\n"engines.claude_code".pinned_version = "2.1.325"\n')
+        self.assertEqual("", loaded[FULL_NAME])
+        self.assertEqual(settings.SOURCE_DEFAULT, loaded.values[FULL_NAME].source)
+        self.assertEqual([settings.UNKNOWN_KEY], self.codes(loaded))
+        self.assertIn("'engines.claude_code' is a quoted key that holds a dot, not a setting", loaded.notes[0].detail)
+
+    def test_without_the_row_each_spelling_is_reported_by_the_table_name_and_nothing_is_applied(self) -> None:
+        self.assertNotIn(FULL_NAME, settings.DECLARED)  # the product's table is back as it was
+        for case, text in {"the plan's printed spelling": PLAN_SPELLING, **OTHER_SPELLINGS}.items():
+            with self.subTest(case=case):
+                loaded = self.read(text)
+                self.assert_default(loaded, settings.UNKNOWN_KEY)
+                self.assertNotIn(FULL_NAME, loaded.values)
+                self.assertEqual("'engines' is not a setting this version knows; it is skipped", loaded.notes[0].detail)
+
+
 if __name__ == "__main__":
     unittest.main()

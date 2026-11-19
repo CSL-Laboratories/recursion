@@ -11,6 +11,7 @@ from unittest import mock
 
 from recursion_core.routes import ClaudeCodeAdapter, ConnectionBreaker, RouteService
 from recursion_core.routes import contract as c
+from recursion_core.routes.host import PLATFORM_UNSUPPORTED, platform_supported
 from recursion_core.routes.profile_route import ProfileRouteAdapter
 from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, FakeProcess, claude_ok, request
 
@@ -23,6 +24,18 @@ def _claude(scripts, clock=None, **kw):
     breaker = ConnectionBreaker(clock)
     svc = RouteService({"claude_code": ClaudeCodeAdapter(launcher, clock, lambda *_: "", {})}, breaker, clock, **kw)
     return svc, launcher, breaker, clock
+
+
+def _assert_platform_refused(test, res, started):
+    """A host the routes refuse (``platform_supported()`` False) ends the case in that refusal, with nothing started.
+
+    The deadline and diagnostics logic these cases test runs only where the platform is supported; there the
+    present assertions run unchanged. ``platform_supported()`` is read at run time, never at import.
+    """
+
+    test.assertEqual(res["code"], c.LAUNCH_REFUSED)
+    test.assertEqual(res["detail"], PLATFORM_UNSUPPORTED)
+    test.assertEqual(started, [])
 
 
 class ClaudeDiagnosticsTest(unittest.TestCase):
@@ -57,8 +70,11 @@ class ClaudeDiagnosticsTest(unittest.TestCase):
         }
         for name, (script, data) in retry_cases.items():
             with self.subTest(name):
-                svc, _, _, _ = _claude([script])
+                svc, launcher, _, _ = _claude([script])
                 res = svc.handle(request())
+                if not platform_supported():
+                    _assert_platform_refused(self, res, launcher.calls)
+                    continue
                 self.assertIsNone(res["code"])
                 self.assertEqual(res["events"][0]["data"], data)
                 self.assertNotIn("S7-TRIAGE-MARKER", json.dumps(res["events"][0]))
@@ -76,8 +92,11 @@ class ClaudeDiagnosticsTest(unittest.TestCase):
         }
         for name, (script, code, detail) in auth_cases.items():
             with self.subTest(name):
-                svc, _, _, _ = _claude([script])
+                svc, launcher, _, _ = _claude([script])
                 res = svc.handle(request())
+                if not platform_supported():
+                    _assert_platform_refused(self, res, launcher.calls)
+                    continue
                 self.assertEqual((res["code"], res["detail"]), (code, detail))
                 self.assertNotIn("S7-TRIAGE-MARKER", json.dumps(res))
         token = "a" * 64
@@ -91,8 +110,12 @@ class ClaudeDiagnosticsTest(unittest.TestCase):
         }
         for name, (subtype, detail) in subtype_cases.items():
             with self.subTest(name):
-                svc, _, _, _ = _claude([[{"type": "result", "subtype": subtype, "is_error": True, "result": MARK}]])
+                script = [[{"type": "result", "subtype": subtype, "is_error": True, "result": MARK}]]
+                svc, launcher, _, _ = _claude(script)
                 res = svc.handle(request())
+                if not platform_supported():
+                    _assert_platform_refused(self, res, launcher.calls)
+                    continue
                 self.assertEqual((res["code"], res["detail"]), (c.ENGINE_ERROR, detail))
                 self.assertNotIn("S7-TRIAGE-MARKER", json.dumps(res))
 
@@ -111,11 +134,14 @@ class DeadlineWorkTest(unittest.TestCase):
             svc = RouteService({"claude_code": ClaudeCodeAdapter(launcher, clock, lambda *_: "", {})},
                                ConnectionBreaker(clock), clock)
             res = svc.handle(request(deadline_s=1))
-            self.assertEqual(res["code"], c.DEADLINE_EXCEEDED)
-            self.assertEqual(res["detail"], "recursion deadline")
-            self.assertEqual(res["breaker_effect"], "none")
-            self.assertEqual(procs[0].sent, [], "the prompt was written after the deadline")
-            self.assertEqual(procs[0].fenced, ["deadline"])
+            if platform_supported():
+                self.assertEqual(res["code"], c.DEADLINE_EXCEEDED)
+                self.assertEqual(res["detail"], "recursion deadline")
+                self.assertEqual(res["breaker_effect"], "none")
+                self.assertEqual(procs[0].sent, [], "the prompt was written after the deadline")
+                self.assertEqual(procs[0].fenced, ["deadline"])
+            else:
+                _assert_platform_refused(self, res, procs)
         with self.subTest("admission_wait"):
             svc, launcher, breaker, clock = _claude([claude_ok()])
             real = breaker.admit
@@ -150,8 +176,12 @@ class DeadlineWorkTest(unittest.TestCase):
             self.assertEqual(launcher.calls, [])
             self.assertEqual(breaker.state("subscription:login-A"), "half_open")
             nxt = svc.handle(request(rid="r2"))
-            self.assertIsNone(nxt["code"])
-            self.assertEqual(len(launcher.calls), 1)
+            if platform_supported():
+                self.assertIsNone(nxt["code"])
+                self.assertEqual(len(launcher.calls), 1)
+            else:
+                # The deadline half above holds on every host: the admission is refused before any adapter runs.
+                _assert_platform_refused(self, nxt, launcher.calls)
             self.assertEqual(res["breaker_effect"], "probe_released")
 
 
@@ -173,7 +203,10 @@ class ProfileDeadlineTest(unittest.TestCase):
                     engine, FakeLauncher(), clock, lambda *_: "", {},
                     argv=lambda request, engine=engine: [engine], driver=driver)
 
-                def launch(*_a, **_k):
+                launched: list[bool] = []
+
+                def launch(*_a, launched=launched, **_k):
+                    launched.append(True)
                     clock.advance(spent)
                     return None, proc
 
@@ -181,6 +214,10 @@ class ProfileDeadlineTest(unittest.TestCase):
                 req = request(engine=engine, model="m", kind="subscription", profile={})
                 with mock.patch("recursion_core.routes.profile_route.guard_then_spawn", launch):
                     res = adapter.run(req, deadline_at)
+                if not platform_supported():
+                    _assert_platform_refused(self, res, launched)
+                    self.assertEqual(called, [])
+                    continue
                 self.assertEqual(res["code"], c.DEADLINE_EXCEEDED)
                 self.assertEqual(res["detail"], "recursion deadline")
                 self.assertEqual(res["events"], [])
@@ -201,7 +238,10 @@ class ProfileDeadlineTest(unittest.TestCase):
             "opencode", FakeLauncher(), clock, lambda *_: "", {},
             argv=lambda request: ["opencode"], driver=driver)
 
+        launched: list[bool] = []
+
         def launch(*_a, **_k):
+            launched.append(True)
             clock.advance(0.999)
             return None, proc
 
@@ -209,10 +249,14 @@ class ProfileDeadlineTest(unittest.TestCase):
         req = request(engine="opencode", model="m", kind="subscription", profile={})
         with mock.patch("recursion_core.routes.profile_route.guard_then_spawn", launch):
             res = adapter.run(req, deadline_at)
-        self.assertIsNone(res["code"])
-        self.assertEqual(res["text"], "ran")
-        self.assertEqual(proc.fenced, [])
-        self.assertEqual(called, [True])
+        if platform_supported():
+            self.assertIsNone(res["code"])
+            self.assertEqual(res["text"], "ran")
+            self.assertEqual(proc.fenced, [])
+            self.assertEqual(called, [True])
+        else:
+            _assert_platform_refused(self, res, launched)
+            self.assertEqual(called, [])
 
 
 if __name__ == "__main__":

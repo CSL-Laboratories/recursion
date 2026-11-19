@@ -363,58 +363,111 @@ def _link_title_end(text: str, i: int) -> int | None:
     return None
 
 
-def _link_interior(text: str, i: int) -> tuple[int, int, int] | None:
-    """From just after a link's `(`, the span of its destination and title, and the index after `)`,
-    when the link closes. None when it does not: then a tag there still counts."""
-    n = len(text)
-    start = i
-    i = _skip_link_ws(text, i)
-    if i >= n:
-        return None
-    if text[i] == "<":
-        i += 1
-        while i < n and text[i] not in ">\n":
-            if text[i] == "\\" and i + 1 < n and text[i + 1] in PUNCT:
-                i += 2
-                continue
-            if text[i] == "<":
-                return None  # an unescaped < is not an angle-bracket destination
-            i += 1
-        if i >= n or text[i] != ">":
-            return None
-        i += 1
-    else:
-        depth = 0
+class _Links:
+    """The inline links of `text`, read in steps that grow in step with its length. One walk finds, for
+    each unescaped `(`, the `)` that closes it within its run of characters (a run ends at a space, a
+    tab, a line ending or another control character), the first `)` in a run that closes none there,
+    and the depth of parentheses before each index; the end of a gap or a title once found is kept. So
+    the text after a `](` is never read again from its start for each `](`."""
+
+    def __init__(self, text: str) -> None:
+        n = len(text)
+        self.text = text
+        self.depth = [0] * (n + 1)  # unescaped ( less unescaped ) before each index
+        self.closes = [-1] * n  # for an unescaped (, the ) of its run that closes it
+        self.stray: dict[int, int] = {}  # a run's start: its first ) that closes no ( of the run
+        self.stop = [n] * (n + 1)  # the next space, tab, line ending or control character, else n
+        self.gaps: dict[int, int] = {}
+        self.titles: dict[str, tuple[int, int | None]] = {}  # a closer: the last title read for it
+        opens: list[int] = []
+        run = depth = i = 0
         while i < n:
             char = text[i]
             if char == "\\" and i + 1 < n and text[i + 1] in PUNCT:
+                self.depth[i + 1] = self.depth[i + 2] = depth
                 i += 2
                 continue
-            if char in " \t\n":
-                break
-            if char == "(":
+            if char in " \t\n" or ord(char) < 32:
+                opens.clear()
+                run = i + 1
+            elif char == "(":
+                opens.append(i)
                 depth += 1
             elif char == ")":
-                if depth == 0:
-                    break
                 depth -= 1
-            if ord(char) < 32:
+                if opens:
+                    self.closes[opens.pop()] = i
+                else:
+                    self.stray.setdefault(run, i)
+            self.depth[i + 1] = depth
+            i += 1
+        for i in range(n - 1, -1, -1):
+            char = text[i]
+            self.stop[i] = i if char in " \t\n" or ord(char) < 32 else self.stop[i + 1]
+
+    def gap(self, i: int) -> int:
+        """`_skip_link_ws` from `i`, each gap read once."""
+        if i not in self.gaps:
+            self.gaps[i] = _skip_link_ws(self.text, i)
+        return self.gaps[i]
+
+    def title_end(self, i: int) -> int | None:
+        """`_link_title_end` from `i`. A title that opens inside one already read, before its closer,
+        ends where that one ends, or never closes when that one never closed."""
+        closer = {"\"": "\"", "'": "'", "(": ")"}[self.text[i]]
+        last = self.titles.get(closer)
+        if last and last[0] < i and (last[1] is None or i < last[1] - 1):
+            return last[1]
+        end = _link_title_end(self.text, i)
+        self.titles[closer] = (i, end)
+        return end
+
+    def interior(self, i: int) -> tuple[int, int, int] | None:
+        """From just after a link's `(`, the span of its destination and title, and the index after `)`,
+        when the link closes. None when it does not: then a tag there still counts. A destination ends
+        at the `)` that closes the `(` before it, or at the first `)` that closes none, or at the end of
+        its run, and stands before a title or `)` only when its parentheses balance there."""
+        text, n = self.text, len(self.text)
+        start = i
+        i = self.gap(i)
+        if i >= n:
+            return None
+        if text[i] == "<":
+            i += 1
+            while i < n and text[i] not in ">\n":
+                if text[i] == "\\" and i + 1 < n and text[i + 1] in PUNCT:
+                    i += 2
+                    continue
+                if text[i] == "<":
+                    return None  # an unescaped < is not an angle-bracket destination
+                i += 1
+            if i >= n or text[i] != ">":
                 return None
             i += 1
-    i = _skip_link_ws(text, i)
-    if i < n and text[i] in "\"'(":
-        title = _link_title_end(text, i)
-        if title is None:
-            return None
-        i = _skip_link_ws(text, title)
-    if i < n and text[i] == ")":
-        return start, i, i + 1
-    return None
+        else:
+            end = self.closes[i - 1] if i == start else self.stray.get(i, -1)
+            if end < 0:
+                end = self.stop[i]
+                if end >= n or text[end] not in " \t\n" or self.depth[end] != self.depth[i]:
+                    return None
+            i = end
+        i = self.gap(i)
+        if i < n and text[i] in "\"'(":
+            title = self.title_end(i)
+            if title is None:
+                return None
+            i = self.gap(title)
+        if i < n and text[i] == ")":
+            return start, i, i + 1
+        return None
 
 
 def _link_spans(text: str) -> list[tuple[int, int]]:
     """Where an inline link's destination and title sit: Markdown puts no HTML tag there."""
     spans: list[tuple[int, int]] = []
+    if "](" not in text:
+        return spans
+    links = _Links(text)
     opens: list[int] = []
     i, n = 0, len(text)
     while i < n:
@@ -427,7 +480,7 @@ def _link_spans(text: str) -> list[tuple[int, int]]:
             continue
         if text[i] == "]" and opens and i + 1 < n and text[i + 1] == "(":
             opens.pop()
-            parsed = _link_interior(text, i + 2)
+            parsed = links.interior(i + 2)
             if parsed is not None:
                 start, end, after = parsed
                 spans.append((start, end))
@@ -437,9 +490,12 @@ def _link_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _one_tag(text: str, i: int, spans: list[tuple[int, int]]) -> int:
+def _one_tag(text: str, i: int, spans: list[tuple[int, int]], markdown: bool = False) -> int:
     """From a `<` at `i`, the index after that tag, recording each quoted attribute value. `i + 1`
-    when `i` does not open a tag, so a `<script` that follows is still seen."""
+    when `i` does not open a tag, so a `<script` that follows is still seen. In Markdown text the values
+    are recorded only for a tag that closes with `>`: one that does not is text there, and a quote it
+    leaves open hides nothing."""
+    values: list[tuple[int, int]] = []
     n = len(text)
     j = i + 1
     if j >= n:
@@ -461,9 +517,15 @@ def _one_tag(text: str, i: int, spans: list[tuple[int, int]]) -> int:
         if j >= n:
             break
         if text[j] == ">":
+            spans.extend(values)
             return j + 1
         if text[j] == "/":
-            return j + 2 if j + 1 < n and text[j + 1] == ">" else j + 1
+            if j + 1 < n and text[j + 1] == ">":
+                spans.extend(values)
+                return j + 2
+            if not markdown:
+                spans.extend(values)
+            return j + 1
         while j < n and text[j] not in " \t\n\r\f=/>":
             j += 1
         while j < n and text[j] in " \t\n\r\f":
@@ -481,12 +543,14 @@ def _one_tag(text: str, i: int, spans: list[tuple[int, int]]) -> int:
             start = j
             while j < n and text[j] != quote:
                 j += 1
-            spans.append((start, j))
+            values.append((start, j))
             if j < n:
                 j += 1
         else:
             while j < n and text[j] not in " \t\n\r\f>":
                 j += 1
+    if not markdown:
+        spans.extend(values)
     return j
 
 
@@ -501,7 +565,7 @@ def _attribute_spans(text: str, markdown: bool) -> list[tuple[int, int]]:
         if text[i] != "<":
             i += 1
             continue
-        nxt = _one_tag(text, i, spans)
+        nxt = _one_tag(text, i, spans, markdown)
         i = nxt if nxt > i else i + 1
     return spans
 
@@ -1939,6 +2003,68 @@ class BrokenRuleTests(unittest.TestCase):
             with self.subTest(whole=whole[:40]):
                 (self.root / "SECURITY.md").write_text(whole, encoding="utf-8", newline="\n")
                 self.assertIn("SECURITY.md has no '## Scope'", self.found())
+
+    def test_an_unclosed_tag_keeps_a_script_in_sight(self) -> None:
+        """Thread 2 of the review of 7fc05fbf: in Markdown text a quoted value counts as an attribute only
+        in a tag that closes with `>`; a quote left open there hides no script that follows it."""
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for prefix, hidden in (('Text <a title=" <script>', True),
+                               ('Text <a title=" <script>">', False)):
+            with self.subTest(prefix=prefix):
+                (self.root / "SECURITY.md").write_text(prefix + "\n\n" + text, encoding="utf-8", newline="\n")
+                if hidden:
+                    self.assertIn("SECURITY.md has no '## Scope'", self.found())
+                else:
+                    self.assertEqual(self.found(), [])
+
+    def test_an_unbalanced_destination_keeps_a_script_in_sight(self) -> None:
+        """Thread 3 of the review of 7fc05fbf: a link destination stands before a title or `)` only when its
+        parentheses balance; one that does not is no link, and a script in its title is seen."""
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for prefix, hidden in (('See [docs](foo( "<script>")', True),
+                               ('See [docs](foo() "<script>")', False)):
+            with self.subTest(prefix=prefix):
+                (self.root / "SECURITY.md").write_text(prefix + "\n\n" + text, encoding="utf-8", newline="\n")
+                if hidden:
+                    self.assertIn("SECURITY.md has no '## Scope'", self.found())
+                else:
+                    self.assertEqual(self.found(), [])
+
+    def test_the_link_scan_grows_in_step_with_the_text(self) -> None:
+        """Thread 1 of the review of 7fc05fbf: the text after each `](` is looked at a bounded number of
+        times, so four times the text costs at most four times the steps, and a constant. A step is one
+        character of the text read by index, counted by the text itself; a scan past the bound stops."""
+
+        class Over(Exception):
+            """The scan read more characters than the bound."""
+
+        class Counted(str):
+            """A text that counts the characters read from it by index."""
+
+            reads = 0
+            limit: int | None = None
+
+            def __getitem__(self, key: object) -> str:
+                self.reads += 1
+                if self.limit is not None and self.reads > self.limit:
+                    raise Over
+                return super().__getitem__(key)
+
+        def steps(text: str, limit: int | None = None) -> int:
+            counted = Counted(text)
+            counted.limit = limit
+            try:
+                _link_spans(counted)
+            except Over:
+                pass
+            return counted.reads
+
+        for unit in ("[x](", "[x](a ("):  # a destination that never closes; a title that never closes
+            with self.subTest(unit=unit):
+                small = steps(unit * 1000)
+                bound = 4 * small + 64
+                large = steps(unit * 4000, limit=bound)
+                self.assertLessEqual(large, bound, f"{small} steps for 1000, more than {bound} for 4000")
 
     def named_in(self, source: str, constant: str, old: str, new: str) -> str:
         """`source` with the one top-level assignment of `constant`, found as Python reads it however

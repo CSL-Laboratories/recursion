@@ -114,7 +114,7 @@ class ParseV1Tests(unittest.TestCase):
         self.assertRefused(v1(schema=MANIFEST_SCHEMA), "manifest_fields")
         self.assertRefused(v1(schema="csl-plugin-manifest/2"), "manifest_fields")
 
-    def test_runtime_and_interface_take_only_their_one_value(self) -> None:
+    def test_runtime_and_interface_refuse_a_value_not_in_their_lists(self) -> None:
         for value in ("python-inprocess/2", "python-subprocess/1", "", ["python-inprocess/1"], None, 1, {}):
             with self.subTest(runtime=value):
                 self.assertRefused(v1(runtime=value), "manifest_runtime")

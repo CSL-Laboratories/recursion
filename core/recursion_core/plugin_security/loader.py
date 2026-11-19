@@ -40,6 +40,8 @@ from .runtime import GilProbe
 
 __all__ = ["CoreHealth", "LoadedPlugin", "PluginLoader"]
 
+_RUNTIME_SANDBOXED = "python-sandboxed/1"
+
 class CoreHealth:
     """Shared poison flag. Once poisoned, only a daemon restart clears it."""
 
@@ -154,7 +156,15 @@ class PluginLoader:
         findings.append(_finding("verify", "manifest_ok", "info", manifest.plugin_id))
         if manifest.runtime == RUNTIME_INPROCESS_RETIRING:
             findings.append(_finding("verify", "runtime_inprocess_retiring", "warn",
-                                     "python-inprocess/1 is read as python-sandboxed/1; refused from 1.1.0"))
+                                     "python-inprocess/1 retires and is refused from 1.1.0; until then it runs "
+                                     "the same way as python-sandboxed/1, in the daemon's own process"))
+        if manifest.runtime == _RUNTIME_SANDBOXED:
+            # The host that contains a python-sandboxed/1 plugin is not in this build. The warning only says
+            # so: no manifest field changes it, and it changes no verdict.
+            findings.append(_finding("verify", "runtime_not_yet_contained", "warn",
+                                     "python-sandboxed/1 is not contained in this build: the plugin runs in "
+                                     "the daemon's own process, with the daemon's rights, until the host that "
+                                     "contains it is built"))
         if hashlib.sha256(artifact).hexdigest() != manifest.artifact_sha256:
             raise Refused("artifact_digest_mismatch")
         trust, kid, reason = self._trust.classify(manifest, signature)

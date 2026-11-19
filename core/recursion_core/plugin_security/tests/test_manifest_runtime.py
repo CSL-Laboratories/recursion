@@ -5,8 +5,10 @@
 ``runtime_reserved`` with its own text; any other value is refused ``manifest_runtime`` with a text
 that names what this release runs. The permission names ``schedule``, ``memory`` and ``computer`` are
 reserved and refused ``permission_reserved``. The record kinds a later release will use are held in
-the schema's reserved list. Every list stays append-only: no text says it is closed. Keys here are
-made up; nothing is signed.
+the schema's reserved list. Every list stays append-only: no text says it is closed. No text says a
+plugin is contained in this build: the schema and the README each say that nothing is contained yet,
+and a ``python-sandboxed/1`` load gives the warning ``runtime_not_yet_contained``, which changes no
+verdict. Keys here are made up; nothing is signed.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from recursion_core.plugin_security.manifest import (
     MANIFEST_SCHEMA_V1, PERMISSIONS, PERMISSIONS_V1, ReservedEffects, TrustStore, parse_manifest,
 )
 from recursion_core.plugin_security.tests.support import PLUGIN_SOURCE, FakeGilProbe, manifest_bytes
-from recursion_core.plugin_security.tests.test_manifest_v1 import FAKE_KEY, v1
+from recursion_core.plugin_security.tests.test_manifest_v1 import FAKE_KEY, v1, v1_fields
 
 ROOT = Path(__file__).resolve().parents[4]
 PLUGIN_SCHEMAS = ROOT / "schemas" / "plugin" / "v1"
@@ -38,6 +40,15 @@ NOT_FROZEN = "reserved is not frozen: a reserved name may be corrected until the
 # Words that would say a list is closed. A later runtime, permission or record kind is an append.
 CLOSED_WORDS = ("the only runtime", "only python-inprocess/1 is defined", "only python-sandboxed/1 is defined",
                 "has one value", "one runtime")
+# The one sentence the runtime's description and the README each carry: what this build does.
+HONEST = ("In this build a plugin of either runtime runs in the daemon's own process and nothing is contained "
+          "yet; the name python-sandboxed/1 is accepted so that manifests can be written for the host that "
+          "follows.")
+# Words that would say or imply that this build runs a plugin in a sandbox.
+SANDBOX_CLAIMS = ("in a sandboxed host", "sandboxed host process", "never in the daemon",
+                  "is read as python-sandboxed/1", "behind the wall")
+NOT_CONTAINED = "runtime_not_yet_contained"
+RUNTIME_FINDINGS = (NOT_CONTAINED, "runtime_inprocess_retiring")
 
 
 def _schema() -> dict:
@@ -56,9 +67,23 @@ def _refusal(raw: bytes) -> Refused:
     raise AssertionError("the manifest was accepted")
 
 
-def _doctor(raw: bytes) -> list:
+def _doctor(raw: bytes, artifact: bytes = PLUGIN_SOURCE) -> list:
     loader = PluginLoader(TrustStore({}), {}, ReservedEffects(), CoreHealth(), FakeGilProbe())
-    return loader.doctor(raw, None, PLUGIN_SOURCE)
+    return loader.doctor(raw, None, artifact)
+
+
+def _load(raw: bytes):
+    return PluginLoader(TrustStore({}), {}, ReservedEffects(), CoreHealth(), FakeGilProbe()).load(
+        raw, None, PLUGIN_SOURCE)
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _without_runtime_findings(findings) -> list:
+    return [(f["stage"], f["code"], f["severity"], f["detail"]) for f in findings
+            if f["code"] not in RUNTIME_FINDINGS]
 
 
 class RuntimeField(unittest.TestCase):
@@ -160,12 +185,84 @@ class FixturesAndTexts(unittest.TestCase):
             self.assertEqual(index[name]["expect"], {"keyword": "enum", "at": "/runtime"})
         self.assertIn("good/manifest.v1/h04-a-sandboxed-runtime.json", index)
 
+    def test_a_reserved_permission_has_a_bad_fixture_refused_at_its_place(self) -> None:
+        name = "bad/manifest.v1/b14-a-reserved-permission.json"
+        self.assertEqual(_refusal(self._fixture(name)).code, "permission_reserved")
+        index = {e["file"]: e for e in json.loads((FIXTURES / "index.json").read_text(encoding="utf-8"))["fixtures"]}
+        self.assertEqual(index[name]["expect"], {"keyword": "enum", "at": "/permissions/1"})
+
     def test_no_text_says_the_runtime_list_is_closed(self) -> None:
         for path in (PLUGIN_SCHEMAS / "manifest.v1.json", PLUGIN_SCHEMAS / "README.md", FIXTURES / "index.json"):
             text = path.read_text(encoding="utf-8").lower()
             for words in CLOSED_WORDS:
                 with self.subTest(file=path.name, words=words):
                     self.assertNotIn(words, text)
+
+
+class TheTextSaysNoMoreThanTheBuild(unittest.TestCase):
+    def test_the_schema_and_the_readme_each_say_that_nothing_is_contained_yet(self) -> None:
+        texts = {"manifest.v1.json runtime": _schema()["properties"]["runtime"]["description"],
+                 "README.md": (PLUGIN_SCHEMAS / "README.md").read_text(encoding="utf-8")}
+        for name, text in texts.items():
+            with self.subTest(text=name):
+                self.assertEqual(_flat(text).count(HONEST), 1)
+
+    def test_no_text_says_this_build_runs_a_plugin_in_a_sandbox(self) -> None:
+        details = [f["detail"] for runtime in (SANDBOXED, INPROCESS) for f in _doctor(v1(runtime=runtime))]
+        texts = {"manifest.v1.json": (PLUGIN_SCHEMAS / "manifest.v1.json").read_text(encoding="utf-8"),
+                 "README.md": (PLUGIN_SCHEMAS / "README.md").read_text(encoding="utf-8"),
+                 "the loader's findings": "\n".join(details)}
+        for name, text in texts.items():
+            for words in SANDBOX_CLAIMS:
+                with self.subTest(text=name, words=words):
+                    self.assertNotIn(words, _flat(text).lower())
+
+
+class NotYetContained(unittest.TestCase):
+    def _one(self, findings) -> dict:
+        found = [f for f in findings if f["code"] == NOT_CONTAINED]
+        self.assertEqual(len(found), 1)
+        return found[0]
+
+    def test_a_sandboxed_plugin_gets_one_warning_at_the_doctor_and_at_load(self) -> None:
+        raw = v1(runtime=SANDBOXED)
+        for where, findings in (("doctor", _doctor(raw)), ("load", _load(raw).findings)):
+            with self.subTest(where=where):
+                finding = self._one(findings)
+                self.assertEqual((finding["stage"], finding["severity"]), ("verify", "warn"))
+                self.assertIn("not contained in this build", finding["detail"])
+                self.assertIn("the daemon's own process", finding["detail"])
+
+    def test_the_retiring_runtime_keeps_its_own_warning_and_does_not_get_this_one(self) -> None:
+        codes = [f["code"] for f in _doctor(v1(runtime=INPROCESS))]
+        self.assertNotIn(NOT_CONTAINED, codes)
+        self.assertEqual(codes.count("runtime_inprocess_retiring"), 1)
+
+    def test_no_manifest_field_silences_it(self) -> None:
+        cases = {"read only": v1(runtime=SANDBOXED, permissions=("read",)),
+                 "network": v1(runtime=SANDBOXED, permissions=("read", "network"), network=("api.example.org",)),
+                 "process and order": v1(runtime=SANDBOXED, permissions=("read", "process", "order")),
+                 "a dependency lock": v1(runtime=SANDBOXED, lock="0" * 64),
+                 "install scripts": v1(runtime=SANDBOXED, install_scripts=("python setup.py",))}
+        for name, raw in cases.items():
+            with self.subTest(manifest=name):
+                self._one(_doctor(raw))
+        for key in ("quiet", "findings", "contained"):
+            with self.subTest(extra_field=key):
+                body = v1_fields(runtime=SANDBOXED)
+                body[key] = True
+                self.assertEqual(_refusal(canonical(body)).code, "manifest_fields")
+
+    def test_it_changes_no_verdict(self) -> None:
+        sandboxed, inprocess = _load(v1(runtime=SANDBOXED)), _load(v1(runtime=INPROCESS))
+        self.assertEqual(_without_runtime_findings(sandboxed.findings), _without_runtime_findings(inprocess.findings))
+        self.assertEqual((sandboxed.permissions, sandboxed.trust), (inprocess.permissions, inprocess.trust))
+        self.assertIsNotNone(sandboxed.module)
+        refused = {runtime: _doctor(v1(runtime=runtime), artifact=b"other bytes") for runtime in (SANDBOXED, INPROCESS)}
+        self.assertEqual(refused[SANDBOXED][-1]["code"], "artifact_digest_mismatch")
+        self.assertEqual(_without_runtime_findings(refused[SANDBOXED]), _without_runtime_findings(refused[INPROCESS]))
+        self._one(refused[SANDBOXED])
+        self.assertEqual(_refusal(v1(runtime=SANDBOXED, permissions=("read", "memory"))).code, "permission_reserved")
 
 
 if __name__ == "__main__":

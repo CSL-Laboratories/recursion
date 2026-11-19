@@ -6,7 +6,8 @@ it in `README.md` has a passing fixture in `fixtures/`.
 
 ## `manifest.v1.json` is `1.0-draft.2` (2026-11-18)
 
-`runtime` takes `python-sandboxed/1` (a plugin run in a sandboxed host process outside the daemon)
+`runtime` takes `python-sandboxed/1` (the name for a plugin run by a host outside the daemon; in this
+build no plugin is contained yet, and a `python-sandboxed/1` load gives the warning `runtime_not_yet_contained`)
 beside `python-inprocess/1`, which retires: it is read as `python-sandboxed/1` in every 1.0.x release,
 with the finding `runtime_inprocess_retiring`. A new `$defs/reserved` holds the names kept for a later
 release, each with a sentence on what it is for: the runtimes `wasm-component/1` and `data/1`, the
@@ -16,7 +17,7 @@ permissions `schedule`, `memory` and `computer`, and the record kinds `trigger.v
 runtime is refused `manifest_runtime` with a text that names what this release runs. What it breaks:
 nothing that loads today. Every manifest draft 1 accepted is still accepted; a manifest that names a
 reserved name was refused before and is refused now, under its own code. One good fixture (`h04`) and
-two bad ones (`b12`, `b13`) hold it.
+three bad ones (`b12`, `b13`, `b14`) hold it.
 
 ## `revoked-keys.v1.json` is `1.0-draft.2` (Nov 15, 2026)
 

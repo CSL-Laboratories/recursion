@@ -712,6 +712,15 @@
       }
     },
     {
+      "file": "bad/manifest.v1/b14-a-reserved-permission.json",
+      "schema": "manifest.v1.json",
+      "rule": "'memory' is held for a later release: the parser refuses it 'permission_reserved', with its own text, and the schema refuses it as a name its list of permissions does not hold.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/permissions/1"
+      }
+    },
+    {
       "file": "bad/manifest.v1/m-manifest.v1.artifact-sha256.json",
       "schema": "manifest.v1.json",
       "rule": "The object described at manifest.v1.json#/ always carries 'artifact_sha256'.",

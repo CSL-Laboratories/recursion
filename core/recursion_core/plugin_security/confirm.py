@@ -7,8 +7,9 @@ carries an origin, every plugin is ``unknown``, so every use below asks.
 ``decide`` is one pure function. It answers ``"ask"`` or ``"go"`` for one use of a handle:
 
 * ``credential``: ask on each use;
-* ``network``: ask on the first use per destination since the daemon started, then go
-  for that destination until the daemon starts again;
+* ``network``: ask on the first use per plugin and destination since the daemon started,
+  then go for that plugin and that destination until the daemon starts again; an approval
+  given for one plugin never lets another plugin reach that destination unasked;
 * ``process``: ask on each start;
 * origin ``person``: go (the grant suffices);
 * lifted by the person for this plugin: go.
@@ -27,10 +28,14 @@ The gate's own rule applies: a veto is final for that effect until the daemon st
 again, so once the person refuses a use, the same use by the same plugin in the same run
 and connection is refused without asking again.
 
-``NetworkFirstUses`` is the record of the destinations the person approved since the
-daemon started. It lives in memory only: the daemon makes a new, empty one at each
-start, so a restart asks again. A destination is recorded only after its approval was
-taken, never on a refusal or a time-out. The destination is compared exactly as given.
+``NetworkFirstUses`` is the record of the network first uses the person approved since
+the daemon started, each held as the pair of plugin and destination: the approval the
+person was shown named one plugin, so it holds for that plugin only. ``decide`` lets a
+network use go only when it is given the asking plugin's ``plugin_id`` and that pair is
+recorded; without a ``plugin_id`` it asks. The record lives in memory only: the daemon
+makes a new, empty one at each start, so a restart asks again. A pair is recorded only
+after its approval was taken, never on a refusal or a time-out. The plugin and the
+destination are compared exactly as given.
 """
 
 from __future__ import annotations
@@ -62,19 +67,26 @@ KNOWN_DESTINATION = "destination approved since the daemon started"
 
 
 class NetworkFirstUses:
-    """The destinations the person approved since this daemon started. In memory only."""
+    """The (plugin, destination) pairs the person approved since this daemon started.
+
+    In memory only. ``(plugin_id, destination) in record`` says whether that plugin's first
+    use of that destination was approved; ``destination in record`` says whether any
+    plugin's was.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._seen: set[str] = set()
+        self._seen: set[tuple[str, str]] = set()
 
-    def __contains__(self, destination: object) -> bool:
+    def __contains__(self, key: object) -> bool:
         with self._lock:
-            return destination in self._seen
+            if type(key) is tuple:
+                return key in self._seen
+            return any(destination == key for _, destination in self._seen)
 
-    def record(self, destination: str) -> None:
+    def record(self, plugin_id: str, destination: str) -> None:
         with self._lock:
-            self._seen.add(destination)
+            self._seen.add((plugin_id, destination))
 
 
 def _check(origin: object, handle: object, target: object, lifted: object) -> str:
@@ -92,14 +104,14 @@ def _check(origin: object, handle: object, target: object, lifted: object) -> st
 
 
 def decide(origin: str | None, handle: str, target: str, *, lifted: bool = False,
-           first_uses: Container[str]) -> str:
-    """Answer ``"ask"`` or ``"go"`` for one use. Pure: it changes nothing."""
+           first_uses: Container[object], plugin_id: str | None = None) -> str:
+    """Answer ``"ask"`` or ``"go"`` for one use by the plugin ``plugin_id``. Pure: it changes nothing."""
     origin = _check(origin, handle, target, lifted)
     if origin == "person":
         return GO
     if lifted:
         return GO
-    if handle == "network" and target in first_uses:
+    if handle == "network" and plugin_id is not None and (plugin_id, target) in first_uses:
         return GO
     return ASK
 
@@ -123,7 +135,7 @@ def confirm(gate: ApprovalGate, wait: Callable[[str, str], None], *, origin: str
     Raises the gate's ``Refused`` when the approval is refused, timed out or not given.
     """
     origin = _check(origin, handle, target, lifted)
-    if decide(origin, handle, target, lifted=lifted, first_uses=first_uses) == GO:
+    if decide(origin, handle, target, lifted=lifted, first_uses=first_uses, plugin_id=plugin_id) == GO:
         if origin == "person":
             return PERSON
         if lifted:
@@ -134,5 +146,5 @@ def confirm(gate: ApprovalGate, wait: Callable[[str, str], None], *, origin: str
     wait(approval_id, digest)
     gate.take(approval_id, effect)
     if handle == "network":
-        first_uses.record(target)
+        first_uses.record(plugin_id, target)
     return APPROVED

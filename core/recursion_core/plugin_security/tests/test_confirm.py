@@ -50,10 +50,10 @@ class _Area:
         # "nothing": the person has not answered when the wait returns
 
     def use(self, handle: str, origin, *, lifted: bool = False, first_uses: NetworkFirstUses,
-            target: str | None = None) -> str:
+            target: str | None = None, plugin_id: str = "demo.plugin") -> str:
         return confirm(self.gate, self.wait, origin=origin, handle=handle,
                        target=target if target is not None else _TARGETS[handle],
-                       plugin_id="demo.plugin", run_id="run-1", connection="conn-a",
+                       plugin_id=plugin_id, run_id="run-1", connection="conn-a",
                        lifted=lifted, first_uses=first_uses)
 
 
@@ -106,7 +106,8 @@ class RuleTests(unittest.TestCase):
     def test_network_first_use_asks_and_the_second_goes(self) -> None:
         area, first_uses = _Area(), NetworkFirstUses()
         self.assertEqual(area.use("network", "model", first_uses=first_uses), "approved by the person")
-        self.assertEqual(decide("model", "network", _TARGETS["network"], first_uses=first_uses), GO)
+        self.assertEqual(decide("model", "network", _TARGETS["network"], first_uses=first_uses,
+                                plugin_id="demo.plugin"), GO)
         self.assertEqual(area.use("network", "model", first_uses=first_uses),
                          "destination approved since the daemon started")
         self.assertEqual(len(area.drawn), 1)
@@ -119,6 +120,41 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(area.use("network", "unknown", first_uses=first_uses, target="other.example.com:443"),
                          "approved by the person")
         self.assertEqual(len(area.drawn), 2)
+
+    def test_a_destination_approved_for_one_plugin_is_asked_again_for_another(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        self.assertEqual(area.use("network", "model", first_uses=first_uses, plugin_id="plugin.a"),
+                         "approved by the person")
+        # Plugin b asks for the same destination: the person is asked, and the box names plugin b.
+        self.assertEqual(area.use("network", "model", first_uses=first_uses, plugin_id="plugin.b"),
+                         "approved by the person")
+        self.assertEqual(len(area.drawn), 2)
+        expected = confirmation_effect("network", _TARGETS["network"], plugin_id="plugin.b",
+                                       run_id="run-1", connection="conn-a")
+        self.assertEqual(area.drawn[1][2], canonical(expected))
+        # Plugin a is not asked a second time.
+        self.assertEqual(area.use("network", "model", first_uses=first_uses, plugin_id="plugin.a"),
+                         "destination approved since the daemon started")
+        self.assertEqual(len(area.drawn), 2)
+        self.assertEqual(area.waited, 2)
+        # decide says the same; a plugin never approved, or no plugin named, is asked.
+        for plugin_id, expected_answer in (("plugin.a", GO), ("plugin.b", GO), ("plugin.c", ASK), (None, ASK)):
+            with self.subTest(plugin_id=plugin_id):
+                self.assertEqual(decide("model", "network", _TARGETS["network"], first_uses=first_uses,
+                                        plugin_id=plugin_id), expected_answer)
+
+    def test_a_network_approval_never_lets_a_credential_or_a_program_of_the_same_name_go(self) -> None:
+        shared = "shared.example-name"
+        area, first_uses = _Area(), NetworkFirstUses()
+        self.assertEqual(area.use("network", "model", first_uses=first_uses, target=shared),
+                         "approved by the person")
+        for handle in ("credential", "process"):
+            with self.subTest(handle=handle):
+                self.assertEqual(area.use(handle, "model", first_uses=first_uses, target=shared),
+                                 "approved by the person")
+                self.assertEqual(decide("model", handle, shared, first_uses=first_uses,
+                                        plugin_id="demo.plugin"), ASK)
+        self.assertEqual(len(area.drawn), 3)
 
     def test_a_daemon_restart_clears_the_record(self) -> None:
         area = _Area()

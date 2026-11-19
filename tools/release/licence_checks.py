@@ -495,7 +495,9 @@ def _one_tag(text: str, i: int, spans: list[tuple[int, int]], markdown: bool = F
     """From a `<` at `i`, the index after that tag, recording each quoted attribute value. `i + 1`
     when `i` does not open a tag, so a `<script` that follows is still seen. In Markdown text the values
     are recorded only for a tag that closes with `>` and whose every attribute name is valid and follows
-    whitespace: one that does not is text there, and a quote it leaves open hides nothing."""
+    whitespace: one that does not is text there, and a quote it leaves open hides nothing. An unquoted
+    value there that is empty or holds `"`, `'`, `=`, `<`, `>` or a backtick, which CommonMark does not allow,
+    gives the tag up the same way."""
     values: list[tuple[int, int]] = []
     n = len(text)
     gap = False
@@ -565,8 +567,16 @@ def _one_tag(text: str, i: int, spans: list[tuple[int, int]], markdown: bool = F
             if j < n:
                 j += 1
         else:
-            while j < n and text[j] not in " \t\n\r\f>":
+            start = j
+            while j < n:
+                c = text[j]
+                if c in " \t\n\r\f>":
+                    break
+                if markdown and c in "\"'=<`":
+                    return i + 1
                 j += 1
+            if markdown and j == start:
+                return i + 1
     if not markdown:
         spans.extend(values)
     return j
@@ -2030,6 +2040,28 @@ class BrokenRuleTests(unittest.TestCase):
                                ('Text <a title=" <script>" !>', True),
                                ('Text <a title=" <script>"x=1>', True),
                                ('Text <a title=" <script>">', False)):
+            with self.subTest(prefix=prefix):
+                (self.root / "SECURITY.md").write_text(prefix + "\n\n" + text, encoding="utf-8", newline="\n")
+                if hidden:
+                    self.assertIn("SECURITY.md has no '## Scope'", self.found())
+                else:
+                    self.assertEqual(self.found(), [])
+
+    def test_a_tag_whose_unquoted_value_commonmark_refuses_keeps_a_script_in_sight(self) -> None:
+        """In Markdown text an unquoted attribute value that is empty or holds `"`, `'`, `=`, `<`, `>` or a
+        backtick makes the tag text, as CommonMark reads it, so a script in a quoted value of that tag is seen."""
+        text = (self.root / "SECURITY.md").read_text(encoding="utf-8")
+        for prefix, hidden in (('Text <div  title = \t=\tx="<script>"/>', True),
+                               ("Text <div\t_d='<script>'  a=b=e.f/>", True),
+                               ('Text <A1  e.f=""\ta=b=\te.f=" <script>" >', True),
+                               ('Text <x-y\tx = "<script>" g-h=" <script>"  a=b= />', True),
+                               ('Text <A1  a=b=1 _d = \'<script>\'  title = "" />', True),
+                               ('Text <A1 _d = "<script>"  g-h =  = >', True),
+                               ('Text <x-y g-h = "<script>" _d a=b="" >', True),
+                               ("Text <div  x = '<script>'\t_d =   -x=>", True),
+                               ('Text <a t="<script>" b= >', True),
+                               ('Text <a x=1 title=" <script>">', False),
+                               ('Text <a x=b/ title=" <script>">', False)):
             with self.subTest(prefix=prefix):
                 (self.root / "SECURITY.md").write_text(prefix + "\n\n" + text, encoding="utf-8", newline="\n")
                 if hidden:

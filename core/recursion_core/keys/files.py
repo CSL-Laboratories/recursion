@@ -178,6 +178,10 @@ def open_folder(path: Path, *, create: bool) -> Folder | None:
     path = Path(path)
     if not path.is_absolute():
         raise KeyStoreError('folder_invalid', f'{path}: not an absolute path')
+    if '\0' in str(path):              # os.open raises ValueError for it, not OSError: refused here, typed
+        raise KeyStoreError('folder_invalid', 'the folder path holds a NUL byte, which no file system takes')
+    if not _encodable(path):            # a lone surrogate: os.open raises UnicodeEncodeError, a ValueError
+        raise KeyStoreError('folder_invalid', 'the folder path holds a character the file system cannot encode')
     if create:
         _make(path)
     try:
@@ -200,6 +204,14 @@ def open_folder(path: Path, *, create: bool) -> Folder | None:
         os.close(fd)
         raise
     return Folder(path, fd)
+
+
+def _encodable(path: Path) -> bool:
+    try:
+        os.fsencode(str(path))
+    except (UnicodeError, ValueError):
+        return False
+    return True
 
 
 def _make(path: Path) -> None:

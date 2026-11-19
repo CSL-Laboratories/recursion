@@ -16,8 +16,9 @@ each raised OUTSIDE the handler of the error underneath it, so no exception chai
 
 WHICH BACKEND ANSWERS (``detect``):
 
-- macOS and Windows always have a keychain: ``macos_keychain`` and ``windows_credential``. Their backends
-  are not built in this slice, so the store refuses there (``backend_not_built``) instead of writing a file.
+- macOS and Windows always have a keychain: ``macos_keychain`` and ``windows_credential``. macOS needs Apple's
+  ``/usr/bin/security`` at that path, which PATH does not change (refused ``keychain_tool_missing`` without it). The
+  Windows backend is not built yet, so the store refuses there (``backend_not_built``) instead of writing a file.
 - Elsewhere the keychain is the Secret Service, reached over the user's session bus. No session bus (no
   address in the environment and no ``$XDG_RUNTIME_DIR/bus`` socket): there is no keychain, ``owner_file``.
 - With a bus, the bus itself is asked which names are owned or can be started (``ListNames`` and
@@ -51,6 +52,7 @@ KWALLET_NAMES = ('org.kde.kwalletd5', 'org.kde.kwalletd6')
 HELPER_ENV_NAMES = ('PATH', 'HOME', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'DISPLAY', 'WAYLAND_DISPLAY')
 BUS_TIMEOUT_S = 10.0
 KEYCHAIN_TIMEOUT_S = 120.0     # an unlock prompt waits for the user
+MAC_SECURITY = '/usr/bin/security'    # Apple's own tool, at its fixed path: never looked for on PATH
 
 
 @dataclass(frozen=True)
@@ -121,6 +123,14 @@ class System:
         folders = _absolute_path(self.environ.get('PATH', ''))
         return shutil.which(name, path=os.pathsep.join(folders)) if folders else None
 
+    def is_executable(self, path: str) -> bool:
+        """True when ``path`` itself is an executable regular file; PATH is not searched."""
+        try:
+            info = os.stat(path)
+        except OSError:
+            return False
+        return stat.S_ISREG(info.st_mode) and os.access(path, os.X_OK)
+
     def run(self, argv: list, *, input: bytes | None = None, timeout: float) -> Completed:
         """Run a helper with its own small environment. Raises ``ToolMissing`` or ``ToolTimeout``."""
         name = os.path.basename(str(argv[0]))
@@ -180,6 +190,9 @@ def _absolute_path(value: str) -> list:
 def detect(system: System) -> str:
     """The backend this host offers now: a name from ``store.STORES``. Raises ``KeyStoreError``."""
     if system.platform == 'darwin':
+        if not system.is_executable(MAC_SECURITY):
+            raise KeyStoreError('keychain_tool_missing', f'the macOS security tool was not found at {MAC_SECURITY}; no '
+                                'key is written to a file on a host that has a keychain')
         return 'macos_keychain'
     if system.platform == 'win32':
         return 'windows_credential'

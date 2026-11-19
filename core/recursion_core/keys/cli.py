@@ -8,7 +8,10 @@
     key may spend money billed to it, and the cap in US dollars (answers typed ahead are kept);
     ``--allow-metered-spend --cap-usd N`` answers both up front, and is the only way to opt in with ``--stdin``.
     With no opt-in the cap is 0, and every run on the key is refused before launch until it is removed and
-    added again with one. An id that looks like a key is refused before any prompt shows it.
+    added again with one. An id that looks like a key is refused before any prompt shows it, and so is everything
+    else it can refuse without the key (``KeyStore.check_add``): a provider, variable name or cap it does not take,
+    a folder, index or host it cannot save in (an index already too full for one more key among them), and an id
+    already saved.
 ``list [--json]``
     Ids, providers, variable names, when each was saved, the store, the spend opt-in and any unfinished
     operation. Never a value.
@@ -22,7 +25,7 @@
     Searches the state folder, the config folder and the journal for every saved value (``audit.py``) and
     names each place a value was found, never the value, and each temp file an interrupted save left in the
     store's folder. Exit 1 when one was found, 4 when the search was incomplete (a value or a file could not be
-    read, an operation is unfinished, the journal was asked for and not searched to the end, or the Secret Service
+    read, an operation is unfinished, the journal was asked for and not searched to the end, or the keychain
     holds items Recursion saved that no saved key names) and nothing was found, and 3, not 1, when it was refused,
     so that 1 always means a finding.
 
@@ -306,6 +309,9 @@ def _add(args, out, err, store, terminal, stdin) -> int:
         raise KeyStoreError('cap_invalid', '--allow-metered-spend needs --cap-usd above 0')
     if cap and not allow:
         raise KeyStoreError('cap_invalid', '--cap-usd above 0 needs --allow-metered-spend')
+    # Everything it can refuse without the key, before the key is read: no prompt for a key it would refuse anyway.
+    store.check_add(args.key_id, args.key_provider, args.key_env, metered_spend_allowed=bool(allow),
+                    cap_usd=cap if allow else 0)
     stdin = stdin if stdin is not None else sys.stdin
     opened = None
     try:
@@ -396,6 +402,15 @@ def _remove(args, out, err, store, terminal) -> int:
     return 0
 
 
+UNNAMED_TEXT = {      # the audit's line on the keychain items no saved key names: where they are, how they are found
+    'secret_service': ('the Secret Service',
+                       'the keychain\'s own tool finds the rest by the attribute "application recursion"'),
+    'macos_keychain': ('the macOS Keychain',
+                       ('Keychain Access finds the rest by the name "Recursion API key <id>" (service '
+                        '"recursion.<store id>.<save id>.<provider>")')),
+}
+
+
 def _audit(args, out, err, store) -> int:
     report = audit_mod.run(store, extra=args.key_paths, journal=not args.key_no_journal)
     for place, label in report.found:
@@ -406,9 +421,9 @@ def _audit(args, out, err, store) -> int:
             print(f'FOUND: a value of {key_id} that no saved key names is in {place}', file=out)
     for key_id, code in sorted(report.missing.items()):
         print(f'not searched for {key_id}: its value could not be read ({code})', file=out)
-    for key_id, op in sorted(report.pending.items()):
-        print(f'unfinished {op} of {key_id}: its value may still be in the store; "key remove {key_id}" clears it',
-              file=out)
+    for key_id, op in sorted(report.pending.items()):     # no removal's outcome is foretold from the audit's count
+        print(f'unfinished {op} of {key_id}: its value may still be in the store; "key remove {key_id}" clears it, '
+              'or names the refusal that stops it', file=out)
     for key_id in report.unbound:
         print(f'not named: the owner-only file holds a value of {key_id} that no saved key names; '
               f'"key remove {key_id}" deletes it', file=out)
@@ -417,11 +432,11 @@ def _audit(args, out, err, store) -> int:
               "file (it names another store, or this store's keys are in a keychain): no command of this store "
               'changes it, and the value leaves with the file', file=out)
     if report.unnamed:
-        print(f'keychain: {report.unnamed} item(s) in the Secret Service that Recursion saved and no saved key of this '
-              "store names (another store's, or this store's from before its index was lost, emptied or put back); "
+        where, finds = UNNAMED_TEXT.get(report.unnamed_in, ('the keychain', "the keychain's own tool finds the rest"))
+        print(f'keychain: {report.unnamed} item(s) in {where} that Recursion saved and no saved key of this store '
+              "names (another store's, or this store's from before its index was lost, emptied or put back); "
               'their values are not looked for. "key remove <id>" deletes every item of this store under an id a '
-              'saved key has, whichever save stored it; the keychain\'s own tool finds the rest by the attribute '
-              '"application recursion"', file=out)
+              f'saved key has, whichever save stored it; {finds}', file=out)
     if report.unnamed_refused:
         print(f'keychain: its items were not counted ({report.unnamed_refused})', file=out)
     for place in report.leftovers:

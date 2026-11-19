@@ -5,12 +5,12 @@ secure storage, in the OS keychain where there is one and in an owner-only file 
 are never logged, never put in a prompt and never sent to CSL; engine sign-ins stay in each engine's own
 store; any vendor's key can be kept.
 
-TWO PLACES. The INDEX (``index.json``) holds what is safe to show: per key id, the provider, the variable name
-the engine reads it from, when it was saved, which backend holds it, and its spend opt-in and cap; and the
-operations that were started on a backend and not finished. It never holds a value. The VALUE is in the
-BACKEND: the Secret Service, or the owner-only file (``backends.py``). Both files live in one owner-only folder,
-``$XDG_CONFIG_HOME/recursion/keys`` (``~/.config/recursion/keys``), with the checks of ``files.py``. Nothing here
-is in the event database: no key state changes with an event, and no secret sits beside the event log.
+TWO PLACES. The INDEX (``index.json``) holds what is safe to show: per key id, the provider, the variable name the
+engine reads it from, when it was saved, which backend holds it, and its spend opt-in and cap; and the operations that
+were started on a backend and not finished. It never holds a value. The VALUE is in the BACKEND: the Secret Service, the
+macOS Keychain, or the owner-only file (``backends.py``). Both files live in one owner-only folder,
+``$XDG_CONFIG_HOME/recursion/keys`` (``~/.config/recursion/keys``), with the checks of ``files.py``. Nothing here is in
+the event database: no key state changes with an event, and no secret sits beside the event log.
 
 IDENTITY. Nothing about a store depends on how its folder is spelled. The store's id, which names its items in a
 keychain all of the user's stores share, is random and is recorded in the index at the first save; every
@@ -18,7 +18,7 @@ spelling that reaches the folder (``..``, a symlinked parent, a trailing or doub
 another letter case on a file system that ignores case) opens the same index, so it reads the same id, takes the
 same lock and reaches the same values. A relative folder is refused, so the working directory never matters.
 THE BINDING. Each save also gets a random ``save_id``, recorded with its key. The backend stores the value WITH
-the store's id, that save id and the record's provider (a Secret Service item's attributes; the owner-only file's
+the store's id, that save id and the record's provider (a keychain item's attributes; the owner-only file's
 entry and its header), and ``credential`` asks for the value of exactly that record: a value is released only
 when all three match the record being used and the store. So an older index put back, or an edited record, gets
 ``secret_missing``, never another save's value. An index copied in from another store's folder carries that
@@ -29,9 +29,13 @@ record names (questions.md K18); on the owner-only file the copy has a file of i
 first write. A removal deletes every value saved for the id in the store, whichever save stored it.
 
 THE INDEX FORMAT, version 1: ``{"version": 1, "store_id": <32 hex>, "backend": <store or null>, "keys": {<id>:
-{"provider", "env_name", "created_at", "store", "metered_spend_allowed", "cap_usd", "save_id"}}, "pending":
-{<id>: {"op": "add" | "remove", "started_at"}}}``, at most 1 MiB. Anything else is refused ``index_invalid``. A
-listing says what the index holds; it does not say that a keychain is reachable or unlocked now.
+{"provider", "env_name", "created_at", "store", "metered_spend_allowed", "cap_usd", "save_id"}}, "pending": {<id>:
+{"op": "add" | "remove", "started_at"}}}``, at most 1 MiB. A store pinned to the macOS Keychain also records
+``"keychain": <its path>``, the login keychain it saved in (only beside a live ``macos_keychain`` pin). An index pinned
+there that records none (only unreleased drafts of the backend wrote one) is listed, and every operation that reaches
+the keychain is refused ``keychain_unavailable``: which keychain it saved in cannot be shown. No index is written with a
+``keychain`` this format refuses. Anything else is refused ``index_invalid``. A listing says what the index holds; it
+does not say that a keychain is reachable or unlocked now.
 
 PINNING. The first save records the backend the host offered then (``system.detect``) in the index. Every later
 operation that touches a value asks again and refuses when the answer differs: ``keychain_unavailable`` when a keychain
@@ -94,9 +98,10 @@ it. A store whose backend is the owner-only file and that has no record takes th
 same folder is the same store). A store on a keychain never takes it, and never reads the owner-only file to save or
 release a key, nor to remove one while its index pins it there (only the audit reads it, for values to look for). On a
 keychain an item is named by the store's id, which only the index records: an index LOST leaves the store's items with
-no name this store knows, so it can neither release nor remove them (the keychain's own tool can: they carry
-``application recursion``). ``remove <id>`` of an id a record names deletes every item of the id in the store, whichever
-save stored it. The audit counts every Recursion item in the keychain that neither a record names by its save nor an
+no name this store knows, so it can neither release nor remove them (the keychain's own tool can: on the Secret Service
+they carry ``application recursion``, on the macOS Keychain their service is ``recursion.<store id>.<save
+id>.<provider>``). ``remove <id>`` of an id a record names deletes every item of the id in the store, whichever save
+stored it. The audit counts every Recursion item in the keychain that neither a record names by its save nor an
 unfinished operation by its id (``unnamed_items``), and is incomplete while there is one.
 """
 from __future__ import annotations
@@ -113,7 +118,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from recursion_core.keys import validate as v
-from recursion_core.keys.backends import OwnerFile, SecretService
+from recursion_core.keys.backends import (
+    UNRECORDED,
+    MacKeychain,
+    OwnerFile,
+    SecretService,
+)
 from recursion_core.keys.errors import KeyRefused, KeyStoreError
 from recursion_core.keys.files import Folder, open_folder
 from recursion_core.keys.system import System, detect
@@ -131,7 +141,8 @@ INDEX_NAME = 'index.json'
 INDEX_MAX = 1 << 20
 INDEX_VERSION = 1
 FIELDS = ('provider', 'env_name', 'created_at', 'store', 'metered_spend_allowed', 'cap_usd', 'save_id')
-SHOWN = ('key_id', 'provider', 'env_name', 'created_at', 'store', 'metered_spend_allowed', 'cap_usd')
+PUBLISHED = ('key_id', 'provider', 'env_name', 'created_at', 'store')    # key.list's answer (methods.v1.json, S1)
+SHOWN = PUBLISHED + ('metered_spend_allowed', 'cap_usd')                 # list --json: the spend opt-in added
 PENDING_FIELDS = ('op', 'started_at')
 OPS = ('add', 'remove')
 RANDOM_ID = re.compile(r'[0-9a-f]{32}')
@@ -161,10 +172,19 @@ class KeyRecord:
     save_id: str
 
     def spend_allowed(self) -> bool:
+        """The opt-in and a cap above 0. ``add`` and the index's parser both refuse an opt-in with a cap of 0, so the
+        second test cannot be false for a record this store reads; it stays so the rule reads whole here."""
         return self.metered_spend_allowed is True and self.cap_usd > 0
 
+    def published(self) -> dict:
+        """What ``key.list`` (S1) answers for the key: exactly the fields its published schema names (``PUBLISHED``).
+        No spend field (lane QUOTA reads those through ``spend_policy``) and no save id."""
+        return {name: getattr(self, name) for name in PUBLISHED}
+
     def as_json(self) -> dict:
-        """What ``list --json`` shows: the record without its save id, which is the store's own business."""
+        """What the local ``list --json`` shows the owner: the published fields, then the spend opt-in and cap typed
+        at ``add`` (``SHOWN``). Never the save id, which is the store's own business. It is not ``key.list``'s
+        answer, which is ``published``."""
         return {name: getattr(self, name) for name in SHOWN}
 
 
@@ -183,6 +203,7 @@ class Index:
     keys: dict                                     # key id -> KeyRecord
     pending: dict = field(default_factory=dict)    # key id -> Pending
     store_id: str | None = None                    # the store's random id; None only before the first save
+    keychain: str | None = None                    # the macOS Keychain a store pinned there saves in (its path)
 
     def live(self) -> bool:
         return bool(self.keys or self.pending)
@@ -207,9 +228,13 @@ def index_bytes(index: Index) -> bytes:
     """The index file exactly as it is written. Every write carries the store's id (``add`` makes it first)."""
     keys ={kid: {name: getattr(record, name) for name in FIELDS} for kid, record in sorted(index.keys.items())}
     pending = {kid: {'op': p.op, 'started_at': p.started_at} for kid, p in sorted(index.pending.items())}
-    body = json.dumps({'version': INDEX_VERSION, 'store_id': index.store_id,
-                       'backend': index.backend if index.live() else None, 'keys': keys, 'pending': pending},
-                      indent=1, ensure_ascii=True)
+    doc = {'version': INDEX_VERSION, 'store_id': index.store_id, 'backend': index.backend if index.live() else None,
+           'keys': keys, 'pending': pending}
+    if index.live() and index.keychain is not None and index.backend == 'macos_keychain':
+        if not _valid_keychain(index.keychain):         # never a keychain its reader refuses, '' included
+            raise KeyStoreError('index_invalid', 'an index is never written with a keychain its reader refuses')
+        doc['keychain'] = index.keychain
+    body = json.dumps(doc, indent=1, ensure_ascii=True)
     return (body + '\n').encode('ascii')
 
 
@@ -258,10 +283,10 @@ class KeyStore:
     def _write_index(cls, folder: Folder, index: Index) -> None:
         folder.write(INDEX_NAME, cls._sized(index))
 
-    def _backend(self, pinned: str | None, store_id: str | None):
+    def _backend(self, pinned: str | None, store_id: str | None, keychain: str | None = None):
         """The backend object to use now, for the store named ``store_id``. With a pin, the host must still offer
-        the pinned backend."""
-        return self._made(self._backend_name(pinned), store_id)
+        the pinned backend. ``keychain`` is the macOS Keychain the index records, if any."""
+        return self._made(self._backend_name(pinned), store_id, keychain)
 
     def _backend_name(self, pinned: str | None) -> str:
         """The backend to use now: the pinned one, which the host must still offer, or the one the host offers."""
@@ -276,18 +301,20 @@ class KeyStore:
                                 'they are removed only where that keychain answers, then added again here')
         return pinned or offered
 
-    def _made(self, name: str, store_id: str | None):
+    def _made(self, name: str, store_id: str | None, keychain: str | None = None):
         if name == 'owner_file':
             return OwnerFile(store_id)
         if name == 'secret_service':
             return SecretService(self.system, store_id)
+        if name == 'macos_keychain':
+            return MacKeychain(self.system, store_id, keychain)
         raise KeyStoreError('backend_not_built',
                             f'the {STORE_TEXT[name]} backend is not built yet; no key is written to a file on a host '
                             'that has a keychain')
 
-    def _removal_backend(self, pinned: str | None, store_id: str | None):
+    def _removal_backend(self, pinned: str | None, store_id: str | None, keychain: str | None = None):
         """The backend a removal uses: the owner-only file is in the store's folder, whatever the host offers now."""
-        return OwnerFile(store_id) if pinned == 'owner_file' else self._backend(pinned, store_id)
+        return OwnerFile(store_id) if pinned == 'owner_file' else self._backend(pinned, store_id, keychain)
 
     @staticmethod
     def _identity(folder: Folder, index: Index, name: str) -> Index:
@@ -348,14 +375,7 @@ class KeyStore:
     def add(self, key_id: str, provider: str, env_name: str, value: str, *, metered_spend_allowed: bool = False,
             cap_usd: float = 0) -> KeyRecord:
         """Save a new key. An id that is already saved is refused (``key_exists``); remove it first."""
-        problem = v.id_problem(key_id)
-        if problem is not None:
-            raise KeyStoreError('id_invalid', problem)
-        if not v.valid_provider(provider):
-            raise KeyStoreError('provider_invalid', 'a provider is a lower-case vendor id: a-z 0-9 . _ -, starting with '
-                                f'a letter or digit (published ids: {", ".join(v.PROVIDER_IDS)})')
-        if not v.valid_env_name(env_name):
-            raise KeyStoreError('env_name_invalid', 'a variable name is A-Z 0-9 _, not starting with a digit')
+        _check_names(key_id, provider, env_name)
         if not v.valid_value(value):
             raise KeyStoreError('value_invalid', f'a key is {v.VALUE_MIN} to {v.VALUE_MAX} visible ASCII characters, '
                                 'with no space')
@@ -372,7 +392,7 @@ class KeyStore:
             index = self._read_index(folder)
             name = self._backend_name(index.backend)     # no pin while the index is empty: a first save pins
             index = self._identity(folder, index, name)
-            backend = self._made(name, index.store_id)
+            backend = self._made(name, index.store_id, _keychain_of(index))
             index = self._recover(folder, index, backend)
             if key_id in index.keys:
                 raise KeyStoreError('key_exists', f'{key_id} is already saved; remove it first')
@@ -380,15 +400,19 @@ class KeyStore:
                 raise KeyStoreError('operation_pending', f'an earlier operation on {key_id} is not finished and its '
                                     'backend could not be reached; remove the key to clear it')
             if name == 'owner_file' and key_id in backend.ids(folder):
-                raise KeyStoreError('key_exists', f'the owner-only file still holds a value of {key_id} that no saved '
-                                    f'key names (its index was lost, emptied or put back); "remove {key_id}" deletes '
-                                    'it, then add the key again')
+                raise _unbound_exists(key_id)
             now = _now(self._clock)
             record = KeyRecord(key_id, provider, env_name, now, backend.name, metered_spend_allowed, cap_usd,
                                _random_id())
             keys = {**index.keys, key_id: record}
             intent = replace(index, backend=backend.name, pending={**index.pending, key_id: Pending(key_id, 'add', now)})
             done = replace(index, backend=backend.name, keys=keys)
+            admit = getattr(backend, 'admit', None)
+            if admit is not None:
+                admit(key_id, value, record)                            # a key the backend cannot carry whole
+            target = getattr(backend, 'target', None)                   # the keychain it saves in, recorded
+            if target is not None:
+                intent, done = replace(intent, keychain=target()), replace(done, keychain=target())
             self._sized(replace(intent, keys=keys))                     # both states fit, before anything changes
             self._write_index(folder, intent)                           # 1. the intent, before the outside effect
             try:
@@ -412,6 +436,43 @@ class KeyStore:
                 raise
             return record
 
+    def check_add(self, key_id: str, provider: str, env_name: str, *, metered_spend_allowed: bool = False,
+                  cap_usd: float = 0) -> None:
+        """Raise what ``add`` would refuse before it has a value, with the same code: an id, provider or variable
+        name it does not take; a folder, index or host it cannot save in (an index already too full for the smallest
+        record among them); an id already saved, or held in the store's own file with no saved key naming it; and,
+        for a store with keys in the macOS Keychain, a keychain it may not use or that does not answer
+        (``keychain_unavailable``, ``keychain_locked``, ``keychain_failed``). ``key add`` calls it before it reads the
+        key, so a command that cannot succeed for one of these reasons never asks for one. It changes nothing and
+        holds the folder's lock shared; ``add`` checks all of it again under the exclusive lock. Left to ``add``: an
+        id with an unfinished operation (the save's own recovery may finish it), a keychain that stops answering in
+        between, the cap and the value."""
+        _check_names(key_id, provider, env_name)
+        folder = self._folder(create=False)
+        if folder is None:
+            self._backend(None, None)       # a host this store cannot save on, as add refuses it
+            return
+        with folder, folder.locked(shared=True):
+            index = self._read_index(folder)
+            name = self._backend_name(index.backend)
+            backend = self._made(name, self._identity(folder, index, name).store_id, _keychain_of(index))
+            target = getattr(backend, 'target', None)
+            if target is not None and index.live():
+                target()                    # the keychain the store's keys are in, as add asks it before the intent
+            if key_id in index.pending:
+                return
+            if key_id in index.keys:
+                raise KeyStoreError('key_exists', f'{key_id} is already saved; remove it first')
+            if name == 'owner_file' and key_id in backend.ids(folder):
+                raise _unbound_exists(key_id)
+            # An index already too full for this record (with the opt-in and cap given, else the smallest one) is
+            # refused store_full, as add refuses it.
+            given = metered_spend_allowed is True and v.valid_cap(cap_usd) and cap_usd > 0
+            smallest = KeyRecord(key_id, provider, env_name, _now(self._clock), name, given, cap_usd if given else 0,
+                                 '0' * 32)
+            self._sized(replace(index, backend=name, keys={**index.keys, key_id: smallest},
+                                pending={**index.pending, key_id: Pending(key_id, 'add', smallest.created_at)}))
+
     def remove(self, key_id: str) -> KeyRecord | None:
         """Delete a key's value from its backend, then its entry from the index.
 
@@ -432,7 +493,7 @@ class KeyStore:
             if record is None and key_id not in index.pending:
                 self._unnamed(folder, index, key_id)     # a value only the store's own file holds, or key_unknown
                 return None
-            backend = self._removal_backend(index.backend, index.store_id)
+            backend = self._removal_backend(index.backend, index.store_id, _keychain_of(index))
             index = self._recover(folder, index, backend, but=key_id)
             keys = {kid: rec for kid, rec in index.keys.items() if kid != key_id}
             others = {kid: p for kid, p in index.pending.items() if kid != key_id}
@@ -492,7 +553,7 @@ class KeyStore:
         if not index.live():
             return {}, {}
         try:
-            backend = self._backend(index.backend, index.store_id)
+            backend = self._backend(index.backend, index.store_id, _keychain_of(index))
         except KeyStoreError as exc:
             return {}, dict.fromkeys(index.keys, exc.code)
         found, missing = {}, {}
@@ -506,11 +567,13 @@ class KeyStore:
         return found, missing
 
     def unnamed_items(self) -> int | None:
-        """For ``audit`` only: how many items in the Secret Service carry ``application recursion`` and are named
-        neither by a record of this index (by its save) nor by an unfinished operation (by its id): another store's,
-        or this store's from before its index was lost, emptied or put back (see VALUES NO RECORD NAMES). None when
-        the store does not use the Secret Service. A pin the host no longer offers, or a keychain that cannot be
-        asked, is refused with its code."""
+        """For ``audit`` only: how many items Recursion saved in the keychain (on the Secret Service those that carry
+        ``application recursion``, on the macOS Keychain the generic passwords whose service is ``recursion.<store
+        id>.<save id>.<provider>``, or ``recursion.<save id>``, the service #422's first head wrote) are named neither
+        by a record of this index (by its save) nor by an unfinished operation (by its id): another store's, or this
+        store's from before its index was lost, emptied or put back (see VALUES NO RECORD NAMES). None when the store
+        keeps its keys in the owner-only file, or on a keychain whose backend is not built. A pin the host no longer
+        offers, or a keychain that cannot be asked, is refused with its code."""
         folder = self._folder(create=False)
         if folder is None:
             return self._unnamed_items(Index(None, {}))
@@ -521,9 +584,15 @@ class KeyStore:
             return self._unnamed_items(index)
 
     def _unnamed_items(self, index: Index) -> int | None:
-        if index.backend == 'owner_file' or self._backend_name(index.backend) != 'secret_service':
+        if index.backend == 'owner_file':
             return None
-        backend = SecretService(self.system, index.store_id)
+        name = self._backend_name(index.backend)
+        if name not in ('secret_service', 'macos_keychain'):
+            return None
+        backend = self._made(name, index.store_id, _keychain_of(index))
+        unnamed = getattr(backend, 'unnamed', None)
+        if unnamed is not None:
+            return unnamed(index)           # one listing for named and unnamed alike (the macOS Keychain)
         named = sum(backend.count(kid, None if kid in index.pending else index.keys[kid])   # a record names its save,
                     for kid in sorted(set(index.keys) | set(index.pending)))                  # an intent every save
         return max(backend.count() - named, 0)
@@ -563,7 +632,8 @@ class KeyStore:
                                         'this key has no metered-spend opt-in and cap; remove it and add it again '
                                         'with one')
                 # The value of this record's own save, and no other: see IDENTITY.
-                return self._backend(index.backend, index.store_id).get(connection_id, folder, record)
+                return self._backend(index.backend, index.store_id, _keychain_of(index)).get(
+                    connection_id, folder, record)
         except KeyRefused:
             raise
         except KeyError:
@@ -579,6 +649,75 @@ class KeyStore:
         log.warning('the key store refused %s: %s', connection_id, code)
         raise KeyRefused(connection_id, code)
 
+    # -- for other lanes: QUOTA's spend policy, INSTALL's doctor -----------------------------------
+    def spend_policy(self, connection_id: str) -> dict:
+        """``{"metered_spend_allowed": bool, "cap_usd": number}`` as typed at ``add``; with no opt-in, the cap is 0.
+
+        Reads the index only (no backend, no keychain prompt). An unknown id raises ``KeyError(connection_id)``;
+        an index the store cannot read raises ``KeyRefused`` with its code, as ``credential`` does, and an ordinary
+        I/O failure underneath it ``KeyRefused`` with ``store_failed`` (no error text).
+        """
+        if not v.valid_key_id(connection_id):
+            raise KeyError(connection_id)
+        code = None
+        try:
+            index = self.list()
+        except KeyStoreError as exc:
+            code = exc.code
+        except OSError:                      # an I/O failure underneath the store: typed, and no text of it
+            code = 'store_failed'
+        if code is not None:
+            raise KeyRefused(connection_id, code)         # outside the handler: no __context__
+        record = index.keys.get(connection_id)
+        if record is None:
+            raise KeyError(connection_id)
+        return {'metered_spend_allowed': record.metered_spend_allowed, 'cap_usd': record.cap_usd}
+
+    def describe(self) -> dict:
+        """Which store holds the keys and which backend this host offers now, for ``doctor``. Never a value.
+
+        ``store``: the pinned backend, or None when no key is saved. ``offered``: what the host offers now, or None
+        with ``offered_refusal`` saying why it cannot say. ``refusal``: why the index itself cannot be read, or None.
+        It never raises for a store it cannot use: a doctor reports that, it does not fail on it.
+        """
+        out = {'folder': str(self.root), 'store': None, 'keys': 0, 'owner_file': None, 'refusal': None,
+               'offered': None, 'offered_refusal': None}
+        try:
+            index = self.list()
+        except KeyStoreError as exc:
+            out['refusal'] = {'code': exc.code, 'detail': exc.detail}
+        except OSError as exc:               # an I/O failure underneath the store: its type and errno only
+            out['refusal'] = {'code': 'store_failed', 'detail': f'{type(exc).__name__} errno {exc.errno}'}
+        else:
+            out['store'], out['keys'] = index.backend, len(index.keys)
+        try:
+            out['offered'] = detect(self.system)
+        except KeyStoreError as exc:
+            out['offered_refusal'] = {'code': exc.code, 'detail': exc.detail}
+        except OSError as exc:
+            out['offered_refusal'] = {'code': 'store_failed', 'detail': f'{type(exc).__name__} errno {exc.errno}'}
+        if 'owner_file' in (out['store'], out['offered']):
+            out['owner_file'] = str(self.owner_file())
+        return out
+
+
+def _check_names(key_id, provider, env_name) -> None:
+    """The refusals of ``add`` that need nothing but its words (``check_add`` and ``add``)."""
+    problem = v.id_problem(key_id)
+    if problem is not None:
+        raise KeyStoreError('id_invalid', problem)
+    if not v.valid_provider(provider):
+        raise KeyStoreError('provider_invalid', 'a provider is a lower-case vendor id: a-z 0-9 . _ -, starting with '
+                            f'a letter or digit (published ids: {", ".join(v.PROVIDER_IDS)})')
+    if not v.valid_env_name(env_name):
+        raise KeyStoreError('env_name_invalid', 'a variable name is A-Z 0-9 _, not starting with a digit')
+
+
+def _unbound_exists(key_id: str) -> KeyStoreError:
+    return KeyStoreError('key_exists', f'the owner-only file still holds a value of {key_id} that no saved key names '
+                         f'(its index was lost, emptied or put back); "remove {key_id}" deletes it, then add the key '
+                         'again')
+
 
 def _parse_index(raw: bytes) -> Index | None:
     """The index exactly as ``index_bytes`` writes it, or None. Nothing raises with the text attached."""
@@ -586,7 +725,7 @@ def _parse_index(raw: bytes) -> Index | None:
         doc = json.loads(raw.decode('ascii'), object_pairs_hook=_pairs, parse_constant=_constant)
     except (ValueError, _Duplicate):
         doc = None
-    if not isinstance(doc, dict) or set(doc) != {'version', 'store_id', 'backend', 'keys', 'pending'}:
+    if not isinstance(doc, dict) or set(doc) - {'keychain'} != {'version', 'store_id', 'backend', 'keys', 'pending'}:
         return None
     if type(doc['version']) is not int or doc['version'] != INDEX_VERSION or not _valid_random_id(doc['store_id']):
         return None
@@ -595,6 +734,8 @@ def _parse_index(raw: bytes) -> Index | None:
     live = bool(doc['keys'] or doc['pending'])
     backend = doc['backend']
     if (backend not in STORES) if live else (backend is not None):
+        return None
+    if 'keychain' in doc and not (live and backend == 'macos_keychain' and _valid_keychain(doc['keychain'])):
         return None
     keys = {}
     for key_id, entry in doc['keys'].items():
@@ -617,7 +758,22 @@ def _parse_index(raw: bytes) -> Index | None:
         if entry['op'] not in OPS or not v.valid_timestamp(entry['started_at']):
             return None
         pending[key_id] = Pending(key_id, entry['op'], entry['started_at'])
-    return Index(backend if live else None, keys, pending, doc['store_id'])
+    return Index(backend if live else None, keys, pending, doc['store_id'], doc.get('keychain'))
+
+
+def _valid_keychain(text: object) -> bool:
+    """A keychain's path as the index records it: absolute, at most 4096 characters, no quote, backslash, control
+    character or U+FFFD (it is quoted on ``security``'s interactive line, and ``_login_path`` refuses the same)."""
+    return (isinstance(text, str) and text.startswith('/') and len(text) <= 4096
+            and not any(c in '"\\�' or ord(c) < 32 or ord(c) == 127 for c in text))
+
+
+def _keychain_of(index: Index) -> str | None:
+    """The keychain a store's backend is made with: the one its index records; ``UNRECORDED`` for an index pinned to
+    the macOS Keychain that records none, which the backend refuses; None before the first save."""
+    if index.keychain is not None:
+        return index.keychain
+    return UNRECORDED if index.live() and index.backend == 'macos_keychain' else None
 
 
 class _Duplicate(Exception):
@@ -654,3 +810,13 @@ def default_store() -> KeyStore:
 def credentials(connection_id: str, env_name: str) -> str:
     """``routes.base.Credentials`` over the default store: what lane KEYS registers into seam S7."""
     return default_store().credential(connection_id, env_name)
+
+
+def spend_policy(connection_id: str) -> dict:
+    """The default store's spend policy for one key: what lane QUOTA reserves against at admission."""
+    return default_store().spend_policy(connection_id)
+
+
+def describe() -> dict:
+    """The default store's description: what lane INSTALL's ``doctor`` reports."""
+    return default_store().describe()

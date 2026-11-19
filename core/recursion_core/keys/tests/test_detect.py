@@ -34,8 +34,13 @@ class DetectTest(unittest.TestCase):
         return detect(FakeSystem(**kw))
 
     def test_macos_and_windows_always_have_a_keychain(self) -> None:
-        self.assertEqual(self.detect(platform='darwin'), 'macos_keychain')
+        self.assertEqual(self.detect(platform='darwin', tools={'security': failing}), 'macos_keychain')
         self.assertEqual(self.detect(platform='win32'), 'windows_credential')
+
+    def test_macos_without_the_security_tool_is_refused_not_answered_with_the_file(self) -> None:
+        with self.assertRaises(KeyStoreError) as caught:
+            self.detect(platform='darwin')
+        self.assertEqual(caught.exception.code, 'keychain_tool_missing')
 
     def test_no_session_bus_means_the_owner_file(self) -> None:
         self.assertEqual(self.detect(tools={'secret-tool': failing, 'busctl': busctl(owner=True)}), 'owner_file')

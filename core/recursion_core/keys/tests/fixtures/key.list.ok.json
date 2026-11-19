@@ -1,0 +1,19 @@
+{
+ "code": "ok",
+ "keys": [
+  {
+   "key_id": "claude-key",
+   "provider": "anthropic",
+   "env_name": "ANTHROPIC_API_KEY",
+   "created_at": "2025-11-14T22:40:00.250Z",
+   "store": "owner_file"
+  },
+  {
+   "key_id": "codex-key",
+   "provider": "openai",
+   "env_name": "CODEX_API_KEY",
+   "created_at": "2025-11-14T22:40:00.250Z",
+   "store": "owner_file"
+  }
+ ]
+}

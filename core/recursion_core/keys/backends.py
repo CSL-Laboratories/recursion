@@ -1,4 +1,5 @@
-"""Where a key's VALUE is kept: the Secret Service (through ``secret-tool``) or the owner-only file.
+"""Where a key's VALUE is kept: the Secret Service (through ``secret-tool``), the macOS Keychain (through
+``security``) or the owner-only file.
 
 Each backend is made for one store (its random id, from the index) and has ``get(key_id, folder, record)``,
 ``put(key_id, value, folder, record=...)``, ``delete(key_id, folder)`` and ``holds(key_id, folder)``. ``folder``
@@ -11,7 +12,7 @@ carries a value.
 
 THE BINDING. A value is stored WITH what authorizes it: the store's id, the save id of the record that saved it
 and that record's provider. ``get`` given a record returns the value only when all three match the record and
-the store; anything else is ``secret_missing``, on both backends. So no index (an older one put back, one copied
+the store; anything else is ``secret_missing``, on every backend. So no index (an older one put back, one copied
 in, one edited) can pair one save's provider and opt-in with another save's value. ``get`` with no record (the
 audit's read of an interrupted add, never a release) returns any value of the id; ``delete`` and ``holds`` act on
 every value of the id. A stored value with no binding beside it is refused, never guessed at.
@@ -37,6 +38,45 @@ when ``lookup`` (which unlocks, prompting if it must) finds nothing AND ``search
 items too, exits 0 and lists none (``presence``). A removal succeeds only then; an add whose helper failed drops
 its intent only then.
 
+MACOS KEYCHAIN. Apple's ``/usr/bin/security``, at that fixed path and never one found on PATH, and the login keychain,
+which ``security login-keychain`` names once per operation and which every command then names: a save, a lookup, a
+removal and a count all go to it, never to the default keychain or the search list (lane KEYS' questions.md K21, default
+(d)). The index records that keychain at the store's first save; an operation on a store whose login keychain is now
+another is refused (``keychain_unavailable``) and keeps its record or intent: nothing of the store's is looked for or
+removed in another keychain. An index pinned here that records none (only unreleased drafts of this backend wrote one,
+before the keychain was recorded) is refused the same way beside any keychain, before ``security`` is asked anything: no
+listing shows which keychain it saved in, since a copy of an item in another keychain lists as the original does. Each
+save is its own generic password: account ``<key id>``, service ``recursion.<store id>.<save id>.<provider>``, generic
+attribute (``-G``) ``<store id>``, comment (``-j``) ``<provider>``, label ``Recursion API key <id>``. Account and
+service are the item's primary key, and given both, ``security`` searches by those two alone (it then ignores ``-G`` and
+``-j``; Apple's keychain_find.c), so the service carries the whole binding: a value is returned only to the record of
+the save that stored it, in this store, for that provider. ``delete`` and ``holds`` search by account and generic
+attribute, with no service, which ``security`` does match, so a removal reaches every save of the id in this store, one
+item per call. No save meets another's item, so none replaces a value it was not given. The value is written with
+``security -i``, which reads its command from standard input: one ``add-generic-password`` line, the value as
+hexadecimal (``-X``), nothing of it in the arguments or the environment. ``security -i`` keeps at most 4095 bytes of a
+line and reads the rest as the next command (security.c, readline.c), so a key whose line would be longer is refused
+(``value_invalid``, with the limit) before the store writes anything; with the longest id, provider and login-keychain
+path that is about 1,800 characters. The exit status of ``-i`` is not documented to report one command's failure, so
+every save is read back by its record and compared; one not kept exactly is taken out again (its own item, no other) and
+refused ``keychain_failed``; a read-back the keychain does not answer keeps its own refusal (a locked keychain stays
+``keychain_locked``) and the save's intent stays. Exit 44 ("item not found") is a hint and never proof: ``security``
+also answers it when its search failed, so absence is established only by a complete listing of the login keychain
+(``count``) that shows no generic password of the id in this store, whatever its service (every item ``delete``
+selects), and a removal, or an add that failed, keeps its record or intent until then. ``count`` reads
+``dump-keychain``, which without ``-d`` prints attributes only (no password) and asks for access to none. The audit's
+count of the items no record names comes from ONE listing (``unnamed``), so a change between two listings cannot hide an
+item; Recursion's items there are those whose service is ``recursion.<store id>.<save id>.<provider>`` or
+``recursion.<save id>`` (the service #422's first head wrote). A lookup or a removal that succeeded but wrote anything
+unexpected on standard error is refused: given a keychain it cannot open, ``security`` falls back to the search list and
+says so there. A listing that exits with a failure, writes anything on standard error, prints nothing it can read as
+items, or lists a generic password without its account and service (or one of Recursion's without its generic attribute
+and comment) is refused: Apple's dump loop ignores an item it could not print whole, so such a listing may be
+incomplete. An empty listing is an empty keychain. "User interaction is not allowed" or a locked keychain is
+``keychain_locked``; a timeout is ``keychain_timeout``; a tool that vanished is ``keychain_tool_missing``; a failure's
+detail is fixed text. Written against Apple's documented interface and its published source and tested against a
+stand-in program that follows them: it has not run on a Mac.
+
 OWNER-ONLY FILE. ``secrets.json`` in the store's folder: ``{"version": 1, "store_id": <the store's id>,
 "secrets": {id: {"save_id", "provider", "value"}}}``, read and written through ``files.Folder`` (0600, owner and
 mode checked on every read, temp file, fsync, rename). Any other shape is refused (``owner_file_invalid``). A
@@ -49,6 +89,7 @@ a keychain never takes it.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 
@@ -181,6 +222,301 @@ def _failure(action: str, done: sysmod.Completed) -> KeyStoreError:
     return KeyStoreError(code, f'secret-tool {action} exited {done.returncode}{why}')
 
 
+class MacKeychain:
+    """The login keychain through Apple's ``/usr/bin/security`` (see MACOS KEYCHAIN above)."""
+
+    name = 'macos_keychain'
+    TOOL = sysmod.MAC_SECURITY      # Apple's tool at its fixed path; never one found on PATH
+    NOT_FOUND = 44                  # errSecItemNotFound as an exit status: a hint, never proof that an item is gone
+    DELETE_LIMIT = 64               # items of one id a removal deletes before it gives up and refuses
+    LINE_MAX = 4094                 # a line and its newline within the 4095 bytes security -i keeps; the rest runs
+
+    def __init__(self, system: sysmod.System, store_id: str, keychain: str | None = None) -> None:
+        self._system = system
+        self._store_id = store_id
+        # The keychain the store's index records it saved in; None before a save; UNRECORDED for an index pinned here
+        # that records none, which is refused (see MACOS KEYCHAIN).
+        self._pinned = keychain
+        self._keychain = None       # the login keychain's path: resolved once, then named by every command
+
+    def __repr__(self) -> str:
+        return 'MacKeychain()'
+
+    def _tool(self) -> str:
+        # Not the only guard: System.run turns a tool it cannot start into the same keychain_tool_missing. This one
+        # names the fixed path in the refusal, and refuses before anything runs (DeepSeek I1, #422 round 2).
+        if not self._system.is_executable(self.TOOL):
+            raise KeyStoreError('keychain_tool_missing', f'the macOS security tool was not found at {self.TOOL}')
+        return self.TOOL
+
+    def _run(self, argv: list, *, input: bytes | None = None) -> sysmod.Completed:
+        code = None
+        try:
+            return self._system.run(argv, input=input, timeout=sysmod.KEYCHAIN_TIMEOUT_S)
+        except sysmod.ToolTimeout:
+            code, detail = 'keychain_timeout', 'security did not answer in time'
+        except sysmod.ToolMissing:
+            code, detail = 'keychain_tool_missing', 'security could not be started'
+        raise KeyStoreError(code, detail)       # outside the handlers: no __context__
+
+    def _login(self) -> str:
+        """The login keychain's path, from ``security login-keychain``, resolved once for this backend's life (one
+        store operation), so every command of it names the same keychain. Anything but one absolute, quoted path is
+        refused, never guessed at."""
+        if self._keychain is None:
+            if self._pinned == UNRECORDED:
+                raise KeyStoreError('keychain_unavailable', "this store's index records no keychain (only unreleased "
+                                    'drafts of this backend wrote such an index), so which keychain holds its keys '
+                                    'cannot be shown; nothing is looked for, read or removed in any keychain')
+            done = self._run([self._tool(), 'login-keychain'])
+            if done.returncode != 0:
+                raise _mac_failure('login-keychain', done)
+            _quiet('login-keychain', done)
+            path = _login_path(done.stdout)
+            if path is None:
+                raise KeyStoreError('keychain_failed', 'security login-keychain named no login keychain this store '
+                                    'can use')
+            if self._pinned is not None and path != self._pinned:
+                raise KeyStoreError('keychain_unavailable', 'the login keychain is not the one this store saved its '
+                                    'keys in; nothing is looked for or removed in another keychain (make that one the '
+                                    'login keychain again)')
+            self._keychain = path
+        return self._keychain
+
+    def target(self) -> str:
+        """The keychain this backend saves in, which the store's index records at a save (see MACOS KEYCHAIN)."""
+        return self._login()
+
+    def _service(self, save_id: str, provider: str) -> str:
+        """The service of the item a save stored: it carries the store, the save and the provider."""
+        return f'recursion.{self._store_id}.{save_id}.{provider}'
+
+    def _of_id(self, key_id: str) -> list:
+        """Every item of ``key_id`` in this store, whichever save stored it: account and generic attribute (no
+        service, so ``security`` matches both)."""
+        return ['-a', key_id, '-G', self._store_id]
+
+    def _of_record(self, key_id: str, record) -> list:
+        """The item a record saved: account and service, its primary key. With no record, any item of the id."""
+        if record is None:
+            return self._of_id(key_id)
+        return ['-a', key_id, '-s', self._service(record.save_id, record.provider)]
+
+    def _line(self, key_id: str, provider: str, save_id: str, hexvalue: str) -> bytes:
+        """The ``add-generic-password`` line, without its newline. The id, the ids and the provider are tokens and
+        the value is hexadecimal, so only the label and the keychain's path are quoted (that path holds no quote,
+        backslash or control character, ``_login_path``)."""
+        return (f'add-generic-password -a {key_id} -s {self._service(save_id, provider)} -G {self._store_id} '
+                f'-j {provider} -l "Recursion API key {key_id}" -X {hexvalue} "{self._login()}"').encode()
+
+    def longest(self, key_id: str, provider: str) -> int:
+        """The longest key, in characters, whose line and newline fit the 4095 bytes ``security -i`` keeps, for this
+        id and provider here. The key goes as hexadecimal, two bytes a character, so its line can end a byte short
+        of ``LINE_MAX``."""
+        fixed = len(self._line(key_id, provider, '0' * 32, ''))
+        return max((self.LINE_MAX - fixed) // 2, 0)
+
+    def admit(self, key_id: str, value: str, record) -> None:
+        """Refuse, before the store writes anything, a key that line could not carry whole."""
+        longest = self.longest(key_id, record.provider)
+        if len(value) > longest:
+            raise KeyStoreError('value_invalid', f'a key kept in the macOS Keychain is at most {longest} characters '
+                                'for this id and keychain (security -i reads one line of at most 4095 bytes); nothing '
+                                'was saved')
+
+    def get(self, key_id: str, folder: Folder, record=None) -> str:
+        done = self._run([self._tool(), 'find-generic-password', *self._of_record(key_id, record), '-w',
+                          self._login()])
+        if done.returncode == 0:
+            _quiet('find-generic-password', done)       # a value from a keychain it fell back to is not released
+            raw = done.stdout[:-1] if done.stdout.endswith(b'\n') else done.stdout
+            done = None
+            value = decode_value(raw)
+            raw = None
+            if value is None:
+                raise KeyStoreError('value_invalid',
+                                    f'the macOS Keychain item for {key_id} is not a key this store saved')
+            return value
+        if done.returncode == self.NOT_FOUND:
+            raise KeyStoreError('secret_missing', f'the macOS Keychain has no item for {key_id}')
+        raise _mac_failure('find-generic-password', done)
+
+    def put(self, key_id: str, value: str, folder: Folder, *, record) -> None:
+        self.admit(key_id, value, record)
+        line = self._line(key_id, record.provider, record.save_id, value.encode('ascii').hex()) + b'\n'
+        done = self._run([self._tool(), '-i'], input=line)
+        line = None
+        if done.returncode != 0:
+            raise _mac_failure('add-generic-password', done)
+        try:
+            kept = self.get(key_id, folder, record) == value
+        except KeyStoreError as exc:
+            if exc.code not in ('secret_missing', 'value_invalid'):
+                raise                   # the keychain did not answer: its own refusal, and the save's intent stays
+            kept = False
+        if not kept:
+            with contextlib.suppress(KeyStoreError):     # this save's own item, and no other save of the id
+                self._run([self._tool(), 'delete-generic-password', *self._of_record(key_id, record), self._login()])
+            raise KeyStoreError('keychain_failed', f'the macOS Keychain did not keep the key for {key_id} as given')
+
+    def presence(self, key_id: str) -> bool:
+        """True when an item of ``key_id`` is in this store; False only when a complete listing of the login
+        keychain shows none (exit 44 alone is not proof). A helper that fails, and so cannot tell, raises its typed
+        refusal. Reads no password."""
+        done = self._run([self._tool(), 'find-generic-password', *self._of_id(key_id), self._login()])
+        if done.returncode == 0:
+            return True         # present, whichever keychain answered: the cautious answer needs no quiet reply
+        if done.returncode != self.NOT_FOUND:
+            raise _mac_failure('find-generic-password', done)
+        return self.count(key_id) > 0
+
+    def holds(self, key_id: str, folder: Folder) -> bool | None:
+        try:
+            return self.presence(key_id)
+        except Exception:  # noqa: BLE001 - a probe that fails cannot tell
+            return None
+
+    def count(self, key_id: str | None = None, record=None) -> int:
+        """How many of Recursion's generic passwords a complete listing of the login keychain shows: with ``key_id``
+        and a record, the item that record's save stored; with ``key_id`` alone, this store's items of that id,
+        whichever save stored them; without, every item whose service is a Recursion save's, whichever store saved
+        it (the audit's count of the items no record names). ``dump-keychain`` without ``-d`` prints attributes
+        only: no password, and it asks for access to none. A listing that is not complete raises its typed
+        refusal (see MACOS KEYCHAIN). With ``key_id`` alone the count is of every generic password ``delete``
+        selects, account and store, whatever its service: absence is confirmed over all of them."""
+        if key_id is None:
+            return len(self._inventory())
+        if record is None:
+            wanted = {'acct': key_id, 'gena': self._store_id}
+        else:
+            wanted = {'acct': key_id, 'svce': self._service(record.save_id, record.provider)}
+        return sum(1 for item in self._listing() if all(item.get(name) == value for name, value in wanted.items()))
+
+    def unnamed(self, index) -> int:
+        """The audit's count of the items no record names, from ONE listing of the login keychain: an item is named
+        by a record of ``index`` when it is that record's save, and by an unfinished operation when it is an item of
+        that id in this store. One listing, not one per id, so a change between two listings cannot hide an item."""
+        def named(item) -> bool:
+            key_id = item.get('acct')
+            if key_id in index.pending:
+                return item.get('gena') == self._store_id
+            record = index.keys.get(key_id)
+            return record is not None and item.get('svce') == self._service(record.save_id, record.provider)
+        return sum(1 for item in self._inventory() if not named(item))
+
+    def _inventory(self) -> list:
+        """Recursion's generic passwords (``RECURSION_SERVICE``) in one complete listing of the login keychain."""
+        return [item for item in self._listing() if RECURSION_SERVICE.fullmatch(item.get('svce') or '')]
+
+    def _listing(self) -> list:
+        """Every generic password in one complete listing of the login keychain, or a typed refusal."""
+        done = self._run([self._tool(), 'dump-keychain', self._login()])
+        if done.returncode != 0:
+            raise _mac_failure('dump-keychain', done)
+        if done.stderr.strip():
+            raise KeyStoreError('keychain_failed', 'security dump-keychain reported an error beside its listing, which '
+                                'may therefore be incomplete')
+        return _dumped(done.stdout)
+
+    def delete(self, key_id: str, folder: Folder) -> None:
+        """Remove every item of ``key_id`` in this store, one per call; succeed only when a complete listing shows
+        none left."""
+        for _ in range(self.DELETE_LIMIT):
+            done = self._run([self._tool(), 'delete-generic-password', *self._of_id(key_id), self._login()])
+            if done.returncode == self.NOT_FOUND:
+                break
+            if done.returncode != 0:
+                raise _mac_failure('delete-generic-password', done)
+            _quiet('delete-generic-password', done, allowed=DELETED)
+        if self.presence(key_id):
+            raise KeyStoreError('keychain_failed', f'the macOS Keychain still holds {key_id}; it stays on record')
+
+
+def _mac_failure(action: str, done: sysmod.Completed) -> KeyStoreError:
+    """A ``security`` failure as a typed refusal. The detail is fixed text: nothing the tool printed is repeated."""
+    lowered = done.stderr.decode('ascii', 'replace').lower()
+    if 'interaction is not allowed' in lowered or 'locked' in lowered:
+        code, why = 'keychain_locked', ': the keychain is locked, or would have to ask'
+    else:
+        code, why = 'keychain_failed', ''
+    return KeyStoreError(code, f'security {action} exited {done.returncode}{why}')
+
+
+DELETED = b'password has been deleted.\n'      # what delete-generic-password always writes on standard error
+
+
+def _quiet(action: str, done: sysmod.Completed, *, allowed: bytes = b'') -> None:
+    """Refuse a reply that succeeded but wrote anything else on standard error. Given a keychain it cannot open,
+    Apple's ``security`` searches the search list instead, says so there, and can still succeed (keychain_find.c,
+    ``keychain_create_array``): such an answer may come from another keychain. Fixed text; nothing is repeated."""
+    rest = done.stderr.replace(allowed, b'') if allowed else done.stderr
+    if rest.strip():
+        raise KeyStoreError('keychain_failed', f'security {action} reported an error beside its answer, which may '
+                            'come from another keychain than the one named')
+
+
+def _login_path(out: bytes) -> str | None:
+    """The one path ``security login-keychain`` prints, ``"<absolute path>"`` (indented); None for anything else,
+    and for a path holding a quote, a backslash or a control character (it is quoted on the ``-i`` line)."""
+    text = out.decode('utf-8', 'replace').strip()
+    if len(text) < 3 or not (text.startswith('"') and text.endswith('"')):
+        return None
+    path = text[1:-1]
+    if not path.startswith('/') or any(c in '"\\�' or ord(c) < 32 or ord(c) == 127 for c in path):
+        return None
+    return path
+
+
+UNRECORDED = ''      # an index pinned to the macOS Keychain that records no keychain (MacKeychain's ``keychain``)
+# Recursion's items, as the audit counts them: recursion.<store id>.<save id>.<provider>, the service a save writes,
+# or recursion.<save id> as #422's first head wrote it.
+RECURSION_SERVICE = re.compile(r'recursion\.[0-9a-f]{32}(?:\.[0-9a-f]{32}\.[a-z0-9][a-z0-9._-]{0,63})?')
+_DUMP_ATTRIBUTE = re.compile(rb'\s+"([A-Za-z0-9]{4})"<[A-Za-z0-9]+>=(.*)')
+_DUMP_HEX = re.compile(rb'0x((?:[0-9A-Fa-f]{2})+)(?:\s+".*")?')
+
+
+def _dumped(out: bytes) -> list:
+    """The generic passwords in ``security dump-keychain``'s output, each as ``{attribute: text or None}``.
+
+    An item starts at a ``keychain:`` line and its class is on a ``class:`` line (``"genp"`` for a generic
+    password); an attribute line is ``"name"<type>=value``, the value ``"text"``, ``0x<hexadecimal>`` (the text after
+    it) or ``<NULL>``. Refused (``keychain_failed``), never read as fewer items: output that is not empty and holds no
+    ``keychain:`` line; an item with no ``class:`` line; a generic password without its account and service; one of
+    Recursion's without its generic attribute and comment. Nothing of it is repeated in an error."""
+    items, item = [], None
+    for line in out.split(b'\n'):
+        if line.startswith(b'keychain: '):
+            item = {'class': None}
+            items.append(item)
+        elif item is not None and line.startswith(b'class: '):
+            item['class'] = line[len(b'class: '):].strip()
+        elif item is not None:
+            match = _DUMP_ATTRIBUTE.fullmatch(line.rstrip(b'\r'))
+            if match is not None:
+                item[match.group(1).decode('ascii')] = _dumped_value(match.group(2).strip())
+    if out.strip() and not items:
+        raise KeyStoreError('keychain_failed', 'security dump-keychain printed nothing that reads as keychain items')
+    generic = []
+    for item in items:
+        if item['class'] is None:
+            raise KeyStoreError('keychain_failed', 'security dump-keychain listed an item without its class')
+        if item['class'] != b'"genp"':
+            continue
+        if 'acct' not in item or 'svce' not in item or (
+                RECURSION_SERVICE.fullmatch(item['svce'] or '') and ('gena' not in item or 'icmt' not in item)):
+            raise KeyStoreError('keychain_failed', 'security dump-keychain listed a generic password without all of '
+                                'its attributes; the listing may be incomplete')
+        generic.append(item)
+    return generic
+
+
+def _dumped_value(raw: bytes) -> str | None:
+    if len(raw) >= 2 and raw.startswith(b'"') and raw.endswith(b'"'):
+        return raw[1:-1].decode('utf-8', 'replace')
+    match = _DUMP_HEX.fullmatch(raw)
+    return bytes.fromhex(match.group(1).decode('ascii')).decode('utf-8', 'replace') if match is not None else None
+
+
 class OwnerFile:
     name = 'owner_file'
 
@@ -310,4 +646,4 @@ def _constant(name):
     raise ValueError('not a JSON number')
 
 
-BACKENDS = {'secret_service': SecretService, 'owner_file': OwnerFile}
+BACKENDS = {'secret_service': SecretService, 'macos_keychain': MacKeychain, 'owner_file': OwnerFile}

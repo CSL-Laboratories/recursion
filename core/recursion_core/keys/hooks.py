@@ -1,8 +1,13 @@
 """Lane KEYS' registrant: what ``control/hooks.py`` (SPINE's seams) calls once, at composition.
 
-``register(hooks)`` registers the credential source into seam S7 (``hooks.set('credentials', ...)``) and the
-``key`` command family into the command table (S2). It only registers: it opens nothing, starts no thread
-and reads no state; the store is first read when an API-key route asks for its key.
+``register(hooks)`` registers:
+
+- the credential source into seam S7 (``hooks.set('credentials', ...)``);
+- the ``key.list`` handler into the method table (S1; a read: no receipt, no service);
+- the ``key`` command family into the command table (S2).
+
+It only registers: it opens nothing, starts no thread and reads no state; the store is first read when an
+API-key route asks for its key or a client calls ``key.list``.
 
 ``control.hooks.compose()`` calls it, and SPINE's seams are on master, but nothing outside them calls ``compose()``
 yet: until the daemon and ``recursion-control`` call the composed hooks, the daemon still hands both engine
@@ -12,10 +17,13 @@ adapters ``no_custody``, every API-key route still refuses "no credential", and 
 from __future__ import annotations
 
 from recursion_core.control.commands import key as key_commands
+from recursion_core.control.methods import key as key_methods
 from recursion_core.keys.store import credentials
 
 
 def register(hooks) -> None:
     commands = hooks.commands       # a hooks object with no command table fails here, before anything is set
+    methods = hooks.methods         # and one with no method table
     hooks.set('credentials', credentials)
+    methods.register('key.list', key_methods.key_list)
     commands.register(key_commands.NAMES, key_commands.parser, key_commands.dispatch)

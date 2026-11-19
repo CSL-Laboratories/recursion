@@ -15,7 +15,9 @@ file) and ``engine.binary`` (``shutil.which`` and ``--version`` with a timeout, 
 call, and an empty home so the command is not pointed at a sign-in file).
 
 Two checks report the event store's ground. ``store.sqlite`` is the SQLite library this
-interpreter loaded (``sqlite3.sqlite_version``): fail below 3.51.3. ``store.filesystem`` is
+interpreter loaded (``sqlite3.sqlite_version``): fail on a version with the WAL reset bug, as
+SQLite's own pages name it (3.51.2 and older, except 3.44.6 and later in 3.44 and 3.50.7 and
+later in 3.50, and the withdrawn 3.52.0), ok on every other. ``store.filesystem`` is
 the file-system type of the state folder (after ``XDG_STATE_HOME``, links followed), read
 from ``/proc/self/mountinfo`` by the longest mount point that holds it: fail on 9p, drvfs,
 v9fs, overlay, nfs, nfs4, cifs or smb3, or when the folder lies under the WSL automount
@@ -69,7 +71,18 @@ _IDS = (
 # map written for ``_IDS`` gives the report it gave before.
 _GROUND_IDS = ("store.sqlite", "store.filesystem")
 _STATES = ("ok", "warn", "fail", "unknown")
-_SQLITE_FLOOR = (3, 51, 3)
+# The WAL reset bug, as SQLite's own pages describe it: present from 3.7.0 to 3.51.2, repaired
+# in 3.51.3 and later and in the backports 3.44.6 and 3.50.7. Per line (major, minor): the first
+# patch release that carries the repair, or None when no release of that line is said to carry
+# it; a line newer than every row carries it, any other line has the bug. Append-only: a later
+# backport is a new row.
+_SQLITE_WAL_RESET_REPAIRED = {
+    (3, 44): 6,
+    (3, 50): 7,
+    (3, 51): 3,
+    # 3.52.0 was withdrawn; SQLite's pages do not say it carries the repair (3.53.0 lists it).
+    (3, 52): None,
+}
 _MOUNTINFO = "/proc/self/mountinfo"
 # The WSL automount root. The base has no WSL probe module to read it from.
 _WSL_AUTOMOUNT = "/mnt/"
@@ -443,15 +456,28 @@ def _probe_sqlite():
     import sqlite3
 
     found = sqlite3.sqlite_version
-    floor = ".".join(str(part) for part in _SQLITE_FLOOR)
     try:
         version = tuple(int(part) for part in found.split("."))
     except (AttributeError, TypeError, ValueError):
         return _body("unknown", f"the SQLite version {found!r} could not be read")
-    if version < _SQLITE_FLOOR:
-        return _body("fail", f"SQLite {found} is loaded and the event store needs {floor} or later",
-                     f"run recursiond on an interpreter built with SQLite {floor} or later")
-    return _body("ok", f"SQLite {found} is loaded")
+    line, patch = version[:2], (version + (0, 0))[2]
+    if line in _SQLITE_WAL_RESET_REPAIRED:
+        first = _SQLITE_WAL_RESET_REPAIRED[line]
+        repaired = first is not None and patch >= first
+    else:
+        repaired = line > max(_SQLITE_WAL_RESET_REPAIRED)
+    if repaired:
+        return _body("ok", f"SQLite {found} is loaded")
+    # Every repaired version, named from the table: the newest line first, then each backport.
+    rows = sorted((line + (first,) for line, first in _SQLITE_WAL_RESET_REPAIRED.items() if first is not None),
+                  reverse=True)
+    newest, backports = ".".join(map(str, rows[0])), [".".join(map(str, row)) for row in rows[1:]]
+    needs = [f"{newest} or later"] + [f"{name} or later in {name.rsplit('.', 1)[0]}" for name in backports]
+    return _body("fail",
+                 f"SQLite {found} is loaded and has the WAL reset bug; the event store needs "
+                 f"{', '.join(needs[:-1])}, or {needs[-1]}",
+                 f"run recursiond on an interpreter built with SQLite {newest} or later, or with "
+                 + " or ".join(backports))
 
 
 def _unescape_mount(field: str) -> str:

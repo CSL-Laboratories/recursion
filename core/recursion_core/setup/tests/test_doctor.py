@@ -487,6 +487,46 @@ class StoreGroundTests(unittest.TestCase):
                 self.assertEqual(row["state"], "ok")
                 self.assertIn(version, row["detail"])
 
+    def _sqlite_row(self, version):
+        report, _state, _opened = self._live(sqlite_version=version)
+        return _check(report, "store.sqlite")
+
+    def test_the_3_50_backport_of_the_repair_is_ok(self):
+        # SQLite's own pages name 3.50.7 as a backport of the WAL reset repair: never fail.
+        row = self._sqlite_row("3.50.7")
+        self.assertEqual(row["state"], "ok")
+        self.assertEqual(row["detail"], "SQLite 3.50.7 is loaded")
+
+    def test_the_3_44_backport_of_the_repair_is_ok(self):
+        # SQLite's own pages name 3.44.6 as a backport of the WAL reset repair: never fail.
+        for version in ("3.44.6", "3.44.7"):
+            with self.subTest(version=version):
+                row = self._sqlite_row(version)
+                self.assertEqual(row["state"], "ok")
+                self.assertEqual(row["detail"], f"SQLite {version} is loaded")
+
+    def test_a_sqlite_with_the_wal_reset_bug_is_fail_naming_every_repaired_version(self):
+        # 3.6.23 is older than WAL itself; SQLite's pages do not name it unaffected, so it is fail too.
+        for version in ("3.44.5", "3.50.6", "3.45.1", "3.46.1", "3.51.2", "3.6.23"):
+            with self.subTest(version=version):
+                row = self._sqlite_row(version)
+                self.assertEqual(row["state"], "fail")
+                self.assertEqual(
+                    row["detail"],
+                    f"SQLite {version} is loaded and has the WAL reset bug; the event store needs 3.51.3 or "
+                    "later, 3.50.7 or later in 3.50, or 3.44.6 or later in 3.44")
+                self.assertNotIn(". ", row["detail"])
+                self.assertEqual(
+                    row["fix"],
+                    "run recursiond on an interpreter built with SQLite 3.51.3 or later, or with 3.50.7 or 3.44.6")
+
+    def test_the_withdrawn_3_52_0_is_fail(self):
+        # 3.52.0 was withdrawn; SQLite's pages do not say it carries the repair, so it is treated as affected.
+        row = self._sqlite_row("3.52.0")
+        self.assertEqual(row["state"], "fail")
+        self.assertIn("SQLite 3.52.0 is loaded and has the WAL reset bug;", row["detail"])
+        self.assertNotIn(". ", row["detail"])
+
     def test_a_9p_or_overlay_mount_under_the_state_folder_is_fail(self):
         for point, kind in ((_STATE, "9p"), (_STATE, "overlay"), (_BASE, "9p"), (_BASE, "overlay")):
             with self.subTest(kind=kind, at="state folder" if point is _STATE else "its parent"):

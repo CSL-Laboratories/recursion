@@ -19,11 +19,14 @@ The rules this module keeps:
 * NEVER WRITTEN. Nothing here writes the file; the standard library reads TOML and cannot write it. A model or
   a plugin never writes it: a person keeps what a model proposes.
 * A WRONG FILE STARTS NOTHING WRONG. A file that fails the owner check, is not TOML, has another ``version``
-  or cannot be read leaves every default in force (note ``settings_unreadable``). A key ``SETTINGS`` does not
+  or cannot be read leaves every default in force (note ``settings_unreadable``, a warning that names the fault
+  and the way out; the command then ends with ``EXIT_WARNED``). A key ``SETTINGS`` does not
   declare is skipped and reported (``settings_unknown_key``): a newer file read by an older core keeps the
-  keys this core knows. A value of the wrong type or outside its floor and ceiling keeps that setting's
-  default, never a clamped value (``settings_value_out_of_range``). Each note names the key, the value found
-  and what is allowed.
+  keys this core knows. That note is a warning, names a close known key or table when there is one, and makes
+  the command end with ``EXIT_WARNED``; nothing is ever corrected. So is a quoted key that holds a dot
+  (``"plugin_host.gil_check" = ...``): it is never a second spelling of a setting. A value of the wrong type
+  or outside its floor and ceiling keeps that setting's default, never a clamped value
+  (``settings_value_out_of_range``). Each note names the key, the value found and what is allowed.
 * SHOWN. ``python -m recursion_core.settings`` prints every setting, its value in force, its default and its
   source, and every note. It takes no argument and writes nothing. The daemon logs the same lines.
 
@@ -33,6 +36,7 @@ calls. ``SETTINGS`` is append-only: a row is added, never renamed or given anoth
 
 from __future__ import annotations
 
+import difflib
 import math
 import os
 import stat
@@ -52,6 +56,8 @@ UNREADABLE = "settings_unreadable"
 UNKNOWN_KEY = "settings_unknown_key"
 OUT_OF_RANGE = "settings_value_out_of_range"
 NOT_READ_HERE = "settings_not_read_on_this_system"
+WARNED = "warning: "  # what begins the line of a note that warns, in the start log and in the command
+EXIT_WARNED = 1      # the command's end when a note warns: a key, a table or the whole file skipped (2: usage)
 
 
 @dataclass(frozen=True)
@@ -66,7 +72,8 @@ class Setting:
     ceiling: int | float | None = None
 
 
-# Append-only. The type is bool, int, float or str.
+# Append-only. The type is bool, int, float or str. A row that loosens safety has the safe value as its default,
+# so a file that cannot be read as a whole, which leaves every default in force, can never loosen anything.
 SETTINGS: tuple[Setting, ...] = (
     Setting("plugin_host.gil_check", bool, True,
             "Whether each plugin host makes its GIL check; on by default, and a person may turn it off."),
@@ -86,6 +93,7 @@ class Value:
 class Note:
     code: str
     detail: str
+    warns: bool = False  # a key, a table or the whole file of the person's was skipped
 
     def __str__(self) -> str:
         return f"{self.code}: {self.detail}"
@@ -126,7 +134,10 @@ def _shown(value: object) -> str:
     if isinstance(value, str):
         text = repr(value)
     elif isinstance(value, (int, float)):
-        text = repr(value)
+        try:
+            text = repr(value)
+        except ValueError:  # a whole number past the interpreter's digit limit cannot be printed
+            text = "a whole number too long to show"
     else:
         text = f"a {type(value).__name__}"
     return text if len(text) <= 80 else text[:77] + "..."
@@ -153,10 +164,15 @@ def _fits(row: Setting, value: object) -> bool:
     return not ((row.floor is not None and value < row.floor) or (row.ceiling is not None and value > row.ceiling))
 
 
+_QUOTED = object()  # a key that itself holds a dot (a quoted dotted key): never joined into a setting name
+
+
 def _flatten(table: dict, prefix: str = ""):
     for key, value in table.items():
         name = prefix + key
-        if isinstance(value, dict) and name not in DECLARED and any(n.startswith(name + ".") for n in DECLARED):
+        if "." in key:  # TOML sees another key than the dotted one, so one setting would have two spellings
+            yield name, _QUOTED
+        elif isinstance(value, dict) and name not in DECLARED and any(n.startswith(name + ".") for n in DECLARED):
             yield from _flatten(value, name + ".")
         else:
             yield name, value
@@ -172,7 +188,13 @@ def _read(path: Path) -> tuple[dict | None, str | None]:
     except OSError as exc:
         return None, f"cannot be looked at ({type(exc).__name__})"
     if not owner_only_file(info):
-        return None, "must be a regular file (not a link) owned by this user and not group or other writable"
+        if not stat.S_ISREG(info.st_mode):
+            fault = "it is a link or another kind of file; put a regular file there"
+        elif info.st_uid != os.geteuid():
+            fault = "it is owned by another user; put a file of your own there"
+        else:
+            fault = f"its mode is {stat.S_IMODE(info.st_mode):04o}; run chmod 600 on it"
+        return None, f"must be a regular file (not a link) owned by this user and not group or other writable: {fault}"
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
     except OSError as exc:
@@ -191,13 +213,16 @@ def _read(path: Path) -> tuple[dict | None, str | None]:
         return None, f"is larger than {MAX_BYTES} bytes"
     try:
         doc = tomllib.loads(data.decode("utf-8"))
-    except UnicodeDecodeError:
-        return None, "is not UTF-8"
-    except tomllib.TOMLDecodeError as exc:
-        return None, f"is not TOML ({exc})"
-    if type(doc.get("version")) is not int or doc["version"] != FILE_VERSION:  # true and 1.0 are not 1
-        found = _shown(doc["version"]) if "version" in doc else "no version"
-        return None, f"version must be {FILE_VERSION}, found {found}"
+    except UnicodeDecodeError as exc:
+        return None, f"is not UTF-8 (at byte {exc.start}); save it as UTF-8"
+    except tomllib.TOMLDecodeError as exc:  # its text ends with the line and column, as the reader reports them
+        return None, f"is not TOML: {exc}; correct the file there"
+    except (ValueError, RecursionError) as exc:  # the parser raises plain ones too, with no line or column
+        return None, f"holds a value or a nesting the TOML reader cannot take ({exc}); shorten it"
+    if "version" not in doc:
+        return None, f"has no version line; add `version = {FILE_VERSION}` at its top"
+    if type(doc["version"]) is not int or doc["version"] != FILE_VERSION:  # true and 1.0 are not 1
+        return None, f"version must be {FILE_VERSION}, found {_shown(doc['version'])}; write `version = {FILE_VERSION}`"
     return doc, None
 
 
@@ -221,13 +246,20 @@ def load(environ) -> Loaded:
         return Loaded(None, MappingProxyType(values), (note,))
     doc, why = _read(path)
     if why is not None:
-        note = Note(UNREADABLE, f"{path} {why}; every default is in force")
+        note = Note(UNREADABLE, f"{path} {why}; every default is in force", warns=True)
         return Loaded(str(path), MappingProxyType(values), (note,))
     notes: list[Note] = []
     for name, found in _flatten({k: v for k, v in (doc or {}).items() if k != "version"}):
         row = DECLARED.get(name)
-        if row is None:
-            notes.append(Note(UNKNOWN_KEY, f"{_shown(name)} is not a setting this version knows; it is skipped"))
+        if found is _QUOTED:
+            notes.append(Note(UNKNOWN_KEY, f"{_shown(name)} is a quoted key that holds a dot, not a setting; it is "
+                                           "skipped; write it without the quotes", warns=True))
+        elif row is None:
+            known = sorted({*DECLARED, *(n.rsplit(".", 1)[0] for n in DECLARED)})  # its keys and its tables
+            close = difflib.get_close_matches(name, known, n=1, cutoff=0.8)  # text only; never applied
+            hint = f"; did you mean {close[0]}?" if close else ""
+            notes.append(Note(UNKNOWN_KEY, f"{_shown(name)} is not a setting this version knows; it is skipped{hint}",
+                              warns=True))
         elif not _fits(row, found):
             notes.append(Note(OUT_OF_RANGE, f"{name}: found {_shown(found)}; allowed: {_allowed(row)}; "
                                             f"the default {_shown(row.default)} stays in force"))
@@ -241,7 +273,7 @@ def lines(loaded: Loaded) -> list[str]:
 
     out = [f"{v.name} = {_shown(v.value)} (default {_shown(v.default)}; source: {v.source})"
            for v in loaded.values.values()]
-    return out + [f"note {note}" for note in loaded.notes]
+    return out + [f"{WARNED if note.warns else ''}note {note}" for note in loaded.notes]
 
 
 def main(argv: list[str] | None = None, environ=None, out=None, err=None) -> int:
@@ -257,7 +289,7 @@ def main(argv: list[str] | None = None, environ=None, out=None, err=None) -> int
     print(f"settings file: {loaded.path or 'none'}", file=out)
     for line in lines(loaded):
         print(line, file=out)
-    return 0
+    return EXIT_WARNED if any(note.warns for note in loaded.notes) else 0
 
 
 if __name__ == "__main__":

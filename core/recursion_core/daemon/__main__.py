@@ -39,7 +39,7 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
     check_operator_linger(getpass.getuser())
     # Read at daemon start in this build; a later reload may call settings.load again.
     for line in settings.lines(settings.load(os.environ)):
-        log.info('settings: %s', line)
+        (log.warning if line.startswith(settings.WARNED) else log.info)('settings: %s', line)
     runtime = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}')
     state = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'recursion'
     stopped = threading.Event()

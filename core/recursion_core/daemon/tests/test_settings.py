@@ -12,9 +12,11 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from types import MappingProxyType
 from unittest import mock
@@ -26,6 +28,35 @@ REPO = CORE.parent
 SCHEMA_DIR = REPO / "schemas" / "settings" / "v1"
 POSIX_ONLY = "the owner check needs a uid; a system without one is the WindowsNoOwnerCheck class"
 OFF = "version = 1\n\n[plugin_host]\ngil_check = false\n"
+DIGITS, HEX = "9" * 5000, "0x" + "f" * 4000
+# Each makes the parser raise a plain ValueError or a RecursionError, not a TOMLDecodeError.
+NOT_READ_BY_THE_PARSER = {
+    "a whole number past the digit limit": f"version = 1\nx = {DIGITS}\n",
+    "a version past the digit limit": f"version = {DIGITS}\n",
+    "3000 nested lists": "version = 1\nx = " + "[" * 3000 + "]" * 3000 + "\n",
+    "3000 nested inline tables": "version = 1\nx = " + "{a=" * 3000 + "1" + "}" * 3000 + "\n",
+}
+# The parser reads these; a whole number of more than 4300 digits cannot be printed.
+TOO_LONG_TO_SHOW = {
+    "gil_check in hex": f"version = 1\n[plugin_host]\ngil_check = {HEX}\n",
+    "version in hex": f"version = {HEX}\n",
+}
+# A RecursionError in the parser on 3.14; on 3.12 it is read and its one key is unknown.
+DOTTED_3000 = "version = 1\n" + ".".join(["a"] * 3000) + " = 1\n"
+# A key or a whole table this version does not know, and the close known name its note names (or None).
+UNKNOWN = {
+    "a mistyped key": ("version = 1\n[plugin_host]\ngil_chek = false\n", "plugin_host.gil_check"),
+    "a mistyped table": ("version = 1\n[plugin_hosts]\ngil_check = false\nmore = 1\n", "plugin_host"),
+    "a key with no close name": ("version = 1\n[plugin_host]\nlater_row = 3\n", None),
+}
+# A file that cannot be read as a whole, and what its warning must hold (None: the reader's line and column).
+BROKEN = {
+    "not TOML": ("version = 1\n[plugin_host\n", None),
+    "a duplicate key": (OFF + "gil_check = true\n", None),
+    "False with a capital": ("version = 1\n[plugin_host]\ngil_check = False\n", None),
+    "no version": ("[plugin_host]\ngil_check = false\n", "has no version line; add `version = 1` at its top"),
+    "group writable": (OFF, "its mode is 0620; run chmod 600 on it"),
+}
 
 
 class _Folder(unittest.TestCase):
@@ -200,6 +231,55 @@ class OwnerOnlyAndWrongFiles(_Folder):
         os.mkfifo(self.file, 0o600)
         self.assert_default(settings.load(self.environ), settings.UNREADABLE)
 
+    def _swap_at_open(self, swap):
+        """``os.open`` of the settings file first runs ``swap``: the file changes after the look, before the open."""
+        real_open, done = os.open, []
+
+        def opening(path, *args, **kwargs):
+            if not done and os.fspath(path) == str(self.file):
+                done.append(swap())
+            return real_open(path, *args, **kwargs)
+        return mock.patch.object(os, "open", side_effect=opening)
+
+    def test_a_file_renamed_over_it_between_the_look_and_the_open_is_refused(self) -> None:
+        self.put("version = 1\n")
+        other = self.put(OFF, self.tmp / "other.toml")
+        with self._swap_at_open(lambda: os.replace(other, self.file)):
+            loaded = settings.load(self.environ)
+        self.assert_default(loaded, settings.UNREADABLE)
+        self.assertIn("changed while it was opened", loaded.notes[0].detail)
+
+    def test_a_fifo_put_there_between_the_look_and_the_open_does_not_block(self) -> None:
+        self.put("version = 1\n")
+        real_open, result = os.open, []
+
+        def to_fifo() -> None:
+            os.unlink(self.file)
+            os.mkfifo(self.file, 0o600)
+        with self._swap_at_open(to_fifo):
+            reader = threading.Thread(target=lambda: result.append(settings.load(self.environ)), daemon=True)
+            reader.start()
+            reader.join(10)
+            blocked = reader.is_alive()
+            if blocked:  # a writer lets the blocked open return, so no thread is left behind
+                os.close(real_open(self.file, os.O_WRONLY))
+                reader.join(10)
+        self.assertFalse(blocked, "opening the settings file blocked on a FIFO")
+        self.assert_default(result[0], settings.UNREADABLE)
+        self.assertIn("changed while it was opened", result[0].notes[0].detail)
+
+    def test_load_routes_makes_the_one_owner_check(self) -> None:
+        from recursion_core.daemon import control_adapter
+        routes = self.put('{"routes": {}}', self.tmp / "routes.json")
+        self.assertEqual({}, control_adapter.load_routes(routes))
+        check, kept = settings.owner_only_file, settings.owner_only_file.__code__
+        check.__code__ = (lambda info: False).__code__  # the one check refuses, under every name it has
+        try:
+            with self.assertRaises(control_adapter.RoutesUnreadable):
+                control_adapter.load_routes(routes)
+        finally:
+            check.__code__ = kept
+
     def test_a_file_that_cannot_be_used_leaves_every_default_with_the_reason(self) -> None:
         cases = {
             "not TOML": "version = 1\n[plugin_host\n",
@@ -208,6 +288,8 @@ class OwnerOnlyAndWrongFiles(_Folder):
             "version true": "version = true\n[plugin_host]\ngil_check = false\n",
             "version 1.0": "version = 1.0\n[plugin_host]\ngil_check = false\n",
             "too large": OFF + "# " + "x" * settings.MAX_BYTES + "\n",
+            **NOT_READ_BY_THE_PARSER,
+            "version in hex": TOO_LONG_TO_SHOW["version in hex"],
         }
         for case, text in cases.items():
             with self.subTest(case=case):
@@ -217,6 +299,104 @@ class OwnerOnlyAndWrongFiles(_Folder):
                 self.assertIn(str(self.file), loaded.notes[0].detail)
         self.file.write_bytes(b"version = 1\n# \xff\n")
         self.assert_default(settings.load(self.environ), settings.UNREADABLE)
+
+    def test_a_dotted_key_of_3000_parts_never_raises(self) -> None:
+        self.put(DOTTED_3000)
+        loaded = settings.load(self.environ)
+        self.assertIs(loaded["plugin_host.gil_check"], True)
+        self.assertEqual(1, len(loaded.notes))
+        self.assertIn(loaded.notes[0].code, (settings.UNREADABLE, settings.UNKNOWN_KEY))
+
+    def test_a_whole_number_too_long_to_show_is_named_and_never_raises(self) -> None:
+        for case, code, end in (("gil_check in hex", settings.OUT_OF_RANGE, 0),
+                                ("version in hex", settings.UNREADABLE, settings.EXIT_WARNED)):
+            with self.subTest(case=case):
+                self.put(TOO_LONG_TO_SHOW[case])
+                loaded = settings.load(self.environ)
+                self.assert_default(loaded, code)
+                self.assertIn("a whole number too long to show", loaded.notes[0].detail)
+                out = io.StringIO()
+                self.assertEqual(end, settings.main([], self.environ, out, io.StringIO()))
+                self.assertIn("a whole number too long to show", out.getvalue())
+
+    def test_a_quoted_key_that_holds_a_dot_is_never_the_setting_and_is_reported_by_name(self) -> None:
+        quoted = '"plugin_host.gil_check"'
+        for text, expect in ((f"version = 1\n{quoted} = true\n[plugin_host]\ngil_check = false\n", False),
+                             (f"version = 1\nplugin_host.gil_check = false\n{quoted} = true\n", False),
+                             (f'version = 1\n{quoted} = "no"\n[plugin_host]\ngil_check = false\n', False),
+                             (f"version = 1\n{quoted} = false\n", True)):
+            with self.subTest(text=text):
+                self.put(text)
+                loaded = settings.load(self.environ)
+                self.assertIs(expect, loaded["plugin_host.gil_check"])
+                source = settings.SOURCE_DEFAULT if expect else settings.SOURCE_FILE
+                self.assertEqual(source, loaded.values["plugin_host.gil_check"].source)
+                self.assertEqual([settings.UNKNOWN_KEY], self.codes(loaded))
+                self.assertIn("'plugin_host.gil_check'", loaded.notes[0].detail)
+                self.assertIn("without the quotes", loaded.notes[0].detail)
+                self.assertNotIn("stays in force", "\n".join(settings.lines(loaded)))
+
+    def test_a_skipped_key_or_table_is_never_applied_and_its_note_is_a_warning(self) -> None:
+        for case, (text, _) in UNKNOWN.items():
+            with self.subTest(case=case):
+                self.put(text)
+                loaded = settings.load(self.environ)
+                self.assert_default(loaded, settings.UNKNOWN_KEY)  # one note, for a whole table too
+                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+
+    def test_the_command_ends_non_zero_when_a_key_or_table_was_skipped(self) -> None:
+        for case, (text, _) in UNKNOWN.items():
+            with self.subTest(case=case):
+                self.put(text)
+                out = io.StringIO()
+                code = settings.main([], self.environ, out, io.StringIO())
+                self.assertNotIn(code, (0, 2))  # 2 is the usage error
+                self.assertEqual(settings.EXIT_WARNED, code)
+                self.assertIn("note settings_unknown_key", out.getvalue())
+        self.put(OFF)
+        self.assertEqual(0, settings.main([], self.environ, io.StringIO(), io.StringIO()))
+
+    def put_broken(self, case: str) -> str:
+        self.put(BROKEN[case][0], mode=0o620 if case == "group writable" else 0o600)
+        return case
+
+    def test_a_file_that_cannot_be_read_as_a_whole_applies_nothing_and_its_note_is_a_warning(self) -> None:
+        for case in BROKEN:
+            with self.subTest(case=self.put_broken(case)):
+                loaded = settings.load(self.environ)
+                self.assert_default(loaded, settings.UNREADABLE)
+                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+
+    def test_the_command_ends_non_zero_for_a_file_that_cannot_be_read_as_a_whole(self) -> None:
+        for case in BROKEN:
+            with self.subTest(case=self.put_broken(case)):
+                out = io.StringIO()
+                self.assertEqual(settings.EXIT_WARNED, settings.main([], self.environ, out, io.StringIO()))
+                self.assertIn("warning: note settings_unreadable", out.getvalue())
+
+    def test_the_warning_names_the_fault_and_the_way_out(self) -> None:
+        for case, (text, expect) in BROKEN.items():
+            with self.subTest(case=self.put_broken(case)):
+                detail = settings.load(self.environ).notes[0].detail
+                if expect is None:  # the line and the column exactly as the TOML reader reports them
+                    with self.assertRaises(settings.tomllib.TOMLDecodeError) as raised:
+                        settings.tomllib.loads(text)
+                    place = re.search(r"\(at line \d+, column \d+\)", str(raised.exception))
+                    self.assertIsNotNone(place, str(raised.exception))
+                    self.assertIn(place.group(0), detail)
+                    self.assertIn("correct the file there", detail)
+                else:
+                    self.assertIn(expect, detail)
+
+    def test_a_close_known_name_is_suggested_as_text_and_no_other(self) -> None:
+        for case, (text, close) in UNKNOWN.items():
+            with self.subTest(case=case):
+                self.put(text)
+                detail = settings.load(self.environ).notes[0].detail
+                if close is None:
+                    self.assertNotIn("did you mean", detail)
+                else:
+                    self.assertTrue(detail.endswith(f"; did you mean {close}?"), detail)
 
     def test_an_unknown_key_is_reported_by_name_and_the_known_keys_are_read(self) -> None:
         self.put(OFF + "later_row = 3\n\n[future]\nanything = 'x'\n")
@@ -261,7 +441,7 @@ class ShownAndNeverWritten(_Folder):
     def test_the_command_prints_each_setting_its_default_source_and_the_notes(self) -> None:
         self.put(OFF + "unknown = 1\n")
         out = io.StringIO()
-        self.assertEqual(0, settings.main([], self.environ, out, io.StringIO()))
+        self.assertEqual(settings.EXIT_WARNED, settings.main([], self.environ, out, io.StringIO()))
         text = out.getvalue()
         self.assertIn(f"settings file: {self.file}", text)
         self.assertIn("plugin_host.gil_check = false (default true; source: settings file)", text)
@@ -317,6 +497,70 @@ class ShownAndNeverWritten(_Folder):
             with self.subTest(module=module):
                 source = (CORE / "recursion_core" / module).read_text(encoding="utf-8")
                 self.assertNotIn("settings", source)
+
+
+class _ReachedTheLock(Exception):
+    pass
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class TheDaemonsStart(_Folder):
+    """The daemon's ``main()`` up to its lock: the start checks are passed and the lock is replaced by a stop."""
+
+    def start_log(self) -> tuple[list, list[str], list[tuple[str, str]]]:
+        from recursion_core.daemon import __main__ as daemon_main
+        loads, real = [], settings.load
+
+        def counted(environ):
+            loads.append(real(environ))
+            return loads[-1]
+        with mock.patch.dict(os.environ, self.environ), \
+                mock.patch.object(settings, "load", side_effect=counted), \
+                mock.patch.object(daemon_main, "require_posix"), \
+                mock.patch.object(daemon_main, "require_free_threaded"), \
+                mock.patch.object(daemon_main, "refuse_engine_user"), \
+                mock.patch.object(daemon_main, "check_operator_linger"), \
+                mock.patch.object(daemon_main.logging, "basicConfig"), \
+                mock.patch.object(daemon_main.signal, "signal"), \
+                mock.patch.object(daemon_main, "UserLock", side_effect=_ReachedTheLock), \
+                self.assertLogs("recursion_core.daemon", "INFO") as logs, \
+                self.assertRaises(_ReachedTheLock):
+            daemon_main.main()
+        records = [(record.levelname, record.getMessage()) for record in logs.records]
+        return loads, [message for _, message in records], records
+
+    def test_the_start_log_holds_the_lines_of_one_load(self) -> None:
+        self.put(OFF + "unknown = 1\n")
+        loads, messages, _ = self.start_log()
+        self.assertEqual(1, len(loads))
+        logged = [message for message in messages if message.startswith("settings: ")]
+        self.assertEqual(["settings: " + line for line in settings.lines(loads[0])], logged)
+        self.assertIn("settings: plugin_host.gil_check = false (default true; source: settings file)", logged)
+        self.assertIn("note settings_unknown_key: 'plugin_host.unknown'", " ".join(logged))
+
+    def test_with_every_file_the_parser_or_the_notes_cannot_take_the_daemon_reaches_its_lock(self) -> None:
+        cases = {**NOT_READ_BY_THE_PARSER, **TOO_LONG_TO_SHOW, "a dotted key of 3000 parts": DOTTED_3000}
+        for case, text in cases.items():
+            with self.subTest(case=case):
+                self.put(text)
+                loads, messages, _ = self.start_log()
+                self.assertEqual(1, len(loads))
+                self.assertIn("settings: plugin_host.gil_check = true (default true; source: default)", messages)
+                self.assertTrue(any("note settings_" in message for message in messages))
+                warned = any(note.warns for note in loads[0].notes)
+                self.assertEqual(settings.EXIT_WARNED if warned else 0,
+                                 settings.main([], self.environ, io.StringIO(), io.StringIO()))
+
+    def test_a_skipped_key_or_table_or_file_is_a_warning_in_the_start_log(self) -> None:
+        for case, (text, _) in {**UNKNOWN, **BROKEN}.items():
+            with self.subTest(case=case):
+                self.put(text, mode=0o620 if case == "group writable" else 0o600)
+                _, _, records = self.start_log()
+                levels = {message: level for level, message in records if message.startswith("settings: ")}
+                warned = [message for message, level in levels.items() if level == "WARNING"]
+                self.assertEqual(1, len(warned), levels)
+                self.assertIn("settings_unknown_key" if case in UNKNOWN else "settings_unreadable", warned[0])
+                self.assertEqual("INFO", levels["settings: plugin_host.gil_check = true (default true; source: default)"])
 
 
 @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)

@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Tests for the offline host start-time and memory measurement tool."""
+from __future__ import annotations
+
+import contextlib
+import importlib.util
+import io
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parent.parent
+SPEC = importlib.util.spec_from_file_location("host_measure", ROOT / "tools" / "host_measure.py")
+host_measure = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(host_measure)
+
+ROW_NAMES = {"host_start_ms", "host_idle_rss_kib", "host_peak_rss_kib"}
+ROW_KEYS = {"name", "status", "detail"}
+
+
+class HostMeasureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.tmp = Path(temporary.name)
+
+    def invoke_with_reading(self, reading: int) -> tuple[int, list[dict]]:
+        """Run the output path with deterministic, injected measurements."""
+        fake_run = (1.0, reading, reading, None)
+        output = io.StringIO()
+        with mock.patch.object(host_measure, "measure_once", return_value=fake_run):
+            with contextlib.redirect_stdout(output):
+                code = host_measure.main(["--runs", "1", "--idle-s", "0"])
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        return code, rows
+
+    def test_json_shape_and_zero_exit_for_small_and_big_readings(self) -> None:
+        for reading in (1, 10**12):
+            with self.subTest(reading=reading):
+                code, rows = self.invoke_with_reading(reading)
+                self.assertEqual(code, 0)
+                self.assertEqual({row["name"] for row in rows}, ROW_NAMES)
+                self.assertEqual(len(rows), len(ROW_NAMES))
+                for row in rows:
+                    self.assertEqual(set(row), ROW_KEYS)
+                    self.assertIn(row["status"], {"ok", "unavailable"})
+                    self.assertIn(sys.executable, row["detail"])
+                    self.assertIn("-I", row["detail"])
+                    self.assertIn(host_measure.platform.release(), row["detail"])
+                    self.assertIn("measured, one host, not a budget", row["detail"])
+
+    def test_child_without_ready_line_is_unavailable_and_ended(self) -> None:
+        command = [
+            sys.executable, "-I", "-X", "utf8", "-B", "-c",
+            "import time; time.sleep(60)",
+        ]
+        children = []
+        original_start = host_measure.start_host
+
+        def remember_child(cmd: list[str]):
+            child = original_start(cmd)
+            children.append(child)
+            return child
+
+        def clean_children() -> None:
+            for child in children:
+                if child.poll() is None:
+                    host_measure.stop_host(child)
+
+        self.addCleanup(clean_children)
+        with mock.patch.object(host_measure, "start_host", side_effect=remember_child):
+            results = host_measure.measure_runs(
+                command, runs=1, idle_s=0, proc_root=self.tmp, ready_timeout_s=0.1,
+            )
+        rows = host_measure.result_rows(results, command)
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].returncode)
+        self.assertTrue(all(row["status"] == "unavailable" for row in rows))
+        self.assertTrue(all("no ready line within" in row["detail"] for row in rows))
+
+    def test_missing_status_file_makes_only_memory_rows_unavailable(self) -> None:
+        command = host_measure.builtin_command()
+        results = host_measure.measure_runs(
+            command, runs=1, idle_s=0, proc_root=self.tmp, ready_timeout_s=5,
+        )
+        rows = {row["name"]: row for row in host_measure.result_rows(results, command)}
+        self.assertEqual(rows["host_start_ms"]["status"], "ok")
+        for name in ("host_idle_rss_kib", "host_peak_rss_kib"):
+            self.assertEqual(rows[name]["status"], "unavailable")
+            self.assertIn("status file", rows[name]["detail"])
+            self.assertIn("measured, one host, not a budget", rows[name]["detail"])
+
+    def test_fake_status_file_supplies_rss_and_peak(self) -> None:
+        pid = 4242
+        status = self.tmp / str(pid) / "status"
+        status.parent.mkdir()
+        rss, peak = 123, 456
+        status.write_text(
+            f"Name:\tfake\nVmRSS:\t{rss} kB\nVmHWM:\t{peak} kB\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(host_measure.read_memory(pid, self.tmp), (rss, peak))
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires a real /proc filesystem")
+    def test_real_proc_reports_memory_when_available(self) -> None:
+        command = host_measure.builtin_command()
+        results = host_measure.measure_runs(command, runs=1, idle_s=0, ready_timeout_s=5)
+        rows = {row["name"]: row for row in host_measure.result_rows(results, command)}
+        self.assertEqual(rows["host_idle_rss_kib"]["status"], "ok")
+        self.assertEqual(rows["host_peak_rss_kib"]["status"], "ok")
+
+
+if __name__ == "__main__":
+    unittest.main()

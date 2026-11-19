@@ -18,6 +18,9 @@ from recursion_core.plugin_security.manifest import ReservedEffects
 PUBLIC = "93.184.216.34"
 PUBLIC6 = "2606:2800:220:1:248:1893:25c8:1946"
 NONE_RESERVED = ReservedEffects()
+# The known cloud platform addresses that hold secrets, as the module lists them.
+PLATFORM_ADDRESSES = ("169.254.169.254", "169.254.170.2", "100.100.100.200", "168.63.129.16",
+                      "fd00:ec2::254", "fd20:ce::254")
 
 
 def check(destination, granted, addresses, reserved=NONE_RESERVED, **kwargs):
@@ -114,7 +117,8 @@ class DestinationCheckTests(unittest.TestCase):
         self.assertAddressClass("unspecified", "0.0.0.0", "::")
 
     def test_address_refused_link_local_including_the_metadata_address(self):
-        self.assertAddressClass("link_local", "169.254.169.254", "169.254.0.1", "fe80::1", "febf::1")
+        self.assertAddressClass("link_local", "169.254.0.1", "fe80::1", "febf::1")
+        self.assertAddressClass("platform_address", "169.254.169.254")
 
     def test_address_refused_private(self):
         self.assertAddressClass("private", "10.0.0.1", "10.255.255.255", "172.16.0.1", "172.31.255.255",
@@ -132,7 +136,7 @@ class DestinationCheckTests(unittest.TestCase):
     def test_ipv4_written_inside_ipv6_is_checked_as_the_ipv4_inside(self):
         self.assertAddressClass("loopback", "::ffff:127.0.0.1")
         self.assertAddressClass("private", "::ffff:10.0.0.1")
-        self.assertAddressClass("link_local", "::ffff:169.254.169.254")
+        self.assertAddressClass("platform_address", "::ffff:169.254.169.254")
         # Python 3.13 changed how such an address is written, so the answer is compared
         # with ipaddress's own spelling of it.
         self.assertEqual(check("api.example.com", ["api.example.com"], ["::ffff:" + PUBLIC]),
@@ -140,7 +144,7 @@ class DestinationCheckTests(unittest.TestCase):
 
     def test_ipv4_written_inside_the_nat64_prefix_is_checked_as_the_ipv4_inside(self):
         self.assertAddressClass("loopback", "64:ff9b::7f00:1")
-        self.assertAddressClass("link_local", "64:ff9b::a9fe:a9fe")
+        self.assertAddressClass("platform_address", "64:ff9b::a9fe:a9fe")
         self.assertAddressClass("private", "64:ff9b::c0a8:101")
         self.assertEqual(check("api.example.com", ["api.example.com"], ["64:ff9b::5db8:d822"]),
                          str(ipaddress.ip_address("64:ff9b::5db8:d822")))
@@ -148,16 +152,65 @@ class DestinationCheckTests(unittest.TestCase):
     def test_addresses_next_to_the_refused_ranges_pass(self):
         for address in ("126.255.255.255", "128.0.0.1", "11.0.0.1", "172.15.255.255", "172.32.0.1",
                         "192.167.255.255", "192.169.0.1", "100.63.255.255", "100.128.0.1",
-                        "169.253.255.255", "169.255.0.1", "223.255.255.255", "fe7f::1",
-                        "fbff::1", "fe00::1", "feff::1", "::ffff:" + PUBLIC, "64:ff9b::5db8:d822"):
+                        "169.253.255.255", "169.255.0.1", "223.255.255.255",
+                        "::ffff:" + PUBLIC, "64:ff9b::5db8:d822"):
             with self.subTest(address=address):
                 self.assertEqual(check("api.example.com", ["api.example.com"], [address]),
                                  str(ipaddress.ip_address(address)))
 
     def test_address_refused_ip_literal(self):
-        for asked in (PUBLIC, PUBLIC + ":8443", "127.1", "0x7f.0.0.1", "8.8.8.8"):
+        for asked in (PUBLIC, PUBLIC + ":8443", "127.1", "0x7f.0.0.1", "127.0.0.0x1", "8.8.8.8"):
             with self.subTest(asked=asked):
                 self.assertRefused("address_refused", "ip_literal", asked, [asked], [PUBLIC])
+
+    def test_a_name_whose_first_label_begins_with_a_digit_is_a_name(self):
+        self.assertEqual(check("1.example.com", ["1.example.com"], [PUBLIC]), PUBLIC)
+
+    # -- the known cloud platform addresses ------------------------------------------
+
+    def test_platform_addresses_are_refused_under_every_setting(self):
+        for address in PLATFORM_ADDRESSES:
+            for allow in (False, True):
+                with self.subTest(address=address, allow_private_addresses=allow):
+                    self.assertRefused("address_refused", "platform_address", "api.example.com",
+                                       ["api.example.com"], [address], allow_private_addresses=allow)
+
+    def test_platform_addresses_written_inside_ipv6_are_refused_under_every_setting(self):
+        for address in PLATFORM_ADDRESSES:
+            if ":" in address:
+                continue
+            packed = int(ipaddress.IPv4Address(address))
+            for written in ("::ffff:" + address, str(ipaddress.IPv6Address((0x64FF9B << 96) | packed))):
+                for allow in (False, True):
+                    with self.subTest(written=written, allow_private_addresses=allow):
+                        self.assertRefused("address_refused", "platform_address", "api.example.com",
+                                           ["api.example.com"], [written], allow_private_addresses=allow)
+
+    def test_a_platform_address_named_as_the_destination_is_refused_with_the_switch_on(self):
+        for address in PLATFORM_ADDRESSES:
+            if ":" in address:
+                continue
+            with self.subTest(address=address):
+                self.assertRefused("address_refused", "platform_address", address, [address], [address],
+                                   allow_private_addresses=True)
+
+    def test_a_platform_address_with_a_zone_id_is_refused(self):
+        for address in ("fd20:ce::254%eth0", "fd00:ec2::254%1"):
+            with self.subTest(address=address):
+                self.assertRefused("address_refused", "platform_address", "api.example.com",
+                                   ["api.example.com"], [address], allow_private_addresses=True)
+
+    def test_the_platform_list_holds_exact_addresses_only(self):
+        for address in ("168.63.129.15", "168.63.129.17", "168.63.128.16"):
+            with self.subTest(address=address):
+                self.assertEqual(check("api.example.com", ["api.example.com"], [address]), address)
+        self.assertEqual(check("api.example.com", ["api.example.com"], ["fd20:ce::253"],
+                               allow_private_addresses=True), "fd20:ce::253")
+
+    def test_a_platform_address_among_good_ones_is_skipped_and_named_once(self):
+        self.assertEqual(check("api.example.com", ["api.example.com"], ["168.63.129.16", PUBLIC]), PUBLIC)
+        self.assertRefused("address_refused", "platform_address,private", "api.example.com",
+                           ["api.example.com"], ["168.63.129.16", "10.0.0.1", "169.254.169.254"])
 
     # -- every address given is checked ---------------------------------------------
 
@@ -180,12 +233,22 @@ class DestinationCheckTests(unittest.TestCase):
                                allow_private_addresses=True), "192.168.1.10")
         self.assertEqual(check("192.168.1.10", ["192.168.1.10"], ["192.168.1.10"],
                                allow_private_addresses=True), "192.168.1.10")
-        for address, name in (("127.0.0.1", "loopback"), ("169.254.169.254", "link_local"),
+        for address, name in (("127.0.0.1", "loopback"), ("169.254.169.254", "platform_address"),
                               ("100.64.0.1", "carrier_grade_nat"), ("0.0.0.0", "unspecified"),
                               ("224.0.0.1", "multicast"), ("255.255.255.255", "broadcast")):
             with self.subTest(address=address):
                 self.assertRefused("address_refused", name, "nas.home.example", ["nas.home.example"],
                                    [address], allow_private_addresses=True)
+
+    def test_allow_private_addresses_still_checks_the_addresses_of_an_ip_literal(self):
+        for asked, address, name in (("169.254.169.254", "169.254.169.254", "platform_address"),
+                                     ("169.254.0.1", "169.254.0.1", "link_local"),
+                                     ("127.0.0.1", "127.0.0.1", "loopback"),
+                                     ("127.1", "127.0.0.1", "loopback"),
+                                     ("100.64.0.1", "100.64.0.1", "carrier_grade_nat")):
+            with self.subTest(asked=asked):
+                self.assertRefused("address_refused", name, asked, [asked], [address],
+                                   allow_private_addresses=True)
 
     def test_allow_private_addresses_is_off_by_default(self):
         self.assertRefused("address_refused", "private", "nas.home.example", ["nas.home.example"],
@@ -210,6 +273,8 @@ class DestinationCheckTests(unittest.TestCase):
             check("api.example.com", ["api.example.com"], [])
         with self.assertRaises(ValueError):
             check("api.example.com", ["api.example.com"], ["not-an-address"])
+        with self.assertRaises(ValueError):
+            check("api.example.com", ["api.example.com"], [PUBLIC, "not-an-address"])
         with self.assertRaises(TypeError):
             check("api.example.com", ["api.example.com"], PUBLIC)
         with self.assertRaises(TypeError):

@@ -12,15 +12,18 @@ to use, or raises ``Refused`` with one of three codes:
 * ``destination_reserved``: the host is one the core reserves for an effect owner,
   as ``ReservedEffects.host_reserved`` answers it (called, never copied).
 * ``address_refused``, with the class as its detail: an address the plugin may not
-  reach (see ``_CLASSES``), or ``ip_literal`` when the destination names an address
+  reach (``platform_address`` or a class of ``_CLASSES``), or ``ip_literal`` when the
+  destination names an address
   instead of a host name. Every address given is checked in the order given; the
   first that passes is answered, so one refused address among good ones is skipped.
   When none passes, the detail names each refused class once, in the order met.
 
 An IPv4 address written inside IPv6 (``::ffff:0:0/96`` and ``64:ff9b::/96``) is
-checked as the IPv4 address inside. The person's ``allow_private_addresses`` (default
-off; it loosens safety) lets the classes ``private`` and ``ip_literal`` pass and no
-other. The address ranges are written out here rather than taken from
+checked as the IPv4 address inside. A known cloud platform address that holds secrets
+(``_PLATFORM_ADDRESSES``) is ``platform_address``, looked at before every class and
+refused under every setting. The person's ``allow_private_addresses`` (default off; it
+loosens safety) lets the classes ``private`` and ``ip_literal`` pass and no other. The
+address ranges are written out here rather than taken from
 ``ipaddress``'s ``is_private`` and similar properties, whose meaning has changed
 between Python versions.
 """
@@ -52,6 +55,19 @@ _CLASSES = (
     ("multicast", _nets("224.0.0.0/4", "ff00::/8")),
     ("broadcast", _nets("255.255.255.255/32")),
 )
+# The known cloud platform addresses that hold secrets (instance metadata, credentials,
+# the platform's own services). Each is refused as platform_address under every setting,
+# before any class is looked at: some sit in public space, two inside fc00::/7 (which the
+# person's allow_private_addresses lets pass), and the rest stay refused here whatever a
+# later change does to their class.
+_PLATFORM_ADDRESSES = frozenset(ipaddress.ip_address(a) for a in (
+    "169.254.169.254",  # instance metadata on several clouds
+    "169.254.170.2",    # one cloud's container credentials and metadata
+    "100.100.100.200",  # one cloud's instance metadata
+    "168.63.129.16",    # one cloud's platform service, in public space
+    "fd00:ec2::254",    # one cloud's IPv6 instance metadata
+    "fd20:ce::254",     # another cloud's IPv6 instance metadata
+))
 # The classes the person's allow_private_addresses lets pass.
 _PRIVATE_ALLOWED = frozenset({"private", "ip_literal"})
 _V4_MAPPED = ipaddress.ip_network("::ffff:0:0/96")
@@ -83,6 +99,9 @@ def _address_class(address) -> str | None:
             address = address.ipv4_mapped
         elif address in _NAT64:
             address = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+    # Compared without a zone id: ``fd20:ce::254%eth0`` is the same machine.
+    if ipaddress.ip_address(address.packed) in _PLATFORM_ADDRESSES:
+        return "platform_address"
     for name, nets in _CLASSES:
         if any(address.version == n.version and address in n for n in nets):
             return name

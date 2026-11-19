@@ -41,6 +41,11 @@ LEDGER_FILE = "ledger.sqlite3"  # daemon/plugins.py LEDGER_FILE; created only on
 # (its private_dir), and setup.route_home.check refuses a root that is missing or not owner-only, so
 # install makes it, 0700, before the first launch (lane INSTALL's question 15).
 HOMES_FOLDER = "homes"
+# The install's own authority key (Ed25519, PKCS#8 PEM, owner-only): <home>/.config/recursion/authority/anchor.key.
+# Under the configuration folder, which the command layer holds to ~/.config (config_home_elsewhere).
+CONFIG_FOLDER = "recursion"
+AUTHORITY_FOLDER = "authority"
+ANCHOR_KEY_FILE = "anchor.key"
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,9 @@ class Owned:
     state_home: str = ""   # the folder the state folder is in: <home>/.local/state, or the chosen place
     state_root: str = ""   # where the state folders are made from: the home, or the chosen place itself
     chosen: bool = False   # True when XDG_STATE_HOME chose another place than the default
+    config: str = ""       # <home>/.config/recursion: install.json's folder (plugins/) is in it
+    authority_dir: str = ""  # <config>/authority, 0700
+    anchor_key: str = ""   # <authority_dir>/anchor.key, the install's own authority key, 0600
 
 
 def owned_paths(roots: Roots) -> Owned:
@@ -80,6 +88,8 @@ def owned_paths(roots: Roots) -> Owned:
     base = state_home(home, roots.state_home)
     state = os.path.join(base, STATE_FOLDER)
     store_dir = os.path.join(state, STORE_FOLDER)
+    config = os.path.join(home, ".config", CONFIG_FOLDER)
+    authority_dir = os.path.join(config, AUTHORITY_FOLDER)
     return Owned(
         home=home,
         unit_dir=unit_dir,
@@ -94,6 +104,9 @@ def owned_paths(roots: Roots) -> Owned:
         state_home=base,
         state_root=base if chosen else home,
         chosen=chosen is not None,
+        config=config,
+        authority_dir=authority_dir,
+        anchor_key=os.path.join(authority_dir, ANCHOR_KEY_FILE),
     )
 
 

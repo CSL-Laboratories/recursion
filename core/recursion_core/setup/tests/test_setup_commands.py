@@ -20,6 +20,7 @@ import recursion_core
 from recursion_core import _entrypoints as entry
 from recursion_core.control.commands import setup
 from recursion_core.daemon_install import UNIT_NAME, Roots, service_fields
+from recursion_core.plugin_security.signing import backend_available
 
 PY = "/opt/recursion/venv/bin/python3.14t"
 PY_NEXT = "/opt/recursion/venv-2/bin/python3.14t"
@@ -65,8 +66,13 @@ class CommandTests(unittest.TestCase):
         store_dir = os.path.join(self.home, ".local", "state", "recursion", "plugin-security")
         stores = [{"kind": "breaker_store", "path": os.path.join(store_dir, "breaker.sqlite3"), "created": True},
                   {"kind": "revocation_store", "path": os.path.join(store_dir, "revoked.sqlite3"), "created": True}]
-        ledger = {"kind": "ledger", "path": os.path.join(store_dir, "ledger.sqlite3"), "created": False,
-                  "detail": "needs the anchor key (Lucas)"}
+        # The install's own authority key is made and the ledger bound to it; with no cryptography in this
+        # interpreter no key can be made, and the detail says so.
+        ledger = ({"kind": "ledger", "path": os.path.join(store_dir, "ledger.sqlite3"), "created": True,
+                   "detail": ""} if backend_available() else
+                  {"kind": "ledger", "path": os.path.join(store_dir, "ledger.sqlite3"), "created": False,
+                   "detail": "needs the cryptography package to make this install's authority key "
+                             "(csl-recursion[plugins])"})
         self.assertEqual(answer, {
             "code": "ok", "action": "install", "changed": True, "unit": self.unit, "interpreter": PY,
             "stores": stores, "ledger": ledger,

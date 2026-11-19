@@ -32,7 +32,9 @@ import types
 from dataclasses import dataclass, replace
 
 from .errors import Refused
-from .manifest import Grant, Manifest, ReservedEffects, TrustStore, effective_permissions, parse_manifest
+from .manifest import (
+    RUNTIME_INPROCESS_RETIRING, Grant, Manifest, ReservedEffects, TrustStore, effective_permissions, parse_manifest,
+)
 from .signing import key_id
 from .runtime import GilProbe
 
@@ -150,6 +152,9 @@ class PluginLoader:
             raise Refused("artifact_not_bytes")
         manifest = parse_manifest(manifest_bytes)
         findings.append(_finding("verify", "manifest_ok", "info", manifest.plugin_id))
+        if manifest.runtime == RUNTIME_INPROCESS_RETIRING:
+            findings.append(_finding("verify", "runtime_inprocess_retiring", "warn",
+                                     "python-inprocess/1 is read as python-sandboxed/1; refused from 1.1.0"))
         if hashlib.sha256(artifact).hexdigest() != manifest.artifact_sha256:
             raise Refused("artifact_digest_mismatch")
         trust, kid, reason = self._trust.classify(manifest, signature)

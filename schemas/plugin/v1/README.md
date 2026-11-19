@@ -48,8 +48,13 @@ Install file:
 - **Recommended, not decided:** the five permission names that are new in version 1 (`surface`,
   `command`, `subscribe`, `tool`, `run`) and their order. An existing name never changes its place:
   permissions are only appended, so the signed bytes for an existing set never change.
-- `runtime` has one value, `python-inprocess/1`: ordinary Python in the daemon's own process and
-  user. That is not a containment boundary.
+- **Decided:** `runtime` is `python-sandboxed/1`: Python run in a sandboxed host process outside the
+  daemon, behind the wall of the system it runs on; a plugin author writes the same `plugin.py` as
+  before, and only the place it runs changes. `python-inprocess/1` retires: every 1.0.x release reads
+  it as `python-sandboxed/1`, with the finding `runtime_inprocess_retiring`, and from 1.1.0 on it is
+  refused `runtime_retired`. Runtimes are only ever appended. Names held for a later release (two
+  runtimes, three permissions, five record kinds) are listed under `$defs/reserved` in
+  `manifest.v1.json`; each is refused with its own text, and reserved is not frozen.
 - **Not decided:** what an install does with a revoked-key list that has expired or cannot be
   fetched. Until that is answered, the last accepted list stays in force, and the absence of a list
   never means that nothing is revoked.

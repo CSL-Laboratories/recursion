@@ -74,7 +74,22 @@ PERMISSIONS = ("read", "propose", "panel", "network", "credential", "process", "
 # for an existing set never change. The five new names and their order are PROVISIONAL
 # until Lucas answers DEC F12 (schemas/plugin/v1/README.md); a vNext manifest refuses them.
 PERMISSIONS_V1 = PERMISSIONS + ("surface", "command", "subscribe", "tool", "run")
-_RUNTIMES_V1 = frozenset({"python-inprocess/1"})   # ordinary Python in the daemon: not contained
+# Runtimes, only ever appended to: a later runtime is a new name, under unchanged plugins.
+# python-sandboxed/1 runs a plugin in a sandboxed host process outside the daemon. python-inprocess/1
+# retires: read as python-sandboxed/1 in every 1.0.x release, with the finding runtime_inprocess_retiring
+# (loader.py); from 1.1.0 on it is refused.
+_RUNTIMES_V1 = frozenset({"python-sandboxed/1", "python-inprocess/1"})
+RUNTIME_INPROCESS_RETIRING = "python-inprocess/1"
+# Runtime names reserved for a later release, each with its own text. Refused runtime_reserved and never
+# run. Reserved is not frozen: a name may be corrected until the first build that answers it.
+_RESERVED_RUNTIMES = MappingProxyType({
+    "wasm-component/1": "wasm-component/1 is reserved for a later release; this release runs python-sandboxed/1 only.",
+    "data/1": "data/1 is reserved; not run in this release.",
+})
+_UNKNOWN_RUNTIME = "unknown runtime; this release runs python-sandboxed/1 only"
+# Permission names reserved for a later release, refused permission_reserved in either form of manifest.
+# They are not in PERMISSIONS or PERMISSIONS_V1, and nothing grants them.
+_RESERVED_PERMISSIONS = frozenset({"schedule", "memory", "computer"})
 _INTERFACES_V1 = frozenset({"csl-plugin-api/1"})
 # The file the loader runs; its digest is artifact_sha256 (daemon/plugins.py, ARTIFACT).
 ENTRY_FILE = "plugin.py"
@@ -263,6 +278,10 @@ def parse_manifest(raw: bytes) -> Manifest:
         raise Refused("manifest_dependency_lock")
     parse_public_key(data["developer_key"])
     perms = data["permissions"]
+    if type(perms) is list:
+        for p in perms:
+            if type(p) is str and p in _RESERVED_PERMISSIONS:
+                raise Refused("permission_reserved", "%s is reserved; not available in this release" % p)
     if type(perms) is not list or any(p not in order for p in perms):
         raise Refused("manifest_unknown_permission")
     if len(set(perms)) != len(perms) or perms != sorted(perms, key=order.index):
@@ -277,8 +296,11 @@ def parse_manifest(raw: bytes) -> Manifest:
     if not v1:
         return Manifest(data["plugin_id"], data["version"], data["artifact_sha256"], lock, scripts,
                         data["developer_key"], tuple(perms), nets, creds, raw)
-    if type(data["runtime"]) is not str or data["runtime"] not in _RUNTIMES_V1:
-        raise Refused("manifest_runtime", "only python-inprocess/1 is defined")
+    runtime = data["runtime"]
+    if type(runtime) is str and runtime in _RESERVED_RUNTIMES:
+        raise Refused("runtime_reserved", _RESERVED_RUNTIMES[runtime])
+    if type(runtime) is not str or runtime not in _RUNTIMES_V1:
+        raise Refused("manifest_runtime", _UNKNOWN_RUNTIME)
     if type(data["interface"]) is not str or data["interface"] not in _INTERFACES_V1:
         raise Refused("manifest_interface", "only csl-plugin-api/1 is defined")
     files = _parse_files(data["files"], data["artifact_sha256"])

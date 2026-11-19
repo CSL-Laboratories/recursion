@@ -311,9 +311,10 @@ class DaemonEnd:
     ``plugin_id``: that is the caller of every ``core`` message on this channel, set from the
     channel and never read from a message. ``receive`` answers what needs an answer (a ``core``
     request, a host's ``call``, or a refusal of a message it cannot take) and returns ``None`` for the
-    rest (``hello``, ``result``, ``refusal``, ``bye``), which the code that sent the call reads itself.
-    The daemon offers no call of its own in this release: a host's call is ``call_reserved``,
-    ``call_unknown`` or ``call_not_offered``, and nothing runs.
+    rest (``hello``, ``refusal``, ``bye``). The daemon offers no call of its own in this release: a
+    host's call is ``call_reserved``, ``call_unknown`` or ``call_not_offered``, and nothing runs. This
+    end sends no call either, so every ``result`` is for an id it never called and is refused
+    ``message_invalid``, as at a host.
     """
 
     def __init__(self, plugin_id: str, core: Any) -> None:
@@ -338,6 +339,9 @@ class DaemonEnd:
             return refusal(message, exc)
         if checked["type"] == "call":
             return answer_call(checked, {})
+        if checked["type"] == "result":
+            exc = ChannelRefusal("message_invalid", f"result: id {checked['id']} answers no call the daemon sent")
+            return refusal(message, exc)
         if checked["type"] != "core":
             return None
         answer = self._core(base64.b64decode(checked["bytes_b64"], validate=True))

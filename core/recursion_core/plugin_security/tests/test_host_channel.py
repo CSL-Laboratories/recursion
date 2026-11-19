@@ -304,7 +304,7 @@ class CallerTests(unittest.TestCase):
 
     def test_other_messages_need_no_answer_from_the_daemon(self):
         end = hc.DaemonEnd("demo.plugin", FakeCore())
-        for message in ({"type": "hello", "channel": hc.CHANNEL}, {"type": "result", "id": 1, "value": [1]},
+        for message in ({"type": "hello", "channel": hc.CHANNEL},
                         {"type": "refusal", "id": None, "code": "call_unknown", "detail": ""},
                         {"type": "bye", "reason": "done"}):
             with self.subTest(type=message["type"]):
@@ -386,6 +386,20 @@ class DirectionTests(unittest.TestCase):
         self.assertIsNone(host.receive({"type": "result", "id": sent["id"], "value": {"status": 200}}))
         self.assertEqual(host.answers[sent["id"]]["value"], {"status": 200})
         self.assertEqual(host.receive({"type": "result", "id": sent["id"], "value": 2})["code"], "message_invalid")
+
+    def test_a_result_at_the_daemon_for_an_id_it_never_called_is_refused(self):
+        core = FakeCore()
+        end = hc.DaemonEnd("demo.plugin", core)
+        stray = {"type": "result", "id": 99, "value": 1}
+        answer = end.receive(stray)
+        self.assertIsNotNone(answer, "the daemon's end took a result for an id it never called in silence")
+        self.assertEqual((answer["type"], answer["id"], answer["code"]), ("refusal", 99, "message_invalid"))
+        self.assertEqual(answer["code"], hc.HostEnd({}).receive(stray)["code"])
+        self.assertIn("answers no call", answer["detail"])
+        self.assertEqual(core.requests, [])
+        # the channel stays as after any other refused frame: the next messages are answered as before
+        self.assertEqual(end.receive(call("credential.request"))["code"], "call_unknown")
+        self.assertIsNone(end.receive({"type": "bye", "reason": "done"}))
 
     def test_a_host_answers_the_daemons_call(self):
         host = hc.HostEnd({"registry": lambda: {"panels": []}})

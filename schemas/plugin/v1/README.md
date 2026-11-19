@@ -10,6 +10,7 @@ The records a plugin package and its install share with the core. Each is a JSON
 | `install.v1.json` | `install.json` | This install's trusted keys and grants, exactly as the daemon reads the file today | PLUGIN-SIGN, PLUGIN-HOST, INSTALL |
 | `api.v1.json` | `csl-plugin-api/1` | The plugin API's entry points as plain data. A skeleton: the shapes are for the lanes that host plugins and draw the page to supply | PLUGIN-HOST, PAGE |
 | `revoked-keys.v1.json` | `csl-revoked-keys/1` | The signed list of revoked developer keys. A draft: revocation's details are open | PLUGIN-SIGN |
+| `host.v1.json` | `csl-plugin-host/1` | The messages on the channel between the daemon and a plugin host, one channel per loaded plugin | PLUGIN-HOST: the daemon's channel end and the plugin host program |
 
 ## What holds for the plugin API whatever its shapes become
 

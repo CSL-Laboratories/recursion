@@ -27,9 +27,11 @@ and `bye`, framed as `control_transport/framing.py` frames. A `call` carries a n
 append-only list (`registry`, `operator`, `surfaces`, `surface`); a name the receiver does not know is
 refused `call_unknown`, and a later surface kind is a new name, never a schema break. A message type the
 receiver does not know is answered with a typed refusal and the channel stays up. The message names
-`event`, `guard` and `surface.update`, the call names `run.request` and `computer.open`, `.act`,
-`.observe` and `.close`, and the run-origin values `trigger`, `agent` and `packet` are reserved: named,
-answered 'reserved; not available in this release', never built here. No message carries a caller: the
+`event`, `guard` and `surface.update` and the call names `run.request` and `computer.open`, `.act`,
+`.observe` and `.close` are reserved: named, answered 'reserved; not available in this release', never
+built here. The run-origin values `trigger`, `agent` and `packet` are in the reserved list with no field
+yet: a message that carries a field for one is refused as any unknown field is (`message_invalid`), not
+answered 'reserved'. No message carries a caller: the
 daemon sets it from the channel. What it breaks: nothing; no schema before it named these messages.
 Forty-nine fixtures prove its rules; `plugin_security/host_channel.py` is its code side and
 `plugin_security/tests/test_host_channel.py` holds the two equal.

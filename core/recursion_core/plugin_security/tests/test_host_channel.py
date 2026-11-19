@@ -83,7 +83,10 @@ class InventoryTests(unittest.TestCase):
     """Every function the daemon calls on a plugin maps to exactly one message; every op stays the core's."""
 
     def daemon_calls_on_a_plugin(self):
-        """The names daemon/plugins.py takes off a loaded plugin module with getattr(module, '<name>', ...)."""
+        """The names daemon/plugins.py takes off a loaded plugin module with getattr(module, '<name>', ...).
+
+        It sees only that form: a direct call such as ``module.on_event()`` is not seen.
+        """
         tree = ast.parse(DAEMON_PLUGINS.read_text(encoding="utf-8"))
         names = set()
         for node in ast.walk(tree):

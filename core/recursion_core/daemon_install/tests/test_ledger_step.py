@@ -6,6 +6,8 @@ which ``recursiond install`` cannot fill until that key is decided. With no key 
 reports ``needs the anchor key (Lucas)`` and creates nothing. A test passes a test-only key
 to show the call to ``stores.create_ledger`` (which calls ``authority.create_ledger``).
 ``install.json``'s ``authority_anchor`` is not read.
+These tests are Linux-only: on Windows install and upgrade refuse ``platform_unsupported``
+before they read a path, and test_unit_surrogate.py tests that refusal.
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ NEEDS_ANCHOR = "needs the anchor key (Lucas)"
 
 
 @unittest.skipUnless(POSIX_PATHS, "the unit's interpreter path is not absolute on this host")
+@unittest.skipUnless(os.name == "posix", "the installer is Linux-only; on Windows install and upgrade refuse "
+                     "platform_unsupported, tested in test_unit_surrogate.py")
 class LedgerStepTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="ledger-step-")

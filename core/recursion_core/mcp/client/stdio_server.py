@@ -23,18 +23,28 @@ Placement
     runs outside the run's group, and every process it starts is inside it too. It is a child of the run,
     never of the daemon's own unit. The server's pid then joins the run's record as a member
     (``member_id`` ``mcp:<name>``, the registry's ``join_member``). A run that is not running, has a Stop
-    asked, or names no cgroup is refused (``RUN_NOT_RUNNING``); a join the registry refuses (the run was
-    stopped, or its record moved since it was read) ends the leaf at once and is refused the same way.
+    asked, or names no cgroup is refused (``RUN_NOT_RUNNING``); a name already on the run's record, its
+    server alive or closed, is refused (``SERVER_NAME_TAKEN``) before any process is started; a join the
+    registry refuses (the run was stopped, or its record moved since it was read) ends the leaf at once and
+    is refused the same way as a run that is not running.
 Stop
     The run's own Stop ends the server: the unit's stop reaches every process of its cgroup, the leaf
     included. The Stop record lists the server: a ``stopped`` answer's attestation names ``mcp:<name>`` in
-    ``member_ids``, and a server still alive after its cgroup reads empty (one that left the group) keeps
-    the Stop ``pending`` with reason ``member_alive`` (the control API's own rule): it is reported and never
-    booked as stopped or terminated.
+    ``member_ids``, and the program the core started (the one pid on the record), still alive after its
+    cgroup reads empty (it left the group), keeps the Stop ``pending`` with reason ``member_alive`` (the
+    control API's own rule): it is reported and never booked as stopped or terminated. A process below that
+    program (a server run by ``sh -c``, ``uv`` or ``npx``) that leaves the group is not on the record, and
+    Stop does not see it.
 The connection
     ``StdioServer.client`` is the MCP client of ``session.py`` over the server's stdout and stdin, under that
     client's bounds. ``StdioServer.close`` shuts the client and kills the leaf; its outcome is the leaf
-    launcher's, which never says ``terminated``.
+    launcher's, which never says ``terminated``. It never waits on a pipe a client thread is still inside:
+    after the kill it waits at most ``STREAM_WAIT_S`` for the client's reader and writer to come out of the
+    server's pipes, and a pipe one of them is still inside (something outside the run's group holds its
+    other end) is left open, named in ``StdioServer.streams_left`` and handed on as one record
+    (``STREAMS_LEFT_RECORD``) through ``on_record``. That is reported, never acted on: no process is looked
+    for or signalled by its pipe. A leaf the run's Stop has already removed closes at once
+    (``leaf_empty``, ``StdioServer.leaf_already_gone``), once the started program's exit is seen.
 
 Linux only. Windows (the run's job object) and macOS (the run's process group) are not built here and
 refuse with ``PlatformUnsupported`` from the leaf launcher.
@@ -47,6 +57,8 @@ import os
 import re
 import secrets
 import subprocess
+import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +74,14 @@ SERVER_NOT_APPROVED = "mcp_server_not_approved"
 SERVER_ENV_REFUSED = "mcp_server_env_refused"
 SERVER_START_FAILED = "mcp_server_start_failed"
 RUN_NOT_RUNNING = "mcp_server_run_not_running"
+SERVER_NAME_TAKEN = "mcp_server_name_taken"
+
+# The record ``StdioServer.close`` hands to ``on_record`` when it leaves a pipe open.
+STREAMS_LEFT_RECORD = "mcp_server_streams_left"
+
+# How long ``StdioServer.close`` waits, after the leaf is killed, for the client's threads to come out of the
+# server's pipes. A first value, not measured.
+STREAM_WAIT_S = 2.0
 
 MEMBER_PREFIX = "mcp:"
 LEAF_PREFIX = "run-mcp-"
@@ -168,29 +188,115 @@ def server_env(entry: ServerEntry, parent: Mapping[str, str] | None = None) -> d
     return env
 
 
+class _WatchedStream:
+    """One of the server's pipes as the client uses it: it knows whether a client thread is inside it."""
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self._cond = threading.Condition()
+        self._inside = 0
+        self._shut = False
+
+    def _call(self, name: str, *args):
+        with self._cond:
+            if self._shut:
+                raise ValueError("I/O operation on closed file.")
+            self._inside += 1
+        try:
+            return getattr(self._stream, name)(*args)
+        finally:
+            with self._cond:
+                self._inside -= 1
+                self._cond.notify_all()
+
+    def readline(self, size: int = -1) -> bytes:
+        return self._call("readline", size)
+
+    def write(self, data) -> int | None:
+        return self._call("write", data)
+
+    def flush(self) -> None:
+        self._call("flush")
+
+    def close(self) -> None:
+        self.shut_when_idle(0.0)
+
+    def shut_when_idle(self, deadline: float) -> bool:
+        """Shut the stream once no thread is inside it, waiting until ``deadline`` (monotonic) at most.
+
+        ``False`` when a thread is still inside then: the stream is left open, because shutting it would wait
+        for that thread, and its read or write ends only when every holder of the pipe's other end is gone.
+        """
+        with self._cond:
+            while self._inside and self._cond.wait(max(0.0, deadline - time.monotonic())):
+                pass
+            if self._inside:
+                return False
+            if not self._shut:
+                self._shut = True  # no thread is inside, and none can enter now
+                try:
+                    self._stream.close()
+                except Exception:  # noqa: BLE001 - a pipe already shut or broken
+                    pass
+            return True
+
+
 class StdioServer:
     """One server started for one run: its leaf, its member id on the run's record, and its client."""
 
     def __init__(self, entry: ServerEntry, run_id: str, member_id: str, leaf: cgroup_leaf.LeafRun,
-                 client: McpClient) -> None:
+                 client: McpClient, *, streams: tuple[_WatchedStream, _WatchedStream] | None = None,
+                 on_record: Callable[[dict], Any] | None = None) -> None:
         self.entry, self.run_id, self.member_id, self.leaf, self.client = entry, run_id, member_id, leaf, client
+        # The server's output and input as the client was given them (``start_server`` gives both).
+        self._streams = streams or (_WatchedStream(leaf.proc.stdout), _WatchedStream(leaf.proc.stdin))
+        self._on_record = on_record
+        # Set by ``close``: the pipes it left open ("output", "input") because a client thread was still inside
+        # them after the leaf was killed: something outside the run's group still holds the server's pipe.
+        self.streams_left: tuple[str, ...] = ()
+        # Set by ``close``: the run's Stop had already removed the leaf, and the started program had ended.
+        self.leaf_already_gone = False
 
     @property
     def pid(self) -> int | None:
         return self.leaf.pid
 
     def close(self) -> cgroup_leaf.Outcome:
-        """Shut the client and kill the leaf. The outcome never says ``terminated``."""
+        """Shut the client and kill the leaf. The outcome never says ``terminated``; see the module text."""
         try:
             self.client.close()
         finally:
-            outcome = self.leaf.close()
-            for stream in (self.leaf.proc.stdout, self.leaf.proc.stdin):
-                try:
-                    stream.close()
-                except Exception:  # noqa: BLE001 - the client's writer may have shut it already
-                    pass
+            outcome = self._close_leaf()
+            self._shut_streams()
         return outcome
+
+    def _close_leaf(self) -> cgroup_leaf.Outcome:
+        leaf = self.leaf
+        with leaf.lock:
+            # The kernel removes a cgroup only once no process is in it; the started program's own exit is seen
+            # (and reaped) here, so a leaf that is missing while its program lives is never read as ended.
+            gone = (not leaf.removed and leaf.proc is not None and not os.path.lexists(leaf.leaf)
+                    and leaf.proc.poll() is not None)
+            if gone:
+                if leaf.pidfd is not None:
+                    fd, leaf.pidfd = leaf.pidfd, None
+                    os.close(fd)
+                leaf.outcome = cgroup_leaf.Outcome("leaf_empty", leaf.proc.returncode, False, True)
+                leaf.removed = True  # the leaf's own close returns this outcome from now on
+        if gone:
+            self.leaf_already_gone = True
+        return leaf.close()
+
+    def _shut_streams(self) -> None:
+        deadline = time.monotonic() + STREAM_WAIT_S
+        left = tuple(name for name, stream in zip(("output", "input"), self._streams)
+                     if not stream.shut_when_idle(deadline))
+        self.streams_left = left
+        if left and self._on_record is not None:
+            try:
+                self._on_record({"record": STREAMS_LEFT_RECORD, "member_id": self.member_id, "streams": list(left)})
+            except Exception:  # noqa: BLE001 - as the client's own records: a callback that raises is ignored
+                pass
 
 
 def _run_cgroup(registry, run_id: str, cgroup_root: Path) -> tuple[Path, dict]:
@@ -217,6 +323,9 @@ def start_server(entry: ServerEntry, *, registry, run_id: str, cgroup_root: str 
         raise ServerStartRefused(SERVER_NOT_APPROVED, type(entry).__name__)
     env = server_env(entry, parent_env)
     group, rec = _run_cgroup(registry, run_id, Path(cgroup_root))
+    member_id = MEMBER_PREFIX + entry.name
+    if any(isinstance(m, dict) and m.get("member_id") == member_id for m in rec.get("members") or ()):
+        raise ServerStartRefused(SERVER_NAME_TAKEN, member_id)  # alive or closed: never started again here
     try:
         root = cgroup_leaf.DelegatedRoot(group)
         leaf = root.launch(f"{LEAF_PREFIX}{entry.name}-{secrets.token_hex(4)}", list(entry.command), env=env,
@@ -226,7 +335,6 @@ def start_server(entry: ServerEntry, *, registry, run_id: str, cgroup_root: str 
         raise
     except (cgroup_leaf.LaunchError, OSError, ValueError) as exc:
         raise ServerStartRefused(SERVER_START_FAILED, type(exc).__name__) from exc
-    member_id = MEMBER_PREFIX + entry.name
     try:
         # The generation read above: if the record moved since (a Stop asked, another member), the join is
         # refused and the server ends here, rather than join a record this start never saw.
@@ -240,5 +348,6 @@ def start_server(entry: ServerEntry, *, registry, run_id: str, cgroup_root: str 
         if isinstance(exc, (JoinRefused, StaleGeneration)):
             raise ServerStartRefused(RUN_NOT_RUNNING, type(exc).__name__) from exc
         raise
-    client = McpClient(leaf.proc.stdout, leaf.proc.stdin, **({"on_record": on_record} if on_record else {}))
-    return StdioServer(entry, run_id, member_id, leaf, client)
+    streams = (_WatchedStream(leaf.proc.stdout), _WatchedStream(leaf.proc.stdin))
+    client = McpClient(*streams, **({"on_record": on_record} if on_record else {}))
+    return StdioServer(entry, run_id, member_id, leaf, client, streams=streams, on_record=on_record)

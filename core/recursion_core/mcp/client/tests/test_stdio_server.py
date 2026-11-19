@@ -19,9 +19,11 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from recursion_core.control import api as a
 from recursion_core.control.api import ControlAPI
@@ -76,18 +78,42 @@ STUB = textwrap.dedent('''
         sys.stdout.flush()
 ''')
 
-STUB_JS = textwrap.dedent('''
-    const fs = require("fs"), cp = require("child_process"), rl = require("readline");
-    process.on("SIGTERM", () => {}); process.on("SIGINT", () => {});
-    const child = cp.spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});process.on('SIGINT',()=>{});setInterval(()=>{},1e6)"], {stdio: "ignore"});
-    fs.writeFileSync(process.argv[2], JSON.stringify({pid: process.pid, child: child.pid, env: Object.keys(process.env).sort()}));
-    rl.createInterface({input: process.stdin}).on("line", (line) => {
-      const msg = JSON.parse(line); if (!("id" in msg)) return;
-      let result = null;
-      if (msg.method === "initialize") result = {protocolVersion: msg.params.protocolVersion, capabilities: {tools: {}}, serverInfo: {name: "stub", version: "1"}};
-      else if (msg.method === "tools/list") result = {tools: [{name: "leave", inputSchema: {type: "object"}}]};
-      process.stdout.write(JSON.stringify(result === null ? {jsonrpc: "2.0", id: msg.id, error: {code: -32601, message: "no"}} : {jsonrpc: "2.0", id: msg.id, result}) + "\\n");
-    });
+HOLDER = textwrap.dedent('''
+    import json, os, sys, time
+    for raw in sys.stdin.buffer:
+        msg = json.loads(raw)
+        if "id" not in msg:
+            continue
+        if msg.get("method") == "initialize":
+            result = {"protocolVersion": msg["params"]["protocolVersion"], "capabilities": {"tools": {}},
+                      "serverInfo": {"name": "holder", "version": "1"}}
+        elif msg.get("method") == "tools/call":  # a child leaves the run's group and keeps the pipes it names
+            args = msg["params"]["arguments"]
+            r, w = os.pipe()
+            child = os.fork()
+            if child == 0:
+                os.close(r)
+                null = os.open(os.devnull, os.O_RDWR)
+                for fd in (0, 1):
+                    if fd not in args["keep"]:
+                        os.dup2(null, fd)
+                with open(args["procs"], "w") as handle:
+                    handle.write(str(os.getpid()))
+                os.write(w, b"x")
+                while True:
+                    time.sleep(3600)
+            os.close(w)
+            os.read(r, 1)
+            result = {"content": [{"type": "text", "text": str(child)}]}
+        else:
+            result = None
+        reply = {"jsonrpc": "2.0", "id": msg["id"]}
+        reply.update({"result": result} if result is not None else {"error": {"code": -32601, "message": "no"}})
+        sys.stdout.write(json.dumps(reply) + "\\n")
+        sys.stdout.flush()
+        if result is not None and msg["params"].get("arguments", {}).get("stop_reading"):
+            while True:  # never reads its input again
+                time.sleep(3600)
 ''')
 
 
@@ -365,21 +391,7 @@ class LiveRunTest(unittest.TestCase):
         info = self._info(out)
         self._stop_and_check(api, registry, run, (server.pid, info["pid"], info["child"]))
 
-    @unittest.skipUnless(shutil.which("npx") and shutil.which("node")
-                         and not shutil.which("npx").startswith("/mnt/"), "no Linux npx and node on this machine")
-    def test_the_npx_launch_shape_ends_with_the_runs_stop(self) -> None:
-        group = self._unit("run")
-        api, registry, run = self._api(group)
-        out = Path(self.tmp.name, "pids.json")
-        script = Path(self.tmp.name, "stub.js")
-        script.write_text(STUB_JS, encoding="utf-8")
-        server = self._start(registry, run, ("npx", "--yes", "node", str(script), str(out)),
-                             env_names=("PATH", "HOME"))
-        server.client.open(deadline_s=GUARD_S)
-        info = self._info(out)
-        self._stop_and_check(api, registry, run, (server.pid, info["pid"], info["child"]))
-
-    def test_a_server_that_leaves_the_run_is_reported_and_never_booked_stopped(self) -> None:
+    def test_the_program_the_core_started_that_leaves_the_run_is_reported_and_never_booked_stopped(self) -> None:
         group = self._unit("run")
         elsewhere = self._unit("elsewhere")  # this test's own second unit: where the server goes
         api, registry, run = self._api(group)
@@ -402,6 +414,165 @@ class LiveRunTest(unittest.TestCase):
                        capture_output=True)
         self.assertFalse(_alive(server.pid))
         self.assertEqual(api.call("run.stop", {"run_id": run})["code"], a.STOPPED)
+
+    def test_a_process_below_the_started_program_that_leaves_the_run_is_not_seen_by_stop(self) -> None:
+        """A KNOWN GAP, BEFORE THE OWNER: this test pins what Stop answers today; it is green by design.
+
+        Only the program the core started (here ``sh``) is on the run's record. When the real server below it
+        writes itself into another group (here this test's own second unit), the run's Stop answers ``stopped``,
+        its attestation names only the started program, and the real server lives on, unseen. Under the same
+        uid this cannot be seen; whether more is wanted is the owner's choice.
+        """
+        group = self._unit("run")
+        elsewhere = self._unit("elsewhere")  # this test's own second unit: where the real server goes
+        api, registry, run = self._api(group)
+        out = Path(self.tmp.name, "pids.json")
+        server = self._start(registry, run, ("sh", "-c", '"$0" "$@"; exit $?', sys.executable, "-I", "-c", STUB,
+                                             str(out)), env_names=("PATH",))
+        server.client.open(deadline_s=GUARD_S)
+        info = self._info(out)
+        self.assertNotEqual(info["pid"], server.pid)  # sh, then the real server under it
+        server.client.call_tool("leave", {"procs": str(CGROUP_ROOT / elsewhere.lstrip("/") / "cgroup.procs")},
+                                deadline_s=GUARD_S)
+        self.assertEqual(_cgroup_of(info["pid"]), elsewhere)
+        res = api.call("run.stop", {"run_id": run})
+        rec = registry.get(run)
+        self.assertEqual((res["code"], rec["state"]), (a.STOPPED, "stopped"))
+        self.assertEqual(rec["stop_attestation"]["member_ids"], ["mcp:stub"])
+        self.assertEqual(rec["members"], [])  # the stopped run's record keeps no member
+        self.assertFalse(_alive(server.pid))  # the started program ended with the run
+        self.assertTrue(_alive(info["pid"]))  # the real server did not, and Stop did not say so
+        subprocess.run(["systemctl", "--user", "stop", "--", self.units[elsewhere]], check=True, timeout=60,
+                       capture_output=True)
+        self.assertFalse(_alive(info["pid"]))
+
+    def _escape(self, server, elsewhere: str, **arguments) -> int:
+        """A child of the server writes itself into ``elsewhere`` (this test's own unit) and keeps ``keep``."""
+        procs = str(CGROUP_ROOT / elsewhere.lstrip("/") / "cgroup.procs")
+        result = server.client.call_tool("escape", dict(arguments, procs=procs), deadline_s=GUARD_S)
+        escaped = int(result["content"][0]["text"])
+        self.pids.add(escaped)
+        self.assertEqual(_cgroup_of(escaped), elsewhere)
+        return escaped
+
+    def _close_held(self, server, elsewhere: str, before: set) -> dict:
+        """``close()`` in a helper thread; this test never hangs on it (its cleanup stops ``elsewhere`` first)."""
+        box = {}
+
+        def close() -> None:
+            started = time.monotonic()
+            box["outcome"] = server.close()
+            box["took"] = time.monotonic() - started
+
+        helper = threading.Thread(target=close, name="test-close-helper", daemon=True)
+        self.addCleanup(helper.join, GUARD_S)
+        self.addCleanup(subprocess.run, ["systemctl", "--user", "stop", "--", self.units[elsewhere]], timeout=60,
+                        capture_output=True)
+        helper.start()
+        helper.join(8.0)
+        self.assertFalse(helper.is_alive(), "close() still waits after 8 s on a pipe held outside the run")
+        return box
+
+    def _threads_end_once_elsewhere_stops(self, elsewhere: str, escaped: int, before: set) -> None:
+        subprocess.run(["systemctl", "--user", "stop", "--", self.units[elsewhere]], check=True, timeout=60,
+                       capture_output=True)
+        self.assertFalse(_alive(escaped))
+        deadline = time.monotonic() + GUARD_S
+        while time.monotonic() < deadline and [t for t in threading.enumerate() if t not in before]:
+            time.sleep(0.05)
+        self.assertEqual([t.name for t in threading.enumerate() if t not in before], [])
+
+    def test_closing_never_waits_on_an_output_pipe_a_process_outside_the_run_holds(self) -> None:
+        group = self._unit("run")
+        elsewhere = self._unit("elsewhere")
+        api, registry, run = self._api(group)
+        records = []
+        before = set(threading.enumerate())
+        server = self._start(registry, run, (sys.executable, "-I", "-c", HOLDER), on_record=records.append)
+        server.client.open(deadline_s=GUARD_S)
+        escaped = self._escape(server, elsewhere, keep=[0, 1])
+        box = self._close_held(server, elsewhere, before)
+        self.assertLess(box["took"], s.STREAM_WAIT_S + 3.0)  # the bound, and a margin of 3 s
+        self.assertEqual(box["outcome"].state, "leaf_empty")
+        self.assertEqual(server.streams_left, ("output",))
+        self.assertEqual(records, [{"record": s.STREAMS_LEFT_RECORD, "member_id": "mcp:stub", "streams": ["output"]}])
+        self.assertTrue(_alive(escaped))  # reported, never acted on
+        self._threads_end_once_elsewhere_stops(elsewhere, escaped, before)
+
+    def test_closing_never_waits_on_an_input_pipe_a_process_outside_the_run_holds(self) -> None:
+        group = self._unit("run")
+        elsewhere = self._unit("elsewhere")
+        api, registry, run = self._api(group)
+        records = []
+        before = set(threading.enumerate())
+        server = self._start(registry, run, (sys.executable, "-I", "-c", HOLDER), on_record=records.append)
+        server.client.open(deadline_s=GUARD_S)
+        escaped = self._escape(server, elsewhere, keep=[0], stop_reading=True)
+        call = server.client.begin_call("big", {"data": "x" * (1024 * 1024)}, deadline_s=GUARD_S)
+        time.sleep(0.5)  # shows only that the client's writer has had time to fill the pipe and block in its write
+        box = self._close_held(server, elsewhere, before)
+        self.assertLess(box["took"], s.STREAM_WAIT_S + 3.0)
+        self.assertEqual(box["outcome"].state, "leaf_empty")
+        self.assertEqual(server.streams_left, ("input",))
+        self.assertEqual(records, [{"record": s.STREAMS_LEFT_RECORD, "member_id": "mcp:stub", "streams": ["input"]}])
+        with self.assertRaises(Exception):
+            call.wait()
+        self._threads_end_once_elsewhere_stops(elsewhere, escaped, before)
+
+    def test_a_leaf_the_runs_stop_already_removed_closes_at_once(self) -> None:
+        group = self._unit("run")
+        api, registry, run = self._api(group)
+        out = Path(self.tmp.name, "pids.json")
+        server = s.start_server(s.ServerEntry("stub", (sys.executable, "-I", "-c", STUB, str(out))),
+                                registry=registry, run_id=run)  # the default kill_timeout
+        self.servers.append(server)
+        self.pids.add(server.pid)
+        server.client.open(deadline_s=GUARD_S)
+        info = self._info(out)
+        self._stop_and_check(api, registry, run, (info["pid"], info["child"]))
+        self.assertFalse(os.path.lexists(server.leaf.leaf))  # the run's Stop removed the leaf
+        for attempt in (1, 2):
+            with self.subTest(attempt=attempt):
+                with self.assertNoLogs(level="ERROR"):
+                    started = time.monotonic()
+                    outcome = server.close()
+                    took = time.monotonic() - started
+                self.assertLess(took, 1.0)
+                self.assertEqual(outcome.state, "leaf_empty")
+                self.assertTrue(getattr(server, "leaf_already_gone", False))
+        self.assertFalse(Path(f"/proc/{server.pid}").exists())  # reaped: no zombie is left
+
+    def test_a_name_already_on_the_runs_record_is_refused_before_any_launch(self) -> None:
+        group = self._unit("run")
+        api, registry, run = self._api(group)
+        first = self._start(registry, run, (sys.executable, "-I", "-c", STUB, str(Path(self.tmp.name, "first"))))
+        self._info(Path(self.tmp.name, "first"))
+        launches = []
+        launch = s.cgroup_leaf.DelegatedRoot.launch
+
+        def counted(root, name, *args, **kwargs):
+            launches.append(name)
+            return launch(root, name, *args, **kwargs)
+
+        with mock.patch.object(s.cgroup_leaf.DelegatedRoot, "launch", counted):
+            for moment in ("alive", "closed"):
+                if moment == "closed":
+                    first.close()
+                with self.subTest(moment=moment):
+                    with self.assertRaises(s.ServerStartRefused) as caught:
+                        self._start(registry, run, (sys.executable, "-I", "-c", STUB,
+                                                    str(Path(self.tmp.name, moment))))
+                    self.assertEqual((caught.exception.code, caught.exception.detail),
+                                     ("mcp_server_name_taken", "mcp:stub"))
+                    self.assertEqual(launches, [])
+            other = s.start_server(s.ServerEntry("other", (sys.executable, "-I", "-c", STUB,
+                                                            str(Path(self.tmp.name, "other")))),
+                                   registry=registry, run_id=run, kill_timeout=1.0)
+            self.servers.append(other)
+            self.pids.add(other.pid)
+            self._info(Path(self.tmp.name, "other"))
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(sorted(m["member_id"] for m in registry.get(run)["members"]), ["mcp:other", "mcp:stub"])
 
     def test_a_join_the_registry_refuses_leaves_no_server_running(self) -> None:
         group = self._unit("run")

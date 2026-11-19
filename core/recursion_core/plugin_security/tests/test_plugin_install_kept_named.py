@@ -27,6 +27,7 @@ from recursion_core.plugin_security.tests.test_plugin_install_only_proven import
     _Case,
     _extras_kept,
     _move_out,
+    _whole_kept,
     entries,
 )
 from recursion_core.plugin_security.tests.test_plugin_install_publish import _Stop
@@ -270,11 +271,21 @@ class LinkWayOutEverywhereTests(_KeptCase):
                 target = self.link_in_place(path)
                 for command in ("list", "install", "remove"):
                     argv = self.argv(command, self.roots["a"])
+                    if name == "plugin.py" and command == "remove":
+                        # A remove completes: the plugin's folder, link and all, is kept aside whole.
+                        folder, held = path.parent, entries(path.parent)
+                        status, said, _out = self.main(argv)
+                        kept = self._kept_places()[0] / "fixture.unsigned"
+                        self.assertEqual((0, f"{_whole_kept(folder, 'fixture.unsigned', kept)}\n"), (status, said))
+                        self.assertEqual(held, entries(kept))
+                        self.assertEqual([], self.listed_ids())
+                        break
                     self.assertEqual((1, f"refused: {code}\n{_link(path)}\n", ""), self.main(argv), command)
-                # The way out: the link moved out and what it stands for put in its place.
-                os.unlink(path)
-                os.rename(target, path)
-                self.assertEqual(["fixture.unsigned"], self.listed_ids())
+                else:
+                    # The way out: the link moved out and what it stands for put in its place.
+                    os.unlink(path)
+                    os.rename(target, path)
+                    self.assertEqual(["fixture.unsigned"], self.listed_ids())
 
     def test_a_manifest_sig_link_and_a_revocation_store_link_refuse_with_the_way_out(self):
         self.install_from(self.roots["a"])
@@ -282,10 +293,15 @@ class LinkWayOutEverywhereTests(_KeptCase):
         target = self.tmp / "a-signature"
         target.write_bytes(b"sig\n")
         signature.symlink_to(target)
-        for command in ("list", "install", "remove"):
+        for command in ("list", "install"):
             self.assertEqual((1, f"refused: plugin_directory_untrusted\n{_link(signature)}\n", ""),
                              self.main(self.argv(command, self.roots["a"])), command)
-        os.unlink(signature)
+        # A remove completes: the link is an entry the plugin was not installed with, kept aside, never followed.
+        status, said, _out = self.main(self.argv("remove", self.roots["a"]))
+        kept = self._kept_places()[0] / "fixture.unsigned"
+        self.assertEqual((0, f"{_extras_kept(signature.parent, 'fixture.unsigned', kept)}\n"), (status, said))
+        self.assertEqual(("link", str(target)), entries(kept)["./manifest.sig"])
+        self.assertEqual(b"sig\n", target.read_bytes())
         store = self.state / "plugin-security" / "revoked.sqlite3"
         store.parent.mkdir(parents=True, exist_ok=True)
         store.symlink_to(target)
@@ -374,6 +390,14 @@ class BorderTests(_KeptCase):
                 self.install_from(self.roots["a"])
                 folder = self._with_extras({"settings.json": b"{}\n", "plugin.py": b"CHANGED = True\n"})
                 held = entries(folder)
+                if command == "remove":
+                    # A remove completes: the whole folder, changed file and extra, is kept aside.
+                    status, said, _out = self.main(self._argvs()[command])
+                    kept = self._kept_places()[0] / "fixture.unsigned"
+                    self.assertEqual((0, f"{_whole_kept(folder, 'fixture.unsigned', kept)}\n"), (status, said))
+                    self.assertEqual(held, entries(kept))
+                    self.assertEqual("2\n", self.current())
+                    continue
                 self.assertEqual((1, f"refused: plugin_directory_untrusted\n{_move_out(folder)}\n", ""),
                                  self.main(self._argvs()[command]))
                 self.assertEqual(held, entries(folder))
@@ -386,10 +410,17 @@ class BorderTests(_KeptCase):
         self.link_in_place(folder / "plugin.py")
         held = entries(folder)
         for command, argv in self._argvs().items():
+            if command == "remove":
+                continue
             self.assertEqual((1, f"refused: plugin_file_untrusted\n{_link(folder / 'plugin.py')}\n", ""),
                              self.main(argv), command)
         self.assertEqual(held, entries(folder))
         self.assertEqual([], self._kept_places())
+        # A remove completes: the whole folder, link and extra, is kept aside; the link is never followed.
+        status, said, _out = self.main(self._argvs()["remove"])
+        kept = self._kept_places()[0] / "fixture.unsigned"
+        self.assertEqual((0, f"{_whole_kept(folder, 'fixture.unsigned', kept)}\n"), (status, said))
+        self.assertEqual(held, entries(kept))
 
     def test_an_own_file_with_only_its_mode_changed_is_proven_and_its_extras_are_kept(self):
         self.install_from(self.roots["a"])

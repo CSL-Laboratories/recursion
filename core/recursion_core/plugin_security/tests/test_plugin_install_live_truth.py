@@ -165,9 +165,11 @@ class FolderNotWrittenTests(LiveCase):
             "remove": (lambda: self.remove("fixture.unsigned"), self.argv("remove")),
         }
 
-    def _refused_with(self, sentence, folder, held):
+    def _refused_with(self, sentence, folder, held, commands=None):
         pointer, listing = self.current(), self.generations()
         for name, (command, argv) in self._commands().items():
+            if commands is not None and name not in commands:
+                continue
             with self.subTest(command=name):
                 refusal = self.refused(command)
                 self.assertEqual(("plugin_directory_untrusted", sentence), (refusal.code, refusal.detail))
@@ -197,7 +199,14 @@ class FolderNotWrittenTests(LiveCase):
         (folder / "plugin.py").write_bytes(b"CHANGED = True\n")
         held = self.tree(folder)
         sentence = f"The folder {folder} is not a plugin this command installed. {MOVE_OUT}"
-        self._refused_with(sentence, folder, held)
+        self._refused_with(sentence, folder, held, commands=("list", "install"))
+        # A remove completes: the changed folder is kept aside whole, never replaced or deleted.
+        result = self.remove("fixture.unsigned")
+        kept = self.gens() / ".kept-2" / "fixture.unsigned"
+        self.assertEqual([f"The folder {folder} of the plugin fixture.unsigned is not the copy this command "
+                          f"installed: it is kept at {kept}."], result["kept"])
+        self.assertEqual(held, self.tree(kept))
+        self.assertFalse(os.path.lexists(folder))
 
     def test_a_folder_whose_name_is_not_its_plugin_id_refuses_before_the_first_install(self):
         self.roots = self.registries()

@@ -60,6 +60,11 @@ def _extras_kept(folder, plugin_id, kept):
             f"they are kept at {kept}.")
 
 
+def _whole_kept(folder, plugin_id, kept, kind="folder"):
+    return (f"The {kind} {folder} of the plugin {plugin_id} is not the copy this command installed: "
+            f"it is kept at {kept}.")
+
+
 def entries(path):
     """Every entry at and under ``path`` by its relative path: its kind and, for a file, its bytes."""
     found = {}
@@ -328,12 +333,15 @@ class ExtraInAPluginFolderTests(_Case):
 
         install_mod._write_profile = write
         self.addCleanup(setattr, install_mod, "_write_profile", real)
-        refusal = self.refused(lambda: self.remove("fixture.unsigned"))
-        held = entries(folder)
-        self.assertEqual(("plugin_directory_untrusted", _move_out(folder)), (refusal.code, refusal.detail))
+        # A remove completes: the whole folder, changed file and extra, is kept aside; nothing is deleted.
+        result = self.remove("fixture.unsigned")
+        kept = self._kept_places()[0] / "fixture.unsigned"
+        held = entries(kept)
+        self.assertEqual([_whole_kept(folder, "fixture.unsigned", kept)], result["kept"])
         self.assertEqual(("file", b"{}\n"), held["./settings.json"])
-        self.assertEqual([], self._kept_places())
-        self.assertEqual("1\n", self.current())
+        self.assertEqual(("file", b"CHANGED = True\n"), held["./plugin.py"])
+        self.assertFalse(os.path.lexists(folder))
+        self.assertEqual("2\n", self.current())
 
     def test_a_folder_with_more_than_its_generation_placed_before_the_first_install_is_kept(self):
         self.write_live({})

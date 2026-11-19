@@ -272,7 +272,7 @@ def remove_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLi
     fd = _lock(config_path, wait=wait)
     try:
         _finish_publish(config_path)
-        snapshot = _load_snapshot(config_path)
+        snapshot = _load_snapshot(config_path, removing=plugin_id)
         if plugin_id not in snapshot.plugins:
             raise InstallRefused("plugin_not_installed")
         plugins = dict(snapshot.plugins)
@@ -282,7 +282,7 @@ def remove_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLi
         kept = Snapshot(snapshot.trusted_keys, grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
                         _labels_for(snapshot.labels, plugins), plugins, snapshot.developer_key_ids)
         notes = []
-        generation = _commit(config_path, kept, notes, report_kept)
+        generation = _commit(config_path, kept, notes, report_kept, removing=plugin_id)
         result = {"command": "remove", "plugin_id": plugin_id, "generation": generation, "plugins": _rows(kept)}
         return _with_notes(result, notes)
     finally:
@@ -577,7 +577,8 @@ def _read_record(config: Path):
                              show_detail=True) from None
 
 
-def _check_publish(config: Path, sources: list, staged: set, installed: Path | None = None) -> list:
+def _check_publish(config: Path, sources: list, staged: set, installed: Path | None = None,
+                   removing: str | None = None) -> list:
     """Before a publish changes the live tree, prove every live entry the swap would move is the installer's.
 
     The swap moves every live entry under a name the generation writes, of any kind, and every folder and
@@ -590,6 +591,10 @@ def _check_publish(config: Path, sources: list, staged: set, installed: Path | N
     ``installed`` is the current generation when no stopped publish is being finished. A folder of a
     plugin it holds, whose own files are each its copy byte for byte, does not refuse for entries it holds
     besides them: those are returned, as (plugin id, extra names), for the caller to keep aside.
+
+    ``removing`` is the plugin a remove drops (only with ``installed``). Its live entry, of any kind, never
+    refuses: when it is not a whole copy and not a proven folder with extras, it is returned as (plugin id,
+    None), for the caller to keep aside whole.
     """
     live = config / "plugins"
     extras = []
@@ -600,13 +605,16 @@ def _check_publish(config: Path, sources: list, staged: set, installed: Path | N
             continue
         path = live / name
         info = os.lstat(path)
-        if name not in staged and not (stat.S_ISLNK(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+        dropped = installed is not None and name == removing
+        if name not in staged and not dropped and not (stat.S_ISLNK(info.st_mode) or stat.S_ISDIR(info.st_mode)):
             continue  # the swap leaves it where it is
         if any(_same_tree(path, source / name) for source in sources):
             continue
         more = _extra_entries(path, installed / name) if installed is not None else None
         if not more:
-            raise _way_out(path)
+            if not dropped:
+                raise _way_out(path)
+            more = None  # the whole entry is kept aside
         extras.append((name, more))
     return extras
 
@@ -629,6 +637,10 @@ def _extra_entries(live: Path, written: Path) -> list | None:
 def _keep_extras(config: Path, number: int, extras: list, report=None) -> list:
     """Move each extra entry into ``plugin-generations/.kept-<number>/<plugin id>``. One line for each plugin.
 
+    An item whose extra names are None is a whole live entry (the plugin a remove drops): it is moved to
+    ``.kept-<number>/<plugin id>`` in one rename, so nothing is half moved, and a link is moved itself,
+    never followed.
+
     Each line goes to ``report`` as soon as every entry is moved, before any sync or later step can fail.
     When an entry cannot be moved, what was moved is put back, no kept folder is left, and the command
     refuses with the steps that end the refusal; an entry that cannot be put back is named by its line.
@@ -644,6 +656,14 @@ def _keep_extras(config: Path, number: int, extras: list, report=None) -> list:
         for name, more in extras:
             folder = config / "plugins" / name
             kept = place / name
+            if more is None:
+                try:
+                    os.rename(folder, kept)
+                except OSError as exc:
+                    failed = (name, folder, None, exc)
+                    raise
+                moved.append((name, folder, kept))
+                continue
             kept.mkdir(mode=0o700)
             made.append(kept)
             os.chmod(kept, 0o700)
@@ -660,21 +680,40 @@ def _keep_extras(config: Path, number: int, extras: list, report=None) -> list:
             _carry(exc, left)
             raise
         name, folder, entry, error = failed
+        if entry is None:
+            raise InstallRefused("plugin_directory_untrusted", detail=" ".join([*left, (
+                f"The folder {folder} of the plugin {name} is not the copy this command installed and cannot be "
+                f"moved aside ({error.strerror or error}). Move it out of {folder.parent} yourself (a folder must "
+                f"allow writing to be moved); then run the command again.")]), show_detail=True) from None
         raise InstallRefused("plugin_directory_untrusted", detail=" ".join([*left, (
             f"The folder {folder} holds {folder / entry}, which the plugin {name} was not installed with and "
             f"which cannot be moved aside ({error.strerror or error}). Move it out of {folder} yourself (a "
             f"folder must allow writing to be moved); then run the command again.")]), show_detail=True) from None
-    notes = [f"The folder {config / 'plugins' / name} held entries the plugin {name} was not installed with: "
-             f"they are kept at {place / name}." for name, _more in extras]
+    notes = [_kept_note(config, place, name, more) for name, more in extras]
     if report is not None:
         for line in notes:
             report(line)
-    for name, _more in extras:
-        _sync_dir(place / name)
-        _sync_dir(config / "plugins" / name)
+    for name, more in extras:
+        if more is not None:
+            _sync_dir(place / name)
+            _sync_dir(config / "plugins" / name)
+    if any(more is None for _name, more in extras):
+        _sync_dir(config / "plugins")  # the moved entry itself is not opened: it may be a link
     _sync_dir(place)
     _sync_dir(root)
     return notes
+
+
+def _kept_note(config: Path, place: Path, name: str, more) -> str:
+    """The line that names where the entries of the plugin ``name`` are kept."""
+    live = config / "plugins" / name
+    if more is not None:
+        return (f"The folder {live} held entries the plugin {name} was not installed with: they are kept at "
+                f"{place / name}.")
+    mode = os.lstat(place / name).st_mode
+    kind = "link" if stat.S_ISLNK(mode) else "folder" if stat.S_ISDIR(mode) else "file"
+    return (f"The {kind} {live} of the plugin {name} is not the copy this command installed: it is kept at "
+            f"{place / name}.")
 
 
 def _put_back(moved: list, made: list) -> list:
@@ -820,7 +859,8 @@ def _read_pointer(config: Path, name: str, form: re.Pattern):
     return match
 
 
-def _commit(config: Path, snapshot: Snapshot, notes: list | None = None, report=None) -> int:
+def _commit(config: Path, snapshot: Snapshot, notes: list | None = None, report=None,
+            removing: str | None = None) -> int:
     # The live plugins/ path is checked before any generation is written or the pointer moves.
     _check_live(config)
     root = config / "plugin-generations"
@@ -845,7 +885,7 @@ def _commit(config: Path, snapshot: Snapshot, notes: list | None = None, report=
         # Every live entry the swap would move is proven the installer's before anything is published.
         sources = [partial] + ([root / str(current)] if current is not None else [])
         installed = root / str(current) if current is not None else None
-        extras = _check_publish(config, sources, set(snapshot.plugins), installed)
+        extras = _check_publish(config, sources, set(snapshot.plugins), installed, removing)
         # Extra entries of a proven installed plugin folder are kept aside, never deleted, and named at once.
         lines = _keep_extras(config, number, extras, report)
         if notes is not None:
@@ -1017,10 +1057,12 @@ def _swap_into(plugins: Path, stage: Path, old: Path) -> None:
     _sync_dir(plugins)
 
 
-def _load_snapshot(config: Path) -> Snapshot:
+def _load_snapshot(config: Path, removing: str | None = None) -> Snapshot:
     """The live ``plugins/`` tree: its install.json and its plugin folders.
 
-    Once a generation is current, each live plugin folder must be the copy written into it.
+    Once a generation is current, each live plugin folder must be the copy written into it. ``removing`` is
+    the plugin a remove drops: its live entry is not read, the current generation's copy stands for it, and
+    the publish keeps the entry aside whole when it is not that copy.
     """
     current = _read_current(config)
     written = None
@@ -1034,7 +1076,7 @@ def _load_snapshot(config: Path) -> Snapshot:
         return Snapshot()
     if live.is_symlink():
         raise _link_refusal(live, "plugin_directory_untrusted")
-    return _read_profile(live, missing_install_ok=True, written=written)
+    return _read_profile(live, missing_install_ok=True, written=written, removing=removing)
 
 
 def _way_out(path: Path, plugin_id: str | None = None) -> InstallRefused:
@@ -1066,7 +1108,8 @@ def _named_way_out(path: Path) -> InstallRefused:
     return _way_out(path, held if _plugin_id_ok(held) else None)
 
 
-def _read_profile(directory: Path, *, missing_install_ok: bool, written: dict | None = None) -> Snapshot:
+def _read_profile(directory: Path, *, missing_install_ok: bool, written: dict | None = None,
+                  removing: str | None = None) -> Snapshot:
     # missing_install_ok is True for the live plugins/ tree only. ``written`` holds the current
     # generation's plugins, against which each live folder is checked.
     _require_owned_dir(directory, "generation_unreadable" if not missing_install_ok else "plugin_directory_untrusted")
@@ -1089,6 +1132,10 @@ def _read_profile(directory: Path, *, missing_install_ok: bool, written: dict | 
         if name == "install.json":
             continue
         path = directory / name
+        if written is not None and name == removing and name in written:
+            # The plugin a remove drops: its live entry, of any kind, is not opened here.
+            plugins[name] = written[name]
+            continue
         info = os.lstat(path)
         if stat.S_ISLNK(info.st_mode):
             if missing_install_ok:

@@ -37,3 +37,14 @@ MAX_BREACHES = 3
 # it does not speak) is cut to this many characters before anything else is done with it, and only then
 # escaped (``session._server_text``). A first value, not measured.
 MAX_SERVER_TEXT_CHARS = 200
+
+# The answers the client owes a server (``ping`` answers and refusals) and has not yet written are held to this
+# many encoded bytes; an answer that would pass it is dropped (``session.ANSWERS_DROPPED``). The value of the
+# Control MCP server's own bound on the answers it owes a client (``MAX_PENDING_REPLY_BYTES`` in
+# ``recursion_core.control.mcp.replies``). A first value, not measured.
+MAX_UNSENT_ANSWER_BYTES = 1024 * 1024
+
+# One listing of tools asks for at most this many pages (512 tools at the smallest useful page of 8); past it
+# the listing ends, cut (``session.TOOL_LIST_CUT``, reason ``session.LIST_CUT_PAGES``). A first value, not
+# measured.
+MAX_LIST_PAGES = 64

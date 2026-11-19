@@ -51,8 +51,23 @@ receives and a record ``{"record": <code>, ...}`` handed to ``on_record``; it to
   ``{RESULT_CUT: {"limit_bytes": ..., "text_bytes": <the text's whole size>}}``;
 * the tool list: listed to ``MAX_TOOLS`` (512); no page is asked for past it; ``list_tools`` returns a
   ``ToolList`` whose ``cut`` is ``TOOL_LIST_CUT`` (``None`` for a whole list);
+* one listing (a caller's ``list_tools`` and the relisting after a change notice): at most ``MAX_LIST_PAGES``
+  pages (64) and one deadline for the whole listing (the caller's, bounded by ``CALL_DEADLINE_S``; each page
+  waits only for what is left of it). Past either the listing ends: the tools read so far, ``cut`` is
+  ``TOOL_LIST_CUT`` and ``reason`` names the bound (``LIST_CUT_PAGES``, ``LIST_CUT_TIME``; ``None`` for the
+  tool count and for a whole list), the record carries the same ``reason``, and no page is asked for after it.
+  A first page that gets no answer still raises ``CALL_TIMEOUT``, as every call does. Cursors are remembered
+  as digests of one size, at most ``MAX_LIST_PAGES`` of them;
+* unsent answers: the answers the client owes the server (``ping`` answers, refusals, answers to messages that
+  are not valid JSON-RPC) and has not yet written are held to ``MAX_UNSENT_ANSWER_BYTES`` (1 MiB) of encoded
+  bytes, the rule of the Control MCP server's own reply queue: an answer is always taken when none is held, the
+  one being written counts until it is written, and an answer that would pass the bound is dropped (the server
+  is not reading). Requests and notices the caller's calls send are never dropped by it; they keep their own
+  deadlines. The first answer dropped gives the record ``{"record": ANSWERS_DROPPED, "pending_bytes": ...,
+  "limit_bytes": ...}`` and counts as a breach; the next answer taken gives ``{"record": ANSWERS_DROPPED,
+  "dropped": <the count>}``;
 * breaches: a call timeout at the client's own deadline (not a shorter one the caller asked for), a cut
-  result and a cut list each count as one breach; at ``MAX_BREACHES`` (3) in this session the server is
+  result, a cut list (by tools, pages or time) and each stretch of dropped answers count as one breach; at ``MAX_BREACHES`` (3) in this session the server is
   cut off: the breaching call still gets its own typed result, then the session ends ``SERVER_CUT_OFF``.
   The count belongs to this client session; a new session starts it again.
 
@@ -84,6 +99,7 @@ that is not valid JSON-RPC is answered as the Control MCP server answers it (``j
 from __future__ import annotations
 
 import collections
+import hashlib
 import itertools
 import threading
 import time
@@ -97,10 +113,12 @@ from .limits import (
     CALL_DEADLINE_S,
     INITIALIZE_DEADLINE_S,
     MAX_BREACHES,
+    MAX_LIST_PAGES,
     MAX_MESSAGE_BYTES,
     MAX_SERVER_TEXT_CHARS,
     MAX_TOOL_RESULT_TEXT_BYTES,
     MAX_TOOLS,
+    MAX_UNSENT_ANSWER_BYTES,
 )
 
 LATEST_PROTOCOL = "2026-07-28"
@@ -130,6 +148,11 @@ BAD_ANSWER = "mcp_bad_answer"
 # A limit that cut what the server sent while the session goes on (a record, and in the result).
 RESULT_CUT = "mcp_result_cut"
 TOOL_LIST_CUT = "mcp_tool_list_cut"
+# Which bound of one listing cut it (``ToolList.reason`` and the record's ``reason``).
+LIST_CUT_PAGES = "pages"
+LIST_CUT_TIME = "time"
+# Answers owed to a server that does not read were dropped (a record; the first counts as a breach).
+ANSWERS_DROPPED = "mcp_answers_dropped"
 
 
 def _server_text(value: Any) -> str:
@@ -170,9 +193,11 @@ def _ignore(_value: Any) -> None:
 
 
 class ToolList(list):
-    """The tools ``list_tools`` read; ``cut`` is ``TOOL_LIST_CUT`` when the list was listed to ``MAX_TOOLS``."""
+    """The tools ``list_tools`` read; ``cut`` is ``TOOL_LIST_CUT`` when the list was listed to ``MAX_TOOLS`` or
+    the listing was ended by one of its bounds, which ``reason`` then names (``LIST_CUT_PAGES``, ``LIST_CUT_TIME``)."""
 
     cut: str | None = None
+    reason: str | None = None
 
 
 class _Pending:
@@ -221,7 +246,9 @@ class McpClient:
         self._cond = threading.Condition()
         self._ids = itertools.count(1)
         self._pending: dict[int, _Pending] = {}
-        self._outbox: collections.deque[dict] = collections.deque()
+        self._outbox: collections.deque[tuple[dict, int]] = collections.deque()  # (message, its size if an answer)
+        self._unsent_answer_bytes = 0  # the answers owed and not yet written, the one being written included
+        self._answers_dropped = 0  # in the stretch of drops under way
         self._started = False
         self._relisting = self._relist_again = False
         self._tools: list = []
@@ -333,12 +360,26 @@ class McpClient:
             return list(self._tools)
 
     def list_tools(self, deadline_s: float = CALL_DEADLINE_S) -> ToolList:
+        limit_s = min(deadline_s, CALL_DEADLINE_S)
+        deadline = time.monotonic() + limit_s  # one deadline for the whole listing
         tools = ToolList()
-        listed = 0
+        listed = pages = 0
         cursor: str | None = None
-        seen: set[str] = set()
+        seen: set[bytes] = set()  # a digest of each cursor, never the cursor: one can be as long as a message
         while True:
-            result = self._request("tools/list", {} if cursor is None else {"cursor": cursor}, None, deadline_s).wait()
+            left = deadline - time.monotonic()
+            if pages and left <= 0:  # no page is asked for after the listing's deadline
+                tools.reason = LIST_CUT_TIME
+                break
+            params = {} if cursor is None else {"cursor": cursor}
+            try:
+                result = self._request("tools/list", params, None, left if pages else deadline_s).wait()
+            except McpClientError as exc:
+                if pages and exc.code == CALL_TIMEOUT and not isinstance(exc, McpSessionEnded):
+                    tools.reason = LIST_CUT_TIME  # a later page ran into the listing's deadline
+                    break
+                raise
+            pages += 1
             page = result.get("tools")
             if not isinstance(page, list):
                 raise McpClientError(BAD_ANSWER, "tools/list: tools is not a list")
@@ -351,13 +392,23 @@ class McpClient:
             cursor = result.get("nextCursor")
             if cursor is None:
                 break
-            if not isinstance(cursor, str) or cursor in seen:
+            digest = hashlib.sha256(cursor.encode("utf-8", "surrogatepass")).digest() if isinstance(cursor, str) else None
+            if digest is None or digest in seen:
                 raise McpClientError(BAD_ANSWER, "tools/list: nextCursor is not a new string")
-            seen.add(cursor)
+            if pages >= MAX_LIST_PAGES:  # no further page is asked for
+                tools.reason = LIST_CUT_PAGES
+                break
+            seen.add(digest)
+        if tools.reason is not None:
+            tools.cut = TOOL_LIST_CUT
         with self._cond:
             self._tools = list(tools)
         self._callback(self._on_tools, list(tools))
-        if tools.cut is not None:
+        if tools.reason == LIST_CUT_PAGES:
+            self._breach(TOOL_LIST_CUT, {"reason": LIST_CUT_PAGES, "limit": MAX_LIST_PAGES, "listed": listed})
+        elif tools.reason == LIST_CUT_TIME:
+            self._breach(TOOL_LIST_CUT, {"reason": LIST_CUT_TIME, "limit_s": limit_s, "listed": listed})
+        elif tools.cut is not None:
             self._breach(TOOL_LIST_CUT, {"limit": MAX_TOOLS, "listed": listed})
         return tools
 
@@ -408,9 +459,31 @@ class McpClient:
         with self._cond:
             if self.ending is not None:
                 return False
-            self._outbox.append(message)
+            self._outbox.append((message, 0))
             self._cond.notify_all()
             return True
+
+    def _answer(self, message: dict) -> None:
+        """Hand over an answer the client owes the server, or drop it (the module text, LIMITS: unsent answers)."""
+
+        size = len(encode(message))
+        started = resumed = 0
+        with self._cond:
+            if self.ending is not None:
+                return
+            if self._unsent_answer_bytes and self._unsent_answer_bytes + size > MAX_UNSENT_ANSWER_BYTES:
+                self._answers_dropped += 1
+                if self._answers_dropped == 1:
+                    started = self._unsent_answer_bytes
+            else:
+                resumed, self._answers_dropped = self._answers_dropped, 0
+                self._unsent_answer_bytes += size
+                self._outbox.append((message, size))
+                self._cond.notify_all()
+        if started:
+            self._breach(ANSWERS_DROPPED, {"pending_bytes": started, "limit_bytes": MAX_UNSENT_ANSWER_BYTES})
+        elif resumed:
+            self._callback(self._on_record, {"record": ANSWERS_DROPPED, "dropped": resumed})
 
     def _write_loop(self) -> None:
         while True:
@@ -419,8 +492,12 @@ class McpClient:
                     self._cond.wait()
                 if not self._outbox:
                     break
-                message = self._outbox.popleft()
-            if not self._writer.write(message):
+                message, size = self._outbox.popleft()
+            written = self._writer.write(message)
+            if size:
+                with self._cond:
+                    self._unsent_answer_bytes -= size
+            if not written:
                 self._end(OUTPUT_FAILED)
                 break
         try:
@@ -452,9 +529,9 @@ class McpClient:
             self._response(message)
         elif isinstance(kind, jsonrpc.Request):
             if kind.method == "ping":
-                self._send(jsonrpc.result(kind.id, {}))
+                self._answer(jsonrpc.result(kind.id, {}))
             else:
-                self._send(jsonrpc.error(kind.id, jsonrpc.METHOD_NOT_FOUND, "Method not found"))
+                self._answer(jsonrpc.error(kind.id, jsonrpc.METHOD_NOT_FOUND, "Method not found"))
                 self._callback(self._on_record, self._refused_record(kind.method))
         elif isinstance(kind, jsonrpc.Notification):
             if kind.method == "notifications/progress":
@@ -462,7 +539,7 @@ class McpClient:
             elif kind.method == "notifications/tools/list_changed":
                 self._schedule_relist()
         else:
-            self._send(jsonrpc.error(kind.id, kind.code, kind.message))
+            self._answer(jsonrpc.error(kind.id, kind.code, kind.message))
 
     @staticmethod
     def _refused_record(method: Any) -> dict:

@@ -1,0 +1,10 @@
+{
+  "recorded": "the installed binary on the builder's Windows laptop, Wed Nov 18 2026 (PST); standard output and standard error together, exit 0; text kept byte for byte (LF line ends)",
+  "binary": "opencode v2.2.7",
+  "argv": [
+    "opencode",
+    "--version"
+  ],
+  "exit_code": 0,
+  "output": "opencode v2.2.7\n"
+}

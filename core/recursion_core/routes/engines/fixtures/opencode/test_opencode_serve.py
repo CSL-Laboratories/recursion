@@ -1,0 +1,1977 @@
+"""The OpenCode serve drive on driver.v2's gate (lane ENGINE-E3, the brief's step 5), against fakes only.
+
+No OpenCode binary runs: a spy stands in for the launch path and gives back scripted processes; the abort is a
+recorded callable, and ``http_abort`` is checked against a small HTTP server of the test's own on 127.0.0.1. Run by
+name:
+
+    PYTHONPATH=core <python> -m unittest recursion_core.routes.engines.fixtures.opencode.test_opencode_serve
+"""
+
+from __future__ import annotations
+
+import base64
+import dis
+import http.server
+import inspect
+import json
+import os
+import re
+import socket
+import sys
+import threading
+import traceback
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from recursion_core.routes import contract as c
+from recursion_core.routes.driver import Declaration, DriverInputError, DriverRefused, DriverStateError
+from recursion_core.routes.engines import opencode as oc
+from recursion_core.routes.launch import ReadTimeout
+from recursion_core.subscription_routes import SubscriptionRouteRefused
+
+HERE = Path(__file__).resolve().parent
+ENV = {"PATH": "/usr/bin:/bin", "HOME": "/var/lib/recursion/homes/opencode", "OPENAI_API_KEY": "sk-made-up"}
+PORT = 41234
+URL = "http://127.0.0.1:41234"
+READY = "opencode server listening on http://127.0.0.1:41234\n"
+# What the installed binary printed, recorded once (ADDITIONS lines 229 and 232); never written by hand.
+RECORDED = {kind: json.loads((HERE / f"recorded-v2.2.7-{kind}.json").read_text("utf-8"))
+            for kind in ("version", "run-help", "serve-help")}
+VERSION = RECORDED["version"]["output"]   # what the caller fills from the detection that already runs
+
+
+class Process:
+    """A scripted process: ``lines`` is what read_line gives, in order; a ReadTimeout instance in it is raised."""
+
+    def __init__(self, lines=()) -> None:
+        self.lines = list(lines)
+        self.sent: list[str] = []
+        self.closes = 0
+        self.terminated = 0
+        self.timeouts: list[float] = []
+
+    def send(self, text: str) -> None:
+        assert self.closes == 0, "send after close_stdin"
+        self.sent.append(text)
+
+    def close_stdin(self) -> None:
+        self.closes += 1
+
+    def read_line(self, timeout: float):
+        self.timeouts.append(timeout)
+        if not self.lines:
+            return None
+        line = self.lines.pop(0)
+        if isinstance(line, BaseException):
+            raise line
+        return line
+
+    def terminate(self) -> None:
+        self.terminated += 1
+
+
+class Spy:
+    """Spawns the server first (with ``server_lines``), then one Process per turn."""
+
+    def __init__(self, server_lines=(READY,)) -> None:
+        self.server_lines = list(server_lines)
+        self.spawns: list[tuple[list, dict]] = []
+        self.processes: list[Process] = []
+
+    def __call__(self, argv: list, env: dict) -> Process:
+        self.spawns.append((list(argv), dict(env)))
+        process = Process(self.server_lines if argv[1] == "serve" else ())
+        self.processes.append(process)
+        return process
+
+
+class Clock:
+    def __init__(self, now: float = 100.0, step: float = 0.0) -> None:
+        self.now, self.step = now, step
+
+    def __call__(self) -> float:
+        value = self.now
+        self.now += self.step
+        return value
+
+
+def session(model="openai/gpt-5.5") -> dict:
+    return {"session_id": "ses-e3serve", "run_id": "run-e3serve",
+            "route": {"engine": "opencode", "model": model, "connection": {"kind": "api_key", "id": "k1"}}}
+
+
+def message(turn="turn-1", delivery="dlv-1", text="Run the tests.") -> dict:
+    return {"kind": "user_message", "turn_id": turn, "text": text, "delivery_id": delivery}
+
+
+def fixture_session_id(name: str) -> str:
+    p = oc.Parser(connection_id="api_key:k1", model=None, wall=lambda: 0.0, clock=lambda: 0.0)
+    for line in (HERE / name).read_bytes().splitlines(keepends=True):
+        p.feed(line)
+    return p.engine_session_id
+
+
+class Base(unittest.TestCase):
+    def make(self, spy=None, **kwargs) -> oc.ServeDriver:
+        self.spy = spy or Spy()
+        self.aborts: list[tuple[str, str]] = []
+        answer = kwargs.pop("abort_answer", True)
+
+        def abort(url, sid, *, password=None):   # the handle's password is the driver's to give
+            self.aborts.append((url, sid))
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        kwargs.setdefault("abort", abort)
+        kwargs.setdefault("port", lambda: PORT)
+        kwargs.setdefault("wall", lambda: 1794614400.0)
+        kwargs.setdefault("clock", Clock())
+        kwargs.setdefault("version", VERSION)
+        return oc.ServeDriver(self.spy, **kwargs)
+
+    def replay(self, driver, handle, name: str) -> list[dict]:
+        drafts = []
+        for line in (HERE / name).read_text("utf-8").splitlines(keepends=True):
+            drafts.extend(driver.parse(handle, line))
+        return drafts
+
+    def changed(self, driver, handle) -> int:
+        anomalies = driver._worker(handle)["turn"]["parser"].anomalies
+        return len([a for a in anomalies if a.endswith("conversation_changed")])
+
+    def turn_argv(self, index: int) -> list:
+        return self.spy.spawns[index][0]
+
+
+class PartsTests(unittest.TestCase):
+    def test_the_declaration_is_driver_v2s_record(self):
+        record = oc.serve_declaration()
+        self.assertEqual(record["flags"], {"multi_turn": True, "mid_turn_input": False, "interrupt": True,
+                                           "resume": True, "fork": False, "permission_bridge": False,
+                                           "typed_limits": True, "usage": True})
+        self.assertEqual((record["engine"], record["driver"], record["input_ack"]), ("opencode", 2, False))
+        self.assertEqual(Declaration.from_record(record), oc.ServeDriver.declaration)
+        record["flags"]["fork"] = True
+        self.assertFalse(oc.serve_declaration()["flags"]["fork"])   # a copy each time
+
+    def test_the_server_binds_the_loopback_address_on_the_picked_port(self):
+        self.assertEqual(oc.serve_argv(PORT), ["opencode", "serve", "--hostname", "127.0.0.1", "--port", "41234"])
+        self.assertEqual(oc.serve_argv(1, binary="/opt/oc/bin/opencode")[0], "/opt/oc/bin/opencode")
+        self.assertEqual(oc.serve_argv(65535)[-1], "65535")
+        for port in (0, 65536, -1, True, "80", 80.0, None):
+            with self.subTest(port=port):
+                with self.assertRaises(ValueError):
+                    oc.serve_argv(port)
+                with self.assertRaises(ValueError):
+                    oc.server_url(port)
+        for binary in ("", "a\nb", 5, " ", "-x"):
+            with self.subTest(binary=binary):
+                with self.assertRaises(ValueError):
+                    oc.serve_argv(PORT, binary=binary)
+
+    def test_only_the_readiness_line_for_the_picked_port_on_loopback_counts(self):
+        self.assertEqual(oc.listening_url(READY, PORT), URL)
+        self.assertEqual(oc.listening_url(READY.rstrip("\n"), PORT), URL)
+        self.assertEqual(oc.listening_url(READY.rstrip("\n") + "\r\n", PORT), URL)
+        for text in ("opencode server listening on http://0.0.0.0:41234\n",
+                     "opencode server listening on http://localhost:41234\n",
+                     "opencode server listening on http://127.0.0.1:41235\n",
+                     "opencode server listening on http://127.0.0.1:041234\n",
+                     "opencode server listening on https://127.0.0.1:41234\n",
+                     "opencode server listening on http://127.0.0.1:41234/x\n",
+                     "note: opencode server listening on http://127.0.0.1:41234\n",
+                     "OPENCODE SERVER LISTENING ON http://127.0.0.1:41234\n",
+                     None, b"opencode server listening on http://127.0.0.1:41234\n"):
+            with self.subTest(text=text):
+                self.assertIsNone(oc.listening_url(text, PORT))
+
+    def test_a_turn_attaches_to_the_loopback_server_only(self):
+        self.assertEqual(oc.attach_argv(URL, "openai/gpt-5.5"),
+                         ["opencode", "run", "--format", "json", "--model", "openai/gpt-5.5", "--attach", URL])
+        self.assertEqual(oc.attach_argv(URL, None, session="ses_abc"),
+                         ["opencode", "run", "--format", "json", "--attach", URL, "--session", "ses_abc"])
+        self.assertEqual(oc.attach_argv("http://127.0.0.1:65535", None)[-1], "http://127.0.0.1:65535")
+        for url in ("http://10.0.0.1:41234", "http://localhost:41234", "https://127.0.0.1:41234",
+                    "http://127.0.0.1:0", "http://127.0.0.1:65536", "http://127.0.0.1:041234",
+                    "http://127.0.0.1", URL + "/", URL + "\n", None):
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError):
+                    oc.attach_argv(url, None)
+        for sid in ("", "-x", "--model", "a\nb", "a\tb", "x" * 257, 5, "a" + chr(0xD800)):
+            with self.subTest(session=sid):
+                with self.assertRaises(ValueError):
+                    oc.attach_argv(URL, None, session=sid)
+        self.assertEqual(oc.attach_argv(URL, None, session="x" * 256)[-1], "x" * 256)
+
+    def test_a_picked_port_is_a_loopback_port(self):
+        self.assertTrue(oc._port_ok(oc.pick_port()))
+
+
+class StartTests(Base):
+    def test_start_runs_the_server_and_waits_for_its_line(self):
+        spy = Spy(["starting\n", "opencode server listening on http://127.0.0.1:41235\n", READY])
+        driver = self.make(spy)
+        handle = driver.start(session(), None, ENV)
+        self.assertEqual(spy.spawns, [(["opencode", "serve", "--hostname", "127.0.0.1", "--port", "41234"],
+                                       {**ENV, oc.PASSWORD_ENV: driver._worker(handle)["password"]})])
+        self.assertEqual(spy.processes[0].terminated, 0)
+        self.assertIsNone(handle.engine_session_id)
+        self.assertIsNone(handle.live_turn)
+
+    def test_a_server_that_gives_no_readiness_line_is_ended_and_start_refuses(self):
+        for lines in ([], ["starting\n"], ["opencode server listening on http://0.0.0.0:41234\n"],
+                      [ReadTimeout()], [ReadTimeout(), READY]):
+            with self.subTest(lines=lines):
+                spy = Spy(lines)
+                driver = self.make(spy)
+                with self.assertRaises(DriverStateError):
+                    driver.start(session(), None, ENV)
+                self.assertEqual(len(spy.spawns), 1)
+                self.assertEqual(spy.processes[0].terminated, 1)
+
+    def test_the_wait_is_bounded_by_ready_s_on_the_clock(self):
+        spy = Spy(["log\n"] * 50 + [READY])
+        driver = self.make(spy, clock=Clock(step=1.0), ready_s=5.0)
+        with self.assertRaises(DriverStateError):
+            driver.start(session(), None, ENV)
+        server = spy.processes[0]
+        self.assertEqual(server.terminated, 1)
+        self.assertEqual(server.timeouts, [4.0, 3.0, 2.0, 1.0])   # each read waits only what is left
+
+    def test_a_read_that_raises_ends_the_server_too(self):
+        spy = Spy([KeyboardInterrupt()])
+        driver = self.make(spy)
+        with self.assertRaises(KeyboardInterrupt):
+            driver.start(session(), None, ENV)
+        self.assertEqual(spy.processes[0].terminated, 1)
+
+    def test_a_route_the_parser_refuses_starts_nothing(self):
+        driver = self.make()
+        bad = session()
+        bad["route"]["connection"]["id"] = "a\nb"
+        with self.assertRaises((ValueError, DriverInputError)):
+            driver.start(bad, None, ENV)
+        with self.assertRaises(SubscriptionRouteRefused) as caught:
+            driver.start(session(model="-x/y"), None, ENV)
+        self.assertEqual(caught.exception.cause, "model_malformed")
+        self.assertEqual(self.spy.spawns, [])
+
+    def test_a_connection_the_gate_takes_and_the_parser_refuses_starts_nothing(self):
+        driver = self.make()
+        bad = session()
+        bad["route"]["connection"]["id"] = "k" + chr(0xD800)   # one line, so the gate takes it
+        with self.assertRaises(ValueError):
+            driver.start(bad, None, ENV)
+        self.assertEqual(self.spy.spawns, [])
+
+    def test_the_constructor_refuses_what_it_cannot_use(self):
+        for kwargs in ({"ready_s": 0}, {"ready_s": float("inf")}, {"ready_s": True}, {"port": 5},
+                       {"abort": None}, {"binary": ""}, {"clock": 1.0}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    oc.ServeDriver(Spy(), **kwargs)
+        with self.assertRaises(ValueError):
+            oc.ServeDriver(None)
+
+
+class TurnTests(Base):
+    def test_two_turns_reach_the_same_conversation(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        self.assertEqual(self.turn_argv(1), ["opencode", "run", "--format", "json", "--model", "openai/gpt-5.5",
+                                             "--server", URL])
+        self.assertEqual(self.spy.spawns[1][1], {**ENV, oc.PASSWORD_ENV: driver._worker(handle)["password"]})
+        first = self.spy.processes[1]
+        self.assertEqual((first.sent, first.closes), (["Run the tests."], 1))
+        drafts = self.replay(driver, handle, "synthetic-v1-tool-use.jsonl")
+        accepted = [d["payload"] for d in drafts if d["type"] == "input.accepted"]
+        self.assertEqual(accepted, [{"delivery_id": "dlv-1", "turn_id": "turn-1", "how": "new_turn"}])
+        sid = fixture_session_id("synthetic-v1-tool-use.jsonl")
+        self.assertEqual(handle.engine_session_id, sid)
+        self.assertEqual(self.changed(driver, handle), 0)
+        (result,) = driver.finish_turn(handle, 0)
+        self.assertEqual(result, {"type": "result", "payload": {"code": None, "detail": ""}})
+        self.assertIsNone(handle.live_turn)
+        driver.send(handle, message(turn="turn-2", delivery="dlv-2", text="And the docs."))
+        self.assertEqual(self.turn_argv(2)[-4:], ["--server", URL, "--session", sid])
+        self.assertEqual(self.spy.processes[2].sent, ["And the docs."])
+        drafts = self.replay(driver, handle, "synthetic-v1-tool-use.jsonl")
+        accepted = [d["payload"] for d in drafts if d["type"] == "input.accepted"]
+        self.assertEqual(accepted, [{"delivery_id": "dlv-2", "turn_id": "turn-2", "how": "new_turn"}])
+        self.assertEqual(handle.ignored_acceptances, 0)
+        self.assertEqual(self.changed(driver, handle), 0)
+        driver.finish_turn(handle, 0)
+        self.assertEqual(len([s for s in self.spy.spawns if s[0][1] == "serve"]), 1)   # one server for both turns
+        self.assertEqual(self.spy.processes[0].terminated, 0)
+
+    def test_the_binary_option_is_argv0_of_the_server_and_of_every_turn(self):
+        driver = self.make(binary="/opt/oc/bin/opencode")
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        self.assertEqual([argv[0] for argv, _ in self.spy.spawns], ["/opt/oc/bin/opencode"] * 2)
+
+    def test_only_a_step_start_accepts_the_message(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        for line in ("not json\n", '{"type":"text","timestamp":1,"sessionID":"ses_x","part":{"text":"hi"}}\n'):
+            self.assertNotIn("input.accepted", [d["type"] for d in driver.parse(handle, line)])
+        start = '{"type":"step_start","timestamp":1,"sessionID":"ses_x","part":{"type":"step-start"}}\n'
+        self.assertIn("input.accepted", [d["type"] for d in driver.parse(handle, start)])
+
+    def test_the_launched_model_is_held_to_the_guard_before_anything_starts(self):
+        for model, cause in (("Claude-Agent/sonnet", "claude_subscription_provider"),
+                             ("claude_max/x", "claude_subscription_provider"), ("gpt", "model_malformed")):
+            with self.subTest(model):
+                driver = self.make()
+                with self.assertRaises(SubscriptionRouteRefused) as caught:
+                    driver.start(session(model=model), None, ENV)
+                self.assertEqual(caught.exception.cause, cause)
+                with self.assertRaises(SubscriptionRouteRefused):
+                    driver.resume("ses_abc", session(model=model), None, ENV)
+                self.assertEqual(self.spy.spawns, [])
+
+    def test_a_turn_accepts_its_message_once(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        start = '{"type":"step_start","timestamp":1,"sessionID":"ses_x","part":{"type":"step-start"}}\n'
+        drafts = driver.parse(handle, start) + driver.parse(handle, start)
+        self.assertEqual([d["type"] for d in drafts].count("input.accepted"), 1)
+        self.assertEqual(handle.ignored_acceptances, 0)
+
+    def test_a_turn_whose_process_cannot_start_ends_and_the_next_turn_runs(self):
+        spy = Spy()
+        real = spy.__call__
+        failures = [OSError("no such file")]
+
+        def spawn(argv, env):
+            if argv[1] == "run" and failures:
+                raise failures.pop()
+            return real(argv, env)
+
+        driver = self.make(spy)
+        driver._spawn = spawn
+        handle = driver.start(session(), None, ENV)
+        with self.assertRaises(OSError):
+            driver.send(handle, message())
+        self.assertIsNone(handle.live_turn)
+        with self.assertRaises(DriverStateError):
+            driver.interrupt(handle, "turn-1")
+        driver.send(handle, message(turn="turn-2", delivery="dlv-2"))   # still the first turn that ran
+        self.assertEqual(spy.spawns[1][0][-2:], ["--server", URL])
+
+    def test_a_resumed_handle_passes_the_session_on_its_first_turn(self):
+        driver = self.make()
+        handle = driver.resume("ses_abc", session(model=None), None, ENV)
+        self.assertEqual(handle.engine_session_id, "ses_abc")
+        driver.send(handle, message())
+        self.assertEqual(self.turn_argv(1), ["opencode", "run", "--format", "json", "--server", URL,
+                                             "--session", "ses_abc"])
+
+    def test_a_resume_with_an_id_that_cannot_be_an_argv_value_starts_nothing(self):
+        driver = self.make()
+        for sid in ("-x", "a\tb"):
+            with self.subTest(sid=sid):
+                with self.assertRaises(DriverInputError):
+                    driver.resume(sid, session(), None, ENV)
+        self.assertEqual(self.spy.spawns, [])
+
+    def test_a_later_turn_without_a_conversation_id_is_refused_and_ended(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        self.assertEqual(driver.finish_turn(handle, None)[0]["payload"]["code"], c.ENGINE_EXITED)
+        with self.assertRaises(DriverStateError):
+            driver.send(handle, message(turn="turn-2", delivery="dlv-2"))
+        self.assertEqual(len(self.spy.spawns), 2)   # the server and the first turn only
+        self.assertIsNone(handle.live_turn)
+
+    def test_what_the_serve_drive_lacks_is_refused_with_nothing_started(self):
+        driver = self.make()
+        with self.assertRaises(DriverRefused):
+            driver.fork("ses_abc", "turn-1")
+        handle = driver.start(session(), None, ENV)
+        with self.assertRaises(DriverRefused) as caught:
+            driver.send(handle, {"kind": "approval_answer", "approval_id": "apr-1", "decision": "approve"})
+        self.assertEqual(caught.exception.flag, "permission_bridge")
+        driver.send(handle, message())
+        with self.assertRaises(DriverRefused) as caught:
+            driver.send(handle, message(delivery="dlv-2"))
+        self.assertEqual(caught.exception.flag, "mid_turn_input")
+        self.assertEqual(len(self.spy.spawns), 2)
+        self.assertEqual(self.spy.processes[1].sent, ["Run the tests."])
+
+    def test_a_typed_429_in_a_turn_is_a_limit_for_that_connection_and_the_turns_result(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        drafts = self.replay(driver, handle, "synthetic-v1-limit-429.jsonl")
+        (limit,) = [d["payload"] for d in drafts if d["type"] == "limit"]
+        self.assertEqual((limit["connection_id"], limit["reset_at"]), ("api_key:k1", "2026-11-14T00:02:00.000Z"))
+        self.assertEqual(driver.finish_turn(handle, 1)[0]["payload"]["code"], c.PLAN_LIMIT)
+
+    def test_each_turn_has_its_own_parser(self):
+        driver = self.make()
+        handle = driver.resume("ses_abc", session(), None, ENV)
+        driver.send(handle, message())
+        self.replay(driver, handle, "synthetic-v1-limit-429.jsonl")
+        self.assertEqual(driver.finish_turn(handle, 1)[0]["payload"]["code"], c.PLAN_LIMIT)
+        driver.send(handle, message(turn="turn-2", delivery="dlv-2"))
+        self.assertEqual(driver.finish_turn(handle, 0)[0]["payload"]["code"], None)   # the old limit stays behind
+
+    def test_a_turn_that_reports_another_conversation_is_recorded(self):
+        driver = self.make()
+        handle = driver.resume("ses_other", session(), None, ENV)
+        driver.send(handle, message())
+        self.replay(driver, handle, "synthetic-v1-tool-use.jsonl")
+        self.assertEqual(handle.engine_session_id, "ses_other")
+        self.assertEqual(self.changed(driver, handle), 1)
+
+    def test_parse_and_finish_without_a_turn_are_refused(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        with self.assertRaises(DriverStateError):
+            driver.parse(handle, '{"type":"text"}\n')
+        with self.assertRaises(DriverStateError):
+            driver.finish_turn(handle, 0)
+
+    def test_an_exit_code_the_parser_refuses_leaves_the_turn_in_progress(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        for bad in ("0", True, 1.0):
+            with self.subTest(bad=bad):
+                with self.assertRaises(DriverInputError):
+                    driver.finish_turn(handle, bad)
+                self.assertEqual(handle.live_turn, "turn-1")
+        driver.finish_turn(handle, 0)
+        self.assertIsNone(handle.live_turn)
+
+
+class InterruptAndCloseTests(Base):
+    def started_turn(self, **kwargs):
+        driver = self.make(**kwargs)
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        return driver, handle
+
+    def test_an_interrupt_asks_the_server_to_abort_the_session(self):
+        driver, handle = self.started_turn()
+        self.replay(driver, handle, "synthetic-v1-tool-use.jsonl")
+        driver.interrupt(handle, "turn-1")
+        self.assertEqual(self.aborts, [(URL, handle.engine_session_id)])
+        self.assertEqual(self.spy.processes[1].terminated, 0)
+        self.assertEqual(handle.live_turn, "turn-1")          # the turn ends through finish_turn
+        driver.finish_turn(handle, 0)
+        self.assertIsNone(handle.live_turn)
+
+    def test_without_an_answer_from_the_server_the_turns_process_is_ended(self):
+        for answer in (False, None, 1, OSError("refused"), ValueError("x")):
+            with self.subTest(answer=answer):
+                driver, handle = self.started_turn(abort_answer=answer)
+                self.replay(driver, handle, "synthetic-v1-tool-use.jsonl")
+                driver.interrupt(handle, "turn-1")
+                self.assertEqual(len(self.aborts), 1)
+                self.assertEqual(self.spy.processes[1].terminated, 1)
+                self.assertEqual(self.spy.processes[0].terminated, 0)
+
+    def test_before_any_conversation_id_the_turns_process_is_ended_without_an_ask(self):
+        driver, handle = self.started_turn()
+        driver.interrupt(handle, "turn-1")
+        self.assertEqual(self.aborts, [])
+        self.assertEqual(self.spy.processes[1].terminated, 1)
+
+    def test_an_interrupt_of_another_turn_is_refused_by_the_gate(self):
+        driver, handle = self.started_turn()
+        with self.assertRaises(DriverStateError):
+            driver.interrupt(handle, "turn-9")
+        self.assertEqual((self.aborts, self.spy.processes[1].terminated), ([], 0))
+
+    def test_a_close_between_turns_stops_the_server(self):
+        driver, handle = self.started_turn()
+        driver.finish_turn(handle, 0)
+        driver.send(handle, {"kind": "close"})
+        self.assertEqual(self.spy.processes[0].terminated, 1)
+        with self.assertRaises(DriverStateError):
+            driver.finish_turn(handle, 0)
+
+    def test_a_close_during_a_turn_stops_the_server_once_the_turn_is_finished(self):
+        driver, handle = self.started_turn()
+        driver.send(handle, {"kind": "close"})
+        self.assertEqual(self.spy.processes[0].terminated, 0)
+        self.assertEqual(self.spy.processes[1].closes, 1)
+        driver.finish_turn(handle, 0)
+        self.assertEqual((self.spy.processes[0].terminated, self.spy.processes[1].terminated), (1, 0))
+
+    def test_release_stops_both_processes_once(self):
+        driver, handle = self.started_turn()
+        driver.release(handle)
+        driver.release(handle)
+        self.assertEqual((self.spy.processes[0].terminated, self.spy.processes[1].terminated), (1, 1))
+        with self.assertRaises(DriverStateError):
+            driver.parse(handle, '{"type":"text"}\n')
+
+    def test_two_handles_have_two_servers(self):
+        driver = self.make()
+        one = driver.start(session(), None, ENV)
+        two = driver.start(session(), None, ENV)
+        driver.release(one)
+        self.assertEqual((self.spy.processes[0].terminated, self.spy.processes[1].terminated), (1, 0))
+        driver.send(two, message())
+        self.assertEqual(self.turn_argv(2)[-2:], ["--server", URL])
+
+
+class Recorder(http.server.BaseHTTPRequestHandler):
+    status = 200
+    seen: list = []
+
+    def do_POST(self):  # noqa: N802 (the handler's own name)
+        length = int(self.headers.get("Content-Length") or 0)
+        self.seen.append((self.command, self.path, self.rfile.read(length)))
+        self.send_response(self.status)
+        if 300 <= self.status < 400:
+            self.send_header("Location", f"http://127.0.0.1:{self.server.server_address[1]}/followed")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_GET = do_POST  # noqa: N815 (a followed redirect would arrive as a GET)
+
+    def log_message(self, *args):
+        pass
+
+
+class HttpAbortTests(unittest.TestCase):
+    def serve(self, status: int) -> str:
+        handler = type("H", (Recorder,), {"status": status, "seen": []})
+        server = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop():
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+        self.addCleanup(stop)
+        self.handler = handler
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    def test_the_abort_is_a_post_to_the_sessions_abort_path(self):
+        url = self.serve(200)
+        self.assertTrue(oc.http_abort(url, "ses_a/b c"))
+        self.assertEqual(self.handler.seen, [("POST", "/session/ses_a%2Fb%20c/abort", b"")])
+
+    def test_an_answer_that_is_not_2xx_is_no_abort(self):
+        for status in (404, 500):
+            with self.subTest(status=status):
+                self.assertFalse(oc.http_abort(self.serve(status), "ses_x"))
+
+    def test_a_redirect_is_not_followed(self):
+        for status in (301, 302, 303, 307, 308):
+            with self.subTest(status=status):
+                self.assertFalse(oc.http_abort(self.serve(status), "ses_x"))
+                self.assertEqual([seen[:2] for seen in self.handler.seen], [("POST", "/session/ses_x/abort")])
+
+    def test_nothing_listening_is_no_abort(self):
+        url = self.serve(200)
+        port = int(url.rsplit(":", 1)[1])
+        self.doCleanups()   # the server is gone; its port is closed
+        self.assertFalse(oc.http_abort(f"http://127.0.0.1:{port}", "ses_x", timeout=5.0))
+
+    def test_only_the_loopback_server_is_asked(self):
+        for url in ("http://10.0.0.1:80", "http://localhost:80", "https://127.0.0.1:80", None):
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError):
+                    oc.http_abort(url, "ses_x")
+        with self.assertRaises(ValueError):
+            oc.http_abort("http://127.0.0.1:80", "-x")
+
+
+def step_start(sid: str, part_type: str = "step-start") -> str:
+    return ('{"type":"step_start","timestamp":1,"sessionID":"%s","part":{"type":"%s"}}\n' % (sid, part_type))
+
+
+class OnceRaisingLock:
+    """A lock whose first acquire raises ``KeyboardInterrupt``: an interruption landing exactly there."""
+
+    def __init__(self) -> None:
+        self.lock, self.armed = threading.RLock(), True
+
+    def acquire(self, *args, **kwargs):
+        if self.armed:
+            self.armed = False
+            raise KeyboardInterrupt("one interruption at the first entry")
+        return self.lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self.lock.release()
+
+    def _is_owned(self) -> bool:
+        return self.lock._is_owned()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        if self._is_owned():
+            self.release()
+        return False
+
+
+class HookLock:
+    """The driver's lock, counting acquires: before acquire ``n`` it calls ``hooks[n]`` once (a call landing there)."""
+
+    def __init__(self, lock, hooks: dict) -> None:
+        self.lock, self.hooks, self.entries = lock, dict(hooks), 0
+
+    def acquire(self, *args, **kwargs):
+        self.entries += 1
+        hook = self.hooks.pop(self.entries, None)
+        if hook is not None:
+            hook()
+        return self.lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self.lock.release()
+
+    def _is_owned(self) -> bool:
+        return self.lock._is_owned()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        if self._is_owned():
+            self.release()
+        return False
+
+
+class ReleaseAndRaceTests(Base):
+    """#421's first round: release is terminal and owns what it stops; nothing is left running or reserved."""
+
+    def started_turn(self, **kwargs):
+        driver = self.make(**kwargs)
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        return driver, handle
+
+    def test_a_release_while_a_turns_spawn_runs_terminates_the_late_process_unwritten(self):
+        entered, go = threading.Event(), threading.Event()
+        spy = Spy()
+
+        def spawn(argv, env):
+            process = spy(argv, env)
+            if argv[1] == "run":
+                entered.set()
+                if not go.wait(30):   # a watchdog only: the test sets it
+                    raise AssertionError("the test never let the spawn return")
+            return process
+
+        driver = self.make(spy)
+        driver._spawn = spawn
+        handle = driver.start(session(), None, ENV)
+        errors = []
+
+        def send():
+            try:
+                driver.send(handle, message())
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=send)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(30))
+            driver.release(handle)   # does not wait for the spawn
+            self.assertEqual(spy.processes[0].terminated, 1)
+            self.assertIn(id(handle), driver._workers)   # still owed the process the spawn will give back
+        finally:
+            go.set()
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
+        server, turn = spy.processes
+        self.assertEqual((turn.terminated, turn.sent, turn.closes), (1, [], 0))
+        self.assertEqual([type(e) for e in errors], [DriverStateError])
+        self.assertEqual(driver._workers, {})
+        self.assertIsNone(handle.live_turn)
+        driver.release(handle)
+        self.assertEqual((server.terminated, turn.terminated), (1, 1))
+
+    def test_a_released_handle_refuses_every_later_call(self):
+        driver, handle = self.started_turn()
+        driver.release(handle)
+        self.assertIsNone(handle.live_turn)   # not left busy: the next message is refused as released
+        for call in (lambda: driver.send(handle, message(turn="turn-2", delivery="dlv-2")),
+                     lambda: driver.parse(handle, '{"type":"text"}\n'), lambda: driver.finish_turn(handle, 0),
+                     lambda: driver.interrupt(handle, "turn-3"), lambda: driver.send(handle, {"kind": "close"})):
+            with self.assertRaises(DriverStateError):
+                call()
+            self.assertIsNone(handle.live_turn)
+        self.assertEqual(len(self.spy.spawns), 2)
+        self.assertEqual([p.terminated for p in self.spy.processes], [1, 1])
+
+    def test_a_release_between_the_registration_and_the_write_leaves_the_prompt_unwritten(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver._lock = HookLock(driver._lock, {4: lambda: driver.release(handle)})   # the 4th entry in send
+        with self.assertRaises(DriverStateError):
+            driver.send(handle, message())
+        server, turn = self.spy.processes
+        self.assertEqual((turn.sent, turn.terminated, server.terminated), ([], 1, 1))
+        self.assertIsNone(handle.live_turn)
+        self.assertEqual(driver._workers, {})
+
+    def test_a_release_just_before_the_spawn_starts_nothing(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver._lock = HookLock(driver._lock, {2: lambda: driver.release(handle)})   # the 2nd entry in send
+        with self.assertRaises(DriverStateError):
+            driver.send(handle, message())
+        self.assertEqual(len(self.spy.spawns), 1)   # the server only
+        self.assertEqual(self.spy.processes[0].terminated, 1)
+        self.assertIsNone(handle.live_turn)
+        self.assertEqual(driver._workers, {})
+
+    def test_an_interruption_in_a_termination_keeps_every_process_not_yet_ended_owed(self):
+        driver, handle = self.started_turn()
+        server, turn = self.spy.processes
+        real, cuts = turn.terminate, [KeyboardInterrupt("cut short")]
+
+        def terminate():
+            if cuts:
+                raise cuts.pop()
+            real()
+
+        turn.terminate = terminate
+        with self.assertRaises(KeyboardInterrupt):
+            driver.release(handle)
+        self.assertEqual((turn.terminated, server.terminated), (0, 0))   # the server was not reached
+        driver.release(handle)
+        self.assertEqual((turn.terminated, server.terminated), (1, 1))
+        self.assertEqual(driver._workers, {})
+
+    def test_one_termination_that_raises_leaves_the_other_tried_and_itself_owed(self):
+        for failing in (0, 1):   # the server's, then the turn's process
+            with self.subTest(failing=failing):
+                driver, handle = self.started_turn()
+                processes = self.spy.processes
+                victim, real = processes[failing], processes[failing].terminate
+                failures = [OSError("synthetic: cannot terminate")]
+
+                def terminate(victim=victim, real=real, failures=failures):
+                    if failures:
+                        raise failures.pop()
+                    real()
+
+                victim.terminate = terminate
+                with self.assertRaises(OSError):
+                    driver.release(handle)
+                self.assertEqual([p.terminated for p in processes], [0 if p is victim else 1 for p in processes])
+                self.assertIn(id(handle), driver._workers)
+                for call, args in ((driver.send, (message(turn="turn-2", delivery="dlv-2"),)),
+                                   (driver.parse, ('{"type":"text"}\n',)), (driver.finish_turn, (0,)),
+                                   (driver.send, ({"kind": "close"},))):
+                    with self.assertRaises(DriverStateError):
+                        call(handle, *args)
+                self.assertEqual([p.terminated for p in processes], [0 if p is victim else 1 for p in processes])
+                driver.release(handle)   # tries the owed one again, and only it
+                self.assertEqual([p.terminated for p in processes], [1, 1])
+                self.assertEqual(driver._workers, {})
+
+    def test_an_interruption_at_the_handles_registration_terminates_the_server(self):
+        for resume in (False, True):
+            with self.subTest(resume=resume):
+                driver = self.make()
+                driver._lock = OnceRaisingLock()
+                with self.assertRaises(KeyboardInterrupt):
+                    if resume:
+                        driver.resume("ses_abc", session(), None, ENV)
+                    else:
+                        driver.start(session(), None, ENV)
+                self.assertEqual(self.spy.processes[0].terminated, 1)
+                self.assertEqual(driver._workers, {})
+
+    def test_a_server_whose_termination_fails_at_start_leaves_the_first_error(self):
+        spy = Spy([])
+        driver = self.make(spy)
+        failed = []
+
+        def spawn(argv, env):
+            process = spy(argv, env)
+
+            def terminate():
+                failed.append(1)
+                raise OSError("synthetic: cannot terminate")
+
+            process.terminate = terminate
+            return process
+
+        driver._spawn = spawn
+        with self.assertRaises(DriverStateError) as caught:
+            driver.start(session(), None, ENV)
+        self.assertEqual(failed, [1])
+        self.assertTrue(any("cannot terminate" in note for note in caught.exception.__notes__))
+
+    def test_a_reported_session_id_a_later_turn_cannot_pass_is_not_adopted(self):
+        for sid in ("-invalid-session", ".."):
+            with self.subTest(sid=sid):
+                driver, handle = self.started_turn()
+                drafts = driver.parse(handle, step_start(sid))
+                self.assertIsNone(handle.engine_session_id)
+                anomalies = driver._worker(handle)["turn"]["parser"].anomalies
+                unusable = [a for a in anomalies if a.endswith("session_id_unusable")]
+                self.assertEqual(unusable, ["line 1: session_id_unusable"])
+                self.assertIn("input.accepted", [d["type"] for d in drafts])   # the engine did take the message
+                driver.finish_turn(handle, 0)
+                with self.assertRaises(DriverStateError):
+                    driver.send(handle, message(turn="turn-2", delivery="dlv-2"))
+                self.assertIsNone(handle.live_turn)   # the refused turn is ended: the next call is not busy
+                with self.assertRaises(DriverStateError):
+                    driver.interrupt(handle, "turn-2")
+                self.assertEqual(len(self.spy.spawns), 2)
+
+    def test_a_turn_whose_preparation_raises_ends_and_spawns_nothing(self):
+        for raised, expected in ((KeyboardInterrupt("cut short"), KeyboardInterrupt),
+                                 (ValueError("session"), DriverStateError)):
+            with self.subTest(raised=raised):
+                driver = self.make()
+                handle = driver.start(session(), None, ENV)
+                with mock.patch.object(oc, "server_argv", side_effect=raised):
+                    with self.assertRaises(expected):
+                        driver.send(handle, message())
+                self.assertIsNone(handle.live_turn)
+                self.assertEqual(len(self.spy.spawns), 1)
+                driver.send(handle, message(turn="turn-2", delivery="dlv-2"))   # the first turn that runs
+                self.assertEqual(self.spy.processes[1].sent, ["Run the tests."])
+
+    def test_an_abort_cut_short_still_terminates_the_turn_and_the_same_exception_leaves(self):
+        for raised in (KeyboardInterrupt("stop"), SystemExit(3), GeneratorExit()):
+            with self.subTest(raised=type(raised).__name__):
+                driver = self.make(abort_answer=raised)
+                handle = driver.resume("ses_abc", session(), None, ENV)
+                driver.send(handle, message())
+                with self.assertRaises(type(raised)) as caught:
+                    driver.interrupt(handle, "turn-1")
+                self.assertIs(caught.exception, raised)
+                self.assertEqual((len(self.aborts), self.spy.processes[1].terminated), (1, 1))
+                self.assertEqual(self.spy.processes[0].terminated, 0)
+
+    def test_an_abort_cut_short_whose_termination_also_fails_still_leaves_as_itself(self):
+        driver = self.make(abort_answer=KeyboardInterrupt("stop"))
+        handle = driver.resume("ses_abc", session(), None, ENV)
+        driver.send(handle, message())
+
+        def terminate():
+            raise OSError("synthetic: cannot terminate")
+
+        self.spy.processes[1].terminate = terminate
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            driver.interrupt(handle, "turn-1")
+        self.assertTrue(any("cannot terminate" in note for note in caught.exception.__notes__))
+
+    def test_a_finish_between_the_gate_and_the_interrupt_is_a_state_error(self):
+        driver, handle = self.started_turn()
+        entered, go = threading.Event(), threading.Event()
+        real = driver._interrupt
+        errors = []
+
+        def paused(h, turn_id):
+            entered.set()
+            if not go.wait(30):   # a watchdog only: the test sets it
+                raise AssertionError("the test never let the interrupt go on")
+            return real(h, turn_id)
+
+        driver._interrupt = paused
+
+        def interrupt():
+            try:
+                driver.interrupt(handle, "turn-1")
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=interrupt)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(30))   # past the gate's check that turn-1 is in progress
+            driver.finish_turn(handle, 0)
+        finally:
+            go.set()
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([type(e) for e in errors], [DriverStateError])
+        self.assertEqual((self.aborts, self.spy.processes[1].terminated), ([], 0))
+
+    def test_two_finishers_of_one_turn_give_one_result(self):
+        driver, handle = self.started_turn()
+        parser = driver._worker(handle)["turn"]["parser"]
+        real, entered, go = parser.end, threading.Event(), threading.Event()
+        results, errors = [], []
+
+        def end(exit_code):
+            if not entered.is_set():   # only the first finisher waits here
+                entered.set()
+                if not go.wait(30):   # a watchdog only: the test sets it
+                    raise AssertionError("the test never let the finish go on")
+            return real(exit_code)
+
+        parser.end = end
+
+        def finish():
+            try:
+                results.append(driver.finish_turn(handle, 0))
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=finish)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(30))
+            with self.assertRaises(DriverStateError):
+                driver.finish_turn(handle, 1)
+            self.assertEqual(handle.live_turn, "turn-1")
+        finally:
+            go.set()
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual((errors, [r[0]["payload"]["code"] for r in results]), ([], [None]))
+        self.assertIsNone(handle.live_turn)
+        with self.assertRaises(DriverStateError):
+            driver.finish_turn(handle, 0)
+
+    def test_a_finish_interrupted_part_way_completes_the_same_turn_when_called_again(self):
+        for after_the_outcome in (False, True):
+            with self.subTest(after_the_outcome=after_the_outcome):
+                driver, handle = self.started_turn()
+                parser = driver._worker(handle)["turn"]["parser"]
+                real_end, real_check, cuts = parser.end, oc.check_draft, [KeyboardInterrupt("cut short")]
+
+                def end(exit_code, real_end=real_end, cuts=cuts, after=after_the_outcome):
+                    if cuts and not after:
+                        raise cuts.pop()
+                    return real_end(exit_code)
+
+                def check(draft, real_check=real_check, cuts=cuts, after=after_the_outcome):
+                    if cuts and after:
+                        raise cuts.pop()
+                    return real_check(draft)
+
+                parser.end = end
+                with mock.patch.object(oc, "check_draft", check):
+                    with self.assertRaises(KeyboardInterrupt):
+                        driver.finish_turn(handle, 0)
+                    self.assertEqual(handle.live_turn, "turn-1")
+                    (result,) = driver.finish_turn(handle, 1)   # the outcome reached first stands
+                self.assertEqual(result["payload"]["code"], c.ENGINE_EXITED if not after_the_outcome else None)
+                self.assertIsNone(handle.live_turn)
+
+    def test_a_prompt_write_that_raised_is_never_accepted(self):
+        spy = Spy()
+
+        def spawn(argv, env):
+            process = spy(argv, env)
+            if argv[1] == "run":
+                def send(text):
+                    raise BrokenPipeError("synthetic: the write failed")
+                process.send = send
+            return process
+
+        driver = self.make(spy)
+        driver._spawn = spawn
+        handle = driver.start(session(), None, ENV)
+        with self.assertRaises(BrokenPipeError):
+            driver.send(handle, message())
+        drafts = driver.parse(handle, step_start("ses_x"))
+        self.assertNotIn("input.accepted", [d["type"] for d in drafts])
+        driver.release(handle)
+        self.assertEqual([p.terminated for p in spy.processes], [1, 1])
+
+    def test_only_a_well_formed_step_start_accepts_the_message(self):
+        driver, handle = self.started_turn()
+        self.assertNotIn("input.accepted", [d["type"] for d in driver.parse(handle, step_start("ses_x", "text"))])
+        self.assertIn("input.accepted", [d["type"] for d in driver.parse(handle, step_start("ses_x"))])
+
+    def test_a_session_id_of_dots_is_never_an_argv_value_or_a_path(self):
+        for sid in (".", ".."):
+            with self.subTest(sid=sid):
+                with self.assertRaises(ValueError):
+                    oc.attach_argv(URL, None, session=sid)
+                with self.assertRaises(ValueError):
+                    oc.http_abort(URL, sid)
+                with self.assertRaises(DriverInputError):
+                    self.make().resume(sid, session(), None, ENV)
+        self.assertEqual(oc.attach_argv(URL, None, session="...")[-1], "...")
+
+
+class ProxyTests(unittest.TestCase):
+    def test_the_proxy_environment_is_never_used(self):
+        target_fixture, proxy_fixture = HttpAbortTests("test_nothing_listening_is_no_abort"), \
+            HttpAbortTests("test_nothing_listening_is_no_abort")
+        target, proxy = target_fixture.serve(200), proxy_fixture.serve(200)
+        self.addCleanup(target_fixture.doCleanups)
+        self.addCleanup(proxy_fixture.doCleanups)
+        names = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+        with mock.patch.dict(os.environ, {**{n: proxy for n in names}, "no_proxy": "", "NO_PROXY": ""}):
+            self.assertTrue(oc.http_abort(target, "ses_x"))
+        self.assertEqual(target_fixture.handler.seen, [("POST", "/session/ses_x/abort", b"")])
+        self.assertEqual(proxy_fixture.handler.seen, [])
+
+
+def _cut_each_line(fn):
+    """The line numbers of ``fn``'s body after its docstring: a test interrupts once before each of them."""
+    lines, first = inspect.getsourcelines(fn)
+    # A ``try:`` line is the one instruction of a try statement that its own handler does not cover (CPython 3.12
+    # and 3.14): an interruption there is the window before the region, and is not walked.
+    body = [first + i for i, text in enumerate(lines)
+            if text.strip() and not text.strip().startswith(("#", "def ", "try:"))]
+    doc = fn.__doc__ is not None
+    if doc:   # skip the docstring's lines
+        end = next(i for i, text in enumerate(lines) if i and text.rstrip().endswith('"""'))
+        body = [n for n in body if n > first + end]
+    return body
+
+
+def _interrupt_before(fn, lineno):
+    """A tracer that raises one KeyboardInterrupt in ``fn`` just before line ``lineno`` runs (bounded: once)."""
+    fired = []
+
+    def trace(frame, event, arg):
+        if frame.f_code is fn.__code__:
+            if event == "line" and frame.f_lineno == lineno and not fired:
+                fired.append(lineno)
+                raise KeyboardInterrupt("one synthetic interruption")
+            return trace
+        return None
+
+    return trace, fired
+
+
+class ServeRoundTwoTests(unittest.TestCase):
+    """#421 round 2: astra C1-C7, sol 1-7, DeepSeek r2 N1-N3. Every wait is bounded; every process is a fake."""
+
+    def make(self, spawn=None, **kw):
+        spy = spawn or Spy()
+        return oc.ServeDriver(spy, port=lambda: PORT, **{"version": VERSION, **kw}), spy
+
+    def begun(self, **kw):
+        driver, spy = self.make(**kw)
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        return driver, spy, handle
+
+    def run_cut(self, fn, lineno, call):
+        trace, fired = _interrupt_before(fn, lineno)
+        sys.settrace(trace)
+        try:
+            call()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            sys.settrace(None)
+        return fired
+
+    # DeepSeek N1 / astra C1 / sol 1: a release after the last check waits for the write, then terminates
+    def test_a_release_during_the_write_waits_for_it_and_then_terminates(self):
+        driver, spy = self.make()
+        handle = driver.start(session(), None, ENV)
+        lines, first = inspect.getsourcelines(oc.ServeDriver._send)
+        target = first + next(i for i, text in enumerate(lines) if 'process.send(item["text"])' in text)
+        entered, go, released, out = threading.Event(), threading.Event(), threading.Event(), []
+
+        def trace(frame, event, arg):
+            if frame.f_code is oc.ServeDriver._send.__code__:
+                if event == "line" and frame.f_lineno == target:
+                    entered.set()
+                    go.wait(5)
+                return trace
+            return None
+
+        def send():
+            sys.settrace(trace)
+            try:
+                driver.send(handle, message())
+                out.append("normal")
+            except BaseException as err:   # noqa: BLE001 (the kind is the answer)
+                out.append(type(err).__name__)
+            finally:
+                sys.settrace(None)
+
+        sender = threading.Thread(target=send, daemon=True)
+        releaser = threading.Thread(target=lambda: (driver.release(handle), released.set()), daemon=True)
+        sender.start()
+        self.assertTrue(entered.wait(5))
+        releaser.start()
+        early = released.wait(0.2)
+        go.set()
+        sender.join(5)
+        releaser.join(15)
+        self.assertFalse(sender.is_alive() or releaser.is_alive())
+        self.assertFalse(early)   # it waited for the write in progress
+        self.assertEqual((out, spy.processes[1].sent, [p.terminated for p in spy.processes]),
+                         (["normal"], ["Run the tests."], [1, 1]))
+        self.assertEqual(driver._workers, {})
+
+    # astra C2 / sol 2: an interruption anywhere in release or in its cleanup loses no process
+    def test_one_interruption_anywhere_in_release_or_its_cleanup_loses_no_process(self):
+        for fn in (oc.ServeDriver.release, oc.ServeDriver._clean):
+            for lineno in _cut_each_line(fn):
+                with self.subTest(fn=fn.__name__, line=lineno):
+                    driver, spy, handle = self.begun()
+                    fired = self.run_cut(fn, lineno, lambda d=driver, h=handle: d.release(h))
+                    driver.release(handle)
+                    if fired:
+                        self.assertTrue(all(p.terminated >= 1 for p in spy.processes))
+                        self.assertEqual(driver._workers, {})
+                        self.assertIsNone(handle.live_turn)
+
+    # astra C3 / sol 3 / DeepSeek N4: the server is owned from its spawn; a failed termination keeps an owner
+    def test_a_start_that_fails_after_the_spawn_terminates_its_server_or_keeps_it_owed(self):
+        for lineno in _cut_each_line(oc.ServeDriver._start):
+            for resume in (False, True):
+                with self.subTest(line=lineno, resume=resume):
+                    driver, spy = self.make()
+                    call = (lambda d=driver: d.resume("ses_old", session(), None, ENV)) if resume \
+                        else (lambda d=driver: d.start(session(), None, ENV))
+                    fired = self.run_cut(oc.ServeDriver._start, lineno, call)
+                    if fired and spy.processes:
+                        self.assertEqual(spy.processes[0].terminated, 1)
+                        self.assertEqual(driver._workers, {})
+        server = Process([])   # no readiness line, and a termination that fails once
+        failures = [OSError("synthetic: not terminated")]
+
+        def terminate():
+            if failures:
+                raise failures.pop()
+            server.terminated += 1
+
+        server.terminate = terminate
+        driver, _ = self.make(lambda argv, env: server)
+        with self.assertRaises(DriverStateError) as caught:
+            driver.start(session(), None, ENV)
+        self.assertTrue(caught.exception.__notes__)
+        (worker,) = driver._workers.values()   # the failed cleanup keeps a reachable owner
+        self.assertEqual(worker["live"], [server])
+        driver._clean(worker)
+        self.assertEqual((server.terminated, driver._workers), (1, {}))
+
+    def test_an_interruption_at_the_registration_leaves_nothing_started(self):
+        driver, spy = self.make()
+
+        class Cut(dict):
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                raise KeyboardInterrupt("registered, then interrupted")
+
+        driver._workers = Cut()
+        with self.assertRaises(KeyboardInterrupt):
+            driver.start(session(), None, ENV)
+        self.assertTrue(all(p.terminated == 1 for p in spy.processes))
+        self.assertEqual(dict(driver._workers), {})
+
+    # astra C4 / sol 6: a finish interrupted before the gate's transition can be asked again
+    def test_one_interruption_anywhere_in_finish_turn_leaves_it_retryable(self):
+        for lineno in _cut_each_line(oc.ServeDriver.finish_turn):
+            with self.subTest(line=lineno):
+                driver, spy, handle = self.begun()
+                fired = self.run_cut(oc.ServeDriver.finish_turn, lineno,
+                                     lambda d=driver, h=handle: d.finish_turn(h, 0))
+                if fired and handle.live_turn is not None:
+                    self.assertIsNone(driver.finish_turn(handle, 0)[0]["payload"]["code"])
+                self.assertIsNone(handle.live_turn)
+                driver.release(handle)
+
+    # astra C5 / sol 5 / DeepSeek N2: the original exception survives a cleanup that raises BaseException
+    def test_the_original_exception_survives_a_cleanup_that_raises(self):
+        for cleanup in (OSError("synthetic"), SystemExit("synthetic cleanup cancellation")):
+            with self.subTest(cleanup=type(cleanup).__name__):
+                original = KeyboardInterrupt("synthetic abort cancellation")
+
+                def abort(url, sid, *, password=None, original=original):
+                    raise original
+
+                driver, spy = self.make(abort=abort)
+                handle = driver.resume("ses_old", session(), None, ENV)
+                driver.send(handle, message())
+
+                def terminate(cleanup=cleanup):
+                    raise cleanup
+
+                real, spy.processes[1].terminate = spy.processes[1].terminate, terminate
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    driver.interrupt(handle, "turn-1")
+                self.assertIs(caught.exception, original)
+                self.assertTrue(original.__notes__)
+                spy.processes[1].terminate = real
+                driver.release(handle)
+                self.assertEqual(driver._workers, {})
+
+    # astra C6 / sol 5 / DeepSeek N3: a late process whose cleanup fails: DriverStateError, noted, still owed
+    def test_a_late_cleanup_failure_is_noted_on_the_state_refusal(self):
+        server, turn, holder = Process([READY]), Process(), {}
+        failures = [OSError("synthetic: not terminated")]
+
+        def terminate():
+            if failures:
+                raise failures.pop()
+            turn.terminated += 1
+
+        turn.terminate = terminate
+
+        def spawn(argv, env):
+            if argv[1] == "serve":
+                return server
+            holder["driver"].release(holder["handle"])   # released while the turn's spawn runs
+            return turn
+
+        driver, _ = self.make(spawn)
+        holder["driver"], holder["handle"] = driver, driver.start(session(), None, ENV)
+        with self.assertRaises(DriverStateError) as caught:
+            driver.send(holder["handle"], message())
+        self.assertTrue(caught.exception.__notes__)
+        self.assertEqual(turn.sent, [])
+        self.assertIn(id(holder["handle"]), driver._workers)
+        driver.release(holder["handle"])
+        self.assertEqual((server.terminated, turn.terminated, driver._workers), (1, 1, {}))
+
+    # sol 4 / astra C7: an interruption anywhere in a turn's start leaves no live turn without a process
+    def test_one_interruption_anywhere_in_send_leaves_no_turn_without_its_process(self):
+        for lineno in _cut_each_line(oc.ServeDriver._send):
+            with self.subTest(line=lineno):
+                driver, spy = self.make()
+                handle = driver.start(session(), None, ENV)
+                fired = self.run_cut(oc.ServeDriver._send, lineno, lambda d=driver, h=handle: d.send(h, message()))
+                if not fired:
+                    driver.release(handle)
+                    continue
+                if handle.live_turn is not None:
+                    self.assertIsNotNone(driver._worker(handle)["turn"]["process"])
+                driver.release(handle)
+                self.assertTrue(all(p.terminated == 1 for p in spy.processes))
+                self.assertEqual(driver._workers, {})
+
+    # astra C7 / sol 7: two cleaners at once keep a failing process reachable
+    def test_two_cleaners_keep_a_failing_process_reachable(self):
+        driver, spy, handle = self.begun()
+        entered, go, errors, calls = threading.Event(), threading.Event(), [], []
+        turn = spy.processes[1]
+        real = turn.terminate
+
+        def terminate():
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set()
+                go.wait(5)
+                raise OSError("synthetic: not terminated")
+            real()
+
+        turn.terminate = terminate
+
+        def release():
+            try:
+                driver.release(handle)
+            except BaseException as err:   # noqa: BLE001 (the kind is the answer)
+                errors.append(type(err).__name__)
+
+        first, second = threading.Thread(target=release, daemon=True), threading.Thread(target=release, daemon=True)
+        first.start()
+        self.assertTrue(entered.wait(5))
+        second.start()
+        second.join(5)
+        go.set()
+        first.join(5)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual(errors, ["OSError"])
+        driver.release(handle)
+        self.assertEqual(([p.terminated for p in spy.processes], driver._workers), ([1, 1], {}))
+
+
+class ServeReviewThreadTests(unittest.TestCase):
+    """The Devin review threads on #421, and #414's two for the serve drive. Every wait is bounded."""
+
+    def test_a_malformed_abort_reply_is_no_abort(self):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        srv.settimeout(5)
+        self.addCleanup(srv.close)
+
+        def answer():
+            conn, _ = srv.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(b"no status line at all\r\n\r\n")
+
+        replier = threading.Thread(target=answer, daemon=True)
+        replier.start()
+        self.assertIs(oc.http_abort(f"http://127.0.0.1:{srv.getsockname()[1]}", "ses_abc"), False)
+        replier.join(5)
+
+    def test_a_process_appended_while_a_cleaner_removes_another_stays_owned(self):
+        driver = oc.ServeDriver(Spy(), port=lambda: PORT, version=VERSION)
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        worker = driver._workers[id(handle)]
+        late = Process()
+
+        class Racing(list):   # the turn spawn's unlocked append lands after the cleaner read, before it writes
+            fired = False
+
+            def land(self):
+                if not Racing.fired:
+                    Racing.fired = True
+                    list.append(self, late)
+
+            def __setitem__(self, key, value):
+                self.land()
+                list.__setitem__(self, key, value)
+
+            def __delitem__(self, key):
+                self.land()
+                list.__delitem__(self, key)
+
+        worker["live"] = Racing(worker["live"])
+        driver.finish_turn(handle, 0)          # takes the turn's own process off the list
+        self.assertTrue(any(p is late for p in worker["live"]))
+        driver.release(handle)
+        self.assertEqual((late.terminated, driver._workers), (1, {}))
+
+    def test_a_start_the_serve_drive_would_not_run_as_asked_is_refused(self):
+        workspace = {"path": "/repo", "mode": "worktree", "base_ref": "main", "worktree_path": "/repo-wt"}
+        codex = session()
+        codex["route"] = dict(codex["route"], engine="codex")
+        for start, ws, field in ((codex, None, "route.engine"), (session(), workspace, "workspace")):
+            with self.subTest(field=field):
+                spy = Spy()
+                with self.assertRaises(DriverInputError) as caught:
+                    oc.ServeDriver(spy, port=lambda: PORT, version=VERSION).start(start, ws, ENV)
+                self.assertEqual((caught.exception.field, spy.processes), (field, []))
+
+
+def _table_codes():
+    """The code a release walks while it holds, or is about to hold, the table lock."""
+    codes = {oc.ServeDriver.release.__code__}
+    under = getattr(oc.ServeDriver, "_under", None)
+    if under is not None:
+        codes.add(under.__code__)
+    return codes
+
+
+def _traced(run, codes, at=None):
+    """Count opcode events in ``codes``. Raise one KeyboardInterrupt at event number ``at`` (from 0).
+
+    Returns ``(how many events, where it was raised or None, the exception the call let out or None)``.
+    ``where`` is ``(code, f_lasti)``. Instruction events are switched back on before the run: a previous
+    tracer, or a function's first run, can leave them off."""
+    counted = [0]
+    where = [None]
+    cut = KeyboardInterrupt("one synthetic interruption")
+    leaked = [None]
+
+    def points(frame, event, arg):
+        if event == "opcode":
+            if counted[0] == at:
+                where[0] = (frame.f_code, frame.f_lasti)
+                raise cut
+            counted[0] += 1
+        return points
+
+    def calls(frame, event, arg):
+        if event == "call" and frame.f_code in codes:
+            frame.f_trace_opcodes = True
+            frame.f_trace_lines = False
+            return points
+        return None
+
+    sys.settrace(calls)
+    sys.monitoring.restart_events()
+    try:
+        try:
+            run()
+        except BaseException as exc:  # noqa: BLE001 - the call's own exception is the answer
+            leaked[0] = exc
+    finally:
+        sys.settrace(None)
+    return counted[0], where[0], leaked[0]
+
+
+def _marker(where) -> bool:
+    """The 3.14 instruction after a conditional jump that is not taken. No signal is delivered there."""
+    if where is None or sys.version_info < (3, 14):
+        return False
+    code, offset = where
+    name = next((ins.opname for ins in dis.get_instructions(code) if ins.offset == offset), "")
+    if name != "NOT_TAKEN":
+        return False
+    return not any(entry.start <= offset < entry.end for entry in dis.Bytecode(code).exception_entries)
+
+
+def _owned(lock) -> bool:
+    if hasattr(lock, "_is_owned"):
+        return lock._is_owned()
+    return lock.locked()
+
+
+def _other_takes(lock) -> bool:
+    got = []
+
+    def take():
+        ok = lock.acquire(timeout=0.3)
+        got.append(ok)
+        if ok:
+            lock.release()
+
+    thread = threading.Thread(target=take, daemon=True)
+    thread.start()
+    thread.join(1.0)
+    return got == [True] and not thread.is_alive()
+
+
+class MediumInterruptTests(Base):
+    """DeepSeek round 4, the three MEDIUM rows. One interruption, at the instruction the line walk never reaches."""
+
+    def begun(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        return driver, self.spy, handle
+
+    def test_an_interruption_after_the_busy_append_does_not_keep_the_process(self):
+        driver, spy, handle = self.begun()
+        worker = driver._worker(handle)
+
+        class CutBusy(list):
+            def append(self, item):
+                list.append(self, item)
+                raise KeyboardInterrupt("after the busy append, before the flag")
+
+        worker["busy"] = CutBusy()
+        with self.assertRaises(KeyboardInterrupt):
+            driver.release(handle)
+        worker["busy"] = list(worker["busy"])   # the cut has fired; the retry is the driver's own list
+        driver.release(handle)
+        self.assertGreaterEqual(spy.processes[0].terminated, 1)
+        self.assertGreaterEqual(spy.processes[1].terminated, 1)
+        self.assertEqual(driver._workers, {})
+        self.assertIsNone(handle.live_turn)
+
+    def test_an_interruption_after_finishing_is_set_can_finish_the_same_turn(self):
+        driver, _spy, handle = self.begun()
+        worker = driver._worker(handle)
+
+        class CutTurn(dict):
+            armed = True
+
+            def __setitem__(self, key, value):
+                dict.__setitem__(self, key, value)
+                if key == "finishing" and value is True and CutTurn.armed:
+                    CutTurn.armed = False
+                    raise KeyboardInterrupt("after finishing, before the claim")
+
+        worker["turn"] = CutTurn(worker["turn"])
+        with self.assertRaises(KeyboardInterrupt):
+            driver.finish_turn(handle, 0)
+        drafts = driver.finish_turn(handle, 0)
+        self.assertIsNone(drafts[0]["payload"]["code"])
+        self.assertIsNone(handle.live_turn)
+        driver.release(handle)
+        self.assertEqual(driver._workers, {})
+
+    def _prime(self, codes, total) -> None:
+        """Traced releases with no cut, until every instruction event is back. An earlier cut can switch one off."""
+        seen = []
+        for _ in range(8):
+            driver, _spy, handle = self.begun()
+            seen.append(_traced(lambda d=driver, h=handle: d.release(h), codes)[0])
+            if seen[-1] == total:
+                return
+        self.fail(f"instruction events did not come back: {seen}, of {total}")
+
+    def test_an_interruption_after_the_table_lock_is_taken_does_not_keep_it(self):
+        codes = _table_codes()
+        counts = []
+        for _ in range(8):
+            driver, _spy, handle = self.begun()
+            counts.append(_traced(lambda d=driver, h=handle: d.release(h), codes)[0])
+            if len(counts) >= 2 and counts[-1] == counts[-2] and counts[-1] > 8:
+                break
+        total = counts[-1]
+        self.assertGreater(total, 8, f"instruction events did not come back: {counts}")
+        for at in range(total):
+            where = raised = driver = None
+            for _aim in range(3):
+                self._prime(codes, total)
+                driver, _spy, handle = self.begun()
+                _count, where, raised = _traced(lambda d=driver, h=handle: d.release(h), codes, at)
+                if where is not None:
+                    break
+            with self.subTest(point=at):
+                self.assertIsNotNone(where, "the interruption was raised at the point it was aimed at")
+                self.assertIsInstance(raised, KeyboardInterrupt)
+                if _marker(where):
+                    while _owned(driver._lock):
+                        driver._lock.release()
+                    continue
+                self.assertFalse(_owned(driver._lock))
+                self.assertTrue(_other_takes(driver._lock))
+
+
+def _codes_under(code):
+    """``code`` and every nested code object it holds."""
+    found = []
+
+    def walk(item):
+        if item in found:
+            return
+        found.append(item)
+        for const in item.co_consts:
+            if isinstance(const, type(item)):
+                walk(const)
+
+    walk(code)
+    return found
+
+
+class ServeRoundFiveTests(unittest.TestCase):
+    """Round 5: a cut while a turn is starting must not leave a published turn or a live process."""
+
+    def test_an_interruption_while_a_turn_starts_leaves_nothing_owed(self):
+        # One interruption at each instruction of the send, including a try line and the nested
+        # publish. Afterwards a release must end the gate turn, terminate every process, and drop
+        # the worker. An RLock acquired from its owner looks free, so the settle does not do that.
+        codes = _codes_under(oc.ServeDriver._send.__code__)
+        code_ids = set(codes)
+        broken = []
+        for code in codes:
+            for inst in dis.get_instructions(code):
+                if inst.opname in ("RESUME", "CACHE", "NOT_TAKEN"):
+                    continue
+                # The store of the spawn's return is the instruction that binds it. Raised before that
+                # store runs, the return is still on the stack: the driver does not have it yet.
+                if inst.opname in ("STORE_FAST", "STORE_DEREF") and inst.argrepr == "process":
+                    continue
+                spy = Spy()
+                driver = oc.ServeDriver(spy, port=lambda: PORT, version=VERSION)
+                handle = driver.start(session(), None, ENV)
+                fired = []
+
+                def trace(frame, event, arg, code=code, offset=inst.offset, fired=fired):
+                    if fired:
+                        return None
+                    if frame.f_code in code_ids:
+                        frame.f_trace_opcodes = True
+                        if frame.f_code is code and event == "opcode" and frame.f_lasti == offset:
+                            fired.append(1)
+                            sys.settrace(None)
+                            raise KeyboardInterrupt
+                        return trace
+                    return None
+
+                sys.settrace(trace)
+                try:
+                    driver.send(handle, message())
+                except BaseException:  # noqa: BLE001 - the cut is the point; the settle is the assertion
+                    pass
+                finally:
+                    sys.settrace(None)
+                if not fired:
+                    continue
+                try:
+                    driver.release(handle)
+                except BaseException:  # noqa: BLE001 - a second release is the one that finishes a partial stop
+                    try:
+                        driver.release(handle)
+                    except BaseException:
+                        pass
+                owed = driver._workers != {} or handle.live_turn is not None or any(
+                    p.terminated < 1 for p in spy.processes)
+                if owed:
+                    broken.append((code.co_name, inst.offset, inst.opname,
+                                   handle.live_turn, [p.terminated for p in spy.processes],
+                                   bool(driver._workers)))
+        self.assertEqual(broken, [])
+
+    def test_an_empty_parse_after_a_start_already_read_does_not_accept(self):
+        # The start is fed while the write is still inside send, so delivery is not set yet.
+        # The empty parse afterwards reads no line. It must not accept. The next start must.
+        entered, go = threading.Event(), threading.Event()
+        spy = Spy()
+
+        def spawn(argv, env):
+            process = spy(argv, env)
+            if len(argv) > 1 and argv[1] == "run":
+                real = process.send
+
+                def send(text, _real=real):
+                    entered.set()
+                    if not go.wait(5):
+                        raise TimeoutError("the early parse did not finish")
+                    _real(text)
+
+                process.send = send
+            return process
+
+        driver = oc.ServeDriver(spy, port=lambda: PORT, version=VERSION)
+        driver._spawn = spawn
+        handle = driver.start(session(), None, ENV)
+        box: dict = {}
+
+        def sender():
+            try:
+                driver.send(handle, message())
+            except BaseException as exc:  # noqa: BLE001 - the sender must not die silent
+                box["error"] = exc
+
+        thread = threading.Thread(target=sender)
+        thread.start()
+        self.assertTrue(entered.wait(5))
+        early = driver.parse(handle, step_start("ses_x"))
+        self.assertNotIn("input.accepted", [d["type"] for d in early])
+        go.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("error", box)
+        empty = driver.parse(handle, "")
+        self.assertNotIn("input.accepted", [d["type"] for d in empty])
+        later = driver.parse(handle, step_start("ses_x"))
+        self.assertIn("input.accepted", [d["type"] for d in later])
+        driver.release(handle)
+
+    def test_release_names_the_calls_that_need_the_server(self):
+        self.assertIn("every later call that needs the handle's server", oc.ServeDriver.__doc__)
+
+    def test_the_abort_text_says_the_status_line_decides(self):
+        self.assertIn("The status line decides", oc.http_abort.__doc__)
+
+
+class RecordedV2Tests(Base):
+    """The serve drive drives OpenCode v2 (ADDITIONS lines 229 and 232, RPrompt151): each turn is the argv the
+    recorded ``opencode run --help`` of v2.2.7 shows (``--server``; v2 has no ``--attach``), the server the argv its
+    recorded ``opencode serve --help`` shows, and any other major, or none, is refused before any argv is built."""
+
+    @staticmethod
+    def flags(kind: str) -> set:
+        return set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", RECORDED[kind]["output"]))
+
+    def test_the_recordings_are_of_the_one_major_the_serve_drive_drives(self):
+        self.assertEqual([RECORDED[k]["argv"] for k in ("version", "run-help", "serve-help")],
+                         [["opencode", "--version"], ["opencode", "run", "--help"], ["opencode", "serve", "--help"]])
+        self.assertEqual(oc.SERVE_MAJOR, 2)
+        self.assertEqual(oc.version_major(VERSION), oc.SERVE_MAJOR)
+        self.assertEqual(oc.version_major("1.19.6\n"), 1)   # 1.x prints the bare number (RPrompt151's census)
+
+    def test_each_turn_is_the_v2_argv_the_recorded_run_help_shows(self):
+        flags = self.flags("run-help")
+        self.assertNotIn("--attach", flags)
+        self.assertTrue({"--format", "--model", "--session", "--server"} <= flags)
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        driver.send(handle, message())
+        self.assertEqual(self.turn_argv(1), ["opencode", "run", "--format", "json", "--model", "openai/gpt-5.5",
+                                             "--server", URL])
+        driver.finish_turn(handle, 0)
+        resumed = driver.resume("ses_abc", session(model=None), None, ENV)
+        driver.send(resumed, message(turn="turn-9", delivery="dlv-9"))
+        self.assertEqual(self.spy.spawns[3][0], ["opencode", "run", "--format", "json", "--server", URL,
+                                                 "--session", "ses_abc"])
+        for argv, _ in self.spy.spawns:
+            with self.subTest(argv=argv):
+                self.assertNotIn("--attach", argv)
+                if argv[1] == "run":
+                    self.assertLessEqual({a for a in argv if a.startswith("--")}, flags)
+
+    def test_the_server_is_the_argv_the_recorded_serve_help_shows(self):
+        self.assertIn("opencode serve [flags]", RECORDED["serve-help"]["output"])
+        driver = self.make()
+        driver.start(session(), None, ENV)
+        argv = self.spy.spawns[0][0]
+        self.assertEqual(argv, ["opencode", "serve", "--hostname", "127.0.0.1", "--port", "41234"])
+        self.assertLessEqual({a for a in argv if a.startswith("--")}, self.flags("serve-help"))
+
+    def test_no_version_or_another_major_is_refused_before_any_argv_is_built(self):
+        for version in (None, "1.19.6", "1.19.6\n", "opencode v1.19.5", "opencode v3.0.0", "v2", "2", "",
+                        "opencode v2.2.7 and more", "opencode v02.2.7", 2, b"opencode v2.2.7"):
+            with self.subTest(version=version):
+                picked = []
+                driver = self.make(version=version, port=lambda: picked.append(PORT) or PORT)
+                with mock.patch.object(oc, "serve_argv", wraps=oc.serve_argv) as built:
+                    with self.assertRaises(oc.MajorRefused) as caught:
+                        driver.start(session(), None, ENV)
+                    with self.assertRaises(oc.MajorRefused):
+                        driver.resume("ses_abc", session(), None, ENV)
+                self.assertEqual(caught.exception.code, "opencode_major_unsupported")
+                self.assertIsInstance(caught.exception, DriverStateError)
+                self.assertEqual((self.spy.spawns, picked, built.call_count), ([], [], 0))
+
+    def test_a_version_of_the_driven_major_is_taken_in_each_form_it_is_printed(self):
+        for version in ("opencode v2.2.7", "opencode v2.2.7\n", "opencode v2.3.2\r\n", "2.0.0", "v2.10.1"):
+            with self.subTest(version=version):
+                driver = self.make(version=version)
+                driver.start(session(), None, ENV)
+                self.assertEqual(self.spy.spawns[0][0][1], "serve")
+
+
+# The readiness line OpenCode 2.2.7 prints: ``server listening on ${url}`` in its server-process.ts at the tag
+# v2.2.7, as the check of #421's threads quotes it (read from the tagged source; the binary was not run in serve
+# mode, since that prints its password).
+READY_V2 = "server listening on http://127.0.0.1:41234\n"
+
+
+class Resisting(Process):
+    """A turn process whose terminate() raises while ``resist`` is set (each call is counted)."""
+
+    resist = False
+
+    def terminate(self) -> None:
+        self.terminated += 1
+        if self.resist:
+            raise OSError("synthetic: the process resists termination")
+
+
+class ResistingSpy(Spy):
+    def __init__(self, resist: bool) -> None:
+        super().__init__()
+        self.resist = resist
+
+    def __call__(self, argv: list, env: dict) -> Process:
+        self.spawns.append((list(argv), dict(env)))
+        process = Resisting(self.server_lines if argv[1] == "serve" else ())
+        process.resist = self.resist and argv[1] != "serve"
+        self.processes.append(process)
+        return process
+
+
+class ServeThreadAnswerTests(Base):
+    """The eight bot threads of #421 at fbf8ad86 (work CHECK-421-565-583): the v2 readiness line, the server's own
+    password in the children's environment only, and the turn process a concurrent release could leave unowned or
+    end twice. Every process is a fake; no OpenCode binary runs."""
+
+    # -- thread JudE (opencode.py:614): the readiness line of v2.2.7 --------------------------------------------
+
+    def test_the_v2_readiness_line_counts_as_the_older_form_does(self):
+        self.assertEqual(oc.listening_url(READY_V2, PORT), URL)
+        self.assertEqual(oc.listening_url(READY_V2.rstrip("\n"), PORT), URL)
+        self.assertEqual(oc.listening_url(READY_V2.rstrip("\n") + "\r\n", PORT), URL)
+        self.assertEqual(oc.listening_url(READY, PORT), URL)
+        for text in ("server listening on http://0.0.0.0:41234\n", "server listening on http://localhost:41234\n",
+                     "server listening on http://127.0.0.1:41235\n", "server listening on http://127.0.0.1:041234\n",
+                     "server listening on https://127.0.0.1:41234\n", "server listening on http://127.0.0.1:41234/x\n",
+                     "note: server listening on http://127.0.0.1:41234\n", " server listening on " + URL + "\n",
+                     "SERVER LISTENING ON " + URL + "\n", "v2 server listening on " + URL + "\n"):
+            with self.subTest(text=text):
+                self.assertIsNone(oc.listening_url(text, PORT))
+
+    def test_start_and_resume_take_the_v2_readiness_line(self):
+        driver = self.make(Spy(["starting\n", READY_V2]))
+        handle = driver.start(session(), None, ENV)
+        self.assertEqual(self.spy.processes[0].terminated, 0)
+        driver.send(handle, message())
+        self.assertEqual(self.turn_argv(1)[-2:], ["--server", URL])
+        driver = self.make(Spy([READY_V2]))
+        resumed = driver.resume("ses_abc", session(), None, ENV)
+        self.assertEqual(resumed.engine_session_id, "ses_abc")
+        self.assertEqual(self.spy.processes[0].terminated, 0)
+
+    # -- thread Jufh (opencode.py:704): the server's own password ------------------------------------------------
+
+    def password_of(self, env: dict) -> str:
+        self.assertIn(oc.PASSWORD_ENV, env)
+        return env[oc.PASSWORD_ENV]
+
+    def test_each_handle_gives_its_own_password_to_its_server_and_every_turn_through_the_environment_only(self):
+        self.assertEqual(oc.PASSWORD_ENV, "OPENCODE_PASSWORD")
+        made = []
+
+        def token(n):
+            made.append(n)
+            return f"made-by-secrets-{len(made)}"
+
+        with mock.patch.object(oc.secrets, "token_urlsafe", side_effect=token):
+            driver = self.make()
+            handle = driver.resume("ses_abc", session(), None, {**ENV, "OPENCODE_PASSWORD": "the caller's own"})
+            driver.send(handle, message())
+            driver.finish_turn(handle, 0)
+            driver.send(handle, message(turn="turn-2", delivery="dlv-2"))
+            other = driver.start(session(), None, ENV)
+        self.assertEqual(made, [32, 32])   # 32 bytes from secrets for each handle
+        (server, _), (first, _), (second, _), (other_server, _) = [(env, argv) for argv, env in self.spy.spawns]
+        self.assertEqual(server, {**ENV, "OPENCODE_PASSWORD": "made-by-secrets-1"})
+        self.assertEqual(first, server)
+        self.assertEqual(second, server)
+        self.assertEqual(other_server, {**ENV, "OPENCODE_PASSWORD": "made-by-secrets-2"})
+        for argv, _ in self.spy.spawns:
+            with self.subTest(argv=argv):
+                self.assertFalse(any("made-by-secrets" in a or "OPENCODE_PASSWORD" in a for a in argv))
+
+    def test_a_real_password_is_long_and_differs_per_handle(self):
+        driver = self.make()
+        driver.start(session(), None, ENV)
+        driver.start(session(), None, ENV)
+        one, two = (self.password_of(env) for _, env in self.spy.spawns)
+        self.assertNotEqual(one, two)
+        self.assertGreaterEqual(min(len(one), len(two)), 43)   # token_urlsafe(32)
+
+    def test_the_driver_asks_the_abort_with_the_handles_password(self):
+        passwords = []
+
+        def abort(url, sid, *, password):
+            passwords.append((url, sid, password))
+            return True
+
+        driver = self.make(abort=abort)
+        handle = driver.resume("ses_abc", session(), None, ENV)
+        driver.send(handle, message())
+        driver.interrupt(handle, "turn-1")
+        self.assertEqual(passwords, [(URL, "ses_abc", self.password_of(self.spy.spawns[0][1]))])
+        self.assertEqual(self.spy.processes[1].terminated, 0)
+
+    def test_the_password_is_in_no_draft_error_text_or_repr(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        password = self.password_of(self.spy.spawns[0][1])
+        driver.send(handle, message())
+        texts = [json.dumps(d) for d in self.replay(driver, handle, "synthetic-v1-tool-use.jsonl")]
+        texts += [json.dumps(d) for d in driver.finish_turn(handle, 0)]
+        self.spy.processes[0].terminate = lambda: (_ for _ in ()).throw(OSError("synthetic"))
+        with self.assertRaises(OSError) as caught:
+            driver.release(handle)
+        texts.append("".join(traceback.format_exception(caught.exception)))
+        with self.assertRaises(DriverStateError) as refused:
+            driver.send(handle, message(turn="turn-2", delivery="dlv-2"))
+        texts.append("".join(traceback.format_exception(refused.exception)))
+        texts += [repr(driver), repr(handle)]
+        for text in texts:
+            with self.subTest(text=text[:60]):
+                self.assertNotIn(password, text)
+
+    def test_the_password_ends_with_the_handle(self):
+        driver = self.make()
+        handle = driver.start(session(), None, ENV)
+        worker = driver._worker(handle)
+        self.assertEqual(worker["password"], self.password_of(self.spy.spawns[0][1]))
+        driver.release(handle)
+        self.assertNotIn(id(handle), driver._workers)
+        self.assertIsNone(worker["password"])
+
+    # -- thread Q6wv (opencode.py:975) and Q6xz (:982): a release during an interrupted turn start ----------------
+
+    def cut_with_release(self, lineno: int, resist: bool, when: str):
+        """An interruption just before ``lineno`` of ``_send``, and a release of the handle landing just ``before``
+        or ``after`` the first table step that follows it (a concurrent release, deterministically placed)."""
+        spy = ResistingSpy(resist)
+        driver = self.make(spy)
+        handle = driver.start(session(), None, ENV)
+        trace, fired = _interrupt_before(oc.ServeDriver._send, lineno)
+        original, injected = driver._under, []
+
+        def release():
+            injected.append(1)
+            try:
+                driver.release(handle)
+            except OSError:
+                pass   # the resisting turn process: it stays owed
+
+        def under(step):
+            if fired and not injected and when == "before":
+                release()
+            value = original(step)
+            if fired and not injected and when == "after":
+                release()
+            return value
+
+        driver._under = under
+        sys.settrace(trace)
+        try:
+            driver.send(handle, message())
+        except (KeyboardInterrupt, DriverStateError, OSError):
+            pass
+        finally:
+            sys.settrace(None)
+            driver._under = original
+        self.assertEqual(injected, [1])
+        return driver, handle, spy, fired
+
+    def spawned_window(self) -> list:
+        lines, first = inspect.getsourcelines(oc.ServeDriver._send)
+        start = next(first + i for i, t in enumerate(lines) if t.strip().startswith("process = self._spawn("))
+        end = next(first + i for i, t in enumerate(lines) if t.strip() == 'with turn["write"]:')
+        return [n for n in _cut_each_line(oc.ServeDriver._send) if start < n < end]
+
+    def test_a_turn_process_whose_termination_fails_stays_owed_through_a_concurrent_release(self):
+        window = self.spawned_window()
+        self.assertGreaterEqual(len(window), 2)
+        for lineno, when in [(n, w) for n in window for w in ("before", "after")]:
+            with self.subTest(line=lineno, release=when):
+                driver, handle, spy, fired = self.cut_with_release(lineno, True, when)
+                self.assertEqual(fired, [lineno])
+                turn = spy.processes[1]
+                tried = turn.terminated
+                self.assertGreaterEqual(tried, 1)
+                self.assertIn(id(handle), driver._workers)   # owed: the handle is kept until it is terminated
+                self.assertTrue(any(turn is q for q in driver._workers[id(handle)]["live"]))
+                with self.assertRaises(OSError):
+                    driver.release(handle)
+                self.assertEqual(turn.terminated, tried + 1)   # the later release tries it again
+                turn.resist = False
+                driver.release(handle)
+                self.assertEqual(turn.terminated, tried + 2)
+                self.assertNotIn(id(handle), driver._workers)
+
+    def test_a_turn_process_another_cleaner_ended_is_never_ended_again(self):
+        for lineno, when in [(n, w) for n in self.spawned_window() for w in ("before", "after")]:
+            with self.subTest(line=lineno, release=when):
+                driver, handle, spy, fired = self.cut_with_release(lineno, False, when)
+                self.assertEqual(fired, [lineno])
+                self.assertEqual([p.terminated for p in spy.processes], [1, 1])
+                self.assertNotIn(id(handle), driver._workers)
+                driver.release(handle)
+                self.assertEqual([p.terminated for p in spy.processes], [1, 1])
+
+
+class HttpAbortPasswordTests(unittest.TestCase):
+    """The driver's own HTTP call sends the handle's password (thread Jufh), as basic authentication only."""
+
+    def serve(self) -> tuple[str, list]:
+        seen: list = []
+
+        class Handler(Recorder):
+            def do_POST(self):  # noqa: N802 (the handler's own name)
+                seen.append((self.path, self.headers.get_all("Authorization")))
+                super().do_POST()
+
+        Handler.seen = []
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop():
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+        self.addCleanup(stop)
+        return f"http://127.0.0.1:{server.server_address[1]}", seen
+
+    def test_the_abort_carries_the_password_as_basic_authentication(self):
+        url, seen = self.serve()
+        self.assertTrue(oc.http_abort(url, "ses_x", password="made-in-this-test"))
+        expected = "Basic " + base64.b64encode(b"opencode:made-in-this-test").decode("ascii")
+        self.assertEqual(seen, [("/session/ses_x/abort", [expected])])
+        self.assertTrue(oc.http_abort(url, "ses_x"))
+        self.assertEqual(seen[1], ("/session/ses_x/abort", None))   # no password, no header
+
+    def test_a_password_that_is_not_one_header_value_is_refused_before_anything_is_sent(self):
+        url, seen = self.serve()
+        for password in ("", "a\nb", "a\rb", 5, b"pw", "a" + chr(0xD800)):
+            with self.subTest(password=password):
+                with self.assertRaises(ValueError):
+                    oc.http_abort(url, "ses_x", password=password)
+        self.assertEqual(seen, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

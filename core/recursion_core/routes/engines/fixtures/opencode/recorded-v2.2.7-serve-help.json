@@ -1,0 +1,11 @@
+{
+  "recorded": "the installed binary on the builder's Windows laptop, Wed Nov 18 2026 (PST); standard output and standard error together, exit 0; text kept byte for byte (LF line ends)",
+  "binary": "opencode v2.2.7",
+  "argv": [
+    "opencode",
+    "serve",
+    "--help"
+  ],
+  "exit_code": 0,
+  "output": "DESCRIPTION\n  Start the v2 API and web server\n\nUSAGE\n  opencode serve [flags]\n\nFLAGS\n  --hostname string    \n  --port integer       \n  --cors string        Additional allowed CORS origin (repeat for multiple origins)\n  --service            \n  --stdio              \n\nGLOBAL FLAGS\n  --help, -h                                                          Show help information\n  --version, -v                                                       Show version information\n  --wizard                                                            Start wizard mode for a command\n  --completions <bash|zsh|fish|powershell|sh|pwsh>                    Print shell completion script (choices: bash, zsh, fish, powershell, sh, pwsh)\n  --log-level <all|trace|debug|info|warn|warning|error|fatal|none>    Sets the minimum log level (choices: all, trace, debug, info, warn, warning, error, fatal, none)\n  --print-logs                                                        Print logs to stderr (server logs require --standalone)\n"
+}

@@ -26,10 +26,11 @@ DAEMON_MODULE = "recursion_core.daemon"
 MARKER = "# Recursion per-user daemon, written by `recursiond install` (csl-recursion)."
 STOP_TIMEOUT_S = 90  # systemd's own default, stated: finite, and long enough for a normal drain
 # The daemon keeps its state in $XDG_STATE_HOME/recursion, or <home>/.local/state/recursion when the
-# variable is unset (daemon/__main__.py). The unit sets the variable to that default under the user
-# manager's %h, the folder `install` creates the stores in, so a value in the user manager's own
-# environment cannot point the daemon at another state folder than the one install prepared.
-STATE_HOME = ".local/state"  # relative to the home
+# variable is unset or empty (layout.state_home, which daemon/__main__.py takes it from). The unit sets
+# the variable to the place install created the stores in: the default under the user manager's %h, or
+# the absolute place the person chose, so a value in the user manager's own environment cannot point the
+# daemon at another state folder than the one install prepared.
+STATE_HOME = ".local/state"  # the standard's default, relative to the home (layout.default_state_home)
 MAX_ARGS = 16
 MAX_ARG_LEN = 256
 _ARG = re.compile(r"[A-Za-z0-9_./:%@=+-]+")
@@ -60,8 +61,13 @@ def daemon_exec_args(interpreter: str) -> tuple[str, ...]:
     return (interpreter.replace("%", "%%"), "-I", "-X", "gil=0", "-m", DAEMON_MODULE)
 
 
-def render_unit(exec_args: tuple[str, ...]) -> str:
+def render_unit(exec_args: tuple[str, ...], state_home: str | None = None) -> str:
     """Return the unit file. ``exec_args`` is the ``ExecStart`` argument vector.
+
+    ``state_home`` is the absolute place the person chose for the state (``Owned.state_home`` when
+    ``Owned.chosen``); None is the default, written ``%h/.local/state`` as before. A chosen place is
+    written in double quotes with systemd's escapes (a backslash, a quote, a control character) and
+    ``%`` as ``%%``, so systemd gives the daemon exactly that path.
 
     Each argument is one token (no spaces, no quotes, no ``..`` segment), so the line needs no
     shell and no quoting. The first token is an absolute path or a systemd specifier such as ``%h``.
@@ -79,6 +85,13 @@ def render_unit(exec_args: tuple[str, ...]) -> str:
             raise InstallRefused("exec_arg", "no '..' segment")
     if not (exec_args[0].startswith("/") or exec_args[0].startswith("%")):
         raise InstallRefused("exec_arg", "the program is an absolute path")
+    if state_home is None:
+        shown, environment = f"%h/{STATE_HOME}", f"XDG_STATE_HOME=%h/{STATE_HOME}"
+    elif type(state_home) is str and os.path.isabs(state_home):
+        shown = _systemd_escaped(state_home)
+        environment = f'"XDG_STATE_HOME={shown}"'
+    else:
+        raise InstallRefused("state_home_relative", f"the unit's state folder must be an absolute path, not {state_home!r}")
     text = (
         f"{MARKER}\n"
         "# `recursiond upgrade` rewrites this file and `recursiond uninstall` removes it.\n"
@@ -86,14 +99,14 @@ def render_unit(exec_args: tuple[str, ...]) -> str:
         "# unit's cgroup, so stopping or killing this unit never stops a run.\n"
         f"# A stop still running after {STOP_TIMEOUT_S} s is ended with SIGKILL: a daemon crash,\n"
         "# with the run units left alive and their state recovered at the next start.\n"
-        f"# The daemon's state, with the stores `recursiond install` creates, is in %h/{STATE_HOME}/recursion.\n"
+        f"# The daemon's state, with the stores `recursiond install` creates, is in {shown}/recursion.\n"
         "[Unit]\n"
         "Description=Recursion per-user daemon\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
         "UnsetEnvironment=PYTHONPATH PYTHONHOME\n"
-        f"Environment=XDG_STATE_HOME=%h/{STATE_HOME}\n"
+        f"Environment={environment}\n"
         f"ExecStart={' '.join(exec_args)}\n"
         "Restart=on-failure\n"
         "RestartSec=2\n"
@@ -108,10 +121,28 @@ def render_unit(exec_args: tuple[str, ...]) -> str:
     return text
 
 
-def state_elsewhere(unit: bytes, home: str) -> str | None:
-    """Why the daemon a unit starts may keep its state in another folder than the one ``render_unit``
-    names, or ``None``: what ``upgrade`` checks in a unit before it replaces it (the S6 sweep's F1 on
+def _systemd_escaped(value: str) -> str:
+    """``value`` for a double-quoted ``Environment=`` word: what ``_words`` and systemd read back as it."""
+
+    out = []
+    for char in value:
+        if char in "\\\"":
+            out.append("\\" + char)
+        elif char == "%":
+            out.append("%%")
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            out.append(f"\\x{ord(char):02x}")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def state_elsewhere(unit: bytes, home: str, state_home: str | None = None) -> str | None:
+    """Why the daemon a unit starts may keep its state in another folder than ``state_home`` (the place
+    ``layout.state_home`` names, the one ``render_unit`` writes; None is the default), or ``None``: what
+    ``upgrade`` checks in a unit before it replaces it (the S6 sweep's F1 on
     #410: a hand-placed unit's own ``XDG_STATE_HOME`` was dropped, and the daemon's revocations with it).
+    With a chosen place, a unit that leaves the daemon its default folder keeps the state elsewhere too.
 
     Its ``[Service]`` section is read as systemd reads it, near enough: an ``Environment=`` line is a
     list of assignments, each in double or single quotes or none, an empty one drops those before it,
@@ -208,6 +239,10 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
             # DeepSeek F10-1 on #382); an empty one drops those before it
             unset = unset | {word for word in words if "=" not in word} if words else set()
             unset_pairs = unset_pairs | {word for word in words if "=" in word} if words else set()
+    from .layout import default_state_home  # the one resolver's default; layout imports this module
+
+    default = default_state_home(home)
+    expected = default if state_home is None else state_home
     # UnsetEnvironment is applied after Environment, EnvironmentFile and PassEnvironment.
     if "XDG_STATE_HOME" not in unset:
         if files:
@@ -216,7 +251,7 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
             return "passes the user manager's own XDG_STATE_HOME to the daemon (PassEnvironment)"
         value = assigned.get("XDG_STATE_HOME")
         if value and f"XDG_STATE_HOME={value}" not in unset_pairs:  # empty: the default, as the daemon reads it (Grok R2)
-            if _names(value, os.path.join(home, *STATE_HOME.split("/")), home):
+            if _names(value, expected, home):
                 return None
             return f"sets XDG_STATE_HOME={value}"
         if value is None and any(pair.startswith("XDG_STATE_HOME=") for pair in unset_pairs):
@@ -225,7 +260,11 @@ def state_elsewhere(unit: bytes, home: str) -> str | None:
             shown = min(pair for pair in unset_pairs if pair.startswith("XDG_STATE_HOME="))
             return (f"has UnsetEnvironment={shown}, which may remove the user manager's own value, "
                     "so where it keeps the daemon's state cannot be told")
-    # No XDG_STATE_HOME: the state is under Path.home(), which reads HOME, so the unit's own HOME moves it too
+    # No XDG_STATE_HOME: the daemon's default. With a chosen place that is another folder than the one chosen.
+    if os.path.realpath(expected) != os.path.realpath(default):
+        return (f"sets no XDG_STATE_HOME, so the daemon keeps its state under {default}, "
+                f"not under the chosen {expected}")
+    # The state is under Path.home(), which reads HOME, so the unit's own HOME moves it too
     # (DeepSeek H9-2 on #382). The user manager's own HOME is the home's.
     if "HOME" not in unset:
         if files:
@@ -450,6 +489,9 @@ def _names(value: str, folder: str, home: str) -> bool:
     """Whether a unit's ``value`` (``%h`` is ``home``) names ``folder``, links followed."""
 
     named = home + value[2:] if value.startswith("%h") else value  # no NUL: it ends the line (DeepSeek H9-1, Grok R1)
+    if "%" in named.replace("%%", ""):  # another specifier: what systemd makes of it is not followed here
+        return False
+    named = named.replace("%%", "%")  # systemd's literal percent, as render_unit writes one
     return os.path.isabs(named) and os.path.realpath(named) == os.path.realpath(folder)
 
 

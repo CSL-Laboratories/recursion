@@ -16,24 +16,26 @@ on the way (a folder the user cannot write, a full disk) is the refusal ``filesy
 detail naming the error and the path; files written before it stay written, so the answer does not
 say that nothing changed. ``XDG_CONFIG_HOME`` naming another folder than ``~/.config`` is refused
 ``config_home_elsewhere``, before anything is read: a user manager started with it reads its units
-from there, not from ``~/.config/systemd/user`` where these commands write. ``XDG_STATE_HOME``
-naming another folder than ``~/.local/state`` is refused ``state_home_elsewhere`` by ``install`` and
-``upgrade``: a daemon started with it keeps its state there, and the unit puts it in
-``~/.local/state/recursion`` (the S6 sweep's F2 and F1 on #410). Both are read from this command's
-own environment, the nearest this package gets to the user manager's (it starts no process to ask
-it); each refusal says how to run the command without the variable. Off Linux the family refuses
+from there, not from ``~/.config/systemd/user`` where these commands write. ``XDG_STATE_HOME`` is the
+person's choice of the state folder: ``install`` and ``upgrade`` make the stores in
+``$XDG_STATE_HOME/recursion`` and write a unit that sets the daemon's ``XDG_STATE_HOME`` to that same
+absolute place (``daemon_install.layout.state_home`` names it; unset or empty is ``~/.local/state``,
+the standard's default). A relative value is refused ``state_home_relative``. With a chosen place the
+answer adds ``state`` (the state folder in use) and, when the default's plugin-security folder holds a
+store, ``stores_left``: one sentence saying those stores are left where they are and not used; the
+product never moves or removes a store. Both variables are read from this command's own environment,
+the nearest this package gets to the user manager's (it starts no process to ask it); the refusal of
+``XDG_CONFIG_HOME`` says how to run the command without it. Off Linux the family refuses
 ``platform_unsupported`` before it reads
 anything (``recursiond`` refuses there first; this holds the same once the family is registered in
 the control CLI).
 
 ``XDG_CONFIG_HOME`` naming another folder than ``~/.config`` is refused ``config_home_elsewhere``,
 before anything is read: a user manager started with it reads its units from there, not from
-``~/.config/systemd/user`` where these commands write. ``XDG_STATE_HOME`` naming another folder than
-``~/.local/state`` is refused ``state_home_elsewhere`` by ``install`` and ``upgrade``: a daemon started
-with it keeps its state there, and the unit leaves it in ``~/.local/state/recursion`` (the S6 sweep's F2
-and F1 on #410, reachable here too). Both are read from this command's own environment, the nearest
-this package gets to the user manager's (it starts no process to ask it); each refusal says how to
-run the command without the variable. A password database that gives no entry for this user (none,
+``~/.config/systemd/user`` where these commands write. ``XDG_STATE_HOME`` chooses the state folder, as
+above; a relative value is refused ``state_home_relative`` by ``install`` and ``upgrade`` before anything
+is read. ``uninstall`` touches no state and does not read it. A password database that gives no entry
+for this user (none,
 or a failed lookup: CPython raises ``KeyError`` for both) is ``home_unknown``, before anything is read.
 
 ``install`` and ``upgrade`` point the unit at the interpreter running this command, and first ask
@@ -50,6 +52,7 @@ import subprocess
 import sys
 
 from recursion_core.daemon_install import InstallRefused, Roots, daemon_exec_args, install, uninstall, upgrade
+from recursion_core.daemon_install.layout import chosen_state_home
 
 NAMES = ("install", "upgrade", "uninstall")
 EXIT_OK, EXIT_REFUSED = 0, 1
@@ -122,7 +125,8 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
         elif action in ("install", "upgrade"):
             require_daemon_interpreter(probe(interpreter), interpreter, package)
             step = install if action == "install" else upgrade
-            plan = step(roots, daemon_exec_args(interpreter))
+            chosen = Roots(home=roots.home, state_home=environ.get("XDG_STATE_HOME") or None)
+            plan = step(chosen, daemon_exec_args(interpreter))
         else:
             raise InstallRefused("action", repr(action))
     except InstallRefused as exc:
@@ -139,18 +143,24 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
         if plan.ledger is not None:
             path, created, detail = plan.ledger
             answer["ledger"] = {"kind": "ledger", "path": path, "created": created, "detail": detail}
+        if plan.state:  # a chosen place: the folder in use, and what is left in the default one
+            answer["state"] = plan.state
+            if plan.left:
+                answer["stores_left"] = plan.left
     _print(out, answer)
     return EXIT_OK
 
 
 def refuse_elsewhere(action: str, environ, roots: Roots) -> None:
-    """Refuse an ``XDG_CONFIG_HOME`` (every command) or ``XDG_STATE_HOME`` (``install``, ``upgrade``) that
-    names another folder than the default under the home. Unset or empty is the default; a relative value
-    names no folder for sure, so it is refused too."""
+    """Refuse an ``XDG_CONFIG_HOME`` (every command) that names another folder than the default under the
+    home, and an ``XDG_STATE_HOME`` (``install``, ``upgrade``) that is relative (``state_home_relative``,
+    from the one resolver). Unset or empty is the default; a relative ``XDG_CONFIG_HOME`` names no folder
+    for sure, so it is refused too."""
 
-    checks = [("XDG_CONFIG_HOME", ".config", "config_home_elsewhere")]
     if action in ("install", "upgrade"):
-        checks.append(("XDG_STATE_HOME", ".local/state", "state_home_elsewhere"))
+        home = roots.home if type(roots) is Roots and type(roots.home) is str else ""
+        chosen_state_home(home, environ.get("XDG_STATE_HOME") or None)
+    checks = [("XDG_CONFIG_HOME", ".config", "config_home_elsewhere")]
     for name, default, code in checks:
         value = environ.get(name) or ""
         if not value:
@@ -159,17 +169,11 @@ def refuse_elsewhere(action: str, environ, roots: Roots) -> None:
         expected = os.path.join(home, *default.split("/"))
         if home and os.path.isabs(value) and os.path.realpath(value) == os.path.realpath(expected):
             continue
-        if code == "config_home_elsewhere":
-            detail = (f"XDG_CONFIG_HOME is {value}: a user manager started with it reads its units from "
-                      f"{value}/systemd/user, and this command writes ~/.config/systemd/user. If "
-                      f"`systemctl --user show-environment` does not list XDG_CONFIG_HOME, run "
-                      f"`env -u XDG_CONFIG_HOME recursiond {action}`; if it does, the unit cannot be installed "
-                      "for that user manager yet")
-        else:
-            detail = (f"XDG_STATE_HOME is {value}: a daemon started with it keeps its state (the revocation and "
-                      f"breaker stores, the run registry) in {value}/recursion, and the unit puts it in "
-                      "~/.local/state/recursion. Stop that daemon and move the folder there first; if no daemon "
-                      f"ran with it, run `env -u XDG_STATE_HOME recursiond {action}`")
+        detail = (f"XDG_CONFIG_HOME is {value}: a user manager started with it reads its units from "
+                  f"{value}/systemd/user, and this command writes ~/.config/systemd/user. If "
+                  f"`systemctl --user show-environment` does not list XDG_CONFIG_HOME, run "
+                  f"`env -u XDG_CONFIG_HOME recursiond {action}`; if it does, the unit cannot be installed "
+                  "for that user manager yet")
         raise InstallRefused(code, detail)
 
 

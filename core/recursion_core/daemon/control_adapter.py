@@ -824,29 +824,44 @@ class DeviceDoor:
 _UNIT_MARKER_MAX = 16384
 
 
-def _installed_profile_store_refusal(state_dir):
+def _installed_profile_store_refusal(state_dir, environ=None):
     """One line when an installed profile is missing the breaker store or the authority ledger.
 
-    Installed means this folder is ``<home>/.local/state/recursion`` and the user unit
-    ``<home>/.config/systemd/user/recursion-daemon.service`` is a regular file whose first line
-    is the installer's marker. The unit is opened with ``O_NOFOLLOW`` and only that first line
-    is read. A symlink, an unreadable file, a file larger than ``_UNIT_MARKER_MAX`` or any other
-    first line is not an installed profile, and the caller creates a missing breaker store as
-    it always has. A store that is present, including as a symlink, is not missing.
+    Installed means the user unit ``<home>/.config/systemd/user/recursion-daemon.service`` is a
+    regular file whose first line is the installer's marker, and this folder is the state folder
+    it names: ``<home>/.local/state/recursion`` (the default, ``<home>`` taken from this folder's
+    own path, and only the unit's first line read), or a place the person chose with
+    ``XDG_STATE_HOME`` (the folder ``daemon_install.layout.state_home`` names, then ``<home>`` is
+    ``HOME``), when the installer's unit sets ``XDG_STATE_HOME`` to that place (the whole unit read,
+    at most ``_UNIT_MARKER_MAX`` bytes, by ``daemon_install.unit.state_elsewhere``). The unit is
+    opened with ``O_NOFOLLOW``. A symlink, an unreadable file, a file larger than
+    ``_UNIT_MARKER_MAX`` or any other first line is not an installed profile, and the caller creates
+    a missing breaker store as it always has. A store that is present, including as a symlink, is
+    not missing.
     """
 
-    from recursion_core.daemon_install.unit import MARKER, UNIT_NAME
+    from recursion_core.daemon_install.layout import STATE_FOLDER, default_state_home
+    from recursion_core.daemon_install.unit import MARKER, UNIT_NAME, state_elsewhere
 
     state = Path(state_dir)
-    if (state.name != 'recursion' or state.parent.name != 'state'
-            or state.parent.parent.name != '.local'):
+    if state.name != STATE_FOLDER:
         return None
     home = state.parent.parent.parent
-    if home == state.parent.parent:  # ``.local`` has no parent folder above it
-        return None
-    unit = home / '.config' / 'systemd' / 'user' / UNIT_NAME
-    if not _unit_first_line_is(unit, MARKER):
-        return None
+    if default_state_home(str(home)) == str(state.parent):  # the default under the home this path names
+        if home == state.parent.parent:  # ``.local`` has no parent folder above it
+            return None
+        unit = home / '.config' / 'systemd' / 'user' / UNIT_NAME
+        if not _unit_first_line_is(unit, MARKER):
+            return None
+    else:  # a chosen place: installed only when the installer's unit names it
+        home = Path((os.environ if environ is None else environ).get('HOME') or str(Path.home()))
+        if not home.is_absolute() or str(state.parent) == default_state_home(str(home)):
+            return None
+        unit = home / '.config' / 'systemd' / 'user' / UNIT_NAME
+        data = _unit_bytes(unit)
+        if (data is None or data.split(b'\n', 1)[0] != MARKER.encode()
+                or state_elsewhere(data, str(home), str(state.parent)) is not None):
+            return None
     breaker = store_path(state)
     ledger = breaker.parent / LEDGER_FILE
     missing = []
@@ -861,6 +876,28 @@ def _installed_profile_store_refusal(state_dir):
         return None
     return (f"recursion daemon refused to start: {' and '.join(missing)}. "
             f"An installed profile does not create them. {' and '.join(tails)}.")
+
+
+def _unit_bytes(path):
+    """The bytes of a regular file of at most ``_UNIT_MARKER_MAX`` bytes, opened with ``O_NOFOLLOW``; None
+    for anything else (a symlink, a larger file, an error), as ``_unit_first_line_is`` reads it."""
+    nofollow = getattr(os, 'O_NOFOLLOW', None)
+    if nofollow is None:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | nofollow | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _UNIT_MARKER_MAX or info.st_size < 0:
+            return None
+        data = os.read(fd, _UNIT_MARKER_MAX + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return data if len(data) <= _UNIT_MARKER_MAX else None
 
 
 def _unit_first_line_is(path, marker):
@@ -943,7 +980,7 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
     registry = DurableRunRegistry(daemon.registry, processes=pid_alive(manager))
     # Before any store is opened. SystemExit is not an Exception, so the open below does not catch it,
     # and nothing in this function creates the missing file.
-    refusal = _installed_profile_store_refusal(state_dir)
+    refusal = _installed_profile_store_refusal(state_dir, environ)
     if refusal:
         raise SystemExit(refusal)
     stored = breaker = breaker_unavailable = None

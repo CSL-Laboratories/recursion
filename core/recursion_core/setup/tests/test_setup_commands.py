@@ -320,17 +320,18 @@ class CommandTests(unittest.TestCase):
                 self.assertEqual((code, answer["code"]), (0, "ok"))
 
     # The S6 integration sweep, F1 on #410 (P1), by this command's environment: a daemon started with
-    # XDG_STATE_HOME keeps its state there, and the unit puts it in ~/.local/state/recursion.
-    def test_a_state_home_elsewhere_is_refused_by_install_and_upgrade(self):
+    # XDG_STATE_HOME keeps its state there. The owner answered that a person may choose the state folder
+    # through XDG_STATE_HOME: install and upgrade refuse a relative one (test_chosen_state_home.py has the rest).
+    def test_a_relative_state_home_is_refused_by_install_and_upgrade(self):
         custom = os.path.join(self._tmp.name, "custom-state")
-        for value in (custom, "relative/state"):
-            for action in ("install", "upgrade"):
-                with self.subTest(value=value, action=action):
-                    code, answer = self.run_action(action, probe=_refusing_probe, environ={"XDG_STATE_HOME": value})
-                    self.assertEqual((code, answer["code"], answer["action"]), (1, "state_home_elsewhere", action))
-                    self.assertIn(f"in {value}/recursion", answer["detail"])
-                    self.assertIn(f"`env -u XDG_STATE_HOME recursiond {action}`", answer["detail"])
-                    self.assertEqual(os.listdir(self.home), [])
+        value = "relative/state"
+        for action in ("install", "upgrade"):
+            with self.subTest(value=value, action=action):
+                code, answer = self.run_action(action, probe=_refusing_probe, environ={"XDG_STATE_HOME": value})
+                self.assertEqual((code, answer["code"], answer["action"]), (1, "state_home_relative", action))
+                self.assertIn(f"XDG_STATE_HOME is {value}", answer["detail"])
+                self.assertIn("absolute path, or unset it", answer["detail"])
+                self.assertEqual(os.listdir(self.home), [])
         code, answer = self.run_action("uninstall", environ={"XDG_STATE_HOME": custom})  # it touches no state
         self.assertEqual((code, answer["code"], answer["changed"]), (0, "ok", False))
         state = os.path.join(self.home, ".local", "state")

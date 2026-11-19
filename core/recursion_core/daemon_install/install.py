@@ -21,8 +21,10 @@ import sqlite3
 from dataclasses import dataclass
 
 from .errors import InstallRefused
-from .layout import (Owned, Roots, check_dirs, check_private_dir, ensure_dir, file_untrusted, held_regular,
-                     owned_paths, replace_regular, still_holds, still_names, unlink_regular, write_exclusive)
+from .layout import (BREAKER_FILE, LEDGER_FILE, REVOCATION_FILE, STATE_FOLDER, STORE_FOLDER, Owned, Roots,
+                     check_dirs, check_private_dir, check_state_root, default_state_home, ensure_dir,
+                     ensure_state_root, file_untrusted, held_regular, owned_paths, replace_regular, still_holds,
+                     still_names, unlink_regular, write_exclusive)
 from .unit import MARKER, UNIT_NAME, render_unit, state_elsewhere
 
 _UNIT_MODE = 0o644
@@ -41,6 +43,10 @@ class Plan:
     # (path, created now, detail). Detail is ``needs the anchor key (Lucas)`` when the step had no key
     # and the ledger was not there. None on uninstall, which does not touch the ledger.
     ledger: tuple[str, bool, str] | None = None
+    # install and upgrade with a chosen place: the daemon's state folder in use, and one plain sentence when
+    # the default's plugin-security folder holds a store, which is left where it is and not used. "" otherwise.
+    state: str = ""
+    left: str = ""
 
 
 def plan_commands(action: str) -> tuple[tuple[str, ...], ...]:
@@ -79,7 +85,8 @@ def ensure_stores(paths: Owned) -> tuple[tuple[str, str, bool], ...]:
 
     if type(paths) is not Owned:
         raise InstallRefused("paths", "ensure_stores takes owned_paths(roots)")
-    ensure_dir(paths.home, paths.store_dir, mode=_DIR_MODE)
+    ensure_state_root(paths)
+    ensure_dir(paths.state_root, paths.store_dir, mode=_DIR_MODE)
     done = []
     for path, magic, create in ((paths.breaker_store, stores.BREAKER_MAGIC, stores.create_breaker_store),
                                 (paths.revocation_store, stores.REVOCATION_MAGIC, stores.create_revocation_store)):
@@ -119,7 +126,8 @@ def ensure_ledger(paths: Owned, anchor_public_key: str | None) -> tuple[str, boo
         raise InstallRefused("paths", "ensure_ledger takes owned_paths(roots)")
     if anchor_public_key is not None and type(anchor_public_key) is not str:
         raise InstallRefused("anchor_public_key", "the anchor is the installer's public key, or absent")
-    ensure_dir(paths.home, paths.store_dir, mode=_DIR_MODE)
+    ensure_state_root(paths)
+    ensure_dir(paths.state_root, paths.store_dir, mode=_DIR_MODE)
     path = paths.ledger
     exists = os.path.lexists(path)
     if not anchor_public_key:
@@ -167,7 +175,7 @@ def install(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
     any path is read or written."""
 
     paths = owned_paths(roots)
-    unit = render_unit(exec_args).encode()
+    unit = render_unit(exec_args, paths.state_home if paths.chosen else None).encode()
     check_dirs(paths.home, paths.unit_dir)
     with contextlib.ExitStack() as held:  # a unit found stays open until the answer: its inode is not reused
         present = os.path.lexists(paths.unit)
@@ -179,11 +187,12 @@ def install(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
             why = file_untrusted(paths.unit, info)
             if why:
                 raise InstallRefused("unit_untrusted", f"{why}; `recursiond upgrade` writes it again, ours and 0644")
-        check_private_dir(paths.home, paths.homes)  # before anything is made
+        check_state_root(paths)  # a chosen place: before anything is made
+        check_private_dir(paths.state_root, paths.homes)  # before anything is made
         made = ensure_stores(paths)  # first: a unit is never left naming a daemon whose stores are missing
         ledger = ensure_ledger(paths, anchor_public_key)
-        homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
-        check_private_dir(paths.home, paths.homes, required=True)  # as made, or as another caller made it
+        homes = ensure_dir(paths.state_root, paths.homes, mode=_DIR_MODE)
+        check_private_dir(paths.state_root, paths.homes, required=True)  # as made, or as another caller made it
         if present:
             still_holds(paths.unit, read)  # the bytes read, first: an in-place rewrite shows here
             still_names(paths.unit, info)  # last: the path still names the file that was read
@@ -208,14 +217,14 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
     ``platform_unsupported`` (one line naming the platform) before any path is read or written."""
 
     paths = owned_paths(roots)
-    unit = render_unit(exec_args).encode()
+    unit = render_unit(exec_args, paths.state_home if paths.chosen else None).encode()
     check_dirs(paths.home, paths.unit_dir)
     if not os.path.lexists(paths.unit):
         raise InstallRefused("unit_missing", f"no unit at {paths.unit}; `recursiond install` writes it")
     with held_regular(paths.unit) as read:  # held open until the answer: its inode is not reused
         data, info = read
         current = data == unit and not file_untrusted(paths.unit, info)
-        why = None if data == unit else state_elsewhere(data, paths.home)
+        why = None if data == unit else state_elsewhere(data, paths.home, paths.state_home)
         if why:  # the S6 sweep's F1 on #410: before anything is made, the unit left as it is
             raise InstallRefused(
                 "unit_state_elsewhere",
@@ -223,11 +232,12 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
                 f"stores, the run registry) there, and the unit `recursiond upgrade` writes puts it in "
                 f"{paths.state}. Stop the daemon, move that state folder to {paths.state}, take the line out "
                 "of the unit, then run `recursiond upgrade` again")
-        check_private_dir(paths.home, paths.homes)  # before anything is made
+        check_state_root(paths)  # a chosen place: before anything is made
+        check_private_dir(paths.state_root, paths.homes)  # before anything is made
         made = ensure_stores(paths)
         ledger = ensure_ledger(paths, anchor_public_key)
-        homes = ensure_dir(paths.home, paths.homes, mode=_DIR_MODE)
-        check_private_dir(paths.home, paths.homes, required=True)  # as made, or as another caller made it
+        homes = ensure_dir(paths.state_root, paths.homes, mode=_DIR_MODE)
+        check_private_dir(paths.state_root, paths.homes, required=True)  # as made, or as another caller made it
         if current:
             still_holds(paths.unit, read)  # the bytes read, first: an in-place rewrite shows here
             still_names(paths.unit, info)  # last: the path still names the file that was read
@@ -270,5 +280,19 @@ def _any_created(made: tuple[tuple[str, str, bool], ...]) -> bool:
 
 def _plan(action: str, changed: bool, paths: Owned, stores: tuple[tuple[str, str, bool], ...] = (),
           ledger: tuple[str, bool, str] | None = None) -> Plan:
+    chosen = paths.chosen and action != "uninstall"
     return Plan(action=action, changed=changed, unit=paths.unit, commands=plan_commands(action),
-                stores=stores, ledger=ledger)
+                stores=stores, ledger=ledger, state=paths.state if chosen else "",
+                left=_default_stores_left(paths) if chosen else "")
+
+
+def _default_stores_left(paths: Owned) -> str:
+    """One plain sentence when the default's plugin-security folder holds a store while the person chose
+    another place; "" otherwise. Nothing there is read, moved or removed: only whether a name is present."""
+
+    folder = os.path.join(default_state_home(paths.home), STATE_FOLDER, STORE_FOLDER)
+    found = [name for name in (BREAKER_FILE, REVOCATION_FILE, LEDGER_FILE) if os.path.lexists(os.path.join(folder, name))]
+    if not found:
+        return ""
+    return (f"{folder} holds {', '.join(found)} from the default state folder; they are left where they are "
+            f"and not used, since XDG_STATE_HOME chose {paths.state_home}")

@@ -5,7 +5,15 @@ A root is resolved once (links above it are the administrator's, such as ``/home
 is reached without following a link: a link there is refused (``symlink_refused`` at a folder,
 ``not_regular`` at a file), and so is a folder there that another user owns or that group or world
 can write (``folder_untrusted``). Nothing
-here reads ``os.environ`` or the process's home folder; the caller passes the roots.
+here reads ``os.environ`` or the process's home folder; the caller passes the roots, and the person's
+``XDG_STATE_HOME`` as it read it.
+
+The state folder is named in one place, ``state_home`` (with ``chosen_state_home`` and
+``default_state_home`` under it): the person's ``XDG_STATE_HOME`` when it is set to an absolute path,
+else ``<home>/.local/state``, the standard's default, with ``recursion`` under it. An empty value is the
+default, as the standard reads it; a relative value is refused ``state_home_relative``. The installer,
+the unit it writes, the command layer, the daemon's start and its installed-profile check all take the
+folder from here.
 """
 
 from __future__ import annotations
@@ -37,9 +45,11 @@ HOMES_FOLDER = "homes"
 
 @dataclass(frozen=True)
 class Roots:
-    """``home`` is the user's home folder as the user manager sees it (``%h``)."""
+    """``home`` is the user's home folder as the user manager sees it (``%h``). ``state_home`` is the
+    person's ``XDG_STATE_HOME`` as the caller read it: None or empty is the default."""
 
     home: str
+    state_home: str | None = None
 
 
 @dataclass(frozen=True)
@@ -48,20 +58,27 @@ class Owned:
     unit_dir: str          # <home>/.config/systemd/user
     unit: str              # <unit_dir>/recursion-daemon.service
     enabled: str           # <unit_dir>/default.target.wants/recursion-daemon.service, made by `enable`
-    state: str             # <home>/.local/state/recursion, the daemon's state folder under the unit
+    state: str             # <state_home>/recursion, the daemon's state folder under the unit
     store_dir: str         # <state>/plugin-security
     breaker_store: str     # <store_dir>/breaker.sqlite3
     revocation_store: str  # <store_dir>/revoked.sqlite3
     ledger: str            # <store_dir>/ledger.sqlite3, the authority ledger (not created until the anchor key is passed)
     homes: str             # <state>/homes, the route homes' custody root (route_home.check's root)
+    state_home: str = ""   # the folder the state folder is in: <home>/.local/state, or the chosen place
+    state_root: str = ""   # where the state folders are made from: the home, or the chosen place itself
+    chosen: bool = False   # True when XDG_STATE_HOME chose another place than the default
 
 
 def owned_paths(roots: Roots) -> Owned:
     if type(roots) is not Roots:
         raise InstallRefused("roots")
+    if roots.state_home is not None and type(roots.state_home) is not str:
+        raise InstallRefused("roots")
     home = _directory_root(roots.home)
     unit_dir = os.path.join(home, ".config", "systemd", "user")
-    state = os.path.join(home, *STATE_HOME.split("/"), STATE_FOLDER)
+    chosen = chosen_state_home(home, roots.state_home)
+    base = state_home(home, roots.state_home)
+    state = os.path.join(base, STATE_FOLDER)
     store_dir = os.path.join(state, STORE_FOLDER)
     return Owned(
         home=home,
@@ -74,7 +91,85 @@ def owned_paths(roots: Roots) -> Owned:
         revocation_store=os.path.join(store_dir, REVOCATION_FILE),
         ledger=os.path.join(store_dir, LEDGER_FILE),
         homes=os.path.join(state, HOMES_FOLDER),
+        state_home=base,
+        state_root=base if chosen else home,
+        chosen=chosen is not None,
     )
+
+
+def default_state_home(home: str) -> str:
+    """``<home>/.local/state``: the standard's default for ``XDG_STATE_HOME``."""
+
+    return os.path.join(home, *STATE_HOME.split("/"))
+
+
+def chosen_state_home(home: str, value: str | None) -> str | None:
+    """The place the person chose with ``XDG_STATE_HOME``, or None when the default applies.
+
+    Unset or empty is the default, as the standard and the daemon read it; so is a value naming the
+    default itself (links followed). A relative value is refused ``state_home_relative``: it would name
+    a folder relative to wherever a process starts, so the stores could be made in one place and the
+    daemon look in another. The text names the value and the way out."""
+
+    if not value:
+        return None
+    default = default_state_home(home)
+    if not os.path.isabs(value):
+        raise InstallRefused(
+            "state_home_relative",
+            f"XDG_STATE_HOME is {value}, a relative path, which names no folder for sure. Set it to an "
+            f"absolute path, or unset it to keep the state in {default}")
+    if os.path.realpath(value) == os.path.realpath(default):
+        return None
+    return value
+
+
+def state_home(home: str, value: str | None) -> str:
+    """The folder the daemon's state folder is in: the chosen place (links resolved), else the default."""
+
+    chosen = chosen_state_home(home, value)
+    return os.path.realpath(chosen) if chosen is not None else default_state_home(home)
+
+
+def state_folder(home: str, value: str | None) -> str:
+    """``state_home(home, value)/recursion``: the daemon's state folder."""
+
+    return os.path.join(state_home(home, value), STATE_FOLDER)
+
+
+def check_state_root(paths: Owned) -> None:
+    """Refuse a chosen place another user could change, before anything is made.
+
+    A chosen place that is there is held to the home's own rule (``_directory_root``): ours, not
+    writable by group or world, and every folder and link on the way root's or ours
+    (``folder_untrusted``). A chosen place that is not there yet is made by ``ensure_state_root``
+    under its nearest folder that is there, which must meet the same rule. The default needs
+    nothing here: its folders are checked under the home as they always were."""
+
+    if not paths.chosen:
+        return
+    _nearest_trusted(paths.state_root)
+
+
+def ensure_state_root(paths: Owned) -> bool:
+    """Make a chosen place that is not there (each new folder 0700), then hold it to the home's rule.
+    True when a folder was made. The default: nothing to do here, False."""
+
+    if not paths.chosen:
+        return False
+    nearest = _nearest_trusted(paths.state_root)
+    created = nearest != paths.state_root and ensure_dir(nearest, paths.state_root, mode=0o700)
+    if _directory_root(paths.state_root) != paths.state_root:
+        raise InstallRefused("folder_untrusted", f"{paths.state_root} was replaced while it was made; run the command again")
+    return created
+
+
+def _nearest_trusted(path: str) -> str:
+    nearest = path
+    while not os.path.lexists(nearest) and os.path.dirname(nearest) != nearest:
+        nearest = os.path.dirname(nearest)
+    _directory_root(nearest)
+    return nearest
 
 
 def _refuse_without_geteuid() -> None:

@@ -27,6 +27,19 @@ from .launcher import EngineUnitManager
 log = logging.getLogger('recursion_core.daemon')
 
 
+def state_dir(environ):
+    """The daemon's state folder, from the installer's one resolver (``daemon_install.layout.state_folder``):
+    ``$XDG_STATE_HOME/recursion``, or ``~/.local/state/recursion`` when it is unset or empty. A relative
+    value is refused before any lock, state, socket or GUI: one line, ``state_home_relative``."""
+    from recursion_core.daemon_install import InstallRefused
+    from recursion_core.daemon_install.layout import state_folder
+
+    try:
+        return Path(state_folder(str(Path.home()), environ.get('XDG_STATE_HOME')))
+    except InstallRefused as exc:
+        raise SystemExit(f'recursion daemon refused to start: {exc.kind}: {exc.detail}') from None
+
+
 def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep_seconds=5):
     """``plugins`` are plain registries an embedding caller already holds (tests); ``plugin_dirs``
     are installed plugin directories, which only the composed daemon loads, through the loader."""
@@ -36,7 +49,7 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
     refuse_engine_user(os.environ)
     check_operator_linger(getpass.getuser())
     runtime = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}')
-    state = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'recursion'
+    state = state_dir(os.environ)
     stopped = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stopped.set())
     signal.signal(signal.SIGINT, lambda *_: stopped.set())

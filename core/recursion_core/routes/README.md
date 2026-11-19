@@ -8,9 +8,10 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
 ## What it is
 
 - `contract.py`: the route contract. Requests, results, events and limit signals are plain dicts that
-  round-trip through JSON; every refusal or failure has a typed code (`CODES`). Surfaces and the daemon
-  call `RouteService.handle(request) -> result` and nothing else, so the tests drive behaviour through
-  the protocol and a later port can reuse them.
+  round-trip through JSON; every refusal or failure has a typed code (`CODES`). Pi and Hermes requests
+  carry `route.wrapper` as a Python WrapperInstall object; that field does not round-trip through JSON yet.
+  Surfaces and the daemon call `RouteService.handle(request) -> result` and nothing else, so the tests
+  drive behaviour through the protocol and a later port can reuse them.
 - `claude_code.py`: `ClaudeCodeAdapter`, `claude -p --input-format stream-json --output-format stream-json`.
   Reads typed limit signals only: `rate_limit_event` with `status: rejected`,
   `api_error_params.rate_limit_info` on an error `result`, and a typed `error: "rate_limit"`.

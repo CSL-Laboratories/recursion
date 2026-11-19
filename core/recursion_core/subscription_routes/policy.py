@@ -311,9 +311,10 @@ def check_route(
 ) -> RouteDecision:
     """Validate one Pi/Hermes/OpenCode profile; raise ``SubscriptionRouteRefused`` or return the decision.
 
-    ``profile`` keys: ``provider`` (id), ``auth`` (must be ``"api_key"``), ``credential_env`` (the variable
-    that carries the key) and optionally ``model`` (``"<provider>/<model>"``; required on a subscription
-    route). ``borrow_claude_code_login`` is not a profile field: Hermes's own setting is
+    ``profile`` keys: ``provider`` (id). ``auth`` is ``"api_key"`` (with ``credential_env``, the variable
+    that carries the key) or ``"subscription"`` with a ``method`` from ``SUBSCRIPTION_SIGN_INS``.
+    ``model`` (``"<provider>/<model>"``) is optional on an api-key route and required on a subscription
+    route. ``borrow_claude_code_login`` is not a profile field: Hermes's own setting is
     ``auth.adopt_external_logins``, required below, and any other key refuses ``profile_unknown_field``.
     A Hermes profile needs ``"auth.adopt_external_logins": False``. ``child_env`` is the exact
     environment the core will pass; ``route_home`` its HOME. Pi and Hermes also need ``wrapper``: the

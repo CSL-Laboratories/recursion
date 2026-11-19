@@ -187,8 +187,9 @@ Symlinks (owner call 1):
   link at other content changes the pin even when the bytes are the same.
 - A link whose real path leaves the real install root refuses `package_link_outside_root`.
   It is followed only when the caller lists the target in `allowed_link_targets`, or the
-  run uses the full-access profile. Its contents are hashed either way, and a link inside
-  an allowed tree may not leave that tree.
+  run uses the full-access profile. Its contents are hashed either way. A link may point
+  anywhere inside the install root or any allowed tree; it is not confined to the allowed
+  tree that contains it.
 - A dangling link or a link loop refuses `package_link_dangling`, with or without full
   access.
 - A directory link back to a directory already being walked (a workspace self-link) is

@@ -1,8 +1,9 @@
 """One route contract for every engine adapter (CSL-797, candidate). See README.md.
 
 The contract is plain dicts that round-trip through JSON, so a surface, an adapter or a later Rust
-core can speak it without importing Python types. Every refusal and failure carries a typed code
-from ``CODES``; nothing downstream reads wording.
+core can speak it without importing Python types. Pi and Hermes requests carry ``route.wrapper`` as a
+Python ``WrapperInstall`` object; that field does not round-trip through JSON yet. Every refusal and
+failure carries a typed code from ``CODES``; nothing downstream reads wording.
 
 Request::
 

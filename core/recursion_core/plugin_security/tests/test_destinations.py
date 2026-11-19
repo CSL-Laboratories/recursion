@@ -212,6 +212,83 @@ class DestinationCheckTests(unittest.TestCase):
         self.assertRefused("address_refused", "platform_address,private", "api.example.com",
                            ["api.example.com"], ["168.63.129.16", "10.0.0.1", "169.254.169.254"])
 
+    # -- IPv4 carried inside IPv6, and ranges that are not routable -------------------
+
+    # Each IPv6 form with the IPv4 address it carries; the form is judged as that address.
+    CARRIED = (
+        ("::ffff:0:a9fe:a9fe", "platform_address"),  # IPv4-translated ::ffff:0:0:0/96
+        ("::ffff:0:7f00:1", "loopback"),
+        ("64:ff9b:1::a9fe:a9fe", "platform_address"),  # local NAT64 64:ff9b:1::/48
+        ("64:ff9b:1::7f00:1", "loopback"),
+        ("64:ff9b::a9fe:a9fe", "platform_address"),  # NAT64 64:ff9b::/96
+        ("::127.0.0.1", "loopback"),  # IPv4-compatible ::/96
+        ("::169.254.169.254", "platform_address"),
+        ("2002:7f00:1::", "loopback"),  # 6to4 2002::/16
+        ("2002:a9fe:a9fe::", "platform_address"),
+        ("2001:0:5db8:d822::80ff:fffe", "loopback"),  # Teredo, client 127.0.0.1
+        ("2001:0:5db8:d822::5601:5601", "platform_address"),  # Teredo, client 169.254.169.254
+        ("2001:0:7f00:1::f7f7:f7f7", "loopback"),  # Teredo, server 127.0.0.1
+    )
+
+    def test_ipv4_carried_inside_ipv6_is_refused_as_the_ipv4_inside_under_every_setting(self):
+        for address, name in self.CARRIED:
+            for allow in (False, True):
+                with self.subTest(address=address, allow_private_addresses=allow):
+                    self.assertRefused("address_refused", name, "api.example.com", ["api.example.com"],
+                                       [address], allow_private_addresses=allow)
+
+    def test_a_public_ipv4_carried_inside_ipv6_stays_allowed(self):
+        for address in ("::ffff:0:5db8:d822", "64:ff9b:1::5db8:d822", "::93.184.216.34",
+                        "2002:5db8:d822::", "2001:0:5db8:d822::f7f7:f7f7"):
+            for allow in (False, True):
+                with self.subTest(address=address, allow_private_addresses=allow):
+                    self.assertEqual(check("api.example.com", ["api.example.com"], [address],
+                                           allow_private_addresses=allow), str(ipaddress.ip_address(address)))
+
+    def test_a_private_ipv4_carried_inside_ipv6_follows_the_switch_like_the_plain_one(self):
+        for address in ("::ffff:0:a00:1", "64:ff9b:1::a00:1", "::10.0.0.1", "2002:a00:1::"):
+            with self.subTest(address=address):
+                self.assertRefused("address_refused", "private", "api.example.com", ["api.example.com"],
+                                   [address])
+                self.assertEqual(check("api.example.com", ["api.example.com"], [address],
+                                       allow_private_addresses=True), str(ipaddress.ip_address(address)))
+
+    def test_a_local_nat64_address_in_another_layout_is_judged_by_every_layout(self):
+        # 64:ff9b:1:7f00:1:: read with a /48 prefix carries 127.0.1.0.
+        self.assertRefused("address_refused", "loopback", "api.example.com", ["api.example.com"],
+                           ["64:ff9b:1:7f00:1::5db8:d822"], allow_private_addresses=True)
+
+    def test_unspecified_and_loopback_ipv6_keep_their_own_class(self):
+        self.assertAddressClass("unspecified", "::")
+        self.assertAddressClass("loopback", "::1")
+
+    def test_address_refused_not_routable_under_every_setting(self):
+        for address in ("0.0.0.1", "0.255.255.255", "240.0.0.1", "255.255.255.254", "fec0::1",
+                        "feff::1", "::ffff:240.0.0.1"):
+            for allow in (False, True):
+                with self.subTest(address=address, allow_private_addresses=allow):
+                    self.assertRefused("address_refused", "not_routable", "api.example.com",
+                                       ["api.example.com"], [address], allow_private_addresses=allow)
+        for asked in ("0.0.0.1", "240.0.0.1"):
+            with self.subTest(asked=asked):
+                self.assertRefused("address_refused", "ip_literal", asked, [asked], [asked])
+                self.assertRefused("address_refused", "not_routable", asked, [asked], [asked],
+                                   allow_private_addresses=True)
+
+    def test_an_ipv6_form_named_as_the_destination_is_not_granted(self):
+        for address, _ in self.CARRIED:
+            for asked in (address, "[" + address + "]", "[" + address + "]:443"):
+                for allow in (False, True):
+                    with self.subTest(asked=asked, allow_private_addresses=allow):
+                        self.assertRefused("destination_not_granted", "", asked, [asked], [address],
+                                           allow_private_addresses=allow)
+
+    def test_an_ip_literal_with_no_address_is_refused_before_the_list_is_read(self):
+        # The docstring says so: ValueError comes once the destination itself has passed.
+        self.assertRefused("address_refused", "ip_literal", "10.0.0.1", ["10.0.0.1"], [])
+        with self.assertRaises(ValueError):
+            check("10.0.0.1", ["10.0.0.1"], [], allow_private_addresses=True)
+
     # -- every address given is checked ---------------------------------------------
 
     def test_one_refused_address_among_good_ones_is_skipped(self):

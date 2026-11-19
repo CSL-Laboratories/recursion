@@ -7,7 +7,7 @@ import os
 import tomllib
 import unittest
 
-from recursion_core.control import mcp_tools
+from recursion_core.control import codex_config, mcp_tools
 from recursion_core.control.codex_config import codex_operator_snippet
 from recursion_core.control.registry import EMPTY, POPULATED
 from recursion_core.control.tests.fakes import FakeKillTree, make_api, started
@@ -220,6 +220,42 @@ class CodexSnippetTest(unittest.TestCase):
     def test_rejects_non_bare_server_id(self) -> None:
         with self.assertRaises(ValueError):
             codex_operator_snippet("a.b", "x")
+
+
+    def test_rejects_trailing_newline_server_id_and_encodes_non_bmp_paths_as_valid_toml(self) -> None:
+        with self.assertRaises(ValueError):
+            codex_operator_snippet("rc\n", "x")
+        text = codex_operator_snippet("rc", "/opt/\U0001f680/mcp", ["--label=\U0001f680", "line\nbreak"])
+        doc = tomllib.loads(text)
+        self.assertEqual(doc["mcp_servers"]["rc"]["command"], "/opt/\U0001f680/mcp")
+        self.assertEqual(doc["mcp_servers"]["rc"]["args"], ["--label=\U0001f680", "line\nbreak"])
+
+    def test_every_value_round_trips_through_toml_and_the_text_is_ascii(self) -> None:
+        values = ["plain", "with \"quotes\" and \\ backslash", "tab\tcr\rff\fbs\b", "del\x7fnul\x00us\x1f",
+                  "caf\u00e9 \u2028 \uffff", "\U0001f680\U0010ffff", ""]
+        text = codex_operator_snippet("rc", values[0], values)
+        self.assertTrue(text.isascii())
+        doc = tomllib.loads(text)
+        self.assertEqual(doc["mcp_servers"]["rc"]["args"], values)
+        self.assertIn("\\U0001f680", text)  # a scalar escape, not JSON's surrogate pair
+        self.assertNotIn("\\ud83d", text)
+
+    def test_below_u_ffff_the_text_is_what_json_wrote_except_del(self) -> None:
+        sample = "a\"b\\c\nd\te\u00e9\u0001\uffff/"
+        self.assertEqual(codex_config.toml_string(sample), json.dumps(sample))
+        self.assertEqual(codex_config.toml_string("\x7f"), '"\\u007f"')
+
+    def test_a_lone_surrogate_or_a_non_string_has_no_toml_form(self) -> None:
+        with self.assertRaises(ValueError):
+            codex_operator_snippet("rc", "/opt/\udc80/mcp")
+        with self.assertRaises(ValueError):
+            codex_operator_snippet("rc", "x", ["\ud83d"])
+        for bad in (5, None, b"x", ["x"]):   # a list of strings would otherwise be written as one string
+            with self.assertRaises(TypeError):
+                codex_operator_snippet("rc", bad)  # type: ignore[arg-type]
+        for bad in (5, None, b"rc", "", "rc\n", "\nrc", "r c"):
+            with self.assertRaises(ValueError):
+                codex_operator_snippet(bad, "x")  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

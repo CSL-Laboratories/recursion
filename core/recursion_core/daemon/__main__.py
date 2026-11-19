@@ -20,6 +20,8 @@ import threading
 from . import (Daemon, Registry, SystemdUserManager, UserLock, check_operator_linger,
                refuse_engine_user, require_free_threaded, require_posix)
 
+from recursion_core.std_fds import occupy_standard_fds
+
 from .control_adapter import compose_control
 from .gui import LoopbackGUI
 from .launcher import EngineUnitManager
@@ -95,6 +97,7 @@ def _start_gui(client, door, plugins, port, *, announced):
 
 
 def cli():
+    occupy_standard_fds()  # before any open: a hole at fd 0, 1 or 2 would be taken by the next file
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gui-port", type=int, default=8765)
     parser.add_argument("--sweep-seconds", type=float, default=None,

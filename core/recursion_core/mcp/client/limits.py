@@ -2,9 +2,14 @@
 
 An outside server is untrusted input. None of these numbers is measured; they are the lane's first values
 and bind only once the owner merges the contract lines on the client and on the limits of outside servers.
-They are meant to become a person's own setting later: a settings reader replaces a value here (or the
-name in ``session``, where it is read when the limit is checked) without touching the logic. The list is
-not final either: a later limit is one more name here and one more check in ``session``.
+They are meant to become a person's own setting later, and that is not a change of this file alone:
+``session`` copies each value when it is imported, so a value replaced here afterwards changes nothing. A
+value replaced on the name in ``session`` is read when its limit is checked, which holds for the sizes and
+counts; the two times are also the default deadlines of four signatures there (``open``, ``list_tools``,
+``begin_call``, ``call_tool``), held at import, so a raised time is not used by a call that keeps its
+default. A later settings reader therefore changes those checks and defaults in ``session`` (or hands a
+session its own values). The list is not final either: a later limit is one more name here and one more
+check in ``session``.
 
 A limit that fires is a typed result the caller receives and a record handed to ``on_record``; it cuts off
 only that server's session (see ``session``, LIMITS).
@@ -22,7 +27,8 @@ CALL_DEADLINE_S = 60.0
 # most this many bytes plus one, and never the rest of the line (``session.MESSAGE_TOO_LARGE``).
 MAX_MESSAGE_BYTES = 2 * 1024 * 1024
 
-# The text of one tool result (its ``text`` content items, UTF-8) is cut at this many bytes and the cut is
+# The text of one tool result (every string ``text`` of its content items and of their ``resource``, UTF-8,
+# in one budget) is cut at this many bytes and the cut is
 # marked in the result (``session.RESULT_CUT``).
 MAX_TOOL_RESULT_TEXT_BYTES = 256 * 1024
 

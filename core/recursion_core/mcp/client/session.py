@@ -3,8 +3,8 @@
 ``McpClient(instream, outstream)`` reads the server's messages from ``instream`` (the server's stdout) and
 writes its own to ``outstream`` (the server's stdin). It starts no process and ends none: whoever made the
 streams owns them. Lines are read with this client's own bounded read and decoded with the Control MCP
-server's ``framing.decode_line``; messages are written with its ``framing.FrameWriter`` and shaped and
-sorted with its ``jsonrpc`` module, both by import.
+server's ``framing.decode_line``; each message is encoded once with its ``framing.encode``, when it is made, and
+those bytes are what is written; messages are shaped and sorted with its ``jsonrpc`` module, both by import.
 
 ``open``
     Sends ``initialize`` asking for ``LATEST_PROTOCOL`` (2026-07-28), with no client capabilities. A
@@ -46,11 +46,15 @@ receives and a record ``{"record": <code>, ...}`` handed to ``on_record``; it to
   call is abandoned (``notifications/cancelled``) and answers ``CALL_TIMEOUT``;
 * one message: a line longer than ``MAX_MESSAGE_BYTES`` (2 MiB, its newline included) ends the session
   (``MESSAGE_TOO_LARGE``): the client reads at most that many bytes plus one and never reads the rest;
-* one tool result: its text (the ``text`` content items, UTF-8) is cut at ``MAX_TOOL_RESULT_TEXT_BYTES``
-  (256 KiB) on a whole character, later text items are left out, and the result's ``_meta`` holds
-  ``{RESULT_CUT: {"limit_bytes": ..., "text_bytes": <the text's whole size>}}``;
+* one tool result: its text (every string ``text`` of a content item, whatever its ``type``, and the string
+  ``text`` of an item's ``resource``; UTF-8, all in one budget) is cut at ``MAX_TOOL_RESULT_TEXT_BYTES``
+  (256 KiB) on a whole character, an item whose text finds the budget spent is left out, and the result's
+  ``_meta`` holds ``{RESULT_CUT: {"limit_bytes": ..., "text_bytes": <the text's whole size>}}`` beside the
+  server's own keys. What is not text (structured content, image data, ``_meta``) is not cut here, and a
+  ``content`` that is not a list is handed back as sent;
 * the tool list: listed to ``MAX_TOOLS`` (512); no page is asked for past it; ``list_tools`` returns a
-  ``ToolList`` whose ``cut`` is ``TOOL_LIST_CUT`` (``None`` for a whole list);
+  ``ToolList`` whose ``cut`` is ``TOOL_LIST_CUT`` (``None`` for a whole list), and ``on_tools`` and ``tools``
+  hand over a ``ToolList`` that keeps the same ``cut`` and ``reason``, also after a change notice;
 * one listing (a caller's ``list_tools`` and the relisting after a change notice): at most ``MAX_LIST_PAGES``
   pages (64) and one deadline for the whole listing (the caller's, bounded by ``CALL_DEADLINE_S``; each page
   waits only for what is left of it). Past either the listing ends: the tools read so far, ``cut`` is
@@ -83,7 +87,9 @@ its backslash escape (``\\x1b``, ``\\t``, ``\\udfff``). ``McpServerError.error``
 
 THREADS. Reading runs on a thread of its own and writing on another, so a server that is slow to answer,
 or slow to read, never holds the caller past the deadline: a caller only puts a message in the outbox and
-waits for its answer with a time limit. Every shared state is changed under one lock; nothing relies on a
+waits for its answer with a time limit. The message is encoded on the caller's thread when the call is made:
+a value JSON cannot hold raises there and nothing is queued, and a later change to the caller's objects
+changes nothing that is sent. A cut result wakes its caller before its record is handed to ``on_record``. Every shared state is changed under one lock; nothing relies on a
 global interpreter lock. A callback (``on_progress``, ``on_tools``, ``on_record``) that raises is ignored.
 
 ENDING. The session ends once, for the first of: a line over the bound, end of the server's output
@@ -92,8 +98,11 @@ ENDING. The session ends once, for the first of: a line over the bound, end of t
 ``ending`` keeps it. The writer sends what it already holds and then closes ``outstream``, so the server
 reads end of input; ``instream`` is left to its owner.
 
-Lines that are not UTF-8 or not JSON, and responses naming no request in flight, are dropped. A message
-that is not valid JSON-RPC is answered as the Control MCP server answers it (``jsonrpc.classify``).
+Lines that are not UTF-8 or not JSON, and responses naming no request in flight, are dropped, and so is a
+line read after the session has ended. A number that is not finite (``1e999``, which the decoder reads as
+infinity) is not JSON either: a message holding one anywhere is dropped, and when it answers a request in
+flight that request fails ``BAD_ANSWER`` and its caller gets no value. A message that is not valid JSON-RPC
+is answered as the Control MCP server answers it (``jsonrpc.classify``).
 """
 
 from __future__ import annotations
@@ -101,13 +110,14 @@ from __future__ import annotations
 import collections
 import hashlib
 import itertools
+import math
 import threading
 import time
 from collections.abc import Callable
 from typing import Any, BinaryIO
 
 from recursion_core.control.mcp import jsonrpc
-from recursion_core.control.mcp.framing import FrameWriter, decode_line, encode
+from recursion_core.control.mcp.framing import decode_line, encode
 
 from .limits import (
     CALL_DEADLINE_S,
@@ -200,6 +210,12 @@ class ToolList(list):
     reason: str | None = None
 
 
+def _marked_copy(tools: ToolList) -> ToolList:
+    copy = ToolList(tools)
+    copy.cut, copy.reason = tools.cut, tools.reason
+    return copy
+
+
 class _Pending:
     __slots__ = ("done", "result", "failure", "on_progress", "method")
 
@@ -241,17 +257,17 @@ class McpClient:
     def __init__(self, instream: BinaryIO, outstream: BinaryIO, *,
                  on_record: Callable[[dict], Any] = _ignore, on_tools: Callable[[list], Any] = _ignore) -> None:
         self._in, self._out = instream, outstream
-        self._writer = FrameWriter(outstream)
         self._on_record, self._on_tools = on_record, on_tools
         self._cond = threading.Condition()
         self._ids = itertools.count(1)
         self._pending: dict[int, _Pending] = {}
-        self._outbox: collections.deque[tuple[dict, int]] = collections.deque()  # (message, its size if an answer)
+        # (the message, its size if an answer, the bytes encoded at the call and written, its id if a request)
+        self._outbox: collections.deque[tuple[dict, int, bytes, int | None]] = collections.deque()
         self._unsent_answer_bytes = 0  # the answers owed and not yet written, the one being written included
         self._answers_dropped = 0  # in the stretch of drops under way
         self._started = False
         self._relisting = self._relist_again = False
-        self._tools: list = []
+        self._tools = ToolList()
         self._breaches = 0
         self.ending: str | None = None
         self.protocol_version: str | None = None
@@ -268,16 +284,17 @@ class McpClient:
             self._started = True
         threading.Thread(target=self._read_loop, name="mcp-client-read", daemon=True).start()
         threading.Thread(target=self._write_loop, name="mcp-client-write", daemon=True).start()
-        deadline = time.monotonic() + min(deadline_s, INITIALIZE_DEADLINE_S)
+        limit_s = min(deadline_s, INITIALIZE_DEADLINE_S)  # the start limit used, named in its record
+        deadline = time.monotonic() + limit_s
         start_bound = deadline_s >= INITIALIZE_DEADLINE_S  # equal counts as the start bound
         asked = LATEST_PROTOCOL
         try:
             try:
-                result = self._initialize(asked, deadline, start_bound)
+                result = self._initialize(asked, deadline, start_bound, limit_s)
             except McpServerError:
                 asked = LEGACY_PROTOCOL
                 try:
-                    result = self._initialize(asked, deadline, start_bound)
+                    result = self._initialize(asked, deadline, start_bound, limit_s)
                 except McpServerError as exc:
                     self._end(INITIALIZE_REFUSED)
                     raise McpSessionEnded(INITIALIZE_REFUSED, exc.detail) from exc
@@ -297,7 +314,7 @@ class McpClient:
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         return result
 
-    def _initialize(self, version: str, deadline: float, start_bound: bool) -> dict:
+    def _initialize(self, version: str, deadline: float, start_bound: bool, limit_s: float) -> dict:
         """One ``initialize`` request within the start's budget, never cancelled. The ending names the deadline
         that fired: the start bound ends the session ``SERVER_START_TIMEOUT`` with its record; a shorter
         deadline the caller gave ends it ``CALL_TIMEOUT`` (through ``open``), with no start-timeout record."""
@@ -305,8 +322,9 @@ class McpClient:
         call = self._request("initialize", self._init_params(version), None,
                              max(0.0, deadline - time.monotonic()), cancel=False)
         if start_bound and not call._pending.done.wait(max(0.0, deadline - time.monotonic())):
-            self._callback(self._on_record, {"record": SERVER_START_TIMEOUT, "limit_s": INITIALIZE_DEADLINE_S})
-            self._end(SERVER_START_TIMEOUT)
+            self._end(SERVER_START_TIMEOUT)  # first: an answer that comes from now on is dropped, never returned
+            self._callback(self._on_record, {"record": SERVER_START_TIMEOUT, "limit_s": limit_s})
+            raise McpSessionEnded(self.ending)
         return call.wait()
 
     @staticmethod
@@ -338,14 +356,20 @@ class McpClient:
             pending.failure = McpSessionEnded(ending)
             pending.done.set()
 
-    def _breach(self, code: str, detail: dict) -> None:
-        """Record a limit that fired; at ``MAX_BREACHES`` in this session the server is cut off."""
+    def _breach(self, code: str, detail: dict, wake: Callable[[], Any] | None = None) -> None:
+        """Record a limit that fired; at ``MAX_BREACHES`` in this session the server is cut off. ``wake``, when
+        given, wakes the breaching caller once the breach is counted (and a cut-off has ended the session)
+        and before any record is handed over, so a slow ``on_record`` never holds that caller."""
 
         with self._cond:
             counted = self.ending is None
             if counted:
                 self._breaches += 1
             breaches = self._breaches
+        if wake is not None:
+            if counted and breaches == MAX_BREACHES:
+                self._end(SERVER_CUT_OFF)
+            wake()
         self._callback(self._on_record, {"record": code, **detail})
         if counted and breaches == MAX_BREACHES:
             self._callback(self._on_record, {"record": SERVER_CUT_OFF, "breaches": breaches})
@@ -353,11 +377,11 @@ class McpClient:
 
     # -- tools -------------------------------------------------------------------------------------------
     @property
-    def tools(self) -> list:
-        """The last full list ``list_tools`` read."""
+    def tools(self) -> ToolList:
+        """The last full list ``list_tools`` read, with its ``cut`` and ``reason``."""
 
         with self._cond:
-            return list(self._tools)
+            return _marked_copy(self._tools)
 
     def list_tools(self, deadline_s: float = CALL_DEADLINE_S) -> ToolList:
         limit_s = min(deadline_s, CALL_DEADLINE_S)
@@ -402,8 +426,8 @@ class McpClient:
         if tools.reason is not None:
             tools.cut = TOOL_LIST_CUT
         with self._cond:
-            self._tools = list(tools)
-        self._callback(self._on_tools, list(tools))
+            self._tools = _marked_copy(tools)
+        self._callback(self._on_tools, _marked_copy(tools))
         if tools.reason == LIST_CUT_PAGES:
             self._breach(TOOL_LIST_CUT, {"reason": LIST_CUT_PAGES, "limit": MAX_LIST_PAGES, "listed": listed})
         elif tools.reason == LIST_CUT_TIME:
@@ -435,7 +459,7 @@ class McpClient:
             params = {**params, "_meta": {"progressToken": request_id}}
         try:
             # Not taken only once the session has ended, and then _end has already answered this call.
-            self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+            self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}, request_id)
         except BaseException:  # a message JSON cannot hold: nothing was sent
             with self._cond:
                 self._pending.pop(request_id, None)
@@ -454,19 +478,20 @@ class McpClient:
                         "params": {"requestId": request_id, "reason": code}})
         return True
 
-    def _send(self, message: dict) -> bool:
-        encode(message)  # a message JSON cannot hold raises here, on the caller's thread
+    def _send(self, message: dict, request_id: int | None = None) -> bool:
+        data = encode(message)  # once, on the caller's thread: a value JSON cannot hold raises here
         with self._cond:
             if self.ending is not None:
                 return False
-            self._outbox.append((message, 0))
+            self._outbox.append((message, 0, data, request_id))
             self._cond.notify_all()
             return True
 
     def _answer(self, message: dict) -> None:
         """Hand over an answer the client owes the server, or drop it (the module text, LIMITS: unsent answers)."""
 
-        size = len(encode(message))
+        data = encode(message)
+        size = len(data)
         started = resumed = 0
         with self._cond:
             if self.ending is not None:
@@ -478,7 +503,7 @@ class McpClient:
             else:
                 resumed, self._answers_dropped = self._answers_dropped, 0
                 self._unsent_answer_bytes += size
-                self._outbox.append((message, size))
+                self._outbox.append((message, size, data, None))
                 self._cond.notify_all()
         if started:
             self._breach(ANSWERS_DROPPED, {"pending_bytes": started, "limit_bytes": MAX_UNSENT_ANSWER_BYTES})
@@ -492,8 +517,8 @@ class McpClient:
                     self._cond.wait()
                 if not self._outbox:
                     break
-                message, size = self._outbox.popleft()
-            written = self._writer.write(message)
+                _message, size, data, _request = self._outbox.popleft()
+            written = self._write(data)
             if size:
                 with self._cond:
                     self._unsent_answer_bytes -= size
@@ -505,13 +530,29 @@ class McpClient:
         except Exception:  # noqa: BLE001 - a failed or already shut stream
             pass
 
+    def _write(self, data: bytes) -> bool:
+        """The bytes of one message, whole (a short write is given the rest), then flushed; ``False`` when the
+        stream failed (a write took nothing, or raised): the rule of the Control MCP server's ``FrameWriter``."""
+
+        try:
+            view = memoryview(data)
+            while view:
+                taken = self._out.write(view)
+                if not taken or taken < 0:  # 0, None (a raw stream that would block) or a negative count
+                    return False
+                view = view[taken:]
+            self._out.flush()
+            return True
+        except Exception:  # noqa: BLE001 - a pipe the server stopped reading, a stream already shut
+            return False
+
     # -- reading -----------------------------------------------------------------------------------------
     def _read_loop(self) -> None:
         ending = SERVER_GONE
         try:
             while self.ending is None:
                 line = self._in.readline(MAX_MESSAGE_BYTES + 1)
-                if not line:
+                if not line or self.ending is not None:  # end of input, or a line read after the ending
                     break
                 if len(line) > MAX_MESSAGE_BYTES:
                     ending = MESSAGE_TOO_LARGE
@@ -519,7 +560,10 @@ class McpClient:
                     break
                 frame = decode_line(line)
                 if frame is not None and frame.error is None:
-                    self._receive(frame.message)
+                    if _finite(frame.message):
+                        self._receive(frame.message)
+                    else:
+                        self._not_finite(frame.message)
         finally:  # end of input, a read that raised, or a line over the bound: every waiting call is answered
             self._end(ending)
 
@@ -540,6 +584,21 @@ class McpClient:
                 self._schedule_relist()
         else:
             self._answer(jsonrpc.error(kind.id, kind.code, kind.message))
+
+    def _not_finite(self, message: Any) -> None:
+        """A message holding a number that is not finite is dropped; one that answers a request in flight
+        fails that request ``BAD_ANSWER``, so its caller gets no value."""
+
+        if not isinstance(jsonrpc.classify(message), jsonrpc.Response):
+            return
+        request_id = message.get("id")
+        if not jsonrpc.valid_id(request_id):
+            return
+        with self._cond:
+            pending = self._pending.pop(request_id, None)
+        if pending is not None:
+            pending.failure = McpClientError(BAD_ANSWER, "a number that is not finite")
+            pending.done.set()
 
     @staticmethod
     def _refused_record(method: Any) -> dict:
@@ -565,9 +624,10 @@ class McpClient:
             pending.result = message["result"]
             if pending.method == "tools/call":
                 cut = _cut_result(pending.result)
-                if cut is not None:  # counted before the caller is woken, so a cut-off is seen with it
+                if cut is not None:  # counted, then the caller woken (a cut-off seen with it), then the record
                     pending.result = cut
-                    self._breach(RESULT_CUT, dict(cut["_meta"][RESULT_CUT]))
+                    self._breach(RESULT_CUT, dict(cut["_meta"][RESULT_CUT]), wake=pending.done.set)
+                    return
         else:
             pending.failure = McpClientError(BAD_ANSWER, "result is not an object")
         pending.done.set()
@@ -615,27 +675,53 @@ class McpClient:
             pass
 
 
+def _finite(value: Any) -> bool:
+    """Whether every number in a decoded message is finite (the decoder reads ``1e999`` as infinity)."""
+
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                return False
+        elif isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return True
+
+
 def _cut_result(result: dict) -> dict | None:
-    """``result`` with its text cut at ``MAX_TOOL_RESULT_TEXT_BYTES`` and the cut marked; ``None`` if whole."""
+    """``result`` with its text cut at ``MAX_TOOL_RESULT_TEXT_BYTES`` and the cut marked; ``None`` if whole. Text
+    is every string ``text`` of an item, whatever its ``type``, and the string ``text`` of its ``resource``."""
 
     content = result.get("content")
     if not isinstance(content, list):
         return None
     budget, total, kept, cut = MAX_TOOL_RESULT_TEXT_BYTES, 0, [], False
     for item in content:
-        if not (isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)):
+        resource = item.get("resource") if isinstance(item, dict) else None
+        places = [] if not isinstance(item, dict) else [
+            place for place, holder in (("text", item), ("resource", resource))
+            if isinstance(holder, dict) and isinstance(holder.get("text"), str)]
+        if not places:
             kept.append(item)
             continue
-        data = item["text"].encode("utf-8", "surrogatepass")
-        total += len(data)
-        if len(data) <= budget:
-            budget -= len(data)
-            kept.append(item)
-            continue
-        cut = True
-        if budget > 0:  # a character the limit splits is left out whole
-            kept.append({**item, "text": data[:budget].decode("utf-8", "ignore")})
+        new, spent = item, 0
+        for place in places:
+            data = (item if place == "text" else resource)["text"].encode("utf-8", "surrogatepass")
+            total += len(data)
+            if len(data) <= budget:
+                budget -= len(data)
+                continue
+            cut = True
+            if budget == 0:  # the budget was spent before this text
+                spent += 1
+            part = data[:budget].decode("utf-8", "ignore")  # a character the limit splits is left out whole
             budget = 0
+            new = {**new, "text": part} if place == "text" else {**new, "resource": {**resource, "text": part}}
+        if spent < len(places):  # an item whose every text found the budget spent is left out
+            kept.append(new)
     if not cut:
         return None
     meta = result.get("_meta")

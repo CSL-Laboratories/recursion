@@ -189,8 +189,9 @@ fallback lives in [When Claude can't fix a review thread](AGENTS.md#when-claude-
 
 <!-- tools/release/licence_checks.py holds this section word for word (SIGN_OFF): change both together. -->
 
-Recursion is licensed under the Apache License 2.0 (`LICENSE`, `NOTICE`), applied
-once its copyright holder is named. From the commit that applies the licence on,
+Recursion is licensed under the Apache License 2.0 (`LICENSE`, `NOTICE`); its
+copyright holder is The Recursion Developers.
+From the commit that applies the licence on,
 every commit must carry a sign-off line naming the person who submits it:
 
 ```text

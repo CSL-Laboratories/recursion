@@ -14,6 +14,14 @@ returns one check body, or a list of them (``engine.binary``, one per engine). A
 file) and ``engine.binary`` (``shutil.which`` and ``--version`` with a timeout, no model
 call, and an empty home so the command is not pointed at a sign-in file).
 
+Two checks report the event store's ground. ``store.sqlite`` is the SQLite library this
+interpreter loaded (``sqlite3.sqlite_version``): fail below 3.51.3. ``store.filesystem`` is
+the file-system type of the state folder (after ``XDG_STATE_HOME``, links followed), read
+from ``/proc/self/mountinfo`` by the longest mount point that holds it: fail on 9p, drvfs,
+v9fs, overlay, nfs, nfs4, cifs or smb3, or when the folder lies under the WSL automount
+root ``/mnt/``; unknown when the type cannot be read. They run on the live host, and under
+a probe map only when the map names them. They report; nothing is refused because of them.
+
 On the live host only, three more checks run. ``plugin.config`` is the plugin config
 folder. ``plugin.revocation`` is the revocation store (``check_store``, which does not
 open it). ``plugin.installed`` is one row per installed plugin: its id, version, trust,
@@ -57,7 +65,16 @@ _IDS = (
     "store.breaker",
     "engine.binary",
 )
+# The event store's ground. Live, and under a probe map only when the map names them, so a
+# map written for ``_IDS`` gives the report it gave before.
+_GROUND_IDS = ("store.sqlite", "store.filesystem")
 _STATES = ("ok", "warn", "fail", "unknown")
+_SQLITE_FLOOR = (3, 51, 3)
+_MOUNTINFO = "/proc/self/mountinfo"
+# The WSL automount root. The base has no WSL probe module to read it from.
+_WSL_AUTOMOUNT = "/mnt/"
+_UNSAFE_FILESYSTEMS = frozenset({"9p", "drvfs", "v9fs", "overlay", "nfs", "nfs4", "cifs", "smb3"})
+_GROUND_STEP = "set XDG_STATE_HOME to a folder on a local Linux file system such as ext4"
 _UNIT_NAME = "recursion-daemon.service"
 _STORE_DIR = "plugin-security"
 _LEDGER_FILE = "ledger.sqlite3"
@@ -113,6 +130,9 @@ def _collect(probes) -> dict:
     checks = []
     for check_id in _IDS:
         checks.extend(_invoke(check_id, probes))
+    for check_id in _GROUND_IDS:
+        if probes is None or check_id in probes:
+            checks.extend(_invoke(check_id, probes))
     if probes is None:
         for check_id in _PLUGIN_IDS:
             checks.extend(_invoke(check_id, None))
@@ -417,6 +437,77 @@ def _probe_ledger():
 def _probe_breaker():
     from recursion_core.plugin_security.stores import BREAKER_MAGIC
     return _probe_store(_BREAKER_FILE, BREAKER_MAGIC)
+
+
+def _probe_sqlite():
+    import sqlite3
+
+    found = sqlite3.sqlite_version
+    floor = ".".join(str(part) for part in _SQLITE_FLOOR)
+    try:
+        version = tuple(int(part) for part in found.split("."))
+    except (AttributeError, TypeError, ValueError):
+        return _body("unknown", f"the SQLite version {found!r} could not be read")
+    if version < _SQLITE_FLOOR:
+        return _body("fail", f"SQLite {found} is loaded and the event store needs {floor} or later",
+                     f"run recursiond on an interpreter built with SQLite {floor} or later")
+    return _body("ok", f"SQLite {found} is loaded")
+
+
+def _unescape_mount(field: str) -> str:
+    """A mountinfo field with its octal escapes (``\\040`` for a space) turned back into characters."""
+
+    import re
+
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), field)
+
+
+def _mount_type(path: str):
+    """The type of the longest mount point holding ``path`` in ``_MOUNTINFO``, or None.
+
+    Of two mounts on the same point, the later line is the one on top.
+    """
+
+    try:
+        with open(_MOUNTINFO, encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    longest = -1
+    kind = None
+    for line in lines:
+        fields = line.split(" ")
+        try:
+            dash = fields.index("-", 6)
+            point = _unescape_mount(fields[4])
+            fstype = fields[dash + 1]
+        except (ValueError, IndexError):
+            continue
+        if not point.startswith("/") or not fstype:
+            continue
+        holds = path == point or path.startswith(point.rstrip("/") + "/")
+        if holds and len(point) >= longest:
+            longest = len(point)
+            kind = fstype
+    return kind
+
+
+def _probe_filesystem():
+    store = _state_store_dir()
+    if store is None:
+        return _body("unknown", "XDG_STATE_HOME is not an absolute path")
+    folder = os.path.realpath(os.path.dirname(store))
+    kind = _mount_type(folder)
+    shown = kind if kind else "a type that could not be read"
+    automount = _WSL_AUTOMOUNT.rstrip("/") + "/"
+    if folder.startswith(automount):
+        return _body("fail", f"{folder} lies under the WSL automount root {automount} ({shown})",
+                     _GROUND_STEP)
+    if kind is None:
+        return _body("unknown", f"the file-system type of {folder} could not be read from {_MOUNTINFO}")
+    if kind in _UNSAFE_FILESYSTEMS:
+        return _body("fail", f"{folder} is on {kind}", _GROUND_STEP)
+    return _body("ok", f"{folder} is on {kind}")
 
 
 def _denied(path) -> bool:
@@ -811,6 +902,8 @@ _LIVE = {
     "store.ledger": _probe_ledger,
     "store.breaker": _probe_breaker,
     "engine.binary": _probe_engines,
+    "store.sqlite": _probe_sqlite,
+    "store.filesystem": _probe_filesystem,
     "plugin.config": _probe_plugin_config,
     "plugin.revocation": _probe_revocation,
     "plugin.installed": _probe_plugins,

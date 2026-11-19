@@ -395,6 +395,144 @@ class DoctorReportTests(unittest.TestCase):
             self.assertNotEqual(socket["state"], "ok")
 
 
+_STATE = object()  # in ``StoreGroundTests._live(mounts=...)``: the run's own state folder
+_BASE = object()  # in ``StoreGroundTests._live(mounts=...)``: the directory the run made
+
+
+def _mount_line(number, point, kind):
+    """One ``/proc/self/mountinfo`` line; a space in the mount point is written as the kernel writes it."""
+
+    shown = point.replace("\\", "\\134").replace(" ", "\\040")
+    return f"{number} 1 0:{number} / {shown} rw,relatime shared:{number} - {kind} source{number} rw\n"
+
+
+class StoreGroundTests(unittest.TestCase):
+    """``store.sqlite`` and ``store.filesystem``: the event store's ground. They report and refuse nothing.
+
+    Each live run reads a home, a state folder and a mountinfo file that the test made, and the
+    account probes take that home as their root.
+    """
+
+    def _live(self, mounts=(), sqlite_version="3.51.3", mountinfo=None, automount=None):
+        """``(report, state_folder, opened)`` from ``doctor.run(None, root=home)`` in a directory this test made.
+
+        ``mounts`` is a list of ``(mount point, type)`` written after a ``/`` on ext4; a mount point
+        may be ``_STATE`` (the run's state folder) or ``_BASE`` (the directory the run made).
+        ``mountinfo`` replaces the path of the written file. ``automount`` is the WSL automount
+        root the doctor reads (``_BASE`` allowed); by default a folder in the run's directory.
+        """
+
+        import recursion_core.setup.doctor as doctor
+
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        base = os.path.realpath(folder.name)
+        home = os.path.join(base, "home")
+        runtime = os.path.join(base, "runtime")
+        scratch = os.path.join(base, "tmp")
+        empty_path = os.path.join(base, "bin")
+        for path in (home, runtime, scratch, empty_path):
+            os.mkdir(path, 0o700)
+        state = os.path.join(home, ".local", "state")
+        state_folder = os.path.join(state, "recursion")
+        os.makedirs(state_folder, 0o700)
+        named = {id(_STATE): state_folder, id(_BASE): base}
+        written = os.path.join(base, "mountinfo")
+        with open(written, "w", encoding="utf-8") as handle:
+            handle.write(_mount_line(21, "/", "ext4"))
+            for number, (point, kind) in enumerate(mounts, start=22):
+                handle.write(_mount_line(number, named.get(id(point), point), kind))
+        if automount is None:
+            automount = os.path.join(base, "automount") + "/"
+        elif automount is _BASE:
+            automount = base + "/"
+        if mountinfo is _BASE:
+            mountinfo = os.path.join(base, "no-mountinfo")
+        env = {
+            "HOME": home,
+            "PATH": empty_path,
+            "XDG_CONFIG_HOME": os.path.join(home, ".config"),
+            "XDG_STATE_HOME": state,
+            "XDG_RUNTIME_DIR": runtime,
+            "TMPDIR": scratch,
+        }
+        _watch_opens()
+        asked = []
+        before = len(_OPENED)
+        with mock.patch.dict(os.environ, env), mock.patch.object(tempfile, "tempdir", scratch), \
+                mock.patch.object(doctor, "_MOUNTINFO", mountinfo or written, create=True), \
+                mock.patch.object(doctor, "_WSL_AUTOMOUNT", automount, create=True), \
+                mock.patch("sqlite3.sqlite_version", sqlite_version), account_untouched(asked):
+            report = doctor.run(None, root=home)
+        self.assertEqual(asked, [])
+        _validate(report)
+        return report, state_folder, [raw for raw in _OPENED[before:] if isinstance(raw, str)]
+
+    def test_a_sqlite_below_the_floor_is_fail_in_one_sentence(self):
+        # Red on the base: the report has no store.sqlite row.
+        report, state_folder, opened = self._live(sqlite_version="3.51.2")
+        row = _check(report, "store.sqlite")
+        self.assertEqual(row["state"], "fail")
+        self.assertIn("3.51.2", row["detail"])
+        self.assertIn("3.51.3", row["detail"])
+        self.assertNotIn(". ", row["detail"])
+        # The report opens no file in the state folder: not a store, not the event store.
+        self.assertEqual([raw for raw in opened if raw.startswith(state_folder + os.sep)], [])
+
+    def test_a_sqlite_at_or_above_the_floor_is_ok(self):
+        for version in ("3.51.3", "3.53.1"):
+            with self.subTest(version=version):
+                report, _state, _opened = self._live(sqlite_version=version)
+                row = _check(report, "store.sqlite")
+                self.assertEqual(row["state"], "ok")
+                self.assertIn(version, row["detail"])
+
+    def test_a_9p_or_overlay_mount_under_the_state_folder_is_fail(self):
+        for point, kind in ((_STATE, "9p"), (_STATE, "overlay"), (_BASE, "9p"), (_BASE, "overlay")):
+            with self.subTest(kind=kind, at="state folder" if point is _STATE else "its parent"):
+                report, state_folder, _opened = self._live(mounts=[(point, kind)])
+                row = _check(report, "store.filesystem")
+                self.assertEqual(row["state"], "fail")
+                self.assertIn(kind, row["detail"])
+                self.assertIn(state_folder, row["detail"])
+
+    def test_the_longest_mount_point_decides(self):
+        # "/" and the run's directory are overlay; the state folder itself is mounted ext4: it is ok.
+        report, state_folder, _opened = self._live(mounts=[("/", "overlay"), (_BASE, "overlay"), (_STATE, "ext4")])
+        row = _check(report, "store.filesystem")
+        self.assertEqual(row["state"], "ok", row["detail"])
+        self.assertIn("ext4", row["detail"])
+        self.assertIn(state_folder, row["detail"])
+
+    def test_an_unreadable_mountinfo_is_unknown_and_never_ok(self):
+        report, _state, _opened = self._live(mountinfo=_BASE)
+        row = _check(report, "store.filesystem")
+        self.assertEqual(row["state"], "unknown")
+        self.assertNotEqual(row["state"], "ok")
+
+    def test_a_state_folder_under_the_wsl_automount_root_is_fail(self):
+        report, state_folder, _opened = self._live(automount=_BASE)
+        row = _check(report, "store.filesystem")
+        self.assertEqual(row["state"], "fail")
+        self.assertIn(state_folder, row["detail"])
+        self.assertIn("ext4", row["detail"])
+
+    def test_a_raised_ground_probe_is_unknown_and_a_probe_map_without_them_is_unchanged(self):
+        import recursion_core.setup.doctor as doctor
+
+        def boom():
+            raise RuntimeError("probe failed")
+
+        report = doctor.run(_fake(**{"store.sqlite": boom, "store.filesystem": boom}))
+        for check_id in ("store.sqlite", "store.filesystem"):
+            row = _check(report, check_id)
+            self.assertEqual(row["state"], "unknown")
+            self.assertIn("RuntimeError", row["detail"])
+        ids = [row["id"] for row in doctor.run(_fake())["checks"]]
+        self.assertNotIn("store.sqlite", ids)
+        self.assertNotIn("store.filesystem", ids)
+        self.assertEqual(len(ids), len(_fake()) + 1)  # engine.binary gives two rows
+
 
 class SchemaLoaderTests(unittest.TestCase):
     """The schema loader reads only the schema folder and fetches nothing."""

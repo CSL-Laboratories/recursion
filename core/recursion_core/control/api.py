@@ -508,96 +508,32 @@ class ControlAPI:
             return True
         return state not in ("Z", "X")
 
-    def _level_populated(self, directory: Path) -> bool | None:
-        """True when this directory lists a live pid or says populated. False when it was read clear.
+    def _held_subtree_populated(self, parent_fd: int, name: str, info: os.stat_result) -> bool | None:
+        """The re-read after a refused rmdir, through the held parent fd, never by a path.
 
-        A missing ``cgroup.procs`` or ``cgroup.events`` is an empty level. A positive pid is
-        a live member only when ``_listed_pid_alive`` says so. A pid that check calls gone
-        is not a live member. A pid whose read did not say is doubt. Any other read error
-        is doubt.
+        True when a level says populated or a listed pid is alive. False when the subtree was
+        read clear. None on doubt: the read could not be made, the leaf is gone from the held
+        parent, a pid is not positive, or a pid's read did not say. The walk bounds are the
+        daemon walk's two constants, read at the call, so a second copy cannot drift.
         """
-        try:
-            text = (directory / "cgroup.procs").read_text()
-        except OSError as exc:
-            if exc.errno not in (errno.ENOENT, errno.ESRCH):
-                return None
-            text = ""
-        except (ValueError, TypeError):
+        from recursion_core.daemon import read_held_cgroup
+        walked = read_held_cgroup(parent_fd, name, (info.st_dev, info.st_ino))
+        if walked is None or walked == "absent":
             return None
+        pids, populated = walked
+        if populated:
+            return True
         unknown = False
-        for token in text.split():
-            if not token.isdigit() or int(token) <= 0:
+        for pid in pids:
+            if pid <= 0:
                 return None
-            alive = self._listed_pid_alive(int(token))
+            alive = self._listed_pid_alive(pid)
             if alive is True:
                 return True
             if alive is None:
                 unknown = True
         if unknown:
             return None
-        try:
-            events = (directory / "cgroup.events").read_text()
-        except OSError as exc:
-            if exc.errno not in (errno.ENOENT, errno.ESRCH):
-                return None
-            events = ""
-        except (ValueError, TypeError):
-            return None
-        try:
-            fields = dict(line.split() for line in events.splitlines() if line.strip())
-        except ValueError:
-            return None
-        populated = fields.get("populated")
-        if populated == "1":
-            return True
-        if populated not in (None, "0"):
-            return None
-        return False
-
-    def _subtree_populated(self, directory: Path) -> bool | None:
-        """True when a re-read shows a process, False when the subtree was read clear, None on doubt.
-
-        The depth and node bounds are the daemon walk's two constants, read at the call so a
-        second copy of the numbers cannot drift. Past either bound the re-read is doubt.
-        """
-        from recursion_core.daemon import CGROUP_WALK_MAX_DEPTH, CGROUP_WALK_MAX_NODES
-        max_depth, max_nodes = CGROUP_WALK_MAX_DEPTH, CGROUP_WALK_MAX_NODES
-        stack = [(directory, 0)]
-        seen: set[tuple[int, int]] = set()
-        nodes = 0
-        while stack:
-            current, depth = stack.pop()
-            nodes += 1
-            if depth > max_depth or nodes > max_nodes:
-                return None
-            try:
-                info = current.lstat()
-            except OSError:
-                return None
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                return None
-            ident = (info.st_dev, info.st_ino)
-            if ident in seen:
-                return None
-            seen.add(ident)
-            level = self._level_populated(current)
-            if level is None:
-                return None
-            if level:
-                return True
-            try:
-                entries = list(current.iterdir())
-            except OSError:
-                return None
-            for entry in entries:
-                try:
-                    child = entry.lstat()
-                except OSError:
-                    return None
-                if stat.S_ISLNK(child.st_mode):
-                    return None
-                if stat.S_ISDIR(child.st_mode) and entry.name not in (".", ".."):
-                    stack.append((entry, depth + 1))
         return False
 
     def _proved_cgroup_directory(self, rec: dict) -> Path | str | None:
@@ -683,26 +619,20 @@ class ControlAPI:
         opened = os.fstat(parent_fd)
         return info.st_dev == opened.st_dev and info.st_ino == opened.st_ino
 
-    def _path_names_a_directory(self, directory: Path) -> bool:
-        """True unless ``lstat`` says the leaf path is gone."""
-        try:
-            directory.lstat()
-        except OSError as exc:
-            return exc.errno != errno.ENOENT
-        return True
-
     def _remove_recorded_cgroup(self, rec: dict) -> str:
         """Remove this run's cgroup directory only when the path is proved.
 
-        ``removed``: this call's ``rmdir`` of the checked inode succeeded, and the path no
-        longer names a directory.
+        ``removed``: this call's ``rmdir`` of the checked inode succeeded, the held parent no
+        longer holds the leaf name, and the recorded path still names that parent.
         ``absent``: the proved directory was already gone. This call did not remove it.
-        ``populated``: a re-read shows a process, the re-read itself failed, or the path
-        still names a directory after the removal call.
+        ``populated``: a re-read shows a process, the re-read could not be made, or after the
+        removal call the held parent still holds the leaf name or the recorded path no longer
+        names the held parent.
         ``empty``: the directory stays. Every doubt is this word, and so is a clear re-read
         after ``rmdir`` answers anything other than ``ENOENT``.
         The parent is opened with ``O_DIRECTORY|O_NOFOLLOW`` and the leaf name is removed
-        relative to that fd, so a symlink swapped in for a parent is not followed.
+        relative to that fd, so a symlink swapped in for a parent is not followed. The re-read
+        after a refused rmdir and the check after a done one go through that same fd.
         A symlink is not removed. Entries inside the directory are not unlinked.
         """
         found = self._proved_cgroup_directory(rec)
@@ -742,16 +672,20 @@ class ControlAPI:
                 if exc.errno == errno.ENOENT:
                     return "absent"
                 # ENOENT is the only rmdir error that means the directory is gone.
-                # Every other error, including EBUSY and ENOTEMPTY, is re-read.
+                # Every other error, including EBUSY and ENOTEMPTY, is re-read through the
+                # held parent fd, never by a path built again.
                 # Only a finished clear re-read is empty. Anything else is not proved.
-                live = self._subtree_populated(directory)
+                live = self._held_subtree_populated(parent_fd, directory.name, info)
                 if live is False:
                     return "empty"
                 return "populated"
             except (ValueError, TypeError):
                 return "empty"
-            if self._path_names_a_directory(directory):
+            from recursion_core.daemon import held_leaf_gone
+            if not held_leaf_gone(parent_fd, directory.name):
                 return "populated"
+            if not self._opened_parent_matches(root, parents, parent_fd):
+                return "populated"  # the removed leaf's parent is no longer at the recorded path
             return "removed"
         finally:
             if parent_fd is not None:

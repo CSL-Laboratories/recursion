@@ -12,12 +12,15 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 from recursion_core.control.registry import EMPTY, REMOVED, StaleGeneration, InMemoryRunRegistry
 from recursion_core.control.tests.fakes import FakeKillTree, make_api
+
+LINUX = sys.platform.startswith("linux")
 
 
 def _starter(cgroup: str):
@@ -27,6 +30,7 @@ def _starter(cgroup: str):
     return start
 
 
+@unittest.skipUnless(LINUX, "the daemon is Linux only")
 class RemovalReceiptTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="rc-stop-receipt-", dir=os.environ.get("TMPDIR")))
@@ -631,6 +635,107 @@ class RemovalReceiptTest(unittest.TestCase):
         self.assertEqual((answer["code"], answer.get("reason")), ("pending", "cgroup_populated"), answer)
         self.assertNotEqual((stored or {}).get("state"), "stopped")
         self.assertIsNone((stored or {}).get("stop_attestation"))
+
+    def _sleeper(self) -> subprocess.Popen:
+        """A ``sleep`` child this test starts and ends itself. Nothing else is signalled."""
+        proc = subprocess.Popen(["sleep", "300"])
+
+        def end() -> None:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+        self.addCleanup(end)
+        return proc
+
+    def _swap_in_rmdir(self, directory: Path, child: subprocess.Popen, move, busy: bool):
+        """An rmdir stand-in. On its first call the leaf lists ``child`` and ``move`` changes the path."""
+        real_rmdir = os.rmdir
+        state = {"done": False}
+
+        def swap(path: object, dir_fd: int | None = None) -> None:
+            if not state["done"]:
+                state["done"] = True
+                (directory / "cgroup.procs").write_text(f"{child.pid}\n")
+                (directory / "cgroup.events").write_text("populated 1\n")
+                move()
+            if busy:
+                raise OSError(errno.EBUSY, "Device or resource busy")
+            if dir_fd is None:
+                real_rmdir(path)
+            else:
+                real_rmdir(path, dir_fd=dir_fd)
+
+        return swap, state
+
+    def _r1(self, root_name: str, busy: bool) -> None:
+        api, reg, run_id, holder = self._proved_unit(root_name)
+        root, unit, directory = holder["root"], holder["unit"], holder["directory"]
+        decoy = self.tmp / f"decoy-{root_name}"
+        (decoy / unit).mkdir(parents=True)
+        child = self._sleeper()
+
+        def move() -> None:
+            (root / "app.slice").rename(root / "app.slice.held")
+            (root / "app.slice").symlink_to(decoy, target_is_directory=True)
+
+        swap, state = self._swap_in_rmdir(directory, child, move, busy)
+        with mock.patch("recursion_core.control.api.os.rmdir", swap):
+            answer = api.call("run.stop", {"run_id": run_id})
+        stored = reg.get(run_id)
+        held = root / "app.slice.held" / unit
+        self.assertTrue(state["done"])
+        self.assertEqual((answer["code"], answer.get("reason")), ("pending", "cgroup_populated"), answer)
+        self.assertNotEqual((stored or {}).get("state"), "stopped")
+        self.assertIsNone((stored or {}).get("stop_attestation"))
+        self.assertEqual((held / "cgroup.procs").read_text().split(), [str(child.pid)])
+        self.assertIsNone(child.poll(), "the sleep child was signalled")
+        self.assertTrue((decoy / unit).is_dir())
+
+    def test_r1_a_live_pid_and_a_swapped_slice_inside_rmdir_stay_pending(self) -> None:
+        """R1. Inside the rmdir call the leaf gains a live pid and app.slice is renamed aside,
+        a link to a clear decoy put in its place. rmdir answers ENOTEMPTY.
+
+        The second look reads the leaf through the parent folder the removal held, so the
+        Stop is pending with no proof. The decoy is not read and not removed.
+        """
+        self._r1("cg-r1", busy=False)
+
+    def test_r1_with_ebusy_as_a_cgroup_mount_answers_stays_pending(self) -> None:
+        """R1 with rmdir answering EBUSY, as a cgroup mount answers for a populated cgroup."""
+        self._r1("cg-r1-busy", busy=True)
+
+    def test_r2_a_live_pid_and_a_swapped_folder_above_the_root_stay_pending(self) -> None:
+        """R2. Inside the rmdir call the leaf gains a live pid and the folder above the cgroup
+        root is renamed aside, a link to a decoy tree put in its place.
+
+        The second look reads the held folder, so the Stop is pending with no proof and the
+        decoy tree's leaf of the same name stays.
+        """
+        top = self.tmp / "top-r2"
+        top.mkdir()
+        api, reg, run_id, holder = self._proved_unit("top-r2/cg")
+        unit, directory = holder["unit"], holder["directory"]
+        decoytop = self.tmp / "decoytop-r2"
+        (decoytop / "cg" / "app.slice" / unit).mkdir(parents=True)
+        child = self._sleeper()
+
+        def move() -> None:
+            top.rename(self.tmp / "top-r2.held")
+            top.symlink_to(decoytop, target_is_directory=True)
+
+        swap, state = self._swap_in_rmdir(directory, child, move, busy=False)
+        with mock.patch("recursion_core.control.api.os.rmdir", swap):
+            answer = api.call("run.stop", {"run_id": run_id})
+        stored = reg.get(run_id)
+        held = self.tmp / "top-r2.held" / "cg" / "app.slice" / unit
+        self.assertTrue(state["done"])
+        self.assertEqual((answer["code"], answer.get("reason")), ("pending", "cgroup_populated"), answer)
+        self.assertNotEqual((stored or {}).get("state"), "stopped")
+        self.assertIsNone((stored or {}).get("stop_attestation"))
+        self.assertEqual((held / "cgroup.procs").read_text().split(), [str(child.pid)])
+        self.assertIsNone(child.poll(), "the sleep child was signalled")
+        self.assertTrue((decoytop / "cg" / "app.slice" / unit).is_dir())
 
 
 class StaleRemovalProofTest(unittest.TestCase):

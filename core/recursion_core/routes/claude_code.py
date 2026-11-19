@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 
 from recursion_core.routes import contract as c
-from recursion_core.routes.base import RouteAdapter, scalar
+from recursion_core.routes.base import RouteAdapter, _Protocol, scalar
 from recursion_core.routes.launch import child_env
 
 # Lucas, Nov 7 ~6:34pm PST (correction to the Nov 8 briefing; replaces "refuse --bare, clear apiKeyHelper,
@@ -190,19 +190,29 @@ def _init_refusal(msg: dict, passed: str, bridge: bool) -> str | None:
 
     An init that omits ``permissionMode`` is not a reported disagreement: streams that predate the
     field keep their result. A present value that is not the mode this launch passed refuses the run.
+    The detail names that reported value only when it is one of ``PERMISSION_MODES``. Any other
+    reported value is the word ``unknown``, so text the engine reported is not copied into the result.
     """
 
     if "permissionMode" in msg and msg.get("permissionMode") != passed:
-        return f"permission mode {scalar(msg.get('permissionMode'))} is not the mode passed ({passed})"
+        reported = msg.get("permissionMode")
+        shown = reported if reported in PERMISSION_MODES else "unknown"
+        return f"permission mode {shown} is not the mode passed ({passed})"
     if bridge and not _bridge_confirmed(msg):
         return f"permission bridge {PERMISSION_BRIDGE_HOOK} is not confirmed at init"
     return None
 
 
 def _stream_fault(msg: dict) -> str | None:
-    """A typed permission denial or error event, or None. Assistant and user payload is not read."""
+    """A typed permission denial or error event, or None. Assistant and user payload is not read.
+
+    A non-string ``type`` or ``subtype`` is not used as a set member. It is a protocol fault, raised
+    so the run loop fences the process and returns a typed result.
+    """
 
     kind, sub = msg.get("type"), msg.get("subtype")
+    if (kind is not None and not isinstance(kind, str)) or (sub is not None and not isinstance(sub, str)):
+        raise _Protocol("stream field is not a string")
     if kind in ("assistant", "user"):
         return None
     if kind in _DENIAL_TYPES or sub in _DENIAL_SUBTYPES:

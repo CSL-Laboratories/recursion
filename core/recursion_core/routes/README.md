@@ -28,9 +28,11 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
 - `breaker.py`: `ConnectionBreaker`, keyed by the connection a route is billed through
   (`subscription:<login>` or `api_key:<key id>`), per model only when the typed signal names a per-model
   vendor bucket. Never keyed by engine id or tenant.
-- `profile_route.py`: Pi, Hermes and OpenCode routes; every launch goes through
-  `recursion_core.subscription_routes.guard_then_spawn` (B3, CSL-786), so a Claude-subscription provider is
-  refused as `subscription_route_refused` before the launcher is called. Pi and Hermes also pass
+- `profile_route.py`: Pi, Hermes and OpenCode routes. An unsupported host is refused at this
+  adapter before a credential or the guard (`launch_refused`, `platform_unsupported`). Every launch
+  that passes that check goes through `recursion_core.subscription_routes.guard_then_spawn` (B3, CSL-786),
+  so a Claude-subscription provider is refused as `subscription_route_refused` before the launcher is
+  called. Pi and Hermes also pass
   `route.wrapper` (the measured launcher and package pin); without it the launch is
   `wrapper_pin_missing`. The launcher receives the env `check_route` accepted.
 - `launch.py`: the injected launcher / process interface, `require_free_threaded()` (refuses a GIL build;
@@ -39,7 +41,9 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
 - `driver.py`: driver contract version 2 (lane SPINE's `driver.v2` schema, draft 4, in #368). A driver
   declares its engine, eleven flags (`multi_turn`, `mid_turn_input`, `interrupt`, `resume`, `fork`,
   `permission_bridge`, `typed_limits`, `usage`, `observes_subagents`, `cancels_subagents`,
-  `usage_complete`) and `input_ack`. `Driver` is the gate every engine's driver
+  `usage_complete`) and `input_ack`. The published record is the schema's eight (`multi_turn` through
+  `usage`); `observes_subagents`, `cancels_subagents` and `usage_complete` stay on the driver and the
+  route label and are not copied into the record. `Driver` is the gate every engine's driver
   subclasses: a call whose flag is false raises `DriverRefused` (`unsupported`, the call, the flag) before
   the subclass is asked, so no process starts and no byte reaches the engine; a malformed call or one the
   worker's state does not allow (closed input, a reused turn or delivery id, an interrupt of a turn not in

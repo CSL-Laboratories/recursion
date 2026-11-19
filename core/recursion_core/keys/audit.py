@@ -9,6 +9,9 @@ It fetches each saved value from the pinned backend and searches, as bytes:
   skipped. A temp file an interrupted save left in the store's folder is a finding by its name alone, whatever
   it holds (it may hold part of a value; the next add or remove deletes it);
 - any folder or file given with ``--path``;
+  a root of these that is there and is neither a regular file nor a folder (a symbolic link, a FIFO, a socket, a
+  device) is not read and nothing follows it: it is named unreadable, so the audit is incomplete; a ``--path`` that is
+  not there is named unreadable too (a state or config folder that is not there holds nothing to search);
 - the user's journal (``journalctl --user -o cat``), where the daemon's log lines go when it runs as a user
   service, unless ``--no-journal``.
 
@@ -131,9 +134,10 @@ def run(store: KeyStore, *, extra=(), journal: bool = True) -> Report:
     found = needles(values)
     longest = max(len(n) for n in found)
     searched = {_identity(store.owner_file())} - {None}     # each file once, though roots may hold one another
-    for root in [*default_roots(store), *(Path(p) for p in extra)]:
+    roots = [(root, False) for root in default_roots(store)] + [(Path(p), True) for p in extra]
+    for root, given in roots:
         report.roots.append(str(root))
-        for path in _walk(root, report):
+        for path in _walk(root, report, given=given):
             identity = _identity(path)
             if identity is not None and identity in searched:
                 continue
@@ -152,10 +156,16 @@ def _identity(path: Path):
     return (st.st_dev, st.st_ino)
 
 
-def _walk(root: Path, report: Report):
+def _walk(root: Path, report: Report, *, given: bool = False):
+    """The regular files under ``root``. A root that is there and is neither a regular file nor a folder (a symbolic
+    link, a FIFO, a socket, a device) is named unreadable and not read, so the audit is incomplete and never says
+    'nothing found' of a place it did not look in; nothing follows a link. A root given with ``--path`` (``given``)
+    that is not there is named unreadable too; a default root that is not there holds nothing to search."""
     try:
         st = os.lstat(root)
     except FileNotFoundError:
+        if given:
+            report.unreadable.append(str(root))
         return
     except OSError:
         report.unreadable.append(str(root))
@@ -164,6 +174,7 @@ def _walk(root: Path, report: Report):
         yield root
         return
     if not stat.S_ISDIR(st.st_mode):
+        report.unreadable.append(str(root))
         return
     for folder, dirs, files in os.walk(root, followlinks=False, onerror=lambda exc: report.unreadable.append(str(exc.filename))):
         dirs.sort()

@@ -1,4 +1,4 @@
-"""Command line for ``recursion plugin install``, ``list``, ``remove`` and ``unpin``.
+"""Command line for ``recursion plugin install``, ``list``, ``remove``, ``unpin`` and ``quarantine``.
 
 The program name is ``recursion``. A refusal prints ``refused: CODE`` on stderr
 and returns 1; a refusal that says how to end it prints that sentence on the
@@ -13,6 +13,13 @@ returns 2. Nothing here fetches.
 ask one question on stderr and read one line: only the typed word ``yes`` goes
 on. Any other answer, or none, prints ``not changed:`` and why on stderr,
 writes nothing and returns 1.
+
+An install of a signed release of a pinned plugin that asks for more is held,
+not installed: it prints one line on stderr for each thing it asks for more,
+then one line with the commands that go on, and returns 0.
+``quarantine list`` shows what is held; ``quarantine accept <id>`` asks one
+question, as unpin does, and installs the held release only on ``yes``;
+``quarantine drop <id>`` moves the held release into a kept place and names it.
 """
 
 from __future__ import annotations
@@ -23,7 +30,8 @@ import os
 import sys
 from pathlib import Path
 
-from .install import InstallRefused, NothingChanged, install_plugin, list_plugins, remove_plugin, unpin_plugin
+from .install import (InstallRefused, NothingChanged, install_plugin, list_plugins, quarantine_accept,
+                      quarantine_drop, quarantine_list, remove_plugin, unpin_plugin)
 
 __all__ = ["main"]
 
@@ -84,6 +92,17 @@ def _parser() -> argparse.ArgumentParser:
     unpin.add_argument("plugin_id")
     unpin.add_argument("--config")
     unpin.add_argument("--state")
+
+    quarantine = commands.add_parser("quarantine")
+    quarantine.error = _error  # type: ignore[method-assign]
+    actions = quarantine.add_subparsers(dest="action", required=True)
+    for action in ("list", "accept", "drop"):
+        held = actions.add_parser(action)
+        held.error = _error  # type: ignore[method-assign]
+        if action != "list":
+            held.add_argument("plugin_id")
+        held.add_argument("--config")
+        held.add_argument("--state")
     return parser
 
 
@@ -127,6 +146,13 @@ def main(argv: list[str] | None = None, out=None, err=None, inp=None) -> int:
         elif args.command == "unpin":
             result = unpin_plugin(_config_dir(args.config), args.plugin_id, state=_state_dir(args.state),
                                   report_kept=report, confirm=ask)
+        elif args.command == "quarantine" and args.action == "list":
+            result = quarantine_list(_config_dir(args.config), state=_state_dir(args.state))
+        elif args.command == "quarantine" and args.action == "accept":
+            result = quarantine_accept(_config_dir(args.config), args.plugin_id, state=_state_dir(args.state),
+                                       report_kept=report, confirm=ask)
+        elif args.command == "quarantine":
+            result = quarantine_drop(_config_dir(args.config), args.plugin_id, state=_state_dir(args.state))
         else:
             result = remove_plugin(_config_dir(args.config), args.plugin, state=_state_dir(args.state),
                                    report_kept=report)
@@ -146,6 +172,10 @@ def main(argv: list[str] | None = None, out=None, err=None, inp=None) -> int:
         return 1
     for line in result.get("kept", ()):
         if line not in said:
+            err.write(f"{line}\n")
+    if result.get("result") == "quarantined":
+        # What the held release asks for more, one line each, then the commands that go on from there.
+        for line in [*result["asks"], result["next"]]:
             err.write(f"{line}\n")
     out.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return 0

@@ -532,6 +532,60 @@
       }
     },
     {
+      "file": "bad/host.v1/b05-a-load-file-path-that-climbs.json",
+      "schema": "host.v1.json#/$defs/load",
+      "rule": "A file path inside a package never holds '..': each part starts with a letter, a digit or '_'.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/files"
+      }
+    },
+    {
+      "file": "bad/host.v1/b06-a-load-file-path-that-is-absolute.json",
+      "schema": "host.v1.json#/$defs/load",
+      "rule": "A file path inside a package is relative: it never starts with '/'.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/files"
+      }
+    },
+    {
+      "file": "bad/host.v1/b07-a-load-plugin-id-of-a-wrong-form.json",
+      "schema": "host.v1.json#/$defs/load",
+      "rule": "A load's plugin id has the plugin id's form.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/plugin_id"
+      }
+    },
+    {
+      "file": "bad/host.v1/b08-an-id-of-two-to-the-53.json",
+      "schema": "host.v1.json#/$defs/call",
+      "rule": "A message id is a whole number from 0 to 2^53-1.",
+      "expect": {
+        "keyword": "maximum",
+        "at": "/id"
+      }
+    },
+    {
+      "file": "bad/host.v1/b09-a-refusal-detail-over-1000-characters.json",
+      "schema": "host.v1.json#/$defs/refusal",
+      "rule": "A refusal's detail is at most 1,000 characters.",
+      "expect": {
+        "keyword": "maxLength",
+        "at": "/detail"
+      }
+    },
+    {
+      "file": "bad/host.v1/b10-a-call-name-with-a-line-break.json",
+      "schema": "host.v1.json#/$defs/call",
+      "rule": "A call name holds no line break.",
+      "expect": {
+        "keyword": "not",
+        "at": "/name"
+      }
+    },
+    {
       "file": "bad/host.v1/f-host.v1.bye.type.json",
       "schema": "host.v1.json#/$defs/bye",
       "rule": "The value at /type is fixed by host.v1.json#/$defs/bye/properties/type.",

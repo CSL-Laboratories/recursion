@@ -14,32 +14,45 @@ later work):
   its fields, sent by a side that may send it. A type the receiver does not know is refused
   ``message_unknown``; a reserved type ``message_reserved``; the channel stays up in both cases
   (the refusal is an answer, never a close).
-* ``answer_call(message, handlers)``: the host's side of a ``call``. A reserved name is refused
+* ``answer_call(message, handlers)``: the receiving side of a ``call``. A reserved name is refused
   ``call_reserved`` and an unknown one ``call_unknown`` before any handler is looked up, so nothing
   runs; a name on the list whose arguments are not exactly its own is refused ``call_args_invalid``.
-* ``DaemonEnd``: the daemon's side of one channel. The caller of every ``core`` message is the
-  plugin the channel was opened for, bound once from ``CoreService.client_for``; nothing in a
-  message can name another, and a ``core`` message that tries is refused ``caller_forged`` before
-  the core sees it. The bytes go to the core's one dispatcher unchanged; every ``csl-core/v0`` op
-  stays the core's.
+  ``call`` and ``result`` travel both ways: the daemon calls a plugin's function by name, and a
+  plugin's host calls a broker handle by name (every reserved call name is one of those, so a
+  reserved name arriving at the daemon is refused ``call_reserved`` before any other check of it).
+* ``DaemonEnd``: the daemon's side of one channel, opened for ONE loaded plugin. The caller of every
+  ``core`` message is that plugin, bound once from ``CoreService.client_for``; nothing in a message
+  can name another, and a ``core`` message that tries is refused ``caller_forged`` before the core
+  sees it. The bytes go to the core's one dispatcher unchanged; every ``csl-core/v0`` op stays the
+  core's. ``DaemonEnd.load`` sends a load only for that plugin.
+* ``HostEnd``: the host's side of one channel: it answers the daemon's calls and takes a ``result``
+  only for an id it called.
+* Frame size: a ``load`` frame (daemon to host only) may be as large as the daemon's largest package
+  needs (``MAX_LOAD_FRAME_BYTES``, computed from the package sizes in ``limits.py``, which the
+  daemon reads); every other
+  frame, and every frame a host sends, is at most ``MAX_FRAME_BYTES`` (1 MiB). A package that does
+  not fit is refused ``load_too_large`` on the daemon's side, never a frame error.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import json
 import re
 from typing import Any, Callable, Mapping
 
 from recursion_core.control_transport.errors import FrameError
-from recursion_core.control_transport.framing import decode_body, encode_frame
+from recursion_core.control_transport.framing import MAX_FRAME_BYTES, decode_body, encode_frame
 
+from .limits import ARTIFACT, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES
 from .protocol import HOST
 
 __all__ = [
-    "CALL_NAMES", "CHANNEL", "INVENTORY", "MESSAGE_TYPES", "RESERVED_CALL_NAMES", "RESERVED_MESSAGE_TYPES",
-    "RESERVED_RUN_ORIGINS", "RESERVED_TEXT", "REFUSAL_CODES", "ChannelRefusal", "DaemonEnd", "answer_call",
-    "check_message", "decode", "encode", "refusal",
+    "CALL_NAMES", "CHANNEL", "INVENTORY", "MAX_FRAME_BYTES", "MAX_LOAD_FRAME_BYTES", "MESSAGE_TYPES",
+    "RESERVED_CALL_NAMES", "RESERVED_MESSAGE_TYPES", "RESERVED_RUN_ORIGINS", "RESERVED_TEXT", "REFUSAL_CODES",
+    "ChannelRefusal", "DaemonEnd", "HostEnd", "answer_call", "check_message", "decode", "encode", "frame_limit",
+    "refusal",
 ]
 
 CHANNEL = "csl-plugin-host/1"
@@ -49,9 +62,9 @@ RESERVED_TEXT = "reserved; not available in this release"
 MESSAGE_TYPES: dict[str, tuple[frozenset, frozenset]] = {
     "hello": (frozenset({"daemon", "host"}), frozenset({"type", "channel"})),
     "load": (frozenset({"daemon"}), frozenset({"type", "plugin_id", "manifest_b64", "files"})),
-    "call": (frozenset({"daemon"}), frozenset({"type", "id", "name", "args"})),
+    "call": (frozenset({"daemon", "host"}), frozenset({"type", "id", "name", "args"})),
     "core": (frozenset({"daemon", "host"}), frozenset({"type", "id", "bytes_b64"})),
-    "result": (frozenset({"host"}), frozenset({"type", "id", "value"})),
+    "result": (frozenset({"daemon", "host"}), frozenset({"type", "id", "value"})),
     "refusal": (frozenset({"daemon", "host"}), frozenset({"type", "id", "code", "detail"})),
     "bye": (frozenset({"daemon", "host"}), frozenset({"type", "reason"})),
 }
@@ -63,8 +76,10 @@ CALL_NAMES: dict[str, tuple[str, ...]] = {
     "surfaces": (),
     "surface": ("kind", "name"),
 }
-# Reserved names (host.v1.json x-reserved): answered as reserved, never built here.
-RESERVED_CALL_NAMES = ("run.request", "computer.open", "computer.act", "computer.observe", "computer.close")
+# Reserved names (host.v1.json x-reserved): answered as reserved, never built here. When built, each
+# reserved call name is sent by a plugin's host to the daemon.
+RESERVED_CALL_NAMES = ("run.request", "computer.open", "computer.act", "computer.observe", "computer.close",
+                       "net.request", "net.connect")
 RESERVED_MESSAGE_TYPES = ("event", "guard", "surface.update")
 RESERVED_RUN_ORIGINS = ("trigger", "agent", "packet")
 # Every function the daemon calls on a plugin -> (message, call name). host.v1.json x-inventory.
@@ -76,7 +91,8 @@ INVENTORY: dict[str, tuple[str, str | None]] = {
     "surface": ("call", "surface"),
 }
 REFUSAL_CODES = ("message_invalid", "message_unknown", "message_reserved", "message_wrong_side", "caller_forged",
-                 "call_unknown", "call_reserved", "call_args_invalid", "call_not_offered", "call_failed")
+                 "call_unknown", "call_reserved", "call_args_invalid", "call_not_offered", "call_failed",
+                 "load_too_large")
 
 SIDES = ("daemon", "host")
 MAX_ID = 2 ** 53 - 1
@@ -85,9 +101,22 @@ _CALL_NAME = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*")
 _ARG_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _PLUGIN_ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
+_PLUGIN_ID_MAX = 64
 _PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*")
 # Fields a core message might use to name a caller. None is ever read: naming one is a forgery.
 _CALLER_FIELDS = frozenset({"caller", "plugin_id", "principal", "plugin", "owner"})
+
+
+def _b64_len(size: int) -> int:
+    return 4 * ((size + 2) // 3)
+
+
+# The largest load frame the daemon can need: its largest manifest and its largest package file
+# (limits.py, the sizes daemon/plugins.py reads) as base64, plus the load's envelope around them with the longest plugin id.
+# Computed from those constants, never a second number; no load comes in parts in this release.
+_LOAD_ENVELOPE = len(json.dumps({"type": "load", "plugin_id": "", "manifest_b64": "", "files": {ARTIFACT: ""}},
+                                separators=(",", ":")).encode("utf-8")) + _PLUGIN_ID_MAX
+MAX_LOAD_FRAME_BYTES = _b64_len(MAX_MANIFEST_BYTES) + _b64_len(MAX_ARTIFACT_BYTES) + _LOAD_ENVELOPE
 
 
 class ChannelRefusal(Exception):
@@ -98,17 +127,48 @@ class ChannelRefusal(Exception):
         self.code, self.detail = code, detail
 
 
+def frame_limit(sender: str) -> int:
+    """The largest frame body a receiver reads from ``sender``: ``MAX_LOAD_FRAME_BYTES`` from the daemon
+    (only a load may use it), ``MAX_FRAME_BYTES`` (1 MiB) from a host."""
+    if sender not in SIDES:
+        raise ValueError("sender must be 'daemon' or 'host'")
+    return MAX_LOAD_FRAME_BYTES if sender == "daemon" else MAX_FRAME_BYTES
+
+
 def encode(message: Mapping[str, Any]) -> bytes:
-    """One message as one frame of ``control_transport/framing.py``."""
-    return encode_frame(dict(message))
+    """One message as one frame of ``control_transport/framing.py``.
 
-
-def decode(body: bytes) -> dict[str, Any]:
-    """One frame body as a message object; a body that is not one JSON object is ``message_invalid``."""
+    A ``load`` may fill ``MAX_LOAD_FRAME_BYTES``; one that still does not fit is ``load_too_large``, never
+    a frame error. Every other message keeps the frame limit of 1 MiB.
+    """
+    message = dict(message)
+    if message.get("type") != "load":
+        return encode_frame(message)
     try:
-        return decode_body(body)
+        return encode_frame(message, max_bytes=MAX_LOAD_FRAME_BYTES)
+    except FrameError as exc:
+        if str(exc) != "frame_too_large":
+            raise
+        raise ChannelRefusal("load_too_large", f"a load frame holds at most {MAX_LOAD_FRAME_BYTES} bytes") from None
+
+
+def decode(body: bytes, *, sender: str | None = None) -> dict[str, Any]:
+    """One frame body as a message object; a body that is not one JSON object is ``message_invalid``.
+
+    A body above 1 MiB is ``message_invalid`` unless it came from the daemon (``sender="daemon"``), holds a
+    ``load`` and is within ``MAX_LOAD_FRAME_BYTES``.
+    """
+    if sender is not None and sender not in SIDES:
+        raise ValueError("sender must be 'daemon' or 'host'")
+    if len(body) > (MAX_LOAD_FRAME_BYTES if sender == "daemon" else MAX_FRAME_BYTES):
+        raise ChannelRefusal("message_invalid", "frame_too_large")
+    try:
+        message = decode_body(body)
     except FrameError as exc:
         raise ChannelRefusal("message_invalid", str(exc)) from None
+    if len(body) > MAX_FRAME_BYTES and message.get("type") != "load":
+        raise ChannelRefusal("message_invalid", "frame_too_large: only a load may pass 1 MiB")
+    return message
 
 
 def _is_id(value: object) -> bool:
@@ -177,7 +237,8 @@ def check_message(message: object, *, receiver: str) -> dict:
     """``message`` as received by ``receiver`` (``"daemon"`` or ``"host"``), or ``ChannelRefusal``.
 
     Order: an object with a type; a reserved type (``message_reserved``); a type nobody defined
-    (``message_unknown``); a type this receiver's peer never sends (``message_wrong_side``); then
+    (``message_unknown``); at the daemon, a call whose name is reserved (``call_reserved``, before any
+    other check of that name); a type this receiver's peer never sends (``message_wrong_side``); then
     exactly its fields, a core message that names a caller (``caller_forged``) first among them,
     and their forms (``message_invalid``). The caller may answer every refusal with ``refusal``
     and keep the channel up.
@@ -191,6 +252,8 @@ def check_message(message: object, *, receiver: str) -> dict:
         raise ChannelRefusal("message_reserved", f"{kind}: {RESERVED_TEXT}")
     if kind not in MESSAGE_TYPES:
         raise ChannelRefusal("message_unknown", kind)
+    if kind == "call" and receiver == "daemon" and message.get("name") in RESERVED_CALL_NAMES:
+        raise ChannelRefusal("call_reserved", f"{message['name']}: {RESERVED_TEXT}")
     senders, fields = MESSAGE_TYPES[kind]
     sender = "host" if receiver == "daemon" else "daemon"
     if sender not in senders:
@@ -214,7 +277,7 @@ def refusal(message: object, exc: ChannelRefusal) -> dict:
 
 
 def answer_call(message: dict, handlers: Mapping[str, Callable[..., Any]]) -> dict:
-    """The host's answer to one checked ``call`` message: a ``result`` or a ``refusal``.
+    """The receiving side's answer to one checked ``call`` message: a ``result`` or a ``refusal``.
 
     ``handlers`` maps a call name to the plugin function that answers it. A reserved name and a name
     not on the list are refused before ``handlers`` is looked at, so nothing runs; so is a name on the
@@ -242,13 +305,15 @@ def answer_call(message: dict, handlers: Mapping[str, Callable[..., Any]]) -> di
 
 
 class DaemonEnd:
-    """The daemon's side of one plugin host's channel.
+    """The daemon's side of the channel of one loaded plugin.
 
     ``core`` is the core service (``CoreService``); its client is taken once, here, for
     ``plugin_id``: that is the caller of every ``core`` message on this channel, set from the
     channel and never read from a message. ``receive`` answers what needs an answer (a ``core``
-    request, or a refusal of a message it cannot take) and returns ``None`` for the rest
-    (``hello``, ``result``, ``refusal``, ``bye``), which the code that sent the call reads itself.
+    request, a host's ``call``, or a refusal of a message it cannot take) and returns ``None`` for the
+    rest (``hello``, ``result``, ``refusal``, ``bye``), which the code that sent the call reads itself.
+    The daemon offers no call of its own in this release: a host's call is ``call_reserved``,
+    ``call_unknown`` or ``call_not_offered``, and nothing runs.
     """
 
     def __init__(self, plugin_id: str, core: Any) -> None:
@@ -257,12 +322,58 @@ class DaemonEnd:
         self.plugin_id = plugin_id
         self._core = core.client_for(plugin_id)
 
+    def load(self, plugin_id: str, manifest: bytes, files: Mapping[str, bytes]) -> bytes:
+        """The frame of one ``load`` for this channel's plugin; any other plugin id is refused (one channel
+        per loaded plugin), and a package that does not fit one load frame is ``load_too_large``."""
+        if plugin_id != self.plugin_id:
+            raise ValueError("one channel per loaded plugin: a load names the plugin the channel was opened for")
+        message = {"type": "load", "plugin_id": plugin_id, "manifest_b64": base64.b64encode(manifest).decode("ascii"),
+                   "files": {path: base64.b64encode(data).decode("ascii") for path, data in files.items()}}
+        return encode(check_message(message, receiver="host"))
+
     def receive(self, message: object) -> dict | None:
         try:
             checked = check_message(message, receiver="daemon")
         except ChannelRefusal as exc:
             return refusal(message, exc)
+        if checked["type"] == "call":
+            return answer_call(checked, {})
         if checked["type"] != "core":
             return None
         answer = self._core(base64.b64decode(checked["bytes_b64"], validate=True))
         return {"type": "core", "id": checked["id"], "bytes_b64": base64.b64encode(answer).decode("ascii")}
+
+
+class HostEnd:
+    """The host's side of one channel.
+
+    ``handlers`` maps a call name to the plugin function that answers it. ``call`` makes a call the host
+    sends the daemon (a broker handle by name, once one is built) and keeps its id open; ``receive``
+    answers a daemon ``call`` through ``answer_call`` and takes a ``result`` only for an id it has open:
+    a result for an id this host never called, or one already answered, is refused. What an open call
+    got back (its ``result`` or ``refusal``) is kept in ``answers`` under its id.
+    """
+
+    def __init__(self, handlers: Mapping[str, Callable[..., Any]]) -> None:
+        self._handlers, self._open, self._next_id = handlers, set(), 0
+        self.answers: dict[int, dict] = {}
+
+    def call(self, name: str, args: Mapping[str, Any] | None = None) -> dict:
+        message = {"type": "call", "id": self._next_id, "name": name, "args": dict(args or {})}
+        self._open.add(self._next_id)
+        self._next_id += 1
+        return message
+
+    def receive(self, message: object) -> dict | None:
+        try:
+            checked = check_message(message, receiver="host")
+            if checked["type"] == "call":
+                return answer_call(checked, self._handlers)
+            if checked["type"] == "result" and checked["id"] not in self._open:
+                raise ChannelRefusal("message_invalid", f"result: id {checked['id']} answers no call this host sent")
+        except ChannelRefusal as exc:
+            return refusal(message, exc)
+        if checked["type"] in ("result", "refusal") and checked["id"] in self._open:
+            self._open.discard(checked["id"])
+            self.answers[checked["id"]] = checked
+        return None

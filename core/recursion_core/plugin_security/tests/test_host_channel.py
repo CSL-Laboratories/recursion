@@ -13,16 +13,23 @@ import json
 import unittest
 from pathlib import Path
 
+from recursion_core.control_transport import framing
+from recursion_core.control_transport.errors import FrameError
 from recursion_core.control_transport.framing import encode_frame
+from recursion_core.daemon import plugins as daemon_plugins
+from recursion_core.plugin_security import limits
+from recursion_core.plugin_security.limits import ARTIFACT, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES
 from recursion_core.plugin_security import PROTOCOL, canonical, parse
 from recursion_core.plugin_security import host_channel as hc
 from recursion_core.plugin_security.tests.support import World, effect, needs_crypto
 
 REPO = Path(__file__).resolve().parents[4]
 SCHEMA = REPO / "schemas" / "plugin" / "v1" / "host.v1.json"
+FIXTURES = REPO / "schemas" / "plugin" / "v1" / "fixtures"
 DAEMON_PLUGINS = REPO / "core" / "recursion_core" / "daemon" / "plugins.py"
 FIRST_CALL_NAMES = ["registry", "operator", "surfaces", "surface"]
 NOT_AVAILABLE = "not available"
+NETWORK_NAMES = ("net.request", "net.connect")
 
 
 def schema() -> dict:
@@ -183,11 +190,10 @@ class MessageTypeTests(unittest.TestCase):
                     self.assertIn(NOT_AVAILABLE, caught.exception.detail)
 
     def test_a_message_from_the_wrong_side_is_refused(self):
-        for message, receiver in ((call("registry"), "daemon"), ({"type": "result", "id": 1, "value": 1}, "host")):
-            with self.subTest(type=message["type"]):
-                with self.assertRaises(hc.ChannelRefusal) as caught:
-                    hc.check_message(message, receiver=receiver)
-                self.assertEqual(caught.exception.code, "message_wrong_side")
+        load = {"type": "load", "plugin_id": "demo.plugin", "manifest_b64": b64(b"{}"), "files": {"plugin.py": b64(b"x")}}
+        with self.assertRaises(hc.ChannelRefusal) as caught:
+            hc.check_message(load, receiver="daemon")
+        self.assertEqual(caught.exception.code, "message_wrong_side")
 
     def test_fields_and_forms_are_exact(self):
         for message in ({"type": "hello", "channel": "csl-plugin-host/2"}, {"type": "hello"},
@@ -217,6 +223,21 @@ class CallNameTests(unittest.TestCase):
                 self.assertNotEqual(answer["code"], "call_unknown")
                 self.assertIn(NOT_AVAILABLE, answer["detail"])
                 self.assertEqual(handlers.looked_up, [])
+
+    def test_both_network_names_get_the_reserved_answer_and_nothing_runs(self):
+        for name in NETWORK_NAMES:
+            with self.subTest(name=name):
+                handlers = RecordingHandlers(**{name: lambda *a: self.fail("a reserved name ran")})
+                answer = hc.answer_call(hc.check_message(call(name), receiver="host"), handlers)
+                self.assertEqual(answer["code"], "call_reserved")
+                self.assertNotEqual(answer["code"], "call_unknown")
+                self.assertIn(NOT_AVAILABLE, answer["detail"])
+                self.assertEqual(handlers.looked_up, [])
+        reserved = {row["name"]: row["about"] for row in schema()["x-reserved"]["call_names"]}
+        self.assertEqual(reserved.get("net.request"),
+                         "The core makes an HTTPS request to a granted destination and returns the answer.")
+        self.assertEqual(reserved.get("net.connect"),
+                         "The core connects to a granted destination and hands the connected socket to the host.")
 
     def test_each_reserved_run_origin_is_read_from_the_reserved_list(self):
         reserved = schema()["x-reserved"]
@@ -265,6 +286,16 @@ class CallerTests(unittest.TestCase):
         self.assertEqual(core.clients_for, ["demo.plugin"])
         self.assertEqual(core.requests, [("demo.plugin", request)])  # bytes unchanged
 
+    def test_bytes_not_in_the_cores_form_cross_unchanged_both_ways(self):
+        answer = b' {"answer" : 1 ,"answer":2}\r\n\xfe\x00'
+        for request in (b' {"op" : 1}\n', b"\xff\x00", b'{"op":1,"op":2}\t'):
+            with self.subTest(request=request):
+                core = FakeCore(answer=answer)
+                end = hc.DaemonEnd("demo.plugin", core)
+                out = end.receive({"type": "core", "id": 3, "bytes_b64": b64(request)})
+                self.assertEqual(core.requests, [("demo.plugin", request)])
+                self.assertEqual(base64.b64decode(out["bytes_b64"]), answer)
+
     def test_no_channel_is_opened_for_the_host(self):
         for plugin_id in ("host", "Bad Id", ""):
             with self.subTest(plugin_id=plugin_id):
@@ -278,6 +309,236 @@ class CallerTests(unittest.TestCase):
                         {"type": "bye", "reason": "done"}):
             with self.subTest(type=message["type"]):
                 self.assertIsNone(end.receive(message))
+
+
+class DirectionTests(unittest.TestCase):
+    """call and result travel both ways: the daemon calls a plugin's function, a plugin's host calls a broker
+    handle by name; every reserved call name is one a host will send, refused at the daemon as reserved."""
+
+    def assert_reserved_from_the_host(self, name):
+        core = FakeCore()
+        end = hc.DaemonEnd("demo.plugin", core)
+        answer = end.receive(call(name, id_=5))
+        self.assertEqual(answer["code"], "call_reserved")
+        self.assertNotEqual(answer["code"], "message_wrong_side")
+        self.assertNotEqual(answer["code"], "call_unknown")
+        self.assertEqual(answer["id"], 5)
+        self.assertIn(hc.RESERVED_TEXT, answer["detail"])
+        self.assertEqual(core.requests, [])
+        # before any other check of that name: arguments of any form do not change the answer
+        junk = {"type": "call", "id": 6, "name": name, "args": {"Not A Name": 1}}
+        self.assertEqual(end.receive(junk)["code"], "call_reserved")
+
+    def test_run_request_from_the_host_is_reserved(self):
+        self.assert_reserved_from_the_host("run.request")
+
+    def test_computer_open_from_the_host_is_reserved(self):
+        self.assert_reserved_from_the_host("computer.open")
+
+    def test_computer_act_from_the_host_is_reserved(self):
+        self.assert_reserved_from_the_host("computer.act")
+
+    def test_computer_observe_from_the_host_is_reserved(self):
+        self.assert_reserved_from_the_host("computer.observe")
+
+    def test_computer_close_from_the_host_is_reserved(self):
+        self.assert_reserved_from_the_host("computer.close")
+
+    def test_net_request_from_the_host_is_reserved(self):
+        self.assert_reserved_from_the_host("net.request")
+
+    def test_net_connect_from_the_host_is_reserved(self):
+        self.assert_reserved_from_the_host("net.connect")
+
+    def test_every_reserved_call_name_has_its_test_from_the_host(self):
+        tested = {name[len("test_"):-len("_from_the_host_is_reserved")].replace("_", ".", 1)
+                  for name in dir(self) if name.endswith("_from_the_host_is_reserved")}
+        self.assertEqual(tested, set(hc.RESERVED_CALL_NAMES))
+
+    def test_call_and_result_travel_both_ways(self):
+        types = schema()["x-message-types"]
+        for kind in ("call", "result"):
+            with self.subTest(kind=kind):
+                self.assertEqual(sorted(types[kind]["from"]), ["daemon", "host"])
+        self.assertEqual(hc.check_message(call("registry"), receiver="daemon"), call("registry"))
+        result = {"type": "result", "id": 1, "value": {"status": 200}}
+        self.assertEqual(hc.check_message(result, receiver="host"), result)
+        about = schema()["x-reserved"]["about"]
+        self.assertIn("each reserved call name here is sent by a plugin's host to the daemon", about)
+        self.assertIn("call and result travel both ways", about)
+
+    def test_a_host_call_with_a_name_neither_reserved_nor_known_is_call_unknown(self):
+        core = FakeCore()
+        answer = hc.DaemonEnd("demo.plugin", core).receive(call("credential.request"))
+        self.assertEqual(answer, {"type": "refusal", "id": 7, "code": "call_unknown", "detail": "credential.request"})
+        self.assertEqual(core.requests, [])
+
+    def test_a_result_at_a_host_for_an_id_it_never_called_is_refused(self):
+        host = hc.HostEnd({})
+        sent = host.call("net.request", {})
+        self.assertEqual((sent["type"], sent["name"]), ("call", "net.request"))
+        stray = {"type": "result", "id": sent["id"] + 1, "value": 1}
+        answer = host.receive(stray)
+        self.assertEqual(answer["type"], "refusal")
+        self.assertEqual(answer["id"], sent["id"] + 1)
+        self.assertEqual(answer["code"], "message_invalid")
+        self.assertEqual(host.answers, {})
+        self.assertIsNone(host.receive({"type": "result", "id": sent["id"], "value": {"status": 200}}))
+        self.assertEqual(host.answers[sent["id"]]["value"], {"status": 200})
+        self.assertEqual(host.receive({"type": "result", "id": sent["id"], "value": 2})["code"], "message_invalid")
+
+    def test_a_host_answers_the_daemons_call(self):
+        host = hc.HostEnd({"registry": lambda: {"panels": []}})
+        self.assertEqual(host.receive(call("registry")), {"type": "result", "id": 7, "value": {"panels": []}})
+
+
+class FixtureConformanceTests(unittest.TestCase):
+    """Every host.v1 fixture is held by the code's own check, not only by the schema."""
+
+    def test_every_host_fixture_is_held_by_the_code(self):
+        index = json.loads((FIXTURES / "index.json").read_text(encoding="utf-8"))["fixtures"]
+        listed = {row["file"] for row in index if row["schema"].startswith("host.v1.json")}
+        on_disk = {f"{group}/host.v1/{path.name}" for group in ("good", "bad")
+                   for path in (FIXTURES / group / "host.v1").glob("*.json")}
+        self.assertEqual(listed, on_disk)
+        self.assertGreaterEqual(len(on_disk), 55)
+        for file in sorted(on_disk):
+            message = json.loads((FIXTURES / file).read_text(encoding="utf-8"))
+            senders = hc.MESSAGE_TYPES.get(message.get("type"), (frozenset({"daemon"}), None))[0]
+            receiver = "host" if "daemon" in senders else "daemon"
+            with self.subTest(file=file):
+                if file.startswith("good/"):
+                    self.assertEqual(hc.check_message(message, receiver=receiver), message)
+                else:
+                    with self.assertRaises(hc.ChannelRefusal):
+                        hc.check_message(message, receiver=receiver)
+
+    def test_every_pattern_has_the_line_break_guard_beside_it(self):
+        found = []
+
+        def walk(node, where):
+            if isinstance(node, dict):
+                if "pattern" in node and not where.endswith("/not"):
+                    found.append(where)
+                    self.assertEqual(node.get("not"), {"pattern": "[\\r\\n]"}, where)
+                for key, value in node.items():
+                    walk(value, f"{where}/{key}")
+            elif isinstance(node, list):
+                for i, value in enumerate(node):
+                    walk(value, f"{where}/{i}")
+        walk(schema()["$defs"], "#/$defs")
+        self.assertEqual(len(found), 5, found)
+
+
+class FrameLimitTests(unittest.TestCase):
+    """A load can carry what the daemon accepts; every other frame stays at most 1 MiB."""
+
+    PLUGIN = "p" + "a" * 63
+
+    def largest_package(self):
+        return b"m" * MAX_MANIFEST_BYTES, {ARTIFACT: b"x" * MAX_ARTIFACT_BYTES}
+
+    def test_the_load_limit_is_derived_from_the_daemons_largest_package(self):
+        end = hc.DaemonEnd(self.PLUGIN, FakeCore())
+        manifest, files = self.largest_package()
+        frame = end.load(self.PLUGIN, manifest, files)
+        self.assertEqual(len(frame) - 4, hc.MAX_LOAD_FRAME_BYTES)  # the largest package fills it exactly
+        self.assertGreater(hc.MAX_LOAD_FRAME_BYTES, MAX_MANIFEST_BYTES + MAX_ARTIFACT_BYTES)
+        self.assertEqual(hc.decode(frame[4:], sender="daemon")["plugin_id"], self.PLUGIN)
+        self.assertEqual(hc.frame_limit("daemon"), hc.MAX_LOAD_FRAME_BYTES)
+
+    def test_a_package_that_does_not_fit_is_load_too_large_on_the_daemons_side(self):
+        end = hc.DaemonEnd(self.PLUGIN, FakeCore())
+        manifest, files = self.largest_package()
+        one_more = {ARTIFACT + "x": files[ARTIFACT]}  # one byte past the edge
+        for package in (one_more, {ARTIFACT: b"x" * (MAX_ARTIFACT_BYTES + 3)}):
+            with self.subTest(size=sum(map(len, package.values()))):
+                with self.assertRaises(hc.ChannelRefusal) as caught:
+                    end.load(self.PLUGIN, manifest, package)
+                self.assertEqual(caught.exception.code, "load_too_large")
+                self.assertNotIsInstance(caught.exception, FrameError)
+        self.assertEqual(hc.REFUSAL_CODES[-1], "load_too_large")
+
+    def test_every_other_frame_and_every_host_frame_stays_at_most_one_mib(self):
+        self.assertEqual(hc.MAX_FRAME_BYTES, framing.MAX_FRAME_BYTES)
+        self.assertEqual(hc.MAX_FRAME_BYTES, 1 << 20)
+        self.assertEqual(hc.frame_limit("host"), 1 << 20)
+        envelope = len(encode_frame({"type": "result", "id": 1, "value": ""})) - 4
+        at_edge = {"type": "result", "id": 1, "value": "v" * (hc.MAX_FRAME_BYTES - envelope)}
+        self.assertEqual(len(hc.encode(at_edge)) - 4, hc.MAX_FRAME_BYTES)
+        self.assertEqual(hc.decode(hc.encode(at_edge)[4:], sender="daemon"), at_edge)
+        past = dict(at_edge, value=at_edge["value"] + "v")
+        with self.assertRaises(FrameError):
+            hc.encode(past)
+        body = encode_frame(past, max_bytes=hc.MAX_LOAD_FRAME_BYTES)[4:]
+        for sender in ("daemon", "host"):
+            with self.subTest(sender=sender):
+                with self.assertRaises(hc.ChannelRefusal) as caught:
+                    hc.decode(body, sender=sender)
+                self.assertEqual(caught.exception.code, "message_invalid")
+        load = {"type": "load", "plugin_id": "demo.plugin", "manifest_b64": b64(b"{}"),
+                "files": {ARTIFACT: b64(b"x" * (hc.MAX_FRAME_BYTES))}}
+        big_load = hc.encode(load)[4:]
+        self.assertGreater(len(big_load), hc.MAX_FRAME_BYTES)
+        self.assertEqual(hc.decode(big_load, sender="daemon"), load)
+        with self.assertRaises(hc.ChannelRefusal):
+            hc.decode(big_load, sender="host")
+        with self.assertRaises(hc.ChannelRefusal):
+            hc.decode(b" " * (hc.MAX_LOAD_FRAME_BYTES + 1), sender="daemon")
+
+    def test_the_schema_says_the_three_frame_rules(self):
+        text = schema()["description"]
+        self.assertNotIn("holding one object, at most 1 MiB", text)
+        self.assertIn("a load frame (daemon to host only) may be as large as the daemon's largest package needs", text)
+        self.assertIn("MAX_MANIFEST_BYTES and MAX_ARTIFACT_BYTES of plugin_security/limits.py, the sizes daemon/plugins.py reads", text)
+        self.assertIn("computed from those constants, never a second number", text)
+        self.assertIn("Every other frame, and every frame a host sends, is at most 1 MiB.", text)
+        self.assertIn("refused on the daemon's side with 'load_too_large'", text)
+        self.assertIn("it is never a frame error", text)
+        self.assertEqual(tuple(schema()["x-refusal-codes"])[-1], "load_too_large")
+
+
+class PackageLimitsTests(unittest.TestCase):
+    """The package sizes live in the channel's own package; the daemon reads them from there."""
+
+    def test_the_daemons_names_are_the_lower_modules_values(self):
+        names = ("ARTIFACT", "MAX_MANIFEST_BYTES", "MAX_ARTIFACT_BYTES")
+        self.assertEqual({n: getattr(daemon_plugins, n) for n in names}, {n: getattr(limits, n) for n in names})
+        self.assertEqual((limits.ARTIFACT, limits.MAX_MANIFEST_BYTES, limits.MAX_ARTIFACT_BYTES),
+                         ("plugin.py", 64 * 1024, 8 * 1024 * 1024))
+
+    def test_the_channels_package_imports_nothing_from_the_daemon(self):
+        package = Path(hc.__file__).resolve().parent
+        found = []
+        for path in sorted(package.glob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Import):
+                    found += [(path.name, a.name) for a in node.names if a.name.startswith("recursion_core.daemon")]
+                elif isinstance(node, ast.ImportFrom):
+                    module = ("." * node.level) + (node.module or "")
+                    if module.startswith("recursion_core.daemon") or module.startswith("..daemon") or (
+                            node.level >= 2 and module == "." * node.level
+                            and any(a.name == "daemon" for a in node.names)):
+                        found.append((path.name, module))
+        self.assertGreater(len(list(package.glob("*.py"))), 5)
+        self.assertEqual(found, [])
+
+
+class OneChannelPerPluginTests(unittest.TestCase):
+    """One channel per loaded plugin; every load on a channel names the plugin it was opened for."""
+
+    def test_the_schema_says_one_channel_per_loaded_plugin(self):
+        text = schema()["description"]
+        self.assertIn("One channel per loaded plugin; every load on a channel names the plugin the channel was opened for.",
+                      text)
+        self.assertNotIn("ONE channel per plugin host", text)
+
+    def test_the_daemon_end_sends_a_load_only_for_its_own_plugin(self):
+        end = hc.DaemonEnd("demo.plugin", FakeCore())
+        with self.assertRaises(ValueError):
+            end.load("other.plugin", b"{}", {ARTIFACT: b"x"})
+        frame = end.load("demo.plugin", b"{}", {ARTIFACT: b"x"})
+        self.assertEqual(hc.decode(frame[4:], sender="daemon")["plugin_id"], "demo.plugin")
 
 
 class FramingTests(unittest.TestCase):

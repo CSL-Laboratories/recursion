@@ -25,6 +25,14 @@ later work):
   can name another, and a ``core`` message that tries is refused ``caller_forged`` before the core
   sees it. The bytes go to the core's one dispatcher unchanged; every ``csl-core/v0`` op stays the
   core's. ``DaemonEnd.load`` sends a load only for that plugin.
+* ``run.request`` (a plugin asks for a run from one of its records): answered at the daemon's end only
+  when the channel was given the daemon's start path (``runs``) and the core says the channel's plugin
+  holds the ``schedule`` permission; otherwise ``call_not_offered``. Its seven arguments are checked
+  before anything starts (``call_args_invalid``); ``tenant``, ``engine`` and ``prompt`` exactly as
+  ``run.start`` checks them. The run is started by ``runs.call("run.start", ..., origin=...)``: the one
+  admission path of ``run.start``, with the start key derived here from the plugin, the record, its
+  revision and the occurrence (never taken from the plugin), so one occurrence starts at most one run.
+  The record gains ``origin``: kind ``trigger``, the plugin the channel was opened for, and the record.
 * ``HostEnd``: the host's side of one channel: it answers the daemon's calls and takes a ``result``
   only for an id it called.
 * Frame size: a ``load`` frame (daemon to host only) may be as large as the daemon's largest package
@@ -38,6 +46,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import datetime
 import json
 import re
 from typing import Any, Callable, Mapping
@@ -45,12 +54,16 @@ from typing import Any, Callable, Mapping
 from recursion_core.control_transport.errors import FrameError
 from recursion_core.control_transport.framing import MAX_FRAME_BYTES, decode_body, encode_frame
 
+from recursion_core.control.api import start_params_problem
+
+from .canonical import canonical, parse
 from .limits import ARTIFACT, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES
-from .protocol import HOST
+from .protocol import HOST, PROTOCOL_VERSION
 
 __all__ = [
     "CALL_NAMES", "CHANNEL", "INVENTORY", "MAX_FRAME_BYTES", "MAX_LOAD_FRAME_BYTES", "MESSAGE_TYPES",
     "RESERVED_CALL_NAMES", "RESERVED_MESSAGE_TYPES", "RESERVED_RUN_ORIGINS", "RESERVED_TEXT", "REFUSAL_CODES",
+    "RUN_ORIGIN_FIELDS", "RUN_ORIGIN_KIND", "RUN_REQUEST_PERMISSION", "RUN_REQUEST_RECORD_KINDS",
     "ChannelRefusal", "DaemonEnd", "HostEnd", "answer_call", "check_message", "decode", "encode", "frame_limit",
     "refusal",
 ]
@@ -75,10 +88,17 @@ CALL_NAMES: dict[str, tuple[str, ...]] = {
     "operator": ("command",),
     "surfaces": (),
     "surface": ("kind", "name"),
+    "run.request": ("record_kind", "record_id", "revision", "occurrence", "tenant", "engine", "prompt"),
 }
+# run.request (host.v1.json x-run-request): the record kinds a run may be asked from (append-only), the
+# permission that offers the call, and the origin the daemon writes into the run's record.
+RUN_REQUEST_RECORD_KINDS = ("routine.v1",)
+RUN_REQUEST_PERMISSION = "schedule"
+RUN_ORIGIN_KIND = "trigger"
+RUN_ORIGIN_FIELDS = ("kind", "plugin", "record_kind", "record_id", "revision", "occurrence")
 # Reserved names (host.v1.json x-reserved): answered as reserved, never built here. When built, each
 # reserved call name is sent by a plugin's host to the daemon.
-RESERVED_CALL_NAMES = ("run.request", "computer.open", "computer.act", "computer.observe", "computer.close",
+RESERVED_CALL_NAMES = ("computer.open", "computer.act", "computer.observe", "computer.close",
                        "net.request", "net.connect")
 RESERVED_MESSAGE_TYPES = ("event", "guard", "surface.update")
 RESERVED_RUN_ORIGINS = ("trigger", "agent", "packet")
@@ -103,6 +123,8 @@ _CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _PLUGIN_ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
 _PLUGIN_ID_MAX = 64
 _PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*")
+_RECORD_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_OCCURRENCE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 # Fields a core message might use to name a caller. None is ever read: naming one is a forgery.
 _CALLER_FIELDS = frozenset({"caller", "plugin_id", "principal", "plugin", "owner"})
 
@@ -276,6 +298,33 @@ def refusal(message: object, exc: ChannelRefusal) -> dict:
     return {"type": "refusal", "id": _id_of(message), "code": exc.code, "detail": exc.detail[:1000]}
 
 
+def _occurrence_ok(value: object) -> bool:
+    if type(value) is not str or not _OCCURRENCE.fullmatch(value):
+        return False
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
+
+
+def _run_request_problem(args: Mapping) -> str | None:
+    """The first argument of a run.request that is not in its form, or None (host.v1.json x-run-request)."""
+    if type(args["record_kind"]) is not str or args["record_kind"] not in RUN_REQUEST_RECORD_KINDS:
+        return "record_kind"
+    if type(args["record_id"]) is not str or not _RECORD_ID.fullmatch(args["record_id"]):
+        return "record_id"
+    if type(args["revision"]) is not int or args["revision"] < 1:
+        return "revision"
+    if not _occurrence_ok(args["occurrence"]):
+        return "occurrence"
+    return start_params_problem(args)
+
+
+# Value checks of a call name whose arguments have forms of their own, run once the names are exact.
+_ARG_CHECKS: dict[str, Callable[[Mapping], str | None]] = {"run.request": _run_request_problem}
+
+
 def answer_call(message: dict, handlers: Mapping[str, Callable[..., Any]]) -> dict:
     """The receiving side's answer to one checked ``call`` message: a ``result`` or a ``refusal``.
 
@@ -292,6 +341,9 @@ def answer_call(message: dict, handlers: Mapping[str, Callable[..., Any]]) -> di
             raise ChannelRefusal("call_unknown", name)
         if set(args) != set(CALL_NAMES[name]):
             raise ChannelRefusal("call_args_invalid", f"{name} takes: {', '.join(CALL_NAMES[name]) or 'nothing'}")
+        problem = _ARG_CHECKS[name](args) if name in _ARG_CHECKS else None
+        if problem is not None:
+            raise ChannelRefusal("call_args_invalid", f"{name}: {problem}")
         handler = handlers.get(name)
         if not callable(handler):
             raise ChannelRefusal("call_not_offered", name)
@@ -311,17 +363,21 @@ class DaemonEnd:
     ``plugin_id``: that is the caller of every ``core`` message on this channel, set from the
     channel and never read from a message. ``receive`` answers what needs an answer (a ``core``
     request, a host's ``call``, or a refusal of a message it cannot take) and returns ``None`` for the
-    rest (``hello``, ``refusal``, ``bye``). The daemon offers no call of its own in this release: a
-    host's call is ``call_reserved``, ``call_unknown`` or ``call_not_offered``, and nothing runs. This
-    end sends no call either, so every ``result`` is for an id it never called and is refused
-    ``message_invalid``, as at a host.
+    rest (``hello``, ``refusal``, ``bye``). The one call the daemon answers is ``run.request``, and only
+    when ``runs`` (the daemon's start path: an object whose ``call(method, params, *, origin=...)`` is
+    ``DaemonControl.call`` or ``ControlAPI.call``) was given and the core answers that this channel's
+    plugin holds ``schedule`` (the ``plugin.permissions`` op, asked at each call, so a revocation counts);
+    otherwise it is ``call_not_offered``. Every other host call is ``call_reserved``, ``call_unknown`` or
+    ``call_not_offered``, and nothing runs. This end sends no call, so every ``result`` is for an id it
+    never called and is refused ``message_invalid``, as at a host.
     """
 
-    def __init__(self, plugin_id: str, core: Any) -> None:
+    def __init__(self, plugin_id: str, core: Any, *, runs: Any = None) -> None:
         if type(plugin_id) is not str or not _PLUGIN_ID.fullmatch(plugin_id) or plugin_id == HOST:
             raise ValueError("a plugin host's channel is opened for one plugin id, never for the host")
         self.plugin_id = plugin_id
         self._core = core.client_for(plugin_id)
+        self._runs = runs
 
     def load(self, plugin_id: str, manifest: bytes, files: Mapping[str, bytes]) -> bytes:
         """The frame of one ``load`` for this channel's plugin; any other plugin id is refused (one channel
@@ -338,7 +394,7 @@ class DaemonEnd:
         except ChannelRefusal as exc:
             return refusal(message, exc)
         if checked["type"] == "call":
-            return answer_call(checked, {})
+            return answer_call(checked, _DaemonOffers(self))
         if checked["type"] == "result":
             exc = ChannelRefusal("message_invalid", f"result: id {checked['id']} answers no call the daemon sent")
             return refusal(message, exc)
@@ -346,6 +402,41 @@ class DaemonEnd:
             return None
         answer = self._core(base64.b64decode(checked["bytes_b64"], validate=True))
         return {"type": "core", "id": checked["id"], "bytes_b64": base64.b64encode(answer).decode("ascii")}
+
+    def _granted(self, permission: str) -> bool:
+        """Whether the core says this channel's plugin holds ``permission`` now (the ``plugin.permissions`` op)."""
+        request = canonical({"protocol": PROTOCOL_VERSION, "op": "plugin.permissions",
+                             "args": {"plugin_id": self.plugin_id}})
+        try:
+            answer = parse(self._core(request))
+        except Exception:  # noqa: BLE001 - an answer that cannot be read grants nothing
+            return False
+        result = answer.get("result") if type(answer) is dict and answer.get("ok") is True else None
+        granted = result.get("permissions") if type(result) is dict else None
+        return type(granted) is list and permission in granted
+
+    def _run_request(self, record_kind: str, record_id: str, revision: int, occurrence: str, tenant: str,
+                     engine: str, prompt: str) -> dict:
+        """Start one run from a record through ``run.start``'s path. The caller is this channel's plugin; the
+        start key is derived here, so the same record, revision and occurrence start at most one run."""
+        origin = {"kind": RUN_ORIGIN_KIND, "plugin": self.plugin_id, "record_kind": record_kind,
+                  "record_id": record_id, "revision": revision, "occurrence": occurrence}
+        key = f"{RUN_ORIGIN_KIND}/{self.plugin_id}/{record_kind}/{record_id}/{revision}/{occurrence}"
+        params = {"tenant": tenant, "engine": engine, "prompt": prompt, "client_key": key}
+        return self._runs.call("run.start", params, origin=origin)
+
+
+class _DaemonOffers:
+    """The daemon end's call table, looked up by ``answer_call`` only once a call's arguments are in form."""
+
+    def __init__(self, end: DaemonEnd) -> None:
+        self._end = end
+
+    def get(self, name: str, default: Any = None) -> Any:
+        end = self._end
+        if name == "run.request" and end._runs is not None and end._granted(RUN_REQUEST_PERMISSION):
+            return end._run_request
+        return default
 
 
 class HostEnd:

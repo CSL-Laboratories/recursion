@@ -820,10 +820,14 @@ class DaemonControl:
         self._starts_in_flight = 0  # run.start calls of this process that have not answered yet
 
     # -- calls ---------------------------------------------------------------------------------
-    def call(self, method, params=None):
-        return self._answer(method, params, 0)
+    def call(self, method, params=None, *, origin=None):
+        """One method for a surface. ``origin`` is the daemon's own, for ``run.start`` only (a plugin host's
+        ``run.request``): it takes the same start path and adds ``origin`` to the run record."""
+        if origin is not None and method != 'run.start':
+            raise ValueError('origin is given only with run.start')
+        return self._answer(method, params, 0, origin=origin)
 
-    def _answer(self, method, params, reserved_bytes):
+    def _answer(self, method, params, reserved_bytes, *, origin=None):
         if method == 'run.list':
             return self._list(params, reserved_bytes)
         if method == 'route.list':
@@ -840,7 +844,10 @@ class DaemonControl:
             with self._starts_lock:
                 self._starts_in_flight += 1
             try:
-                answer = self.api.call(method, dict(params or {}))
+                if origin is None:
+                    answer = self.api.call(method, dict(params or {}))
+                else:
+                    answer = self.api.call(method, dict(params or {}), origin=origin)
             finally:
                 with self._starts_lock:
                     self._starts_in_flight -= 1

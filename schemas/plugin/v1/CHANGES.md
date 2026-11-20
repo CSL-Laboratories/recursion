@@ -4,6 +4,20 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `host.v1.json` is `1.0-draft.3`, `manifest.v1.json` is `1.0-draft.2` (2026-11-19)
+
+`run.request` is built: it leaves the reserved call names and is the fifth name of `x-call-names`, the one
+call a plugin's host sends that the daemon answers. Its arguments are exactly `record_kind` (one of the
+append-only `x-run-request.record_kinds`, which holds `routine.v1`), `record_id`, `revision`, `occurrence`,
+`tenant`, `engine` and `prompt`; a missing, extra or malformed one is `call_args_invalid` before anything
+starts. It is offered only to a plugin granted the new permission `schedule` (appended to the permission
+list of `manifest.v1.json` and of `plugin_security/manifest.py`), else `call_not_offered`. The daemon
+starts the run through `run.start`'s own path with a start key it derives, and the run's record gains
+`origin` (`kind` `trigger`, `plugin`, `record_kind`, `record_id`, `revision`, `occurrence`). The run-origin
+values stay in the reserved list; `agent` and `packet` are written nowhere. What it breaks: a host that
+counted on `run.request` being answered `call_reserved`; the other six reserved call names are unchanged.
+One good fixture shows the call.
+
 ## `host.v1.json` is `1.0-draft.2` (2026-11-18)
 
 `call` and `result` travel both ways: the daemon calls a plugin's function by name, and a plugin's host

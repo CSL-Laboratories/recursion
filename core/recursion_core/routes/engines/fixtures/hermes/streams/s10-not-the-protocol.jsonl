@@ -1,0 +1,14 @@
+not json at all
+[1, 2]
+{"type": "reasoning", "text": "hmm", "timestamp": 1794700000001}
+{"type": "text", "text": NaN, "timestamp": 1794700000002}
+{"type": "text", "text": "a", "text": "b", "timestamp": 1794700000003}
+{"type": "text", "text": "x\ud800", "timestamp": 1794700000003}
+{"type": "result", "session_id": "s", "exit_code": 0, "text": "x", "tokens": {"output": 1}, "duration_ms": 1e999, "timestamp": 1794700000003}
+{"type": "tool_use", "timestamp": 1794700000004}
+{"type": "text", "text": "", "timestamp": 1794700000005}
+{"type": "system", "subtype": "init", "model": "m", "session_id": "", "timestamp": 1794700000006}
+{"type": "system", "subtype": "init", "model": "m2", "session_id": "other", "timestamp": 1794700000007}
+{"type": "result", "session_id": "20261114_170000_a1b2c3", "exit_code": 0, "text": "fine", "tokens": {"input": 0, "output": 2, "total": 2, "cache_read": 0, "cache_write": 0}, "duration_ms": 2100, "timestamp": 1794700000008}
+{"type": "text", "text": "after", "timestamp": 1794700000009}
+{"type": "result", "session_id": "20261114_170000_a1b2c3", "exit_code": 1, "text": "", "tokens": {"input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_write": 0}, "duration_ms": 2100, "error": "a second result", "timestamp": 1794700000010}

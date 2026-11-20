@@ -34,7 +34,9 @@ person was shown named one plugin, so it holds for that plugin only. ``decide`` 
 network use go only when it is given the asking plugin's ``plugin_id`` and that pair is
 recorded; without a ``plugin_id`` it asks. The record lives in memory only: the daemon
 makes a new, empty one at each start, so a restart asks again. A pair is recorded only
-after its approval was taken, never on a refusal or a time-out. The plugin and the
+after its approval was taken, never on a refusal or a time-out; after the take the gate
+is asked once more whether the person refused this same use, and if so the use is
+refused with ``approval_vetoed`` and nothing is recorded. The plugin and the
 destination are compared exactly as given.
 """
 
@@ -44,6 +46,7 @@ import threading
 from collections.abc import Callable, Container
 
 from .approval import ApprovalGate, EFFECT_SCHEMA, SCOPE_FIELDS
+from .errors import Refused
 
 __all__ = ["ASK", "GO", "HANDLES", "ORIGINS", "NetworkFirstUses", "confirm", "confirmation_effect", "decide"]
 
@@ -132,7 +135,9 @@ def confirm(gate: ApprovalGate, wait: Callable[[str, str], None], *, origin: str
 
     Returns why the use may go: ``"origin person"``, ``"lifted by the person"``,
     ``"destination approved since the daemon started"`` or ``"approved by the person"``.
-    Raises the gate's ``Refused`` when the approval is refused, timed out or not given.
+    Raises the gate's ``Refused`` when the approval is refused, timed out or not given, and
+    ``approval_vetoed`` when the person refused this same use after the approval was taken
+    and before the use was recorded; then nothing is recorded.
     """
     origin = _check(origin, handle, target, lifted)
     if decide(origin, handle, target, lifted=lifted, first_uses=first_uses, plugin_id=plugin_id) == GO:
@@ -145,6 +150,10 @@ def confirm(gate: ApprovalGate, wait: Callable[[str, str], None], *, origin: str
     approval_id, digest = gate.request(effect)
     wait(approval_id, digest)
     gate.take(approval_id, effect)
+    # A refusal of this same use that the person gave after the take returned is final too:
+    # ask the gate again before anything is recorded, as the core's commit section does.
+    if gate.is_vetoed(digest):
+        raise Refused("approval_vetoed")
     if handle == "network":
         first_uses.record(plugin_id, target)
     return APPROVED

@@ -57,6 +57,21 @@ class _Area:
                        lifted=lifted, first_uses=first_uses)
 
 
+class _TwinRefusedInsideTake(ApprovalGate):
+    """A gate where the person refuses a twin approval of the same use (the same digest,
+    drawn earlier and still pending) right after the real ``take`` returned: the refusal
+    lands between the take and the record."""
+
+    twin: tuple[str, str] | None = None
+
+    def take(self, approval_id: str, effect: dict) -> str:
+        digest = super().take(approval_id, effect)
+        if self.twin is not None:
+            twin, self.twin = self.twin, None
+            self.decide(twin[0], twin[1], _OPERATOR, False)
+        return digest
+
+
 class EachCaseTests(unittest.TestCase):
     """One test per handle, origin and lift (filled in below the class)."""
 
@@ -209,6 +224,54 @@ class RuleTests(unittest.TestCase):
             area.use("network", "model", first_uses=first_uses)
         self.assertEqual((caught.exception.code, caught.exception.detail), ("approval_not_granted", "pending"))
         self.assertNotIn(_TARGETS["network"], first_uses)
+
+    def test_a_refusal_landing_after_the_take_refuses_the_use_and_records_nothing(self) -> None:
+        for handle in ("credential", "network", "process"):
+            with self.subTest(handle=handle):
+                area, first_uses = _Area(), NetworkFirstUses()
+                gate = _TwinRefusedInsideTake(lambda i, d, raw: area.drawn.append((i, d, raw)),
+                                              lambda credential: "operator_ui" if credential == _OPERATOR else None,
+                                              area.clock, ttl_seconds=_TTL)
+                area.gate = gate
+                twin = confirmation_effect(handle, _TARGETS[handle], plugin_id="demo.plugin",
+                                           run_id="run-1", connection="conn-a")
+                gate.twin = gate.request(twin)
+                digest = gate.twin[1]
+                with self.assertRaises(Refused) as caught:
+                    area.use(handle, "model", first_uses=first_uses)
+                self.assertEqual(caught.exception.code, "approval_vetoed")
+                self.assertTrue(gate.is_vetoed(digest))
+                self.assertEqual(len(area.drawn), 2)
+                # Nothing is recorded, for that plugin or for any plugin.
+                self.assertNotIn(("demo.plugin", _TARGETS[handle]), first_uses)
+                self.assertNotIn(_TARGETS[handle], first_uses)
+                self.assertEqual(decide("model", handle, _TARGETS[handle], first_uses=first_uses,
+                                        plugin_id="demo.plugin"), ASK)
+                # A later use of the same plugin and target asks again: the same use reaches the
+                # gate, which refuses it without drawing; in another run the person is asked.
+                with self.assertRaises(Refused) as again:
+                    area.use(handle, "model", first_uses=first_uses)
+                self.assertEqual(again.exception.code, "approval_vetoed")
+                self.assertEqual(len(area.drawn), 2)
+                self.assertEqual(confirm(gate, area.wait, origin="model", handle=handle, target=_TARGETS[handle],
+                                         plugin_id="demo.plugin", run_id="run-2", connection="conn-a",
+                                         first_uses=first_uses), "approved by the person")
+                self.assertEqual(len(area.drawn), 3)
+
+    def test_a_bare_destination_with_no_plugin_named_asks(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        target = _TARGETS["network"]
+        self.assertEqual(area.use("network", "model", first_uses=first_uses, plugin_id="plugin.a"),
+                         "approved by the person")
+        # The record says a destination alone was approved for some plugin ...
+        self.assertIn(target, first_uses)
+        self.assertNotIn("other.example.com:443", first_uses)
+        # ... yet a lookup that names no plugin asks, and so does a record of bare destinations.
+        self.assertEqual(decide("model", "network", target, first_uses=first_uses), ASK)
+        for plugin_id in (None, "plugin.a"):
+            with self.subTest(plugin_id=plugin_id):
+                self.assertEqual(decide("model", "network", target, first_uses={target},
+                                        plugin_id=plugin_id), ASK)
 
     def test_what_is_drawn_names_the_handle_and_the_target(self) -> None:
         for handle in ("credential", "network", "process"):

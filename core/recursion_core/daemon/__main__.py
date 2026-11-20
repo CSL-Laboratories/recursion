@@ -17,6 +17,8 @@ import os
 from pathlib import Path
 import signal
 import threading
+
+from recursion_core import settings
 from . import (Daemon, Registry, SystemdUserManager, UserLock, check_operator_linger,
                refuse_engine_user, require_free_threaded, require_posix)
 
@@ -35,6 +37,9 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
     logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s: %(message)s')
     refuse_engine_user(os.environ)
     check_operator_linger(getpass.getuser())
+    # Read at daemon start in this build; a later reload may call settings.load again.
+    for line in settings.lines(settings.load(os.environ)):
+        (log.warning if line.startswith(settings.WARNED) else log.info)('settings: %s', line)
     runtime = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}')
     state = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'recursion'
     stopped = threading.Event()

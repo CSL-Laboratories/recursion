@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "settings.v1.json",
+  "title": "settings.v1: a person's own settings, the file $XDG_CONFIG_HOME/recursion/settings.toml",
+  "x-version": "1.0-draft.1",
+  "description": "The shape of the TOML file once it is parsed. One owner-only file of the person's own; the core reads it (recursion_core/settings.py) and nothing of the product writes it. Every setting has a default, so the file and every key in it may be absent. The list of settings is append-only: a later version adds properties and never renames or removes one. A key this version does not declare is reported by the reader (settings_unknown_key) and skipped, so additional properties are allowed here. A value of the wrong type or outside minimum and maximum keeps the default (settings_value_out_of_range). Each leaf's 'default' and 'description' are those of the reader's table.",
+  "type": "object",
+  "required": [
+    "version"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "plugin_host": {
+      "type": "object",
+      "properties": {
+        "gil_check": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether each plugin host makes its GIL check; on by default, and a person may turn it off."
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

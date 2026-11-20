@@ -395,6 +395,236 @@ class DoctorReportTests(unittest.TestCase):
             self.assertNotEqual(socket["state"], "ok")
 
 
+_STATE = object()  # in ``StoreGroundTests._live(mounts=...)``: the run's own state folder
+_BASE = object()  # in ``StoreGroundTests._live(mounts=...)``: the directory the run made
+
+
+def _mount_line(number, point, kind):
+    """One ``/proc/self/mountinfo`` line; a space in the mount point is written as the kernel writes it."""
+
+    shown = point.replace("\\", "\\134").replace(" ", "\\040")
+    return f"{number} 1 0:{number} / {shown} rw,relatime shared:{number} - {kind} source{number} rw\n"
+
+
+class StoreGroundTests(unittest.TestCase):
+    """``store.sqlite`` and ``store.filesystem``: the event store's ground. They report and refuse nothing.
+
+    Each live run reads a home, a state folder and a mountinfo file that the test made, and the
+    account probes take that home as their root.
+    """
+
+    def _live(self, mounts=(), sqlite_version="3.51.3", mountinfo=None, automount=None):
+        """``(report, state_folder, opened)`` from ``doctor.run(None, root=home)`` in a directory this test made.
+
+        ``mounts`` is a list of ``(mount point, type)`` written after a ``/`` on ext4; a mount point
+        may be ``_STATE`` (the run's state folder) or ``_BASE`` (the directory the run made).
+        ``mountinfo`` replaces the path of the written file. ``automount`` is the WSL automount
+        root the doctor reads (``_BASE`` allowed); by default a folder in the run's directory.
+        """
+
+        import recursion_core.setup.doctor as doctor
+
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        base = os.path.realpath(folder.name)
+        home = os.path.join(base, "home")
+        runtime = os.path.join(base, "runtime")
+        scratch = os.path.join(base, "tmp")
+        empty_path = os.path.join(base, "bin")
+        for path in (home, runtime, scratch, empty_path):
+            os.mkdir(path, 0o700)
+        state = os.path.join(home, ".local", "state")
+        state_folder = os.path.join(state, "recursion")
+        os.makedirs(state_folder, 0o700)
+        named = {id(_STATE): state_folder, id(_BASE): base}
+        written = os.path.join(base, "mountinfo")
+        with open(written, "w", encoding="utf-8") as handle:
+            handle.write(_mount_line(21, "/", "ext4"))
+            for number, (point, kind) in enumerate(mounts, start=22):
+                handle.write(_mount_line(number, named.get(id(point), point), kind))
+        if automount is None:
+            automount = os.path.join(base, "automount") + "/"
+        elif automount is _BASE:
+            automount = base + "/"
+        if mountinfo is _BASE:
+            mountinfo = os.path.join(base, "no-mountinfo")
+        env = {
+            "HOME": home,
+            "PATH": empty_path,
+            "XDG_CONFIG_HOME": os.path.join(home, ".config"),
+            "XDG_STATE_HOME": state,
+            "XDG_RUNTIME_DIR": runtime,
+            "TMPDIR": scratch,
+        }
+        _watch_opens()
+        asked = []
+        before = len(_OPENED)
+        with mock.patch.dict(os.environ, env), mock.patch.object(tempfile, "tempdir", scratch), \
+                mock.patch.object(doctor, "_MOUNTINFO", mountinfo or written, create=True), \
+                mock.patch.object(doctor, "_WSL_AUTOMOUNT", automount, create=True), \
+                mock.patch("sqlite3.sqlite_version", sqlite_version), account_untouched(asked):
+            report = doctor.run(None, root=home)
+        self.assertEqual(asked, [])
+        _validate(report)
+        return report, state_folder, [raw for raw in _OPENED[before:] if isinstance(raw, str)]
+
+    def test_a_sqlite_below_the_floor_is_fail_in_one_sentence(self):
+        # Red on the base: the report has no store.sqlite row.
+        report, state_folder, opened = self._live(sqlite_version="3.51.2")
+        row = _check(report, "store.sqlite")
+        self.assertEqual(row["state"], "fail")
+        self.assertIn("3.51.2", row["detail"])
+        self.assertIn("3.51.3", row["detail"])
+        self.assertNotIn(". ", row["detail"])
+        # The report opens no file in the state folder: not a store, not the event store.
+        self.assertEqual([raw for raw in opened if raw.startswith(state_folder + os.sep)], [])
+
+    def test_a_sqlite_at_or_above_the_floor_is_ok(self):
+        for version in ("3.51.3", "3.53.1"):
+            with self.subTest(version=version):
+                report, _state, _opened = self._live(sqlite_version=version)
+                row = _check(report, "store.sqlite")
+                self.assertEqual(row["state"], "ok")
+                self.assertIn(version, row["detail"])
+
+    def _sqlite_row(self, version):
+        report, _state, _opened = self._live(sqlite_version=version)
+        return _check(report, "store.sqlite")
+
+    def test_the_3_50_backport_of_the_repair_is_ok(self):
+        # SQLite's own pages name 3.50.7 as a backport of the WAL reset repair: never fail.
+        row = self._sqlite_row("3.50.7")
+        self.assertEqual(row["state"], "ok")
+        self.assertEqual(row["detail"], "SQLite 3.50.7 is loaded")
+
+    def test_the_3_44_backport_of_the_repair_is_ok(self):
+        # SQLite's own pages name 3.44.6 as a backport of the WAL reset repair: never fail.
+        for version in ("3.44.6", "3.44.7"):
+            with self.subTest(version=version):
+                row = self._sqlite_row(version)
+                self.assertEqual(row["state"], "ok")
+                self.assertEqual(row["detail"], f"SQLite {version} is loaded")
+
+    def test_a_sqlite_with_the_wal_reset_bug_is_fail_naming_every_repaired_version(self):
+        for version in ("3.44.5", "3.50.6", "3.45.1", "3.46.1", "3.51.2"):
+            with self.subTest(version=version):
+                row = self._sqlite_row(version)
+                self.assertEqual(row["state"], "fail")
+                self.assertEqual(
+                    row["detail"],
+                    f"SQLite {version} is loaded and has the WAL reset bug; the event store needs 3.51.3 or "
+                    "later, 3.50.7 or later in 3.50, or 3.44.6 or later in 3.44")
+                self.assertNotIn(". ", row["detail"])
+                self.assertEqual(
+                    row["fix"],
+                    "run recursiond on an interpreter built with SQLite 3.51.3 or later, or with 3.50.7 or 3.44.6")
+
+    def test_the_withdrawn_3_52_0_is_fail(self):
+        # 3.52.0 was withdrawn; SQLite's pages do not say it carries the repair, so it is treated as affected.
+        row = self._sqlite_row("3.52.0")
+        self.assertEqual(row["state"], "fail")
+        self.assertIn("SQLite 3.52.0 is loaded and is a withdrawn release that SQLite's pages do not say is repaired;",
+                      row["detail"])
+        self.assertNotIn(". ", row["detail"])
+
+    # The versions that pass, as the store.sqlite row names them where no range may hold the version found.
+    _ONLY_PASSING = "3.53.0 or later, 3.51.3 or later in 3.51, 3.50.7 or later in 3.50, or 3.44.6 or later in 3.44"
+
+    def _assert_the_way_out_names_only_versions_that_pass(self, version, row):
+        way_out = row["detail"].split("; the event store needs ", 1)[1]
+        self.assertEqual(row["fix"], "run recursiond on an interpreter built with SQLite " + way_out)
+        found = tuple(int(part) for part in version.split("."))
+        ranges = re.findall(r"(\d+\.\d+\.\d+) or later(?: in (\d+\.\d+))?", way_out)
+        self.assertTrue(ranges)
+        for start, within in ranges:
+            with self.subTest(version=version, named=start):
+                self.assertEqual(self._sqlite_row(start)["state"], "ok")
+                begins = tuple(int(part) for part in start.split("."))
+                holds = found >= begins and (not within or found[:2] == begins[:2])
+                self.assertFalse(holds, f"{start} or later {within} holds {version}")
+
+    def test_the_withdrawn_3_52_0_names_only_versions_that_pass(self):
+        # "3.51.3 or later" would hold 3.52.0 itself: the way out names only versions that pass.
+        row = self._sqlite_row("3.52.0")
+        self.assertEqual(row["state"], "fail")
+        self.assertEqual(
+            row["detail"],
+            "SQLite 3.52.0 is loaded and is a withdrawn release that SQLite's pages do not say is repaired; "
+            "the event store needs " + self._ONLY_PASSING)
+        self.assertNotIn("WAL reset bug", row["detail"])
+        self.assertNotIn(". ", row["detail"])
+        self._assert_the_way_out_names_only_versions_that_pass("3.52.0", row)
+
+    def test_a_sqlite_older_than_wal_is_fail_without_the_wal_reset_sentence(self):
+        # WAL first came in 3.7.0, so an older SQLite cannot have the WAL reset bug; it still fails.
+        for version in ("3.6.0", "3.6.23"):
+            with self.subTest(version=version):
+                row = self._sqlite_row(version)
+                self.assertEqual(row["state"], "fail")
+                self.assertEqual(
+                    row["detail"],
+                    f"SQLite {version} is loaded and is older than the first SQLite with WAL (3.7.0) and older "
+                    "than every version SQLite names as unaffected; the event store needs " + self._ONLY_PASSING)
+                self.assertNotIn("WAL reset bug", row["detail"])
+                self.assertNotIn(". ", row["detail"])
+                self._assert_the_way_out_names_only_versions_that_pass(version, row)
+
+    def test_the_first_sqlite_with_wal_keeps_the_wal_reset_sentence(self):
+        row = self._sqlite_row("3.7.0")
+        self.assertEqual(row["state"], "fail")
+        self.assertEqual(
+            row["detail"],
+            "SQLite 3.7.0 is loaded and has the WAL reset bug; the event store needs 3.51.3 or later, "
+            "3.50.7 or later in 3.50, or 3.44.6 or later in 3.44")
+        self.assertEqual(
+            row["fix"], "run recursiond on an interpreter built with SQLite 3.51.3 or later, or with 3.50.7 or 3.44.6")
+
+    def test_a_9p_or_overlay_mount_under_the_state_folder_is_fail(self):
+        for point, kind in ((_STATE, "9p"), (_STATE, "overlay"), (_BASE, "9p"), (_BASE, "overlay")):
+            with self.subTest(kind=kind, at="state folder" if point is _STATE else "its parent"):
+                report, state_folder, _opened = self._live(mounts=[(point, kind)])
+                row = _check(report, "store.filesystem")
+                self.assertEqual(row["state"], "fail")
+                self.assertIn(kind, row["detail"])
+                self.assertIn(state_folder, row["detail"])
+
+    def test_the_longest_mount_point_decides(self):
+        # "/" and the run's directory are overlay; the state folder itself is mounted ext4: it is ok.
+        report, state_folder, _opened = self._live(mounts=[("/", "overlay"), (_BASE, "overlay"), (_STATE, "ext4")])
+        row = _check(report, "store.filesystem")
+        self.assertEqual(row["state"], "ok", row["detail"])
+        self.assertIn("ext4", row["detail"])
+        self.assertIn(state_folder, row["detail"])
+
+    def test_an_unreadable_mountinfo_is_unknown_and_never_ok(self):
+        report, _state, _opened = self._live(mountinfo=_BASE)
+        row = _check(report, "store.filesystem")
+        self.assertEqual(row["state"], "unknown")
+        self.assertNotEqual(row["state"], "ok")
+
+    def test_a_state_folder_under_the_wsl_automount_root_is_fail(self):
+        report, state_folder, _opened = self._live(automount=_BASE)
+        row = _check(report, "store.filesystem")
+        self.assertEqual(row["state"], "fail")
+        self.assertIn(state_folder, row["detail"])
+        self.assertIn("ext4", row["detail"])
+
+    def test_a_raised_ground_probe_is_unknown_and_a_probe_map_without_them_is_unchanged(self):
+        import recursion_core.setup.doctor as doctor
+
+        def boom():
+            raise RuntimeError("probe failed")
+
+        report = doctor.run(_fake(**{"store.sqlite": boom, "store.filesystem": boom}))
+        for check_id in ("store.sqlite", "store.filesystem"):
+            row = _check(report, check_id)
+            self.assertEqual(row["state"], "unknown")
+            self.assertIn("RuntimeError", row["detail"])
+        ids = [row["id"] for row in doctor.run(_fake())["checks"]]
+        self.assertNotIn("store.sqlite", ids)
+        self.assertNotIn("store.filesystem", ids)
+        self.assertEqual(len(ids), len(_fake()) + 1)  # engine.binary gives two rows
+
 
 class SchemaLoaderTests(unittest.TestCase):
     """The schema loader reads only the schema folder and fetches nothing."""

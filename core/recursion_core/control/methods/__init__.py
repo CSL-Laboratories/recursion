@@ -303,7 +303,10 @@ _SHORT = {0x08: '\\b', 0x09: '\\t', 0x0A: '\\n', 0x0C: '\\f', 0x0D: '\\r', 0x22:
 
 
 def _number(number) -> str:
-    """A number as ECMAScript writes it (RFC 8785, 3.2.2.3): 1.0 is 1, 1e-7 stays 1e-7, 1e21 is 1e+21."""
+    """A number as ECMAScript writes it (RFC 8785, 3.2.2.3): 1.0 is 1, and 1e-7 stays 1e-7.
+
+    An integral value beyond 2**53-1, for example 1e21, has no canonical text and is refused.
+    """
     if type(number) is int:
         if not -MAX_INT <= number <= MAX_INT:
             raise NoCanonicalText('integer')

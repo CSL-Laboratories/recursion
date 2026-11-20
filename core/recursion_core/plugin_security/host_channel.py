@@ -33,6 +33,10 @@ later work):
   admission path of ``run.start``, with the start key derived here from the plugin, the record, its
   revision and the occurrence (never taken from the plugin), so one occurrence starts at most one run.
   The record gains ``origin``: kind ``trigger``, the plugin the channel was opened for, and the record.
+  What the code does today: a plugin granted ``schedule`` can ask for a run of any engine, with any
+  prompt, for any tenant, in any number; the record it names is a label the core does not read; the
+  permission is granted with no ask-once step; these limits are for the merge to settle and for the
+  slices above this one to narrow.
 * ``HostEnd``: the host's side of one channel: it answers the daemon's calls and takes a ``result``
   only for an id it called.
 * Frame size: a ``load`` frame (daemon to host only) may be as large as the daemon's largest package

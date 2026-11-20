@@ -702,6 +702,80 @@ class RunRequestTests(unittest.TestCase):
             plain = control.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p", "origin": {"x": 1}})
             self.assertNotIn("origin", self.registry.get(plain["run"]["run_id"]))
 
+    # (A2) a requested start is counted in the daemon's in-flight starts exactly as a control start is
+    def test_a_requested_start_is_in_the_daemons_in_flight_count_as_a_control_start_is(self):
+        from recursion_core.daemon.control_adapter import DaemonControl
+
+        class Starter:
+            failures, results = {}, {}
+
+        class Waiting:
+            """A start function that waits inside the start until released, and reads the count there."""
+
+            def __init__(self):
+                self.control, self.seen = None, []
+                self.entered, self.release = threading.Event(), threading.Event()
+
+            def __call__(self, params):
+                self.seen.append(self.control._starts_in_flight)
+                self.entered.set()
+                if not self.release.wait(10):
+                    raise RuntimeError("the test never released the start")
+                return {"cgroup": f"/sys/fs/cgroup/fake/{params['run_id']}"}
+
+        waiting = Waiting()
+        api, registry, _kill, _starter = make_api(starter=waiting)
+        answers = []
+
+        def during_a_start(start):
+            waiting.entered.clear()
+            waiting.release.clear()
+            thread = threading.Thread(target=lambda: answers.append(start()), daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(waiting.entered.wait(10))
+            finally:
+                waiting.release.set()
+                thread.join(10)
+            self.assertFalse(thread.is_alive())
+
+        with tempfile.TemporaryDirectory() as state:
+            control = DaemonControl(api, registry, None, Starter(), state)
+            control._observe = lambda run, full: None
+            waiting.control = control
+            end = hc.DaemonEnd("demo.plugin", GrantingCore(), runs=control)
+            during_a_start(lambda: control.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p"}))
+            during_a_start(lambda: end.receive(call("run.request", run_args(), id_=5)))
+            self.assertEqual(waiting.seen, [1, 1])
+            self.assertEqual(control._starts_in_flight, 0)
+            self.assertEqual(answers[0]["code"], "started")
+            self.assertEqual(answers[1]["value"]["code"], "started")
+            self.assertEqual(registry.get(answers[1]["value"]["run"]["run_id"])["origin"], origin_of(run_args()))
+
+    # (A3) a core whose permission answer raises or cannot be read grants nothing
+    def test_a_core_whose_permission_answer_raises_or_cannot_be_read_grants_nothing(self):
+        class Raising(FakeCore):
+            def client_for(self, caller):
+                self.clients_for.append(caller)
+
+                def call(request):
+                    self.requests.append((caller, request))
+                    raise RuntimeError("the core cannot answer")
+                return call
+
+        listed = canonical({"protocol": "csl-core/v0", "ok": True, "result": {"permissions": "schedule"}})
+        cores = {"raises": Raising(), "not json": FakeCore(answer=b"not json at all"), "empty": FakeCore(answer=b""),
+                 "not an object": FakeCore(answer=b'["schedule"]'), "no result": FakeCore(answer=b'{"ok":true}'),
+                 "permissions not a list": FakeCore(answer=listed)}
+        for label, core in cores.items():
+            with self.subTest(core=label):
+                runs = SpyRuns(self.api)
+                answer = self.ask(end=hc.DaemonEnd("demo.plugin", core, runs=runs))
+                self.assertEqual((answer["type"], answer["code"]), ("refusal", "call_not_offered"))
+                self.assertEqual(runs.seen, [])
+                self.assertEqual(len(core.requests), 1)
+        self.assert_nothing_started()
+
 
 class FixtureConformanceTests(unittest.TestCase):
     """Every host.v1 fixture is held by the code's own check, not only by the schema."""

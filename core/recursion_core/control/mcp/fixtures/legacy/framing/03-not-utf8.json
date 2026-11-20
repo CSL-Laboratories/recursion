@@ -1,0 +1,51 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "framing/03-not-utf8",
+  "protocol": "2025-06-18",
+  "summary": "Bytes that are not UTF-8 get a parse error; serving goes on.",
+  "source": "MCP 2025-06-18 basic/index (Messages) and basic/transports (stdio); JSON-RPC 2.0 sections 4-5",
+  "api": [],
+  "steps": [
+    {
+      "send_hex": "ff fe 0a",
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32700,
+            "message": "Parse error: not UTF-8"
+          }
+        }
+      ]
+    },
+    {
+      "send_hex": "7b 22 6a 73 6f 6e 72 70 63 22 3a 22 c3 28 22 7d 0a",
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": null,
+          "error": {
+            "code": -32700,
+            "message": "Parse error: not UTF-8"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {}
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

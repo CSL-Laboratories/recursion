@@ -1,0 +1,332 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "tools/01-tools-list",
+  "protocol": "2025-06-18",
+  "summary": "tools/list returns the four run tools of control/mcp_tools.py with their names, titles, input schemas and marks by effect, unchanged, in one page; a cursor is refused.",
+  "source": "MCP 2025-06-18 server/tools (Listing Tools, Calling Tools, Error Handling); marks decided Nov 7 (\"All picks\"), stop destructiveHint true, openWorldHint false",
+  "api": [],
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-06-18",
+          "capabilities": {},
+          "clientInfo": {
+            "name": "fixture-client",
+            "version": "1.0.0"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {
+              "tools": {
+                "listChanged": false
+              }
+            },
+            "serverInfo": {
+              "name": "recursion-control",
+              "title": "Recursion control",
+              "version": "0.0.0"
+            },
+            "instructions": "Starts, reads and stops agent runs on this machine's Recursion daemon. recursion_run_stop answers \"stopped\" only when cleanup is confirmed and \"pending\" otherwise; read recursion_run_status before retrying a stop or a start."
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+      },
+      "expect": []
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "result": {
+            "tools": [
+              {
+                "name": "recursion_run_list",
+                "title": "List runs",
+                "description": "List runs and their states, in run_id order. A page that is not the last carries next_after; pass it back as after for the next page. Read only.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "limit": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000
+                    },
+                    "after": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "annotations": {
+                  "title": "List runs",
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                }
+              },
+              {
+                "name": "recursion_run_status",
+                "title": "Run status",
+                "description": "Read one run's state. Read only.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "run_id": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "run_id"
+                  ],
+                  "additionalProperties": false
+                },
+                "annotations": {
+                  "title": "Run status",
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                }
+              },
+              {
+                "name": "recursion_run_start",
+                "title": "Start a run",
+                "description": "Start an agent run on an engine route.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "tenant": {
+                      "type": "string"
+                    },
+                    "engine": {
+                      "type": "string"
+                    },
+                    "prompt": {
+                      "type": "string"
+                    },
+                    "client_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "tenant",
+                    "engine",
+                    "prompt"
+                  ],
+                  "additionalProperties": false
+                },
+                "annotations": {
+                  "title": "Start a run",
+                  "readOnlyHint": false,
+                  "destructiveHint": false,
+                  "idempotentHint": false,
+                  "openWorldHint": true
+                }
+              },
+              {
+                "name": "recursion_run_stop",
+                "title": "Stop a run",
+                "description": "Stop a run. Answers 'stopped' only when cleanup is confirmed; otherwise 'pending'.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "run_id": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "run_id"
+                  ],
+                  "additionalProperties": false
+                },
+                "annotations": {
+                  "title": "Stop a run",
+                  "readOnlyHint": false,
+                  "destructiveHint": true,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/list",
+        "params": {}
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {
+            "tools": [
+              {
+                "name": "recursion_run_list",
+                "title": "List runs",
+                "description": "List runs and their states, in run_id order. A page that is not the last carries next_after; pass it back as after for the next page. Read only.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "limit": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000
+                    },
+                    "after": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "annotations": {
+                  "title": "List runs",
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                }
+              },
+              {
+                "name": "recursion_run_status",
+                "title": "Run status",
+                "description": "Read one run's state. Read only.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "run_id": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "run_id"
+                  ],
+                  "additionalProperties": false
+                },
+                "annotations": {
+                  "title": "Run status",
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                }
+              },
+              {
+                "name": "recursion_run_start",
+                "title": "Start a run",
+                "description": "Start an agent run on an engine route.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "tenant": {
+                      "type": "string"
+                    },
+                    "engine": {
+                      "type": "string"
+                    },
+                    "prompt": {
+                      "type": "string"
+                    },
+                    "client_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "tenant",
+                    "engine",
+                    "prompt"
+                  ],
+                  "additionalProperties": false
+                },
+                "annotations": {
+                  "title": "Start a run",
+                  "readOnlyHint": false,
+                  "destructiveHint": false,
+                  "idempotentHint": false,
+                  "openWorldHint": true
+                }
+              },
+              {
+                "name": "recursion_run_stop",
+                "title": "Stop a run",
+                "description": "Stop a run. Answers 'stopped' only when cleanup is confirmed; otherwise 'pending'.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "run_id": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "run_id"
+                  ],
+                  "additionalProperties": false
+                },
+                "annotations": {
+                  "title": "Stop a run",
+                  "readOnlyHint": false,
+                  "destructiveHint": true,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/list",
+        "params": {
+          "cursor": "next"
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "error": {
+            "code": -32602,
+            "message": "Invalid params: unknown cursor"
+          }
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

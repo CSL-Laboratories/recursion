@@ -58,10 +58,17 @@ replacement. It builds the child environment from nothing:
 The engine is an explicit profile id, never inferred from argv (ledger CX-082: a
 first-token guess let wrapped or renamed argv through). An unknown engine refuses.
 
-POSIX only. On Windows the ownership checks the rules rely on do not exist here, so
-every call refuses (``platform_unsupported``) instead of passing values unchecked.
-The same holds for any build without ``os.geteuid``, and the owner helpers refuse
-(``owner_check_unsupported``, or a false owned-chain / private-dir result) there.
+On Windows (``os.name == "nt"``) the ownership checks do not run. ``build_child_env``
+returns an allow-list instead of passing the parent through: ``SystemRoot``, ``windir``,
+``PATHEXT``, ``ComSpec``, ``TEMP``, ``TMP``, ``NUMBER_OF_PROCESSORS`` and
+``PROCESSOR_ARCHITECTURE`` are copied when the parent has them, and ``USERPROFILE``,
+``APPDATA`` and ``LOCALAPPDATA`` are set from the route home. Every other parent name is
+dropped and recorded, as on Linux. Names are compared case-insensitively; two spellings of
+one name refuse with ``env_name_ambiguous``. ``spawn`` still refuses ``platform_unsupported``
+on Windows, because there is no Windows launcher here. A build whose ``os.name`` is not
+``nt`` and which has no ``os.geteuid`` still refuses ``platform_unsupported``. The owner
+helpers refuse (``owner_check_unsupported``, or a false owned-chain / private-dir result)
+without ``os.geteuid``.
 
 Candidate policy code used by the daemon and subscription-route launch helpers.
 Policy validation itself starts no engine and makes no provider or network call.
@@ -151,6 +158,21 @@ BASE_NAMES = (
     "USERPROFILE",
     "XDG_RUNTIME_DIR",
 )
+# Windows parent names ``build_child_env`` copies when ``os.name == "nt"``. Spellings are the
+# canonical ones written into the child; a parent key matches case-insensitively.
+NT_INHERITED_NAMES = (
+    "SystemRoot",
+    "windir",
+    "PATHEXT",
+    "ComSpec",
+    "TEMP",
+    "TMP",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+)
+# Set from the route home, never copied from the parent. APPDATA and LOCALAPPDATA are the
+# Windows locations of those variables, under that home.
+NT_HOME_NAMES = ("USERPROFILE", "APPDATA", "LOCALAPPDATA")
 # Claude Code's mTLS and cert-store names (C1-46; network-config.md:64-105, env-vars.md:219-223).
 CLAUDE_TLS_NAMES = (
     "CLAUDE_CODE_CLIENT_CERT",
@@ -343,6 +365,10 @@ def build_child_env(
     ``subscription`` route a base URL that is not Anthropic's own, not in the route's trusted list and not under
     an acknowledged full-access run refuses with ``route_base_url_untrusted``.
     ``home`` is the route-owned private home the child gets as HOME; the parent's HOME is never passed.
+    On Windows (``os.name == "nt"``) the same argument is ``USERPROFILE``, and ``APPDATA`` /
+    ``LOCALAPPDATA`` are its ``AppData/Roaming`` and ``AppData/Local`` subfolders. The parent
+    allow-list there is ``NT_INHERITED_NAMES``; every other parent name is dropped. ``spawn``
+    still refuses ``platform_unsupported`` on Windows.
     ``overrides`` are values the core itself sets. An override may only set a name already on this engine's
     allowlist (never HOME, PATH, a credential or a scrubbed name), and it is merged before the checks, so it
     meets exactly the value, PATH, NO_PROXY and temp rules an inherited value meets. While a proxy is set, a
@@ -362,6 +388,8 @@ def build_child_env(
     with ``no_proxy_unparseable`` on any route.
     """
 
+    if os.name == "nt":
+        return _build_nt_child_env(engine, home=home, auth_mode=auth_mode, route=route, parent=parent, overrides=overrides)
     if not _posix_supported():
         raise EnvRefused(None, "platform_unsupported")
     profile = ENGINE_PROFILES.get(engine) if isinstance(engine, str) else None
@@ -600,10 +628,110 @@ def _unsafe_value(name: str, value: str) -> str | None:
 def _posix_supported() -> bool:
     """False on Windows (``os.name == "nt"``) and on any build without ``os.geteuid``.
 
-    The public entry points refuse ``platform_unsupported`` there instead of raising ``AttributeError``.
+    ``spawn`` refuses ``platform_unsupported`` there instead of raising ``AttributeError``.
+    ``build_child_env`` does that only when ``os.name`` is not ``nt``; on ``nt`` it builds
+    ``NT_INHERITED_NAMES`` rather than passing the parent through.
     """
 
     return os.name != "nt" and hasattr(os, "geteuid")
+
+
+def _nt_home_ok(home: str) -> bool:
+    """Structural route-home check for Windows. Owner bits are not available without ``os.geteuid``."""
+
+    if not isinstance(home, str) or not home or "\0" in home or not os.path.isabs(home):
+        return False
+    if ".." in Path(home).parts:
+        return False
+    entry = _lexical_dir(home)
+    # A final ".." names no entry of its own, and a root is not a route home.
+    return os.path.basename(entry) != ".." and os.path.dirname(entry) != entry
+
+
+def _nt_profile_paths(home: str) -> dict[str, str]:
+    return {
+        "USERPROFILE": home,
+        "APPDATA": os.path.join(home, "AppData", "Roaming"),
+        "LOCALAPPDATA": os.path.join(home, "AppData", "Local"),
+    }
+
+
+def _nt_refuse_ambiguous(mapping: Mapping) -> None:
+    """Refuse a mapping that holds two spellings of one name. Windows env names are one name each."""
+
+    groups: dict[str, list[str]] = {}
+    for name in mapping:
+        if not isinstance(name, str) or not name or "\0" in name or "=" in name:
+            raise EnvRefused(None, "value_malformed")
+        groups.setdefault(name.casefold(), []).append(name)
+    dupes = sorted(fold for fold, names in groups.items() if len(names) > 1)
+    if dupes:
+        raise EnvRefused(dupes[0].upper(), "env_name_ambiguous")
+
+
+def _build_nt_child_env(
+    engine: str,
+    *,
+    home: str,
+    auth_mode: str | None,
+    route: ChildRoute | None,
+    parent: Mapping[str, str] | None,
+    overrides: Mapping[str, str] | None,
+) -> ValidatedEnv:
+    """Windows allow-list. No POSIX owner check, and no value is copied unless its name is listed.
+
+    Route-owned names (the vendor key, the base URL, the provider switches) are still taken from
+    ``route`` after the parent is filtered, as on Linux. The parent's own copies of those names
+    stay in ``dropped``. ``USERPROFILE``, ``APPDATA`` and ``LOCALAPPDATA`` are written from
+    ``home`` and are not a parent value and not an override.
+    """
+
+    profile = ENGINE_PROFILES.get(engine) if isinstance(engine, str) else None
+    if profile is None:
+        raise EnvRefused(None, "unknown_engine")
+    if auth_mode is None:
+        raise EnvRefused(None, "auth_mode_missing")
+    if not isinstance(auth_mode, str) or auth_mode not in AUTH_MODES:
+        raise EnvRefused(None, "auth_mode_unknown")
+    route_env = _route_env(profile, auth_mode, route)  # refuses before anything is read from the parent
+    if not _nt_home_ok(home):
+        raise EnvRefused("HOME", "home_unsafe")
+    source = dict(os.environ if parent is None else parent)
+    _nt_refuse_ambiguous(source)
+    inherited = {name.casefold(): name for name in NT_INHERITED_NAMES}
+    home_folds = {name.casefold() for name in NT_HOME_NAMES}
+    found: dict[str, object] = {}
+    for name, value in source.items():
+        canonical = inherited.get(name.casefold())
+        if canonical is not None:
+            found[canonical] = value
+    for name, value in (overrides or {}).items():
+        if not isinstance(name, str) or not isinstance(value, str) or not name or "=" in name or "\0" in name + value:
+            raise EnvRefused(None, "override_malformed")
+    if overrides:
+        _nt_refuse_ambiguous(overrides)
+    for name, value in (overrides or {}).items():
+        fold = name.casefold()
+        if (_DENIED.search(name) or name in _OVERRIDE_DENIED_NAMES or name in profile.scrub
+                or name in profile.passthrough or fold in ("home", "path") or fold in home_folds):
+            raise EnvRefused(name, "override_denied")
+        canonical = inherited.get(fold)
+        if canonical is None:
+            raise EnvRefused(name, "override_not_allowed")
+        found[canonical] = value
+    for name, value in found.items():
+        if not isinstance(value, str) or "\0" in value:
+            raise EnvRefused(name, "value_malformed")
+    env: dict[str, str] = {name: value for name, value in found.items()}  # checked str above
+    kept = {name.casefold() for name in env} | home_folds
+    dropped = tuple(sorted(name for name in source if isinstance(name, str) and name.casefold() not in kept))
+    env.update(_nt_profile_paths(home))
+    leaked = sorted(name for name in env if name in profile.scrub
+                    or (name not in NT_INHERITED_NAMES and name not in NT_HOME_NAMES and _DENIED.search(name)))
+    if leaked:  # unreachable by construction; kept so a later edit to the allow-list fails closed
+        raise EnvRefused(leaked[0], "scrub_failed")
+    env.update(route_env)  # last: only what this call's route named, never a parent or override value
+    return ValidatedEnv(env, engine, dropped, auth_mode=auth_mode, _seal=ValidatedEnv._seal)
 
 
 def _posix_euid() -> int | None:

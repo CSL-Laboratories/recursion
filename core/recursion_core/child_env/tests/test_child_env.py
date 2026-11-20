@@ -509,9 +509,19 @@ class ProfileTests(unittest.TestCase):
             ValidatedEnv({"PATH": "/usr/bin"}, "codex", ())
 
     def test_windows_refuses_instead_of_passing_values_unchecked(self) -> None:
+        # os.name nt builds the Windows allow-list. A parent credential is dropped, not passed through.
+        parent = {"ANTHROPIC_API_KEY": FAKE, "SystemRoot": "/windows", "PATH": "/windows"}
+        with mock.patch("recursion_core.child_env.policy.os.name", "nt"):
+            env = build_child_env("codex", home="/route/home", auth_mode=SUB, parent=parent)
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertIn("ANTHROPIC_API_KEY", env.dropped)
+        self.assertNotIn(FAKE, env.to_dict().values())
+        self.assertEqual("/route/home", env["USERPROFILE"])
+        self.assertEqual("/windows", env["SystemRoot"])
+        self.assertNotIn("PATH", env)
         with mock.patch("recursion_core.child_env.policy.os.name", "nt"), self.assertRaises(EnvRefused) as caught:
-            build_child_env("codex", home="C:\\x", auth_mode=SUB, parent={})
-        self.assertEqual("platform_unsupported", caught.exception.cause)
+            build_child_env("codex", home="not-absolute", auth_mode=SUB, parent=parent)
+        self.assertEqual(("HOME", "home_unsafe"), (caught.exception.name, caught.exception.cause))
 
 
 @unittest.skipIf(os.name == "nt", "POSIX rules")

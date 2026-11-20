@@ -1,0 +1,68 @@
+# Distribution csl-recursion: the import package recursion_core (from core/) and the recursiond command.
+# Lucas, Nov 11, 2026: "let's go with csl-recursion"; "recursiond works well, easy to type".
+# Nothing is published to any package index ("Do not publish anything to a registry").
+# The licence fields are left out on purpose until Lucas names the holder (lane RELEASE fills them).
+
+[build-system]
+# uv's own backend. The uv binary builds this project offline with it ("uv build"); pip and other
+# PEP 517 frontends fetch the backend from the index, as they would any backend.
+requires = ["uv_build>=0.12.23,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "csl-recursion"
+version = "0.1.0"
+description = "Recursion: a provider-neutral core with a per-user Linux daemon and its control clients."
+readme = "README.md"
+# The control clients run on 3.12 and later (hosted CI runs 3.12). The daemon needs free-threaded
+# CPython 3.14; recursiond checks that itself, as package metadata cannot express a build.
+requires-python = ">=3.12"
+authors = [{ name = "CSL Laboratories" }]
+dependencies = []
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: No Input/Output (Daemon)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[project.optional-dependencies]
+# Plugin signatures are checked with cryptography; without it every plugin is refused, never loaded unchecked.
+plugins = ["cryptography>=43"]
+
+[project.scripts]
+recursiond = "recursion_core._entrypoints:main"
+
+[project.urls]
+Repository = "https://github.com/CSL-Laboratories/recursion"
+
+[tool.uv.build-backend]
+module-root = "core"
+module-name = "recursion_core"
+# Tests, test helpers, evidence harnesses, internal documents and the plugin requirements file stay
+# in the repository. Runtime data that ships: plugin_security/protocol.json.
+source-exclude = [
+    "**/tests",
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/*_tests.py",
+    "**/*.test.py",
+    "core/recursion_core/**/*.md",
+    "core/recursion_core/plugin_security/requirements.txt",
+    "core/recursion_core/daemon/evidence_*",
+    "core/recursion_core/cgroup_leaf/b6_evidence.py",
+]
+wheel-exclude = [
+    "**/tests",
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/*_tests.py",
+    "**/*.test.py",
+    "**/*.md",
+    "recursion_core/plugin_security/requirements.txt",
+    "recursion_core/daemon/evidence_*",
+    "recursion_core/cgroup_leaf/b6_evidence.py",
+]

@@ -20,7 +20,9 @@ to use, or raises ``Refused`` with one of three codes:
 
 An IPv4 address carried inside IPv6 (``::ffff:0:0/96``, ``::ffff:0:0:0/96``, ``::/96``,
 ``64:ff9b::/96``, ``64:ff9b:1::/48``, 6to4 ``2002::/16`` and Teredo ``2001::/32``) is
-checked as the IPv4 address it carries, by the same rules. ``0.0.0.0/8``,
+checked as the IPv4 address it carries, by the same rules; a form that carries
+several (Teredo's server and client, the readings of a local NAT64 address) passes only
+if each of them passes. ``0.0.0.0/8``,
 ``240.0.0.0/4`` and the old site-local ``fec0::/10`` are ``not_routable``. A known cloud
 platform address that holds secrets (``_PLATFORM_ADDRESSES``) is ``platform_address``,
 looked at before every class and refused under every setting. The person's
@@ -134,13 +136,17 @@ def _one_class(address) -> str | None:
     return None
 
 
-def _address_class(address) -> str | None:
+def _address_class(address, allowed: frozenset = frozenset()) -> str | None:
+    # Every address carried is judged: the first class met that ``allowed`` does not let
+    # pass names the address; when each one passes, the first class met (or None).
     carried = _carried_ipv4(address) if address.version == 6 else ()
+    first = None
     for one in carried or (address,):
         name = _one_class(one)
-        if name is not None:
+        if name is not None and name not in allowed:
             return name
-    return None
+        first = first or name
+    return first
 
 
 def check_destination(destination: str, granted, reserved: ReservedEffects, addresses, *,
@@ -176,10 +182,11 @@ def check_destination(destination: str, granted, reserved: ReservedEffects, addr
     if not addresses:
         raise ValueError("no address given")
     parsed = tuple(ipaddress.ip_address(a) for a in addresses)
+    allowed = _PRIVATE_ALLOWED if allow_private_addresses else frozenset()
     refused = []
     for address in parsed:
-        name = _address_class(address)
-        if name is None or (allow_private_addresses and name in _PRIVATE_ALLOWED):
+        name = _address_class(address, allowed)
+        if name is None or name in allowed:
             return str(address)
         if name not in refused:
             refused.append(name)

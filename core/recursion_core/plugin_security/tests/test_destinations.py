@@ -258,6 +258,54 @@ class DestinationCheckTests(unittest.TestCase):
         self.assertRefused("address_refused", "loopback", "api.example.com", ["api.example.com"],
                            ["64:ff9b:1:7f00:1::5db8:d822"], allow_private_addresses=True)
 
+    def test_a_local_nat64_address_read_with_a_56_or_64_prefix_is_judged_by_that_reading(self):
+        # The /56 reading of the first is 100.64.0.1, the /64 reading of the second too;
+        # every other reading of both is public.
+        for address in ("64:ff9b:1:5d64:40:1:5db8:d822", "64:ff9b:1:5db8:64:4000:101:101"):
+            for allow in (False, True):
+                with self.subTest(address=address, allow_private_addresses=allow):
+                    self.assertRefused("address_refused", "carrier_grade_nat", "api.example.com",
+                                       ["api.example.com"], [address], allow_private_addresses=allow)
+
+    # A form that carries several IPv4 addresses, one private and one the switch never
+    # lets pass, with the class of the one refused.
+    CARRIED_PRIVATE_AND_REFUSED = (
+        ("2001:0:a00:1::80ff:fffe", "loopback"),  # Teredo, server 10.0.0.1, client 127.0.0.1
+        ("2001:0:a00:1:8000:edcb:80ff:fffe", "loopback"),
+        ("2001:0:a00:1:8000:edcb:5601:fefe", "link_local"),  # client 169.254.1.1
+        ("2001:0:a00:1:8000:edcb:5601:5601", "platform_address"),  # client 169.254.169.254
+        ("64:ff9b:1:a7f:a:1:5db8:d822", "loopback"),  # local NAT64: /48 10.127.10.0, /56 127.10.0.1
+        ("64:ff9b:1:a0a:7f:0:10a:a0a", "loopback"),  # /48 10.10.0.127, /64 127.0.1.10
+        ("64:ff9b:1:a0a:a9:fe01:10a:a0a", "link_local"),  # /64 169.254.1.1
+        ("64:ff9b:1:a0a:a:a0a:7f00:1", "loopback"),  # /48 10.10.10.10, /96 127.0.0.1
+        ("64:ff9b:1:a0a:a:a0a:a9fe:101", "link_local"),  # /96 169.254.1.1
+        ("64:ff9b:1:a0a:a:a0a:a9fe:a9fe", "platform_address"),  # /96 169.254.169.254
+        # /48 10.0.0.1, then /56 0.0.1.0 (not routable) is met before /96 127.0.0.1.
+        ("64:ff9b:1:a00:0:100:7f00:1", "not_routable"),
+    )
+
+    def test_every_ipv4_a_form_carries_is_judged_with_the_switch_on(self):
+        for address, name in self.CARRIED_PRIVATE_AND_REFUSED:
+            with self.subTest(address=address):
+                self.assertRefused("address_refused", name, "api.example.com", ["api.example.com"],
+                                   [address], allow_private_addresses=True)
+
+    def test_a_form_carrying_a_private_address_first_is_private_with_the_switch_off(self):
+        # With the switch off the first refused address met names the class, as before.
+        for address, _ in self.CARRIED_PRIVATE_AND_REFUSED:
+            with self.subTest(address=address):
+                self.assertRefused("address_refused", "private", "api.example.com", ["api.example.com"],
+                                   [address])
+
+    def test_a_teredo_address_carrying_only_private_addresses_follows_the_switch(self):
+        # Server 10.0.0.1 with client 192.168.1.1, and with a public client 93.184.216.34.
+        for address in ("2001:0:a00:1::3f57:fefe", "2001:0:a00:1::a247:27dd"):
+            with self.subTest(address=address):
+                self.assertRefused("address_refused", "private", "api.example.com", ["api.example.com"],
+                                   [address])
+                self.assertEqual(check("api.example.com", ["api.example.com"], [address],
+                                       allow_private_addresses=True), str(ipaddress.ip_address(address)))
+
     def test_unspecified_and_loopback_ipv6_keep_their_own_class(self):
         self.assertAddressClass("unspecified", "::")
         self.assertAddressClass("loopback", "::1")

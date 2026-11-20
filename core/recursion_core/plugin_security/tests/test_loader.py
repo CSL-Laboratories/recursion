@@ -338,6 +338,28 @@ class ReservedHostFormTests(unittest.TestCase):
                 self.assertFalse(reserved.host_reserved(destination))
         self.assertFalse(ReservedEffects().host_reserved("venue.example"))
 
+    def test_a_one_word_entry_reserves_every_destination_under_it(self) -> None:
+        for entry, under, other in (("localhost", "api.localhost", "localhost.example"),
+                                    ("com", "api.example.com", "api.example.org")):
+            with self.subTest(entry=entry):
+                reserved = ReservedEffects(frozenset({entry}), ())
+                self.assertTrue(reserved.host_reserved(entry))
+                self.assertTrue(reserved.host_reserved(under))
+                self.assertFalse(reserved.host_reserved(other))
+
+    def test_a_one_word_entry_in_another_form_is_still_refused(self) -> None:
+        for entry in ("Localhost", "localhost.", "localhost:80", "*", "", "-com"):
+            with self.subTest(entry=entry):
+                with self.assertRaises(Refused) as ctx:
+                    ReservedEffects(frozenset({entry}), ())
+                self.assertEqual(ctx.exception.code, "reserved_host_form")
+
+    def test_hosts_given_once_as_an_iterator_are_all_kept(self) -> None:
+        reserved = ReservedEffects(iter(("venue.example", "localhost")), ())
+        self.assertEqual(reserved.hosts, frozenset({"venue.example", "localhost"}))
+        self.assertTrue(reserved.host_reserved("api.venue.example"))
+        self.assertTrue(reserved.host_reserved("api.localhost"))
+
 
 if __name__ == "__main__":
     unittest.main()

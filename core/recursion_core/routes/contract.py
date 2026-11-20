@@ -144,6 +144,17 @@ class RouteError(Exception):
         self.code, self.detail = code, detail
 
 
+def _finite(value: object) -> bool:
+    """A real int or float. A bool is not one. A huge int that cannot be a float is not one."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def validate_request(request: object, *, engines: object = None) -> dict:
     """Return a normalised copy of ``request`` or raise ``RouteError(REQUEST_INVALID)``.
 
@@ -159,7 +170,7 @@ def validate_request(request: object, *, engines: object = None) -> dict:
         if not isinstance(request.get(name), str) or not request[name]:
             raise RouteError(REQUEST_INVALID, name)
     deadline = request.get("deadline_s")
-    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline) or deadline <= 0:
+    if not _finite(deadline) or deadline <= 0:
         raise RouteError(REQUEST_INVALID, "deadline_s")
     route = request.get("route")
     if not isinstance(route, Mapping):
@@ -167,8 +178,15 @@ def validate_request(request: object, *, engines: object = None) -> dict:
     engine = route.get("engine")
     if engine not in engine_names(engines):  # read now, not at import (seam S3)
         raise RouteError(ENGINE_UNKNOWN, str(engine))
-    if not isinstance(route.get("model"), str) or not route["model"]:
+    model = route.get("model")
+    # NUL is refused on its own: encoding it succeeds, and Popen still rejects the byte.
+    # A lone surrogate is not UTF-8, so it is the same refusal before any launch.
+    if not isinstance(model, str) or not model or "\x00" in model:
         raise RouteError(REQUEST_INVALID, "route.model")
+    try:
+        model.encode("utf-8")
+    except UnicodeEncodeError:
+        raise RouteError(REQUEST_INVALID, "route.model") from None
     conn = route.get("connection")
     if not isinstance(conn, Mapping) or conn.get("kind") not in CONNECTION_KINDS:
         raise RouteError(REQUEST_INVALID, "route.connection.kind")
@@ -212,20 +230,25 @@ def vendor_reset(epoch: object, clock: Callable[[], float], wall: Callable[[], f
     the breaker uses its own cooldown instead of treating a real epoch as eight days away.
     """
 
-    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) or not math.isfinite(float(epoch)):
+    if not _finite(epoch):
         return None
-    translated = clock() + (float(epoch) - wall())
+    number = float(epoch)
+    translated = clock() + (number - wall())
     if not math.isfinite(translated) or translated <= clock():
         return None
     return translated
 
 
 def limit_signal(scope: str, source: str, *, model: str | None = None, reset_at: float | None = None) -> dict:
-    """Build a limit signal. Adapters call this only from typed vendor fields, never from text."""
+    """Build a limit signal. Adapters call this only from typed vendor fields, never from text.
+
+    A reset that is not a finite int or float, including a bool or an int too large for a float,
+    is stored as None so the breaker uses its own cooldown.
+    """
 
     if scope not in ("connection", "model") or (scope == "model" and not model):
         raise ValueError(scope)
-    if reset_at is not None and (not isinstance(reset_at, (int, float)) or not math.isfinite(reset_at)):
+    if reset_at is not None and not _finite(reset_at):
         reset_at = None
     return {"scope": scope, "model": model if scope == "model" else None, "reset_at": reset_at, "source": source}
 

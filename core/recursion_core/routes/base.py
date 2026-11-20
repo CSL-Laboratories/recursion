@@ -49,8 +49,11 @@ class RouteAdapter:
         # STARTED CHILDREN ARE FENCED ON EVERY WAY OUT OF THIS METHOD (an override of ``run`` owns its own
         # cleanup). Once the launcher has returned a process:
         # - A typed exit (deadline, protocol error, engine io) fences with its own reason and answers.
-        # - Any other exception, BaseException included, fences with UNEXPECTED_FENCE, and the same exception
-        #   object leaves.
+        # - Any other Exception fences with UNEXPECTED_FENCE. When that fence succeeds, the method answers:
+        #   a RouteError keeps its own code and detail; any other Exception is engine_error and the detail is
+        #   the type name, never the message. An interruption (a BaseException that is not an Exception) still
+        #   leaves as the same object. When that fence raises, the ORIGINAL exception leaves, with the fence
+        #   failure recorded on it.
         # - If a typed exit's fence raises, the ORIGINAL typed exception leaves instead of the answer (its type
         #   is what callers decide on); the fence is tried once more as UNEXPECTED_FENCE, and the first
         #   failure is noted on the original.
@@ -69,6 +72,7 @@ class RouteAdapter:
         # unfenced instead.
         process = None
         fenced = False
+        events: list[dict] = []
         try:
             try:
                 process = self._launcher(argv, env=env, shell=False)
@@ -86,7 +90,6 @@ class RouteAdapter:
                 if not done:
                     raise err
                 return c.result(rid, c.DEADLINE_EXCEEDED, detail="recursion deadline")
-            events: list[dict] = []
             try:
                 return self.drive(process, request, deadline_at, events)
             except Deadline as err:
@@ -118,8 +121,16 @@ class RouteAdapter:
             if process is not None and not fenced:
                 try:
                     process.fence(UNEXPECTED_FENCE)
-                except BaseException as fence_err:  # noqa: BLE001 - the exception that reached here is the one that leaves
+                except BaseException as fence_err:  # noqa: BLE001 - recorded; the original exception is what leaves
                     _record_cleanup_failure(err, fence_err, still_running=True)
+                else:
+                    # An Exception is answered once the child is fenced. A RouteError keeps its code. Any
+                    # other Exception is engine_error and the detail is the type name, never the message.
+                    # An interruption still leaves, so a caller can tell that case.
+                    if isinstance(err, c.RouteError):
+                        return c.result(rid, err.code, events=events, detail=err.detail)
+                    if isinstance(err, Exception):
+                        return c.result(rid, c.ENGINE_ERROR, events=events, detail=type(err).__name__)
             raise
 
     # -- subclass hooks -----------------------------------------------------------------------
@@ -255,6 +266,10 @@ def _typed_fence(process: EngineProcess, reason: str, err: BaseException) -> boo
 
 
 def scalar(value: object) -> object:
-    """Copy only scalar typed fields into events; never nested model payload."""
+    """Copy only scalar typed fields into events; never nested model payload or a non-finite number."""
 
-    return value if isinstance(value, (str, int, float, bool)) or value is None else None
+    if isinstance(value, bool) or isinstance(value, str) or value is None or type(value) is int:
+        return value
+    if type(value) is float and value == value and value not in (float("inf"), float("-inf")):
+        return value
+    return None

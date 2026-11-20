@@ -130,8 +130,11 @@ class ConnectionBreaker:
     # -- outcomes -----------------------------------------------------------------------------
     def record(self, connection: str, model: str, tenant: str, outcome: dict, probe: str | None = None) -> str:
         """Book one route result. Returns the effect: ``opened``, ``short_fault``, ``closed``,
-        ``probe_released`` or ``none``. Only ``outcome["limit"]`` on a PLAN_LIMIT opens a key."""
+        ``probe_released`` or ``none``. Only ``outcome["limit"]`` on a PLAN_LIMIT opens a key.
+        An outcome that is not a dict is ``none``: nothing is written."""
 
+        if not isinstance(outcome, dict):
+            return "none"
         code = outcome.get("code")
         with self._lock:
             now = self._clock()
@@ -211,12 +214,16 @@ class ConnectionBreaker:
 
 
 def _is_signal(value: object) -> bool:
-    return (
+    if not (
         isinstance(value, dict)
         and value.get("scope") in ("connection", "model")
         and isinstance(value.get("source"), str)
         and (value["scope"] == "connection" or isinstance(value.get("model"), str))
-    )
+    ):
+        return False
+    # A reset that is not a number is refused before any key is written.
+    reset = value.get("reset_at")
+    return reset is None or (not isinstance(reset, bool) and isinstance(reset, (int, float)))
 
 
 def _refused(code: str, retry_at: float, key: str) -> dict:

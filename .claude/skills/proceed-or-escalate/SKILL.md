@@ -127,8 +127,12 @@ holds the record format and wins on any conflict.
   once its writers have stopped; work under your other non-overlapping claims
   does not block it.
   Releasing never releases a hold.
-- Agent commits under a claim carry the trailer `Agent-Claim: <uuid>`; fixer,
-  bot and human commits are exempt.
+- Agent commits carry no `Agent-Claim` trailer and no other AI trailer; the
+  claim uuid goes in the Linear claim comment and in PR comments (claim,
+  evidence, release). Lucas, 2026-11-10: "yes, no AI trailers includes
+  Agent-Claim; claims go in Linear and PR comments"
+  ([csl-research PR #1159 comment](https://github.com/CSL-Laboratories/csl-research/pull/1159#issuecomment-6777082374)),
+  superseding the CSL-357 comment 1c643648 rule.
 - Link a PR with `Fixes CSL-N` only when it completes the issue's acceptance
   criteria; use `Related to CSL-N` when scope or decisions remain.
 

@@ -13,7 +13,9 @@ PRODUCT.md 4.1 and 4.3 (at 055cc7a5, CSLR-D-011), as implemented here:
   ``plugin.py``.
 * Grants are bound to the developer key they were given for (review R4, finding 6, under
   Lucas's D0, Nov 12, 2026): a grant naming another developer key grants nothing, and so
-  does a manual grant that names none, in either form (grant again).
+  does a manual grant that names none, in either form (grant again). Such a grant does not
+  stop the plugin: it is still loaded and its code still runs, with an empty permission set.
+  This build does not refuse a plugin whose grant is not bound.
 * Installer configuration is refused unless it is in normal form: a reserved host is a
   lower-case host name with no port, no trailing dot and no IP address; a reserved
   credential prefix is lower case. A declared destination's port is 1 to 65535, and a
@@ -74,7 +76,23 @@ PERMISSIONS = ("read", "propose", "panel", "network", "credential", "process", "
 # for an existing set never change. The five new names and their order are PROVISIONAL
 # until Lucas answers DEC F12 (schemas/plugin/v1/README.md); a vNext manifest refuses them.
 PERMISSIONS_V1 = PERMISSIONS + ("surface", "command", "subscribe", "tool", "run")
-_RUNTIMES_V1 = frozenset({"python-inprocess/1"})   # ordinary Python in the daemon: not contained
+# Runtimes, only ever appended to: a later runtime is a new name, under unchanged plugins.
+# python-sandboxed/1 names Python run by a host of its own outside the daemon; that host is not in this
+# build, so a plugin of either runtime runs in the daemon's own process (loader.py warns
+# runtime_not_yet_contained). python-inprocess/1 retires: accepted in every 1.0.x release and run the same
+# way, with the finding runtime_inprocess_retiring (loader.py); from 1.1.0 on it is refused.
+_RUNTIMES_V1 = frozenset({"python-sandboxed/1", "python-inprocess/1"})
+RUNTIME_INPROCESS_RETIRING = "python-inprocess/1"
+# Runtime names reserved for a later release, each with its own text. Refused runtime_reserved and never
+# run. Reserved is not frozen: a name may be corrected until the first build that answers it.
+_RESERVED_RUNTIMES = MappingProxyType({
+    "wasm-component/1": "wasm-component/1 is reserved for a later release; this release runs python-sandboxed/1 only.",
+    "data/1": "data/1 is reserved; not run in this release.",
+})
+_UNKNOWN_RUNTIME = "unknown runtime; this release runs python-sandboxed/1 only"
+# Permission names reserved for a later release, refused permission_reserved in either form of manifest.
+# They are not in PERMISSIONS or PERMISSIONS_V1, and nothing grants them.
+_RESERVED_PERMISSIONS = frozenset({"schedule", "memory", "computer"})
 _INTERFACES_V1 = frozenset({"csl-plugin-api/1"})
 # The file the loader runs; its digest is artifact_sha256 (daemon/plugins.py, ARTIFACT).
 ENTRY_FILE = "plugin.py"
@@ -262,6 +280,10 @@ def parse_manifest(raw: bytes) -> Manifest:
         raise Refused("manifest_dependency_lock")
     parse_public_key(data["developer_key"])
     perms = data["permissions"]
+    if type(perms) is list:
+        for p in perms:
+            if type(p) is str and p in _RESERVED_PERMISSIONS:
+                raise Refused("permission_reserved", "%s is reserved; not available in this release" % p)
     if type(perms) is not list or any(p not in order for p in perms):
         raise Refused("manifest_unknown_permission")
     if len(set(perms)) != len(perms) or perms != sorted(perms, key=order.index):
@@ -276,8 +298,11 @@ def parse_manifest(raw: bytes) -> Manifest:
     if not v1:
         return Manifest(data["plugin_id"], data["version"], data["artifact_sha256"], lock, scripts,
                         data["developer_key"], tuple(perms), nets, creds, raw)
-    if type(data["runtime"]) is not str or data["runtime"] not in _RUNTIMES_V1:
-        raise Refused("manifest_runtime", "only python-inprocess/1 is defined")
+    runtime = data["runtime"]
+    if type(runtime) is str and runtime in _RESERVED_RUNTIMES:
+        raise Refused("runtime_reserved", _RESERVED_RUNTIMES[runtime])
+    if type(runtime) is not str or runtime not in _RUNTIMES_V1:
+        raise Refused("manifest_runtime", _UNKNOWN_RUNTIME)
     if type(data["interface"]) is not str or data["interface"] not in _INTERFACES_V1:
         raise Refused("manifest_interface", "only csl-plugin-api/1 is defined")
     files = _parse_files(data["files"], data["artifact_sha256"])
@@ -304,6 +329,14 @@ def create_revocation_store(path: str) -> None:
         db.close()
 
 
+# A key id in the form ``signing.key_id`` gives it. ``revoke`` stores nothing else, so
+# a refusal never repeats caller text and the store holds only ids a key can have.
+_KEY_ID = re.compile(r"ed25519:[0-9a-f]{32}")
+# The largest generation SQLite keeps as an INTEGER; a revoke that would pass it is
+# refused before anything is written (SQLite would turn it into a float).
+_GENERATION_MAX = 2 ** 63 - 1
+
+
 class TrustStore:
     """This install's own trusted developer keys and its revoked-key list.
 
@@ -318,7 +351,11 @@ class TrustStore:
     ``synchronous=FULL``) before it takes effect, and every key in that store is read
     back as revoked when the trust store is built. Each ``revoke`` advances that key's
     generation, including a repeat, so a grant that turned order back on after an
-    earlier revocation does not apply to the later one. The daemon never creates the
+    earlier revocation does not apply to the later one. The next generation is taken
+    from the stored row inside one write transaction, so two handles on one store never
+    write a generation that is not above the row (no roll-back to an older number whose
+    grant would apply again). A row another writer left below 1 is not a floor: the
+    revoke refuses and writes nothing. The daemon never creates the
     store; a named store that is missing or invalid refuses. Without a store, or when
     the SQLite write fails, ``revoke`` still revokes in memory but refuses
     ``revocation_not_durable`` (the SQLite error does not escape). The same-uid limit
@@ -332,6 +369,7 @@ class TrustStore:
             keys[key_id(hex_key)] = (label, hex_key)
         self._keys = MappingProxyType(keys)
         self._lock = threading.Lock()
+        self._store_path = revocation_store
         self._db = None if revocation_store is None else self._open_store(revocation_store)
         generations = {}
         if self._db is not None:
@@ -394,28 +432,98 @@ class TrustStore:
         updated even when the durable write fails or there is no store, and then
         ``revocation_not_durable`` is raised. A ``sqlite3`` error is that refusal; it
         does not escape the method.
+
+        The generation returned is one past the stored row, and never below this
+        handle's own next number (a failed write leaves memory ahead of the row), so
+        another handle opened earlier on the same store cannot write an older number.
+        A key id not in ``signing.key_id``'s form is refused ``invalid_key_id`` before
+        anything changes, and the refusal does not repeat it. A stored generation that
+        is not an integer or is below 1, or a next generation past SQLite's INTEGER
+        range, writes nothing and refuses ``revocation_not_durable``.
         """
+        if type(kid) is not str or not _KEY_ID.fullmatch(kid):
+            raise Refused("invalid_key_id")
         with self._lock:
             generation = self._generation.get(kid, 0) + 1
-            updated = dict(self._generation)
-            updated[kid] = generation
-            self._generation = MappingProxyType(updated)
-            self._revoked = frozenset(updated)
+            self._remember(kid, generation)
             if self._db is None:
                 raise Refused("revocation_not_durable", kid)
             try:
-                self._db.execute(
-                    "INSERT INTO revoked (key_id, generation) VALUES (?, ?) "
-                    "ON CONFLICT(key_id) DO UPDATE SET generation = excluded.generation",
-                    (kid, generation),
-                )
-                row = self._db.execute(
-                    "SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+                stored = self._advance(kid, generation)
             except sqlite3.Error:
                 raise Refused("revocation_not_durable", kid) from None
-            if row is None or row[0] != generation:
+            if stored is None:
                 raise Refused("revocation_not_durable", kid)
-            return generation
+            self._remember(kid, stored)
+            return stored
+
+    def _remember(self, kid: str, generation: int) -> None:
+        updated = dict(self._generation)
+        updated[kid] = generation
+        self._generation = MappingProxyType(updated)
+        self._revoked = frozenset(updated)
+
+    def _advance(self, kid: str, floor: int) -> int | None:
+        """Write ``kid``'s next generation, at least ``floor``, and return it.
+
+        The row is read and written inside ``BEGIN IMMEDIATE``: no other connection
+        writes the store between the read and the write. ``None`` when nothing was
+        written (see ``revoke``). A ``sqlite3`` error rolls back and propagates.
+        When that roll-back itself fails, the connection is dropped and the store is
+        opened again, then the original error propagates.
+        """
+        db = self._db
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            row = db.execute("SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+            stored = 0 if row is None else row[0]
+            # An absent row is a first revoke (stored stands in as 0). A row that exists
+            # and is below 1 is a damaged store, same as a value that is not an integer:
+            # writing generation 1 again would let a grant that cites generation 1 apply.
+            if row is not None and (type(stored) is not int or stored < 1):
+                db.execute("ROLLBACK")
+                return None
+            generation = max(stored + 1, floor)
+            if generation > _GENERATION_MAX:
+                db.execute("ROLLBACK")
+                return None
+            db.execute(
+                "INSERT INTO revoked (key_id, generation) VALUES (?, ?) "
+                "ON CONFLICT(key_id) DO UPDATE SET generation = excluded.generation",
+                (kid, generation),
+            )
+            row = db.execute("SELECT generation FROM revoked WHERE key_id = ?", (kid,)).fetchone()
+            if row is None or row[0] != generation:
+                db.execute("ROLLBACK")
+                return None
+            db.execute("COMMIT")
+        except BaseException:
+            if db.in_transaction:
+                try:
+                    db.execute("ROLLBACK")
+                except sqlite3.Error:
+                    self._replace_store_connection(db)
+            raise
+        return generation
+
+    def _replace_store_connection(self, db) -> None:
+        """A roll-back that itself fails leaves the connection inside a transaction.
+
+        Drop that connection and open the store again so a later revoke can write.
+        """
+        try:
+            db.close()
+        except sqlite3.Error:
+            pass
+        if self._db is db:
+            self._db = None
+        path = self._store_path
+        if not path:
+            return
+        try:
+            self._db = self._open_store(path)
+        except Refused:
+            self._db = None
 
     def close(self) -> None:
         with self._lock:
@@ -456,7 +564,8 @@ class Grant:
     # naming another key grants nothing. A manual grant (signer_key_id None) that names no
     # key here may still be bound by ``order_after_revoked_key``, which names the key the
     # user turned order back on for; with neither it is unbound and grants nothing, in
-    # either manifest form: the user grants again, for the key the manifest names now.
+    # either manifest form: the user grants again, for the key the manifest names now. An unbound
+    # grant only empties the permission set; the plugin is still loaded and its code still runs.
     # Null, or a key id (``ed25519:`` and 32 lower-case hex). Anything else is refused.
     developer_key_id: str | None = None
 
@@ -547,7 +656,9 @@ def effective_permissions(manifest: Manifest, trust: str, signer_key_id: str | N
     grants nothing, so rewriting an unsigned manifest under another key does not carry a
     manual grant (or escape that key's revocation). A manual grant bound to no key cannot
     show which key it was for, so it grants nothing in either form (``grant_developer_key_missing``);
-    its identity is never inferred from the unsigned manifest on disk.
+    its identity is never inferred from the unsigned manifest on disk. This result is a permission
+    set and findings: it does not refuse the plugin, which is still loaded and whose code still runs
+    with the empty set; that the loader does not refuse it before it starts is today's behaviour.
     """
     dropped: list[tuple[str, str]] = []
     if type(manifest) is not Manifest:

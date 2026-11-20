@@ -504,10 +504,10 @@ class InstallReaderBindingTests(unittest.TestCase):
 
     def test_the_reader_and_the_schema_member_agree_once_both_are_in(self) -> None:
         """The schema file is master's (this branch does not edit it). The member is added
-        in memory, the way the schema draft adds it. Reader and member then agree."""
+        in memory, the way the schema draft adds it, so the test holds whether or not the
+        companion schema already has it. Reader and member then agree."""
         schema_path = Path(__file__).resolve().parents[4] / "schemas" / "plugin" / "v1" / "install.v1.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        self.assertNotIn("developer_key_id", schema["$defs"]["grant"]["properties"])
         key_def = schema["$defs"]["key_id"]
         self.assertEqual(key_def["pattern"], r"^ed25519:[0-9a-f]{32}$")
         schema["$defs"]["grant"]["properties"]["developer_key_id"] = {

@@ -9,8 +9,13 @@ Each command prints one JSON object on stdout. Success is ``"code": "ok"`` (exit
 ``changed`` (whether a file was written or removed), ``unit`` (its path) and ``next`` (the
 ``systemctl --user`` commands that apply the change; none is run here); ``install`` and
 ``upgrade`` add ``stores``, one ``{"kind", "path", "created"}`` for the breaker store and one for
-the revocation store, and ``ledger`` (``kind``, ``path``, ``created``, ``detail``). With no anchor
-key, ``detail`` is ``needs the anchor key, which recursiond install makes`` and the ledger file is not created. A refusal
+the revocation store, and ``ledger`` (``kind``, ``path``, ``created``, ``detail``). ``install`` and
+``upgrade`` bind the ledger to the install's own authority key: on a profile with none they make it
+(Ed25519, owner-only, ``~/.config/recursion/authority/anchor.key``), create the ledger bound to its public
+half (``created`` true, ``detail`` empty) and print one line on stderr saying so; the key itself is never
+printed, logged or answered. A key, a ledger and ``install.json``'s ``authority_anchor`` that disagree are
+refused ``authority_anchor_disagrees`` before anything is written. Where this interpreter cannot import
+``cryptography`` no key is made and ``detail`` says so, with no ledger created. A refusal
 is ``"code": <kind>`` with ``detail`` (exit 1). A file-system error
 on the way (a folder the user cannot write, a full disk) is the refusal ``filesystem_error``, its
 detail naming the error and the path; files written before it stay written, so the answer does not
@@ -52,6 +57,7 @@ import subprocess
 import sys
 
 from recursion_core.daemon_install import InstallRefused, Roots, daemon_exec_args, install, uninstall, upgrade
+from recursion_core.daemon_install.install import ANCHOR_MADE
 from recursion_core.daemon_install.layout import chosen_state_home
 
 NAMES = ("install", "upgrade", "uninstall")
@@ -115,9 +121,11 @@ def default_roots() -> Roots:
     return Roots(home=home)
 
 
-def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe=None, environ=None) -> int:
+def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe=None, environ=None,
+        err=None) -> int:
     probe = probe_interpreter if probe is None else probe
     environ = os.environ if environ is None else environ
+    err = sys.stderr if err is None else err
     try:
         refuse_elsewhere(action, environ, roots)
         if action == "uninstall":
@@ -126,7 +134,9 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
             require_daemon_interpreter(probe(interpreter), interpreter, package)
             step = install if action == "install" else upgrade
             chosen = Roots(home=roots.home, state_home=environ.get("XDG_STATE_HOME") or None)
-            plan = step(chosen, daemon_exec_args(interpreter))
+            # The key made now is told as soon as it is kept, before a later step can fail: one line, its path only.
+            plan = step(chosen, daemon_exec_args(interpreter), make_anchor=True,
+                        on_anchor_made=lambda path: print(ANCHOR_MADE.format(path=path), file=err))
         else:
             raise InstallRefused("action", repr(action))
     except InstallRefused as exc:

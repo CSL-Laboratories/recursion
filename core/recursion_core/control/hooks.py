@@ -711,6 +711,7 @@ class Hooks:
         self.methods = MethodTable()
         self.commands = CommandTable()
         self._engines = None
+        self._engines_lock = threading.Lock()
         self._single: dict[str, Callable] = {}
         self._start: dict[str, tuple] = {}       # lane name -> (fields, keys, normalize, chooses_engine)
         self._services: list = []
@@ -720,6 +721,8 @@ class Hooks:
         self.closing = self.methods.closing
         self.gate = Admission()
         self.store = None
+        self._store_decided = False
+        self._store_dir = None
         # The lifecycle has one owner at a time: starting, stopping and closing are serialised by this lock.
         self._lifecycle = threading.RLock()   # re-entrant only so that its owner can be told: see own_teardown
         self._closed = False
@@ -732,13 +735,22 @@ class Hooks:
 
     @property
     def engines(self):
-        """The engine table (S3). Made on first use, so a process that builds no adapter imports none."""
-        if self._engines is None:
-            from recursion_core.routes.engines import EngineTable
-            self._engines = EngineTable()
-            if self._frozen:
+        """The engine table (S3). Made on first use, so a process that builds no adapter imports none.
+
+        A frozen composition publishes the table only after ``freeze`` has returned, and a second reader
+        waits for that. It never observes a table that is still open. A table that already exists when
+        ``freeze`` runs is frozen under the same lock, before a reader can take it from a frozen composition.
+        """
+        with self._engines_lock:
+            if self._engines is None:
+                from recursion_core.routes.engines import EngineTable
+                table = EngineTable()
+                if self._frozen:
+                    table.freeze()
+                self._engines = table
+            elif self._frozen and not self._engines._frozen:
                 self._engines.freeze()
-        return self._engines
+            return self._engines
 
     def set(self, name: str, function: Callable) -> None:
         """Register a single-valued hook: one of ``SINGLE``. A second registration fails composition.
@@ -816,11 +828,14 @@ class Hooks:
         for method, needs in self.methods.services_needed().items():
             if needs not in names:
                 raise HookError(f'method {method!r} needs the service {needs!r}, which nobody registered')
-        self._frozen = True
+        # The flag and the table change together. A reader takes this same lock, so it cannot
+        # observe a frozen composition whose table is still open, including a table made earlier.
+        with self._engines_lock:
+            self._frozen = True
+            if self._engines is not None:
+                self._engines.freeze()
         self.methods.freeze()
         self.commands.freeze()
-        if self._engines is not None:
-            self._engines.freeze()
         self.methods.service_ready = self.service_ready
         # The gate guards what a lane brought: a handler, a service, a store. With none of them it stays off.
         self.gate.enabled = bool(self._services or self.methods.registered() or 'event_store' in self._single)
@@ -1043,10 +1058,17 @@ class Hooks:
         with self._lifecycle:
             if self.closing.is_set() or self._closed:
                 raise HookError('closing has begun: no store is opened')
+            if self._store_decided:
+                if state_dir != self._store_dir:
+                    raise HookError('the store is already open at another directory')
+                return self.store
             factory = self._single.get('event_store')
-            if factory is not None:
-                self.store = factory(state_dir)
-                self.methods.store = self.store
+            if factory is None:
+                return None
+            self.store = factory(state_dir)
+            self.methods.store = self.store
+            self._store_dir = state_dir
+            self._store_decided = True
             return self.store
 
     def start_services(self, context: ServiceContext) -> None:
@@ -1057,6 +1079,10 @@ class Hooks:
         if self._lifecycle._is_owned():
             raise HookError('a lifecycle method was called from inside another one; only the composition owner calls them')
         with self._lifecycle:
+            if self.closing.is_set() or self._closed:
+                raise HookError('closing has begun: no service is started')
+            if self._started:
+                return
             for service in self._services:
                 if self.closing.is_set() or self._closed:
                     log.error('closing began while services were starting; stopping the ones that did')

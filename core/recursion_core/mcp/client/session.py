@@ -55,7 +55,9 @@ receives and a record ``{"record": <code>, ...}`` handed to ``on_record``; it to
   deadline again (the caller's shorter one if it gave one) from the moment the notice is read, never past
   ``CALL_CEILING_S`` (30 min) from the moment the call was made; a call that meets that ceiling answers
   ``CALL_TIMEOUT`` and its record carries ``"reason": CALL_CUT_CEILING``. Only ``tools/call`` is given more
-  time; a notice naming no call in flight changes nothing;
+  time; a notice naming no call in flight changes nothing. A notice naming a call whose deadline has already
+  passed (the writer, the session's timer, was held in a write) gives it no time: the reader ends that call
+  ``CALL_TIMEOUT`` there, as it does for an answer read after the deadline, and its late answer is dropped;
 * one message: a line longer than ``MAX_MESSAGE_BYTES`` (2 MiB, its newline included) ends the session
   (``MESSAGE_TOO_LARGE``): the client reads at most that many bytes plus one and never reads the rest;
 * one tool result: everything a model reads of it shares ``MAX_TOOL_RESULT_TEXT_BYTES`` (256 KiB). Its text
@@ -84,9 +86,10 @@ receives and a record ``{"record": <code>, ...}`` handed to ``on_record``; it to
   bytes, the rule of the Control MCP server's own reply queue: an answer is always taken when none is held, the
   one being written counts until it is written, and an answer that would pass the bound is dropped (the server
   is not reading). Requests and notices the caller's calls send are never dropped by it; they keep their own
-  deadlines. The first answer dropped gives the record ``{"record": ANSWERS_DROPPED, "pending_bytes": ...,
-  "limit_bytes": ...}`` and counts as a breach; the next answer taken gives ``{"record": ANSWERS_DROPPED,
-  "dropped": <the count>}``;
+  deadlines. A stretch of drops is one pause of the server: it ends only when an answer is taken while none is
+  held (an answer taken while others are still held does not end it). The first answer dropped in a stretch
+  gives the record ``{"record": ANSWERS_DROPPED, "pending_bytes": ..., "limit_bytes": ...}`` and counts as a
+  breach; the answer that ends the stretch gives ``{"record": ANSWERS_DROPPED, "dropped": <the count>}``;
 * breaches: only what a cut does not already mend counts: a call timeout at the client's own deadline or at
   the ceiling (not at a shorter deadline the caller asked for), a listing cut by pages or by time, and each
   stretch of dropped answers count as one breach. A cut result and a list cut at ``MAX_TOOLS`` are marked
@@ -126,7 +129,10 @@ reads end of input; ``instream`` is left to its owner.
 Lines that are not UTF-8 or not JSON, and responses naming no request in flight, are dropped, and so is a
 line read after the session has ended. A number that is not finite (``1e999``, which the decoder reads as
 infinity) is not JSON either: a message holding one anywhere is dropped, and when it answers a request in
-flight that request fails ``BAD_ANSWER`` and its caller gets no value. A message that is not valid JSON-RPC
+flight that request fails ``BAD_ANSWER`` and its caller gets no value. Only such a number can be infinite, and
+only a line that holds an exponent or a run of 309 digits or more can spell one (the words ``NaN`` and
+``Infinity`` are refused by the decoder), so only the message of such a line is walked for one; every other
+line pays one scan of its bytes. A message that is not valid JSON-RPC
 is answered as the Control MCP server answers it (``jsonrpc.classify``).
 """
 
@@ -137,6 +143,7 @@ import hashlib
 import itertools
 import json
 import math
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -195,6 +202,10 @@ LIST_CUT_TIME = "time"
 CALL_CUT_CEILING = "ceiling"
 # Answers owed to a server that does not read were dropped (a record; the first counts as a breach).
 ANSWERS_DROPPED = "mcp_answers_dropped"
+
+# A line that can spell a number the decoder reads as infinite: an exponent, or 309 digits or more in a row (a
+# run that long is found from its first digit only, so the scan stays linear in the line).
+_MAY_BE_NOT_FINITE = re.compile(rb"[0-9][eE][+-]?[0-9]|(?<![0-9])[0-9]{309}")
 
 
 def _server_text(value: Any) -> str:
@@ -581,7 +592,8 @@ class McpClient:
                 if self._answers_dropped == 1:
                     started = self._unsent_answer_bytes
             else:
-                resumed, self._answers_dropped = self._answers_dropped, 0
+                if not self._unsent_answer_bytes:  # taken with none held: the server read all, the stretch ends
+                    resumed, self._answers_dropped = self._answers_dropped, 0
                 self._unsent_answer_bytes += size
                 self._outbox.append((message, size, data, None))
                 self._cond.notify_all()
@@ -672,7 +684,7 @@ class McpClient:
                     break
                 frame = decode_line(line)
                 if frame is not None and frame.error is None:
-                    if _finite(frame.message):
+                    if _MAY_BE_NOT_FINITE.search(line) is None or _finite(frame.message):
                         self._receive(frame.message)
                     else:
                         self._not_finite(frame.message)
@@ -764,8 +776,12 @@ class McpClient:
             return
         with self._cond:
             pending = self._pending.get(token)
-            if pending is not None and pending.method == "tools/call":  # its deadline again, never past the ceiling
+            late = pending is not None and pending.cancel and pending.deadline <= time.monotonic()
+            if not late and pending is not None and pending.method == "tools/call":  # never past the ceiling
                 pending.deadline = max(pending.deadline, min(time.monotonic() + pending.limit_s, pending.ceiling))
+        if late:  # its deadline passed before the timer saw it: no more time, it ends as a timeout here
+            self._time_out(token)
+            return
         if pending is not None and pending.on_progress is not None:
             self._callback(pending.on_progress, params)
 

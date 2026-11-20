@@ -78,7 +78,8 @@ def main(argv: list[str], api, out: TextIO | None = None, err: TextIO | None = N
     else:
         method = "run.start"
         params = {"tenant": ns.tenant, "engine": ns.engine, "prompt": ns.prompt}
-        if ns.client_key:
+        # An explicit empty string is a key the API dedupes on. Only an omitted flag is absent.
+        if ns.client_key is not None:
             params["client_key"] = ns.client_key
     result = api.call(method, params)
     print(json.dumps(result, sort_keys=True), file=out)

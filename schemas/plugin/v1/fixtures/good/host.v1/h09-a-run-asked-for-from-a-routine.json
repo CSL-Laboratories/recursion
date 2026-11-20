@@ -1,0 +1,14 @@
+{
+  "type": "call",
+  "id": 12,
+  "name": "run.request",
+  "args": {
+    "record_kind": "routine.v1",
+    "record_id": "daily-digest",
+    "revision": 3,
+    "occurrence": "2026-11-20T09:00:00Z",
+    "tenant": "default",
+    "engine": "codex",
+    "prompt": "Summarise yesterday's runs."
+  }
+}

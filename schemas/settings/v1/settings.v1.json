@@ -22,6 +22,21 @@
         }
       },
       "additionalProperties": true
+    },
+    "stores": {
+      "type": "object",
+      "properties": {
+        "sqlite_wal_bug": {
+          "type": "string",
+          "enum": [
+            "refuse",
+            "accept_risk"
+          ],
+          "default": "refuse",
+          "description": "Whether the stores refuse to open on an SQLite with the WAL reset bug (refuse, the default) or open anyway at the person's own risk (accept_risk)."
+        }
+      },
+      "additionalProperties": true
     }
   },
   "additionalProperties": true

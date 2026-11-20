@@ -366,5 +366,18 @@ class GenerationRuleTests(unittest.TestCase):
         self.assertEqual(trust.revoke(KID), 2)
         self.assertEqual(self._open(path).generation(KID), 2)
 
+
+def setUpModule():
+    # Every store refuses an SQLite with the WAL reset bug unless the person accepts the risk
+    # (daemon/tests/test_sqlite_wal_bug.py). This module tests other behaviour, so it runs on a stubbed
+    # repaired version, whatever SQLite this Python has.
+    import sqlite3
+    import unittest
+    from unittest import mock
+    stub = mock.patch.object(sqlite3, "sqlite_version", "3.51.3")
+    stub.start()
+    unittest.addModuleCleanup(stub.stop)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -246,7 +246,9 @@ class Adv2BreakerTests(unittest.TestCase):
         self.assertFalse(again.tripped(CONN))  # decision 5 in S34: the trip is gone, only a log says so
 
     def test_trip_survives_sigkill_of_the_writer(self):
-        code = ('import os, signal, sys; from recursion_core.daemon import breaker as b\n'
+        # The child runs on a stubbed repaired SQLite version, as this module does (setUpModule).
+        code = ('import os, signal, sqlite3, sys; sqlite3.sqlite_version = "3.51.3"\n'
+                'from recursion_core.daemon import breaker as b\n'
                 's, _ = b.open_breaker_store(sys.argv[1], clock=lambda: 0.0)\n'
                 's.report(%r, "plan_limit"); s.bind_run("run-k", %r, "host", "claude_code", "m"); s.fault_run("run-k")\n'
                 'os.kill(os.getpid(), signal.SIGKILL)\n' % (CONN, CONN))
@@ -430,6 +432,18 @@ class Adv2StarterTests(unittest.TestCase):
         with self.assertRaises(adapter.StartRefused) as caught:
             starter({'run_id': 'run-1', 'engine': 'codex', 'tenant': 't', 'prompt': 'p'})
         self.assertEqual(caught.exception.code, 'breaker_connection_unrepresentable')
+
+
+def setUpModule():
+    # Every store refuses an SQLite with the WAL reset bug unless the person accepts the risk
+    # (daemon/tests/test_sqlite_wal_bug.py). This module tests other behaviour, so it runs on a stubbed
+    # repaired version, whatever SQLite this Python has.
+    import sqlite3
+    import unittest
+    from unittest import mock
+    stub = mock.patch.object(sqlite3, 'sqlite_version', '3.51.3')
+    stub.start()
+    unittest.addModuleCleanup(stub.stop)
 
 
 if __name__ == '__main__':

@@ -218,8 +218,11 @@ class PluginHost:
 
     def __init__(self, config_dir, state_dir, breaker=None, *, plugin_dirs=(), verification_available=None,
                  gil_probe=None, clock=time.time, operator_deadline_s=OPERATOR_DEADLINE_S,
-                 operator_turn_wait_s=OPERATOR_TURN_WAIT_S):
+                 operator_turn_wait_s=OPERATOR_TURN_WAIT_S, sqlite_wal_bug='refuse'):
         require_launcher_platform()  # Windows: typed PlatformUnsupported; no plugin file is opened
+        # The person's choice for an SQLite with the WAL reset bug, as the daemon read it once: each store opened
+        # here takes it.
+        self._sqlite_wal_bug = sqlite_wal_bug
         self._config, self._state = Path(config_dir) / PLUGINS_DIR, Path(state_dir)
         self._gil = gil_probe if gil_probe is not None else GilProbe()
         self._clock = clock
@@ -250,7 +253,8 @@ class PluginHost:
             return
         try:
             install = read_install(self._config)
-            self._trust = TrustStore(install['trusted_keys'], revocation_store=self._revocation_store())
+            self._trust = TrustStore(install['trusted_keys'], revocation_store=self._revocation_store(),
+                                     sqlite_wal_bug=self._sqlite_wal_bug)
         except (PluginRefused, Refused) as exc:
             log.error('no plugin can load: %s', exc)
             self._refuse_all(sources, exc.code, exc.detail)
@@ -285,7 +289,7 @@ class PluginHost:
     def _revocation_store(self):
         path = private_dir(self._state / STORE_DIR) / REVOCATION_FILE
         if not os.path.lexists(path):
-            create_revocation_store(str(path))
+            create_revocation_store(str(path), sqlite_wal_bug=self._sqlite_wal_bug)
         return str(path)
 
     def _compose_core(self, install, breaker):
@@ -296,7 +300,8 @@ class PluginHost:
         anchor = install['authority_anchor']
         if anchor is not None:
             try:
-                self.authority = Authority(anchor, str(self._state / STORE_DIR / LEDGER_FILE), lambda: int(self._clock()))
+                self.authority = Authority(anchor, str(self._state / STORE_DIR / LEDGER_FILE), lambda: int(self._clock()),
+                                           sqlite_wal_bug=self._sqlite_wal_bug)
                 self.authority_state = 'configured'
             except Refused as exc:
                 self.authority_state = f'unavailable: {exc.code}'

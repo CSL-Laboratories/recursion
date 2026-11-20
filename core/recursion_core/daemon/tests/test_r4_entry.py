@@ -40,6 +40,11 @@ class RealEntryTests(unittest.TestCase):
         config = tmp / 'config' / 'recursion'
         fx.write_install(config, grants=[fx.grant_for(fx.OPERATOR_SOURCE)])
         fx.write_plugin(config / 'plugins' / 'fixture')
+        # The child daemon is its own process, so no stub of this one reaches it: the test's own settings file
+        # makes the choice, as a person would (the child's stores may open on an SQLite with the WAL reset bug).
+        settings_file = config / 'settings.toml'
+        settings_file.write_text('version = 1\n\n[stores]\nsqlite_wal_bug = "accept_risk"\n')
+        os.chmod(settings_file, 0o600)
         runtime = tmp / 'runtime'
         runtime.mkdir(mode=0o700)
         env = {'PATH': str(bins), 'HOME': str(tmp), 'XDG_RUNTIME_DIR': str(runtime),

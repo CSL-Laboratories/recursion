@@ -102,7 +102,8 @@ LOG = logging.getLogger(__name__)
 
 __all__ = [
     'APPLICATION_ID', 'CommitUnknown', 'EVENT_SCHEMA', 'EVENT_TYPES', 'EventStore', 'FakeStore', 'LockOrderError',
-    'Receipt', 'ReceiptExists', 'SCHEMA_VERSION', 'StoreError', 'in_transaction', 'require_no_transaction',
+    'Receipt', 'ReceiptExists', 'SCHEMA_VERSION', 'SQLITE_WAL_BUG', 'SQLITE_WAL_RESET_REPAIRED', 'StoreError',
+    'in_transaction', 'require_no_transaction', 'sqlite_wal_affected', 'sqlite_wal_refusal',
 ]
 
 APPLICATION_ID = 0x52634576      # 'RcEv' in the file header: a file that is not this store is refused
@@ -131,7 +132,92 @@ _HELPER_DDL = (
 
 
 class StoreError(RuntimeError):
-    """A refusal of the helper. ``str(exc)`` is its code."""
+    """A refusal of the helper. ``str(exc)`` is its code; ``detail`` says more where there is more to say."""
+
+    def __init__(self, code: str, detail: str = '') -> None:
+        super().__init__(code)
+        self.code, self.detail = code, detail
+
+
+# -- the WAL-reset bug: the ONE rule and the ONE table for every store that opens SQLite in WAL mode
+#
+# SQLite's page (wal.html, section 11): the bug "is likely present in all version of SQLite from 3.7.0 (2010-07-21)
+# through 3.51.2 (2026-01-09). It is fixed in version 3.51.3 (2026-03-13) and later. Backports of the fix are
+# available for some earlier releases: 3.44.6 and 3.50.7." Every store calls ``sqlite_wal_refusal`` before it
+# connects: the event store here, the authority ledger, the breaker store and the revocation store. A store added
+# later calls it too. The table is append-only: a later backport, or a release SQLite's pages say is repaired, is a
+# row added.
+
+SQLITE_WAL_BUG = 'store_sqlite_wal_bug'     # the typed refusal of every store
+SQLITE_WAL_FIRST = (3, 7, 0)                 # WAL, and the bug with it, begins here
+SQLITE_WAL_REPAIRED_FROM = (3, 53, 0)        # every release from here carries the repair
+# (major, minor) -> the first patch release of that line that carries the repair; None: none of that line is said to.
+SQLITE_WAL_RESET_REPAIRED = {
+    (3, 44): 6,      # a backport
+    (3, 50): 7,      # a backport
+    (3, 51): 3,      # 3.51.3, 2026-03-13
+    # 3.52.0 (2026-03-06) is a withdrawn release: SQLite's pages mark it only as withdrawn and nowhere say it
+    # carries the repair; it came out a week before 3.51.3, and the 3.53.0 entry lists the repair as its own
+    # change. It is refused (the cautious reading; it would pass as a release above 3.51.3 only if SQLite's
+    # pages ever said it is repaired).
+    (3, 52): None,
+}
+_SQLITE_WAL_REST = ('Recursion does not open its stores with it. Use a Python whose SQLite is 3.51.3 or later (or '
+                    '3.50.7, or 3.44.6), and check it with: python3 -c "import sqlite3; print(sqlite3.sqlite_version)". '
+                    'To accept the risk and go on, set stores.sqlite_wal_bug = "accept_risk" in '
+                    '$XDG_CONFIG_HOME/recursion/settings.toml.')
+_SQLITE_WAL_HAS_THE_BUG = 'This Python uses SQLite {found}, which has a known bug that can damage a database in WAL mode. '
+_SQLITE_WAL_WITHDRAWN = ("This Python uses SQLite {found}, a withdrawn release that SQLite's pages do not say is "
+                         'repaired: it may have a known bug that can damage a database in WAL mode. ')
+
+
+def _sqlite_version_parts(version: str) -> tuple[int, int, int] | None:
+    try:
+        parts = tuple(int(part) for part in version.split('.')[:3])
+    except ValueError:
+        return None
+    return (parts + (0, 0, 0))[:3] if parts else None
+
+
+def sqlite_wal_affected(version: str) -> bool:
+    """Whether SQLite ``version`` (the text of ``sqlite3.sqlite_version``) has the WAL-reset bug, by the table.
+
+    Before 3.7.0 there is no WAL and SQLite's page names no bug; from 3.53.0 every release carries the repair; in
+    between, a line in the table passes from its repaired patch (a line marked None never passes) and every other
+    line is affected. A version text that cannot be read is affected."""
+    parts = _sqlite_version_parts(version)
+    if parts is None:
+        return True
+    if parts < SQLITE_WAL_FIRST or parts >= SQLITE_WAL_REPAIRED_FROM:
+        return False
+    repaired = SQLITE_WAL_RESET_REPAIRED.get(parts[:2], None)
+    return repaired is None or parts[2] < repaired
+
+
+def sqlite_wal_refusal(choice: str = 'refuse') -> str | None:
+    """None when a store may open on this Python's SQLite, else the message of its ``store_sqlite_wal_bug`` refusal.
+
+    ``choice`` is the person's own setting ``stores.sqlite_wal_bug`` as the daemon read it: 'refuse' (the default) or
+    'accept_risk'; any other value refuses. With 'accept_risk' the store opens and a WARNING names the loaded
+    version, at each open."""
+    found = sqlite3.sqlite_version
+    affected = sqlite_wal_affected(found)
+    if choice == 'accept_risk':
+        state = 'has the WAL reset bug' if affected else 'is not affected; the setting is not needed'
+        LOG.warning("stores.sqlite_wal_bug = 'accept_risk': a store opens on SQLite %s, which %s; the person "
+                    'accepted the risk', found, state)
+        return None
+    if not affected:
+        return None
+    parts = _sqlite_version_parts(found)
+    withdrawn = parts is not None and parts[:2] in SQLITE_WAL_RESET_REPAIRED and SQLITE_WAL_RESET_REPAIRED[parts[:2]] is None
+    return (_SQLITE_WAL_WITHDRAWN if withdrawn else _SQLITE_WAL_HAS_THE_BUG).format(found=found) + _SQLITE_WAL_REST
+
+
+def _refuse_sqlite_wal_bug(choice: str) -> None:
+    message = sqlite_wal_refusal(choice)
+    if message is not None:
+        raise StoreError(SQLITE_WAL_BUG, message)
 
 
 class LockOrderError(StoreError):
@@ -426,9 +512,10 @@ class EventStore:
     _SYNCHRONOUS = 'FULL'
     _SYNCHRONOUS_LEVEL = 2
 
-    def __init__(self, path, *, clock: Callable[[], float] | None = None) -> None:
+    def __init__(self, path, *, clock: Callable[[], float] | None = None, sqlite_wal_bug: str = 'refuse') -> None:
         if fcntl is None:
             raise StoreError('unsupported_platform')
+        _refuse_sqlite_wal_bug(sqlite_wal_bug)   # before the lock file and the database file are made
         self._setup(os.fspath(path), clock)
         self._lock_fd = self._take_file_lock(self._path + '.lock')
         try:
@@ -959,7 +1046,9 @@ class FakeStore(EventStore):
     _SYNCHRONOUS = 'OFF'
     _SYNCHRONOUS_LEVEL = 0
 
-    def __init__(self, log: list | None = None, *, clock: Callable[[], float] | None = None) -> None:
+    def __init__(self, log: list | None = None, *, clock: Callable[[], float] | None = None,
+                 sqlite_wal_bug: str = 'refuse') -> None:
+        _refuse_sqlite_wal_bug(sqlite_wal_bug)   # before its folder is made; its reader opens only this store
         folder = tempfile.mkdtemp(prefix='events-fake-store-')
         self._finalizer = weakref.finalize(self, shutil.rmtree, folder, True)
         self._setup(os.path.join(folder, 'events.sqlite3'), clock)

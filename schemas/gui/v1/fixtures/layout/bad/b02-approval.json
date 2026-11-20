@@ -1,0 +1,9 @@
+{
+  "schema": "gui.layout/1",
+  "name": "badapproval",
+  "title": "Names approval",
+  "columns": 1,
+  "slots": [
+    {"panel": "approval", "column": 1, "span": 1, "order": 0, "collapsed": false}
+  ]
+}

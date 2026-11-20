@@ -1,0 +1,8 @@
+{
+  "schema": "gui.layout/1",
+  "name": "hidecore",
+  "title": "Extra key",
+  "columns": 1,
+  "slots": [],
+  "hide-core": true
+}

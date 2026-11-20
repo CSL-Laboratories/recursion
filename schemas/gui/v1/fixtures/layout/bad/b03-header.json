@@ -1,0 +1,9 @@
+{
+  "schema": "gui.layout/1",
+  "name": "badheader",
+  "title": "Names header",
+  "columns": 1,
+  "slots": [
+    {"panel": "header", "column": 1, "span": 1, "order": 0, "collapsed": false}
+  ]
+}

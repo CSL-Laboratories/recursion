@@ -1,0 +1,7 @@
+{
+  "schema": "gui.layout/1",
+  "name": "zero",
+  "title": "Zero columns",
+  "columns": 0,
+  "slots": []
+}

@@ -1,0 +1,7 @@
+{
+  "schema": "gui.layout/1",
+  "name": "empty",
+  "title": "No panels",
+  "columns": 1,
+  "slots": []
+}

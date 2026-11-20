@@ -235,6 +235,17 @@ class NotAccepted(Exception):
         self.answer = dict(answer)
 
 
+def _typed_answer(answer):
+    """An answer the caller may see: a dict whose ``code`` is non-empty text. Anything else is not one."""
+    code = answer.get('code') if isinstance(answer, dict) else None
+    if not isinstance(code, str) or not code:
+        return None
+    try:
+        return copy.deepcopy(answer)
+    except Exception:  # noqa: BLE001 - a refusal that cannot be copied is not an answer
+        return None
+
+
 class NoCanonicalText(ValueError):
     """The value has no RFC 8785 text."""
 
@@ -578,9 +589,13 @@ class MethodTable:
                 raise TypeError(f'handler of {method} returned no answer')
             scope.succeeded = True
         except NotAccepted as refusal:
-            return copy.deepcopy(refusal.answer)
+            answer = _typed_answer(refusal.answer)
+            if answer is None:
+                log.error('handler of %s refused without a typed answer', method)
+                return {'code': 'unavailable', 'detail': 'handler:NotAccepted'}
+            return answer
         except Exception as exc:  # noqa: BLE001 - a handler's bug is an answer, never a dropped call
-            log.exception('handler of %s failed', method)
+            log.error('handler of %s failed (%s)', method, type(exc).__name__)
             return {'code': 'unavailable', 'detail': f'handler:{type(exc).__name__}'}
         finally:
             scope.active = False
@@ -615,21 +630,31 @@ class MethodTable:
                 if not isinstance(tenant, str) or not tenant:
                     raise TypeError(f'tenant_of of {method} named no tenant')
             except NotAccepted as refusal:
-                return copy.deepcopy(refusal.answer)
+                answer = _typed_answer(refusal.answer)
+                if answer is None:
+                    log.error('the tenant of %s refused without a typed answer', method)
+                    return {'code': 'unavailable', 'detail': 'tenant:NotAccepted'}
+                return answer
             except Exception as exc:  # noqa: BLE001 - no tenant, no receipt: nothing is run
-                log.exception('the tenant of %s could not be derived', method)
+                log.error('the tenant of %s could not be derived (%s)', method, type(exc).__name__)
                 return {'code': 'unavailable', 'detail': f'tenant:{type(exc).__name__}'}
         key = (tenant, method, command_id)
         stage = 'store'
-        with self._slot(key):
+        outcome = None
+        committed_answer = None
+
+        def run_command():
+            nonlocal stage, outcome, committed_answer
             try:
                 with store.transaction() as tx:
                     receipt = tx.receipt_get(tenant, method, command_id)
                     if receipt is not None:
                         kept_digest, kept_answer = receipt
                         if kept_digest == digest:
-                            return copy.deepcopy(kept_answer)     # a replay: no handler, no callback
-                        return {'code': 'conflict', 'detail': 'command_id_reused'}
+                            outcome = copy.deepcopy(kept_answer)     # a replay: no handler, no callback
+                            return
+                        outcome = {'code': 'conflict', 'detail': 'command_id_reused'}
+                        return
                     # From here to the end of the transaction this dispatch is a command with its transaction
                     # open: nested calls are restricted, and nested reads' callbacks join this command's.
                     scope.in_transaction = True
@@ -646,16 +671,25 @@ class MethodTable:
                     stage = 'store'
                     tx.receipt_put(tenant, method, command_id, digest, copy.deepcopy(committed_answer))
             except NotAccepted as refusal:
-                return copy.deepcopy(refusal.answer)
+                answer = _typed_answer(refusal.answer)
+                if answer is None:
+                    log.error('command %s refused without a typed answer', method)
+                    outcome = {'code': 'unavailable', 'detail': 'handler:NotAccepted'}
+                else:
+                    outcome = answer
             except Exception as exc:  # noqa: BLE001 - rolled back by the store's own context manager
                 # Whatever failed (the handler, the receipt's write, the commit itself), nothing of this
                 # command is committed and no callback runs, the nested reads' included.
-                log.exception('command %s was rolled back (%s)', method, stage)
-                return {'code': 'unavailable', 'detail': f'{stage}:{type(exc).__name__}'}
+                log.error('command %s was rolled back (%s, %s)', method, stage, type(exc).__name__)
+                outcome = {'code': 'unavailable', 'detail': f'{stage}:{type(exc).__name__}'}
             finally:
                 scope.in_transaction = False
                 with scope.lock:
                     scope.sealed = True      # committed or rolled back: no callback joins this command any more
+
+        self._with_slot(key, run_command)
+        if outcome is not None:
+            return outcome
         # Committed, and the slot is released: callbacks run outside every lock of the dispatcher, the ones
         # nested reads registered among them, in the order they were registered.
         scope.succeeded = True
@@ -673,35 +707,43 @@ class MethodTable:
                 continue                     # its own dispatch, or one around it, did not succeed
             try:
                 fn()
-            except Exception:  # noqa: BLE001 - the receipt is committed; a later callback still runs
-                log.exception('an after-commit callback of %s failed', method)
+            except Exception as exc:  # noqa: BLE001 - the receipt is committed; a later callback still runs
+                log.error('an after-commit callback of %s failed (%s)', method, type(exc).__name__)
 
-    def _slot(self, key):
-        return _Slot(self, key)
+    def _enter_count(self, key, marker):
+        """Count this caller under the table lock and return its ``[lock, waiters]`` slot.
 
+        Acquire and release are one straight-line statement. A branch between them is a second
+        trace event, and an interruption on that event used to leave the table lock held, so
+        every command method waited. ``marker[0]`` is the slot before the lock is given back,
+        so the caller can drop the count even when this function's return is itself interrupted.
+        """
+        lock = self._slots_lock
+        slots = self._slots
+        fresh = [threading.Lock(), 0]
+        lock.acquire(); slot = slots.setdefault(key, fresh); slot[1] += 1; marker.__setitem__(0, slot); lock.release(); return slot
 
-class _Slot:
-    """One command at a time for one ``(tenant, method, command_id)``; the entry goes when nobody waits."""
+    def _leave_count(self, key, slot):
+        """Give this caller's waiter count back. The entry goes when it was the last waiter."""
+        lock = self._slots_lock
+        slots = self._slots
+        missing = object()
+        choice = (missing, key)  # index 0 keeps the entry; index 1 drops it. No branch, so no second trace event.
+        lock.acquire(); slot[1] -= 1; slots.pop(choice[(slot[1] == 0) & (slots.get(key) is slot)], None); lock.release()
 
-    def __init__(self, table: MethodTable, key: tuple) -> None:
-        self._table, self._key = table, key
+    def _with_slot(self, key, body):
+        """Run ``body`` while this caller holds the command slot, then drop the slot before returning.
 
-    def __enter__(self):
-        table = self._table
-        with table._slots_lock:
-            slot = table._slots.get(self._key)
-            if slot is None:
-                slot = table._slots[self._key] = [threading.Lock(), 0]
-            slot[1] += 1
-        self._slot = slot
-        slot[0].acquire()
-        return self
-
-    def __exit__(self, *exc) -> bool:
-        table, slot = self._table, self._slot
-        slot[0].release()
-        with table._slots_lock:
-            slot[1] -= 1
-            if slot[1] == 0 and table._slots.get(self._key) is slot:
-                del table._slots[self._key]
-        return False
+        The per-key lock is taken with its own ``with``, so there is no Python step between "the lock
+        is mine" and "that ``with`` owns the exit". The waiter count is separate accounting and is
+        given back on the way out, including when ``body`` is interrupted.
+        """
+        marker = [None]
+        try:
+            slot = self._enter_count(key, marker)
+            with slot[0]:
+                return body()
+        finally:
+            held = marker[0]
+            if held is not None:
+                self._leave_count(key, held)

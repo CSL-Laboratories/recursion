@@ -7,13 +7,16 @@ everything it accepts (O49 is still open; this is not a decision on the digest f
 
 * objects with ASCII string keys, sorted by code point, no duplicate keys;
 * arrays, ASCII strings, ``true``, ``false``, ``null``;
+* no string, value or key, at any depth, holds U+007F (DEL): the writer here would
+  escape it as ``\\u007f`` while RFC 8785 writes the raw byte, so it is refused;
 * integers in ``[-(2**53 - 1), 2**53 - 1]``. No floats, NaN, infinities or exponents,
   so money is always integer minor units;
 * no whitespace; ``bool`` is never accepted where an integer is expected.
 
 ``parse`` is the strict reader for bytes that arrive over the protocol: it refuses
-duplicate keys, floats, non-finite numbers, out-of-range integers, non-ASCII text and
-any input that does not round-trip to the identical bytes.
+duplicate keys, floats, non-finite numbers, out-of-range integers, non-ASCII text,
+U+007F in any spelling (the raw byte or an escape) and any input that does not
+round-trip to the identical bytes.
 """
 
 from __future__ import annotations
@@ -39,9 +42,11 @@ def check_value(value: object, depth: int = 0) -> None:
             return
         raise Refused("noncanonical_value", "integer out of range")
     if type(value) is str:
-        if value.isascii():
-            return
-        raise Refused("noncanonical_value", "non-ASCII text")
+        if not value.isascii():
+            raise Refused("noncanonical_value", "non-ASCII text")
+        if "\x7f" in value:  # RFC 8785 writes DEL raw; json.dumps escapes it.
+            raise Refused("noncanonical_value", "control character")
+        return
     if type(value) in (list, tuple):
         for item in value:
             check_value(item, depth + 1)
@@ -50,6 +55,8 @@ def check_value(value: object, depth: int = 0) -> None:
         for key, item in value.items():
             if type(key) is not str or not key.isascii():
                 raise Refused("noncanonical_value", "key")
+            if "\x7f" in key:
+                raise Refused("noncanonical_value", "control character")
             check_value(item, depth + 1)
         return
     raise Refused("noncanonical_value", type(value).__name__)

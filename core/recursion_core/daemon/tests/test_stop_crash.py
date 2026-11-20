@@ -289,6 +289,7 @@ class RecordedStopGuard(unittest.TestCase):
         self.registry.add('one', 'boot-a')
         self.registry.request_stop('one')
         self.registry.db.close()  # no orderly close: the connection just goes away
+        self.registry._owner.close()  # and so does the lease on the state folder
         self.registry = Registry(Path(self.temp.name) / 'state')
         run = self.registry.get('one')
         self.assertTrue(run.stop_requested)

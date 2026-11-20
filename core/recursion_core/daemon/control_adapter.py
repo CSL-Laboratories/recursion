@@ -770,10 +770,17 @@ class RouteStarter:
             fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
             opened = True
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-                json.dump(result, handle, sort_keys=True)
+                # Non-finite numbers are not JSON. A value that cannot be serialised raises here,
+                # before the rename, and the temp name is removed below.
+                json.dump(result, handle, sort_keys=True, allow_nan=False)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, path)
+            folder = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fsync(folder)  # the rename is not crash-durable until its folder is synced (E32)
+            finally:
+                os.close(folder)
         except (OSError, TypeError, ValueError) as exc:
             log.error('route result for %s was not written (%s)', run_id, type(exc).__name__)
             if opened:

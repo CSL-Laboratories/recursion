@@ -155,17 +155,17 @@ class SocketAttackTest(ComposedBase):
         winners[0].__exit__(None, None, None)
 
     def test_a_second_composition_without_the_user_lock_leaves_the_live_daemons_token_file_alone(self):
-        # ADV1-12 (fixed). main() takes UserLock first, so this only matters to an embedder or test that
-        # composes twice. The second compose fails at the socket lock; it used to have rewritten and then
-        # unlinked the token file the live daemon's GUI depends on. The file is now written only after
-        # server.start() succeeds, and a door removes only the file it wrote.
-        _, first = self.boot()
+        # ADV1-12. main() takes UserLock first. boot() does not: it builds a Registry on the same state
+        # folder, so the folder lease is what refuses the second one. The token file is what the first
+        # composition wrote, byte for byte, and a door removes only the file it wrote.
+        daemon, first = self.boot()
         token_file = self.runtime / 'recursion' / 'gui-device-token'
-        live = token_file.read_text().strip()
-        with self.assertRaises(InsecureSocketPath):
+        live_bytes = token_file.read_bytes()
+        live = live_bytes.decode().strip()
+        with self.assertRaises(AlreadyRunning):
             self.boot()
+        self.assertEqual(token_file.read_bytes(), live_bytes, 'the refused composition left the live token file')
         self.assertTrue(first.door({'HTTP_AUTHORIZATION': 'Bearer ' + live}))  # in-memory token unchanged
-        self.assertEqual(token_file.read_text().strip(), live, 'the losing composition left the live token file')
         self.assertEqual(os.listdir(token_file.parent).count('gui-device-token.tmp'), 0)
         # A door that never published, or whose file was replaced by another door, unlinks nothing.
         stranger = adapter.DeviceDoor(token_file.parent, publish=False)
@@ -176,6 +176,21 @@ class SocketAttackTest(ComposedBase):
         self.assertTrue(token_file.exists(), 'the older door does not remove its successor\'s file')
         other.close()
         self.assertFalse(token_file.exists())
+
+    def test_a_second_compose_on_the_same_daemon_meets_the_socket_lock(self):
+        # ADV1-12, the same-daemon compose. A second boot() is refused by the
+        # folder lease and never reaches this call. compose_control on the daemon
+        # that already holds the socket must still be refused there, and the live
+        # token file must stay byte for byte.
+        daemon, first = self.boot()
+        token_file = self.runtime / 'recursion' / 'gui-device-token'
+        live_bytes = token_file.read_bytes()
+        with self.assertRaises(InsecureSocketPath):
+            adapter.compose_control(daemon, self.state, environ=self.environ, routes=self.routes)
+        self.assertEqual(token_file.read_bytes(), live_bytes,
+                         'the losing composition left the live token file')
+        live = live_bytes.decode().strip()
+        self.assertTrue(first.door({'HTTP_AUTHORIZATION': 'Bearer ' + live}))
 
     def test_garbage_and_oversized_frames_are_typed_and_the_daemon_keeps_serving(self):
         _, composed = self.boot()

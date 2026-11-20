@@ -338,5 +338,82 @@ class TheDaemonsOneLoad(_PersonsOwnFolder):
         self.assertTrue(created)
 
 
+class TheChoiceReachesEveryStoreTheHostOpens(unittest.TestCase):
+    """The plugin host hands the person's choice to the trust store and to the authority, and every public
+    callable that takes the choice defaults to refusing."""
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.tmp = Path(temp.name)
+        os.chmod(self.tmp, 0o700)
+
+    def prepare(self) -> tuple[Path, Path]:
+        """A config folder whose install file names an authority anchor, one plugin folder, and a state folder
+        holding a ledger made beforehand on a repaired version."""
+        from recursion_core.daemon import plugins
+        from recursion_core.daemon.tests import plugin_fixture as fx
+        config, state = self.tmp / "config" / "recursion", self.tmp / "state"
+        fx.write_install(config, authority_anchor=ANCHOR)
+        (config / "plugins" / "fixture").mkdir(mode=0o700)
+        state.mkdir(mode=0o700)
+        store = plugins.private_dir(state / plugins.STORE_DIR)
+        with stub("3.51.3"):
+            create_ledger(str(store / plugins.LEDGER_FILE), ANCHOR)
+        return config, state
+
+    def host(self, config: Path, state: Path, **kw):
+        from recursion_core.daemon import plugins
+        from recursion_core.plugin_security.tests.support import FakeGilProbe
+        host = plugins.PluginHost(config, state, gil_probe=FakeGilProbe(), verification_available=lambda: True,
+                                  **kw)
+        self.addCleanup(host.close)
+        return host
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.name == "posix", POSIX_ONLY)
+    def test_the_host_refuses_every_plugin_and_makes_no_store_file_when_the_choice_is_refuse(self) -> None:
+        config, state = self.prepare()
+        before = _listing(state)
+        for given in ({}, {"sqlite_wal_bug": "refuse"}):
+            with self.subTest(given=given), stub("3.45.1"), \
+                    self.assertLogs("recursion_core.daemon.plugins", "ERROR"):
+                host = self.host(config, state, **given)
+                self.assertEqual(["refused"], [row["state"] for row in host.records])
+                self.assertEqual(["store_sqlite_wal_bug"], [row["code"] for row in host.records])
+                self.assertEqual(before, _listing(state), "no store file is made")
+                self.assertEqual("not configured", host.authority_state)
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.name == "posix", POSIX_ONLY)
+    def test_the_host_hands_accept_risk_to_the_trust_store_and_the_authority(self) -> None:
+        config, state = self.prepare()
+        with stub("3.45.1"), self.assertLogs("recursion_core.daemon.plugins", "WARNING") as logs:
+            host = self.host(config, state, sqlite_wal_bug="accept_risk")
+        self.assertIsNotNone(host._trust, "the trust store opened")
+        self.assertEqual("configured", host.authority_state)
+        self.assertIsNotNone(host.authority)
+        self.assertTrue((state / "plugin-security" / "revoked.sqlite3").is_file(), "the revocation store opened")
+        self.assertEqual("accept_risk", host._sqlite_wal_bug)
+        self.assertFalse([line for line in logs.output if "no plugin can load" in line])
+
+    def test_every_callable_that_takes_the_choice_takes_it_by_keyword_and_defaults_to_refuse(self) -> None:
+        import inspect
+        from recursion_core.daemon import breaker as daemon_breaker
+        from recursion_core.daemon import control_adapter, plugins
+        callables = {
+            "EventStore": D.EventStore, "FakeStore": D.FakeStore, "create_ledger": create_ledger,
+            "Authority": Authority, "create_breaker_store": create_breaker_store,
+            "ConnectionBreaker": ConnectionBreaker, "create_revocation_store": create_revocation_store,
+            "TrustStore": TrustStore, "open_breaker_store": daemon_breaker.open_breaker_store,
+            "compose_control": control_adapter.compose_control, "PluginHost": plugins.PluginHost,
+        }
+        self.assertEqual(11, len(callables))
+        for name, thing in callables.items():
+            with self.subTest(callable=name):
+                parameter = inspect.signature(thing).parameters["sqlite_wal_bug"]
+                self.assertEqual((inspect.Parameter.KEYWORD_ONLY, "refuse"), (parameter.kind, parameter.default))
+        private = inspect.signature(TrustStore._open_store).parameters["sqlite_wal_bug"]
+        self.assertEqual("refuse", private.default)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,4 @@
+{"type":"_fixture","written_by":"Claude Opus 5.5 (claude-opus-5-5), lane ENGINE-E6","provenance":"synthetic","shapes_from":"https://cursor.com/docs/cli/reference/output-format, retrieved 2026-11-15 about 01:05 UTC","guessed":["the whole terminal error line: Cursor documents no error event"]}
+{"type":"system","subtype":"init","apiKeySource":"login","cwd":"/work/demo","session_id":"c0ffee00-0000-4000-8000-000000000003","model":"synthetic-model","permissionMode":"default"}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Summarise the repository."}]},"session_id":"c0ffee00-0000-4000-8000-000000000003"}
+{"type":"result","subtype":"error","duration_ms":12,"duration_api_ms":12,"is_error":true,"result":"You have hit your usage limit. Too many requests, try again later.","session_id":"c0ffee00-0000-4000-8000-000000000003"}

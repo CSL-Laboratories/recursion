@@ -1,0 +1,18 @@
+{"type":"_fixture","written_by":"Claude Opus 5.5 (claude-opus-5-5), lane ENGINE-E6","provenance":"synthetic","shapes_from":"https://cursor.com/docs/cli/acp (retrieved 2026-11-15 about 01:05 UTC) and the ACP v1 schema at agentclientprotocol/agent-client-protocol 13b765828f961812f0c78ae577220e994209fa2f","guessed":["the initialize answer's capabilities","the tool_call and tool_call_update fields","the authenticate answer"]}
+{"dir":"client","msg":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":false}},"authMethods":[{"id":"cursor_login","name":"Cursor login","description":null}]}}}
+{"dir":"client","msg":{"jsonrpc":"2.0","id":2,"method":"authenticate","params":{"methodId":"cursor_login"}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","id":2,"result":{}}}
+{"dir":"client","msg":{"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"/work/demo","mcpServers":[]}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","id":3,"result":{"sessionId":"acp-session-0001"}}}
+{"dir":"client","msg":{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"acp-session-0001","prompt":[{"type":"text","text":"Read README.md."}]}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-session-0001","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Reading it now."}}}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-session-0001","update":{"sessionUpdate":"tool_call","toolCallId":"call-acp-1","title":"Read README.md","kind":"read","status":"pending","rawInput":{"path":"README.md"}}}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"sessionId":"acp-session-0001","toolCall":{"toolCallId":"call-acp-1"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"allow-always","name":"Allow always","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}}
+{"dir":"client","msg":{"jsonrpc":"2.0","id":100,"result":{"outcome":{"outcome":"selected","optionId":"reject-once"}}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-session-0001","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-acp-1","status":"failed"}}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-session-0001","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"I was not allowed to read it."}}}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}}
+{"dir":"client","msg":{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":"acp-session-0001","prompt":[{"type":"text","text":"Then say goodbye."}]}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp-session-0001","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Goodbye."}}}}}
+{"dir":"agent","msg":{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}}

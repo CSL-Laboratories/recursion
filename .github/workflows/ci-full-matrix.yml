@@ -65,3 +65,58 @@ jobs:
 
       - name: Provider-free gate
         run: python -X utf8 -B tools/ci_gate.py --force
+
+  # Informs only: continue-on-error keeps this leg from gating the labelled run until Lucas removes that line.
+  windows-314t:
+    name: windows-314t
+    continue-on-error: true
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Enable Git long paths
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14t"
+
+      - name: Install dependencies
+        working-directory: ${{ runner.temp }}
+        env:
+          REQUIREMENTS_CI: ${{ github.workspace }}/requirements-ci.txt
+        shell: bash
+        run: 'python -P -m pip install --only-binary=:all: -r "$REQUIREMENTS_CI"'
+
+      - name: Provider-free gate
+        run: python -X utf8 -B tools/ci_gate.py --force
+
+  # Informs only: continue-on-error keeps this leg from gating the labelled run until Lucas removes that line.
+  macos-314t:
+    name: macos-314t
+    continue-on-error: true
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14t"
+
+      - name: Install dependencies
+        working-directory: ${{ runner.temp }}
+        env:
+          REQUIREMENTS_CI: ${{ github.workspace }}/requirements-ci.txt
+        shell: bash
+        run: 'python -P -m pip install --only-binary=:all: -r "$REQUIREMENTS_CI"'
+
+      - name: Provider-free gate
+        run: python -X utf8 -B tools/ci_gate.py --force

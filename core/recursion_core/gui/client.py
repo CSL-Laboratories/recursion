@@ -67,10 +67,18 @@ class ControlClient:
         body = None if payload is None else json.dumps(payload, sort_keys=True).encode()
         try:
             status, raw = self._transport(method, path, body)
-            data = json.loads(raw)
         except ControlError:
             raise
         except Exception:  # noqa: BLE001 - any transport failure is "unavailable", nothing more
+            raise ControlError("control_api_unavailable") from None
+        # None, str, bool, NaN and any other non-int are not an HTTP status. %d would raise, and a
+        # float such as 503.0 is not an integer status either. Judged before the body is parsed, so
+        # a body that is not JSON cannot hide a status that is not an int.
+        if type(status) is not int:
+            raise ControlError("control_api_response_invalid")
+        try:
+            data = json.loads(raw)
+        except Exception:  # noqa: BLE001 - a body that is not JSON, with an int status, is unavailable
             raise ControlError("control_api_unavailable") from None
         if status != 200:
             code = data.get("error") if type(data) is dict else None

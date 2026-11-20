@@ -62,8 +62,9 @@ import time
 from recursion_core.gui.client import ACTIONS, READS
 from recursion_core.gui.panels import panel_registry
 from recursion_core.plugin_security import (ApprovalGate, Authority, CoreHealth, CoreService, GilProbe, Grant,
-                                            PERMISSIONS, PluginLoader, Refused, ReservedEffects, TrustStore,
+                                            PluginLoader, Refused, ReservedEffects, TrustStore,
                                             create_revocation_store)
+from recursion_core.plugin_security.manifest import MAX_MANIFEST_BYTES, PERMISSIONS_V1, developer_key_id_ok
 from recursion_core.plugin_security.signing import backend_available
 
 from .breaker import STORE_DIR
@@ -77,14 +78,14 @@ INSTALL_FILE = 'install.json'
 MANIFEST, SIGNATURE, ARTIFACT = 'manifest.json', 'manifest.sig', 'plugin.py'
 REVOCATION_FILE = 'revoked.sqlite3'     # <state dir>/plugin-security/
 LEDGER_FILE = 'ledger.sqlite3'          # installer-created; never created here
-MAX_MANIFEST_BYTES, MAX_ARTIFACT_BYTES, MAX_INSTALL_BYTES = 64 * 1024, 8 * 1024 * 1024, 1024 * 1024
+MAX_ARTIFACT_BYTES, MAX_INSTALL_BYTES = 8 * 1024 * 1024, 1024 * 1024
 VERIFICATION_UNAVAILABLE = 'plugin_verification_unavailable'
 CRYPTOGRAPHY_MISSING = 'cryptography missing; install recipe in plugin_security/README.md'
 EFFECT_PERMISSIONS = {'order': 'order'}
 AUTHORITY_REQUIRED = frozenset({'order'})
 _INSTALL_KEYS = frozenset({'trusted_keys', 'grants', 'reserved', 'authority_anchor'})
 _GRANT_KEYS = frozenset({'plugin_id', 'artifact_sha256', 'signer_key_id', 'permissions', 'unsigned_order_acknowledged',
-                         'order_after_revoked_key', 'order_after_revocation_generation'})
+                         'order_after_revoked_key', 'order_after_revocation_generation', 'developer_key_id'})
 _SAFE_ID = re.compile(r'[^A-Za-z0-9_.-]')
 # O7 reads (ADV2-3). Uncalibrated defaults: a plugin call that has not answered by its deadline is
 # answered 504 and the plugin is marked degraded; a read that finds another one running waits this
@@ -165,7 +166,10 @@ def _owned_directory(path):
 
 
 def read_install(directory):
-    """Parse ``install.json``. With no file: no trusted key and no grant, so nothing gets a permission."""
+    """Parse ``install.json``. With no file: no trusted key and no grant, so nothing gets a permission.
+
+    ``developer_key_id`` is null or ``ed25519:`` plus 32 lower-case hex; a grant may name the five version-1 permissions.
+    """
     raw = _read_owned(Path(directory) / INSTALL_FILE, MAX_INSTALL_BYTES, missing_ok=True)
     if raw is None:
         return {'trusted_keys': {}, 'grants': {}, 'reserved': ReservedEffects(), 'authority_anchor': None}
@@ -189,16 +193,18 @@ def read_install(directory):
         perms, signer = item['permissions'], item.get('signer_key_id')
         generation = item.get('order_after_revocation_generation')
         if (not isinstance(item['plugin_id'], str) or not isinstance(item['artifact_sha256'], str)
-                or not isinstance(perms, list) or any(p not in PERMISSIONS for p in perms)
+                or not isinstance(perms, list) or any(p not in PERMISSIONS_V1 for p in perms)
                 or not (signer is None or isinstance(signer, str))
                 or type(item.get('unsigned_order_acknowledged', False)) is not bool
                 or not (item.get('order_after_revoked_key') is None or isinstance(item['order_after_revoked_key'], str))
                 or not (generation is None or type(generation) is int)
+                or not developer_key_id_ok(item.get('developer_key_id'))
                 or item['plugin_id'] in grants):
             raise PluginRefused('plugin_install_config_invalid', 'grant value')
         grants[item['plugin_id']] = Grant(item['plugin_id'], item['artifact_sha256'], signer, tuple(perms),
                                           item.get('unsigned_order_acknowledged', False),
-                                          item.get('order_after_revoked_key'), generation)
+                                          item.get('order_after_revoked_key'), generation,
+                                          developer_key_id=item.get('developer_key_id'))
     reserved = data.get('reserved', {})
     hosts = reserved.get('hosts', []) if isinstance(reserved, dict) else None
     prefixes = reserved.get('credential_prefixes', []) if isinstance(reserved, dict) else None

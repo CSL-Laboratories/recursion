@@ -32,6 +32,7 @@ the existing routes package may load its eager adapter exports.
 """
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Iterator
 
 CATALOGUE = ('claude_code', 'codex', 'opencode', 'grok', 'antigravity', 'cursor', 'gemini_cli', 'pi', 'hermes',
@@ -56,33 +57,48 @@ class EngineTable:
         assert tuple(self._factories) == SEEDED
         self._replaced: set[str] = set()
         self._frozen = False
+        # register, freeze, names, items and containment share this lock. A registration that has
+        # passed the frozen check cannot commit after freeze has returned. A reader copies under the
+        # same lock, so it does not walk the dict while a registration changes it. freeze sets the
+        # flag that refuses a later registration; it does not take a snapshot of its own.
+        self._lock = threading.Lock()
 
     def register(self, name: str, factory: Callable, *, replace: bool = False) -> None:
         """Add the factory of an engine, or replace a seeded one on purpose (``replace=True``, once)."""
-        if self._frozen:
-            raise EngineTableError(f'engine {name!r}: the table is closed; register at composition')
-        if name not in CATALOGUE:
-            raise EngineTableError(f'engine {name!r} is not in the catalogue')
-        if not callable(factory):
-            raise EngineTableError(f'engine {name!r}: the factory is not callable')
-        if replace:
-            if name not in SEEDED or name in self._replaced:
-                raise EngineTableError(f'engine {name!r}: only a seeded factory can be replaced, and only once')
-            self._replaced.add(name)
-        elif name in self._factories:
-            raise EngineTableError(f'engine {name!r} already has a factory')
-        self._factories[name] = factory   # a replaced name keeps its place in the order
+        # A name that is not a str can call back from equality or from its text form. Refuse that
+        # before the lock is taken, and do not ask the name for either.
+        if type(name) is not str:
+            raise EngineTableError('the engine name is not a str')
+        with self._lock:
+            if self._frozen:
+                raise EngineTableError(f'engine {name!r}: the table is closed; register at composition')
+            if name not in CATALOGUE:
+                raise EngineTableError(f'engine {name!r} is not in the catalogue')
+            if not callable(factory):
+                raise EngineTableError(f'engine {name!r}: the factory is not callable')
+            if replace:
+                if name not in SEEDED or name in self._replaced:
+                    raise EngineTableError(f'engine {name!r}: only a seeded factory can be replaced, and only once')
+            elif name in self._factories:
+                raise EngineTableError(f'engine {name!r} already has a factory')
+            self._factories[name] = factory   # a replaced name keeps its place in the order
+            if replace:
+                self._replaced.add(name)
 
     def freeze(self) -> None:
-        self._frozen = True
+        with self._lock:
+            self._frozen = True
 
     def names(self) -> tuple:
         """The engines with a factory, in order: today's two first, then each registered one."""
-        return tuple(self._factories)
+        with self._lock:
+            return tuple(self._factories)
 
     def items(self) -> Iterator[tuple]:
-        """``(name, factory)`` in the same order."""
-        return iter(tuple(self._factories.items()))
+        """``(name, factory)`` in the same order. The copy is taken under the lock."""
+        with self._lock:
+            return iter(tuple(self._factories.items()))
 
     def __contains__(self, name) -> bool:
-        return name in self._factories
+        with self._lock:
+            return name in self._factories

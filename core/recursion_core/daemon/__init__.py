@@ -47,6 +47,9 @@ TERMINAL = frozenset({'terminated', 'lost_reboot'})
 SCHEMA_VERSION = 1
 # A delegated unit cgroup is shallow. Past either bound the walk is not a
 # positive empty result: callers treat None as unknown, never as terminated.
+# The node budget is shared by the root, every directory entry read, and every
+# child still queued. Entries come from os.scandir one at a time. The iterator
+# is closed once the budget is spent, after one peek that is not stat'd.
 CGROUP_WALK_MAX_DEPTH = 64
 CGROUP_WALK_MAX_NODES = 4096
 # How long to re-read a recorded cgroup after its processes were sent SIGKILL.
@@ -1094,29 +1097,103 @@ class SystemdUserManager:
             return None
         return (info.st_dev, info.st_ino)
 
-    def _cgroup_children(self, directory: Path):
+    def _entry_kind(self, entry):
+        """Classify one scandir entry: 'dir', 'symlink', 'other', or 'gone'."""
+        is_symlink = getattr(entry, 'is_symlink', None)
+        is_dir = getattr(entry, 'is_dir', None)
+        if callable(is_symlink) and callable(is_dir):
+            try:
+                if is_symlink():
+                    return 'symlink'
+                if is_dir(follow_symlinks=False):
+                    return 'dir'
+            except OSError as exc:
+                if exc.errno in (errno.ENOENT, errno.ESRCH):
+                    return 'gone'
+                raise
+            return 'other'
+        path = getattr(entry, 'path', None)
+        if path is None:
+            raise OSError(errno.EIO, 'unreadable directory entry')
+        try:
+            info = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ESRCH):
+                return 'gone'
+            raise
+        if stat.S_ISLNK(info.st_mode):
+            return 'symlink'
+        if stat.S_ISDIR(info.st_mode):
+            return 'dir'
+        return 'other'
+
+    def _cgroup_children(self, directory: Path, remaining: list):
         """Return child directories, [] if this directory vanished, or None if unreadable.
 
-        A symlink child fails the walk. Children are not descended into here.
+        ``remaining`` is the shared discovered-plus-queued budget. The listing
+        is ``os.scandir``: each entry consumes one slot before it is classified,
+        and the iterator is closed as soon as the budget is spent. One further
+        name is peeked and not stat'd; if it exists, the walk is unknown. A
+        symlink child fails the walk. Children are not descended into here.
         """
         try:
-            entries = list(directory.iterdir())
+            scan = os.scandir(directory)
         except OSError as exc:
             if exc.errno in (errno.ENOENT, errno.ESRCH):
                 return []
             return None
-        children = []
-        for entry in entries:
+        iterator = scan
+        if hasattr(scan, '__enter__'):
             try:
-                info = entry.lstat()
+                iterator = scan.__enter__()
             except OSError as exc:
+                close = getattr(scan, 'close', None)
+                if close is not None:
+                    close()
                 if exc.errno in (errno.ENOENT, errno.ESRCH):
+                    return []
+                return None
+        children = []
+        read = False
+        try:
+            while True:
+                if remaining[0] <= 0:
+                    try:
+                        next(iterator)
+                    except StopIteration:
+                        break
+                    except OSError:
+                        return None
+                    return None
+                try:
+                    entry = next(iterator)
+                except StopIteration:
+                    break
+                except OSError as exc:
+                    if exc.errno in (errno.ENOENT, errno.ESRCH) and not read:
+                        return []
+                    return None
+                read = True
+                remaining[0] -= 1
+                try:
+                    kind = self._entry_kind(entry)
+                except OSError:
+                    return None
+                if kind == 'gone':
                     continue
-                return None
-            if stat.S_ISLNK(info.st_mode):
-                return None
-            if stat.S_ISDIR(info.st_mode) and entry.name not in ('.', '..'):
-                children.append(entry)
+                if kind == 'symlink':
+                    return None
+                if kind == 'dir' and entry.name not in ('.', '..'):
+                    child = getattr(entry, 'path', None)
+                    children.append(Path(child if child is not None else entry))
+        finally:
+            close = getattr(iterator, 'close', None)
+            if close is not None:
+                close()
+            elif iterator is not scan:
+                exit_ = getattr(scan, '__exit__', None)
+                if exit_ is not None:
+                    exit_(None, None, None)
         return children
 
     def _subtree(self, directory: Path):
@@ -1124,18 +1201,22 @@ class SystemdUserManager:
 
         None means the walk could not be finished: a read error, a symlink, a
         cycle, or a tree past the depth or node bound. The walk is iterative.
-        Delegate= lets a run create child cgroups, and a pid in one of those is
-        still inside the unit.
+        The node bound is charged before the next directory entry is read or
+        stat'd, and the scandir iterator is closed at that point. Delegate=
+        lets a run create child cgroups, and a pid in one of
+        those is still inside the unit.
         """
+        remaining = [CGROUP_WALK_MAX_NODES]
+        if remaining[0] < 1:
+            return None
+        remaining[0] -= 1
         stack = [(directory, 0)]
         seen = set()
-        nodes = 0
         pids = []
         populated = False
         while stack:
             current, depth = stack.pop()
-            nodes += 1
-            if depth > CGROUP_WALK_MAX_DEPTH or nodes > CGROUP_WALK_MAX_NODES:
+            if depth > CGROUP_WALK_MAX_DEPTH:
                 return None
             identity = self._cgroup_identity(current)
             if identity is None or identity in seen:
@@ -1147,10 +1228,12 @@ class SystemdUserManager:
             level_pids, level_populated = level
             pids.extend(level_pids)
             populated = populated or level_populated
-            children = self._cgroup_children(current)
+            children = self._cgroup_children(current, remaining)
             if children is None:
                 return None
             for child in children:
+                if depth + 1 > CGROUP_WALK_MAX_DEPTH:
+                    return None
                 stack.append((child, depth + 1))
         return pids, populated
 

@@ -1,0 +1,260 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "negotiation/06-requests-before-initialize",
+  "protocol": "2025-06-18",
+  "summary": "Before initialize: tools/list and tools/call are refused and reach nothing, ping is answered, an unknown method is Method not found, and an early initialized notification is ignored.",
+  "source": "MCP 2025-06-18 basic/lifecycle (Initialization, Version Negotiation)",
+  "api": [],
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+      },
+      "expect": []
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: not initialized; send initialize first"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+          "name": "recursion_run_status",
+          "arguments": {
+            "run_id": "run-1"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "error": {
+            "code": -32600,
+            "message": "Invalid Request: not initialized; send initialize first"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "ping"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {}
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "resources/list"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "error": {
+            "code": -32601,
+            "message": "Method not found: resources/list"
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-06-18",
+          "capabilities": {},
+          "clientInfo": {
+            "name": "fixture-client",
+            "version": "1.0.0"
+          }
+        }
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 5,
+          "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {
+              "tools": {
+                "listChanged": false
+              }
+            },
+            "serverInfo": {
+              "name": "recursion-control",
+              "title": "Recursion control",
+              "version": "0.0.0"
+            },
+            "instructions": "Starts, reads and stops agent runs on this machine's Recursion daemon. recursion_run_stop answers \"stopped\" only when cleanup is confirmed and \"pending\" otherwise; read recursion_run_status before retrying a stop or a start."
+          }
+        }
+      ]
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+      },
+      "expect": []
+    },
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/list"
+      },
+      "expect": [
+        {
+          "jsonrpc": "2.0",
+          "id": 6,
+          "result": {
+            "tools": [
+              {
+                "name": "recursion_run_list",
+                "title": "List runs",
+                "description": "List runs and their states, in run_id order. A page that is not the last carries next_after; pass it back as after for the next page. Read only.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "limit": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000
+                    },
+                    "after": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "annotations": {
+                  "title": "List runs",
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                }
+              },
+              {
+                "name": "recursion_run_status",
+                "title": "Run status",
+                "description": "Read one run's state. Read only.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "run_id": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "run_id"
+                  ],
+                  "additionalProperties": false
+                },
+                "annotations": {
+                  "title": "Run status",
+                  "readOnlyHint": true,
+                  "destructiveHint": false,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                }
+              },
+              {
+                "name": "recursion_run_start",
+                "title": "Start a run",
+                "description": "Start an agent run on an engine route.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "tenant": {
+                      "type": "string"
+                    },
+                    "engine": {
+                      "type": "string"
+                    },
+                    "prompt": {
+                      "type": "string"
+                    },
+                    "client_key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "tenant",
+                    "engine",
+                    "prompt"
+                  ],
+                  "additionalProperties": false
+                },
+                "annotations": {
+                  "title": "Start a run",
+                  "readOnlyHint": false,
+                  "destructiveHint": false,
+                  "idempotentHint": false,
+                  "openWorldHint": true
+                }
+              },
+              {
+                "name": "recursion_run_stop",
+                "title": "Stop a run",
+                "description": "Stop a run. Answers 'stopped' only when cleanup is confirmed; otherwise 'pending'.",
+                "inputSchema": {
+                  "type": "object",
+                  "properties": {
+                    "run_id": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "run_id"
+                  ],
+                  "additionalProperties": false
+                },
+                "annotations": {
+                  "title": "Stop a run",
+                  "readOnlyHint": false,
+                  "destructiveHint": true,
+                  "idempotentHint": true,
+                  "openWorldHint": false
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "after_end_of_input": []
+}

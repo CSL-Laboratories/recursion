@@ -1,0 +1,21 @@
+{
+  "format": "mcp-stdio-fixture/1",
+  "name": "framing/12-last-line-without-newline",
+  "protocol": "2025-06-18",
+  "summary": "A last message with no newline before end of input is still read and answered.",
+  "source": "MCP 2025-06-18 basic/index (Messages) and basic/transports (stdio); JSON-RPC 2.0 sections 4-5",
+  "api": [],
+  "steps": [
+    {
+      "send_text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+      "expect": []
+    }
+  ],
+  "after_end_of_input": [
+    {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {}
+    }
+  ]
+}

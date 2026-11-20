@@ -1513,6 +1513,61 @@ class RulesTest(unittest.TestCase):
                 self.refused("not_delivering", model.step, "accepted", accepted)
                 self.assertEqual((model.item["state"], model.item["turn_id"], model.evidence), ("outcome_unknown", None, [accepted]))
 
+    def test_a_stopped_session_stop_is_reported_while_a_run_is_pending(self):
+        """The hosted suite holds this rule. The published pending session.stop stays clean. The same
+        answer with code stopped, while a run is still pending, is reported by the rule and by the
+        client."""
+        h13 = self.folder / "fixtures" / "good" / "methods.v1" / "h13-session-stop-of-a-subtree-still-pending.json"
+        exchange = client.read_json(h13)
+        self.assertEqual(self.rules.session_stop_problems(exchange), [])
+        stopped = copy.deepcopy(exchange)
+        stopped["answer"]["code"] = "stopped"
+        self.assertIn("stopped_while_pending", self.rules.session_stop_problems(stopped))
+        entry = {"file": "good/methods.v1/h13-session-stop-of-a-subtree-still-pending.json",
+                 "schema": "methods.v1.json#/$defs/exchange"}
+        message = client.check_instance(self.schemas, entry, stopped)
+        self.assertIsNotNone(message)
+        self.assertIn("stopped_while_pending", message)
+
+    def test_a_pending_or_ended_answer_requires_a_run_of_that_code(self):
+        """One pending run makes the answer pending, and an ended answer has a run whose code is ended.
+        The published schema accepts both of the answers below; the rule does not."""
+        h13 = self.folder / "fixtures" / "good" / "methods.v1" / "h13-session-stop-of-a-subtree-still-pending.json"
+        entry = {"file": "good/methods.v1/h13-session-stop-of-a-subtree-still-pending.json",
+                 "schema": "methods.v1.json#/$defs/exchange"}
+
+        def stopped_runs(code):
+            exchange = copy.deepcopy(client.read_json(h13))
+            exchange["answer"]["code"] = code
+            exchange["answer"]["pending"] = []
+            for run in exchange["answer"]["runs"]:
+                run["code"] = "stopped"
+                run["state"] = "stopped"
+                run.pop("reason", None)
+                run["repeat"] = False
+            return exchange
+
+        pending = stopped_runs("pending")
+        self.assertIn("pending_without_a_pending_run", self.rules.session_stop_problems(pending))
+        pending_message = client.check_instance(self.schemas, entry, pending)
+        self.assertIsNotNone(pending_message)
+        self.assertIn("pending_without_a_pending_run", pending_message)
+        ended = stopped_runs("ended")
+        self.assertIn("ended_without_an_ended_run", self.rules.session_stop_problems(ended))
+        ended_message = client.check_instance(self.schemas, entry, ended)
+        self.assertIsNotNone(ended_message)
+        self.assertIn("ended_without_an_ended_run", ended_message)
+        clean = copy.deepcopy(client.read_json(h13))
+        clean["answer"]["code"] = "ended"
+        clean["answer"]["pending"] = []
+        clean["answer"]["runs"] = [{
+            "code": "ended",
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "state": "ended",
+        }]
+        self.assertEqual(self.rules.session_stop_problems(clean), [])
+        self.assertIsNone(client.check_instance(self.schemas, entry, clean))
+
 
 class FixtureTest(unittest.TestCase):
     """One test per fixture; the methods are added below from the index."""

@@ -357,6 +357,10 @@ def check_instance(schemas: SchemaSet, entry: dict, instance: Any) -> str | None
         if errors:
             keyword, location, message = errors[0]
             return f"refused, but it is a good fixture: {keyword} at {location or '/'}: {message[:200]}"
+        # The schema accepts a stopped session.stop while a run is still pending. The rule does not.
+        found = rules.session_stop_problems(instance) if isinstance(instance, dict) else []
+        if found:
+            return "session.stop does not agree: " + ", ".join(found)
         return None
     if not errors:
         return f"accepted, but it breaks a rule: {entry['rule']}"

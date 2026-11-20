@@ -25,7 +25,7 @@ from recursion_core.plugin_security import (
 
 POSIX_ONLY = "the stores and the settings file's owner check need a POSIX system"
 ANCHOR = "11" * 32  # a public value in the anchor's format; nothing signs with it or verifies against it
-REST = ("Recursion does not open its stores with it. Use a Python whose SQLite is 3.53.0 or later, 3.52.0, 3.51.3 "
+REST = ("Recursion does not open its stores with it. Use a Python whose SQLite is 3.53.0 or later, 3.51.3 "
         "or later in 3.51, 3.50.7 or later in 3.50, or 3.44.6 or later in 3.44, and check it with: python3 -c \"import sqlite3; print(sqlite3.sqlite_version)\". To accept the "
         "risk and go on, set stores.sqlite_wal_bug = \"accept_risk\" in $XDG_CONFIG_HOME/recursion/settings.toml.")
 HAS_THE_BUG = "This Python uses SQLite {found}, which has a known bug that can damage a database in WAL mode. " + REST

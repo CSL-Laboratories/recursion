@@ -1,0 +1,36 @@
+{"to":"pi","record":{"id":"e8-1","type":"prompt","message":"Refactor the parser."},"delivery":{"delivery_id":"dlv-c1","turn_id":"turn-c1","how":"new_turn"}}
+{"from":"pi","record":{"id":"e8-1","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}}
+{"from":"pi","record":{"type":"agent_start"}}
+{"from":"pi","record":{"type":"turn_start"}}
+{"from":"pi","record":{"type":"message_start","message":{"role":"user","content":"Refactor the parser.","timestamp":1794693610000}}}
+{"from":"pi","record":{"type":"message_end","message":{"role":"user","content":"Refactor the parser.","timestamp":1794693610000}}}
+{"from":"pi","record":{"type":"message_start","message":{"role":"assistant","content":[],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"pending","timestamp":1794693610100}}}
+{"from":"pi","record":{"type":"message_update","usage":{"input":1000,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":1020,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.0021}},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Reading the parser."}}}
+{"to":"pi","record":{"id":"e8-2","type":"prompt","message":"Keep the old names.","streamingBehavior":"steer"},"delivery":{"delivery_id":"dlv-c2","turn_id":"turn-c1","how":"mid_turn"}}
+{"from":"pi","record":{"id":"e8-2","type":"response","command":"prompt","success":true,"data":{"disposition":"queued"}}}
+{"to":"pi","record":{"id":"e8-3","type":"get_state"}}
+{"from":"pi","record":{"id":"e8-3","type":"response","command":"get_state","success":true,"data":{"thinkingLevel":"medium","isStreaming":true,"isCompacting":false,"steeringMode":"one-at-a-time","followUpMode":"one-at-a-time","sessionFile":"/state/pi/sessions/--work-project--/2026-11-14T22-00-00-000Z_019a5b2e-1111-7000-8000-00000000e801.jsonl","sessionId":"019a5b2e-1111-7000-8000-00000000e801","autoCompactionEnabled":true,"messageCount":2,"pendingMessageCount":1}}}
+{"to":"pi","record":{"id":"e8-4","type":"abort"}}
+{"from":"pi","record":{"type":"message_end","message":{"role":"assistant","content":[],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"aborted","timestamp":1794693610100,"errorMessage":"Request was aborted"}}}
+{"from":"pi","record":{"type":"turn_end","message":{"role":"assistant","content":[],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"aborted","timestamp":1794693610100,"errorMessage":"Request was aborted"},"toolResults":[]}}
+{"from":"pi","record":{"type":"agent_end","messages":[],"willRetry":false}}
+{"from":"pi","record":{"type":"agent_settled","aborted":true}}
+{"from":"pi","record":{"id":"e8-4","type":"response","command":"abort","success":true}}
+{"to":"pi","record":{"id":"e8-5","type":"get_state"}}
+{"from":"pi","record":{"id":"e8-5","type":"response","command":"get_state","success":true,"data":{"thinkingLevel":"medium","isStreaming":false,"isCompacting":false,"steeringMode":"one-at-a-time","followUpMode":"one-at-a-time","sessionFile":"/state/pi/sessions/--work-project--/2026-11-14T22-00-00-000Z_019a5b2e-1111-7000-8000-00000000e801.jsonl","sessionId":"019a5b2e-1111-7000-8000-00000000e801","autoCompactionEnabled":true,"messageCount":2,"pendingMessageCount":1}}}
+{"to":"pi","record":{"id":"e8-6","type":"prompt","message":"Go on."},"delivery":{"delivery_id":"dlv-c3","turn_id":"turn-c2","how":"new_turn"}}
+{"from":"pi","record":{"id":"e8-6","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}}
+{"from":"pi","record":{"type":"agent_start"}}
+{"from":"pi","record":{"type":"turn_start"}}
+{"from":"pi","record":{"type":"message_start","message":{"role":"user","content":"Go on.","timestamp":1794693620000}}}
+{"from":"pi","record":{"type":"message_end","message":{"role":"user","content":"Go on.","timestamp":1794693620000}}}
+{"from":"pi","record":{"type":"message_start","message":{"role":"user","content":"Keep the old names.","timestamp":1794693620001}}}
+{"from":"pi","record":{"type":"message_end","message":{"role":"user","content":"Keep the old names.","timestamp":1794693620001}}}
+{"from":"pi","record":{"type":"message_start","message":{"role":"assistant","content":[],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"pending","timestamp":1794693620100}}}
+{"from":"pi","record":{"type":"message_update","usage":{"input":1000,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":1020,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.0021}},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Done, with the old names kept."}}}
+{"from":"pi","record":{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Done, with the old names kept."}],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":1000,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":1020,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.0021}},"stopReason":"stop","timestamp":1794693620100}}}
+{"from":"pi","record":{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"Done, with the old names kept."}],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":1000,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":1020,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.0021}},"stopReason":"stop","timestamp":1794693620100},"toolResults":[]}}
+{"from":"pi","record":{"type":"agent_end","messages":[{"role":"user","content":"Go on.","timestamp":1794693620000},{"role":"assistant","content":[{"type":"text","text":"Done, with the old names kept."}],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":1000,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":1020,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.0021}},"stopReason":"stop","timestamp":1794693620100}],"willRetry":false}}
+{"from":"pi","record":{"type":"agent_settled","aborted":false}}
+{"to":"pi","record":{"id":"e8-7","type":"get_state"}}
+{"from":"pi","record":{"id":"e8-7","type":"response","command":"get_state","success":true,"data":{"thinkingLevel":"medium","isStreaming":false,"isCompacting":false,"steeringMode":"one-at-a-time","followUpMode":"one-at-a-time","sessionFile":"/state/pi/sessions/--work-project--/2026-11-14T22-00-00-000Z_019a5b2e-1111-7000-8000-00000000e801.jsonl","sessionId":"019a5b2e-1111-7000-8000-00000000e801","autoCompactionEnabled":true,"messageCount":5,"pendingMessageCount":0}}}

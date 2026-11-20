@@ -1,0 +1,34 @@
+{"to":"pi","record":{"id":"e8-1","type":"prompt","message":"Check the build."},"delivery":{"delivery_id":"dlv-b1","turn_id":"turn-b1","how":"new_turn"}}
+{"from":"pi","record":{"id":"e8-1","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}}
+{"from":"pi","record":{"type":"agent_start"}}
+{"from":"pi","record":{"type":"turn_start"}}
+{"from":"pi","record":{"type":"message_start","message":{"role":"user","content":"Check the build.","timestamp":1794693610000}}}
+{"from":"pi","record":{"type":"message_end","message":{"role":"user","content":"Check the build.","timestamp":1794693610000}}}
+{"to":"pi","record":{"id":"e8-2","type":"prompt","message":"Also check the tests.","streamingBehavior":"steer"},"delivery":{"delivery_id":"dlv-b2","turn_id":"turn-b1","how":"mid_turn"}}
+{"from":"pi","record":{"id":"e8-2","type":"response","command":"prompt","success":true,"data":{"disposition":"queued"}}}
+{"from":"pi","record":{"type":"message_start","message":{"role":"assistant","content":[],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"pending","timestamp":1794693610100}}}
+{"from":"pi","record":{"type":"message_update","usage":{"input":1000,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":1020,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.0021}},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Looking now."}}}
+{"from":"pi","record":{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Looking now."}],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":1000,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":1020,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.0021}},"stopReason":"stop","timestamp":1794693610100}}}
+{"from":"pi","record":{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"Looking now."}],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":1000,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":1020,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.0021}},"stopReason":"stop","timestamp":1794693610100},"toolResults":[]}}
+{"from":"pi","record":{"type":"turn_start"}}
+{"from":"pi","record":{"type":"message_start","message":{"role":"user","content":"Also check the tests.","timestamp":1794693611000}}}
+{"from":"pi","record":{"type":"message_end","message":{"role":"user","content":"Also check the tests.","timestamp":1794693611000}}}
+{"from":"pi","record":{"type":"message_start","message":{"role":"assistant","content":[],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"pending","timestamp":1794693611100}}}
+{"to":"pi","record":{"id":"e8-3","type":"abort"}}
+{"from":"pi","record":{"type":"message_end","message":{"role":"assistant","content":[],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"aborted","timestamp":1794693611100,"errorMessage":"Request was aborted"}}}
+{"from":"pi","record":{"type":"turn_end","message":{"role":"assistant","content":[],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"aborted","timestamp":1794693611100,"errorMessage":"Request was aborted"},"toolResults":[]}}
+{"from":"pi","record":{"type":"agent_end","messages":[],"willRetry":false}}
+{"from":"pi","record":{"type":"agent_settled","aborted":true}}
+{"from":"pi","record":{"id":"e8-3","type":"response","command":"abort","success":true}}
+{"to":"pi","record":{"id":"e8-4","type":"prompt","message":"Start over."},"delivery":{"delivery_id":"dlv-b3","turn_id":"turn-b2","how":"new_turn"}}
+{"from":"pi","record":{"id":"e8-4","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}}
+{"from":"pi","record":{"type":"agent_start"}}
+{"from":"pi","record":{"type":"turn_start"}}
+{"from":"pi","record":{"type":"message_start","message":{"role":"user","content":"Start over.","timestamp":1794693621000}}}
+{"from":"pi","record":{"type":"message_end","message":{"role":"user","content":"Start over.","timestamp":1794693621000}}}
+{"from":"pi","record":{"type":"message_start","message":{"role":"assistant","content":[],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"pending","timestamp":1794693621100}}}
+{"from":"pi","record":{"type":"message_update","usage":{"input":1000,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":1020,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.0021}},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Starting over."}}}
+{"from":"pi","record":{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Starting over."}],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":1000,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":1020,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.0021}},"stopReason":"stop","timestamp":1794693621100}}}
+{"from":"pi","record":{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"Starting over."}],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":1000,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":1020,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.0021}},"stopReason":"stop","timestamp":1794693621100},"toolResults":[]}}
+{"from":"pi","record":{"type":"agent_end","messages":[{"role":"user","content":"Start over.","timestamp":1794693621000},{"role":"assistant","content":[{"type":"text","text":"Starting over."}],"api":"openai-responses","provider":"openai","model":"model-synthetic","usage":{"input":1000,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":1020,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0.0021}},"stopReason":"stop","timestamp":1794693621100}],"willRetry":false}}
+{"from":"pi","record":{"type":"agent_settled","aborted":false}}

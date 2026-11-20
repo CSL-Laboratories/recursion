@@ -12,7 +12,10 @@ without one, and it says plainly at the end what it does not do.
 
 - A Linux machine where the Recursion daemon is running for your user and reachable at
   its control socket (`$XDG_RUNTIME_DIR/recursion/control.sock`). The daemon and that
-  socket are Linux only at this commit.
+  socket are Linux only at this commit. How to install and start the daemon is in
+  [core/recursion_core/daemon/README.md](../core/recursion_core/daemon/README.md).
+- An engine set up for the daemon. A `start` can only succeed when the engine it names
+  (`claude_code` or `codex`) is set up, so check that by hand once before you schedule it.
 - The control command. It is reached as `python -m recursion_core.control`. Where the
   package ships a `recursion-control` command, `recursion-control` takes the same
   arguments; that command is pending, so the examples below use the module form.
@@ -31,8 +34,9 @@ answer as one line of JSON and exits 0 when the run started, 1 on any other answ
 ## Why a repeat starts one run
 
 `--client-key` is what makes the call safe to repeat. The daemon remembers the key for
-each tenant. A second `start` with the same tenant and key does not launch again: it
-answers the first run, with `"duplicate": true`. The key is tied to the engine and to
+each tenant. A retry never starts a second run: a second `start` with the same tenant and
+key answers the first run, with `"duplicate": true`. (If the first `start` itself failed
+to launch, the retry tries again under the same run id; it is still one run.) The key is tied to the engine and to
 the prompt (kept as a digest), so the same key with a different engine or prompt is
 refused with `request_invalid` / `client_key_reused` and nothing is launched. The key
 survives a daemon restart.
@@ -61,6 +65,20 @@ machine's local time, like the timer's `OnCalendar=`.
 The file is read by the shell, so put the prompt on one line inside single quotes (a
 prompt that holds a single quote needs it written as `'\''`). Put only text you trust in
 it: the file is run as shell text with your rights.
+
+The script's default command, `python3 -m recursion_core.control`, finds the package
+only when `PYTHONPATH` points at it. The systemd service below sets it. Any other way
+of calling the script (launchd, Task Scheduler, a shell) must set it in the routine file,
+which the script reads, for example with these lines at the end of the file:
+
+```
+export PYTHONPATH="$HOME/.local/lib/recursion/core"
+export RECURSION_CONTROL="$HOME/.local/lib/recursion/venv/bin/python3.14t -X gil=0 -m recursion_core.control"
+```
+
+Use `PYTHONPATH` alone if `python3` can run the package, or `RECURSION_CONTROL` to name
+the interpreter too. Without either, the command fails with
+`No module named 'recursion_core'` before it reaches the daemon.
 
 ## The script
 
@@ -147,7 +165,8 @@ the service ending does not stop the run.
 This form is written from launchd's documented format and has not been run. At this
 commit the daemon and its control socket are Linux only, so on a Mac the command answers
 `control_api_unavailable` unless it reaches a daemon on a Linux machine by some route of
-your own. The form below is the scheduling half only.
+your own. The form below is the scheduling half only. Set `PYTHONPATH` or
+`RECURSION_CONTROL` in the routine file, as described under the routine file above.
 
 `~/Library/LaunchAgents/recursion.routine.nightly-review.plist`:
 
@@ -184,15 +203,19 @@ carries the same key, so it makes one run.
 This form has not been run. The control socket needs POSIX; run natively on Windows the
 command answers `control_api_unavailable` with the detail `platform_unsupported`. So the
 task calls into a Linux distribution under WSL where the daemon runs and the script is
-installed:
+installed. Set `PYTHONPATH` or `RECURSION_CONTROL` in the routine file, as described under
+the routine file above. Under WSL the daemon may not be running when the task fires (the
+distribution can be idle, and its user session may not be up); in that case the firing
+answers `control_api_unavailable`.
 
 ```
 schtasks /Create /TN "recursion-routine-nightly-review" /SC DAILY /ST 03:00 /TR "wsl.exe -d Ubuntu -- /home/YOU/.local/bin/recursion-run-routine nightly-review"
 ```
 
-Replace `Ubuntu` with your distribution's name and `YOU` with your user in it. Use the
-task's setting "Run task as soon as possible after a scheduled start is missed" for the
-catch-up that `Persistent=true` gives on Linux; the repeat carries the same key.
+Replace `Ubuntu` with your distribution's name and `YOU` with your user in it. `schtasks /Create` has no
+flag for it, so for the catch-up that `Persistent=true` gives on Linux set "Run task as
+soon as possible after a scheduled start is missed" in the task's settings or its XML;
+the repeat carries the same key.
 
 ## What this does not do
 

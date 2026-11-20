@@ -37,8 +37,8 @@ takes it from the same resolver) is the one install made the stores in, whatever
 environment says. A unit `upgrade` would replace whose daemon may keep its state in another folder than
 the chosen one (or the default) is refused `unit_state_elsewhere`, its text naming the folder in use and,
 with a chosen place or a unit the installer wrote, the two ways out that work (run the command again with
-`XDG_STATE_HOME` naming the unit's folder, or unset where it names the default; or `recursiond uninstall`,
-the state folder the unit names moved to the new place, then `recursiond install` there: the ledger moves
+`XDG_STATE_HOME` naming the unit's folder, or unset where it names the default; or the daemon stopped,
+`recursiond uninstall`, the state folder the unit names moved to the new place, then `recursiond install` there: the ledger moves
 with the stores, since the install's key with no ledger beside it is refused); a
 value only in the user manager's own environment (`environment.d`, `systemctl --user set-environment`) is
 not seen, since this package starts no process to ask it. With a chosen place the answer adds `state`
@@ -63,8 +63,12 @@ Losing it means making new permissions; it is not recoverable." The key is never
 answered, and no copy is made anywhere. The line is printed as soon as the key and its ledger are both in
 place, before the later steps, so a later step that fails does not hide it. A failure between the key and
 the ledger leaves the two agreeing or neither: a ledger already bound to the key just made keeps the key
-with it (the line is printed), and with no ledger there the key is removed again. Only a process ended
-between the two (a power cut, a kill) can leave the key alone.
+with it (the line is printed), and with no ledger there the key is removed again, only while the path
+still names the file read (a key moved onto the path after that read is kept; a file moved there between
+the last comparison and the unlink is not seen). Only a process ended between the two (a power cut, a kill)
+can leave the key alone. The folders made on the way to the key are synced in their parents before the
+key is written. A key found with its ledger never gets a new ledger: a ledger gone between the look and
+the ledger step is refused `authority_anchor_disagrees`, and the key is left as it is.
 
 Run again with the key, the ledger and `install.json`'s `authority_anchor` (null, or the same key) agreeing,
 it writes nothing (`created: false`). Before anything is written, a disagreement is refused

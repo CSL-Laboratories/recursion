@@ -29,6 +29,7 @@ from .layout import (BREAKER_FILE, LEDGER_FILE, REVOCATION_FILE, STATE_FOLDER, S
                      check_dirs, check_private_dir, check_state_root, default_state_home, ensure_dir,
                      ensure_state_root, file_untrusted, held_regular, owned_paths, read_regular_and_stat,
                      replace_regular, still_holds, still_names, unlink_regular, write_exclusive)
+from .layout import _fsync_dir
 from .unit import MARKER, UNIT_NAME, render_unit, state_elsewhere
 
 _UNIT_MODE = 0o644
@@ -136,6 +137,13 @@ def ensure_ledger(paths: Owned, anchor_public_key: str | None) -> tuple[str, boo
     ``open_store`` and left as it is, whether or not a key was passed.
     """
 
+    return _ensure_ledger(paths, anchor_public_key, create=True)
+
+
+def _ensure_ledger(paths: Owned, anchor_public_key: str | None, *, create: bool) -> tuple[str, bool, str]:
+    """``ensure_ledger``. Without ``create`` (a key found with its ledger) a ledger not there now is
+    ``authority_anchor_disagrees`` and nothing is created: a key that had a ledger never gets a new one."""
+
     from recursion_core.plugin_security import Refused, stores
 
     if type(paths) is not Owned:
@@ -154,6 +162,8 @@ def ensure_ledger(paths: Owned, anchor_public_key: str | None) -> tuple[str, boo
     if exists:
         _open_ledger(path)
         return (path, False, "")
+    if not create:
+        raise InstallRefused("authority_anchor_disagrees", _ledger_gone_detail(paths))
     try:
         stores.create_ledger(path, anchor_public_key)
     except Refused as refusal:
@@ -257,7 +267,8 @@ def _make_key(paths: Owned, found: _Found) -> tuple[str, bytes]:
     if found.public is not None:
         raise InstallRefused("anchor_key", "the key is there already")
     private_class, serialization = found.backend
-    ensure_dir(paths.home, paths.authority_dir, mode=_DIR_MODE)
+    if ensure_dir(paths.home, paths.authority_dir, mode=_DIR_MODE):
+        _sync_parents(paths.home, paths.authority_dir)
     _check_key_dir(paths.authority_dir)
     key = private_class.generate()
     pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
@@ -271,13 +282,36 @@ def _make_key(paths: Owned, found: _Found) -> tuple[str, bytes]:
     return public, pem
 
 
+def _sync_parents(root: str, path: str) -> None:
+    """After folders were made on the way to ``path``: fsync the parent of each folder from ``path`` up to
+    ``root``, so the new folders' own entries are on disk before the key is written into the last one
+    (``write_exclusive`` syncs the key's entry in ``path`` itself). Only where the platform has a directory
+    sync (``O_DIRECTORY``)."""
+
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    cur = path
+    while cur != root:
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return
+        _fsync_dir(parent)
+        cur = parent
+
+
 def _remove_key_made(path: str, pem: bytes) -> None:
     """Remove the key file at ``path`` if it holds ``pem``, the private key this run made (no other caller
-    can hold those bytes). Called on a failure: a second failure here leaves the first to be raised."""
+    can hold those bytes), and only while the path still names the file read: it is held open, and its
+    device and inode are compared with the path's (``still_names``) immediately before the unlink, so a
+    key moved onto the path after the read is kept. One window is left: a file moved there between that
+    comparison and the unlink (``unlink_regular``'s own lookup and its unlink). Called on a failure: a
+    second failure here leaves the first to be raised."""
 
     with contextlib.suppress(OSError, InstallRefused):
-        if read_regular_and_stat(path)[0] == pem:
-            unlink_regular(path)
+        with held_regular(path) as (data, info):
+            if data == pem:
+                still_names(path, info)  # another file at the path now: unit_changed, and it is kept
+                unlink_regular(path)
 
 
 def _bound_to(ledger: str, public: str) -> bool:
@@ -307,6 +341,13 @@ def _ledger_alone_detail(paths: Owned) -> str:
             f"key was moved, put it back at {paths.anchor_key} (the person's own, mode 0600) and run the "
             "command again. If it is lost, the permissions it signed cannot be used again; the ledger is left "
             f"as it is, and a new key is made only when no ledger is at {paths.ledger}")
+
+
+def _ledger_gone_detail(paths: Owned) -> str:
+    return (f"{paths.ledger} was there with the key at {paths.anchor_key} when this run looked, and is not there "
+            "now. A key that had a ledger is never given a new ledger, which would take the place of that "
+            "ledger's spend history, so none was made and the key is left as it is. Put the ledger back at "
+            f"{paths.ledger} and run the command again")
 
 
 def _ed25519():
@@ -396,15 +437,17 @@ def _anchor_and_ledger(paths: Owned, anchor_public_key: str | None, found: _Foun
     removed again (``_remove_key_made``); a ledger there that is not bound to it, or cannot be read, keeps
     the key too, so this run leaves no ledger without its key. A process ended between the two can still
     leave the key alone, which the next run refuses with the ways on. ``on_anchor_made(path)`` is called
-    once the key made now is kept, before any later step, so a later failure does not hide it."""
+    once the key made now is kept, before any later step, so a later failure does not hide it. A key that
+    was found (with its ledger, ``find_anchor``) never gets a new ledger: one gone since the look is
+    ``authority_anchor_disagrees``, the key and whatever moved the ledger left as they are."""
 
     if not make_anchor:
         return ensure_ledger(paths, anchor_public_key), None
     if found is None:  # no cryptography here: no key, so no ledger
         ledger = ensure_ledger(paths, None)
         return (ledger[0], ledger[1], NEEDS_BACKEND if ledger[2] == NEEDS_ANCHOR else ledger[2]), None
-    if found.public is not None:
-        return ensure_ledger(paths, found.public), (paths.anchor_key, False)
+    if found.public is not None:  # found with its ledger: a ledger gone since the look is refused, never made anew
+        return _ensure_ledger(paths, found.public, create=False), (paths.anchor_key, False)
     public, pem = _make_key(paths, found)
     try:
         ledger = ensure_ledger(paths, public)
@@ -517,7 +560,8 @@ def _elsewhere_detail(paths: Owned, data: bytes, why: str) -> str:
     With a place the person chose, or a unit this installer wrote (which names a chosen place when it is
     refused), the two ways that work: run ``recursiond upgrade`` again with ``XDG_STATE_HOME`` naming the
     folder the unit names (unset where the unit names the default) to keep the state where it is, or
-    ``recursiond uninstall``, the state folder the unit names moved to the folder this command would use,
+    the daemon stopped, ``recursiond uninstall``, the state folder the unit names moved to the folder this
+    command would use,
     then ``recursiond install`` to start there: the ledger moves with the stores, since a key with no ledger
     is refused (``find_anchor``). A unit
     placed by hand, while the default applies, is still told to move the state folder and take its line
@@ -532,10 +576,11 @@ def _elsewhere_detail(paths: Owned, data: bytes, why: str) -> str:
     keep = "unset" if state_elsewhere(data, paths.home) is None else "set to the folder that unit names"
     now = f"set to {paths.state_home}" if paths.chosen else "unset"
     start = ("run `recursiond uninstall`" if ours else
-             f"stop the daemon, remove {paths.unit}, which `recursiond install` did not write")
+             f"remove {paths.unit}, which `recursiond install` did not write")
     return said + (f"To keep the state where it is, run `recursiond upgrade` again with XDG_STATE_HOME {keep}. "
-                   f"To start in {paths.state} instead, {start}, move the state folder that unit names (with the "
-                   f"ledger in it) to {paths.state}, where nothing may be yet, then run `recursiond install` with "
+                   f"To start in {paths.state} instead, stop the daemon, {start}, move the state folder that unit "
+                   f"names (with the ledger in it) to {paths.state}, where nothing may be yet, then "
+                   "run `recursiond install` with "
                    f"XDG_STATE_HOME {now}: the ledger moves with the stores, since a key with no ledger is refused")
 
 

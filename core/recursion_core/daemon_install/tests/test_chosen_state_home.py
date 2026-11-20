@@ -327,7 +327,8 @@ class ChosenStateHomeTests(unittest.TestCase):
         self.assertNotIn("take the line out", detail)
         self.assertNotIn("move that state folder", detail)
         self.assertIn("To keep the state where it is, run `recursiond upgrade` again with XDG_STATE_HOME unset", detail)
-        self.assertIn(f"To start in {self.state} instead, run `recursiond uninstall`, move the state folder that "
+        self.assertIn(f"To start in {self.state} instead, stop the daemon, run `recursiond uninstall`, move the state "
+                      "folder that "
                       f"unit names (with the ledger in it) to {self.state}, where nothing may be yet, then run "
                       f"`recursiond install` with XDG_STATE_HOME set to {self.chosen}", detail)
         # The first way, as printed: the state stays where it is.
@@ -358,7 +359,8 @@ class ChosenStateHomeTests(unittest.TestCase):
         self.assertIn(f"sets XDG_STATE_HOME={self.chosen}", detail)
         self.assertIn("To keep the state where it is, run `recursiond upgrade` again with XDG_STATE_HOME set to the "
                       "folder that unit names", detail)
-        self.assertIn(f"To start in {self.default_state} instead, run `recursiond uninstall`, move the state folder "
+        self.assertIn(f"To start in {self.default_state} instead, stop the daemon, run `recursiond uninstall`, move "
+                      "the state folder "
                       f"that unit names (with the ledger in it) to {self.default_state}, where nothing may be yet, then "
                       "run `recursiond install` with XDG_STATE_HOME unset", detail)
         code, answer = self.run_action("upgrade", {"XDG_STATE_HOME": self.chosen})  # the first way, as printed

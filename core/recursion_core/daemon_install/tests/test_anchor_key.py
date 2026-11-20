@@ -11,11 +11,13 @@ Linux-only: on Windows install and upgrade refuse ``platform_unsupported`` befor
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import io
 import json
 import logging
 import os
+import sqlite3
 import stat
 import tempfile
 import unittest
@@ -492,6 +494,132 @@ class AnchorKeyTests(unittest.TestCase):
                 code, answer, err = self.run_action(home, environ)
                 self.assertEqual((code, answer["code"], answer["ledger"]["created"], err), (0, "ok", False, ""),
                                  answer)
+
+    @needs_crypto
+    def test_a_key_found_with_its_ledger_never_gets_a_new_ledger(self):
+        # A second actor moves the closed ledger aside after the look (find_anchor) and before the ledger step.
+        real_find = install_module.find_anchor
+        for root, home, environ in self.profiles():
+            paths = self.paths(home, environ)
+            code, answer, err = self.run_action(home, environ)  # a first install: key and ledger, both made
+            self.assertEqual((code, answer["code"], answer["ledger"]["created"]), (0, "ok", True), answer)
+            self.assertEqual(self.ledger_anchor(paths.ledger), key_id(self.public_of(paths.anchor_key)))
+            db = sqlite3.connect(paths.ledger)
+            try:
+                db.execute("INSERT INTO meta(k, v) VALUES ('spend-history-marker', 'kept')")
+                db.commit()
+            finally:
+                db.close()
+            aside = os.path.join(root, "ledger-aside")
+            os.mkdir(aside, 0o700)
+            folder, base = os.path.split(paths.ledger)
+            for action in ("install", "upgrade"):
+                with self.subTest(environ=environ, action=action):
+                    with open(paths.anchor_key, "rb") as handle:
+                        key_bytes = handle.read()
+                    moved = []
+
+                    def find_then_move(paths_):
+                        found = real_find(paths_)
+                        for name in sorted(os.listdir(folder)):  # the closed ledger and any side file of it
+                            if name == base or name.startswith(base + "-"):
+                                os.rename(os.path.join(folder, name), os.path.join(aside, name))
+                                moved.append(name)
+                        return found
+                    with mock.patch.object(install_module, "find_anchor", side_effect=find_then_move):
+                        code, answer, err = self.run_action(home, environ, action)
+                    self.assertIn(base, moved)
+                    self.assertEqual((code, answer["code"], err), (1, "authority_anchor_disagrees", ""), answer)
+                    self.assertIn(f"{paths.ledger} was there with the key at {paths.anchor_key}", answer["detail"])
+                    self.assertIn("is never given a new ledger", answer["detail"])
+                    self.assertFalse(os.path.lexists(paths.ledger))  # nothing created in its place
+                    with open(paths.anchor_key, "rb") as handle:
+                        self.assertEqual(handle.read(), key_bytes)  # the key untouched
+                    db = sqlite3.connect(os.path.join(aside, base))
+                    try:  # the moved ledger untouched: its history is still in it
+                        self.assertEqual(db.execute("SELECT v FROM meta WHERE k='spend-history-marker'").fetchone(),
+                                         ("kept",))
+                    finally:
+                        db.close()
+                    for name in moved:  # put back, as the text says: the next run agrees and writes no ledger
+                        os.rename(os.path.join(aside, name), os.path.join(folder, name))
+                    code, answer, err = self.run_action(home, environ, action)
+                    self.assertEqual((code, answer["code"], answer["ledger"]["created"], err), (0, "ok", False, ""),
+                                     answer)
+
+    @needs_crypto
+    def test_the_roll_back_keeps_a_key_put_at_the_path_after_it_read_the_key(self):
+        # A second actor moves another key onto the path after the roll-back read the key and before its unlink.
+        real_read = install_module.read_regular_and_stat
+        real_held = install_module.held_regular
+        replacement = b"a stand-in for another key, moved onto the path by a second actor\n"
+        for root, home, environ in self.profiles():
+            with self.subTest(environ=environ):
+                paths = self.paths(home, environ)
+                staged = os.path.join(root, "staged")
+                os.mkdir(staged, 0o700)
+                swapped = []
+
+                def swap(path):
+                    if path == paths.anchor_key and not swapped:
+                        other = os.path.join(staged, "replacement")
+                        fd = os.open(other, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        try:
+                            os.write(fd, replacement)
+                        finally:
+                            os.close(fd)
+                        os.replace(other, paths.anchor_key)  # no other copy is left anywhere
+                        swapped.append(path)
+
+                def read(path):
+                    result = real_read(path)
+                    swap(path)
+                    return result
+
+                @contextlib.contextmanager
+                def held(path):
+                    with real_held(path) as result:
+                        swap(path)
+                        yield result
+
+                def failing(paths_, anchor):
+                    if anchor:
+                        raise install_module.InstallRefused("store_not_created", "the disk is full")
+                    return (paths_.ledger, False, install_module.NEEDS_ANCHOR)
+                with mock.patch.object(install_module, "ensure_ledger", side_effect=failing), \
+                        mock.patch.object(install_module, "read_regular_and_stat", side_effect=read), \
+                        mock.patch.object(install_module, "held_regular", held):
+                    code, answer, err = self.run_action(home, environ)
+                self.assertEqual(swapped, [paths.anchor_key])
+                self.assertEqual((code, answer["code"], err), (1, "store_not_created", ""), answer)
+                self.assertTrue(os.path.lexists(paths.anchor_key), "the replacement key was removed")
+                with open(paths.anchor_key, "rb") as handle:
+                    self.assertEqual(handle.read(), replacement)
+
+    @needs_crypto
+    def test_the_folders_made_for_the_key_are_synced_in_their_parents(self):
+        if not os.path.isdir(os.path.join(os.sep, "proc", "self", "fd")) or not hasattr(os, "O_DIRECTORY"):
+            self.skipTest("no descriptor names to trace, or no directory sync on this platform")
+        real_fsync = os.fsync
+        for root, home, environ in self.profiles():
+            with self.subTest(environ=environ):
+                paths = self.paths(home, environ)
+                synced = []
+
+                def fsync(fd):
+                    try:
+                        name = os.readlink(os.path.join(os.sep, "proc", "self", "fd", str(fd)))
+                        synced.append(os.path.realpath(name))
+                    except OSError:
+                        pass
+                    return real_fsync(fd)
+                with mock.patch.object(os, "fsync", side_effect=fsync):
+                    code, answer, err = self.run_action(home, environ)
+                self.assertEqual((code, answer["code"]), (0, "ok"), answer)
+                parent = os.path.realpath(os.path.dirname(paths.authority_dir))
+                self.assertIn(os.path.realpath(paths.authority_dir), synced)  # the key's entry, as before
+                self.assertIn(parent, synced)  # the authority folder's own entry in its parent
+                self.assertIn(os.path.realpath(home), synced)  # ~/.config, made by this run, in the home
 
     def test_the_installer_function_without_make_anchor_makes_no_key(self):
         # A caller that passes neither a key nor make_anchor keeps the old step (test_ledger_step.py).

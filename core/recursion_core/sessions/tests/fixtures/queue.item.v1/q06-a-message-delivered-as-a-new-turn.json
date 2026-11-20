@@ -1,0 +1,12 @@
+{
+  "created_at": "2026-11-14T09:00:05.000Z",
+  "delivery": "next_turn",
+  "delivery_id": "dlv-0000000000000000000000000000000c",
+  "item_id": "qi-0000000000000000000000000000000a",
+  "order": 2,
+  "revision": 2,
+  "session_id": "ses-00000000000000000000000000000002",
+  "state": "delivered",
+  "text": "Then update the changelog and the version.",
+  "turn_id": "turn-0000000000000000000000000000000b"
+}

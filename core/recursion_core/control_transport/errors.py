@@ -44,3 +44,15 @@ class TransportBusy(TransportRefused, ConnectionError):
     The request was not delivered: no handler saw it. A surface can report a Stop sent
     into this as not delivered (S6 "pending"), never as stopped.
     """
+
+
+# Names the remote lane's product code imports from this module.
+__all__ = [
+    "FrameError",
+    "InsecureSocketPath",
+    "PeerNotAdmitted",
+    "PlatformNotSupported",
+    "RemoteBindRefused",
+    "TransportBusy",
+    "TransportRefused",
+]

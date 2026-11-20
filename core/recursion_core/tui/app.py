@@ -56,6 +56,7 @@ class _Output:
         self.sanitizer = OutputSanitizer()
         self.events = 0
         self.dropped = 0
+        self.finished = 0  # lines finished since the output began: a line's place, which retention does not move
         self.left = 0  # finished lines the deque no longer keeps (a transcript pane says so; Devin's thread on #405)
         self.label = f"output run={field(run_id)}: "
         # The display rows of each retained line at one width, kept beside the lines, so a frame need not wrap
@@ -93,6 +94,7 @@ class _Output:
         # beside as many new lines (round 3 of #404, Astra's required 1).
         width, self._width = self._width, -1
         self.lines.extend(done)
+        self.finished += len(done)
         if width >= 0:  # the counts stay beside the lines: the same maxlen drops the same oldest ones
             self._rows.extend(len(wrap(line, width)) for line in done)
             self._width = width
@@ -109,6 +111,7 @@ class _Output:
         # them (#404's round 3, Astra's required 1, for feed; the same order here).
         width, self._width = self._width, -1
         self.lines.extend(rows)
+        self.finished += len(rows)  # a line's place, as feed counts it (the Grok read of #404's round 8, R1)
         if width >= 0:
             self._rows.extend(len(wrap(row, width)) for row in rows)
             self._width = width
@@ -199,6 +202,7 @@ class TuiApp:
         self.help_scroll = 0  # the first help row shown in full screen
         self._keys_row = True  # the last frame had a row for the open keys (review 3 of #404, DeepSeek F6)
         self._out_rows = 10  # rows the output pane had in the last frame (a half page is half of it)
+        self._landing: tuple | None = None  # the last search's match until a frame lands it (Sol's r5 of #404, 2)
         # Burst input seen since the line was opened, or on any key of the sequence that armed a Stop
         # (review of #372, R1): the next Enter or y does not act on it, however it arrives itself.
         self._line_burst = self._stop_burst = False
@@ -267,10 +271,11 @@ class TuiApp:
 
     def _attach_view(self, run_id: str) -> None:
         """The run the output pane shows. Another run starts at its newest rows with no search: an offset or
-        a search kept from the last run would show rows that are not there (reviews 1 of #404, M2 and R4)."""
+        a search, or its landing, kept from the last run would show rows that are not there (reviews 1 of #404, M2
+        and R4; DeepSeek's round 6, F2)."""
 
         if run_id != self.attached or self.pane is not None:  # a transcript's view is not the run's
-            self.scroll, self.search = 0, ""
+            self.scroll, self.search, self._landing = 0, "", None
         self.attached = self.selected = run_id
         self.pane = None  # the output pane goes back to the run's output
 
@@ -790,16 +795,18 @@ class TuiApp:
     def _help_rows(self) -> list[str]:
         return [row for text in self.help_lines for row in wrap(text, self._pane_width())]
 
-    def _top_scroll(self) -> int:
+    def _top_scroll(self, width: int | None = None) -> int:
         """The pager's largest offset: the oldest retained display row is the pane's newest (as before, in
         rows instead of lines, so a long line's first row is reachable too)."""
 
         out = self._pane_output()
-        return max(0, out.total_rows(self._pane_width()) - 1) if out else 0
+        # ``width``: the frame's own, given as it is (0 too); None reads the pane's (DeepSeek r7 of #404, F4)
+        return max(0, out.total_rows(self._pane_width() if width is None else width) - 1) if out else 0
 
     def _page(self, action: str, burst: bool = False) -> None:
         """Pager steps in display rows (a long line's rows are each reachable; review 1 of #404, R2)."""
 
+        self._landing = None  # a pager key moves the view itself (a search sets its own again)
         half = max(1, self._out_rows // 2)
         step = {"pager.down": -1, "pager.up": 1, "pager.half_down": -half, "pager.half_up": half}.get(action)
         if step is not None:
@@ -817,12 +824,16 @@ class TuiApp:
                 self._notice("no search yet: press / in the output pager")
 
     def _search(self, pattern: str, step: int) -> None:
-        """Find ``pattern`` (case-insensitive when it has no capital letter) in the attached run's output.
+        """Find ``pattern`` (case-insensitive when it has no capital letter) in what the output pane shows (the
+        attached run's output, a transcript or the session list).
         A new search starts at the newest line shown and goes to older lines; ``n`` goes on to older ones,
-        ``N`` back to newer ones, both wrapping around. The match's last display row becomes the pager's
-        newest row."""
+        ``N`` back to newer ones, both wrapping around. The match is landed (``_land``): its line's
+        last display row becomes the pager's newest row; when the line is taller than the pane and the match
+        begins above what that shows, the row the match begins on becomes the pane's oldest. The frame that next
+        draws the pane lands it again at its own width and height (Devin's thread on #404; DeepSeek's round 5,
+        F1, F3, F5; Sol's round 5, required 1 and 2)."""
 
-        self.search = pattern
+        self.search, self._landing = pattern, None
         out = self._pane_output()
         src = out.source() if out else []
         if not pattern or not src:
@@ -844,11 +855,42 @@ class TuiApp:
         else:  # N: back to newer lines
             visit = [(shown + i) % n for i in range(1, n + 1)]
         for idx in visit:
-            if needle in (src[idx].lower() if fold else src[idx]):
-                self.scroll = sum(counts[idx + 1:])  # the match's last row is the pane's newest
+            pos = (src[idx].lower() if fold else src[idx]).find(needle)
+            if pos >= 0:
+                # The line by its place since the output began, so output that arrives before the frame (retention
+                # dropping older lines included) does not move it (Sol's round 5 of #404, required 2).
+                self._landing = (out, out.finished - len(out.lines) + idx, pos, needle, fold)
+                self._land(self._pane_width(), self._out_rows)
                 self._notice(f"search {field(pattern)}: line {idx + 1} of {n}")
                 return
         self._notice(f"search {field(pattern)}: not found in the {n} lines kept")
+
+    def _land(self, w: int, rows: int) -> None:
+        """Put the last search's match in a pane ``w`` cells wide and ``rows`` rows high. The search gives this
+        width and the last frame's rows; the frame that next draws the pane gives its own, read once, so a resize
+        on another thread meanwhile cannot land it at a width the pane is not drawn at (Sol's round 5 of #404,
+        required 2; DeepSeek's round 6, F3). The line's last
+        display row is the pane's newest; when the line is taller than the pane and the match begins above what
+        that shows, the row the match begins on is the pane's oldest (Devin's thread on #404). That row is found
+        from the match's offset in the line as searched, lowered when the search is: lowering a row gives as many
+        characters as its part of the lowered line (only a final sigma looks at its neighbours, and it stays one
+        character), so a match over a row's end, over three rows, or after characters that lower to two is found
+        on the row it begins on (Sol's round 5 of #404, required 1; DeepSeek's, F1). A line not kept as it was
+        found is not landed: the pager stays where it is."""
+
+        out, line, pos, needle, fold = self._landing
+        src = out.source() if out is self._pane_output() else []  # the pane's own: a run's, a transcript, the sessions
+        idx = line - (out.finished - len(out.lines))
+        if not 0 <= idx < len(src) or (src[idx].lower() if fold else src[idx])[pos:pos + len(needle)] != needle:
+            return
+        counts, at, end = out.counts(w), 0, 0
+        for k, row in enumerate(wrap(src[idx], w)):  # wrap drops no character
+            end += len(row.lower() if fold else row)
+            if pos < end:  # the first row reaching past the match's offset: the row it begins on
+                at = k
+                break
+        below = sum(counts[idx + 1:])
+        self.scroll = max(below, below + (counts[idx] - 1 - at) - (max(1, rows) - 1))
 
     # -- help -------------------------------------------------------------------------------------
     def show_help(self) -> None:
@@ -856,7 +898,7 @@ class TuiApp:
 
         km, lines = self.keymap, []
         for focus, title in (("runs", "run list"), ("output", "output pager (Tab from the run list)"),
-                             ("command", "command line (: or /)")):
+                             ("command", "command line (: or /)"), ("help", "this keys view")):
             lines.append(f"keys, {title}:")
             seen = set()
             for seq, action in km.view(focus).items():
@@ -1122,22 +1164,29 @@ class TuiApp:
                              "selected" if rid == self.selected else None))
             rows.extend((5, "", None) for _ in range(run_rows - len(self.runs[start:start + run_rows])))
         self._keys_row = rem >= 2  # a row for the header and one for an entry; else the prompt says so
-        if rem and self.mode == "help":  # the keys, in the output pane's place, until Esc, q or ?
+        if rem and self.mode == "help":  # the keys, in the output pane's place, until a key that closes them
             self._out_rows = rem - 1
+            scroll, leave = self._help_keys()  # the header and the prompt say the same (DeepSeek r7 of #404, F1)
             every = self._help_rows()
             self.help_scroll = min(self.help_scroll, max(0, len(every) - (rem - 1)))  # every row can be reached
             lines = every[self.help_scroll:self.help_scroll + rem - 1]
-            more = (f"; rows {self.help_scroll + 1}-{self.help_scroll + len(lines)} of {len(every)}, j/k and "
-                    f"Page Up/Down scroll" if len(every) > rem - 1 else "")
+            more = (f"; rows {self.help_scroll + 1}-{self.help_scroll + len(lines)} of {len(every)}"
+                    + (f", {scroll} scroll" if scroll else "") if len(every) > rem - 1 else "")
             if not lines:  # no row for an entry: name no range (review 2 of #404, Astra 2)
                 more = "; no room to show them here"
-            rows.append((6, f"-- keys (Esc, q or ? closes{more}; the transcript has them too) --", None))
+            rows.append((6, f"-- keys ({leave}{more}; the transcript has them too) --", None))
             rows.extend((6, "│ " + line, None) for line in lines)
             rows.extend((6, "│", None) for _ in range(rem - 1 - len(lines)))
         elif rem:
             self._out_rows = rem - 1
+            # The frame that draws the pane lands the last search's match at its own width and rows: a resize (in
+            # Loop.tick, after the keys) or a condition row since the search moved them (Sol's round 5 of #404, 2).
+            if self._landing is not None:
+                self._land(max(1, w - 2), rem - 1)  # the width and rows this frame draws the pane at
+                self._landing = None
             out = self._pane_output()
-            self.scroll = min(self.scroll, self._top_scroll())  # retention may have dropped the rows it was on
+            # retention may have dropped the rows it was on; counted at this frame's width (DeepSeek r6 of #404, F3)
+            self.scroll = min(self.scroll, self._top_scroll(max(1, w - 2)))
             pager = ""
             if self.focus == "output" or self.scroll:
                 pager = (f" [pager: {self.scroll} rows up, G follows]" if self.scroll else " [pager: following]")
@@ -1278,9 +1327,10 @@ class TuiApp:
                 return f"search older lines: {shown}"
             return f"recursion: {'/' if self.line_kind == '/' else ''}{shown}"
         if self.mode == "help":
+            scroll, leave = self._help_keys()
             if not self._keys_row:
-                return "recursion: keys open, no room to show them here (the transcript has them); Esc, q or ? closes"
-            return "recursion: keys shown; j/k and Page Up/Down scroll; Esc, q or ? closes"
+                return f"recursion: keys open, no room to show them here (the transcript has them); {leave}"
+            return f"recursion: keys shown; {scroll + ' scroll; ' if scroll else ''}{leave}"
         if self.focus == "output":
             return self._hints("output pager", (("pager.down", "pager.up", "line"), ("pager.half_down", "pager.half_up",
                                "half page"), ("pager.top", "pager.bottom", "top/newest"), ("pager.search", None, "search"),
@@ -1307,6 +1357,21 @@ class TuiApp:
             return None
         return show_sequence(min(seqs, key=lambda s: (len(s), len(show_sequence(s, self.keymap.leader)))),
                              self.keymap.leader)
+
+    def _help_keys(self) -> tuple[str, str]:
+        """The keys view's two hints, from the keymap in force: how it scrolls and what closes it ("j/k and
+        Page Up/Down" and "Esc, q or ? closes" with the default keys), so a binding file that rebinds ``q`` or adds
+        a close key is told what the keys do (the Sol sweep of #404 against master ff3f8071, F2). A keymap with no
+        close key (a consumer's own; a binding file cannot remove Esc) says so (DeepSeek r7 of #404, F3)."""
+
+        view, leader = self.keymap.view("help"), self.keymap.leader
+        closers = [show_sequence(s, leader) for s, a in view.items() if a == "help.close"]
+        closes = ", ".join(closers[:-1]) + " or " + closers[-1] if len(closers) > 1 else "".join(closers)
+        steps = [self._first_key(a, "help") for a in ("help.down", "help.up")]
+        scroll = ["/".join(k for k in steps if k)] if any(steps) else []  # one alone is named too (Grok r8 of #404)
+        if view.get(("pagedown",)) == "help.page_down" and view.get(("pageup",)) == "help.page_up":
+            scroll.append("Page Up/Down")
+        return " and ".join(scroll), (f"{closes} closes" if closes else "no key closes it")
 
     # -- notices and errors (logged; an error is never redrawn away) -----------------------------
     def _notice(self, text: str, speech: str | None = None) -> None:

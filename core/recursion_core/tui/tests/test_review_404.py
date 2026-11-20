@@ -14,7 +14,7 @@ import io
 import unittest
 
 from recursion_core.tui import term
-from recursion_core.tui.keymap import Keymap, load
+from recursion_core.tui.keymap import Keymap, load, show_sequence
 from recursion_core.tui.keys import Paste
 from recursion_core.tui.sanitize import wrap
 from recursion_core.tui.tests.test_keymap import new_app
@@ -94,15 +94,16 @@ class LeaderTest(unittest.TestCase):  # M3
 
 class EscWithASequencePendingTest(unittest.TestCase):  # M4
     def test_esc_leaves_the_line_even_with_a_sequence_pending(self) -> None:
-        app, api = new_app(load('version = 1\n[bindings.command]\n"g g" = "line.home"\n'))
+        # A key that types text may not begin a binding on the line (Devin's thread on #404): F5 does not.
+        app, api = new_app(load('version = 1\n[bindings.command]\n"f5 f5" = "line.home"\n'))
         app.press(":")
         for ch in "ab":
             app.press(ch)
-        app.press("g")
-        self.assertEqual(app.keymap.pending, ("g",))
+        app.press("f5")
+        self.assertEqual(app.keymap.pending, ("f5",))
         app.press("esc")
         self.assertEqual((app.mode, app.line, app.keymap.pending), ("keys", "", ()))
-        self.assertIn("g cancelled; nothing sent", app.notice)
+        self.assertIn(f"{show_sequence(('f5',))} cancelled; nothing sent", app.notice)
         self.assertEqual(api.calls, [])
 
     def test_esc_leaves_the_help_even_with_a_sequence_pending(self) -> None:

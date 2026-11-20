@@ -16,13 +16,16 @@ global ``<leader> p`` plugin binding does not reach the command line. The Stop c
 of the keymap: ``y`` alone confirms and any other key cancels.
 
 No timers. Within one context no binding may be a prefix of another, so a sequence is complete, still
-pending, or not bound, decided by the keys alone. A pending sequence waits for the next key; Esc cancels it,
+pending, or not bound, decided by the keys alone. Binding is not serialised: two threads that bind into one
+keymap at once are the caller's to order (each client keeps its own pending sequence, ``for_client``; the
+binding tables are shared). A pending sequence waits for the next key; Esc cancels it,
 and then does what Esc does where it was pressed (leaves the line, the help or the pager).
 A key that breaks a leader sequence is consumed (the user meant a leader command); a key that breaks any
 other prefix (``ctrl+d`` then ``j``) is read again on its own.
 
-The binding file (TOML, ``version = 1``) overrides the defaults per sequence; the value ``"none"`` removes a
-default. A ``[safety]`` table states rules that a binding file can only make stricter: it may add keys to
+The binding file (TOML, ``version = 1``) overrides the defaults per sequence; the value ``"none"`` removes
+that context's binding, a default or a file's own (in ``runs`` and ``output`` a global binding of the same keys
+then applies). A ``[safety]`` table states rules that a binding file can only make stricter: it may add keys to
 ``never_bind``, and may restate the fixed rules as ``true``, never ``false``. The fixed rules:
 
 - ``ctrl+y`` is bound nowhere and ``ctrl+p`` nowhere globally (no YOLO key, no global palette over
@@ -32,7 +35,8 @@ default. A ``[safety]`` table states rules that a binding file can only make str
 - no action approves anything: approvals are answered by number and Enter, never by a key binding;
 - ``esc`` is bound to nothing that sends a request; Esc cancels local UI and never stops or interrupts a run,
   and no binding file takes that cancel away (``[safety] never_bind`` cannot hold Esc);
-- plugin actions (``plugin.<plugin>.<command>``) are bound only under ``<leader> p``, and only they are;
+- plugin actions (``plugin.<plugin>.<command>``) are bound only under ``<leader> p``, and only where a leader
+  sequence is typed (``global``, ``runs``, ``output``); only they are bound under ``<leader> p``;
 - the Stop action opens the confirmation; no binding sends ``run.stop`` by itself.
 
 A binding file that cannot be read, or whose ``[safety]`` loosens a rule, is not used at all; one bad binding
@@ -46,6 +50,8 @@ import re
 import tomllib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
+
+from recursion_core.tui.sanitize import visible
 
 LEADER = "ctrl+x"
 CONTEXTS = ("global", "runs", "output", "command", "help")
@@ -164,6 +170,17 @@ DEFAULT_KEYS = frozenset(key for context in LEADER_CONTEXTS for seq in DEFAULTS[
                          for key in seq.split() if key != "<leader>")
 
 
+def _sendable(ch: str) -> bool:
+    """One character a terminal can send and the decoder gives as a key: UTF-8 (a lone surrogate is neither sent
+    nor read; DeepSeek's round 6 of #404, F4) and visible."""
+
+    try:
+        ch.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return visible(ch)
+
+
 def key_name(token: str) -> str | None:
     """The name ``keys.KeyDecoder`` gives the key that ``token`` names (``space`` is " ", ``ctrl+i`` is
     ``tab``), or None when no key a terminal sends is read as it (review 2 of #404, Astra 4)."""
@@ -172,7 +189,7 @@ def key_name(token: str) -> str | None:
         return None
     token = " " if token == "space" else ALIASES.get(token, token)
     if len(token) == 1:
-        return token if token.isprintable() else None
+        return token if _sendable(token) else None  # what the decoder gives (Devin's thread on #404: U+034F)
     if token in _CTRL or token in _SINGLE or token in _NAMED or token == "shift+tab":
         return token
     if any(token.startswith(mods) and token[len(mods):] in _NAMED for mods in _MODIFIER_SETS):
@@ -180,7 +197,7 @@ def key_name(token: str) -> str | None:
     if token.startswith("ctrl+alt+") and "ctrl+" + token[9:] in _CTRL:
         return token
     rest = token[4:] if token.startswith("alt+") else ""
-    return token if len(rest) == 1 and rest.isprintable() or rest in _SINGLE[:3] else None
+    return token if len(rest) == 1 and _sendable(rest) or rest in _SINGLE[:3] else None  # DeepSeek r5, r6 of #404
 
 
 def is_key_name(token: str) -> bool:
@@ -305,11 +322,15 @@ class Keymap:
     def _refusal(self, context: str, seq: tuple[str, ...], action: str) -> str | None:
         if seq == (self.leader,) and context in LEADER_CONTEXTS:  # alone it would shadow the leader (#404, M3)
             return "the leader is not bound alone; it starts the leader's sequences"
+        if context == "command" and len(seq[0]) == 1:  # a typed key would be lost from the line (Devin, #404)
+            return f"{show_sequence(seq[:1], self.leader)} types text on the command line; no binding there begins with it"
         if "esc" in seq and (seq != ("esc",) or ESC_CANCELS.get(context) != action):  # review 1 of #404, R1
             return ("Esc never sends a request or arms anything: it is bound only alone, to the cancel of its "
                     "context (line.cancel, help.close, focus.runs)")
         under_p = len(seq) >= 2 and seq[:2] == (self.leader, "p")
         if action.startswith(PLUGIN_PREFIX):
+            if context not in LEADER_CONTEXTS:  # the line and the keys view never see a leader sequence (Devin, #404)
+                return f"plugin actions are bound only where a leader sequence is typed ({', '.join(LEADER_CONTEXTS)})"
             if not under_p:
                 return "plugin actions are bound only under <leader> p"
             plugin_id, _, command = action[len(PLUGIN_PREFIX):].rpartition(".")

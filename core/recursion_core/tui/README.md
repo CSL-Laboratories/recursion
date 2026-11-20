@@ -123,11 +123,13 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
 - The binding file: `$XDG_CONFIG_HOME/recursion/tui-keys.toml` (or `~/.config/...`), or `--keys FILE`;
   `--print-keys` prints the defaults to start from. `version = 1`, an optional `leader`, a table per
   context under `[bindings]` (a key sequence written with spaces, `<leader>` for the leader, the action
-  id as the value, `"none"` to remove a default), and `[safety]`, which can only make the fixed rules
+  id as the value, `"none"` to remove that context's binding: in `runs` and `output` a global binding of the same keys
+  then applies, as `q` quits once `output`'s own `q` is removed, and `[safety] never_bind` takes a key away
+  everywhere), and `[safety]`, which can only make the fixed rules
   stricter: it may add keys to `never_bind` and restate `confirm_stop`, `esc_never_sends`,
   `plugins_under_leader_p` and `no_key_approves` as `true`. Plugin actions (`plugin.<plugin_id>.<command>`,
   in SPINE's names: api.v1's `plugin_id`, which may hold dots, and `name`, which holds none) are bound only
-  under `<leader> p`; until a plugin host exists, pressing one says so and sends nothing.
+  under `<leader> p`, and only where a leader sequence is typed (global, runs, output); until a plugin host exists, pressing one says so and sends nothing.
   A key name means the key a terminal sends: `ctrl+h` is Backspace, `ctrl+i` is Tab, `ctrl+j` and `ctrl+m`
   are Enter (and `ctrl+alt+` likewise), so a leader written `ctrl+i` is judged as Tab; a name no key arrives
   as (`ctrl+enter`, `alt+esc`) is refused. Alt+Space is written `alt+space`. A binding for the same keys as a

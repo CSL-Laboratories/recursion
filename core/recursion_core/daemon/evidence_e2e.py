@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import errno
 import hashlib
 import http.client
 import json
@@ -160,22 +161,41 @@ class Harness:
         return dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
 
     def cgroup_pids(self, group):
-        """Every pid in the cgroup subtree, or None when the cgroup directory does not exist."""
+        """Every pid in the cgroup subtree, or None when the cgroup directory does not exist.
+
+        A directory or cgroup.procs that cannot be read is not an empty subtree:
+        os.walk would skip it and the tree would be booked clean. ENOENT during
+        the walk is a level that vanished; any other read error is raised.
+        """
         root = Path('/sys/fs/cgroup') / group.lstrip('/')
         if not root.is_dir():
             return None
         pids = []
-        for directory, _, files in os.walk(root):
-            if 'cgroup.procs' in files:
-                pids += [int(p) for p in (Path(directory) / 'cgroup.procs').read_text().split()]
+
+        def unreadable(err):
+            raise err
+
+        for directory, _, files in os.walk(root, onerror=unreadable):
+            if 'cgroup.procs' not in files:
+                continue
+            try:
+                text = (Path(directory) / 'cgroup.procs').read_text()
+            except OSError as exc:
+                if exc.errno in (errno.ENOENT, errno.ESRCH):
+                    continue
+                raise
+            pids.extend(int(p) for p in text.split())
         return sorted(pids)
 
     @staticmethod
     def pid_exists(pid):
+        """True when the pid is alive. Only ENOENT and ESRCH mean it is gone."""
         try:
             state = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0]
-        except OSError:
-            return False
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ESRCH):
+                return False
+            raise
         return state not in ('Z', 'X')
 
     def start_daemon(self):

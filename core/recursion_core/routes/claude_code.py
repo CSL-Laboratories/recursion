@@ -1,6 +1,8 @@
 """Claude Code adapter: stream-json over stdio (CSL-797, candidate). See README.md.
 
-Launch: ``claude -p --input-format stream-json --output-format stream-json --verbose --model <m>``.
+Launch: ``claude -p --input-format stream-json --output-format stream-json --verbose
+--permission-mode dontAsk --permission-prompts none --model <m>``. The mode is the fail-closed
+value unless the route names another; a reported mode that differs ends the run refused.
 One user message goes in as a JSONL line, stdin is closed, and stdout is read until the ``result``
 envelope. The Claude subscription is used only here (Q12); other harnesses go through
 ``profile_route`` and ``subscription_routes``.
@@ -29,7 +31,7 @@ from __future__ import annotations
 import json
 
 from recursion_core.routes import contract as c
-from recursion_core.routes.base import RouteAdapter, scalar
+from recursion_core.routes.base import RouteAdapter, _Protocol, scalar
 from recursion_core.routes.launch import child_env
 
 # Lucas, Nov 7 ~6:34pm PST (correction to the Nov 8 briefing; replaces "refuse --bare, clear apiKeyHelper,
@@ -58,11 +60,13 @@ API_KEY_DROP_ENV = ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_C
 # parent" (its own key comes from custody instead).
 CLAUDE_CREDENTIAL_ENV = API_KEY_DROP_ENV + ("ANTHROPIC_API_KEY",)
 API_KEY_HELPER_STATES = ("absent", "present")
-# Passthrough route: the method the user picked gets its own variables for this run, and nothing else from
-# the daemon's environment (no other engine's key, no stray ANTHROPIC_API_KEY that would move the run to the
-# API meter; PRODUCT.md 3.4 S8, 11.5). Names are from Claude Code's public docs (code.claude.com/docs/en/
-# amazon-bedrock, google-vertex-ai, microsoft-foundry, llm-gateway; retrieved 2026-11-09), not from engine
-# source. A method not listed here is refused, never widened to the whole environment.
+# Passthrough route (refused before launch until credential custody exists: PASSTHROUGH_REFUSED below; these
+# tables are the rules passthrough_env keeps for that day): the method the user picked gets its own variables
+# for this run, and nothing else from the daemon's environment (no other engine's key, no stray
+# ANTHROPIC_API_KEY that would move the run to the API meter; PRODUCT.md 3.4 S8, 11.5). Names are from Claude
+# Code's public docs (code.claude.com/docs/en/amazon-bedrock, google-vertex-ai, microsoft-foundry, llm-gateway;
+# retrieved 2026-11-09), not from engine source. A method not listed here is refused, never widened to the whole
+# environment.
 PASSTHROUGH_METHOD_ENV = {
     "bedrock": ("CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE", "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "AWS_CONFIG_FILE",
@@ -107,6 +111,127 @@ def _method_var_missing(name: str, value: str | None) -> bool:
     return value.lower() in ("", "0", "false")  # a gateway URL or token: set, and not a placeholder off value
 
 
+# Every passthrough route is refused before launch, by the adapter itself and not only by the daemon (R3-8).
+# Lucas, Nov 12, decision sheet A2 ("Yes, as recommended"): "The daemon refuses routes with key_source:
+# api_key_helper and cloud passthrough routes until credential custody is built"; A8 ("Yes, all four"): the
+# gateway passthrough method stays refused with the cloud ones. The words are the daemon's own refusal
+# (daemon/control_adapter.py, route_unsupported), so both layers say the same thing.
+PASSTHROUGH_REFUSED = "no credential custody: a passthrough route is not launched"
+
+
+def passthrough_env(parent_env: dict[str, str], method: object) -> dict[str, str]:
+    """The environment a passthrough route's method would get. NO launch path calls this.
+
+    Every passthrough route is refused before launch until credential custody exists (A2, A8, above), so
+    this function only keeps the method rules (which names, which switch values) tested for that day. Before
+    a launch path calls it again, R3-8's open point has to be settled: a ``gateway`` method still receives
+    the user's ``CLAUDE_CODE_OAUTH_TOKEN`` and an ``ANTHROPIC_BASE_URL`` that may carry credentials, and the
+    daemon's child-environment policy drops the cloud methods' variables. Raises ``RouteError(LAUNCH_REFUSED)``
+    for a method with no listed variables or whose own switch or credential is unset.
+    """
+
+    names = PASSTHROUGH_METHOD_ENV.get(method) if isinstance(method, str) else None
+    if names is None:
+        raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {scalar(method)} has no listed variables")
+    missing = [n for n in PASSTHROUGH_METHOD_REQUIRED[method] if _method_var_missing(n, parent_env.get(n))]
+    if missing:
+        raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {method} needs {', '.join(missing)} "
+                           "set; without it the run would use the sign-in instead")
+    prefixes = PASSTHROUGH_METHOD_PREFIX.get(method, ())
+    names += tuple(sorted(n for n in parent_env if prefixes and n.startswith(prefixes)))
+    env = child_env(parent_env, extra_names=USER_KEEP_ENV + names)
+    for name in list(env):
+        if name.startswith("CLAUDE_CODE_USE_"):
+            env[name] = env[name].strip().lower()
+    return env
+
+
+# Claude Code's own permission modes, as `claude --help` lists them (recorded in eval/arms.py at 2.1.318).
+# The fail-closed pair is PRODUCT.md 11.6: `--permission-mode dontAsk --permission-prompts none`.
+# bypassPermissions is that product line's full-access profile, and only when this run acknowledges it.
+PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan")
+FAIL_CLOSED_PERMISSION_MODE = "dontAsk"
+FAIL_CLOSED_PERMISSION_PROMPTS = "none"
+FULL_ACCESS_MODE = "bypassPermissions"
+FULL_ACCESS_ACK = "full_access"
+# The permission bridge is a PreToolUse hook. Init confirms it only when the hook was applied and a
+# hook failure denies the tool. Anything else, when the route asks for the bridge, refuses the run.
+PERMISSION_BRIDGE_HOOK = "PreToolUse"
+_DENIAL_TYPES = frozenset({"permission_denial", "permission_denied"})
+_DENIAL_SUBTYPES = frozenset({"permission_denial", "permission_denied", "hook_denied"})
+_ERROR_SUBTYPES = frozenset({"error", "hook_error"})
+
+
+def _permission_mode(route: dict) -> str:
+    """The mode this launch passes. Omitted means the fail-closed value, named on the argv anyway."""
+
+    mode = route.get("permission_mode", FAIL_CLOSED_PERMISSION_MODE)
+    if not isinstance(mode, str) or mode not in PERMISSION_MODES:
+        raise c.RouteError(c.REQUEST_INVALID, "route.permission_mode")
+    if mode == FULL_ACCESS_MODE and route.get("permission_ack") != FULL_ACCESS_ACK:
+        raise c.RouteError(c.LAUNCH_REFUSED, "bypassPermissions needs a full-access profile acknowledged for this run")
+    return mode
+
+
+def _bridge_requested(route: dict) -> bool:
+    """True when the route asks for the permission bridge. Absent, or an explicit false, does not."""
+
+    if "permission_bridge" not in route:
+        return False
+    return route["permission_bridge"] is not False
+
+
+def _bridge_confirmed(msg: dict) -> bool:
+    return msg.get("hooks_applied") is True and msg.get("hook_on_failure_supported") is True
+
+
+def _init_refusal(msg: dict, passed: str, bridge: bool) -> str | None:
+    """A system/init that reports a different mode, or a bridge init that is not confirmed.
+
+    An init that omits ``permissionMode`` is not a reported disagreement: streams that predate the
+    field keep their result. A present value that is not the mode this launch passed refuses the run.
+    The detail names that reported value only when it is one of ``PERMISSION_MODES``. Any other
+    reported value is the word ``unknown``, so text the engine reported is not copied into the result.
+    """
+
+    if "permissionMode" in msg and msg.get("permissionMode") != passed:
+        reported = msg.get("permissionMode")
+        shown = reported if reported in PERMISSION_MODES else "unknown"
+        return f"permission mode {shown} is not the mode passed ({passed})"
+    if bridge and not _bridge_confirmed(msg):
+        return f"permission bridge {PERMISSION_BRIDGE_HOOK} is not confirmed at init"
+    return None
+
+
+def _stream_fault(msg: dict) -> str | None:
+    """A typed permission denial or error event, or None. Assistant and user payload is not read.
+
+    A non-string ``type`` or ``subtype`` is not used as a set member. It is a protocol fault, raised
+    so the run loop fences the process and returns a typed result.
+    """
+
+    kind, sub = msg.get("type"), msg.get("subtype")
+    if (kind is not None and not isinstance(kind, str)) or (sub is not None and not isinstance(sub, str)):
+        raise _Protocol("stream field is not a string")
+    if kind in ("assistant", "user"):
+        return None
+    if kind in _DENIAL_TYPES or sub in _DENIAL_SUBTYPES:
+        return "denial"
+    denials = msg.get("permission_denials")
+    if "permission_denials" in msg and denials not in (None, [], ""):
+        return "denial"
+    if kind == "error" or (kind == "system" and sub in _ERROR_SUBTYPES):
+        return "error"
+    return None
+
+
+def _turn_blocks_success(msg: dict, events: list) -> bool:
+    if any(isinstance(event, dict) and event.get("kind") in ("denial", "error") for event in events):
+        return True
+    denials = msg.get("permission_denials")
+    return "permission_denials" in msg and denials not in (None, [], "")
+
+
 class ClaudeCodeAdapter(RouteAdapter):
     engine = "claude_code"
 
@@ -130,8 +255,14 @@ class ClaudeCodeAdapter(RouteAdapter):
         if kind == "subscription":
             self._check_api_key_helper(route)
         # --verbose: stream-json output in print mode is documented to need it (unverified on this box).
+        # The model stays last. Every launch names its permission mode; the fail-closed value also
+        # sets permission-prompts to none (PRODUCT.md 11.6).
+        mode = _permission_mode(route)
+        prompts = (["--permission-prompts", FAIL_CLOSED_PERMISSION_PROMPTS]
+                   if mode == FAIL_CLOSED_PERMISSION_MODE else [])
         return [self._binary, *(["--bare"] if bare else []), "-p", "--input-format", "stream-json",
-                "--output-format", "stream-json", "--verbose", "--model", route["model"]]
+                "--output-format", "stream-json", "--verbose", "--permission-mode", mode, *prompts,
+                "--model", route["model"]]
 
     def env(self, request: dict) -> dict[str, str]:
         conn = request["route"]["connection"]
@@ -146,25 +277,9 @@ class ClaudeCodeAdapter(RouteAdapter):
             cred = self.credential(request, ("ANTHROPIC_API_KEY",))
             return child_env(self._parent_env, extra_names=USER_KEEP_ENV, never=never, credential=cred)
         if kind == "passthrough":
-            # Cloud providers (Bedrock, Vertex, Foundry) or a gateway the user picked: that method's own
-            # variables pass through for this run, with the user's own sign-in and config location.
-            # CLAUDE_CODE_USE_* is copied as its stripped lowercase spelling so the child sees 1/true/yes/on.
-            method = conn.get("method")
-            names = PASSTHROUGH_METHOD_ENV.get(method) if isinstance(method, str) else None
-            if names is None:
-                raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {scalar(method)} has no listed variables")
-            missing = [n for n in PASSTHROUGH_METHOD_REQUIRED[method]
-                       if _method_var_missing(n, self._parent_env.get(n))]
-            if missing:
-                raise c.RouteError(c.LAUNCH_REFUSED, f"passthrough method {method} needs {', '.join(missing)} "
-                                   "set; without it the run would use the sign-in instead")
-            prefixes = PASSTHROUGH_METHOD_PREFIX.get(method, ())
-            names += tuple(sorted(n for n in self._parent_env if prefixes and n.startswith(prefixes)))
-            env = child_env(self._parent_env, extra_names=USER_KEEP_ENV + names)
-            for name in list(env):
-                if name.startswith("CLAUDE_CODE_USE_"):
-                    env[name] = env[name].strip().lower()
-            return env
+            # Cloud providers (Bedrock, Vertex, Foundry) and a gateway: refused for every method, before any
+            # variable is read (A2, A8; see PASSTHROUGH_REFUSED). passthrough_env keeps the method rules.
+            raise c.RouteError(c.LAUNCH_REFUSED, PASSTHROUGH_REFUSED)
         raise c.RouteError(c.LAUNCH_REFUSED, f"connection kind {kind} not supported for claude_code")
 
     @staticmethod
@@ -174,14 +289,15 @@ class ClaudeCodeAdapter(RouteAdapter):
         The surface reports whether the user's settings carry one (``route.api_key_helper``); this adapter
         never opens the settings. Present, or not reported, is a typed question, not a silent override.
         The user answers with ``route.billing_ack = "api_key_helper"`` (run anyway, billing their API key)
-        or by picking the API-key route.
+        or by picking the API-key route. The question offers that answer in both cases, so it works in both
+        (R3-13 part 1): an acknowledgment given while the state was not reported runs the route too.
         """
         state = route.get("api_key_helper")
         if state is not None and state not in API_KEY_HELPER_STATES:
             raise c.RouteError(c.REQUEST_INVALID, "route.api_key_helper")
         if state == "absent":
             return
-        if state == "present" and route.get("billing_ack") == "api_key_helper":
+        if route.get("billing_ack") == "api_key_helper":
             return
         if state == "present":
             why = ("your Claude Code settings carry an apiKeyHelper, which outranks the sign-in: "
@@ -194,6 +310,16 @@ class ClaudeCodeAdapter(RouteAdapter):
 
     def drive(self, process, request, deadline_at, events):
         rid, model = request["request_id"], request["route"]["model"]
+        route = request["route"]
+        try:
+            passed = _permission_mode(route)
+        except c.RouteError as err:
+            # drive can be entered only after argv, which already refused a bad mode. A request that
+            # changed in between still ends as a typed result, and the prompt is not written.
+            process.fence("permission_mode")
+            return c.result(rid, err.code, events=events, detail=err.detail)
+        bridge = _bridge_requested(route)
+        bridge_ok = not bridge
         process.send(json.dumps({"type": "user", "message": {"role": "user", "content": [
             {"type": "text", "text": request["prompt"]}]}}))
         process.close_stdin()
@@ -205,7 +331,14 @@ class ClaudeCodeAdapter(RouteAdapter):
                     return c.result(rid, c.PLAN_LIMIT, limit=limit, events=events, detail="exit after limit")
                 return c.result(rid, c.ENGINE_EXITED, events=events, detail="stdout closed before result")
             kind, sub = msg.get("type"), msg.get("subtype")
-            if kind == "system" and sub == "api_retry":
+            if kind == "system" and sub == "init":
+                refusal = _init_refusal(msg, passed, bridge)
+                if refusal is not None:
+                    process.fence("permission_mode" if "permission mode" in refusal else "permission_bridge")
+                    return c.result(rid, c.LAUNCH_REFUSED, events=events, detail=refusal)
+                if bridge:
+                    bridge_ok = True
+            elif kind == "system" and sub == "api_retry":
                 events.append(c.event("retry", "claude.system.api_retry", {
                     k: scalar(msg.get(k)) for k in ("attempt", "max_retries", "retry_delay_ms", "error_status", "error")}))
                 # Not booked. A retry Claude is still attempting is not a rejected plan limit, even when
@@ -215,7 +348,15 @@ class ClaudeCodeAdapter(RouteAdapter):
                 events.append(c.event("usage", "claude.rate_limit_event", _info_fields(info)))
                 limit = _rejected(info, "claude.rate_limit_event", self.vendor_reset) or limit
             elif kind == "result":
+                if bridge and not bridge_ok:
+                    process.fence("permission_bridge")
+                    return c.result(rid, c.LAUNCH_REFUSED, events=events,
+                                    detail=f"permission bridge {PERMISSION_BRIDGE_HOOK} is not confirmed at init")
                 return _classify_result(rid, msg, limit, events, model, self.vendor_reset)
+            else:
+                fault = _stream_fault(msg)
+                if fault is not None:
+                    events.append(c.event(fault, "claude.stream", {"type": scalar(kind), "subtype": scalar(sub)}))
             # assistant / user / other system envelopes: model payload or progress, never classified
 
 
@@ -245,9 +386,13 @@ def _rate_limit_info(params: object, source: str, translate) -> dict | None:
 
 
 def _classify_result(rid: str, msg: dict, limit: dict | None, events: list, model: str, translate) -> dict:
-    if msg.get("is_error") is not True and msg.get("subtype") == "success":
+    # Success needs subtype success and no permission denial or error event in the same turn.
+    # A denial carried on the result itself counts: the final line must not hide it.
+    if msg.get("is_error") is not True and msg.get("subtype") == "success" and not _turn_blocks_success(msg, events):
         text = msg.get("result")
         return c.result(rid, None, text=text if isinstance(text, str) else "", events=events)
+    if msg.get("is_error") is not True and msg.get("subtype") == "success":
+        return c.result(rid, c.ENGINE_ERROR, events=events, detail="permission denial or error in the turn")
     limit = _rate_limit_info(msg.get("api_error_params"), "claude.result.rate_limit_info", translate) or limit
     if limit is None and msg.get("error") == "rate_limit":
         limit = c.limit_signal("connection", "claude.result.error")

@@ -13,10 +13,11 @@ from recursion_core.routes import contract as c
 from recursion_core.routes.breaker import ConnectionBreaker
 from recursion_core.routes.codex import CodexAdapter, check_daemon_config, daemon_config
 from recursion_core.routes.base import Deadline
+from recursion_core.routes.host import PLATFORM_UNSUPPORTED, platform_supported
 from recursion_core.routes.launch import GilBuildRefused, child_env, require_free_threaded
 from recursion_core.routes.profile_route import profile_adapters
 from recursion_core.routes.service import RouteService
-from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, codex_script, request
+from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher, codex_script, request, runs_adapter
 from recursion_core.subscription_routes import WrapperInstall, measure_package_pin
 
 PKG = pathlib.Path(__file__).resolve().parents[1]
@@ -26,6 +27,7 @@ POSIX_ONLY = ("POSIX-only: the route home owner check needs os.geteuid; subscrip
 
 
 class CodexUpdaterTest(unittest.TestCase):
+    @runs_adapter
     def test_stdio_worker_never_spawns_an_updater_over_a_simulated_hour(self) -> None:
         clock = FakeClock()
         launcher = FakeLauncher(lambda argv, env: codex_script("ok"), clock)
@@ -117,8 +119,11 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
                  ("opencode", {"provider": "claude-agent", "auth": "subscription", "credential_env": "ANTHROPIC_API_KEY"})]
         for engine, profile in cases:
             res = self.service.handle(self.req(engine, profile))
-            self.assertEqual(res["code"], c.SUBSCRIPTION_ROUTE_REFUSED, engine)
-            self.assertEqual(res["detail"], "claude_subscription_provider")
+            if platform_supported():
+                self.assertEqual(res["code"], c.SUBSCRIPTION_ROUTE_REFUSED, engine)
+                self.assertEqual(res["detail"], "claude_subscription_provider")
+            else:
+                self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, PLATFORM_UNSUPPORTED), engine)
         self.assertEqual(self.launcher.calls, [])
 
     @unittest.skipIf(NOT_POSIX, POSIX_ONLY)
@@ -154,7 +159,11 @@ class SubscriptionRouteReuseTest(unittest.TestCase):
             req = request(engine=engine, model="m", kind="api_key", conn_id="no-such-key",
                           credential_env="OPENAI_API_KEY", profile=prof, home=self.home)
             res = self.service.handle(req)
-            self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, "no credential for no-such-key"), engine)
+            if platform_supported():
+                self.assertEqual((res["code"], res["detail"]),
+                                 (c.LAUNCH_REFUSED, "no credential for no-such-key"), engine)
+            else:
+                self.assertEqual((res["code"], res["detail"]), (c.LAUNCH_REFUSED, PLATFORM_UNSUPPORTED), engine)
         self.assertEqual(self.launcher.calls, [])
 
     def test_unlisted_or_mismatched_credential_env_refuses_before_custody(self) -> None:

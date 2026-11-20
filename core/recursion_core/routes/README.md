@@ -10,7 +10,12 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
 - `contract.py`: the route contract. Requests, results, events and limit signals are plain dicts that
   round-trip through JSON; every refusal or failure has a typed code (`CODES`). Surfaces and the daemon
   call `RouteService.handle(request) -> result` and nothing else, so the tests drive behaviour through
-  the protocol and a later port can reuse them.
+  the protocol and a later port can reuse them. The engine a route names is checked against
+  `engine_names()` at the time of the call: today's five (`BASE_ENGINES`) plus the engines the
+  composition registered in its engine table (seam S3). The table belongs to one composition, so it
+  reaches the check through the route service: `RouteService(..., engines=<table>)`, or, by default, the
+  engines the service has an adapter for (the daemon builds those from the same table). A name that is
+  only in S3's catalogue stays `engine_unknown`; with nothing registered the answer is the five, as before.
 - `claude_code.py`: `ClaudeCodeAdapter`, `claude -p --input-format stream-json --output-format stream-json`.
   Reads typed limit signals only: `rate_limit_event` with `status: rejected`,
   `api_error_params.rate_limit_info` on an error `result`, and a typed `error: "rate_limit"`.
@@ -23,17 +28,61 @@ engine), 11.2 (breaker, plan limits), Q12 (Claude subscription only inside Claud
 - `breaker.py`: `ConnectionBreaker`, keyed by the connection a route is billed through
   (`subscription:<login>` or `api_key:<key id>`), per model only when the typed signal names a per-model
   vendor bucket. Never keyed by engine id or tenant.
-- `profile_route.py`: Pi, Hermes and OpenCode routes; every launch goes through
-  `recursion_core.subscription_routes.guard_then_spawn` (B3, CSL-786), so a Claude-subscription provider is
-  refused as `subscription_route_refused` before the launcher is called. Pi and Hermes also pass
+- `profile_route.py`: Pi, Hermes and OpenCode routes. An unsupported host is refused at this
+  adapter before a credential or the guard (`launch_refused`, `platform_unsupported`). Every launch
+  that passes that check goes through `recursion_core.subscription_routes.guard_then_spawn` (B3, CSL-786),
+  so a Claude-subscription provider is refused as `subscription_route_refused` before the launcher is
+  called. Pi and Hermes also pass
   `route.wrapper` (the measured launcher and package pin); without it the launch is
   `wrapper_pin_missing`. The launcher receives the env `check_route` accepted.
 - `launch.py`: the injected launcher / process interface, `require_free_threaded()` (refuses a GIL build;
   the daemon calls it before starting processes and after each plugin load) and `child_env()` (explicit
   env from an allowlist; never `os.environ`).
+- `driver.py`: driver contract version 2 (lane SPINE's `driver.v2` schema, draft 4, in #368). A driver
+  declares its engine, eleven flags (`multi_turn`, `mid_turn_input`, `interrupt`, `resume`, `fork`,
+  `permission_bridge`, `typed_limits`, `usage`, `observes_subagents`, `cancels_subagents`,
+  `usage_complete`) and `input_ack`. The published record is the schema's eight (`multi_turn` through
+  `usage`); `observes_subagents`, `cancels_subagents` and `usage_complete` stay on the driver and the
+  route label and are not copied into the record. `Driver` is the gate every engine's driver
+  subclasses: a call whose flag is false raises `DriverRefused` (`unsupported`, the call, the flag) before
+  the subclass is asked, so no process starts and no byte reaches the engine; a malformed call or one the
+  worker's state does not allow (closed input, a reused turn or delivery id, an interrupt of a turn not in
+  progress) is refused the same way. `parse` returns only the event types a driver may draft, with exactly
+  their keys, and an `input.accepted` only when it matches a delivery this worker wrote, with the turn and
+  the `how` of that write; anything else is dropped and counted. `one_turn(engine)` declares today's path,
+  `RouteAdapter.run`, with every flag false. No engine has a driver yet (later slices: Claude Code's).
+  A handle's writes reach the engine in the order the gate reserved them, close and interrupt included: a
+  per-handle write lock is held from the state check through the subclass's write, while the state lock
+  stays free for the reader in `parse`. `start` checks the nested route and workspace (common.v1) before
+  the subclass starts anything, and `parse` checks every payload value and relation of event.v1 (enums,
+  identifiers, digests, timestamps as real instants, `text` xor `output_ref`, `model` exactly when a limit's
+  scope is `model`), against #368 as pinned at `c77aa2e0`, in plain code. The calls, for the engine lanes:
+  `start(session, workspace, env) -> Handle` (`session` is `{session_id, run_id, route}`),
+  `resume(engine_session_id, session, workspace, env) -> Handle`, `send(handle, input)`,
+  `interrupt(handle, turn_id)`, `fork(engine_session_id, at) -> engine_session_id`,
+  `parse(handle, line) -> [draft]`; a subclass implements `_start`, `_send`, `_interrupt`, `_fork` and
+  `_parse`, calls `turn_ended(handle, turn_id)` at the engine's end-of-turn sign and
+  `handle.set_engine_session_id(id)` when the engine reports its conversation id. PROVISIONAL, by the
+  Liaison's ruling of Nov 14 (5:01 PM): the start and resume forms follow the frozen brief rather than
+  driver.v2's one start record (the subclass still receives that record), and a user_message sent into a
+  turn in progress, on a driver without `mid_turn_input`, answers the brief's `busy` (`DriverBusy`, a
+  `DriverRefused`) rather than driver.v2's `unsupported`. Which stands is Lucas's; consumers must not rely
+  on either yet.
+- `host.py`: `platform_supported()`, the one place in this package that reads `os` (`os.name` and whether
+  `os.geteuid` exists, the same test as `child_env` and `subscription_routes`). The adapter modules still
+  never import `os`.
 
 ## Rules it enforces
 
+- Windows refuses at the shared adapter boundary (Lucas, Nov 12, decision sheet D9: "Windows refuses
+  uniformly at the shared adapter boundary, before any path or connector is looked at"; R3-7).
+  `RouteAdapter.run`, which the Claude Code and Codex adapters share, answers `launch_refused` with detail
+  `platform_unsupported` before it builds an argv or an environment, asks for a credential or calls the
+  launcher. The profile routes keep their own refusal, `subscription_route_refused` with the same detail,
+  from `subscription_routes`. Route tests that run an adapter through a fake launcher carry
+  `fakes.runs_adapter`, which for the test's duration lets the shared boundary's host check pass, so their
+  protocol and environment assertions run on Windows too, against fakes; `tests/test_r3_finding_7.py`
+  asserts the refusal itself with the real host check.
 - Only a typed limit signal opens a connection; it fences every tenant on that connection and no other
   connection. Text inside the model's payload (assistant/user content, Codex agent messages) is never
   inspected. Vague quota-sounding error text is a `short_fault`: one model, one tenant, 60 s (grill Q23).
@@ -76,12 +125,21 @@ run's environment changes:
   untouched; `/login` is the engine's. If the user's settings carry an `apiKeyHelper` (reported by the
   surface as `route.api_key_helper`; this adapter never opens settings), the result is
   `route_choice_required`: the run would bill their API key, and they pick (`billing_ack`, the API-key
-  route, or cancel). Not reported is the same question.
+  route, or cancel). Not reported is the same question, and the same answer, `billing_ack: "api_key_helper"`,
+  runs it (R3-13 part 1: the question offered that answer and the adapter then refused it).
 - `api_key`: the user's own key from custody (`ANTHROPIC_API_KEY`) or their own `apiKeyHelper`
   (`key_source: "api_key_helper"`, no key added); `--bare` is allowed (`route.bare`). The user's
   `CLAUDE_CODE_OAUTH_TOKEN` still passes through; the key outranks it by the engine's own precedence.
 - `passthrough` (a cloud provider or gateway the user picks, `connection.method`: `bedrock`, `vertex`,
-  `foundry` or `gateway`): that method's own variables (names from Claude Code's public docs) pass through
+  `foundry` or `gateway`): refused before launch, by this adapter, for every method: `launch_refused`,
+  `no credential custody: a passthrough route is not launched`, the daemon's own words (Lucas, Nov 12,
+  decision sheet A2: "The daemon refuses routes with key_source: api_key_helper and cloud passthrough
+  routes until credential custody is built"; A8: the gateway method stays refused with the cloud ones;
+  R3-8). `env()` refuses before it reads a variable, so no caller of the adapter launches one. The method
+  rules below are kept in `passthrough_env()`, which no launch path calls; before one does, R3-8's open
+  point has to be settled (a gateway still receives the user's `CLAUDE_CODE_OAUTH_TOKEN` and an
+  `ANTHROPIC_BASE_URL` that may carry credentials). The rules: that method's own variables (names from
+  Claude Code's public docs) pass through
   unchanged for that run, with the base allowlist and the user's sign-in; nothing else from the daemon's
   environment does (no other engine's key, no stray `ANTHROPIC_API_KEY`). A method with no listed
   variables is `launch_refused`, and so is a method whose own switch or credential is unset
@@ -110,6 +168,9 @@ end. `route.limits` or the service default sets `on_limit`: `ask` (default:
 nothing else runs), `wait` (nothing else runs; re-submit at `reset_at`) or `fallback` (the user's own
 `fallback` routes in the user's order, each switch shown as a `fallback` event and `switched_to`).
 Every attempt shares the request's one deadline. Nothing picks a route by itself; `fallback` with an empty list is refused.
+A fallback route may carry the keys a primary route's adapter reads, `wrapper` (the Pi and Hermes launcher
+pin) among them (R3-13 part 2); `subscription_routes` still refuses a wrapper that is not a measured pin
+when the route is launched. Any other key is `request_invalid`.
 
 Lesson: [CSL-608](https://linear.app/csl-laboratories/issue/CSL-608) (Done research) found master's breaker
 keyed by engine, shared by every tenant and never reset. This module does not claim to have measured

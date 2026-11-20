@@ -537,7 +537,8 @@ class ComposedStopTest(ComposedBase):
         self.assertTrue(wait_for(lambda: any(l.get('subtype') == 'init' for l in self.lines(run_id)), 15))
         init = next(l for l in self.lines(run_id) if l.get('subtype') == 'init')
         self.assertEqual(init['argv'], ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json',
-                                        '--verbose', '--model', 'stand-in-model'])
+                                        '--verbose', '--permission-mode', 'dontAsk', '--permission-prompts', 'none',
+                                        '--model', 'stand-in-model'])
         started = self.units.started[-1]['argv']
         self.assertFalse([a for a in started if 'dangerously' in a or '$(id)' in a or '\x00' in a], started)
 

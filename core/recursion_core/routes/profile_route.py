@@ -1,9 +1,11 @@
 """Pi, Hermes and OpenCode routes through ``subscription_routes`` (B3, CSL-786 reused; CSL-797 candidate).
 
-Every launch for these engines goes through ``subscription_routes.guard_then_spawn``, so
-``check_route`` refuses a Claude-subscription provider (Q12: the Claude subscription is used only
-inside Claude Code) before the launcher is ever called. The refusal comes back through the route
-contract as ``subscription_route_refused`` with the policy's typed cause in ``detail``.
+An unsupported host is refused here, before a credential, an environment or the guard, with the
+same detail as the shared adapter boundary. Every launch that passes that check goes through
+``subscription_routes.guard_then_spawn``, so ``check_route`` refuses a Claude-subscription provider
+(Q12: the Claude subscription is used only inside Claude Code) before the launcher is ever called.
+The refusal from the guard comes back through the route contract as ``subscription_route_refused``
+with the policy's typed cause in ``detail``.
 
 The engines' own stdio protocols are not built here: ``driver`` is injected and owns the run once the
 guard has passed. No running core wires a driver yet.
@@ -15,6 +17,7 @@ from collections.abc import Callable, Mapping
 
 from recursion_core.routes import contract as c
 from recursion_core.routes.base import Deadline, RouteAdapter, _Protocol
+from recursion_core.routes.host import PLATFORM_UNSUPPORTED, platform_supported
 from recursion_core.subscription_routes import ENGINES, SAFE_ENV, SubscriptionRouteRefused, guard_then_spawn
 
 # driver(process, request, deadline_at, events) -> contract result
@@ -30,7 +33,11 @@ class ProfileRouteAdapter(RouteAdapter):
         self.engine, self._argv, self._driver, self._operator_home = engine, argv, driver, operator_home
 
     def run(self, request: dict, deadline_at: float) -> dict:
-        rid, route = request["request_id"], request["route"]
+        rid = request["request_id"]
+        if not platform_supported():
+            # The same boundary as RouteAdapter.run: nothing is built, and no credential is read.
+            return c.result(rid, c.LAUNCH_REFUSED, detail=PLATFORM_UNSUPPORTED)
+        route = request["route"]
         home = route.get("home")
         conn = route["connection"]
         env = {name: self._parent_env[name] for name in SAFE_ENV if name in self._parent_env and name != "HOME"}

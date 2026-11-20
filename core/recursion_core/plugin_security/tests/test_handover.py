@@ -1184,5 +1184,206 @@ class PromiseTests(unittest.TestCase):
             got.send(b"x")
 
 
+def still_open(peer: socket.socket) -> bool:
+    """True while the connection whose other end is ``peer`` has not ended; looked at without waiting."""
+    try:
+        return peer.recv(1, socket.MSG_DONTWAIT) != b""
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+
+
+@unittest.skipUnless(LINUX, "the hand-over is shown on Linux only")
+class CutOrderTests(unittest.TestCase):
+    """Once the descriptor went the connection is cut on any error; cut, cut_host and a hand-over keep one order."""
+
+    BIG = b"p" * (1 << 20)  # far more than an empty channel takes at once: the descriptor goes, the rest waits
+
+    def pair(self):
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        return a, b
+
+    def assert_cut_everywhere(self, table, caught, far, host_end) -> None:
+        if isinstance(caught, Refused):
+            self.assertEqual((REFUSED_CODE, "channel_broken"), (caught.code, caught.detail))
+        self.assertEqual((), table.handed("host-1"))
+        self.assertFalse(still_open(far), "the other end of the connection did not see its end")
+        data, got = receive_handover(host_end, 1 << 21, timeout=1.0)
+        self.assertIsNotNone(got, "the descriptor went with the first bytes")
+        self.addCleanup(got.close)
+        self.assertTrue(data)
+        self.assertFalse(still_open(got), "the host's end of the connection still works")
+        with self.assertRaises((BrokenPipeError, ConnectionResetError)):
+            got.send(b"x")
+
+    def test_a_channel_closed_just_before_the_wait_registers_leaves_the_connection_cut(self) -> None:
+        own = pidfd_of(self)
+        real_wait = handover._wait_writable
+
+        def close_first(channel, timeout):
+            channel.close()  # where another thread of the core closes the channel object
+            return real_wait(channel, timeout)
+
+        for channel_timeout in (None, 5.0):
+            with self.subTest(channel_timeout=channel_timeout):
+                channel, host_end = self.pair()
+                channel.settimeout(channel_timeout)
+                host_end.settimeout(5)
+                x, far = self.pair()
+                table = HandoverTable()
+                self.addCleanup(table.cut_host, "host-1")
+                with mock.patch.object(handover, "_wait_writable", side_effect=close_first) as waited:
+                    with self.assertRaises(Exception) as caught:
+                        table.hand_over("host-1", channel, x, self.BIG, host_pidfd=own, send_timeout_s=2.0)
+                self.assertTrue(waited.called, "the send never waited after the descriptor went")
+                self.assertEqual(-1, x.fileno())
+                self.assert_cut_everywhere(table, caught.exception, far, host_end)
+
+    def test_a_channel_with_its_own_timeout_closed_by_another_thread_during_the_wait_ends_cut(self) -> None:
+        own = pidfd_of(self)
+        for delay in (0.05, 0.08, 0.12, 0.16):  # each well inside the wait of a 1 s cap nobody reads
+            with self.subTest(delay=delay):
+                channel, host_end = self.pair()
+                channel.settimeout(5.0)
+                host_end.settimeout(5)
+                x, far = self.pair()
+                table = HandoverTable()
+                self.addCleanup(table.cut_host, "host-1")
+                closer = threading.Timer(delay, channel.close)
+                closer.daemon = True
+                self.addCleanup(closer.cancel)
+                closer.start()
+                with self.assertRaises(Exception) as caught:
+                    table.hand_over("host-1", channel, x, self.BIG, host_pidfd=own, send_timeout_s=1.0)
+                closer.join(5)
+                self.assertFalse(closer.is_alive())
+                self.assert_cut_everywhere(table, caught.exception, far, host_end)
+
+    def test_a_cut_host_waits_for_a_hand_over_that_has_passed_its_check_then_cuts_both(self) -> None:
+        own = pidfd_of(self)
+        channel, host_end = self.pair()
+        table = HandoverTable()
+        self.addCleanup(table.cut_host, "host-1")
+        x1, far1 = self.pair()
+        self.assertEqual(HANDED, table.hand_over("host-1", channel, x1, PAYLOAD, host_pidfd=own).outcome)
+        checked, go = threading.Event(), threading.Event()
+        self.addCleanup(go.set)
+        real_check = handover._check_host
+
+        def park(pidfd):
+            real_check(pidfd)
+            checked.set()
+            go.wait(10)
+
+        x2, far2 = self.pair()
+        out = {}
+
+        def sender() -> None:
+            out["result"] = table.hand_over("host-1", channel, x2, PAYLOAD, host_pidfd=own)
+
+        def stopper() -> None:
+            out["cut"] = table.cut_host("host-1")
+
+        with mock.patch.object(handover, "_check_host", side_effect=park):
+            a_thread = threading.Thread(target=sender, daemon=True)
+            a_thread.start()
+            self.assertTrue(checked.wait(10), "the hand-over never reached its check")
+            b_thread = threading.Thread(target=stopper, daemon=True)
+            b_thread.start()
+            b_thread.join(0.3)
+            waited = b_thread.is_alive()
+            go.set()
+            a_thread.join(10)
+            b_thread.join(10)
+        self.assertFalse(a_thread.is_alive() or b_thread.is_alive(), "a thread did not end")
+        self.assertTrue(waited, "cut_host returned while a hand-over past its check was still to come")
+        self.assertEqual(HANDED, out["result"].outcome)
+        self.assertEqual(2, out["cut"])
+        self.assertEqual((), table.handed("host-1"))
+        self.assertFalse(still_open(far1))
+        self.assertFalse(still_open(far2))
+
+    def test_cut_host_does_not_return_while_a_cut_of_that_host_is_still_shutting_down(self) -> None:
+        own = pidfd_of(self)
+        channel, _host_end = self.pair()
+        table = HandoverTable()
+        self.addCleanup(table.cut_host, "host-1")
+        x, far = self.pair()
+        handle = table.hand_over("host-1", channel, x, PAYLOAD, host_pidfd=own).handle
+        inside, go = threading.Event(), threading.Event()
+        self.addCleanup(go.set)
+        real_cut_fd = handover._cut_fd
+        parked = []
+
+        def park(fd):
+            if not parked:  # only the cut stands still, inside its shutdown
+                parked.append(fd)
+                inside.set()
+                go.wait(10)
+            return real_cut_fd(fd)
+
+        out = {}
+
+        def cutter() -> None:
+            out["cut"] = table.cut("host-1", handle)
+
+        def stopper() -> None:
+            out["cut_host"] = table.cut_host("host-1")
+            out["open_when_cut_host_returned"] = still_open(far)
+
+        with mock.patch.object(handover, "_cut_fd", side_effect=park):
+            a_thread = threading.Thread(target=cutter, daemon=True)
+            a_thread.start()
+            self.assertTrue(inside.wait(10), "the cut never reached its shutdown")
+            b_thread = threading.Thread(target=stopper, daemon=True)
+            b_thread.start()
+            b_thread.join(0.3)
+            waited = b_thread.is_alive()
+            go.set()
+            a_thread.join(10)
+            b_thread.join(10)
+        self.assertFalse(a_thread.is_alive() or b_thread.is_alive(), "a thread did not end")
+        self.assertTrue(waited, "cut_host returned while a cut of that host was still shutting it down")
+        self.assertIs(True, out["cut"])
+        self.assertEqual(0, out["cut_host"])
+        self.assertIs(False, out["open_when_cut_host_returned"])
+        self.assertFalse(still_open(far))
+
+    def test_cut_cut_host_and_a_hand_over_of_one_host_run_together_without_a_deadlock(self) -> None:
+        own = pidfd_of(self)
+        table = HandoverTable()
+        self.addCleanup(table.cut_host, "host-1")
+        for _ in range(60):
+            channel, host_end = socket.socketpair()
+            x1, far1 = socket.socketpair()
+            x2, far2 = socket.socketpair()
+            try:
+                handle = table.hand_over("host-1", channel, x1, PAYLOAD, host_pidfd=own).handle
+                out = {}
+                threads = [
+                    threading.Thread(target=lambda: out.__setitem__("cut", table.cut("host-1", handle)), daemon=True),
+                    threading.Thread(target=lambda: out.__setitem__("cut_host", table.cut_host("host-1")),
+                                     daemon=True),
+                    threading.Thread(target=lambda: out.__setitem__("hand", table.hand_over(
+                        "host-1", channel, x2, PAYLOAD, host_pidfd=own, send_timeout_s=1.0)), daemon=True),
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(5)
+                self.assertFalse(any(thread.is_alive() for thread in threads), "cut, cut_host and hand_over locked up")
+                self.assertEqual(HANDED, out["hand"].outcome)
+                table.cut_host("host-1")
+                self.assertEqual((), table.handed("host-1"))
+                self.assertFalse(still_open(far1))
+                self.assertFalse(still_open(far2))
+            finally:
+                for s in (channel, host_end, x1, far1, x2, far2):
+                    s.close()
+
+
 if __name__ == "__main__":
     unittest.main()

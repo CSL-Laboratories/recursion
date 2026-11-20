@@ -27,6 +27,13 @@ What this module keeps, each with its own test in ``tests/test_handover.py``:
 - The sender keeps its own copy of each handed socket in a table per host. A cut is
   ``shutdown(SHUT_RDWR)`` on that copy: the host's read ends with end of file and its
   writes fail with EPIPE. ``close()`` alone would leave the host's copy working.
+- Once the descriptor has gone with the first bytes, any error in sending the rest of
+  the message, whatever its type, cuts the connection (``shutdown``, not only
+  ``close``) before the error reaches the caller: nothing usable is left at the host.
+- Every hand-over, ``cut`` and ``cut_host`` of a host holds that host's lock: a
+  hand-over takes it before the host is checked, so a ``cut_host`` waits for a
+  hand-over in progress, and for a ``cut`` still shutting a connection down. The
+  host's lock is always taken before the table's lock, never the other way round.
 - A send is capped in time, whatever timeout the channel object carries. A full
   channel answers ``HOST_SLOW``: the socket is not handed, not kept, and stays the
   caller's. A host whose process has ended is refused at once and the connection is
@@ -269,16 +276,16 @@ class HandoverTable:
         except OSError:
             raise ValueError("host_pidfd is not an open descriptor") from None
         held = _hold(sock)
-        try:
-            _check_host(host_pidfd)
-        except Refused:
-            held.close()
-            sock.close()
-            raise
-        except BaseException:
-            held.close()
-            raise
-        with self._host_lock(host_id):
+        with self._host_lock(host_id):  # before the check: a cut_host waits for this hand-over
+            try:
+                _check_host(host_pidfd)
+            except Refused:
+                held.close()
+                sock.close()
+                raise
+            except BaseException:
+                held.close()
+                raise
             sender = _sender(channel)
             try:
                 outcome = self._send(channel, sender, held, payload, send_timeout_s)
@@ -317,28 +324,35 @@ class HandoverTable:
             except (BrokenPipeError, ConnectionResetError):
                 raise Refused(REFUSED_CODE, HOST_GONE) from None
         rest = payload[sent:]
-        while rest:  # the descriptor went with the first byte; the rest of the message must follow
-            try:
-                rest = rest[sender.send(rest, flags):]
-            except BlockingIOError:
-                left = deadline - time.monotonic()
-                if left <= 0:
+        try:
+            while rest:  # the descriptor went with the first byte; the rest of the message must follow
+                try:
+                    rest = rest[sender.send(rest, flags):]
+                except BlockingIOError:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        _cut_fd(sock.detach())
+                        raise Refused(REFUSED_CODE, CHANNEL_BROKEN) from None
+                    _wait_writable(channel, min(left, _POLL_SLICE_S))
+                except OSError:
                     _cut_fd(sock.detach())
                     raise Refused(REFUSED_CODE, CHANNEL_BROKEN) from None
-                _wait_writable(channel, min(left, _POLL_SLICE_S))
-            except OSError:
-                _cut_fd(sock.detach())
-                raise Refused(REFUSED_CODE, CHANNEL_BROKEN) from None
+        except BaseException:  # whatever the error: the descriptor went, so the connection is cut
+            fd = sock.detach()
+            if fd >= 0:  # not cut already on the way here
+                _cut_fd(fd)
+            raise
         return HANDED
 
     def cut(self, host_id: str, handle: int) -> bool:
         """Cut one handed socket: shutdown(SHUT_RDWR) on the kept copy, then close it. False if unknown."""
-        with self._lock:
-            fd = self._hosts.get(host_id, {}).pop(handle, None)
-        if fd is None:
-            return False
-        _cut_fd(fd)
-        return True
+        with self._host_lock(host_id):  # a cut_host of this host waits until the shutdown is done
+            with self._lock:
+                fd = self._hosts.get(host_id, {}).pop(handle, None)
+            if fd is None:
+                return False
+            _cut_fd(fd)
+            return True
 
     def cut_host(self, host_id: str) -> int:
         """Cut every socket handed to ``host_id`` (a revoke, a grant change, Stop). Answers how many."""

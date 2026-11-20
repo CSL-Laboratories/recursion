@@ -54,6 +54,14 @@ def check_bases(tmp_base: Path, xdg_base: Path) -> None:
     xdg_resolved = xdg_base.resolve()
     if xdg_resolved == runtime or runtime in xdg_resolved.parents:
         raise ScratchError(f"XDG_RUNTIME_DIR base {xdg_base} is the real runtime folder {runtime}")
+    for base in (tmp_base, xdg_base):
+        # The base, or the nearest part of it that exists, must be a folder: a file there (or a dangling
+        # link) is the caller's mistake, refused here, not once per attempt.
+        here = base
+        while not os.path.lexists(here) and here != here.parent:
+            here = here.parent
+        if not here.is_dir():
+            raise ScratchError(f"scratch base {base}: {here} is not a folder")
 
 
 def _make_base(base: Path) -> None:

@@ -514,7 +514,6 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual("platform_unsupported", caught.exception.cause)
 
 
-@unittest.skipIf(os.name == "nt", "POSIX rules")
 class AuthRouteTests(unittest.TestCase):
     """CSLR-D-011, PRODUCT.md 055cc7a5 section 3.3: an explicit auth mode, and a route-owned key, base URL and switches."""
 
@@ -526,6 +525,7 @@ class AuthRouteTests(unittest.TestCase):
             build_child_env(engine, home=home, **kwargs)
         return caught.exception.name, caught.exception.cause
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_auth_mode_is_required_and_one_of_exactly_three(self) -> None:
         home = _home(self)
         self.assertEqual(("subscription", "api_key", "cloud_provider"), AUTH_MODES)
@@ -546,6 +546,7 @@ class AuthRouteTests(unittest.TestCase):
                 self.assertEqual(mode, env.auth_mode)
                 self.assertIn(repr(mode), repr(env))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_the_mode_is_never_taken_from_the_launching_shell(self) -> None:
         # A parent that looks like an API-key or a Bedrock shell does not pick the mode, and no mode is the default.
         home = _home(self)
@@ -555,6 +556,7 @@ class AuthRouteTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, parent):
                     self.assertEqual((None, "auth_mode_missing"), self._refused("claude_code", home))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_ambient_base_url_is_dropped_in_every_mode(self) -> None:
         home = _home(self)
         for mode in AUTH_MODES:
@@ -568,6 +570,7 @@ class AuthRouteTests(unittest.TestCase):
                     with mock.patch.dict(os.environ, {"PATH": "/usr/bin", URL: ambient}, clear=True):
                         self.assertNotIn(URL, build_child_env("claude_code", home=home, auth_mode=mode, route=ROUTES[mode]))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_route_base_url_is_set_only_from_the_route_and_a_subscription_route_needs_trust(self) -> None:
         home = _home(self)
         for mode in AUTH_MODES:
@@ -584,6 +587,7 @@ class AuthRouteTests(unittest.TestCase):
                     env = build_child_env("claude_code", home=home, auth_mode=mode, route=route, parent=parent)
                     self.assertEqual(url, env[URL])
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_route_base_url_meets_the_url_rule(self) -> None:
         home = _home(self)
         bad = (("https://fakeuser:fakepass@gateway.invalid", "base_url_userinfo"), ("https://fakeuser@gateway.invalid/api", "base_url_userinfo"),
@@ -601,6 +605,7 @@ class AuthRouteTests(unittest.TestCase):
                                        provider_switches=ROUTES[mode].provider_switches)
                     self.assertEqual((URL, cause), self._refused("claude_code", home, auth_mode=mode, route=route, parent={}))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_bracketed_base_url_host_must_be_an_ipv6_address(self) -> None:
         """Devin, "Invalid IPv6 gateway reaches child": the pattern alone let ``https://[:::]`` reach the child."""
 
@@ -635,6 +640,7 @@ class AuthRouteTests(unittest.TestCase):
                 route = ChildRoute(base_url=url, trusted_base_urls=(url,))
                 self.assertEqual(url, build_child_env("claude_code", home=home, auth_mode=SUB, route=route, parent={})[URL])
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_bracketed_proxy_host_must_be_an_ipv6_address(self) -> None:
         home = _home(self)
         for name, scheme in (("HTTPS_PROXY", "http://"), ("http_proxy", ""), ("ALL_PROXY", "socks5://")):
@@ -650,6 +656,7 @@ class AuthRouteTests(unittest.TestCase):
                     parent = {"PATH": "/usr/bin", name: scheme + host}
                     self.assertEqual(scheme + host, build_child_env("claude_code", home=home, auth_mode=SUB, parent=parent)[name])
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_userinfo_is_reported_before_a_malformed_bracketed_host(self) -> None:
         """Devin, "Userinfo refusal lost for malformed hosts": the bracket check ran first and hid the userinfo code."""
 
@@ -676,6 +683,7 @@ class AuthRouteTests(unittest.TestCase):
         return build_child_env("claude_code", home=home, auth_mode=mode, route=route, parent={"PATH": "/usr/bin", **parent},
                                **more)
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_no_proxy_entry_matching_the_route_host_is_refused_while_a_proxy_is_set(self) -> None:
         """CSL-839: NO_PROXY was checked against the engine's hosts only, so the route gateway could skip the proxy."""
 
@@ -716,6 +724,7 @@ class AuthRouteTests(unittest.TestCase):
                     "claude_code", home, auth_mode=SUB, route=ChildRoute(base_url=gateway, **more),
                     parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": "gateway.example"}))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_no_proxy_ip_and_cidr_entries_match_an_ip_literal_route_host(self) -> None:
         home = _home(self)
         proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
@@ -752,6 +761,7 @@ class AuthRouteTests(unittest.TestCase):
                 env = self._no_proxy_route(home, base_url, {**proxy, "NO_PROXY": entry})
                 self.assertEqual((entry, base_url), (env["NO_PROXY"], env[URL]))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_no_proxy_may_name_a_loopback_route_host(self) -> None:
         """Owner call, 2026-11-10: loopback only. A gateway on this machine is not refused; a lookalike still is."""
 
@@ -810,6 +820,7 @@ class AuthRouteTests(unittest.TestCase):
         imported |= {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
         self.assertFalse({name for name in imported if name and name.split(".")[0] == "socket"})
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_loopback_route_still_refuses_a_wildcard_or_engine_host_entry(self) -> None:
         """Pins current behaviour: the loopback exemption covers ``no_proxy_route_host`` only."""
 
@@ -830,6 +841,7 @@ class AuthRouteTests(unittest.TestCase):
                     self._no_proxy_route(home, base_url, {**proxy, **parent})
                 self.assertEqual(expected, (caught.exception.name, caught.exception.cause))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_an_all_address_no_proxy_block_is_a_wildcard_on_any_route(self) -> None:
         """Owner call, 2026-11-10: an all-address CIDR block skips the proxy for every host, as ``*`` does."""
 
@@ -898,6 +910,7 @@ class AuthRouteTests(unittest.TestCase):
                 self._no_proxy_route(home, base_url, {**proxy, **parent})
             self.assertEqual(expected, (caught.exception.name, caught.exception.cause))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_narrower_no_proxy_block_is_not_a_wildcard(self) -> None:
         home = _home(self)
         proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
@@ -963,6 +976,7 @@ class AuthRouteTests(unittest.TestCase):
                 # The name, the completing entry's position and the reason, never a value.
                 self._assert_position_only(caught.exception, name, "no_proxy_wildcard", position, self.COVER_WHY)
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_the_union_of_no_proxy_blocks_is_a_wildcard_when_it_covers_every_address(self) -> None:
         """Owner call, 2026-11-10 (2a): ``0.0.0.0/1,128.0.0.0/1`` skips the proxy for every host, as ``0.0.0.0/0`` does."""
 
@@ -1028,6 +1042,7 @@ class AuthRouteTests(unittest.TestCase):
                               parent={"PATH": "/usr/bin", "NO_PROXY": "0.0.0.0/1,128.0.0.0/1"})
         self.assertEqual("0.0.0.0/1,128.0.0.0/1", env["NO_PROXY"])
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_the_union_is_taken_over_no_proxy_and_its_lowercase_name_as_one_list(self) -> None:
         """Owner call, 2026-11-10 (2a): ``NO_PROXY=0.0.0.0/1`` with ``no_proxy=128.0.0.0/1`` covers every address."""
 
@@ -1119,6 +1134,7 @@ class AuthRouteTests(unittest.TestCase):
             self._no_proxy_route(home, v4, {**proxy, "NO_PROXY": "128.0.0.0/2", "no_proxy": "0.0.0.0/1"})
         self._assert_position_only(caught.exception, "no_proxy", "no_proxy_route_host", 1, self.ROUTE_HOST_WHY)
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_open_no_proxy_covers_still_launch(self) -> None:
         """Open, post-Nov-11 (owner call, 2026-11-10): pinned as launching so closing them is a deliberate change.
 
@@ -1208,6 +1224,7 @@ class AuthRouteTests(unittest.TestCase):
         with self.assertRaises(TypeError):  # the position is passed by keyword only
             EnvRefused("NO_PROXY", "no_proxy_wildcard", "detail", 2)
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_every_no_proxy_refusal_gives_the_variable_the_position_and_the_reason(self) -> None:
         """Owner call, 2026-11-10: one rule for all four NO_PROXY causes. The text of each, written out once."""
 
@@ -1245,6 +1262,7 @@ class AuthRouteTests(unittest.TestCase):
                          (caught.exception.name, caught.exception.cause, caught.exception.detail, caught.exception.position,
                           str(caught.exception)))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_no_proxy_entry_with_a_slash_that_is_no_cidr_block_is_unparseable(self) -> None:
         """Owner calls, 2026-11-10 (1, 2b), fail closed: a matcher may read ``0/0`` or ``10.0.0.0/33`` as a block."""
 
@@ -1312,6 +1330,7 @@ class AuthRouteTests(unittest.TestCase):
                 self._no_proxy_route(home, "https://gateway.example/api", {**proxy, **parent})
             self.assertEqual(expected, (caught.exception.name, caught.exception.cause))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_no_proxy_entry_with_a_second_slash_or_a_bad_port_is_unparseable(self) -> None:
         """Devin, on 7cd75440; owner call, 2026-11-10: ``10.1.2.3:8080/path/8`` was read as ``10.0.0.0/8`` and launched.
 
@@ -1367,6 +1386,7 @@ class AuthRouteTests(unittest.TestCase):
             env = build_child_env(engine, home=home, auth_mode=API, route=ROUTES[API], parent={"PATH": "/usr/bin", **parent})
             self.assertEqual(parent, {k: env[k] for k in parent})
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_no_proxy_prefix_that_is_not_a_plain_decimal_length_is_unparseable(self) -> None:
         """Owner call, 2026-11-10 (2b): a netmask, a leading zero, a sign, hex or a non-ASCII digit is no prefix length."""
 
@@ -1410,6 +1430,7 @@ class AuthRouteTests(unittest.TestCase):
                              ("::/0", "::/0"), ("::/128", "::/128"), ("2001:db8::/32", "2001:db8::/32")):
             self.assertEqual(ipaddress.ip_network(block), policy._no_proxy_ip(entry), entry)
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_no_proxy_entry_with_a_percent_sign_is_unparseable(self) -> None:
         """Owner call, 2026-11-10 (2c), fail closed for names too: a zone id or a percent escape is read differently by matchers."""
 
@@ -1446,6 +1467,7 @@ class AuthRouteTests(unittest.TestCase):
                                   parent={"PATH": "/usr/bin", "NO_PROXY": "fe80::1%eth0/64,host%2f"})
             self.assertEqual("fe80::1%eth0/64,host%2f", env["NO_PROXY"])
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_percent_entry_position_counts_that_variables_own_entries(self) -> None:
         """The position is 1-based among the variable's own entries as ``_no_proxy_entries`` splits them."""
 
@@ -1522,6 +1544,7 @@ class AuthRouteTests(unittest.TestCase):
             for protocol, data in pickled.items():
                 self.assertNotIn(marker.lower().encode(), data.lower(), f"pickle protocol {protocol}")
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_percent_entry_is_never_shown_in_any_form_of_the_refusal(self) -> None:
         """Owner call, 2026-11-10: an entry with a "%" may hide userinfo (``pw%40host``), so none of its text is shown.
 
@@ -1601,6 +1624,7 @@ class AuthRouteTests(unittest.TestCase):
             holds_none(row, row["cell"])
         holds_none(rows, "all rows")
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_the_route_record_of_a_percent_entry_refusal_holds_no_entry_text(self) -> None:
         home = _home(self)
         routes = (("none", "claude_code", None), ("none_codex", "codex", None), ("gateway", "claude_code", "https://gateway.example/api"),
@@ -1669,6 +1693,7 @@ class AuthRouteTests(unittest.TestCase):
              ("NO_PROXY", route_host, 2, self.ROUTE_HOST_WHY)),
         )
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_no_no_proxy_refusal_shows_entry_text_when_a_comma_splits_a_password(self) -> None:
         """Owner call, 2026-11-10: no NO_PROXY refusal, whatever its cause, shows any text of an entry.
 
@@ -1698,6 +1723,7 @@ class AuthRouteTests(unittest.TestCase):
         self.assertEqual({(cause, why) for cause, whys in self.NO_PROXY_WHYS.items() for why in whys}, hit)
         self.assertEqual(12 * 5 + 4 + 1 + 3, checked)
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_the_route_record_of_a_split_password_refusal_holds_no_entry_text(self) -> None:
         home = _home(self)
         extra = []
@@ -1711,6 +1737,7 @@ class AuthRouteTests(unittest.TestCase):
         self.assertEqual(set(self.NO_PROXY_WHYS), {cell.expect[1] for cell in extra})
         self._assert_route_records_hold_none_of(home, extra, (self.SPLIT_PA, self.SPLIT_SS, self.SECRET_USER))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_validated_env_repr_never_shows_a_no_proxy_value(self) -> None:
         """With no proxy set a "%" entry launches; the env's repr is names only, so it shows no entry text."""
 
@@ -1725,6 +1752,7 @@ class AuthRouteTests(unittest.TestCase):
                         for text in (repr(env), str(env), f"{env}", repr([env]), repr(env.dropped)):
                             self.assertNotIn(marker.lower(), text.lower())
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_no_proxy_route_host_changes_nothing_else(self) -> None:
         home = _home(self)
         proxy = {"HTTPS_PROXY": "http://127.0.0.1:3128"}
@@ -1768,6 +1796,7 @@ class AuthRouteTests(unittest.TestCase):
             "claude_code", home, auth_mode=SUB, route=ChildRoute(base_url=gateway),
             parent={"PATH": "/usr/bin", **proxy, "NO_PROXY": "gateway.example"}))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_ambient_keys_are_dropped_in_every_mode(self) -> None:
         home = _home(self)
         for engine, profile in ENGINE_PROFILES.items():
@@ -1783,6 +1812,7 @@ class AuthRouteTests(unittest.TestCase):
                     self.assertEqual(route_set, set(self.AMBIENT) & set(env))
                     self.assertLessEqual(set(self.AMBIENT) - route_set, set(env.dropped))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_a_user_key_is_injected_only_on_an_api_key_route(self) -> None:
         home = _home(self)
         env = build_child_env("claude_code", home=home, auth_mode=API, route=ChildRoute(api_key=USER_KEY),
@@ -1805,6 +1835,7 @@ class AuthRouteTests(unittest.TestCase):
                 self.assertEqual((KEY, "route_key_malformed"),
                                  self._refused("claude_code", home, auth_mode=API, route=ChildRoute(api_key=key), parent={}))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_provider_switches_come_only_from_the_route(self) -> None:
         home = _home(self)
         leftovers = {"PATH": "/usr/bin", BEDROCK: "1", VERTEX: "true", FOUNDRY: "1"}
@@ -1826,6 +1857,7 @@ class AuthRouteTests(unittest.TestCase):
                 self.assertEqual((None, "route_provider_unknown"),
                                  self._refused("claude_code", home, auth_mode=CLOUD, route=route, parent={}))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_the_route_is_its_own_input_not_a_mapping_or_an_override(self) -> None:
         home = _home(self)
         for route in ({"api_key": USER_KEY}, (USER_KEY,), USER_KEY, mock.Mock(api_key=USER_KEY, base_url=None, provider_switches=())):
@@ -1844,6 +1876,7 @@ class AuthRouteTests(unittest.TestCase):
         self.assertEqual(("CODEX_API_KEY", "override_denied"), self._refused(
             "codex", home, auth_mode=API, route=ROUTES[API], parent={}, overrides={"CODEX_API_KEY": "fake-override"}))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_oauth_token_invariants_hold_in_every_mode(self) -> None:
         home = _home(self)
         for mode in AUTH_MODES:
@@ -1875,6 +1908,7 @@ class AuthRouteTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             ChildRoute(oauth_token=FAKE)
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_codex_routes(self) -> None:
         home = _home(self)
         parent = {"PATH": "/usr/bin", **self.AMBIENT, OAUTH: FAKE}
@@ -1891,6 +1925,7 @@ class AuthRouteTests(unittest.TestCase):
         for route in (None, ChildRoute(provider_switches=(BEDROCK,))):
             self.assertEqual((None, "auth_mode_unsupported"), self._refused("codex", home, auth_mode=CLOUD, route=route, parent=parent))
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_no_secret_in_repr_str_or_refusal_text(self) -> None:
         home = _home(self)
         secret, url_secret = "fake-user-entered-SECRET-0123456789", "fakepass-SECRET-9876"
@@ -1925,6 +1960,7 @@ class AuthRouteTests(unittest.TestCase):
             self.assertNotIn(url_secret, text)
             self.assertNotIn(FAKE, text)
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_child_env_reads_no_keyring_and_no_key_file(self) -> None:
         # Key custody: the caller fetches the key (OS keyring, or the owner-only file); this package is handed it.
         allowed = {"__future__", "ipaddress", "os", "re", "shutil", "stat", "subprocess", "tempfile", "threading", "collections.abc",
@@ -1947,6 +1983,7 @@ class AuthRouteTests(unittest.TestCase):
                 self.assertEqual(mode, env.auth_mode)
         self.assertEqual(USER_KEY, build_child_env("claude_code", home=home, auth_mode=API, route=ROUTES[API], parent={})[KEY])
 
+    @unittest.skipIf(os.name == "nt", "POSIX rules")
     def test_disable_autoupdater_stays_off_the_claude_allowlist(self) -> None:
         # Owner call: a Claude child may update its own binary. The name is not carried, not set, and not settable.
         home = _home(self)

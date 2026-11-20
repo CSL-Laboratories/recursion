@@ -1,0 +1,46 @@
+{
+  "seq": 11,
+  "session_id": "ses-q2-codex-key-0001",
+  "run_id": "run-8d2f4a6c0e1b3d5f7a9c2e4b6d8f0a1c",
+  "turn_id": "turn-0002",
+  "time": "2026-11-14T18:13:47.930Z",
+  "type": "usage",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "connection_id": "api_key:openai-main",
+    "model": "gpt-6.1-codex",
+    "bucket": null,
+    "span": "session_total",
+    "input_tokens": {
+      "value": 11904,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "output_tokens": {
+      "value": 1630,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "reasoning_tokens": {
+      "value": 702,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "cache_read_tokens": {
+      "value": 9216,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "cache_write_tokens": {
+      "value": 0,
+      "quality": "known",
+      "provenance": "observed"
+    },
+    "cost_usd": {
+      "value": null,
+      "quality": "unknown",
+      "provenance": "unavailable"
+    }
+  }
+}

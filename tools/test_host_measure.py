@@ -6,8 +6,10 @@ import contextlib
 import importlib.util
 import io
 import json
+import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -111,6 +113,60 @@ class HostMeasureTests(unittest.TestCase):
         rows = {row["name"]: row for row in host_measure.result_rows(results, command)}
         self.assertEqual(rows["host_idle_rss_kib"]["status"], "ok")
         self.assertEqual(rows["host_peak_rss_kib"]["status"], "ok")
+
+
+class FollowUpTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("sh"), "requires a POSIX shell")
+    def test_bound_holds_when_a_grandchild_keeps_the_pipe_open(self) -> None:
+        command = ["sh", "-c", "sleep 6 & sleep 6"]
+        began = time.monotonic()
+        results = host_measure.measure_runs(command, runs=1, idle_s=0, ready_timeout_s=1)
+        elapsed = time.monotonic() - began
+        rows = host_measure.result_rows(results, command)
+        self.assertLess(elapsed, 3)
+        self.assertTrue(all(row["status"] == "unavailable" for row in rows))
+
+    def test_the_bound_number_is_the_one_given(self) -> None:
+        command = [sys.executable, "-I", "-B", "-c", "import time; time.sleep(60)"]
+        results = host_measure.measure_runs(command, runs=1, idle_s=0, ready_timeout_s=0.25)
+        rows = host_measure.result_rows(results, command)
+        self.assertTrue(all("within 0.25 seconds" in row["detail"] for row in rows))
+
+    def test_median_not_maximum_and_partial_success_keeps_the_numbers(self) -> None:
+        results = [(10.0, 100, 150, None), (20.0, 200, 250, None), (1000.0, 900, 950, None)]
+        rows = {r["name"]: r for r in host_measure.result_rows(results, ["x"])}
+        self.assertIn("median_ms=20.000", rows["host_start_ms"]["detail"])
+        self.assertIn("range_ms=10.000..1000.000", rows["host_start_ms"]["detail"])
+        self.assertIn("median_kib=200.000", rows["host_idle_rss_kib"]["detail"])
+        self.assertIn("median_kib=250.000", rows["host_peak_rss_kib"]["detail"])
+        partial = results[:2] + [(None, None, None, "child failed")]
+        rows = {r["name"]: r for r in host_measure.result_rows(partial, ["x"])}
+        for row in rows.values():
+            self.assertEqual(row["status"], "ok")
+            self.assertIn("successful_runs=2/3", row["detail"])
+
+    def test_the_double_dash_is_not_part_of_the_command(self) -> None:
+        fake = (1.0, 1, 1, None)
+        with mock.patch.object(host_measure, "measure_once", return_value=fake) as once:
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = host_measure.main(["--runs", "1", "--idle-s", "0", "--", "stand-in", "arg"])
+        self.assertEqual(code, 0)
+        self.assertEqual(once.call_args[0][0], ["stand-in", "arg"])
+
+    @unittest.skipUnless(Path("/proc/self/fd/0").exists(), "requires /proc/self/fd")
+    def test_the_child_stdin_is_closed(self) -> None:
+        program = (
+            "import os, time\n"
+            "print('ready' if os.readlink('/proc/self/fd/0') == os.devnull else 'stdin-open', flush=True)\n"
+            "time.sleep(60)"
+        )
+        child = host_measure.start_host([sys.executable, "-I", "-B", "-c", program])
+        try:
+            line = child.stdout.readline()
+        finally:
+            host_measure.stop_host(child)
+            child.stdout.close()
+        self.assertEqual(line.strip(), b"ready")
 
 
 if __name__ == "__main__":

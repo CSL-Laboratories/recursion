@@ -115,7 +115,8 @@ def measure_once(
         return start_ms, rss_kib, peak_kib, None
     finally:
         stop_host(process)
-        process.stdout.close()
+        if not reader.is_alive():
+            process.stdout.close()
 
 
 def measure_runs(

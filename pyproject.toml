@@ -1,4 +1,5 @@
-# Distribution csl-recursion: the import package recursion_core (from core/) and the recursiond command.
+# Distribution csl-recursion: the import package recursion_core (from core/), the recursiond command and
+# the recursion-control command (the control client of a running daemon).
 # Lucas, Nov 11, 2026: "let's go with csl-recursion"; "recursiond works well, easy to type".
 # Nothing is published to any package index ("Do not publish anything to a registry").
 # The licence fields are left out on purpose until Lucas names the holder (lane RELEASE fills them).
@@ -35,6 +36,7 @@ plugins = ["cryptography>=43"]
 
 [project.scripts]
 recursiond = "recursion_core._entrypoints:main"
+recursion-control = "recursion_core.control.__main__:main"
 
 [project.urls]
 Repository = "https://github.com/CSL-Laboratories/recursion"

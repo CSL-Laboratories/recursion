@@ -669,7 +669,7 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(p.end(1)[0]["payload"], {"code": c.ENGINE_ERROR, "detail": "APIError status 503"})
 
     def test_how_the_run_ended(self):
-        cases = [(0, (None, "")), (None, (c.ENGINE_EXITED, "no exit status")),
+        cases = [(0, (None, "")), (None, (c.ENGINE_EXITED, "no exit status and no finished step")),
                  (-15, (c.ENGINE_EXITED, "exit -15 without a typed error")),
                  (1, (c.ENGINE_EXITED, "exit 1 without a typed error"))]
         for exit_code, (code, detail) in cases:
@@ -677,6 +677,17 @@ class StreamTests(unittest.TestCase):
                 self.assertEqual(parser().end(exit_code)[0]["payload"], {"code": code, "detail": detail})
         with self.assertRaises(ValueError):
             parser().end(True)
+
+    def test_without_an_exit_status_a_last_step_that_stopped_is_the_end_of_the_turn(self):
+        for reasons, code in ((["tool-calls", "stop"], None), (["stop", "tool-calls"], c.ENGINE_EXITED),
+                              (["length"], c.ENGINE_EXITED), ([7], c.ENGINE_EXITED)):
+            with self.subTest(reasons):
+                p = parser()
+                for reason in reasons:
+                    event = step({"input": 1})
+                    event["part"]["reason"] = reason
+                    p.feed(line(event))
+                self.assertEqual(p.end(None)[0]["payload"]["code"], code)
 
     def test_a_typed_limit_outranks_an_exit_0_and_an_auth_error_outranks_other_errors(self):
         p, _ = replay("synthetic-v1-limit-429.jsonl", exit_code=0)
@@ -1280,12 +1291,13 @@ class DeclarationTests(unittest.TestCase):
         self.assertEqual(oc.build_argv(MODEL), ["opencode", "run", "--format", "json", "--model", MODEL])
         self.assertEqual(oc.build_argv(MODEL, binary="/opt/opencode/bin/opencode")[0], "/opt/opencode/bin/opencode")
         self.assertEqual(oc.build_argv(MODEL)[0], oc.DEFAULT_EXECUTABLE)
-        for model in ("-x/y", "openai", "/gpt", "a b/c", "a/b\n", "", "a/", None, "x" * 257 + "/y",
+        self.assertEqual(oc.build_argv(None), ["opencode", "run", "--format", "json"])   # the engine's default
+        for model in ("-x/y", "openai", "/gpt", "a b/c", "a/b\n", "", "a/", 5, "x" * 257 + "/y",
                       "a/" + chr(7) + "b", "a/" + chr(0x7F) + "b"):
             with self.subTest(model):
                 with self.assertRaises(ValueError):
                     oc.build_argv(model)
-        for binary in ("", "a\x00b", 5):
+        for binary in ("", "a\x00b", 5, " ", "  ", "-x", "--model"):
             with self.subTest(binary):
                 with self.assertRaises(ValueError):
                     oc.build_argv(MODEL, binary=binary)
@@ -1300,6 +1312,14 @@ class DeclarationTests(unittest.TestCase):
         hooks.freeze()
         self.assertNotIn(oc.ENGINE, hooks.engines)
         self.assertEqual(hooks.engines.names(), SEEDED)
+
+
+class SweepDocumentationTests(unittest.TestCase):
+    def test_route_readme_does_not_retract_masters_codex_protocol_evidence(self):
+        routes = HERE.parents[2]
+        readme = (routes / "README.md").read_text(encoding="utf-8")
+        self.assertNotIn("Codex method names beyond `account/rateLimits/*`", readme)
+        self.assertNotIn("`codexErrorInfo` values).", readme)
 
 
 if __name__ == "__main__":

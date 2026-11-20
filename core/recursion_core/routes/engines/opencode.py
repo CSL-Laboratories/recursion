@@ -4,7 +4,9 @@ OpenCode is one of the engines the product names (``routes.engines.CATALOGUE``).
 has installed and configured it: Recursion never installs it, never signs it in and never reads its login store.
 This module is the first slice of its driver, the PARSER. It turns the lines that ``opencode run --format json``
 prints into driver.v2 event drafts, each payload exactly event.v1's, and the end of a run into the run's result.
-It starts no process, reads no file and registers nothing; no daemon loads it yet.
+The parser starts no process and reads no file. ``OneShot`` and ``OpenCodeDriver`` (the second slice) drive a
+process the caller's launch path started or the ``spawn`` given to them starts; nothing registers either, and no
+daemon loads this module yet.
 
 THE TWO PACKAGE LINES. OpenCode ships as two npm packages with the same binary name, ``opencode``: ``opencode-ai``
 1.19.x (tag v1.19.5, anomalyco/opencode 810c0eba) and ``@opencode/cli`` 2.x (2.2.6, dc2ffcf8), the one OpenCode's
@@ -79,11 +81,12 @@ call id, a tool name) is refused into ``anomalies``.
 THE RESULT, at ``end(exit_code)``: ``plan_limit`` after a typed 429; else ``auth_failed`` after a typed sign-in
 error (1.x ``ProviderAuthError``, 2.x ``provider.auth``); else, after any other error, ``short_fault`` when its
 envelope's text sounds like a quota and ``engine_error`` otherwise; else ``ok`` (code null) on exit 0, and
-``engine_exited`` on any other exit or none. ``detail`` names the typed error only when it is one of the error
+``engine_exited`` on any other exit, and with no exit status unless the last step finished with reason ``stop``
+(then ``ok``). ``detail`` names the typed error only when it is one of the error
 names OpenCode's source defines (``KNOWN_ERRORS``), and says ``error`` otherwise: never the engine's own words.
 
-What is NOT here: the driver itself (start, send, interrupt, resume), the ``serve`` worker, the permission bridge,
-and any registration (later slices; a registration will state ``default_executable='opencode'``). The guard and the
+What is NOT here: interrupt and resume (the ``serve`` worker, a later slice), the permission bridge, and any
+registration (later slices; a registration will state ``default_executable='opencode'``). The guard and the
 child environment are other lanes' files.
 """
 
@@ -95,12 +98,19 @@ import hashlib
 import json
 import math
 import re
+import threading
 import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 from types import MappingProxyType
 
 from recursion_core.routes import contract as c
+from recursion_core.routes.driver import (Declaration, Driver, DriverInputError, DriverStateError, Flags,
+                                          check_draft)
+from recursion_core.subscription_routes import ENGINES as _GUARD_ENGINES
+from recursion_core.subscription_routes import SubscriptionRouteRefused
+from recursion_core.subscription_routes.policy import _looks_like_claude_login   # the guard's own test
 
 ENGINE = "opencode"
 # The command a registration will state as ``default_executable``: argv[0] is the binary option composition gives,
@@ -169,14 +179,17 @@ def declaration() -> dict:
     return {"engine": ENGINE, "driver": 2, "flags": dict(FLAGS), "input_ack": False}
 
 
-def build_argv(model: str, *, binary: str | None = None) -> list[str]:
+def build_argv(model: str | None, *, binary: str | None = None) -> list[str]:
     """argv for one turn of ``opencode run``. The prompt goes on standard input, never into argv.
 
     ``binary`` is the binary option composition gives (argv[0] is it, else ``DEFAULT_EXECUTABLE``). 1.19.5 reads a
     piped standard input as the message (run.ts:417-418), so no prompt can be read as an option.
     """
-    if binary is not None and (not isinstance(binary, str) or not binary or _CONTROL.search(binary)):
+    if binary is not None and (not isinstance(binary, str) or not binary.strip() or binary.startswith("-")
+                               or _CONTROL.search(binary)):
         raise ValueError("binary")
+    if model is None:   # driver.v2's route: null is the engine's own default model
+        return [binary if binary is not None else DEFAULT_EXECUTABLE, "run", "--format", "json"]
     if not model_ok(model):
         raise ValueError("model")
     return [binary if binary is not None else DEFAULT_EXECUTABLE, "run", "--format", "json", "--model", model]
@@ -202,12 +215,376 @@ def input_digest(tool_input: object) -> str:
     return hashlib.sha256(canonical_text(tool_input).encode("utf-8")).hexdigest()
 
 
+def held_to_the_guard(model: object, profile: Mapping | None) -> str | None:
+    """The model that goes into argv (``--model``, or None for OpenCode's own default), refused unless the guard's
+    rules accept that very value. The one place a launched model is worked out, for the route path and the driver.
+
+    The guard (``subscription_routes.check_route``) reads ``profile.model``, and argv carries the route's model. So
+    when the profile names a model the two must be the same value (``model_differs_from_profile``); a launched model
+    whose provider is a Claude-subscription provider id or a spelling of a Claude login is refused whatever its
+    source (``claude_subscription_provider``, the guard's own list and test); and on the route path a model the
+    profile does not name must be of the profile's provider (``model_provider_mismatch``, the guard's API-key rule).
+    A model OpenCode cannot take, or one that is not a plain ``str`` (a subclass could answer ``!=`` as it likes),
+    is ``model_malformed``. Each refusal is the guard's own ``SubscriptionRouteRefused``,
+    which the profile adapter answers with a typed ``subscription_route_refused`` before the launcher is called.
+    ``profile`` is None on the driver path, which has no profile (driver.v2's route record); a profile that is not
+    a mapping counts as an empty one. A null model is OpenCode's own default (no ``--model``): this function then
+    holds nothing, and the default the engine's own configuration names is what runs. Today's route service refuses
+    a null model before any adapter; on the driver path (driver.v2 allows null) the caller vouches for it.
+    """
+    if model is not None and (type(model) is not str or not model_ok(model)):
+        raise SubscriptionRouteRefused(ENGINE, "model_malformed", "route.model")
+    if profile is not None and not isinstance(profile, Mapping):
+        profile = {}
+    named = profile.get("model") if profile is not None else None
+    if named is not None and (type(named) is not str or named != model):
+        raise SubscriptionRouteRefused(ENGINE, "model_differs_from_profile")
+    if model is not None:
+        provider = model.split("/", 1)[0].strip().lower()
+        if provider in _GUARD_ENGINES[ENGINE].subscription_providers or _looks_like_claude_login(provider):
+            raise SubscriptionRouteRefused(ENGINE, "claude_subscription_provider", provider)
+        if profile is not None and named is None:
+            stated = profile.get("provider")
+            if not isinstance(stated, str) or provider != stated.strip().lower():
+                raise SubscriptionRouteRefused(ENGINE, "model_provider_mismatch", provider)
+    return model
+
+
+def route_argv(request: dict, *, binary: str | None = None) -> list[str]:
+    """``ProfileRouteAdapter``'s argv hook for one route request: ``build_argv`` on ``held_to_the_guard``'s model.
+
+    The adapter calls it before the guard and the launcher, so each refusal comes back as a typed result with
+    nothing launched. A request without a route mapping is ``RouteError(request_invalid, "route")`` (the route
+    service never sends one).
+    """
+    route = request.get("route") if isinstance(request, Mapping) else None
+    if not isinstance(route, Mapping):
+        raise c.RouteError(c.REQUEST_INVALID, "route")
+    profile = route.get("profile")
+    return build_argv(held_to_the_guard(route.get("model"), profile if isinstance(profile, Mapping) else {}),
+                      binary=binary)
+
+
+class OneShot:
+    """The one-shot drive on today's route contract: ``ProfileRouteAdapter`` calls it once the guard has passed.
+
+    ``drive(process, request, deadline_at, events) -> result``: the prompt is written to standard input, which is
+    then closed (OpenCode reads it to its end as the message), and stdout is read a line at a time until it ends.
+    ``clock`` is the deadline and breaker clock: the deadline is checked before the prompt is written, before every
+    read and again after every read, the end of the output included; a read that passes it raises ``Deadline``,
+    which the adapter fences for this request only. A chunk from ``read_line`` that is not text, or holds a line
+    break (LF or CR) anywhere but in its terminal ``\n`` or ``\r\n``, is a protocol error (``_Protocol``, fenced by
+    the adapter). The end of stdout is not the end of the process: before the result is returned the process is
+    handed to the cleanup layer (``fence("stdout_ended")``), and a fence that fails leaves as its own exception.
+    An ``OSError`` from the process (``send``, ``close_stdin``, ``read_line``) leaves unfenced here: the profile
+    adapter fences it (``io_error``) and answers with a typed ``engine_error``; a caller that drives ``OneShot``
+    without that adapter fences it itself. Every other way out once the process has started fences it first
+    (``driver_error``) and lets the same exception leave, ``BaseException`` included. A route whose connection the parser refuses writes nothing and is fenced
+    (``request_invalid``).
+    """
+
+    def __init__(self, clock: Callable[[], float], *, wall: Callable[[], float] = time.time) -> None:
+        if not callable(clock) or not callable(wall):
+            raise ValueError("clock")
+        self._clock, self._wall = clock, wall
+
+    def __call__(self, process, request: dict, deadline_at: float, events: list) -> dict:
+        from recursion_core.routes.base import Deadline, _Protocol   # local: base imports nothing of this module
+        from recursion_core.routes.launch import ReadTimeout
+
+        try:
+            route = request["route"]
+            parser = Parser(connection_id=c.connection_key(route), model=route["model"], wall=self._wall,
+                            clock=self._clock)
+        except ValueError as err:
+            _fence(process, "request_invalid")
+            return c.result(request["request_id"], c.REQUEST_INVALID, detail=f"route.{err}")
+        except BaseException:
+            _fence(process, "driver_error")
+            raise
+        try:
+            if deadline_at - self._clock() <= 0:   # nothing is written once the deadline has passed
+                raise Deadline()
+            process.send(request["prompt"])
+            process.close_stdin()
+            while True:
+                remaining = deadline_at - self._clock()
+                if remaining <= 0:
+                    raise Deadline()
+                try:
+                    line = process.read_line(remaining)
+                except ReadTimeout:
+                    raise Deadline() from None
+                if deadline_at - self._clock() <= 0:   # a read that returned late, the end of output included
+                    raise Deadline()
+                if line is None:
+                    break
+                if type(line) is not str:
+                    raise _Protocol(f"stdout chunk is {type(line).__name__}, not text")
+                body = line[:-2] if line.endswith("\r\n") else line[:-1] if line.endswith("\n") else line
+                if _LINE_BREAK.search(body):
+                    raise _Protocol("stdout chunk holds more than one line")
+                parser.feed(line if line.endswith("\n") else line + "\n")
+            parser.end(None)   # today's EngineProcess gives no exit status: the stream's last step decides
+            result = parser.route_result(request["request_id"])
+            process.fence("stdout_ended")   # the end of stdout is not the end of the process
+            events.extend(result["events"])
+            result["events"] = events
+            return result
+        except (Deadline, _Protocol, OSError):
+            raise   # the profile adapter fences these and answers with a typed result
+        except BaseException:
+            _fence(process, "driver_error")
+            raise
+
+
+def _refuse_what_is_not_run(request: dict) -> None:
+    """A start this driver would not run as asked is refused before anything is spawned (``DriverInputError``): a
+    route naming another engine (``route.engine``; the gate checks only its shape), and a workspace
+    (``workspace``): ``spawn(argv, env)`` takes no directory, so a run would start in the spawn's own directory, not
+    the one asked for. Running in a workspace waits for the launch path to carry it (lane DRIVER-CC's and LAUNCH's).
+
+    The engine is checked before the guard, so a route that names both another engine and a refused model answers
+    ``route.engine``. The caller passes a record the gate built; another mapping raises ``KeyError``."""
+    engine = request["route"]["engine"]
+    # A ``str`` subclass can answer ``==`` as it likes and still pass the gate's shape check. Only a plain ``str``
+    # is this engine.
+    if type(engine) is not str or engine != ENGINE:
+        raise DriverInputError("route.engine")
+    if request["workspace"] is not None:
+        raise DriverInputError("workspace")
+
+
+def _reopen_input(handle) -> None:
+    """Open the gate's input again after a close that did not complete.
+
+    The handle's lock is an ``RLock`` (set in ``OpenCodeDriver._start``) so this region can ask who owns it.
+    One protected region, the same form as ``_exclusive``: the taking (``take_once``), the store and the release
+    are inside one try. An interruption, including the instruction just after the lock is taken, leaves the lock
+    free and is raised once it is free. A ``with`` on this lock does not: the instructions that call its exit
+    sit outside the ``with``'s handler, so an interruption there leaves the lock owned and a later call from
+    another thread waits for ever.
+    """
+    from recursion_core.control.hooks import raise_kept, take_once  # local: routes must not load control at import
+
+    lock = handle._lock
+    kept: list = []
+    done = False
+    while True:
+        try:
+            if not kept and not done:
+                if not lock._is_owned():
+                    take_once(lock, kept)
+                if not kept:
+                    handle._closed = False
+                    done = True
+            if lock._is_owned():
+                lock.release()
+            break
+        except BaseException as exc:  # noqa: BLE001 - kept; the lock is released first
+            kept.append(exc)
+    raise_kept(kept)
+
+
+def _fence(process, reason: str) -> None:
+    """Ask the cleanup layer to end the process's tree. A fence that fails does not hide the error being raised."""
+    try:
+        process.fence(reason)
+    except Exception:
+        pass
+
+
+class OpenCodeDriver(Driver):
+    """driver.v2 for the one-shot drive, on the gate every driver shares (``routes.driver.Driver``, lane DRIVER-CC).
+
+    ``spawn(argv, env) -> process`` starts the engine; the launch path behind it (the guard, the child environment,
+    the unit) is the caller's. ``start`` spawns ``opencode run``; the first ``user_message`` is the prompt, written
+    to standard input, which is then closed; ``parse`` reads stdout; ``finish(handle, exit_code)`` drafts the result
+    once the process has exited and ends the turn. A null route model starts OpenCode's own default model
+    (``held_to_the_guard``). The flags are ``FLAGS``: resume, a second message, a message
+    mid-turn, an interrupt, a fork and an approval answer are refused by the gate before this class is asked, so no
+    process is started and no byte written. The one prompt is accepted (``input.accepted``, ``new_turn``) on the
+    first well-formed ``step_start`` of the run's own session that OpenCode prints after the prompt was written: the
+    engine's own typed sign that it began the turn, read by the parse call that consumed that line (an empty
+    parse consumes none). A write that raised records no delivery, so nothing later can accept it (its outcome is
+    unknown, and it is never written again). This is ON PURPOSE stricter than ``routes.driver``'s DELIVERY
+    paragraph, which lets a later typed acceptance of such a write count: here that delivery stays pending in the
+    gate for ever and no draft names it. A close that raised is not recorded: an implicit one is tried again by a
+    later close, and an explicit ``close`` that raised opens the gate's input again (the gate closes it before the
+    write), so the same ``close`` may be asked again.
+
+    TERMINAL TRANSITIONS. ``finish``, ``release`` and the reading of one line by ``parse`` hold the driver's one
+    lock, so a finish waits for a line being read (a 429 in it decides the result) and a release waits for a
+    finish. The lock is taken and released in ONE protected region (``_exclusive``, the form of
+    ``control.hooks``' OWNERSHIP note, with its ``take_once``): one interruption anywhere in it, a real SIGINT
+    included, leaves the lock free, and the interruption is raised once it is free. A message whose reservation comes after
+    ``finish`` or ``release`` has returned is refused with ``DriverStateError`` and its turn is ended again, so the
+    refusal leaves no live turn. A ``finish`` or ``release`` that lands between that check and the prompt write lets
+    the write reach the process, whose end is the caller's (see ``release``).
+    """
+
+    declaration = Declaration(ENGINE, Flags(**FLAGS), input_ack=False)
+
+    def __init__(self, spawn: Callable[[list, dict], object], *, binary: str | None = None,
+                 wall: Callable[[], float] = time.time, clock: Callable[[], float] = time.monotonic) -> None:
+        if not callable(spawn) or not callable(wall) or not callable(clock):
+            raise ValueError("callable")
+        if binary is not None:
+            build_argv(None, binary=binary)   # the binary rule, refused here rather than at the first start
+        self._spawn, self._binary, self._wall, self._clock = spawn, binary, wall, clock
+        self._workers: dict[int, dict] = {}
+        # One finish, release or parsed line at a time; an RLock only so that its owner can be told (take_once).
+        self._ending = threading.RLock()
+
+    def _worker(self, handle) -> dict:
+        worker = self._workers.get(id(handle))   # a worker holds its handle, so no other handle has its id
+        if worker is None:
+            raise DriverStateError("no worker for this handle (finished, released or never started)")
+        return worker
+
+    def _start(self, handle, request: dict, env: dict) -> None:
+        # The gate's lock is a plain Lock. Reopening the input has to ask who owns it, and a ``with`` on a plain
+        # Lock is left held by one interruption on 3.14. An RLock is the same lock to every ``with`` the gate writes.
+        handle._lock = threading.RLock()
+        route = request["route"]
+        _refuse_what_is_not_run(request)
+        model = held_to_the_guard(route["model"], None)
+        parser = Parser(connection_id=f"{route['connection']['kind']}:{route['connection']['id']}",
+                        model=model, wall=self._wall, clock=self._clock)
+        argv = build_argv(model, binary=self._binary)
+        process = self._spawn(argv, env)
+        self._workers[id(handle)] = {"process": process, "parser": parser, "turn": None, "delivery": None,
+                                     "accepted": False, "handle": handle}
+
+    def _send(self, handle, item: dict) -> None:
+        worker = self._workers.get(id(handle))
+        if worker is None:
+            self._unreserve(handle, item)
+            raise DriverStateError("no worker for this handle (finished, released or never started)")
+        if item["kind"] == "user_message":     # the gate lets exactly one through: multi_turn is false
+            worker["turn"] = item["turn_id"]
+            if self._workers.get(id(handle)) is not worker:   # a finish or release ran meanwhile: nothing is written
+                self._unreserve(handle, item)
+                raise DriverStateError("the run ended before its prompt was written")
+            worker["process"].send(item["text"])
+            # Lines already read cannot accept this prompt. Record the count before the delivery, so a line whose
+            # feed began earlier fails the check even when the write lands inside that feed.
+            worker["written_at"] = worker["parser"].lines_read
+            worker["delivery"] = item["delivery_id"]   # only a write that returned can be accepted later
+        if not worker.get("stdin_closed"):     # the prompt is the whole input; a close only ends it sooner
+            try:
+                worker["process"].close_stdin()
+            except BaseException:
+                if item["kind"] == "close":    # the gate closed the input before this close: not done, so open again
+                    _reopen_input(handle)
+                raise
+            worker["stdin_closed"] = True          # only a close that returned is done; a raised one is tried again
+
+    def _unreserve(self, handle, item: dict) -> None:
+        """End the turn the gate reserved for a message no worker will write, so its refusal leaves no live turn."""
+        if item["kind"] == "user_message" and handle.live_turn == item["turn_id"]:
+            try:
+                self.turn_ended(handle, item["turn_id"])
+            except DriverStateError:            # ended by a finish or release that ran at the same moment
+                pass
+
+    def _parse(self, handle, line: str) -> list[dict]:
+        def step() -> list[dict]:
+            worker = self._worker(handle)
+            parser = worker["parser"]
+            fed = parser.lines_read
+            drafts = parser.feed(line)
+            if parser.engine_session_id is not None and handle.engine_session_id is None:
+                handle.set_engine_session_id(parser.engine_session_id)
+            if not worker["accepted"] and worker["delivery"] is not None and parser.lines_read != fed \
+                    and parser.started and fed >= worker["written_at"]:
+                # a start read by THIS call, and the feed began at or after the prompt was written
+                worker["accepted"] = True
+                drafts.append(_draft("input.accepted", {"delivery_id": worker["delivery"],
+                                                        "turn_id": worker["turn"], "how": "new_turn"}))
+            return drafts
+
+        return self._exclusive(step)
+
+    def _exclusive(self, step: Callable[[], object]) -> object:
+        """``step()`` run once while this driver's lock is held, and its value; the lock is free again however one
+        interruption lands. ONE protected region in the form of ``control.hooks``' OWNERSHIP note: the taking
+        (``take_once``), the step and the release are inside one try; an interruption or an error is kept, the
+        lock is released, and what was kept is raised (``raise_kept``). An interruption kept before the step was
+        called skips it: nothing was done, and the call can be made again. Interrupted inside the step, the step's
+        own state says what was done (``finish`` can be called again). What this form cannot cover is that note's:
+        the instructions before the region and after it, a second interruption inside the except clause, and on
+        3.14 the marker after a conditional jump not taken, where no signal is delivered."""
+        from recursion_core.control.hooks import raise_kept, take_once   # local: routes must not load control at import
+
+        kept: list = []
+        box: list = []
+        while True:
+            try:
+                if not kept and not box:
+                    if not self._ending._is_owned():
+                        take_once(self._ending, kept)
+                    if not kept:
+                        box.append(step())
+                if self._ending._is_owned():
+                    self._ending.release()
+                break
+            except BaseException as exc:  # noqa: BLE001 - kept; the lock is released first
+                kept.append(exc)
+        raise_kept(kept)
+        return box[0]
+
+    def finish(self, handle, exit_code: int | None) -> list[dict]:
+        """The ``result`` draft once the process has exited; the turn in progress ends with it, and the handle is
+        released. One terminal transition per handle: finishers are serialised, exactly one returns the result, and
+        any other (or later) caller gets ``DriverStateError``. An ``exit_code`` that is not an int or None is
+        ``DriverInputError`` with nothing changed. Interrupted part-way, ``finish`` can be called again and completes
+        the same transition: the parser's outcome, once reached, is kept (the first exit code given decides it), the
+        turn is ended, and only then is the worker removed, so a live turn never outlives its worker. The one window
+        left: an interruption after the worker was removed (the transition complete) loses the result it drafted,
+        and a later call is ``DriverStateError``. A finish waits for a line being parsed (``_exclusive``)."""
+        def step() -> list[dict]:
+            worker = self._worker(handle)
+            if exit_code is not None and type(exit_code) is not int:
+                raise DriverInputError("exit_code")
+            parser = worker["parser"]
+            if parser.outcome is None:
+                parser.end(exit_code)
+            code, detail = parser.outcome
+            drafts = [check_draft(_draft("result", {"code": code, "detail": detail}))]
+            if worker["turn"] is not None and handle.live_turn == worker["turn"]:
+                self.turn_ended(handle, worker["turn"])
+            self._workers.pop(id(handle), None)
+            return drafts
+
+        return self._exclusive(step)
+
+    def release(self, handle) -> None:
+        """Forget a handle whose ``finish`` will never come (a lost run), and end its turn in progress, so the
+        handle refuses a later message as ended rather than busy. Its process is the caller's to end: who calls this
+        on Stop and shutdown is lane STOP's and DRIVER-CC's to define. A handle this driver does not hold (another
+        driver's, a released one, None) is left as it is. It waits for a finish or a parsed line in progress."""
+        def step() -> None:
+            worker = self._workers.get(id(handle))
+            if worker is None:
+                return
+            if worker["turn"] is not None and handle.live_turn == worker["turn"]:
+                self.turn_ended(handle, worker["turn"])
+            self._workers.pop(id(handle), None)
+
+        self._exclusive(step)
+
+
 class Parser:
     """One run's stdout, a line at a time. One reader feeds it; it is not shared between threads.
 
     ``connection_id`` is the route's connection (``<kind>:<id>``, ``contract.connection_key``) and ``model`` its model
     (null for the engine's default): both are copied into ``usage`` and ``limit``. ``wall`` reads Unix seconds, for
     event.v1's ``reset_at``; ``clock`` is the breaker's clock, for the route contract's limit signal.
+
+    ``started`` is True when the line just fed was a well-formed ``step_start`` of the run's own session (reset by
+    every line, put back by ``feed``'s rollback); ``lines_read`` counts the lines fed (an empty feed is none);
+    ``outcome`` is the run's ``(code, detail)`` once ``end`` has returned.
     """
 
     def __init__(self, *, connection_id: str, model: str | None, wall: Callable[[], float] = time.time,
@@ -227,6 +604,9 @@ class Parser:
         self._limit: dict | None = None       # the route contract's limit signal, from the latest typed 429
         self._usage: list[dict] = []          # the route contract's usage events
         self._result: tuple[str | None, str] | None = None
+        self._finish: str | None = None       # the reason of the latest step_finish, a typed field
+        self.last_type: str | None = None     # the type of the line just fed, when it was an event
+        self.started = False                  # the line just fed was a well-formed step_start of this run's session
         self.engine_session_id: str | None = None
         self.anomalies: list[str] = []
 
@@ -241,7 +621,8 @@ class Parser:
             raw = bytes(line)
         else:
             raise TypeError("a line is bytes or str")
-        if b"\n" in raw[:-1]:
+        body = raw[:-2] if raw.endswith(b"\r\n") else raw[:-1] if raw.endswith(b"\n") else raw
+        if b"\n" in body or b"\r" in body:   # a line break (LF or CR) anywhere but at its end: two lines
             raise ValueError("one line at a time")
         if not raw:
             return []
@@ -252,10 +633,12 @@ class Parser:
         # read: its drafts are the caller's to keep or lose. A SECOND interruption that lands inside the rollback
         # below is the one case not put back: no rollback written in Python can guard its own lines.
         start, lines, session, limit = self._offset, self._lines, self.engine_session_id, self._limit
+        finish, last_type, started = self._finish, self.last_type, self.started
         kept = [(kept_list, len(kept_list)) for kept_list in (self.anomalies, self._text, self._usage, self._errors)]
         try:
             self._offset += len(raw)
             self._lines += 1
+            self.last_type, self.started = None, False
             drafts = [_draft("engine.output", {"stream": "stdout", "text": raw.decode("utf-8", errors="replace"),
                                                "offset_start": start, "offset_end": self._offset})]
             event = self._load(raw)
@@ -265,6 +648,7 @@ class Parser:
             return drafts
         except BaseException:
             self._offset, self._lines, self.engine_session_id, self._limit = start, lines, session, limit
+            self._finish, self.last_type, self.started = finish, last_type, started
             for kept_list, length in kept:
                 del kept_list[length:]
             raise
@@ -284,6 +668,16 @@ class Parser:
             # again; a second one that lands on the line below is not put back.
             self._result = None
             raise
+
+    @property
+    def lines_read(self) -> int:
+        """How many lines have been fed (an empty feed is none; a line whose reading raised is not counted)."""
+        return self._lines
+
+    @property
+    def outcome(self) -> tuple[str | None, str] | None:
+        """The run's ``(code, detail)`` once ``end`` has returned, else None."""
+        return self._result
 
     @property
     def text(self) -> str:
@@ -319,16 +713,23 @@ class Parser:
 
     def _typed(self, event: dict) -> list[dict]:
         self._session(event.get("sessionID"))
-        kind = event["type"]
+        kind = self.last_type = event["type"]
         if kind == "text":
             part = event.get("part")
             if isinstance(part, dict) and isinstance(part.get("text"), str):
                 self._text.append(_SURROGATE.sub(REPLACEMENT, part["text"]))
             return []
+        if kind == "step_start":
+            # A later step starts: whatever an earlier step finished with no longer says how the run ended.
+            self._finish = None
+            part, session = event.get("part"), event.get("sessionID")
+            self.started = (isinstance(part, dict) and part.get("type") == "step-start" and isinstance(session, str)
+                            and session == self.engine_session_id)
+            return []
         if kind == "tool_use":
             return self._tool(event.get("part"))
         if kind == "step_finish":
-            return self._step(event.get("part"))
+            return self._step(event.get("part"), event.get("sessionID"))
         if kind == "error":
             return self._error(event.get("error"))
         return []
@@ -380,10 +781,14 @@ class Parser:
                                    "output_ref": None, "truncated": shortened or not isinstance(output, str)}),
         ]
 
-    def _step(self, part: object) -> list[dict]:
+    def _step(self, part: object, session: object = None) -> list[dict]:
         if not isinstance(part, dict) or part.get("type") != "step-finish":
             self._anomaly("step_shape")
             return []
+        if session is None or session == self.engine_session_id:
+            # Only a step of the run's own session says how the run ended. Another session's, or one with an
+            # invalid id (``_session`` counted it), leaves the run's proof as it was.
+            self._finish = part.get("reason") if isinstance(part.get("reason"), str) else None
         tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
         cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
         output, reasoning = _positive_int(tokens.get("output")), _positive_int(tokens.get("reasoning"))
@@ -421,7 +826,7 @@ class Parser:
         elif isinstance(error, dict) and isinstance(error.get("type"), str):      # 2.x session error
             tag, status, message = error["type"], error.get("status"), error.get("message")
             auth = tag == "provider.auth"
-            wait_of = lambda now: _positive_finite(error.get("retryAfterMs"), scale=1000.0)   # noqa: E731
+            wait_of = lambda now: _retry_ms(error.get("retryAfterMs"))   # noqa: E731
             source = "opencode.error.status"
         else:
             self._anomaly("error_shape")
@@ -432,10 +837,16 @@ class Parser:
         if status == LIMIT_STATUS:   # both clocks are read before anything is kept (see ``feed``)
             now = self._wall()     # read once: an HTTP date's wait and the reset share this one reading
             wait = wait_of(now)
-            reset_at = _timestamp(now + wait) if wait is not None else None
+            # The sum is exact. ``now + wait`` as floats can round under the real sum, and the ceiling of that
+            # float is then one millisecond earlier than the wait that was asked for.
+            if wait is not None and not (type(now) is float and not math.isfinite(now)):
+                reset_at = _timestamp(Fraction(now) + wait)
+            else:
+                reset_at = None
             if reset_at is None:
                 wait = None   # a wait too far off to write is not known: the event and the breaker agree
-            limit = c.limit_signal("connection", source, reset_at=self._clock() + wait if wait is not None else None)
+            limit = c.limit_signal("connection", source,
+                                   reset_at=self._clock() + float(wait) if wait is not None else None)
         self._errors.append({"tag": tag if tag in KNOWN_ERRORS else "error", "status": status, "auth": auth,
                              "quota_text": c.sounds_like_quota(message)})
         if limit is None:
@@ -461,7 +872,11 @@ class Parser:
         if exit_code == 0:
             return None, ""
         if exit_code is None:
-            return c.ENGINE_EXITED, "no exit status"
+            # No exit status was read (today's EngineProcess gives none): the stream's own end-of-turn sign
+            # decides, a last step that finished with reason "stop". OpenCode's loop goes on after "tool-calls".
+            if self._finish == "stop":
+                return None, ""
+            return c.ENGINE_EXITED, "no exit status and no finished step"
         return c.ENGINE_EXITED, f"exit {exit_code} without a typed error"
 
     def _anomaly(self, what: str) -> None:
@@ -499,6 +914,21 @@ def _cost(value: object) -> dict:
     return _known(number, "modelled") if number is not None else dict(_UNKNOWN)
 
 
+def _retry_ms(value: object) -> Fraction | None:
+    """``retryAfterMs`` as an exact fraction of a second, or None when it is not a positive finite number."""
+    if type(value) is bool or type(value) not in (int, float):
+        return None
+    if type(value) is float and not math.isfinite(value):
+        return None
+    try:
+        number = Fraction(value)
+    except (OverflowError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return number / 1000
+
+
 def _positive_finite(value: object, *, scale: float = 1.0) -> float | None:
     if type(value) not in (int, float):
         return None
@@ -521,7 +951,7 @@ def _js_float(text: str) -> float | None:
     return float(match.group(1)) if match else None
 
 
-def _retry_after_s(headers: object, now: float) -> float | None:
+def _retry_after_s(headers: object, now: float) -> Fraction | None:
     """The wait 1.x response headers ask for, in seconds, read the way OpenCode reads them (retry.ts:47-75).
 
     ``now`` is the wall clock's reading for this line. ``retry-after-ms`` when it holds a number (then nothing else
@@ -535,17 +965,24 @@ def _retry_after_s(headers: object, now: float) -> float | None:
     if millis:
         number = _js_float(millis)
         if number is not None:
-            return number / 1000.0 if number > 0 else None   # an infinite wait has no timestamp: no reset
+            if not math.isfinite(number) or number <= 0:   # an infinite wait has no timestamp: no reset
+                return None
+            return Fraction(number) / 1000
     after = lower.get("retry-after")
     if not after:
         return None
     number = _js_float(after)
     if number is not None:
-        return number if number > 0 else None
+        if not math.isfinite(number) or number <= 0:
+            return None
+        return Fraction(number)
     moment = _http_date(after, now)
     if moment is None:
         return None
-    wait = moment - now
+    try:
+        wait = Fraction(moment) - Fraction(now)
+    except (OverflowError, ValueError):
+        return None
     return wait if wait > 0 else None
 
 
@@ -595,17 +1032,20 @@ def _http_date(text: str, now: float) -> float | None:
     return moment
 
 
-def _timestamp(epoch: float) -> str | None:
-    """common.v1's timestamp, rounded UP to the millisecond (a reset is never earlier than asked).
+def _timestamp(epoch: float | Fraction) -> str | None:
+    """common.v1's timestamp, rounded UP to the millisecond (never earlier than the instant given).
 
-    None when it cannot be written: before the first second of the year 1, after 9999-12-31T23:59:58Z
-    (``_LAST_EPOCH``, kept a second short of the year's end so that rounding up never reaches the year 10000; the
-    last second of the year 9999 is refused too, and only an injected wall clock gets that far), infinite, or not
-    a number. The year is always written with four digits.
+    ``epoch`` is a float or an exact ``Fraction``. The ceiling is of that value, so a caller that passes the exact
+    sum of the wall reading and the wait is never a millisecond early. None when it cannot be written: before the
+    first second of the year 1, after 9999-12-31T23:59:58Z (``_LAST_EPOCH``, kept a second short of the year's end
+    so that rounding up never reaches the year 10000; the last second of the year 9999 is refused too, and only an
+    injected wall clock gets that far), infinite, or not a number. The year is always written with four digits.
     """
     if not _FIRST_EPOCH <= epoch <= _LAST_EPOCH:
         return None
-    millis = math.ceil(epoch * 1000)
+    # Fraction keeps the float's exact value. ``epoch * 1000`` can land on the previous millisecond,
+    # and ceiling that product would stamp a reset earlier than the wait that was asked for.
+    millis = math.ceil(Fraction(epoch) * 1000)
     m = _UNIX_EPOCH + timedelta(seconds=millis // 1000)
     return f"{m.year:04d}-{m.month:02d}-{m.day:02d}T{m.hour:02d}:{m.minute:02d}:{m.second:02d}.{millis % 1000:03d}Z"
 

@@ -195,6 +195,35 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(set(defs["route"]["properties"]), set(rc.ROUTE_KEYS))
         self.assertEqual(set(defs["rule"]["properties"]["when"]["properties"]), set(rc.WHEN_KEYS))
 
+    def test_fallback_route_admits_wrapper_in_schema_and_limits(self) -> None:
+        # The schema's fallback_route key list and validate_limits both admit "wrapper"
+        # (the Pi launcher pin a fallback may carry) and both refuse "wrapperx".
+        # Dropping the name from either side leaves this test red.
+        keys = SCHEMA["$defs"]["fallback_route"]["propertyNames"]["enum"]
+        self.assertEqual(
+            keys,
+            ["engine", "model", "connection", "profile", "home", "bare", "api_key_helper", "billing_ack", "wrapper"],
+        )
+        self.assertNotIn("wrapperx", keys)
+        pi = {
+            "engine": "pi",
+            "model": "anthropic/m",
+            "connection": {"kind": "api_key", "id": "k1", "credential_env": "ANTHROPIC_API_KEY"},
+            "profile": {"provider": "anthropic", "auth": "api_key", "credential_env": "ANTHROPIC_API_KEY"},
+            "wrapper": "dummy-pin",
+        }
+        accepted = route_limits.validate_limits({"on_limit": "fallback", "fallback": [dict(pi)]})
+        self.assertEqual(accepted["fallback"][0]["wrapper"], "dummy-pin")
+        refused = dict(pi)
+        del refused["wrapper"]
+        refused["wrapperx"] = "dummy-pin"
+        with self.assertRaises(contract.RouteError) as caught:
+            route_limits.validate_limits({"on_limit": "fallback", "fallback": [refused]})
+        self.assertEqual(
+            (caught.exception.code, caught.exception.detail),
+            (contract.REQUEST_INVALID, "route.limits.fallback entry"),
+        )
+
     def test_loader_cross_field_rules(self) -> None:
         cases = {
             "second_login_same_vendor": (lambda c: c["logins"].append(

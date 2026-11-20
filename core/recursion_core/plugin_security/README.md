@@ -86,7 +86,10 @@ runtime check. The quote is frozen in
 against it.
 
 Production runtime: CPython 3.14 free-threaded, started with `-X gil=0`
-(`runtime.require_production_runtime`). Signature checks need `cryptography`
+(`runtime.require_production_runtime`). The daemon refuses to start without `-X gil=0`
+(`daemon/__main__.py`, decision D2); `PYTHON_GIL=0` in the environment does not stand in
+for it. If the GIL is found on later, at a sweep, the daemon poisons the plugin core and
+keeps its sweep, reconciliation and Stop running. Signature checks need `cryptography`
 (`requirements.txt`); without it every verification refuses, and the daemon loads no
 plugin at all (next section).
 
@@ -100,13 +103,21 @@ the daemon reads each installed plugin as bytes and never imports one by name.
 - Installed plugins are `$XDG_CONFIG_HOME/recursion/plugins/<name>/` (`manifest.json`,
   `manifest.sig`, `plugin.py`) plus every `--plugin DIR`. Trusted keys, grants and reserved
   effects come from `$XDG_CONFIG_HOME/recursion/plugins/install.json`. Every file must be
-  operator-owned and not group- or other-writable.
+  operator-owned and not group- or other-writable. An install directory that exists and
+  is not an operator-owned directory nobody else can write (a link, a file, another
+  owner's, group- or other-writable) refuses every plugin, every `--plugin DIR` included,
+  and its `install.json` is not read (decision D4).
+- What runs before a grant is checked: only Recursion's code (the file reads, the manifest
+  parse, the digest, the signature check, the grant). A plugin left with no effective
+  permission is refused `plugin_not_granted` and none of its code is compiled or run. With
+  at least one permission, its whole module body runs in the daemon's process, then
+  `registry()` and `bind_core()` if it holds their permissions.
 - A plugin the loader refuses (bad manifest, artifact digest mismatch, reserved credential
-  or destination, compile or import failure) is kept out. Its typed code and findings are
-  in the inventory (`plugin.list` on the control socket, and a `plugin:<id>` row on the
-  GUI's route table), and the daemon keeps running without it. A plugin with a bad or
-  untrusted signature loads as unsigned, as section 4.3 says, and a grant bound to a signer
-  then grants it nothing.
+  or destination, no effective permission, compile or import failure) is kept out. Its
+  typed code and findings are in the inventory (`plugin.list` on the control socket, and a
+  `plugin:<id>` row on the GUI's route table), and the daemon keeps running without it. A
+  plugin with a bad or untrusted signature is classified unsigned, as section 4.3 says, and
+  a grant bound to a signer then grants it nothing, so it is refused before it runs.
 - **No verification, no load.** If `cryptography` cannot be imported, no signature can be
   checked, so the daemon refuses every installed plugin with
   `plugin_verification_unavailable: cryptography missing; install recipe in
@@ -114,7 +125,9 @@ the daemon reads each installed plugin as bytes and never imports one by name.
   is skipped quietly; the refusal is logged and shown on every surface.
 - A loaded plugin's `registry()` panels need the `panel` permission and its
   `operator(command)` O7 reads need `read`. `bind_core(call)` receives the plugin's
-  `csl-core/v0` client. No surface can approve or veto yet, and every run is bound to
+  `csl-core/v0` client only with a permission that client serves (`order` today); without
+  one it is not called. A plugin call that turns the GIL on gets nothing it offered used,
+  and the O7 read that did it answers 503. No surface can approve or veto yet, and every run is bound to
   `host`, so no effect is authorized today. The authority ledger is never created by the
   daemon; without an installer-made ledger an order effect refuses `authority_unconfigured`.
 - The breaker store is `$XDG_STATE_HOME/recursion/plugin-security/breaker.sqlite3`. There

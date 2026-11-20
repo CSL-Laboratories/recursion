@@ -90,7 +90,11 @@ class Adv2FaultingPluginTests(Adv2HostCase):
         from recursion_core.daemon import breaker as daemon_breaker
         stored, _ = daemon_breaker.open_breaker_store(self.state, clock=lambda: 0.0)
         self.addCleanup(stored.close)
-        self.install(b'def bind_core(call):\n    raise KeyboardInterrupt\n')
+        # bind_core() is called only with order (PLUGIN-HOST PR 1); unsigned order needs the manual grant.
+        source, everything = b'def bind_core(call):\n    raise KeyboardInterrupt\n', ('read', 'panel', 'order')
+        fx.write_install(self.config, grants=[fx.grant_for(source, permissions=everything,
+                                                           unsigned_order_acknowledged=True)])
+        fx.write_plugin(self.plugins / 'one', source, permissions=everything)
         try:
             host = self.host(breaker=stored)
         except BaseException as exc:  # noqa: BLE001
@@ -138,8 +142,9 @@ class Adv2FaultingPluginTests(Adv2HostCase):
         probe = FakeGilProbe([False, True])  # off after the load, on after the first operator() call
         host = self.host(gil_probe=probe)
         first = self.read(host)
-        # Observed on 08775416: the answer of the call that turned the GIL on is still served.
-        self.assertEqual(first[0], 200)
+        # Was 200 on 08775416 (the poisoning call's answer was served). Decision D2 (Lucas, Nov 12 2026):
+        # "the call that did it answers 503".
+        self.assertEqual(first, (503, {'error': 'unavailable: core_poisoned_restart_required'}))
         self.assertEqual(host.health.poisoned, 'gil_enabled_after_plugin_call')
         self.assertEqual(self.read(host), (503, {'error': 'unavailable: core_poisoned_restart_required'}))
         self.assertEqual(host.inventory()['plugins'][0]['permissions'], [])
@@ -323,13 +328,16 @@ class Adv2FilesystemTests(Adv2HostCase):
 
     def test_a_grant_for_another_digest_gives_no_permission(self):
         # 4.3: grants are bound to the artifact digest. Same-uid tampering of install.json is the documented
-        # same-uid limit; a grant that names another digest must not apply.
-        source = ANSWER
+        # same-uid limit; a grant that names another digest must not apply. PLUGIN-HOST PR 1: with no
+        # permission left the plugin is refused and none of its code runs (it used to load with none).
+        source = self.touch() + ANSWER
         fx.write_install(self.config, grants=[fx.grant_for(b'other bytes')])
         fx.write_plugin(self.plugins / 'one', source)
-        host = self.host()
-        self.assertEqual(host.records[0]['state'], 'loaded')
-        self.assertEqual(host.inventory()['plugins'][0]['permissions'], [])
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            host = self.host()
+        self.assertEqual((host.records[0]['state'], host.records[0]['code']), ('refused', 'plugin_not_granted'))
+        self.assertIn('grant_artifact_mismatch', codes(host.records[0]))
+        self.assertFalse(self.marker.exists())
         self.assertEqual(self.read(host)[0], 503)
 
     def test_duplicate_plugin_ids_load_once(self):

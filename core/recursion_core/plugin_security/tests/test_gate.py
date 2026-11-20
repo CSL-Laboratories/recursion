@@ -165,10 +165,13 @@ class RevocationTests(unittest.TestCase):
         self.assertIn(self.kid, trust.revoked)
         loader = PluginLoader(trust, {"demo.plugin": self.w.grant}, self.w.reserved, CoreHealth(),
                               FakeGilProbe())
-        loaded = loader.load(self.w.manifest, self.w.developer.sign(self.w.manifest), PLUGIN_SOURCE)
-        self.assertEqual(loaded.trust, "unsigned")
+        # Unsigned after the restart, so the signed grant gives it nothing, and a plugin with no
+        # permission is refused before any of its code runs (PLUGIN-HOST PR 1, plugin_not_granted).
+        with self.assertRaises(Refused) as ctx:
+            loader.load(self.w.manifest, self.w.developer.sign(self.w.manifest), PLUGIN_SOURCE)
+        self.assertEqual(ctx.exception.code, "plugin_not_granted")
         self.assertNotIn("order", loader.permissions("demo.plugin"))
-        codes = [f["code"] for f in loaded.findings]
+        codes = [f["code"] for f in loader.last_findings]
         self.assertIn("signer_key_revoked", codes)
         self.assertIn("grant_signer_mismatch", codes)  # the user's step is a fresh grant
 

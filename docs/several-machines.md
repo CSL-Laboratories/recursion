@@ -1,8 +1,8 @@
 # Run Recursion on several machines
 
-Each machine runs its own Recursion daemon.
+Each machine runs its own Recursion daemon (Linux only at this head).
 Each machine keeps its own record of runs.
-Machines share no run data or daemon state.
+No code at this head connects one machine's daemon to another's.
 
 ## List runs over SSH
 
@@ -24,6 +24,10 @@ It connects through an owner-only Unix socket.
 
 No package installs `recursion_core` at this head. From a checkout, run the
 command from the repository root with `PYTHONPATH=core` set.
+On a machine set up as in the daemon's README, the code is in
+`~/.local/lib/recursion/core`: run the venv's python,
+`~/.local/lib/recursion/venv/bin/python`, with
+`PYTHONPATH=$HOME/.local/lib/recursion/core` set instead.
 
 If the daemon is down, the command returns `control_api_unavailable`
 and exits with status 1.
@@ -40,5 +44,5 @@ installs it as a command is pending. Use the `python -m` form shown above.
 - There is no lease on a run.
 - There is no way to enroll one machine with another.
 
-A single view over several machines is a planned add-on outside this release.
-The add-on has no scheduled release date.
+A single view over several machines is not part of this release.
+No date is given for it.

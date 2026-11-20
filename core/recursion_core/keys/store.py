@@ -51,7 +51,8 @@ nothing is left in the index.
 
 THE HOSTS. The person binds a key to the hosts it may be sent to when the key is added (``add(...,
 destinations=...)``, ``key add ... --destination HOST``), in the grammar of the plugin manifest's network destinations
-(``validate.valid_destination``: no IP literal, ports 1 to 65535). A host the injected reserved set reserves
+(``validate.valid_destination``: no IP literal, ports 1 to 65535, a name of at most 253 characters; at most 64 hosts
+per key, ``validate.DESTINATIONS_MAX``). A host the injected reserved set reserves
 (``reserved``, the plugin layer's ``ReservedEffects`` or any object with ``host_reserved``) is refused
 (``destination_reserved``): the store CALLS it and keeps no list of its own. The hosts are on the record (``KeyRecord.
 destinations``) and stored WITH the value in every backend, inside the save's token (``validate.save_token``), so an
@@ -285,7 +286,8 @@ class KeyStore:
         bound = v.destinations_of(destinations)
         if bound is None:
             raise KeyStoreError('destination_invalid', 'hosts are distinct lower-case names with a dot and an optional '
-                                'port 1 to 65535, as a plugin manifest lists them; no IP address')
+                                'port 1 to 65535, as a plugin manifest lists them; no IP address; a name is at most '
+                                f'{v.HOST_NAME_MAX} characters, and a key has at most {v.DESTINATIONS_MAX} hosts')
         for host in bound:
             self._refuse_reserved(host)
         return bound

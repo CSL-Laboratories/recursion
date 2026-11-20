@@ -20,7 +20,9 @@
   signed plugin manifest's ``network_destinations`` (``plugin_security/manifest.py``, ``_HOST``; a test pins the two
   patterns equal): lower-case DNS labels, at least one dot, an optional port. Narrower here: an IP literal (a host
   ``ipaddress`` reads, or whose last label is all digits) and a port outside 1 to 65535 or written with a leading
-  zero are refused, so one host has one spelling.
+  zero are refused, so one host has one spelling. A host's name is at most ``HOST_NAME_MAX`` (253) characters,
+  the longest name DNS carries, and a key is bound to at most ``DESTINATIONS_MAX`` (64) hosts, so every key a save
+  accepts fits the index with room to remove it.
 """
 from __future__ import annotations
 
@@ -56,6 +58,8 @@ VALUE_MIN, VALUE_MAX = 8, 4096
 # The manifest's network destination, character for character (plugin_security/manifest.py, _HOST).
 DESTINATION = re.compile(r"[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+(:[0-9]{1,5})?")
 PORT_MAX = 65535
+HOST_NAME_MAX = 253          # characters in a host's name, the port not counted: the longest name DNS carries
+DESTINATIONS_MAX = 64        # hosts one key is bound to
 SAVE_TOKEN = re.compile(r'[0-9a-f]{32}(-[0-9a-f]{64})?')     # a save id, and the digest of its hosts when bound
 CAP_MAX = 100000
 
@@ -184,10 +188,13 @@ def valid_cap(value: object) -> bool:
 
 
 def valid_destination(text: object) -> bool:
-    """A host a key may be bound to (see the module's text): the manifest's grammar, no IP literal, port 1 to 65535."""
+    """A host a key may be bound to (see the module's text): the manifest's grammar, no IP literal, port 1 to 65535,
+    a name of at most HOST_NAME_MAX characters."""
     if not _full(DESTINATION, text):
         return False
     host, _, port = text.partition(':')
+    if len(host) > HOST_NAME_MAX:
+        return False
     if port and (port[0] == '0' or not 1 <= int(port) <= PORT_MAX):
         return False
     if host.rsplit('.', 1)[-1].isdigit():
@@ -201,8 +208,11 @@ def valid_destination(text: object) -> bool:
 
 def destinations_of(given: object) -> tuple | None:
     """The hosts given at ``add`` as the record keeps them (a sorted tuple), or None when they are not a list or tuple
-    of distinct valid destinations. No hosts at all is the empty tuple: a key that is handed out for no host."""
-    if not isinstance(given, (list, tuple)) or not all(valid_destination(d) for d in given):
+    of at most DESTINATIONS_MAX distinct valid destinations. No hosts at all is the empty tuple: a key that is handed
+    out for no host."""
+    if not isinstance(given, (list, tuple)) or len(given) > DESTINATIONS_MAX:
+        return None
+    if not all(valid_destination(d) for d in given):
         return None
     if len(set(given)) != len(given):
         return None

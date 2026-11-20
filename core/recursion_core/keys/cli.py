@@ -5,19 +5,21 @@
     cut at the kernel's 4095-byte line), never from the command line. ``--stdin`` reads it from standard input
     instead, and only when standard input is not a terminal (where it would be echoed). With no terminal and no
     ``--stdin`` it refuses (``no_terminal``) and saves nothing. On a terminal it then asks whether runs on this
-    key may spend money billed to it, and the cap in US dollars (answers typed ahead are kept);
+    key may spend money billed to it, and the cap in US dollars (answers typed ahead are kept; for a key bound to
+    hosts the question says that the opt-in governs engine runs, which that key never goes to);
     ``--allow-metered-spend --cap-usd N`` answers both up front, and is the only way to opt in with ``--stdin``.
     With no opt-in the cap is 0, and every run on the key is refused before launch until it is removed and
     added again with one. An id that looks like a key is refused before any prompt shows it, and so is everything
     else it can refuse without the key (``KeyStore.check_add``): a provider, variable name or cap it does not take,
     a folder, index or host it cannot save in (an index already too full for one more key among them), and an id
     already saved. Each ``--destination`` binds the key to one host it may be sent to (the plugin manifest's grammar:
-    no IP address, a port 1 to 65535); a bound key is handed out only for one of its hosts and never to an engine's
-    environment. With none, the key is bound to no host (``store.py``, THE HOSTS).
+    no IP address, a port 1 to 65535, a name of at most 253 characters; at most 64 of them); a bound key is handed out
+    only for one of its hosts and never to an engine's environment. With none, the key is bound to no host and keeps
+    the engine path every key had before hosts were bound (``store.py``, THE HOSTS).
 ``list [--json]``
     Ids, providers, variable names, when each was saved, the store, the spend opt-in, the hosts each key is bound
-    to (``hosts=none`` for a key bound to none; ``--json``: ``destinations`` per bound key and the ids of the others
-    in ``unbound``) and any unfinished operation. Never a value.
+    to (``hosts=none`` for a key bound to none, which engine runs still get as before; ``--json``: ``destinations``
+    per bound key and the ids of the others in ``unbound``) and any unfinished operation. Never a value.
 ``remove <id> [--yes]``
     Asks on the terminal before it deletes (``--yes`` skips the question; with no terminal it is required),
     then says what it removed and from where. It also clears what an interrupted save left behind, and a value of
@@ -251,14 +253,22 @@ def _store_line(backend: str | None, store: KeyStore) -> str:
     return f'Keys are kept in {STORE_TEXT.get(backend, backend)} (pinned at the first save).'
 
 
-def _spend_text(allowed: bool, cap) -> str:
-    return f'allowed, cap ${cap}' if allowed else 'not allowed (runs on this key are refused)'
+BOUND_NOTE = 'handed out for its hosts, and to no engine run'
+
+
+def _spend_text(record) -> str:
+    """The spend opt-in as the engine path applies it. A key bound to hosts never reaches an engine run (the engine
+    path refuses it, destination_required), so for it the opt-in is only recorded, and its line says so."""
+    allowed = f'allowed, cap ${record.cap_usd}' if record.metered_spend_allowed else 'not allowed'
+    if record.destinations:
+        return f'{allowed} (it governs engine runs; this key is {BOUND_NOTE})'
+    return allowed if record.metered_spend_allowed else 'not allowed (runs on this key are refused)'
 
 
 def _hosts_text(record) -> str:
     if record.destinations:
         return 'hosts=' + ','.join(record.destinations)
-    return 'hosts=none (bound to no host: handed out for none)'
+    return 'hosts=none (bound to no host: handed out for no host; engine runs get it as before)'
 
 
 def run(args, out=None, err=None, *, store: KeyStore | None = None, terminal: Terminal | None = None,
@@ -345,7 +355,9 @@ def _add(args, out, err, store, terminal, stdin) -> int:
             raise KeyStoreError('value_invalid', f'a key is {v.VALUE_MIN} to {v.VALUE_MAX} visible ASCII characters, '
                                 'with no space; nothing was saved')
         if not args.key_stdin and cap_text is None and not allow:
-            answer = terminal.ask('Allow runs on this key to spend money billed to it? [y/N] ')
+            answer = terminal.ask(f'This key is {BOUND_NOTE}; the spend opt-in governs engine runs only. Record '
+                                  'one for it anyway? [y/N] ' if args.key_destinations else
+                                  'Allow runs on this key to spend money billed to it? [y/N] ')
             if answer.lower() in ('y', 'yes'):
                 cap = v.parse_cap(terminal.ask('Spend cap in US dollars: '))
                 if not cap:
@@ -359,7 +371,7 @@ def _add(args, out, err, store, terminal, stdin) -> int:
         if opened is not None:
             opened.close()
     print(f'saved {record.key_id} ({record.provider}, {record.env_name}) in {STORE_TEXT[record.store]}; '
-          f'metered spend: {_spend_text(record.metered_spend_allowed, record.cap_usd)}; {_hosts_text(record)}',
+          f'metered spend: {_spend_text(record)}; {_hosts_text(record)}',
           file=out)
     if not v.known_provider(record.provider):
         print(f'note: {record.provider} is not a published vendor; the key is kept and listed, and handed to no '
@@ -381,7 +393,7 @@ def _list(args, out, store) -> int:
     for r in records:
         unrouted = '' if v.known_provider(r.provider) else '  (not a published vendor: handed to no engine)'
         print(f'{r.key_id}  provider={r.provider}  env={r.env_name}  saved={r.created_at}  store={r.store}  '
-              f'metered spend: {_spend_text(r.metered_spend_allowed, r.cap_usd)}  {_hosts_text(r)}{unrouted}', file=out)
+              f'metered spend: {_spend_text(r)}  {_hosts_text(r)}{unrouted}', file=out)
     for p in pending:
         print(f'{p.key_id}  an unfinished {p.op} (started {p.started_at}): the next save or removal finishes it, '
               f'or "remove {p.key_id}" clears it', file=out)

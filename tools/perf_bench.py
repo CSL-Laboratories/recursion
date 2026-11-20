@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Small provider-free benchmark of the M1A planning kernel.
+"""Small provider-free benchmark of the M1A planning kernel and one Stop.
 
-Times canonical digest, strict decode, policy validation, and DAG validation.
-The workload is frozen in tools/perf_workload.json plus a fixed in-memory
-document, so a PR and its base run the same inputs. No network and no live
-AI provider is used.
+Times canonical digest, strict decode, policy validation, DAG validation,
+replay reduce, and one in-process control Stop decision. The workload is
+frozen in tools/perf_workload.json plus a fixed in-memory document, so a PR
+and its base run the same inputs. No network and no live AI provider is used.
 
     python -X utf8 -B tools/perf_bench.py --out /tmp/head.json
     python -X utf8 -B tools/perf_bench.py --root /path/to/tree --out /tmp/base.json
@@ -27,7 +27,7 @@ DEFAULT_ROUNDS = 5
 DEFAULT_ROUND_MS = 50
 DEFAULT_WARMUP_MS = 30
 # Paired PR comparison. Rounds alternate which side goes first so a warm cache
-# does not land on only one tree. 8 * 50ms * 2 sides * 4 benches is a few seconds.
+# does not land on only one tree. 8 * 50ms * 2 sides * 6 benches is a few seconds.
 PAIRED_ROUNDS = 8
 PAIRED_REPEATS = 3
 PAIRED_ROUND_S = 0.05
@@ -274,6 +274,55 @@ def build_cases(product, workload: dict) -> list[tuple[str, object]]:
     ]
 
 
+def stop_decision_case(root: Path) -> tuple[str, object]:
+    """One in-process ``run.stop`` against ``root``'s control API.
+
+    Classes are captured here. The next tree's import must not replace them.
+    The timed call is the Stop decision: start a run, then stop it against an
+    in-memory registry whose confirm is immediately empty. It does not call
+    systemd and it does not flood a TUI.
+    """
+    core = str((root / "core").resolve())
+    saved_path = list(sys.path)
+    sys.dont_write_bytecode = True
+    for name in list(sys.modules):
+        if name == "recursion_core" or name.startswith("recursion_core."):
+            del sys.modules[name]
+    sys.path = [path for path in sys.path if path != core]
+    sys.path.insert(0, core)
+    try:
+        from recursion_core.control.api import ControlAPI
+        from recursion_core.control.registry import EMPTY, InMemoryRunRegistry
+        from recursion_core.control.tests.fakes import FakeKillTree
+    except Exception as exc:  # noqa: BLE001 - the suite must say which tree failed
+        raise BenchError(f"cannot import the Stop decision from {root}: {exc}") from exc
+    finally:
+        sys.path = saved_path
+
+    api_cls = ControlAPI
+    registry_cls = InMemoryRunRegistry
+    kill_cls = FakeKillTree
+    empty = EMPTY
+
+    def stop_decision() -> None:
+        registry = registry_cls()
+        kill = kill_cls([empty])
+        api = api_cls(
+            registry,
+            kill,
+            lambda params: {"cgroup": f"/cg/{params['run_id']}"},
+            clock=lambda: 0.0,
+        )
+        started = api.call("run.start", {"tenant": "t", "engine": "bench", "prompt": "p"})
+        if started.get("code") != "started":
+            raise RuntimeError(f"start did not start: {started.get('code')}")
+        stopped = api.call("run.stop", {"run_id": started["run"]["run_id"]})
+        if stopped.get("code") != "stopped":
+            raise RuntimeError(f"stop did not stop: {stopped.get('code')}")
+
+    return ("stop_decision", stop_decision)
+
+
 def _warmup(fn, warmup_s: float) -> None:
     deadline = time.perf_counter() + warmup_s
     while time.perf_counter() < deadline:
@@ -445,8 +494,10 @@ def run_paired(
     workload = load_workload()
     # Capture baseline callables before the candidate import replaces sys.modules.
     baseline_cases = build_cases(load_product(baseline_root), workload)
+    baseline_cases.append(stop_decision_case(baseline_root))
     _check_cases(baseline_cases)
     candidate_cases = build_cases(load_product(candidate_root), workload)
+    candidate_cases.append(stop_decision_case(candidate_root))
     _check_cases(candidate_cases)
     if [name for name, _fn in baseline_cases] != [name for name, _fn in candidate_cases]:
         raise BenchError("baseline and candidate benchmark names differ")
@@ -483,6 +534,7 @@ def run_suite(
     product = load_product(root)
     workload = load_workload()
     cases = build_cases(product, workload)
+    cases.append(stop_decision_case(root))
     _check_cases(cases)
     benchmarks = []
     for name, fn in cases:

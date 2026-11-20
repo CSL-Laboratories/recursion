@@ -206,7 +206,14 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(report["provider_calls"], 0)
         self.assertEqual(
             [row["name"] for row in report["benchmarks"]],
-            ["canonical_digest", "decode_command", "validate_policy", "validate_dag", "replay_reduce"],
+            [
+                "canonical_digest",
+                "decode_command",
+                "validate_policy",
+                "validate_dag",
+                "replay_reduce",
+                "stop_decision",
+            ],
         )
         for row in report["benchmarks"]:
             self.assertGreater(row["median_s"], 0)

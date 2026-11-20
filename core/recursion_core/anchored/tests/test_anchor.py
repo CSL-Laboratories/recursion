@@ -9,19 +9,23 @@ its own duration, as a Windows interpreter has them out.
 
 from __future__ import annotations
 
+import copy
 import gc
 import os
+import pickle
 import shlex
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import recursion_core
-from recursion_core.anchored import ABOVE, CAUSES, Anchor, AnchorRefused, open_anchor
+from recursion_core.anchored import ABOVE, CAUSES, Anchor, AnchorRefused, _posix, open_anchor
 from recursion_core.anchored.tests import test_system_facts as facts
 
 POSIX = os.name == "posix"
@@ -398,6 +402,31 @@ class BelowTheAnchorTests(unittest.TestCase):
                 os.geteuid = real_euid
         self.assertEqual(("owner", str(self.home / "mine")), (caught.exception.cause, caught.exception.path))
 
+    def test_write_atomic_and_ensure_dir_refuse_a_mode_outside_0o777_before_anything_is_made(self) -> None:
+        bad = (0o4700, 0o2700, 0o1700, 0o10000, -1, "0o600", 384.0, None)
+        with open_anchor(self.home) as home:
+            for index, mode in enumerate(bad):
+                box = self.home / f"box{index}"
+                with self.subTest(mode=mode), home.ensure_dir(box.name) as inside:
+                    with self.assertRaises(ValueError) as caught:
+                        inside.write_atomic("f", b"x", mode=mode)
+                    self.assertIn("0o777", str(caught.exception))
+                    with self.assertRaises(ValueError):
+                        inside.ensure_dir("d", mode=mode).release()
+                    self.assertEqual([], os.listdir(box))
+
+    def test_a_group_or_world_writable_mode_given_on_purpose_is_applied_as_given(self) -> None:
+        old = os.umask(0o077)
+        try:
+            with open_anchor(self.home) as home:
+                home.write_atomic("shared", b"x", mode=0o666)
+                home.write_atomic("group", b"x", mode=0o664)
+                home.write_atomic("plain", b"x", mode=0o644)
+        finally:
+            os.umask(old)
+        self.assertEqual((0o666, 0o664, 0o644), tuple(stat.S_IMODE((self.home / name).stat().st_mode)
+                                                      for name in ("shared", "group", "plain")))
+
     def test_release_closes_the_descriptor_once_and_a_released_anchor_refuses_use(self) -> None:
         anchor = open_anchor(self.home)
         with anchor.ensure_dir("a") as below:
@@ -534,6 +563,110 @@ class ChainedFormTests(unittest.TestCase):
                         pass
                 gc.collect()
                 self.assertEqual(before, _open_descriptors())
+
+
+class _CountingOs:
+    """A stand-in for the module's ``os``: each close is counted by its number, then done for real."""
+
+    def __init__(self) -> None:
+        self.closed: list = []
+
+    def __getattr__(self, name: str):
+        return getattr(os, name)
+
+    def close(self, fd: int) -> None:
+        self.closed.append(fd)
+        os.close(fd)
+
+
+class _Widened(Anchor):
+    """A test-only stand-in: the held descriptor is read slowly, so a second release would land between
+    a release's read of it and its clear (the window a free race has, made wide enough to hit)."""
+
+    @property
+    def _fd(self):
+        value = self.__dict__.get("_held")
+        time.sleep(0.0002)
+        return value
+
+    @_fd.setter
+    def _fd(self, value) -> None:
+        self.__dict__["_held"] = value
+
+
+@unittest.skipUnless(POSIX, NOT_POSIX)
+class ReleaseTests(unittest.TestCase):
+    ROUNDS = 40
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.folder = Path(tmp.name, "held")
+        self.folder.mkdir(mode=0o700)
+
+    def test_two_threads_releasing_one_anchor_at_the_same_moment_shut_its_descriptor_once(self) -> None:
+        counting, flags, errors, counts, hung = _CountingOs(), _posix._walk_flags(), [], [], 0
+
+        def releaser(anchor: Anchor, start: threading.Barrier) -> None:
+            try:
+                start.wait()
+                anchor.release()
+            except Exception as exc:  # noqa: BLE001  every error is the finding
+                errors.append(repr(exc))
+
+        with mock.patch.object(_posix, "os", counting):
+            for _ in range(self.ROUNDS):
+                fd = os.open(self.folder, flags[0])
+                anchor = _Widened(fd, str(self.folder), flags, None)
+                start = threading.Barrier(2, timeout=10)
+                del counting.closed[:]
+                threads = [threading.Thread(target=releaser, args=(anchor, start), name=f"releaser-{n}", daemon=True)
+                           for n in (1, 2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+                if any(thread.is_alive() for thread in threads):
+                    hung += 1
+                    break
+                counts.append(counting.closed.count(fd))
+        self.assertEqual(0, hung)
+        self.assertEqual([], errors[:5], f"{len(errors)} errors in {self.ROUNDS} rounds")
+        self.assertEqual({1}, set(counts), f"{sum(n > 1 for n in counts)} of {len(counts)} rounds shut it twice")
+
+    def test_a_second_release_in_one_thread_is_harmless_and_shuts_nothing_more(self) -> None:
+        counting = _CountingOs()
+        with mock.patch.object(_posix, "os", counting):
+            anchor = open_anchor(self.folder)
+            fd = anchor.fd
+            anchor.release()
+            anchor.release()
+        self.assertEqual([fd], counting.closed)
+
+
+@unittest.skipUnless(POSIX, NOT_POSIX)
+class CopyTests(unittest.TestCase):
+    def test_an_anchor_refuses_copy_deepcopy_and_pickle_and_keeps_its_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp, "held")
+            folder.mkdir(mode=0o700)
+            folder.joinpath("entry").write_bytes(b"")
+            made, refused = [], []
+            with open_anchor(folder) as anchor:
+                for how, call in (("copy", copy.copy), ("deepcopy", copy.deepcopy),
+                                  ("pickle", lambda a: pickle.loads(pickle.dumps(a)))):
+                    try:
+                        other = call(anchor)
+                    except TypeError as exc:
+                        refused.append((how, str(exc)))
+                    else:
+                        other.__dict__["_fd"] = None  # a copy shares the number: let it go without shutting it
+                        made.append(how)
+                self.assertEqual([("entry", "file")], anchor.entries())
+            self.assertEqual([], made)
+            self.assertEqual(["copy", "deepcopy", "pickle"], [how for how, _ in refused])
+            for _, text in refused:
+                self.assertIn("cannot be copied or pickled", text)
 
 
 if __name__ == "__main__":

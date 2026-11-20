@@ -20,6 +20,7 @@ import os
 import secrets
 import shlex
 import stat
+import threading
 from pathlib import Path
 
 # One finite set. A later cause is appended; none is renamed or removed.
@@ -29,6 +30,8 @@ ABOVE = ("owner_trusted", "operator_root")
 
 _UNSAFE_BITS = stat.S_IWGRP | stat.S_IWOTH
 _MAX_LINKS = 40  # Linux's MAXSYMLINKS: the links one path lookup follows before ELOOP
+_NO_COPY = ("an Anchor cannot be copied or pickled: it owns one open folder; open another anchor on the "
+            "same path instead")
 
 
 class AnchorRefused(Exception):
@@ -292,6 +295,17 @@ def _classified(exc: OSError, shown: str, name: str, dir_fd: int | None = None) 
     return exc
 
 
+def _mode(mode: object) -> int:
+    """``mode`` as given when it is a whole number with no bit outside 0o777; else ``ValueError``.
+
+    Setuid, setgid and the sticky bit are refused, as are a negative number and anything that is not an
+    ``int``. A group- or world-writable mode given on purpose is applied as given.
+    """
+    if type(mode) is not int or mode & ~0o777:
+        raise ValueError("mode must be a whole number from 0 to 0o777, with no setuid, setgid or sticky bit")
+    return mode
+
+
 def _read_bounded(fd: int, limit: int, shown: str) -> bytes:
     # Copied from the registry checker (plugin_security/registry.py ``_read_bounded``, #537 at 2d9005cb, :382-393).
     chunks = []
@@ -316,9 +330,12 @@ class Anchor:
     Use it as a context manager, or call ``release``; an anchor from ``child`` or ``ensure_dir`` is its
     own and is released on its own. An anchor that is never released (the first one of
     ``child("a").child("b")``) closes its folder when it is collected, as a file object does.
+    Release it only when no other thread is inside a call on it, and do not copy it (a copy or a pickle
+    raises ``TypeError``). A descriptor handed to the constructor belongs to the anchor from then on.
     """
 
     def __init__(self, fd: int, path: str, flags: tuple, trusted: tuple | None) -> None:
+        self._lock = threading.Lock()  # before ``_fd``: ``__del__`` releases only when ``_fd`` is set
         self._fd: int | None = fd
         self.path = path
         self._flags = flags
@@ -333,7 +350,8 @@ class Anchor:
         return self._fd
 
     def release(self) -> None:
-        fd, self._fd = self._fd, None
+        with self._lock:  # the descriptor is taken and cleared as one step: two releases shut it once
+            fd, self._fd = self._fd, None
         if fd is not None:
             os.close(fd)
 
@@ -346,6 +364,15 @@ class Anchor:
     def __del__(self) -> None:
         if getattr(self, "_fd", None) is not None:
             self.release()
+
+    def __copy__(self):
+        raise TypeError(_NO_COPY)
+
+    def __deepcopy__(self, memo):
+        raise TypeError(_NO_COPY)
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError(_NO_COPY)
 
     def __repr__(self) -> str:
         return f"Anchor({self.path!r}{', released' if self._fd is None else ''})"
@@ -372,8 +399,12 @@ class Anchor:
         return Anchor(fd, self._below(name), self._flags, self._trusted)
 
     def ensure_dir(self, name: str, mode: int = 0o700) -> "Anchor":
-        """``child(name)``, making the folder first, owner-only, when it is missing."""
+        """``child(name)``, making the folder first, owner-only, when it is missing.
+
+        ``mode`` is a whole number with no bit outside 0o777 (``ValueError`` before anything is made).
+        """
         name = self._name(name)
+        mode = _mode(mode)
         try:
             os.mkdir(name, mode, dir_fd=self.fd)  # makes no folder through a link: a link here is EEXIST
         except FileExistsError:
@@ -436,8 +467,13 @@ class Anchor:
             os.close(fd)
 
     def write_atomic(self, name: str, data: bytes, mode: int = 0o600) -> None:
-        """Write ``data`` as ``name``: a new temporary file beside it, synced, renamed into place, folder synced."""
+        """Write ``data`` as ``name``: a new temporary file beside it, synced, renamed into place, folder synced.
+
+        ``mode`` is a whole number with no bit outside 0o777 (``ValueError`` before anything is made); the
+        file gets it exactly, whatever the umask.
+        """
         name = self._name(name)
+        mode = _mode(mode)
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError("data must be bytes")
         parent = self.fd

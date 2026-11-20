@@ -30,6 +30,8 @@ CODES = (
     'keychain_timeout', 'keychain_tool_missing', 'keychain_undetermined', 'keychain_unsupported', 'secret_missing',
     # spend
     'spend_not_allowed',
+    # the hosts a key is bound to
+    'destination_invalid', 'destination_reserved', 'destination_required', 'credential_not_bound',
 )
 
 

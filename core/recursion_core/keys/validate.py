@@ -16,9 +16,18 @@
   Code, ``CODEX_API_KEY`` or ``OPENAI_API_KEY`` for Codex); the store checks only the shape.
 - value: 8 to 4096 visible ASCII characters (``!`` to ``~``): no space, no control character, no newline.
 - spend cap: US dollars, 0 to 100000 with at most two decimals.
+- destination: a host a key may be sent to, bound by the person when the key is added. The grammar is exactly the
+  signed plugin manifest's ``network_destinations`` (``plugin_security/manifest.py``, ``_HOST``; a test pins the two
+  patterns equal): lower-case DNS labels, at least one dot, an optional port. Narrower here: an IP literal (a host
+  ``ipaddress`` reads, or whose last label is all digits) and a port outside 1 to 65535 or written with a leading
+  zero are refused, so one host has one spelling. A host's name is at most ``HOST_NAME_MAX`` (253) characters,
+  the longest name DNS carries, and a key is bound to at most ``DESTINATIONS_MAX`` (64) hosts, so every key a save
+  accepts fits the index with room to remove it.
 """
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -46,6 +55,12 @@ CAP_TEXT = re.compile(r'[0-9]{1,6}(\.[0-9]{1,2})?')
 TIMESTAMP = re.compile(r'[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]'
                        r'\.[0-9]{3}Z')
 VALUE_MIN, VALUE_MAX = 8, 4096
+# The manifest's network destination, character for character (plugin_security/manifest.py, _HOST).
+DESTINATION = re.compile(r"[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+(:[0-9]{1,5})?")
+PORT_MAX = 65535
+HOST_NAME_MAX = 253          # characters in a host's name, the port not counted: the longest name DNS carries
+DESTINATIONS_MAX = 64        # hosts one key is bound to
+SAVE_TOKEN = re.compile(r'[0-9a-f]{32}(-[0-9a-f]{64})?')     # a save id, and the digest of its hosts when bound
 CAP_MAX = 100000
 
 
@@ -170,3 +185,48 @@ def valid_cap(value: object) -> bool:
     if not 0 <= value <= CAP_MAX:
         return False
     return round(value, 2) == value
+
+
+def valid_destination(text: object) -> bool:
+    """A host a key may be bound to (see the module's text): the manifest's grammar, no IP literal, port 1 to 65535,
+    a name of at most HOST_NAME_MAX characters."""
+    if not _full(DESTINATION, text):
+        return False
+    host, _, port = text.partition(':')
+    if len(host) > HOST_NAME_MAX:
+        return False
+    if port and (port[0] == '0' or not 1 <= int(port) <= PORT_MAX):
+        return False
+    if host.rsplit('.', 1)[-1].isdigit():
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return False
+
+
+def destinations_of(given: object) -> tuple | None:
+    """The hosts given at ``add`` as the record keeps them (a sorted tuple), or None when they are not a list or tuple
+    of at most DESTINATIONS_MAX distinct valid destinations. No hosts at all is the empty tuple: a key that is handed
+    out for no host."""
+    if not isinstance(given, (list, tuple)) or len(given) > DESTINATIONS_MAX:
+        return None
+    if not all(valid_destination(d) for d in given):
+        return None
+    if len(set(given)) != len(given):
+        return None
+    return tuple(sorted(given))
+
+
+def binding_digest(destinations: tuple) -> str:
+    """The SHA-256 of a record's bound hosts in their one canonical form, which the backend stores with the value."""
+    return hashlib.sha256('\n'.join(sorted(destinations)).encode('ascii')).hexdigest()
+
+
+def save_token(record) -> str:
+    """What a backend stores beside a value to bind it to its record: the save id, and for a key bound to hosts the
+    digest of those hosts after a ``-``. A record with no hosts has the save id alone, as every key saved before
+    hosts were bound has; so an index edited to widen, narrow or drop a key's hosts names no stored value."""
+    destinations = getattr(record, 'destinations', ())
+    return f'{record.save_id}-{binding_digest(destinations)}' if destinations else record.save_id

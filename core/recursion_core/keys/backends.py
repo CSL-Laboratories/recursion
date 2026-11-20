@@ -10,12 +10,15 @@ there: True, False only when that is verified, None when it cannot be told. A mi
 ``secret_missing``; any other failure is a typed ``KeyStoreError``. No error, repr or log line of a backend
 carries a value.
 
-THE BINDING. A value is stored WITH what authorizes it: the store's id, the save id of the record that saved it
-and that record's provider. ``get`` given a record returns the value only when all three match the record and
-the store; anything else is ``secret_missing``, on every backend. So no index (an older one put back, one copied
-in, one edited) can pair one save's provider and opt-in with another save's value. ``get`` with no record (the
-audit's read of an interrupted add, never a release) returns any value of the id; ``delete`` and ``holds`` act on
-every value of the id. A stored value with no binding beside it is refused, never guessed at.
+THE BINDING. A value is stored WITH what authorizes it: the store's id, the save id of the record that saved it and
+that record's provider; for a key bound to hosts, the save id carries the SHA-256 of those hosts after a ``-``
+(``validate.save_token``: the save's TOKEN), so an index edited to widen, narrow or drop a key's hosts names no stored
+value. A key with no hosts has the save id alone, exactly as before hosts were bound. ``get`` given a record returns
+the value only when all three match the record and the store; anything else is ``secret_missing``, on every backend. So
+no index (an older one put back, one copied in, one edited) can pair one save's provider and opt-in with another save's
+value. ``get`` with no record (the audit's read of an interrupted add, never a release) returns any value of the id;
+``delete`` and ``holds`` act on every value of the id. A stored value with no binding beside it is refused, never
+guessed at.
 
 SECRET SERVICE. ``secret-tool`` is given the value on its standard input (``store``) and gives it back on its
 standard output (``lookup``). An item carries five attributes: ``application recursion``, ``recursion_store
@@ -77,15 +80,15 @@ incomplete. An empty listing is an empty keychain. "User interaction is not allo
 detail is fixed text. Written against Apple's documented interface and its published source and tested against a
 stand-in program that follows them: it has not run on a Mac.
 
-OWNER-ONLY FILE. ``secrets.json`` in the store's folder: ``{"version": 1, "store_id": <the store's id>,
-"secrets": {id: {"save_id", "provider", "value"}}}``, read and written through ``files.Folder`` (0600, owner and
-mode checked on every read, temp file, fsync, rename). Any other shape is refused (``owner_file_invalid``). A
-file whose store id is not the index's belongs to another store: it releases nothing to this store's records
-(``secret_missing``), holds nothing this store can remove (a removal or recovery succeeds without touching it),
-and is not written over while this store has records (``owner_file_invalid``); the audit searches for its values
-as not the store's own. A store whose backend is this file and that has no record takes the file's id as its own
-at its next save, and with it every value the file holds (``KeyStore.add``); a removal takes no id, and a store on
-a keychain never takes it.
+OWNER-ONLY FILE. ``secrets.json`` in the store's folder: ``{"version": 1, "store_id": <the store's id>, "secrets": {id:
+{"save_id", "provider", "value"}}}`` (``save_id`` holds the save's token), read and written through ``files.Folder``
+(0600, owner and mode checked on every read, temp file, fsync, rename). Any other shape is refused
+(``owner_file_invalid``). A file whose store id is not the index's belongs to another store: it releases nothing to
+this store's records (``secret_missing``), holds nothing this store can remove (a removal or recovery succeeds without
+touching it), and is not written over while this store has records (``owner_file_invalid``); the audit searches for its
+values as not the store's own. A store whose backend is this file and that has no record takes the file's id as its own
+at its next save, and with it every value the file holds (``KeyStore.add``); a removal takes no id, and a store on a
+keychain never takes it.
 """
 from __future__ import annotations
 
@@ -96,7 +99,14 @@ import re
 from recursion_core.keys import system as sysmod
 from recursion_core.keys.errors import KeyStoreError
 from recursion_core.keys.files import Folder
-from recursion_core.keys.validate import decode_value, valid_key_id, valid_provider, valid_value
+from recursion_core.keys.validate import (
+    SAVE_TOKEN,
+    decode_value,
+    save_token,
+    valid_key_id,
+    valid_provider,
+    valid_value,
+)
 
 OWNER_FILE_NAME = 'secrets.json'
 OWNER_FILE_MAX = 4 << 20
@@ -126,7 +136,7 @@ class SecretService:
         """The item a record saved: its store, id, save and provider. With no record, any item of the id."""
         if record is None:
             return self._attributes(key_id)
-        return self._attributes(key_id) + ['recursion_save', record.save_id, 'recursion_provider', record.provider]
+        return self._attributes(key_id) + ['recursion_save', save_token(record), 'recursion_provider', record.provider]
 
     def _run(self, argv: list, *, input: bytes | None = None) -> sysmod.Completed:
         code = None
@@ -287,9 +297,10 @@ class MacKeychain:
         """The keychain this backend saves in, which the store's index records at a save (see MACOS KEYCHAIN)."""
         return self._login()
 
-    def _service(self, save_id: str, provider: str) -> str:
-        """The service of the item a save stored: it carries the store, the save and the provider."""
-        return f'recursion.{self._store_id}.{save_id}.{provider}'
+    def _service(self, token: str, provider: str) -> str:
+        """The service of the item a save stored: it carries the store, the save's token (its id, and the digest of
+        its hosts when it is bound to any) and the provider."""
+        return f'recursion.{self._store_id}.{token}.{provider}'
 
     def _of_id(self, key_id: str) -> list:
         """Every item of ``key_id`` in this store, whichever save stored it: account and generic attribute (no
@@ -300,7 +311,7 @@ class MacKeychain:
         """The item a record saved: account and service, its primary key. With no record, any item of the id."""
         if record is None:
             return self._of_id(key_id)
-        return ['-a', key_id, '-s', self._service(record.save_id, record.provider)]
+        return ['-a', key_id, '-s', self._service(save_token(record), record.provider)]
 
     def _line(self, key_id: str, provider: str, save_id: str, hexvalue: str) -> bytes:
         """The ``add-generic-password`` line, without its newline. The id, the ids and the provider are tokens and
@@ -309,16 +320,16 @@ class MacKeychain:
         return (f'add-generic-password -a {key_id} -s {self._service(save_id, provider)} -G {self._store_id} '
                 f'-j {provider} -l "Recursion API key {key_id}" -X {hexvalue} "{self._login()}"').encode()
 
-    def longest(self, key_id: str, provider: str) -> int:
+    def longest(self, key_id: str, provider: str, token: str = '0' * 32) -> int:
         """The longest key, in characters, whose line and newline fit the 4095 bytes ``security -i`` keeps, for this
         id and provider here. The key goes as hexadecimal, two bytes a character, so its line can end a byte short
         of ``LINE_MAX``."""
-        fixed = len(self._line(key_id, provider, '0' * 32, ''))
+        fixed = len(self._line(key_id, provider, token, ''))
         return max((self.LINE_MAX - fixed) // 2, 0)
 
     def admit(self, key_id: str, value: str, record) -> None:
         """Refuse, before the store writes anything, a key that line could not carry whole."""
-        longest = self.longest(key_id, record.provider)
+        longest = self.longest(key_id, record.provider, save_token(record))
         if len(value) > longest:
             raise KeyStoreError('value_invalid', f'a key kept in the macOS Keychain is at most {longest} characters '
                                 'for this id and keychain (security -i reads one line of at most 4095 bytes); nothing '
@@ -343,7 +354,7 @@ class MacKeychain:
 
     def put(self, key_id: str, value: str, folder: Folder, *, record) -> None:
         self.admit(key_id, value, record)
-        line = self._line(key_id, record.provider, record.save_id, value.encode('ascii').hex()) + b'\n'
+        line = self._line(key_id, record.provider, save_token(record), value.encode('ascii').hex()) + b'\n'
         done = self._run([self._tool(), '-i'], input=line)
         line = None
         if done.returncode != 0:
@@ -389,7 +400,7 @@ class MacKeychain:
         if record is None:
             wanted = {'acct': key_id, 'gena': self._store_id}
         else:
-            wanted = {'acct': key_id, 'svce': self._service(record.save_id, record.provider)}
+            wanted = {'acct': key_id, 'svce': self._service(save_token(record), record.provider)}
         return sum(1 for item in self._listing() if all(item.get(name) == value for name, value in wanted.items()))
 
     def unnamed(self, index) -> int:
@@ -401,7 +412,7 @@ class MacKeychain:
             if key_id in index.pending:
                 return item.get('gena') == self._store_id
             record = index.keys.get(key_id)
-            return record is not None and item.get('svce') == self._service(record.save_id, record.provider)
+            return record is not None and item.get('svce') == self._service(save_token(record), record.provider)
         return sum(1 for item in self._inventory() if not named(item))
 
     def _inventory(self) -> list:
@@ -468,9 +479,11 @@ def _login_path(out: bytes) -> str | None:
 
 
 UNRECORDED = ''      # an index pinned to the macOS Keychain that records no keychain (MacKeychain's ``keychain``)
-# Recursion's items, as the audit counts them: recursion.<store id>.<save id>.<provider>, the service a save writes,
-# or recursion.<save id> as #422's first head wrote it.
-RECURSION_SERVICE = re.compile(r'recursion\.[0-9a-f]{32}(?:\.[0-9a-f]{32}\.[a-z0-9][a-z0-9._-]{0,63})?')
+# Recursion's items, as the audit counts them: recursion.<store id>.<save token>.<provider>, the service a save writes
+# (the token is the save id, and the digest of the key's hosts when it is bound), or recursion.<save id> as #422's
+# first head wrote it.
+RECURSION_SERVICE = re.compile(r'recursion\.[0-9a-f]{32}'
+                               r'(?:\.[0-9a-f]{32}(?:-[0-9a-f]{64})?\.[a-z0-9][a-z0-9._-]{0,63})?')
 _DUMP_ATTRIBUTE = re.compile(rb'\s+"([A-Za-z0-9]{4})"<[A-Za-z0-9]+>=(.*)')
 _DUMP_HEX = re.compile(rb'0x((?:[0-9A-Fa-f]{2})+)(?:\s+".*")?')
 
@@ -568,7 +581,7 @@ class OwnerFile:
         if entry is None:
             raise KeyStoreError('secret_missing', f'the owner-only file has no value for {key_id}')
         save_id, provider, value = entry
-        if record is not None and (save_id != record.save_id or provider != record.provider):
+        if record is not None and (save_id != save_token(record) or provider != record.provider):
             raise KeyStoreError('secret_missing', f'the owner-only file holds no value saved by this record of {key_id}')
         return value
 
@@ -587,7 +600,7 @@ class OwnerFile:
         if store_id not in (None, self._store_id):
             raise KeyStoreError('owner_file_invalid', f'{folder.path / OWNER_FILE_NAME} belongs to another store; '
                                 'remove this index\'s keys, or put its own index back, before saving here')
-        entries[key_id] = (record.save_id, record.provider, value)     # this id's entry only: every other value stays
+        entries[key_id] = (save_token(record), record.provider, value)  # this id's entry only: every other value stays
         self._save(folder, entries)
 
     def delete(self, key_id: str, folder: Folder) -> None:
@@ -603,6 +616,11 @@ _ENTRY_FIELDS = {'save_id', 'provider', 'value'}
 
 def _random_id(text: object) -> bool:
     return isinstance(text, str) and text.isascii() and _RANDOM_ID.fullmatch(text) is not None
+
+
+def _save_token(text: object) -> bool:
+    """A save's token as the file keeps it: the save id, and the digest of the key's hosts when it is bound."""
+    return isinstance(text, str) and text.isascii() and SAVE_TOKEN.fullmatch(text) is not None
 
 
 def _parse(raw: bytes) -> tuple | None:
@@ -623,7 +641,7 @@ def _parse(raw: bytes) -> tuple | None:
     for key_id, entry in doc['secrets'].items():
         if not valid_key_id(key_id) or not isinstance(entry, dict) or set(entry) != _ENTRY_FIELDS:
             return None
-        if not (_random_id(entry['save_id']) and valid_provider(entry['provider']) and valid_value(entry['value'])):
+        if not (_save_token(entry['save_id']) and valid_provider(entry['provider']) and valid_value(entry['value'])):
             return None
         out[key_id] = (entry['save_id'], entry['provider'], entry['value'])
     return doc['store_id'], out

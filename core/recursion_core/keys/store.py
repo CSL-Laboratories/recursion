@@ -30,7 +30,9 @@ first write. A removal deletes every value saved for the id in the store, whiche
 
 THE INDEX FORMAT, version 1: ``{"version": 1, "store_id": <32 hex>, "backend": <store or null>, "keys": {<id>:
 {"provider", "env_name", "created_at", "store", "metered_spend_allowed", "cap_usd", "save_id"}}, "pending": {<id>:
-{"op": "add" | "remove", "started_at"}}}``, at most 1 MiB. A store pinned to the macOS Keychain also records
+{"op": "add" | "remove", "started_at"}}}``, at most 1 MiB. A key bound to hosts (THE HOSTS, below) also records
+``"destinations": [<host>, ...]``, sorted, distinct and never empty; a key with none records no such field, so an
+index written before hosts were bound reads as it did. A store pinned to the macOS Keychain also records
 ``"keychain": <its path>``, the login keychain it saved in (only beside a live ``macos_keychain`` pin). An index pinned
 there that records none (only unreleased drafts of the backend wrote one) is listed, and every operation that reaches
 the keychain is refused ``keychain_unavailable``: which keychain it saved in cannot be shown. No index is written with a
@@ -46,6 +48,20 @@ the host offers now, the file being in the store's own folder, so that once a ke
 and added again into it; a file in its place that the store did not write (a folder, a symlink, a FIFO, another shape)
 is refused, as every command that reads the file refuses it (``list`` reads only the index). The pin is released when
 nothing is left in the index.
+
+THE HOSTS. The person binds a key to the hosts it may be sent to when the key is added (``add(...,
+destinations=...)``, ``key add ... --destination HOST``), in the grammar of the plugin manifest's network destinations
+(``validate.valid_destination``: no IP literal, ports 1 to 65535, a name of at most 253 characters; at most 64 hosts
+per key, ``validate.DESTINATIONS_MAX``). A host the injected reserved set reserves
+(``reserved``, the plugin layer's ``ReservedEffects`` or any object with ``host_reserved``) is refused
+(``destination_reserved``): the store CALLS it and keeps no list of its own. The hosts are on the record (``KeyRecord.
+destinations``) and stored WITH the value in every backend, inside the save's token (``validate.save_token``), so an
+index edited by hand can neither widen nor drop them. Nothing changes them but the person: no method, seam or plugin
+call writes a record, and a key is bound again by removing it and adding it again. A bound key leaves the store only
+through ``credential_for(key_id, destination)``, and only for one of its hosts (else ``credential_not_bound``); the
+engine path ``credential`` refuses it (``destination_required``), so it never reaches an environment. A key with no
+hosts (every key saved before hosts were bound among them) is handed out by ``credential_for`` for NO host, and keeps
+its engine path; ``key list`` names it with ``hosts=none`` and ``list --json`` in ``unbound``.
 
 SPEND. Every key has ``metered_spend_allowed`` and ``cap_usd``, typed when it is added; with no opt-in the cap
 is 0. ``credentials()`` hands a key out only when both say spend is allowed (opt-in and a cap above 0):
@@ -141,6 +157,7 @@ INDEX_NAME = 'index.json'
 INDEX_MAX = 1 << 20
 INDEX_VERSION = 1
 FIELDS = ('provider', 'env_name', 'created_at', 'store', 'metered_spend_allowed', 'cap_usd', 'save_id')
+BOUND_FIELD = 'destinations'      # in the index only for a key bound to hosts (see THE HOSTS)
 PUBLISHED = ('key_id', 'provider', 'env_name', 'created_at', 'store')    # key.list's answer (methods.v1.json, S1)
 SHOWN = PUBLISHED + ('metered_spend_allowed', 'cap_usd')                 # list --json: the spend opt-in added
 PENDING_FIELDS = ('op', 'started_at')
@@ -170,6 +187,7 @@ class KeyRecord:
     metered_spend_allowed: bool
     cap_usd: int | float
     save_id: str
+    destinations: tuple = ()      # the hosts the person bound the key to, sorted; () for none (see THE HOSTS)
 
     def spend_allowed(self) -> bool:
         """The opt-in and a cap above 0. ``add`` and the index's parser both refuse an opt-in with a cap of 0, so the
@@ -184,8 +202,11 @@ class KeyRecord:
     def as_json(self) -> dict:
         """What the local ``list --json`` shows the owner: the published fields, then the spend opt-in and cap typed
         at ``add`` (``SHOWN``). Never the save id, which is the store's own business. It is not ``key.list``'s
-        answer, which is ``published``."""
-        return {name: getattr(self, name) for name in SHOWN}
+        answer, which is ``published``. A key bound to hosts also shows them (``destinations``)."""
+        shown = {name: getattr(self, name) for name in SHOWN}
+        if self.destinations:
+            shown[BOUND_FIELD] = list(self.destinations)
+        return shown
 
 
 @dataclass(frozen=True)
@@ -226,7 +247,7 @@ def _now(clock) -> str:
 
 def index_bytes(index: Index) -> bytes:
     """The index file exactly as it is written. Every write carries the store's id (``add`` makes it first)."""
-    keys ={kid: {name: getattr(record, name) for name in FIELDS} for kid, record in sorted(index.keys.items())}
+    keys = {kid: _entry(record) for kid, record in sorted(index.keys.items())}
     pending = {kid: {'op': p.op, 'started_at': p.started_at} for kid, p in sorted(index.pending.items())}
     doc = {'version': INDEX_VERSION, 'store_id': index.store_id, 'backend': index.backend if index.live() else None,
            'keys': keys, 'pending': pending}
@@ -238,16 +259,43 @@ def index_bytes(index: Index) -> bytes:
     return (body + '\n').encode('ascii')
 
 
+def _entry(record: KeyRecord) -> dict:
+    entry = {name: getattr(record, name) for name in FIELDS}
+    if record.destinations:
+        entry[BOUND_FIELD] = list(record.destinations)
+    return entry
+
+
 class KeyStore:
     """One user's key store. Every call opens and checks the folder again; nothing is cached between calls.
 
     The store's identity is read from its index on every call (see IDENTITY above), never from ``root``.
     """
 
-    def __init__(self, root: Path | str | None = None, *, system: System | None = None, clock=time.time) -> None:
+    def __init__(self, root: Path | str | None = None, *, system: System | None = None, clock=time.time,
+                 reserved=None) -> None:
         self.system = system or System()
         self.root = Path(root) if root is not None else default_root(self.system)
         self._clock = clock
+        self._reserved = reserved     # what only an effect owner may hold: CALLED at add and at every hand-out
+
+    def _bound(self, destinations) -> tuple:
+        """The hosts given at ``add`` as the record keeps them, or the refusal: ``destination_invalid`` for a value
+        that is not a list of distinct hosts in the manifest's grammar, ``destination_reserved`` for a host the
+        reserved set reserves."""
+        bound = v.destinations_of(destinations)
+        if bound is None:
+            raise KeyStoreError('destination_invalid', 'hosts are distinct lower-case names with a dot and an optional '
+                                'port 1 to 65535, as a plugin manifest lists them; no IP address; a name is at most '
+                                f'{v.HOST_NAME_MAX} characters, and a key has at most {v.DESTINATIONS_MAX} hosts')
+        for host in bound:
+            self._refuse_reserved(host)
+        return bound
+
+    def _refuse_reserved(self, host: str) -> None:
+        if self._reserved is not None and self._reserved.host_reserved(host):
+            raise KeyStoreError('destination_reserved', f'{host} is reserved for its effect owner; no key is bound to '
+                                'it or sent to it')
 
     def __repr__(self) -> str:
         return f'KeyStore({str(self.root)!r})'
@@ -373,9 +421,11 @@ class KeyStore:
 
     # -- commands ----------------------------------------------------------------------------------
     def add(self, key_id: str, provider: str, env_name: str, value: str, *, metered_spend_allowed: bool = False,
-            cap_usd: float = 0) -> KeyRecord:
-        """Save a new key. An id that is already saved is refused (``key_exists``); remove it first."""
+            cap_usd: float = 0, destinations=()) -> KeyRecord:
+        """Save a new key, bound to ``destinations`` (none by default). An id that is already saved is refused
+        (``key_exists``); remove it first."""
         _check_names(key_id, provider, env_name)
+        bound = self._bound(destinations)
         if not v.valid_value(value):
             raise KeyStoreError('value_invalid', f'a key is {v.VALUE_MIN} to {v.VALUE_MAX} visible ASCII characters, '
                                 'with no space')
@@ -403,7 +453,7 @@ class KeyStore:
                 raise _unbound_exists(key_id)
             now = _now(self._clock)
             record = KeyRecord(key_id, provider, env_name, now, backend.name, metered_spend_allowed, cap_usd,
-                               _random_id())
+                               _random_id(), bound)
             keys = {**index.keys, key_id: record}
             intent = replace(index, backend=backend.name, pending={**index.pending, key_id: Pending(key_id, 'add', now)})
             done = replace(index, backend=backend.name, keys=keys)
@@ -437,7 +487,7 @@ class KeyStore:
             return record
 
     def check_add(self, key_id: str, provider: str, env_name: str, *, metered_spend_allowed: bool = False,
-                  cap_usd: float = 0) -> None:
+                  cap_usd: float = 0, destinations=()) -> None:
         """Raise what ``add`` would refuse before it has a value, with the same code: an id, provider or variable
         name it does not take; a folder, index or host it cannot save in (an index already too full for the smallest
         record among them); an id already saved, or held in the store's own file with no saved key naming it; and,
@@ -446,8 +496,9 @@ class KeyStore:
         key, so a command that cannot succeed for one of these reasons never asks for one. It changes nothing and
         holds the folder's lock shared; ``add`` checks all of it again under the exclusive lock. Left to ``add``: an
         id with an unfinished operation (the save's own recovery may finish it), a keychain that stops answering in
-        between, the cap and the value."""
+        between, the cap and the value. Hosts ``add`` would refuse are refused here too."""
         _check_names(key_id, provider, env_name)
+        bound = self._bound(destinations)
         folder = self._folder(create=False)
         if folder is None:
             self._backend(None, None)       # a host this store cannot save on, as add refuses it
@@ -469,7 +520,7 @@ class KeyStore:
             # refused store_full, as add refuses it.
             given = metered_spend_allowed is True and v.valid_cap(cap_usd) and cap_usd > 0
             smallest = KeyRecord(key_id, provider, env_name, _now(self._clock), name, given, cap_usd if given else 0,
-                                 '0' * 32)
+                                 '0' * 32, bound)
             self._sized(replace(index, backend=name, keys={**index.keys, key_id: smallest},
                                 pending={**index.pending, key_id: Pending(key_id, 'add', smallest.created_at)}))
 
@@ -622,6 +673,9 @@ class KeyStore:
                     raise KeyStoreError('file_invalid', f'{folder.path} has an index and no lock file beside it')
                 if unfinished:       # an add or removal that did not finish, with or without a record yet
                     raise KeyStoreError('operation_pending', f'an operation on {connection_id} is not finished')
+                if record.destinations:
+                    raise KeyStoreError('destination_required', f'{connection_id} is bound to hosts and is handed out '
+                                        'only for one of them, never into an engine\'s environment')
                 if not v.known_provider(record.provider):
                     # A vendor outside the published list is kept and listed, never handed to an engine: no route
                     # or grant can name a provider yet, so nothing could tell that this route is meant for it.
@@ -648,6 +702,53 @@ class KeyStore:
             raise KeyError(connection_id)
         log.warning('the key store refused %s: %s', connection_id, code)
         raise KeyRefused(connection_id, code)
+
+    def credential_for(self, key_id: str, destination: str) -> str:
+        """The key ``key_id`` for a request to ``destination``, only when the person bound it to that host (see THE
+        HOSTS). An unknown id raises ``KeyError(key_id)``; a known one it will not hand out raises ``KeyRefused``:
+        ``destination_invalid`` (not a host in the grammar), ``operation_pending``, ``credential_not_bound`` (the key
+        is bound to other hosts, or to none), ``destination_reserved`` (the reserved set, asked again now, reserves
+        it), or the backend's code. The host is compared exactly as the person typed it, port included. The spend
+        opt-in and the published vendors are the engine path's rules and are not asked here."""
+        if not v.valid_key_id(key_id):
+            raise KeyError(key_id)
+        unknown, code = False, None
+        try:
+            if not v.valid_destination(destination):
+                raise KeyStoreError('destination_invalid', 'not a host in the grammar of a plugin manifest')
+            folder = self._folder(create=False)
+            if folder is None:
+                raise KeyError(key_id)
+            with folder, folder.locked(shared=True) as held:
+                index = self._read_index(folder)
+                record = index.keys.get(key_id)
+                unfinished = key_id in index.pending
+                if record is None and not unfinished:
+                    raise KeyError(key_id)
+                if not held:
+                    raise KeyStoreError('file_invalid', f'{folder.path} has an index and no lock file beside it')
+                if unfinished:
+                    raise KeyStoreError('operation_pending', f'an operation on {key_id} is not finished')
+                if destination not in record.destinations:
+                    raise KeyStoreError('credential_not_bound', f'{key_id} is not bound to {destination}' + (
+                        '' if record.destinations else ' (it is bound to no host; remove it and add it again with '
+                        'its hosts)'))
+                self._refuse_reserved(destination)
+                # The value of this record's own save, bound to these hosts, and no other: see THE HOSTS.
+                return self._backend(index.backend, index.store_id, _keychain_of(index)).get(key_id, folder, record)
+        except KeyRefused:
+            raise
+        except KeyError:
+            unknown = True
+        except KeyStoreError as exc:
+            code = exc.code
+        except Exception as exc:  # noqa: BLE001 - a store that fails has no credential to give
+            log.warning('the key store failed for %s: %s', key_id, type(exc).__name__)
+            code = 'store_failed'
+        if unknown:
+            raise KeyError(key_id)
+        log.warning('the key store refused %s: %s', key_id, code)
+        raise KeyRefused(key_id, code)
 
     # -- for other lanes: QUOTA's spend policy, INSTALL's doctor -----------------------------------
     def spend_policy(self, connection_id: str) -> dict:
@@ -739,8 +840,13 @@ def _parse_index(raw: bytes) -> Index | None:
         return None
     keys = {}
     for key_id, entry in doc['keys'].items():
-        if not v.valid_key_id(key_id) or not isinstance(entry, dict) or set(entry) != set(FIELDS):
+        if not v.valid_key_id(key_id) or not isinstance(entry, dict) or set(entry) - {BOUND_FIELD} != set(FIELDS):
             return None
+        bound = ()
+        if BOUND_FIELD in entry:       # a key bound to hosts: never an empty list, always as add writes it
+            bound = v.destinations_of(entry[BOUND_FIELD]) if isinstance(entry[BOUND_FIELD], list) else None
+            if not bound or list(bound) != entry[BOUND_FIELD]:
+                return None
         allowed, cap = entry['metered_spend_allowed'], entry['cap_usd']
         if not (v.valid_provider(entry['provider']) and v.valid_env_name(entry['env_name'])
                 and v.valid_timestamp(entry['created_at']) and entry['store'] == backend
@@ -748,7 +854,7 @@ def _parse_index(raw: bytes) -> Index | None:
                 and _valid_random_id(entry['save_id'])):
             return None
         keys[key_id] = KeyRecord(key_id, entry['provider'], entry['env_name'], entry['created_at'], entry['store'],
-                                 allowed, cap, entry['save_id'])
+                                 allowed, cap, entry['save_id'], bound)
     if len({record.save_id for record in keys.values()}) != len(keys):
         return None                      # two records naming one save: an index this store never writes
     pending = {}

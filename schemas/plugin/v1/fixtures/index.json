@@ -456,6 +456,469 @@
       }
     },
     {
+      "file": "good/host.v1/h01-hello.json",
+      "schema": "host.v1.json#/$defs/hello",
+      "shows": "The first message each side sends: the channel's version and nothing else."
+    },
+    {
+      "file": "good/host.v1/h02-load-one-plugin.json",
+      "schema": "host.v1.json#/$defs/load",
+      "shows": "The daemon hands a host one plugin as verified bytes. It may come after hello at any time."
+    },
+    {
+      "file": "good/host.v1/h03-an-operator-read-by-name.json",
+      "schema": "host.v1.json#/$defs/call",
+      "shows": "A call by NAME from the one append-only list, with exactly the arguments listed for that name."
+    },
+    {
+      "file": "good/host.v1/h04-a-core-request-as-bytes.json",
+      "schema": "host.v1.json#/$defs/core",
+      "shows": "One csl-core/v0 request, its bytes unchanged. No caller: the daemon sets it from the channel."
+    },
+    {
+      "file": "good/host.v1/h05-what-a-call-returned.json",
+      "schema": "host.v1.json#/$defs/result",
+      "shows": "What one call returned, under the call's id."
+    },
+    {
+      "file": "good/host.v1/h06-a-call-name-the-host-does-not-know.json",
+      "schema": "host.v1.json#/$defs/refusal",
+      "shows": "A typed refusal: the host did not know the call name, nothing ran, and the channel stays up."
+    },
+    {
+      "file": "good/host.v1/h07-bye.json",
+      "schema": "host.v1.json#/$defs/bye",
+      "shows": "The last message of a channel."
+    },
+    {
+      "file": "good/host.v1/h08-a-name-a-later-release-may-add.json",
+      "schema": "host.v1.json#/$defs/call",
+      "shows": "A name not on this release's list still has the form of a call: the receiver refuses it call_unknown, so a later name is never a schema break."
+    },
+    {
+      "file": "bad/host.v1/b01-a-core-message-naming-its-caller.json",
+      "schema": "host.v1.json#/$defs/core",
+      "rule": "A core message carries no caller: the daemon sets it from the channel.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/b02-a-call-name-in-capitals.json",
+      "schema": "host.v1.json#/$defs/call",
+      "rule": "A call name is lower-case dotted words.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/name"
+      }
+    },
+    {
+      "file": "bad/host.v1/b03-a-refusal-code-with-spaces.json",
+      "schema": "host.v1.json#/$defs/refusal",
+      "rule": "A refusal code is one lower-case word with underscores.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/code"
+      }
+    },
+    {
+      "file": "bad/host.v1/b04-bytes-that-are-not-base64.json",
+      "schema": "host.v1.json#/$defs/core",
+      "rule": "Bytes on the channel are standard base64 with padding.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/bytes_b64"
+      }
+    },
+    {
+      "file": "bad/host.v1/b05-a-load-file-path-that-climbs.json",
+      "schema": "host.v1.json#/$defs/load",
+      "rule": "A file path inside a package never holds '..': each part starts with a letter, a digit or '_'.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/files"
+      }
+    },
+    {
+      "file": "bad/host.v1/b06-a-load-file-path-that-is-absolute.json",
+      "schema": "host.v1.json#/$defs/load",
+      "rule": "A file path inside a package is relative: it never starts with '/'.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/files"
+      }
+    },
+    {
+      "file": "bad/host.v1/b07-a-load-plugin-id-of-a-wrong-form.json",
+      "schema": "host.v1.json#/$defs/load",
+      "rule": "A load's plugin id has the plugin id's form.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/plugin_id"
+      }
+    },
+    {
+      "file": "bad/host.v1/b08-an-id-of-two-to-the-53.json",
+      "schema": "host.v1.json#/$defs/call",
+      "rule": "A message id is a whole number from 0 to 2^53-1.",
+      "expect": {
+        "keyword": "maximum",
+        "at": "/id"
+      }
+    },
+    {
+      "file": "bad/host.v1/b09-a-refusal-detail-over-1000-characters.json",
+      "schema": "host.v1.json#/$defs/refusal",
+      "rule": "A refusal's detail is at most 1,000 characters.",
+      "expect": {
+        "keyword": "maxLength",
+        "at": "/detail"
+      }
+    },
+    {
+      "file": "bad/host.v1/b10-a-call-name-with-a-line-break.json",
+      "schema": "host.v1.json#/$defs/call",
+      "rule": "A call name holds no line break.",
+      "expect": {
+        "keyword": "not",
+        "at": "/name"
+      }
+    },
+    {
+      "file": "bad/host.v1/f-host.v1.bye.type.json",
+      "schema": "host.v1.json#/$defs/bye",
+      "rule": "The value at /type is fixed by host.v1.json#/$defs/bye/properties/type.",
+      "expect": {
+        "keyword": "const",
+        "at": "/type"
+      }
+    },
+    {
+      "file": "bad/host.v1/f-host.v1.call.type.json",
+      "schema": "host.v1.json#/$defs/call",
+      "rule": "The value at /type is fixed by host.v1.json#/$defs/call/properties/type.",
+      "expect": {
+        "keyword": "const",
+        "at": "/type"
+      }
+    },
+    {
+      "file": "bad/host.v1/f-host.v1.core.type.json",
+      "schema": "host.v1.json#/$defs/core",
+      "rule": "The value at /type is fixed by host.v1.json#/$defs/core/properties/type.",
+      "expect": {
+        "keyword": "const",
+        "at": "/type"
+      }
+    },
+    {
+      "file": "bad/host.v1/f-host.v1.hello.channel.json",
+      "schema": "host.v1.json#/$defs/hello",
+      "rule": "The value at /channel is fixed by host.v1.json#/$defs/hello/properties/channel.",
+      "expect": {
+        "keyword": "const",
+        "at": "/channel"
+      }
+    },
+    {
+      "file": "bad/host.v1/f-host.v1.hello.type.json",
+      "schema": "host.v1.json#/$defs/hello",
+      "rule": "The value at /type is fixed by host.v1.json#/$defs/hello/properties/type.",
+      "expect": {
+        "keyword": "const",
+        "at": "/type"
+      }
+    },
+    {
+      "file": "bad/host.v1/f-host.v1.load.type.json",
+      "schema": "host.v1.json#/$defs/load",
+      "rule": "The value at /type is fixed by host.v1.json#/$defs/load/properties/type.",
+      "expect": {
+        "keyword": "const",
+        "at": "/type"
+      }
+    },
+    {
+      "file": "bad/host.v1/f-host.v1.refusal.type.json",
+      "schema": "host.v1.json#/$defs/refusal",
+      "rule": "The value at /type is fixed by host.v1.json#/$defs/refusal/properties/type.",
+      "expect": {
+        "keyword": "const",
+        "at": "/type"
+      }
+    },
+    {
+      "file": "bad/host.v1/f-host.v1.result.type.json",
+      "schema": "host.v1.json#/$defs/result",
+      "rule": "The value at /type is fixed by host.v1.json#/$defs/result/properties/type.",
+      "expect": {
+        "keyword": "const",
+        "at": "/type"
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.bye.reason.json",
+      "schema": "host.v1.json#/$defs/bye",
+      "rule": "The object described at host.v1.json#/$defs/bye always carries 'reason'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.bye.type.json",
+      "schema": "host.v1.json#/$defs/bye",
+      "rule": "The object described at host.v1.json#/$defs/bye always carries 'type'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.call.args.json",
+      "schema": "host.v1.json#/$defs/call",
+      "rule": "The object described at host.v1.json#/$defs/call always carries 'args'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.call.id.json",
+      "schema": "host.v1.json#/$defs/call",
+      "rule": "The object described at host.v1.json#/$defs/call always carries 'id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.call.name.json",
+      "schema": "host.v1.json#/$defs/call",
+      "rule": "The object described at host.v1.json#/$defs/call always carries 'name'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.call.type.json",
+      "schema": "host.v1.json#/$defs/call",
+      "rule": "The object described at host.v1.json#/$defs/call always carries 'type'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.core.bytes_b64.json",
+      "schema": "host.v1.json#/$defs/core",
+      "rule": "The object described at host.v1.json#/$defs/core always carries 'bytes_b64'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.core.id.json",
+      "schema": "host.v1.json#/$defs/core",
+      "rule": "The object described at host.v1.json#/$defs/core always carries 'id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.core.type.json",
+      "schema": "host.v1.json#/$defs/core",
+      "rule": "The object described at host.v1.json#/$defs/core always carries 'type'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.hello.channel.json",
+      "schema": "host.v1.json#/$defs/hello",
+      "rule": "The object described at host.v1.json#/$defs/hello always carries 'channel'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.hello.type.json",
+      "schema": "host.v1.json#/$defs/hello",
+      "rule": "The object described at host.v1.json#/$defs/hello always carries 'type'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.load.files.json",
+      "schema": "host.v1.json#/$defs/load",
+      "rule": "The object described at host.v1.json#/$defs/load always carries 'files'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.load.manifest_b64.json",
+      "schema": "host.v1.json#/$defs/load",
+      "rule": "The object described at host.v1.json#/$defs/load always carries 'manifest_b64'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.load.plugin_id.json",
+      "schema": "host.v1.json#/$defs/load",
+      "rule": "The object described at host.v1.json#/$defs/load always carries 'plugin_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.load.type.json",
+      "schema": "host.v1.json#/$defs/load",
+      "rule": "The object described at host.v1.json#/$defs/load always carries 'type'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.refusal.code.json",
+      "schema": "host.v1.json#/$defs/refusal",
+      "rule": "The object described at host.v1.json#/$defs/refusal always carries 'code'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.refusal.detail.json",
+      "schema": "host.v1.json#/$defs/refusal",
+      "rule": "The object described at host.v1.json#/$defs/refusal always carries 'detail'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.refusal.id.json",
+      "schema": "host.v1.json#/$defs/refusal",
+      "rule": "The object described at host.v1.json#/$defs/refusal always carries 'id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.refusal.type.json",
+      "schema": "host.v1.json#/$defs/refusal",
+      "rule": "The object described at host.v1.json#/$defs/refusal always carries 'type'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.result.id.json",
+      "schema": "host.v1.json#/$defs/result",
+      "rule": "The object described at host.v1.json#/$defs/result always carries 'id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.result.type.json",
+      "schema": "host.v1.json#/$defs/result",
+      "rule": "The object described at host.v1.json#/$defs/result always carries 'type'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/m-host.v1.result.value.json",
+      "schema": "host.v1.json#/$defs/result",
+      "rule": "The object described at host.v1.json#/$defs/result always carries 'value'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/u-host.v1.bye.json",
+      "schema": "host.v1.json#/$defs/bye",
+      "rule": "The object described at host.v1.json#/$defs/bye is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/u-host.v1.call.json",
+      "schema": "host.v1.json#/$defs/call",
+      "rule": "The object described at host.v1.json#/$defs/call is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/u-host.v1.core.json",
+      "schema": "host.v1.json#/$defs/core",
+      "rule": "The object described at host.v1.json#/$defs/core is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/u-host.v1.hello.json",
+      "schema": "host.v1.json#/$defs/hello",
+      "rule": "The object described at host.v1.json#/$defs/hello is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/u-host.v1.load.json",
+      "schema": "host.v1.json#/$defs/load",
+      "rule": "The object described at host.v1.json#/$defs/load is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/u-host.v1.refusal.json",
+      "schema": "host.v1.json#/$defs/refusal",
+      "rule": "The object described at host.v1.json#/$defs/refusal is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/host.v1/u-host.v1.result.json",
+      "schema": "host.v1.json#/$defs/result",
+      "rule": "The object described at host.v1.json#/$defs/result is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
       "file": "good/install.v1/h01-one-trusted-key-one-grant.json",
       "schema": "install.v1.json",
       "shows": "One trusted developer key and one grant bound to a digest and that key."

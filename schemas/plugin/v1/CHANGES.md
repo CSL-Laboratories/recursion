@@ -4,6 +4,38 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `host.v1.json` is `1.0-draft.2` (2026-11-18)
+
+`call` and `result` travel both ways: the daemon calls a plugin's function by name, and a plugin's host
+calls a broker handle by name; when built, every reserved call name is sent by a host to the daemon, and a
+reserved name arriving at the daemon is refused `call_reserved` before any other check of it. A result for
+an id the receiver never called is refused. `net.request` and `net.connect` join the reserved call names.
+A `load` frame (daemon to host only) may be as large as the daemon's largest package needs, computed from
+`MAX_MANIFEST_BYTES` and `MAX_ARTIFACT_BYTES` (now in `plugin_security/limits.py`, which
+`daemon/plugins.py` reads); every other frame, and every frame a
+host sends, stays at most 1 MiB; a package that still does not fit is refused `load_too_large` (a new code,
+appended) on the daemon's side. One channel per loaded plugin: every load names the plugin the channel was
+opened for. The four patterns without it gain the line-break guard. What it breaks: nothing merged; inside
+this draft, `call` was daemon-only and `result` host-only, and the frame limit was 1 MiB for every frame.
+Six more bad fixtures prove the load's file paths and plugin id, the id range, the detail length and the
+line-break guard.
+
+## `host.v1.json` is new, `1.0-draft.1` (2026-11-18)
+
+The channel between the daemon and a plugin host: `hello`, `load`, `call`, `core`, `result`, `refusal`
+and `bye`, framed as `control_transport/framing.py` frames. A `call` carries a name from one
+append-only list (`registry`, `operator`, `surfaces`, `surface`); a name the receiver does not know is
+refused `call_unknown`, and a later surface kind is a new name, never a schema break. A message type the
+receiver does not know is answered with a typed refusal and the channel stays up. The message names
+`event`, `guard` and `surface.update` and the call names `run.request` and `computer.open`, `.act`,
+`.observe` and `.close` are reserved: named, answered 'reserved; not available in this release', never
+built here. The run-origin values `trigger`, `agent` and `packet` are in the reserved list with no field
+yet: a message that carries a field for one is refused as any unknown field is (`message_invalid`), not
+answered 'reserved'. No message carries a caller: the
+daemon sets it from the channel. What it breaks: nothing; no schema before it named these messages.
+Forty-nine fixtures prove its rules; `plugin_security/host_channel.py` is its code side and
+`plugin_security/tests/test_host_channel.py` holds the two equal.
+
 ## `revoked-keys.v1.json` is `1.0-draft.2` (Nov 15, 2026)
 
 Its `timestamp` (a list's `issued_at` and `expires_at`, and each key's `revoked_at`) is now the control

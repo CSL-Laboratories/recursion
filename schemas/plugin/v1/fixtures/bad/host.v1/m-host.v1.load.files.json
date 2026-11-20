@@ -1,0 +1,5 @@
+{
+  "type": "load",
+  "plugin_id": "demo.plugin",
+  "manifest_b64": "eyJwbHVnaW5faWQiOiJkZW1vLnBsdWdpbiJ9"
+}

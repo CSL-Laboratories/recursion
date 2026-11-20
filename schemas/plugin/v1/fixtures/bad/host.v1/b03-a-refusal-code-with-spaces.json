@@ -1,0 +1,6 @@
+{
+  "type": "refusal",
+  "id": 3,
+  "code": "call unknown",
+  "detail": "widgets"
+}

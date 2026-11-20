@@ -314,7 +314,8 @@ class Anchor:
     :396-535) and the settings-file gate's ``_open_walk`` (setup/open_guard.py, #533 at 5b0be1ee,
     :147-160), turned so that the caller holds each folder: ``a/b`` is ``child("a").child("b")``.
     Use it as a context manager, or call ``release``; an anchor from ``child`` or ``ensure_dir`` is its
-    own and is released on its own.
+    own and is released on its own. An anchor that is never released (the first one of
+    ``child("a").child("b")``) closes its folder when it is collected, as a file object does.
     """
 
     def __init__(self, fd: int, path: str, flags: tuple, trusted: tuple | None) -> None:
@@ -341,6 +342,10 @@ class Anchor:
 
     def __exit__(self, *exc) -> None:
         self.release()
+
+    def __del__(self) -> None:
+        if getattr(self, "_fd", None) is not None:
+            self.release()
 
     def __repr__(self) -> str:
         return f"Anchor({self.path!r}{', released' if self._fd is None else ''})"
@@ -379,8 +384,14 @@ class Anchor:
         """``(name, kind)`` for each entry, sorted by name; kind is ``dir``, ``file``, ``link`` or ``other``."""
         parent = self.fd
         found = []
-        with os.scandir(parent) as listing:
-            names = sorted(entry.name for entry in listing)
+        # A listing of its own: a read position shared with another listing on this anchor (another
+        # thread's) would make either one short, doubled or empty.
+        own = os.open(".", self._flags[0], dir_fd=parent)
+        try:
+            with os.scandir(own) as listing:
+                names = sorted(entry.name for entry in listing)
+        finally:
+            os.close(own)
         for name in names:
             kind = self._kind(parent, name)
             if kind is not None:
@@ -457,7 +468,11 @@ class Anchor:
                     pass
 
     def rename(self, name: str, to: "Anchor", to_name: str) -> None:
-        """Move ``name`` here to ``to_name`` in the held folder ``to``; a link at ``name`` is refused."""
+        """Move ``name`` here to ``to_name`` in the held folder ``to``.
+
+        A link seen at ``name`` is refused. A link put there while the call runs may itself be moved, so a
+        caller must not take the moved entry for a file; what a link points at is never touched.
+        """
         name = self._name(name)
         if not isinstance(to, Anchor):
             raise TypeError("to must be an Anchor")
@@ -474,7 +489,11 @@ class Anchor:
             os.fsync(parent)
 
     def remove(self, name: str) -> None:
-        """Remove the file or the empty folder ``name``; a link at ``name`` is refused, not removed."""
+        """Remove the file or the empty folder ``name``.
+
+        A link seen at ``name`` is refused. A link put there while the call runs may itself be removed;
+        what a link points at is never touched, and nothing outside the held folder is.
+        """
         name = self._name(name)
         parent = self.fd
         kind = self._kind(parent, name)

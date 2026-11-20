@@ -9,15 +9,18 @@ its own duration, as a Windows interpreter has them out.
 
 from __future__ import annotations
 
+import gc
 import os
 import shlex
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 
+import recursion_core
 from recursion_core.anchored import ABOVE, CAUSES, Anchor, AnchorRefused, open_anchor
 from recursion_core.anchored.tests import test_system_facts as facts
 
@@ -43,6 +46,19 @@ def _files(top: Path) -> int:
 
 def _open_descriptors() -> int:
     return len(os.listdir("/proc/self/fd"))
+
+
+_MODULE = "recursion_core.anchored.tests.test_anchor"  # by name: the gate runs this file as __main__
+
+
+def _run_alone(case: str, tmpdir: str) -> subprocess.CompletedProcess:
+    """One case of this module in a fresh interpreter, with ``TMPDIR`` set, as the gate's first run of a file."""
+    env = dict(os.environ)
+    core = os.path.dirname(os.path.dirname(os.path.abspath(recursion_core.__file__)))
+    env["PYTHONPATH"] = os.pathsep.join(part for part in (core, env.get("PYTHONPATH", "")) if part)
+    env["TMPDIR"] = tmpdir
+    command = [sys.executable, "-X", "utf8", "-B", "-m", "unittest", f"{_MODULE}.{case}"]
+    return subprocess.run(command, capture_output=True, text=True, timeout=150, env=env, cwd=tmpdir, check=False)
 
 
 @unittest.skipUnless(POSIX, NOT_POSIX)
@@ -113,7 +129,7 @@ class AboveTheAnchorTests(unittest.TestCase):
 
     def test_a_folder_above_that_group_or_world_can_write_refuses_unless_it_is_sticky(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            shared = Path(tmp, "shared")
+            shared = Path(os.path.realpath(tmp), "shared")  # the module names the link-free path it resolved
             shared.joinpath("home").mkdir(parents=True, mode=0o700)
             os.chmod(shared, 0o777)
             with self.assertRaises(AnchorRefused) as caught:
@@ -124,6 +140,45 @@ class AboveTheAnchorTests(unittest.TestCase):
             os.chmod(shared, 0o1777)
             open_anchor(shared / "home").release()
             os.chmod(shared, 0o700)
+
+    def test_the_writable_case_holds_when_the_temporary_folder_lies_behind_a_link(self) -> None:
+        # As on macOS, where the temporary folder is under /var, a link to private/var.
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "real").mkdir(mode=0o700)
+            os.symlink(Path(tmp, "real"), Path(tmp, "link"))
+            case = ("AboveTheAnchorTests."
+                    "test_a_folder_above_that_group_or_world_can_write_refuses_unless_it_is_sticky")
+            done = _run_alone(case, str(Path(tmp, "link")))
+            self.assertEqual(0, done.returncode, done.stderr[-3000:])
+            self.assertEqual([], os.listdir(Path(tmp, "real")))
+
+    def test_the_folders_above_are_held_to_the_owner_rule_and_the_owner_cause_is_reached(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root owns everything this case would show as another user's")
+        real_euid = os.geteuid
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "home").mkdir(mode=0o700)
+            os.geteuid = lambda: real_euid() + 1  # a stand-in: this user is someone else for the call
+            try:
+                with self.assertRaises(AnchorRefused) as caught:
+                    open_anchor(Path(tmp, "home"))
+            finally:
+                os.geteuid = real_euid
+            self.assertEqual("owner", caught.exception.cause)
+            self.assertEqual(real_euid(), os.lstat(caught.exception.path).st_uid)
+            self.assertIn("is owned by another user", caught.exception.way_out)
+
+    def test_the_anchor_itself_that_group_or_world_can_write_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp, "home")
+            home.mkdir(mode=0o700)
+            for mode in (0o770, 0o702):
+                os.chmod(home, mode)
+                with self.subTest(mode=oct(mode)), self.assertRaises(AnchorRefused) as caught:
+                    open_anchor(home)
+                self.assertEqual(("writable", str(home)), (caught.exception.cause, caught.exception.path))
+            os.chmod(home, 0o700)
+            open_anchor(home).release()
 
     def test_more_than_forty_links_above_refuse(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -284,6 +339,65 @@ class BelowTheAnchorTests(unittest.TestCase):
         self.assertEqual(["link"], os.listdir(self.home))
         self.assertTrue(self.outside.is_dir())
 
+    def test_a_write_that_fails_leaves_no_temporary_file(self) -> None:
+        (self.home / "dir").mkdir()
+        with open_anchor(self.home) as home:
+            with self.assertRaises(AnchorRefused) as caught:
+                home.write_atomic("dir", b"onto a folder")
+            self.assertEqual("not_regular", caught.exception.cause)
+        self.assertEqual(["dir"], os.listdir(self.home))
+        self.assertEqual([], os.listdir(self.home / "dir"))
+
+    def test_ensure_dir_makes_the_folder_in_the_held_folder_not_by_its_path(self) -> None:
+        with open_anchor(self.home) as home:
+            moved = self.tmp / "home.moved"
+            os.rename(self.home, moved)  # the path now leads elsewhere; the held folder is the same
+            os.symlink(self.outside, self.home)
+            with home.ensure_dir("made") as made:
+                made.write_atomic("record", b"in")
+        self.assertEqual([], os.listdir(self.outside))
+        self.assertEqual(b"in", (moved / "made" / "record").read_bytes())
+
+    def test_write_atomic_and_rename_sync_the_file_and_the_folders(self) -> None:
+        real_fsync, synced = os.fsync, []
+
+        def recording(fd):
+            info = os.fstat(fd)
+            synced.append((info.st_dev, info.st_ino))
+            return real_fsync(fd)
+
+        os.fsync = recording
+        try:
+            with open_anchor(self.home) as home, home.ensure_dir("a") as a, home.ensure_dir("b") as b:
+                a.write_atomic("f", b"x")
+                written = list(synced)
+                del synced[:]
+                a.rename("f", b, "g")
+        finally:
+            os.fsync = real_fsync
+
+        def ident(path: Path) -> tuple:
+            info = os.stat(path)
+            return info.st_dev, info.st_ino
+
+        file, folder_a, folder_b = ident(self.home / "b" / "g"), ident(self.home / "a"), ident(self.home / "b")
+        self.assertEqual([file, folder_a], written)
+        self.assertEqual([folder_b, folder_a], synced)
+
+    def test_read_refuses_a_file_of_another_user(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root owns everything this case would show as another user's")
+        (self.home / "mine").write_bytes(b"x")
+        real_euid = os.geteuid
+        with open_anchor(self.home) as home:
+            os.geteuid = lambda: real_euid() + 1  # a stand-in: the file now belongs to someone else
+            try:
+                with self.assertRaises(AnchorRefused) as caught:
+                    home.read("mine", 64)
+            finally:
+                os.geteuid = real_euid
+        self.assertEqual(("owner", str(self.home / "mine")), (caught.exception.cause, caught.exception.path))
+
     def test_release_closes_the_descriptor_once_and_a_released_anchor_refuses_use(self) -> None:
         anchor = open_anchor(self.home)
         with anchor.ensure_dir("a") as below:
@@ -305,6 +419,7 @@ class CauseSetTests(unittest.TestCase):
 
 class WindowsRefusalTests(unittest.TestCase):
     def test_without_o_nofollow_and_o_directory_open_anchor_refuses_platform_unsupported_before_any_open(self) -> None:
+        target = os.path.abspath(tempfile.gettempdir())  # its first call opens a probe file: not counted
         removed = {name: getattr(os, name) for name in ("O_NOFOLLOW", "O_DIRECTORY") if hasattr(os, name)}
         real_open, real_lstat, calls = os.open, os.lstat, []
 
@@ -320,7 +435,7 @@ class WindowsRefusalTests(unittest.TestCase):
         os.supports_dir_fd.add(os.open)  # so the only thing missing is the two flags
         try:
             with self.assertRaises(AnchorRefused) as caught:
-                open_anchor(os.path.abspath(tempfile.gettempdir()))
+                open_anchor(target)
         finally:
             os.supports_dir_fd.discard(os.open)
             os.open, os.lstat = real_open, real_lstat
@@ -329,6 +444,14 @@ class WindowsRefusalTests(unittest.TestCase):
         self.assertEqual("platform_unsupported", caught.exception.cause)
         self.assertEqual([], calls)
         self.assertIn("Run the command on Linux or macOS.", caught.exception.way_out)
+
+    def test_the_refusal_case_holds_alone_in_a_fresh_interpreter(self) -> None:
+        # As on Windows, where every case before it skips: nothing has asked for the temporary folder yet.
+        with tempfile.TemporaryDirectory() as tmp:
+            case = ("WindowsRefusalTests."
+                    "test_without_o_nofollow_and_o_directory_open_anchor_refuses_platform_unsupported_before_any_open")
+            done = _run_alone(case, tmp)
+            self.assertEqual(0, done.returncode, done.stderr[-3000:])
 
 
 @unittest.skipUnless(POSIX and os.path.isdir("/proc/self/fd"), "counts descriptors in /proc/self/fd (Linux)")
@@ -363,6 +486,54 @@ class ThreadTests(unittest.TestCase):
             self.assertEqual([], errors)
             self.assertEqual(before, after)
             self.assertEqual(["own1", "own2"], sorted(os.listdir(Path(tmp, "tree", "shared"))))
+
+
+@unittest.skipUnless(POSIX, NOT_POSIX)
+class SharedAnchorTests(unittest.TestCase):
+    def test_one_anchor_used_by_four_threads_lists_the_whole_folder_every_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp, "full")
+            folder.mkdir(mode=0o700)
+            for index in range(40):
+                folder.joinpath(f"e{index:02d}").write_bytes(b"")
+            want = [(f"e{index:02d}", "file") for index in range(40)]
+            wrong: list = []
+            start = threading.Barrier(4)
+
+            def lister(anchor: Anchor) -> None:
+                start.wait()
+                for _ in range(THREAD_ROUNDS):
+                    got = anchor.entries()
+                    if got != want:
+                        wrong.append(len(got))
+
+            with open_anchor(folder) as anchor:
+                threads = [threading.Thread(target=lister, args=(anchor,), name=f"lister-{n}") for n in range(4)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+                self.assertEqual(want, anchor.entries())
+            self.assertEqual([], wrong[:20], f"{len(wrong)} of {4 * THREAD_ROUNDS} listings were not the folder")
+
+
+@unittest.skipUnless(POSIX and os.path.isdir("/proc/self/fd"), "counts descriptors in /proc/self/fd (Linux)")
+class ChainedFormTests(unittest.TestCase):
+    def test_the_chained_form_leaves_no_descriptor_open_on_success_or_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp, "home")
+            home.joinpath("a", "b").mkdir(parents=True, mode=0o700)
+            os.symlink(Path(tmp), home / "a" / "link")
+            with open_anchor(home) as anchor:
+                before = _open_descriptors()
+                for _ in range(100):
+                    anchor.child("a").child("b").release()
+                    try:
+                        anchor.child("a").child("link")
+                    except AnchorRefused:
+                        pass
+                gc.collect()
+                self.assertEqual(before, _open_descriptors())
 
 
 if __name__ == "__main__":

@@ -2688,6 +2688,15 @@
       }
     },
     {
+      "file": "bad/event.v1/b41-a-run-change-with-no-record.json",
+      "schema": "event.v1.json",
+      "rule": "A run's change carries at least one record: the daemon's row or the stored control record. Either may be null while it does not exist yet, never both: such an event has no state to project.",
+      "expect": {
+        "keyword": "not",
+        "at": "/payload/post_image"
+      }
+    },
+    {
       "file": "bad/event.v1/f-event.v1.allOf.1.then.source.json",
       "schema": "event.v1.json",
       "rule": "The value at /source is fixed by event.v1.json#/allOf/1/then/properties/source.",

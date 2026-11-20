@@ -29,6 +29,7 @@ METHODS = {"list": "run.list", "status": "run.status", "stop": "run.stop", "star
 ALLOWED_METHODS = frozenset(METHODS.values())
 SUCCESS = frozenset({"ok", "started", "stopped"})
 UNCERTAIN_CODES = frozenset({"pending"})
+START_UNCONFIRMED = "start_unconfirmed"  # run.start's own answer: the launch may be running (methods.v1)
 UNAVAILABLE = "control_api_unavailable"
 # O7's response `surface` allows only gui or cli; the TUI labels itself cli until O7's own version step
 # adds tui (PRODUCT.md 550cca0e A36). The control API takes no surface field, so this is a label only.
@@ -125,6 +126,12 @@ def keyed_conditions(answer: Mapping) -> list[tuple[str, str, str]]:
         found.append((UNCERTAIN, f"run={answer.get('run_id')}",
                       f"stop not confirmed for run={field(answer.get('run_id'))}: "
                       f"reason={field(answer.get('reason', 'unknown'))}; run may still be running"))
+    elif code == START_UNCONFIRMED:  # never a refusal: the run may be running (the triage of Nov 16, T23)
+        run = answer.get("run")
+        rid = run.get("run_id") if isinstance(run, Mapping) and run.get("run_id") is not None else answer.get("run_id")
+        found.append((UNCERTAIN, f"start={rid}",
+                      f"start not confirmed for run={field(rid)}: detail={field(answer.get('detail', 'unknown'))}; "
+                      f"the run may be running"))
     elif code not in SUCCESS:
         what = answer.get("detail", answer.get("run_id", ""))
         found.append((REFUSED, "answer", f"{field(code)} {field(what)}".strip()))

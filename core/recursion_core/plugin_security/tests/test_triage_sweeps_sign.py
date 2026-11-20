@@ -366,5 +366,197 @@ class GenerationRuleTests(unittest.TestCase):
         self.assertEqual(trust.revoke(KID), 2)
         self.assertEqual(self._open(path).generation(KID), 2)
 
+
+class RefusedWriteTakesUpTheRowTests(unittest.TestCase):
+    """After a refused write, a handle answers at least one past the durable row.
+
+    Two handles on one store: A revokes five times, then B's write is refused. B must answer
+    6, one past the row (5), not its own next number (1) and not the row itself: a refused
+    revoke counts as a new revocation, so neither a grant citing 1 nor a grant citing 5
+    (A's last revocation) has order on B. Nothing lowers memory: a damaged row, or a row
+    that cannot be read, leaves B's memory as it was.
+    """
+
+    def _row_at_5_and_a_stale_handle(self):
+        path = _store(self)
+        a = TrustStore({}, revocation_store=path)
+        b = TrustStore({}, revocation_store=path)  # opened before A revokes
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        self.assertEqual([a.revoke(KID) for _ in range(5)], [1, 2, 3, 4, 5])
+        self.assertIsNone(b.generation(KID))
+        return path, b
+
+    def _order_for_a_grant_citing(self, cited, generation):
+        """Whether order stays on for a grant citing ``cited`` when the handle answers ``generation``.
+
+        It calls ``effective_permissions`` with KID as the revoked key and ``generation`` as
+        its generation, the two values the loader hands it. It does not exercise the loader's
+        own lookup (``PluginLoader`` derives the key id from the manifest's developer key and
+        asks the trust store); the manifest's key here is not KID.
+        """
+        source = b"VALUE = 1\n"
+        manifest = parse_manifest(canonical({
+            "schema": "csl-plugin-manifest/vNext", "plugin_id": "demo.plugin", "version": "1.0.0",
+            "artifact_sha256": hashlib.sha256(source).hexdigest(), "dependency_lock_sha256": "0" * 64,
+            "install_scripts": [], "developer_key": "33" * 32, "permissions": ["read", "propose", "order"],
+            "network_destinations": [], "credential_refs": []}))
+        grant = Grant("demo.plugin", manifest.artifact_sha256, None, ("read", "propose", "order"),
+                      unsigned_order_acknowledged=True, order_after_revoked_key=KID,
+                      order_after_revocation_generation=cited)
+        perms, _ = effective_permissions(manifest, "unsigned", None, grant, KID, generation)
+        return "order" in perms
+
+    def _refused(self, trust):
+        with self.assertRaises(Refused) as caught:
+            trust.revoke(KID)
+        self.assertEqual(caught.exception.code, "revocation_not_durable")
+
+    def _no_order_before_6(self, b):
+        self.assertFalse(self._order_for_a_grant_citing(1, b.generation(KID)))
+        self.assertFalse(self._order_for_a_grant_citing(5, b.generation(KID)))
+        self.assertTrue(self._order_for_a_grant_citing(6, b.generation(KID)))  # the helper can say yes
+
+    def test_a_write_refused_after_the_read_answers_one_past_the_stored_generation(self):
+        path, b = self._row_at_5_and_a_stale_handle()
+        b._db.execute("PRAGMA query_only=ON")  # the INSERT fails; the SELECT before it ran
+        self._refused(b)
+        self.assertEqual(b.generation(KID), 6)
+        self._no_order_before_6(b)
+        b._db.execute("PRAGMA query_only=OFF")
+        self.assertEqual(b.revoke(KID), 7)
+
+    def test_a_write_refused_before_the_read_answers_one_past_the_stored_generation(self):
+        path, b = self._row_at_5_and_a_stale_handle()
+        b._db.execute("PRAGMA busy_timeout=0")
+        holder = sqlite3.connect(path, isolation_level=None)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN IMMEDIATE")  # B's own BEGIN IMMEDIATE is refused: locked
+        try:
+            self._refused(b)
+        finally:
+            holder.execute("ROLLBACK")
+        self.assertEqual(b.generation(KID), 6)
+        self._no_order_before_6(b)
+        b._db.execute("PRAGMA busy_timeout=30000")
+        self.assertEqual(b.revoke(KID), 7)
+
+    def test_a_write_that_writes_nothing_answers_one_past_the_stored_generation(self):
+        # The row is at the largest generation, so the store's own check writes nothing.
+        path = _store(self)
+        b = TrustStore({}, revocation_store=path)
+        self.addCleanup(b.close)
+        _set_row(path, 2 ** 63 - 1)
+        self._refused(b)
+        self.assertEqual(b.generation(KID), 2 ** 63)
+        self.assertFalse(self._order_for_a_grant_citing(1, b.generation(KID)))
+        self.assertFalse(self._order_for_a_grant_citing(2 ** 63 - 1, b.generation(KID)))
+
+    def test_a_row_at_the_handles_own_next_number_answers_one_past_it(self):
+        # B wrote 4; A then wrote 5, the number B would take next. B's refused write
+        # counts after A's: B answers 6, so a grant citing A's 5 has no order on B.
+        path = _store(self)
+        a = TrustStore({}, revocation_store=path)
+        b = TrustStore({}, revocation_store=path)
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        self.assertEqual([b.revoke(KID) for _ in range(4)], [1, 2, 3, 4])
+        self.assertEqual(a.revoke(KID), 5)
+        b._db.execute("PRAGMA query_only=ON")
+        self._refused(b)
+        self.assertEqual(b.generation(KID), 6)
+        self.assertFalse(self._order_for_a_grant_citing(5, b.generation(KID)))
+
+    def test_one_handle_refused_at_row_5_answers_6_as_before(self):
+        path = _store(self)
+        trust = TrustStore({}, revocation_store=path)
+        self.addCleanup(trust.close)
+        self.assertEqual([trust.revoke(KID) for _ in range(5)], [1, 2, 3, 4, 5])
+        trust._db.execute("PRAGMA query_only=ON")
+        self._refused(trust)
+        self.assertEqual(trust.generation(KID), 6)
+        self.assertFalse(self._order_for_a_grant_citing(5, trust.generation(KID)))
+
+    def test_a_refused_write_never_lowers_memory_below_its_own_number(self):
+        # One handle, row 3: its first refused write answers 4 (one past the row, and its
+        # own next number); a second refused write answers 5, its own number, not row + 1.
+        path = _store(self)
+        trust = TrustStore({}, revocation_store=path)
+        self.addCleanup(trust.close)
+        self.assertEqual([trust.revoke(KID) for _ in range(3)], [1, 2, 3])
+        trust._db.execute("PRAGMA query_only=ON")
+        self._refused(trust)
+        self.assertEqual(trust.generation(KID), 4)
+        self._refused(trust)
+        self.assertEqual(trust.generation(KID), 5)
+        self.assertFalse(self._order_for_a_grant_citing(4, trust.generation(KID)))
+
+    def test_a_row_below_1_leaves_memory_as_it_was(self):
+        for damage in (0, -4):
+            with self.subTest(damage=damage):
+                path = _store(self)
+                trust = TrustStore({}, revocation_store=path)
+                self.addCleanup(trust.close)
+                self.assertEqual([trust.revoke(KID) for _ in range(2)], [1, 2])
+                _set_row(path, damage)
+                self._refused(trust)  # the store's own check writes nothing
+                self.assertEqual(trust.generation(KID), 3)
+                self.assertFalse(self._order_for_a_grant_citing(1, trust.generation(KID)))
+
+    def test_a_damaged_row_or_a_failed_read_leaves_memory_as_it_was(self):
+        for damage in (7.5, "seven", "no table"):
+            with self.subTest(damage=damage):
+                path, b = self._row_at_5_and_a_stale_handle()
+                db = sqlite3.connect(path)
+                try:
+                    if damage == "no table":
+                        db.execute("ALTER TABLE revoked RENAME TO revoked_moved")
+                    else:
+                        db.execute("UPDATE revoked SET generation = ? WHERE key_id = ?",
+                                   (damage, KID))
+                    db.commit()
+                finally:
+                    db.close()
+                self._refused(b)
+                self.assertEqual(b.generation(KID), 1)
+                self.assertIn(KID, b.revoked)  # the key stays revoked in memory
+
+    def test_the_loader_answers_as_the_helper_when_the_manifests_own_key_was_refused(self):
+        # The loader's own lookup, which the helper does not exercise: PluginLoader derives the
+        # key id from the manifest's developer key and asks the trust store for its generation.
+        # Here that key id is the one A revoked five times and B's refused write revoked again.
+        source = b"VALUE = 1\n"
+        developer_key = "33" * 32
+        dev_kid = key_id(developer_key)
+        path = _store(self)
+        a = TrustStore({}, revocation_store=path)
+        b = TrustStore({}, revocation_store=path)  # opened before A revokes
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        self.assertEqual([a.revoke(dev_kid) for _ in range(5)], [1, 2, 3, 4, 5])
+        b._db.execute("PRAGMA query_only=ON")  # the INSERT fails; the SELECT before it ran
+        with self.assertRaises(Refused) as caught:
+            b.revoke(dev_kid)
+        self.assertEqual(caught.exception.code, "revocation_not_durable")
+        self.assertEqual(b.generation(dev_kid), 6)
+        manifest = canonical({
+            "schema": "csl-plugin-manifest/vNext", "plugin_id": "demo.plugin", "version": "1.0.0",
+            "artifact_sha256": hashlib.sha256(source).hexdigest(), "dependency_lock_sha256": "0" * 64,
+            "install_scripts": [], "developer_key": developer_key, "permissions": ["read", "propose", "order"],
+            "network_destinations": [], "credential_refs": []})
+        for cited, order in ((5, False), (6, True)):
+            with self.subTest(cited=cited):
+                grant = Grant("demo.plugin", hashlib.sha256(source).hexdigest(), None,
+                              ("read", "propose", "order"), unsigned_order_acknowledged=True,
+                              order_after_revoked_key=dev_kid, order_after_revocation_generation=cited)
+                loader = PluginLoader(b, {"demo.plugin": grant}, ReservedEffects(), CoreHealth())
+                findings = loader.doctor(manifest, None, source)
+                codes = [f["code"] for f in findings]
+                effective = [f["detail"] for f in findings if f["code"] == "effective_permissions"]
+                self.assertEqual(effective, ["read,propose,order" if order else "read,propose"])
+                self.assertEqual("signer_key_revoked_order_off" in codes, not order)
+                # the same answer as the helper gives for the generation B answers
+                self.assertEqual(self._order_for_a_grant_citing(cited, b.generation(dev_kid)), order)
+
 if __name__ == "__main__":
     unittest.main()

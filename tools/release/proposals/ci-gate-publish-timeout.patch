@@ -1,0 +1,85 @@
+Proposal (lane RELEASE, the brief's step 4): a longer gate limit for one test file.
+
+Not applied: tools/ci_gate.py and tools/ are frozen; only Lucas applies this, by his
+hand or his word. Apply from the repository root:
+
+    git apply --check tools/release/proposals/ci-gate-publish-timeout.patch
+    git apply tools/release/proposals/ci-gate-publish-timeout.patch
+
+Why: lane A7 found tools/test_claude_fixer_publish.py passing the gate's 180 s limit
+on two hosted macOS jobs (macos-26-arm64) and taking 97.6 s and 128.4 s on two
+passing ones. CSL-495 keeps that file, so the retirement patch does not remove it.
+Hosted macOS logs show only dots for it, so no per-test macOS timing exists yet;
+tools/release/timings.py prints one when run there. On Linux (lane RELEASE, Nov 14,
+2026, python 3.12 and 3.14t) it takes 29 to 31 s, of which one wiring test takes
+10 s; with retire-review-workflows.patch applied it takes 19 to 20 s.
+
+What it does:
+- tools/ci_gate.py: FILE_TIMEOUTS gives tools/test_claude_fixer_publish.py 300 s
+  (lane A7's suggestion); every other file keeps RUN_TIMEOUT (180 s).
+- tools/test_ci_gate.py: FileTimeoutTests, which fails if a FILE_TIMEOUTS entry names
+  a file the gate does not run, lowers a limit, or is not passed by run_suite.
+
+Blank context lines are written as empty lines, which git apply accepts; the file
+then has no trailing whitespace for the gate's whitespace check.
+
+diff --git a/tools/ci_gate.py b/tools/ci_gate.py
+index c98bd2f30d3e5956df17def69a7c1aebc57d9776..07430adcd74a3d4c9313488b62a72cae7b3e0276 100644
+--- a/tools/ci_gate.py
++++ b/tools/ci_gate.py
+@@ -32,6 +32,11 @@ ROOT = Path(__file__).resolve().parents[1]
+ ZERO_SHA = "0" * 40
+ GIT = ["git", "-c", "core.longpaths=true", "-c", "core.quotePath=false"]
+ RUN_TIMEOUT = 180
++# Test files allowed longer than RUN_TIMEOUT, each with the measurement behind it.
++# tools/test_claude_fixer_publish.py: 97.6 s and 128.4 s on passing macos-26-arm64 jobs and
++# over 180 s on two others (lane A7, Nov 12, 2026); 29 to 31 s on Linux, where one test
++# takes 10 s of it (lane RELEASE, Nov 14, 2026, tools/release/timings.py).
++FILE_TIMEOUTS = {"tools/test_claude_fixer_publish.py": 300}
+
+ # Paths that can break the provider-free gate. Only logged since CSL-376.
+ GATE_PREFIXES = (
+@@ -434,7 +439,7 @@ def run_suite() -> None:
+         else:
+             run_program(list(program))
+     for program in extra_suite_programs(tests):
+-        run_test_file(program[0])
++        run_test_file(program[0], timeout=FILE_TIMEOUTS.get(program[0], RUN_TIMEOUT))
+     print("CI_GATE_PASS provider_calls=0 scientific_admission=false", flush=True)
+
+
+diff --git a/tools/test_ci_gate.py b/tools/test_ci_gate.py
+index 7ac146d42d6ed75ebafeb68b83eef2fcafd34496..d9dc165804b647364bab34e5e2f1afa9ec696a1c 100644
+--- a/tools/test_ci_gate.py
++++ b/tools/test_ci_gate.py
+@@ -301,6 +301,30 @@ class CoreGateTests(unittest.TestCase):
+         self.assertEqual(str(raised.exception), "byte-compile failed")
+
+
++class FileTimeoutTests(unittest.TestCase):
++    def test_file_timeouts_only_raise_the_limit_of_files_the_gate_runs(self) -> None:
++        run = set(ci_gate.assert_tests_accounted())
++        self.assertTrue(ci_gate.FILE_TIMEOUTS)
++        for rel, seconds in ci_gate.FILE_TIMEOUTS.items():
++            self.assertIn(rel, run)
++            self.assertGreater(seconds, ci_gate.RUN_TIMEOUT)
++
++    def test_run_suite_gives_each_file_its_limit(self) -> None:
++        limits: dict[str, int] = {}
++
++        def record(rel: str, *, root: Path | None = None, timeout: int = ci_gate.RUN_TIMEOUT) -> None:
++            limits[rel] = timeout
++
++        with mock.patch.object(ci_gate, "run_lightweight"), mock.patch.object(ci_gate, "byte_compile"), \
++                mock.patch.object(ci_gate, "run_program"), \
++                mock.patch.object(ci_gate, "run_test_file", side_effect=record), mock.patch("builtins.print"):
++            ci_gate.run_suite()
++        self.assertEqual(limits["tools/test_claude_fixer_publish.py"], 300)
++        self.assertEqual(limits["tools/test_ci_gate.py"], ci_gate.RUN_TIMEOUT)
++        others = {rel: limit for rel, limit in limits.items() if rel not in ci_gate.FILE_TIMEOUTS}
++        self.assertEqual(set(others.values()), {ci_gate.RUN_TIMEOUT})
++
++
+ class TestInventoryTests(unittest.TestCase):
+     def test_repo_test_files_are_run_or_excluded(self) -> None:
+         run = ci_gate.assert_tests_accounted()

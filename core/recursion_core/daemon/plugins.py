@@ -84,7 +84,10 @@ EFFECT_PERMISSIONS = {'order': 'order'}
 AUTHORITY_REQUIRED = frozenset({'order'})
 _INSTALL_KEYS = frozenset({'trusted_keys', 'grants', 'reserved', 'authority_anchor'})
 _GRANT_KEYS = frozenset({'plugin_id', 'artifact_sha256', 'signer_key_id', 'permissions', 'unsigned_order_acknowledged',
-                         'order_after_revoked_key', 'order_after_revocation_generation'})
+                         'order_after_revoked_key', 'order_after_revocation_generation', 'developer_key_id'})
+# The schema's key id: "ed25519:" and 32 lower-case hex digits. fullmatch, not a trailing "$": a "$" matches
+# before a newline, and a value that is not this whole text is refused.
+_INSTALL_KEY_ID = re.compile(r'ed25519:[0-9a-f]{32}')
 _SAFE_ID = re.compile(r'[^A-Za-z0-9_.-]')
 # O7 reads (ADV2-3). Uncalibrated defaults: a plugin call that has not answered by its deadline is
 # answered 504 and the plugin is marked degraded; a read that finds another one running waits this
@@ -165,7 +168,11 @@ def _owned_directory(path):
 
 
 def read_install(directory):
-    """Parse ``install.json``. With no file: no trusted key and no grant, so nothing gets a permission."""
+    """Parse ``install.json``. With no file: no trusted key and no grant, so nothing gets a permission.
+
+    A grant may name ``developer_key_id`` as null or as ``ed25519:`` and 32 lower-case hex digits. Any other
+    shape is refused. The id is checked here and is not copied onto the grant, and it is not a second binding:
+    the grant stays bound to the artifact digest and ``signer_key_id``."""
     raw = _read_owned(Path(directory) / INSTALL_FILE, MAX_INSTALL_BYTES, missing_ok=True)
     if raw is None:
         return {'trusted_keys': {}, 'grants': {}, 'reserved': ReservedEffects(), 'authority_anchor': None}
@@ -188,12 +195,16 @@ def read_install(directory):
             raise PluginRefused('plugin_install_config_invalid', 'grant fields')
         perms, signer = item['permissions'], item.get('signer_key_id')
         generation = item.get('order_after_revocation_generation')
+        developer_key_id = item.get('developer_key_id')
+        developer_key_ok = developer_key_id is None or (
+            type(developer_key_id) is str and _INSTALL_KEY_ID.fullmatch(developer_key_id) is not None)
         if (not isinstance(item['plugin_id'], str) or not isinstance(item['artifact_sha256'], str)
                 or not isinstance(perms, list) or any(p not in PERMISSIONS for p in perms)
                 or not (signer is None or isinstance(signer, str))
                 or type(item.get('unsigned_order_acknowledged', False)) is not bool
                 or not (item.get('order_after_revoked_key') is None or isinstance(item['order_after_revoked_key'], str))
                 or not (generation is None or type(generation) is int)
+                or not developer_key_ok
                 or item['plugin_id'] in grants):
             raise PluginRefused('plugin_install_config_invalid', 'grant value')
         grants[item['plugin_id']] = Grant(item['plugin_id'], item['artifact_sha256'], signer, tuple(perms),

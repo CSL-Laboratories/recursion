@@ -1,0 +1,15 @@
+{
+  "synthetic": true,
+  "provenance": "Written by hand: a run ended by SIGTERM. The headless guide gives exit 143 for SIGTERM and 130 for SIGINT (14-headless-mode.md:559-566, 677-684, at xai-org/grok-build 2bdd1d6a). Whether a Stop caused it is the core's record, not the parser's.",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "thought", "data": "Reading the repository."},
+    {"type": "text", "data": "So far"}
+  ],
+  "exit_code": 143,
+  "expect": {
+    "code": "engine_exited",
+    "drafts": ["engine.output", "engine.output", "result"],
+    "text": "So far"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "synthetic": true,
+  "provenance": "Written by hand: output that stops before end while the process exits 0. The guide says end is always the last event of a turn (14-headless-mode.md:239), so an exit 0 without it is not a finished turn (vault record 20261109-csl815-grok-route-outcome-recording-01, rule R2).",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "text", "data": "Half an answer"}
+  ],
+  "exit_code": 0,
+  "expect": {
+    "code": "engine_exited",
+    "drafts": ["engine.output", "result"],
+    "text": "Half an answer"
+  }
+}

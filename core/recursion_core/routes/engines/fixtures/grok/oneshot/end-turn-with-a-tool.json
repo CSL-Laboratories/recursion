@@ -1,0 +1,22 @@
+{
+  "synthetic": true,
+  "provenance": "Written by hand from the streaming-json line shapes of xai-org/grok-build 2bdd1d6a (headless/reducer/acp.rs: AcpLine, AcpUsageLine, AcpEndLine) and the headless guide's example (docs/user-guide/14-headless-mode.md:216-223). Spend fields as notification.rs project_result_usage writes them. Ids, counts and text are made up.",
+  "drive": "oneshot",
+  "stdout": [
+    {"type": "available_commands", "tools": ["read_file", "grep"], "commands": ["review"]},
+    {"type": "thought", "data": "Looking for the entry point."},
+    {"type": "tool_call", "toolCallId": "call_1", "title": "Read", "kind": "read", "status": "in_progress", "toolName": "read_file", "rawInput": {"path": "src/main.rs"}, "content": [], "locations": [{"path": "src/main.rs"}]},
+    {"type": "tool_call_update", "toolCallId": "call_1", "status": "completed", "content": [{"type": "content", "content": {"type": "text", "text": "fn main() {}"}}], "rawOutput": {"lines": 1}, "locations": []},
+    {"type": "usage", "messageId": "resp_1", "stopReason": "tool_use", "usage": {"input_tokens": 812, "output_tokens": 45, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "reasoning_tokens": 12}},
+    {"type": "text", "data": "The entry point is "},
+    {"type": "text", "data": "src/main.rs."},
+    {"type": "usage", "messageId": "resp_2", "stopReason": "end_turn", "usage": {"input_tokens": 40, "output_tokens": 9, "cache_read_input_tokens": 800, "cache_creation_input_tokens": 0, "reasoning_tokens": 0}},
+    {"type": "end", "stopReason": "end_turn", "sessionId": "0b8f6a52-7d0e-4c1b-9a43-2f5e8d6c1a70", "requestId": "req_7", "usage": {"input_tokens": 852, "cache_read_input_tokens": 800, "cache_creation_input_tokens": 0, "output_tokens": 54, "reasoning_tokens": 12, "total_tokens": 1706}, "num_turns": 2, "modelUsage": {"grok-4.6": {"inputTokens": 852, "outputTokens": 54, "cacheReadInputTokens": 800, "cacheCreationInputTokens": 0, "modelCalls": 2, "costUSD": 0.00123}}, "total_cost_usd": 0.00123, "total_cost_usd_ticks": 12300000}
+  ],
+  "exit_code": 0,
+  "expect": {
+    "code": null,
+    "drafts": ["engine.output", "engine.output", "engine.output", "tool.call", "engine.output", "tool.result", "engine.output", "usage", "engine.output", "engine.output", "engine.output", "usage", "engine.output", "usage", "result"],
+    "text": "The entry point is src/main.rs."
+  }
+}

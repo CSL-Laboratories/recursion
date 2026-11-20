@@ -1,7 +1,7 @@
 # GitHub-hosted macOS is ~$0.08/min. Do not run it on every master push.
 # Nightly coverage of master at 07:17 UTC (off-peak US), skipped when master
 # has no commits in the last 24 hours. PR/dispatch macOS stays in ci.yml
-# behind workflow_dispatch and the ci:full label.
+# for non-draft same-repo PRs, the ci:full label and workflow_dispatch.
 #
 # The recent-commit check runs on GitHub-hosted Ubuntu (public repo: free)
 # so idle nights never allocate a macOS runner.

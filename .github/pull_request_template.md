@@ -17,7 +17,7 @@ Touches other repos? (link the cross-repo Linear issue)
 - [ ] Linear issue updated, and any follow-ups filed to Triage
 - [ ] No secrets in tracked files, logs, or notifications
 - [ ] Perf impact noted (or N/A)
-- [ ] Codex review completed on the current head commit
+- [ ] Devin Review threads on the current head read and answered by hand
 - [ ] All review threads resolved (or answered with rationale)
 - [ ] Linear checked for an open `Stuck PR threads: recursion#<PR>` roll-up on this PR (if you file the fallback, first description line is `<!-- stuck-pr-threads:recursion#<PR> -->`)
 - [ ] Tests run locally and/or green in CI (name the commands)

@@ -12,9 +12,9 @@ issues and PRs.
   comment on the matching CSL Linear issue, so the Linear bot notifies them. A GitHub
   mention alone is not enough. Current Linear handles (check Linear if ownership has
   changed): Chaandan = @chaandansaini101, Samir = @samirshahahmed, Lucas =
-  @lucassalvador987. This applies to interactive agents and Grok Bot. The GitHub-only
-  Claude Code Action fixer has no Linear tooling; it replies on the PR threads, and the
-  PR author relays anything it cannot fix to the Linear issue.
+  @lucassalvador987. This applies to interactive agents and Grok Bot. The Devin
+  reviewer (a GitHub App) has no Linear tooling; the PR author relays any of its findings
+  that need a decision to the Linear issue.
 - **Formal GitHub review requests.** Every review ask also needs a formal GitHub
   review request, not only the Linear @mention above. Use
   `gh pr edit <n> --add-reviewer samir-shah-ahmed,CDanTheMan` (whichever
@@ -27,9 +27,8 @@ issues and PRs.
   eligible code owner can be requested and that the founders' reviews are
   independent review, not code-owner review. Both (a) the Linear @mention
   and (b) this GitHub request are required. This is mandatory for agents too.
-- **Wait for jobs before human sign-off.** Order: the Codex review that the Codex gate
-  requests on each non-draft head runs first, then required CI. No human approves or
-  requests changes on a PR until both have finished on the current head commit. A review on a stale head does not
+- **Wait for jobs before human sign-off.** Required CI runs first. No human approves or
+  requests changes on a PR until it has finished on the current head commit. A review on a stale head does not
   count. After new pushes, the reviewer reviews again. Review requests and their status
   are posted as @mention comments on the CSL Linear issue, and a watcher posts there when
   a PR is ready for review.
@@ -145,10 +144,6 @@ File follow-ups to **Triage**. Keep the Linear issue current as work progresses,
 anything that comes up in a session to **Triage** instead of dropping it; Linear is the
 primary async channel, alongside Google Meet and Discord.
 
-## When Claude can't fix a review thread
-
-See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-fix-a-review-thread).
-
 ## Branch and review flow
 
 - Branch from up-to-date `master` as `csl-<N>-<slug>` (example `csl-26-short-slug`).
@@ -182,8 +177,8 @@ See [AGENTS.md#when-claude-cant-fix-a-review-thread](AGENTS.md#when-claude-cant-
 
 ## Review loop
 
-See [AGENTS.md#review-loop](AGENTS.md#review-loop). The stuck-thread author
-fallback lives in [When Claude can't fix a review thread](AGENTS.md#when-claude-cant-fix-a-review-thread).
+See [AGENTS.md#review-loop](AGENTS.md#review-loop) and
+[When a review thread stays open](AGENTS.md#when-a-review-thread-stays-open).
 
 ## Run a gate
 

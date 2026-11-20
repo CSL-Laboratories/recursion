@@ -22,7 +22,9 @@ LINEAR_API = "https://api.linear.app/graphql"
 CSL_KEY_RE = re.compile(r"CSL-(\d+)")
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 MARKER_PREFIX = "pr-sync"
-REVIEWER_DEFAULT = "chatgpt-codex-connector[bot]"
+# No bot reviewer since the Codex gate was removed (CSL-238). Set REVIEWER_LOGIN
+# to a "[bot]" login to show whether that reviewer reviewed the head.
+REVIEWER_DEFAULT = ""
 TOP_FILES_DEFAULT = 10
 PURPOSE_LINES = 8
 PURPOSE_CHARS = 800
@@ -139,7 +141,7 @@ def purpose_excerpt(body: str, *, max_lines: int = PURPOSE_LINES, max_chars: int
 
 def _norm_login(value: str | None) -> str:
     # GitHub logins are case-insensitive. The "[bot]" suffix is kept: a bare
-    # alias like "chatgpt-codex-connector" is an ordinary user, not the App.
+    # alias without it is an ordinary user account, not the App.
     return (value or "").strip().casefold()
 
 
@@ -221,7 +223,10 @@ class Config:
 def comment_body(pull: PullSnapshot, cfg: Config) -> str:
     marker = sync_marker(cfg.repo, pull.number)
     status = pr_status(state=pull.state, draft=pull.draft, merged=pull.merged)
-    on_head = "yes" if review_on_head(list(pull.reviews), pull.head_sha, cfg.reviewer_login) else "no"
+    review_line = ""
+    if cfg.reviewer_login:
+        on_head = "yes" if review_on_head(list(pull.reviews), pull.head_sha, cfg.reviewer_login) else "no"
+        review_line = f"- **Review on head (`{cfg.reviewer_login}`):** {on_head}\n"
     flag = merge_flag(pull.mergeable_state, cfg.default_branch)
     files = pull.files[: cfg.top_files]
     file_lines = "\n".join(f"- `{path}`" for path in files) if files else "- _(none)_"
@@ -238,7 +243,7 @@ def comment_body(pull: PullSnapshot, cfg: Config) -> str:
         f"- **Mergeable:** `{mergeable}`\n"
         f"{flag_line}"
         f"- **Head SHA:** `{pull.head_sha}`\n"
-        f"- **Codex review on head:** {on_head}\n\n"
+        f"{review_line}\n"
         f"### Purpose\n\n{purpose}\n\n"
         f"### Top changed files\n\n{file_lines}\n"
     )
@@ -344,7 +349,7 @@ class GitHubClient:
         )
         head = data.get("head") or {}
         head_sha = str(head.get("sha") or "")
-        reviews = self._list_reviews(number, head_sha)
+        reviews = self._list_reviews(number, head_sha) if self.cfg.reviewer_login else ()
         user = data.get("user") or {}
         head_repo = str(((head.get("repo") or {}).get("full_name")) or "")
         return PullSnapshot(

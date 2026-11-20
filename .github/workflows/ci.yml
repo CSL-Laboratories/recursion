@@ -50,9 +50,11 @@
 #
 # Do not listen for labeled/unlabeled. A skipped or no-op job named `linux` is
 # treated as success and would overlay a failed required check on the same SHA.
-# Adding `ci:full` starts windows/macos from ci-full-label.yml (no linux job).
-# `ci:full` also gates windows/macos on the next synchronize / ready_for_review
-# / dispatch / master push. Discord `/ci full` retriggers.
+# windows and macos run on every non-draft same-repository PR event once linux
+# passed (no label, token or reviewer verdict; the Codex gate is gone, CSL-238),
+# on dispatch, and windows on master pushes. A fork PR gets them only when a
+# person adds `ci:full` (ci-full-label.yml starts them at once; later non-draft
+# events carry the label). Discord `/ci full` retriggers.
 name: CI
 
 on:
@@ -306,7 +308,7 @@ jobs:
        (!(github.event_name == 'pull_request' && github.event.action == 'synchronize') && needs.settle.result == 'skipped')) &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'pull_request' && github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci:full')))
+       (github.event_name == 'pull_request' && github.event.pull_request.draft == false && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:full'))))
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
@@ -346,7 +348,7 @@ jobs:
       ((github.event_name == 'pull_request' && github.event.action == 'synchronize' && needs.settle.result == 'success') ||
        (!(github.event_name == 'pull_request' && github.event.action == 'synchronize') && needs.settle.result == 'skipped')) &&
       (github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'pull_request' && github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci:full')))
+       (github.event_name == 'pull_request' && github.event.pull_request.draft == false && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:full'))))
     runs-on: macos-latest
     timeout-minutes: 15
     steps:

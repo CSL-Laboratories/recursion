@@ -67,10 +67,7 @@ TEST_GLOBS = (
 CORE_ROOT = "core"
 
 # Intentionally skipped/slow/platform tests. Paths are posix, relative to ROOT.
-TEST_EXCLUDE = {
-    # Claude fixer workflow runs this; not part of the linux runtime budget.
-    "tools/test_claude_pr_fixer.py",
-}
+TEST_EXCLUDE: set[str] = set()
 
 # Floor against shrinking the suite. Additions are allowed; deletions fail.
 # inventory.test.py matches scripts/tests/**/*.test.py and is loaded by path,

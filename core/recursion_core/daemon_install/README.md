@@ -37,8 +37,9 @@ takes it from the same resolver) is the one install made the stores in, whatever
 environment says. A unit `upgrade` would replace whose daemon may keep its state in another folder than
 the chosen one (or the default) is refused `unit_state_elsewhere`, its text naming the folder in use and,
 with a chosen place or a unit the installer wrote, the two ways out that work (run the command again with
-`XDG_STATE_HOME` naming the unit's folder, or unset where it names the default; or `recursiond uninstall`
-then `recursiond install` to start in the new place, the stores already made left where they are); a
+`XDG_STATE_HOME` naming the unit's folder, or unset where it names the default; or `recursiond uninstall`,
+the state folder the unit names moved to the new place, then `recursiond install` there: the ledger moves
+with the stores, since the install's key with no ledger beside it is refused); a
 value only in the user manager's own environment (`environment.d`, `systemctl --user set-environment`) is
 not seen, since this package starts no process to ask it. With a chosen place the answer adds `state`
 (the folder in use) and, when the default's `plugin-security` folder holds a store, `stores_left`: one
@@ -59,13 +60,21 @@ a fresh temporary name made with `O_EXCL` and `O_NOFOLLOW`, linked into place ex
 `ledger.sqlite3` bound to its public half, and prints one line on stderr: "Made this install's own
 authority key (owner-only, <path>); it signs your order permissions on this machine and never leaves it.
 Losing it means making new permissions; it is not recoverable." The key is never printed, logged or
-answered, and no copy is made anywhere. If the ledger cannot be made, the key just made is removed again.
+answered, and no copy is made anywhere. The line is printed as soon as the key and its ledger are both in
+place, before the later steps, so a later step that fails does not hide it. A failure between the key and
+the ledger leaves the two agreeing or neither: a ledger already bound to the key just made keeps the key
+with it (the line is printed), and with no ledger there the key is removed again. Only a process ended
+between the two (a power cut, a kill) can leave the key alone.
 
 Run again with the key, the ledger and `install.json`'s `authority_anchor` (null, or the same key) agreeing,
 it writes nothing (`created: false`). Before anything is written, a disagreement is refused
 `authority_anchor_disagrees`, its detail naming which part: a key without a ledger, a ledger without a
 key (a new key would orphan the ledger's spend history, so none is made), a ledger bound to another key,
-an `authority_anchor` without a key or naming another key. A key or an `authority_anchor` on CSL's
+an `authority_anchor` without a key or naming another key. The first two say what is there and what can
+be done: for a key alone, run again with `XDG_STATE_HOME` naming the folder its ledger was made in, or move
+the key out of its folder and run again, which makes a new key and ledger (permissions the old key signed
+are then not accepted); for a ledger alone, put its key back, since a new key is made only when no ledger
+is there. A key or an `authority_anchor` on CSL's
 published list (`install.CSL_KEY_IDS`; none is published yet) is `anchor_is_csl_key`. A link at the key is
 `not_regular` and its target is not touched; a link at its folder is `symlink_refused`; a folder another
 user could change, or not exactly owner-only, is `folder_untrusted`; a key file open to anyone else is

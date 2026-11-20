@@ -134,7 +134,9 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
             require_daemon_interpreter(probe(interpreter), interpreter, package)
             step = install if action == "install" else upgrade
             chosen = Roots(home=roots.home, state_home=environ.get("XDG_STATE_HOME") or None)
-            plan = step(chosen, daemon_exec_args(interpreter), make_anchor=True)
+            # The key made now is told as soon as it is kept, before a later step can fail: one line, its path only.
+            plan = step(chosen, daemon_exec_args(interpreter), make_anchor=True,
+                        on_anchor_made=lambda path: print(ANCHOR_MADE.format(path=path), file=err))
         else:
             raise InstallRefused("action", repr(action))
     except InstallRefused as exc:
@@ -156,8 +158,6 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
             if plan.left:
                 answer["stores_left"] = plan.left
     _print(out, answer)
-    if plan.anchor is not None and plan.anchor[1]:  # the key was made now: one line, its path only
-        print(ANCHOR_MADE.format(path=plan.anchor[0]), file=err)
     return EXIT_OK
 
 

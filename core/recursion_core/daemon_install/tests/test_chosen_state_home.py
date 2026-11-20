@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 import recursion_core
+from recursion_core.plugin_security.signing import backend_available
 from recursion_core.control.commands import setup
 from recursion_core.daemon_install import InstallRefused, Roots, install, owned_paths, render_unit, uninstall, upgrade
 from recursion_core.daemon_install.install import ensure_ledger
@@ -326,17 +327,21 @@ class ChosenStateHomeTests(unittest.TestCase):
         self.assertNotIn("take the line out", detail)
         self.assertNotIn("move that state folder", detail)
         self.assertIn("To keep the state where it is, run `recursiond upgrade` again with XDG_STATE_HOME unset", detail)
-        self.assertIn(f"To start in {self.state} instead, run `recursiond uninstall`, then `recursiond install` with "
-                      f"XDG_STATE_HOME set to {self.chosen}", detail)
+        self.assertIn(f"To start in {self.state} instead, run `recursiond uninstall`, move the state folder that "
+                      f"unit names (with the ledger in it) to {self.state}, where nothing may be yet, then run "
+                      f"`recursiond install` with XDG_STATE_HOME set to {self.chosen}", detail)
         # The first way, as printed: the state stays where it is.
         code, answer = self.run_action("upgrade", {})
         self.assertEqual((code, answer["code"]), (0, "ok"), answer)
-        # The second way, as printed: the chosen place, the default's stores left where they are.
+        # The second way, as printed: the state folder moved to the chosen place, the ledger with it.
         code, answer = self.run_action("uninstall", {})
         self.assertEqual((code, answer["code"]), (0, "ok"), answer)
+        self.hold_the_key_alone_refusal({"XDG_STATE_HOME": self.chosen})
+        os.makedirs(self.chosen, 0o700)
+        os.rename(self.default_state, self.state)
         code, answer = self.run_action("install", {"XDG_STATE_HOME": self.chosen})
         self.assertEqual((code, answer["code"], answer["state"]), (0, "ok", self.state), answer)
-        self.assertIn("stores_left", answer)
+        self.assertNotIn("stores_left", answer)  # nothing is left in the default folder
         code, answer = self.run_action("upgrade", {"XDG_STATE_HOME": self.chosen})
         self.assertEqual((code, answer["code"]), (0, "ok"), answer)
         ensure_ledger(owned_paths(self.roots), TEST_ANCHOR)  # the anchor key's own step, with a test-only key
@@ -353,13 +358,31 @@ class ChosenStateHomeTests(unittest.TestCase):
         self.assertIn(f"sets XDG_STATE_HOME={self.chosen}", detail)
         self.assertIn("To keep the state where it is, run `recursiond upgrade` again with XDG_STATE_HOME set to the "
                       "folder that unit names", detail)
-        self.assertIn(f"To start in {self.default_state} instead, run `recursiond uninstall`, then `recursiond install` "
-                      "with XDG_STATE_HOME unset", detail)
+        self.assertIn(f"To start in {self.default_state} instead, run `recursiond uninstall`, move the state folder "
+                      f"that unit names (with the ledger in it) to {self.default_state}, where nothing may be yet, then "
+                      "run `recursiond install` with XDG_STATE_HOME unset", detail)
         code, answer = self.run_action("upgrade", {"XDG_STATE_HOME": self.chosen})  # the first way, as printed
         self.assertEqual((code, answer["code"]), (0, "ok"), answer)
-        for action in ("uninstall", "install", "upgrade"):  # the second way, as printed
+        code, answer = self.run_action("uninstall", {})  # the second way, as printed
+        self.assertEqual((code, answer["code"]), (0, "ok"), answer)
+        self.hold_the_key_alone_refusal({})
+        os.makedirs(os.path.dirname(self.default_state), 0o700, exist_ok=True)
+        os.rename(self.state, self.default_state)
+        for action in ("install", "upgrade"):
             code, answer = self.run_action(action, {})
             self.assertEqual((code, answer["code"]), (0, "ok"), (action, answer))
+
+    def hold_the_key_alone_refusal(self, environ):
+        """With the install's key made, an install in a state folder with no ledger is refused and writes
+        nothing: the state folder must be moved first, as the printed way says."""
+        if not backend_available():
+            return  # no key is made without cryptography: nothing to refuse
+        target = os.path.join(environ.get("XDG_STATE_HOME") or os.path.join(self.home, ".local", "state"), "recursion")
+        there = os.path.lexists(target)
+        code, answer = self.run_action("install", environ)
+        self.assertEqual((code, answer["code"]), (1, "authority_anchor_disagrees"), answer)
+        self.assertIn("no ledger is at", answer["detail"])
+        self.assertEqual(os.path.lexists(target), there)
 
     def test_a_link_another_user_owns_on_the_way_to_the_chosen_place_is_refused(self):
         target = os.path.join(self.case, "target")

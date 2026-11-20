@@ -363,6 +363,136 @@ class AnchorKeyTests(unittest.TestCase):
                 code, answer, _ = self.run_action(home, environ)  # run again: a whole key and ledger
                 self.assertEqual((code, answer["ledger"]["created"]), (0, True))
 
+    def assert_neither_then_whole(self, root, home, environ, paths, answer, err):
+        """After a failure between the key and the ledger: no key and no ledger, no line, and the next run
+        makes both, agreeing."""
+        self.assertFalse(os.path.lexists(paths.anchor_key), answer)
+        self.assertFalse(os.path.lexists(paths.ledger), answer)
+        self.assertEqual(err, "")
+        code, again, err = self.run_action(home, environ)
+        self.assertEqual((code, again["code"], again["ledger"]["created"]), (0, "ok", True), again)
+        self.assertEqual(self.ledger_anchor(paths.ledger), key_id(self.public_of(paths.anchor_key)))
+        self.assertEqual(err, install_module.ANCHOR_MADE.format(path=paths.anchor_key) + "\n")
+
+    @needs_crypto
+    def test_a_key_linked_and_then_its_temporary_name_not_removed_is_removed_again(self):
+        layout_module = importlib.import_module("recursion_core.daemon_install.layout")
+        real_unlink = os.unlink
+        for root, home, environ in self.profiles():
+            with self.subTest(environ=environ):
+                paths = self.paths(home, environ)
+                calls = []
+
+                def unlink(name, *args, **kwargs):
+                    base = os.path.basename(str(name))
+                    if base.startswith(".anchor.key.") and base.endswith(".tmp") and not calls:
+                        calls.append(name)
+                        raise OSError(5, "Input/output error (injected)", name)
+                    return real_unlink(name, *args, **kwargs)
+                with mock.patch.object(layout_module.os, "unlink", side_effect=unlink):
+                    code, answer, err = self.run_action(home, environ)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual((code, answer["code"]), (1, "filesystem_error"), answer)
+                for name in calls:  # the temporary name the injected failure left
+                    real_unlink(name)
+                self.assert_neither_then_whole(root, home, environ, paths, answer, err)
+
+    @needs_crypto
+    def test_a_key_linked_and_then_its_folder_not_synced_is_removed_again(self):
+        layout_module = importlib.import_module("recursion_core.daemon_install.layout")
+        real_fsync_dir = layout_module._fsync_dir
+        for root, home, environ in self.profiles():
+            with self.subTest(environ=environ):
+                paths = self.paths(home, environ)
+                calls = []
+
+                def fsync_dir(folder):
+                    if folder == paths.authority_dir and not calls:
+                        calls.append(folder)
+                        raise OSError(5, "Input/output error (injected)")
+                    return real_fsync_dir(folder)
+                with mock.patch.object(layout_module, "_fsync_dir", side_effect=fsync_dir):
+                    code, answer, err = self.run_action(home, environ)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual((code, answer["code"]), (1, "filesystem_error"), answer)
+                self.assert_neither_then_whole(root, home, environ, paths, answer, err)
+
+    @needs_crypto
+    def test_a_ledger_made_and_then_its_step_failing_keeps_the_key_with_it(self):
+        from recursion_core.plugin_security import stores
+        real_create = stores.create_ledger
+        for root, home, environ in self.profiles():
+            with self.subTest(environ=environ):
+                paths = self.paths(home, environ)
+
+                def create_then_fail(path, anchor):
+                    real_create(path, anchor)
+                    raise OSError(5, "Input/output error (injected)", path)
+                with mock.patch.object(stores, "create_ledger", side_effect=create_then_fail):
+                    code, answer, err = self.run_action(home, environ)
+                self.assertEqual((code, answer["code"]), (1, "store_not_created"), answer)
+                self.assertTrue(os.path.lexists(paths.anchor_key))
+                self.assertEqual(self.ledger_anchor(paths.ledger), key_id(self.public_of(paths.anchor_key)))
+                self.assertEqual(err, install_module.ANCHOR_MADE.format(path=paths.anchor_key) + "\n")
+                before = self.public_of(paths.anchor_key)
+                code, again, err = self.run_action(home, environ)
+                self.assertEqual((code, again["code"], again["ledger"]["created"], err), (0, "ok", False, ""), again)
+                self.assertEqual(self.public_of(paths.anchor_key), before)
+
+    @needs_crypto
+    def test_the_made_line_is_shown_when_a_later_step_fails(self):
+        if os.geteuid() == 0:
+            self.skipTest("root writes into a folder whose mode refuses its owner")
+        for root, home, environ in self.profiles():
+            with self.subTest(environ=environ):
+                paths = self.paths(home, environ)
+                systemd = os.path.join(home, ".config", "systemd")
+                os.makedirs(systemd, 0o700)
+                os.chmod(systemd, 0o500)  # the person's folder, not writable: the unit cannot be written
+                self.addCleanup(os.chmod, systemd, 0o700)
+                code, answer, err = self.run_action(home, environ)
+                self.assertEqual((code, answer["code"]), (1, "filesystem_error"), answer)
+                self.assertEqual(self.ledger_anchor(paths.ledger), key_id(self.public_of(paths.anchor_key)))
+                self.assertEqual(err, install_module.ANCHOR_MADE.format(path=paths.anchor_key) + "\n")
+                os.chmod(systemd, 0o700)
+                code, again, err = self.run_action(home, environ)
+                self.assertEqual((code, again["code"], err), (0, "ok", ""), again)
+
+    @needs_crypto
+    def test_a_key_or_a_ledger_alone_is_refused_with_a_next_step_that_works(self):
+        for root, home, environ in self.profiles():
+            with self.subTest(environ=environ, case="key without ledger"):
+                paths = self.paths(home, environ)
+                self.run_action(home, environ)
+                os.unlink(paths.ledger)
+                code, answer, err = self.run_action(home, environ)
+                self.assertEqual((code, answer["code"], err), (1, "authority_anchor_disagrees", ""), answer)
+                detail = answer["detail"]
+                self.assertIn(f"the key at {paths.anchor_key} is there and no ledger is at {paths.ledger}", detail)
+                self.assertNotIn("nothing was written", detail)
+                self.assertIn("this run wrote nothing", detail)
+                self.assertIn(f"move {paths.anchor_key} out of {paths.authority_dir}", detail)
+                self.assertIn("XDG_STATE_HOME", detail)
+                os.rename(paths.anchor_key, os.path.join(root, "old.key"))  # the step the text names
+                code, answer, err = self.run_action(home, environ)
+                self.assertEqual((code, answer["code"], answer["ledger"]["created"]), (0, "ok", True), answer)
+            with self.subTest(environ=environ, case="ledger without key"):
+                moved = os.path.join(root, "kept.key")
+                os.rename(paths.anchor_key, moved)
+                before = self.snapshot(root)
+                code, answer, err = self.run_action(home, environ)
+                self.assertEqual((code, answer["code"], err), (1, "authority_anchor_disagrees", ""), answer)
+                self.assertEqual(self.snapshot(root), before)
+                detail = answer["detail"]
+                self.assertIn(f"{paths.ledger} is there and no key is at {paths.anchor_key}", detail)
+                self.assertNotIn("nothing was written", detail)
+                self.assertIn("this run wrote nothing", detail)
+                self.assertIn(f"put it back at {paths.anchor_key}", detail)
+                os.rename(moved, paths.anchor_key)  # the step the text names
+                code, answer, err = self.run_action(home, environ)
+                self.assertEqual((code, answer["code"], answer["ledger"]["created"], err), (0, "ok", False, ""),
+                                 answer)
+
     def test_the_installer_function_without_make_anchor_makes_no_key(self):
         # A caller that passes neither a key nor make_anchor keeps the old step (test_ledger_step.py).
         for root, home, environ in self.profiles():

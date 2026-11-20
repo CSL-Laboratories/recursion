@@ -19,7 +19,9 @@ What it checks:
   ``recursiond relay`` is refused, so that a key kept for the relay cannot be used for a shell, scp or
   anything else through it.
 * A frame that was readable but cannot be framed again (too large, a lone surrogate, NaN or Infinity,
-  all of which ``json.loads`` accepts) is refused ``bad_frame``, not delivered, before anything is sent.
+  all of which ``json.loads`` accepts) is refused ``bad_frame``, not delivered, before anything is sent,
+  and the session goes on with the next frame. Only a frame with no sound boundary (a length over the
+  limit, a truncated body, a body that is not one JSON object) ends the session.
 
 One connection per frame, as the CLI makes one connection per call (``control.client.SocketAPI``): the
 relay holds no slot of the socket between requests, and a ``run.stop`` arriving while the socket's

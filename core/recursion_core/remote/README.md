@@ -119,8 +119,9 @@ that file trusts exactly the expected key for the host and no certificate author
 `pairing.OfferBook` and `device_state.DeviceBook` fix the rules the device store and the phone door
 will keep, before either exists. They mint nothing: a redeemed offer is a `PairingGrant`, the request
 to make of the one token authority (lane CONTROL's credentials). Scopes are a non-empty subset of
-read, run and approve; manage is refused at every step. How long a device stays paired, whether a
-phone needs a second factor, and when the phone page ships are not decided here.
+read and stop (watch and Stop): there is no passkey here, so run and approve are refused, and manage
+is refused at every step. A device stays paired at most 30 days, and 7 days if unused. Nothing here
+asks for a second factor, and there is no phone page in this package.
 
 ## Research this slice used
 

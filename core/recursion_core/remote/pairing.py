@@ -20,8 +20,8 @@ The rules, each with a test that fails without it:
 * At most eight offers are open at once.
 * Failed tries are limited per source in a sliding window, and all sources together too.
 
-Whether a phone needs a second factor at pairing or per approval (F-14 step-up, and what happens where a
-passkey is not supported) is the owner's open choice; nothing here assumes an answer to it.
+Nothing here asks for a second factor, at pairing or per approval: there is no passkey in this package,
+so a device is never given a scope that would need one.
 
 What this package keeps is the settled values of record 20261115-csl238-harness-dr-09-phone-pairing-01,
 named once below: a pairing lasts at most 30 days, and 7 days if unused; a dangerous action needs a

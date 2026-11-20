@@ -24,6 +24,7 @@ delivered, and invite a duplicate.
 
 from __future__ import annotations
 
+import json
 from typing import Any, BinaryIO
 
 from recursion_core.control_transport.errors import FrameError
@@ -68,7 +69,14 @@ def read_message(stream: BinaryIO, *, max_bytes: int = MAX_FRAME_BYTES) -> Messa
     """One frame from ``stream``; ``None`` when the stream ended cleanly between frames.
 
     A length over ``max_bytes`` is refused before its body is read (``frame_too_large``): the stream
-    cannot be trusted to resynchronise after it, so the caller ends the session.
+    cannot be trusted to resynchronise after it, so the caller ends the session. So does a body that is
+    not JSON or not one object (``frame_not_json``, ``frame_not_object``), and a truncated one.
+
+    A whole body that is one JSON object but holds a value the control socket refuses on read (NaN,
+    Infinity, a number too large for a float, a lone surrogate written as an escape) leaves the boundary
+    sound. It is returned as ``json.loads`` reads it, so that the relay refuses that one frame
+    (``frame_refusal``: ``bad_frame``, not delivered, its id kept when it can be framed again), sends
+    nothing, and reads the next frame.
     """
     header = read_exact(stream, HEADER.size)
     if header is None:
@@ -79,7 +87,18 @@ def read_message(stream: BinaryIO, *, max_bytes: int = MAX_FRAME_BYTES) -> Messa
     body = read_exact(stream, length)
     if body is None:
         raise FrameError("frame_truncated")
-    return decode_body(body)
+    try:
+        return decode_body(body)
+    except FrameError as exc:
+        if str(exc) != "frame_not_json":
+            raise
+        try:
+            message = json.loads(body.decode("utf-8"))
+        except (RecursionError, UnicodeDecodeError, ValueError):
+            raise exc from None
+        if not isinstance(message, dict):
+            raise exc from None
+        return message
 
 
 def write_message(stream: BinaryIO, message: Message, *, max_bytes: int = MAX_FRAME_BYTES) -> None:

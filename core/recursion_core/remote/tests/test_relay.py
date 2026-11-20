@@ -334,6 +334,25 @@ class RelayStreamTests(unittest.TestCase):
         self.assertEqual(code, EXIT_STREAM)
         self.assertEqual(read_all(out.getvalue())[0]["error"]["detail"], "frame_not_json")
 
+    def test_a_refused_frame_is_answered_and_the_next_sound_frame_is_still_served(self) -> None:
+        # A whole frame holding a value the socket refuses on read (NaN, a number too large for a float) has a
+        # sound boundary: it is answered "not delivered" with its id, nothing is sent, and the session goes on.
+        daemon = support.SocketDaemon(self)
+        out = io.BytesIO()
+        bodies = (b'{"op":"control","method":"run.list","params":{"x":NaN},"id":1}',
+                  b'{"op":"control","method":"run.list","params":{"x":1e999},"id":2}')
+        stream = b"".join(HEADER.pack(len(body)) + body for body in bodies)
+        stream += frames({"op": "control", "method": "run.list", "params": {}, "id": 3})
+        code = Relay(environ=daemon.environ).serve(io.BytesIO(stream), out)
+        self.assertEqual(code, EXIT_OK)
+        first, second, sound = read_all(out.getvalue())
+        for reply, request_id in ((first, 1), (second, 2)):
+            self.assertEqual((reply["error"]["code"], reply["error"]["delivered"], reply["id"]),
+                             ("bad_frame", False, request_id))
+        self.assertEqual(sound["id"], 3)
+        self.assertNotEqual(sound.get("error", {}).get("layer"), "relay")
+        self.assertEqual([message["id"] for message in daemon.seen], [3])
+
     def test_a_relay_answer_too_large_for_the_frame_is_not_delivered(self) -> None:
         daemon = support.SocketDaemon(self)
         out = io.BytesIO()

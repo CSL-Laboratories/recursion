@@ -98,7 +98,10 @@ def _worktree(sha: str) -> Path:
 def _remove_worktree(path: Path | None) -> None:
     if path is None:
         return
-    _run([*GIT, "worktree", "remove", "--force", str(path)], cwd=HARNESS_ROOT)
+    removed = _run([*GIT, "worktree", "remove", "--force", str(path)], cwd=HARNESS_ROOT)
+    if removed.returncode != 0:
+        detail = removed.stderr.strip() or f"exit {removed.returncode}"
+        raise PerfCIError(f"git worktree remove failed: {detail}")
 
 
 def _command_text(text: str) -> str:
@@ -141,6 +144,7 @@ def main() -> int:
     started = time.perf_counter()
     base_sha = os.environ.get("CI_BASE_SHA", "").strip()
     tree: Path | None = None
+    code = job_ok()
     try:
         limit = _ratio_limit()
         floor = _absolute_floor()
@@ -149,23 +153,29 @@ def main() -> int:
             _print_side("head", head)
             print("PERF_CI_NO_BASE no CI_BASE_SHA; recorded head only", flush=True)
             print(f"PERF_CI_SECONDS={time.perf_counter() - started:.3f}", flush=True)
-            return job_ok()
-        tree = _worktree(base_sha)
-        baseline, head = run_paired(tree, HARNESS_ROOT)
-        _print_side("base", baseline)
-        _print_side("head", head)
-        report = perf_compare.compare_reports(
-            baseline, head, ratio_limit=limit, absolute_floor_s=floor,
-        )
-        _emit(report, baseline_label=base_sha[:12], candidate_label="head")
-        print(f"PERF_CI_SECONDS={time.perf_counter() - started:.3f}", flush=True)
-        print(f"PERF_REGRESSIONS={len(report['regressions'])}", flush=True)
-        return job_ok()
+            code = job_ok()
+        else:
+            tree = _worktree(base_sha)
+            baseline, head = run_paired(tree, HARNESS_ROOT)
+            _print_side("base", baseline)
+            _print_side("head", head)
+            report = perf_compare.compare_reports(
+                baseline, head, ratio_limit=limit, absolute_floor_s=floor,
+            )
+            _emit(report, baseline_label=base_sha[:12], candidate_label="head")
+            print(f"PERF_CI_SECONDS={time.perf_counter() - started:.3f}", flush=True)
+            print(f"PERF_REGRESSIONS={len(report['regressions'])}", flush=True)
+            code = job_ok()
     except (PerfCIError, BenchError) as exc:
         print(f"PERF_CI_FAIL: {exc}", file=sys.stderr)
-        return perf_compare.job_exit_code(bench_ok=False)
+        code = perf_compare.job_exit_code(bench_ok=False)
     finally:
-        _remove_worktree(tree)
+        try:
+            _remove_worktree(tree)
+        except PerfCIError as exc:
+            print(f"PERF_CI_FAIL: {exc}", file=sys.stderr)
+            code = perf_compare.job_exit_code(bench_ok=False)
+    return code
 
 
 def job_ok() -> int:

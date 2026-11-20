@@ -41,7 +41,98 @@ SESSION_LAUNCHERS = frozenset({
     'su', 'sudo', 'sudoedit', 'runuser', 'login', 'machinectl', 'pkexec', 'doas',
     'ssh', 'sshd', 'systemd-run0', 'run0',
 })
-PAM_PROPERTY = re.compile(r'PAMName=', re.IGNORECASE)
+
+
+# systemd-run's options, from ``systemd-run --help`` on this host. A long name may
+# be written as any unambiguous prefix, the way getopt_long accepts it. Short
+# options cluster, and an option that takes an argument consumes the rest of
+# the element (``-qpPAMName=login`` is ``-q`` then ``-p PAMName=login``).
+_LONG_WITH_ARG = (
+    'host', 'machine', 'unit', 'property', 'description', 'slice',
+    'expand-environment', 'service-type', 'uid', 'gid', 'nice',
+    'working-directory', 'setenv', 'path-property', 'socket-property',
+    'on-active', 'on-boot', 'on-startup', 'on-unit-active', 'on-unit-inactive',
+    'on-calendar', 'timer-property',
+)
+_LONG_FLAGS = (
+    'help', 'version', 'no-ask-password', 'user', 'scope', 'slice-inherit',
+    'no-block', 'remain-after-exit', 'wait', 'send-sighup', 'same-dir',
+    'pty', 'pipe', 'quiet', 'collect', 'shell', 'on-timezone-change',
+    'on-clock-change',
+)
+_SHORT_WITH_ARG = frozenset('HMupE')  # -H -M -u -p -E
+_SHORT_FLAGS = frozenset('hrdtPqGS')
+_LONG_NAMES = _LONG_WITH_ARG + _LONG_FLAGS
+
+
+def _lines_of(arg: str) -> list[str]:
+    """Split on LF and CR only. A later line of the same element is its own assignment."""
+    lines: list[str] = []
+    buf: list[str] = []
+    for ch in arg:
+        if ch in '\n\r':
+            lines.append(''.join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    lines.append(''.join(buf))
+    return lines
+
+
+def _long_option(name: str) -> str | None:
+    """The one long option ``name`` names, or None when it is unknown or ambiguous."""
+    folded = name.lower()
+    exact = [item for item in _LONG_NAMES if item == folded]
+    if exact:
+        return exact[0]
+    matches = [item for item in _LONG_NAMES if item.startswith(folded) and folded]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _assignment_is_pam(value: str) -> bool:
+    """True when the property key, not a searched value, is PAMName."""
+    return value.split('=', 1)[0].lower() == 'pamname'
+
+
+def _element_sets_pam(text: str) -> bool:
+    if text.startswith('--'):
+        body = text[2:]
+        name, sep, value = body.partition('=')
+        resolved = _long_option(name)
+        if resolved == 'property' and sep:
+            return _assignment_is_pam(value)
+        return False
+    if text.startswith('-') and len(text) > 1 and text[1].isalpha():
+        index = 1
+        while index < len(text):
+            letter = text[index]
+            index += 1
+            if letter in _SHORT_WITH_ARG:
+                attached = text[index:]
+                if letter == 'p' and attached:
+                    return _assignment_is_pam(attached)
+                return False
+            if letter in _SHORT_FLAGS:
+                continue
+            return False
+        return False
+    if '=' in text:
+        return _assignment_is_pam(text)
+    return False
+
+
+def _is_pam_name_property(arg: str) -> bool:
+    """True when this argv element sets the unit property PAMName.
+
+    The property key is compared, not searched. ``PAMName=`` inside another
+    property's value (an ``Environment=`` assignment, for example) does not
+    open a PAM session. A clustered short option, an unambiguous prefix of
+    ``--property``, and a PAMName assignment on a later line of the same
+    element do. The value is never copied into a refusal.
+    """
+    return any(_element_sets_pam(line) for line in _lines_of(arg) if line)
 
 
 class EngineManagerPresent(RuntimeError):
@@ -50,6 +141,23 @@ class EngineManagerPresent(RuntimeError):
 
 class SessionLaunchRefused(ValueError):
     """The launch would open a PAM/logind session."""
+
+
+def _runtime_path_present(path: Path) -> bool:
+    """Whether ``path`` is present. Only ENOENT is absence.
+
+    ``os.path.lexists`` turns EACCES into False, so a runtime directory the
+    operator cannot search was reported as a missing manager socket or bus.
+    Any other OSError fails closed: the path was not shown to be absent.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise EngineManagerPresent(
+            f'runtime path cannot be inspected ({type(exc).__name__})') from exc
+    return True
 
 
 def refuse_session_launch(argv):
@@ -67,8 +175,8 @@ def refuse_session_launch(argv):
         # PAMName= opens a PAM session for the unit.
         head = argv[1:argv.index('--')] if '--' in argv else argv[1:]
         for arg in head:
-            if PAM_PROPERTY.search(arg):
-                raise SessionLaunchRefused(f'systemd-run {arg} opens a PAM session; refused')
+            if _is_pam_name_property(arg):
+                raise SessionLaunchRefused('systemd-run PAMName property opens a PAM session; refused')
 
 
 def check_engine_no_user_manager(user, uid, *, operator_uid=None, call=subprocess.run,
@@ -76,7 +184,7 @@ def check_engine_no_user_manager(user, uid, *, operator_uid=None, call=subproces
     """Read-only B9 pass probe for the engine user. Returns evidence; raises on doubt.
 
     Pass needs all three: `loginctl show-user <engine> -p Linger` says `no` or logind
-    has no such user; `systemctl is-active user@<uid>.service` says `inactive`;
+    has no such user; `systemctl is-active user@<uid>.service` says `inactive` and exits 3;
     `<runtime_root>/<uid>/systemd/private` does not exist. Anything else, including
     a probe that cannot run, fails closed. Masking user@<uid>.service is not part of
     the bar: it is proposed hardening, unmeasured.
@@ -110,12 +218,16 @@ def check_engine_no_user_manager(user, uid, *, operator_uid=None, call=subproces
                                    f'out={out[:40]!r})')
 
     state = (active.stdout or '').strip()
-    if state != 'inactive' or active.returncode == 0:
-        raise EngineManagerPresent(f'user@{uid}.service is {state[:40]!r}, not inactive')
+    # `systemctl is-active` prints inactive and exits 3. A probe killed by a
+    # signal (returncode -9, or 137 when a wrapper stores 128+signal) can leave
+    # the same text and must not attest that the manager is absent.
+    if state != 'inactive' or active.returncode != 3:
+        raise EngineManagerPresent(
+            f'user@{uid}.service is {state[:40]!r} (exit {active.returncode}), not inactive (exit 3)')
     evidence['user_manager'] = 'inactive'
 
     socket = Path(runtime_root) / str(uid) / 'systemd' / 'private'
-    if os.path.lexists(socket):
+    if _runtime_path_present(socket):
         raise EngineManagerPresent(f'{socket} exists: an engine user manager is listening')
     evidence['manager_socket'] = 'absent'
     return evidence
@@ -158,7 +270,7 @@ def signin_without_session_bus(engine_env, uid, runtime_root=Path('/run/user')):
     if runtime:
         buses.append(Path(runtime) / 'bus')  # sd-bus falls back to $XDG_RUNTIME_DIR/bus
     for bus in buses:
-        if os.path.lexists(bus):
+        if _runtime_path_present(bus):
             raise EngineManagerPresent(f'{bus} exists: a session bus is reachable for the engine')
     return {
         'session_bus': 'absent from engine env',

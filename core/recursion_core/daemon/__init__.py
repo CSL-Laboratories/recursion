@@ -1352,7 +1352,7 @@ def refuse_engine_user(environ):
     engine = environ.get('RECURSION_ENGINE_USER', '').strip()
     if engine:
         raise RuntimeError(
-            f'RECURSION_ENGINE_USER={engine} is not supported: the cross-uid path is not '
+            'RECURSION_ENGINE_USER is set and is not supported: the cross-uid path is not '
             'implemented (B7, CSL-734 picks its spawn path), and it will require the engine '
             'user to have no user manager (Linger=no, user@<engine uid>.service inactive, '
             'no /run/user/<uid>/systemd/private) during runs; see engine_user.py')

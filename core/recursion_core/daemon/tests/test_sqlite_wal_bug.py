@@ -1,8 +1,8 @@
 """The stores refuse to open on an SQLite with the WAL-reset bug, and a person's own setting accepts the risk.
 
 SQLite's page (wal.html, section 11) names the bug in 3.7.0 through 3.51.2 and the repair in 3.51.3 and later and
-in the backports 3.44.6 and 3.50.7; 3.52.0 is a withdrawn release that SQLite's pages do not say is repaired, so it
-is refused. The version is STUBBED in each test, never the machine's own, and every store, settings file and folder
+in the backports 3.44.6 and 3.50.7; SQLite's news page counts the withdrawn 3.52.0 among the releases that hold the
+repair, so it opens. The table is read per branch: a repaired patch passes only inside its own branch. The version is STUBBED in each test, never the machine's own, and every store, settings file and folder
 a test makes lives in its own temporary folder.
 """
 
@@ -25,15 +25,13 @@ from recursion_core.plugin_security import (
 
 POSIX_ONLY = "the stores and the settings file's owner check need a POSIX system"
 ANCHOR = "11" * 32  # a public value in the anchor's format; nothing signs with it or verifies against it
-REST = ("Recursion does not open its stores with it. Use a Python whose SQLite is 3.51.3 or later (or 3.50.7, or "
-        "3.44.6), and check it with: python3 -c \"import sqlite3; print(sqlite3.sqlite_version)\". To accept the "
+REST = ("Recursion does not open its stores with it. Use a Python whose SQLite is 3.53.0 or later, 3.51.3 "
+        "or later in 3.51, 3.50.7 or later in 3.50, or 3.44.6 or later in 3.44, and check it with: python3 -c \"import sqlite3; print(sqlite3.sqlite_version)\". To accept the "
         "risk and go on, set stores.sqlite_wal_bug = \"accept_risk\" in $XDG_CONFIG_HOME/recursion/settings.toml.")
 HAS_THE_BUG = "This Python uses SQLite {found}, which has a known bug that can damage a database in WAL mode. " + REST
-WITHDRAWN = ("This Python uses SQLite {found}, a withdrawn release that SQLite's pages do not say is repaired: it may "
-             "have a known bug that can damage a database in WAL mode. " + REST)
 REFUSED = {"3.45.1": HAS_THE_BUG, "3.51.2": HAS_THE_BUG, "3.50.6": HAS_THE_BUG, "3.44.5": HAS_THE_BUG,
-           "3.7.0": HAS_THE_BUG, "3.46.1": HAS_THE_BUG, "3.52.0": WITHDRAWN}
-OPENS = ("3.51.3", "3.51.9", "3.50.7", "3.50.8", "3.44.6", "3.44.9", "3.53.0", "3.53.1", "3.60.2")
+           "3.7.0": HAS_THE_BUG, "3.46.1": HAS_THE_BUG}
+OPENS = ("3.51.3", "3.51.9", "3.50.7", "3.50.8", "3.44.6", "3.44.9", "3.52.0", "3.53.0", "3.53.1", "3.60.2")
 
 
 def stub(version: str):
@@ -176,12 +174,24 @@ class TheOneRule(unittest.TestCase):
         for version in OPENS + ("3.6.23",):  # before 3.7.0 there is no WAL and SQLite's page names no bug
             with self.subTest(version=version):
                 self.assertIs(False, D.sqlite_wal_affected(version))
-        for version in (*REFUSED, "3.52.1", "3.51.2.9", "three", ""):
+        for version in (*REFUSED, "3.51.2.9", "three", ""):
             with self.subTest(version=version):
                 self.assertIs(True, D.sqlite_wal_affected(version))
 
     def test_the_table_carries_its_rows_and_is_the_one_place(self) -> None:
-        self.assertEqual({(3, 44): 6, (3, 50): 7, (3, 51): 3, (3, 52): None}, dict(D.SQLITE_WAL_RESET_REPAIRED))
+        self.assertEqual({(3, 44): 6, (3, 50): 7, (3, 51): 3, (3, 52): 0}, dict(D.SQLITE_WAL_RESET_REPAIRED))
+
+    def test_each_branch_is_read_on_its_own_and_3_52_0_passes(self) -> None:
+        # 'X or later' holds inside X's own branch only: 3.45.0, 3.50.6 and 3.51.2 sit above a repaired number of
+        # another branch and are not repaired; the withdrawn 3.52.0 holds the repair.
+        for version in ("3.45.0", "3.50.6", "3.51.2"):
+            with self.subTest(version=version), stub(version):
+                self.assertIs(True, D.sqlite_wal_affected(version))
+                self.assertEqual(HAS_THE_BUG.format(found=version), D.sqlite_wal_refusal())
+        for version in ("3.44.6", "3.50.7", "3.51.3", "3.52.0", "3.53.0"):
+            with self.subTest(version=version), stub(version):
+                self.assertIs(False, D.sqlite_wal_affected(version))
+                self.assertIsNone(D.sqlite_wal_refusal())
 
 
 class _PersonsOwnFolder(unittest.TestCase):

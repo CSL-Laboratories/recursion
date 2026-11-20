@@ -1,4 +1,4 @@
-"""``recursiond install | upgrade | uninstall``: the per-user service unit (lane INSTALL).
+"""``recursiond install | upgrade | uninstall``: the per-user service unit and the daemon's stores (lane INSTALL).
 
 One command family in the shape of seam S2 (``control/commands/__init__.py`` on SPINE's #369):
 ``NAMES``, ``parser(family)`` and ``dispatch(args, client) -> exit status``. ``recursiond`` runs it
@@ -7,12 +7,22 @@ seams merge, and then lane INSTALL's ``setup/hooks.py`` registers this same fami
 
 Each command prints one JSON object on stdout. Success is ``"code": "ok"`` (exit 0), with
 ``changed`` (whether a file was written or removed), ``unit`` (its path) and ``next`` (the
-``systemctl --user`` commands that apply the change; none is run here). A refusal is
-``"code": <kind>`` with ``detail`` (exit 1). A file-system error on the way (a folder the user
-cannot write, a full disk) is the refusal ``filesystem_error``, its detail naming the error and the path;
-files written before it stay written, so the answer does not say that nothing changed. Off Linux
-the family refuses ``platform_unsupported`` before it reads anything (``recursiond`` refuses there
-first; this holds the same once the family is registered in the control CLI).
+``systemctl --user`` commands that apply the change; none is run here); ``install`` and
+``upgrade`` add ``stores``, one ``{"kind", "path", "created"}`` for the breaker store and one for
+the revocation store. A refusal is ``"code": <kind>`` with ``detail`` (exit 1). A file-system error
+on the way (a folder the user cannot write, a full disk) is the refusal ``filesystem_error``, its
+detail naming the error and the path; files written before it stay written, so the answer does not
+say that nothing changed. ``XDG_CONFIG_HOME`` naming another folder than ``~/.config`` is refused
+``config_home_elsewhere``, before anything is read: a user manager started with it reads its units
+from there, not from ``~/.config/systemd/user`` where these commands write. ``XDG_STATE_HOME``
+naming another folder than ``~/.local/state`` is refused ``state_home_elsewhere`` by ``install`` and
+``upgrade``: a daemon started with it keeps its state there, and the unit puts it in
+``~/.local/state/recursion`` (the S6 sweep's F2 and F1 on #410). Both are read from this command's
+own environment, the nearest this package gets to the user manager's (it starts no process to ask
+it); each refusal says how to run the command without the variable. Off Linux the family refuses
+``platform_unsupported`` before it reads
+anything (``recursiond`` refuses there first; this holds the same once the family is registered in
+the control CLI).
 
 ``XDG_CONFIG_HOME`` naming another folder than ``~/.config`` is refused ``config_home_elsewhere``,
 before anything is read: a user manager started with it reads its units from there, not from
@@ -25,9 +35,15 @@ run the command without the variable. A password database that gives no entry fo
 or a failed lookup: CPython raises ``KeyError`` for both) is ``home_unknown``, before anything is read.
 
 ``install`` and ``upgrade`` point the unit at the interpreter running this command, and first ask
-that interpreter, started as the unit will start it (``-I``, from ``/``), what it is: it must be
+that interpreter, isolated (``-I``, from ``/``) with ``-W error::RuntimeWarning`` and without
+``-X gil=0``, what it is. An extension that would switch the GIL on raises during that probe
+instead of loading silently. The interpreter must be
 free-threaded CPython 3.14 (``interpreter_not_free_threaded``), and it must import this same
 ``recursion_core`` with no ``PYTHONPATH`` (``not_installed``), or the daemon could not start.
+
+``provision`` is that same ``install``: the unit, the stores and the route homes' custody root,
+as one JSON object. It runs no ``systemctl``. A second call, when those are already what
+``install`` would write, changes nothing.
 """
 
 from __future__ import annotations
@@ -37,14 +53,15 @@ import os
 import subprocess
 import sys
 
-from recursion_core.daemon_install import InstallRefused, Roots, daemon_exec_args, install, uninstall, upgrade
+from recursion_core.daemon_install import (InstallRefused, Roots, daemon_exec_args, install, owned_paths, uninstall,
+                                           upgrade)
 
 NAMES = ("install", "upgrade", "uninstall")
 EXIT_OK, EXIT_REFUSED = 0, 1
 _HELP = {
-    "install": "write the per-user systemd unit for the daemon (twice changes nothing)",
-    "upgrade": "rewrite the unit for this interpreter and this version",
-    "uninstall": "remove the unit `install` wrote; the daemon's state folder stays",
+    "install": "create the daemon's stores and write its per-user systemd unit (twice changes nothing)",
+    "upgrade": "create any missing store and rewrite the unit for this interpreter and this version",
+    "uninstall": "remove the unit `install` wrote; the daemon's state folder and its stores stay",
 }
 
 # Run by the interpreter the unit will run, as the unit runs it. Standard library only.
@@ -123,17 +140,18 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
               "next": [list(command) for command in plan.commands]}
     if action != "uninstall":
         answer["interpreter"] = interpreter
+        answer["stores"] = [{"kind": kind, "path": path, "created": created} for kind, path, created in plan.stores]
     _print(out, answer)
     return EXIT_OK
 
 
 def refuse_elsewhere(action: str, environ, roots: Roots) -> None:
-    """Refuse an ``XDG_CONFIG_HOME`` (every command) or ``XDG_STATE_HOME`` (``install``, ``upgrade``) that
-    names another folder than the default under the home. Unset or empty is the default; a relative value
-    names no folder for sure, so it is refused too."""
+    """Refuse an ``XDG_CONFIG_HOME`` (every command) or ``XDG_STATE_HOME`` (``install``, ``upgrade``,
+    ``provision``) that names another folder than the default under the home. Unset or empty is the
+    default; a relative value names no folder for sure, so it is refused too."""
 
     checks = [("XDG_CONFIG_HOME", ".config", "config_home_elsewhere")]
-    if action in ("install", "upgrade"):
+    if action in ("install", "upgrade", "provision"):
         checks.append(("XDG_STATE_HOME", ".local/state", "state_home_elsewhere"))
     for name, default, code in checks:
         value = environ.get(name) or ""
@@ -169,11 +187,16 @@ def _filesystem_detail(exc: OSError, roots: Roots) -> str:
 
 
 def probe_interpreter(interpreter: str) -> dict:
-    """What ``interpreter`` is, asked of it as the unit will start it: ``-I``, working folder ``/``."""
+    """What ``interpreter`` is, asked with ``-I`` and ``-W error::RuntimeWarning``, from ``/``.
+
+    ``-X gil=0`` is not passed. An extension that would switch the GIL on warns, and that warning
+    is an error, so the probe refuses instead of loading the extension silently.
+    """
 
     try:
-        done = subprocess.run([interpreter, "-I", "-c", _PROBE], cwd="/", capture_output=True, text=True,
-                              timeout=120, check=False)
+        done = subprocess.run(
+            [interpreter, "-I", "-W", "error::RuntimeWarning", "-c", _PROBE],
+            cwd="/", capture_output=True, text=True, timeout=120, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         raise InstallRefused("interpreter_unknown", f"{interpreter} could not be run: {type(exc).__name__}") from None
     try:
@@ -211,3 +234,58 @@ def require_daemon_interpreter(info: dict, interpreter: str, package: str) -> No
 
 def _print(out, answer: dict) -> None:
     print(json.dumps(answer, sort_keys=True), file=out)
+
+
+def provision_command(out=None) -> int:
+    """``recursiond provision``: this user's roots, this interpreter, one JSON object on stdout."""
+
+    import recursion_core
+
+    out = sys.stdout if out is None else out
+    if not sys.platform.startswith("linux"):
+        _print(out, {"code": "platform_unsupported", "action": "provision",
+                     "detail": f"the per-user service needs Linux with systemd; this system is {sys.platform}"})
+        return EXIT_REFUSED
+    try:
+        roots = default_roots()
+    except InstallRefused as exc:
+        _print(out, {"code": exc.kind, "action": "provision", "detail": exc.detail})
+        return EXIT_REFUSED
+    return provision(out, roots=roots, interpreter=sys.executable, package=recursion_core.__file__)
+
+
+def provision(out, *, roots: Roots, interpreter: str, package: str, probe=None, environ=None) -> int:
+    """Write the unit, the stores and the route homes' custody root. A second call changes nothing.
+
+    This is ``install`` (``daemon_install.install``): on this branch that creates the breaker
+    store, the revocation store and ``<state>/homes``, then the unit. The printed ``next``
+    commands are the ones ``install`` returns; none is run here. ``KeyboardInterrupt`` and
+    ``SystemExit`` propagate. A second caller, with its own roots, gets its own answer.
+    """
+
+    probe = probe_interpreter if probe is None else probe
+    environ = os.environ if environ is None else environ
+    try:
+        refuse_elsewhere("provision", environ, roots)
+        require_daemon_interpreter(probe(interpreter), interpreter, package)
+        paths = owned_paths(roots)
+        homes_before = os.path.lexists(paths.homes)
+        plan = install(roots, daemon_exec_args(interpreter))
+    except InstallRefused as exc:
+        _print(out, {"code": exc.kind, "action": "provision", "detail": exc.detail})
+        return EXIT_REFUSED
+    except OSError as exc:
+        _print(out, {"code": "filesystem_error", "action": "provision", "detail": _filesystem_detail(exc, roots)})
+        return EXIT_REFUSED
+    answer = {
+        "code": "ok",
+        "action": "provision",
+        "changed": bool(plan.changed),
+        "unit": plan.unit,
+        "interpreter": interpreter,
+        "stores": [{"kind": kind, "path": path, "created": created} for kind, path, created in plan.stores],
+        "homes": {"root": paths.homes, "created": (not homes_before) and os.path.lexists(paths.homes)},
+        "next": [list(command) for command in plan.commands],
+    }
+    _print(out, answer)
+    return EXIT_OK

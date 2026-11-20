@@ -13,7 +13,9 @@ PRODUCT.md 4.1 and 4.3 (at 055cc7a5, CSLR-D-011), as implemented here:
   loader imports only ``plugin.py`` until it uses it.
 * Grants are bound to the developer key they were given for (review R4, finding 6, under
   Lucas's D0, Nov 12, 2026): a grant naming another developer key grants nothing, and so
-  does a manual grant that names none, in either form (grant again).
+  does a manual grant that names none, in either form (grant again). Such a grant does not
+  stop the plugin: it is still loaded and its code still runs, with an empty permission set.
+  This build does not refuse a plugin whose grant is not bound.
 * Installer configuration is refused unless it is in normal form: a reserved host is a
   lower-case host name with no port, no trailing dot and no IP address; a reserved
   credential prefix is lower case. A declared destination's port is 1 to 65535, and a
@@ -563,7 +565,8 @@ class Grant:
     # naming another key grants nothing. A manual grant (signer_key_id None) that names no
     # key here may still be bound by ``order_after_revoked_key``, which names the key the
     # user turned order back on for; with neither it is unbound and grants nothing, in
-    # either manifest form: the user grants again, for the key the manifest names now.
+    # either manifest form: the user grants again, for the key the manifest names now. An unbound
+    # grant only empties the permission set; the plugin is still loaded and its code still runs.
     # Null, or a key id (``ed25519:`` and 32 lower-case hex). Anything else is refused.
     developer_key_id: str | None = None
 
@@ -654,7 +657,9 @@ def effective_permissions(manifest: Manifest, trust: str, signer_key_id: str | N
     grants nothing, so rewriting an unsigned manifest under another key does not carry a
     manual grant (or escape that key's revocation). A manual grant bound to no key cannot
     show which key it was for, so it grants nothing in either form (``grant_developer_key_missing``);
-    its identity is never inferred from the unsigned manifest on disk.
+    its identity is never inferred from the unsigned manifest on disk. This result is a permission
+    set and findings: it does not refuse the plugin, which is still loaded and whose code still runs
+    with the empty set; that the loader does not refuse it before it starts is today's behaviour.
     """
     dropped: list[tuple[str, str]] = []
     if type(manifest) is not Manifest:

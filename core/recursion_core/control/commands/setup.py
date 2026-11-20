@@ -1,4 +1,4 @@
-"""``recursiond install | upgrade | uninstall``: the per-user service unit (lane INSTALL).
+"""``recursiond install | upgrade | uninstall``: the per-user service unit and the daemon's stores (lane INSTALL).
 
 One command family in the shape of seam S2 (``control/commands/__init__.py`` on SPINE's #369):
 ``NAMES``, ``parser(family)`` and ``dispatch(args, client) -> exit status``. ``recursiond`` runs it
@@ -7,12 +7,22 @@ seams merge, and then lane INSTALL's ``setup/hooks.py`` registers this same fami
 
 Each command prints one JSON object on stdout. Success is ``"code": "ok"`` (exit 0), with
 ``changed`` (whether a file was written or removed), ``unit`` (its path) and ``next`` (the
-``systemctl --user`` commands that apply the change; none is run here). A refusal is
-``"code": <kind>`` with ``detail`` (exit 1). A file-system error on the way (a folder the user
-cannot write, a full disk) is the refusal ``filesystem_error``, its detail naming the error and the path;
-files written before it stay written, so the answer does not say that nothing changed. Off Linux
-the family refuses ``platform_unsupported`` before it reads anything (``recursiond`` refuses there
-first; this holds the same once the family is registered in the control CLI).
+``systemctl --user`` commands that apply the change; none is run here); ``install`` and
+``upgrade`` add ``stores``, one ``{"kind", "path", "created"}`` for the breaker store and one for
+the revocation store. A refusal is ``"code": <kind>`` with ``detail`` (exit 1). A file-system error
+on the way (a folder the user cannot write, a full disk) is the refusal ``filesystem_error``, its
+detail naming the error and the path; files written before it stay written, so the answer does not
+say that nothing changed. ``XDG_CONFIG_HOME`` naming another folder than ``~/.config`` is refused
+``config_home_elsewhere``, before anything is read: a user manager started with it reads its units
+from there, not from ``~/.config/systemd/user`` where these commands write. ``XDG_STATE_HOME``
+naming another folder than ``~/.local/state`` is refused ``state_home_elsewhere`` by ``install`` and
+``upgrade``: a daemon started with it keeps its state there, and the unit puts it in
+``~/.local/state/recursion`` (the S6 sweep's F2 and F1 on #410). Both are read from this command's
+own environment, the nearest this package gets to the user manager's (it starts no process to ask
+it); each refusal says how to run the command without the variable. Off Linux the family refuses
+``platform_unsupported`` before it reads
+anything (``recursiond`` refuses there first; this holds the same once the family is registered in
+the control CLI).
 
 ``XDG_CONFIG_HOME`` naming another folder than ``~/.config`` is refused ``config_home_elsewhere``,
 before anything is read: a user manager started with it reads its units from there, not from
@@ -42,9 +52,9 @@ from recursion_core.daemon_install import InstallRefused, Roots, daemon_exec_arg
 NAMES = ("install", "upgrade", "uninstall")
 EXIT_OK, EXIT_REFUSED = 0, 1
 _HELP = {
-    "install": "write the per-user systemd unit for the daemon (twice changes nothing)",
-    "upgrade": "rewrite the unit for this interpreter and this version",
-    "uninstall": "remove the unit `install` wrote; the daemon's state folder stays",
+    "install": "create the daemon's stores and write its per-user systemd unit (twice changes nothing)",
+    "upgrade": "create any missing store and rewrite the unit for this interpreter and this version",
+    "uninstall": "remove the unit `install` wrote; the daemon's state folder and its stores stay",
 }
 
 # Run by the interpreter the unit will run, as the unit runs it. Standard library only.
@@ -123,6 +133,7 @@ def run(action: str, *, out, roots: Roots, interpreter: str, package: str, probe
               "next": [list(command) for command in plan.commands]}
     if action != "uninstall":
         answer["interpreter"] = interpreter
+        answer["stores"] = [{"kind": kind, "path": path, "created": created} for kind, path, created in plan.stores]
     _print(out, answer)
     return EXIT_OK
 

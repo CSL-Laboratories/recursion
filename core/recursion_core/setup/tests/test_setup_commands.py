@@ -62,14 +62,19 @@ class CommandTests(unittest.TestCase):
     def test_install_prints_ok_and_install_twice_changes_nothing(self):
         code, answer = self.run_action("install")
         self.assertEqual(code, 0)
+        store_dir = os.path.join(self.home, ".local", "state", "recursion", "plugin-security")
+        stores = [{"kind": "breaker_store", "path": os.path.join(store_dir, "breaker.sqlite3"), "created": True},
+                  {"kind": "revocation_store", "path": os.path.join(store_dir, "revoked.sqlite3"), "created": True}]
         self.assertEqual(answer, {
             "code": "ok", "action": "install", "changed": True, "unit": self.unit, "interpreter": PY,
+            "stores": stores,
             "next": [["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", UNIT_NAME]]})
         with open(self.unit, encoding="utf-8") as handle:
             first = handle.read()
         self.assertEqual(service_fields(first)["Service.ExecStart"], f"{PY} -I -X gil=0 -m recursion_core.daemon")
         code, answer = self.run_action("install")
         self.assertEqual((code, answer["changed"]), (0, False))
+        self.assertEqual(answer["stores"], [dict(store, created=False) for store in stores])
         with open(self.unit, encoding="utf-8") as handle:
             self.assertEqual(handle.read(), first)
 
@@ -160,6 +165,10 @@ class CommandTests(unittest.TestCase):
         # Review 3 of #382, DeepSeek L2: an fsync (or a read or write on an open file) fails with an
         # OSError that carries no file name; the detail still names where it happened.
         unit_dir = os.path.dirname(self.unit)
+        # Slice 2: install makes the stores first, and their creation fsyncs too (a failure there is
+        # store_not_created); with the stores in place, the unit's own write is what fails here.
+        self.run_action("install")
+        os.unlink(self.unit)
         with mock.patch("os.fsync", side_effect=OSError(5, "Input/output error")):
             code, answer = self.run_action("install")
         self.assertEqual((code, answer["code"], answer["action"]), (1, "filesystem_error", "install"))
@@ -181,6 +190,9 @@ class CommandTests(unittest.TestCase):
         real_home = os.path.join(self._tmp.name, "real-home")
         os.rename(self.home, real_home)
         os.symlink(real_home, self.home)
+        # Slice 2: the stores are made (and fsynced) first; with them in place the unit's write fails.
+        self.run_action("install")
+        os.unlink(os.path.join(real_home, ".config", "systemd", "user", UNIT_NAME))
         with mock.patch("os.fsync", side_effect=OSError(5, "Input/output error")):
             code, answer = self.run_action("install")
         self.assertEqual((code, answer["code"]), (1, "filesystem_error"))

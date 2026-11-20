@@ -1,18 +1,23 @@
-"""The per-user unit: install, upgrade, uninstall. No systemctl, no network; files under a temporary home."""
+"""The per-user unit and the stores: install, upgrade, uninstall. No systemctl, no network; files under a temporary home."""
 
 from __future__ import annotations
 
+import errno
+import importlib.util
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from recursion_core.daemon_install import layout
 from recursion_core.daemon_install import (
     MARKER,
+    STATE_HOME,
     STOP_TIMEOUT_S,
     UNIT_NAME,
     InstallRefused,
@@ -20,12 +25,14 @@ from recursion_core.daemon_install import (
     daemon_exec_args,
     install,
     leftovers,
+    owned_paths,
     plan_commands,
     render_unit,
     service_fields,
     uninstall,
     upgrade,
 )
+from recursion_core.plugin_security import stores
 
 PY = "/opt/recursion/venv/bin/python3.14t"
 PY_NEXT = "/opt/recursion/venv-2/bin/python3.14t"
@@ -79,7 +86,10 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(fields["Service.SendSIGKILL"], "yes")
         self.assertEqual(fields["Service.UnsetEnvironment"].split(), ["PYTHONPATH", "PYTHONHOME"])
         self.assertEqual(fields["Install.WantedBy"], "default.target")
-        self.assertNotIn("Service.Environment", fields)
+        # The one variable the unit sets: the daemon's state folder is the one install made the stores in.
+        self.assertEqual(fields["Service.Environment"], "XDG_STATE_HOME=%h/.local/state")
+        self.assertEqual(STATE_HOME, ".local/state")
+        self.assertEqual(text.count("Environment="), 2)  # this line and UnsetEnvironment's
         self.assertNotIn("Service.ExecStartPre", fields)
         self.assertTrue(0 < STOP_TIMEOUT_S < 3600)
 
@@ -203,25 +213,232 @@ class InstallTests(unittest.TestCase):
         self.roots = Roots(home=self.home)
         self.unit_dir = os.path.join(self.home, ".config", "systemd", "user")
         self.unit = os.path.join(self.unit_dir, UNIT_NAME)
-        # The daemon's state folder: the installer never writes, reads or removes anything in it.
+        # The daemon's state folder: the installer adds plugin-security/ with the two stores in it, and
+        # never writes, reads or removes anything else there.
         self.state = os.path.join(self.home, ".local", "state", "recursion")
         os.makedirs(self.state, 0o700)
         with open(os.path.join(self.state, "runs.sqlite3"), "wb") as handle:
             handle.write(b"rows-v1")
+        self.store_dir = os.path.join(self.state, "plugin-security")
+        self.breaker = os.path.join(self.store_dir, "breaker.sqlite3")
+        self.revoked = os.path.join(self.store_dir, "revoked.sqlite3")
+        self.homes = os.path.join(self.state, "homes")
 
     def test_install_writes_the_unit_and_install_twice_equals_install_once(self) -> None:
         state_before = _tree(self.state)
         plan = install(self.roots, EXEC)
         self.assertEqual((plan.action, plan.changed, plan.unit), ("install", True, self.unit))
         self.assertEqual(plan.commands, plan_commands("install"))
+        self.assertEqual(plan.stores, (("breaker_store", self.breaker, True), ("revocation_store", self.revoked, True)))
         self.assertEqual(_read(self.unit), render_unit(EXEC))
         self.assertEqual(stat.S_IMODE(os.stat(self.unit).st_mode), 0o644)
+        state_after = _tree(self.state)
+        self.assertEqual(set(state_after) - set(state_before), {self.store_dir, self.breaker, self.revoked, self.homes})
+        self.assertEqual({path: state_after[path] for path in state_before}, state_before)
         once = _tree(self.home)
         again = install(self.roots, EXEC)
         self.assertEqual((again.action, again.changed, again.unit), ("install", False, self.unit))
+        self.assertEqual(again.stores, (("breaker_store", self.breaker, False), ("revocation_store", self.revoked, False)))
         self.assertEqual(_tree(self.home), once)
-        self.assertEqual(_tree(self.state), state_before)
         self.assertEqual(sorted(os.listdir(self.unit_dir)), [UNIT_NAME])  # no temporary file left
+        self.assertEqual(sorted(os.listdir(self.store_dir)), ["breaker.sqlite3", "revoked.sqlite3"])
+
+    def test_install_makes_the_route_homes_custody_root_owner_only_and_uninstall_keeps_it(self) -> None:
+        # Question 15 (default (a)): setup.route_home.check refuses a missing custody root, so install
+        # makes <state>/homes, 0700, before the unit; install or upgrade makes it again if it is gone.
+        self.assertTrue(install(self.roots, EXEC).changed)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.homes).st_mode), 0o700)
+        self.assertEqual(os.listdir(self.homes), [])
+        os.mkdir(os.path.join(self.homes, "claude_code"), 0o700)  # a route home the launcher made
+        self.assertFalse(install(self.roots, EXEC).changed)
+        self.assertFalse(upgrade(self.roots, EXEC).changed)
+        uninstall(self.roots)
+        self.assertEqual(os.listdir(self.homes), ["claude_code"])  # the route homes and their logins stay
+        install(self.roots, EXEC)  # the unit again
+        shutil.rmtree(self.homes)
+        self.assertTrue(install(self.roots, EXEC).changed)  # the unit and the stores are there: only the root
+        self.assertEqual(stat.S_IMODE(os.lstat(self.homes).st_mode), 0o700)
+        shutil.rmtree(self.homes)
+        self.assertTrue(upgrade(self.roots, EXEC).changed)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.homes).st_mode), 0o700)
+
+    def test_a_unit_gone_or_replaced_while_the_stores_are_made_is_refused_not_answered(self) -> None:
+        # Review 1 of #410, DeepSeek F1: between the read and the answer install and upgrade make the stores
+        # and the custody root; a unit removed (or replaced) then was answered "changed: false" with no
+        # unit on disk. The unit found is held open until the answer and checked against its path last.
+        module = importlib.import_module("recursion_core.daemon_install.install")
+        real_ensure_stores = module.ensure_stores
+
+        def removing(paths):
+            os.unlink(self.unit)
+            return real_ensure_stores(paths)
+
+        def replacing(paths):
+            os.unlink(self.unit)
+            with open(self.unit, "wb") as handle:
+                handle.write(render_unit(EXEC).encode())  # the same bytes, another file
+            return real_ensure_stores(paths)
+        for change, code in ((removing, "unit_missing"), (replacing, "unit_changed")):
+            for step in (install, upgrade):
+                with self.subTest(step=step.__name__, code=code):
+                    if os.path.lexists(self.unit):
+                        os.unlink(self.unit)
+                    install(self.roots, EXEC)
+                    with self.assertRaises(InstallRefused) as caught, \
+                            mock.patch.object(module, "ensure_stores", side_effect=change):
+                        step(self.roots, EXEC)
+                    self.assertEqual(caught.exception.kind, code)
+        # The last look at the unit's path comes before the unit is let go (so its inode cannot be reused).
+        if os.path.lexists(self.unit):
+            os.unlink(self.unit)
+        install(self.roots, EXEC)
+        real_open, real_close, real_lstat = os.open, os.close, os.lstat
+        events, unit_fds = [], set()
+
+        def opening(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if os.fspath(path) == self.unit:
+                unit_fds.add(fd)
+                events.append("open")
+            return fd
+
+        def closing(fd):
+            if fd in unit_fds:
+                unit_fds.discard(fd)
+                events.append("close")
+            return real_close(fd)
+
+        def looking(path, *args, **kwargs):
+            if os.fspath(path) == self.unit:
+                events.append("lstat")
+            return real_lstat(path, *args, **kwargs)
+        for step in (install, upgrade):
+            with self.subTest(step=step.__name__, check="held"):
+                events.clear()
+                with mock.patch("os.open", side_effect=opening), mock.patch("os.close", side_effect=closing), \
+                        mock.patch("os.lstat", side_effect=looking):
+                    self.assertFalse(step(self.roots, EXEC).changed)
+                self.assertEqual(events.count("close"), 1, events)
+                self.assertEqual(events[-1], "close", events)
+                self.assertEqual(events[-2], "lstat", events)  # the look at the answer, with the unit still held
+
+    def test_a_unit_rewritten_in_place_while_the_stores_are_made_is_refused(self) -> None:
+        # Review 2 of #410, DeepSeek F1-a: rewritten in place (the same inode, other bytes) the unit passed the
+        # path's identity check and was answered "changed: false". The bytes are read again through the held
+        # descriptor at the answer, one past their length, so an append shows too.
+        module = importlib.import_module("recursion_core.daemon_install.install")
+        real_ensure_stores = module.ensure_stores
+
+        def rewriting(new_bytes):
+            def ensure(paths):
+                with open(self.unit, "r+b") as handle:
+                    handle.truncate(0)
+                    handle.write(new_bytes)
+                return real_ensure_stores(paths)
+            return ensure
+        for name, new_bytes in (("other bytes", b"# rewritten in place\n"),
+                                ("appended", render_unit(EXEC).encode() + b"# appended\n")):
+            for step in (install, upgrade):
+                with self.subTest(change=name, step=step.__name__):
+                    if os.path.lexists(self.unit):
+                        os.unlink(self.unit)
+                    install(self.roots, EXEC)
+                    inode = os.stat(self.unit).st_ino
+                    with self.assertRaises(InstallRefused) as caught, \
+                            mock.patch.object(module, "ensure_stores", side_effect=rewriting(new_bytes)):
+                        step(self.roots, EXEC)
+                    self.assertEqual(caught.exception.kind, "unit_changed")
+                    self.assertIn("was rewritten while it was read", caught.exception.detail)
+                    self.assertEqual(os.stat(self.unit).st_ino, inode)  # the same file: only its bytes moved
+
+    def test_a_folder_another_caller_makes_first_is_used_not_raised(self) -> None:
+        # Review 2 of #410, DeepSeek F8 (older than slice 2): a second installer made a folder between this one's
+        # look and its mkdir, and FileExistsError came out raw. Such a folder is held to the same rule and used.
+        shutil.rmtree(os.path.join(self.home, ".local"))
+        real_mkdir = os.mkdir
+
+        def the_other_caller_first(path, mode=0o777, *args, **kwargs):
+            real_mkdir(path, 0o700)
+            return real_mkdir(path, mode, *args, **kwargs)
+        with mock.patch("os.mkdir", side_effect=the_other_caller_first):
+            plan = install(self.roots, EXEC)
+        self.assertTrue(plan.changed)
+        self.assertEqual(_read(self.unit), render_unit(EXEC))
+        self.assertTrue(os.path.isdir(self.homes))
+
+        def a_writable_one_first(path, mode=0o777, *args, **kwargs):
+            real_mkdir(path, 0o700)
+            os.chmod(path, 0o777)  # made by the other caller, but open to everyone: refused, not used
+            return real_mkdir(path, mode, *args, **kwargs)
+        other = os.path.join(self.case, "other-home")
+        os.mkdir(other, 0o700)
+        with self.assertRaises(InstallRefused) as caught, mock.patch("os.mkdir", side_effect=a_writable_one_first):
+            install(Roots(other), EXEC)
+        self.assertEqual(caught.exception.kind, "folder_untrusted")
+
+    def test_a_custody_root_its_owner_cannot_use_is_refused(self) -> None:
+        # Review 1 of #410, DeepSeek F3: a custody root at 0000 has no group or world bit and was accepted,
+        # yet neither the launcher nor route_home.check can use it. Its owner needs read, write and search.
+        os.mkdir(self.homes, 0o700)
+        self.addCleanup(os.chmod, self.homes, 0o700)
+        for mode in (0o000, 0o600, 0o500, 0o300, 0o100):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.homes, mode)
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    install(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "folder_untrusted")
+                self.assertEqual(caught.exception.detail, f"{self.homes} must be readable, writable and searchable "
+                                 "by its owner; `chmod 700` it")
+                self.assertEqual(_tree(self.home), before)  # no store, no unit
+        os.chmod(self.homes, 0o700)
+        self.assertTrue(install(self.roots, EXEC).changed)
+
+    def test_ensure_stores_refuses_what_is_not_owned_paths(self) -> None:
+        # Review 1 of #410, DeepSeek F5: every other entry refuses a wrong argument typed; this one raised
+        # AttributeError (a Roots is the easy mistake: every other entry takes one).
+        module = importlib.import_module("recursion_core.daemon_install.install")
+        for wrong in (self.roots, None, self.home):
+            with self.subTest(argument=type(wrong).__name__):
+                with self.assertRaises(InstallRefused) as caught:
+                    module.ensure_stores(wrong)
+                self.assertEqual(caught.exception.kind, "paths")
+        self.assertFalse(os.path.lexists(self.store_dir))
+
+    def test_a_custody_root_open_to_anyone_else_is_refused_before_anything_is_made(self) -> None:
+        os.mkdir(self.homes, 0o700)
+        for mode in (0o740, 0o720, 0o710, 0o704, 0o702, 0o701):  # each bit alone
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.homes, mode)
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    install(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "folder_untrusted")
+                if mode & 0o022:  # a write bit: the rule every folder on the way is held to answers first
+                    expected = f"{self.homes} can be written by group or world; `chmod go-w` it"
+                else:
+                    expected = f"{self.homes} is open to group or world; route homes need it owner-only: `chmod 700` it"
+                self.assertEqual(caught.exception.detail, expected)
+                self.assertEqual(_tree(self.home), before)  # no store, no unit
+        os.chmod(self.homes, 0o700)
+        install(self.roots, EXEC)
+        os.chmod(self.homes, 0o750)
+        before = _tree(self.home)
+        with self.assertRaises(InstallRefused) as caught:
+            upgrade(self.roots, EXEC_NEXT)
+        self.assertEqual(caught.exception.kind, "folder_untrusted")
+        self.assertEqual(_tree(self.home), before)
+        os.rmdir(self.homes)
+        os.symlink(self.store_dir, self.homes)  # a link where the root belongs
+        with self.assertRaises(InstallRefused) as caught:
+            install(self.roots, EXEC)
+        self.assertEqual(caught.exception.kind, "symlink_refused")
+
+    def test_the_custody_root_is_the_launchers_own(self) -> None:
+        self.assertEqual(layout.HOMES_FOLDER, "homes")
+        self.assertEqual(owned_paths(self.roots).homes, os.path.join(self.state, "homes"))
+        launcher = Path(importlib.util.find_spec("recursion_core.daemon.launcher").origin).read_text(encoding="utf-8")
+        self.assertIn("private_dir(self._state / 'homes' / self.engine)", launcher)
 
     def test_a_new_unit_folder_is_owner_only_and_an_existing_one_is_left_as_it_is(self) -> None:
         install(self.roots, EXEC)
@@ -293,13 +510,15 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
                 self.assertIn(said, caught.exception.detail)
                 self.assertIn(f"move that state folder to {self.state}", caught.exception.detail)
-                self.assertEqual(_tree(self.home), before)  # the unit as it was
+                self.assertEqual(_tree(self.home), before)  # the unit as it was; no store, no custody root
+                self.assertFalse(os.path.lexists(self.store_dir))
         with open(self.unit, "wb") as handle:
             handle.write(b"[Service]\nEnvironment=XDG_STATE_HOME=\xff\nExecStart=/old\n")
         with self.assertRaises(InstallRefused) as caught:
             upgrade(self.roots, EXEC)
         self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
         self.assertIn("is not UTF-8 text", caught.exception.detail)
+        self.assertFalse(os.path.lexists(self.store_dir))
 
     def test_upgrade_still_replaces_a_unit_whose_state_is_the_default(self) -> None:
         os.makedirs(self.unit_dir, 0o700)
@@ -386,6 +605,56 @@ class InstallTests(unittest.TestCase):
                     handle.write(f"[Service]\n{service}ExecStart=/old\n")
                 self.assertTrue(upgrade(self.roots, EXEC).changed)
                 self.assertEqual(_read(self.unit), render_unit(EXEC))
+
+    # DeepSeek's round 3 on #410, F3-2, the part the assignment case does not cover: a valued unset with no
+    # Environment= assignment may remove the user manager's own value, which this package does not read.
+    def test_a_valued_unset_with_no_assignment_cannot_be_told(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        for value in ("/not-it", ""):
+            shown = f"XDG_STATE_HOME={value}"
+            text = f"[Service]\nUnsetEnvironment={shown}\nExecStart=/old\n"
+            with self.subTest(value=value):
+                with open(self.unit, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                before = _tree(self.home)
+                with self.assertRaises(InstallRefused) as caught:
+                    upgrade(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_state_elsewhere")
+                self.assertIn(f"has UnsetEnvironment={shown}", caught.exception.detail)
+                self.assertIn("cannot be told", caught.exception.detail)
+                self.assertFalse(os.path.lexists(self.store_dir))
+                self.assertEqual(_tree(self.home), before)
+                self.assertEqual(_read(self.unit), text)
+
+    # DeepSeek's round 3 on #410, F3-4: the path was checked and then the bytes, so a new file put at the path
+    # between them was answered ok. The byte check runs first; the name check is last and sees that file.
+    def test_a_replacement_before_the_byte_check_is_refused_when_the_name_is_checked_last(self) -> None:
+        install(self.roots, EXEC)
+        foreign = b"# not our unit, put there between the checks\n"
+        # The package attribute ``install`` is the function; the module stays in sys.modules.
+        import sys
+        install_module = sys.modules["recursion_core.daemon_install.install"]
+        real_holds = install_module.still_holds
+
+        def holds(path: str, read) -> None:
+            os.unlink(path)  # the descriptor still holds the file that was read; the path gets a new inode
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            try:
+                os.write(fd, foreign)
+            finally:
+                os.close(fd)
+            return real_holds(path, read)
+
+        for action in (install, upgrade):
+            with self.subTest(action=action.__name__):
+                with open(self.unit, "wb") as handle:
+                    handle.write(render_unit(EXEC).encode())
+                with mock.patch.object(install_module, "still_holds", holds):
+                    with self.assertRaises(InstallRefused) as caught:
+                        action(self.roots, EXEC)
+                self.assertEqual(caught.exception.kind, "unit_changed")
+                self.assertIn("was replaced while it was read", caught.exception.detail)
+                self.assertEqual(Path(self.unit).read_bytes(), foreign)
 
     # Grok's round 10 on #382 (23f76e4a). R2: an empty XDG_STATE_HOME= was refused, but the daemon reads an empty value as
     # the default (daemon/__main__.py: XDG_STATE_HOME or Path.home()); the unit's HOME then decides. R3: str.splitlines
@@ -766,6 +1035,7 @@ class InstallTests(unittest.TestCase):
             upgrade(self.roots, EXEC)
         self.assertEqual(caught.exception.kind, "unit_missing")
         self.assertFalse(os.path.lexists(self.unit_dir))
+        self.assertFalse(os.path.lexists(self.store_dir))  # refused before any store is made
 
     def test_an_existing_unit_another_user_could_change_is_refused_by_install_and_rewritten_by_upgrade(self) -> None:
         # Review 3 of #382, DeepSeek L1: the same bytes are not enough. A unit group or world can
@@ -988,8 +1258,10 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(plan.commands, plan_commands("uninstall"))
         self.assertEqual(leftovers(self.roots), ())
         after = _tree(self.home)
+        # Left: the unit folders (other units share them), the neighbour, and the stores (question 3).
         self.assertEqual(set(after) - set(before),
-                         {os.path.join(self.home, ".config"), os.path.dirname(self.unit_dir), self.unit_dir, neighbour})
+                         {os.path.join(self.home, ".config"), os.path.dirname(self.unit_dir), self.unit_dir, neighbour,
+                          self.store_dir, self.breaker, self.revoked, self.homes})
         self.assertEqual({path: after[path] for path in before}, before)  # the state folder too
         again = uninstall(self.roots)
         self.assertEqual((again.action, again.changed), ("uninstall", False))
@@ -1273,6 +1545,8 @@ class InstallTests(unittest.TestCase):
                          ("folder_untrusted", True))
 
     def test_losing_the_race_for_the_unit_is_refused_and_leaves_no_temporary_file(self) -> None:
+        install(self.roots, EXEC)
+        uninstall(self.roots)  # the stores stay, so the link below is the unit's alone
         with mock.patch("os.link", side_effect=FileExistsError):
             with self.assertRaises(InstallRefused) as caught:
                 install(self.roots, EXEC)
@@ -1296,11 +1570,257 @@ class InstallTests(unittest.TestCase):
             return real_fsync(fd)
         with mock.patch("os.fsync", side_effect=fsync):
             install(self.roots, EXEC)
-            self.assertEqual(synced, ["file", "dir"])
+            # Each new store's folder (``stores._create``; SQLite syncs the store's own file), then the unit.
+            self.assertEqual(synced, ["dir", "dir", "file", "dir"])
             upgrade(self.roots, EXEC_NEXT)
-            self.assertEqual(synced, ["file", "dir", "file", "dir"])
+            self.assertEqual(synced, ["dir", "dir", "file", "dir", "file", "dir"])
             uninstall(self.roots)
-            self.assertEqual(synced, ["file", "dir", "file", "dir", "dir"])
+            self.assertEqual(synced, ["dir", "dir", "file", "dir", "file", "dir", "dir"])
+
+
+@unittest.skipUnless(os.name == "posix", "the installer is Linux-only")
+class StoreTests(unittest.TestCase):
+    """``install`` and ``upgrade`` make the breaker store and the revocation store before the unit."""
+
+    setUp = InstallTests.setUp
+
+    def refused(self, kind: str, call, *args) -> InstallRefused:
+        with self.assertRaises(InstallRefused) as caught:
+            call(*args)
+        self.assertEqual(caught.exception.kind, kind)
+        return caught.exception
+
+    def test_both_stores_are_owner_only_and_open_as_the_daemon_opens_them(self) -> None:
+        install(self.roots, EXEC)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.store_dir).st_mode), 0o700)
+        for path, magic in ((self.breaker, stores.BREAKER_MAGIC), (self.revoked, stores.REVOCATION_MAGIC)):
+            with self.subTest(store=os.path.basename(path)):
+                self.assertEqual(stat.S_IMODE(os.lstat(path).st_mode), 0o600)
+                stores.open_store(path, magic).close()
+        from recursion_core.plugin_security import ConnectionBreaker, TrustStore
+        ConnectionBreaker(self.breaker).close()
+        TrustStore({}, revocation_store=self.revoked).close()
+
+    def test_the_paths_are_the_daemons_own(self) -> None:
+        from recursion_core.daemon import breaker as daemon_breaker
+        from recursion_core.daemon import plugins as daemon_plugins
+        paths = owned_paths(self.roots)
+        self.assertEqual(paths.state, self.state)
+        self.assertEqual(str(daemon_breaker.store_path(paths.state)), paths.breaker_store)
+        self.assertEqual(str(Path(paths.state) / daemon_plugins.STORE_DIR / daemon_plugins.REVOCATION_FILE),
+                         paths.revocation_store)
+        # The daemon's state folder is $XDG_STATE_HOME/recursion (daemon/__main__.py), and the unit sets
+        # XDG_STATE_HOME to %h/.local/state: together, paths.state.
+        main = Path(importlib.util.find_spec("recursion_core.daemon.__main__").origin).read_text(encoding="utf-8")
+        self.assertIn("state = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'recursion'",
+                      main)
+        self.assertEqual(service_fields(render_unit(EXEC))["Service.Environment"], f"XDG_STATE_HOME=%h/{STATE_HOME}")
+        self.assertEqual(os.path.join(self.home, *STATE_HOME.split("/"), "recursion"), paths.state)
+
+    def test_stores_already_there_are_checked_and_left_as_they_are(self) -> None:
+        install(self.roots, EXEC)
+        uninstall(self.roots)
+        before = _tree(self.store_dir)
+        plan = install(self.roots, EXEC)
+        self.assertTrue(plan.changed)  # the unit was written again
+        self.assertEqual(plan.stores, (("breaker_store", self.breaker, False), ("revocation_store", self.revoked, False)))
+        self.assertEqual(_tree(self.store_dir), before)
+
+    def test_a_missing_store_alone_is_made_and_counts_as_a_change(self) -> None:
+        install(self.roots, EXEC)
+        unit = _read(self.unit)
+        os.unlink(self.revoked)
+        plan = install(self.roots, EXEC)
+        self.assertEqual((plan.changed, plan.stores),
+                         (True, (("breaker_store", self.breaker, False), ("revocation_store", self.revoked, True))))
+        os.unlink(self.breaker)
+        plan = upgrade(self.roots, EXEC)
+        self.assertEqual((plan.changed, plan.stores),
+                         (True, (("breaker_store", self.breaker, True), ("revocation_store", self.revoked, False))))
+        self.assertEqual(_read(self.unit), unit)
+        self.assertFalse(upgrade(self.roots, EXEC).changed)
+
+    def test_a_store_open_store_refuses_is_refused_with_its_code_and_no_unit_is_written(self) -> None:
+        elsewhere = os.path.join(self.case, "elsewhere.sqlite3")
+        stores.create_breaker_store(elsewhere)
+
+        def link(path):
+            os.symlink(elsewhere, path)
+
+        def group_writable(path):
+            stores.create_revocation_store(path)
+            os.chmod(path, 0o660)
+
+        def junk(path):
+            with open(path, "wb") as handle:
+                handle.write(b"not a store" * 16)
+
+        def another_store(path):
+            stores.create_breaker_store(path)  # a breaker store where the revocation store belongs
+
+        cases = ((self.breaker, link, "breaker_store_untrusted"), (self.revoked, group_writable, "revocation_store_untrusted"),
+                 (self.breaker, junk, "breaker_store_invalid"), (self.revoked, another_store, "revocation_store_invalid"))
+        for path, make, kind in cases:
+            with self.subTest(case=make.__name__):
+                os.makedirs(self.store_dir, 0o700, exist_ok=True)
+                make(path)
+                self.assertIn(path, self.refused(kind, install, self.roots, EXEC).detail)
+                self.assertFalse(os.path.lexists(self.unit))
+                for name in os.listdir(self.store_dir):
+                    os.unlink(os.path.join(self.store_dir, name))
+        install(self.roots, EXEC)
+        os.unlink(self.breaker)
+        link(self.breaker)
+        self.refused("breaker_store_untrusted", upgrade, self.roots, EXEC_NEXT)
+        self.assertEqual(_read(self.unit), render_unit(EXEC))  # not rewritten
+
+    def test_a_leftover_wal_beside_a_missing_store_is_refused_and_left(self) -> None:
+        os.makedirs(self.store_dir, 0o700)
+        with open(self.breaker + "-wal", "wb") as handle:
+            handle.write(b"stale")
+        self.assertIn("breaker.sqlite3-wal", self.refused("breaker_store_exists", install, self.roots, EXEC).detail)
+        with open(self.breaker + "-wal", "rb") as handle:
+            self.assertEqual(handle.read(), b"stale")
+        self.assertEqual(os.listdir(self.store_dir), ["breaker.sqlite3-wal"])
+        self.assertFalse(os.path.lexists(self.unit))
+
+    def test_a_different_unit_is_refused_before_any_store_is_made(self) -> None:
+        os.makedirs(self.unit_dir, 0o700)
+        with open(self.unit, "w", encoding="utf-8") as handle:
+            handle.write("# hand placed\n[Service]\nExecStart=/old\n")
+        self.refused("unit_differs", install, self.roots, EXEC)
+        self.assertFalse(os.path.lexists(self.store_dir))
+
+    def test_a_link_in_the_state_path_is_refused_not_followed(self) -> None:
+        outside = os.path.join(self.case, "outside")
+        os.mkdir(outside, 0o700)
+        os.symlink(outside, self.store_dir)
+        self.refused("symlink_refused", install, self.roots, EXEC)
+        self.assertEqual(os.listdir(outside), [])
+        self.assertFalse(os.path.lexists(self.unit))
+
+    def test_a_store_that_cannot_be_made_is_refused_and_no_unit_is_written(self) -> None:
+        for exc in (OSError(28, "No space left on device"), sqlite3.OperationalError("disk I/O error")):
+            with self.subTest(error=type(exc).__name__):
+                with mock.patch.object(stores, "create_revocation_store", side_effect=exc):
+                    error = self.refused("store_not_created", install, self.roots, EXEC)
+                self.assertIn(self.revoked, error.detail)
+                self.assertIn(type(exc).__name__, error.detail)
+                self.assertFalse(os.path.lexists(self.unit))
+        # For real: a umask that takes the owner's own write bit leaves a folder no store can be made in.
+        shutil.rmtree(self.store_dir)
+        old = os.umask(0o277)
+        try:
+            error = self.refused("store_not_created", install, self.roots, EXEC)
+        finally:
+            os.umask(old)
+            os.chmod(self.store_dir, 0o700)
+        self.assertIn("PermissionError", error.detail)
+        self.assertEqual(os.listdir(self.store_dir), [])
+        self.assertFalse(os.path.lexists(self.unit))
+
+    def test_a_store_the_helper_cannot_link_into_place_is_not_created(self) -> None:
+        # Review 1 of #410, Codex GPT-6.1 Sol R2: an I/O error at the helper's final link answered
+        # <store>_invalid, though the new store was valid and could not be put in place.
+        real_link = os.link
+        for path in (self.breaker, self.revoked):
+            for number in (errno.ENOSPC, errno.EIO, errno.EPERM):
+                with self.subTest(store=os.path.basename(path), errno=number):
+                    def link(src, dst, *args, **kwargs):
+                        if os.fspath(dst) == path:
+                            raise OSError(number, os.strerror(number), dst)
+                        return real_link(src, dst, *args, **kwargs)
+                    with mock.patch("os.link", side_effect=link):
+                        error = self.refused("store_not_created", install, self.roots, EXEC)
+                    self.assertIn(path, error.detail)
+                    self.assertIn("cannot link the new store", error.detail)
+                    self.assertFalse(os.path.lexists(path))
+                    self.assertFalse(os.path.lexists(self.unit))
+                    self.assertLessEqual(set(os.listdir(self.store_dir)), {"breaker.sqlite3"})  # no temporary file
+
+
+@unittest.skipUnless(os.name == "posix", "the installer is Linux-only")
+class CustodyRootMadeTests(unittest.TestCase):
+    """Review 1 of #410, Codex GPT-6.1 Sol R1 and GPT-6 Astra R1: the custody root ``install`` or ``upgrade``
+    makes, or finds made meanwhile by another caller, is held to the custody rule before the unit is written
+    or kept. Sol's five probes and Astra's umask test, each red before this answer."""
+
+    setUp = InstallTests.setUp
+
+    def refused(self, call, *args) -> InstallRefused:
+        with self.assertRaises(InstallRefused) as caught:
+            call(*args)
+        self.assertEqual(caught.exception.kind, "folder_untrusted", caught.exception.detail)
+        return caught.exception
+
+    def unit_bytes(self) -> bytes:
+        with open(self.unit, "rb") as handle:
+            return handle.read()
+
+    def another_caller_makes(self, mode: int):
+        """``os.mkdir`` of the custody root, won by another caller with ``mode`` between the look and the make."""
+        real_mkdir = os.mkdir
+
+        def mkdir(path, *args, **kwargs):
+            if os.fspath(path) == self.homes:
+                real_mkdir(path, mode)
+                os.chmod(path, mode)
+            return real_mkdir(path, *args, **kwargs)
+        return mock.patch("os.mkdir", side_effect=mkdir)
+
+    def test_a_root_another_caller_made_meanwhile_is_held_to_the_rule(self) -> None:
+        for mode in (0o755, 0o750, 0o701):
+            with self.subTest(command="install", mode=oct(mode)):
+                with self.another_caller_makes(mode):
+                    self.refused(install, self.roots, EXEC)
+                self.assertFalse(os.path.lexists(self.unit))
+                os.rmdir(self.homes)
+        install(self.roots, EXEC)
+        before = self.unit_bytes()
+        for mode in (0o755, 0o750, 0o701):
+            with self.subTest(command="upgrade", mode=oct(mode)):
+                os.rmdir(self.homes)
+                with self.another_caller_makes(mode):
+                    self.refused(upgrade, self.roots, EXEC_NEXT)
+                self.assertEqual(self.unit_bytes(), before)  # the old unit is not replaced
+                os.chmod(self.homes, 0o700)
+
+    def test_a_root_made_under_a_umask_that_takes_the_owners_bits_is_refused(self) -> None:
+        install(self.roots, EXEC)
+        for umask in (0o300, 0o700):
+            for command, args in (("install", EXEC), ("upgrade", EXEC), ("upgrade", EXEC_NEXT)):
+                with self.subTest(umask=oct(umask), command=command, rewrite=args is EXEC_NEXT):
+                    if command == "install":
+                        uninstall(self.roots)
+                    before = self.unit_bytes() if os.path.lexists(self.unit) else None
+                    os.rmdir(self.homes)
+                    old = os.umask(umask)
+                    try:
+                        error = self.refused(install if command == "install" else upgrade, self.roots, args)
+                    finally:
+                        os.umask(old)
+                        if os.path.lexists(self.homes):
+                            os.chmod(self.homes, 0o700)
+                    self.assertIn("readable, writable and searchable by its owner", error.detail)
+                    if before is None:
+                        self.assertFalse(os.path.lexists(self.unit))
+                        install(self.roots, EXEC)
+                    else:
+                        self.assertEqual(self.unit_bytes(), before)
+
+    def test_a_root_gone_after_another_caller_made_it_is_not_success(self) -> None:
+        real_mkdir = os.mkdir
+
+        def made_then_gone(path, *args, **kwargs):
+            if os.fspath(path) == self.homes:
+                real_mkdir(path, 0o700)
+                os.rmdir(path)
+                raise FileExistsError(17, "File exists", path)
+            return real_mkdir(path, *args, **kwargs)
+        with mock.patch("os.mkdir", side_effect=made_then_gone):
+            error = self.refused(install, self.roots, EXEC)
+        self.assertIn("is not there", error.detail)
+        self.assertFalse(os.path.lexists(self.unit))
 
 
 if __name__ == "__main__":

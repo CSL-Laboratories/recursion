@@ -34,6 +34,7 @@ except ImportError:  # Windows: the launcher refuses in require_launcher_platfor
     fcntl = None
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -265,6 +266,14 @@ class EngineUnitManager(SystemdUserManager):
         return fd
 
 
+def _decode_line(raw):
+    """An engine's line as text. Bytes that are not UTF-8 are refused, never replaced into valid JSON (E42)."""
+    try:
+        return raw.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise OSError(errno.EILSEQ, 'engine stdout is not valid UTF-8') from exc
+
+
 class UnitEngineProcess:
     """``routes.launch.EngineProcess`` over one run unit: FIFO stdin, a tailed stdout file, a pidfd."""
 
@@ -274,6 +283,7 @@ class UnitEngineProcess:
         self._stdin, self._pidfd, self._poll_s = stdin_fd, pidfd, poll_s
         self._out = os.open(stdout_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         self._buffer = b''
+        self._discarding = False
         self._liveness_at = 0.0
         self._ended_seen = False
         self.fenced = []
@@ -291,6 +301,8 @@ class UnitEngineProcess:
                     raise TimeoutError(errno.ETIMEDOUT, 'engine did not read its stdin')
                 if not select.select([], [self._stdin], [], min(left, 1.0))[1]:
                     continue
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(errno.ETIMEDOUT, 'engine did not read its stdin')  # the select used the budget up (E40)
                 try:
                     written = os.write(self._stdin, data)
                 except BlockingIOError:
@@ -307,9 +319,21 @@ class UnitEngineProcess:
         """True once the unit's main process is gone (pidfd), or the sweep recorded a terminal state."""
         if self._ended_seen:
             return True
-        if self._pidfd is not None:
-            self._ended_seen = bool(select.select([self._pidfd], [], [], 0)[0])
-            return self._ended_seen
+        with self._lock:
+            pidfd = self._pidfd
+            if pidfd is not None:
+                try:
+                    # Timeout 0 does not block. The lock stays held so a shut cannot
+                    # reuse this number before the wait returns.
+                    gone = bool(select.select([pidfd], [], [], 0)[0])
+                except OSError as exc:
+                    if exc.errno != errno.EBADF:
+                        raise
+                    # The descriptor was already released. That is not an engine
+                    # fault: fall through to the registry.
+                else:
+                    self._ended_seen = gone
+                    return self._ended_seen
         now = time.monotonic()
         if now - self._liveness_at < 0.5:
             return False
@@ -321,23 +345,72 @@ class UnitEngineProcess:
         return self._ended_seen
 
     def read_line(self, timeout_s):
-        deadline = time.monotonic() + timeout_s
+        """One stdout line, None at EOF, or ReadTimeout.
+
+        A timeout that is not a finite number greater than zero checks the buffer
+        once and then raises ReadTimeout. It does not poll.
+
+        An unterminated line over the bound is refused. Bytes of that line that
+        arrive later, up to and including its newline, are not returned. The
+        following line is read as usual.
+        """
+        immediate = not (isinstance(timeout_s, (int, float)) and math.isfinite(timeout_s) and timeout_s > 0)
+        deadline = 0.0 if immediate else time.monotonic() + timeout_s
         while True:
-            cut = self._buffer.find(b'\n')
-            if cut >= 0:
-                line, self._buffer = self._buffer[:cut], self._buffer[cut + 1:]
-                return line.decode('utf-8', 'replace')
-            if len(self._buffer) > MAX_LINE_BYTES:
-                raise OSError(errno.EMSGSIZE, 'engine stdout line is too long')
+            with self._lock:
+                out = self._out
+                if self._discarding:
+                    cut = self._buffer.find(b'\n')
+                    if cut >= 0:
+                        # The rest of the refused line, including its newline.
+                        self._buffer = self._buffer[cut + 1:]
+                        self._discarding = False
+                    elif len(self._buffer) > MAX_LINE_BYTES:
+                        self._buffer = b''
+                        raise OSError(errno.EMSGSIZE, 'engine stdout line is too long')
+                cut = self._buffer.find(b'\n')
+                if cut >= 0:
+                    if cut > MAX_LINE_BYTES:  # a newline does not excuse a line over the bound (E07)
+                        # Drop the refused line, including its newline, so a later line can be read.
+                        self._buffer = self._buffer[cut + 1:]
+                        raise OSError(errno.EMSGSIZE, 'engine stdout line is too long')
+                    line, self._buffer = self._buffer[:cut], self._buffer[cut + 1:]
+                    return _decode_line(line)
+                if len(self._buffer) > MAX_LINE_BYTES:
+                    # The rest of this line is still to come. Keep that until its newline.
+                    self._discarding = True
+                    self._buffer = b''
+                    raise OSError(errno.EMSGSIZE, 'engine stdout line is too long')
+                if out is None:
+                    return None
+            if immediate:
+                raise ReadTimeout()
             ended = self._ended()  # read liveness first, so output written before the exit is not missed
-            chunk = os.read(self._out, 65536)
-            if chunk:
-                self._buffer += chunk
-                continue
+            with self._lock:
+                # A regular file opened read-only: this read does not block. The lock
+                # stays held so a shut cannot reuse the number for this read.
+                if self._out is None or self._out != out:
+                    continue
+                try:
+                    chunk = os.read(self._out, 65536)
+                except OSError as exc:
+                    if exc.errno == errno.EBADF:
+                        return None
+                    raise
+                if chunk:
+                    self._buffer += chunk
+                    if time.monotonic() > deadline:
+                        raise ReadTimeout()  # output that arrives after the deadline is late; it stays buffered (E40)
+                    continue
             if ended:
-                if self._buffer:
-                    line, self._buffer = self._buffer, b''
-                    return line.decode('utf-8', 'replace')
+                with self._lock:
+                    if self._discarding:
+                        # The refused line never completed. Its tail is not a line.
+                        self._buffer = b''
+                        return None
+                    if self._buffer:
+                        line, self._buffer = self._buffer, b''
+                        return _decode_line(line)
                 return None
             left = deadline - time.monotonic()
             if left <= 0:
@@ -354,9 +427,11 @@ class UnitEngineProcess:
 
     def close(self):
         self.close_stdin()
-        for name in ('_out', '_pidfd'):
-            fd = getattr(self, name)
-            setattr(self, name, None)
+        with self._lock:
+            # Taken and cleared together: a second closer must not close a number the first one released,
+            # which the process may already have given to something else (E06).
+            descriptors, self._out, self._pidfd = (self._out, self._pidfd), None, None
+        for fd in descriptors:
             if fd is not None:
                 try:
                     os.close(fd)

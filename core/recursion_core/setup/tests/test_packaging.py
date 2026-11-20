@@ -4,11 +4,12 @@ The build test runs when ``RECURSION_PACKAGING_UV`` names a uv binary; hosted CI
 skips it. It builds outside the checkout with ``uv build --offline``, so nothing is fetched and the
 tree is not touched, then checks both archives against what must and must not ship, installs the
 wheel into a fresh virtual environment with no index, and runs ``recursiond`` and the unit's own
-command line from ``/`` with no ``PYTHONPATH``.
+command line from ``/`` with no ``PYTHONPATH``; ``recursion-control`` answers its usage there too.
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import subprocess
@@ -57,7 +58,8 @@ class PyprojectTests(unittest.TestCase):
     def test_distribution_command_and_dependencies(self):
         project = _pyproject()["project"]
         self.assertEqual(project["name"], "csl-recursion")
-        self.assertEqual(project["scripts"], {"recursiond": "recursion_core._entrypoints:main"})
+        self.assertEqual(project["scripts"], {"recursiond": "recursion_core._entrypoints:main",
+                                              "recursion-control": "recursion_core.control.__main__:main"})
         self.assertEqual(project["dependencies"], [])
         self.assertEqual(project["optional-dependencies"], {"plugins": ["cryptography>=43"]})
         self.assertEqual(project["requires-python"], ">=3.12")
@@ -74,6 +76,20 @@ class PyprojectTests(unittest.TestCase):
         module, _, attribute = _pyproject()["project"]["scripts"]["recursiond"].partition(":")
         self.assertEqual(module, _entrypoints.__name__)
         self.assertTrue(callable(getattr(_entrypoints, attribute)))
+
+    def test_the_control_command_is_the_control_package_entry(self):
+        scripts = _pyproject()["project"]["scripts"]
+        self.assertEqual(scripts.get("recursion-control"), "recursion_core.control.__main__:main")
+        self.assertEqual(scripts["recursiond"], "recursion_core._entrypoints:main")
+
+    def test_every_console_script_target_imports_to_a_callable(self):
+        scripts = _pyproject()["project"]["scripts"]
+        self.assertEqual(sorted(scripts), ["recursion-control", "recursiond"])
+        for name, target in scripts.items():
+            with self.subTest(command=name):
+                module, colon, attribute = target.partition(":")
+                self.assertEqual(colon, ":")
+                self.assertTrue(callable(getattr(importlib.import_module(module), attribute, None)))
 
     def test_the_backend_builds_recursion_core_from_core(self):
         data = _pyproject()
@@ -125,6 +141,7 @@ class BuiltWheelTests(unittest.TestCase):
                     expected.add(rel)
         self.assertEqual(expected - files, set())
         self.assertIn("recursiond = recursion_core._entrypoints:main", entry_points)
+        self.assertIn("recursion-control = recursion_core.control.__main__:main", entry_points)
         lines = metadata.splitlines()
         self.assertIn("Name: csl-recursion", lines)
         self.assertIn("Requires-Python: >=3.12", lines)
@@ -156,6 +173,12 @@ class BuiltWheelTests(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(helped.returncode, 0, helped.stderr)
         self.assertIn("install", helped.stdout)
+
+        # The control command, installed beside recursiond: a socket client, so its usage answer needs no daemon.
+        controlled = subprocess.run([os.path.join(venv, "bin", "recursion-control"), "--help"], cwd="/", env=clean,
+                                    capture_output=True, text=True)
+        self.assertEqual(controlled.returncode, 0, controlled.stderr)
+        self.assertIn("usage: recursion-control", controlled.stdout)
 
         served = subprocess.run([os.path.join(venv, "bin", "recursiond"), "serve", "--plugin", "relative/dir"],
                                 cwd="/", env=dict(clean, PYTHON_GIL="1"), capture_output=True, text=True)

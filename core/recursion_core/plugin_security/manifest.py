@@ -9,8 +9,8 @@ PRODUCT.md 4.1 and 4.3 (at 055cc7a5, CSLR-D-011), as implemented here:
   every file of the package with its SHA-256, so the signed bytes name the whole package.
   ``csl-plugin-manifest/vNext`` names ``plugin.py`` only; Lucas's rule (Nov 11, 2026) is
   that such a signature is not enough for non-paper authority. Parsing ``files`` does not
-  verify the package: that is ``verify_package`` (lane PLUGIN-SIGN, next slice), and the
-  loader imports only ``plugin.py`` until it uses it.
+  verify the package: that is ``package.verify_package``, and the loader imports only
+  ``plugin.py``.
 * Grants are bound to the developer key they were given for (review R4, finding 6, under
   Lucas's D0, Nov 12, 2026): a grant naming another developer key grants nothing, and so
   does a manual grant that names none, in either form (grant again). Such a grant does not
@@ -141,9 +141,8 @@ _PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)
 _WINDOWS_DEVICE = re.compile(r"(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?")
 # The install schema's key_id (schemas/plugin/v1/install.v1.json): ed25519: and 32 lower-case hex.
 _KEY_ID = re.compile(r"ed25519:[0-9a-f]{32}")
-# The daemon reads a manifest only up to this many bytes. The same bound sits beside
-# package verification: verify_package is the next slice, and a manifest the daemon
-# will not read is not parsed.
+# The daemon reads a manifest only up to this many bytes. ``package.verify_package``
+# uses the same bound: a manifest the daemon will not read is not parsed.
 MAX_MANIFEST_BYTES = 64 * 1024
 
 

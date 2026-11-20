@@ -42,8 +42,11 @@ fallback the signed authority profile is tamper evidence, not a boundary. Paper 
 live capital stays separately authorised (PRODUCT.md 5.2). This module has one
 ``order`` permission. ``scope.environment`` is signed into the profile and the effect's
 approval digest and must match exactly, so a profile signed for ``paper`` cannot charge
-a ``live`` effect; but the core takes no view on which environment names are allowed,
-so "paper only" is still what the installer signs, not a value ``charge`` refuses.
+a ``live`` effect. ``charge`` also refuses any environment that is not exactly ``paper``
+unless the caller supplies a whole-package verification for this plugin (a version-1
+manifest, every listed file intact, signed by a key on this install's list). The install
+path supplies that verification. Live capital stays separately unauthorised either way
+(PRODUCT.md 5.2).
 """
 
 from __future__ import annotations
@@ -61,6 +64,7 @@ from .approval import SCOPE_FIELDS
 from .breaker import ConnectionBreaker
 from .canonical import MAX_INT, canonical, parse
 from .errors import Refused
+from .package import PAPER_ENVIRONMENT, require_whole_package
 from .signing import key_id, parse_public_key, verify
 
 __all__ = ["PROFILE_SCHEMA", "Authority", "create_ledger"]
@@ -116,8 +120,15 @@ def create_ledger(path: str, anchor_public_key: str) -> None:
 
 class Authority:
     def __init__(self, anchor_public_key: str, ledger_path: str, clock: Callable[[], int],
-                 csl_key_ids: frozenset = frozenset()) -> None:
+                 csl_key_ids: frozenset = frozenset(), *,
+                 package_for: Callable[[str], object] | None = None) -> None:
+        """``package_for(plugin_id)`` is the install path's whole-package verification, or None.
+
+        A non-paper ``scope.environment`` is refused when it is missing or is not a whole
+        signed package for this plugin. Paper does not consult it.
+        """
         parse_public_key(anchor_public_key)
+        self._package_for = package_for
         self._anchor_id = key_id(anchor_public_key)
         if self._anchor_id in csl_key_ids:
             raise Refused("anchor_is_csl_key")
@@ -258,6 +269,18 @@ class Authority:
             raise Refused("profile_plugin_mismatch")
         if profile["scope"] != scope:
             raise Refused("profile_scope_mismatch")
+        # After the match, so a paper profile presented with another environment still
+        # refuses ``profile_scope_mismatch``. A matched non-paper environment needs the
+        # install path's whole-package verification of this same artifact. Nothing is
+        # written: this runs before the ledger transaction.
+        if scope["environment"] != PAPER_ENVIRONMENT:
+            found = self._package_for(plugin_id) if self._package_for is not None else None
+            require_whole_package(found, scope["environment"])
+            if (found.manifest.plugin_id != plugin_id
+                    or found.manifest.artifact_sha256 != artifact_sha256):
+                raise Refused(
+                    "package_not_signed_whole",
+                    "the whole-package verification is for another artifact")
         if (profile["provider"], profile["model_version"]) != (provider, model_version):
             raise Refused("profile_model_mismatch")
         if kind not in profile["actions"]:

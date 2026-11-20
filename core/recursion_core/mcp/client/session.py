@@ -15,7 +15,8 @@ those bytes are what is written; messages are shaped and sorted with its ``jsonr
     not speak (``PROTOCOL_UNSUPPORTED``), the second request refused too (``INITIALIZE_REFUSED``), or the
     session's own ending. ``ending`` keeps that code, a later call raises ``McpSessionEnded`` with it, and the
     server reads end of input. ``initialize`` is never cancelled: its late answer, if one comes, is dropped.
-    On success, sends ``notifications/initialized``.
+    On success, sends ``notifications/initialized``; a session that has ended by then (the server's output
+    ended after its answer, say) is not opened: ``open`` raises ``McpSessionEnded`` with that ending.
 ``list_tools``
     ``tools/list`` page by page (``cursor``, ``nextCursor``) until a page has no ``nextCursor``; a cursor
     the server gives twice, or one that is not a string, is ``BAD_ANSWER``. On
@@ -24,8 +25,8 @@ those bytes are what is written; messages are shaped and sorted with its ``jsonr
 ``begin_call``, ``call_tool``
     ``tools/call``. Every such request carries a ``progressToken`` of its own (its id: new for each request,
     never used twice in a session), so a server may report progress whatever the caller asked to see; with
-    ``on_progress`` every ``notifications/progress`` naming it is handed to the callback (on the reader's
-    thread) until the call is over. A call abandoned (``ToolCall.abandon``, or its deadline passed, whether
+    ``on_progress`` every sound ``notifications/progress`` naming it (LIMITS, each call) is handed to the
+    callback (on the reader's thread) until the call is over. A call abandoned (``ToolCall.abandon``, or its deadline passed, whether
     or not anyone waits on it) is answered at once with ``CALL_ABANDONED`` or ``CALL_TIMEOUT``,
     ``notifications/cancelled`` is sent for it once (never for ``initialize``), and its late answer, when it
     comes, is dropped. A request whose deadline passed before its bytes were written is taken out of the
@@ -51,22 +52,28 @@ receives and a record ``{"record": <code>, ...}`` handed to ``on_record``; it to
   the session ends ``SERVER_START_TIMEOUT``; no ``notifications/cancelled`` is sent for ``initialize``;
 * each call: a deadline (``CALL_DEADLINE_S``, 60 s, unless the caller gives a shorter one), held by the
   session: past it the call is abandoned (``notifications/cancelled``) and answers ``CALL_TIMEOUT`` even when
-  nobody waits on it. A ``notifications/progress`` naming a ``tools/call`` in flight gives that call its
-  deadline again (the caller's shorter one if it gave one) from the moment the notice is read, never past
+  nobody waits on it. A sound ``notifications/progress`` naming a ``tools/call`` in flight (its ``progress`` a
+  number, not a boolean, greater than the last that call was given; the first may be any number) gives that
+  call its deadline again (the caller's shorter one if it gave one) from the moment the notice is read, never past
   ``CALL_CEILING_S`` (30 min) from the moment the call was made; a call that meets that ceiling answers
   ``CALL_TIMEOUT`` and its record carries ``"reason": CALL_CUT_CEILING``. Only ``tools/call`` is given more
-  time; a notice naming no call in flight changes nothing. A notice naming a call whose deadline has already
+  time; a notice naming no call in flight, or one that is not sound, changes nothing and reaches no callback. A notice naming a call whose deadline has already
   passed (the writer, the session's timer, was held in a write) gives it no time: the reader ends that call
   ``CALL_TIMEOUT`` there, as it does for an answer read after the deadline, and its late answer is dropped;
 * one message: a line longer than ``MAX_MESSAGE_BYTES`` (2 MiB, its newline included) ends the session
   (``MESSAGE_TOO_LARGE``): the client reads at most that many bytes plus one and never reads the rest;
 * one tool result: everything a model reads of it shares ``MAX_TOOL_RESULT_TEXT_BYTES`` (256 KiB). Its text
   comes first (every string ``text`` of a content item, whatever its ``type``, the string ``text`` of an
-  item's ``resource``, or a ``content`` that is one string; UTF-8): it is cut on a whole character where the
-  budget ends, and an item whose text finds the budget spent is left out. Then ``structuredContent``, the
-  result's annotations (those of its items and of their resources, as one part) and the result's ``_meta``
-  are each measured as the UTF-8 bytes of their compact JSON and, in that order, left out whole when what is
-  left of the budget does not hold them (a server's ``_meta`` left out keeps only the client's mark). The
+  item's ``resource``, an item's string ``name``, ``title`` and ``description``, an item that is a bare
+  string, or a ``content`` that is one string; UTF-8): it is cut on a whole character where the budget ends,
+  and an item whose every text finds the budget spent is left out. Then ``structuredContent``, the result's
+  annotations (those of its items and of their resources, as one part) and the ``_meta`` of the result, of its
+  items and of their resources (as one part) are each measured as the UTF-8 bytes of their compact JSON and,
+  in that order, left out whole when what is left of the budget does not hold them (a ``_meta`` left out is
+  taken from every item and resource, and the result's keeps only the client's mark). A server's own
+  ``RESULT_CUT`` key in the result's ``_meta`` is dropped, whatever its size (and a ``_meta`` that held only it
+  with it): only the client writes the mark.
+  An item's ``uri`` and ``mimeType`` are not counted. The
   result's ``_meta`` then holds ``{RESULT_CUT: {"limit_bytes": ..., "text_bytes": <the text's whole size>}}``,
   with ``"left_out": [<the parts>]`` when a part was left out; the mark is never left out and is not
   counted. Images, audio and other binary data (an item's ``data``, a resource's ``blob``) are bound only by
@@ -123,8 +130,9 @@ ENDING. The session ends once, for the first of: a line over the bound, end of t
 (``SERVER_GONE``), a write that fails or raises anything at all (``OUTPUT_FAILED``; an exception that is not
 an ``Exception``, such as ``KeyboardInterrupt`` or ``SystemExit``, is raised again on the writer's thread
 once the ending is set), ``close`` (``CLIENT_SHUT``) or a failed ``open`` (its own code, see ``open``). Every call still waiting then raises ``McpSessionEnded`` with that ending as its ``code``, and
-``ending`` keeps it. The writer sends what it already holds and then closes ``outstream``, so the server
-reads end of input; ``instream`` is left to its owner.
+``ending`` keeps it. A request not yet written is then taken out of the outbox and never written (only the rest
+of a message whose write was already under way still goes out). The writer sends the notices and answers it
+already holds and then closes ``outstream``, so the server reads end of input; ``instream`` is left to its owner.
 
 Lines that are not UTF-8 or not JSON, and responses naming no request in flight, are dropped, and so is a
 line read after the session has ended. A number that is not finite (``1e999``, which the decoder reads as
@@ -261,7 +269,7 @@ def _marked_copy(tools: ToolList) -> ToolList:
 
 class _Pending:
     __slots__ = ("done", "result", "failure", "on_progress", "method", "deadline", "limit_s", "ceiling",
-                 "at_limit", "cancel", "written")
+                 "at_limit", "cancel", "written", "progress")
 
     def __init__(self, on_progress: Callable[[dict], Any] | None, method: str = "", deadline: float = math.inf,
                  limit_s: float = 0.0, ceiling: float = math.inf, at_limit: bool = False,
@@ -277,6 +285,7 @@ class _Pending:
         self.at_limit = at_limit  # the deadline is the client's own limit, not a shorter one asked for
         self.cancel = cancel  # False for initialize: never cancelled, and its deadline is kept by open
         self.written = False  # the writer has taken its bytes
+        self.progress: int | float | None = None  # the last sound progress value reported for it
 
 
 class ToolCall:
@@ -365,7 +374,11 @@ class McpClient:
         self.server_info = info if isinstance(info, dict) else {}
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         with self._cond:
-            self._open = True
+            ending = self.ending
+            if ending is None:
+                self._open = True
+        if ending is not None:  # the session ended before open could return it open
+            raise McpSessionEnded(ending)
         return result
 
     def _initialize(self, version: str, deadline: float, start_bound: bool, limit_s: float) -> dict:
@@ -405,7 +418,12 @@ class McpClient:
             self.ending = ending
             waiting = list(self._pending.values())
             self._pending.clear()
-            self._cond.notify_all()  # the writer sends what it holds, then shuts outstream
+            # A request not yet written is never written now: its caller is told the session ended. The writer
+            # finishes the write under way, sends the notices and answers it holds, then shuts outstream.
+            kept = [entry for entry in self._outbox if entry[3] is None]
+            self._outbox.clear()
+            self._outbox.extend(kept)
+            self._cond.notify_all()
         for pending in waiting:
             pending.failure = McpSessionEnded(ending)
             pending.done.set()
@@ -757,6 +775,12 @@ class McpClient:
                 pending.result = None
                 pending.failure = McpClientError(BAD_ANSWER, "tools/call: content is neither a list nor a string")
             elif pending.method == "tools/call":
+                meta = pending.result.get("_meta")
+                if isinstance(meta, dict) and RESULT_CUT in meta:  # a server's look-alike is never the client's mark
+                    meta = {key: value for key, value in meta.items() if key != RESULT_CUT}
+                    pending.result = {key: value for key, value in pending.result.items() if key != "_meta"}
+                    if meta:  # a _meta that held only the look-alike is gone with it
+                        pending.result["_meta"] = meta
                 cut = _cut_result(pending.result)
                 if cut is not None:  # the caller woken first, then the record; mended by the cut, not counted
                     pending.result = cut
@@ -774,15 +798,20 @@ class McpClient:
         token = params.get("progressToken")
         if not jsonrpc.valid_id(token):
             return
+        value = params.get("progress")
         with self._cond:
             pending = self._pending.get(token)
             late = pending is not None and pending.cancel and pending.deadline <= time.monotonic()
-            if not late and pending is not None and pending.method == "tools/call":  # never past the ceiling
+            sound = (pending is not None and isinstance(value, (int, float)) and not isinstance(value, bool)
+                     and (pending.progress is None or value > pending.progress))
+            if sound:
+                pending.progress = value
+            if not late and sound and pending.method == "tools/call":  # never past the ceiling
                 pending.deadline = max(pending.deadline, min(time.monotonic() + pending.limit_s, pending.ceiling))
         if late:  # its deadline passed before the timer saw it: no more time, it ends as a timeout here
             self._time_out(token)
             return
-        if pending is not None and pending.on_progress is not None:
+        if sound and pending.on_progress is not None:
             self._callback(pending.on_progress, params)
 
     def _schedule_relist(self) -> None:
@@ -841,35 +870,41 @@ def _wire_size(value: Any) -> int:
     return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8", "surrogatepass"))
 
 
-def _annotations(content: Any) -> list:
-    """The annotations of a result's items and of their resources (one part of the budget)."""
+def _held(content: Any, name: str) -> list:
+    """The ``name`` values (``annotations``, ``_meta``) of a result's items and of their resources (one part of
+    the budget each)."""
 
     found = []
     for item in content if isinstance(content, list) else ():
         if isinstance(item, dict):
             resource = item.get("resource")
-            found.extend(holder["annotations"] for holder in (item, resource)
-                         if isinstance(holder, dict) and "annotations" in holder)
+            found.extend(holder[name] for holder in (item, resource) if isinstance(holder, dict) and name in holder)
     return found
 
 
-def _without_annotations(content: list) -> list:
+def _without(content: list, name: str) -> list:
     kept = []
     for item in content:
         if isinstance(item, dict):
-            item = {key: value for key, value in item.items() if key != "annotations"}
+            item = {key: value for key, value in item.items() if key != name}
             resource = item.get("resource")
-            if isinstance(resource, dict) and "annotations" in resource:
-                item["resource"] = {key: value for key, value in resource.items() if key != "annotations"}
+            if isinstance(resource, dict) and name in resource:
+                item["resource"] = {key: value for key, value in resource.items() if key != name}
         kept.append(item)
     return kept
+
+
+# The texts of a content item, in the order they take the budget: (whose, key), ``whose`` the item or its resource.
+_TEXTS = (("item", "text"), ("resource", "text"), ("item", "name"), ("item", "title"), ("item", "description"))
 
 
 def _cut_result(result: dict) -> dict | None:
     """``result`` with all a model reads of it held to ``MAX_TOOL_RESULT_TEXT_BYTES`` and the cut marked; ``None``
     if whole (the module text, LIMITS: one tool result). Text first: every string ``text`` of an item, whatever
-    its ``type``, the string ``text`` of its ``resource``, or a ``content`` that is one string; then
-    ``structuredContent``, the annotations and ``_meta``, each left out whole when the rest does not hold it."""
+    its ``type``, the string ``text`` of its ``resource``, its string ``name``, ``title`` and ``description``,
+    an item that is a bare string, or a ``content`` that is one string; then ``structuredContent``, the
+    annotations and the ``_meta`` of the result, its items and their resources, each left out whole when the
+    rest does not hold it."""
 
     content = result.get("content")
     budget, total, cut = MAX_TOOL_RESULT_TEXT_BYTES, 0, False
@@ -883,16 +918,28 @@ def _cut_result(result: dict) -> dict | None:
     elif isinstance(content, list):
         kept = []
         for item in content:
+            if isinstance(item, str):  # a bare string is a text
+                data = item.encode("utf-8", "surrogatepass")
+                total += len(data)
+                if len(data) <= budget:
+                    budget -= len(data)
+                    kept.append(item)
+                    continue
+                cut = True
+                if budget:  # else the budget was spent before it: left out
+                    kept.append(data[:budget].decode("utf-8", "ignore"))
+                budget = 0
+                continue
             resource = item.get("resource") if isinstance(item, dict) else None
-            places = [] if not isinstance(item, dict) else [
-                place for place, holder in (("text", item), ("resource", resource))
-                if isinstance(holder, dict) and isinstance(holder.get("text"), str)]
+            holders = {"item": item, "resource": resource}
+            places = [(whose, key) for whose, key in _TEXTS
+                      if isinstance(holders[whose], dict) and isinstance(holders[whose].get(key), str)]
             if not places:
                 kept.append(item)
                 continue
             new, spent = item, 0
-            for place in places:
-                data = (item if place == "text" else resource)["text"].encode("utf-8", "surrogatepass")
+            for whose, key in places:
+                data = holders[whose][key].encode("utf-8", "surrogatepass")
                 total += len(data)
                 if len(data) <= budget:
                     budget -= len(data)
@@ -902,14 +949,15 @@ def _cut_result(result: dict) -> dict | None:
                     spent += 1
                 part = data[:budget].decode("utf-8", "ignore")  # a character the limit splits is left out whole
                 budget = 0
-                new = {**new, "text": part} if place == "text" else {**new, "resource": {**resource, "text": part}}
+                new = {**new, key: part} if whose == "item" else {**new, "resource": {**new["resource"], key: part}}
             if spent < len(places):  # an item whose every text found the budget spent is left out
                 kept.append(new)
         content = kept
-    notes = _annotations(content)
+    notes, metas = _held(content, "annotations"), _held(content, "_meta")
     parts = (("structuredContent", "structuredContent" in result, lambda: _wire_size(result["structuredContent"])),
              ("annotations", bool(notes), lambda: sum(_wire_size(note) for note in notes)),
-             ("_meta", "_meta" in result, lambda: _wire_size(result["_meta"])))
+             ("_meta", "_meta" in result or bool(metas),
+              lambda: (_wire_size(result["_meta"]) if "_meta" in result else 0) + sum(map(_wire_size, metas))))
     left_out = []
     for name, present, size in parts:
         if present:
@@ -922,7 +970,10 @@ def _cut_result(result: dict) -> dict | None:
         return None
     new_result = dict(result)
     if "content" in result:
-        new_result["content"] = _without_annotations(content) if "annotations" in left_out else content
+        for name in ("annotations", "_meta"):
+            if name in left_out and isinstance(content, list):
+                content = _without(content, name)
+        new_result["content"] = content
     if "structuredContent" in left_out:
         del new_result["structuredContent"]
     meta = result.get("_meta")

@@ -29,7 +29,8 @@ The rules this module keeps:
   outside a row's advice stays in force. Each note names the key, the value found and what is allowed.
 * SHOWN. ``python -m recursion_core.settings`` prints the file path and the values a daemon started
   from this environment would take, with their defaults, sources, any advice and any notes. It takes no argument
-  and writes nothing. The daemon records the path and its values at start and logs the notes.
+  and writes nothing. The daemon that holds the one-daemon lock records the path and its values in its
+  log at start, with the process id and a time on each line.
 
 Read at daemon start in this build; a later reload may call ``load`` again. ``load`` keeps no state between
 calls. ``SETTINGS`` is append-only: a row is added, never renamed or given another meaning.
@@ -346,9 +347,11 @@ def main(argv: list[str] | None = None, environ=None, out=None, err=None) -> int
         return 2
     loaded = load(os.environ if environ is None else environ)
     print(f"settings file: {loaded.path or 'none'}", file=out)
-    print("These are the values a daemon started from this environment would take, "
-          "and a daemon already running keeps the values it read at its own start, "
-          "as shown in the recursion_core.daemon startup log.", file=out)
+    print("These are the values a daemon started from this environment would take; a daemon already running "
+          "keeps the values it read at its own start, which it wrote to its log in the lines beginning "
+          "`settings file:` and `settings:` (for the shipped user unit, `journalctl --user -u recursion-daemon` "
+          "shows them; a daemon started another way writes them to its standard error, wherever that start "
+          "sent it).", file=out)
     for line in lines(loaded):
         print(line, file=out)
     return EXIT_WARNED if any(note.warns for note in loaded.notes) else 0

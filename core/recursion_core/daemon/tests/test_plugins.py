@@ -24,6 +24,8 @@ from recursion_core.plugin_security.signing import backend_available
 from recursion_core.plugin_security.tests.support import FakeGilProbe, Key, needs_crypto
 from recursion_core.plugin_security.tests.test_manifest_v1 import NOTES_SOURCE, v1
 
+MISSING = ("%s is listed in the signed manifest but is not a regular file in the plugin's folder: "
+           "install the package again from its source, or ask its developer for a whole package.")
 LINUX = sys.platform.startswith('linux')
 LINUX_ONLY = ('Linux-only: the plugin host checks file ownership by uid and keeps its stores under the daemon '
               'state directory; on Windows PluginHost refuses PlatformUnsupported (platform_unsupported), '
@@ -143,10 +145,10 @@ class PackagePresenceTests(HostCase):
         args = (self.raw, self.signature, fx.OPERATOR_SOURCE)
         with self.assertRaises(Refused) as ctx:
             loader.load(*args)
-        self.assertEqual(str(ctx.exception), 'package_file_missing: notes/__init__.py')
+        self.assertEqual(str(ctx.exception), 'package_file_missing: ' + MISSING % 'notes/__init__.py')
         with self.assertRaises(Refused) as ctx:
             loader.load(*args, package_dir=self.package)
-        self.assertEqual(str(ctx.exception), 'package_file_missing: notes/__init__.py')
+        self.assertEqual(str(ctx.exception), 'package_file_missing: ' + MISSING % 'notes/__init__.py')
 
         self.complete_package()
         loaded = loader.load(*args, package_dir=self.package)
@@ -156,7 +158,7 @@ class PackagePresenceTests(HostCase):
         with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
             record, = self.host().records
         self.assertEqual((record['state'], record['code'], record['detail']),
-                         ('refused', 'package_file_missing', 'notes/__init__.py'))
+                         ('refused', 'package_file_missing', MISSING % 'notes/__init__.py'))
 
         self.complete_package()
         record, = self.host().records
@@ -175,7 +177,40 @@ class PackagePresenceTests(HostCase):
         with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
             record, = self.host().records
         self.assertEqual((record['state'], record['code'], record['detail']),
-                         ('refused', 'package_file_missing', 'notes/index.py'))
+                         ('refused', 'package_file_missing', MISSING % 'notes/index.py'))
+
+    def test_a_folder_in_the_place_of_a_listed_file_is_absent(self):
+        self.complete_package()
+        index = self.package / 'notes' / 'index.py'
+        index.unlink()
+        index.mkdir()
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            record, = self.host().records
+        self.assertEqual((record['state'], record['code'], record['detail']),
+                         ('refused', 'package_file_missing', MISSING % 'notes/index.py'))
+
+    def test_a_link_to_a_parent_folder_is_not_followed(self):
+        self.complete_package()
+        elsewhere = self.package / 'elsewhere'
+        elsewhere.mkdir()
+        for name in ('__init__.py', 'index.py'):
+            (self.package / 'notes' / name).rename(elsewhere / name)
+        (self.package / 'notes').rmdir()
+        (self.package / 'notes').symlink_to(elsewhere, target_is_directory=True)
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            record, = self.host().records
+        self.assertEqual((record['state'], record['code'], record['detail']),
+                         ('refused', 'package_file_missing', MISSING % 'notes/__init__.py'))
+
+    def test_a_package_folder_given_as_text_is_a_path_not_an_error(self):
+        loader = PluginLoader(TrustStore(self.trusted), {}, ReservedEffects(), CoreHealth(), FakeGilProbe())
+        args = (self.raw, self.signature, fx.OPERATOR_SOURCE)
+        with self.assertRaises(Refused) as ctx:
+            loader.load(*args, package_dir=str(self.package))
+        self.assertEqual(ctx.exception.code, 'package_file_missing')
+        self.assertEqual(loader.doctor(*args, package_dir=str(self.package))[-1]['code'], 'package_file_missing')
+        self.complete_package()
+        self.assertEqual(loader.load(*args, package_dir=str(self.package)).trust, 'signed')
 
     def test_daemon_names_the_missing_entry_in_a_signed_package(self):
         self.complete_package()
@@ -183,7 +218,7 @@ class PackagePresenceTests(HostCase):
         with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
             record, = self.host().records
         self.assertEqual((record['state'], record['code'], record['detail']),
-                         ('refused', 'package_file_missing', 'plugin.py'))
+                         ('refused', 'package_file_missing', MISSING % 'plugin.py'))
 
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)

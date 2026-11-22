@@ -547,6 +547,8 @@ class InstallReaderBindingTests(unittest.TestCase):
                     grant = {"plugin_id": "demo.plugin", "artifact_sha256": "0" * 64,
                              "permissions": ["read"], "developer_key_id": value}
                     self.assertEqual(validator.is_valid({"grants": [grant]}), member_ok)
+        if validator is None:
+            self.skipTest("the jsonschema package is not installed: the shipped member was not validated")
 
     @staticmethod
     def _with_member(schema: dict) -> dict:
@@ -570,7 +572,7 @@ class InstallReaderBindingTests(unittest.TestCase):
         try:
             import jsonschema
         except ImportError:
-            return
+            self.skipTest("the jsonschema package is not installed: the shipped member was not validated")
         grant = {"plugin_id": "demo.plugin", "artifact_sha256": "0" * 64, "permissions": ["read"],
                  "developer_key_id": "ed25519:" + "ab" * 16}
         self.assertFalse(jsonschema.Draft202012Validator(schema).is_valid({"grants": [grant]}))

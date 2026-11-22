@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.machinery
+import os
 import stat
 import sys
 import threading
@@ -44,6 +45,10 @@ from .runtime import GilProbe
 __all__ = ["CoreHealth", "LoadedPlugin", "PluginLoader"]
 
 _RUNTIME_SANDBOXED = "python-sandboxed/1"
+
+PACKAGE_FILE_MISSING_TEXT = ("%s is listed in the signed manifest but is not a regular file in the plugin's folder: "
+                             "install the package again from its source, or ask its developer for a whole package.")
+
 
 class CoreHealth:
     """Shared poison flag. Once poisoned, only a daemon restart clears it."""
@@ -166,6 +171,8 @@ class PluginLoader:
         return findings
 
     def _verify_admit(self, manifest_bytes, signature, artifact, registry_label, findings, package_dir):
+        if isinstance(package_dir, (str, os.PathLike)):
+            package_dir = Path(package_dir)
         # The daemon can supply None for a missing entry so a signed manifest can name it.
         if type(artifact) is not bytes and (artifact is not None or package_dir is None):
             raise Refused("artifact_not_bytes")
@@ -194,7 +201,7 @@ class PluginLoader:
                 else:
                     present = (path != ENTRY_FILE or artifact is not None) and _package_file_present(package_dir, path)
                 if not present:
-                    raise Refused("package_file_missing", path)
+                    raise Refused("package_file_missing", PACKAGE_FILE_MISSING_TEXT % path)
         if artifact is None:
             raise Refused("plugin_file_missing", ENTRY_FILE)
         label = registry_label if registry_label in ("verified", "non_verified") else "unlisted"

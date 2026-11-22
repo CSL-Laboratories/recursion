@@ -1,0 +1,10 @@
+{
+  "reads_outside": true,
+  "home_canary": true,
+  "program_start": true,
+  "new_socket": false,
+  "signal_other": true,
+  "landlock_abi": 3,
+  "arch": "x86_64",
+  "proven": true
+}

@@ -1026,6 +1026,202 @@
         "keyword": "enum",
         "at": "/keys/0/reason"
       }
+    },
+    {
+      "file": "good/wall.v1/h01-a-proven-wall.json",
+      "schema": "wall.v1.json",
+      "shows": "A host on x86_64 with Landlock ABI 3: all five escapes refused, so it may load plugins."
+    },
+    {
+      "file": "good/wall.v1/h02-a-proven-wall-on-aarch64.json",
+      "schema": "wall.v1.json",
+      "shows": "The same wall on aarch64 with a newer Landlock."
+    },
+    {
+      "file": "good/wall.v1/h03-no-landlock-nothing-refused.json",
+      "schema": "wall.v1.json",
+      "shows": "A kernel with no Landlock and no wall applied: every escape succeeds, nothing is proven, and the host loads no plugin."
+    },
+    {
+      "file": "good/wall.v1/h04-one-escape-is-not-a-wall.json",
+      "schema": "wall.v1.json",
+      "shows": "Four checks refused and one not: the record is not proven."
+    },
+    {
+      "file": "good/wall.v1/h05-a-wall-on-another-machine-is-not-proven.json",
+      "schema": "wall.v1.json",
+      "shows": "All five refused on a machine the wall does not know: not proven, because the seccomp filter cannot be checked there."
+    },
+    {
+      "file": "bad/wall.v1/b01-proven-with-no-landlock.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall has Landlock ABI 1 or above.",
+      "expect": {
+        "keyword": "minimum",
+        "at": "/landlock_abi"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b02-a-check-as-a-word.json",
+      "schema": "wall.v1.json",
+      "rule": "Each check is true or false, never a word.",
+      "expect": {
+        "keyword": "type",
+        "at": "/home_canary"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b03-a-negative-abi.json",
+      "schema": "wall.v1.json",
+      "rule": "An ABI is 0 or above.",
+      "expect": {
+        "keyword": "minimum",
+        "at": "/landlock_abi"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b04-an-arch-with-a-space.json",
+      "schema": "wall.v1.json",
+      "rule": "The arch is a short name without spaces.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/arch"
+      }
+    },
+    {
+      "file": "bad/wall.v1/u-wall.v1.json",
+      "schema": "wall.v1.json",
+      "rule": "A field nobody defined is refused (no field can switch the wall off).",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.reads-outside.json",
+      "schema": "wall.v1.json",
+      "rule": "'reads_outside' is required.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.home-canary.json",
+      "schema": "wall.v1.json",
+      "rule": "'home_canary' is required.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.program-start.json",
+      "schema": "wall.v1.json",
+      "rule": "'program_start' is required.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.new-socket.json",
+      "schema": "wall.v1.json",
+      "rule": "'new_socket' is required.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.signal-other.json",
+      "schema": "wall.v1.json",
+      "rule": "'signal_other' is required.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.landlock-abi.json",
+      "schema": "wall.v1.json",
+      "rule": "'landlock_abi' is required.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.arch.json",
+      "schema": "wall.v1.json",
+      "rule": "'arch' is required.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.proven.json",
+      "schema": "wall.v1.json",
+      "rule": "'proven' is required.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/f-wall.v1.then.reads-outside.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall has 'reads_outside' refused.",
+      "expect": {
+        "keyword": "const",
+        "at": "/reads_outside"
+      }
+    },
+    {
+      "file": "bad/wall.v1/f-wall.v1.then.home-canary.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall has 'home_canary' refused.",
+      "expect": {
+        "keyword": "const",
+        "at": "/home_canary"
+      }
+    },
+    {
+      "file": "bad/wall.v1/f-wall.v1.then.program-start.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall has 'program_start' refused.",
+      "expect": {
+        "keyword": "const",
+        "at": "/program_start"
+      }
+    },
+    {
+      "file": "bad/wall.v1/f-wall.v1.then.new-socket.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall has 'new_socket' refused.",
+      "expect": {
+        "keyword": "const",
+        "at": "/new_socket"
+      }
+    },
+    {
+      "file": "bad/wall.v1/f-wall.v1.then.signal-other.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall has 'signal_other' refused.",
+      "expect": {
+        "keyword": "const",
+        "at": "/signal_other"
+      }
+    },
+    {
+      "file": "bad/wall.v1/v-wall.v1.then.arch.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall runs on x86_64 or aarch64.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/arch"
+      }
     }
   ]
 }

@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wall.v1.json",
+  "title": "wall.v1: what a plugin host proved of its own wall, from inside, before it loaded any plugin byte",
+  "x-version": "1.0-draft.1",
+  "description": "A plugin host on Linux applies its wall to itself (Landlock: read and map only the Python install; one seccomp filter: no new socket, no program start, no signal to another process, among other calls) and then tries five escapes from inside. Each of the five fields is true only when the kernel refused that escape; an escape that succeeded, or a check that failed or raised, is false (fail closed). 'proven' is true only when all five are refused, on x86_64 or aarch64, with Landlock ABI 1 or above. A host whose record is not proven loads no plugin.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "reads_outside",
+    "home_canary",
+    "program_start",
+    "new_socket",
+    "signal_other",
+    "landlock_abi",
+    "arch",
+    "proven"
+  ],
+  "properties": {
+    "reads_outside": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: reading the root folder, which is outside the allowed paths. A check that succeeded, failed for another reason or raised is false."
+    },
+    "home_canary": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: reading a canary file in the home folder it was given. A check that succeeded, failed for another reason or raised is false."
+    },
+    "program_start": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: starting a program. A check that succeeded, failed for another reason or raised is false."
+    },
+    "new_socket": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: making a new AF_INET socket and a new AF_UNIX socket (both must be refused). A check that succeeded, failed for another reason or raised is false."
+    },
+    "signal_other": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: signalling another process (the daemon's pid, with signal 0). A check that succeeded, failed for another reason or raised is false."
+    },
+    "landlock_abi": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The kernel's Landlock ABI for the host, read by the version flag; 0 when Landlock is absent or disabled."
+    },
+    "arch": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]{1,32}$",
+      "description": "The machine the host runs on, as the system names it."
+    },
+    "proven": {
+      "type": "boolean",
+      "description": "True only when all five checks are refused, on a supported arch, with Landlock ABI 1 or above."
+    }
+  },
+  "if": {
+    "properties": {
+      "proven": {
+        "const": true
+      }
+    },
+    "required": [
+      "proven"
+    ]
+  },
+  "then": {
+    "properties": {
+      "reads_outside": {
+        "const": true
+      },
+      "home_canary": {
+        "const": true
+      },
+      "program_start": {
+        "const": true
+      },
+      "new_socket": {
+        "const": true
+      },
+      "signal_other": {
+        "const": true
+      },
+      "landlock_abi": {
+        "minimum": 1
+      },
+      "arch": {
+        "enum": [
+          "x86_64",
+          "aarch64"
+        ]
+      }
+    }
+  }
+}

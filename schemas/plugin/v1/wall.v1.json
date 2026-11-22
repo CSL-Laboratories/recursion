@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "wall.v1.json",
   "title": "wall.v1: what a plugin host proved of its own wall, from inside, before it loaded any plugin byte",
-  "x-version": "1.0-draft.1",
-  "description": "A plugin host on Linux applies its wall to itself (Landlock: read and map only the Python install; one seccomp filter: no new socket, no program start, no signal to another process, among other calls) and then tries five escapes from inside. Each of the five fields is true only when the kernel refused that escape; an escape that succeeded, or a check that failed or raised, is false (fail closed). 'proven' is true only when all five are refused, on x86_64 or aarch64, with Landlock ABI 1 or above. A host whose record is not proven loads no plugin.",
+  "x-version": "1.0-draft.2",
+  "description": "A plugin host on Linux applies its wall to itself (Landlock: read and map only the Python install; one seccomp filter: no new socket, no program start, no signal, limit or priority aimed at another process, no change of a file's mode, owner, times or attributes, no new namespace, among other calls) and then tries eight checks from inside. Each of the eight fields is true only when the kernel refused that check; a check that succeeded, or that failed or raised in another way, is false (fail shut). A target that would make a refusal prove nothing (a daemon pid of another user, a canary of another user) is not refused. 'proven' is true only when all eight are refused, on x86_64 or aarch64, with Landlock ABI 1 or above, and no step of the wall failed in the process. A host whose record is not proven loads no plugin.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -12,6 +12,9 @@
     "program_start",
     "new_socket",
     "signal_other",
+    "signal_other_ways",
+    "metadata_change",
+    "kernel_surface",
     "landlock_abi",
     "arch",
     "proven"
@@ -35,7 +38,19 @@
     },
     "signal_other": {
       "type": "boolean",
-      "description": "True only when the kernel refused it: signalling another process (the daemon's pid, with signal 0). A check that succeeded, failed for another reason or raised is false."
+      "description": "True only when the kernel refused it: signalling another process of the same user (the daemon's pid, with signal 0). A check that succeeded, failed for another reason or raised is false."
+    },
+    "signal_other_ways": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: three other ways at the same process: a queued signal 0, making it the receiver of a pipe's signals, and reading its CPU limit (all three must be refused). A check that succeeded, failed for another reason or raised is false."
+    },
+    "metadata_change": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: changing the mode of the canary file (to the mode it has). A check that succeeded, failed for another reason or raised is false."
+    },
+    "kernel_surface": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: calls only this wall refuses: io_uring_setup, unshare, a keyctl operation, getpid by its x32 number on x86_64, clone asking a new user namespace (all refused with EPERM), and clone3 (answered ENOSYS). A check that succeeded, failed for another reason or raised is false."
     },
     "landlock_abi": {
       "type": "integer",
@@ -49,7 +64,7 @@
     },
     "proven": {
       "type": "boolean",
-      "description": "True only when all five checks are refused, on a supported arch, with Landlock ABI 1 or above."
+      "description": "True only when all eight checks are refused, on a supported arch, with Landlock ABI 1 or above, and no step of the wall failed in the process."
     }
   },
   "if": {
@@ -77,6 +92,15 @@
         "const": true
       },
       "signal_other": {
+        "const": true
+      },
+      "signal_other_ways": {
+        "const": true
+      },
+      "metadata_change": {
+        "const": true
+      },
+      "kernel_surface": {
         "const": true
       },
       "landlock_abi": {

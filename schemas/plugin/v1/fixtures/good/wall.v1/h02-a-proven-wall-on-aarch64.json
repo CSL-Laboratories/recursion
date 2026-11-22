@@ -4,6 +4,9 @@
   "program_start": true,
   "new_socket": true,
   "signal_other": true,
+  "signal_other_ways": true,
+  "metadata_change": true,
+  "kernel_surface": true,
   "landlock_abi": 6,
   "arch": "aarch64",
   "proven": true

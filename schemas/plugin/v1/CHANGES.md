@@ -4,6 +4,12 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## Loader admission
+
+A plugin that requests permissions with an unbound manual grant is refused `grant_unbound`
+before its code runs. A signed version 1 load is refused `package_file_missing` when a file
+listed in the manifest is absent. The refusal names the first missing path in manifest path order.
+
 ## `manifest.v1.json` is `1.0-draft.2` (2026-11-18)
 
 `runtime` takes `python-sandboxed/1` (the name for a plugin run by a host outside the daemon; in this

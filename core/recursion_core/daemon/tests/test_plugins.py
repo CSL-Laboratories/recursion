@@ -11,14 +11,18 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from recursion_core.daemon import breaker as breaker_module
 from recursion_core.daemon import plugins
 from recursion_core.daemon.tests import plugin_fixture as fx
 from recursion_core.gui.client import ACTIONS, o7_command
-from recursion_core.plugin_security import canonical, parse
+from recursion_core.plugin_security import (
+    CoreHealth, PluginLoader, Refused, ReservedEffects, TrustStore, canonical, parse,
+)
 from recursion_core.plugin_security.signing import backend_available
 from recursion_core.plugin_security.tests.support import FakeGilProbe, Key, needs_crypto
+from recursion_core.plugin_security.tests.test_manifest_v1 import NOTES_SOURCE, v1
 
 LINUX = sys.platform.startswith('linux')
 LINUX_ONLY = ('Linux-only: the plugin host checks file ownership by uid and keeps its stores under the daemon '
@@ -109,6 +113,77 @@ class VerificationUnavailableTests(HostCase):
         host = self.host(verification_available=lambda: False)
         self.assertEqual(host.records, [])
         self.assertEqual(self.read(host), (503, {'error': 'unavailable: no operator plugin is installed'}))
+
+
+@unittest.skipUnless(LINUX, LINUX_ONLY)
+class PackagePresenceTests(HostCase):
+    def setUp(self):
+        super().setUp()
+        key = Key() if backend_available() else None
+        developer = key.public if key is not None else fx.FAKE_DEVELOPER_KEY
+        self.raw = v1(developer, source=fx.OPERATOR_SOURCE, plugin_id='fixture.operator', permissions=())
+        if key is None:
+            # Keep the admission tests running on interpreters without the signature backend.
+            self.enterContext(mock.patch.object(plugins, 'backend_available', return_value=True))
+            self.enterContext(mock.patch('recursion_core.plugin_security.manifest.verify', return_value=True))
+        self.signature = key.sign(self.raw) if key is not None else 'test signature'
+        self.package = self.plugins / 'fixture'
+        self.trusted = {'dev': developer}
+        fx.write_install(self.config, trusted=self.trusted)
+        fx.write_plugin(self.package, fx.OPERATOR_SOURCE, manifest=self.raw, signature=self.signature)
+
+    def complete_package(self):
+        notes = self.package / 'notes'
+        notes.mkdir()
+        (notes / '__init__.py').write_bytes(b'')
+        (notes / 'index.py').write_bytes(NOTES_SOURCE)
+
+    def test_loader_refuses_an_incomplete_signed_package(self):
+        loader = PluginLoader(TrustStore(self.trusted), {}, ReservedEffects(), CoreHealth(), FakeGilProbe())
+        args = (self.raw, self.signature, fx.OPERATOR_SOURCE)
+        with self.assertRaises(Refused) as ctx:
+            loader.load(*args)
+        self.assertEqual(str(ctx.exception), 'package_file_missing: notes/__init__.py')
+        with self.assertRaises(Refused) as ctx:
+            loader.load(*args, package_dir=self.package)
+        self.assertEqual(str(ctx.exception), 'package_file_missing: notes/__init__.py')
+
+        self.complete_package()
+        loaded = loader.load(*args, package_dir=self.package)
+        self.assertEqual(loaded.trust, 'signed')
+
+    def test_daemon_refuses_an_incomplete_signed_package(self):
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            record, = self.host().records
+        self.assertEqual((record['state'], record['code'], record['detail']),
+                         ('refused', 'package_file_missing', 'notes/__init__.py'))
+
+        self.complete_package()
+        record, = self.host().records
+        self.assertEqual((record['state'], record['trust']), ('loaded', 'signed'))
+
+    def test_unsigned_package_is_not_held_to_its_listing(self):
+        loader = PluginLoader(TrustStore({}), {}, ReservedEffects(), CoreHealth(), FakeGilProbe())
+        loaded = loader.load(self.raw, None, fx.OPERATOR_SOURCE, package_dir=self.package)
+        self.assertEqual(loaded.trust, 'unsigned')
+
+    def test_a_link_in_the_place_of_a_listed_file_is_absent(self):
+        self.complete_package()
+        index = self.package / 'notes' / 'index.py'
+        index.unlink()
+        index.symlink_to(self.package / 'notes' / '__init__.py')
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            record, = self.host().records
+        self.assertEqual((record['state'], record['code'], record['detail']),
+                         ('refused', 'package_file_missing', 'notes/index.py'))
+
+    def test_daemon_names_the_missing_entry_in_a_signed_package(self):
+        self.complete_package()
+        (self.package / 'plugin.py').unlink()
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            record, = self.host().records
+        self.assertEqual((record['state'], record['code'], record['detail']),
+                         ('refused', 'package_file_missing', 'plugin.py'))
 
 
 @unittest.skipUnless(LINUX, LINUX_ONLY)

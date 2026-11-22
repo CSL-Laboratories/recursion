@@ -325,10 +325,10 @@ class PluginHost:
                 raise PluginRefused('plugin_directory_untrusted',
                                     'must be an operator-owned directory, not group/other writable')
             manifest = _read_owned(source / MANIFEST, MAX_MANIFEST_BYTES)
-            artifact = _read_owned(source / ARTIFACT, MAX_ARTIFACT_BYTES)
+            artifact = _read_owned(source / ARTIFACT, MAX_ARTIFACT_BYTES, missing_ok=True)
             signature = _read_owned(source / SIGNATURE, 4096, missing_ok=True)
             signature = None if signature is None else signature.decode('ascii', 'replace').strip()
-            loaded = self.loader.load(manifest, signature, artifact)
+            loaded = self.loader.load(manifest, signature, artifact, package_dir=source)
         except (PluginRefused, Refused) as exc:
             findings = list(self.loader.last_findings) if isinstance(exc, Refused) else []
             record.update(code=exc.code, detail=exc.detail,

@@ -41,6 +41,16 @@ Install file:
 - No two grants name the same `plugin_id`.
 - The file is a regular file of the operator's that no one else can write.
 
+## Loader admission
+
+To bind a hand-made grant, set `developer_key_id` in its `install.json` grant entry.
+A manual grant with no developer key binding is refused before plugin code runs if the
+manifest requests permissions. A plugin that asks for no permissions can still load.
+
+For a signed version 1 load, every listed path must name a file in the package. The loader
+checks file presence and the entry digest. The other file digests are reserved for a future
+content check.
+
 ## What is not decided
 
 - **Recommended, not decided:** that the plugin contract is frozen as version 1 now (as a draft

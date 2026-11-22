@@ -360,10 +360,10 @@ class GrantBoundToDeveloperKeyTests(unittest.TestCase):
 class LoaderBindingTests(unittest.TestCase):
     """Through today's loader. Unsigned manifests under an untrusted key need no signature check."""
 
-    def load(self, raw: bytes, grant: Grant):
+    def load(self, raw: bytes, grant: Grant, source: bytes = PLUGIN_SOURCE):
         loader = PluginLoader(TrustStore({}), {"demo.plugin": grant}, ReservedEffects(), CoreHealth(),
                               FakeGilProbe())
-        return loader.load(raw, None, PLUGIN_SOURCE)
+        return loader.load(raw, None, source)
 
     def test_a_manual_grant_does_not_survive_a_change_of_the_declared_developer_key(self) -> None:
         grant = Grant("demo.plugin", DIGEST, None, ALL, True, developer_key_id=key_id(K1))
@@ -372,10 +372,24 @@ class LoaderBindingTests(unittest.TestCase):
         self.assertEqual((swapped.trust, swapped.permissions), ("unsigned", ()))
         self.assertIn("grant_developer_key_mismatch", [f["code"] for f in swapped.findings])
 
-    def test_an_unbound_manual_grant_loads_with_no_permission_and_says_why(self) -> None:
-        loaded = self.load(manifest_bytes(K1), Grant("demo.plugin", DIGEST, None, ALL, True))
-        self.assertEqual((loaded.trust, loaded.permissions), ("unsigned", ()))
-        self.assertIn("grant_developer_key_missing", [f["code"] for f in loaded.findings])
+    def test_an_unbound_manual_grant_is_refused_before_plugin_code_runs(self) -> None:
+        marker = Path(temp_dir(self)) / "plugin-code-ran"
+        source = f'open({str(marker)!r}, "w").close()\n'.encode()
+        raw = manifest_bytes(K1, source=source, permissions=("read",))
+        grant = Grant("demo.plugin", hashlib.sha256(source).hexdigest(), None, ("read",))
+        try:
+            with self.assertRaises(Refused) as ctx:
+                self.load(raw, grant, source)
+        finally:
+            self.assertFalse(marker.exists(), "plugin code ran before the refusal")
+        self.assertEqual(ctx.exception.code, "grant_unbound")
+        self.assertEqual(str(ctx.exception), "grant_unbound: Make the grant again with developer_key_id "
+                                             "in install.json set to this plugin's developer key ID.")
+
+    def test_an_unbound_manual_grant_can_load_a_plugin_that_asks_for_nothing(self) -> None:
+        grant = Grant("demo.plugin", DIGEST, None, ALL, True)
+        loaded = self.load(manifest_bytes(K1, permissions=()), grant)
+        self.assertEqual((loaded.trust, loaded.permissions, loaded.module.VALUE), ("unsigned", (), 42))
 
 
 @needs_crypto
@@ -403,10 +417,10 @@ class ManualGrantIdentityTests(unittest.TestCase):
         changed_manifest = manifest_bytes(replacement.public)
         # Same plugin id, artifact bytes and grant; only the unsigned manifest's developer_key changed.
         self.assertEqual(self.reload(changed_manifest, bound).permissions, ())
-        # The reviewer's own grant names no key: it is unbound, so it grants nothing anywhere.
+        # A manual grant without a developer key is refused for either manifest.
         unbound = Grant("demo.plugin", DIGEST, None, ALL, unsigned_order_acknowledged=True)
-        self.assertEqual(self.reload(self.world.manifest, unbound).permissions, ())
-        self.assertEqual(self.reload(changed_manifest, unbound).permissions, ())
+        self.assertEqual(refusal(self.reload, self.world.manifest, unbound), "grant_unbound")
+        self.assertEqual(refusal(self.reload, changed_manifest, unbound), "grant_unbound")
         # Order under the new key comes back only through a new grant the user makes for that key.
         regranted = Grant("demo.plugin", DIGEST, None, ALL, unsigned_order_acknowledged=True,
                           developer_key_id=key_id(replacement.public))

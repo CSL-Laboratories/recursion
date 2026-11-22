@@ -25,10 +25,10 @@ The rules this module keeps:
   keys this core knows. That note is a warning, names a close known key or table when there is one, and makes
   the command end with ``EXIT_WARNED``; nothing is ever corrected. So is a quoted key that holds a dot
   (``"plugin_host.gil_check" = ...``): it is never a second spelling of a setting. A value of the wrong type
-  or outside its floor and ceiling keeps that setting's default, never a clamped value
-  (``settings_value_out_of_range``). Each note names the key, the value found and what is allowed.
+  or below its meaningful floor keeps that setting's default (``settings_value_out_of_range``). A value
+  outside a row's advice stays in force. Each note names the key, the value found and what is allowed.
 * SHOWN. ``python -m recursion_core.settings`` prints the file path and the values a daemon started
-  from this environment would take, with their defaults, sources and any notes. It takes no argument
+  from this environment would take, with their defaults, sources, any advice and any notes. It takes no argument
   and writes nothing. The daemon records the path and its values at start and logs the notes.
 
 Read at daemon start in this build; a later reload may call ``load`` again. ``load`` keeps no state between
@@ -61,20 +61,38 @@ WARNED = "warning: "  # what begins the line of a note that warns, in the start 
 EXIT_WARNED = 1      # the command's end when a note warns: a key, a table or the whole file skipped (2: usage)
 
 
+class _NoLimit:
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "NO_LIMIT"
+
+
+NO_LIMIT = _NoLimit()
+_NO_LIMIT_TEXT = "none"
+_Advice = tuple[int | float | None, int | float | None]  # (at least, at most)
+
+
 @dataclass(frozen=True)
 class Setting:
-    """One declared setting: its dotted name, type, default, floor and ceiling (numbers only), and what it does."""
+    """One setting with a TOML type and a default.
+
+    A list row uses a tuple of strings for its default. For numeric rows, floor is the first
+    meaningful value, advice gives optional inclusive bounds, and allow_no_limit opts in to "none".
+    """
 
     name: str
     type: type
     default: object
     says: str
     floor: int | float | None = None
-    ceiling: int | float | None = None
+    allow_no_limit: bool = False
+    advice: _Advice | None = None
 
 
-# Append-only. The type is bool, int, float or str. A row that loosens safety has the safe value as its default,
-# so a file that cannot be read as a whole, which leaves every default in force, can never loosen anything.
+# Append-only. The type is bool, int, float, str or list. A row that loosens safety has the safe value as
+# its default, so a file that cannot be read as a whole, which leaves every default in force, can never
+# loosen anything.
 SETTINGS: tuple[Setting, ...] = (
     Setting("plugin_host.gil_check", bool, True,
             "Whether each plugin host makes its GIL check; on by default, and a person may turn it off."),
@@ -88,6 +106,7 @@ class Value:
     value: object
     default: object
     source: str  # SOURCE_DEFAULT or SOURCE_FILE
+    advice: _Advice | None = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +149,10 @@ def owner_only_file(info: os.stat_result) -> bool:
 
 
 def _shown(value: object) -> str:
+    if value is NO_LIMIT:
+        return "no limit"
+    if isinstance(value, tuple):  # a validated list of names
+        return "[" + ", ".join(repr(name) for name in value) + "]"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
@@ -144,25 +167,33 @@ def _shown(value: object) -> str:
     return text if len(text) <= 80 else text[:77] + "..."
 
 
+def _allows_no_limit(row: Setting) -> bool:
+    return row.allow_no_limit and row.type in (int, float)
+
+
 def _allowed(row: Setting) -> str:
-    if row.type is bool:
-        return "true or false"
-    kind = {int: "a whole number", float: "a number", str: "a text"}[row.type]
-    if row.floor is not None and row.ceiling is not None:
-        return f"{kind} from {_shown(row.floor)} to {_shown(row.ceiling)}"
+    kind = {bool: "true or false", int: "a whole number", float: "a number",
+            str: f'a text other than "{_NO_LIMIT_TEXT}"', list: "a list of strings"}[row.type]
+    if _allows_no_limit(row):
+        return f'{kind} or "{_NO_LIMIT_TEXT}" for no limit'
     return kind
 
 
-def _fits(row: Setting, value: object) -> bool:
-    if row.type is bool:
-        return isinstance(value, bool)
-    if row.type is str:
-        return isinstance(value, str)
+def _accepted(row: Setting, value: object) -> object | None:
+    """Return the typed value, or None for an invalid type or spelling."""
+    if isinstance(value, str) and value == _NO_LIMIT_TEXT:
+        return NO_LIMIT if _allows_no_limit(row) else None
+    if row.type is list:
+        if isinstance(value, list) and all(isinstance(name, str) for name in value):
+            return tuple(dict.fromkeys(value))
+        return None
+    if row.type in (bool, str):
+        return value if isinstance(value, row.type) else None
     if isinstance(value, bool) or not isinstance(value, (int, float) if row.type is float else int):
-        return False
+        return None
     if isinstance(value, float) and not math.isfinite(value):
-        return False
-    return not ((row.floor is not None and value < row.floor) or (row.ceiling is not None and value > row.ceiling))
+        return None
+    return value
 
 
 _QUOTED = object()  # a key that itself holds a dot (a quoted dotted key): never joined into a setting name
@@ -228,7 +259,7 @@ def _read(path: Path) -> tuple[dict | None, str | None]:
 
 
 def _defaults() -> dict:
-    return {row.name: Value(row.name, row.default, row.default, SOURCE_DEFAULT) for row in SETTINGS}
+    return {row.name: Value(row.name, row.default, row.default, SOURCE_DEFAULT, row.advice) for row in SETTINGS}
 
 
 def load(environ) -> Loaded:
@@ -261,19 +292,45 @@ def load(environ) -> Loaded:
             hint = f"; did you mean {close[0]}?" if close else ""
             notes.append(Note(UNKNOWN_KEY, f"{_shown(name)} is not a setting this version knows; it is skipped{hint}",
                               warns=True))
-        elif not _fits(row, found):
-            notes.append(Note(OUT_OF_RANGE, f"{name}: found {_shown(found)}; allowed: {_allowed(row)}; "
-                                            f"the default {_shown(row.default)} stays in force"))
         else:
-            values[name] = Value(name, found, row.default, SOURCE_FILE)
+            value = _accepted(row, found)
+            if value is None:
+                reason = f"allowed: {_allowed(row)}"
+            elif row.floor is not None and type(value) in (int, float) and value < row.floor:
+                reason = f"a value below {_shown(row.floor)} has no meaning"
+            else:
+                values[name] = Value(name, value, row.default, SOURCE_FILE, row.advice)
+                continue
+            notes.append(Note(OUT_OF_RANGE, f"{name}: found {_shown(found)}; {reason}; "
+                                            f"the default {_shown(row.default)} stays in force"))
     return Loaded(str(path), MappingProxyType(values), tuple(notes))
 
 
+def _shown_advice(v: Value) -> str:
+    if v.advice is None:
+        return ""
+    lower, upper = v.advice
+    bounds = []
+    if lower is not None:
+        bounds.append(f"at least {_shown(lower)}")
+    if upper is not None:
+        bounds.append(f"at most {_shown(upper)}")
+    if not bounds:
+        return ""
+    text = f"; advised: {', '.join(bounds)}"
+    value = v.value
+    if type(value) in (int, float) and (
+        (lower is not None and value < lower) or (upper is not None and value > upper)
+    ):
+        text += "; outside the advice"
+    return text
+
+
 def lines(loaded: Loaded) -> list[str]:
-    """What status and the daemon's start log show: each setting, its value, default and source, then the notes."""
+    """What status and the daemon's start log show: each setting, its value, default, source and advice, then the notes."""
 
     # A future secret row must show set or not set here and keep raw values out of notes.
-    out = [f"{v.name} = {_shown(v.value)} (default {_shown(v.default)}; source: {v.source})"
+    out = [f"{v.name} = {_shown(v.value)} (default {_shown(v.default)}; source: {v.source}{_shown_advice(v)})"
            for v in loaded.values.values()]
     return out + [f"{WARNED if note.warns else ''}note {note}" for note in loaded.notes]
 

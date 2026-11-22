@@ -423,12 +423,12 @@ class OwnerOnlyAndWrongFiles(_Folder):
                 self.assertIn(f"found {shown}", detail)
                 self.assertIn("allowed: true or false", detail)
 
-    def test_a_number_outside_its_floor_and_ceiling_keeps_the_default_never_a_clamp(self) -> None:
-        row = settings.Setting("test.limit", int, 5, "A test row.", floor=1, ceiling=10)
+    def test_a_whole_number_has_no_ceiling_and_must_be_meaningful(self) -> None:
+        row = settings.Setting("test.limit", int, 5, "A one-based position.", floor=1)
         rows = settings.SETTINGS + (row,)
         with mock.patch.object(settings, "SETTINGS", rows), \
                 mock.patch.object(settings, "DECLARED", MappingProxyType({r.name: r for r in rows})):
-            for found, expect, codes in (("11", 5, [settings.OUT_OF_RANGE]), ("0", 5, [settings.OUT_OF_RANGE]),
+            for found, expect, codes in (("11", 11, []), ("0", 5, [settings.OUT_OF_RANGE]),
                                          ("7", 7, []), ("10", 10, []), ("1", 1, []),
                                          ("2.5", 5, [settings.OUT_OF_RANGE]), ("true", 5, [settings.OUT_OF_RANGE])):
                 with self.subTest(found=found):
@@ -437,7 +437,154 @@ class OwnerOnlyAndWrongFiles(_Folder):
                     self.assertEqual(expect, loaded["test.limit"])
                     self.assertEqual(codes, self.codes(loaded))
                     if codes:
-                        self.assertIn("allowed: a whole number from 1 to 10", loaded.notes[0].detail)
+                        reason = "a value below 1 has no meaning" if found == "0" else "allowed: a whole number"
+                        self.assertEqual(f"test.limit: found {found}; {reason}; the default 5 stays in force",
+                                         loaded.notes[0].detail)
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class LimitsNamesAndAdvice(_Folder):
+    def declared(self, *rows: settings.Setting):
+        return mock.patch.multiple(settings, SETTINGS=rows,
+                                   DECLARED=MappingProxyType({row.name: row for row in rows}))
+
+    def read(self, row: settings.Setting, text: str) -> settings.Loaded:
+        self.put(f"version = 1\n{row.name} = {text}\n")
+        with self.declared(row):
+            return settings.load(self.environ)
+
+    def test_no_limit_is_a_distinct_value(self) -> None:
+        for kind, default, ordinary, expected in ((int, 5, "4", 4), (float, 5.0, "1.25", 1.25)):
+            with self.subTest(kind=kind):
+                row = settings.Setting("test.limit", kind, default, "A limit.", floor=0,
+                                       allow_no_limit=True)
+                loaded = self.read(row, '"none"')
+                value = loaded[row.name]
+                self.assertIs(settings.NO_LIMIT, value)
+                self.assertEqual("NO_LIMIT", repr(value))
+                for number in (default, 0, -1, float("inf")):
+                    self.assertNotEqual(number, value)
+                self.assertEqual([], self.codes(loaded))
+                self.assertEqual(settings.SOURCE_FILE, loaded.values[row.name].source)
+                loaded = self.read(row, ordinary)
+                self.assertEqual(expected, loaded[row.name])
+                self.assertEqual([], self.codes(loaded))
+
+    def test_a_row_must_opt_in_to_no_limit(self) -> None:
+        for kind, default, allowed in ((int, 5, "a whole number"), (float, 5.0, "a number"),
+                                       (bool, True, "true or false"), (str, "usual", 'a text other than "none"')):
+            with self.subTest(kind=kind):
+                row = settings.Setting("test.limit", kind, default, "A test row.")
+                loaded = self.read(row, '"none"')
+                self.assertEqual(default, loaded[row.name])
+                self.assertEqual(settings.SOURCE_DEFAULT, loaded.values[row.name].source)
+                self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
+                self.assertIn(f"found 'none'; allowed: {allowed};", loaded.notes[0].detail)
+
+    def test_only_the_reserved_string_means_no_limit(self) -> None:
+        row = settings.Setting("test.limit", float, 5.0, "A limit.", allow_no_limit=True)
+        for text in ('"None"', '"unlimited"', "inf", "-inf", "nan"):
+            with self.subTest(text=text):
+                loaded = self.read(row, text)
+                self.assertEqual(5.0, loaded[row.name])
+                self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
+                self.assertIn('allowed: a number or "none" for no limit;', loaded.notes[0].detail)
+
+    def test_a_string_array_is_in_force(self) -> None:
+        row = settings.Setting("test.names", list, ("fallback",), "Names.")
+        loaded = self.read(row, '["Ada", "none", "Lin"]')
+        self.assertEqual(("Ada", "none", "Lin"), loaded[row.name])
+        self.assertEqual(settings.SOURCE_FILE, loaded.values[row.name].source)
+        self.assertEqual([], self.codes(loaded))
+
+    def test_a_non_string_item_rejects_the_whole_array(self) -> None:
+        row = settings.Setting("test.names", list, ("fallback",), "Names.")
+        for member in ("1", "false", "{name = 'Lin'}", '["Lin"]', HEX):
+            with self.subTest(kind=member[:12]):
+                loaded = self.read(row, f'["Ada", {member}]')
+                self.assertEqual(("fallback",), loaded[row.name])
+                self.assertEqual(settings.SOURCE_DEFAULT, loaded.values[row.name].source)
+                self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
+                self.assertEqual(
+                    "test.names: found a list; allowed: a list of strings; the default ['fallback'] stays in force",
+                    loaded.notes[0].detail,
+                )
+
+    def test_an_empty_array_is_a_value(self) -> None:
+        row = settings.Setting("test.names", list, ("fallback",), "Names.")
+        loaded = self.read(row, "[]")
+        self.assertEqual((), loaded[row.name])
+        self.assertEqual(settings.SOURCE_FILE, loaded.values[row.name].source)
+        self.assertEqual([], self.codes(loaded))
+        self.assertEqual(["test.names = [] (default ['fallback']; source: settings file)"],
+                         settings.lines(loaded))
+
+    def test_repeated_names_keep_the_order_of_first_occurrence(self) -> None:
+        row = settings.Setting("test.names", list, (), "Names.")
+        loaded = self.read(row, '["Lin", "Ada", "Lin", "lin", "Ada"]')
+        self.assertEqual(("Lin", "Ada", "lin"), loaded[row.name])
+        self.assertEqual([], self.codes(loaded))
+
+    def test_a_declaration_has_no_ceiling(self) -> None:
+        self.assertNotIn("ceiling", inspect.signature(settings.Setting).parameters)
+
+    def test_numbers_on_either_side_of_advice_stay_in_force(self) -> None:
+        row = settings.Setting("test.limit", int, 5, "A limit.", advice=(2, 10))
+        for value in (-1, 2, 10, 11):
+            with self.subTest(value=value):
+                loaded = self.read(row, str(value))
+                self.assertEqual(value, loaded[row.name])
+                self.assertEqual(settings.SOURCE_FILE, loaded.values[row.name].source)
+                self.assertEqual([], self.codes(loaded))
+                outside = "; outside the advice" if value in (-1, 11) else ""
+                self.assertEqual(
+                    [f"test.limit = {value} (default 5; source: settings file; advised: at least 2, "
+                     f"at most 10{outside})"],
+                    settings.lines(loaded),
+                )
+
+    def test_advice_can_be_one_sided_and_is_shown_with_a_default(self) -> None:
+        for bounds, shown in (((0, None), "at least 0"), ((None, 10), "at most 10")):
+            with self.subTest(bounds=bounds):
+                row = settings.Setting("test.limit", int, 5, "A limit.", advice=bounds)
+                with self.declared(row):
+                    loaded = settings.load(self.environ)
+                self.assertEqual(
+                    [f"test.limit = 5 (default 5; source: default; advised: {shown})"],
+                    settings.lines(loaded),
+                )
+
+    def test_below_a_meaningful_floor_keeps_the_default_with_the_reason(self) -> None:
+        row = settings.Setting("test.length", int, 5, "A length.", floor=0)
+        loaded = self.read(row, "-1")
+        self.assertEqual(5, loaded[row.name])
+        self.assertEqual(settings.SOURCE_DEFAULT, loaded.values[row.name].source)
+        self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
+        self.assertEqual("test.length: found -1; a value below 0 has no meaning; the default 5 stays in force",
+                         loaded.notes[0].detail)
+        loaded = self.read(row, "0")
+        self.assertEqual(0, loaded[row.name])
+        self.assertEqual([], self.codes(loaded))
+
+    def test_status_shows_no_limit_and_the_names(self) -> None:
+        rows = (
+            settings.Setting("test.limit", int, 5, "A limit.", allow_no_limit=True, advice=(None, 10)),
+            settings.Setting("test.names", list, (), "Names."),
+        )
+        self.put('version = 1\n[test]\nlimit = "none"\nnames = ["Lin", "Ada"]\n')
+        out, err = io.StringIO(), io.StringIO()
+        with self.declared(*rows):
+            self.assertEqual(0, settings.main([], self.environ, out, err))
+        self.assertEqual("", err.getvalue())
+        self.assertEqual(
+            [f"settings file: {self.file}",
+             "These are the values a daemon started from this environment would take, "
+             "and a daemon already running keeps the values it read at its own start, "
+             "as shown in the recursion_core.daemon startup log.",
+             "test.limit = no limit (default 5; source: settings file; advised: at most 10)",
+             "test.names = ['Lin', 'Ada'] (default []; source: settings file)"],
+            out.getvalue().splitlines(),
+        )
 
 
 @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
@@ -726,7 +873,7 @@ class PublishedShape(_Folder):
                                            part.get("minimum"), part.get("maximum"))
 
         walk(schema["properties"], "")
-        expect = {r.name: (kinds[r.type], r.default, r.says, r.floor, r.ceiling) for r in settings.SETTINGS}
+        expect = {r.name: (kinds[r.type], r.default, r.says, r.floor, None) for r in settings.SETTINGS}
         self.assertEqual(expect, found)
 
     def test_the_schema_describes_the_readers_version_type(self) -> None:

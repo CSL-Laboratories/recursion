@@ -4,6 +4,13 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `host.v1.json` is `1.0-draft.3` (2026-11-21)
+
+The daemon's first `hello` may carry `gil_check` (`on` or `off`). The host defaults to `on`
+and its own `hello` carries only the channel version. With checking on, a host that reads its GIL
+as enabled after a load or call refuses that work and every later load or call with
+`host_gil_enabled`. Existing hello messages still validate.
+
 ## `host.v1.json` is `1.0-draft.2` (2026-11-18)
 
 `call` and `result` travel both ways: the daemon calls a plugin's function by name, and a plugin's host

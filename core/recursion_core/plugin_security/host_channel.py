@@ -7,11 +7,10 @@ below are the schema's, and a test holds them equal to it. Frames are those of
 ``control_transport/framing.py``, reused as they are: ``encode``/``decode`` here only wrap its
 ``encode_frame``/``decode_body``.
 
-What this module settles, and nothing more (the host program, its wall and the broker's handles are
-later work):
+What this module settles (the host program uses this channel; the wall and broker handles are later work):
 
 * ``check_message(message, receiver=...)``: a message is one object of a known type with exactly
-  its fields, sent by a side that may send it. A type the receiver does not know is refused
+  its required and permitted optional fields, sent by a side that may send it. An unknown type is refused
   ``message_unknown``; a reserved type ``message_reserved``; the channel stays up in both cases
   (the refusal is an answer, never a close).
 * ``answer_call(message, handlers)``: the receiving side of a ``call``. A reserved name is refused
@@ -58,7 +57,7 @@ __all__ = [
 CHANNEL = "csl-plugin-host/1"
 RESERVED_TEXT = "reserved; not available in this release"
 
-# type -> (the sides that may send it, its exact fields). host.v1.json x-message-types.
+# type -> (the sides that may send it, its required fields). host.v1.json x-message-types.
 MESSAGE_TYPES: dict[str, tuple[frozenset, frozenset]] = {
     "hello": (frozenset({"daemon", "host"}), frozenset({"type", "channel"})),
     "load": (frozenset({"daemon"}), frozenset({"type", "plugin_id", "manifest_b64", "files"})),
@@ -68,6 +67,9 @@ MESSAGE_TYPES: dict[str, tuple[frozenset, frozenset]] = {
     "refusal": (frozenset({"daemon", "host"}), frozenset({"type", "id", "code", "detail"})),
     "bye": (frozenset({"daemon", "host"}), frozenset({"type", "reason"})),
 }
+# (message type, sender) -> fields that sender may add. host.v1.json x-message-types.optional_from.
+OPTIONAL_MESSAGE_FIELDS = {("hello", "daemon"): frozenset({"gil_check"})}
+
 # The ONE append-only list of call names, each with the arguments it takes, in order. host.v1.json
 # x-call-names. A later surface kind is a new name here, never a new message type.
 CALL_NAMES: dict[str, tuple[str, ...]] = {
@@ -92,7 +94,7 @@ INVENTORY: dict[str, tuple[str, str | None]] = {
 }
 REFUSAL_CODES = ("message_invalid", "message_unknown", "message_reserved", "message_wrong_side", "caller_forged",
                  "call_unknown", "call_reserved", "call_args_invalid", "call_not_offered", "call_failed",
-                 "load_too_large")
+                 "host_gil_enabled", "load_too_large")
 
 SIDES = ("daemon", "host")
 MAX_ID = 2 ** 53 - 1
@@ -193,6 +195,8 @@ def _check_fields(kind: str, message: dict) -> None:
     if kind == "hello":
         if message["channel"] != CHANNEL:
             raise bad("channel")
+        if "gil_check" in message and message["gil_check"] not in ("on", "off"):
+            raise bad("gil_check")
     elif kind == "load":
         plugin_id = message["plugin_id"]
         if type(plugin_id) is not str or not _PLUGIN_ID.fullmatch(plugin_id) or plugin_id == HOST:
@@ -239,7 +243,7 @@ def check_message(message: object, *, receiver: str) -> dict:
     Order: an object with a type; a reserved type (``message_reserved``); a type nobody defined
     (``message_unknown``); at the daemon, a call whose name is reserved (``call_reserved``, before any
     other check of that name); a type this receiver's peer never sends (``message_wrong_side``); then
-    exactly its fields, a core message that names a caller (``caller_forged``) first among them,
+    its required and permitted optional fields, a core message that names a caller (``caller_forged``) first among them,
     and their forms (``message_invalid``). The caller may answer every refusal with ``refusal``
     and keep the channel up.
     """
@@ -260,8 +264,12 @@ def check_message(message: object, *, receiver: str) -> dict:
         raise ChannelRefusal("message_wrong_side", f"{kind} is never sent by the {sender}")
     if kind == "core" and set(message) & _CALLER_FIELDS:
         raise ChannelRefusal("caller_forged", "the caller is set from the channel, never from a message")
-    if set(message) != fields:
-        raise ChannelRefusal("message_invalid", f"{kind}: fields must be {', '.join(sorted(fields))}")
+    optional = OPTIONAL_MESSAGE_FIELDS.get((kind, sender), frozenset())
+    if not fields <= message.keys() <= (fields | optional):
+        detail = f"{kind}: fields must be {', '.join(sorted(fields))}"
+        if optional:
+            detail += f" (optional: {', '.join(sorted(optional))})"
+        raise ChannelRefusal("message_invalid", detail)
     _check_fields(kind, message)
     return message
 

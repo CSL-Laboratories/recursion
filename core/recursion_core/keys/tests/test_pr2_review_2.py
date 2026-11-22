@@ -264,7 +264,7 @@ class EncodedLineBoundaryTest(MacCase):
             return security([LOGIN if word == path else word for word in argv], input)
 
         system.tools['security'] = tool
-        key_id, provider = ('alpha-' * 11)[:64], 'p' * 64
+        key_id, provider = ('alpha-' * 11)[:64], ('vendor-' * 10)[:64]    # 64 characters the key-shape rule takes
         longest = MacKeychain(system, '0' * 32).longest(key_id, provider)
         self.add(store, key_id=key_id, provider=provider, value='x' * longest)
         lines = [stdin for argv, stdin in system.calls if argv[1] == '-i']
@@ -394,7 +394,7 @@ class FullIndexWithACapTest(TempStoreCase):
         def with_new(filled, allowed, cap):
             record = KeyRecord('new-key', 'openai', 'CODEX_API_KEY', stamp, 'owner_file', allowed, cap, '0' * 32)
             return len(index_bytes(replace(filled, keys={**filled.keys, 'new-key': record},
-                                           pending={'new-key': Pending('new-key', 'add', stamp)})))
+                                           pending={'new-key': Pending('new-key', 'add', stamp, '0' * 32)})))
 
         per = len(index_bytes(fill(5))) - len(index_bytes(fill(4)))
         count = (INDEX_MAX - len(index_bytes(index))) // per

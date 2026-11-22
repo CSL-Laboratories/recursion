@@ -21,8 +21,9 @@ each such value: one ``remove`` deletes, in the store's own file, or one in a fi
 store's while the index has records on the file, or any while the index pins the store to a keychain), which no command
 of the store changes; such a file that cannot be read is named unreadable. Each value is looked for as it was saved and
 as JSON would write it inside a string. Symlinks are not followed and only regular files are read (a FIFO cannot block
-the search). The report names files and key ids only: no value, no part of one, no surrounding text. Two ids that hold
-one value are both named, once per place.
+the search). The report names files and key ids only: no value, no part of one, no surrounding text. A looked-for
+value that occurs in a path the report names (a file's name, a folder's name, a root given with ``--path``) is written
+there as ``<value of ID>``. Two ids that hold one value are both named, once per place.
 
 ITEMS NO RECORD NAMES. On a keychain it also counts the items Recursion saved (on the Secret Service those that carry
 ``application recursion``, on the macOS Keychain the generic passwords whose service is ``recursion.<store id>.<save
@@ -43,6 +44,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,6 +78,7 @@ class Report:
     unnamed: int = 0                                 # keychain items Recursion saved that no record names
     unnamed_refused: str | None = None               # why those items could not be counted
     unnamed_in: str | None = None                    # the keychain they were counted in (a store's name)
+    owner_file: str = ''                             # the owner-only file's path as the report may print it
 
     def complete(self) -> bool:
         return not (self.missing or self.unreadable or self.journal_incomplete or self.pending or self.unnamed
@@ -150,7 +153,23 @@ def run(store: KeyStore, *, extra=(), journal: bool = True) -> Report:
             _search_file(path, found, longest, report)
     if journal:
         _search_journal(store, found, longest, report)
+    _mask_paths(report, found, store)
     return report
+
+
+def _mask_paths(report: Report, found: dict, store: KeyStore) -> None:
+    """Write every looked-for value that occurs in a path the report names as ``<value of ID>`` (longest first, in
+    one pass), so a file or folder named by a key never prints the key."""
+    marks = {needle.decode('ascii'): f'<value of {named(key_ids[0])[0]}>' for needle, key_ids in found.items()}
+    pattern = re.compile('|'.join(re.escape(text) for text in sorted(marks, key=len, reverse=True)))
+
+    def masked(text: str) -> str:
+        return pattern.sub(lambda match: marks[match.group(0)], text)
+    report.roots = [masked(text) for text in report.roots]
+    report.unreadable = [masked(text) for text in report.unreadable]
+    report.leftovers = [masked(text) for text in report.leftovers]
+    report.found = [(masked(place), key_id) for place, key_id in report.found]
+    report.owner_file = masked(str(store.owner_file()))
 
 
 def _identity(path: Path):

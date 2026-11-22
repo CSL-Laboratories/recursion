@@ -428,7 +428,8 @@ def _audit(args, out, err, store) -> int:
         print(f'not named: the owner-only file holds a value of {key_id} that no saved key names; '
               f'"key remove {key_id}" deletes it', file=out)
     for key_id in report.foreign:
-        print(f"not this store's: {store.owner_file()} holds a value of {key_id}, and this store does not use that "
+        print(f"not this store's: {report.owner_file or store.owner_file()} holds a value of {key_id}, and this store "
+              "does not use that "
               "file (it names another store, or this store's keys are in a keychain): no command of this store "
               'changes it, and the value leaves with the file', file=out)
     if report.unnamed:

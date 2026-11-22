@@ -44,6 +44,10 @@ The index, `$XDG_CONFIG_HOME/recursion/keys/index.json` (default `~/.config/recu
 - the next save or removal finishes or undoes it;
 - `remove ID` clears it on request.
 
+An intent records the save it was written for (`save_id` in `index.json`), and a recovery, or the rollback of an add whose last index write failed, deletes only that save's value: an older `index.json` put back can carry an intent whose id was saved again since, and that newer value stays. An intent written before intents carried a save id is read as it is: with a saved key beside it, the key's own save is the one; with none, it is finished only when the store verifiably holds no value of its id, and otherwise stays (refused `operation_pending`) until `remove ID` clears it.
+
+**Names shaped like keys.** `add` refuses a provider (`provider_invalid`) or a variable name (`env_name_invalid`) that has the shape of a key, by the same rule as a key id, and does not repeat it, so a key pasted into `--provider` or `--env` is not written to `index.json` or shown by `list`. An `index.json` that already holds such a name is still read.
+
 ## The credential source
 
 `credentials(connection_id, env_name)`, imported as `from recursion_core.keys import credentials`, is the `Credentials` type of `routes/base.py`. It returns the value only when the id is saved under exactly that variable name and the key has a spend opt-in with a cap above 0. An unknown id, or a known one asked for under another name, raises `KeyError(connection_id)`, as the daemon's default does. A refused known id, or one whose add or removal is unfinished, raises `KeyRefused`, a `KeyError` with a typed code. Either way the route refuses before launch: `launch_refused`, "no credential for ID". It is the only way a value leaves the store for a route; `KeyStore.values()` serves `audit` alone.

@@ -119,6 +119,24 @@ install `daemon-reload`, `enable` (no `--now`: `recursiond up`, slice 4, starts 
 `daemon-reload`, `try-restart`; uninstall `stop`, `daemon-reload`. This package starts no process,
 opens no socket and touches no system unit.
 
+### The disk under the stores
+
+Before any folder, store, custody root or unit is made, `install` and `upgrade` read the file-system type
+of the folder each store goes in (the breaker store's, the revocation store's and the ledger's, under the
+state folder the one resolver names, chosen or default) from `/proc/self/mountinfo`: the longest mount
+point that holds the folder's nearest folder that is there decides. On `9p`, `v9fs`, `drvfs`, `overlay`,
+`nfs`, `nfs4`, `cifs` or `smb3` (`install.REFUSED_FILESYSTEMS`, append-only) they refuse
+`store_filesystem_unsupported` and make nothing, with this one line, `<folder>` the folder whose type was
+read and `<kind>` the type: "Recursion does not create its stores in <folder>: it is on <kind>, where
+SQLite's write-ahead log can damage a database. Put a local disk or volume at <folder> (in a container:
+mount a volume there) and run recursiond install again, or run it with XDG_STATE_HOME set to an absolute
+folder on a local disk. Check a folder with: findmnt -no FSTYPE -T "<folder>"". The XDG_STATE_HOME way is
+for `install`: an `upgrade` whose unit names another state folder is still refused `unit_state_elsewhere`,
+with that refusal's own ways out. Where the table cannot be read (no `/proc/self/mountinfo`), nothing is
+refused and the plan's `filesystem` lines say the type was not read. A person's setting to accept the
+risk is not read yet; `check_store_ground` takes it as an argument (`accept_risk`), and no caller passes
+it.
+
 ## Ported from branch `cursor/csl-758-daemon-install-b4bd` (59b96a7b), not merged
 
 Kept: the unit text and its reader, the closed `ExecStart` grammar, the user-manager-only plans,

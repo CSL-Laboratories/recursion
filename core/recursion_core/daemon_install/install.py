@@ -12,6 +12,11 @@ unit from before the installer). ``uninstall`` removes the unit it wrote and not
 folders around it, which other units share, and not the daemon's state folder with the run
 registry and the stores in it (lane INSTALL's question 3).
 
+Before any store is made, ``install`` and ``upgrade`` read the file-system type of the folder the stores
+go in from the kernel's mount table (``filesystem_type``) and refuse 9p, overlay and network disks
+(``store_filesystem_unsupported``, ``check_store_ground``), where SQLite's write-ahead log can damage a
+database; a table that cannot be read refuses nothing and the plan says the type was not read.
+
 Each returns a ``Plan`` with the ``systemctl --user`` commands that apply the change. This module
 runs none of them: it starts no process, opens no socket and touches no system unit.
 """
@@ -20,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import sqlite3
 import stat
 from dataclasses import dataclass
@@ -46,6 +52,21 @@ CSL_KEY_IDS: frozenset = frozenset()
 # The one line ``recursiond install`` prints when it made the key.
 ANCHOR_MADE = ("Made this install's own authority key (owner-only, {path}); it signs your order permissions on "
                "this machine and never leaves it. Losing it means making new permissions; it is not recoverable.")
+# The file-system kinds the stores are not made on: SQLite's write-ahead log can damage a database there. The
+# same kinds as the doctor's store.filesystem row; append-only (a kind added later is appended in both places).
+REFUSED_FILESYSTEMS = ("9p", "v9fs", "drvfs", "overlay", "nfs", "nfs4", "cifs", "smb3")
+# The kernel's mount table the type is read from.
+_MOUNTINFO = "/proc/self/mountinfo"
+# The values ``check_store_ground`` takes for a refused kind: refuse (the default) or go on, the risk accepted.
+_FILESYSTEM_UNSAFE = ("refuse", "accept_risk")
+# The whole detail of ``store_filesystem_unsupported``. {folder} is the folder whose type was read (the store
+# folder, or its nearest folder that is there, so the findmnt command runs as printed). The XDG_STATE_HOME way is
+# for install: an upgrade whose unit names another state folder is still refused ``unit_state_elsewhere``, with
+# that refusal's own ways out.
+_STORE_GROUND = ("Recursion does not create its stores in {folder}: it is on {kind}, where SQLite's write-ahead log "
+                 "can damage a database. Put a local disk or volume at {folder} (in a container: mount a volume "
+                 "there) and run recursiond install again, or run it with XDG_STATE_HOME set to an absolute folder "
+                 "on a local disk. Check a folder with: findmnt -no FSTYPE -T \"{folder}\"")
 
 
 @dataclass(frozen=True)
@@ -64,6 +85,9 @@ class Plan:
     left: str = ""
     # make_anchor: (the key's path, made now). None when no key was asked for, or none can be made here.
     anchor: tuple[str, bool] | None = None
+    # install and upgrade: one line per store folder whose file-system type was not read, or whose refused
+    # kind was accepted (``check_store_ground``). () when every type was read and none is refused.
+    filesystem: tuple[str, ...] = ()
 
 
 def plan_commands(action: str) -> tuple[tuple[str, ...], ...]:
@@ -81,6 +105,76 @@ def plan_commands(action: str) -> tuple[tuple[str, ...], ...]:
     if action == "uninstall":
         return (("systemctl", "--user", "stop", UNIT_NAME), ("systemctl", "--user", "daemon-reload"))
     raise InstallRefused("action", repr(action))
+
+
+def _nearest_real(folder: str) -> str:
+    """``folder``'s nearest folder that is there (itself, when it is), with its links resolved."""
+
+    nearest = os.path.abspath(folder)
+    while not os.path.lexists(nearest) and os.path.dirname(nearest) != nearest:
+        nearest = os.path.dirname(nearest)
+    return os.path.realpath(nearest)
+
+
+def _unescape(field: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def filesystem_type(folder: str) -> str | None:
+    """The file-system type of ``folder`` as the kernel's mount table (``/proc/self/mountinfo``) gives it, or
+    None when the table cannot be read or names no mount for it.
+
+    The folder's nearest folder that is there is resolved (its links followed, as the kernel's table names
+    real paths), and the LONGEST mount point that holds it decides; of two equal ones, the later line (a
+    mount over a mount). Standard library only; nothing is written."""
+
+    real = _nearest_real(folder)
+    try:
+        with open(_MOUNTINFO, encoding="utf-8", errors="surrogateescape") as table:
+            lines = table.read().splitlines()
+    except (OSError, ValueError):
+        return None
+    best, kind = -1, None
+    for line in lines:
+        fields = line.split(" ")
+        try:
+            dash = fields.index("-", 6)
+            point, fstype = _unescape(fields[4]), fields[dash + 1]
+        except (ValueError, IndexError):
+            continue
+        holds = point == "/" or real == point or real.startswith(point.rstrip("/") + "/")
+        if holds and len(point) >= best:
+            best, kind = len(point), fstype
+    return kind
+
+
+def check_store_ground(folders, filesystem_unsafe: str = "refuse") -> tuple[str, ...]:
+    """Refuse to make the stores on a refused kind of disk (``REFUSED_FILESYSTEMS``), before anything is made.
+
+    For each folder: its type is read (``filesystem_type``); a refused kind is ``store_filesystem_unsupported``,
+    the detail naming the folder, the kind and the ways out, unless ``filesystem_unsafe`` is ``accept_risk``:
+    then the step goes on and one line names the folder, the kind and that the risk was accepted. A type that
+    cannot be read refuses nothing: one line says it was not read. Returns those lines."""
+
+    if filesystem_unsafe not in _FILESYSTEM_UNSAFE:
+        raise InstallRefused("filesystem_unsafe", f"filesystem_unsafe is {filesystem_unsafe!r}, not refuse or accept_risk")
+    lines = []
+    for folder in dict.fromkeys(folders):
+        where = _nearest_real(folder)
+        kind = filesystem_type(where)
+        if kind is None:
+            lines.append(f"the file-system type of {where} was not read")
+        elif kind in REFUSED_FILESYSTEMS:
+            if filesystem_unsafe != "accept_risk":
+                raise InstallRefused("store_filesystem_unsupported", _STORE_GROUND.format(folder=where, kind=kind))
+            lines.append(f"{where} is on {kind}, where SQLite's write-ahead log can damage a database; the risk was accepted")
+    return tuple(lines)
+
+
+def _store_folders(paths: Owned) -> tuple[str, ...]:
+    """The folders of every store the step makes: the breaker and revocation stores' and the ledger's."""
+
+    return (os.path.dirname(paths.breaker_store), os.path.dirname(paths.revocation_store), os.path.dirname(paths.ledger))
 
 
 def ensure_stores(paths: Owned) -> tuple[tuple[str, str, bool], ...]:
@@ -498,6 +592,7 @@ def install(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
         check_state_root(paths)  # a chosen place: before anything is made
         check_private_dir(paths.state_root, paths.homes)  # before anything is made
         found = _found(paths, anchor_public_key, make_anchor)  # before anything is made
+        ground = check_store_ground(_store_folders(paths))  # before anything is made
         made = ensure_stores(paths)  # first: a unit is never left naming a daemon whose stores are missing
         ledger, anchor = _anchor_and_ledger(paths, anchor_public_key, found, make_anchor, on_anchor_made)
         homes = ensure_dir(paths.state_root, paths.homes, mode=_DIR_MODE)
@@ -508,7 +603,8 @@ def install(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
         else:
             ensure_dir(paths.home, paths.unit_dir, mode=_DIR_MODE)
             write_exclusive(paths.unit, unit, _UNIT_MODE)
-        return _plan("install", not present or _any_created(made) or homes or ledger[1], paths, made, ledger, anchor)
+        return _plan("install", not present or _any_created(made) or homes or ledger[1], paths, made, ledger, anchor,
+                     ground)
 
 
 def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str | None = None,
@@ -542,6 +638,7 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
         check_state_root(paths)  # a chosen place: before anything is made
         check_private_dir(paths.state_root, paths.homes)  # before anything is made
         found = _found(paths, anchor_public_key, make_anchor)  # before anything is made
+        ground = check_store_ground(_store_folders(paths))  # before anything is made
         made = ensure_stores(paths)
         ledger, anchor = _anchor_and_ledger(paths, anchor_public_key, found, make_anchor, on_anchor_made)
         homes = ensure_dir(paths.state_root, paths.homes, mode=_DIR_MODE)
@@ -551,7 +648,8 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
             still_names(paths.unit, info)  # last: the path still names the file that was read
         else:
             replace_regular(paths.unit, unit, _UNIT_MODE)
-        return _plan("upgrade", not current or _any_created(made) or homes or ledger[1], paths, made, ledger, anchor)
+        return _plan("upgrade", not current or _any_created(made) or homes or ledger[1], paths, made, ledger, anchor,
+                     ground)
 
 
 def _elsewhere_detail(paths: Owned, data: bytes, why: str) -> str:
@@ -617,11 +715,12 @@ def _any_created(made: tuple[tuple[str, str, bool], ...]) -> bool:
 
 
 def _plan(action: str, changed: bool, paths: Owned, stores: tuple[tuple[str, str, bool], ...] = (),
-          ledger: tuple[str, bool, str] | None = None, anchor: tuple[str, bool] | None = None) -> Plan:
+          ledger: tuple[str, bool, str] | None = None, anchor: tuple[str, bool] | None = None,
+          ground: tuple[str, ...] = ()) -> Plan:
     chosen = paths.chosen and action != "uninstall"
     return Plan(action=action, changed=changed or bool(anchor and anchor[1]), unit=paths.unit,
                 commands=plan_commands(action), stores=stores, ledger=ledger, state=paths.state if chosen else "",
-                left=_default_stores_left(paths) if chosen else "", anchor=anchor)
+                left=_default_stores_left(paths) if chosen else "", anchor=anchor, filesystem=ground)
 
 
 def _default_stores_left(paths: Owned) -> str:

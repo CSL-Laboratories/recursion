@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import base64
 import json
+import os
 import tempfile
 import threading
 import time
@@ -775,6 +776,91 @@ class RunRequestTests(unittest.TestCase):
                 self.assertEqual(runs.seen, [])
                 self.assertEqual(len(core.requests), 1)
         self.assert_nothing_started()
+
+    def test_the_install_schema_grant_enum_matches_permissions_and_schedule_sample_validates(self):
+        install_schema = json.loads(
+            (REPO / "schemas" / "plugin" / "v1" / "install.v1.json").read_text(encoding="utf-8")
+        )
+        grant_def = install_schema["$defs"]["grant"]
+        perms_prop = grant_def["properties"]["permissions"]
+        enum = perms_prop["items"]["enum"]
+        self.assertEqual(tuple(enum), PERMISSIONS)
+        self.assertNotIn("seven", perms_prop["description"].lower())
+        with tempfile.TemporaryDirectory() as tmp:
+            install_path = Path(tmp) / daemon_plugins.INSTALL_FILE
+            probe = {"grants": [{"plugin_id": "demo.plugin", "artifact_sha256": "0123456789abcdef" * 4,
+                                 "signer_key_id": None, "permissions": list(enum)}]}
+            install_path.write_text(json.dumps(probe), encoding="utf-8")
+            os.chmod(install_path, 0o600)
+            loaded = daemon_plugins.read_install(tmp)
+            self.assertEqual(loaded["grants"]["demo.plugin"].permissions, tuple(enum))
+        sample_path = FIXTURES / "good" / "install.v1" / "h05-schedule-grant.json"
+        sample_text = sample_path.read_text(encoding="utf-8")
+        sample = json.loads(sample_text)
+        self.assertEqual(set(sample) - set(install_schema["properties"]), set())
+        self.assertIsInstance(sample.get("grants"), list)
+        self.assertTrue(sample["grants"])
+        grant = sample["grants"][0]
+        self.assertEqual(grant["permissions"], ["schedule"])
+        self.assertTrue(set(grant_def["required"]) <= set(grant))
+        self.assertEqual(set(grant) - set(grant_def["properties"]), set())
+        self.assertRegex(grant["plugin_id"], grant_def["properties"]["plugin_id"]["pattern"])
+        self.assertNotRegex(grant["plugin_id"], r"[\r\n]")
+        self.assertRegex(grant["artifact_sha256"], install_schema["$defs"]["hex64"]["pattern"])
+        self.assertNotRegex(grant["artifact_sha256"], r"[\r\n]")
+        if grant.get("signer_key_id") is not None:
+            self.assertRegex(grant["signer_key_id"], install_schema["$defs"]["key_id"]["pattern"])
+            self.assertNotRegex(grant["signer_key_id"], r"[\r\n]")
+        for perm in grant["permissions"]:
+            self.assertIn(perm, enum)
+        try:
+            import jsonschema
+        except ImportError:
+            validator = None
+        else:
+            validator = getattr(jsonschema, "Draft202012Validator", None)
+        if validator is not None:
+            validator(install_schema).validate(sample)
+        with tempfile.TemporaryDirectory() as tmp:
+            install_path = Path(tmp) / daemon_plugins.INSTALL_FILE
+            install_path.write_text(sample_text, encoding="utf-8")
+            os.chmod(install_path, 0o600)
+            loaded = daemon_plugins.read_install(tmp)
+            self.assertEqual(loaded["grants"][grant["plugin_id"]].permissions, ("schedule",))
+
+    def test_one_occurrence_for_two_tenants_starts_two_runs_and_same_tenant_twice_starts_one(self):
+        from recursion_core.daemon.control_adapter import DaemonControl
+
+        class Starter:
+            failures, results = {}, {}
+
+        promise = "start at most one run for one tenant; the same occurrence for another tenant is another run"
+        self.assertIn(promise, schema()["description"])
+        self.assertIn(promise, hc.__doc__)
+        self.assertIn(promise, hc.DaemonEnd._run_request.__doc__)
+        with tempfile.TemporaryDirectory() as state:
+            control = DaemonControl(self.api, self.registry, None, Starter(), state)
+            control._observe = lambda run, full: None
+            end = hc.DaemonEnd("demo.plugin", GrantingCore(), runs=control)
+            first = self.ask(run_args(tenant="t1"), id_=1, end=end)
+            again = self.ask(run_args(tenant="t1"), id_=2, end=end)
+            self.assertEqual(first["value"]["code"], "started")
+            self.assertEqual(again["value"]["run"]["run_id"], first["value"]["run"]["run_id"])
+            self.assertTrue(again["value"]["duplicate"])
+            self.assertEqual(len(self.starter.calls), 1)
+            self.assertEqual(len(self.registry.list()), 1)
+            other = self.ask(run_args(tenant="t2"), id_=3, end=end)
+            self.assertEqual(other["value"]["code"], "started")
+            self.assertFalse(other["value"].get("duplicate", False))
+            self.assertNotEqual(other["value"]["run"]["run_id"], first["value"]["run"]["run_id"])
+            self.assertEqual(other["value"]["run"]["start_key"]["client_key"],
+                             first["value"]["run"]["start_key"]["client_key"])
+            self.assertEqual(len(self.starter.calls), 2)
+            self.assertEqual(len(self.registry.list()), 2)
+            self.assertEqual(self.registry.get(first["value"]["run"]["run_id"])["origin"],
+                             origin_of(run_args(tenant="t1")))
+            self.assertEqual(self.registry.get(other["value"]["run"]["run_id"])["origin"],
+                             origin_of(run_args(tenant="t2")))
 
 
 class FixtureConformanceTests(unittest.TestCase):

@@ -4,6 +4,22 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `install.v1.json` is `1.0-draft.3` (2026-11-21)
+
+A grant's `permissions` list gains `schedule`, matching the eight permissions today's reader takes
+(`plugin_security/manifest.py`, `PERMISSIONS`; `daemon/plugins.py`, `read_install`), and its description
+no longer says "seven". The five names that are new in the version 1 manifest remain out because today's
+reader still refuses them. What it breaks: a validator or reader that assumed an install file valid
+against `install.v1.json` could never grant `schedule` (the set of accepted install files widens). One
+good fixture (`good/install.v1/h05-schedule-grant.json`) shows a grant with `"permissions": ["schedule"]`.
+
+## `host.v1.json` is `1.0-draft.4` (2026-11-21)
+
+The `run.request` description now names the tenant in its idempotency promise: the same plugin, record,
+revision and occurrence start at most one run for one tenant; the same occurrence for another tenant is
+another run. No field, pattern or refusal code changed. What it breaks: nothing in wire validation; a
+reader that assumed one occurrence started at most one run across tenants.
+
 ## `host.v1.json` is `1.0-draft.3`, `manifest.v1.json` is `1.0-draft.2` (2026-11-19)
 
 `run.request` is built: it leaves the reserved call names and is the fifth name of `x-call-names`, the one

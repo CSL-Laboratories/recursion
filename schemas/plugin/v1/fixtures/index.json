@@ -944,6 +944,11 @@
       "shows": "The user turned 'order' back on after the signing key was revoked."
     },
     {
+      "file": "good/install.v1/h05-schedule-grant.json",
+      "schema": "install.v1.json",
+      "shows": "A grant of the 'schedule' permission alone to an unsigned plugin: the permission that lets a plugin's host ask the daemon to start a run."
+    },
+    {
       "file": "bad/install.v1/b01-a-field-the-reader-does-not-know.json",
       "schema": "install.v1.json",
       "rule": "Today's reader refuses a top-level field it does not know, so version 1 adds none.",

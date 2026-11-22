@@ -31,7 +31,8 @@ later work):
   before anything starts (``call_args_invalid``); ``tenant``, ``engine`` and ``prompt`` exactly as
   ``run.start`` checks them. The run is started by ``runs.call("run.start", ..., origin=...)``: the one
   admission path of ``run.start``, with the start key derived here from the plugin, the record, its
-  revision and the occurrence (never taken from the plugin), so one occurrence starts at most one run.
+  revision and the occurrence (never taken from the plugin), so the same plugin, record, revision and
+  occurrence start at most one run for one tenant; the same occurrence for another tenant is another run.
   The record gains ``origin``: kind ``trigger``, the plugin the channel was opened for, and the record.
   What the code does today: a plugin granted ``schedule`` can ask for a run of any engine, with any
   prompt, for any tenant, in any number; the record it names is a label the core does not read; the
@@ -422,7 +423,8 @@ class DaemonEnd:
     def _run_request(self, record_kind: str, record_id: str, revision: int, occurrence: str, tenant: str,
                      engine: str, prompt: str) -> dict:
         """Start one run from a record through ``run.start``'s path. The caller is this channel's plugin; the
-        start key is derived here, so the same record, revision and occurrence start at most one run."""
+        start key is derived here, so the same plugin, record, revision and occurrence
+        start at most one run for one tenant; the same occurrence for another tenant is another run."""
         origin = {"kind": RUN_ORIGIN_KIND, "plugin": self.plugin_id, "record_kind": record_kind,
                   "record_id": record_id, "revision": revision, "occurrence": occurrence}
         key = f"{RUN_ORIGIN_KIND}/{self.plugin_id}/{record_kind}/{record_id}/{revision}/{occurrence}"

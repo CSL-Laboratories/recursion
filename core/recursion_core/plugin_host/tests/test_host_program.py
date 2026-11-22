@@ -23,6 +23,12 @@ CORE = Path(__file__).resolve().parents[3]
 PLUGIN = "demo.plugin"
 SECRET_NAME = "CSL_HOST_TEST_SECRET"
 SECRET = "stand-in-secret-value"
+MARKER = "CSL_PLUGIN_HOST_CLEAN"
+CANARY_NAME = "CSL_HOST_TEST_CANARY"
+CANARY = "canary-value-7d3f19"
+# The named exit statuses of a host that refuses to start (sysexits EX_OSERR and EX_CONFIG).
+EXIT_RESTART_FAILED = 71
+EXIT_ENVIRONMENT_NOT_CLEAN = 78
 HELLO = {"type": "hello", "channel": hc.CHANNEL}
 BYE = {"type": "bye", "reason": "done"}
 SOURCE = (
@@ -69,7 +75,38 @@ def frames(output):
         output = output[end:]
 
 
+ENV_SOURCE = textwrap.dedent("""
+    import glob
+    import os
+
+    def registry():
+        def read(path):
+            with open(path, 'rb') as record:
+                return record.read().decode('latin-1')
+        return {'environ': dict(os.environ), 'cmdline': read('/proc/self/cmdline'),
+                'proc': read('/proc/self/environ'),
+                'tasks': [read(path) for path in glob.glob('/proc/self/task/*/environ')]}
+    """).encode()
+
+FDS_SOURCE = textwrap.dedent("""
+    import os
+
+    def registry():
+        found = {}
+        for entry in os.listdir('/proc/self/fd'):
+            try:
+                info = os.fstat(int(entry))
+            except OSError:
+                continue
+            found[entry] = [info.st_dev, info.st_ino]
+        with open('/proc/self/environ', 'rb') as record:
+            return {'fds': found, 'proc': record.read().decode('latin-1')}
+    """).encode()
+
+
 class HostProgramTests(unittest.TestCase):
+    counter = __import__("itertools").count()
+
     @classmethod
     def setUpClass(cls):
         scratch = tempfile.TemporaryDirectory()
@@ -85,12 +122,15 @@ class HostProgramTests(unittest.TestCase):
             encoding="ascii",
         )
 
-    def exchange(self, *messages, states=(False,), real=False, extra=None, secret=False):
+    def exchange(self, *messages, states=(False,), real=False, extra=None, secret=False, environ=None,
+                 standin=None, code=0):
         # Isolated Python runs venv .pth files but ignores PYTHONPATH. This shim passes a probe to
         # main and writes its returned status to a file in the host's working folder, because the
         # host points its own stderr at the null device. The host may start itself again once with a
         # clean environment: the venv's own interpreter is the command, so the shim loads both times.
-        env = {"PYTHONPATH": str(CORE)}
+        env = {"PYTHONPATH": str(CORE)} if environ is None else {}
+        env.update(environ or {})
+        starts = self.root / ("starts-%d" % next(self.counter))
         command = [str(self.python), "-X", "gil=0", "-I", "-m", "recursion_core.plugin_host"]
         if secret:
             env[SECRET_NAME] = SECRET
@@ -121,8 +161,21 @@ class HostProgramTests(unittest.TestCase):
             )
         else:
             bootstrap = "extra_identity = None\n"
+        # standin "dirty": the first restart hands the new image one more variable, so no restart ever
+        # comes out clean. standin "fail": the interpreter path the restart uses is a file that is not there.
+        # standin "norecord": the kernel's record of the environment cannot be read (os.environ stands in).
         startup_code = (
             f"import json, os, sys\nsys.path.insert(0, {str(CORE)!r})\n"
+            f"open({str(starts)!r}, 'a').write('x')\n"
+            + ("_real = os.execve\nos.execve = lambda p, a, e: _real(p, a, dict(e, CHECK_STANDIN_DIRTY='x'))\n"
+               if "dirty" in (standin or "") else "")
+            + ("sys.executable = '/nonexistent/python'\n" if standin == "fail" else "")
+            + ("import builtins\n_open = builtins.open\n"
+               "def _no_record(name, *a, **k):\n"
+               "    if name == '/proc/self/environ':\n        raise OSError('no record')\n"
+               "    return _open(name, *a, **k)\n"
+               "builtins.open = _no_record\n" if "norecord" in (standin or "") else "")
+            +
             "from recursion_core import plugin_host\n"
             "from recursion_core.plugin_security.tests.support import FakeGilProbe\n"
             + bootstrap
@@ -167,10 +220,13 @@ class HostProgramTests(unittest.TestCase):
             report = Path(cwd, "host-status.json")
             report = report.read_text() if report.exists() else None
         self.stderr = stderr
-        self.assertEqual(process.returncode, 0, stderr.decode(errors="replace"))
+        self.starts = len(starts.read_text()) if starts.exists() else 0
+        self.assertEqual(process.returncode, code, stderr.decode(errors="replace"))
         replies = list(frames(stdout))
         self.assertTrue(replies, stderr.decode(errors="replace"))
         self.assertEqual(replies.pop(0), HELLO)
+        if code != 0:
+            return replies, None, None, None
         self.assertIsNotNone(report, "the host wrote no status")
         status, reads, identity = json.loads(report)
         return replies, status, reads, identity
@@ -544,3 +600,108 @@ class HostProgramTests(unittest.TestCase):
             """).encode()
         replies, _, _, _ = self.exchange(HELLO, load(source), call(7, command={}), call(8, command={}), BYE)
         self.assertEqual(replies, [result(7, ["RuntimeError"]), result(8, ["RuntimeError"])])
+
+    def assert_no_canary(self, seen):
+        for place in ("environ", "cmdline", "proc"):
+            self.assertNotIn(CANARY, str(seen[place]), place)
+            self.assertNotIn(CANARY_NAME, str(seen[place]), place)
+        for task in seen["tasks"]:
+            self.assertNotIn(CANARY, task)
+            self.assertNotIn(CANARY_NAME, task)
+
+    @unittest.skipIf(os.name == "nt", "the restart is POSIX only")
+    def test_n1_a_canary_is_not_readable_however_the_starter_sets_the_marker(self):
+        # The host goes on only when the environment block holds nothing but the marker; it never
+        # takes the marker alone as the answer. Each form below gets one restart.
+        forms = {"marker absent": {}, "marker 1": {MARKER: "1"}, "marker 0": {MARKER: "0"},
+                 "marker yes": {MARKER: "yes"}, "marker 2": {MARKER: "2"}, "marker empty": {MARKER: ""}}
+        for label, marker in forms.items():
+            with self.subTest(form=label):
+                replies, _, _, _ = self.exchange(
+                    HELLO, load(ENV_SOURCE), call(7, "registry"), BYE,
+                    environ=dict(marker, **{CANARY_NAME: CANARY, "PATH": "/stand/in", "HOME": "/stand/in"}))
+                self.assertEqual(len(replies), 1, replies)
+                self.assertEqual(replies[0]["type"], "result", replies[0])
+                self.assert_no_canary(replies[0]["value"])
+                self.assertEqual(replies[0]["value"]["proc"], MARKER + "=1\0")
+                self.assertEqual(self.starts, 2)
+
+    @unittest.skipIf(os.name == "nt", "the restart is POSIX only")
+    def test_n1_an_environment_that_holds_only_the_marker_or_nothing_is_not_restarted(self):
+        for label, environ in (("marker only", {MARKER: "1"}), ("nothing", {})):
+            with self.subTest(form=label):
+                replies, _, _, _ = self.exchange(
+                    HELLO, load(ENV_SOURCE), call(7, "registry"), BYE, environ=environ)
+                self.assertEqual(self.starts, 1)
+                self.assertEqual(replies[0]["value"]["environ"], {})
+                self.assertIn(replies[0]["value"]["proc"], ("", MARKER + "=1\0"))
+
+    @unittest.skipIf(os.name == "nt", "the restart is POSIX only")
+    def test_n1_descriptors_after_the_restart_are_the_channels_and_nothing_more(self):
+        with tempfile.TemporaryFile() as extra:
+            replies, _, _, identity = self.exchange(
+                HELLO, load(FDS_SOURCE), call(7, "registry"), BYE, extra=extra.fileno(),
+                environ={MARKER: "1", CANARY_NAME: CANARY})
+        value = replies[0]["value"]
+        self.assertEqual(len(value["fds"]), 5)  # 0, 1, 2 and the channel's two descriptors
+        self.assertNotIn(identity, value["fds"].values())
+        self.assertNotIn(CANARY, value["proc"])
+        self.assertEqual(self.starts, 2)
+
+    @unittest.skipIf(os.name == "nt", "the restart is POSIX only")
+    def test_n1_an_environment_that_never_comes_out_clean_ends_in_one_typed_refusal(self):
+        ran = self.root / "plugin-ran"
+        source = ("open(%r, 'w').write('x')\ndef registry():\n    return {}\n" % str(ran)).encode()
+        replies, _, _, _ = self.exchange(
+            HELLO, load(source), call(7, "registry"), BYE,
+            environ={MARKER: "1", CANARY_NAME: CANARY}, standin="dirty", code=EXIT_ENVIRONMENT_NOT_CLEAN)
+        self.assertEqual(len(replies), 1)
+        self.assert_refusal(replies[0], None, "host_start_refused", "environment_not_clean")
+        self.assertEqual(self.starts, 2)  # one restart, then the refusal: bounded by the mechanism
+        self.assertFalse(ran.exists(), "plugin code ran in a host that was not clean")
+        self.assertEqual(self.stderr, b"")
+
+    @unittest.skipIf(os.name == "nt", "the restart is POSIX only")
+    def test_n2_a_restart_that_cannot_be_made_is_a_typed_refusal_and_a_named_exit(self):
+        ran = self.root / "plugin-ran-2"
+        source = ("open(%r, 'w').write('x')\ndef registry():\n    return {}\n" % str(ran)).encode()
+        replies, _, _, _ = self.exchange(
+            HELLO, load(source), call(7, "registry"), BYE,
+            environ={CANARY_NAME: CANARY}, standin="fail", code=EXIT_RESTART_FAILED)
+        self.assertEqual(len(replies), 1)
+        self.assert_refusal(replies[0], None, "host_start_refused", "restart_failed")
+        self.assertEqual(self.starts, 1)
+        self.assertFalse(ran.exists())
+        self.assertEqual(self.stderr, b"")  # no traceback on the starter's stream
+        from recursion_core import plugin_host
+        self.assertEqual((plugin_host.EXIT_RESTART_FAILED, plugin_host.EXIT_ENVIRONMENT_NOT_CLEAN),
+                         (EXIT_RESTART_FAILED, EXIT_ENVIRONMENT_NOT_CLEAN))
+        self.assertEqual(plugin_host.START_REFUSED, "host_start_refused")
+
+    @unittest.skipIf(os.name == "nt", "the restart is POSIX only")
+    def test_n1_a_marker_with_another_value_is_not_clean_even_alone(self):
+        for value in ("0", "yes", "2", ""):
+            with self.subTest(marker=value):
+                replies, _, _, _ = self.exchange(
+                    HELLO, load(ENV_SOURCE), call(7, "registry"), BYE, environ={MARKER: value})
+                self.assertEqual(self.starts, 2)
+                self.assertEqual(replies[0]["value"]["proc"], MARKER + "=1\0")
+
+    @unittest.skipIf(os.name == "nt", "the restart is POSIX only")
+    def test_n1_without_the_kernel_record_the_host_restarts_once_and_then_reads_os_environ(self):
+        plugin = b"import os\ndef registry():\n    return dict(os.environ)\n"
+        # The host cannot see what the block holds, so it always restarts once and then accepts only
+        # os.environ with the marker alone (the locale name the interpreter may add is set aside).
+        forms = ({MARKER: "1"}, {MARKER: "1", CANARY_NAME: CANARY}, {"LC_CTYPE": "stand-in-locale"})
+        for environ in forms:
+            with self.subTest(environ=environ):
+                replies, _, _, _ = self.exchange(
+                    HELLO, load(plugin), call(7, "registry"), BYE, environ=environ, standin="norecord")
+                self.assertEqual(self.starts, 2)
+                self.assertEqual(replies[0]["value"], {})
+        # An image that is not clean after its one restart is refused, record or no record.
+        replies, _, _, _ = self.exchange(
+            HELLO, load(plugin), call(7, "registry"), BYE, environ={CANARY_NAME: CANARY},
+            standin="dirty+norecord", code=EXIT_ENVIRONMENT_NOT_CLEAN)
+        self.assert_refusal(replies[0], None, "host_start_refused", "environment_not_clean")
+        self.assertEqual(self.starts, 2)

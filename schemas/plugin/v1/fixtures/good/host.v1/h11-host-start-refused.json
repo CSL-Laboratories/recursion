@@ -1,0 +1,6 @@
+{
+  "type": "refusal",
+  "id": null,
+  "code": "host_start_refused",
+  "detail": "environment_not_clean"
+}

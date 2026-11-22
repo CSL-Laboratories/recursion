@@ -94,7 +94,7 @@ INVENTORY: dict[str, tuple[str, str | None]] = {
 }
 REFUSAL_CODES = ("message_invalid", "message_unknown", "message_reserved", "message_wrong_side", "caller_forged",
                  "call_unknown", "call_reserved", "call_args_invalid", "call_not_offered", "call_failed",
-                 "host_gil_enabled", "load_too_large")
+                 "host_gil_enabled", "host_start_refused", "load_too_large")
 
 SIDES = ("daemon", "host")
 MAX_ID = 2 ** 53 - 1

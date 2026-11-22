@@ -506,6 +506,11 @@
       "shows": "The host refuses a call after it reads an enabled GIL."
     },
     {
+      "file": "good/host.v1/h11-host-start-refused.json",
+      "schema": "host.v1.json#/$defs/refusal",
+      "shows": "A host that cannot start with a clean environment says so once, with no call to answer, and ends."
+    },
+    {
       "file": "bad/host.v1/b11-an-unknown-gil-check.json",
       "schema": "host.v1.json#/$defs/hello",
       "rule": "The daemon hello's optional GIL policy is either on or off.",

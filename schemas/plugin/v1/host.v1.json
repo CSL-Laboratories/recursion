@@ -64,6 +64,7 @@
     "call_not_offered": "The plugin does not offer this call; nothing ran.",
     "call_failed": "Plugin compilation, activation, a function or result encoding failed; the detail names the exception's type only.",
     "host_gil_enabled": "An enforcing host read its own GIL as enabled after a load or call. It refuses that work and all later loads and calls on this channel.",
+    "host_start_refused": "The host could not start with a clean environment: the restart could not be made (detail restart_failed), or the environment was still not clean after the one restart (detail environment_not_clean). The host sends it once, after its hello, and ends with a named exit status; no plugin code ran.",
     "load_too_large": "The daemon's side: a package does not fit one load frame, so no load is sent; never a frame error."
   },
   "$defs": {

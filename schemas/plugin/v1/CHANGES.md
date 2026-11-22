@@ -9,7 +9,13 @@ it in `README.md` has a passing fixture in `fixtures/`.
 The daemon's first `hello` may carry `gil_check` (`on` or `off`). The host defaults to `on`
 and its own `hello` carries only the channel version. With checking on, a host that reads its GIL
 as enabled after a load or call refuses that work and every later load or call with
-`host_gil_enabled`. Existing hello messages still validate.
+`host_gil_enabled`. A host that cannot start with a clean environment sends one `host_start_refused`
+refusal (detail `restart_failed` or `environment_not_clean`) after its `hello` and ends. Existing hello
+messages still validate.
+
+Plugin code shares the host's process, so it can read and write the channel's two descriptors itself:
+every frame on the channel is the plugin's voice, and the daemon must check each request against that
+plugin's grant and take no result on trust.
 
 ## `host.v1.json` is `1.0-draft.2` (2026-11-18)
 

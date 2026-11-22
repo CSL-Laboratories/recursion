@@ -1,4 +1,16 @@
-"""Run one plugin on the host end of a daemon channel."""
+"""Run one plugin on the host end of a daemon channel.
+
+What this host is and is not. Plugin code runs in this very process. Every frame on the channel is the
+plugin's voice: the plugin can read the daemon's next message and write any frame this host may write,
+by the channel's two descriptors, and neither a guard in this module nor a wall around the process can
+keep it from those descriptors. The guards here (one plugin and one load per host, nothing before hello,
+core requests only from the plugin's own thread) keep an honest plugin in order; they are not a
+boundary. The boundary is on the daemon's side, which must check every request that arrives on the
+channel against that plugin's grant and must take no result on trust (the daemon's reader of this
+channel is a later draft and that rule is its first requirement), and the wall around the process,
+which limits what the process can do to the machine. With this draft alone, do not run a plugin you
+do not trust.
+"""
 
 from __future__ import annotations
 
@@ -22,23 +34,86 @@ from recursion_core.plugin_security.runtime import GilProbe
 DEFAULT_GIL_CHECK = "on"
 
 
-# The one variable the host keeps for itself on POSIX: it marks a process that has already started
-# itself again with a clean environment, so that start-up can never loop. Nothing else is kept.
+# The restart (POSIX). The host goes on only when the environment block it holds is clean, and it
+# never decides by this marker alone: a starter can set any variable, the marker too. The block is clean
+# when it holds nothing at all, or exactly this one variable with the value 1 and nothing else. Why this
+# one: it is the only variable the restart itself passes on, and it is what the restarted image holds.
+# On Linux the block is read from the kernel's own record (/proc/self/environ), to which the interpreter
+# adds nothing: its locale step (PEP 538) sets LC_CTYPE only inside the running process, never in that
+# record. Where that record cannot be read (no /proc), os.environ is all there is to read, and it can
+# hide a starter's own LC_CTYPE, which the locale step may overwrite. So there an image counts as clean
+# only when this host made it itself (it carries RESTARTED) and os.environ then holds the marker alone;
+# the one name the interpreter itself may add to os.environ is LC_CTYPE, and it is set aside only with
+# a value that locale step writes.
 RESTART_GUARD = "CSL_PLUGIN_HOST_CLEAN"
+_LOCALE_NAME, _LOCALE_VALUES = "LC_CTYPE", ("C.UTF-8", "C.utf8", "UTF-8")
+
+# How many restarts there are is decided by the mechanism, not by a figure: a restart appends this one
+# word to the command line, and an image that carries it never restarts again. A host whose block is
+# still not clean after its one restart ends in one typed refusal. A starter that writes the word itself
+# can only get that refusal, never a host that runs plugin code with the starter's variables.
+RESTARTED = "--restarted-once"
+
+# A host that cannot start clean says so on the channel (START_REFUSED, with the detail named below) and
+# ends with one of these statuses. They are named parts of this program's interface, not settings:
+# 71 (sysexits EX_OSERR) the restart could not be made; 78 (EX_CONFIG) the environment was not clean
+# after the restart. 0 is a clean end and 1 an internal failure of the host.
+START_REFUSED = "host_start_refused"
+EXIT_RESTART_FAILED = 71
+EXIT_ENVIRONMENT_NOT_CLEAN = 78
+
+
+def _environment_is_clean():
+    """True when the environment block holds nothing, or exactly RESTART_GUARD=1 (see above).
+
+    Without the kernel's record it is true only for an image this host made by its own restart."""
+    try:
+        with open("/proc/self/environ", "rb") as record:
+            held = [item for item in record.read().split(b"\0") if item]
+    except OSError:
+        held = None
+    if held is not None:
+        return held in ([], [RESTART_GUARD.encode() + b"=1"])
+    if sys.orig_argv[-1:] != [RESTARTED]:
+        return False
+    environment = dict(os.environ)
+    if environment.get(_LOCALE_NAME) in _LOCALE_VALUES:
+        del environment[_LOCALE_NAME]
+    return environment in ({}, {RESTART_GUARD: "1"})
+
+
+def _refuse_start(detail, status):
+    """Say on the starter's own standard output that this host cannot start clean, then end with status."""
+    try:
+        for message in ({"type": "hello", "channel": hc.CHANNEL},
+                        hc.refusal(None, hc.ChannelRefusal(START_REFUSED, detail))):
+            data = hc.encode(hc.check_message(message, receiver="daemon"))
+            while data:
+                data = data[os.write(1, data):]
+    except OSError:
+        pass  # the write side is not there; the exit status still says it
+    raise SystemExit(status)
 
 
 def _restart_with_clean_environment():
-    """Start this same program again, once, with an environment of only RESTART_GUARD.
+    """Go on only when the environment is clean; otherwise start this same program again, once.
 
     Clearing os.environ does not touch the block the kernel keeps for the process (it stays readable
-    in /proc/self/environ), so the host replaces its own process image before anything else runs. The
-    channel descriptors are unchanged by this: the new image reads the same standard descriptors.
-    Windows has no such call (it would end the starter's handle on this process), so it is not done
-    there and os.environ is cleared in main as before.
+    in /proc/self/environ), so the host replaces its own process image before anything else runs, with
+    an environment of RESTART_GUARD=1 alone. The channel descriptors are unchanged by this: the new
+    image reads the same standard descriptors. An image that already carries RESTARTED and is still
+    not clean is refused, and so is a restart that cannot be made. Windows has no such call (it would
+    end the starter's handle on this process), so it is not done there and os.environ is cleared in
+    main as before.
     """
-    if os.name == "nt" or os.environ.get(RESTART_GUARD) == "1" or not set(os.environ) - {RESTART_GUARD}:
+    if os.name == "nt" or _environment_is_clean():
         return
-    os.execve(sys.executable, sys.orig_argv, {RESTART_GUARD: "1"})
+    if sys.orig_argv[-1:] == [RESTARTED]:
+        _refuse_start("environment_not_clean", EXIT_ENVIRONMENT_NOT_CLEAN)
+    try:
+        os.execve(sys.executable, [*sys.orig_argv, RESTARTED], {RESTART_GUARD: "1"})
+    except (OSError, ValueError, TypeError):
+        _refuse_start("restart_failed", EXIT_RESTART_FAILED)
 
 
 def _close_inherited():
@@ -80,8 +155,9 @@ class _Channel:
         with os.fdopen(os.dup(0), "rb") as reader, os.fdopen(os.dup(1), "wb") as writer:
             for stream in (reader, writer):
                 os.set_inheritable(stream.fileno(), False)
-            # Plugin code gets the null device on all three standard descriptors: it can read
-            # nothing from the channel and its output reaches neither the channel nor the starter.
+            # Plugin code gets the null device on all three standard descriptors, so a stray read
+            # or print does not touch the channel or the starter. This is not a boundary: the channel's
+            # two descriptors stay open in this process and plugin code can name them by number.
             with open(os.devnull, "rb") as null_in, open(os.devnull, "wb") as null_out:
                 os.dup2(null_in.fileno(), 0)
                 os.dup2(null_out.fileno(), 1)

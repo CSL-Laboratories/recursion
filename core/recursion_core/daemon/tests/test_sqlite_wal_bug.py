@@ -25,9 +25,14 @@ from recursion_core.plugin_security import (
 
 POSIX_ONLY = "the stores and the settings file's owner check need a POSIX system"
 ANCHOR = "11" * 32  # a public value in the anchor's format; nothing signs with it or verifies against it
-REST = ("Recursion does not open its stores with it. Use a Python whose SQLite is 3.51.3 or later (or 3.50.7, or "
-        "3.44.6), and check it with: python3 -c \"import sqlite3; print(sqlite3.sqlite_version)\". To accept the "
-        "risk and go on, set stores.sqlite_wal_bug = \"accept_risk\" in $XDG_CONFIG_HOME/recursion/settings.toml.")
+REST = ("Recursion does not open its stores with it. Use a Python whose SQLite is 3.53.0 or later, or "
+        "3.51.3 or later on the 3.51 line, 3.50.7 or later on the 3.50 line, or 3.44.6 or later on the "
+        "3.44 line (the 3.52 line is refused). Check the daemon's interpreter with: "
+        "~/.local/lib/recursion/venv/bin/python3.14t -c \"import sqlite3; print(sqlite3.sqlite_version)\" "
+        "(a program that calls a store itself checks the interpreter it runs). To accept the risk and "
+        "go on, set stores.sqlite_wal_bug = \"accept_risk\" in $XDG_CONFIG_HOME/recursion/settings.toml "
+        "for the daemon's own stores, or pass "
+        "sqlite_wal_bug=\"accept_risk\" from a program that calls a store itself.")
 HAS_THE_BUG = "This Python uses SQLite {found}, which has a known bug that can damage a database in WAL mode. " + REST
 WITHDRAWN = ("This Python uses SQLite {found}, a withdrawn release that SQLite's pages do not say is repaired: it may "
              "have a known bug that can damage a database in WAL mode. " + REST)
@@ -182,6 +187,47 @@ class TheOneRule(unittest.TestCase):
 
     def test_the_table_carries_its_rows_and_is_the_one_place(self) -> None:
         self.assertEqual({(3, 44): 6, (3, 50): 7, (3, 51): 3, (3, 52): None}, dict(D.SQLITE_WAL_RESET_REPAIRED))
+
+    def test_the_refusal_message_names_the_repaired_lines_the_daemons_interpreter_and_both_ways_to_accept(self) -> None:
+        for version in ("3.45.1", "3.52.0"):
+            with self.subTest(version=version):
+                with stub(version):
+                    message = D.sqlite_wal_refusal()
+                self.assertIsNotNone(message)
+                self.assertNotIn("3.51.3 or later (", message)
+                self.assertIn("3.53.0 or later", message)
+                self.assertIn("3.51.3 or later on the 3.51 line", message)
+                self.assertIn("3.50.7 or later on the 3.50 line", message)
+                self.assertIn("3.44.6 or later on the 3.44 line", message)
+                self.assertIn("the 3.52 line is refused", message)
+                self.assertIn("python3.14t", message)
+                self.assertIn("~/.local/lib/recursion/venv/bin/python3.14t -c", message)
+                self.assertNotIn("python3 -c", message)
+                self.assertIn("a program that calls a store itself checks the interpreter it runs", message)
+                self.assertIn(
+                    'To accept the risk and go on, set stores.sqlite_wal_bug = "accept_risk" in '
+                    "$XDG_CONFIG_HOME/recursion/settings.toml for the daemon's own stores, or pass "
+                    'sqlite_wal_bug="accept_risk" from a program that calls a store itself.',
+                    message,
+                )
+
+    def test_breaker_contract_lists_sqlite_wal_bug_and_its_refusal_on_both_open_calls(self) -> None:
+        contract = Path(__file__).resolve().parents[2] / "plugin_security" / "BREAKER-CONTRACT.md"
+        rows = {}
+        for line in contract.read_text(encoding="utf-8").splitlines():
+            if not line.startswith("|"):
+                continue
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if len(cells) < 3:
+                continue
+            for name in ("create_breaker_store", "ConnectionBreaker"):
+                if cells[0].startswith(f"`{name}("):
+                    rows[name] = cells
+        self.assertEqual({"create_breaker_store", "ConnectionBreaker"}, set(rows))
+        for name, cells in rows.items():
+            with self.subTest(call=name):
+                self.assertIn("sqlite_wal_bug", cells[0])
+                self.assertIn("store_sqlite_wal_bug", cells[2])
 
 
 class _PersonsOwnFolder(unittest.TestCase):

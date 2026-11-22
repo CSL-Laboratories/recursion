@@ -15,14 +15,18 @@ and to everything it starts later, and neither can be lifted again from inside:
    - every call of ``DENIED_CALLS`` (sockets, program starts, tracing, keys, mounts, namespaces, bpf, ...);
    - every call of ``DENIED_METADATA_CALLS``: the mode, owner, times and extended attributes of a file,
      by path and by descriptor (Landlock does not mediate them at any ABI);
-   - ``kill``, ``tkill``, ``tgkill`` (``SELF_ONLY_SIGNAL_CALLS``) and ``rt_sigqueueinfo``,
-     ``rt_tgsigqueueinfo`` (``SELF_ONLY_QUEUE_CALLS``) unless the target is this process itself;
-   - the calls of ``SELF_OR_ZERO_CALLS`` (a limit, a scheduling class or a CPU set, the pages of
-     memory) unless the target pid is 0 or this process; ``setpriority`` and ``ioprio_set``
-     (``SELF_PROCESS_CALLS``) unless they name one process that is 0 or this process;
+   - every call of ``DENIED_SIGNAL_CALLS`` (``kill``, ``tkill``, ``tgkill``, ``rt_sigqueueinfo``,
+     ``rt_tgsigqueueinfo``), whatever its target: a walled process cannot signal any process, not even
+     itself. A pid is a number that outlives its process, so no call is ever let through because its pid
+     argument equals a number; timers, alarms and faults that the kernel delivers still arrive;
+   - every call of ``DENIED_IPC_CALLS``: the System V shared memory, semaphores and message queues, and
+     the POSIX message queues, which reach objects of other processes by key, id or name;
+   - the calls of ``CALLER_ONLY_CALLS`` (a limit, a scheduling class or a CPU set, the pages of memory)
+     unless the target pid is 0, the kernel's own form for the caller; ``setpriority`` and
+     ``ioprio_set`` (``CALLER_ONLY_PRIORITY_CALLS``) unless they name one process and that is 0;
    - ``fcntl`` with a command of ``DENIED_FCNTL_COMMANDS`` and ``ioctl`` with a command of
-     ``DENIED_IOCTL_COMMANDS`` (making another process the receiver of a descriptor's signals, and a
-     file's attribute flags);
+     ``DENIED_IOCTL_COMMANDS`` (making another process the receiver of a descriptor's signals, a lease
+     that makes another process's open of a file wait, and a file's attribute flags);
    - ``clone`` with any flag of ``NAMESPACE_CLONE_FLAGS``; ``clone3`` is answered ENOSYS, so that the C
      library starts threads and children through ``clone``, where the flags can be read;
    - where the kernel's Landlock ABI is below 3 (it cannot refuse a truncation there),
@@ -34,7 +38,17 @@ and to everything it starts later, and neither can be lifted again from inside:
 The deny list is the wall's own definition, not a setting: there is no row, flag or argument that
 shortens it. Landlock below ABI 4 does not limit TCP and below ABI 6 does not scope signals; the seccomp
 filter shuts both here (``socket``, ``connect`` and every way named above to signal, limit, slow or move
-another process are denied whatever the ABI).
+another process are denied whatever the ABI). Where the kernel's Landlock ABI is 6 or above, the ruleset
+also asks both of the kernel's scopes (``LANDLOCK_SCOPES``: abstract unix sockets and signals, each kept
+to the domain); the filter's refusals stay, as the floor for every older kernel, and the record names
+the scopes in force (``landlock_scopes``).
+
+What the record is: a check that the host's own code makes on itself, from inside the process, after
+``apply_wall`` and BEFORE any plugin code runs. It shows that the named attempts were refused by the
+kernel at that moment; it does not show which filter refused them, and code in the same process could
+write any record. It means something under two conditions only: it is made before the plugin is loaded,
+and its reader takes it only from frames the host sent before the load (everything later on the channel
+is the plugin's voice).
 
 Landlock limits only the calling thread, so ``apply_wall`` refuses ``wall_threads_running`` before any
 change when the process has more than one thread. The refusals before the first change:
@@ -60,10 +74,10 @@ import struct
 import sys
 import threading
 
-__all__ = ["DENIED_CALLS", "DENIED_FCNTL_COMMANDS", "DENIED_IOCTL_COMMANDS", "DENIED_METADATA_CALLS",
-           "NAMESPACE_CLONE_FLAGS", "OLD_LANDLOCK_DENIED_CALLS", "RECORD_CHECKS", "SELF_ONLY_QUEUE_CALLS",
-           "SELF_ONLY_SIGNAL_CALLS", "SELF_OR_ZERO_CALLS", "SELF_PROCESS_CALLS", "WallRefused", "apply_wall",
-           "probe_wall"]
+__all__ = ["CALLER_ONLY_CALLS", "CALLER_ONLY_PRIORITY_CALLS", "DENIED_CALLS", "DENIED_FCNTL_COMMANDS",
+           "DENIED_IOCTL_COMMANDS", "DENIED_IPC_CALLS", "DENIED_METADATA_CALLS", "DENIED_SIGNAL_CALLS",
+           "LANDLOCK_SCOPES", "NAMESPACE_CLONE_FLAGS", "OLD_LANDLOCK_DENIED_CALLS", "RECORD_CHECKS", "WallRefused",
+           "apply_wall", "probe_wall"]
 
 # The wall's own definition (not a setting, not a tunable): each call is answered EPERM.
 DENIED_CALLS = (
@@ -75,8 +89,14 @@ DENIED_CALLS = (
     "mount", "umount2", "unshare", "setns",
     "bpf", "perf_event_open", "userfaultfd", "io_uring_setup",
 )
-# Answered EPERM unless the first argument (the target pid, tid or thread group) is this process itself.
-SELF_ONLY_SIGNAL_CALLS = ("kill", "tkill", "tgkill")
+# Every way to send a signal, answered EPERM whatever the target: a pid number outlives its process, and
+# these calls have no form that means 'the caller' (kill with 0 or a negative number reaches a whole group).
+DENIED_SIGNAL_CALLS = ("kill", "tkill", "tgkill", "rt_sigqueueinfo", "rt_tgsigqueueinfo")
+# System V IPC (shared memory, semaphores, message queues) and POSIX message queues: answered EPERM.
+# Neither arch here has the multiplexed ``ipc`` call (i386's is refused by the arch check).
+DENIED_IPC_CALLS = ("shmget", "shmat", "shmdt", "shmctl", "semget", "semop", "semtimedop", "semctl",
+                    "msgget", "msgsnd", "msgrcv", "msgctl",
+                    "mq_open", "mq_unlink", "mq_timedsend", "mq_timedreceive", "mq_notify", "mq_getsetattr")
 # The mode, owner, times and extended attributes of a file: answered EPERM by path and by descriptor.
 # A call the arch does not have (aarch64 has no chmod, chown, lchown, utime, utimes, futimesat) is skipped.
 DENIED_METADATA_CALLS = (
@@ -87,16 +107,14 @@ DENIED_METADATA_CALLS = (
     "removexattr", "lremovexattr", "fremovexattr", "removexattrat",
     "file_setattr",
 )
-# A queued signal: answered EPERM unless the first argument (the target pid or thread group) is this process.
-SELF_ONLY_QUEUE_CALLS = ("rt_sigqueueinfo", "rt_tgsigqueueinfo")
 # A limit, a scheduling class or parameter, a CPU set, the pages of memory: answered EPERM unless the first
-# argument (the target pid) is 0 (the caller) or this process.
-SELF_OR_ZERO_CALLS = ("prlimit64", "sched_setaffinity", "sched_setscheduler", "sched_setparam", "sched_setattr",
-                      "migrate_pages", "move_pages")
-# A priority by (which, who): answered EPERM unless `which` names one process and `who` is 0 or this process.
-SELF_PROCESS_CALLS = ("setpriority", "ioprio_set")
-# fcntl commands that make another process the receiver of a descriptor's signals.
-DENIED_FCNTL_COMMANDS = {"F_SETOWN": 8, "F_SETOWN_EX": 15}
+# argument (the target pid) is 0, the kernel's form for the caller.
+CALLER_ONLY_CALLS = ("prlimit64", "sched_setaffinity", "sched_setscheduler", "sched_setparam", "sched_setattr",
+                     "migrate_pages", "move_pages")
+# A priority by (which, who): answered EPERM unless `which` names one process and `who` is 0 (the caller).
+CALLER_ONLY_PRIORITY_CALLS = ("setpriority", "ioprio_set")
+# fcntl commands: another process as the receiver of a descriptor's signals; a lease (F_GETLEASE stays).
+DENIED_FCNTL_COMMANDS = {"F_SETOWN": 8, "F_SETOWN_EX": 15, "F_SETLEASE": 1024}
 # ioctl commands: another process as the receiver of a socket's signals; a file's attribute flags.
 DENIED_IOCTL_COMMANDS = {"FIOSETOWN": 0x8901, "SIOCSPGRP": 0x8902, "FS_IOC_SETFLAGS": 0x40086602,
                          "FS_IOC_FSSETXATTR": 0x401C5820}
@@ -105,6 +123,8 @@ NAMESPACE_CLONE_FLAGS = 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000 | 0x10
 # Below Landlock ABI 3 the ruleset cannot refuse a truncation, so these are refused by the filter instead,
 # with an open or openat that asks O_TRUNC (openat2 carries its flags in a struct the filter cannot read).
 OLD_LANDLOCK_DENIED_CALLS = ("truncate", "openat2")
+# The kernel's Landlock scopes (struct landlock_ruleset_attr, field ``scoped``), asked from ABI 6 on.
+LANDLOCK_SCOPES = {"abstract_unix_socket": 1 << 0, "signal": 1 << 1}
 
 # The kernel's interface (x86_64: arch/x86/entry/syscalls/syscall_64.tbl; aarch64: asm-generic/unistd.h).
 _NR = {
@@ -113,16 +133,14 @@ _NR = {
         "execve": 59, "execveat": 322, "ptrace": 101, "process_vm_readv": 310, "process_vm_writev": 311,
         "pidfd_open": 434, "pidfd_getfd": 438, "pidfd_send_signal": 424, "keyctl": 250, "add_key": 248,
         "request_key": 249, "mount": 165, "umount2": 166, "unshare": 272, "setns": 308, "bpf": 321,
-        "perf_event_open": 298, "userfaultfd": 323, "io_uring_setup": 425,
-        "kill": 62, "tkill": 200, "tgkill": 234, "seccomp": 317,
+        "perf_event_open": 298, "userfaultfd": 323, "io_uring_setup": 425, "seccomp": 317,
     },
     "aarch64": {
         "socket": 198, "socketpair": 199, "connect": 203, "bind": 200, "listen": 201, "accept": 202, "accept4": 242,
         "execve": 221, "execveat": 281, "ptrace": 117, "process_vm_readv": 270, "process_vm_writev": 271,
         "pidfd_open": 434, "pidfd_getfd": 438, "pidfd_send_signal": 424, "keyctl": 219, "add_key": 217,
         "request_key": 218, "mount": 40, "umount2": 39, "unshare": 97, "setns": 268, "bpf": 280,
-        "perf_event_open": 241, "userfaultfd": 282, "io_uring_setup": 425,
-        "kill": 129, "tkill": 130, "tgkill": 131, "seccomp": 277,
+        "perf_event_open": 241, "userfaultfd": 282, "io_uring_setup": 425, "seccomp": 277,
     },
 }
 # The numbers of the calls the filter reads beyond the first list (kept apart, so that table stays that list).
@@ -132,7 +150,10 @@ _NR_MORE = {
         "fchownat": 260, "utime": 132, "utimes": 235, "futimesat": 261, "utimensat": 280, "setxattr": 188,
         "lsetxattr": 189, "fsetxattr": 190, "setxattrat": 463, "removexattr": 197, "lremovexattr": 198,
         "fremovexattr": 199, "removexattrat": 466, "file_setattr": 469,
-        "rt_sigqueueinfo": 129, "rt_tgsigqueueinfo": 297,
+        "kill": 62, "tkill": 200, "tgkill": 234, "rt_sigqueueinfo": 129, "rt_tgsigqueueinfo": 297,
+        "shmget": 29, "shmat": 30, "shmdt": 67, "shmctl": 31, "semget": 64, "semop": 65, "semtimedop": 220,
+        "semctl": 66, "msgget": 68, "msgsnd": 69, "msgrcv": 70, "msgctl": 71, "mq_open": 240, "mq_unlink": 241,
+        "mq_timedsend": 242, "mq_timedreceive": 243, "mq_notify": 244, "mq_getsetattr": 245,
         "prlimit64": 302, "sched_setaffinity": 203, "sched_setscheduler": 144, "sched_setparam": 142,
         "sched_setattr": 314, "migrate_pages": 256, "move_pages": 279, "setpriority": 141, "ioprio_set": 251,
         "fcntl": 72, "ioctl": 16, "clone": 56, "clone3": 435,
@@ -142,7 +163,10 @@ _NR_MORE = {
         "fchmod": 52, "fchmodat": 53, "fchmodat2": 452, "fchown": 55, "fchownat": 54, "utimensat": 88,
         "setxattr": 5, "lsetxattr": 6, "fsetxattr": 7, "setxattrat": 463, "removexattr": 14, "lremovexattr": 15,
         "fremovexattr": 16, "removexattrat": 466, "file_setattr": 469,
-        "rt_sigqueueinfo": 138, "rt_tgsigqueueinfo": 240,
+        "kill": 129, "tkill": 130, "tgkill": 131, "rt_sigqueueinfo": 138, "rt_tgsigqueueinfo": 240,
+        "shmget": 194, "shmat": 196, "shmdt": 197, "shmctl": 195, "semget": 190, "semop": 193, "semtimedop": 192,
+        "semctl": 191, "msgget": 186, "msgsnd": 189, "msgrcv": 188, "msgctl": 187, "mq_open": 180, "mq_unlink": 181,
+        "mq_timedsend": 182, "mq_timedreceive": 183, "mq_notify": 184, "mq_getsetattr": 185,
         "prlimit64": 261, "sched_setaffinity": 122, "sched_setscheduler": 119, "sched_setparam": 118,
         "sched_setattr": 274, "migrate_pages": 238, "move_pages": 239, "setpriority": 140, "ioprio_set": 30,
         "fcntl": 25, "ioctl": 29, "clone": 220, "clone3": 435,
@@ -151,9 +175,10 @@ _NR_MORE = {
 }
 _AUDIT_ARCH = {"x86_64": 0xC000003E, "aarch64": 0xC00000B7}
 _X32_SYSCALL_BIT = 0x40000000  # x86_64 only: the x32 calls share the arch value and are denied whole
-_PRIO_PROCESS, _IOPRIO_WHO_PROCESS = 0, 1   # the `which` that names one process, for SELF_PROCESS_CALLS
+_PRIO_PROCESS, _IOPRIO_WHO_PROCESS = 0, 1   # the `which` that names one process, for CALLER_ONLY_PRIORITY_CALLS
 _O_TRUNC = 0o1000                           # the same value on x86_64 and aarch64
 _TRUNCATE_ABI = 3                           # the Landlock ABI that first handles truncation
+_SCOPE_ABI = 6                              # the Landlock ABI that first scopes signals and abstract unix sockets
 
 _SYS_LANDLOCK_CREATE_RULESET, _SYS_LANDLOCK_ADD_RULE, _SYS_LANDLOCK_RESTRICT_SELF = 444, 445, 446
 _LANDLOCK_CREATE_RULESET_VERSION = 1
@@ -176,8 +201,9 @@ RECORD_CHECKS = ("reads_outside", "home_canary", "program_start", "new_socket", 
                  "signal_other_ways", "metadata_change", "kernel_surface")
 
 # How far apply_wall has gone in THIS process (a forked child inherits it): the steps that changed the
-# process, and the step that failed. A process with a failed step, or with any step, is never walled again.
-_STATE: dict = {"applied": [], "failed": None}
+# process, the step that failed, and the Landlock scopes in force. A process with a failed step, or with any
+# step, is never walled again.
+_STATE: dict = {"applied": [], "failed": None, "scopes": []}
 
 
 class WallRefused(Exception):
@@ -235,8 +261,9 @@ def _thread_count() -> int:
     return max(tasks, threading.active_count())
 
 
-def _filter(arch: str, own_pid: int, landlock_abi: int = _MIN_LANDLOCK_ABI) -> list[tuple[int, int, int, int]]:
-    """The one seccomp program, as (code, jt, jf, k) rows. ``landlock_abi`` below 3 adds the truncation rules."""
+def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI) -> list[tuple[int, int, int, int]]:
+    """The one seccomp program, as (code, jt, jf, k) rows. ``landlock_abi`` below 3 adds the truncation rules.
+    No pid number appears in it: the same program for every process."""
     numbers = dict(_NR[arch], **_NR_MORE[arch])
     rows: list[tuple] = [(_BPF_LD_W_ABS, 0, 0, _OFF_ARCH), (_BPF_JEQ_K, 1, 0, _AUDIT_ARCH[arch]),
                          (_BPF_RET_K, 0, 0, _RET_EPERM), (_BPF_LD_W_ABS, 0, 0, _OFF_NR)]
@@ -244,12 +271,12 @@ def _filter(arch: str, own_pid: int, landlock_abi: int = _MIN_LANDLOCK_ABI) -> l
         rows.append((_BPF_JGE_K, "deny", 0, _X32_SYSCALL_BIT))
     rows += [(_BPF_JEQ_K, "deny", 0, numbers[name]) for name in DENIED_CALLS]
     rows += [(_BPF_JEQ_K, "deny", 0, numbers[name]) for name in DENIED_METADATA_CALLS if name in numbers]
+    rows += [(_BPF_JEQ_K, "deny", 0, numbers[name]) for name in DENIED_SIGNAL_CALLS + DENIED_IPC_CALLS]
     if landlock_abi < _TRUNCATE_ABI:
         rows += [(_BPF_JEQ_K, "deny", 0, numbers[name]) for name in OLD_LANDLOCK_DENIED_CALLS]
         rows += [(_BPF_JEQ_K, label, 0, numbers[name])
                  for name, label in (("open", "trunc1"), ("openat", "trunc2")) if name in numbers]
-    rows += [(_BPF_JEQ_K, "signal", 0, numbers[name]) for name in SELF_ONLY_SIGNAL_CALLS + SELF_ONLY_QUEUE_CALLS]
-    rows += [(_BPF_JEQ_K, "self_or_zero", 0, numbers[name]) for name in SELF_OR_ZERO_CALLS]
+    rows += [(_BPF_JEQ_K, "caller", 0, numbers[name]) for name in CALLER_ONLY_CALLS]
     rows += [(_BPF_JEQ_K, "prio", 0, numbers["setpriority"]), (_BPF_JEQ_K, "ioprio", 0, numbers["ioprio_set"]),
              (_BPF_JEQ_K, "fcntl", 0, numbers["fcntl"]), (_BPF_JEQ_K, "ioctl", 0, numbers["ioctl"]),
              (_BPF_JEQ_K, "clone", 0, numbers["clone"]), (_BPF_JEQ_K, "enosys", 0, numbers["clone3"])]
@@ -261,12 +288,10 @@ def _filter(arch: str, own_pid: int, landlock_abi: int = _MIN_LANDLOCK_ABI) -> l
         rows.extend(body)
 
     # pid_t, int commands and flags are 32 bits and the kernel reads only the low word, so only it is compared.
-    block("signal", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[0]), (_BPF_JEQ_K, 0, "deny", own_pid), (_BPF_RET_K, 0, 0, _RET_ALLOW))
-    block("self_or_zero", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[0]), (_BPF_JEQ_K, "allow", 0, 0),
-          (_BPF_JEQ_K, "allow", "deny", own_pid))
+    block("caller", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[0]), (_BPF_JEQ_K, "allow", "deny", 0))
     block("prio", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[0]), (_BPF_JEQ_K, "who", "deny", _PRIO_PROCESS))
     block("ioprio", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[0]), (_BPF_JEQ_K, "who", "deny", _IOPRIO_WHO_PROCESS))
-    block("who", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]), (_BPF_JEQ_K, "allow", 0, 0), (_BPF_JEQ_K, "allow", "deny", own_pid))
+    block("who", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]), (_BPF_JEQ_K, "allow", "deny", 0))
     block("fcntl", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]),
           *[(_BPF_JEQ_K, "deny", 0, value) for value in DENIED_FCNTL_COMMANDS.values()], (_BPF_RET_K, 0, 0, _RET_ALLOW))
     block("ioctl", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]),
@@ -325,7 +350,7 @@ def _no_new_privs(libc) -> None:
 
 
 def _load_seccomp_filter(libc, arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI) -> None:
-    rows = _filter(arch, os.getpid(), landlock_abi)
+    rows = _filter(arch, landlock_abi)
     program = (_SockFilter * len(rows))(*(_SockFilter(*row) for row in rows))
     fprog = _SockFprog(len(rows), ctypes.addressof(program))
     _step("no_new_privs_before_filter", lambda: _no_new_privs(libc))
@@ -357,14 +382,24 @@ def _open_paths(read_only_paths) -> list[tuple[int, int]]:
     return opened
 
 
-def _apply_landlock(libc, abi: int, opened: list[tuple[int, int]]) -> None:
+def _ruleset_attr(abi: int) -> tuple[bytes, list[str]]:
+    """struct landlock_ruleset_attr for this ABI, and the names of the scopes it asks. Below ABI 6 it is the
+    first field only (handled_access_fs); from ABI 6 on it holds the three fields, with no network right
+    handled (the filter refuses sockets) and both scopes asked."""
     handled = _FS_ABI1
     for since, right in _FS_LATER.items():
         if abi >= since:
             handled |= right
-    attr = ctypes.c_uint64(handled)
+    if abi < _SCOPE_ABI:
+        return struct.pack("<Q", handled), []
+    return struct.pack("<QQQ", handled, 0, sum(LANDLOCK_SCOPES.values())), sorted(LANDLOCK_SCOPES)
+
+
+def _apply_landlock(libc, abi: int, opened: list[tuple[int, int]]) -> None:
+    data, scopes = _ruleset_attr(abi)
+    attr = ctypes.create_string_buffer(data, len(data))
     ruleset = _step("landlock_create_ruleset", lambda: _kernel("landlock_create_ruleset", *_call(
-        libc, _SYS_LANDLOCK_CREATE_RULESET, ctypes.addressof(attr), ctypes.sizeof(attr), 0)), changes=False)
+        libc, _SYS_LANDLOCK_CREATE_RULESET, ctypes.addressof(attr), len(data), 0)), changes=False)
     try:
         for fd, allowed in opened:
             rule = ctypes.create_string_buffer(struct.pack("<Qi", allowed, fd), 12)  # struct landlock_path_beneath_attr
@@ -374,6 +409,7 @@ def _apply_landlock(libc, abi: int, opened: list[tuple[int, int]]) -> None:
         _step("no_new_privs", lambda: _no_new_privs(libc))
         _step("landlock_restrict_self", lambda: _kernel("landlock_restrict_self", *_call(
             libc, _SYS_LANDLOCK_RESTRICT_SELF, ruleset, 0)))
+        _STATE["scopes"] = scopes
     finally:
         os.close(ruleset)
 
@@ -514,16 +550,30 @@ def _change_mode(path: str) -> None:
     os.chmod(path, mode)
 
 
+def _lease_on_a_pipe(libc) -> None:
+    read_end, write_end = os.pipe()
+    try:
+        _sys(libc, "fcntl", read_end, DENIED_FCNTL_COMMANDS["F_SETLEASE"], 2)  # F_UNLCK on a pipe: EINVAL if allowed
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+
+
 def _kernel_surface() -> None:
     """Calls only this wall refuses, each harmless where it is allowed: io_uring_setup with no entries,
-    unshare of nothing, a keyctl operation that does not exist, (x86_64) getpid by its x32 number, and
-    clone asking a new user namespace with flags the kernel itself rejects; then clone3, which this wall
-    answers ENOSYS (the kernel's own answer to these arguments is EINVAL)."""
+    unshare of nothing, a keyctl operation that does not exist, (x86_64) getpid by its x32 number, clone
+    asking a new user namespace with flags the kernel itself rejects, msgctl IPC_STAT of the id -1,
+    mq_getsetattr of the descriptor -1, signal 0 to this process itself by its own pid, and a lease on a
+    pipe; then clone3, which this wall answers ENOSYS (the kernel's own answer to these arguments is EINVAL)."""
     libc, arch = _libc(), _arch()
     attempts = [lambda: _sys(libc, "io_uring_setup", 0, 0),
                 lambda: _sys(libc, "unshare", 0),
                 lambda: _sys(libc, "keyctl", 0x7FFFFFFF, 0, 0, 0, 0),
-                lambda: _sys(libc, "clone", 0x10000000 | 0x00000200, 0, 0, 0, 0)]  # CLONE_NEWUSER|CLONE_FS: EINVAL
+                lambda: _sys(libc, "clone", 0x10000000 | 0x00000200, 0, 0, 0, 0),  # CLONE_NEWUSER|CLONE_FS: EINVAL
+                lambda: _sys(libc, "msgctl", -1, 2, 0),                             # IPC_STAT of no queue: EINVAL
+                lambda: _sys(libc, "mq_getsetattr", -1, 0, 0),                      # no descriptor: EBADF
+                lambda: _sys(libc, "kill", os.getpid(), 0),                         # signal 0 to itself: ok
+                lambda: _lease_on_a_pipe(libc)]
     if arch == "x86_64":
         attempts.append(lambda: _kernel("x32 getpid", *_call(libc, _X32_SYSCALL_BIT | 39)))
     try:
@@ -537,12 +587,15 @@ def _kernel_surface() -> None:
 
 
 def probe_wall(canary_path, daemon_pid) -> dict:
-    """The record ``wall.v1``, proved from inside this process.
+    """The record ``wall.v1``: a check the host's own code makes on itself, from inside this process.
 
     Eight checks are tried; each field is True only when the kernel refused it. ``proven`` is True only when
     all eight are refused, on a supported arch with Landlock ABI 1 or above, and no step of ``apply_wall``
-    failed in this process. Refuses ``wall_system_unsupported`` where the two system calls are absent,
-    without trying.
+    failed in this process. ``landlock_scopes`` names the Landlock scopes ``apply_wall`` put in force (none
+    below ABI 6). The record is a self-check, not a proof against a hostile process: it means something only
+    when it is made after ``apply_wall`` and before any plugin code is loaded, and when its reader takes it
+    only from frames sent before the load. Refuses ``wall_system_unsupported`` where the two system calls
+    are absent, without trying.
     """
     libc = _libc()
     canary = os.fspath(canary_path)
@@ -556,6 +609,7 @@ def probe_wall(canary_path, daemon_pid) -> dict:
         "metadata_change": _refused(lambda: _change_mode(canary)),
         "kernel_surface": _refused(_kernel_surface),
         "landlock_abi": _landlock_abi(libc),
+        "landlock_scopes": list(_STATE["scopes"]),
         "arch": platform.machine() or "unknown",
     }
     record["proven"] = (all(record[name] for name in RECORD_CHECKS) and record["landlock_abi"] >= _MIN_LANDLOCK_ABI

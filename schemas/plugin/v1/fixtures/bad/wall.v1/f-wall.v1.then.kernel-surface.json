@@ -8,6 +8,7 @@
   "metadata_change": true,
   "kernel_surface": false,
   "landlock_abi": 3,
+  "landlock_scopes": [],
   "arch": "x86_64",
   "proven": true
 }

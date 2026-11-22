@@ -1281,6 +1281,38 @@
         "keyword": "enum",
         "at": "/arch"
       }
+    },
+    {
+      "file": "good/wall.v1/h07-a-proven-wall-with-both-scopes.json",
+      "schema": "wall.v1.json",
+      "shows": "A host on a kernel with Landlock ABI 6: all eight checks refused and both scopes in force."
+    },
+    {
+      "file": "bad/wall.v1/b05-a-scope-named-twice.json",
+      "schema": "wall.v1.json",
+      "rule": "Each scope is named once.",
+      "expect": {
+        "keyword": "uniqueItems",
+        "at": "/landlock_scopes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.landlock-scopes.json",
+      "schema": "wall.v1.json",
+      "rule": "'landlock_scopes' is required.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/v-wall.v1.landlock-scopes.json",
+      "schema": "wall.v1.json",
+      "rule": "A scope is one the kernel names: abstract_unix_socket or signal.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/landlock_scopes/0"
+      }
     }
   ]
 }

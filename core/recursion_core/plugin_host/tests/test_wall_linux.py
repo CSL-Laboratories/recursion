@@ -227,7 +227,7 @@ class WallInAChildTests(unittest.TestCase):
         self.assertEqual(result["more_denied"], {"socketpair": True, "pidfd_open": True, "unshare": True,
                                                  "write_in_home": True})
         self.assertEqual(result["start_errno"], "EPERM", "starting a program is refused by the filter itself")
-        self.assertEqual(result["self_signal"], "applied", "a signal to its own pid stays allowed")
+        self.assertEqual(result["self_signal"], "PermissionError", "no signal passes, not even to its own pid")
         fresh, fraction, number, value = result["imported"]
         self.assertTrue(fresh, "at least one stdlib module was imported for the first time inside the wall")
         self.assertEqual((fraction, number, value), ("4/3", "3.0", 1))
@@ -277,22 +277,22 @@ class WallDefinitionTests(unittest.TestCase):
             "ptrace", "process_vm_readv", "process_vm_writev", "pidfd_open", "pidfd_getfd", "pidfd_send_signal",
             "keyctl", "add_key", "request_key", "mount", "umount2", "unshare", "setns", "bpf", "perf_event_open",
             "userfaultfd", "io_uring_setup"))
-        self.assertEqual(wall_linux.SELF_ONLY_SIGNAL_CALLS, ("kill", "tkill", "tgkill"))
+        self.assertEqual(wall_linux.DENIED_SIGNAL_CALLS, ("kill", "tkill", "tgkill", "rt_sigqueueinfo", "rt_tgsigqueueinfo"))
         for arch, numbers in wall_linux._NR.items():
             with self.subTest(arch=arch):
-                names = wall_linux.DENIED_CALLS + wall_linux.SELF_ONLY_SIGNAL_CALLS + ("seccomp",)
+                names = wall_linux.DENIED_CALLS + ("seccomp",)
                 self.assertEqual(sorted(numbers), sorted(names))
                 self.assertEqual(len(set(numbers.values())), len(numbers))
 
     def test_every_listed_call_is_answered_eperm_by_the_program(self):
         for arch in wall_linux._NR:
-            rows = wall_linux._filter(arch, 4242)
+            rows = wall_linux._filter(arch, 3)
             with self.subTest(arch=arch):
                 self.assertEqual([_interpret(rows, arch, wall_linux._NR[arch][name], 0) for name in wall_linux.DENIED_CALLS],
                                  ["eperm"] * len(wall_linux.DENIED_CALLS))
-                for name in wall_linux.SELF_ONLY_SIGNAL_CALLS:
-                    self.assertEqual(_interpret(rows, arch, wall_linux._NR[arch][name], 4242), "allow")
-                    self.assertEqual(_interpret(rows, arch, wall_linux._NR[arch][name], 4243), "eperm")
+                for name in wall_linux.DENIED_SIGNAL_CALLS:
+                    for target in (4242, 4243, 0, -1):
+                        self.assertEqual(_interpret(rows, arch, wall_linux._NR_MORE[arch][name], target), "eperm")
                 self.assertEqual(_interpret(rows, arch, 0, 0), "allow")
                 self.assertEqual(_interpret(rows, arch, wall_linux._NR[arch]["socket"], 0, audit_arch=0x40000003), "eperm")
                 if arch == "x86_64":  # the x32 calls share the arch value: denied whole
@@ -300,7 +300,7 @@ class WallDefinitionTests(unittest.TestCase):
 
     def test_the_record_has_exactly_the_fields_of_its_schema(self):
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
-        fields = set(wall_linux.RECORD_CHECKS) | {"landlock_abi", "arch", "proven"}
+        fields = set(wall_linux.RECORD_CHECKS) | {"landlock_abi", "landlock_scopes", "arch", "proven"}
         self.assertEqual(set(schema["required"]), fields)
         self.assertEqual(set(schema["properties"]), fields)
 

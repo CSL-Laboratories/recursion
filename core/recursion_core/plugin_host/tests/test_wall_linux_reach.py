@@ -1,5 +1,6 @@
 """What a walled process can still reach: other processes, the metadata of files, an older kernel, new
-namespaces, a half-applied wall, and whether the proof proves this wall.
+namespaces, a half-applied wall, whether the proof proves this wall, the kernel's old IPC objects of other
+processes, a process that later takes the host's old pid number, a lease, and the Landlock scopes.
 
 Every walled case runs in a CHILD interpreter (``-I``, the runner's own ``-X`` options) with its own
 temporary folder, stand-in files and stand-in processes (a 'daemon' and three victims) that the test starts
@@ -10,11 +11,13 @@ process with stand-ins and wall nothing.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import platform
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -40,7 +43,11 @@ NUM = {
                "removexattrat": 466, "file_setattr": 469, "truncate": 76, "openat2": 437, "clone": 56,
                "clone3": 435, "openat": 257, "open": 2, "fcntl": 72, "ioctl": 16, "prlimit64": 302,
                "setpriority": 141, "sched_setaffinity": 203, "sched_setscheduler": 144, "sched_setparam": 142,
-               "read": 0, "getpid": 39},
+               "read": 0, "getpid": 39, "kill": 62, "tkill": 200, "tgkill": 234,
+               "shmget": 29, "shmat": 30, "shmdt": 67, "shmctl": 31, "semget": 64, "semop": 65, "semtimedop": 220,
+               "semctl": 66, "msgget": 68, "msgsnd": 69, "msgrcv": 70, "msgctl": 71, "mq_open": 240,
+               "mq_unlink": 241, "mq_timedsend": 242, "mq_timedreceive": 243, "mq_notify": 244,
+               "mq_getsetattr": 245},
     "aarch64": {"rt_sigqueueinfo": 138, "rt_tgsigqueueinfo": 240, "sched_setattr": 274, "ioprio_set": 30,
                 "migrate_pages": 238, "move_pages": 239, "fchmod": 52, "fchown": 55, "fchownat": 54,
                 "fchmodat": 53, "fchmodat2": 452, "utimensat": 88, "setxattr": 5, "lsetxattr": 6, "fsetxattr": 7,
@@ -48,13 +55,17 @@ NUM = {
                 "removexattrat": 466, "file_setattr": 469, "truncate": 45, "openat2": 437, "clone": 220,
                 "clone3": 435, "openat": 56, "fcntl": 25, "ioctl": 29, "prlimit64": 261, "setpriority": 140,
                 "sched_setaffinity": 122, "sched_setscheduler": 119, "sched_setparam": 118, "read": 63,
-                "getpid": 172},
+                "getpid": 172, "kill": 129, "tkill": 130, "tgkill": 131,
+                "shmget": 194, "shmat": 196, "shmdt": 197, "shmctl": 195, "semget": 190, "semop": 193,
+                "semtimedop": 192, "semctl": 191, "msgget": 186, "msgsnd": 189, "msgrcv": 188, "msgctl": 187,
+                "mq_open": 180, "mq_unlink": 181, "mq_timedsend": 182, "mq_timedreceive": 183, "mq_notify": 184,
+                "mq_getsetattr": 185},
 }
 CLONE_NEW = {"NEWNS": 0x00020000, "NEWCGROUP": 0x02000000, "NEWUTS": 0x04000000, "NEWIPC": 0x08000000,
              "NEWUSER": 0x10000000, "NEWPID": 0x20000000, "NEWNET": 0x40000000}
 
 CHILD = r'''
-import ctypes, errno, fcntl, json, mmap, os, platform, resource, signal, socket, struct, sys, threading, _thread
+import ctypes, errno, fcntl, json, mmap, os, platform, resource, signal, socket, struct, sys, threading, time, _thread
 spec = json.loads(sys.argv[1])
 sys.path.insert(0, spec["core"])
 from recursion_core.plugin_host import wall_linux as w
@@ -170,15 +181,40 @@ if mode == "reach":
     out["a1"] = a1
     own = {}
     own["prlimit_self_zero"] = res("prlimit64", 0, 0, 0, pold)
-    own["prlimit_self_pid"] = res("prlimit64", me, 0, 0, pold)
     own["getrlimit"] = t(lambda: resource.getrlimit(resource.RLIMIT_NOFILE))
     own["setpriority_self"] = t(lambda: os.setpriority(os.PRIO_PROCESS, 0, os.getpriority(os.PRIO_PROCESS, 0)))
     own["sched_setaffinity_self"] = t(lambda: os.sched_setaffinity(0, os.sched_getaffinity(0)))
     own["sched_setscheduler_self"] = t(lambda: os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0)))
-    own["rt_sigqueueinfo_self_0"] = res("rt_sigqueueinfo", me, 0, pzero)
     own["move_pages_self"] = res("move_pages", 0, 0, 0, 0, 0, 0)
-    own["kill_self_0"] = t(lambda: os.kill(me, 0))
     out["own"] = own
+    signal.signal(signal.SIGUSR1, lambda *_a: None)
+    by_pid = {}  # the process at itself by its own pid number, and every way to signal itself
+    by_pid["prlimit_own_pid"] = res("prlimit64", me, 0, 0, pold)
+    by_pid["setpriority_own_pid"] = t(lambda: os.setpriority(os.PRIO_PROCESS, me, os.getpriority(os.PRIO_PROCESS, 0)))
+    by_pid["sched_setaffinity_own_pid"] = t(lambda: os.sched_setaffinity(me, os.sched_getaffinity(0)))
+    by_pid["sched_setscheduler_own_pid"] = t(lambda: os.sched_setscheduler(me, os.SCHED_OTHER, os.sched_param(0)))
+    by_pid["ioprio_set_own_pid"] = res("ioprio_set", 1, me, (2 << 13) | 4)
+    by_pid["move_pages_own_pid"] = res("move_pages", me, 0, 0, 0, 0, 0)
+    by_pid["kill_own_pid_0"] = t(lambda: os.kill(me, 0))
+    by_pid["kill_own_group_0"] = t(lambda: os.kill(0, 0))
+    by_pid["tkill_own_0"] = res("tkill", me, 0)
+    by_pid["tgkill_own_0"] = res("tgkill", me, me, 0)
+    by_pid["rt_sigqueueinfo_own_0"] = res("rt_sigqueueinfo", me, 0, pzero)
+    by_pid["rt_tgsigqueueinfo_own_0"] = res("rt_tgsigqueueinfo", me, me, 0, pzero)
+    by_pid["raise_signal"] = t(lambda: signal.raise_signal(signal.SIGUSR1))
+    by_pid["pthread_kill_own_0"] = t(lambda: signal.pthread_kill(threading.get_ident(), 0))
+    out["by_pid"] = by_pid
+    arrives, rang = {}, []
+    signal.signal(signal.SIGALRM, lambda *_a: rang.append(1))
+    signal.setitimer(signal.ITIMER_REAL, 0.05)
+    until = time.monotonic() + 5
+    while not rang and time.monotonic() < until:
+        time.sleep(0.01)
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    arrives["itimer_real_handler"] = bool(rang)
+    arrives["alarm_ends"] = forked(lambda: (signal.alarm(1), time.sleep(5), 0)[-1])
+    arrives["abort"] = forked(lambda: (os.abort(), 97)[-1])
+    out["arrives"] = arrives
     a2, P, fd = {}, F["meta"], spec["metafd"]
     p_, pp = at_symbols(P)
     uid, gid = os.getuid(), os.getgid()
@@ -331,8 +367,9 @@ elif mode == "weak":
     for fd_, _ in opened:
         os.close(fd_)
     w.DENIED_CALLS = ("socket", "socketpair", "execve", "execveat")
-    for name, empty in (("DENIED_METADATA_CALLS", ()), ("SELF_ONLY_QUEUE_CALLS", ()), ("SELF_OR_ZERO_CALLS", ()),
-                        ("DENIED_FCNTL_COMMANDS", {}), ("DENIED_IOCTL_COMMANDS", {})):
+    for name, empty in (("DENIED_METADATA_CALLS", ()), ("CALLER_ONLY_CALLS", ()), ("DENIED_IPC_CALLS", ()),
+                        ("DENIED_SIGNAL_CALLS", ("kill",)), ("DENIED_FCNTL_COMMANDS", {}),
+                        ("DENIED_IOCTL_COMMANDS", {})):
         if hasattr(w, name):
             setattr(w, name, empty)
     w._load_seccomp_filter(lc, arch)
@@ -353,6 +390,62 @@ elif mode == "threads_native":
 
 elif mode == "probe_other_user":
     out["record"] = w.probe_wall(spec["canary"], 1)
+
+elif mode == "ipc":
+    out["apply"] = apply(paths) if spec["wall"] else {"code": "unwalled", "step": None}
+    I, ipc = spec["ipc"], {}
+    def shm_write():
+        r, e = sc("shmat", I["shm_a"], 0, 0)
+        if r == -1:
+            return errno.errorcode.get(e, str(e))
+        ctypes.memmove(r, b"WALLED!\0", 8)
+        sc("shmdt", r)
+        return "ok"
+    ipc["shmat_write"] = shm_write()
+    s0, ps0 = buf(struct.pack("<HhH", 0, -1, 0o4000))   # struct sembuf: take one, IPC_NOWAIT
+    s1, ps1 = buf(struct.pack("<HhH", 1, -1, 0o4000))
+    ipc["semop_take"] = res("semop", I["sem_a"], ps0, 1)
+    ipc["semtimedop_take"] = res("semtimedop", I["sem_a"], ps1, 1, 0)
+    m, pm = buf(struct.pack("<q", 1) + b"x")
+    ipc["msgsnd_fill"] = res("msgsnd", I["msq_a"], pm, 1, 0o4000)
+    rb, prb = buf(bytes(64))
+    ipc["msgrcv_take"] = res("msgrcv", I["msq_c"], prb, 16, 0, 0o4000)
+    ipc["shmctl_rmid"] = res("shmctl", I["shm_b"], 0, 0)
+    ipc["semctl_rmid"] = res("semctl", I["sem_b"], 0, 0, 0)
+    ipc["msgctl_rmid"] = res("msgctl", I["msq_b"], 0, 0)
+    for kind, make, remove in (("shmget", ("shmget", 0, 4096, 0o600), lambda i: sc("shmctl", i, 0, 0)),
+                               ("semget", ("semget", 0, 1, 0o600), lambda i: sc("semctl", i, 0, 0, 0)),
+                               ("msgget", ("msgget", 0, 0o600), lambda i: sc("msgctl", i, 0, 0))):
+        r, e = sc(*make)
+        if r >= 0:
+            remove(r)   # made by the unwalled control only, and removed at once
+        ipc[kind + "_private"] = "ok" if r >= 0 else errno.errorcode.get(e, str(e))
+    na, pna = buf(I["mq_a"].encode() + b"\0")
+    nc, pnc = buf(I["mq_c"].encode() + b"\0")
+    ipc["mq_unlink"] = res("mq_unlink", pna)
+    r, e = sc("mq_open", pnc, os.O_RDWR, 0, 0)
+    if r >= 0:
+        os.close(r)
+    ipc["mq_open"] = "ok" if r >= 0 else errno.errorcode.get(e, str(e))
+    fd = I["mq_fd"]
+    x, px = buf(b"x")
+    rq, prq = buf(bytes(64))
+    at, pat = buf(bytes(64))
+    ipc["mq_timedsend"] = res("mq_timedsend", fd, px, 1, 0, 0)
+    ipc["mq_timedreceive"] = res("mq_timedreceive", fd, prq, 16, 0, 0)
+    ipc["mq_getsetattr"] = res("mq_getsetattr", fd, 0, pat)
+    ipc["mq_notify"] = res("mq_notify", fd, 0)
+    out["ipc"] = ipc
+
+elif mode == "lease":
+    signal.signal(signal.SIGIO, signal.SIG_IGN)   # a lease break is signalled to its holder
+    out["apply"] = apply(paths) if spec["wall"] else {"code": "unwalled", "step": None}
+    held = os.open(os.path.join(spec["ro"], "inside"), os.O_RDONLY)
+    out["setlease"] = t(lambda: fcntl.fcntl(held, 1024, fcntl.F_RDLCK))   # F_SETLEASE
+    out["getlease"] = t(lambda: fcntl.fcntl(held, 1025))                  # F_GETLEASE
+    chan.sendall(b"h")
+    chan.recv(1)
+    os.close(held)
 
 print(json.dumps(out), flush=True)
 '''
@@ -439,6 +532,221 @@ def run_reach_child(mode: str, **extra) -> dict:
     return result
 
 
+def _sys(name, *args):
+    """One call by number in the test process (stand-ins it makes and removes); (result, errno)."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    ctypes.set_errno(0)
+    result = libc.syscall(ctypes.c_long(NUM[platform.machine()][name]), *(ctypes.c_long(a) for a in args))
+    return result, ctypes.get_errno()
+
+
+def run_ipc_child(wall: bool) -> dict:
+    """One child that tries the kernel's old IPC on stand-ins this test makes and removes: System V shared
+    memory, semaphores and message queues, and POSIX message queues. Returns its JSON line plus what the
+    parent saw afterwards ('_seen')."""
+    import ctypes
+    tag = f"cw3-{os.getpid()}-{'w' if wall else 'c'}"
+    made = {"shm": [], "sem": [], "msq": [], "mq": [], "fd": []}
+    keep = []
+
+    def ptr(data):
+        b = ctypes.create_string_buffer(data, max(len(data), 1))
+        keep.append(b)
+        return b, ctypes.addressof(b)
+
+    def make(kind, *args):
+        r, e = _sys({"shm": "shmget", "sem": "semget", "msq": "msgget"}[kind], 0, *args)  # IPC_PRIVATE: only this test knows it
+        if r < 0:
+            raise OSError(e, f"{kind}get")
+        made[kind].append(r)
+        return r
+    try:
+        shm_a, shm_b = make("shm", 4096, 0o600), make("shm", 4096, 0o600)
+        addr, _ = _sys("shmat", shm_a, 0, 0)
+        ctypes.memmove(addr, b"stand-in", 8)
+        _sys("shmdt", addr)
+        sem_a, sem_b = make("sem", 2, 0o600), make("sem", 1, 0o600)
+        for n in (0, 1):
+            _sys("semctl", sem_a, n, 16, 1)                      # SETVAL 1
+        msq_a, msq_b, msq_c = make("msq", 0o600), make("msq", 0o600), make("msq", 0o600)
+        _, pm = ptr(struct.pack("<q", 1) + b"y")
+        _sys("msgsnd", msq_c, pm, 1, 0o4000)
+        _, pattr = ptr(struct.pack("<qqqq", 0, 4, 16, 0) + bytes(32))         # struct mq_attr: 4 messages of 16 bytes
+        names = {}
+        for key in ("a", "c"):
+            names[key] = f"{tag}-{key}"
+            _, pname = ptr(names[key].encode() + b"\0")
+            fd, e = _sys("mq_open", pname, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK, 0o600, pattr)
+            if fd < 0:
+                raise OSError(e, "mq_open")
+            made["mq"].append(pname)
+            made["fd"].append(fd)
+        spec_ipc = {"shm_a": shm_a, "shm_b": shm_b, "sem_a": sem_a, "sem_b": sem_b, "msq_a": msq_a, "msq_b": msq_b,
+                    "msq_c": msq_c, "mq_a": names["a"], "mq_c": names["c"], "mq_fd": made["fd"][1]}
+        ours, theirs = socket.socketpair()
+        with tempfile.TemporaryDirectory() as folder:
+            spec = {"core": str(CORE), "mode": "ipc", "wall": wall, "canary": "", "daemon": 0, "dir": folder,
+                    "files": {}, "chan": theirs.fileno(), "num": NUM, "ipc": spec_ipc,
+                    "paths": sorted({sys.base_prefix, sys.prefix})}
+            try:
+                child = subprocess.run(_interpreter() + ["-c", CHILD, json.dumps(spec)], capture_output=True, text=True,
+                                       timeout=CHILD_TIMEOUT_S, cwd=folder, pass_fds=[theirs.fileno(), made["fd"][1]],
+                                       env={"TMPDIR": folder})
+            finally:
+                ours.close()
+                theirs.close()
+        seen = {}
+        addr, _ = _sys("shmat", shm_a, 0, 0)
+        seen["shm_a"] = ctypes.string_at(addr, 8).rstrip(b"\0").decode()
+        _sys("shmdt", addr)
+        seen["sem_a"] = [_sys("semctl", sem_a, n, 12, 0)[0] for n in (0, 1)]   # GETVAL
+        _, pr = ptr(bytes(64))
+        seen["msq_a_messages"] = sum(1 for _ in range(4) if _sys("msgrcv", msq_a, pr, 16, 0, 0o4000)[0] >= 0)
+        seen["msq_c_messages"] = sum(1 for _ in range(4) if _sys("msgrcv", msq_c, pr, 16, 0, 0o4000)[0] >= 0)
+        _, pstat = ptr(bytes(256))
+        seen["shm_b_exists"] = _sys("shmctl", shm_b, 2, pstat)[0] >= 0               # IPC_STAT
+        seen["sem_b_exists"] = _sys("semctl", sem_b, 0, 12, 0)[0] >= 0
+        seen["msq_b_exists"] = _sys("msgctl", msq_b, 2, pstat)[0] >= 0
+        fd, _ = _sys("mq_open", made["mq"][0], os.O_RDWR, 0, 0)
+        seen["mq_a_exists"] = fd >= 0
+        if fd >= 0:
+            os.close(fd)
+    finally:
+        for i in made["shm"]:
+            _sys("shmctl", i, 0, 0)
+        for i in made["sem"]:
+            _sys("semctl", i, 0, 0, 0)
+        for i in made["msq"]:
+            _sys("msgctl", i, 0, 0)
+        for pname in made["mq"]:
+            _sys("mq_unlink", pname)
+        for fd in made["fd"]:
+            os.close(fd)
+    lines = child.stdout.strip().splitlines()
+    if child.returncode != 0 or not lines:
+        raise AssertionError(f"the child (ipc) ended {child.returncode}: {child.stderr[-2000:]}")
+    result = json.loads(lines[-1])
+    result["_seen"] = seen
+    return result
+
+
+def run_lease_child(wall: bool) -> dict:
+    """One child that holds a lease on a file it may read while this test opens the file for writing."""
+    with tempfile.TemporaryDirectory() as folder:
+        ro = os.path.join(folder, "ro")
+        os.mkdir(ro)
+        with open(os.path.join(ro, "inside"), "w", encoding="utf-8") as handle:
+            handle.write("read-only stand-in")
+        ours, theirs = socket.socketpair()
+        spec = {"core": str(CORE), "mode": "lease", "wall": wall, "canary": "", "daemon": 0, "dir": folder,
+                "files": {}, "ro": ro, "chan": theirs.fileno(), "num": NUM, "paths": sorted({sys.base_prefix, sys.prefix})}
+        child = subprocess.Popen(_interpreter() + ["-c", CHILD, json.dumps(spec)], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=folder,
+                                 pass_fds=[theirs.fileno()], env={"TMPDIR": folder})
+        theirs.close()
+        try:
+            ours.settimeout(CHILD_TIMEOUT_S)
+            ours.recv(1)
+            try:
+                os.close(os.open(os.path.join(ro, "inside"), os.O_WRONLY | os.O_NONBLOCK))
+                opened = "ok"
+            except OSError as exc:
+                opened = errno.errorcode.get(exc.errno, str(exc.errno))
+            ours.sendall(b"g")
+            stdout, stderr = child.communicate(timeout=CHILD_TIMEOUT_S)
+        finally:
+            ours.close()
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+    lines = stdout.strip().splitlines()
+    if child.returncode != 0 or not lines:
+        raise AssertionError(f"the child (lease) ended {child.returncode}: {stderr[-2000:]}")
+    result = json.loads(lines[-1])
+    result["_writer"] = opened
+    return result
+
+
+PIDNS = r'''
+import ctypes, json, os, select, signal, subprocess, sys, time
+a = json.loads(sys.argv[1])
+uid, gid = os.getuid(), os.getgid()
+try:
+    os.unshare(os.CLONE_NEWUSER | os.CLONE_NEWPID)
+    for name, text in (("setgroups", "deny"), ("uid_map", f"0 {uid} 1"), ("gid_map", f"0 {gid} 1")):
+        with open(f"/proc/self/{name}", "w") as handle:
+            handle.write(text)
+except (OSError, AttributeError) as exc:
+    print(json.dumps({"skip": f"no user and pid namespace here: {exc}"}), flush=True)
+    sys.exit(0)
+first = os.fork()
+if first:                                        # outside the namespace: wait for its pid 1
+    os.waitpid(first, 0)
+    sys.exit(0)
+# pid 1 of a pid namespace made for this test: every process below is ours, and all end when it ends
+libc = ctypes.CDLL(None, use_errno=True)
+libc.prctl(1, signal.SIGKILL)                    # PR_SET_PDEATHSIG: it ends if the outer process ends
+signal.signal(signal.SIGALRM, lambda *_a: os._exit(3))
+signal.alarm(a["bound"])
+HOST = """
+import json, os, sys
+a = json.loads(sys.argv[1]); sys.path.insert(0, a["core"])
+from recursion_core.plugin_host import wall_linux as w
+out = {"host_pid": os.getpid()}
+if a["wall"]:
+    w.apply_wall(a["paths"])
+    out["apply"] = "applied"
+pid = os.fork()
+if pid == 0:                                     # the leftover child: walled like its host
+    os.close(1)
+    os.read(a["go"], 1)
+    try:
+        os.kill(out["host_pid"], 15)
+        r = "ok"
+    except OSError as exc:
+        r = "errno:%d" % exc.errno
+    os.write(a["res"], r.encode())
+    os._exit(0)
+print(json.dumps(out), flush=True)
+os._exit(0)                                      # the host ends; its walled child lives on
+"""
+go_r, go_w = os.pipe()
+res_r, res_w = os.pipe()
+spec = dict(a, go=go_r, res=res_w)
+host = subprocess.Popen(a["interp"] + ["-c", HOST, json.dumps(spec)], stdout=subprocess.PIPE, text=True,
+                        pass_fds=(go_r, res_w))
+info = json.loads(host.communicate()[0].strip().splitlines()[-1])
+out = {"host": info}
+with open("/proc/sys/kernel/ns_last_pid", "w") as handle:  # this namespace's own counter
+    handle.write(str(info["host_pid"] - 1))
+victim = subprocess.Popen(a["interp"] + ["-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL)
+out["victim_has_the_hosts_old_pid"] = victim.pid == info["host_pid"]
+os.write(go_w, b"g")
+ready, _, _ = select.select([res_r], [], [], 20)
+out["leftover_kill"] = os.read(res_r, 64).decode() if ready else "no answer"
+time.sleep(1)
+out["victim"] = victim.poll()
+print(json.dumps(out), flush=True)
+os._exit(0)                                      # pid 1 ends: the kernel ends every process of the namespace
+'''
+
+
+def run_pid_reuse(wall: bool) -> dict:
+    """A host (walled or not) forks a child and ends; in a pid namespace made for the test, a stand-in victim
+    is given the host's old pid number; the leftover child then signals that number."""
+    spec = {"core": str(CORE), "wall": wall, "paths": sorted({sys.base_prefix, sys.prefix}),
+            "interp": _interpreter(), "bound": CHILD_TIMEOUT_S}
+    with tempfile.TemporaryDirectory() as folder:
+        child = subprocess.run(_interpreter() + ["-c", PIDNS, json.dumps(spec)], capture_output=True, text=True,
+                               timeout=CHILD_TIMEOUT_S, cwd=folder, env={"TMPDIR": folder})
+    lines = child.stdout.strip().splitlines()
+    if child.returncode != 0 or not lines:
+        raise AssertionError(f"the pid-namespace child ended {child.returncode}: {child.stderr[-2000:]}")
+    return json.loads(lines[-1])
+
+
 A1_CALLS = ("rt_sigqueueinfo_victim", "f_setown_victim", "prlimit_cpu_victim", "rt_tgsigqueueinfo_daemon",
             "f_setown_ex_daemon", "fiosetown_daemon", "siocspgrp_daemon", "setpriority_daemon",
             "sched_setaffinity_daemon", "sched_setscheduler_daemon", "sched_setparam_daemon", "sched_setattr_daemon",
@@ -520,6 +828,30 @@ class ReachTests(unittest.TestCase):
         self.assertEqual((walled["o2"]["thread"], walled["o2"]["fork_then_thread"]), ("ran", "exit:0"),
                          "walled, a thread starts, and a forked child starts a thread of its own")
 
+    def test_b2_itself_is_never_a_pid_number(self):
+        control, walled = self.control, self.walled
+        self.assertEqual(control["by_pid"], dict.fromkeys(control["by_pid"], "ok"),
+                         "unwalled, each call at its own pid (and each signal to itself) goes through")
+        self.assertEqual(walled["by_pid"], dict.fromkeys(control["by_pid"], "EPERM"),
+                         "walled, no call passes because its pid is the process's own, and no signal passes at all")
+
+    def test_b2_timers_alarms_and_abort_still_end_or_reach_the_process(self):
+        control, walled = self.control, self.walled
+        self.assertIs(walled["arrives"]["itimer_real_handler"], True, "a timer the kernel delivers still arrives")
+        self.assertEqual((control["arrives"]["alarm_ends"], walled["arrives"]["alarm_ends"]),
+                         (f"signal:{signal.SIGALRM}", f"signal:{signal.SIGALRM}"), "an alarm still ends the process")
+        self.assertEqual(control["arrives"]["abort"], f"signal:{signal.SIGABRT}")
+        # glibc: abort cannot raise SIGABRT, so its abort instruction ends the process (SIGSEGV on x86_64),
+        # or, where there is none, _exit(127). It never returns.
+        self.assertIn(walled["arrives"]["abort"], (f"signal:{signal.SIGABRT}", f"signal:{signal.SIGSEGV}",
+                                                   f"signal:{signal.SIGILL}", f"signal:{signal.SIGTRAP}", "exit:127"))
+
+    def test_b2plus_the_record_names_the_scopes_in_force(self):
+        record = self.walled["record"]
+        expected = ["abstract_unix_socket", "signal"] if record["landlock_abi"] >= 6 else []
+        self.assertEqual(record["landlock_scopes"], expected)
+        self.assertEqual(self.control["record"]["landlock_scopes"], [], "no wall, no scope")
+
     def test_python_keeps_working_and_the_record_is_proven(self):
         walled = self.walled
         self.assertEqual(walled["keeps_working"], {"fresh_import": True, "pipe": "question"})
@@ -544,6 +876,98 @@ class OlderKernelTests(unittest.TestCase):
         self.assertEqual(result["keeps_working"], {"fresh_import": True, "pipe": "question"})
         self.assertEqual(result["_answer"], "answer:ping")
         self.assertEqual((result["o2"]["thread"], result["o2"]["fork_then_thread"]), ("ran", "exit:0"))
+
+
+@unittest.skipIf(_why_not_here(), _why_not_here() or "")
+class OldIpcTests(unittest.TestCase):
+    """B1: System V IPC and POSIX message queues of other processes, on stand-ins this test makes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.control = run_ipc_child(wall=False)
+        cls.walled = run_ipc_child(wall=True)
+
+    def test_b1_no_ipc_object_of_another_process_can_be_touched(self):
+        control, walled = self.control, self.walled
+        self.assertEqual(control["ipc"], dict.fromkeys(control["ipc"], "ok"), "unwalled, every call goes through")
+        self.assertEqual(control["_seen"], {"shm_a": "WALLED!", "sem_a": [0, 0], "msq_a_messages": 1,
+                                            "msq_c_messages": 0, "shm_b_exists": False, "sem_b_exists": False,
+                                            "msq_b_exists": False, "mq_a_exists": False},
+                         "unwalled, each stand-in changed: written, taken, filled, emptied, deleted")
+        self.assertEqual(walled["apply"]["code"], "applied")
+        self.assertEqual(walled["ipc"], dict.fromkeys(control["ipc"], "EPERM"))
+        self.assertEqual(walled["_seen"], {"shm_a": "stand-in", "sem_a": [1, 1], "msq_a_messages": 0,
+                                           "msq_c_messages": 1, "shm_b_exists": True, "sem_b_exists": True,
+                                           "msq_b_exists": True, "mq_a_exists": True},
+                         "walled, every stand-in stays whole")
+
+
+@unittest.skipIf(_why_not_here(), _why_not_here() or "")
+class LeaseTests(unittest.TestCase):
+
+    def test_b3_no_lease_so_a_writer_opens_at_once(self):
+        control, walled = run_lease_child(wall=False), run_lease_child(wall=True)
+        self.assertEqual(control["setlease"], "ok")
+        self.assertIn(control["_writer"], ("EAGAIN", "EWOULDBLOCK"),
+                         "unwalled, a lease on a readable file makes another process's write-open wait")
+        self.assertEqual(walled["apply"]["code"], "applied")
+        self.assertEqual((walled["setlease"], walled["getlease"], walled["_writer"]), ("EPERM", "ok", "ok"))
+
+
+@unittest.skipIf(_why_not_here(), _why_not_here() or "")
+class PidReuseTests(unittest.TestCase):
+
+    def test_b2_a_process_given_the_hosts_old_pid_is_not_reached_by_its_leftover_child(self):
+        control = run_pid_reuse(wall=False)
+        if "skip" in control:
+            self.skipTest(control["skip"])
+        walled = run_pid_reuse(wall=True)
+        for result in (control, walled):
+            self.assertIs(result["victim_has_the_hosts_old_pid"], True)
+        self.assertEqual((control["leftover_kill"], control["victim"]), ("ok", -signal.SIGTERM),
+                         "unwalled, the leftover child ends whatever process took the host's pid")
+        self.assertEqual(walled["host"].get("apply"), "applied")
+        self.assertEqual((walled["leftover_kill"], walled["victim"]), (f"errno:{errno.EPERM}", None),
+                         "walled, the stand-in that took the host's old pid lives")
+
+
+class LandlockScopeTests(unittest.TestCase):
+
+    def test_b2plus_the_ruleset_asks_both_scopes_from_abi_6_and_none_below(self):
+        self.assertEqual(wall_linux.LANDLOCK_SCOPES, {"abstract_unix_socket": 1, "signal": 2})
+        for abi in (1, 2, 3, 4, 5):
+            data, scopes = wall_linux._ruleset_attr(abi)
+            self.assertEqual((len(data), scopes), (8, []), abi)
+        for abi in (6, 7):
+            data, scopes = wall_linux._ruleset_attr(abi)
+            self.assertEqual(len(data), 24, abi)
+            self.assertEqual(struct.unpack("<QQQ", data)[1:], (0, 3), "no network right handled; both scopes")
+            self.assertEqual(scopes, ["abstract_unix_socket", "signal"])
+
+    @unittest.skipIf(_why_not_here(), _why_not_here() or "")
+    def test_b2plus_apply_wall_asks_the_scopes_and_the_record_names_them(self):
+        """A stand-in ABI in this process: the kernel calls are stand-ins too, so nothing is walled here."""
+        import ctypes
+        for abi, expected, size in ((3, [], 8), (6, ["abstract_unix_socket", "signal"], 24)):
+            seen = {}
+
+            def fake_call(libc, number, *args):
+                if number == 444:
+                    seen["attr"] = ctypes.string_at(args[0], args[1])
+                    return os.open(os.devnull, os.O_RDONLY), 0   # a stand-in ruleset descriptor; apply_wall closes it
+                if number in (445, 446):
+                    return 0, 0
+                raise AssertionError(f"an unexpected call {number}")
+            stand_ins = {fn: _refuse for fn in CHECK_FUNCTIONS.values()}
+            with self.subTest(abi=abi), mock.patch.multiple(
+                    wall_linux, _call=fake_call, _landlock_abi=lambda libc: abi, _thread_count=lambda: 1,
+                    _no_new_privs=lambda libc: None, _load_seccomp_filter=lambda *a, **k: None,
+                    _STATE={"applied": [], "failed": None, "scopes": []}, **stand_ins):
+                wall_linux.apply_wall([sys.prefix])
+                record = wall_linux.probe_wall("/nonexistent/canary", 1)
+                self.assertEqual(len(seen["attr"]), size)
+                self.assertEqual(record["landlock_scopes"], expected)
+                self.assertIs(record["proven"], True)
 
 
 HALF_POINTS = {"create": "landlock_create_ruleset", "addrule": "landlock_add_rule", "nnp1": "no_new_privs",
@@ -680,18 +1104,21 @@ class FilterProgramTests(unittest.TestCase):
     OWN, OTHER = 4242, 4243
 
     def program(self, arch, abi=3):
-        return wall_linux._filter(arch, self.OWN, abi)
+        return wall_linux._filter(arch, abi)
 
     def test_the_added_entries_are_the_walls_own_definition(self):
         self.assertEqual(wall_linux.DENIED_METADATA_CALLS, (
             "chmod", "fchmod", "fchmodat", "fchmodat2", "chown", "fchown", "lchown", "fchownat", "utime", "utimes",
             "futimesat", "utimensat", "setxattr", "lsetxattr", "fsetxattr", "setxattrat", "removexattr",
             "lremovexattr", "fremovexattr", "removexattrat", "file_setattr"))
-        self.assertEqual(wall_linux.SELF_ONLY_QUEUE_CALLS, ("rt_sigqueueinfo", "rt_tgsigqueueinfo"))
-        self.assertEqual(wall_linux.SELF_OR_ZERO_CALLS, ("prlimit64", "sched_setaffinity", "sched_setscheduler",
-                                                         "sched_setparam", "sched_setattr", "migrate_pages", "move_pages"))
-        self.assertEqual(wall_linux.SELF_PROCESS_CALLS, ("setpriority", "ioprio_set"))
-        self.assertEqual(wall_linux.DENIED_FCNTL_COMMANDS, {"F_SETOWN": 8, "F_SETOWN_EX": 15})
+        self.assertEqual(wall_linux.DENIED_SIGNAL_CALLS, ("kill", "tkill", "tgkill", "rt_sigqueueinfo", "rt_tgsigqueueinfo"))
+        self.assertEqual(wall_linux.DENIED_IPC_CALLS, (
+            "shmget", "shmat", "shmdt", "shmctl", "semget", "semop", "semtimedop", "semctl", "msgget", "msgsnd",
+            "msgrcv", "msgctl", "mq_open", "mq_unlink", "mq_timedsend", "mq_timedreceive", "mq_notify", "mq_getsetattr"))
+        self.assertEqual(wall_linux.CALLER_ONLY_CALLS, ("prlimit64", "sched_setaffinity", "sched_setscheduler",
+                                                        "sched_setparam", "sched_setattr", "migrate_pages", "move_pages"))
+        self.assertEqual(wall_linux.CALLER_ONLY_PRIORITY_CALLS, ("setpriority", "ioprio_set"))
+        self.assertEqual(wall_linux.DENIED_FCNTL_COMMANDS, {"F_SETOWN": 8, "F_SETOWN_EX": 15, "F_SETLEASE": 1024})
         self.assertEqual(wall_linux.DENIED_IOCTL_COMMANDS, {"FIOSETOWN": 0x8901, "SIOCSPGRP": 0x8902,
                                                             "FS_IOC_SETFLAGS": 0x40086602, "FS_IOC_FSSETXATTR": 0x401C5820})
         self.assertEqual(wall_linux.NAMESPACE_CLONE_FLAGS, sum(CLONE_NEW.values()))
@@ -707,21 +1134,30 @@ class FilterProgramTests(unittest.TestCase):
             rows, n = self.program(arch), NUM[arch]
             with self.subTest(arch=arch):
                 run = lambda name, *args: _run_program(rows, n[name], args + (0,) * (3 - len(args)), arch=arch)
-                for name in ("rt_sigqueueinfo", "rt_tgsigqueueinfo"):
-                    self.assertEqual((run(name, self.OWN), run(name, self.OTHER), run(name, 0)), ("allow", "eperm", "eperm"))
+                for name in ("kill", "tkill", "tgkill", "rt_sigqueueinfo", "rt_tgsigqueueinfo"):
+                    self.assertEqual([run(name, pid) for pid in (self.OWN, self.OTHER, 0, -1)], ["eperm"] * 4, name)
                 for name in ("prlimit64", "sched_setaffinity", "sched_setscheduler", "sched_setparam", "sched_setattr",
                              "migrate_pages", "move_pages"):
-                    self.assertEqual((run(name, 0), run(name, self.OWN), run(name, self.OTHER)), ("allow", "allow", "eperm"), name)
+                    self.assertEqual((run(name, 0), run(name, self.OWN), run(name, self.OTHER)), ("allow", "eperm", "eperm"), name)
                 self.assertEqual([run("setpriority", which, who) for which, who in
                                   ((0, 0), (0, self.OWN), (0, self.OTHER), (1, 0), (2, 0))],
-                                 ["allow", "allow", "eperm", "eperm", "eperm"], "PRIO_PROCESS only, for itself")
+                                 ["allow", "eperm", "eperm", "eperm", "eperm"], "PRIO_PROCESS only, by 0 alone")
                 self.assertEqual([run("ioprio_set", which, who) for which, who in
                                   ((1, 0), (1, self.OWN), (1, self.OTHER), (2, 0), (3, 0))],
-                                 ["allow", "allow", "eperm", "eperm", "eperm"], "IOPRIO_WHO_PROCESS only, for itself")
-                self.assertEqual([run("fcntl", 3, cmd) for cmd in (8, 15, 1, 3, 4, 10)],
-                                 ["eperm", "eperm", "allow", "allow", "allow", "allow"], "F_SETOWN and F_SETOWN_EX only")
+                                 ["allow", "eperm", "eperm", "eperm", "eperm"], "IOPRIO_WHO_PROCESS only, by 0 alone")
+                self.assertEqual([run("fcntl", 3, cmd) for cmd in (8, 15, 1024, 1, 3, 4, 10, 1025)],
+                                 ["eperm", "eperm", "eperm", "allow", "allow", "allow", "allow", "allow"],
+                                 "F_SETOWN, F_SETOWN_EX and F_SETLEASE only")
                 self.assertEqual([run("ioctl", 3, cmd) for cmd in (0x8901, 0x8902, 0x40086602, 0x401C5820, 0x5401, 0x80086601)],
                                  ["eperm", "eperm", "eperm", "eperm", "allow", "allow"])
+
+    def test_b1_b2_every_ipc_and_signal_call_is_refused_whatever_its_arguments(self):
+        for arch in ("x86_64", "aarch64"):
+            rows, n = self.program(arch), NUM[arch]
+            with self.subTest(arch=arch):
+                for name in wall_linux.DENIED_IPC_CALLS + wall_linux.DENIED_SIGNAL_CALLS:
+                    for first in (0, self.OWN, self.OTHER, -1):
+                        self.assertEqual(_run_program(rows, n[name], (first, 0, 0), arch=arch), "eperm", name)
 
     def test_o2_clone_with_a_namespace_flag_is_refused_and_clone3_falls_back(self):
         for arch in ("x86_64", "aarch64"):

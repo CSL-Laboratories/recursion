@@ -21,6 +21,8 @@ from recursion_core.plugin_security.tests.support import FakeGilProbe, manifest_
 
 CORE = Path(__file__).resolve().parents[3]
 PLUGIN = "demo.plugin"
+SECRET_NAME = "CSL_HOST_TEST_SECRET"
+SECRET = "stand-in-secret-value"
 HELLO = {"type": "hello", "channel": hc.CHANNEL}
 BYE = {"type": "bye", "reason": "done"}
 SOURCE = (
@@ -35,13 +37,13 @@ def b64(value):
     return base64.b64encode(value).decode("ascii")
 
 
-def load(source=SOURCE, *, extras=None, manifest_field=None):
-    manifest = manifest_bytes("01" * 32, plugin_id=PLUGIN, source=source)
+def load(source=SOURCE, *, extras=None, manifest_field=None, plugin_id=PLUGIN):
+    manifest = manifest_bytes("01" * 32, plugin_id=plugin_id, source=source)
     if manifest_field is not None:
         manifest = json.dumps(dict(json.loads(manifest), gil_check=manifest_field)).encode()
     files = {ARTIFACT: source}
     files.update(extras or {})
-    return {"type": "load", "plugin_id": PLUGIN, "manifest_b64": b64(manifest),
+    return {"type": "load", "plugin_id": plugin_id, "manifest_b64": b64(manifest),
             "files": {path: b64(data) for path, data in files.items()}}
 
 
@@ -83,16 +85,23 @@ class HostProgramTests(unittest.TestCase):
             encoding="ascii",
         )
 
-    def exchange(self, *messages, states=(False,), real=False, extra=None):
-        # Isolated Python runs venv .pth files but ignores PYTHONPATH. This shim
-        # passes a probe to main and reports its returned status on stderr.
-        env = {"PYTHONPATH": str(CORE), "__PYVENV_LAUNCHER__": str(self.python)}
+    def exchange(self, *messages, states=(False,), real=False, extra=None, secret=False):
+        # Isolated Python runs venv .pth files but ignores PYTHONPATH. This shim passes a probe to
+        # main and writes its returned status to a file in the host's working folder, because the
+        # host points its own stderr at the null device. The host may start itself again once with a
+        # clean environment: the venv's own interpreter is the command, so the shim loads both times.
+        env = {"PYTHONPATH": str(CORE)}
+        command = [str(self.python), "-X", "gil=0", "-I", "-m", "recursion_core.plugin_host"]
+        if secret:
+            env[SECRET_NAME] = SECRET
         options = {}
         bootstrap = ""
         if os.name == "nt":
             import msvcrt
 
             env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+            env["__PYVENV_LAUNCHER__"] = str(self.python)
+            command[0] = sys.executable
             # Bypass the Windows venv redirector to keep this a single child.
             options["executable"] = sys._base_executable
         if extra is not None:
@@ -107,7 +116,6 @@ class HostProgramTests(unittest.TestCase):
                 options["pass_fds"] = (extra,)
                 bootstrap = f"extra = {extra}\n"
             bootstrap += (
-                "assert os.environ['CSL_HOST_TEST_MARKER'] == 'inherited'\n"
                 "info = os.fstat(extra)\n"
                 "extra_identity = [info.st_dev, info.st_ino]\n"
             )
@@ -128,7 +136,8 @@ class HostProgramTests(unittest.TestCase):
                         status = main()
                     else:
                         status = main(gil_probe=probe)
-                    print(json.dumps([status, probe.calls, extra_identity]), file=sys.stderr)
+                    with open("host-status.json", "w") as out:
+                        out.write(json.dumps([status, probe.calls, extra_identity]))
 
                 plugin_host.main = run
                 """)
@@ -141,7 +150,7 @@ class HostProgramTests(unittest.TestCase):
                 os.set_handle_inheritable(handle, True)
             try:
                 process = subprocess.Popen(
-                    [sys.executable, "-X", "gil=0", "-I", "-m", "recursion_core.plugin_host"],
+                    command,
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     cwd=cwd, env=env, **options,
                 )
@@ -155,11 +164,15 @@ class HostProgramTests(unittest.TestCase):
                     process.kill()
                     process.communicate()
                     raise
+            report = Path(cwd, "host-status.json")
+            report = report.read_text() if report.exists() else None
+        self.stderr = stderr
         self.assertEqual(process.returncode, 0, stderr.decode(errors="replace"))
         replies = list(frames(stdout))
         self.assertTrue(replies, stderr.decode(errors="replace"))
         self.assertEqual(replies.pop(0), HELLO)
-        status, reads, identity = json.loads(stderr.splitlines()[-1])
+        self.assertIsNotNone(report, "the host wrote no status")
+        status, reads, identity = json.loads(report)
         return replies, status, reads, identity
 
     def assert_refusal(self, reply, id_, code, detail=None):
@@ -285,6 +298,7 @@ class HostProgramTests(unittest.TestCase):
     def test_t7_inherited_descriptor_and_environment_are_removed(self):
         source = textwrap.dedent("""
             import os
+            import stat
             import sys
 
             def registry():
@@ -301,17 +315,26 @@ class HostProgramTests(unittest.TestCase):
                     except OSError:
                         continue
                     descriptors[str(fd)] = [info.st_dev, info.st_ino]
-                return {'fds': descriptors, 'env': dict(os.environ), 'cwd_empty': not os.listdir('.')}
+                standard = {str(fd): [stat.S_ISCHR(os.fstat(fd).st_mode), getattr(os.fstat(fd), 'st_rdev', 0)] for fd in (0, 1, 2)}
+                null = [True, os.stat(os.devnull).st_rdev] if os.name != 'nt' else None
+                return {'fds': descriptors, 'env': dict(os.environ), 'cwd_empty': not os.listdir('.'),
+                        'standard': standard, 'null': null}
             """).encode()
         with tempfile.TemporaryFile() as extra:
             replies, _, _, identity = self.exchange(HELLO, load(source), call(7, "registry"), BYE,
                                                     extra=extra.fileno())
         self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[0]["type"], "result", replies[0])
         observed = replies[0]["value"]
         fds = observed["fds"]
         self.assertEqual(len(fds), 5)
         self.assertTrue({"0", "1", "2"} <= fds.keys())
         self.assertNotIn(identity, fds.values())  # The same fd number may now belong to a channel.
+        # Descriptors 0, 1 and 2 are the null device: nothing of the channel or the starter is there.
+        for fd, (is_device, rdev) in observed["standard"].items():
+            self.assertTrue(is_device, fd)
+            if observed["null"] is not None:
+                self.assertEqual([is_device, rdev], observed["null"], fd)
         expected_env = {"SYSTEMROOT": os.environ["SYSTEMROOT"]} if os.name == "nt" else {}
         self.assertEqual(observed["env"], expected_env)
         self.assertTrue(observed["cwd_empty"])
@@ -418,3 +441,106 @@ class HostProgramTests(unittest.TestCase):
         self.assertEqual(schema["x-message-types"]["hello"]["optional_from"], {"daemon": ["gil_check"]})
         self.assertEqual(hc.OPTIONAL_MESSAGE_FIELDS, {("hello", "daemon"): frozenset({"gil_check"})})
         self.assertEqual(schema["$defs"]["hello"]["properties"]["gil_check"]["enum"], ["on", "off"])
+
+    def test_a1_plugin_reading_standard_input_cannot_reach_the_channel(self):
+        source = textwrap.dedent("""
+            import os
+            import stat
+            import sys
+
+            def operator(command):
+                if command != 'drain':
+                    return command
+                data = b''
+                while True:
+                    chunk = os.read(0, 65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                return [len(data), len(sys.stdin.buffer.read()), stat.S_ISCHR(os.fstat(0).st_mode)]
+            """).encode()
+        big = "x" * 200000  # far more than the host reads ahead, so later frames wait in the pipe
+        replies, _, _, _ = self.exchange(
+            HELLO, load(source), call(7, command="drain"), call(8, command=big), call(9, command="after"), BYE,
+        )
+        self.assertEqual(replies, [result(7, [0, 0, True]), result(8, big), result(9, "after")])
+
+    def test_a2_plugin_output_reaches_neither_the_channel_nor_the_starter(self):
+        source = textwrap.dedent("""
+            import os
+            import sys
+
+            def operator(command):
+                sys.stdout.write('stdout-marker'); sys.stdout.flush()
+                sys.stderr.write('stderr-marker'); sys.stderr.flush()
+                os.write(1, b'fd1-marker')
+                os.write(2, b'fd2-marker')
+                print('dunder-marker', file=sys.__stderr__, flush=True)
+                return command
+            """).encode()
+        replies, _, _, _ = self.exchange(HELLO, load(source), call(7, command="a"), call(8, command="b"), BYE)
+        self.assertEqual(replies, [result(7, "a"), result(8, "b")])
+        self.assertNotIn(b"marker", self.stderr)
+
+    def test_a3_starter_variables_are_not_readable_by_the_plugin(self):
+        source = textwrap.dedent("""
+            import os
+
+            def operator(command):
+                proc = None
+                if os.path.exists('/proc/self/environ'):
+                    with open('/proc/self/environ', 'rb') as record:
+                        proc = record.read().decode('latin-1')
+                return {'environ': dict(os.environ), 'proc': proc}
+            """).encode()
+        replies, _, _, _ = self.exchange(HELLO, load(source), call(7, command={}), BYE, secret=True)
+        value = replies[0]["value"]
+        expected_env = {"SYSTEMROOT": os.environ["SYSTEMROOT"]} if os.name == "nt" else {}
+        self.assertEqual(value["environ"], expected_env)
+        if value["proc"] is not None:
+            self.assertNotIn(SECRET, value["proc"])
+            self.assertNotIn(SECRET_NAME, value["proc"])
+
+    def test_a4_nothing_runs_before_hello(self):
+        replies, _, reads, _ = self.exchange(load(), call(7, command={}), HELLO, load(), call(8, command="after"), BYE)
+        self.assert_refusal(replies[0], None, "message_invalid", "expected hello")
+        self.assert_refusal(replies[1], 7, "message_invalid", "expected hello")
+        self.assertEqual(replies[2:], [result(8, replies[2]["value"])])
+        self.assertEqual(replies[2]["value"]["command"], "after")
+        self.assertEqual(reads, 2)  # only the load and call after hello were worked
+
+    def test_a4_a_host_takes_one_plugin_id_and_one_load(self):
+        failing = b"raise RuntimeError('private')\n"
+        replies, _, _, _ = self.exchange(
+            HELLO, load(failing), load(plugin_id="other.plugin"), load(), load(), call(7, command="ok"), BYE,
+        )
+        self.assert_refusal(replies[0], None, "call_failed", "RuntimeError")  # a failed load may be retried
+        self.assert_refusal(replies[1], None, "message_invalid")  # another plugin id
+        self.assert_refusal(replies[2], None, "message_invalid")  # a second load after one succeeded
+        self.assertEqual(len(replies), 4)
+        self.assertEqual(replies[3]["value"]["module"], "csl_plugin_demo_plugin")
+
+    def test_a4_core_requests_are_refused_off_the_plugin_thread(self):
+        source = textwrap.dedent("""
+            import threading
+
+            def bind_core(client):
+                global core_call
+                core_call = client
+
+            def operator(command):
+                seen = []
+                def other():
+                    try:
+                        core_call(b'x')
+                    except Exception as exc:
+                        seen.append(type(exc).__name__)
+                    else:
+                        seen.append('sent')
+                thread = threading.Thread(target=other)
+                thread.start()
+                thread.join()
+                return seen
+            """).encode()
+        replies, _, _, _ = self.exchange(HELLO, load(source), call(7, command={}), call(8, command={}), BYE)
+        self.assertEqual(replies, [result(7, ["RuntimeError"]), result(8, ["RuntimeError"])])

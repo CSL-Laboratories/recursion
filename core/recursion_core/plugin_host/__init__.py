@@ -22,6 +22,25 @@ from recursion_core.plugin_security.runtime import GilProbe
 DEFAULT_GIL_CHECK = "on"
 
 
+# The one variable the host keeps for itself on POSIX: it marks a process that has already started
+# itself again with a clean environment, so that start-up can never loop. Nothing else is kept.
+RESTART_GUARD = "CSL_PLUGIN_HOST_CLEAN"
+
+
+def _restart_with_clean_environment():
+    """Start this same program again, once, with an environment of only RESTART_GUARD.
+
+    Clearing os.environ does not touch the block the kernel keeps for the process (it stays readable
+    in /proc/self/environ), so the host replaces its own process image before anything else runs. The
+    channel descriptors are unchanged by this: the new image reads the same standard descriptors.
+    Windows has no such call (it would end the starter's handle on this process), so it is not done
+    there and os.environ is cleared in main as before.
+    """
+    if os.name == "nt" or os.environ.get(RESTART_GUARD) == "1" or not set(os.environ) - {RESTART_GUARD}:
+        return
+    os.execve(sys.executable, sys.orig_argv, {RESTART_GUARD: "1"})
+
+
 def _close_inherited():
     first = 2 + 1
     if os.name == "nt":
@@ -61,9 +80,16 @@ class _Channel:
         with os.fdopen(os.dup(0), "rb") as reader, os.fdopen(os.dup(1), "wb") as writer:
             for stream in (reader, writer):
                 os.set_inheritable(stream.fileno(), False)
-            with open(os.devnull, "wb") as null:
-                os.dup2(null.fileno(), 1)
+            # Plugin code gets the null device on all three standard descriptors: it can read
+            # nothing from the channel and its output reaches neither the channel nor the starter.
+            with open(os.devnull, "rb") as null_in, open(os.devnull, "wb") as null_out:
+                os.dup2(null_in.fileno(), 0)
+                os.dup2(null_out.fileno(), 1)
+                os.dup2(null_out.fileno(), 2)
+            sys.stdin = sys.__stdin__ = open(0, "r", encoding="utf-8", closefd=False)
             sys.stdout = sys.__stdout__ = open(1, "w", encoding="utf-8", buffering=1, closefd=False)
+            sys.stderr = sys.__stderr__ = open(
+                2, "w", encoding="utf-8", errors="backslashreplace", buffering=1, closefd=False)
             yield cls(reader, writer)
 
     def receive(self):
@@ -262,6 +288,7 @@ class _Program:
 
 def main(*, gil_probe: GilProbe | None = None) -> dict:
     """Start the stdio host and return its final status to the local caller."""
+    _restart_with_clean_environment()
     _close_inherited()
     keep = {"SYSTEMROOT": os.environ["SYSTEMROOT"]} if os.name == "nt" and "SYSTEMROOT" in os.environ else {}
     os.environ.clear()

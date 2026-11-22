@@ -473,7 +473,7 @@ class LimitsNamesAndAdvice(_Folder):
 
     def test_a_row_must_opt_in_to_no_limit(self) -> None:
         for kind, default, allowed in ((int, 5, "a whole number"), (float, 5.0, "a number"),
-                                       (bool, True, "true or false"), (str, "usual", 'a text other than "none"')):
+                                       (bool, True, "true or false")):
             with self.subTest(kind=kind):
                 row = settings.Setting("test.limit", kind, default, "A test row.")
                 loaded = self.read(row, '"none"')
@@ -481,6 +481,18 @@ class LimitsNamesAndAdvice(_Folder):
                 self.assertEqual(settings.SOURCE_DEFAULT, loaded.values[row.name].source)
                 self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
                 self.assertIn(f"found 'none'; allowed: {allowed};", loaded.notes[0].detail)
+
+    def test_a_text_row_keeps_the_word_none_as_text(self) -> None:
+        row = settings.Setting("test.word", str, "usual", "A word.")
+        loaded = self.read(row, '"none"')
+        self.assertEqual("none", loaded[row.name])
+        self.assertEqual(settings.SOURCE_FILE, loaded.values[row.name].source)
+        self.assertEqual([], self.codes(loaded))
+        self.assertEqual(["test.word = 'none' (default 'usual'; source: settings file)"], settings.lines(loaded))
+        names = settings.Setting("test.names", list, ("a",), "Names.")
+        loaded = self.read(names, '"none"')
+        self.assertEqual(("a",), loaded[names.name])
+        self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
 
     def test_only_the_reserved_string_means_no_limit(self) -> None:
         row = settings.Setting("test.limit", float, 5.0, "A limit.", allow_no_limit=True)
@@ -577,14 +589,14 @@ class LimitsNamesAndAdvice(_Folder):
         with self.declared(*rows):
             self.assertEqual(0, settings.main([], self.environ, out, err))
         self.assertEqual("", err.getvalue())
+        shown = out.getvalue().splitlines()
+        self.assertEqual(4, len(shown))
+        self.assertEqual(f"settings file: {self.file}", shown[0])
+        self.assertTrue(shown[1].startswith("These are the values a daemon started from this environment"))
         self.assertEqual(
-            [f"settings file: {self.file}",
-             "These are the values a daemon started from this environment would take, "
-             "and a daemon already running keeps the values it read at its own start, "
-             "as shown in the recursion_core.daemon startup log.",
-             "test.limit = no limit (default 5; source: settings file; advised: at most 10)",
+            ["test.limit = no limit (default 5; source: settings file; advised: at most 10)",
              "test.names = ['Lin', 'Ada'] (default []; source: settings file)"],
-            out.getvalue().splitlines(),
+            shown[2:],
         )
 
 

@@ -174,7 +174,7 @@ def _allows_no_limit(row: Setting) -> bool:
 
 def _allowed(row: Setting) -> str:
     kind = {bool: "true or false", int: "a whole number", float: "a number",
-            str: f'a text other than "{_NO_LIMIT_TEXT}"', list: "a list of strings"}[row.type]
+            str: "a text", list: "a list of strings"}[row.type]
     if _allows_no_limit(row):
         return f'{kind} or "{_NO_LIMIT_TEXT}" for no limit'
     return kind
@@ -182,8 +182,8 @@ def _allowed(row: Setting) -> str:
 
 def _accepted(row: Setting, value: object) -> object | None:
     """Return the typed value, or None for an invalid type or spelling."""
-    if isinstance(value, str) and value == _NO_LIMIT_TEXT:
-        return NO_LIMIT if _allows_no_limit(row) else None
+    if isinstance(value, str) and value == _NO_LIMIT_TEXT and _allows_no_limit(row):
+        return NO_LIMIT
     if row.type is list:
         if isinstance(value, list) and all(isinstance(name, str) for name in value):
             return tuple(dict.fromkeys(value))

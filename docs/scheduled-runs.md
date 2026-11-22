@@ -73,15 +73,18 @@ not yet answering (`control_api_unavailable`), such as during a catch-up firing 
 
 ```
 ROUTINE_WAIT=0
-ROUTINE_PAUSE=0
+ROUTINE_PAUSE=2
 ```
 
 `ROUTINE_WAIT` is a whole number of seconds to keep retrying `start` on
 `control_api_unavailable`; `0` (the default when omitted) means no wait. `ROUTINE_PAUSE`
-is a whole number of seconds to sleep between tries (default `0`). When you set a
-non-zero `ROUTINE_WAIT`, set a non-zero `ROUTINE_PAUSE` too so the script sleeps between
-tries; pick figures that fit your host's daemon startup sweep (no fixed figures are
-written into the script).
+is a whole number of seconds to sleep between tries (default `2`). The `2` is an example
+first value, yours to set, and not a limit. A pause of `0` that you write is honoured: the
+script then retries without pausing, which keeps one processor busy for the whole wait and
+starts the control command thousands of times. Pick values that fit your host's daemon
+startup sweep. The wait is measured by the machine's clock, so a clock that is set during
+boot can stretch or cut it. A number of 19 digits or more, for either value, is refused
+with exit status 2, because the shell cannot count a number that long.
 
 The file is read by the shell, so put the prompt on one line inside single quotes (a
 prompt that holds a single quote needs it written as `'\''`). Put only text you trust in
@@ -116,9 +119,15 @@ name="${1:?usage: recursion-run-routine NAME}"
 case "$name" in *[!A-Za-z0-9._-]*|"") echo "bad routine name" >&2; exit 2;; esac
 . "${RECURSION_ROUTINES_DIR:-$HOME/.config/recursion/routines}/$name.env"
 wait_s="${ROUTINE_WAIT:-0}"
-pause_s="${ROUTINE_PAUSE:-0}"
-case "$wait_s" in ""|*[!0-9]*|0[0-9]*) echo "bad ROUTINE_WAIT" >&2; exit 2;; esac
-case "$pause_s" in ""|*[!0-9]*|0[0-9]*) echo "bad ROUTINE_PAUSE" >&2; exit 2;; esac
+pause_s="${ROUTINE_PAUSE:-2}"
+case "$wait_s" in
+  ""|*[!0-9]*|0[0-9]*) echo "bad ROUTINE_WAIT" >&2; exit 2;;
+  ???????????????????*) echo "ROUTINE_WAIT is a number the shell cannot count" >&2; exit 2;;
+esac
+case "$pause_s" in
+  ""|*[!0-9]*|0[0-9]*) echo "bad ROUTINE_PAUSE" >&2; exit 2;;
+  ???????????????????*) echo "ROUTINE_PAUSE is a number the shell cannot count" >&2; exit 2;;
+esac
 slot=$(date +"$ROUTINE_SLOT")
 deadline=0
 if [ "$wait_s" -gt 0 ]; then
@@ -141,10 +150,6 @@ while :; do
       exit "$rc"
       ;;
   esac
-  if [ "$wait_s" -eq 0 ]; then
-    printf '%s\n' "$out"
-    exit "$rc"
-  fi
   now=$(date +%s)
   if [ "$now" -ge "$deadline" ]; then
     printf '%s\n' "$out"
@@ -161,8 +166,9 @@ The key is `NAME-SLOT`, for example `nightly-review-20261120`. Run it twice by h
 and, when the first `start` launched, the second answer carries `"duplicate": true`.
 
 The script retries `start` only when the command exits 1 with `control_api_unavailable`,
-for up to `ROUTINE_WAIT` seconds with `ROUTINE_PAUSE` seconds between tries (both default
-to `0`, so with `ROUTINE_WAIT=0` or unset it tries once and returns). Any other answer,
+for up to `ROUTINE_WAIT` seconds with `ROUTINE_PAUSE` seconds between tries (`ROUTINE_WAIT`
+defaults to `0` and `ROUTINE_PAUSE` to `2`, so with `ROUTINE_WAIT=0` or unset it tries once
+and returns). Any other answer,
 and exit 2 on a usage error, are returned at once.
 
 ## Linux: a systemd user timer and service
@@ -208,8 +214,9 @@ A catch-up firing at boot can reach the daemon before its control socket answers
 `recursion-daemon.service` is `Type=simple`, so systemd considers
 `After=recursion-daemon.service` satisfied as soon as the daemon process starts, while
 the daemon runs its startup sweep before creating `$XDG_RUNTIME_DIR/recursion/control.sock`.
-To wait through that startup window, set `ROUTINE_WAIT` and `ROUTINE_PAUSE` in the routine
-file so the script retries `control_api_unavailable` until the socket answers; otherwise
+To wait through that startup window, set `ROUTINE_WAIT` in the routine file (and
+`ROUTINE_PAUSE` if you want a pause other than 2 seconds) so the script retries
+`control_api_unavailable` until the socket answers; otherwise
 start the service by hand once the daemon is up, or let the next period's firing try again.
 
 Check the files, then turn the timer on:

@@ -37,7 +37,7 @@ exit "$rc"
 
 
 def _find_doc() -> Path:
-    for parent in Path(__file__).resolve().parents:
+    for parent in Path(os.path.abspath(__file__)).parents:
         candidate = parent / "docs" / "scheduled-runs.md"
         if candidate.is_file():
             return candidate
@@ -113,18 +113,20 @@ class ScheduledRunsScriptTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            timeout=60,
         )
         calls = int(count_file.read_text(encoding="utf-8").strip()) if count_file.exists() else 0
         arg_lines = args_file.read_text(encoding="utf-8").splitlines() if args_file.exists() else []
         return proc, calls, arg_lines
 
-    def test_script_syntax_and_no_fixed_figures(self) -> None:
+    def test_script_syntax_and_no_default_wait(self) -> None:
         assert _SH is not None
         proc = subprocess.run([_SH, "-n", str(self.script)], capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         body = self.script.read_text(encoding="utf-8")
+        # The wait has no non-zero default. The pause has a first value, in one place only.
         self.assertNotRegex(body, r"ROUTINE_WAIT:-[1-9]")
-        self.assertNotRegex(body, r"ROUTINE_PAUSE:-[1-9]")
+        self.assertEqual(body.count("ROUTINE_PAUSE:-"), 1)
 
     def test_retries_control_api_unavailable_twice_then_starts(self) -> None:
         responses = [
@@ -204,7 +206,55 @@ class ScheduledRunsScriptTests(unittest.TestCase):
         proc, calls, _ = self._run_routine(responses, wait="2", pause="1")
         self.assertEqual(proc.returncode, 1)
         self.assertGreaterEqual(calls, 2)
+        self.assertLessEqual(calls, 4)
         self.assertEqual(json.loads(proc.stdout)["code"], "control_api_unavailable")
+
+    def test_wait_without_a_pause_does_not_spin(self) -> None:
+        responses = ['1|{"code": "control_api_unavailable", "delivered": false}']
+        proc, calls, _ = self._run_routine(responses, wait="1", pause=None)
+        self.assertEqual(proc.returncode, 1)
+        self.assertGreaterEqual(calls, 1)
+        # With the first pause value a one second wait allows two or three tries; a spin makes hundreds.
+        self.assertLessEqual(calls, 5)
+        self.assertEqual(json.loads(proc.stdout)["code"], "control_api_unavailable")
+
+    def test_a_pause_of_zero_that_is_written_is_honoured(self) -> None:
+        responses = ['1|{"code": "control_api_unavailable", "delivered": false}']
+        proc, calls, _ = self._run_routine(responses, wait="1", pause="0")
+        self.assertEqual(proc.returncode, 1)
+        self.assertGreaterEqual(calls, 2)
+        self.assertEqual(json.loads(proc.stdout)["code"], "control_api_unavailable")
+
+    def test_a_pause_of_zero_with_no_wait_makes_one_try(self) -> None:
+        responses = ['1|{"code": "control_api_unavailable", "delivered": false}']
+        proc, calls, _ = self._run_routine(responses, wait="0", pause="0")
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(calls, 1)
+
+    def test_a_number_the_shell_cannot_count_is_refused(self) -> None:
+        responses = ['1|{"code": "control_api_unavailable", "delivered": false}']
+        too_long = "9" * 19
+        cases = {
+            "wait": dict(wait=too_long, pause=None),
+            "pause": dict(wait="5", pause=too_long),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name=name):
+                proc, calls, _ = self._run_routine(responses, **kwargs)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertEqual(calls, 0)
+                self.assertEqual(proc.stdout, "")
+                self.assertIn("cannot count", proc.stderr)
+
+    def test_eighteen_digits_are_counted(self) -> None:
+        responses = [
+            '1|{"code": "control_api_unavailable", "delivered": false}',
+            '1|{"code": "control_api_unavailable", "delivered": false}',
+            '0|{"code": "started", "duplicate": false}',
+        ]
+        proc, calls, _ = self._run_routine(responses, wait="9" * 18, pause="1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(calls, 3)
 
 
 if __name__ == "__main__":

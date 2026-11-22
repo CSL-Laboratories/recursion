@@ -26,12 +26,16 @@ store's id: on a keychain it reaches that store's own values through that store'
 owner-only file it reaches nothing (the file names another store). A copy of the whole folder carries the store's
 id too: on a keychain both indexes name one set of items, so a removal through either deletes the value the other's
 record names (questions.md K18); on the owner-only file the copy has a file of its own, and the two part at their
-first write. A removal deletes every value saved for the id in the store, whichever save stored it.
+first write. A removal deletes every value saved for the id in the store, whichever save stored it; a recovery or a
+rollback deletes only the value of the save its intent was written for (ORDER OF WRITES).
 
 THE INDEX FORMAT, version 1: ``{"version": 1, "store_id": <32 hex>, "backend": <store or null>, "keys": {<id>:
 {"provider", "env_name", "created_at", "store", "metered_spend_allowed", "cap_usd", "save_id"}}, "pending":
-{<id>: {"op": "add" | "remove", "started_at"}}}``, at most 1 MiB. Anything else is refused ``index_invalid``. A
-listing says what the index holds; it does not say that a keychain is reachable or unlocked now.
+{<id>: {"op": "add" | "remove", "started_at", "save_id"}}}``, at most 1 MiB. Anything else is refused
+``index_invalid``. An intent's ``save_id`` names the save it was written for: the new record's for an add, the
+record's for a remove. An index written before intents carried it (an intent with only ``op`` and ``started_at``) is
+read as it is; see ORDER OF WRITES for what a recovery does with such an intent. A listing says what the index holds;
+it does not say that a keychain is reachable or unlocked now.
 
 PINNING. The first save records the backend the host offered then (``system.detect``) in the index. Every later
 operation that touches a value asks again and refuses when the answer differs: ``keychain_unavailable`` when a keychain
@@ -72,6 +76,13 @@ was saved: ``list`` shows it, ``credential`` refuses that id (``operation_pendin
 recovers it (deletes the orphaned value, or finishes the removal), and ``remove <id>`` clears it on request. Both
 index states are checked against the size limit before anything is changed (``store_full``). Every write first
 deletes the temp files an interrupted write left in the folder (``Folder.sweep``).
+A recovery, and the rollback of an add whose last index write failed, delete only the value of the save the intent
+was written for (the intent's ``save_id``), never a newer or an older save of the same id: an older index put back
+can carry an intent whose id has been saved again since. An intent written before intents carried a save id takes
+its record's save id when a record names the id; with no record it is finished only when the backend verifiably
+holds no value of the id, and otherwise stays (the id is refused ``operation_pending``) until ``remove <id>``, which
+deletes every value of the id on the person's request, clears it: which save it was for cannot be told, and a value
+the person did not ask to delete is never guessed away.
 
 VALUES NO RECORD NAMES. An index lost, emptied or put back no longer names every value the store holds. A save, a
 removal and a recovery change the values of the id they name and of no other, so such a value is never deleted by an
@@ -133,6 +144,7 @@ INDEX_VERSION = 1
 FIELDS = ('provider', 'env_name', 'created_at', 'store', 'metered_spend_allowed', 'cap_usd', 'save_id')
 SHOWN = ('key_id', 'provider', 'env_name', 'created_at', 'store', 'metered_spend_allowed', 'cap_usd')
 PENDING_FIELDS = ('op', 'started_at')
+PENDING_FIELDS_SAVED = ('op', 'started_at', 'save_id')     # an intent that names its save (the older shape is read too)
 OPS = ('add', 'remove')
 RANDOM_ID = re.compile(r'[0-9a-f]{32}')
 UNBOUND = '(a value in the owner-only file that no record of this index reaches)'
@@ -170,11 +182,13 @@ class KeyRecord:
 
 @dataclass(frozen=True)
 class Pending:
-    """An operation started on the backend and not finished: ``op`` is ``add`` or ``remove``."""
+    """An operation started on the backend and not finished: ``op`` is ``add`` or ``remove``. ``save_id`` names the
+    save it was written for; None in an intent written before intents carried it."""
 
     key_id: str
     op: str
     started_at: str
+    save_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -206,7 +220,8 @@ def _now(clock) -> str:
 def index_bytes(index: Index) -> bytes:
     """The index file exactly as it is written. Every write carries the store's id (``add`` makes it first)."""
     keys ={kid: {name: getattr(record, name) for name in FIELDS} for kid, record in sorted(index.keys.items())}
-    pending = {kid: {'op': p.op, 'started_at': p.started_at} for kid, p in sorted(index.pending.items())}
+    pending = {kid: {'op': p.op, 'started_at': p.started_at, **({'save_id': p.save_id} if p.save_id else {})}
+               for kid, p in sorted(index.pending.items())}
     body = json.dumps({'version': INDEX_VERSION, 'store_id': index.store_id,
                        'backend': index.backend if index.live() else None, 'keys': keys, 'pending': pending},
                       indent=1, ensure_ascii=True)
@@ -332,10 +347,17 @@ class KeyStore:
             if entry.op == 'add' and kid in keys:
                 del pending[kid]                 # the add finished; only its intent was left behind
                 continue
-            try:
-                backend.delete(kid, folder)
-            except KeyStoreError:
-                continue                         # still unreachable: the intent stays, and list shows it
+            save_id = entry.save_id
+            if save_id is None and kid in keys:
+                save_id = keys[kid].save_id      # an intent from before save ids: its record names the save
+            if save_id is None:
+                if backend.holds(kid, folder) is not False:
+                    continue                     # which save it was for cannot be told: it stays, refused as unfinished
+            else:
+                try:
+                    backend.delete(kid, folder, save_id=save_id)    # the value of that save only
+                except KeyStoreError:
+                    continue                     # still unreachable: the intent stays, and list shows it
             keys.pop(kid, None)                  # an unfinished remove is finished; an orphaned add is undone
             del pending[kid]
         if pending == index.pending:
@@ -356,6 +378,12 @@ class KeyStore:
                                 f'a letter or digit (published ids: {", ".join(v.PROVIDER_IDS)})')
         if not v.valid_env_name(env_name):
             raise KeyStoreError('env_name_invalid', 'a variable name is A-Z 0-9 _, not starting with a digit')
+        if v.looks_like_a_key(provider):
+            raise KeyStoreError('provider_invalid', 'this provider looks like a key, not a vendor id, so it is refused and '
+                                'not repeated here; a key is never taken from the command line')
+        if v.looks_like_a_key(env_name):
+            raise KeyStoreError('env_name_invalid', 'this variable name looks like a key, not a name, so it is refused '
+                                'and not repeated here; a key is never taken from the command line')
         if not v.valid_value(value):
             raise KeyStoreError('value_invalid', f'a key is {v.VALUE_MIN} to {v.VALUE_MAX} visible ASCII characters, '
                                 'with no space')
@@ -387,7 +415,8 @@ class KeyStore:
             record = KeyRecord(key_id, provider, env_name, now, backend.name, metered_spend_allowed, cap_usd,
                                _random_id())
             keys = {**index.keys, key_id: record}
-            intent = replace(index, backend=backend.name, pending={**index.pending, key_id: Pending(key_id, 'add', now)})
+            intent = replace(index, backend=backend.name,
+                             pending={**index.pending, key_id: Pending(key_id, 'add', now, record.save_id)})
             done = replace(index, backend=backend.name, keys=keys)
             self._sized(replace(intent, keys=keys))                     # both states fit, before anything changes
             self._write_index(folder, intent)                           # 1. the intent, before the outside effect
@@ -402,7 +431,7 @@ class KeyStore:
                 self._write_index(folder, done)                         # 3. the key, and no intent
             except BaseException:
                 try:
-                    backend.delete(key_id, folder)
+                    backend.delete(key_id, folder, save_id=record.save_id)    # this save's value, and no other's
                     undone = True
                 except Exception:  # noqa: BLE001 - the intent stays in the index: the next write recovers it
                     undone = False
@@ -436,8 +465,10 @@ class KeyStore:
             index = self._recover(folder, index, backend, but=key_id)
             keys = {kid: rec for kid, rec in index.keys.items() if kid != key_id}
             others = {kid: p for kid, p in index.pending.items() if kid != key_id}
+            earlier = index.pending.get(key_id)
+            save_id = record.save_id if record is not None else (earlier.save_id if earlier is not None else None)
             now = _now(self._clock)
-            self._write_index(folder, replace(index, pending={**others, key_id: Pending(key_id, 'remove', now)}))
+            self._write_index(folder, replace(index, pending={**others, key_id: Pending(key_id, 'remove', now, save_id)}))
             backend.delete(key_id, folder)     # every value of the id in this store, and no other id's, or it refuses
             self._write_index(folder, replace(index, keys=keys, pending=others))
             return record
@@ -612,11 +643,14 @@ def _parse_index(raw: bytes) -> Index | None:
         return None                      # two records naming one save: an index this store never writes
     pending = {}
     for key_id, entry in doc['pending'].items():
-        if not v.valid_key_id(key_id) or not isinstance(entry, dict) or set(entry) != set(PENDING_FIELDS):
+        if not v.valid_key_id(key_id) or not isinstance(entry, dict) \
+                or set(entry) not in (set(PENDING_FIELDS), set(PENDING_FIELDS_SAVED)):
             return None
         if entry['op'] not in OPS or not v.valid_timestamp(entry['started_at']):
             return None
-        pending[key_id] = Pending(key_id, entry['op'], entry['started_at'])
+        if 'save_id' in entry and not _valid_random_id(entry['save_id']):
+            return None
+        pending[key_id] = Pending(key_id, entry['op'], entry['started_at'], entry.get('save_id'))
     return Index(backend if live else None, keys, pending, doc['store_id'])
 
 

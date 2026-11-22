@@ -1,10 +1,13 @@
 """Where a key's VALUE is kept: the Secret Service (through ``secret-tool``) or the owner-only file.
 
 Each backend is made for one store (its random id, from the index) and has ``get(key_id, folder, record)``,
-``put(key_id, value, folder, record=...)``, ``delete(key_id, folder)`` and ``holds(key_id, folder)``. ``folder``
-is the store's open, checked folder (only the owner-only file uses it). A ``put`` or a ``delete`` changes the
-values of the id it names and of no other id: a value no record of the index names any more (the index lost,
-emptied or put back) stays where it is until a removal names its id. ``holds`` says whether a value for the id is
+``put(key_id, value, folder, record=...)``, ``delete(key_id, folder, save_id=None)`` and ``holds(key_id, folder)``.
+``folder`` is the store's open, checked folder (only the owner-only file uses it). A ``put`` or a ``delete`` changes
+the values of the id it names and of no other id: a value no record of the index names any more (the index lost,
+emptied or put back) stays where it is until a removal names its id. ``delete`` given a ``save_id`` (a recovery, or
+the rollback of an add) deletes only the value that save stored, and leaves a newer or older save of the id; it
+returns True when it found a value to delete, False when there verifiably was none. ``holds`` says whether a value
+for the id is
 there: True, False only when that is verified, None when it cannot be told. A missing value is
 ``secret_missing``; any other failure is a typed ``KeyStoreError``. No error, repr or log line of a backend
 carries a value.
@@ -81,6 +84,10 @@ class SecretService:
         """Every item saved for ``key_id`` in this store, whichever save stored it."""
         return ['application', 'recursion', 'recursion_store', self._store_id, 'recursion_key_id', key_id]
 
+    def _saved(self, key_id: str, save_id: str | None) -> list:
+        """The item one save stored, whatever its provider; with no save id, every item of the id."""
+        return self._attributes(key_id) + (['recursion_save', save_id] if save_id else [])
+
     def _item(self, key_id: str, record) -> list:
         """The item a record saved: its store, id, save and provider. With no record, any item of the id."""
         if record is None:
@@ -119,15 +126,17 @@ class SecretService:
         if done.returncode != 0:
             raise _failure('store', done)
 
-    def presence(self, key_id: str) -> bool:
-        """True when an item of ``key_id`` is there, False when it verifiably is not (``lookup`` finds none and
-        ``count`` lists none); a helper that fails, and so cannot tell, raises its typed refusal."""
-        look = self._run([self._tool(), 'lookup', *self._attributes(key_id)])
+    def presence(self, key_id: str, save_id: str | None = None) -> bool:
+        """True when an item of ``key_id`` (of that save, when ``save_id`` is given) is there, False when it verifiably
+        is not (``lookup`` finds none and ``search --all`` lists none); a helper that fails, and so cannot tell, raises
+        its typed refusal."""
+        words = self._saved(key_id, save_id)
+        look = self._run([self._tool(), 'lookup', *words])
         if look.returncode == 0:
             return True
         if not self._absent(look):
             raise _failure('lookup', look)
-        return self.count(key_id) > 0
+        return self._listed(words) > 0
 
     def count(self, key_id: str | None = None, record=None) -> int:
         """How many items ``search --all`` lists, locked ones too: with ``key_id`` and a record, the item that record's
@@ -138,7 +147,9 @@ class SecretService:
         ``search`` prints the secrets of the unlocked items it lists: its output is read for item lines only
         (``[<id>]``, one per item) and dropped.
         """
-        words = self._item(key_id, record) if key_id is not None else ['application', 'recursion']
+        return self._listed(self._item(key_id, record) if key_id is not None else ['application', 'recursion'])
+
+    def _listed(self, words: list) -> int:
         found = self._run([self._tool(), 'search', '--all', *words])
         if found.returncode != 0:
             raise _failure('search', found)
@@ -152,19 +163,21 @@ class SecretService:
         except Exception:  # noqa: BLE001 - a probe that fails cannot tell
             return None
 
-    def delete(self, key_id: str, folder: Folder) -> None:
-        """Remove every item of ``key_id`` in this store; succeed only when none is verifiably left.
+    def delete(self, key_id: str, folder: Folder, save_id: str | None = None) -> bool:
+        """Remove every item of ``key_id`` in this store (only the one ``save_id`` stored, when it is given); succeed
+        only when none is verifiably left. True when an item was there to remove, False when none ever was.
 
         ``clear`` removes the unlocked ones. Then ``presence`` decides: gone is done; still there (a locked item,
         which presence's ``lookup`` may just have unlocked) is cleared once more and asked again; a helper that
         cannot tell, or an item still there after the second try, is refused, and the caller keeps its record.
         """
-        for _ in range(2):
-            done = self._run([self._tool(), 'clear', *self._attributes(key_id)])
+        words = self._saved(key_id, save_id)
+        for attempt in range(2):
+            done = self._run([self._tool(), 'clear', *words])
             if done.returncode != 0 and not self._absent(done):
                 raise _failure('clear', done)
-            if self.presence(key_id) is False:
-                return
+            if self.presence(key_id, save_id) is False:
+                return attempt > 0 or done.returncode == 0
         raise KeyStoreError('keychain_locked', f'the Secret Service still holds {key_id} (in a locked collection?); it '
                             'stays on record')
 
@@ -254,11 +267,13 @@ class OwnerFile:
         entries[key_id] = (record.save_id, record.provider, value)     # this id's entry only: every other value stays
         self._save(folder, entries)
 
-    def delete(self, key_id: str, folder: Folder) -> None:
+    def delete(self, key_id: str, folder: Folder, save_id: str | None = None) -> bool:
         entries = self._load(folder)     # none when the file is another store's: nothing of this store to remove
-        if key_id in entries:
-            del entries[key_id]          # this id's entry only: every other value stays
-            self._save(folder, entries)
+        if key_id not in entries or (save_id is not None and entries[key_id][0] != save_id):
+            return False                 # nothing of the id (or of that save) is here: a newer or older save stays
+        del entries[key_id]              # this id's entry only: every other value stays
+        self._save(folder, entries)
+        return True
 
 
 _RANDOM_ID = re.compile(r'[0-9a-f]{32}')

@@ -21,10 +21,11 @@ from recursion_core.plugin_security.canonical import canonical
 from recursion_core.plugin_security.errors import Refused
 from recursion_core.plugin_security.loader import CoreHealth, PluginLoader
 from recursion_core.plugin_security.manifest import (
-    MANIFEST_SCHEMA_V1, PERMISSIONS, PERMISSIONS_V1, ReservedEffects, TrustStore, parse_manifest,
+    MANIFEST_SCHEMA_V1, PERMISSIONS, PERMISSIONS_V1, Grant, ReservedEffects, TrustStore, parse_manifest,
 )
+from recursion_core.plugin_security.signing import key_id
 from recursion_core.plugin_security.tests.support import PLUGIN_SOURCE, FakeGilProbe, manifest_bytes
-from recursion_core.plugin_security.tests.test_manifest_v1 import FAKE_KEY, v1, v1_fields
+from recursion_core.plugin_security.tests.test_manifest_v1 import FAKE_KEY, sha, v1, v1_fields
 
 ROOT = Path(__file__).resolve().parents[4]
 PLUGIN_SCHEMAS = ROOT / "schemas" / "plugin" / "v1"
@@ -72,8 +73,9 @@ def _doctor(raw: bytes, artifact: bytes = PLUGIN_SOURCE) -> list:
     return loader.doctor(raw, None, artifact)
 
 
-def _load(raw: bytes):
-    return PluginLoader(TrustStore({}), {}, ReservedEffects(), CoreHealth(), FakeGilProbe()).load(
+def _load(raw: bytes, grant: Grant | None = None):
+    grants = {} if grant is None else {grant.plugin_id: grant}
+    return PluginLoader(TrustStore({}), grants, ReservedEffects(), CoreHealth(), FakeGilProbe()).load(
         raw, None, PLUGIN_SOURCE)
 
 
@@ -263,6 +265,13 @@ class NotYetContained(unittest.TestCase):
         self.assertEqual(_without_runtime_findings(refused[SANDBOXED]), _without_runtime_findings(refused[INPROCESS]))
         self._one(refused[SANDBOXED])
         self.assertEqual(_refusal(v1(runtime=SANDBOXED, permissions=("read", "memory"))).code, "permission_reserved")
+
+    def test_it_changes_no_verdict_for_a_plugin_that_holds_a_grant(self) -> None:
+        grant = Grant("demo.plugin", sha(PLUGIN_SOURCE), None, ("read",), developer_key_id=key_id(FAKE_KEY))
+        loads = {runtime: _load(v1(runtime=runtime, permissions=("read",)), grant) for runtime in (SANDBOXED, INPROCESS)}
+        for runtime, loaded in loads.items():
+            with self.subTest(runtime=runtime):
+                self.assertEqual((loaded.trust, loaded.permissions), ("unsigned", ("read",)))
 
 
 if __name__ == "__main__":

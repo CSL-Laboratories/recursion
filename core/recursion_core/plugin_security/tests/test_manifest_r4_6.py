@@ -521,13 +521,9 @@ class InstallReaderBindingTests(unittest.TestCase):
         in memory, the way the schema draft adds it, so the test holds whether or not the
         companion schema already has it. Reader and member then agree."""
         schema_path = Path(__file__).resolve().parents[4] / "schemas" / "plugin" / "v1" / "install.v1.json"
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        schema = self._with_member(json.loads(schema_path.read_text(encoding="utf-8")))
         key_def = schema["$defs"]["key_id"]
         self.assertEqual(key_def["pattern"], r"^ed25519:[0-9a-f]{32}$")
-        schema["$defs"]["grant"]["properties"]["developer_key_id"] = {
-            "anyOf": [{"type": "null"}, {"$ref": "#/$defs/key_id"}]}
-        schema["$defs"]["grant"]["description"] = schema["$defs"]["grant"]["description"] + (
-            " developer_key_id is the developer key a manual grant is bound to, or null when the grant names none.")
         pattern = re.compile(key_def["pattern"])
         banned = key_def["not"]["pattern"]
         samples = [None, "ed25519:" + "ab" * 16, "", "ed25519:", "ed25519:" + "a" * 31,
@@ -551,6 +547,33 @@ class InstallReaderBindingTests(unittest.TestCase):
                     grant = {"plugin_id": "demo.plugin", "artifact_sha256": "0" * 64,
                              "permissions": ["read"], "developer_key_id": value}
                     self.assertEqual(validator.is_valid({"grants": [grant]}), member_ok)
+
+    @staticmethod
+    def _with_member(schema: dict) -> dict:
+        """Add the developer_key_id member in memory only when the schema has none; one it ships is kept."""
+        grant = schema["$defs"]["grant"]
+        if "developer_key_id" not in grant["properties"]:
+            grant["properties"]["developer_key_id"] = {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/key_id"}]}
+            grant["description"] = grant["description"] + (
+                " developer_key_id is the developer key a manual grant is bound to, or null when the grant names none.")
+        return schema
+
+    def test_a_member_the_schema_ships_is_kept_and_so_is_what_it_rejects(self) -> None:
+        schema_path = Path(__file__).resolve().parents[4] / "schemas" / "plugin" / "v1" / "install.v1.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        shipped = {"type": "null"}  # a stand-in definition that accepts nothing but null
+        schema["$defs"]["grant"]["properties"]["developer_key_id"] = shipped
+        description = schema["$defs"]["grant"]["description"]
+        kept = self._with_member(schema)["$defs"]["grant"]
+        self.assertIs(kept["properties"]["developer_key_id"], shipped)
+        self.assertEqual(kept["description"], description)
+        try:
+            import jsonschema
+        except ImportError:
+            return
+        grant = {"plugin_id": "demo.plugin", "artifact_sha256": "0" * 64, "permissions": ["read"],
+                 "developer_key_id": "ed25519:" + "ab" * 16}
+        self.assertFalse(jsonschema.Draft202012Validator(schema).is_valid({"grants": [grant]}))
 
     def _reader_keeps(self, value) -> bool:
         from recursion_core.daemon.plugins import PluginRefused

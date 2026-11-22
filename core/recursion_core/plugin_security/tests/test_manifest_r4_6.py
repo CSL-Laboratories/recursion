@@ -391,6 +391,30 @@ class LoaderBindingTests(unittest.TestCase):
         loaded = self.load(manifest_bytes(K1, permissions=()), grant)
         self.assertEqual((loaded.trust, loaded.permissions, loaded.module.VALUE), ("unsigned", (), 42))
 
+    def test_a_stale_unbound_manual_grant_is_refused_before_plugin_code_runs(self) -> None:
+        marker = Path(temp_dir(self)) / "plugin-code-ran"
+        source = f'open({str(marker)!r}, "w").close()\n'.encode()
+        raw = manifest_bytes(K1, source=source, permissions=("read",))
+        grant = Grant("demo.plugin", "0" * 64, None, ("read",))
+        try:
+            with self.assertRaises(Refused) as ctx:
+                self.load(raw, grant, source)
+        finally:
+            self.assertFalse(marker.exists(), "plugin code ran before the refusal")
+        self.assertEqual(ctx.exception.code, "grant_unbound")
+        self.assertEqual(str(ctx.exception), "grant_unbound: Make the grant again with developer_key_id "
+                                             "in install.json set to this plugin's developer key ID.")
+
+    def test_a_stale_bound_manual_grant_still_loads_with_no_permissions(self) -> None:
+        marker = Path(temp_dir(self)) / "plugin-code-ran"
+        source = f'open({str(marker)!r}, "w").close()\n'.encode()
+        raw = manifest_bytes(K1, source=source, permissions=("read",))
+        grant = Grant("demo.plugin", "0" * 64, None, ("read",), developer_key_id=key_id(K1))
+        loaded = self.load(raw, grant, source)
+        self.assertEqual((loaded.trust, loaded.permissions), ("unsigned", ()))
+        self.assertTrue(marker.exists())
+        self.assertIn("grant_artifact_mismatch", [f["code"] for f in loaded.findings])
+
 
 @needs_crypto
 class ManualGrantIdentityTests(unittest.TestCase):

@@ -360,10 +360,10 @@ class GrantBoundToDeveloperKeyTests(unittest.TestCase):
 class LoaderBindingTests(unittest.TestCase):
     """Through today's loader. Unsigned manifests under an untrusted key need no signature check."""
 
-    def load(self, raw: bytes, grant: Grant):
+    def load(self, raw: bytes, grant: Grant, source: bytes = PLUGIN_SOURCE):
         loader = PluginLoader(TrustStore({}), {"demo.plugin": grant}, ReservedEffects(), CoreHealth(),
                               FakeGilProbe())
-        return loader.load(raw, None, PLUGIN_SOURCE)
+        return loader.load(raw, None, source)
 
     def test_a_manual_grant_does_not_survive_a_change_of_the_declared_developer_key(self) -> None:
         grant = Grant("demo.plugin", DIGEST, None, ALL, True, developer_key_id=key_id(K1))
@@ -372,10 +372,24 @@ class LoaderBindingTests(unittest.TestCase):
         self.assertEqual((swapped.trust, swapped.permissions), ("unsigned", ()))
         self.assertIn("grant_developer_key_mismatch", [f["code"] for f in swapped.findings])
 
-    def test_an_unbound_manual_grant_loads_with_no_permission_and_says_why(self) -> None:
-        loaded = self.load(manifest_bytes(K1), Grant("demo.plugin", DIGEST, None, ALL, True))
-        self.assertEqual((loaded.trust, loaded.permissions), ("unsigned", ()))
-        self.assertIn("grant_developer_key_missing", [f["code"] for f in loaded.findings])
+    def test_an_unbound_manual_grant_is_refused_before_plugin_code_runs(self) -> None:
+        marker = Path(temp_dir(self)) / "plugin-code-ran"
+        source = f'open({str(marker)!r}, "w").close()\n'.encode()
+        raw = manifest_bytes(K1, source=source, permissions=("read",))
+        grant = Grant("demo.plugin", hashlib.sha256(source).hexdigest(), None, ("read",))
+        try:
+            with self.assertRaises(Refused) as ctx:
+                self.load(raw, grant, source)
+        finally:
+            self.assertFalse(marker.exists(), "plugin code ran before the refusal")
+        self.assertEqual(ctx.exception.code, "grant_unbound")
+        self.assertEqual(str(ctx.exception), "grant_unbound: Make the grant again with developer_key_id "
+                                             "in install.json set to this plugin's developer key ID.")
+
+    def test_an_unbound_manual_grant_can_load_a_plugin_that_asks_for_nothing(self) -> None:
+        grant = Grant("demo.plugin", DIGEST, None, ALL, True)
+        loaded = self.load(manifest_bytes(K1, permissions=()), grant)
+        self.assertEqual((loaded.trust, loaded.permissions, loaded.module.VALUE), ("unsigned", (), 42))
 
 
 @needs_crypto
@@ -403,10 +417,10 @@ class ManualGrantIdentityTests(unittest.TestCase):
         changed_manifest = manifest_bytes(replacement.public)
         # Same plugin id, artifact bytes and grant; only the unsigned manifest's developer_key changed.
         self.assertEqual(self.reload(changed_manifest, bound).permissions, ())
-        # The reviewer's own grant names no key: it is unbound, so it grants nothing anywhere.
+        # A manual grant without a developer key is refused for either manifest.
         unbound = Grant("demo.plugin", DIGEST, None, ALL, unsigned_order_acknowledged=True)
-        self.assertEqual(self.reload(self.world.manifest, unbound).permissions, ())
-        self.assertEqual(self.reload(changed_manifest, unbound).permissions, ())
+        self.assertEqual(refusal(self.reload, self.world.manifest, unbound), "grant_unbound")
+        self.assertEqual(refusal(self.reload, changed_manifest, unbound), "grant_unbound")
         # Order under the new key comes back only through a new grant the user makes for that key.
         regranted = Grant("demo.plugin", DIGEST, None, ALL, unsigned_order_acknowledged=True,
                           developer_key_id=key_id(replacement.public))
@@ -507,13 +521,9 @@ class InstallReaderBindingTests(unittest.TestCase):
         in memory, the way the schema draft adds it, so the test holds whether or not the
         companion schema already has it. Reader and member then agree."""
         schema_path = Path(__file__).resolve().parents[4] / "schemas" / "plugin" / "v1" / "install.v1.json"
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        schema = self._with_member(json.loads(schema_path.read_text(encoding="utf-8")))
         key_def = schema["$defs"]["key_id"]
         self.assertEqual(key_def["pattern"], r"^ed25519:[0-9a-f]{32}$")
-        schema["$defs"]["grant"]["properties"]["developer_key_id"] = {
-            "anyOf": [{"type": "null"}, {"$ref": "#/$defs/key_id"}]}
-        schema["$defs"]["grant"]["description"] = schema["$defs"]["grant"]["description"] + (
-            " developer_key_id is the developer key a manual grant is bound to, or null when the grant names none.")
         pattern = re.compile(key_def["pattern"])
         banned = key_def["not"]["pattern"]
         samples = [None, "ed25519:" + "ab" * 16, "", "ed25519:", "ed25519:" + "a" * 31,
@@ -537,6 +547,35 @@ class InstallReaderBindingTests(unittest.TestCase):
                     grant = {"plugin_id": "demo.plugin", "artifact_sha256": "0" * 64,
                              "permissions": ["read"], "developer_key_id": value}
                     self.assertEqual(validator.is_valid({"grants": [grant]}), member_ok)
+        if validator is None:
+            self.skipTest("the jsonschema package is not installed: the shipped member was not validated")
+
+    @staticmethod
+    def _with_member(schema: dict) -> dict:
+        """Add the developer_key_id member in memory only when the schema has none; one it ships is kept."""
+        grant = schema["$defs"]["grant"]
+        if "developer_key_id" not in grant["properties"]:
+            grant["properties"]["developer_key_id"] = {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/key_id"}]}
+            grant["description"] = grant["description"] + (
+                " developer_key_id is the developer key a manual grant is bound to, or null when the grant names none.")
+        return schema
+
+    def test_a_member_the_schema_ships_is_kept_and_so_is_what_it_rejects(self) -> None:
+        schema_path = Path(__file__).resolve().parents[4] / "schemas" / "plugin" / "v1" / "install.v1.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        shipped = {"type": "null"}  # a stand-in definition that accepts nothing but null
+        schema["$defs"]["grant"]["properties"]["developer_key_id"] = shipped
+        description = schema["$defs"]["grant"]["description"]
+        kept = self._with_member(schema)["$defs"]["grant"]
+        self.assertIs(kept["properties"]["developer_key_id"], shipped)
+        self.assertEqual(kept["description"], description)
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("the jsonschema package is not installed: the shipped member was not validated")
+        grant = {"plugin_id": "demo.plugin", "artifact_sha256": "0" * 64, "permissions": ["read"],
+                 "developer_key_id": "ed25519:" + "ab" * 16}
+        self.assertFalse(jsonschema.Draft202012Validator(schema).is_valid({"grants": [grant]}))
 
     def _reader_keeps(self, value) -> bool:
         from recursion_core.daemon.plugins import PluginRefused

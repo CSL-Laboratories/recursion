@@ -360,6 +360,7 @@ class PluginHost:
         # Loads are serial (the constructor's loop; the loader holds its own lock), so the modules
         # that appear between here and the end of this load were first imported for this plugin.
         before = set(sys.modules)
+        absent = None  # the loader's findings for a listed file that is absent, ending in its refusal
         try:
             if not _owned_directory(source):
                 raise PluginRefused('plugin_directory_untrusted',
@@ -367,19 +368,30 @@ class PluginHost:
             try:
                 verified = verify_package(source, self._trust)
             except Refused as exc:
-                if exc.code.startswith('package_'):
+                if not exc.code.startswith('package_'):
+                    raise
+                absent = self._absent_listed_file(source)
+                if absent is None:
                     raise _package_refusal(exc) from None
-                raise
-            # The entry file's own mismatch stays the loader's artifact_digest_mismatch, and a
-            # missing entry file stays plugin_file_missing. Every other changed, added or missing
-            # file is not accepted as signed: the signature is withheld.
+                raise Refused(absent[-1]['code'], absent[-1]['detail']) from None
+            # The entry file's own mismatch stays the loader's artifact_digest_mismatch. Every other
+            # changed, added or missing file is not accepted as signed: the signature is withheld.
+            # A version-1 package whose trusted signature lists a file that is not a regular file in
+            # this folder is refused package_file_missing, by the loader's own presence check.
             artifact = verified.files.get(ARTIFACT)
             if artifact is None:
-                artifact = _read_owned(source / ARTIFACT, MAX_ARTIFACT_BYTES)
+                artifact = _read_owned(source / ARTIFACT, MAX_ARTIFACT_BYTES, missing_ok=True)
+            if verified.missing:
+                absent = self._absent_listed_file(source, verified.manifest.raw, verified.signature, artifact)
+                if absent is not None:
+                    raise Refused(absent[-1]['code'], absent[-1]['detail'])
             signature = verified.signature if verified.intact else None
-            loaded = self.loader.load(verified.manifest.raw, signature, artifact)
+            loaded = self.loader.load(verified.manifest.raw, signature, artifact, package_dir=source)
         except (PluginRefused, Refused) as exc:
-            findings = list(self.loader.last_findings) if isinstance(exc, Refused) else []
+            if absent is not None:
+                findings = list(absent[:-1])
+            else:
+                findings = list(self.loader.last_findings) if isinstance(exc, Refused) else []
             record.update(code=exc.code, detail=exc.detail,
                           findings=findings + self._import_findings(before)
                           + [_finding(exc.code, 'refuse', exc.detail)])
@@ -404,6 +416,28 @@ class PluginHost:
         log.info('plugin %s loaded through the plugin loader: trust=%s permissions=%s provides=%s',
                  loaded.plugin_id, loaded.trust, ','.join(loaded.permissions) or '-', ','.join(record['provides']) or '-')
         return record
+
+    def _absent_listed_file(self, source, *read):
+        """The loader's findings when a trusted signature lists a file that is not a regular file in
+        ``source``, ending in its ``package_file_missing`` refusal; otherwise None.
+
+        ``read`` is (manifest bytes, signature, entry bytes or None). With none given (``verify_package``
+        refused), they are read here, and a file that cannot be read leaves that refusal standing.
+        ``doctor`` runs verify and admit only: no plugin code runs and nothing is loaded.
+        """
+        if not read:
+            try:
+                manifest = _read_owned(source / MANIFEST, MAX_MANIFEST_BYTES)
+                artifact = _read_owned(source / ARTIFACT, MAX_ARTIFACT_BYTES, missing_ok=True)
+                signature = _read_owned(source / SIGNATURE, 4096, missing_ok=True)
+            except PluginRefused:
+                return None
+            signature = None if signature is None else signature.decode('ascii', 'replace').strip()
+            read = (manifest, signature, artifact)
+        findings = self.loader.doctor(*read, package_dir=source)
+        if findings and (findings[-1]['code'], findings[-1]['severity']) == ('package_file_missing', 'refuse'):
+            return findings
+        return None
 
     @staticmethod
     def _import_findings(before, own=None):

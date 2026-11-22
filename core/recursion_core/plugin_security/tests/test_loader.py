@@ -113,7 +113,8 @@ class SignatureTests(unittest.TestCase):
                                  else "unlisted")
         stranger = Key()
         raw = manifest_bytes(stranger.public)
-        loaded = _loader(self.dev, Grant("demo.plugin", DIGEST, None, ALL)).load(
+        grant = Grant("demo.plugin", DIGEST, None, ALL, developer_key_id=_kid(stranger))
+        loaded = _loader(self.dev, grant).load(
             raw, stranger.sign(raw), PLUGIN_SOURCE, registry_label="verified")
         self.assertEqual(loaded.trust, "unsigned")  # the label does not make a key trusted
         self.assertNotIn("order", loaded.permissions)

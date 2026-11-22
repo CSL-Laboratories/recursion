@@ -331,8 +331,9 @@ class SignatureCoversTheFilesTests(unittest.TestCase):
                 self.assertEqual(self.trust.classify(tampered, self.signature)[::2],
                                  ("unsigned", "signature_invalid"))
 
-    def test_todays_loader_loads_a_version_1_package_by_its_entry_file(self) -> None:
-        raw = v1(self.dev.public, permissions=("read", "propose", "order"))
+    def test_a_signed_manifest_listing_only_the_entry_loads_from_its_bytes(self) -> None:
+        raw = v1(self.dev.public, permissions=("read", "propose", "order"),
+                 files={ENTRY_FILE: sha(PLUGIN_SOURCE)})
         grant = Grant("demo.plugin", sha(PLUGIN_SOURCE), key_id(self.dev.public), ("read", "propose", "order"))
         loader = PluginLoader(self.trust, {"demo.plugin": grant}, ReservedEffects(), CoreHealth(), FakeGilProbe())
         loaded = loader.load(raw, self.dev.sign(raw), PLUGIN_SOURCE)

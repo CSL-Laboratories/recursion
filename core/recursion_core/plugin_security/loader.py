@@ -26,14 +26,18 @@ from __future__ import annotations
 
 import hashlib
 import importlib.machinery
+import os
+import stat
 import sys
 import threading
 import types
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from .errors import Refused
 from .manifest import (
-    RUNTIME_INPROCESS_RETIRING, Grant, Manifest, ReservedEffects, TrustStore, effective_permissions, parse_manifest,
+    ENTRY_FILE, RUNTIME_INPROCESS_RETIRING, Grant, Manifest, ReservedEffects, TrustStore,
+    effective_permissions, parse_manifest,
 )
 from .signing import key_id
 from .runtime import GilProbe
@@ -41,6 +45,10 @@ from .runtime import GilProbe
 __all__ = ["CoreHealth", "LoadedPlugin", "PluginLoader"]
 
 _RUNTIME_SANDBOXED = "python-sandboxed/1"
+
+PACKAGE_FILE_MISSING_TEXT = ("%s is listed in the signed manifest but is not a regular file in the plugin's folder: "
+                             "install the package again from its source, or ask its developer for a whole package.")
+
 
 class CoreHealth:
     """Shared poison flag. Once poisoned, only a daemon restart clears it."""
@@ -78,6 +86,19 @@ class LoadedPlugin:
 
 def _finding(stage: str, code: str, severity: str, detail: str = "") -> dict:
     return {"stage": stage, "code": code, "severity": severity, "detail": detail}
+
+
+def _package_file_present(directory: Path, path: str) -> bool:
+    """Check a listed path for a regular file, without following symlinks within the package."""
+    *parents, name = path.split("/")
+    try:
+        for part in parents:
+            directory = directory / part
+            if not stat.S_ISDIR(directory.lstat().st_mode):
+                return False
+        return stat.S_ISREG((directory / name).lstat().st_mode)
+    except OSError:
+        return False
 
 
 class PluginLoader:
@@ -138,19 +159,22 @@ class PluginLoader:
         plugin = self._active.get(plugin_id)
         return None if plugin is None else plugin.artifact_sha256
 
-    def doctor(self, manifest_bytes: bytes, signature: object, artifact: bytes,
-               registry_label: str | None = None) -> list[dict]:
+    def doctor(self, manifest_bytes: bytes, signature: object, artifact: bytes | None,
+               registry_label: str | None = None, *, package_dir: Path | None = None) -> list[dict]:
         """Run verify and admit only (no code executes) and return every finding."""
         findings: list[dict] = []
         try:
-            self._verify_admit(manifest_bytes, signature, artifact, registry_label, findings)
+            self._verify_admit(manifest_bytes, signature, artifact, registry_label, findings, package_dir)
         except Refused as exc:
             findings.append(_finding(findings[-1]["stage"] if findings else "verify",
                                      exc.code, "refuse", exc.detail))
         return findings
 
-    def _verify_admit(self, manifest_bytes, signature, artifact, registry_label, findings):
-        if type(artifact) is not bytes:
+    def _verify_admit(self, manifest_bytes, signature, artifact, registry_label, findings, package_dir):
+        if isinstance(package_dir, (str, os.PathLike)):
+            package_dir = Path(package_dir)
+        # The daemon can supply None for a missing entry so a signed manifest can name it.
+        if type(artifact) is not bytes and (artifact is not None or package_dir is None):
             raise Refused("artifact_not_bytes")
         manifest = parse_manifest(manifest_bytes)
         findings.append(_finding("verify", "manifest_ok", "info", manifest.plugin_id))
@@ -165,10 +189,21 @@ class PluginLoader:
                                      "python-sandboxed/1 is not contained in this build: the plugin runs in "
                                      "the daemon's own process, with the daemon's rights, until the host that "
                                      "contains it is built"))
-        if hashlib.sha256(artifact).hexdigest() != manifest.artifact_sha256:
+        if artifact is not None and hashlib.sha256(artifact).hexdigest() != manifest.artifact_sha256:
             raise Refused("artifact_digest_mismatch")
         trust, kid, reason = self._trust.classify(manifest, signature)
         findings.append(_finding("verify", reason, "info" if trust == "signed" else "warn", trust))
+        if trust == "signed":
+            for path, _ in manifest.files:
+                # Bytes alone can supply the entry. With a directory, require the listed file there too.
+                if package_dir is None:
+                    present = path == ENTRY_FILE and artifact is not None
+                else:
+                    present = (path != ENTRY_FILE or artifact is not None) and _package_file_present(package_dir, path)
+                if not present:
+                    raise Refused("package_file_missing", PACKAGE_FILE_MISSING_TEXT % path)
+        if artifact is None:
+            raise Refused("plugin_file_missing", ENTRY_FILE)
         label = registry_label if registry_label in ("verified", "non_verified") else "unlisted"
         findings.append(_finding("verify", "registry_label", "info",
                                  label + " (a label, not a gate)"))
@@ -185,6 +220,9 @@ class PluginLoader:
                                                revoked, generation)
         for code, detail in dropped:
             findings.append(_finding("admit", code, "warn", detail))
+            if code == "grant_developer_key_missing" and manifest.permissions and not perms:
+                raise Refused("grant_unbound", "Make the grant again with developer_key_id "
+                                               "in install.json set to this plugin's developer key ID.")
         for perm in ("process", "network", "credential"):
             if perm in perms:
                 findings.append(_finding("admit", perm + "_granted", "warn",
@@ -197,14 +235,18 @@ class PluginLoader:
         findings.append(_finding("admit", "effective_permissions", "info", ",".join(perms)))
         return manifest, trust, kid, label, perms
 
-    def load(self, manifest_bytes: bytes, signature: object, artifact: bytes,
-             registry_label: str | None = None) -> LoadedPlugin:
+    def load(self, manifest_bytes: bytes, signature: object, artifact: bytes | None,
+             registry_label: str | None = None, *, package_dir: Path | None = None) -> LoadedPlugin:
+        """Load an entry artifact and check signed manifests' listed files in package_dir.
+
+        Entry bytes supply the entry file when no directory is given.
+        """
         with self._lock:
             self._health.require_healthy()
             findings: list[dict] = []
             try:
                 manifest, trust, kid, label, perms = self._verify_admit(
-                    manifest_bytes, signature, artifact, registry_label, findings)
+                    manifest_bytes, signature, artifact, registry_label, findings, package_dir)
                 if manifest.plugin_id in self._active:
                     raise Refused("plugin_already_active", manifest.plugin_id)
                 code = compile(artifact, "<plugin %s>" % manifest.plugin_id, "exec", dont_inherit=True)

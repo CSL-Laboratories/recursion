@@ -7,6 +7,9 @@ Every path is made inside the test's own temporary folder. Nothing outside it is
 from __future__ import annotations
 
 import ast
+import collections
+import contextlib
+import functools
 import inspect
 import io
 import json
@@ -17,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from types import MappingProxyType
 from unittest import mock
@@ -493,10 +497,10 @@ class ShownAndNeverWritten(_Folder):
         names = json.dumps(table["methods"]).lower()
         self.assertTrue(table["methods"])
         self.assertNotIn("setting", names)
-        for module in ("daemon/plugins.py", "plugin_security/protocol.py"):
-            with self.subTest(module=module):
-                source = (CORE / "recursion_core" / module).read_text(encoding="utf-8")
-                self.assertNotIn("settings", source)
+        # The core's side of the boundary, the module a plugin's client closes over, says nothing of settings.
+        # The plugin host module may read its own row: what a plugin is handed is tested in WhatAPluginIsHanded.
+        source = (CORE / "recursion_core" / "plugin_security" / "protocol.py").read_text(encoding="utf-8")
+        self.assertNotIn("settings", source)
 
 
 class _ReachedTheLock(Exception):
@@ -538,6 +542,29 @@ class TheDaemonsStart(_Folder):
         self.assertIn("settings: plugin_host.gil_check = false (default true; source: settings file)", logged)
         self.assertIn("note settings_unknown_key: 'plugin_host.unknown'", " ".join(logged))
 
+    def test_status_and_start_log_name_the_file_from_each_environment(self) -> None:
+        self.put(OFF)
+        shell_config = self.tmp / "shell-config"
+        shell_file = self.put(OFF.replace("false", "true"),
+                              shell_config / "recursion" / "settings.toml")
+        sentence = ("These are the values a daemon started from this environment would take, "
+                    "and a daemon already running keeps the values it read at its own start, "
+                    "as shown in the recursion_core.daemon startup log.")
+        for config, path, value in ((self.config, self.file, "false"),
+                                    (shell_config, shell_file, "true")):
+            with self.subTest(config=config), mock.patch.dict(os.environ, XDG_CONFIG_HOME=str(config)):
+                out = io.StringIO()
+                self.assertEqual(0, settings.main([], out=out, err=io.StringIO()))
+                shown = out.getvalue().splitlines()
+                self.assertEqual(f"settings file: {path}", shown[0])
+                self.assertIn(sentence, shown)
+                self.assertIn(f"plugin_host.gil_check = {value} (default true; source: settings file)", shown)
+
+        _, _, records = self.start_log()
+        self.assertIn(("INFO", f"settings file: {self.file}"), records)
+        self.assertIn(("INFO", "settings: plugin_host.gil_check = false (default true; source: settings file)"),
+                      records)
+
     def test_with_every_file_the_parser_or_the_notes_cannot_take_the_daemon_reaches_its_lock(self) -> None:
         cases = {**NOT_READ_BY_THE_PARSER, **TOO_LONG_TO_SHOW, "a dotted key of 3000 parts": DOTTED_3000}
         for case, text in cases.items():
@@ -563,6 +590,123 @@ class TheDaemonsStart(_Folder):
                 self.assertEqual("INFO", levels["settings: plugin_host.gil_check = true (default true; source: default)"])
 
 
+def _held_of_settings(root) -> list[str]:
+    """The paths by which ``root``, an object handed to a plugin, holds anything of the settings module.
+
+    It follows closures, defaults, bound objects, partials, attributes and containers. It does not follow a
+    function's module namespace: a plugin in the daemon's process can always import ``sys`` for itself, so
+    what is tested is what the core and the host hand over, and what the handed objects hold."""
+
+    held = settings.__name__
+    found, seen, todo = [], set(), [("handed", root)]
+    while todo:
+        path, obj = todo.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if obj is settings or type(obj).__module__ == held or getattr(obj, "__module__", None) == held:
+            found.append(path)
+            continue
+        if isinstance(obj, (types.ModuleType, type, str, bytes, int, float, complex, type(None))):
+            continue
+        kids: list[tuple[str, object]] = []
+        if isinstance(obj, types.FunctionType):
+            for i, cell in enumerate(obj.__closure__ or ()):
+                try:
+                    kids.append((f"{path}.closure[{i}]", cell.cell_contents))
+                except ValueError:  # an empty cell
+                    pass
+            kids += [(f"{path}.default", d) for d in obj.__defaults__ or ()]
+            kids += [(f"{path}.kwdefault", d) for d in (obj.__kwdefaults__ or {}).values()]
+        elif isinstance(obj, types.MethodType):
+            kids += [(f"{path}.__self__", obj.__self__), (f"{path}.__func__", obj.__func__)]
+        elif isinstance(obj, functools.partial):
+            kids += [(f"{path}.func", obj.func), (f"{path}.args", obj.args), (f"{path}.keywords", obj.keywords)]
+        elif isinstance(obj, dict):
+            for key, value in list(obj.items()):
+                kids += [(f"{path}.key", key), (f"{path}[{key!r}]", value)]
+        elif isinstance(obj, (list, tuple, set, frozenset, collections.deque)):
+            kids += [(f"{path}[]", item) for item in list(obj)]
+        else:
+            if hasattr(obj, "__dict__"):
+                kids.append((f"{path}.__dict__", vars(obj)))
+            for klass in type(obj).__mro__:
+                for slot in getattr(klass, "__slots__", ()):
+                    if hasattr(obj, slot):
+                        kids.append((f"{path}.{slot}", getattr(obj, slot)))
+        todo += kids
+    return found
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class WhatAPluginIsHanded(_Folder):
+    """A stand-in plugin is loaded by the real plugin host; what it was handed is searched for the settings."""
+
+    def hosted(self, host_class=None, leak: bool = False):
+        from recursion_core.daemon import breaker as daemon_breaker
+        from recursion_core.daemon import plugins
+        from recursion_core.daemon.tests import plugin_fixture as fx
+        from recursion_core.plugin_security.tests.support import FakeGilProbe
+        config, state = self.config / "recursion", self.tmp / "state"
+        store, _ = daemon_breaker.open_breaker_store(state, clock=lambda: 0.0)
+        self.addCleanup(store.close)
+        fx.write_install(config, grants=[fx.grant_for(fx.OPERATOR_SOURCE)])
+        fx.write_plugin(config / "plugins" / "one", fx.OPERATOR_SOURCE)
+
+        def leaky(core, caller):  # a core that hands the plugin the settings in force
+            held = settings.load(self.environ)
+            return lambda request: held
+
+        patched = mock.patch.object(plugins.CoreService, "client_for", leaky) if leak else contextlib.nullcontext()
+        with patched:
+            host = (host_class or plugins.PluginHost)(config, state, store, gil_probe=FakeGilProbe(),
+                                                      verification_available=lambda: True)
+        self.addCleanup(host.close)
+        kept = host._operators["fixture.operator"].__globals__["CORE"]  # what the stand-in's bind_core was handed
+        self.assertEqual(1, len(kept))
+        return host, kept[0]
+
+    def test_nothing_of_the_settings_module_is_reachable_from_what_a_plugin_is_handed(self) -> None:
+        self.put(OFF)
+        _, handed = self.hosted()
+        self.assertEqual([], _held_of_settings(handed))
+        self.assertEqual([], _held_of_settings(((lambda: 1),)))  # the search finds nothing where there is nothing
+
+    def test_the_search_finds_a_plugin_that_is_handed_the_settings(self) -> None:
+        self.put(OFF)
+        _, handed = self.hosted(leak=True)
+        found = _held_of_settings(handed)
+        self.assertTrue(found)
+        self.assertEqual(["handed.closure[0]"], found)
+
+    def test_the_host_may_read_one_row_and_a_plugin_still_cannot_reach_the_settings(self) -> None:
+        from recursion_core.daemon import plugins
+        self.put(OFF)
+
+        class ReadsItsRow(plugins.PluginHost):
+            def __init__(host, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                host.gil_check = settings.load(os.environ)["plugin_host.gil_check"]
+
+        with mock.patch.dict(os.environ, self.environ):
+            host, handed = self.hosted(ReadsItsRow)
+        self.assertIs(False, host.gil_check)
+        self.assertEqual([], _held_of_settings(handed))
+
+    def test_a_host_that_keeps_the_whole_settings_where_the_core_can_reach_them_is_found(self) -> None:
+        from recursion_core.daemon import plugins
+        self.put(OFF)
+
+        class KeepsTheFile(plugins.PluginHost):
+            def __init__(host, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                host.in_force = settings.load(os.environ)
+
+        with mock.patch.dict(os.environ, self.environ):
+            _, handed = self.hosted(KeepsTheFile)
+        self.assertTrue(_held_of_settings(handed))
+
+
 @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
 class PublishedShape(_Folder):
     def test_the_schema_declares_exactly_the_table(self) -> None:
@@ -584,6 +728,24 @@ class PublishedShape(_Folder):
         walk(schema["properties"], "")
         expect = {r.name: (kinds[r.type], r.default, r.says, r.floor, r.ceiling) for r in settings.SETTINGS}
         self.assertEqual(expect, found)
+
+    def test_the_schema_describes_the_readers_version_type(self) -> None:
+        schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
+        self.assertIn("The settings file reader accepts version only as a TOML integer "
+                      "(a whole number such as 1) and rejects a float such as 1.0.",
+                      schema["description"])
+        self.put(OFF.replace("version = 1", "version = 1.0"))
+        loaded = settings.load(self.environ)
+        self.assert_default(loaded, settings.UNREADABLE)
+        self.assertIn("version must be 1, found 1.0", loaded.notes[0].detail)
+        for wrong in ('"1"', "2", "true"):
+            with self.subTest(version=wrong):
+                self.put(OFF.replace("version = 1", f"version = {wrong}"))
+                loaded = settings.load(self.environ)
+                self.assert_default(loaded, settings.UNREADABLE)
+                self.assertIn("version must be 1, found", loaded.notes[0].detail)
+        self.put(OFF)
+        self.assertEqual([], self.codes(settings.load(self.environ)))
 
     def test_the_readme_names_each_setting(self) -> None:
         readme = (SCHEMA_DIR / "README.md").read_text(encoding="utf-8")

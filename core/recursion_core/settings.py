@@ -27,8 +27,9 @@ The rules this module keeps:
   (``"plugin_host.gil_check" = ...``): it is never a second spelling of a setting. A value of the wrong type
   or outside its floor and ceiling keeps that setting's default, never a clamped value
   (``settings_value_out_of_range``). Each note names the key, the value found and what is allowed.
-* SHOWN. ``python -m recursion_core.settings`` prints every setting, its value in force, its default and its
-  source, and every note. It takes no argument and writes nothing. The daemon logs the same lines.
+* SHOWN. ``python -m recursion_core.settings`` prints the file path and the values a daemon started
+  from this environment would take, with their defaults, sources and any notes. It takes no argument
+  and writes nothing. The daemon records the path and its values at start and logs the notes.
 
 Read at daemon start in this build; a later reload may call ``load`` again. ``load`` keeps no state between
 calls. ``SETTINGS`` is append-only: a row is added, never renamed or given another meaning.
@@ -271,13 +272,14 @@ def load(environ) -> Loaded:
 def lines(loaded: Loaded) -> list[str]:
     """What status and the daemon's start log show: each setting, its value, default and source, then the notes."""
 
+    # A future secret row must show set or not set here and keep raw values out of notes.
     out = [f"{v.name} = {_shown(v.value)} (default {_shown(v.default)}; source: {v.source})"
            for v in loaded.values.values()]
     return out + [f"{WARNED if note.warns else ''}note {note}" for note in loaded.notes]
 
 
 def main(argv: list[str] | None = None, environ=None, out=None, err=None) -> int:
-    """``python -m recursion_core.settings``: print the settings in force. It takes no argument and writes nothing."""
+    """Show what a daemon started from this environment would read. It takes no argument and writes nothing."""
 
     argv = sys.argv[1:] if argv is None else argv
     out, err = out or sys.stdout, err or sys.stderr
@@ -287,6 +289,9 @@ def main(argv: list[str] | None = None, environ=None, out=None, err=None) -> int
         return 2
     loaded = load(os.environ if environ is None else environ)
     print(f"settings file: {loaded.path or 'none'}", file=out)
+    print("These are the values a daemon started from this environment would take, "
+          "and a daemon already running keeps the values it read at its own start, "
+          "as shown in the recursion_core.daemon startup log.", file=out)
     for line in lines(loaded):
         print(line, file=out)
     return EXIT_WARNED if any(note.warns for note in loaded.notes) else 0

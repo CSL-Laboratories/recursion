@@ -164,11 +164,14 @@ SQLITE_WAL_RESET_REPAIRED = {
     # check-in, and 3.51.3 ships the same change. So 3.52.0 passes from its patch 0.
     (3, 52): 0,
 }
-_SQLITE_WAL_REST = ('Recursion does not open its stores with it. Use a Python whose SQLite is 3.53.0 or later, '
-                    '3.51.3 or later in 3.51, 3.50.7 or later in 3.50, or 3.44.6 or later in 3.44, and check it with: '
-                    'python3 -c "import sqlite3; print(sqlite3.sqlite_version)". '
-                    'To accept the risk and go on, set stores.sqlite_wal_bug = "accept_risk" in '
-                    '$XDG_CONFIG_HOME/recursion/settings.toml.')
+_SQLITE_WAL_REST = ('Recursion does not open its stores with it. Use a Python whose SQLite is 3.53.0 or later, or '
+                    '3.51.3 or later on the 3.51 line, 3.50.7 or later on the 3.50 line, or 3.44.6 or later on the '
+                    "3.44 line. Check the daemon's interpreter with: "
+                    '~/.local/lib/recursion/venv/bin/python3.14t -c "import sqlite3; print(sqlite3.sqlite_version)" '
+                    '(a program that calls a store itself checks the interpreter it runs). To accept the risk and '
+                    'go on, set stores.sqlite_wal_bug = "accept_risk" in $XDG_CONFIG_HOME/recursion/settings.toml '
+                    "for the daemon's own stores, or pass "
+                    'sqlite_wal_bug="accept_risk" from a program that calls a store itself.')
 _SQLITE_WAL_HAS_THE_BUG = 'This Python uses SQLite {found}, which has a known bug that can damage a database in WAL mode. '
 
 

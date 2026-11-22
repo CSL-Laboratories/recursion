@@ -26,7 +26,9 @@ The rules this module keeps:
   the command end with ``EXIT_WARNED``; nothing is ever corrected. So is a quoted key that holds a dot
   (``"plugin_host.gil_check" = ...``): it is never a second spelling of a setting. A value of the wrong type
   or below its meaningful floor keeps that setting's default (``settings_value_out_of_range``). A value
-  outside a row's advice stays in force. Each note names the key, the value found and what is allowed.
+  outside a row's advice stays in force. A number row declared to accept no limit reads the string
+  ``"none"`` as no limit; on a text row it is the text, and on any other row it is refused. Each note
+  names the key, the value found and what is allowed.
 * SHOWN. ``python -m recursion_core.settings`` prints the file path and the values a daemon started
   from this environment would take, with their defaults, sources, any advice and any notes. It takes no argument
   and writes nothing. The daemon that holds the one-daemon lock records the path and its values in its
@@ -66,6 +68,9 @@ class _NoLimit:
     __slots__ = ()
 
     def __repr__(self) -> str:
+        return "NO_LIMIT"
+
+    def __reduce__(self):  # a copy or a pickle round trip is this one object, never a second
         return "NO_LIMIT"
 
 
@@ -320,7 +325,7 @@ def _shown_advice(v: Value) -> str:
         return ""
     text = f"; advised: {', '.join(bounds)}"
     value = v.value
-    if type(value) in (int, float) and (
+    if (value is NO_LIMIT and upper is not None) or type(value) in (int, float) and (
         (lower is not None and value < lower) or (upper is not None and value > upper)
     ):
         text += "; outside the advice"

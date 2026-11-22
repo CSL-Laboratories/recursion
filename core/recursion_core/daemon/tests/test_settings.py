@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import collections
 import contextlib
+import copy
 import functools
 import inspect
 import io
@@ -16,6 +17,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import pickle
 import re
 import subprocess
 import sys
@@ -579,6 +581,46 @@ class LimitsNamesAndAdvice(_Folder):
         self.assertEqual(0, loaded[row.name])
         self.assertEqual([], self.codes(loaded))
 
+    def test_no_limit_is_outside_an_at_most_advice_and_not_an_at_least_one(self) -> None:
+        for kind, default, advice, outside in ((int, 5, (None, 10), True), (int, 5, (1, None), False),
+                                               (float, 5.0, (None, 10.0), True), (float, 5.0, (1.0, None), False)):
+            with self.subTest(kind=kind, advice=advice):
+                row = settings.Setting("test.limit", kind, default, "A limit.", allow_no_limit=True, advice=advice)
+                line = settings.lines(self.read(row, '"none"'))[0]
+                self.assertEqual(outside, line.endswith("; outside the advice)"), line)
+
+    def test_no_limit_stays_the_one_value_through_a_copy_and_a_pickle(self) -> None:
+        one = settings.NO_LIMIT
+        self.assertIs(one, copy.copy(one))
+        self.assertIs(one, copy.deepcopy(one))
+        for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+            with self.subTest(protocol=protocol):
+                self.assertIs(one, pickle.loads(pickle.dumps(one, protocol)))
+        row = settings.Setting("test.limit", int, 5, "A limit.", allow_no_limit=True)
+        held = copy.deepcopy(dict(self.read(row, '"none"').values))
+        self.assertIs(one, held[row.name].value)
+        self.assertEqual("no limit", settings._shown(held[row.name].value))
+
+    def test_a_float_below_its_floor_keeps_the_default_with_the_reason(self) -> None:
+        row = settings.Setting("test.span", float, 1.5, "A span.", floor=0)
+        loaded = self.read(row, "-0.5")
+        self.assertEqual(1.5, loaded[row.name])
+        self.assertEqual(settings.SOURCE_DEFAULT, loaded.values[row.name].source)
+        self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
+        self.assertEqual("test.span: found -0.5; a value below 0 has no meaning; the default 1.5 stays in force",
+                         loaded.notes[0].detail)
+        loaded = self.read(row, "0.0")
+        self.assertEqual(0.0, loaded[row.name])
+        self.assertEqual([], self.codes(loaded))
+
+    def test_a_float_beyond_its_advice_is_in_force_and_marked(self) -> None:
+        row = settings.Setting("test.span", float, 1.5, "A span.", advice=(None, 10.0))
+        loaded = self.read(row, "11.5")
+        self.assertEqual(11.5, loaded[row.name])
+        self.assertEqual([], self.codes(loaded))
+        self.assertEqual(["test.span = 11.5 (default 1.5; source: settings file; advised: at most 10.0; "
+                          "outside the advice)"], settings.lines(loaded))
+
     def test_status_shows_no_limit_and_the_names(self) -> None:
         rows = (
             settings.Setting("test.limit", int, 5, "A limit.", allow_no_limit=True, advice=(None, 10)),
@@ -594,7 +636,7 @@ class LimitsNamesAndAdvice(_Folder):
         self.assertEqual(f"settings file: {self.file}", shown[0])
         self.assertTrue(shown[1].startswith("These are the values a daemon started from this environment"))
         self.assertEqual(
-            ["test.limit = no limit (default 5; source: settings file; advised: at most 10)",
+            ["test.limit = no limit (default 5; source: settings file; advised: at most 10; outside the advice)",
              "test.names = ['Lin', 'Ada'] (default []; source: settings file)"],
             shown[2:],
         )

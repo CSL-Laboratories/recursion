@@ -20,15 +20,16 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
 - A key the reader does not know is skipped and reported (`settings_unknown_key`); the others are read.
 - A value of the wrong type or below a numeric setting's meaningful floor keeps the default
   (`settings_value_out_of_range`). A length or count, for example, has no meaning below zero.
-- A numeric setting can opt in to the reserved TOML string `"none"`. Status shows it as `no limit`.
-  Other settings refuse that string as a value. Numeric values must be finite.
+- A numeric setting can opt in to the TOML string `"none"`, which means no limit. Status shows it as
+  `no limit`. A numeric setting that does not opt in, a true-or-false setting and a list setting refuse that
+  string with a note; a text setting keeps it as its text. Numeric values must be finite.
 - A list setting takes a TOML array of strings, including `[]`. Every item must be a string. The reader
   keeps the first occurrence of each name in a tuple, and status shows the names in order.
 - A numeric setting can give advice on how low or high to go. Status shows the advice beside the value
-  and marks a number outside it. That number stays in force.
+  and marks a number outside it, and no limit when the advice has an upper bound. That value stays in force.
 - On a system without an owner check (Windows) no file is read (`settings_not_read_on_this_system`).
-- `python -m recursion_core.settings` shows each setting, its value in force, its default and its source,
-  and every note; it takes no argument and writes nothing. The daemon logs the same lines at start.
+- `python -m recursion_core.settings` shows each setting, its value in force, its default, its source and
+  any advice, and every note; it takes no argument and writes nothing. The daemon logs the same lines at start.
 - The daemon reads the file at start in this build; a later reload may read it again.
 - The list of settings is append-only: a row is added, never renamed or given another meaning.
 

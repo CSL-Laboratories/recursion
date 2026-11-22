@@ -207,6 +207,18 @@ class MessageTypeTests(unittest.TestCase):
                     hc.check_message(message, receiver="daemon")
                 self.assertEqual(caught.exception.code, "message_invalid")
 
+    def test_an_origin_field_is_message_reserved_on_event_and_message_invalid_on_call(self):
+        for receiver in ("daemon", "host"):
+            with self.subTest(kind="event", receiver=receiver):
+                with self.assertRaises(hc.ChannelRefusal) as caught:
+                    hc.check_message({"type": "event", "origin": "trigger"}, receiver=receiver)
+                self.assertEqual(caught.exception.code, "message_reserved")
+                self.assertIn(NOT_AVAILABLE, caught.exception.detail)
+            with self.subTest(kind="call", receiver=receiver):
+                with self.assertRaises(hc.ChannelRefusal) as caught:
+                    hc.check_message(dict(call("registry"), origin="trigger"), receiver=receiver)
+                self.assertEqual(caught.exception.code, "message_invalid")
+
 
 class CallNameTests(unittest.TestCase):
     """A call carries a NAME; an unknown one is refused call_unknown, a reserved one call_reserved; nothing runs."""

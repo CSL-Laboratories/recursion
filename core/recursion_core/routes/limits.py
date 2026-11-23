@@ -1,6 +1,6 @@
 """What happens when a route hits a limit: shown, user-configurable, never a silent switch (Nov 8 briefing).
 
-Lucas's Nov 8 briefing: "when a subscription hits a limit, show it clearly and let the user switch. Model
+The owner's Nov 8 briefing: "when a subscription hits a limit, show it clearly and let the user switch. Model
 or provider per request, what happens at a limit, and fallback order are all user-configurable. The
 default is show and ask, never a silent switch."
 

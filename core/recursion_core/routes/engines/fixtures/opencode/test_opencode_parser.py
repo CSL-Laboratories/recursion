@@ -170,7 +170,7 @@ class FixtureTests(Shape, unittest.TestCase):
         self.assertEqual(on_disk, sorted(ENTRIES))
         for name, entry in ENTRIES.items():
             self.assertIsInstance(entry["synthetic"], bool, name)   # a JSON true or false, not 1 or "yes"
-            # A hand-written file is named synthetic-; a run Lucas captures will be named captured-.
+            # A hand-written file is named synthetic-; a run the owner captures will be named captured-.
             self.assertTrue(name.startswith("synthetic-" if entry["synthetic"] else "captured-"), name)
             self.assertIn(entry["package"], INDEX["sources"], name)
         self.assertIn("SYNTHETIC", INDEX["synthetic"])

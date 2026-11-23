@@ -27,6 +27,7 @@ import recursion_core
 from recursion_core.control.commands import setup
 from recursion_core.daemon_install import Roots, daemon_exec_args, install as install_function, owned_paths
 from recursion_core.daemon_install.tests.test_daemon_install import POSIX_PATHS
+from recursion_core.daemon_install.tests.mount_stub import setUpModule, tearDownModule  # noqa: F401
 from recursion_core.plugin_security.signing import backend_available, key_id
 
 # The module, not the package attribute ``install``, which is the function.

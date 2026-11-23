@@ -18,6 +18,7 @@ from recursion_core.daemon import control_adapter as adapter
 from recursion_core.daemon.launcher import EngineUnitManager
 from recursion_core.daemon_install import Roots, install
 from recursion_core.daemon_install.tests.test_daemon_install import EXEC, POSIX_PATHS
+from recursion_core.daemon_install.tests.mount_stub import setUpModule, tearDownModule  # noqa: F401
 from recursion_core.plugin_security import stores
 
 TEST_ANCHOR = '11' * 32

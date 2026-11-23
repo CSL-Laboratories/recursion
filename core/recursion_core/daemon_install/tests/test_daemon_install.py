@@ -32,6 +32,7 @@ from recursion_core.daemon_install import (
     uninstall,
     upgrade,
 )
+from recursion_core.daemon_install.tests.mount_stub import setUpModule, tearDownModule  # noqa: F401
 from recursion_core.plugin_security import stores
 
 PY = "/opt/recursion/venv/bin/python3.14t"

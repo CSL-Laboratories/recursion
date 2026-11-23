@@ -22,6 +22,7 @@ import zipfile
 
 import recursion_core
 from recursion_core import _entrypoints
+from recursion_core.daemon_install.tests import mount_stub
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(recursion_core.__file__))
 REPO = os.path.dirname(os.path.dirname(PACKAGE_DIR))
@@ -164,10 +165,13 @@ class BuiltWheelTests(unittest.TestCase):
 
         home = os.path.join(self.tmp, "home")
         os.mkdir(home, 0o700)
-        script = ("import sys, recursion_core; from recursion_core.control.commands import setup; "
+        table = mount_stub.write_table(self.tmp)  # the install reads a stand-in mount table, never the machine's
+        script = ("import importlib, sys, recursion_core; from recursion_core.control.commands import setup; "
+                  "importlib.import_module('recursion_core.daemon_install.install')._MOUNTINFO = sys.argv[2]; "
                   "sys.exit(setup.run('install', out=sys.stdout, roots=setup.Roots(home=sys.argv[1]), "
                   "interpreter=sys.executable, package=recursion_core.__file__))")
-        installed = subprocess.run([python, "-I", "-c", script, home], cwd="/", env=clean, capture_output=True, text=True)
+        installed = subprocess.run([python, "-I", "-c", script, home, table], cwd="/", env=clean, capture_output=True,
+                                   text=True)
         self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
         answer = json.loads(installed.stdout)
         self.assertEqual((answer["code"], answer["interpreter"]), ("ok", python))

@@ -130,7 +130,8 @@ point that holds the folder's nearest folder that is there decides. On `9p`, `v9
 read and `<kind>` the type: "Recursion does not create its stores in <folder>: it is on <kind>, where
 SQLite's write-ahead log can damage a database. Put a local disk or volume at <folder> (in a container:
 mount a volume there) and run recursiond install again, or run it with XDG_STATE_HOME set to an absolute
-folder on a local disk. Check a folder with: findmnt -no FSTYPE -T "<folder>"". The XDG_STATE_HOME way is
+folder on a local disk. Check a folder with: findmnt -no FSTYPE -T <folder>", where the command's `<folder>`
+is quoted for a POSIX shell (`shlex.quote`), so the pasted line checks exactly that folder. The XDG_STATE_HOME way is
 for `install`: an `upgrade` whose unit names another state folder is still refused `unit_state_elsewhere`,
 with that refusal's own ways out. Where the table cannot be read (no `/proc/self/mountinfo`), nothing is
 refused and the plan's `filesystem` lines say the type was not read. A person's setting to accept the

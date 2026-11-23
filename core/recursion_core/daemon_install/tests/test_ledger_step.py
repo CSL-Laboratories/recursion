@@ -20,6 +20,7 @@ import unittest
 from recursion_core.daemon import plugins as daemon_plugins
 from recursion_core.daemon_install import InstallRefused, Roots, install, owned_paths, upgrade
 from recursion_core.daemon_install.tests.test_daemon_install import EXEC, POSIX_PATHS
+from recursion_core.daemon_install.tests.mount_stub import setUpModule, tearDownModule  # noqa: F401
 from recursion_core.plugin_security import stores
 from recursion_core.plugin_security.signing import key_id
 

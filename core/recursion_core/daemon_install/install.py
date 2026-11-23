@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import shlex
 import sqlite3
 import stat
 from dataclasses import dataclass
@@ -60,13 +61,14 @@ _MOUNTINFO = "/proc/self/mountinfo"
 # The values ``check_store_ground`` takes for a refused kind: refuse (the default) or go on, the risk accepted.
 _FILESYSTEM_UNSAFE = ("refuse", "accept_risk")
 # The whole detail of ``store_filesystem_unsupported``. {folder} is the folder whose type was read (the store
-# folder, or its nearest folder that is there, so the findmnt command runs as printed). The XDG_STATE_HOME way is
+# folder, or its nearest folder that is there, so the findmnt command runs as printed); {quoted} is that folder
+# quoted for a POSIX shell (``shlex.quote``), so the pasted command reads back exactly it. The XDG_STATE_HOME way is
 # for install: an upgrade whose unit names another state folder is still refused ``unit_state_elsewhere``, with
 # that refusal's own ways out.
 _STORE_GROUND = ("Recursion does not create its stores in {folder}: it is on {kind}, where SQLite's write-ahead log "
                  "can damage a database. Put a local disk or volume at {folder} (in a container: mount a volume "
                  "there) and run recursiond install again, or run it with XDG_STATE_HOME set to an absolute folder "
-                 "on a local disk. Check a folder with: findmnt -no FSTYPE -T \"{folder}\"")
+                 "on a local disk. Check a folder with: findmnt -no FSTYPE -T {quoted}")
 
 
 @dataclass(frozen=True)
@@ -166,7 +168,8 @@ def check_store_ground(folders, filesystem_unsafe: str = "refuse") -> tuple[str,
             lines.append(f"the file-system type of {where} was not read")
         elif kind in REFUSED_FILESYSTEMS:
             if filesystem_unsafe != "accept_risk":
-                raise InstallRefused("store_filesystem_unsupported", _STORE_GROUND.format(folder=where, kind=kind))
+                detail = _STORE_GROUND.format(folder=where, kind=kind, quoted=shlex.quote(where))
+                raise InstallRefused("store_filesystem_unsupported", detail)
             lines.append(f"{where} is on {kind}, where SQLite's write-ahead log can damage a database; the risk was accepted")
     return tuple(lines)
 
@@ -591,8 +594,8 @@ def install(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
                 raise InstallRefused("unit_untrusted", f"{why}; `recursiond upgrade` writes it again, ours and 0644")
         check_state_root(paths)  # a chosen place: before anything is made
         check_private_dir(paths.state_root, paths.homes)  # before anything is made
+        ground = check_store_ground(_store_folders(paths))  # before anything is made or opened
         found = _found(paths, anchor_public_key, make_anchor)  # before anything is made
-        ground = check_store_ground(_store_folders(paths))  # before anything is made
         made = ensure_stores(paths)  # first: a unit is never left naming a daemon whose stores are missing
         ledger, anchor = _anchor_and_ledger(paths, anchor_public_key, found, make_anchor, on_anchor_made)
         homes = ensure_dir(paths.state_root, paths.homes, mode=_DIR_MODE)
@@ -637,8 +640,8 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
             raise InstallRefused("unit_state_elsewhere", _elsewhere_detail(paths, data, why))
         check_state_root(paths)  # a chosen place: before anything is made
         check_private_dir(paths.state_root, paths.homes)  # before anything is made
+        ground = check_store_ground(_store_folders(paths))  # before anything is made or opened
         found = _found(paths, anchor_public_key, make_anchor)  # before anything is made
-        ground = check_store_ground(_store_folders(paths))  # before anything is made
         made = ensure_stores(paths)
         ledger, anchor = _anchor_and_ledger(paths, anchor_public_key, found, make_anchor, on_anchor_made)
         homes = ensure_dir(paths.state_root, paths.homes, mode=_DIR_MODE)

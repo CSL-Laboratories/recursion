@@ -22,6 +22,7 @@ from recursion_core.daemon_install import (
     render_unit,
     upgrade,
 )
+from recursion_core.daemon_install.tests.mount_stub import setUpModule, tearDownModule  # noqa: F401
 from recursion_core.daemon_install.unit import state_elsewhere
 
 PY = "/opt/recursion/venv/bin/python3.14t"

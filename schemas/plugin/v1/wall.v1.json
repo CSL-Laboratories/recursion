@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wall.v1.json",
+  "title": "wall.v1: what a plugin host proved of its own wall, from inside, before it loaded any plugin byte",
+  "x-version": "1.0-draft.3",
+  "description": "A plugin host on Linux applies its wall to itself (Landlock: read and map only the Python install; one seccomp filter: no new socket, no program start, no signal at all, no limit or priority aimed at any process but the caller by the kernel's own form, no System V IPC or POSIX message queue, no lease, no change of a file's mode, owner, times or attributes, no new namespace, among other calls) and then tries eight checks from inside. Each of the eight fields is true only when the kernel refused that check; a check that succeeded, or that failed or raised in another way, is false (fail shut). A target that would make a refusal prove nothing (a daemon pid of another user, a canary of another user) is not refused. 'proven' is true only when all eight are refused, on x86_64 or aarch64, with Landlock ABI 1 or above, and no step of the wall failed in the process. 'landlock_scopes' names the Landlock scopes the wall put in force (abstract unix sockets and signals, each kept to the domain, from Landlock ABI 6 on; none below). What the record is: a check that the host's own code makes on itself, from inside the process, after the wall and before any plugin code runs. It shows that the named attempts were refused by the kernel at that moment; it does not show which filter refused them, and code in the same process could write any record. It means something under two conditions only: it is made before the plugin is loaded, and its reader takes it only from frames the host sent before the load (everything later on the channel is the plugin's voice). A host whose record is not proven loads no plugin.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "reads_outside",
+    "home_canary",
+    "program_start",
+    "new_socket",
+    "signal_other",
+    "signal_other_ways",
+    "metadata_change",
+    "kernel_surface",
+    "landlock_abi",
+    "landlock_scopes",
+    "arch",
+    "proven"
+  ],
+  "properties": {
+    "reads_outside": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: reading the root folder, which is outside the allowed paths. A check that succeeded, failed for another reason or raised is false."
+    },
+    "home_canary": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: reading a canary file in the home folder it was given. A check that succeeded, failed for another reason or raised is false."
+    },
+    "program_start": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: starting a program. A check that succeeded, failed for another reason or raised is false."
+    },
+    "new_socket": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: making a new AF_INET socket and a new AF_UNIX socket (both must be refused). A check that succeeded, failed for another reason or raised is false."
+    },
+    "signal_other": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: signalling another process of the same user (the daemon's pid, with signal 0). A check that succeeded, failed for another reason or raised is false."
+    },
+    "signal_other_ways": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: three other ways at the same process: a queued signal 0, making it the receiver of a pipe's signals, and reading its CPU limit (all three must be refused). A check that succeeded, failed for another reason or raised is false."
+    },
+    "metadata_change": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: changing the mode of the canary file (to the mode it has). A check that succeeded, failed for another reason or raised is false."
+    },
+    "kernel_surface": {
+      "type": "boolean",
+      "description": "True only when the kernel refused it: calls only this wall refuses: io_uring_setup, unshare, a keyctl operation, getpid by its x32 number on x86_64, clone asking a new user namespace, msgctl of the id -1, mq_getsetattr of the descriptor -1, signal 0 to the host itself by its own pid, and a lease on a pipe (all refused with EPERM), and clone3 (answered ENOSYS). A check that succeeded, failed for another reason or raised is false."
+    },
+    "landlock_abi": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The kernel's Landlock ABI for the host, read by the version flag; 0 when Landlock is absent or disabled."
+    },
+    "landlock_scopes": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "abstract_unix_socket",
+          "signal"
+        ]
+      },
+      "uniqueItems": true,
+      "description": "The Landlock scopes the wall put in force for the host: 'abstract_unix_socket' and 'signal' (each kept to the wall's own domain), asked from Landlock ABI 6 on; empty below ABI 6 and when no wall was applied. The seccomp filter's refusals hold whatever this list says."
+    },
+    "arch": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]{1,32}$",
+      "description": "The machine the host runs on, as the system names it."
+    },
+    "proven": {
+      "type": "boolean",
+      "description": "True only when all eight checks are refused, on a supported arch, with Landlock ABI 1 or above, and no step of the wall failed in the process."
+    }
+  },
+  "if": {
+    "properties": {
+      "proven": {
+        "const": true
+      }
+    },
+    "required": [
+      "proven"
+    ]
+  },
+  "then": {
+    "properties": {
+      "reads_outside": {
+        "const": true
+      },
+      "home_canary": {
+        "const": true
+      },
+      "program_start": {
+        "const": true
+      },
+      "new_socket": {
+        "const": true
+      },
+      "signal_other": {
+        "const": true
+      },
+      "signal_other_ways": {
+        "const": true
+      },
+      "metadata_change": {
+        "const": true
+      },
+      "kernel_surface": {
+        "const": true
+      },
+      "landlock_abi": {
+        "minimum": 1
+      },
+      "arch": {
+        "enum": [
+          "x86_64",
+          "aarch64"
+        ]
+      }
+    }
+  }
+}

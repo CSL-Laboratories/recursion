@@ -1,0 +1,13 @@
+{
+  "reads_outside": true,
+  "home_canary": true,
+  "program_start": true,
+  "new_socket": true,
+  "signal_other": true,
+  "signal_other_ways": true,
+  "metadata_change": true,
+  "kernel_surface": true,
+  "landlock_scopes": [],
+  "arch": "x86_64",
+  "proven": true
+}

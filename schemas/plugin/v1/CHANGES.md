@@ -51,6 +51,17 @@ daemon sets it from the channel. What it breaks: nothing; no schema before it na
 Forty-nine fixtures prove its rules; `plugin_security/host_channel.py` is its code side and
 `plugin_security/tests/test_host_channel.py` holds the two equal.
 
+## `wall.v1.json` is `1.0-draft.3` (Nov 21, 2026)
+
+A record gains `landlock_scopes`, required: the Landlock scopes the wall put in force (`abstract_unix_socket`,
+`signal`), asked from Landlock ABI 6 on and empty below. `kernel_surface` also tries msgctl, mq_getsetattr,
+a signal 0 to the host itself and a lease on a pipe, so a filter that lets any of them through reads not
+proven. The description now says what the record is: a check the host's own code makes on itself before any
+plugin code runs, which means something only when it is made before the load and read only from frames sent
+before it. Draft 2 added `signal_other_ways`, `metadata_change` and `kernel_surface`. What it breaks: a
+record without `landlock_scopes`. Every wall fixture carries the field; one good fixture (`h07`) and three
+bad ones (`b05`, `m-wall.v1.landlock-scopes`, `v-wall.v1.landlock-scopes`) hold it.
+
 ## `revoked-keys.v1.json` is `1.0-draft.2` (Nov 15, 2026)
 
 Its `timestamp` (a list's `issued_at` and `expires_at`, and each key's `revoked_at`) is now the control

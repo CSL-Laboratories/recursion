@@ -300,8 +300,10 @@ def main(argv: list[str] | None = None, environ=None, out=None, err=None) -> int
     print("These are the values a daemon started from this environment would take; a daemon already running "
           "keeps the values it read at its own start, which it wrote to its log in the lines beginning "
           "`settings file:` and `settings:` (for the shipped user unit, `journalctl --user -u recursion-daemon` "
-          "shows them; a daemon started another way writes them to its standard error, wherever that start "
-          "sent it).", file=out)
+          "shows them only where the system journal is stored on disk; where there is no per-user journal, "
+          "someone allowed to read the system journal can match the unit with "
+          "`journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service`; a daemon started another way writes them "
+          "to its standard error, wherever that start sent it).", file=out)
     for line in lines(loaded):
         print(line, file=out)
     return EXIT_WARNED if any(note.warns for note in loaded.notes) else 0

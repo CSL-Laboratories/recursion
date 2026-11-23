@@ -554,7 +554,7 @@ class TheDaemonsStart(_Folder):
         shell_config = self.tmp / "shell-config"
         shell_file = self.put(OFF.replace("false", "true"),
                               shell_config / "recursion" / "settings.toml")
-        sentence = ('These are the values a daemon started from this environment would take; a daemon already running keeps the values it read at its own start, which it wrote to its log in the lines beginning `settings file:` and `settings:` (for the shipped user unit, `journalctl --user -u recursion-daemon` shows them; a daemon started another way writes them to its standard error, wherever that start sent it).')
+        sentence = ('These are the values a daemon started from this environment would take; a daemon already running keeps the values it read at its own start, which it wrote to its log in the lines beginning `settings file:` and `settings:` (for the shipped user unit, `journalctl --user -u recursion-daemon` shows them only where the system journal is stored on disk; where there is no per-user journal, someone allowed to read the system journal can match the unit with `journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service`; a daemon started another way writes them to its standard error, wherever that start sent it).')
         for config, path, value in ((self.config, self.file, "false"),
                                     (shell_config, shell_file, "true")):
             with self.subTest(config=config), mock.patch.dict(os.environ, XDG_CONFIG_HOME=str(config)):
@@ -608,7 +608,8 @@ class TheDaemonsStart(_Folder):
         out = io.StringIO()
         settings.main([], environ=self.environ, out=out, err=io.StringIO())
         shown = out.getvalue()
-        self.assertIn("`journalctl --user -u recursion-daemon`", shown)
+        self.assertIn("`journalctl --user -u recursion-daemon` shows them only where the system journal is stored on disk", shown)
+        self.assertIn("`journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service`", shown)
         self.assertIn("lines beginning `settings file:` and `settings:`", shown)
         self.assertIn("standard error", shown)
         self.put(OFF)
@@ -647,7 +648,8 @@ def _held_of_settings(root) -> list[str]:
     keyword defaults; a function's own attributes (its ``__dict__``, where ``functools.wraps`` stores
     ``__wrapped__``); a bound method's instance and function; a built-in method's object; a partial's
     function, arguments and keywords; the items of dicts, lists, tuples, sets and deques; an instance's
-    ``__dict__`` and ``__slots__``; the attributes of the classes of an object (all but the built-in
+    ``__dict__`` and ``__slots__`` (including a single-string ``__slots__`` and private double-underscore
+    slots under their mangled name); the attributes of the classes of an object (all but the built-in
     ones); a property's getter, setter and deleter; a static or class method's function; and the local
     variables of a paused generator, coroutine or asynchronous generator.
 
@@ -709,7 +711,12 @@ def _held_of_settings(root) -> list[str]:
             if hasattr(obj, "__dict__"):
                 kids.append((f"{path}.__dict__", vars(obj)))
             for klass in type(obj).__mro__:
-                for slot in getattr(klass, "__slots__", ()):
+                slots = vars(klass).get("__slots__", ())
+                for slot in (slots,) if isinstance(slots, str) else slots:
+                    if slot.startswith("__") and not slot.endswith("__"):
+                        owner = klass.__name__.lstrip("_")
+                        if owner:
+                            slot = f"_{owner}{slot}"
                     if hasattr(obj, slot):
                         kids.append((f"{path}.{slot}", getattr(obj, slot)))
             kids += class_attributes(path, type(obj))  # carrier: the class attributes of the handed object
@@ -754,6 +761,34 @@ def _handed_over(kind: str, held):
         gen = paused()
         next(gen)
         return gen
+    if kind == "single-string slot":
+        class WithStringSlot:
+            __slots__ = "held"
+
+            def __init__(self, value):
+                self.held = value
+        return WithStringSlot(held)
+    if kind == "private slot":
+        class __WithPrivateSlot:
+            __slots__ = ("__priv",)
+
+            def __init__(self, value):
+                self.__priv = value
+        return __WithPrivateSlot(held)
+    if kind == "dunder slot":
+        class WithDunderSlot:
+            __slots__ = ("__held__",)  # begins and ends with two underscores: Python does not mangle it
+
+            def __init__(self, value):
+                self.__held__ = value
+        return WithDunderSlot(held)
+    if kind == "slot of an underscore class":
+        class ___:  # a class name made only of underscores: Python does not mangle a private name in it
+            __slots__ = ("__priv",)
+
+            def __init__(self, value):
+                self.__priv = value
+        return ___(held)
     raise AssertionError(kind)
 
 
@@ -802,7 +837,8 @@ class WhatAPluginIsHanded(_Folder):
     def test_the_search_finds_each_carrier_through_the_real_host(self) -> None:
         self.put(OFF)
         for kind in ("closure", "built-in method", "function attribute", "wraps", "class attribute", "property",
-                     "generator"):
+                     "generator", "single-string slot", "private slot", "dunder slot",
+                     "slot of an underscore class"):
             with self.subTest(carrier=kind):
                 _, handed = self.hosted(leak=kind)
                 self.assertTrue(_held_of_settings(handed))
@@ -810,10 +846,20 @@ class WhatAPluginIsHanded(_Folder):
     def test_the_search_finds_each_carrier_in_a_plain_stand_in(self) -> None:
         held = settings.load(self.environ)
         for kind in ("closure", "built-in method", "function attribute", "wraps", "class attribute", "property",
-                     "generator"):
+                     "generator", "single-string slot", "private slot", "dunder slot",
+                     "slot of an underscore class"):
             with self.subTest(carrier=kind):
                 self.assertTrue(_held_of_settings(_handed_over(kind, held)))
         self.assertEqual([], _held_of_settings(_handed_over("closure", {"copy": "plain values"})))
+
+    def test_the_search_names_the_slot_it_finds_where_python_does_not_mangle_the_name(self) -> None:
+        held = settings.load(self.environ)
+        # a slot spelled with two underscores at both ends is looked up under its own name
+        self.assertEqual(["handed.__held__"], _held_of_settings(_handed_over("dunder slot", held)))
+        # a private slot in a class whose name is only underscores is looked up under its own name too
+        self.assertEqual(["handed.__priv"], _held_of_settings(_handed_over("slot of an underscore class", held)))
+        # control: an ordinary private slot is found under the class's mangled name
+        self.assertEqual(["handed._WithPrivateSlot__priv"], _held_of_settings(_handed_over("private slot", held)))
 
     def test_the_host_may_read_one_row_and_a_plugin_still_cannot_reach_the_settings(self) -> None:
         from recursion_core.daemon import plugins

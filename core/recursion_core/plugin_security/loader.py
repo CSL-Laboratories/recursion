@@ -37,7 +37,7 @@ from pathlib import Path
 from .errors import Refused
 from .manifest import (
     ENTRY_FILE, RUNTIME_INPROCESS_RETIRING, Grant, Manifest, ReservedEffects, TrustStore,
-    effective_permissions, parse_manifest,
+    _bound_developer_key, effective_permissions, parse_manifest,
 )
 from .signing import key_id
 from .runtime import GilProbe
@@ -216,13 +216,14 @@ class PluginLoader:
         dev_kid = key_id(manifest.developer_key)
         revoked = dev_kid if dev_kid in self._trust.revoked else None
         generation = None if revoked is None else self._trust.generation(dev_kid)
-        perms, dropped = effective_permissions(manifest, trust, kid, self._grants.get(manifest.plugin_id),
-                                               revoked, generation)
+        grant = self._grants.get(manifest.plugin_id)
+        perms, dropped = effective_permissions(manifest, trust, kid, grant, revoked, generation)
         for code, detail in dropped:
             findings.append(_finding("admit", code, "warn", detail))
-            if code == "grant_developer_key_missing" and manifest.permissions and not perms:
-                raise Refused("grant_unbound", "Make the grant again with developer_key_id "
-                                               "in install.json set to this plugin's developer key ID.")
+        if (trust != "signed" and grant is not None and grant.signer_key_id is None
+                and _bound_developer_key(grant) is None and manifest.permissions and not perms):
+            raise Refused("grant_unbound", "Make the grant again with developer_key_id "
+                                           "in install.json set to this plugin's developer key ID.")
         for perm in ("process", "network", "credential"):
             if perm in perms:
                 findings.append(_finding("admit", perm + "_granted", "warn",

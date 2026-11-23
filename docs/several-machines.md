@@ -6,14 +6,25 @@ No code at this head connects one machine's daemon to another's.
 
 ## List runs over SSH
 
-Make sure the daemon is running on each machine you want to check.
+Make sure the daemon is running on each machine you want to check. The
+control command requires Python 3.11 or newer because it imports `tomllib`
+from the standard library through the terminal package (`recursion_core.tui`).
+
+No package installs `recursion_core` at this head. From a checkout, run the
+control command from the repository root with `PYTHONPATH=core` set. On a
+machine set up as in the daemon's README, the code is in
+`~/.local/lib/recursion/core`: run the venv's python,
+`~/.local/lib/recursion/venv/bin/python`, with
+`PYTHONPATH=$HOME/.local/lib/recursion/core` set instead.
 
 1. Open an SSH session to the first machine.
    Sign in as the user who runs the daemon.
-2. Run the control command in that session.
+2. Run the control command in that session (from a checkout at the repository
+   root; for the daemon README layout, use the venv python and `PYTHONPATH`
+   above).
 
    ```sh
-   python -m recursion_core.control list
+   PYTHONPATH=core python -m recursion_core.control list
    ```
 
 3. Read the JSON reply for that machine.
@@ -21,13 +32,6 @@ Make sure the daemon is running on each machine you want to check.
 
 The command talks to the daemon on the machine where you run it.
 It connects through an owner-only Unix socket.
-
-No package installs `recursion_core` at this head. From a checkout, run the
-command from the repository root with `PYTHONPATH=core` set.
-On a machine set up as in the daemon's README, the code is in
-`~/.local/lib/recursion/core`: run the venv's python,
-`~/.local/lib/recursion/venv/bin/python`, with
-`PYTHONPATH=$HOME/.local/lib/recursion/core` set instead.
 
 If the daemon is down, the command returns `control_api_unavailable`
 and exits with status 1.

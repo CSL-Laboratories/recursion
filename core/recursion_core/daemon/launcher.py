@@ -219,6 +219,38 @@ class EngineUnitManager(SystemdUserManager):
             command.append('--working-directory=' + str(cwd))
         self._call([*command, '--', *argv])
 
+    def start_piped(self, unit, argv, channel, *, properties=(), working_directory=None):
+        """Start ``unit`` with ``channel`` (one socket) as its standard input and output; return systemd-run's process.
+
+        The unit path ``start`` builds (``KillMode=control-group``, ``Delegate=yes``, ``STOP_PROPERTIES``, the argv
+        verbatim) with ``--pipe``: systemd-run hands the unit its own standard input and output and stays running
+        until the unit has ended, then exits. So such a unit carries no ``RemainAfterExit=yes``: with it the unit stays
+        active after its process ends, and systemd-run, with its copy of the channel, stays too. ``--collect`` unloads
+        the unit once it has ended, killed or not. ``_call`` is not used: it waits for systemd-run to return.
+        """
+        if not argv:
+            raise ValueError('Empty launch')
+        self.require_verbatim_argv()
+        command = ['systemd-run', '--user', '--quiet', '--unit=' + unit, '--service-type=exec',
+                   '--expand-environment=no', '--pipe', '--collect',
+                   '--property=KillMode=control-group', '--property=Delegate=yes']
+        command += ['--property=' + item for item in (*STOP_PROPERTIES, *properties)]
+        if working_directory is not None:
+            command.append('--working-directory=' + str(working_directory))
+        return subprocess.Popen([*command, '--', *argv], stdin=channel, stdout=channel,
+                                stderr=subprocess.DEVNULL, close_fds=True)
+
+    def kill_cgroup(self, group, unit):
+        """SIGKILL every process in ``unit``'s cgroup ``group`` now. True when a kill was delivered.
+
+        ``cgroup.kill`` where the kernel has it, otherwise by pidfd to each pid still in the cgroup (the path a
+        recorded Stop already takes). Waits for nothing: the processes are gone once the kernel has delivered it.
+        """
+        if (not isinstance(group, str) or not group.startswith('/') or '..' in Path(group).parts
+                or Path(group).name != unit):
+            return False
+        return self._kill_recorded_cgroup(self.cgroup_root / group.lstrip('/'), group)
+
     def require_verbatim_argv(self):
         """Refuse the launch unless this systemd-run can hand the engine its argv unchanged (ADV1-11).
 

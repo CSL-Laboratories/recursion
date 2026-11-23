@@ -26,6 +26,7 @@ from recursion_core.plugin_security.tests.support import World, effect, needs_cr
 REPO = Path(__file__).resolve().parents[4]
 SCHEMA = REPO / "schemas" / "plugin" / "v1" / "host.v1.json"
 FIXTURES = REPO / "schemas" / "plugin" / "v1" / "fixtures"
+CHANGES = REPO / "schemas" / "plugin" / "v1" / "CHANGES.md"
 DAEMON_PLUGINS = REPO / "core" / "recursion_core" / "daemon" / "plugins.py"
 FIRST_CALL_NAMES = ["registry", "operator", "surfaces", "surface"]
 NOT_AVAILABLE = "not available"
@@ -217,6 +218,68 @@ class MessageTypeTests(unittest.TestCase):
             with self.subTest(kind="call", receiver=receiver):
                 with self.assertRaises(hc.ChannelRefusal) as caught:
                     hc.check_message(dict(call("registry"), origin="trigger"), receiver=receiver)
+                self.assertEqual(caught.exception.code, "message_invalid")
+
+    def test_changelog_run_origin_paragraph_names_the_check_order(self):
+        paragraph = next(
+            (" ".join(p.split()) for p in CHANGES.read_text(encoding="utf-8").split("\n\n")
+             if "run-origin" in p),
+            "",
+        )
+        for expected in ("run-origin", "trigger", "agent", "packet",
+                         "message_reserved", "message_wrong_side", "message_invalid",
+                         "wrong side", "right receiver"):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, paragraph)
+
+    def test_a_load_with_an_origin_field_is_wrong_side_at_daemon_and_invalid_at_host(self):
+        _, fields = hc.MESSAGE_TYPES["load"]
+        values = {
+            "type": "load",
+            "plugin_id": "demo.plugin",
+            "manifest_b64": b64(b"{}"),
+            "files": {"plugin.py": b64(b"x")},
+        }
+        load = {field: values[field] for field in fields}
+        self.assertEqual(hc.check_message(load, receiver="host"), load)
+        for origin in hc.RESERVED_RUN_ORIGINS:
+            with_origin = dict(load, origin=origin)
+            with self.subTest(origin=origin, receiver="daemon"):
+                with self.assertRaises(hc.ChannelRefusal) as caught:
+                    hc.check_message(with_origin, receiver="daemon")
+                self.assertEqual(caught.exception.code, "message_wrong_side")
+            with self.subTest(origin=origin, receiver="host"):
+                with self.assertRaises(hc.ChannelRefusal) as caught:
+                    hc.check_message(with_origin, receiver="host")
+                self.assertEqual(caught.exception.code, "message_invalid")
+
+
+    def test_a_load_from_the_wrong_side_is_refused_before_its_field_values_are_looked_at(self):
+        _, fields = hc.MESSAGE_TYPES["load"]
+        values = {
+            "type": "load",
+            "plugin_id": "demo.plugin",
+            "manifest_b64": b64(b"{}"),
+            "files": {"plugin.py": b64(b"x")},
+        }
+        load = {field: values[field] for field in fields}
+        malformed = [
+            ("a plugin id that is not an id", dict(load, plugin_id="Bad Id!")),
+            ("a manifest that is not text", dict(load, manifest_b64=5)),
+            ("only a type", {"type": "load"}),
+        ]
+        for origin in hc.RESERVED_RUN_ORIGINS:
+            malformed.append(("a plugin id that is not an id, with an origin", dict(load, plugin_id="Bad Id!", origin=origin)))
+            malformed.append(("a manifest that is not text, with an origin", dict(load, manifest_b64=5, origin=origin)))
+            malformed.append(("only a type and an origin", {"type": "load", "origin": origin}))
+        for label, message in malformed:
+            with self.subTest(case=label, fields=sorted(message), receiver="daemon"):
+                with self.assertRaises(hc.ChannelRefusal) as caught:
+                    hc.check_message(message, receiver="daemon")
+                self.assertEqual(caught.exception.code, "message_wrong_side")
+            with self.subTest(case=label, fields=sorted(message), receiver="host"):
+                with self.assertRaises(hc.ChannelRefusal) as caught:
+                    hc.check_message(message, receiver="host")
                 self.assertEqual(caught.exception.code, "message_invalid")
 
 

@@ -1,0 +1,10 @@
+{
+  "grants": [
+    {
+      "plugin_id": "demo.scheduler",
+      "artifact_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "signer_key_id": null,
+      "permissions": ["schedule"]
+    }
+  ]
+}

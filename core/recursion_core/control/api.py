@@ -64,6 +64,15 @@ launched. The key and digest live in the run record (``start_key``) and are look
 registry, so a ``ControlAPI`` rebuilt over the same durable registry after a restart still answers the
 retried start with the original run (11.3, B-17).
 
+Where a run came from (``origin``). ``call("run.start", params, origin=...)`` is the same start with one
+more field in the record: ``origin``, a mapping the in-process caller builds (the daemon's end of a plugin
+host's channel, answering ``run.request``). It is never read from ``params``: a client's ``run.start`` that
+carries an ``origin`` key is answered as today (the key is ignored and never stored). A keyed start whose
+record carries another origin than the one asked with (a client's start against a key the daemon derived,
+or the other way round) is ``request_invalid`` / ``client_key_reused``, as any reuse of a key for another
+request. ``start_params_problem`` is the check of ``tenant``, ``engine`` and ``prompt`` that ``run.start``
+makes, for a caller that must refuse the same values before it starts anything.
+
 Stop decisions and launch records are serialised per run, so a slow or hung cleanup on one run never
 queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed during it.
 The registry write is a compare-and-swap on the record's generation, so a stop is also not overwritten by
@@ -111,6 +120,22 @@ def _new_run_id() -> str:
     return f"run-{uuid.uuid4().hex}"
 
 
+def start_params_problem(params: Mapping) -> str | None:
+    """The first of ``tenant``, ``engine`` and ``prompt`` that ``run.start`` refuses, or None.
+
+    Each must be a non-empty string; the prompt must also be strict UTF-8 (JSON can carry an unpaired
+    surrogate). ``run.start`` answers ``request_invalid`` with this name as its detail.
+    """
+    for name in ("tenant", "engine", "prompt"):
+        if not isinstance(params.get(name), str) or not params[name]:
+            return name
+    try:
+        params["prompt"].encode("utf-8")  # JSON can carry an unpaired surrogate; reject it before launch
+    except UnicodeEncodeError:
+        return "prompt"
+    return None
+
+
 class ControlAPI:
     def __init__(self, registry: RunRegistry, kill_tree: KillTree, starter: Starter, clock: Callable[[], float],
                  *, confirm_timeout_s: float = 5.0, new_run_id: Callable[[], str] = _new_run_id) -> None:
@@ -136,9 +161,13 @@ class ControlAPI:
         self._stop_wanted: set[str] = set()  # Stops that arrived before the launch was recorded
         self._failed: set[str] = set()  # starts that raised but whose start_failed write failed
 
-    def call(self, method: str, params: Mapping | None = None) -> dict:
+    def call(self, method: str, params: Mapping | None = None, *, origin: Mapping | None = None) -> dict:
+        """One method. ``origin`` is for an in-process ``run.start`` only (see the module text); a surface's
+        request never reaches it."""
+        if origin is not None and method != "run.start":
+            raise ValueError("origin is given only with run.start")
         try:
-            return self._call(method, dict(params or {}))
+            return self._call(method, dict(params or {}), origin)
         except _RegistryError as err:  # every method answers with a typed code (red-team r2 finding 1)
             return {"code": REGISTRY_UNAVAILABLE, "detail": str(err)}
 
@@ -148,11 +177,11 @@ class ControlAPI:
         except Exception as err:
             raise _RegistryError(f"{op}:{type(err).__name__}") from err
 
-    def _call(self, method: str, params: dict) -> dict:
+    def _call(self, method: str, params: dict, origin: Mapping | None = None) -> dict:
         if method == "run.list":
             return self.list_runs(params)
         if method == "run.start":
-            return self.start(params)
+            return self.start(params, origin=origin)
         handler = {"run.status": self.status, "run.stop": self.stop}.get(method)
         if handler is None:
             return {"code": METHOD_UNKNOWN, "detail": str(method)}
@@ -187,19 +216,16 @@ class ControlAPI:
         return {"code": OK, "runs": runs}
 
     # -- start --------------------------------------------------------------------------------
-    def start(self, params: Mapping) -> dict:
-        for name in ("tenant", "engine", "prompt"):
-            if not isinstance(params.get(name), str) or not params[name]:
-                return {"code": REQUEST_INVALID, "detail": name}
-        try:
-            params["prompt"].encode("utf-8")  # JSON can carry an unpaired surrogate; reject it before launch
-        except UnicodeEncodeError:
-            return {"code": REQUEST_INVALID, "detail": "prompt"}
+    def start(self, params: Mapping, *, origin: Mapping | None = None) -> dict:
+        problem = start_params_problem(params)
+        if problem is not None:
+            return {"code": REQUEST_INVALID, "detail": problem}
+        origin = dict(origin) if origin is not None else None
         key = params.get("client_key")
         self._enter_owner()
         try:
             if not isinstance(key, str):
-                return self._start(params)  # no key: a fresh run id, nothing to dedupe
+                return self._start(params, origin)  # no key: a fresh run id, nothing to dedupe
             slot_key = (params["tenant"], key)
             with self._locks_lock:
                 slot = self._start_locks.get(slot_key)
@@ -210,7 +236,7 @@ class ControlAPI:
             lock_key = _start_lock_key(slot_key)
             self._locks.acquire(self._local.owner, [lock_key])
             try:
-                return self._start(params)
+                return self._start(params, origin)
             finally:
                 self._locks.release(self._local.owner, [lock_key])
                 with self._locks_lock:
@@ -220,18 +246,20 @@ class ControlAPI:
         finally:
             self._exit_owner()
 
-    def _start(self, params: Mapping) -> dict:
+    def _start(self, params: Mapping, origin: dict | None = None) -> dict:
         key = params.get("client_key")
         start_key = None
         if isinstance(key, str):
             start_key = {"client_key": key, "engine": params["engine"],
                          "prompt_sha256": hashlib.sha256(params["prompt"].encode("utf-8")).hexdigest()}
         prior = self._reg("find_start", params["tenant"], key) if start_key is not None else None
-        if prior is not None and prior.get("start_key") != start_key:
+        if prior is not None and (prior.get("start_key") != start_key or prior.get("origin") != origin):
             return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
         run_id = prior["run_id"] if prior is not None else self._new_run_id()
         rec = {"run_id": run_id, "tenant": params["tenant"], "engine": params["engine"], "state": "starting",
                "cgroup": None, "started_at": self._clock(), "stop": None, "start_key": start_key}
+        if origin is not None:
+            rec["origin"] = origin
         with self._run_lock(run_id):
             if prior is not None:  # a retried start is not run twice, across restarts too (11.3, 11.8)
                 answer = self._retry(self._current(prior))

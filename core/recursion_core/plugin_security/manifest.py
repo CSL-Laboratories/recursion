@@ -45,7 +45,7 @@ __all__ = [
 MANIFEST_SCHEMA = "csl-plugin-manifest/vNext"
 # Canonical permission order. Requests must list permissions in this order, so the
 # signed bytes for one permission set are unique.
-PERMISSIONS = ("read", "propose", "panel", "network", "credential", "process", "order")
+PERMISSIONS = ("read", "propose", "panel", "network", "credential", "process", "order", "schedule")
 _FIELDS = frozenset({
     "schema", "plugin_id", "version", "artifact_sha256", "dependency_lock_sha256",
     "install_scripts", "developer_key", "permissions", "network_destinations",

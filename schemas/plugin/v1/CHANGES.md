@@ -4,6 +4,41 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `install.v1.json` is `1.0-draft.3` (2026-11-21)
+
+A grant's `permissions` list gains `schedule`, matching the eight permissions today's reader takes
+(`plugin_security/manifest.py`, `PERMISSIONS`; `daemon/plugins.py`, `read_install`), and its description
+no longer says "seven". The five names that are new in the version 1 manifest remain out because today's
+reader still refuses them. What it breaks: a validator or reader that assumed an install file valid
+against `install.v1.json` could never grant `schedule` (the set of accepted install files widens). One
+good fixture (`good/install.v1/h05-schedule-grant.json`) shows a grant with `"permissions": ["schedule"]`.
+
+## `host.v1.json` is `1.0-draft.4` (2026-11-21)
+
+The `run.request` description now names the tenant in its idempotency promise: the same plugin, record,
+revision and occurrence start at most one run for one tenant; the same occurrence for another tenant is
+another run. No field, pattern or refusal code changed. What it breaks: nothing in wire validation; a
+reader that assumed one occurrence started at most one run across tenants.
+
+## `host.v1.json` is `1.0-draft.3`, `manifest.v1.json` is `1.0-draft.2` (2026-11-19)
+
+`run.request` is built: it leaves the reserved call names and is the fifth name of `x-call-names`, the one
+call a plugin's host sends that the daemon answers. Its arguments are exactly `record_kind` (one of the
+append-only `x-run-request.record_kinds`, which holds `routine.v1`), `record_id`, `revision`, `occurrence`,
+`tenant`, `engine` and `prompt`; a missing, extra or malformed one is `call_args_invalid` before anything
+starts. It is offered only to a plugin granted the new permission `schedule` (appended to the permission
+list of `manifest.v1.json` and of `plugin_security/manifest.py`), else `call_not_offered`. The daemon
+starts the run through `run.start`'s own path with a start key it derives, and the run's record gains
+`origin` (`kind` `trigger`, `plugin`, `record_kind`, `record_id`, `revision`, `occurrence`). The run-origin
+values stay in the reserved list; `agent` and `packet` are written nowhere. The daemon builds `origin`
+itself from the channel's plugin and the call's arguments, and no message carries one: a field for a
+run origin is still refused in the order of the `1.0-draft.1` note, `message_reserved` on a reserved
+message type and `message_wrong_side` on a defined message type from the wrong side, both before any
+field is read, and `message_invalid` only on a defined message type that reaches its right receiver,
+a `run.request` call among them. What it breaks: a host that
+counted on `run.request` being answered `call_reserved`; the other six reserved call names are unchanged.
+One good fixture shows the call.
+
 ## `host.v1.json` is `1.0-draft.2` (2026-11-18)
 
 `call` and `result` travel both ways: the daemon calls a plugin's function by name, and a plugin's host

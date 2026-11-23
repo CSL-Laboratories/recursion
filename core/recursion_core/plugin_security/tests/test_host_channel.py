@@ -10,6 +10,10 @@ from __future__ import annotations
 import ast
 import base64
 import json
+import os
+import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -22,6 +26,8 @@ from recursion_core.plugin_security.limits import ARTIFACT, MAX_ARTIFACT_BYTES, 
 from recursion_core.plugin_security import PROTOCOL, canonical, parse
 from recursion_core.plugin_security import host_channel as hc
 from recursion_core.plugin_security.tests.support import World, effect, needs_crypto
+from recursion_core.plugin_security.manifest import PERMISSIONS
+from recursion_core.control.tests.fakes import FakeStarter, make_api
 
 REPO = Path(__file__).resolve().parents[4]
 SCHEMA = REPO / "schemas" / "plugin" / "v1" / "host.v1.json"
@@ -232,6 +238,17 @@ class MessageTypeTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertIn(expected, paragraph)
 
+    def test_every_changelog_paragraph_that_names_run_origins_names_the_check_order(self):
+        paragraphs = [" ".join(p.split()) for p in CHANGES.read_text(encoding="utf-8").split("\n\n")
+                      if "run-origin" in p]
+        self.assertTrue(paragraphs)
+        for index, paragraph in enumerate(paragraphs):
+            for expected in ("run-origin", "trigger", "agent", "packet",
+                             "message_reserved", "message_wrong_side", "message_invalid",
+                             "wrong side", "right receiver"):
+                with self.subTest(paragraph=index, expected=expected):
+                    self.assertIn(expected, paragraph)
+
     def test_a_load_with_an_origin_field_is_wrong_side_at_daemon_and_invalid_at_host(self):
         _, fields = hc.MESSAGE_TYPES["load"]
         values = {
@@ -293,7 +310,7 @@ class CallNameTests(unittest.TestCase):
         self.assertEqual(handlers.looked_up, [])
 
     def test_each_reserved_call_name_gets_the_reserved_answer_and_the_dispatcher_is_never_reached(self):
-        for name in ("run.request", "computer.open", "computer.act", "computer.observe", "computer.close"):
+        for name in ("computer.open", "computer.act", "computer.observe", "computer.close"):
             with self.subTest(name=name):
                 handlers = RecordingHandlers(**{name: lambda *a: self.fail("a reserved name ran")})
                 answer = hc.answer_call(hc.check_message(call(name), receiver="host"), handlers)
@@ -407,9 +424,6 @@ class DirectionTests(unittest.TestCase):
         junk = {"type": "call", "id": 6, "name": name, "args": {"Not A Name": 1}}
         self.assertEqual(end.receive(junk)["code"], "call_reserved")
 
-    def test_run_request_from_the_host_is_reserved(self):
-        self.assert_reserved_from_the_host("run.request")
-
     def test_computer_open_from_the_host_is_reserved(self):
         self.assert_reserved_from_the_host("computer.open")
 
@@ -482,6 +496,512 @@ class DirectionTests(unittest.TestCase):
     def test_a_host_answers_the_daemons_call(self):
         host = hc.HostEnd({"registry": lambda: {"panels": []}})
         self.assertEqual(host.receive(call("registry")), {"type": "result", "id": 7, "value": {"panels": []}})
+
+
+OCCURRENCE = "2026-11-20T09:00:00Z"
+RUN_ARGS = ("record_kind", "record_id", "revision", "occurrence", "tenant", "engine", "prompt")
+OTHER_RESERVED_CALL_NAMES = ("computer.open", "computer.act", "computer.observe", "computer.close",
+                             "net.request", "net.connect")
+
+
+def run_args(**changes):
+    args = {"record_kind": "routine.v1", "record_id": "daily-digest", "revision": 1, "occurrence": OCCURRENCE,
+            "tenant": "t1", "engine": "codex", "prompt": "summarise the day"}
+    args.update(changes)
+    return args
+
+
+def origin_of(args, plugin="demo.plugin"):
+    return {"kind": "trigger", "plugin": plugin, "record_kind": args["record_kind"], "record_id": args["record_id"],
+            "revision": args["revision"], "occurrence": args["occurrence"]}
+
+
+class GrantingCore(FakeCore):
+    """A stand-in core that answers ``plugin.permissions`` with the granted list; every request is recorded."""
+
+    def __init__(self, permissions=("read", "schedule"), ok=True):
+        super().__init__()
+        self.permissions, self.ok = list(permissions), ok
+
+    def client_for(self, caller):
+        self.clients_for.append(caller)
+
+        def call(request):
+            self.requests.append((caller, request))
+            message = parse(request)
+            if type(message) is dict and message.get("op") == "plugin.permissions":
+                if not self.ok:
+                    return canonical({"protocol": "csl-core/v0", "ok": False, "refusal": {"code": "core_poisoned"}})
+                granted = self.permissions if message["args"].get("plugin_id") == caller else []
+                return canonical({"protocol": "csl-core/v0", "ok": True, "result": {"permissions": granted}})
+            return self.answer
+        return call
+
+
+class SpyRuns:
+    """Passes every call to the control API and records the method and the origin it was asked with."""
+
+    def __init__(self, api):
+        self.api, self.seen = api, []
+
+    def call(self, method, params=None, *, origin=None):
+        self.seen.append((method, origin))
+        return self.api.call(method, params, origin=origin)
+
+
+class RunRequestTests(unittest.TestCase):
+    """run.request is answered at the daemon's end: the caller is the channel's plugin, the run is admitted by
+    run.start's own path, and its record says where it came from."""
+
+    def setUp(self):
+        self.api, self.registry, self.kill, self.starter = make_api()
+        self.core = GrantingCore()
+        self.end = hc.DaemonEnd("demo.plugin", self.core, runs=self.api)
+
+    def ask(self, args=None, id_=5, end=None):
+        return (end or self.end).receive(call("run.request", run_args() if args is None else args, id_=id_))
+
+    def assert_nothing_started(self):
+        self.assertEqual(self.starter.calls, [])
+        self.assertEqual(self.registry.list(), [])
+
+    # (1) the name is answered; every other reserved name stays reserved
+    def test_run_request_is_answered_and_no_longer_reserved(self):
+        answer = self.ask()
+        self.assertEqual((answer["type"], answer["id"]), ("result", 5))
+        self.assertEqual(answer["value"]["code"], "started")
+        self.assertNotIn("run.request", hc.RESERVED_CALL_NAMES)
+        self.assertIn("run.request", hc.CALL_NAMES)
+        self.assertEqual(hc.RESERVED_CALL_NAMES, OTHER_RESERVED_CALL_NAMES)
+        reserved = [row["name"] for row in schema()["x-reserved"]["call_names"]]
+        self.assertEqual(tuple(reserved), OTHER_RESERVED_CALL_NAMES)
+        for name in OTHER_RESERVED_CALL_NAMES:
+            with self.subTest(name=name):
+                self.assertEqual(self.end.receive(call(name, run_args()))["code"], "call_reserved")
+        self.assertEqual(len(self.starter.calls), 1)
+
+    # (2) exactly seven arguments, each in its form, refused before anything starts
+    def test_the_arguments_are_exactly_the_seven_and_a_bad_set_starts_nothing(self):
+        self.assertEqual(hc.CALL_NAMES["run.request"], RUN_ARGS)
+        self.assertEqual(hc.RUN_REQUEST_RECORD_KINDS, ("routine.v1",))
+        cases = [{k: v for k, v in run_args().items() if k != field} for field in RUN_ARGS]
+        cases += [run_args(extra=1), run_args(client_key="k-1"), {}]
+        for args in cases:
+            with self.subTest(args=sorted(args)):
+                answer = self.ask(args)
+                self.assertEqual((answer["type"], answer["code"]), ("refusal", "call_args_invalid"))
+        self.assert_nothing_started()
+
+    def test_each_argument_is_checked_in_its_form_before_anything_starts(self):
+        bad = {"record_kind": ["routine.v2", "", 1, None, ["routine.v1"]],
+               "record_id": ["", "a" * 65, "bad id", "x/y", "café", 5, "line\n"],
+               "revision": [0, -1, True, 1.0, "1", None],
+               "occurrence": ["2026-11-20T09:00:00.5Z", "2026-11-20T09:00:00+00:00", "2026-11-20 09:00:00Z",
+                              "2026-02-30T09:00:00Z", "2026-11-20T09:00:00z", "2026-11-20T24:00:00Z",
+                              "2026-11-20T09:00:60Z", "2026-11-20T09:00:00Z\n", 5, None],
+               "tenant": ["", 1, None], "engine": ["", 1, None], "prompt": ["", "\ud800", 1, None]}
+        for field, values in bad.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    answer = self.ask(run_args(**{field: value}))
+                    self.assertEqual((answer["type"], answer["code"]), ("refusal", "call_args_invalid"))
+                    self.assertIn(field, answer["detail"])
+        self.assert_nothing_started()
+        good = {"record_id": ["a", "A-Z_a.z-0", "x" * 64], "revision": [1, 2 ** 40],
+                "occurrence": ["2028-02-29T23:59:59Z", "2026-01-01T00:00:00Z"]}
+        for field, values in good.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.assertEqual(self.ask(run_args(**{field: value}))["value"]["code"], "started")
+
+    def test_tenant_engine_and_prompt_are_checked_exactly_as_run_start_checks_them(self):
+        for field, value in (("tenant", ""), ("tenant", 1), ("engine", ""), ("engine", None), ("prompt", ""),
+                             ("prompt", "\ud800")):
+            with self.subTest(field=field, value=value):
+                params = {"tenant": "t1", "engine": "codex", "prompt": "p", field: value}
+                self.assertEqual(self.api.call("run.start", params), {"code": "request_invalid", "detail": field})
+                answer = self.ask(run_args(**{field: value}))
+                self.assertEqual(answer["code"], "call_args_invalid")
+                self.assertIn(field, answer["detail"])
+        self.assert_nothing_started()
+
+    # (3) the caller is the channel's plugin; no argument names one
+    def test_the_caller_is_the_plugin_the_channel_was_opened_for(self):
+        answer = self.ask()
+        self.assertEqual(answer["value"]["run"]["origin"]["plugin"], "demo.plugin")
+        self.assertEqual(set(hc.CALL_NAMES["run.request"]) & {"caller", "plugin", "plugin_id", "principal", "owner"},
+                         set())
+        for field in ("caller", "plugin", "plugin_id", "principal", "owner"):
+            with self.subTest(field=field):
+                refused = self.ask(run_args(**{field: "other.plugin"}), id_=6)
+                self.assertEqual((refused["type"], refused["code"]), ("refusal", "call_args_invalid"))
+        self.assertEqual(len(self.starter.calls), 1)
+        other = hc.DaemonEnd("other.plugin", GrantingCore(), runs=self.api)
+        self.assertEqual(self.ask(end=other)["value"]["run"]["origin"]["plugin"], "other.plugin")
+
+    # (4) offered only to a plugin granted 'schedule'
+    def test_the_call_is_offered_only_to_a_plugin_granted_schedule(self):
+        self.assertEqual(PERMISSIONS[:7], ("read", "propose", "panel", "network", "credential", "process", "order"))
+        self.assertEqual(PERMISSIONS[-1], "schedule")
+        manifest = json.loads((REPO / "schemas" / "plugin" / "v1" / "manifest.v1.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["$defs"]["permission"]["enum"][-1], "schedule")
+        for core in (GrantingCore(permissions=("read", "panel")), GrantingCore(permissions=()),
+                     GrantingCore(ok=False)):
+            with self.subTest(permissions=core.permissions, ok=core.ok):
+                end = hc.DaemonEnd("demo.plugin", core, runs=self.api)
+                answer = self.ask(end=end)
+                self.assertEqual((answer["type"], answer["code"]), ("refusal", "call_not_offered"))
+        no_runs = hc.DaemonEnd("demo.plugin", GrantingCore())
+        self.assertEqual(self.ask(end=no_runs)["code"], "call_not_offered")
+        self.assert_nothing_started()
+        self.assertEqual(self.ask()["value"]["code"], "started")
+        asked = [parse(request) for caller, request in self.core.requests]
+        self.assertEqual([(m["op"], m["args"]) for m in asked], [("plugin.permissions", {"plugin_id": "demo.plugin"})])
+        self.assertEqual({caller for caller, _ in self.core.requests}, {"demo.plugin"})
+
+    # (5) admitted through run.start's own path; the record is run.start's plus origin
+    def test_the_run_is_admitted_through_run_start_and_its_record_differs_only_by_origin(self):
+        spy = SpyRuns(self.api)
+        end = hc.DaemonEnd("demo.plugin", GrantingCore(), runs=spy)
+        answer = self.ask(end=end)
+        self.assertEqual(spy.seen, [("run.start", origin_of(run_args()))])
+        run_id = answer["value"]["run"]["run_id"]
+        record = self.registry.get(run_id)
+        self.assertEqual(record["origin"], origin_of(run_args()))
+        self.assertEqual(sorted(record["origin"]), sorted(hc.RUN_ORIGIN_FIELDS))
+        api2, registry2, _, starter2 = make_api()
+        same = api2.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "summarise the day",
+                                       "client_key": record["start_key"]["client_key"]})
+        self.assertEqual(same["code"], "started")
+        plain = registry2.get(same["run"]["run_id"])
+        self.assertNotIn("origin", plain)
+        self.assertEqual({k: v for k, v in record.items() if k != "origin"}, plain)
+        self.assertEqual(self.starter.calls, starter2.calls)
+        self.assertEqual(self.api.call("run.status", {"run_id": run_id})["run"]["origin"], origin_of(run_args()))
+        self.assertEqual([r.get("origin") for r in self.api.call("run.list", {})["runs"]], [origin_of(run_args())])
+
+    # (6) repeat-safe, through the start key the daemon derives
+    def test_the_same_occurrence_starts_at_most_one_run_and_a_new_one_starts_a_new_run(self):
+        first, again = self.ask(), self.ask(id_=6)
+        self.assertEqual(again["value"]["run"]["run_id"], first["value"]["run"]["run_id"])
+        self.assertTrue(again["value"]["duplicate"])
+        self.assertEqual(len(self.starter.calls), 1)
+        later = self.ask(run_args(occurrence="2026-11-21T09:00:00Z"), id_=7)
+        revised = self.ask(run_args(revision=2), id_=8)
+        other = self.ask(run_args(record_id="weekly"), id_=9)
+        ids = {a["value"]["run"]["run_id"] for a in (first, later, revised, other)}
+        self.assertEqual(len(ids), 4)
+        self.assertEqual(len(self.starter.calls), 4)
+        key = first["value"]["run"]["start_key"]["client_key"]
+        self.assertNotIn(key, json.dumps(run_args()))  # derived by the daemon, never one of the plugin's values
+
+    def test_two_racing_calls_for_one_occurrence_start_one_run(self):
+        entered, release = threading.Event(), threading.Event()
+        inner = FakeStarter()
+
+        def slow(params):
+            entered.set()
+            release.wait(10)
+            return inner(params)
+        api, registry, _, _ = make_api(starter=slow)
+        end = hc.DaemonEnd("demo.plugin", GrantingCore(), runs=api)
+        answers = []
+        threads = [threading.Thread(target=lambda i=i: answers.append(self.ask(id_=i, end=end))) for i in (1, 2)]
+        threads[0].start()
+        self.assertTrue(entered.wait(10))
+        threads[1].start()
+        time.sleep(0.3)
+        release.set()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual(len(answers), 2)
+        self.assertEqual(len(inner.calls), 1)
+        self.assertEqual(len(registry.list()), 1)
+        self.assertEqual({a["value"]["run"]["run_id"] for a in answers if "run" in a["value"]},
+                         {registry.list()[0]["run_id"]})
+
+    # (7) a control-API client cannot set origin
+    def test_a_control_client_cannot_set_origin(self):
+        forged = origin_of(run_args())
+        answer = self.api.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p", "origin": forged})
+        self.assertEqual(answer["code"], "started")
+        self.assertNotIn("origin", answer["run"])
+        self.assertNotIn("origin", self.registry.get(answer["run"]["run_id"]))  # ignored and never stored, as today
+
+    def test_a_control_client_reusing_the_derived_key_neither_takes_nor_hides_the_requested_run(self):
+        requested = self.ask()["value"]["run"]
+        key = requested["start_key"]["client_key"]
+        params = {"tenant": "t1", "engine": "codex", "prompt": "summarise the day", "client_key": key}
+        self.assertEqual(self.api.call("run.start", params), {"code": "request_invalid", "detail": "client_key_reused"})
+        api2, registry2, _, _ = make_api()
+        self.assertEqual(api2.call("run.start", params)["code"], "started")
+        end2 = hc.DaemonEnd("demo.plugin", GrantingCore(), runs=api2)
+        answer = self.ask(end=end2)
+        self.assertEqual(answer["value"], {"code": "request_invalid", "detail": "client_key_reused"})
+        self.assertEqual([r.get("origin") for r in registry2.list()], [None])
+
+    # (8) Stop of such a run is Stop of any run
+    def test_stop_of_a_requested_run_is_stop_of_any_run(self):
+        run = self.ask()["value"]["run"]
+        stop = self.api.call("run.stop", {"run_id": run["run_id"]})
+        self.assertEqual(stop["code"], "stopped")
+        self.assertEqual(self.kill.requests, [run["cgroup"]])
+        record = self.registry.get(run["run_id"])
+        self.assertEqual(record["state"], "stopped")
+        self.assertEqual(record["origin"], origin_of(run_args()))
+
+    # (9) agent and packet are written nowhere and stay reserved
+    def test_agent_and_packet_are_written_nowhere_and_stay_reserved(self):
+        self.assertEqual(hc.RESERVED_RUN_ORIGINS, ("trigger", "agent", "packet"))
+        self.assertEqual(self.ask()["value"]["run"]["origin"]["kind"], "trigger")
+        for path in (Path(hc.__file__), REPO / "core" / "recursion_core" / "control" / "api.py",
+                     REPO / "core" / "recursion_core" / "daemon" / "control_adapter.py"):
+            constants = [node.value for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+                         if isinstance(node, ast.Constant) and node.value in ("agent", "packet")]
+            with self.subTest(path=path.name):
+                self.assertEqual(constants, ["agent", "packet"] if path.name == "host_channel.py" else [])
+
+    def test_the_schema_and_the_code_say_the_same_of_run_request(self):
+        s = schema()
+        row = next(r for r in s["x-call-names"] if r["name"] == "run.request")
+        self.assertEqual(tuple(row["args"]), hc.CALL_NAMES["run.request"])
+        self.assertEqual(row["permission"], "schedule")
+        self.assertEqual(row["permission"], hc.RUN_REQUEST_PERMISSION)
+        block = s["x-run-request"]
+        self.assertEqual(tuple(block["record_kinds"]), hc.RUN_REQUEST_RECORD_KINDS)
+        self.assertEqual(tuple(block["origin"]["fields"]), hc.RUN_ORIGIN_FIELDS)
+        self.assertEqual(block["origin"]["kind"], "trigger")
+        self.assertEqual(sorted(block["args"]), sorted(hc.CALL_NAMES["run.request"]))
+        self.assertIn("append-only", block["about"])
+
+    def test_the_daemons_control_object_carries_origin_on_its_one_start_path(self):
+        from recursion_core.daemon.control_adapter import DaemonControl
+
+        class Starter:
+            failures, results = {}, {}
+        with tempfile.TemporaryDirectory() as state:
+            control = DaemonControl(self.api, self.registry, None, Starter(), state)
+            control._observe = lambda run, full: None
+            end = hc.DaemonEnd("demo.plugin", GrantingCore(), runs=control)
+            answer = self.ask(end=end)
+            self.assertEqual(answer["value"]["code"], "started")
+            self.assertEqual(self.registry.get(answer["value"]["run"]["run_id"])["origin"], origin_of(run_args()))
+            plain = control.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p", "origin": {"x": 1}})
+            self.assertNotIn("origin", self.registry.get(plain["run"]["run_id"]))
+
+    # (A2) a requested start is counted in the daemon's in-flight starts exactly as a control start is
+    def test_a_requested_start_is_in_the_daemons_in_flight_count_as_a_control_start_is(self):
+        from recursion_core.daemon.control_adapter import DaemonControl
+
+        class Starter:
+            failures, results = {}, {}
+
+        class Waiting:
+            """A start function that waits inside the start until released, and reads the count there."""
+
+            def __init__(self):
+                self.control, self.seen = None, []
+                self.entered, self.release = threading.Event(), threading.Event()
+
+            def __call__(self, params):
+                self.seen.append(self.control._starts_in_flight)
+                self.entered.set()
+                if not self.release.wait(10):
+                    raise RuntimeError("the test never released the start")
+                return {"cgroup": f"/sys/fs/cgroup/fake/{params['run_id']}"}
+
+        waiting = Waiting()
+        api, registry, _kill, _starter = make_api(starter=waiting)
+        answers = []
+
+        def during_a_start(start):
+            waiting.entered.clear()
+            waiting.release.clear()
+            thread = threading.Thread(target=lambda: answers.append(start()), daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(waiting.entered.wait(10))
+            finally:
+                waiting.release.set()
+                thread.join(10)
+            self.assertFalse(thread.is_alive())
+
+        with tempfile.TemporaryDirectory() as state:
+            control = DaemonControl(api, registry, None, Starter(), state)
+            control._observe = lambda run, full: None
+            waiting.control = control
+            end = hc.DaemonEnd("demo.plugin", GrantingCore(), runs=control)
+            during_a_start(lambda: control.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p"}))
+            during_a_start(lambda: end.receive(call("run.request", run_args(), id_=5)))
+            self.assertEqual(waiting.seen, [1, 1])
+            self.assertEqual(control._starts_in_flight, 0)
+            self.assertEqual(answers[0]["code"], "started")
+            self.assertEqual(answers[1]["value"]["code"], "started")
+            self.assertEqual(registry.get(answers[1]["value"]["run"]["run_id"])["origin"], origin_of(run_args()))
+
+    # (A3) a core whose permission answer raises or cannot be read grants nothing
+    def test_a_core_whose_permission_answer_raises_or_cannot_be_read_grants_nothing(self):
+        class Raising(FakeCore):
+            def client_for(self, caller):
+                self.clients_for.append(caller)
+
+                def call(request):
+                    self.requests.append((caller, request))
+                    raise RuntimeError("the core cannot answer")
+                return call
+
+        listed = canonical({"protocol": "csl-core/v0", "ok": True, "result": {"permissions": "schedule"}})
+        cores = {"raises": Raising(), "not json": FakeCore(answer=b"not json at all"), "empty": FakeCore(answer=b""),
+                 "not an object": FakeCore(answer=b'["schedule"]'), "no result": FakeCore(answer=b'{"ok":true}'),
+                 "permissions not a list": FakeCore(answer=listed)}
+        for label, core in cores.items():
+            with self.subTest(core=label):
+                runs = SpyRuns(self.api)
+                answer = self.ask(end=hc.DaemonEnd("demo.plugin", core, runs=runs))
+                self.assertEqual((answer["type"], answer["code"]), ("refusal", "call_not_offered"))
+                self.assertEqual(runs.seen, [])
+                self.assertEqual(len(core.requests), 1)
+        self.assert_nothing_started()
+
+    def test_the_install_schema_grant_enum_matches_permissions_and_schedule_sample_validates(self):
+        steps = []
+        self._install_schema_steps = steps
+        install_schema = json.loads(
+            (REPO / "schemas" / "plugin" / "v1" / "install.v1.json").read_text(encoding="utf-8")
+        )
+        grant_def = install_schema["$defs"]["grant"]
+        perms_prop = grant_def["properties"]["permissions"]
+        enum = perms_prop["items"]["enum"]
+        self.assertEqual(tuple(enum), PERMISSIONS)
+        self.assertNotIn("seven", perms_prop["description"].lower())
+        steps.append("enum")
+        sample_path = FIXTURES / "good" / "install.v1" / "h05-schedule-grant.json"
+        sample_text = sample_path.read_text(encoding="utf-8")
+        sample = json.loads(sample_text)
+        self.assertEqual(set(sample) - set(install_schema["properties"]), set())
+        self.assertIsInstance(sample.get("grants"), list)
+        self.assertTrue(sample["grants"])
+        grant = sample["grants"][0]
+        self.assertEqual(grant["permissions"], ["schedule"])
+        self.assertTrue(set(grant_def["required"]) <= set(grant))
+        self.assertEqual(set(grant) - set(grant_def["properties"]), set())
+        self.assertRegex(grant["plugin_id"], grant_def["properties"]["plugin_id"]["pattern"])
+        self.assertNotRegex(grant["plugin_id"], r"[\r\n]")
+        self.assertRegex(grant["artifact_sha256"], install_schema["$defs"]["hex64"]["pattern"])
+        self.assertNotRegex(grant["artifact_sha256"], r"[\r\n]")
+        if grant.get("signer_key_id") is not None:
+            self.assertRegex(grant["signer_key_id"], install_schema["$defs"]["key_id"]["pattern"])
+            self.assertNotRegex(grant["signer_key_id"], r"[\r\n]")
+        for perm in grant["permissions"]:
+            self.assertIn(perm, enum)
+        try:
+            import jsonschema
+        except ImportError:
+            validator = None
+        else:
+            validator = getattr(jsonschema, "Draft202012Validator", None)
+        if validator is not None:
+            validator(install_schema).validate(sample)
+        steps.append("sample")
+        with self.subTest(step="read_install"):
+            if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "geteuid")):
+                self.skipTest("daemon_plugins.read_install requires os.O_NOFOLLOW and os.geteuid")
+            with tempfile.TemporaryDirectory() as tmp:
+                install_path = Path(tmp) / daemon_plugins.INSTALL_FILE
+                probe = {"grants": [{"plugin_id": "demo.plugin", "artifact_sha256": "0123456789abcdef" * 4,
+                                     "signer_key_id": None, "permissions": list(enum)}]}
+                install_path.write_text(json.dumps(probe), encoding="utf-8")
+                os.chmod(install_path, 0o600)
+                loaded = daemon_plugins.read_install(tmp)
+                self.assertEqual(loaded["grants"]["demo.plugin"].permissions, tuple(enum))
+            with tempfile.TemporaryDirectory() as tmp:
+                install_path = Path(tmp) / daemon_plugins.INSTALL_FILE
+                install_path.write_text(sample_text, encoding="utf-8")
+                os.chmod(install_path, 0o600)
+                loaded = daemon_plugins.read_install(tmp)
+                self.assertEqual(loaded["grants"][grant["plugin_id"]].permissions, ("schedule",))
+            steps.append("read_install")
+
+    def test_the_install_schema_test_skips_only_read_install_without_posix_calls(self):
+        sentinel = object()
+        for missing in (("O_NOFOLLOW", "geteuid"), ("O_NOFOLLOW",), ("geteuid",)):
+            with self.subTest(missing=missing):
+                saved = {name: getattr(os, name, sentinel) for name in missing}
+                case = RunRequestTests(
+                    "test_the_install_schema_grant_enum_matches_permissions_and_schedule_sample_validates"
+                )
+                result = unittest.TestResult()
+                try:
+                    for name, value in saved.items():
+                        if value is not sentinel:
+                            delattr(os, name)
+                    case.run(result)
+                finally:
+                    for name, value in saved.items():
+                        if value is not sentinel:
+                            setattr(os, name, value)
+                self.assertEqual(result.errors, [])
+                self.assertEqual(result.failures, [])
+                self.assertTrue(result.wasSuccessful())
+                self.assertEqual(case._install_schema_steps, ["enum", "sample"])
+                self.assertEqual(
+                    [
+                        "read_install" if "read_install" in str(subtest) else str(subtest)
+                        for subtest, _ in result.skipped
+                    ],
+                    ["read_install"],
+                )
+                for _subtest, reason in result.skipped:
+                    self.assertIn("O_NOFOLLOW", reason)
+                    self.assertIn("geteuid", reason)
+
+    def test_the_install_schema_test_still_runs_read_install_where_the_posix_calls_exist(self):
+        if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "geteuid")):
+            self.skipTest("this platform has no os.O_NOFOLLOW or os.geteuid; there the step is skipped on purpose")
+        case = RunRequestTests(
+            "test_the_install_schema_grant_enum_matches_permissions_and_schedule_sample_validates"
+        )
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.skipped, [])
+        self.assertTrue(result.wasSuccessful())
+        self.assertEqual(case._install_schema_steps, ["enum", "sample", "read_install"])
+
+    def test_one_occurrence_for_two_tenants_starts_two_runs_and_same_tenant_twice_starts_one(self):
+        from recursion_core.daemon.control_adapter import DaemonControl
+
+        class Starter:
+            failures, results = {}, {}
+
+        promise = "start at most one run for one tenant; the same occurrence for another tenant is another run"
+        self.assertIn(promise, schema()["description"])
+        self.assertIn(promise, hc.__doc__)
+        self.assertIn(promise, hc.DaemonEnd._run_request.__doc__)
+        with tempfile.TemporaryDirectory() as state:
+            control = DaemonControl(self.api, self.registry, None, Starter(), state)
+            control._observe = lambda run, full: None
+            end = hc.DaemonEnd("demo.plugin", GrantingCore(), runs=control)
+            first = self.ask(run_args(tenant="t1"), id_=1, end=end)
+            again = self.ask(run_args(tenant="t1"), id_=2, end=end)
+            self.assertEqual(first["value"]["code"], "started")
+            self.assertEqual(again["value"]["run"]["run_id"], first["value"]["run"]["run_id"])
+            self.assertTrue(again["value"]["duplicate"])
+            self.assertEqual(len(self.starter.calls), 1)
+            self.assertEqual(len(self.registry.list()), 1)
+            other = self.ask(run_args(tenant="t2"), id_=3, end=end)
+            self.assertEqual(other["value"]["code"], "started")
+            self.assertFalse(other["value"].get("duplicate", False))
+            self.assertNotEqual(other["value"]["run"]["run_id"], first["value"]["run"]["run_id"])
+            self.assertEqual(other["value"]["run"]["start_key"]["client_key"],
+                             first["value"]["run"]["start_key"]["client_key"])
+            self.assertEqual(len(self.starter.calls), 2)
+            self.assertEqual(len(self.registry.list()), 2)
+            self.assertEqual(self.registry.get(first["value"]["run"]["run_id"])["origin"],
+                             origin_of(run_args(tenant="t1")))
+            self.assertEqual(self.registry.get(other["value"]["run"]["run_id"])["origin"],
+                             origin_of(run_args(tenant="t2")))
 
 
 class FixtureConformanceTests(unittest.TestCase):

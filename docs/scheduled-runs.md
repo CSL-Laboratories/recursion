@@ -158,6 +158,11 @@ while :; do
   if [ "$pause_s" -gt 0 ]; then
     rem=$(( deadline - now ))
     if [ "$pause_s" -lt "$rem" ]; then sleep "$pause_s"; else sleep "$rem"; fi
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline" ]; then
+      printf '%s\n' "$out"
+      exit "$rc"
+    fi
   fi
 done
 ```
@@ -168,8 +173,9 @@ and, when the first `start` launched, the second answer carries `"duplicate": tr
 The script retries `start` only when the command exits 1 with `control_api_unavailable`,
 for up to `ROUTINE_WAIT` seconds with `ROUTINE_PAUSE` seconds between tries (`ROUTINE_WAIT`
 defaults to `0` and `ROUTINE_PAUSE` to `2`, so with `ROUTINE_WAIT=0` or unset it tries once
-and returns). Any other answer,
-and exit 2 on a usage error, are returned at once.
+and returns). The wait is counted in whole seconds of the machine's clock, so
+`ROUTINE_WAIT=1` can end after the first try, and no try begins at or after the end of the
+wait. Any other answer, and exit 2 on a usage error, are returned at once.
 
 ## Linux: a systemd user timer and service
 

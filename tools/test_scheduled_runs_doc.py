@@ -35,6 +35,22 @@ fi
 exit "$rc"
 """
 
+_FAKE_DATE_SCRIPT = """#!/bin/sh
+set -eu
+if [ "$#" -eq 1 ] && [ "$1" = "+%s" ]; then
+  cat "$FAKE_CLOCK"
+  exit 0
+fi
+exec /bin/date "$@"
+"""
+
+_FAKE_SLEEP_SCRIPT = """#!/bin/sh
+set -eu
+cur=$(cat "$FAKE_CLOCK")
+inc="$1"
+printf '%s\\n' "$(( cur + inc ))" > "$FAKE_CLOCK"
+"""
+
 
 def _find_doc() -> Path:
     for parent in Path(os.path.abspath(__file__)).parents:
@@ -77,6 +93,7 @@ class ScheduledRunsScriptTests(unittest.TestCase):
         *,
         wait: str | None,
         pause: str | None = "0",
+        fake_clock: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], int, list[str]]:
         lines = [
             "ROUTINE_TENANT=demo",
@@ -106,6 +123,20 @@ class ScheduledRunsScriptTests(unittest.TestCase):
             "FAKE_ARGS": str(args_file),
             "FAKE_RESPONSES": str(responses_file),
         }
+        fake_date = self.tmp / "date"
+        fake_sleep = self.tmp / "sleep"
+        clock_file = self.tmp / "clock"
+        if fake_clock:
+            clock_file.write_text("100\n", encoding="utf-8")
+            fake_date.write_text(_FAKE_DATE_SCRIPT, encoding="utf-8")
+            fake_date.chmod(fake_date.stat().st_mode | stat.S_IXUSR)
+            fake_sleep.write_text(_FAKE_SLEEP_SCRIPT, encoding="utf-8")
+            fake_sleep.chmod(fake_sleep.stat().st_mode | stat.S_IXUSR)
+            env["FAKE_CLOCK"] = str(clock_file)
+        else:
+            fake_date.unlink(missing_ok=True)
+            fake_sleep.unlink(missing_ok=True)
+            clock_file.unlink(missing_ok=True)
         assert _SH is not None
         proc = subprocess.run(
             [_SH, str(self.script), "nightly"],
@@ -220,7 +251,7 @@ class ScheduledRunsScriptTests(unittest.TestCase):
 
     def test_a_pause_of_zero_that_is_written_is_honoured(self) -> None:
         responses = ['1|{"code": "control_api_unavailable", "delivered": false}']
-        proc, calls, _ = self._run_routine(responses, wait="1", pause="0")
+        proc, calls, _ = self._run_routine(responses, wait="2", pause="0")
         self.assertEqual(proc.returncode, 1)
         self.assertGreaterEqual(calls, 2)
         self.assertEqual(json.loads(proc.stdout)["code"], "control_api_unavailable")
@@ -255,6 +286,13 @@ class ScheduledRunsScriptTests(unittest.TestCase):
         proc, calls, _ = self._run_routine(responses, wait="9" * 18, pause="1")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(calls, 3)
+
+    def test_no_try_begins_at_or_after_the_deadline(self) -> None:
+        responses = ['1|{"code": "control_api_unavailable", "delivered": false}']
+        proc, calls, _ = self._run_routine(responses, wait="3", pause="1", fake_clock=True)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual(calls, 3)
+        self.assertEqual(json.loads(proc.stdout)["code"], "control_api_unavailable")
 
 
 if __name__ == "__main__":

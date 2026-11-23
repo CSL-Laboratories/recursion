@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import os
 import subprocess
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import unittest.mock
 import venv
 from pathlib import Path
 
@@ -104,6 +106,110 @@ FDS_SOURCE = textwrap.dedent("""
     """).encode()
 
 
+def require_proc(*paths):
+    missing = [path for path in paths if not os.path.exists(path)]
+    return unittest.skipIf(bool(missing), f"requires {', '.join(missing)}")
+
+
+def venv_python(env: Path) -> Path:
+    windows = env / "Scripts/python.exe"
+    return windows if windows.is_file() else env / "bin/python"
+
+
+class HostTestHelperTests(unittest.TestCase):
+    def test_require_proc_skips_only_when_a_path_is_missing(self):
+        def sample():
+            return "ran"
+
+        with unittest.mock.patch.object(os.path, "exists", return_value=False):
+            skipped = require_proc("/proc/self/environ", "/proc/self/fd")(sample)
+        self.assertTrue(getattr(skipped, "__unittest_skip__", False))
+        self.assertIn("/proc/self/environ", getattr(skipped, "__unittest_skip_why__", ""))
+        self.assertIn("/proc/self/fd", getattr(skipped, "__unittest_skip_why__", ""))
+        with self.assertRaises(unittest.SkipTest) as caught:
+            skipped()
+        self.assertTrue(str(caught.exception))
+
+        with unittest.mock.patch.object(os.path, "exists", return_value=True):
+            kept = require_proc("/proc/self/environ", "/proc/self/fd")(sample)
+        self.assertFalse(getattr(kept, "__unittest_skip__", False))
+        self.assertEqual(kept(), "ran")
+
+    def test_venv_python_uses_environment_layout_under_nt_name(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            posix_env = Path(scratch, "posix")
+            (posix_env / "bin").mkdir(parents=True)
+            posix_python = posix_env / "bin/python"
+            posix_python.write_text("", encoding="ascii")
+            with unittest.mock.patch.object(os, "name", "nt"):
+                chosen = venv_python(posix_env)
+            self.assertEqual(chosen, posix_python)
+            self.assertTrue(chosen.is_file())
+
+            windows_env = Path(scratch, "windows")
+            (windows_env / "Scripts").mkdir(parents=True)
+            windows_python = windows_env / "Scripts/python.exe"
+            windows_python.write_text("", encoding="ascii")
+            with unittest.mock.patch.object(os, "name", "posix"):
+                chosen_windows = venv_python(windows_env)
+            self.assertEqual(chosen_windows, windows_python)
+            self.assertTrue(chosen_windows.is_file())
+
+
+    @staticmethod
+    def proc_skips(present):
+        """Load a fresh copy of this module while only the /proc files in `present` exist.
+
+        Returns {test name: skip reason} for the tests of HostProgramTests that come out skipped
+        for a missing /proc file, and the names of the tests that load the /proc readers.
+        """
+        real_exists = os.path.exists
+
+        def exists(path):
+            text = os.fspath(path)
+            return text in present if text.startswith("/proc") else real_exists(path)
+
+        spec = importlib.util.spec_from_file_location("host_program_proc_probe", __file__)
+        probe = importlib.util.module_from_spec(spec)
+        with unittest.mock.patch.object(os.path, "exists", exists):
+            spec.loader.exec_module(probe)
+        skipped, readers = {}, set()
+        for name in dir(probe.HostProgramTests):
+            member = getattr(probe.HostProgramTests, name)
+            if not name.startswith("test_"):
+                continue
+            inner = member
+            while hasattr(inner, "__wrapped__"):
+                inner = inner.__wrapped__
+            if {"ENV_SOURCE", "FDS_SOURCE"} & set(inner.__code__.co_names):
+                readers.add(name)
+            reason = getattr(member, "__unittest_skip_why__", "")
+            if getattr(member, "__unittest_skip__", False) and reason.startswith("requires "):
+                skipped[name] = reason
+        return skipped, readers
+
+    @unittest.skipIf(os.name == "nt", "the /proc paths are POSIX only")
+    def test_every_proc_reading_test_is_skipped_without_proc_and_no_other(self):
+        skipped, readers = self.proc_skips(present=set())
+        self.assertEqual(len(readers), 4, readers)
+        self.assertEqual(set(skipped), readers)
+        for name, reason in skipped.items():
+            self.assertIn("/proc/self/environ", reason, name)
+        everything, _ = self.proc_skips(present={"/proc/self/environ", "/proc/self/cmdline", "/proc/self/fd"})
+        self.assertEqual(everything, {})
+
+    @unittest.skipIf(os.name == "nt", "the /proc paths are POSIX only")
+    def test_a_test_is_skipped_when_only_one_of_its_proc_paths_is_missing(self):
+        skipped, readers = self.proc_skips(present={"/proc/self/environ", "/proc/self/cmdline"})
+        self.assertEqual(len(skipped), 1, skipped)
+        self.assertEqual(set(skipped), {n for n in readers if n.endswith("channels_and_nothing_more")})
+        self.assertEqual(list(skipped.values()), ["requires /proc/self/fd"])
+        only_fd, _ = self.proc_skips(present={"/proc/self/fd", "/proc/self/environ"})
+        self.assertEqual(len(only_fd), 3, only_fd)
+        for reason in only_fd.values():
+            self.assertEqual(reason, "requires /proc/self/cmdline")
+
+
 class HostProgramTests(unittest.TestCase):
     counter = __import__("itertools").count()
 
@@ -114,7 +220,7 @@ class HostProgramTests(unittest.TestCase):
         cls.root = Path(scratch.name)
         env = cls.root / "python"
         venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(env)
-        cls.python = env / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        cls.python = venv_python(env)
         cls.site = Path(subprocess.check_output(
             [str(cls.python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True).strip())
         (cls.site / "host_test.pth").write_text(
@@ -610,6 +716,7 @@ class HostProgramTests(unittest.TestCase):
             self.assertNotIn(CANARY_NAME, task)
 
     @unittest.skipIf(os.name == "nt", "the restart is POSIX only")
+    @require_proc("/proc/self/environ", "/proc/self/cmdline")
     def test_n1_a_canary_is_not_readable_however_the_starter_sets_the_marker(self):
         # The host goes on only when the environment block holds nothing but the marker; it never
         # takes the marker alone as the answer. Each form below gets one restart.
@@ -627,6 +734,7 @@ class HostProgramTests(unittest.TestCase):
                 self.assertEqual(self.starts, 2)
 
     @unittest.skipIf(os.name == "nt", "the restart is POSIX only")
+    @require_proc("/proc/self/environ", "/proc/self/cmdline")
     def test_n1_an_environment_that_holds_only_the_marker_or_nothing_is_not_restarted(self):
         for label, environ in (("marker only", {MARKER: "1"}), ("nothing", {})):
             with self.subTest(form=label):
@@ -637,6 +745,7 @@ class HostProgramTests(unittest.TestCase):
                 self.assertIn(replies[0]["value"]["proc"], ("", MARKER + "=1\0"))
 
     @unittest.skipIf(os.name == "nt", "the restart is POSIX only")
+    @require_proc("/proc/self/fd", "/proc/self/environ")
     def test_n1_descriptors_after_the_restart_are_the_channels_and_nothing_more(self):
         with tempfile.TemporaryFile() as extra:
             replies, _, _, identity = self.exchange(
@@ -679,6 +788,7 @@ class HostProgramTests(unittest.TestCase):
         self.assertEqual(plugin_host.START_REFUSED, "host_start_refused")
 
     @unittest.skipIf(os.name == "nt", "the restart is POSIX only")
+    @require_proc("/proc/self/environ", "/proc/self/cmdline")
     def test_n1_a_marker_with_another_value_is_not_clean_even_alone(self):
         for value in ("0", "yes", "2", ""):
             with self.subTest(marker=value):

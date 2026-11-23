@@ -173,9 +173,13 @@ def _first_imports(before, own=None):
 
 
 def _read_owned(path, limit, *, missing_ok=False):
-    """Bytes of an operator-owned regular file nobody else can write, or a typed refusal."""
+    """Bytes of an operator-owned regular file nobody else can write, or a typed refusal.
+
+    The open does not wait: a pipe at ``path`` is opened at once and refused by the ``fstat``
+    below before anything is read, so a pipe in a package never blocks the install path.
+    """
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | getattr(os, 'O_NONBLOCK', 0))
     except FileNotFoundError:
         if missing_ok:
             return None

@@ -229,7 +229,7 @@ class HostProgramTests(unittest.TestCase):
         )
 
     def exchange(self, *messages, states=(False,), real=False, extra=None, secret=False, environ=None,
-                 standin=None, code=0):
+                 standin=None, code=0, wall="standin", home=None, files=None):
         # Isolated Python runs venv .pth files but ignores PYTHONPATH. This shim passes a probe to
         # main and writes its returned status to a file in the host's working folder, because the
         # host points its own stderr at the null device. The host may start itself again once with a
@@ -270,6 +270,7 @@ class HostProgramTests(unittest.TestCase):
         # standin "dirty": the first restart hands the new image one more variable, so no restart ever
         # comes out clean. standin "fail": the interpreter path the restart uses is a file that is not there.
         # standin "norecord": the kernel's record of the environment cannot be read (os.environ stands in).
+        # wall: see WALL_SHIMS below; home: the stand-in home folder the host's probe takes as its canary.
         startup_code = (
             f"import json, os, sys\nsys.path.insert(0, {str(CORE)!r})\n"
             f"open({str(starts)!r}, 'a').write('x')\n"
@@ -284,6 +285,8 @@ class HostProgramTests(unittest.TestCase):
             +
             "from recursion_core import plugin_host\n"
             "from recursion_core.plugin_security.tests.support import FakeGilProbe\n"
+            + WALL_SHIMS[wall]
+            + (f"plugin_host._home = lambda: {home!r}\n" if home is not None else "")
             + bootstrap
             + textwrap.dedent(f"""
                 main = plugin_host.main
@@ -295,8 +298,11 @@ class HostProgramTests(unittest.TestCase):
                         status = main()
                     else:
                         status = main(gil_probe=probe)
-                    with open("host-status.json", "w") as out:
-                        out.write(json.dumps([status, probe.calls, extra_identity]))
+                    try:
+                        with open("host-status.json", "w") as out:
+                            out.write(json.dumps([status, probe.calls, extra_identity]))
+                    except PermissionError:
+                        pass  # a real wall refuses every new write; the caller reads no status then
 
                 plugin_host.main = run
                 """)
@@ -305,6 +311,9 @@ class HostProgramTests(unittest.TestCase):
         (self.site / "_recursion_host_test_startup.py").write_text(startup_code, encoding="utf-8")
         stdin = b"".join(msg if isinstance(msg, bytes) else hc.encode(msg) for msg in messages)
         with tempfile.TemporaryDirectory(dir=self.root) as cwd:
+            for name, text in (files or {}).items():
+                Path(cwd, name).parent.mkdir(parents=True, exist_ok=True)
+                Path(cwd, name).write_text(text, encoding="utf-8")
             if extra is not None and os.name == "nt":
                 os.set_handle_inheritable(handle, True)
             try:
@@ -330,8 +339,9 @@ class HostProgramTests(unittest.TestCase):
         self.assertEqual(process.returncode, code, stderr.decode(errors="replace"))
         replies = list(frames(stdout))
         self.assertTrue(replies, stderr.decode(errors="replace"))
-        self.assertEqual(replies.pop(0), HELLO)
-        if code != 0:
+        self.hello = replies.pop(0)
+        self.assertEqual({key: value for key, value in self.hello.items() if key != "wall"}, HELLO)
+        if code != 0 or wall == "real":
             return replies, None, None, None
         self.assertIsNotNone(report, "the host wrote no status")
         status, reads, identity = json.loads(report)
@@ -600,8 +610,10 @@ class HostProgramTests(unittest.TestCase):
 
     def test_schema_names_the_optional_hello_field(self):
         schema = json.loads((CORE.parent / "schemas/plugin/v1/host.v1.json").read_text(encoding="utf-8"))
-        self.assertEqual(schema["x-message-types"]["hello"]["optional_from"], {"daemon": ["gil_check"]})
-        self.assertEqual(hc.OPTIONAL_MESSAGE_FIELDS, {("hello", "daemon"): frozenset({"gil_check"})})
+        self.assertEqual(schema["x-message-types"]["hello"]["optional_from"],
+                         {"daemon": ["gil_check"], "host": ["wall"]})
+        self.assertEqual(hc.OPTIONAL_MESSAGE_FIELDS, {("hello", "daemon"): frozenset({"gil_check"}),
+                                                      ("hello", "host"): frozenset({"wall"})})
         self.assertEqual(schema["$defs"]["hello"]["properties"]["gil_check"]["enum"], ["on", "off"])
 
     def test_a1_plugin_reading_standard_input_cannot_reach_the_channel(self):
@@ -815,3 +827,158 @@ class HostProgramTests(unittest.TestCase):
             standin="dirty+norecord", code=EXIT_ENVIRONMENT_NOT_CLEAN)
         self.assert_refusal(replies[0], None, "host_start_refused", "environment_not_clean")
         self.assertEqual(self.starts, 2)
+
+    # THE WALL. The host walls itself in before it reads any message, proves the wall from inside, sends
+    # the record in its hello, and answers every load with plugin_wall_unproven when the record is not
+    # proven. The stand-in home holds a canary; the plugin below tries to read it and to make sockets.
+
+    def stand_in_home(self):
+        home = self.root / ("home-%d" % next(self.counter))
+        home.mkdir()
+        canary = home / "canary.txt"
+        canary.write_text(CANARY, encoding="ascii")
+        return home, canary
+
+    def test_w1_a_walled_host_keeps_its_plugin_from_a_canary_and_a_socket_and_still_answers(self):
+        why = _why_no_wall()
+        if why:
+            self.skipTest(why)
+        home, canary = self.stand_in_home()
+        replies, _, _, _ = self.exchange(HELLO, load(WALL_SOURCE), call(7, command={"canary": str(canary)}), BYE,
+                                         wall="real", home=str(home))
+        self.assertEqual(replies, [result(7, {"canary": "PermissionError", "inet": "PermissionError",
+                                              "unix": "PermissionError"})])
+        record = self.hello.get("wall")
+        self.assertIsInstance(record, dict, self.hello)
+        self.assertEqual({name: record[name] for name in RECORD_CHECKS}, dict.fromkeys(RECORD_CHECKS, True))
+        self.assertIs(record["proven"], True)
+        # The same walled host still answers an ordinary read command, as the in-process loader does.
+        loader = PluginLoader(TrustStore({}), {}, ReservedEffects(), CoreHealth(), FakeGilProbe())
+        plugin = loader.load(manifest_bytes("01" * 32, source=SOURCE), None, SOURCE)
+        command = {"command": "positions", "terms": [1, False, None]}
+        replies, _, _, _ = self.exchange(HELLO, load(), call(7, command=command), BYE, wall="real", home=str(home))
+        self.assertIs(self.hello["wall"]["proven"], True)
+        self.assertEqual(replies, [result(7, plugin.module.operator(command))])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the stand-in kernel answer is Linux's")
+    def test_w2_with_no_landlock_the_record_is_not_proven_and_no_plugin_byte_runs(self):
+        home, _ = self.stand_in_home()
+        ran = home / "plugin-ran"
+        source = SOURCE + b"open(%r, 'w').close()\n" % str(ran).encode()
+        replies, _, _, _ = self.exchange(HELLO, load(source), call(7, command={"command": "positions"}), load(source),
+                                         BYE, wall="nolandlock", home=str(home))
+        self.assertEqual(len(replies), 3, replies)
+        for reply in (replies[0], replies[2]):
+            self.assert_refusal(reply, None, "plugin_wall_unproven")
+            for missing in ("landlock_unavailable", "reads_outside", "proven"):
+                self.assertIn(missing, reply["detail"])
+        self.assert_refusal(replies[1], 7, "call_not_offered")
+        self.assertFalse(ran.exists(), "plugin code ran")
+        record = self.hello.get("wall")
+        self.assertIsInstance(record, dict, self.hello)
+        self.assertIs(record["proven"], False)
+        self.assertEqual(record["landlock_abi"], 0)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the stand-in kernel answer is Linux's")
+    def test_w3_no_message_manifest_field_file_or_setting_skips_the_wall(self):
+        home, _ = self.stand_in_home()
+        ran = home / "plugin-ran"
+        source = SOURCE + b"open(%r, 'w').close()\n" % str(ran).encode()
+        asking = load(source)
+        manifest = json.loads(base64.b64decode(asking["manifest_b64"]))
+        manifest.update(wall="none", sandbox="none", runtime="python-inprocess/1")
+        asking["manifest_b64"] = b64(json.dumps(manifest).encode())
+        config = home / "config"
+        for place in (config / "settings.toml", config / "recursion" / "settings.toml",
+                      home / ".config" / "recursion" / "settings.toml"):
+            place.parent.mkdir(parents=True, exist_ok=True)
+            place.write_text('[plugin_host]\nwall = "none"\n', encoding="utf-8")
+        files = {name: 'wall = "none"\n' for name in
+                 ("settings.toml", "recursion.toml", ".recursion/settings.toml", "plugin.toml", "wall.toml")}
+        environ = {"PYTHONPATH": str(CORE), "HOME": str(home), "XDG_CONFIG_HOME": str(config),
+                   "CSL_PLUGIN_WALL": "none", "CSL_PLUGIN_HOST_WALL": "off"}
+        claimed = dict(STANDIN_RECORD)
+        replies, _, _, _ = self.exchange(
+            dict(HELLO, wall=claimed), dict(HELLO, gil_check="off"), dict(claimed, type="wall"), asking,
+            call(7, command={"command": "positions"}), load(source), BYE,
+            wall="nolandlock", home=str(home), environ=environ, files=files)
+        self.assertEqual([(reply["type"], reply["code"]) for reply in replies],
+                         [("refusal", "message_invalid"), ("refusal", "message_unknown"),
+                          ("refusal", "plugin_wall_unproven"), ("refusal", "call_not_offered"),
+                          ("refusal", "plugin_wall_unproven")], replies)
+        self.assertFalse(ran.exists(), "plugin code ran")
+        self.assertIs(self.hello["wall"]["proven"], False)
+
+    def test_w4_without_the_two_calls_the_host_sends_no_record_and_refuses_every_load(self):
+        from recursion_core import plugin_host
+
+        with unittest.mock.patch.object(sys, "platform", "darwin"):
+            record, refused = plugin_host._wall()  # the wall's first step refuses before any change
+        self.assertIsNone(record)
+        self.assertEqual(refused, "wall_system_unsupported")
+        sent = []
+
+        class Channel:
+            inbox = [HELLO, load(), call(7, command={"command": "positions"}), BYE]
+
+            def receive(self):
+                return self.inbox.pop(0) if self.inbox else None
+
+            def send(self, message):
+                sent.append(hc.check_message(message, receiver="daemon"))
+
+        plugin_host._Program(Channel(), FakeGilProbe(), (record, refused)).serve()
+        self.assertEqual(sent[0], HELLO)
+        self.assert_refusal(sent[1], None, "plugin_wall_unproven",
+                            "the wall around this host is not proven, so it loads nothing and runs no plugin "
+                            "code; missing: wall_system_unsupported, no_record")
+        self.assert_refusal(sent[2], 7, "call_not_offered")
+        self.assertEqual(len(sent), 3, sent)
+
+
+def _why_no_wall():
+    if not sys.platform.startswith("linux"):
+        return "the wall is Linux-only"
+    from recursion_core.plugin_host.tests.test_wall_linux import _why_not_here
+
+    return _why_not_here()
+
+
+# The plugin of the wall tests: it tries to read the canary it is given and to make an AF_INET and an
+# AF_UNIX socket, and says what happened to each.
+WALL_SOURCE = textwrap.dedent("""
+    import socket
+
+    def operator(command):
+        seen = {}
+        try:
+            with open(command['canary'], 'rb') as record:
+                seen['canary'] = record.read().decode('ascii')
+        except OSError as exc:
+            seen['canary'] = type(exc).__name__
+        for name, family in (('inet', socket.AF_INET), ('unix', socket.AF_UNIX)):
+            try:
+                socket.socket(family, socket.SOCK_STREAM).close()
+                seen[name] = 'made'
+            except OSError as exc:
+                seen[name] = type(exc).__name__
+        return seen
+    """).encode()
+
+RECORD_CHECKS = ("reads_outside", "home_canary", "program_start", "new_socket", "signal_other",
+                 "signal_other_ways", "metadata_change", "kernel_surface")
+# A proven record as the stand-in wall gives it (and as a daemon might claim one in its own hello).
+STANDIN_RECORD = dict(dict.fromkeys(RECORD_CHECKS, True), landlock_abi=6,
+                      landlock_scopes=["abstract_unix_socket", "signal"], arch="x86_64", proven=True)
+# The wall each exchange gives its host, as lines run inside the host before main. "standin": no wall
+# and a proven stand-in record, for the tests of the channel, the environment and the GIL rule, several of
+# whose plugins read /proc, which a real wall refuses. "real": the host's own wall on this kernel.
+# "nolandlock": the kernel answers that it has no Landlock, so apply_wall refuses before any change.
+WALL_SHIMS = {
+    "standin": ("from recursion_core.plugin_host import wall_linux as _wall_linux\n"
+                "_wall_linux.apply_wall = lambda paths: None\n"
+                f"_wall_linux.probe_wall = lambda canary, pid: {STANDIN_RECORD!r}\n"),
+    "real": "",
+    "nolandlock": ("from recursion_core.plugin_host import wall_linux as _wall_linux\n"
+                   "_wall_linux._landlock_abi = lambda libc: 0\n"),
+}

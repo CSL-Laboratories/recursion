@@ -8,8 +8,17 @@ core requests only from the plugin's own thread) keep an honest plugin in order;
 boundary. The boundary is on the daemon's side, which must check every request that arrives on the
 channel against that plugin's grant and must take no result on trust (the daemon's reader of this
 channel is a later draft and that rule is its first requirement), and the wall around the process,
-which limits what the process can do to the machine. With this draft alone, do not run a plugin you
-do not trust.
+which limits what the process can do to the machine.
+
+The wall. Before it reads its first load, the host walls itself in (``wall_linux.apply_wall``, with the
+Python install as the only path it may read) and proves that wall from inside (``wall_linux.probe_wall``,
+with its own home folder as the canary and its starter as the other process); its hello carries the
+record (``wall.v1``). A host whose record is not proven, or whose wall was refused, answers every load
+with ``plugin_wall_unproven`` naming what is missing, loads nothing and runs no plugin byte. Nothing on
+the channel, in a manifest, in a file or in a setting reaches that step: it runs once, before the host
+reads any message, and nothing here offers a way around it. Outside Linux there is no wall, so no load
+is ever taken there. Until the daemon's reader of this channel exists, do not run a plugin you do not
+trust.
 """
 
 from __future__ import annotations
@@ -29,6 +38,8 @@ from recursion_core.control_transport.framing import HEADER
 from recursion_core.plugin_security import host_channel as hc
 from recursion_core.plugin_security.limits import ARTIFACT
 from recursion_core.plugin_security.runtime import GilProbe
+
+from . import wall_linux
 
 # This becomes a setting in the person's own settings file. The daemon alone passes it.
 DEFAULT_GIL_CHECK = "on"
@@ -61,6 +72,59 @@ RESTARTED = "--restarted-once"
 START_REFUSED = "host_start_refused"
 EXIT_RESTART_FAILED = 71
 EXIT_ENVIRONMENT_NOT_CLEAN = 78
+
+# A host whose own wall is not proven answers every load with this refusal and runs no plugin byte.
+WALL_UNPROVEN = "plugin_wall_unproven"
+
+
+def _install_paths():
+    """The Python install this host runs from: the only paths its wall lets it read (the environment's
+    own folder and the install it was made from; one folder when they are the same)."""
+    return sorted({sys.prefix, sys.base_prefix})
+
+
+def _home():
+    """This user's home folder, the probe's canary: read from the password database before the wall,
+    since the host's environment is empty by then. A home that cannot be read is '' and proves nothing."""
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.getuid()).pw_dir or ""
+    except (ImportError, KeyError, OSError):
+        return ""
+
+
+def _wall():
+    """Wall this process in, then probe the wall from inside: (the wall.v1 record or None, the refusal).
+
+    Runs once, before the host reads any message. The refusal is the code of ``apply_wall``'s refusal, or
+    the name of what it raised, or '' when the wall applied. The probe runs either way: its checks are
+    harmless where they are allowed, and a record that shows them allowed is not proven. Where the probe
+    cannot run at all (not Linux), the record is None."""
+    canary, refused = _home(), ""
+    try:
+        wall_linux.apply_wall(_install_paths())
+    except wall_linux.WallRefused as exc:
+        refused = exc.code
+    except Exception as exc:  # a path that cannot be opened, or any other failure: no wall is in place
+        refused = "apply_wall_" + type(exc).__name__
+    try:
+        record = wall_linux.probe_wall(canary, os.getppid())
+    except Exception:  # wall_system_unsupported, or a probe that cannot run: nothing is proven
+        record = None
+    return record, refused
+
+
+def _wall_missing(record, refused):
+    """What keeps the wall from being proven: the refusal, then each check of the record that the kernel
+    did not refuse, then 'proven' when the record still does not say so. Empty only for a proven wall."""
+    missing = [refused] if refused else []
+    if type(record) is not dict:
+        return missing + ["no_record"]
+    missing += [name for name in wall_linux.RECORD_CHECKS if record.get(name) is not True]
+    if record.get("proven") is not True:
+        missing.append("proven")
+    return missing
 
 
 def _environment_is_clean():
@@ -225,8 +289,10 @@ def _check_json(value):
 
 
 class _Program:
-    def __init__(self, channel, probe):
+    def __init__(self, channel, probe, wall=(None, "wall_not_applied")):
         self._channel, self._probe = channel, probe
+        self._wall_record, refused = wall
+        self._wall_missing = _wall_missing(self._wall_record, refused)
         self._handlers = {}
         self._end = hc.HostEnd(self._handlers)
         self._deferred = deque()
@@ -241,7 +307,10 @@ class _Program:
         return {"gil_check": self._gil_check, "gil": self._gil, "accepting_work": not self._gil_latched}
 
     def serve(self):
-        self._channel.send({"type": "hello", "channel": hc.CHANNEL})
+        hello = {"type": "hello", "channel": hc.CHANNEL}
+        if type(self._wall_record) is dict:
+            hello["wall"] = self._wall_record
+        self._channel.send(hello)
         while not self._closed:
             message = self._deferred.popleft() if self._deferred else self._read_peer()
             if message is not None:
@@ -285,6 +354,9 @@ class _Program:
             self._channel.send(answer)
 
     def _work(self, message):
+        if message["type"] == "load" and self._wall_missing:
+            self._channel.send(self._wall_refusal(message))
+            return
         if self._gil_latched:
             self._channel.send(self._gil_refusal(message))
             return
@@ -309,6 +381,11 @@ class _Program:
                 self._channel.send(answer)
             except (FrameError, RecursionError, TypeError, ValueError) as exc:
                 self._channel.send(self._failed(message, exc))
+
+    def _wall_refusal(self, message):
+        detail = ("the wall around this host is not proven, so it loads nothing and runs no plugin code; "
+                  "missing: " + ", ".join(self._wall_missing))
+        return hc.refusal(message, hc.ChannelRefusal(WALL_UNPROVEN, detail))
 
     @staticmethod
     def _gil_refusal(message):
@@ -370,6 +447,9 @@ def main(*, gil_probe: GilProbe | None = None) -> dict:
     os.environ.clear()
     os.environ.update(keep)
     with _Channel.from_stdio() as channel:
-        program = _Program(channel, GilProbe() if gil_probe is None else gil_probe)
+        # The wall comes after the inherited descriptors are shut and the standard ones point at the null
+        # device, and before the first message is read or sent: nothing the daemon sends reaches it.
+        wall = _wall()
+        program = _Program(channel, GilProbe() if gil_probe is None else gil_probe, wall)
         program.serve()
     return program.status()

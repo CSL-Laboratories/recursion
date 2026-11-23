@@ -790,6 +790,8 @@ class RunRequestTests(unittest.TestCase):
         self.assert_nothing_started()
 
     def test_the_install_schema_grant_enum_matches_permissions_and_schedule_sample_validates(self):
+        steps = []
+        self._install_schema_steps = steps
         install_schema = json.loads(
             (REPO / "schemas" / "plugin" / "v1" / "install.v1.json").read_text(encoding="utf-8")
         )
@@ -798,14 +800,7 @@ class RunRequestTests(unittest.TestCase):
         enum = perms_prop["items"]["enum"]
         self.assertEqual(tuple(enum), PERMISSIONS)
         self.assertNotIn("seven", perms_prop["description"].lower())
-        with tempfile.TemporaryDirectory() as tmp:
-            install_path = Path(tmp) / daemon_plugins.INSTALL_FILE
-            probe = {"grants": [{"plugin_id": "demo.plugin", "artifact_sha256": "0123456789abcdef" * 4,
-                                 "signer_key_id": None, "permissions": list(enum)}]}
-            install_path.write_text(json.dumps(probe), encoding="utf-8")
-            os.chmod(install_path, 0o600)
-            loaded = daemon_plugins.read_install(tmp)
-            self.assertEqual(loaded["grants"]["demo.plugin"].permissions, tuple(enum))
+        steps.append("enum")
         sample_path = FIXTURES / "good" / "install.v1" / "h05-schedule-grant.json"
         sample_text = sample_path.read_text(encoding="utf-8")
         sample = json.loads(sample_text)
@@ -833,12 +828,72 @@ class RunRequestTests(unittest.TestCase):
             validator = getattr(jsonschema, "Draft202012Validator", None)
         if validator is not None:
             validator(install_schema).validate(sample)
-        with tempfile.TemporaryDirectory() as tmp:
-            install_path = Path(tmp) / daemon_plugins.INSTALL_FILE
-            install_path.write_text(sample_text, encoding="utf-8")
-            os.chmod(install_path, 0o600)
-            loaded = daemon_plugins.read_install(tmp)
-            self.assertEqual(loaded["grants"][grant["plugin_id"]].permissions, ("schedule",))
+        steps.append("sample")
+        with self.subTest(step="read_install"):
+            if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "geteuid")):
+                self.skipTest("daemon_plugins.read_install requires os.O_NOFOLLOW and os.geteuid")
+            with tempfile.TemporaryDirectory() as tmp:
+                install_path = Path(tmp) / daemon_plugins.INSTALL_FILE
+                probe = {"grants": [{"plugin_id": "demo.plugin", "artifact_sha256": "0123456789abcdef" * 4,
+                                     "signer_key_id": None, "permissions": list(enum)}]}
+                install_path.write_text(json.dumps(probe), encoding="utf-8")
+                os.chmod(install_path, 0o600)
+                loaded = daemon_plugins.read_install(tmp)
+                self.assertEqual(loaded["grants"]["demo.plugin"].permissions, tuple(enum))
+            with tempfile.TemporaryDirectory() as tmp:
+                install_path = Path(tmp) / daemon_plugins.INSTALL_FILE
+                install_path.write_text(sample_text, encoding="utf-8")
+                os.chmod(install_path, 0o600)
+                loaded = daemon_plugins.read_install(tmp)
+                self.assertEqual(loaded["grants"][grant["plugin_id"]].permissions, ("schedule",))
+            steps.append("read_install")
+
+    def test_the_install_schema_test_skips_only_read_install_without_posix_calls(self):
+        sentinel = object()
+        for missing in (("O_NOFOLLOW", "geteuid"), ("O_NOFOLLOW",), ("geteuid",)):
+            with self.subTest(missing=missing):
+                saved = {name: getattr(os, name, sentinel) for name in missing}
+                case = RunRequestTests(
+                    "test_the_install_schema_grant_enum_matches_permissions_and_schedule_sample_validates"
+                )
+                result = unittest.TestResult()
+                try:
+                    for name, value in saved.items():
+                        if value is not sentinel:
+                            delattr(os, name)
+                    case.run(result)
+                finally:
+                    for name, value in saved.items():
+                        if value is not sentinel:
+                            setattr(os, name, value)
+                self.assertEqual(result.errors, [])
+                self.assertEqual(result.failures, [])
+                self.assertTrue(result.wasSuccessful())
+                self.assertEqual(case._install_schema_steps, ["enum", "sample"])
+                self.assertEqual(
+                    [
+                        "read_install" if "read_install" in str(subtest) else str(subtest)
+                        for subtest, _ in result.skipped
+                    ],
+                    ["read_install"],
+                )
+                for _subtest, reason in result.skipped:
+                    self.assertIn("O_NOFOLLOW", reason)
+                    self.assertIn("geteuid", reason)
+
+    def test_the_install_schema_test_still_runs_read_install_where_the_posix_calls_exist(self):
+        if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "geteuid")):
+            self.skipTest("this platform has no os.O_NOFOLLOW or os.geteuid; there the step is skipped on purpose")
+        case = RunRequestTests(
+            "test_the_install_schema_grant_enum_matches_permissions_and_schedule_sample_validates"
+        )
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.skipped, [])
+        self.assertTrue(result.wasSuccessful())
+        self.assertEqual(case._install_schema_steps, ["enum", "sample", "read_install"])
 
     def test_one_occurrence_for_two_tenants_starts_two_runs_and_same_tenant_twice_starts_one(self):
         from recursion_core.daemon.control_adapter import DaemonControl

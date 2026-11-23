@@ -238,6 +238,17 @@ class MessageTypeTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertIn(expected, paragraph)
 
+    def test_every_changelog_paragraph_that_names_run_origins_names_the_check_order(self):
+        paragraphs = [" ".join(p.split()) for p in CHANGES.read_text(encoding="utf-8").split("\n\n")
+                      if "run-origin" in p]
+        self.assertTrue(paragraphs)
+        for index, paragraph in enumerate(paragraphs):
+            for expected in ("run-origin", "trigger", "agent", "packet",
+                             "message_reserved", "message_wrong_side", "message_invalid",
+                             "wrong side", "right receiver"):
+                with self.subTest(paragraph=index, expected=expected):
+                    self.assertIn(expected, paragraph)
+
     def test_a_load_with_an_origin_field_is_wrong_side_at_daemon_and_invalid_at_host(self):
         _, fields = hc.MESSAGE_TYPES["load"]
         values = {

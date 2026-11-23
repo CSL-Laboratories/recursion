@@ -30,7 +30,12 @@ starts. It is offered only to a plugin granted the new permission `schedule` (ap
 list of `manifest.v1.json` and of `plugin_security/manifest.py`), else `call_not_offered`. The daemon
 starts the run through `run.start`'s own path with a start key it derives, and the run's record gains
 `origin` (`kind` `trigger`, `plugin`, `record_kind`, `record_id`, `revision`, `occurrence`). The run-origin
-values stay in the reserved list; `agent` and `packet` are written nowhere. What it breaks: a host that
+values stay in the reserved list; `agent` and `packet` are written nowhere. The daemon builds `origin`
+itself from the channel's plugin and the call's arguments, and no message carries one: a field for a
+run origin is still refused in the order of the `1.0-draft.1` note, `message_reserved` on a reserved
+message type and `message_wrong_side` on a defined message type from the wrong side, both before any
+field is read, and `message_invalid` only on a defined message type that reaches its right receiver,
+a `run.request` call among them. What it breaks: a host that
 counted on `run.request` being answered `call_reserved`; the other six reserved call names are unchanged.
 One good fixture shows the call.
 

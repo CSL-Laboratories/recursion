@@ -11,16 +11,20 @@ test it names must fail against it.
 from __future__ import annotations
 
 import pathlib
+import re
 import tempfile
 import unittest
 
 from recursion_core.approvals.model import principal_refusal
+from recursion_core.approvals import queue as queue_module
 from recursion_core.approvals.queue import ApprovalQueue
 from recursion_core.plugin_security import approval as gate_module
 from recursion_core.plugin_security import ApprovalGate, Refused
 from recursion_core.plugin_security.tests.support import (
     AGENT_TOKEN, OPERATOR_TOKEN, PLUGIN_TOKEN, Clock, authenticate, effect,
 )
+
+OWNER = {"kind": "owner", "id": "owner-1"}
 
 try:
     from recursion_core.control.tests.test_seams import FakeStore
@@ -273,6 +277,149 @@ class MemoryGateRunStateTests(unittest.TestCase):
         self.assertIsNone(gate.run_state("run-1"))
 
 
+@needs_store
+class RoundOnTheKeptGateTests(unittest.TestCase):
+    """The cases a hostile read of the kept gate met: each was red before this round."""
+
+    def setUp(self) -> None:
+        self.store = FakeStore()
+        self.addCleanup(self.store.close)
+        self.clock = Clock()
+        self.declared = False
+        self.drawn: list = []
+
+    def gate(self, **figures) -> ApprovalGate:
+        gate = ApprovalGate(lambda *drawn: self.drawn.append(drawn), authenticate, self.clock, store=self.store,
+                            declare_tables=not self.declared, **figures)
+        self.declared = True
+        return gate
+
+    def outcome(self, call, *args) -> tuple:
+        try:
+            return ("ok", call(*args))
+        except Refused as refused:
+            return ("refused", refused.code)
+
+    def test_a_stall_shorter_than_the_deadline_ends_the_approval(self) -> None:
+        for kept in (True, False):
+            with self.subTest(kept=kept):
+                clock = self.clock if kept else Clock()
+                gate = self.gate(ttl_seconds=10, stall_seconds=4) if kept else \
+                    ApprovalGate(lambda *drawn: None, authenticate, clock, ttl_seconds=10, stall_seconds=4)
+                unanswered, digest = gate.request(_note(intent="unanswered"))
+                answered, answered_digest = gate.request(_note(intent="answered"))
+                clock.now += 1
+                gate.decide(answered, answered_digest, OPERATOR_TOKEN, True)
+                clock.now += 4  # past the stall time, still inside the deadline
+                self.assertEqual(gate.run_state("run-1")["state"], "stalled")
+                self.assertEqual(self.outcome(gate.decide, unanswered, digest, OPERATOR_TOKEN, True),
+                                 ("refused", "approval_expired"))
+                self.assertEqual(self.outcome(gate.take, unanswered, _note(intent="unanswered")),
+                                 ("refused", "approval_expired"))
+                self.assertEqual(self.outcome(gate.take, answered, _note(intent="answered")),
+                                 ("refused", "approval_expired"))
+                self.assertIn("not done", gate_module.words_for("stalled"))
+
+    def test_an_approval_found_past_its_deadline_is_ended_for_good(self) -> None:
+        gate = self.gate()
+        approval_id, digest = gate.request(_note())
+        gate.decide(approval_id, digest, OPERATOR_TOKEN, True)
+        start = self.clock.now
+        self.clock.now = start + gate_module.APPROVAL_DEADLINE_SECONDS + 5
+        self.assertEqual(self.outcome(gate.take, approval_id, _note()), ("refused", "approval_expired"))
+        self.assertEqual(_rows(self.store)[approval_id][0], "expired")
+        self.clock.now = start + 1  # the clock steps back
+        for after in (gate, self.gate()):
+            self.assertEqual(self.outcome(after.take, approval_id, _note()), ("refused", "approval_expired"))
+            self.assertEqual(self.outcome(after.decide, approval_id, digest, OPERATOR_TOKEN, True),
+                             ("refused", "approval_expired"))
+        answered = [(event["payload"]["state"], event["payload"]["answer"]) for event in self.store.events
+                    if event["type"] == "approval.answered"]
+        self.assertEqual(answered, [("approved", "approve"), ("expired", None)])  # who approved stays in the log
+
+    def test_a_veto_through_one_gate_is_seen_by_every_gate_on_the_store(self) -> None:
+        first, second = self.gate(), self.gate()  # the second is made before the veto
+        vetoed, digest = first.request(_note())
+        sibling, _ = first.request(_note())
+        self.assertEqual(first.decide(vetoed, digest, OPERATOR_TOKEN, False), "vetoed")
+        self.assertTrue(second.is_vetoed(digest))
+        self.assertEqual(self.outcome(second.decide, sibling, digest, OPERATOR_TOKEN, True),
+                         ("refused", "approval_vetoed"))
+        self.assertEqual(self.outcome(second.request, _note()), ("refused", "approval_vetoed"))
+        approved, digest = first.request(_note(intent="b"))
+        first.decide(approved, digest, OPERATOR_TOKEN, True)
+        other, _ = first.request(_note(intent="b"))
+        second.decide(other, digest, OPERATOR_TOKEN, False)  # vetoed after the first was approved
+        self.assertEqual(self.outcome(first.take, approved, _note(intent="b")), ("refused", "approval_vetoed"))
+
+    def test_a_denial_through_the_queue_is_a_veto_for_every_gate(self) -> None:
+        gate = self.gate()
+        queue = ApprovalQueue(clock=lambda: float(self.clock.now))
+        queue.attach(self.store, declare_tables=False)
+        denied, digest = gate.request(_note())
+        sibling, _ = gate.request(_note())
+        with self.store.transaction() as tx:
+            queue.open_in(tx, OWNER, {"approval_id": denied, "surface": "cli"})
+            answer = queue.answer_in(tx, OWNER, {"command_id": "command-0001", "approval_id": denied, "surface": "cli",
+                                                 "expected_revision": 1, "digest": digest, "answer": "deny"},
+                                     lambda later: later())
+        self.assertEqual(answer["code"], "ok")
+        self.assertTrue(gate.is_vetoed(digest))
+        self.assertEqual(self.outcome(gate.decide, sibling, digest, OPERATOR_TOKEN, True),
+                         ("refused", "approval_vetoed"))
+        self.assertEqual(self.outcome(gate.request, _note()), ("refused", "approval_vetoed"))
+
+    def test_a_store_that_cannot_commit_is_a_typed_refusal(self) -> None:
+        gate = self.gate()
+        approval_id, digest = gate.request(_note())
+        gate.decide(approval_id, digest, OPERATOR_TOKEN, True)
+        self.store.fail_commit = True
+        self.assertEqual(self.outcome(gate.request, _note(intent="x")), ("refused", "store_unavailable"))
+        self.assertEqual(len(self.drawn), 1)  # a request whose commit failed is never drawn
+        self.assertEqual(self.outcome(gate.take, approval_id, _note()), ("refused", "store_unavailable"))
+        self.store.fail_commit = False
+        self.assertEqual(self.outcome(gate.take, approval_id, _note()), ("ok", digest))
+        self.assertEqual(self.outcome(gate.take, approval_id, _note()), ("refused", "approval_replayed"))
+
+    def test_every_code_the_gate_answers_has_its_sentence(self) -> None:
+        text = pathlib.Path(gate_module.__file__).read_text(encoding="utf-8")
+        codes = set(re.findall(r'(?:Refused\(|return \(?)"([a-z_]+)"', text))
+        self.assertGreater(len(codes), 15)
+        for code in sorted(codes):
+            with self.subTest(code=code):
+                self.assertIsNotNone(gate_module.words_for(code))
+        gate = self.gate()
+        crowded = _note(**{"k%03d" % number: "v" for number in range(500)})
+        ApprovalGate(lambda *drawn: None, authenticate, Clock()).request(crowded)  # a gate without a store takes it
+        for refused_effect in (crowded, effect(kind="note.post", amount=0, run_id="run 1", payload={"intent": "a"})):
+            with self.subTest(effect=refused_effect["run_id"]):
+                with self.assertRaises(Refused) as caught:
+                    gate.request(refused_effect)
+                self.assertEqual(caught.exception.code, "record_invalid")
+                self.assertIsNotNone(gate_module.words_for(caught.exception.code))
+
+    def test_the_words_are_true_in_every_case_that_reaches_them(self) -> None:
+        for kept in (True, False):
+            with self.subTest(kept=kept):
+                gate = self.gate() if kept else ApprovalGate(lambda *drawn: None, authenticate, self.clock)
+                waiting, _ = gate.request(_note(intent="waiting"))
+                vetoed, digest = gate.request(_note(intent="vetoed"))
+                gate.decide(vetoed, digest, OPERATOR_TOKEN, False)
+                for approval_id, intent in ((waiting, "waiting"), (vetoed, "vetoed")):
+                    self.assertEqual(self.outcome(gate.take, approval_id, _note(intent=intent)),
+                                     ("refused", "approval_not_granted"))
+                words = gate_module.words_for("approval_not_granted")
+                self.assertIn("waiting", words)
+                self.assertIn("refused", words)
+                self.assertNotIn("Answer it first", words)
+        words = gate_module.words_for("record_invalid")
+        self.assertIn("could not be kept", words)  # a request refused before anything was saved
+        self.assertIn("could not be read", words)  # a saved record torn
+
+    def test_the_deadline_is_one_value_the_queue_reads_too(self) -> None:
+        self.assertIs(queue_module.DEADLINE_SECONDS["plugin_effect"], gate_module.APPROVAL_DEADLINE_SECONDS)
+
+
 class _ApproveExpiredOnReload(ApprovalGate):
     def _reloaded(self, tx, held, now):
         due = gate_module._durable()[1].expire_if_due(held, gate_module._durable()[2](now))
@@ -282,9 +429,9 @@ class _ApproveExpiredOnReload(ApprovalGate):
                     answered_at=held["expires_at"])
 
 
-class _ForgetVetoOnReload(ApprovalGate):
-    def _vetoed_in_store(self):
-        return set()
+class _IgnoreVetoesInTheStore(ApprovalGate):
+    def _vetoed_in(self, tx, digest):
+        return False
 
 
 class _ApprovalCoversAnyDigest(ApprovalGate):
@@ -294,7 +441,7 @@ class _ApprovalCoversAnyDigest(ApprovalGate):
 
 MUTANTS = {
     "approve_expired_on_reload": (_ApproveExpiredOnReload, "test_deadline_passed_while_the_daemon_was_down"),
-    "forget_veto_on_reload": (_ForgetVetoOnReload, "test_a_veto_then_a_restart_then_the_same_digest"),
+    "ignore_vetoes_in_the_store": (_IgnoreVetoesInTheStore, "test_a_veto_then_a_restart_then_the_same_digest"),
     "approval_covers_any_digest": (_ApprovalCoversAnyDigest, "test_a_second_effect_digest_with_the_first_approval"),
 }
 

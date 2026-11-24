@@ -879,5 +879,118 @@ class W1ToW4AndW6WindowsTests(unittest.TestCase):
                    link_tag=f"0x{through['tag']:08X}")
 
 
+# -- W7, W8: a junction made with the system's own command, and one swapped in after the check ------
+# Real Windows only, like W1 to W4 and W6 (the same skip and the same clean-up habits). W7 makes the
+# junction with the command every Windows install has (``cmd.exe /c mklink /J``; no administrator
+# right and no Developer Mode) and shows the held walk refuses it. W8 checks a plain folder part
+# through the held parent, then swaps a junction in under the same name, and shows that the part
+# already held is not redirected and that a new walk refuses the junction; a by-path use after the
+# same swap is only recorded. Every junction points inside the test's own directory and is removed
+# by its own name in a ``finally``.
+
+# Seconds one ``cmd.exe`` call of W7 and W8 may take before the case fails. A first value: it becomes
+# a row of the person's settings file once that file is at the base.
+W_COMMAND_SECONDS = 60
+
+
+def _system_command() -> str | None:
+    """The system's own command interpreter, from ``ComSpec`` or the system folder; None when absent."""
+    for candidate in (os.environ.get("ComSpec"),
+                      os.path.join(os.environ.get("SystemRoot", ""), "System32", "cmd.exe")):
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _mklink_junction(target: Path, junction: Path) -> str:
+    """Make ``junction`` -> ``target`` with ``cmd.exe /c mklink /J``; returns the command's exit code."""
+    cmd = _system_command()
+    if cmd is None:
+        raise unittest.SkipTest("no cmd.exe on this Windows host (ComSpec and the system folder have none)")
+    proc = subprocess.run([cmd, "/d", "/c", "mklink", "/J", junction.name, str(target)], cwd=str(junction.parent),
+                          capture_output=True, text=True, timeout=W_COMMAND_SECONDS, check=False)
+    if proc.returncode != 0 or not os.path.lexists(junction):
+        raise AssertionError(f"mklink /J answered {proc.returncode}: {(proc.stdout + proc.stderr).strip()[-500:]}")
+    return str(proc.returncode)
+
+
+@unittest.skipUnless(REAL_WINDOWS, NOT_REAL_WINDOWS)
+class W7W8BuiltInJunctionTests(unittest.TestCase):
+    def test_w7_a_junction_made_by_mklink_is_refused_by_the_held_walk(self) -> None:
+        win = _Win()
+        with tempfile.TemporaryDirectory() as tmp:
+            held, outside = Path(tmp, "held"), Path(tmp, "outside")
+            (held / "a").mkdir(parents=True)
+            (outside / "c").mkdir(parents=True)
+            junction = held / "a" / "j"
+            try:
+                exit_code = _mklink_junction(outside, junction)
+                islink, isjunction = os.path.islink(junction), os.path.isjunction(junction)
+                anchor = win.hold_folder(str(held))
+                try:
+                    through = win.nt_walk(anchor, ("a", "j", "c"))
+                    plain = win.nt_walk(anchor, ("a",))
+                finally:
+                    win.close(anchor)
+            finally:
+                _remove_reparse_point(junction)
+            left = sorted(os.listdir(held / "a")) + sorted(os.listdir(outside))
+        self.assertEqual("refused", through["result"])
+        self.assertEqual(1, through["part"])
+        self.assertEqual(IO_REPARSE_TAG_MOUNT_POINT, through["tag"])
+        self.assertEqual("opened", plain["result"])
+        self.assertEqual(["c"], left)  # the junction is gone and its target was not emptied
+        _wfact("W7", made_by="cmd.exe /d /c mklink /J", mklink_exit=exit_code, islink=islink,
+               isjunction=isjunction, walk="NtCreateFile per part relative to the held parent, FILE_OPEN_REPARSE_POINT",
+               junction_part=through["part"], junction_status=through["status"],
+               junction_tag=f"0x{through['tag']:08X}", plain_part="opened")
+
+    def test_w8_a_junction_swapped_in_after_the_check_is_refused_and_the_held_part_is_not_redirected(self) -> None:
+        win = _Win()
+        options = win.FILE_DIRECTORY_FILE | win.FILE_SYNCHRONOUS_IO_NONALERT | win.FILE_OPEN_REPARSE_POINT
+        with tempfile.TemporaryDirectory() as tmp:
+            held, outside = Path(tmp, "held"), Path(tmp, "outside")
+            (held / "a" / "c").mkdir(parents=True)
+            (outside / "c").mkdir(parents=True)
+            part, moved = held / "a", held / "a-moved"
+            handles = []
+            try:
+                anchor = win.hold_folder(str(held))
+                handles.append(anchor)
+                # The check: the part is opened as itself through the held parent and is no reparse point.
+                status, checked = win.nt_open(anchor, "a", attributes=win.OBJ_CASE_INSENSITIVE, options=options)
+                self.assertIsNotNone(checked, f"0x{status:08X}")
+                handles.append(checked)
+                checked_attributes, _ = win.tag(checked)
+                # The swap, after the check: the folder moves away and a junction takes its name.
+                os.rename(part, moved)
+                exit_code = _mklink_junction(outside, part)
+                # The use through the part already held: it stays on the folder that was checked.
+                use_status, used = win.nt_open(checked, "c", attributes=win.OBJ_CASE_INSENSITIVE, options=options)
+                self.assertIsNotNone(used, f"0x{use_status:08X}")
+                handles.append(used)
+                held_use = _masked(win.final_path(used), tmp)
+                # A new walk of the same name meets the junction and refuses it.
+                again = win.nt_walk(anchor, ("a", "c"))
+                # Recorded only: a use of the same path by its text after the same swap.
+                by_path = win.create_file(str(part / "c"), win.FILE_READ_ATTRIBUTES, win.SHARE_ALL,
+                                          win.FILE_FLAG_BACKUP_SEMANTICS)
+                handles.append(by_path)
+                by_path_use = _masked(win.final_path(by_path), tmp)
+            finally:
+                for handle in reversed(handles):
+                    win.close(handle)
+                _remove_reparse_point(part)
+            left = sorted(os.listdir(held)) + sorted(os.listdir(outside))
+        self.assertFalse(checked_attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        self.assertEqual("<tmp>\\held\\a-moved\\c", held_use)
+        self.assertEqual("refused", again["result"])
+        self.assertEqual(0, again["part"])
+        self.assertEqual(IO_REPARSE_TAG_MOUNT_POINT, again["tag"])
+        self.assertEqual(["a-moved", "c"], left)  # the junction is gone and its target was not emptied
+        _wfact("W8", swap="rename of the checked folder, then cmd.exe /d /c mklink /J under its name",
+               mklink_exit=exit_code, held_part_use=held_use, new_walk=again["result"], new_walk_part=again["part"],
+               new_walk_tag=f"0x{again['tag']:08X}", by_path_use_recorded=by_path_use)
+
 if __name__ == "__main__":
     unittest.main()

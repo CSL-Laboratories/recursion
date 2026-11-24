@@ -99,3 +99,37 @@ W3 asserts nothing (both statuses are recorded) and W6 did not run.
 Clean-up: every junction, folder and file lives in a `tempfile.TemporaryDirectory`, every junction
 points at a folder in that same directory, and each junction is removed by its own name before the
 directory goes. The temp folder of the run held 0 entries before and after each run and each flip.
+
+## Run 3: real Windows 11 and the host's own WSL2 layer, Mon Nov 23 2026, on 71381ea2
+
+This section adds rows for W7 and W8 and the WSL2 side of W5 on the same laptop. It does not rewrite
+the rows above.
+
+- Host: Windows 11, build `10.0.26200.9974` (`ver`), machine `AMD64`, NTFS. An ordinary account,
+  not elevated; no setting was changed for the run.
+- Interpreters: CPython 3.12.16 (`-X utf8 -B`, GIL on) and CPython 3.14.10 free-threaded
+  (`-X gil=0 -B`, GIL off).
+- Command, run from `core/`, one process at a time, with `TEMP` and `TMP` pointed at an empty
+  folder of the run's own: `python -X utf8 -B -m unittest -v recursion_core.anchored.tests.test_system_facts`
+  (3.12), and the same with `-X gil=0 -B` (3.14t). The same file through the gate's own runner
+  (`ci_gate.run_test_file`, 3.12) gave the same result.
+- Result: `Ran 14 tests ... OK (skipped=8)` on both interpreters. The skips are L1 to L5 and W5 (not
+  Linux) and W6 (winerror 1314, as in Run 2). W7 and W8 ran and passed on both.
+
+| Case | Interpreter | Result | Raw numbers |
+|---|---|---|---|
+| W7 junction made by `cmd.exe /d /c mklink /J` | 3.12 | asserted, holds | `mklink /J` exit 0, no special right; `os.path.islink` False, `os.path.isjunction` True; the walk (`NtCreateFile` per part relative to the held parent, `FILE_OPEN_REPARSE_POINT`) refused part 1 of `a\j\c`, status `0x00000000`, tag `0xA0000003`; a plain part opened; afterwards the junction was gone and its target still held `c` |
+| W7 the same | 3.14t, GIL off | asserted, holds | the same: exit 0, islink False, isjunction True, part 1, status `0x00000000`, tag `0xA0000003` |
+| W8 junction swapped in after the check | 3.12 | asserted, holds | the part `a` opened through the held parent as itself, no reparse point (the check); then `a` was renamed to `a-moved` and `mklink /J` made a junction `a` to the outside folder (exit 0); `c` opened through the part already held gave `<tmp>\held\a-moved\c` (not redirected); a new walk of `a\c` refused part 0, tag `0xA0000003`. Recorded only: `CreateFileW` of the path's text `held\a\c` after the same swap gave `<tmp>\outside\c` |
+| W8 the same | 3.14t, GIL off | asserted, holds | the same: held part `<tmp>\held\a-moved\c`, new walk refused at part 0, tag `0xA0000003`; by the path's text `<tmp>\outside\c` (recorded) |
+| W5 the junction seen from the host's WSL2 layer | 3.12.3 (the layer's own python3) | **NOT RUN** | the host's only WSL2 distribution (kernel `6.6.87.2-microsoft-standard-WSL2`) has automount and interop turned off in its own `/etc/wsl.conf`: no Windows drive is mounted (`/mnt/c` is an empty folder) and no `cmd.exe` is reachable, so the layer cannot see a junction on the Windows drive at all. The module, fed on stdin with the opt-in set, skipped W5 with `cmd.exe or wslpath is not on PATH`. Nothing was installed, mounted or changed in the layer, so what it reports for a junction is still not known |
+
+Red first: in a scratch copy, the walk's reparse-point check taken out, and separately the walk's
+`FILE_OPEN_REPARSE_POINT` taken out, each turned W7 and W8 red (and W2, which uses the same walk);
+W8's use made by the path's text instead of through the held part turned W8 alone red; the unchanged
+copy was green. On both interpreters.
+
+Clean-up: every junction, folder and file of W7 and W8 lives in a `tempfile.TemporaryDirectory`,
+every junction points at a folder in that same directory, and each junction is removed by its own
+name in a `finally` before the directory goes; each case asserts that the junction is gone and its
+target was not emptied. The temp folder of the run held 0 entries after each run and each cut.

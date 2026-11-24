@@ -1,4 +1,4 @@
-"""Round 2 of #443: the Grok read of d6bba735 (ruling 12). R1 (P2): a ``start_unconfirmed`` answer erased its own
+"""Late answers, a second set of rules. R1: a ``start_unconfirmed`` answer erased its own
 UNCERTAIN warning when its run was already on screen, as a retry of the same key repeats the answer. R2 to R6 (P3),
 rules no test held: a late list of a run the app did not hold shows it stopped; a lane begins nothing once
 ``Loop.shutdown`` ran, before the app ended; an event at an infinite clock sample keeps the last event's time; a
@@ -81,7 +81,7 @@ class RulesNoTestHeldTest(unittest.TestCase):  # R2 to R6
         answer(pending, 0, {"code": "ok", "runs": [{"run_id": "run-9", "state": "running"}]})
         self.assertEqual([(r["run_id"], r["state"]) for r in app.runs], [("run-9", "stopped")])
 
-    def test_a_lane_begins_nothing_once_shutdown_ran_before_the_app_ended(self) -> None:  # R3; holds
+    def test_a_lane_begins_only_a_confirmed_stop_once_shutdown_ran_before_the_app_ended(self) -> None:  # R3
         api = API()
         app = TuiApp(api, clock=lambda: 1000.0, environ={"NO_COLOR": "1"})
         loop = Loop(app, api)
@@ -91,7 +91,7 @@ class RulesNoTestHeldTest(unittest.TestCase):  # R2 to R6
         self.assertFalse(app.closed)
         for lane in loop._lanes.values():
             loop._lane(lane)
-        self.assertEqual(api.calls, [])
+        self.assertEqual(api.calls, ["run.stop"])
 
     def test_an_event_at_an_infinite_clock_sample_keeps_the_last_time(self) -> None:  # R4; holds
         for sample in (float("inf"), float("-inf")):

@@ -3,8 +3,9 @@
 ``TuiApp`` holds view state only: the last answers it was given, which run is selected, a bounded
 copy of engine output and one ordered event log (``events.EventLog``). It owns no session, run,
 approval or plugin state. Opening reads ``run.list``; attaching reads ``run.status``; closing sends
-nothing. Every request goes through the injected ``api.call(method, params)``, the same surface the
-CLI uses; ``run.list`` follows ``next_after`` to the last page as the CLI does (``protocol.list_all_runs``).
+no new request, and a Stop the person confirmed is always sent. Every request goes through the injected
+``api.call(method, params)``, the same surface the CLI uses; ``run.list`` follows ``next_after`` to the
+last page as the CLI does (``protocol.list_all_runs``).
 
 Every request, answer, condition edge, engine output chunk, notice and error is appended to the log
 before anything shows it. The full-screen frame, the inline painter and the linear (screen-reader)
@@ -46,6 +47,19 @@ SESSION_LIST = object()  # ``TuiApp.pane`` when the output pane shows the sessio
 
 def _fmt(params: Mapping) -> str:
     return " ".join(f"{k}={field(v)}" for k, v in sorted(params.items()))
+
+
+class _Done:
+    """The answer callback of one request: it carries the request's number (``asked``), so a Loop's lane can say
+    to the app which request it begins, and the app knows at every moment which requests were not begun."""
+
+    __slots__ = ("app", "asked")
+
+    def __init__(self, app: "TuiApp", asked: int) -> None:
+        self.app, self.asked = app, asked
+
+    def __call__(self, method: str, params: dict, answer: dict) -> None:
+        self.app.on_answer(method, params, answer, asked=self.asked)
 
 
 class _Output:
@@ -192,6 +206,19 @@ class TuiApp:
         self._uncertain: dict[str, str] = {}
         self._asked = 0  # requests asked so far, in order: a read asked before a confirmed Stop is known by it
         self._stopped: dict[str, int] = {}  # run id -> requests asked when its Stop was first confirmed (T2)
+        # Requests handed to the dispatch that no lane has begun yet, by number: (method, params). A confirmed Stop is
+        # sent whatever happens; any other request still here when the TUI closes is not sent, and the close line
+        # names it.
+        self._queued: dict[int, tuple[str, dict]] = {}
+        self._lane_begins = False  # set by a Loop, whose lanes call begin(): only then is a queued request known
+        self._stops_out: dict[int, str] = {}  # confirmed Stops asked and not yet answered: number -> run id
+        self._not_sent: list[str] = []  # requests a lane did not send because the TUI was closing or had ended
+        # Set by a Loop: a close with a confirmed Stop not yet answered first waits for that answer, at most this
+        # many seconds (the Loop's own bound), so the transcript records it. None (no Loop): a close is at once.
+        self.stop_wait_s: float | None = None
+        self.awaiting_stop = False  # q was pressed while a confirmed Stop had no answer yet: the TUI waits for it
+        self._ending = False  # the Loop ended (end_wait): an answer taken now comes after the screen's last frame
+        self._answered_at_close: list[str] = []  # runs whose Stop was answered while closing or after the Loop ended
         self.errors: list[str] = []
         self.last_error: Event | None = None  # kept here too, so a bounded log cannot drop it
         self.mode, self.line, self.stop_target = "keys", "", None
@@ -232,7 +259,7 @@ class TuiApp:
               state: str | None = None) -> Event | None:
         elapsed = (self._clock() - self._t0) * 1000
         # A clock sample that is no number (NaN, or infinite) keeps the last event's time, so the event is still
-        # logged and no answer or error is lost to a ValueError (the triage of Nov 16, T4).
+        # logged and no answer or error is lost to a ValueError.
         ms = self._last_ms = int(round(elapsed)) if elapsed - elapsed == 0 else self._last_ms
         # The final event seals the log in the same step: any later append, even one a busy thread had
         # already begun, is refused by the log itself, so the final event stays last.
@@ -261,7 +288,7 @@ class TuiApp:
             return f"output run={field(self.attached)}"
         return f"runs run={field(self.selected)}" if self.selected else "runs"
 
-    # -- lifecycle: opening and attaching are reads; closing sends nothing ----------------------
+    # -- lifecycle: opening and attaching are reads; closing sends no new request ---------------
     def open(self) -> None:
         self._emit("open", "operator", f"open surface={p.SURFACE}: reads run.list; starts nothing")
         for note in self.keymap.notes:  # a binding file that was not used, or a binding it skipped
@@ -288,12 +315,80 @@ class TuiApp:
             self.request("run.status", {"run_id": self.attached})
 
     def close(self) -> None:
-        """Closing sends nothing. After it the app takes no key, answer or output: nothing is logged,
-        sent or changed, so a thread that is still busy cannot add to the log or send a request."""
+        """Closing sends no new request, and a request still queued and not begun is not sent, except a Stop the
+        person confirmed: that one is always sent. Under a Loop, a close while a confirmed Stop has no answer yet
+        first waits for that answer (at most ``stop_wait_s``; Ctrl-C, or a second close, ends the wait), so the
+        transcript records it. The close line names what was not sent and any Stop whose answer did not come.
+        After it the app takes no key, answer or output: nothing is logged, sent or changed, so a thread that is
+        still busy cannot add to the log or send a request."""
 
         with self._lock:  # a state change already under way finishes first; none starts after this
-            self.closed = True  # a second call changes nothing: the sealed log refuses its event
-            self._emit("close", "operator", "closed: no request sent; runs keep going and can be reattached")
+            if self.closed:
+                return  # a second call changes nothing
+            if not self.awaiting_stop and self.stop_wait_s is not None and self._stops_out:
+                self.awaiting_stop = True
+                runs = ", ".join(field(r) for r in dict.fromkeys(self._stops_out.values()))
+                self._notice(f"closing: the Stop of {runs} is sent; the TUI closes when its answer comes, within "
+                             f"{self.stop_wait_s:g} s; Ctrl-C closes now")
+                return
+            self.closed = True  # the sealed log refuses any later event
+            self._emit("close", "operator", self._end_line())
+
+    def _end_line(self) -> str:
+        """The final line: true at the moment it is written. A Stop answered while closing is said with its answer
+        above; a confirmed Stop with no answer yet is said as begun (sent) or still queued (it is still sent after
+        the close, while the TUI's process runs); every other request not begun is named as not sent."""
+
+        parts = []
+        out = list(dict.fromkeys(self._stops_out.values()))
+        answered = [r for r in dict.fromkeys(self._answered_at_close) if r not in out]
+        if answered:
+            parts.append(f"the Stop of {', '.join(field(r) for r in answered)} was sent and answered (above)")
+        begun = list(dict.fromkeys(r for n, r in self._stops_out.items() if n not in self._queued))
+        queued = [r for r in out if r not in begun]
+        if begun:
+            parts.append(f"the Stop of {', '.join(field(r) for r in begun)} was sent and its answer had not come")
+        if queued:
+            parts.append(f"the Stop of {', '.join(field(r) for r in queued)} was not yet begun; it is still "
+                         f"sent after this, while the TUI's process runs")
+        not_sent = self._not_sent + [f"{m} {_fmt(pa)}".rstrip() for m, pa in self._queued.values()
+                                     if m != "run.stop"]
+        if not_sent:
+            parts.append(f"{len(not_sent)} queued request{'s' if len(not_sent) != 1 else ''} not sent "
+                         f"({'; '.join(not_sent)})")
+        if not parts:
+            return "closed: no request sent; runs keep going and can be reattached"
+        if answered and not (begun or queued or not_sent):
+            parts.append("nothing else is sent at close")
+        stops = answered or out
+        tail = ("every other run keeps going and can be reattached" if stops
+                else "runs keep going and can be reattached")
+        if stops and (begun or queued):
+            tail = "look with run status before you trust that the run stopped; " + tail
+        return "closed: " + "; ".join(parts) + "; " + tail
+
+    def begin(self, asked: int | None, method: str, params: dict, *, ending: bool = False) -> bool:
+        """Called by a Loop's lane before it sends a request: True to send it. A confirmed Stop is always sent, also
+        after the TUI closed or the Loop ended (``ending``); any other request is not sent then, and is named on
+        the close line."""
+
+        with self._lock:
+            entry = self._queued.pop(asked, None) if asked is not None else None
+            if method == "run.stop":
+                return True
+            if self.closed or self.awaiting_stop or ending:
+                if not self.closed:  # once the close line is written it has named it already
+                    self._not_sent.append(f"{method} {_fmt(params)}".rstrip() if entry is None else
+                                          f"{entry[0]} {_fmt(entry[1])}".rstrip())
+                return False
+            return True
+
+    def end_wait(self) -> None:
+        """A Loop ended: a close from now on is at once (there is no tick left to wait in)."""
+
+        with self._lock:
+            self.stop_wait_s = None
+            self._ending = True
 
     # -- requests -------------------------------------------------------------------------------
     def request(self, method: str, params: dict) -> None:
@@ -301,7 +396,7 @@ class TuiApp:
         if method not in p.ALLOWED_METHODS and method not in s.SESSION_METHODS:
             raise ValueError(method)
         with self._lock:
-            if self.closed:
+            if self.closed or self.awaiting_stop:
                 return
             if method == "run.start" and self.watch_only:
                 self._error(f"refused locally: start while watch_only ({self._stale_text()}); refresh first")
@@ -309,8 +404,12 @@ class TuiApp:
             self.in_flight[method] += 1
             self._asked += 1
             asked = self._asked
+            if self._lane_begins:
+                self._queued[asked] = (method, dict(params))
+            if method == "run.stop":
+                self._stops_out[asked] = str(params.get("run_id"))
             self._emit("request", "operator", f"request {method} {_fmt(params)}".rstrip())
-            self.dispatch(method, params, lambda m, pa, a: self.on_answer(m, pa, a, asked=asked))
+            self.dispatch(method, params, _Done(self, asked))
 
     def _inline(self, method: str, params: dict, done: Callable[[str, dict, dict], None]) -> None:
         done(method, params, call_api(self._api, method, params))
@@ -330,12 +429,18 @@ class TuiApp:
         with self._lock:
             if self.closed:  # the TUI ended while the answer was read: it changes nothing
                 return
+            if asked is not None:
+                self._queued.pop(asked, None)
+                if self._stops_out.pop(asked, None) is not None and (self.awaiting_stop or self._ending):
+                    self._answered_at_close.append(str(params.get("run_id")))
             try:
                 self._apply_answer(method, params, answer, code, kept, asked)
             except Exception as exc:  # noqa: BLE001 - one answer that cannot be read must not end the loop
                 # A Loop runs this on its only thread, and raw mode turns Ctrl-C into a key: a raise here would
                 # leave a terminal no key can reach (review 1 of #405, DeepSeek H1). Said, and not taken.
                 self._error(f"the answer to {method} could not be read ({type(exc).__name__}); it was not taken")
+            if self.awaiting_stop and not self._stops_out:
+                self.close()  # every Stop the closing waited for is answered, and the answer is logged above
 
     def _apply_answer(self, method: str, params: dict, answer: dict, code, kept: dict | None = None,
                       asked: int | None = None) -> None:
@@ -667,7 +772,9 @@ class TuiApp:
         if self.closed:
             return
         if key == "ctrl+c":  # the terminal sends Ctrl-C as a key (raw mode); it closes, from any mode
-            self.close()
+            self.close()  # while the TUI waits for a confirmed Stop's answer, this ends the wait: it closes now
+            return
+        if self.awaiting_stop:  # waiting for a confirmed Stop's answer: only Ctrl-C acts
             return
         if self.mode == "confirm_stop":
             target, self.mode, self.stop_target = self.stop_target, "keys", None
@@ -992,8 +1099,7 @@ class TuiApp:
                 or any(label == p.STALE for label, _ in self.answer_conditions)):
             return True
         # Fresh only while the snapshot's age is a number from 0 to the limit: a clock sample that is no number
-        # (NaN), infinite, or later than now leaves the view stale, never fresh for ever (the triage of Nov 16, T4;
-        # DeepSeek's round 1 of #443, F1).
+        # (NaN), infinite, or later than now leaves the view stale, never fresh for ever.
         return self.snapshot_at is not None and not 0 <= self._clock() - self.snapshot_at <= self.stale_after_s
 
     @property
@@ -1413,12 +1519,26 @@ class Loop:
         self._wake = threading.Event()
         self._halt = threading.Event()
         self._paint_lock = threading.Lock()  # a paint and shutdown() never overlap; none starts after it
+        # How long shutdown() waits for each thread, and how long a close waits for a confirmed Stop's answer. Not a
+        # new figure: the value shutdown() has always used; it is to become a row of the person's settings file.
         self.join_timeout_s = 5.0
+        self._wait_since: float | None = None
         self._lanes = {"stop": queue.SimpleQueue(), "other": queue.SimpleQueue()}
         self._threads: list[threading.Thread] = []
         self.frame: list[Row] = []
         self.frames = 0
         app.dispatch = self._dispatch
+        app._lane_begins = True
+
+    @property
+    def join_timeout_s(self) -> float:
+        return self._join_timeout_s
+
+    @join_timeout_s.setter
+    def join_timeout_s(self, value: float) -> None:
+        self._join_timeout_s = value
+        if not self._halt.is_set():
+            self.app.stop_wait_s = value
 
     # thread-safe inputs
     def press(self, key: Key, *, burst: bool = False) -> None:
@@ -1441,9 +1561,9 @@ class Loop:
             if item is None:
                 return
             method, params, done = item
-            if self.app.closed or self._halt.is_set():
-                # Closing sends nothing: a request this lane has not begun when the TUI closes is not sent, a
-                # Start or a Stop alike; one begun before may end after it (the triage of Nov 16, T1).
+            # A request not begun when the TUI closes, or the Loop ends, is not sent, except a confirmed Stop: that
+            # one is always sent. One begun before may end after it.
+            if not self.app.begin(getattr(done, "asked", None), method, params, ending=self._halt.is_set()):
                 continue
             try:
                 answer = call_api(self._api, method, params)
@@ -1467,12 +1587,23 @@ class Loop:
 
         with self._paint_lock:
             self._halt.set()
+        self.app.end_wait()
         self._wake.set()
         for lane in self._lanes.values():
             lane.put(None)
         for t in self._threads:
             t.join(timeout=self.join_timeout_s)
+        # A Stop the lanes sent before they ended has its answer recorded before the app's close line.
+        self._take_answers()
         return not any(t.is_alive() for t in self._threads)
+
+    def _take_answers(self) -> None:
+        while True:
+            try:
+                done, method, params, answer = self._answers.get_nowait()
+            except queue.Empty:
+                return
+            done(method, params, answer)
 
     def run(self) -> None:
         self.app.open()
@@ -1489,12 +1620,13 @@ class Loop:
             except queue.Empty:
                 break
             app.press(key, burst=burst)
-        while True:  # 2. API answers
-            try:
-                done, method, params, answer = self._answers.get_nowait()
-            except queue.Empty:
-                break
-            done(method, params, answer)
+        self._take_answers()  # 2. API answers
+        if app.awaiting_stop and not app.closed:  # a close waits for a confirmed Stop's answer, within its bound
+            now = time.monotonic()
+            if self._wait_since is None:
+                self._wait_since = now
+            elif now - self._wait_since >= self.join_timeout_s:
+                app.close()
         deadline = time.monotonic() + self.drain_budget_s  # 3. engine output, time-sliced
         while time.monotonic() < deadline:
             with self._events_lock:

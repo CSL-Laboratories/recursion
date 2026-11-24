@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "manifest.v1.json",
   "title": "manifest.v1: the plugin manifest, 'csl-plugin-manifest/1'",
-  "x-version": "1.0-draft.2",
+  "x-version": "1.0-draft.3",
   "description": "The manifest a plugin's developer signs. It is the ten fields of 'csl-plugin-manifest/vNext' (core/recursion_core/plugin_security/manifest.py) with the same meanings, plus three: runtime (how the plugin's code is run), interface (which plugin API it is written against) and files (every file of the package with its SHA-256, so the signature covers the whole package and not only the entry file). The manifest is read as bytes in the restricted canonical form (ASCII, sorted keys, whole numbers, no spaces) and the developer's Ed25519 signature is over those bytes. PROVISIONAL (recommended, not decided): that this contract is frozen as version 1 now, and the five permission names after 'order'. Four rules the parser enforces cannot be written in a schema and are listed in README.md: permissions must be in the order this schema lists them; network_destinations and credential_refs must be sorted; files must contain the entry file, with the digest artifact_sha256 names; and the bytes must be in canonical form. Permissions are only ever appended to the list: an existing name never changes its place or its meaning, so the signed bytes for an existing set of permissions never change.",
   "type": "object",
   "additionalProperties": false,
@@ -81,7 +81,7 @@
     },
     "permission": {
       "description": "In canonical order. A manifest and a grant list permissions in this order.",
-      "enum": ["read", "propose", "panel", "network", "credential", "process", "order", "surface", "command", "subscribe", "tool", "run", "schedule"]
+      "enum": ["read", "propose", "panel", "network", "credential", "process", "order", "surface", "command", "subscribe", "tool", "run", "schedule", "memory"]
     }
   }
 }

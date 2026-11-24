@@ -64,11 +64,12 @@ from recursion_core.control.api import start_params_problem
 from .canonical import canonical, parse
 from .limits import ARTIFACT, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES
 from .protocol import HOST, PROTOCOL_VERSION
+from recursion_core.plugin_memory import words as memory_words
 
 __all__ = [
     "CALL_NAMES", "CHANNEL", "INVENTORY", "MAX_FRAME_BYTES", "MAX_LOAD_FRAME_BYTES", "MESSAGE_TYPES",
     "RESERVED_CALL_NAMES", "RESERVED_MESSAGE_TYPES", "RESERVED_RUN_ORIGINS", "RESERVED_TEXT", "REFUSAL_CODES",
-    "RUN_ORIGIN_FIELDS", "RUN_ORIGIN_KIND", "RUN_REQUEST_PERMISSION", "RUN_REQUEST_RECORD_KINDS",
+    "MEMORY_CALL_NAMES", "MEMORY_KEY_MAX_BYTES", "MEMORY_PERMISSION", "RUN_ORIGIN_FIELDS", "RUN_ORIGIN_KIND", "RUN_REQUEST_PERMISSION", "RUN_REQUEST_RECORD_KINDS",
     "ChannelRefusal", "DaemonEnd", "HostEnd", "answer_call", "check_message", "decode", "encode", "frame_limit",
     "refusal",
 ]
@@ -94,7 +95,17 @@ CALL_NAMES: dict[str, tuple[str, ...]] = {
     "surfaces": (),
     "surface": ("kind", "name"),
     "run.request": ("record_kind", "record_id", "revision", "occurrence", "tenant", "engine", "prompt"),
+    "memory.put": ("key", "value_b64", "if_revision"),
+    "memory.get": ("key",),
+    "memory.list": ("prefix", "after", "limit"),
+    "memory.delete": ("key", "if_revision"),
 }
+# memory.* (host.v1.json x-memory): a plugin's saved data, kept by the daemon for the plugin the channel was
+# opened for and its install identity. Offered only when the daemon gave the channel a store (the plugin is in
+# the person's row plugin_memory.plugins) AND the core says the plugin holds the permission 'memory'.
+MEMORY_CALL_NAMES = ("memory.put", "memory.get", "memory.list", "memory.delete")
+MEMORY_PERMISSION = "memory"
+MEMORY_KEY_MAX_BYTES = 256  # a form of the protocol, like _RECORD_ID: not a setting
 # run.request (host.v1.json x-run-request): the record kinds a run may be asked from (append-only), the
 # permission that offers the call, and the origin the daemon writes into the run's record.
 RUN_REQUEST_RECORD_KINDS = ("routine.v1",)
@@ -326,8 +337,53 @@ def _run_request_problem(args: Mapping) -> str | None:
     return start_params_problem(args)
 
 
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def memory_key_ok(value: object, *, empty: bool = False) -> bool:
+    """A key of saved data: 1 to 256 bytes of UTF-8 (0 for a list's prefix) with no control character. A key
+    is never a file name: the store keeps it as a row's text."""
+    if type(value) is not str or _CONTROL.search(value):
+        return False
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
+    return (0 if empty else 1) <= size <= MEMORY_KEY_MAX_BYTES
+
+
+def _revision_ok(value: object) -> bool:
+    return value is None or (type(value) is int and 1 <= value <= MAX_ID)
+
+
+def _memory_problem(name: str):
+    def problem(args: Mapping) -> str | None:
+        if "key" in args and not memory_key_ok(args["key"]):
+            return "key"
+        if "value_b64" in args and not _is_bytes(args["value_b64"]):
+            return "value_b64"
+        if "if_revision" in args and not _revision_ok(args["if_revision"]):
+            return "if_revision"
+        if "prefix" in args and not memory_key_ok(args["prefix"], empty=True):
+            return "prefix"
+        if "after" in args and not (args["after"] is None or memory_key_ok(args["after"])):
+            return "after"
+        if "limit" in args and not (args["limit"] is None or (type(args["limit"]) is int and 1 <= args["limit"] <= MAX_ID)):
+            return "limit"
+        return None
+    return problem
+
+
 # Value checks of a call name whose arguments have forms of their own, run once the names are exact.
-_ARG_CHECKS: dict[str, Callable[[Mapping], str | None]] = {"run.request": _run_request_problem}
+_ARG_CHECKS: dict[str, Callable[[Mapping], str | None]] = {"run.request": _run_request_problem,
+                                                           **{name: _memory_problem(name) for name in MEMORY_CALL_NAMES}}
+
+
+def _not_offered(handlers: Any, name: str) -> str:
+    """The detail of call_not_offered: at the daemon's end, for a memory call, which grant is missing in words."""
+    if type(handlers) is _DaemonOffers:
+        return handlers.why_not_offered(name) or name
+    return name
 
 
 def answer_call(message: dict, handlers: Mapping[str, Callable[..., Any]]) -> dict:
@@ -351,7 +407,7 @@ def answer_call(message: dict, handlers: Mapping[str, Callable[..., Any]]) -> di
             raise ChannelRefusal("call_args_invalid", f"{name}: {problem}")
         handler = handlers.get(name)
         if not callable(handler):
-            raise ChannelRefusal("call_not_offered", name)
+            raise ChannelRefusal("call_not_offered", _not_offered(handlers, name))
         try:
             value = handler(*(args[arg] for arg in CALL_NAMES[name]))
         except Exception as exc:  # noqa: BLE001 - the plugin's failure is answered typed, never guessed around
@@ -372,17 +428,28 @@ class DaemonEnd:
     when ``runs`` (the daemon's start path: an object whose ``call(method, params, *, origin=...)`` is
     ``DaemonControl.call`` or ``ControlAPI.call``) was given and the core answers that this channel's
     plugin holds ``schedule`` (the ``plugin.permissions`` op, asked at each call, so a revocation counts);
-    otherwise it is ``call_not_offered``. Every other host call is ``call_reserved``, ``call_unknown`` or
+    otherwise it is ``call_not_offered``. The four ``memory.*`` names are answered by ``memory`` (the store the
+    daemon built for this plugin and its install identity, given only to a plugin in the person's row
+    ``plugin_memory.plugins``) and only while the core answers that the plugin holds ``memory``; otherwise
+    ``call_not_offered``, whose words say which of the two grants is missing. Every other host call is ``call_reserved``, ``call_unknown`` or
     ``call_not_offered``, and nothing runs. This end sends no call, so every ``result`` is for an id it
     never called and is refused ``message_invalid``, as at a host.
     """
 
-    def __init__(self, plugin_id: str, core: Any, *, runs: Any = None) -> None:
+    def __init__(self, plugin_id: str, core: Any, *, runs: Any = None, memory: Any = None) -> None:
         if type(plugin_id) is not str or not _PLUGIN_ID.fullmatch(plugin_id) or plugin_id == HOST:
             raise ValueError("a plugin host's channel is opened for one plugin id, never for the host")
         self.plugin_id = plugin_id
         self._core = core.client_for(plugin_id)
         self._runs = runs
+        if memory is not None and getattr(memory, "plugin_id", None) != plugin_id:
+            raise ValueError("a channel is given the store of its own plugin only")
+        self._memory = memory
+
+    def host_ended(self) -> None:
+        """The daemon saw this channel's host end; a saved-data write that commits after it says so."""
+        if self._memory is not None:
+            self._memory.host_ended()
 
     def load(self, plugin_id: str, manifest: bytes, files: Mapping[str, bytes]) -> bytes:
         """The frame of one ``load`` for this channel's plugin; any other plugin id is refused (one channel
@@ -437,12 +504,25 @@ class _DaemonOffers:
 
     def __init__(self, end: DaemonEnd) -> None:
         self._end = end
+        self._missing: dict[str, str] = {}
 
     def get(self, name: str, default: Any = None) -> Any:
         end = self._end
         if name == "run.request" and end._runs is not None and end._granted(RUN_REQUEST_PERMISSION):
             return end._run_request
+        if name in MEMORY_CALL_NAMES:
+            if not end._granted(MEMORY_PERMISSION):
+                self._missing[name] = "permission"
+            elif end._memory is None:
+                self._missing[name] = "row"
+            else:
+                return {"memory.put": end._memory.put, "memory.get": end._memory.get,
+                        "memory.list": end._memory.list_keys, "memory.delete": end._memory.delete}[name]
         return default
+
+    def why_not_offered(self, name: str) -> str | None:
+        missing = self._missing.get(name)
+        return None if missing is None else memory_words.not_offered_detail(missing, self._end.plugin_id, name)
 
 
 class HostEnd:

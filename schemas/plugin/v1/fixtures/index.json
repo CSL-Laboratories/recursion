@@ -501,6 +501,11 @@
       "shows": "A plugin's host asks the daemon for a run from one of its records: run.request with its seven arguments and no plugin named."
     },
     {
+      "file": "good/host.v1/h10-saved-data-kept-by-the-daemon.json",
+      "schema": "host.v1.json#/$defs/call",
+      "shows": "A plugin's host keeps one item of its saved data: memory.put with a key, the value as base64 and a null revision (create only); no plugin, install or namespace named."
+    },
+    {
       "file": "bad/host.v1/b01-a-core-message-naming-its-caller.json",
       "schema": "host.v1.json#/$defs/core",
       "rule": "A core message carries no caller: the daemon sets it from the channel.",
@@ -947,6 +952,11 @@
       "file": "good/install.v1/h05-schedule-grant.json",
       "schema": "install.v1.json",
       "shows": "A grant of the 'schedule' permission alone to an unsigned plugin: the permission that lets a plugin's host ask the daemon to start a run."
+    },
+    {
+      "file": "good/install.v1/h06-memory-grant.json",
+      "schema": "install.v1.json",
+      "shows": "A grant of the 'memory' permission alone to an unsigned plugin: the first half of what lets it keep saved data; the second half is the person's settings row plugin_memory.plugins."
     },
     {
       "file": "bad/install.v1/b01-a-field-the-reader-does-not-know.json",

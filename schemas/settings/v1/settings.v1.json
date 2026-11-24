@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "settings.v1.json",
   "title": "settings.v1: a person's own settings, the file $XDG_CONFIG_HOME/recursion/settings.toml",
-  "x-version": "1.0-draft.1",
+  "x-version": "1.0-draft.2",
   "description": "The shape of the TOML file once it is parsed. One owner-only file of the person's own; the core reads it (recursion_core/settings.py) and nothing of the product writes it. Every setting has a default, so the file and every key in it may be absent. The list of settings is append-only: a later version adds properties and never renames or removes one. A key this version does not declare is reported by the reader (settings_unknown_key) and skipped, so additional properties are allowed here. A value of the wrong type or below its meaningful floor keeps the default (settings_value_out_of_range). Numeric advice does not constrain the value in force. A numeric setting can opt in to the reserved string 'none' for no limit. List settings take arrays of strings, with repeated names read once in first-occurrence order. Each leaf's 'default' and 'description' are those of the reader's table. The settings file reader accepts version only as a TOML integer (a whole number such as 1) and rejects a float such as 1.0.",
   "type": "object",
   "required": [
@@ -19,6 +19,143 @@
           "type": "boolean",
           "default": true,
           "description": "Whether each plugin host makes its GIL check; on by default, and a person may turn it off."
+        }
+      },
+      "additionalProperties": true
+    },
+    "plugin_memory": {
+      "type": "object",
+      "properties": {
+        "plugins": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Plugins listed here may keep saved data between runs. Recursion keeps it for them in its own state folder; no other plugin can read it, and Recursion never hands it to a task it runs, though the plugin itself may put what it saved into a task it asks for. Read when Recursion starts. Empty as shipped."
+        },
+        "max_bytes_per_plugin": {
+          "type": [
+            "integer",
+            "string"
+          ],
+          "default": 67108864,
+          "description": "The most saved data one plugin may keep, keys and values together, in bytes; none for no limit.",
+          "minimum": 1,
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "const": "none"
+            }
+          ]
+        },
+        "max_item_bytes": {
+          "type": [
+            "integer",
+            "string"
+          ],
+          "default": 262144,
+          "description": "The largest one item of a plugin's saved data may be, in bytes; held to what fits one message between Recursion and a plugin, and shown so; none means only that bound.",
+          "minimum": 1,
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "const": "none"
+            }
+          ]
+        },
+        "max_items_per_plugin": {
+          "type": [
+            "integer",
+            "string"
+          ],
+          "default": 100000,
+          "description": "The most items of saved data one plugin may keep; none for no limit.",
+          "minimum": 1,
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "const": "none"
+            }
+          ]
+        },
+        "list_page_max": {
+          "type": [
+            "integer",
+            "string"
+          ],
+          "default": 1000,
+          "description": "The most keys one listing of a plugin's saved data answers; none means as many as fit one message.",
+          "minimum": 1,
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "const": "none"
+            }
+          ]
+        },
+        "calls_per_minute": {
+          "type": [
+            "integer",
+            "string"
+          ],
+          "default": 6000,
+          "description": "The most calls on its saved data one plugin may make in one minute; none for no limit.",
+          "minimum": 1,
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "const": "none"
+            }
+          ]
+        },
+        "sync": {
+          "type": "string",
+          "default": "full",
+          "description": "How each write of saved data reaches the disk: full waits for the disk; normal is faster and may lose the last writes if the power fails. Any other text reads as full."
+        },
+        "wal_max_bytes": {
+          "type": [
+            "integer",
+            "string"
+          ],
+          "default": 16777216,
+          "description": "How large the write-ahead file of a plugin's saved data may grow, in bytes, before Recursion folds it into the store ahead of the next write; none for no limit.",
+          "minimum": 1,
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "const": "none"
+            }
+          ]
+        },
+        "record_each_write": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether every write and delete of saved data leaves a record row; false leaves one summary when the plugin's host ends."
+        },
+        "record_key_text": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether a record row keeps the text of a saved-data key; false keeps only its SHA-256 and its length."
         }
       },
       "additionalProperties": true

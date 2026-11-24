@@ -4,6 +4,21 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `host.v1.json` is `1.0-draft.5`, `manifest.v1.json` is `1.0-draft.3`, `install.v1.json` is `1.0-draft.4` (2026-11-23)
+
+Four call names are appended to `x-call-names`, each with the permission `memory`, sent by a plugin's host
+and answered by the daemon: `memory.put` (`key`, `value_b64`, `if_revision`), `memory.get` (`key`),
+`memory.list` (`prefix`, `after`, `limit`) and `memory.delete` (`key`, `if_revision`). The new block
+`x-memory` says their forms and answers: a key is 1 to 256 bytes of UTF-8 with no control character and
+never a file name; every answer is a result whose value is `{ok: true, ...}` or a refusal value with its
+code (`memory_key_unknown`, `memory_revision_moved`, `memory_item_too_large`, `memory_full`,
+`memory_unreadable`) and four parts of words; every answer fits one frame. The channel's own
+`x-refusal-codes` are unchanged. The permission `memory` is appended to the permission list of
+`manifest.v1.json`, of `install.v1.json` and of `plugin_security/manifest.py`. What it breaks: a reader
+that assumed `x-call-names` held five names or that `schedule` was the last permission; a validator that
+assumed no install file could grant `memory`. Two good fixtures (`good/host.v1/h10-saved-data-kept-by-the-daemon.json`,
+`good/install.v1/h06-memory-grant.json`) show a put and a grant.
+
 ## `install.v1.json` is `1.0-draft.3` (2026-11-21)
 
 A grant's `permissions` list gains `schedule`, matching the eight permissions today's reader takes

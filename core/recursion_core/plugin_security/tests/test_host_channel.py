@@ -642,9 +642,9 @@ class RunRequestTests(unittest.TestCase):
     # (4) offered only to a plugin granted 'schedule'
     def test_the_call_is_offered_only_to_a_plugin_granted_schedule(self):
         self.assertEqual(PERMISSIONS[:7], ("read", "propose", "panel", "network", "credential", "process", "order"))
-        self.assertEqual(PERMISSIONS[-1], "schedule")
+        self.assertEqual(PERMISSIONS[7], "schedule")
         manifest = json.loads((REPO / "schemas" / "plugin" / "v1" / "manifest.v1.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["$defs"]["permission"]["enum"][-1], "schedule")
+        self.assertEqual(manifest["$defs"]["permission"]["enum"][12], "schedule")
         for core in (GrantingCore(permissions=("read", "panel")), GrantingCore(permissions=()),
                      GrantingCore(ok=False)):
             with self.subTest(permissions=core.permissions, ok=core.ok):

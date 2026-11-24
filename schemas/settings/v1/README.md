@@ -8,6 +8,16 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
 | Setting | Type | Default | What it does |
 |---|---|---|---|
 | `plugin_host.gil_check` | boolean | `true` | Whether each plugin host makes its GIL check; on by default, and a person may turn it off. Read by no host yet. |
+| `plugin_memory.plugins` | list of strings | `[]` | Plugins listed here may keep saved data between runs. Recursion keeps it for them in its own state folder; no other plugin can read it, and Recursion never hands it to a task it runs, though the plugin itself may put what it saved into a task it asks for. Read when Recursion starts. Empty as shipped. |
+| `plugin_memory.max_bytes_per_plugin` | whole number or `"none"` | `67108864` | The most saved data one plugin may keep, keys and values together, in bytes; none for no limit. |
+| `plugin_memory.max_item_bytes` | whole number or `"none"` | `262144` | The largest one item of a plugin's saved data may be, in bytes; held to what fits one message between Recursion and a plugin, and shown so; none means only that bound. |
+| `plugin_memory.max_items_per_plugin` | whole number or `"none"` | `100000` | The most items of saved data one plugin may keep; none for no limit. |
+| `plugin_memory.list_page_max` | whole number or `"none"` | `1000` | The most keys one listing of a plugin's saved data answers; none means as many as fit one message. |
+| `plugin_memory.calls_per_minute` | whole number or `"none"` | `6000` | The most calls on its saved data one plugin may make in one minute; none for no limit. |
+| `plugin_memory.sync` | text | `full` | How each write of saved data reaches the disk: full waits for the disk; normal is faster and may lose the last writes if the power fails. Any other text reads as full. |
+| `plugin_memory.wal_max_bytes` | whole number or `"none"` | `16777216` | How large the write-ahead file of a plugin's saved data may grow, in bytes, before Recursion folds it into the store ahead of the next write; none for no limit. |
+| `plugin_memory.record_each_write` | boolean | `true` | Whether every write and delete of saved data leaves a record row; false leaves one summary when the plugin's host ends. |
+| `plugin_memory.record_key_text` | boolean | `false` | Whether a record row keeps the text of a saved-data key; false keeps only its SHA-256 and its length. |
 
 ## What holds for the file
 

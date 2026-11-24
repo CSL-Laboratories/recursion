@@ -35,6 +35,19 @@ REPO = CORE.parent
 SCHEMA_DIR = REPO / "schemas" / "settings" / "v1"
 POSIX_ONLY = "the owner check needs a uid; a system without one is the WindowsNoOwnerCheck class"
 OFF = "version = 1\n\n[plugin_host]\ngil_check = false\n"
+# The lines of the saved-data rows at their defaults, as status shows them after the first row.
+SAVED_DATA_LINES = [
+    "plugin_memory.plugins = [] (default []; source: default)",
+    "plugin_memory.max_bytes_per_plugin = 67108864 (default 67108864; source: default)",
+    "plugin_memory.max_item_bytes = 262144 (default 262144; source: default)",
+    "plugin_memory.max_items_per_plugin = 100000 (default 100000; source: default)",
+    "plugin_memory.list_page_max = 1000 (default 1000; source: default)",
+    "plugin_memory.calls_per_minute = 6000 (default 6000; source: default)",
+    "plugin_memory.sync = 'full' (default 'full'; source: default)",
+    "plugin_memory.wal_max_bytes = 16777216 (default 16777216; source: default)",
+    "plugin_memory.record_each_write = true (default true; source: default)",
+    "plugin_memory.record_key_text = false (default false; source: default)",
+]
 DIGITS, HEX = "9" * 5000, "0x" + "f" * 4000
 # Each makes the parser raise a plain ValueError or a RecursionError, not a TOMLDecodeError.
 NOT_READ_BY_THE_PARSER = {
@@ -112,7 +125,7 @@ class TheFileAndItsDefaults(_Folder):
         self.assertIs(loaded["plugin_host.gil_check"], False)
         self.assertEqual(settings.SOURCE_FILE, loaded.values["plugin_host.gil_check"].source)
         self.assertEqual([], self.codes(loaded))
-        self.assertEqual(["plugin_host.gil_check = false (default true; source: settings file)"],
+        self.assertEqual(["plugin_host.gil_check = false (default true; source: settings file)", *SAVED_DATA_LINES],
                          settings.lines(loaded))
 
     def test_a_dotted_key_is_the_same_setting(self) -> None:
@@ -349,7 +362,7 @@ class OwnerOnlyAndWrongFiles(_Folder):
                 self.put(text)
                 loaded = settings.load(self.environ)
                 self.assert_default(loaded, settings.UNKNOWN_KEY)  # one note, for a whole table too
-                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+                self.assertEqual([*SAVED_DATA_LINES, f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
 
     def test_the_command_ends_non_zero_when_a_key_or_table_was_skipped(self) -> None:
         for case, (text, _) in UNKNOWN.items():
@@ -372,7 +385,7 @@ class OwnerOnlyAndWrongFiles(_Folder):
             with self.subTest(case=self.put_broken(case)):
                 loaded = settings.load(self.environ)
                 self.assert_default(loaded, settings.UNREADABLE)
-                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+                self.assertEqual([*SAVED_DATA_LINES, f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
 
     def test_the_command_ends_non_zero_for_a_file_that_cannot_be_read_as_a_whole(self) -> None:
         for case in BROKEN:
@@ -1092,7 +1105,7 @@ class PublishedShape(_Folder):
     def test_the_schema_declares_exactly_the_table(self) -> None:
         schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
         self.assertEqual({"const": settings.FILE_VERSION}, schema["properties"]["version"])
-        kinds = {bool: "boolean", int: "integer", float: "number", str: "string"}
+        kinds = {bool: "boolean", int: "integer", float: "number", str: "string", list: "array"}
         found = {}
 
         def walk(props: dict, prefix: str) -> None:
@@ -1106,7 +1119,9 @@ class PublishedShape(_Folder):
                                            part.get("minimum"), part.get("maximum"))
 
         walk(schema["properties"], "")
-        expect = {r.name: (kinds[r.type], r.default, r.says, r.floor, None) for r in settings.SETTINGS}
+        expect = {r.name: ([kinds[r.type], "string"] if r.allow_no_limit else kinds[r.type],
+                           list(r.default) if r.type is list else r.default, r.says, r.floor, None)
+                  for r in settings.SETTINGS}
         self.assertEqual(expect, found)
 
     def test_the_schema_describes_the_readers_version_type(self) -> None:

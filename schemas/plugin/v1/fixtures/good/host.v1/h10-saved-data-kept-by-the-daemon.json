@@ -1,0 +1,10 @@
+{
+  "type": "call",
+  "id": 13,
+  "name": "memory.put",
+  "args": {
+    "key": "notes/today",
+    "value_b64": "aGVsbG8=",
+    "if_revision": null
+  }
+}

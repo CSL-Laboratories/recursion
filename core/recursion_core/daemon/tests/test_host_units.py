@@ -581,6 +581,43 @@ class HostUnitsInTheUserManagerTest(unittest.TestCase):
         self.assertEqual(getattr(box.get('error'), 'reason', None), 'stopped', box)
         self.assertTrue(self.unloaded(unit, timeout_s=10.0), unit)
 
+    def test_a_stop_that_lands_between_the_units_start_and_its_registration_ends_the_start(self):
+        # The stop arrives while the unit is being started: before the system's start of it, just after, or as the
+        # daemon's own close. The start must end 'stopped' and leave no unit and no working folder behind.
+        for label, where in (('stop before the start', 'before'), ('stop after the start', 'after'),
+                             ('close after the start', 'close')):
+            with self.subTest(label):
+                units = self.units(python=self.mute(), start_deadline_s=None)
+                first = len(self.started)
+                real = self.manager.start_piped
+
+                def landing(unit, *args, where=where, units=units, real=real, **kwargs):
+                    if where == 'before':
+                        units.stop('gap')
+                    process = real(unit, *args, **kwargs)
+                    if where == 'after':
+                        units.stop('gap')
+                    elif where == 'close':
+                        units.close()
+                    return process
+
+                self.manager.start_piped = landing
+                try:
+                    thread, box = self.start_in_thread(units, 'gap')
+                    thread.join(15)  # its own bound: a start that is not ended fails here and never hangs
+                    waiting = thread.is_alive()
+                    units.close()  # a start still waiting is ended here, so nothing of this case outlives it
+                    thread.join(10)
+                finally:
+                    self.manager.start_piped = real
+                self.assertFalse(waiting, 'the start went on waiting on a host that was already stopped')
+                self.assertEqual(getattr(box.get('error'), 'reason', None), 'stopped', box)
+                self.assertEqual(len(self.started), first + 1)
+                self.assertTrue(self.unloaded(self.started[first]), self.started[first])
+                self.assertIsNone(units.unit_of('gap'))
+                folders = self.state / 'plugin-hosts'
+                self.assertEqual(sorted(folders.iterdir()) if folders.exists() else [], [])
+
     def test_a_host_that_never_says_hello_is_ended_at_its_start_deadline(self):
         units = self.units(python=self.mute(), start_deadline_s=2.0)
         thread, box = self.start_in_thread(units, 'mute')

@@ -28,8 +28,10 @@ The rules this module keeps:
   or outside its floor and ceiling keeps that setting's default, never a clamped value
   (``settings_value_out_of_range``), and so does a text a row does not allow (``Setting.allowed``). Each note
   names the key, the value found and what is allowed.
-* SHOWN. ``python -m recursion_core.settings`` prints every setting, its value in force, its default and its
-  source, and every note. It takes no argument and writes nothing. The daemon logs the same lines.
+* SHOWN. ``python -m recursion_core.settings`` prints the file path and the values a daemon started
+  from this environment would take, with their defaults, sources and any notes. It takes no argument
+  and writes nothing. The daemon that holds the one-daemon lock records the path and its values in its
+  log at start, with the process id and a time on each line.
 
 Read at daemon start in this build; a later reload may call ``load`` again. ``load`` keeps no state between
 calls. ``SETTINGS`` is append-only: a row is added, never renamed or given another meaning.
@@ -278,13 +280,14 @@ def load(environ) -> Loaded:
 def lines(loaded: Loaded) -> list[str]:
     """What status and the daemon's start log show: each setting, its value, default and source, then the notes."""
 
+    # A future secret row must show set or not set here and keep raw values out of notes.
     out = [f"{v.name} = {_shown(v.value)} (default {_shown(v.default)}; source: {v.source})"
            for v in loaded.values.values()]
     return out + [f"{WARNED if note.warns else ''}note {note}" for note in loaded.notes]
 
 
 def main(argv: list[str] | None = None, environ=None, out=None, err=None) -> int:
-    """``python -m recursion_core.settings``: print the settings in force. It takes no argument and writes nothing."""
+    """Show what a daemon started from this environment would read. It takes no argument and writes nothing."""
 
     argv = sys.argv[1:] if argv is None else argv
     out, err = out or sys.stdout, err or sys.stderr
@@ -294,6 +297,20 @@ def main(argv: list[str] | None = None, environ=None, out=None, err=None) -> int
         return 2
     loaded = load(os.environ if environ is None else environ)
     print(f"settings file: {loaded.path or 'none'}", file=out)
+    uid = os.geteuid() if hasattr(os, "geteuid") else None
+    owner = "<your user id>" if uid is None else uid
+    whose = (f"{uid} is the user id of the account that ran this command" if uid is not None else
+             "put in place of <your user id> the number `id -u` prints for the account whose daemon you mean, "
+             "on the machine that runs it")
+    print("These are the values a daemon started from this environment would take; a daemon already running "
+          "keeps the values it read at its own start, which it wrote to its log in the lines beginning "
+          "`settings file:` and `settings:` (for the shipped user unit, `journalctl --user -u recursion-daemon` "
+          "shows them only where the system journal is stored on disk; where there is no per-user journal, "
+          "someone allowed to read the system journal can match the unit and its owner with "
+          f"`journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service _SYSTEMD_OWNER_UID={owner}` ({whose}; the "
+          "unit has this same name for every account, so the unit match alone also shows the daemons of other "
+          "accounts on a shared host); a daemon started another way writes them "
+          "to its standard error, wherever that start sent it).", file=out)
     for line in lines(loaded):
         print(line, file=out)
     return EXIT_WARNED if any(note.warns for note in loaded.notes) else 0

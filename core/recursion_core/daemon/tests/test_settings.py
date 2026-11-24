@@ -7,9 +7,13 @@ Every path is made inside the test's own temporary folder. Nothing outside it is
 from __future__ import annotations
 
 import ast
+import collections
+import contextlib
+import functools
 import inspect
 import io
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -17,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from types import MappingProxyType
 from unittest import mock
@@ -496,10 +501,10 @@ class ShownAndNeverWritten(_Folder):
         names = json.dumps(table["methods"]).lower()
         self.assertTrue(table["methods"])
         self.assertNotIn("setting", names)
-        for module in ("daemon/plugins.py", "plugin_security/protocol.py"):
-            with self.subTest(module=module):
-                source = (CORE / "recursion_core" / module).read_text(encoding="utf-8")
-                self.assertNotIn("settings", source)
+        # The core's protocol module, the one a plugin's client is built from, says nothing of settings.
+        # The plugin host module may read its own row: what a plugin is handed is searched in WhatAPluginIsHanded.
+        source = (CORE / "recursion_core" / "plugin_security" / "protocol.py").read_text(encoding="utf-8")
+        self.assertNotIn("settings", source)
 
 
 class _ReachedTheLock(Exception):
@@ -508,7 +513,8 @@ class _ReachedTheLock(Exception):
 
 @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
 class TheDaemonsStart(_Folder):
-    """The daemon's ``main()`` up to its lock: the start checks are passed and the lock is replaced by a stop."""
+    """The daemon's ``main()`` up to its registry: the start checks are passed, the lock holds nothing and the
+    registry is replaced by a stop."""
 
     def start_log(self) -> tuple[list, list[str], list[tuple[str, str]]]:
         from recursion_core.daemon import __main__ as daemon_main
@@ -523,11 +529,13 @@ class TheDaemonsStart(_Folder):
                 mock.patch.object(daemon_main, "require_free_threaded"), \
                 mock.patch.object(daemon_main, "refuse_engine_user"), \
                 mock.patch.object(daemon_main, "check_operator_linger"), \
-                mock.patch.object(daemon_main.logging, "basicConfig"), \
+                mock.patch.object(daemon_main.logging, "basicConfig") as basic_config, \
                 mock.patch.object(daemon_main.signal, "signal"), \
-                mock.patch.object(daemon_main, "UserLock", side_effect=_ReachedTheLock), \
+                mock.patch.object(daemon_main, "UserLock"), \
+                mock.patch.object(daemon_main, "Registry", side_effect=_ReachedTheLock), \
                 self.assertLogs("recursion_core.daemon", "INFO") as logs, \
                 self.assertRaises(_ReachedTheLock):
+            self.basic_config = basic_config
             daemon_main.main()
         records = [(record.levelname, record.getMessage()) for record in logs.records]
         return loads, [message for _, message in records], records
@@ -540,6 +548,83 @@ class TheDaemonsStart(_Folder):
         self.assertEqual(["settings: " + line for line in settings.lines(loads[0])], logged)
         self.assertIn("settings: plugin_host.gil_check = false (default true; source: settings file)", logged)
         self.assertIn("note settings_unknown_key: 'plugin_host.unknown'", " ".join(logged))
+
+    def test_status_and_start_log_name_the_file_from_each_environment(self) -> None:
+        self.put(OFF)
+        shell_config = self.tmp / "shell-config"
+        shell_file = self.put(OFF.replace("false", "true"),
+                              shell_config / "recursion" / "settings.toml")
+        sentence = ('These are the values a daemon started from this environment would take; a daemon already running keeps the values it read at its own start, which it wrote to its log in the lines beginning `settings file:` and `settings:` (for the shipped user unit, `journalctl --user -u recursion-daemon` shows them only where the system journal is stored on disk; where there is no per-user journal, someone allowed to read the system journal can match the unit and its owner with `journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service _SYSTEMD_OWNER_UID=@UID@` (@UID@ is the user id of the account that ran this command; the unit has this same name for every account, so the unit match alone also shows the daemons of other accounts on a shared host); a daemon started another way writes them to its standard error, wherever that start sent it).').replace("@UID@", str(os.geteuid()))
+        for config, path, value in ((self.config, self.file, "false"),
+                                    (shell_config, shell_file, "true")):
+            with self.subTest(config=config), mock.patch.dict(os.environ, XDG_CONFIG_HOME=str(config)):
+                out = io.StringIO()
+                self.assertEqual(0, settings.main([], out=out, err=io.StringIO()))
+                shown = out.getvalue().splitlines()
+                self.assertEqual(f"settings file: {path}", shown[0])
+                self.assertIn(sentence, shown)
+                self.assertIn(f"plugin_host.gil_check = {value} (default true; source: settings file)", shown)
+
+        _, _, records = self.start_log()
+        self.assertIn(("INFO", f"settings file: {self.file}"), records)
+        self.assertIn(("INFO", "settings: plugin_host.gil_check = false (default true; source: settings file)"),
+                      records)
+
+    def test_a_start_the_lock_refuses_writes_no_settings_record(self) -> None:
+        from recursion_core.daemon import AlreadyRunning
+        from recursion_core.daemon import UserLock
+        from recursion_core.daemon import __main__ as daemon_main
+        self.put(OFF)
+        other = self.tmp / "other-config"
+        self.put(OFF.replace("false", "true"), other / "recursion" / "settings.toml")
+        runtime = self.tmp / "runtime"
+        environ = {**self.environ, "XDG_CONFIG_HOME": str(other), "XDG_RUNTIME_DIR": str(runtime)}
+        with UserLock(runtime):  # a daemon of the first configuration holds the lock
+            with mock.patch.dict(os.environ, environ), \
+                    mock.patch.object(daemon_main, "require_posix"), \
+                    mock.patch.object(daemon_main, "require_free_threaded"), \
+                    mock.patch.object(daemon_main, "refuse_engine_user"), \
+                    mock.patch.object(daemon_main, "check_operator_linger"), \
+                    mock.patch.object(daemon_main.logging, "basicConfig"), \
+                    mock.patch.object(daemon_main.signal, "signal"), \
+                    self.assertNoLogs("recursion_core.daemon", "INFO"), \
+                    self.assertRaises(AlreadyRunning):
+                daemon_main.main()
+
+    def test_every_start_line_carries_the_process_id_and_a_time(self) -> None:
+        self.put(OFF)
+        self.start_log()
+        fmt = self.basic_config.call_args.kwargs["format"]
+        record = logging.LogRecord("recursion_core.daemon", logging.INFO, __file__, 1, "settings file: x", None, None)
+        shown = logging.Formatter(fmt).format(record)
+        self.assertIn(f"[{os.getpid()}]", shown)
+        self.assertRegex(shown, r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} ")
+
+    def test_the_status_sentence_names_the_line_and_the_place_the_unit_file_gives(self) -> None:
+        unit = (CORE / "systemd" / "recursion-daemon.service").read_text(encoding="utf-8")
+        self.assertIn("ExecStart=%h/.local/lib/recursion/venv/bin/python3.14t -X gil=0 -m recursion_core.daemon", unit)
+        self.assertNotIn("StandardOutput", unit)  # so the daemon's log is the user journal's, by the unit's name
+        self.assertNotIn("StandardError", unit)
+        out = io.StringIO()
+        settings.main([], environ=self.environ, out=out, err=io.StringIO())
+        shown = out.getvalue()
+        self.assertIn("`journalctl --user -u recursion-daemon` shows them only where the system journal is stored on disk", shown)
+        self.assertIn(f"`journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service _SYSTEMD_OWNER_UID={os.geteuid()}`", shown)
+        self.assertIn("lines beginning `settings file:` and `settings:`", shown)
+        self.assertIn("standard error", shown)
+        self.put(OFF)
+        self.assertIn("settings file: " + str(self.file), [m for m in self.start_log()[1]])
+
+    def test_the_status_sentence_adds_the_owner_filter_beside_the_unit_match(self) -> None:
+        out = io.StringIO()
+        settings.main([], environ=self.environ, out=out, err=io.StringIO())
+        shown = out.getvalue()
+        uid = os.geteuid()
+        self.assertEqual(1, shown.count("_SYSTEMD_OWNER_UID="))
+        self.assertIn(f"_SYSTEMD_OWNER_UID={uid}", shown)
+        self.assertIn(f"`journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service _SYSTEMD_OWNER_UID={uid}`", shown)
+        self.assertIn(f"{uid} is the user id of the account that ran this command", shown)
+        self.assertNotIn("<your user id>", shown)
 
     def test_with_every_file_the_parser_or_the_notes_cannot_take_the_daemon_reaches_its_lock(self) -> None:
         cases = {**NOT_READ_BY_THE_PARSER, **TOO_LONG_TO_SHOW, "a dotted key of 3000 parts": DOTTED_3000}
@@ -564,6 +649,255 @@ class TheDaemonsStart(_Folder):
                 self.assertEqual(1, len(warned), levels)
                 self.assertIn("settings_unknown_key" if case in UNKNOWN else "settings_unreadable", warned[0])
                 self.assertEqual("INFO", levels["settings: plugin_host.gil_check = true (default true; source: default)"])
+
+
+def _held_of_settings(root) -> list[str]:
+    """The paths by which ``root``, an object handed to a plugin, carries a reference to the settings module.
+
+    WHAT A GREEN RESULT PROVES: nothing the plugin is handed carries a reference to the settings module, or
+    to an object made by it, by any of these walks, each named: a function's closure cells, defaults and
+    keyword defaults; a function's own attributes (its ``__dict__``, where ``functools.wraps`` stores
+    ``__wrapped__``); a bound method's instance and function; a built-in method's object; a partial's
+    function, arguments and keywords; the items of dicts, lists, tuples, sets and deques; an instance's
+    ``__dict__`` and ``__slots__`` (including a single-string ``__slots__`` and private double-underscore
+    slots under their mangled name); the attributes of the classes of an object (all but the built-in
+    ones); a property's getter, setter and deleter; a static or class method's function; and the local
+    variables of a paused generator, coroutine or asynchronous generator.
+
+    WHAT IT CANNOT PROVE: anything by a walk not listed, and anything reached through the interpreter
+    itself: a function's module namespace (``__globals__``, ``__builtins__``), ``sys.modules``, a module's
+    attributes, the garbage collector, the frames of running threads. A plugin in the daemon's process can
+    always import a module for itself; this search says what is handed, and no more."""
+
+    held = settings.__name__
+    found, seen, todo = [], set(), [("handed", root)]
+
+    def class_attributes(path, klass):
+        return [(f"{path}.class[{k.__name__}].{name}", value) for k in klass.__mro__ if k.__module__ != "builtins"
+                for name, value in list(vars(k).items())]
+
+    while todo:
+        path, obj = todo.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if obj is settings or type(obj).__module__ == held or getattr(obj, "__module__", None) == held:
+            found.append(path)
+            continue
+        if isinstance(obj, (types.ModuleType, str, bytes, int, float, complex, type(None))):
+            continue
+        kids: list[tuple[str, object]] = []
+        if isinstance(obj, type):
+            kids += class_attributes(path, obj)
+        elif isinstance(obj, types.FunctionType):
+            for i, cell in enumerate(obj.__closure__ or ()):
+                try:
+                    kids.append((f"{path}.closure[{i}]", cell.cell_contents))
+                except ValueError:  # an empty cell
+                    pass
+            kids += [(f"{path}.default", d) for d in obj.__defaults__ or ()]
+            kids += [(f"{path}.kwdefault", d) for d in (obj.__kwdefaults__ or {}).values()]
+            kids.append((f"{path}.__dict__", vars(obj)))  # carrier: a function's own attributes
+        elif isinstance(obj, types.MethodType):
+            kids += [(f"{path}.__self__", obj.__self__), (f"{path}.__func__", obj.__func__)]
+        elif isinstance(obj, types.BuiltinMethodType):
+            kids.append((f"{path}.__self__", obj.__self__))  # carrier: a built-in method's object
+        elif isinstance(obj, functools.partial):
+            kids += [(f"{path}.func", obj.func), (f"{path}.args", obj.args), (f"{path}.keywords", obj.keywords)]
+        elif isinstance(obj, property):
+            kids += [(f"{path}.{name}", fn) for name, fn in (("fget", obj.fget), ("fset", obj.fset),  # carrier: a property
+                                                              ("fdel", obj.fdel))]
+        elif isinstance(obj, (staticmethod, classmethod)):
+            kids.append((f"{path}.__func__", obj.__func__))
+        elif isinstance(obj, (types.GeneratorType, types.CoroutineType, types.AsyncGeneratorType)):
+            frame = getattr(obj, "gi_frame", None) or getattr(obj, "cr_frame", None) or getattr(obj, "ag_frame", None)
+            if frame is not None:
+                kids.append((f"{path}.locals", dict(frame.f_locals)))  # carrier: a paused generator's local variables
+        elif isinstance(obj, dict):
+            for key, value in list(obj.items()):
+                kids += [(f"{path}.key", key), (f"{path}[{key!r}]", value)]
+        elif isinstance(obj, (list, tuple, set, frozenset, collections.deque)):
+            kids += [(f"{path}[]", item) for item in list(obj)]
+        else:
+            if hasattr(obj, "__dict__"):
+                kids.append((f"{path}.__dict__", vars(obj)))
+            for klass in type(obj).__mro__:
+                slots = vars(klass).get("__slots__", ())
+                for slot in (slots,) if isinstance(slots, str) else slots:
+                    if slot.startswith("__") and not slot.endswith("__"):
+                        owner = klass.__name__.lstrip("_")
+                        if owner:
+                            slot = f"_{owner}{slot}"
+                    if hasattr(obj, slot):
+                        kids.append((f"{path}.{slot}", getattr(obj, slot)))
+            kids += class_attributes(path, type(obj))  # carrier: the class attributes of the handed object
+        todo += kids
+    return found
+
+
+def _handed_over(kind: str, held):
+    """Stand-ins for what a core that hands a plugin the settings could return, one carrier for each kind."""
+
+    if kind == "closure":
+        return lambda request: held
+    if kind == "built-in method":
+        return {"in force": held}.get
+    if kind == "function attribute":
+        def with_attribute(request):
+            return None
+        with_attribute.in_force = held
+        return with_attribute
+    if kind == "wraps":
+        @functools.wraps(lambda request: held)
+        def wrapper(request):
+            return None
+        return wrapper
+    if kind == "class attribute":
+        class WithClassAttribute:
+            in_force = held
+
+            def __call__(self, request):
+                return None
+        return WithClassAttribute()
+    if kind == "property":
+        class WithProperty:
+            @property
+            def in_force(self):
+                return held
+        return WithProperty()
+    if kind == "generator":
+        def paused():
+            in_force = held  # noqa: F841 - the local variable is what the stand-in carries
+            yield
+        gen = paused()
+        next(gen)
+        return gen
+    if kind == "single-string slot":
+        class WithStringSlot:
+            __slots__ = "held"
+
+            def __init__(self, value):
+                self.held = value
+        return WithStringSlot(held)
+    if kind == "private slot":
+        class __WithPrivateSlot:
+            __slots__ = ("__priv",)
+
+            def __init__(self, value):
+                self.__priv = value
+        return __WithPrivateSlot(held)
+    if kind == "dunder slot":
+        class WithDunderSlot:
+            __slots__ = ("__held__",)  # begins and ends with two underscores: Python does not mangle it
+
+            def __init__(self, value):
+                self.__held__ = value
+        return WithDunderSlot(held)
+    if kind == "slot of an underscore class":
+        class ___:  # a class name made only of underscores: Python does not mangle a private name in it
+            __slots__ = ("__priv",)
+
+            def __init__(self, value):
+                self.__priv = value
+        return ___(held)
+    raise AssertionError(kind)
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class WhatAPluginIsHanded(_Folder):
+    """A stand-in plugin is loaded by the real plugin host; what it was handed is searched for the settings.
+
+    The search is ``_held_of_settings``: its docstring says what a green result proves and what it cannot."""
+
+    def hosted(self, host_class=None, leak=False):
+        from recursion_core.daemon import breaker as daemon_breaker
+        from recursion_core.daemon import plugins
+        from recursion_core.daemon.tests import plugin_fixture as fx
+        from recursion_core.plugin_security.tests.support import FakeGilProbe
+        config, state = self.config / "recursion", self.tmp / "state"
+        store, _ = daemon_breaker.open_breaker_store(state, clock=lambda: 0.0)
+        self.addCleanup(store.close)
+        fx.write_install(config, grants=[fx.grant_for(fx.OPERATOR_SOURCE)])
+        fx.write_plugin(config / "plugins" / "one", fx.OPERATOR_SOURCE)
+
+        def leaky(core, caller):  # a core that hands the plugin the settings in force, by the carrier named
+            return _handed_over("closure" if leak is True else leak, settings.load(self.environ))
+
+        patched = mock.patch.object(plugins.CoreService, "client_for", leaky) if leak else contextlib.nullcontext()
+        with patched:
+            host = (host_class or plugins.PluginHost)(config, state, store, gil_probe=FakeGilProbe(),
+                                                      verification_available=lambda: True)
+        self.addCleanup(host.close)
+        kept = host._operators["fixture.operator"].__globals__["CORE"]  # what the stand-in's bind_core was handed
+        self.assertEqual(1, len(kept))
+        return host, kept[0]
+
+    def test_nothing_of_the_settings_module_is_reachable_from_what_a_plugin_is_handed(self) -> None:
+        self.put(OFF)
+        _, handed = self.hosted()
+        self.assertEqual([], _held_of_settings(handed))
+        self.assertEqual([], _held_of_settings(((lambda: 1),)))  # the search finds nothing where there is nothing
+
+    def test_the_search_finds_a_plugin_that_is_handed_the_settings(self) -> None:
+        self.put(OFF)
+        _, handed = self.hosted(leak=True)
+        found = _held_of_settings(handed)
+        self.assertTrue(found)
+        self.assertEqual(["handed.closure[0]"], found)
+
+    def test_the_search_finds_each_carrier_through_the_real_host(self) -> None:
+        self.put(OFF)
+        for kind in ("closure", "built-in method", "function attribute", "wraps", "class attribute", "property",
+                     "generator", "single-string slot", "private slot", "dunder slot",
+                     "slot of an underscore class"):
+            with self.subTest(carrier=kind):
+                _, handed = self.hosted(leak=kind)
+                self.assertTrue(_held_of_settings(handed))
+
+    def test_the_search_finds_each_carrier_in_a_plain_stand_in(self) -> None:
+        held = settings.load(self.environ)
+        for kind in ("closure", "built-in method", "function attribute", "wraps", "class attribute", "property",
+                     "generator", "single-string slot", "private slot", "dunder slot",
+                     "slot of an underscore class"):
+            with self.subTest(carrier=kind):
+                self.assertTrue(_held_of_settings(_handed_over(kind, held)))
+        self.assertEqual([], _held_of_settings(_handed_over("closure", {"copy": "plain values"})))
+
+    def test_the_search_names_the_slot_it_finds_where_python_does_not_mangle_the_name(self) -> None:
+        held = settings.load(self.environ)
+        # a slot spelled with two underscores at both ends is looked up under its own name
+        self.assertEqual(["handed.__held__"], _held_of_settings(_handed_over("dunder slot", held)))
+        # a private slot in a class whose name is only underscores is looked up under its own name too
+        self.assertEqual(["handed.__priv"], _held_of_settings(_handed_over("slot of an underscore class", held)))
+        # control: an ordinary private slot is found under the class's mangled name
+        self.assertEqual(["handed._WithPrivateSlot__priv"], _held_of_settings(_handed_over("private slot", held)))
+
+    def test_the_host_may_read_one_row_and_a_plugin_still_cannot_reach_the_settings(self) -> None:
+        from recursion_core.daemon import plugins
+        self.put(OFF)
+
+        class ReadsItsRow(plugins.PluginHost):
+            def __init__(host, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                host.gil_check = settings.load(os.environ)["plugin_host.gil_check"]
+
+        with mock.patch.dict(os.environ, self.environ):
+            host, handed = self.hosted(ReadsItsRow)
+        self.assertIs(False, host.gil_check)
+        self.assertEqual([], _held_of_settings(handed))
+
+    def test_a_host_that_keeps_the_whole_settings_where_the_core_can_reach_them_is_found(self) -> None:
+        from recursion_core.daemon import plugins
+        self.put(OFF)
+
+        class KeepsTheFile(plugins.PluginHost):
+            def __init__(host, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                host.in_force = settings.load(os.environ)
+
+        with mock.patch.dict(os.environ, self.environ):
+            _, handed = self.hosted(KeepsTheFile)
+        self.assertTrue(_held_of_settings(handed))
 
 
 @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
@@ -599,6 +933,24 @@ class PublishedShape(_Folder):
         walk_enums(schema["properties"], "")
         self.assertEqual({r.name: tuple(r.allowed) for r in settings.SETTINGS if r.allowed}, enums)
 
+    def test_the_schema_describes_the_readers_version_type(self) -> None:
+        schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
+        self.assertIn("The settings file reader accepts version only as a TOML integer "
+                      "(a whole number such as 1) and rejects a float such as 1.0.",
+                      schema["description"])
+        self.put(OFF.replace("version = 1", "version = 1.0"))
+        loaded = settings.load(self.environ)
+        self.assert_default(loaded, settings.UNREADABLE)
+        self.assertIn("version must be 1, found 1.0", loaded.notes[0].detail)
+        for wrong in ('"1"', "2", "true"):
+            with self.subTest(version=wrong):
+                self.put(OFF.replace("version = 1", f"version = {wrong}"))
+                loaded = settings.load(self.environ)
+                self.assert_default(loaded, settings.UNREADABLE)
+                self.assertIn("version must be 1, found", loaded.notes[0].detail)
+        self.put(OFF)
+        self.assertEqual([], self.codes(settings.load(self.environ)))
+
     def test_the_readme_names_each_setting(self) -> None:
         readme = (SCHEMA_DIR / "README.md").read_text(encoding="utf-8")
         for row in settings.SETTINGS:
@@ -631,6 +983,20 @@ class WindowsNoOwnerCheck(_Folder):
         self.assertIsNone(loaded.path)
         self.assert_default(loaded, settings.NOT_READ_HERE)
         self.assertIn("note settings_not_read_on_this_system", "\n".join(settings.lines(loaded)))
+
+    def test_no_uid_prints_the_placeholder_sentence_and_the_exit_is_unchanged(self) -> None:
+        self.file.write_text(OFF, encoding="utf-8")
+        saved = getattr(os, "geteuid", None)
+        if saved is not None:
+            del os.geteuid
+            self.addCleanup(setattr, os, "geteuid", saved)
+        out = io.StringIO()
+        self.assertEqual(0, settings.main([], environ=self.environ, out=out, err=io.StringIO()))
+        shown = out.getvalue()
+        self.assertIn("`journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service _SYSTEMD_OWNER_UID=<your user id>`", shown)
+        self.assertIn("put in place of <your user id> the number `id -u` prints", shown)
+        self.assertNotRegex(shown, r"_SYSTEMD_OWNER_UID=[0-9]")
+        self.assertIn("note settings_not_read_on_this_system", shown)
 
 
 # The spelling the pinned-copy plan prints for a person: a table and a key under it.
@@ -686,6 +1052,18 @@ class ATableAndAKeyReadUnderTheFullDottedName(_Folder):
                 self.assert_default(loaded, settings.UNKNOWN_KEY)
                 self.assertNotIn(FULL_NAME, loaded.values)
                 self.assertEqual("'engines' is not a setting this version knows; it is skipped", loaded.notes[0].detail)
+
+
+def setUpModule():
+    # Every store refuses an SQLite with the WAL reset bug unless the person accepts the risk
+    # (daemon/tests/test_sqlite_wal_bug.py). This module tests other behaviour, so it runs on a stubbed
+    # repaired version, whatever SQLite this Python has.
+    import sqlite3
+    import unittest
+    from unittest import mock
+    stub = mock.patch.object(sqlite3, 'sqlite_version', '3.51.3')
+    stub.start()
+    unittest.addModuleCleanup(stub.stop)
 
 
 if __name__ == "__main__":

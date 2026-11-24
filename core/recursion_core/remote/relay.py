@@ -303,9 +303,10 @@ class Relay:
         if self.max_frames is None:
             return None
         with self._window_lock:
-            now = self._clock()
+            # The key's window reads the clock itself, under the lock its sessions share (KeyWindow.take).
             if self._key_window is not None:
-                return self._key_window.take(now, self.max_frames, self.window_s)
+                return self._key_window.take(self._clock, self.max_frames, self.window_s)
+            now = self._clock()
             while self._forwarded and self._forwarded[0] <= now - self.window_s:
                 self._forwarded.popleft()
             if len(self._forwarded) >= self.max_frames:

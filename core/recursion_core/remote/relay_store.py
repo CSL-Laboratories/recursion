@@ -7,8 +7,9 @@ across sessions is kept here, each file under an exclusive ``flock`` while it is
 
 * ``KeyWindow``: the times at which the frames of one key were forwarded inside the window, one file per
   key (``window-<key>.json``). Every session of that key shares it, so a cap of N frames in S seconds
-  holds for the key, however many sessions it opens. Times come from the relay's monotonic clock; a time
-  later than now (a clock that started again, as after a restart of the machine) is dropped.
+  holds for the key, however many sessions it opens, one after another or at the same time. Times come
+  from the relay's monotonic clock, read while the file's lock is held; a time later than now (a clock
+  that started again, as after a restart of the machine) is dropped.
 * ``RefusalRecord``: one JSON line per refusal the relay's rights and caps made (``refusals.jsonl``),
   newest last, at most ``max_entries`` lines kept (older lines are dropped first; ``None`` keeps every
   line, ``0`` keeps none). The person reads it with any text tool.
@@ -22,6 +23,7 @@ import json
 import math
 import os
 import stat
+from collections.abc import Callable
 
 RELAY_STATE_DIR = "relay"  # <state folder>/relay
 WINDOW_FILE = "window-{key}.json"
@@ -94,11 +96,16 @@ class KeyWindow:
     def __init__(self, folder: str, key: str) -> None:
         self.path = os.path.join(folder, WINDOW_FILE.format(key=key))
 
-    def take(self, now: float, max_frames: int, window_s: float) -> int | None:
+    def take(self, clock: Callable[[], float], max_frames: int, window_s: float) -> int | None:
         """Let one frame through and return ``None``, or return how many were already in the window.
 
-        ``OSError`` when the file cannot be read or written; the caller refuses the frame then."""
+        ``clock`` is read once the lock is held. A session that read it before waiting for the lock would
+        find the time a session that went first wrote meanwhile later than its own now, drop it as a
+        clock that started again, and let its frame through: the cap would not hold for sessions at
+        the same time. ``OSError`` when the file cannot be read or written; the caller refuses the
+        frame then."""
         with _Locked(self.path) as fd:
+            now = clock()
             try:
                 stamps = json.loads(_read_all(fd) or b"[]")
             except ValueError:

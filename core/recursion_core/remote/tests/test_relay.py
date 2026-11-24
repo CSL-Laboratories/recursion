@@ -13,8 +13,12 @@ import fcntl
 import io
 import json
 import os
+import select
 import stat
+import subprocess
+import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -1003,6 +1007,137 @@ class RelayKeyWindowTests(unittest.TestCase):
         relay = Relay(environ=bare, cap_scope="session", record_max=0)  # nothing to keep: no folder needed
         self.assertIsNone(relay.state_folder)
         self.assertEqual(relay.handle(control("run.list", 1))["result"]["method"], "run.list")
+
+    def test_a_relay_folder_owned_by_another_uid_is_refused_at_start(self) -> None:
+        daemon = support.SocketDaemon(self)
+        Relay(environ=daemon.environ)  # the folder, made by this uid
+        state = os.path.join(daemon.environ["XDG_STATE_HOME"], "recursion")
+        other = os.geteuid() + 1
+        with self.assertRaises(relay_store.RelayStateRefused) as caught:
+            relay_store.relay_folder(state, uid=other)
+        self.assertIn(f"is owned by uid {os.geteuid()}, not {other}", str(caught.exception))
+        # No socket directory here (the daemon not running), so only the relay's own folder can refuse.
+        bare = {"XDG_RUNTIME_DIR": support.scratch_dir(self), "XDG_STATE_HOME": daemon.environ["XDG_STATE_HOME"]}
+        with self.assertRaises(relay_store.RelayStateRefused):
+            Relay(environ=bare, uid=other)
+        self.assertEqual(Relay(environ=bare).state_folder, relay_folder_of(daemon))  # its owner starts
+
+
+# Sessions of one key started at the same time (RelayKeyWindowRaceTests). Each round starts RACE_SESSIONS
+# sessions of a key of its own behind a barrier, each sending RACE_FRAMES frames under a cap of RACE_CAP
+# in a window of an hour, and counts what the stand-in daemon saw. Every clock of these sessions sleeps
+# RACE_PAUSE_S after it is read: a session held up between reading the clock and taking the window's
+# lock, which is where a clock read outside the lock lets a frame through. RACE_ROUNDS rounds: with the
+# clock read outside the lock, about three rounds in four forwarded more than the cap, on both
+# interpreters, as processes and as threads, and at least 9 of 20 in every run, so that 20 rounds all at
+# the cap by luck is a chance below one in a hundred thousand; with it read under the lock every round
+# is at the cap. These are the test's own figures, not settings of the relay.
+RACE_SESSIONS, RACE_FRAMES, RACE_CAP, RACE_ROUNDS, RACE_PAUSE_S = 8, 4, 3, 20, 0.002
+
+RACE_CHILD = r"""
+import io, json, sys, time
+real = time.monotonic
+def held_up():
+    now = real()
+    time.sleep(PAUSE)
+    return now
+time.monotonic = held_up  # before the relay is imported: its clock is this one
+sys.path.insert(0, sys.argv[1])
+from recursion_core.control_transport.framing import encode_frame
+from recursion_core.remote.relay import main
+environ, child, rounds, frames_each, cap = json.loads(sys.argv[2]), *map(int, sys.argv[3:7])
+print("ready", flush=True)
+for r in range(rounds):
+    if sys.stdin.readline().strip() != f"go {r}":
+        sys.exit(3)
+    data = b"".join(encode_frame({"op": "control", "method": "run.list", "params": {}, "id": 1000 * r + 10 * child + n})
+                    for n in range(frames_each))
+    main(["relay", "--key-label", f"race-{r}", "--max-frames", str(cap), "--window-s", "3600"], environ=environ,
+         stdin=io.BytesIO(data), stdout=io.BytesIO(), stderr=io.StringIO())
+    print(f"done {r}", flush=True)
+"""
+
+
+def held_up_clock():
+    def clock() -> float:
+        now = time.monotonic()
+        time.sleep(RACE_PAUSE_S)
+        return now
+    return clock
+
+
+def forwarded_per_round(daemon) -> list[int]:
+    counts = [0] * RACE_ROUNDS
+    for message in daemon.seen:
+        counts[message["id"] // 1000] += 1
+    return counts
+
+
+@unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")
+class RelayKeyWindowRaceTests(unittest.TestCase):
+    def test_sessions_of_one_key_at_the_same_time_as_processes_forward_exactly_the_cap(self) -> None:
+        daemon = support.SocketDaemon(self)
+        environ = {**daemon.environ, "SSH_ORIGINAL_COMMAND": RELAY_COMMAND}
+        core = str(REMOTE_DIR.parents[1])
+        code = RACE_CHILD.replace("PAUSE", repr(RACE_PAUSE_S))
+        children = []
+        for child in range(RACE_SESSIONS):  # a hard count of processes, each ended in the cleanup
+            proc = subprocess.Popen([sys.executable, "-B", "-c", code, core, json.dumps(environ), str(child),
+                                     str(RACE_ROUNDS), str(RACE_FRAMES), str(RACE_CAP)],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self.addCleanup(end_process, proc)
+            children.append(proc)
+        deadline = time.monotonic() + support.WATCHDOG_S * 3
+        for proc in children:
+            self.assertEqual(line_of(proc, deadline), "ready")
+        for r in range(RACE_ROUNDS):
+            for proc in children:  # every session is waiting on this line: the barrier
+                proc.stdin.write(f"go {r}\n".encode("ascii"))
+                proc.stdin.flush()
+            for proc in children:
+                self.assertEqual(line_of(proc, deadline), f"done {r}")
+        self.assertEqual(forwarded_per_round(daemon), [RACE_CAP] * RACE_ROUNDS)
+
+    def test_sessions_of_one_key_at_the_same_time_as_threads_forward_exactly_the_cap(self) -> None:
+        daemon = support.SocketDaemon(self)
+        for r in range(RACE_ROUNDS):
+            relays = [Relay(environ=daemon.environ, key_label=f"race-{r}", max_frames=RACE_CAP, window_s=3600.0,
+                            clock=held_up_clock()) for _ in range(RACE_SESSIONS)]
+            barrier = threading.Barrier(RACE_SESSIONS, timeout=support.WATCHDOG_S)
+
+            def session(relay, child, r=r, barrier=barrier):
+                barrier.wait()
+                for n in range(RACE_FRAMES):
+                    relay.handle(control("run.list", 1000 * r + 10 * child + n))
+
+            workers = [threading.Thread(target=session, args=(relay, child), daemon=True)
+                       for child, relay in enumerate(relays)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(support.WATCHDOG_S)
+            self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(forwarded_per_round(daemon), [RACE_CAP] * RACE_ROUNDS)
+
+
+def line_of(proc, deadline: float) -> str:
+    """The next line a child writes, waiting no longer than ``deadline`` (a hang fails, never waits for ever)."""
+    remaining = deadline - time.monotonic()
+    ready, _, _ = select.select([proc.stdout], [], [], max(remaining, 0.0))
+    if not ready:
+        raise AssertionError(f"child {proc.pid} wrote nothing in time")
+    return proc.stdout.readline().decode("ascii").strip()
+
+
+def end_process(proc) -> None:
+    for stream in (proc.stdin, proc.stdout):
+        try:
+            stream.close()
+        except OSError:
+            pass
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(support.WATCHDOG_S)
 
 
 @unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")

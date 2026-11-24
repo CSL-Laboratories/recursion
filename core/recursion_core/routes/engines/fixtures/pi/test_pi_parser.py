@@ -216,7 +216,7 @@ class UsageTest(unittest.TestCase):
 
 
 class HeldUsageTest(unittest.TestCase):
-    """Usage that is not one model call: measured, kept once as a signal, never drafted (questions.md Q10)."""
+    """Usage that is not one model call: measured, kept once as a signal, never drafted (no span names a sum of some calls)."""
 
     def tool_result(self, used, call_id="c1"):
         message = {"role": "toolResult", "toolCallId": call_id, "toolName": "delegate",

@@ -1,0 +1,6 @@
+# A text where a boolean is allowed: the reader keeps the default (true) and says so
+# (settings_value_out_of_range), naming the key, the value found and what is allowed.
+version = 1
+
+[plugin_host]
+gil_check = "no"

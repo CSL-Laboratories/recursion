@@ -290,12 +290,19 @@ def main(argv: list[str] | None = None, environ=None, out=None, err=None) -> int
         return 2
     loaded = load(os.environ if environ is None else environ)
     print(f"settings file: {loaded.path or 'none'}", file=out)
+    uid = os.geteuid() if hasattr(os, "geteuid") else None
+    owner = "<your user id>" if uid is None else uid
+    whose = (f"{uid} is the user id of the account that ran this command" if uid is not None else
+             "put in place of <your user id> the number `id -u` prints for the account whose daemon you mean, "
+             "on the machine that runs it")
     print("These are the values a daemon started from this environment would take; a daemon already running "
           "keeps the values it read at its own start, which it wrote to its log in the lines beginning "
           "`settings file:` and `settings:` (for the shipped user unit, `journalctl --user -u recursion-daemon` "
           "shows them only where the system journal is stored on disk; where there is no per-user journal, "
-          "someone allowed to read the system journal can match the unit with "
-          "`journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service`; a daemon started another way writes them "
+          "someone allowed to read the system journal can match the unit and its owner with "
+          f"`journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service _SYSTEMD_OWNER_UID={owner}` ({whose}; the "
+          "unit has this same name for every account, so the unit match alone also shows the daemons of other "
+          "accounts on a shared host); a daemon started another way writes them "
           "to its standard error, wherever that start sent it).", file=out)
     for line in lines(loaded):
         print(line, file=out)

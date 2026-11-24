@@ -28,6 +28,7 @@ SECRET = "stand-in-secret-value"
 MARKER = "CSL_PLUGIN_HOST_CLEAN"
 CANARY_NAME = "CSL_HOST_TEST_CANARY"
 CANARY = "canary-value-7d3f19"
+RESTARTED = "--restarted-once"
 # The named exit statuses of a host that refuses to start (sysexits EX_OSERR and EX_CONFIG).
 EXIT_RESTART_FAILED = 71
 EXIT_ENVIRONMENT_NOT_CLEAN = 78
@@ -103,6 +104,19 @@ FDS_SOURCE = textwrap.dedent("""
             found[entry] = [info.st_dev, info.st_ino]
         with open('/proc/self/environ', 'rb') as record:
             return {'fds': found, 'proc': record.read().decode('latin-1')}
+    """).encode()
+
+
+PREFIX_SOURCE = textwrap.dedent("""
+    import os
+    import sys
+
+    def registry():
+        proc = None
+        if os.path.exists('/proc/self/environ'):
+            with open('/proc/self/environ', 'rb') as record:
+                proc = record.read().decode('latin-1')
+        return {'prefix': sys.prefix, 'argv': sys.orig_argv, 'executable': sys.executable, 'proc': proc}
     """).encode()
 
 
@@ -229,7 +243,7 @@ class HostProgramTests(unittest.TestCase):
         )
 
     def exchange(self, *messages, states=(False,), real=False, extra=None, secret=False, environ=None,
-                 standin=None, code=0):
+                 standin=None, code=0, bare=False):
         # Isolated Python runs venv .pth files but ignores PYTHONPATH. This shim passes a probe to
         # main and writes its returned status to a file in the host's working folder, because the
         # host points its own stderr at the null device. The host may start itself again once with a
@@ -238,6 +252,9 @@ class HostProgramTests(unittest.TestCase):
         env.update(environ or {})
         starts = self.root / ("starts-%d" % next(self.counter))
         command = [str(self.python), "-X", "gil=0", "-I", "-m", "recursion_core.plugin_host"]
+        if bare:
+            # The interpreter is typed by its bare name and found through the PATH the caller gives.
+            command[0] = self.python.name
         if secret:
             env[SECRET_NAME] = SECRET
         options = {}
@@ -786,6 +803,31 @@ class HostProgramTests(unittest.TestCase):
         self.assertEqual((plugin_host.EXIT_RESTART_FAILED, plugin_host.EXIT_ENVIRONMENT_NOT_CLEAN),
                          (EXIT_RESTART_FAILED, EXIT_ENVIRONMENT_NOT_CLEAN))
         self.assertEqual(plugin_host.START_REFUSED, "host_start_refused")
+
+    @unittest.skipIf(os.name == "nt", "the restart is POSIX only")
+    def test_n1_a_host_started_by_bare_name_restarts_into_the_same_environment(self):
+        # The starter finds the interpreter through a PATH that names only the environment's own bin
+        # folder. The restart gives the new image no PATH, so the new image can keep the environment's
+        # prefix only when its first word is the interpreter's own path.
+        path = {"PATH": str(self.python.parent)}
+        replies, _, _, _ = self.exchange(HELLO, BYE, environ=path, bare=True)
+        self.assertEqual(replies, [])
+        self.assertEqual(self.starts, 2)
+        expected = os.path.realpath(self.python.parent.parent)
+        for label, bare in (("bare name", True), ("absolute path", False)):
+            with self.subTest(started_by=label):
+                replies, _, _, _ = self.exchange(
+                    HELLO, load(PREFIX_SOURCE), call(7, "registry"), BYE, environ=path, bare=bare)
+                self.assertEqual(self.starts, 2)
+                self.assertEqual(len(replies), 1, replies)
+                self.assertEqual(replies[0]["type"], "result", replies[0])
+                value = replies[0]["value"]
+                self.assertEqual(os.path.realpath(value["prefix"]), expected)
+                self.assertEqual(value["executable"], str(self.python))
+                self.assertEqual(value["argv"], [str(self.python), "-X", "gil=0", "-I", "-m",
+                                                 "recursion_core.plugin_host", RESTARTED])
+                if value["proc"] is not None:
+                    self.assertEqual(value["proc"], MARKER + "=1\0")
 
     @unittest.skipIf(os.name == "nt", "the restart is POSIX only")
     @require_proc("/proc/self/environ", "/proc/self/cmdline")

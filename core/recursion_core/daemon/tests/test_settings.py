@@ -554,7 +554,7 @@ class TheDaemonsStart(_Folder):
         shell_config = self.tmp / "shell-config"
         shell_file = self.put(OFF.replace("false", "true"),
                               shell_config / "recursion" / "settings.toml")
-        sentence = ('These are the values a daemon started from this environment would take; a daemon already running keeps the values it read at its own start, which it wrote to its log in the lines beginning `settings file:` and `settings:` (for the shipped user unit, `journalctl --user -u recursion-daemon` shows them only where the system journal is stored on disk; where there is no per-user journal, someone allowed to read the system journal can match the unit with `journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service`; a daemon started another way writes them to its standard error, wherever that start sent it).')
+        sentence = ('These are the values a daemon started from this environment would take; a daemon already running keeps the values it read at its own start, which it wrote to its log in the lines beginning `settings file:` and `settings:` (for the shipped user unit, `journalctl --user -u recursion-daemon` shows them only where the system journal is stored on disk; where there is no per-user journal, someone allowed to read the system journal can match the unit and its owner with `journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service _SYSTEMD_OWNER_UID=@UID@` (@UID@ is the user id of the account that ran this command; the unit has this same name for every account, so the unit match alone also shows the daemons of other accounts on a shared host); a daemon started another way writes them to its standard error, wherever that start sent it).').replace("@UID@", str(os.geteuid()))
         for config, path, value in ((self.config, self.file, "false"),
                                     (shell_config, shell_file, "true")):
             with self.subTest(config=config), mock.patch.dict(os.environ, XDG_CONFIG_HOME=str(config)):
@@ -609,11 +609,22 @@ class TheDaemonsStart(_Folder):
         settings.main([], environ=self.environ, out=out, err=io.StringIO())
         shown = out.getvalue()
         self.assertIn("`journalctl --user -u recursion-daemon` shows them only where the system journal is stored on disk", shown)
-        self.assertIn("`journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service`", shown)
+        self.assertIn(f"`journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service _SYSTEMD_OWNER_UID={os.geteuid()}`", shown)
         self.assertIn("lines beginning `settings file:` and `settings:`", shown)
         self.assertIn("standard error", shown)
         self.put(OFF)
         self.assertIn("settings file: " + str(self.file), [m for m in self.start_log()[1]])
+
+    def test_the_status_sentence_adds_the_owner_filter_beside_the_unit_match(self) -> None:
+        out = io.StringIO()
+        settings.main([], environ=self.environ, out=out, err=io.StringIO())
+        shown = out.getvalue()
+        uid = os.geteuid()
+        self.assertEqual(1, shown.count("_SYSTEMD_OWNER_UID="))
+        self.assertIn(f"_SYSTEMD_OWNER_UID={uid}", shown)
+        self.assertIn(f"`journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service _SYSTEMD_OWNER_UID={uid}`", shown)
+        self.assertIn(f"{uid} is the user id of the account that ran this command", shown)
+        self.assertNotIn("<your user id>", shown)
 
     def test_with_every_file_the_parser_or_the_notes_cannot_take_the_daemon_reaches_its_lock(self) -> None:
         cases = {**NOT_READ_BY_THE_PARSER, **TOO_LONG_TO_SHOW, "a dotted key of 3000 parts": DOTTED_3000}
@@ -972,6 +983,20 @@ class WindowsNoOwnerCheck(_Folder):
         self.assertIsNone(loaded.path)
         self.assert_default(loaded, settings.NOT_READ_HERE)
         self.assertIn("note settings_not_read_on_this_system", "\n".join(settings.lines(loaded)))
+
+    def test_no_uid_prints_the_placeholder_sentence_and_the_exit_is_unchanged(self) -> None:
+        self.file.write_text(OFF, encoding="utf-8")
+        saved = getattr(os, "geteuid", None)
+        if saved is not None:
+            del os.geteuid
+            self.addCleanup(setattr, os, "geteuid", saved)
+        out = io.StringIO()
+        self.assertEqual(0, settings.main([], environ=self.environ, out=out, err=io.StringIO()))
+        shown = out.getvalue()
+        self.assertIn("`journalctl _SYSTEMD_USER_UNIT=recursion-daemon.service _SYSTEMD_OWNER_UID=<your user id>`", shown)
+        self.assertIn("put in place of <your user id> the number `id -u` prints", shown)
+        self.assertNotRegex(shown, r"_SYSTEMD_OWNER_UID=[0-9]")
+        self.assertIn("note settings_not_read_on_this_system", shown)
 
 
 # The spelling the pinned-copy plan prints for a person: a table and a key under it.

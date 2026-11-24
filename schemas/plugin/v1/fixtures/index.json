@@ -1800,6 +1800,215 @@
         "keyword": "enum",
         "at": "/landlock_scopes/0"
       }
+    },
+    {
+      "file": "good/wall.v1/h08-writes-left-open-are-not-a-wall.json",
+      "schema": "wall.v1.json",
+      "shows": "Every check refused, but every kind of write went through on the file and in the folder made for the test: not proven, and the host loads no plugin."
+    },
+    {
+      "file": "good/wall.v1/h09-below-abi-3-the-filter-refuses-truncation.json",
+      "schema": "wall.v1.json",
+      "shows": "Landlock ABI 2 cannot refuse cutting a file; the filter refuses it and the record says so: proven."
+    },
+    {
+      "file": "good/wall.v1/h10-a-write-refused-elsewhere-is-not-proven.json",
+      "schema": "wall.v1.json",
+      "shows": "Opening a file for writing refused, but not by the wall (by the file's own flags or another layer): not proven, since that shows nothing of the wall."
+    },
+    {
+      "file": "good/wall.v1/h11-no-file-or-folder-for-the-writes.json",
+      "schema": "wall.v1.json",
+      "shows": "A host that gave the probe no file or folder for the writes: nothing of them was tried, not proven."
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes.json",
+      "schema": "wall.v1.json",
+      "rule": "'writes' is required.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes-not-tried.json",
+      "schema": "wall.v1.json",
+      "rule": "'writes_not_tried' is required.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes.open-for-write.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes always carries 'open_for_write'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes.truncate.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes always carries 'truncate'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes.create-file.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes always carries 'create_file'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes.create-folder.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes always carries 'create_folder'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes.make-fifo.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes always carries 'make_fifo'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes.make-symlink.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes always carries 'make_symlink'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes.make-link.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes always carries 'make_link'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes.make-char-device.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes always carries 'make_char_device'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes.make-block-device.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes always carries 'make_block_device'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes.remove-file.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes always carries 'remove_file'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes.remove-folder.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes always carries 'remove_folder'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes-not-tried.make-socket-node.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes_not_tried always carries 'make_socket_node'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes-not-tried.device-ioctl.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes_not_tried always carries 'device_ioctl'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.writes-not-tried.move-between-folders.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes_not_tried always carries 'move_between_folders'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/u-wall.v1.writes.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes is closed: a kind nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/writes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/u-wall.v1.writes-not-tried.json",
+      "schema": "wall.v1.json",
+      "rule": "The object at /writes_not_tried is closed: a kind nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/writes_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/v-wall.v1.writes.json",
+      "schema": "wall.v1.json",
+      "rule": "The outcome of a kind of write is one of the six the record defines.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/writes/open_for_write"
+      }
+    },
+    {
+      "file": "bad/wall.v1/v-wall.v1.then.writes.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall has every kind of write refused by the part of the wall that holds it.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/writes/create_file"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b06-proven-with-truncation-refused-elsewhere.json",
+      "schema": "wall.v1.json",
+      "rule": "A refusal by something other than the wall does not make a wall proven.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/writes/truncate"
+      }
     }
   ]
 }

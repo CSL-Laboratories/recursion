@@ -4,6 +4,19 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `wall.v1.json` is `1.0-draft.4` (Nov 23, 2026)
+
+A record gains `writes` and `writes_not_tried`, both required. `writes` holds, for each of eleven kinds of
+change (open a file for writing, cut it to its own length, make a file, a folder, a named pipe, a symbolic
+link, a hard link, a character and a block device, remove a file and a folder), the outcome of trying it
+behind the wall on a file and in a folder made for the purpose: `refused_by_landlock`, `refused_by_filter`,
+`refused_elsewhere`, `let_through`, `error` or `not_tried`. `proven` needs every kind refused by the part of
+the wall that holds it (the filter holds only truncation, below Landlock ABI 3); draft 3 called a wall
+proven that left writes open, because it never tried one. `writes_not_tried` names the three kinds the
+probe cannot try harmlessly, each with the check that shows it refused instead. What it breaks: a record
+without the two fields, so a host built on draft 3 reads as not proven and loads nothing until it hands the
+probe a file and a folder. Every wall fixture carries both fields; 4 good fixtures (`h08` to `h11`) and
+21 bad ones hold them.
 ## `host.v1.json` is `1.0-draft.4` (2026-11-23)
 
 The host's own `hello` may carry `wall`, the `wall.v1` record of the wall the host applied to itself

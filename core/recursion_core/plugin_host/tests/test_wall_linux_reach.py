@@ -31,6 +31,16 @@ from recursion_core.plugin_host.tests.test_wall_linux import CORE, _interpreter,
 
 CHILD_TIMEOUT_S = 90  # a bound on one child process of this test; test-side only, not a product figure
 VICTIM_WAIT_S = 5     # how long a test waits to see a stand-in victim end; test-side only
+# What these tests assume about the runner's own priority is read, never taken as a literal: a runner may start
+# at any nice value. All of these are test-side values, not product figures.
+NICE_TOP = 19                 # the largest nice value the kernel knows (setpriority(2)); a kernel number
+DAEMON_NICE_STEP = 1          # how far above its starting nice the child tries to raise the stand-in daemon
+SPINNER_CPU_MIN_S = 1.1       # the spinning victim must have used this much CPU before the child sets a 1 s limit
+SPINNER_CPU_WAIT_S = 120      # the bound on that wait, on a busy host at a lowered priority
+SPINNER_CPU_POLL_S = 0.05     # how often the wait looks
+PRIORITY_RUNS = (0, 10, 19)   # the starting priorities the A1 tests are run at, one nested run each
+PRIORITY_RUN_TIMEOUT_S = 600  # a bound on one nested run
+PRIORITY_RUN_ENV = "RECURSION_REACH_PRIORITY_RUN"  # set in a nested run so that it does not start more
 
 # The kernel's numbers for the calls these tests make by number, written here again so that the tests do
 # not take them from the module they check (x86_64: syscall_64.tbl; aarch64: asm-generic/unistd.h).
@@ -166,11 +176,12 @@ if mode == "reach":
     a1["f_setown_ex_daemon"] = t(owner_ex)
     a1["fiosetown_daemon"] = t(lambda: fcntl.ioctl(chan.fileno(), 0x8901, struct.pack("i", daemon)))
     a1["siocspgrp_daemon"] = t(lambda: fcntl.ioctl(chan.fileno(), 0x8902, struct.pack("i", daemon)))
-    a1["setpriority_daemon"] = t(lambda: os.setpriority(os.PRIO_PROCESS, daemon, 19))
+    a1["setpriority_daemon"] = t(lambda: os.setpriority(os.PRIO_PROCESS, daemon, spec["daemon_nice_set"]))
     a1["sched_setaffinity_daemon"] = t(lambda: os.sched_setaffinity(daemon, os.sched_getaffinity(0)))
     a1["sched_setscheduler_daemon"] = t(lambda: os.sched_setscheduler(daemon, os.SCHED_OTHER, os.sched_param(0)))
     a1["sched_setparam_daemon"] = t(lambda: os.sched_setparam(daemon, os.sched_param(0)))
-    attr, pattr = buf(struct.pack("<IIQiIQQQ", 48, 0, 0, 19, 0, 0, 0, 0))  # nice 19: the control may set it unprivileged
+    # the same nice value as above (one step above the daemon's start): an unprivileged process may raise it
+    attr, pattr = buf(struct.pack("<IIQiIQQQ", 48, 0, 0, spec["daemon_nice_set"], 0, 0, 0, 0))
     a1["sched_setattr_daemon"] = res("sched_setattr", daemon, pattr, 0)
     a1["ioprio_set_daemon"] = res("ioprio_set", 1, daemon, (2 << 13) | 4)
     nodes, pnodes = buf(struct.pack("<Q", 1))
@@ -327,7 +338,7 @@ if mode == "reach":
                             "pipe": sys.stdin.readline().strip()}
     message, fds, _f, _a = socket.recv_fds(chan, 64, 1)
     handed = socket.socket(fileno=fds[0]); handed.sendall(b"answer:" + message); handed.close()
-    out["record"] = w.probe_wall(spec["canary"], daemon)
+    out["record"] = w.probe_wall(spec["canary"], daemon, write_file=spec["canary"], write_folder=spec["writes"])
 
 elif mode.startswith("half_"):
     point = mode[5:]
@@ -351,14 +362,14 @@ elif mode.startswith("half_"):
     out["apply"] = apply(paths)
     w._call, w._no_new_privs = real_call, real_nnp
     out["status"] = status()
-    out["record"] = w.probe_wall(spec["canary"], daemon)
+    out["record"] = w.probe_wall(spec["canary"], daemon, write_file=spec["canary"], write_folder=spec["writes"])
     out["reapply"] = apply(paths)
-    out["proven_after_reapply"] = w.probe_wall(spec["canary"], daemon)["proven"]
+    out["proven_after_reapply"] = w.probe_wall(spec["canary"], daemon, write_file=spec["canary"], write_folder=spec["writes"])["proven"]
 
 elif mode == "twice":
     out["apply"] = apply(paths)
     out["reapply"] = apply(paths)
-    out["proven"] = w.probe_wall(spec["canary"], daemon)["proven"]
+    out["proven"] = w.probe_wall(spec["canary"], daemon, write_file=spec["canary"], write_folder=spec["writes"])["proven"]
 
 elif mode == "weak":
     lc, arch = w._libc(), w._arch()
@@ -373,7 +384,7 @@ elif mode == "weak":
         if hasattr(w, name):
             setattr(w, name, empty)
     w._load_seccomp_filter(lc, arch)
-    out["record"] = w.probe_wall(spec["canary"], daemon)
+    out["record"] = w.probe_wall(spec["canary"], daemon, write_file=spec["canary"], write_folder=spec["writes"])
     out["io_uring_setup"] = res(425 if ARCH == "x86_64" else 425, 0, 0)
 
 elif mode == "threads_native":
@@ -456,15 +467,43 @@ def _start(args, folder):
                             stderr=subprocess.DEVNULL, cwd=folder, env={"TMPDIR": folder})
 
 
+def _daemon_reading(pid: int) -> dict:
+    """The priority, the CPU set and the scheduling policy of one stand-in process, as the parent sees them."""
+    return {"nice": os.getpriority(os.PRIO_PROCESS, pid), "affinity": sorted(os.sched_getaffinity(pid)),
+            "policy": os.sched_getscheduler(pid)}
+
+
+def _cpu_used_s(pid: int) -> float:
+    """The CPU seconds one stand-in process has used so far (user and system), from its stat line."""
+    with open(f"/proc/{pid}/stat", "rb") as handle:
+        after_name = handle.read().rsplit(b")", 1)[1].split()   # field 3 (state) comes first
+    return (int(after_name[11]) + int(after_name[12])) / os.sysconf("SC_CLK_TCK")
+
+
+def _wait_for_cpu(pid: int) -> None:
+    """Wait, bounded, until the spinning stand-in has used more CPU than the limit the child will set: how long
+    that takes depends on the runner's priority and the host's load, so no fixed sleep stands in for it."""
+    end = time.monotonic() + SPINNER_CPU_WAIT_S
+    while _cpu_used_s(pid) < SPINNER_CPU_MIN_S:
+        if time.monotonic() > end:
+            raise AssertionError(f"the spinning stand-in used less than {SPINNER_CPU_MIN_S} s of CPU in "
+                                 f"{SPINNER_CPU_WAIT_S} s: the host is too busy to show a CPU limit")
+        time.sleep(SPINNER_CPU_POLL_S)
+
+
 def run_reach_child(mode: str, **extra) -> dict:
     """One child in ``mode``; returns its JSON line plus what the parent saw afterwards ('_victims',
-    '_files', '_answer', '_daemon_nice')."""
+    '_files', '_answer', '_daemon_nice') and what it read of the stand-in daemon right after starting it
+    ('_daemon_start') and after the child ended ('_daemon_after'): priority, CPU set and scheduling policy."""
     with tempfile.TemporaryDirectory() as folder:
         home = os.path.join(folder, "home")
         os.mkdir(home)
         canary = os.path.join(home, "canary")
         with open(canary, "w", encoding="utf-8") as handle:
             handle.write("the daemon's secret, stand-in")
+        writes = os.path.join(folder, "write-probe")  # the folder made for the probe's write kinds, before any wall
+        os.mkdir(writes)
+        wall_linux.prepare_write_folder(writes)
         files = {}
         for name in ("read", "truncate", "meta", "metafd"):
             files[name] = os.path.join(folder, "outside-" + name)
@@ -481,6 +520,8 @@ def run_reach_child(mode: str, **extra) -> dict:
             with open(os.path.join(ro, name), "w", encoding="utf-8") as handle:
                 handle.write("read-only stand-in")
         daemon = _start(["-c", "import time; time.sleep(300)"], folder)
+        daemon_start = _daemon_reading(daemon.pid)   # before the child runs: what the later reading is compared with
+        daemon_nice_set = min(daemon_start["nice"] + DAEMON_NICE_STEP, NICE_TOP)
         victims = [_start(["-c", "import time; time.sleep(300)"], folder),
                    _start(["-c", "import time; time.sleep(300)"], folder),
                    _start(["-c", "while True: pass"], folder)]
@@ -490,10 +531,11 @@ def run_reach_child(mode: str, **extra) -> dict:
         try:
             spec = dict({"core": str(CORE), "mode": mode, "canary": canary, "daemon": daemon.pid, "dir": folder,
                          "files": files, "ro": ro, "victims": [v.pid for v in victims], "chan": theirs.fileno(),
-                         "metafd": metafd, "num": NUM, "paths": sorted({sys.base_prefix, sys.prefix})}, **extra)
+                         "metafd": metafd, "num": NUM, "daemon_nice_set": daemon_nice_set, "paths": sorted({sys.base_prefix, sys.prefix}),
+                         "writes": writes}, **extra)
             socket.send_fds(ours, [b"ping"], [handed_there.fileno()])
             handed_there.close()
-            time.sleep(1.2)  # the spinning victim has used more than one second of CPU before any limit is set
+            _wait_for_cpu(victims[2].pid)  # the spinning victim has used more than the limit's CPU before it is set
             child = subprocess.run(_interpreter() + ["-c", CHILD, json.dumps(spec)], input="question\n",
                                    capture_output=True, text=True, timeout=CHILD_TIMEOUT_S, cwd=folder,
                                    pass_fds=[theirs.fileno(), metafd], env={"HOME": home, "TMPDIR": folder})
@@ -506,7 +548,7 @@ def run_reach_child(mode: str, **extra) -> dict:
             while time.monotonic() < end and any(v.poll() is None for v in victims):
                 time.sleep(0.1)
             seen_victims = [v.poll() for v in victims]
-            daemon_nice = os.getpriority(os.PRIO_PROCESS, daemon.pid)
+            daemon_after = _daemon_reading(daemon.pid)
             seen_files = {}
             for name, path in list(files.items()) + [("ro_trunc", os.path.join(ro, "trunc")),
                                                      ("ro_doomed", os.path.join(ro, "doomed"))]:
@@ -528,7 +570,8 @@ def run_reach_child(mode: str, **extra) -> dict:
     if child.returncode != 0 or not lines:
         raise AssertionError(f"the child ({mode}) ended {child.returncode}: {child.stderr[-2000:]}")
     result = json.loads(lines[-1])
-    result.update(_victims=seen_victims, _files=seen_files, _answer=answer, _daemon_nice=daemon_nice)
+    result.update(_victims=seen_victims, _files=seen_files, _answer=answer, _daemon_nice=daemon_after["nice"],
+                  _daemon_start=daemon_start, _daemon_after=daemon_after, _daemon_nice_set=daemon_nice_set)
     return result
 
 
@@ -777,7 +820,18 @@ class ReachTests(unittest.TestCase):
         self.assertEqual(walled["apply"]["code"], "applied")
         self.assertEqual(walled["_victims"], [None, None, None], "walled, all three stand-in victims live")
         self.assertEqual({name: walled["a1"][name] for name in A1_CALLS}, dict.fromkeys(A1_CALLS, "EPERM"))
-        self.assertEqual(walled["_daemon_nice"], 0, "the stand-in daemon's priority is unchanged")
+        start, after = walled["_daemon_start"], walled["_daemon_after"]
+        self.assertEqual(walled["_daemon_nice"], start["nice"], "the stand-in daemon's priority is unchanged")
+        self.assertEqual((after["affinity"], after["policy"]), (start["affinity"], start["policy"]),
+                         "the stand-in daemon's CPU set and scheduling policy are unchanged")
+        if walled["_daemon_nice_set"] != start["nice"]:
+            self.assertEqual((control["_daemon_start"]["nice"], control["_daemon_nice"]),
+                             (start["nice"], control["_daemon_nice_set"]),
+                             "unwalled, the raised nice reaches the daemon, so the walled comparison can bite")
+        with self.subTest("the priority comparison"):
+            if walled["_daemon_nice_set"] == start["nice"]:
+                self.skipTest(f"the runner starts at nice {start['nice']}, the top of the range: no raised value "
+                              "differs from it, so the priority comparison cannot bite; every other check ran")
         for name in ("rt_tgsigqueueinfo_daemon", "f_setown_ex_daemon", "fiosetown_daemon", "setpriority_daemon",
                      "sched_setaffinity_daemon", "sched_setscheduler_daemon", "sched_setparam_daemon",
                      "sched_setattr_daemon", "ioprio_set_daemon", "move_pages_daemon", "prlimit_read_daemon"):
@@ -858,6 +912,42 @@ class ReachTests(unittest.TestCase):
         self.assertEqual(walled["_answer"], "answer:ping", "the socket handed over by recvmsg answers")
         self.assertIs(walled["record"]["proven"], True)
         self.assertEqual(walled["status"], {"NoNewPrivs": "1", "Seccomp": "2"})
+
+
+A1_TESTS = ("test_a1_no_other_process_is_signalled_limited_slowed_or_moved",
+            "test_a1_the_process_may_still_act_on_itself")
+PRIORITY_RUN_CODE = r'''
+import os, sys, unittest
+os.nice(int(sys.argv[1]))
+sys.path.insert(0, sys.argv[2])
+suite = unittest.defaultTestLoader.loadTestsFromNames(sys.argv[3:])
+result = unittest.TextTestRunner(verbosity=0, stream=sys.stderr).run(suite)
+print(os.nice(0), result.testsRun, len(result.failures) + len(result.errors), len(result.skipped), flush=True)
+sys.exit(0 if result.wasSuccessful() else 1)
+'''
+
+
+@unittest.skipIf(_why_not_here(), _why_not_here() or "")
+@unittest.skipIf(os.environ.get(PRIORITY_RUN_ENV), "this is one of the priority runs already")
+class StartingPriorityTests(unittest.TestCase):
+    """The A1 tests, each in a process of its own that starts at a given nice value, one run after another."""
+
+    def test_a1_holds_at_every_starting_priority(self):
+        here = os.nice(0)
+        names = [f"recursion_core.plugin_host.tests.test_wall_linux_reach.ReachTests.{name}" for name in A1_TESTS]
+        for target in PRIORITY_RUNS:
+            with self.subTest(nice=target):
+                if target < here:
+                    self.skipTest(f"the runner is at nice {here}: an unprivileged process cannot lower it to {target}")
+                with tempfile.TemporaryDirectory() as folder:
+                    run = subprocess.run(_interpreter() + ["-c", PRIORITY_RUN_CODE, str(target - here), str(CORE)] + names,
+                                         stdin=subprocess.DEVNULL, capture_output=True, text=True, cwd=folder,
+                                         timeout=PRIORITY_RUN_TIMEOUT_S, env={"TMPDIR": folder, PRIORITY_RUN_ENV: "1"})
+                self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+                nice, ran, bad, skipped = (int(word) for word in run.stdout.split()[-4:])
+                self.assertEqual((nice, ran, bad), (target, len(A1_TESTS), 0), run.stderr[-2000:])
+                # only the priority comparison may be unable to bite, and only where the start is the top of the range
+                self.assertEqual(skipped, 1 if target == NICE_TOP else 0, run.stderr[-2000:])
 
 
 @unittest.skipIf(_why_not_here(), _why_not_here() or "")
@@ -958,7 +1048,7 @@ class LandlockScopeTests(unittest.TestCase):
                 if number in (445, 446):
                     return 0, 0
                 raise AssertionError(f"an unexpected call {number}")
-            stand_ins = {fn: _refuse for fn in CHECK_FUNCTIONS.values()}
+            stand_ins = dict({fn: _refuse for fn in CHECK_FUNCTIONS.values()}, _write_outcomes=_writes_refused)
             with self.subTest(abi=abi), mock.patch.multiple(
                     wall_linux, _call=fake_call, _landlock_abi=lambda libc: abi, _thread_count=lambda: 1,
                     _no_new_privs=lambda libc: None, _load_seccomp_filter=lambda *a, **k: None,
@@ -1035,12 +1125,18 @@ def _let_through(*_args, **_kwargs):
     return None
 
 
+def _writes_refused(*_args, **_kwargs):
+    """A stand-in for the write kinds: each refused by Landlock (nothing is tried in this process)."""
+    return dict.fromkeys(wall_linux.WRITE_KINDS, "refused_by_landlock")
+
+
 @unittest.skipIf(_why_not_here(), _why_not_here() or "")
 class ProvenNeedsEveryCheckTests(unittest.TestCase):
     """In this process, with every check replaced by a stand-in: nothing is walled and no escape is tried."""
 
     def probe(self, let_through=None, **patches):
         stand_ins = {fn: (_let_through if name == let_through else _refuse) for name, fn in CHECK_FUNCTIONS.items()}
+        stand_ins["_write_outcomes"] = _writes_refused
         with mock.patch.multiple(wall_linux, create=True, **stand_ins, **patches):
             return wall_linux.probe_wall("/nonexistent/canary", 1)
 

@@ -1,8 +1,10 @@
 """The wall a plugin host puts around itself on Linux, before it loads any plugin byte.
 
-A host process calls ``apply_wall(read_only_paths)`` on itself while it has ONE thread, then
-``probe_wall(canary_path, daemon_pid)``, and sends the record that the probe returns (``wall.v1``,
-``schemas/plugin/v1/wall.v1.json``). The wall has two parts, both applied by the kernel to this process
+A host process makes a write folder of its own and calls ``prepare_write_folder(folder)`` on it, calls
+``apply_wall(read_only_paths)`` on itself while it has ONE thread, then
+``probe_wall(canary_path, daemon_pid, write_file=..., write_folder=folder)``, and sends the record that the
+probe returns (``wall.v1``, ``schemas/plugin/v1/wall.v1.json``); when the record is not proven,
+``why_not_proven(record)`` gives the sentences a person reads, every word from the one table ``WORDS``. The wall has two parts, both applied by the kernel to this process
 and to everything it starts later, and neither can be lifted again from inside:
 
 1. A Landlock ruleset that handles every file-system right the kernel's Landlock ABI knows and allows only
@@ -45,8 +47,14 @@ the scopes in force (``landlock_scopes``).
 
 What the record is: a check that the host's own code makes on itself, from inside the process, after
 ``apply_wall`` and BEFORE any plugin code runs. It shows that the named attempts were refused by the
-kernel at that moment; it does not show which filter refused them, and code in the same process could
-write any record. It means something under two conditions only: it is made before the plugin is loaded,
+kernel at that moment, and code in the same process could write any record. Each kind of write
+(``WRITE_KINDS``) is tried on a file and in a folder the caller made for the purpose before the wall, each
+attempt harmless if it goes through, and the record names, per kind, which part of the wall refused it by
+the kernel's answer (Landlock answers EACCES, the filter EPERM); a refusal is credited only to the part that
+holds that kind in this process (the filter holds only truncation, and only below Landlock ABI 3), and any
+other refusal is ``refused_elsewhere``, which proves nothing. Whatever a weak wall let the probe make in the
+folder is the caller's to remove, with the folder. The kinds that cannot be tried harmlessly are named in
+the record with their reasons (``WRITES_NOT_TRIED``). It means something under two conditions only: it is made before the plugin is loaded,
 and its reader takes it only from frames the host sent before the load (everything later on the channel
 is the plugin's voice).
 
@@ -76,8 +84,9 @@ import threading
 
 __all__ = ["CALLER_ONLY_CALLS", "CALLER_ONLY_PRIORITY_CALLS", "DENIED_CALLS", "DENIED_FCNTL_COMMANDS",
            "DENIED_IOCTL_COMMANDS", "DENIED_IPC_CALLS", "DENIED_METADATA_CALLS", "DENIED_SIGNAL_CALLS",
-           "LANDLOCK_SCOPES", "NAMESPACE_CLONE_FLAGS", "OLD_LANDLOCK_DENIED_CALLS", "RECORD_CHECKS", "WallRefused",
-           "apply_wall", "probe_wall"]
+           "LANDLOCK_SCOPES", "NAMESPACE_CLONE_FLAGS", "OLD_LANDLOCK_DENIED_CALLS", "RECORD_CHECKS", "WORDS",
+           "WRITES_NOT_TRIED", "WRITE_FOLDER_NAMES", "WRITE_KINDS", "WRITE_OUTCOMES", "WallRefused", "apply_wall",
+           "prepare_write_folder", "probe_wall", "why_not_proven"]
 
 # The wall's own definition (not a setting, not a tunable): each call is answered EPERM.
 DENIED_CALLS = (
@@ -187,6 +196,10 @@ _FS_EXECUTE, _FS_READ_FILE, _FS_READ_DIR = 1 << 0, 1 << 2, 1 << 3
 _FS_ABI1 = (1 << 13) - 1                     # EXECUTE .. MAKE_SYM
 _FS_LATER = {2: 1 << 13, 3: 1 << 14, 5: 1 << 15}  # REFER, TRUNCATE, IOCTL_DEV
 _MIN_LANDLOCK_ABI = 1                        # Linux 5.13
+# The Landlock rights the write kinds of the probe need (include/uapi/linux/landlock.h).
+_FS_WRITE_FILE, _FS_REMOVE_DIR, _FS_REMOVE_FILE, _FS_MAKE_CHAR = 1 << 1, 1 << 4, 1 << 5, 1 << 6
+_FS_MAKE_DIR, _FS_MAKE_REG, _FS_MAKE_FIFO, _FS_MAKE_BLOCK, _FS_MAKE_SYM = 1 << 7, 1 << 8, 1 << 10, 1 << 11, 1 << 12
+_FS_TRUNCATE = 1 << 14
 
 _PR_SET_NO_NEW_PRIVS = 38
 _SECCOMP_SET_MODE_FILTER, _SECCOMP_FILTER_FLAG_TSYNC = 1, 1
@@ -199,11 +212,79 @@ _OFF_ARG_LOW = (16, 24, 32)                   # the low word of arguments 0, 1 a
 # The checks of the record, in its order; each is True only when the kernel refused it.
 RECORD_CHECKS = ("reads_outside", "home_canary", "program_start", "new_socket", "signal_other",
                  "signal_other_ways", "metadata_change", "kernel_surface")
+# The kinds of change the probe tries behind the wall, in its order (the record's field ``writes``), each on the
+# write file or in the write folder that the caller made for the purpose before the wall.
+WRITE_KINDS = ("open_for_write", "truncate", "create_file", "create_folder", "make_fifo", "make_symlink",
+               "make_link", "make_char_device", "make_block_device", "remove_file", "remove_folder")
+# The outcome of one kind; only the first two are refusals of this wall, and proven needs one of them for every kind.
+WRITE_OUTCOMES = ("refused_by_landlock", "refused_by_filter", "refused_elsewhere", "let_through", "error", "not_tried")
+_WRITE_REFUSED = WRITE_OUTCOMES[:2]
+# The kinds of change the wall refuses that the probe cannot try harmlessly on its own, each with its reason
+# (the record's field ``writes_not_tried``).
+WRITES_NOT_TRIED = {
+    "make_socket_node": "a socket file is made only by binding a new socket, and the wall refuses every new "
+                        "socket first (new_socket)",
+    "device_ioctl": "a device's own commands need a device opened, and the wall lets nothing be opened outside "
+                    "the install, where no device lies (reads_outside)",
+    "move_between_folders": "a move or a link into another folder also makes a name there, which the make kinds "
+                            "show refused",
+}
+# The names the probe uses in the write folder: the two that prepare_write_folder makes for the removals, and the
+# ones the make kinds try to create (absent before the probe; whatever a weak wall let it make stays there for the
+# caller to remove). File names, not figures.
+WRITE_FOLDER_NAMES = {"remove_file": "remove-me", "remove_folder": "remove-me.d", "create_file": "made-file",
+                      "create_folder": "made-folder", "make_fifo": "made-fifo", "make_symlink": "made-symlink",
+                      "make_link": "made-link", "make_char_device": "made-char", "make_block_device": "made-block"}
+_LANDLOCK_RIGHT = {"open_for_write": _FS_WRITE_FILE, "truncate": _FS_TRUNCATE, "create_file": _FS_MAKE_REG,
+                   "create_folder": _FS_MAKE_DIR, "make_fifo": _FS_MAKE_FIFO, "make_symlink": _FS_MAKE_SYM,
+                   "make_link": _FS_MAKE_REG, "make_char_device": _FS_MAKE_CHAR, "make_block_device": _FS_MAKE_BLOCK,
+                   "remove_file": _FS_REMOVE_FILE, "remove_folder": _FS_REMOVE_DIR}
+
+# What a person reads when a wall is not proven: ONE table of words (why_not_proven puts them together). The
+# entries named after a check or a kind say what was tried; the others are whole sentences.
+WORDS = {
+    "not_loaded": "The plugin was not loaded. Before any plugin code runs, the plugin host shuts itself in and "
+                  "then tests that it is shut in; this time the test found a gap, so nothing of the plugin ran.",
+    "reads_outside": "reading a folder outside the Python install",
+    "home_canary": "reading a test file that the host made for this test",
+    "program_start": "starting another program",
+    "new_socket": "opening a new network or local connection",
+    "signal_other": "sending a signal to another of your processes",
+    "signal_other_ways": "reaching another of your processes in other ways (a queued signal, a pipe's signals, "
+                         "its limits)",
+    "metadata_change": "changing the permissions of a test file",
+    "kernel_surface": "kernel calls that only this sandbox refuses",
+    "open_for_write": "opening a test file for writing (nothing was written)",
+    "truncate": "cutting a test file to its own length (nothing was cut off)",
+    "create_file": "making a new file in a test folder",
+    "create_folder": "making a new folder in a test folder",
+    "make_fifo": "making a named pipe in a test folder",
+    "make_symlink": "making a shortcut (a symbolic link) in a test folder",
+    "make_link": "giving a test file a second name (a hard link)",
+    "make_char_device": "making a character device file in a test folder",
+    "make_block_device": "making a block device file in a test folder",
+    "remove_file": "deleting a test file",
+    "remove_folder": "deleting a test folder",
+    "not_refused": "Not shown to be refused: {what}.",
+    "let_through": "A change went through that should have been refused: {what}. It touched only a file or "
+                   "folder made for this test, never one of yours.",
+    "refused_elsewhere": "Refused, but not by the sandbox itself (by the file's own settings or by another "
+                         "security layer), so the test does not show that the sandbox would refuse it: {what}.",
+    "error": "Could not be tested, so it shows nothing: {what}.",
+    "not_tried": "Not tested, because the host gave no usable test file or folder for it: {what}.",
+    "no_landlock": "This system's kernel gives the host no Landlock, the part of Linux the sandbox is built on.",
+    "other_arch": "The sandbox knows x86_64 and aarch64 machines only; this one is {arch}.",
+    "partial": "A step of the sandbox failed while it was being put up, so the host loads nothing.",
+    "what_to_do": "What you can do: run the plugin host on Linux 5.13 or newer with Landlock turned on (most "
+                  "distributions turn it on; otherwise add landlock to the kernel's lsm= boot setting), outside "
+                  "any container or security tool that changes what a process may do with files, and start it "
+                  "again. If it is still refused, keep this message: it says what got through.",
+}
 
 # How far apply_wall has gone in THIS process (a forked child inherits it): the steps that changed the
 # process, the step that failed, and the Landlock scopes in force. A process with a failed step, or with any
 # step, is never walled again.
-_STATE: dict = {"applied": [], "failed": None, "scopes": []}
+_STATE: dict = {"applied": [], "failed": None, "scopes": [], "landlock_handled": 0, "filter_truncate": False}
 
 
 class WallRefused(Exception):
@@ -361,6 +442,7 @@ def _load_seccomp_filter(libc, arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI)
         if result != 0:  # a positive result is the id of a thread that could not be synced
             raise OSError(err or errno.EAGAIN, f"seccomp filter not loaded (result {result})")
     _step("seccomp_filter", load)
+    _STATE["filter_truncate"] = landlock_abi < _TRUNCATE_ABI  # what the loaded program refuses, for the record
 
 
 def _open_paths(read_only_paths) -> list[tuple[int, int]]:
@@ -410,6 +492,7 @@ def _apply_landlock(libc, abi: int, opened: list[tuple[int, int]]) -> None:
         _step("landlock_restrict_self", lambda: _kernel("landlock_restrict_self", *_call(
             libc, _SYS_LANDLOCK_RESTRICT_SELF, ruleset, 0)))
         _STATE["scopes"] = scopes
+        _STATE["landlock_handled"] = struct.unpack_from("<Q", data)[0]  # the rights the ruleset in force handles
     finally:
         os.close(ruleset)
 
@@ -586,12 +669,184 @@ def _kernel_surface() -> None:
     raise PermissionError("every call of the kernel's surface was refused")
 
 
-def probe_wall(canary_path, daemon_pid) -> dict:
+def prepare_write_folder(write_folder) -> None:
+    """Make, in ``write_folder`` (an EMPTY folder of this user that the caller made for the probe), the file and the
+    folder that the probe's removals try to remove (``WRITE_FOLDER_NAMES``). The caller calls it BEFORE
+    ``apply_wall``, and afterwards removes the whole folder with whatever a weak wall let the probe make in it."""
+    folder = os.fspath(write_folder)
+    if os.listdir(folder):
+        raise ValueError("the write folder must be empty: a name already there would make a refusal prove nothing")
+    os.close(os.open(os.path.join(folder, WRITE_FOLDER_NAMES["remove_file"]),
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
+    os.mkdir(os.path.join(folder, WRITE_FOLDER_NAMES["remove_folder"]), 0o700)
+
+
+def _refused_by(kind: str, err) -> str:
+    """Which part of this wall a refusal of ``kind`` belongs to, by the kernel's answer. Landlock answers EACCES
+    and holds the kind only when the ruleset in force handles its right; the filter answers EPERM and holds only
+    truncation, only where it was loaded with the rows for a Landlock ABI below 3. Any other refusal (a file's own
+    flags, another security layer) is ``refused_elsewhere``: it shows nothing of this wall."""
+    applied = _STATE.get("applied", [])
+    if (err == errno.EACCES and "landlock_restrict_self" in applied
+            and _STATE.get("landlock_handled", 0) & _LANDLOCK_RIGHT[kind]):
+        return "refused_by_landlock"
+    if err == errno.EPERM and kind == "truncate" and "seccomp_filter" in applied and _STATE.get("filter_truncate"):
+        return "refused_by_filter"
+    return "refused_elsewhere"
+
+
+def _attempt(kind: str, act, changed=None) -> str:
+    """One write kind, tried once. ``changed`` (when given) says afterwards whether the change took place (a name
+    made or gone), so a call that raised after it changed something is counted as let through."""
+    try:
+        act()
+    except PermissionError as exc:
+        outcome = _refused_by(kind, exc.errno)
+    except Exception:
+        outcome = "error"
+    else:
+        outcome = "let_through"
+    if changed is not None and outcome != "let_through":
+        try:
+            if changed():
+                outcome = "let_through"
+        except Exception:
+            outcome = "error"
+    return outcome
+
+
+def _kind_in(folder_fd: int, name: str):
+    """The file type of ``name`` in the folder (not followed), or None when it is not there. A name of another user
+    is an OSError: a refusal on it would prove nothing."""
+    try:
+        found = os.stat(name, dir_fd=folder_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if found.st_uid != os.geteuid():
+        raise OSError(f"{name} in the write folder is not this user's")
+    return stat.S_IFMT(found.st_mode)
+
+
+def _write_file_usable(path: str) -> bool:
+    """A regular file of this user, writable by its mode: a refusal on anything else would prove nothing."""
+    try:
+        found = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(found.st_mode) and found.st_uid == os.geteuid() and os.access(path, os.W_OK)
+
+
+def _write_folder_fd(folder: str):
+    """An O_PATH descriptor of the write folder, or None when the probe may not use it: a real folder of this user,
+    writable and searchable by its mode, holding the two names prepare_write_folder made and none of the names the
+    make kinds create."""
+    try:
+        fd = os.open(folder, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        found = os.fstat(fd)
+        usable = (stat.S_ISDIR(found.st_mode) and found.st_uid == os.geteuid()
+                  and os.access(folder, os.W_OK | os.X_OK) and os.lstat(folder).st_ino == found.st_ino
+                  and _kind_in(fd, WRITE_FOLDER_NAMES["remove_file"]) == stat.S_IFREG
+                  and _kind_in(fd, WRITE_FOLDER_NAMES["remove_folder"]) == stat.S_IFDIR
+                  and all(_kind_in(fd, name) is None for kind, name in WRITE_FOLDER_NAMES.items()
+                          if not kind.startswith("remove_")))
+    except OSError:
+        usable = False
+    if not usable:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _write_outcomes(write_file, write_folder) -> dict:
+    """The outcome of each kind of ``WRITE_KINDS``, in its order. Each attempt is harmless where it goes through:
+    the file is opened for writing and shut with nothing written, and cut to its own length; the folder gets new
+    names the caller removes, and loses only the two names prepare_write_folder made for that. A kind whose file or
+    folder is not given, or is not one the probe may use, is ``not_tried``."""
+    outcomes = dict.fromkeys(WRITE_KINDS, "not_tried")
+    if write_file is not None:
+        path = os.fspath(write_file)
+        if _write_file_usable(path):
+            size = os.lstat(path).st_size
+            outcomes["open_for_write"] = _attempt("open_for_write", lambda: os.close(
+                os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NOCTTY | os.O_CLOEXEC)))
+            outcomes["truncate"] = _attempt("truncate", lambda: os.truncate(path, size))
+    fd = None if write_folder is None else _write_folder_fd(os.fspath(write_folder))
+    if fd is None:
+        return outcomes
+    name = WRITE_FOLDER_NAMES
+    try:
+        def made(kind):
+            return lambda: _kind_in(fd, name[kind]) is not None
+
+        def gone(kind):
+            return lambda: _kind_in(fd, name[kind]) is None
+        attempts = {
+            "create_file": (lambda: os.mknod(name["create_file"], stat.S_IFREG | 0o600, dir_fd=fd),
+                            made("create_file")),
+            "create_folder": (lambda: os.mkdir(name["create_folder"], 0o700, dir_fd=fd), made("create_folder")),
+            "make_fifo": (lambda: os.mkfifo(name["make_fifo"], 0o600, dir_fd=fd), made("make_fifo")),
+            "make_symlink": (lambda: os.symlink(name["remove_file"], name["make_symlink"], dir_fd=fd),
+                             made("make_symlink")),
+            "make_link": (lambda: os.link(name["remove_file"], name["make_link"], src_dir_fd=fd, dst_dir_fd=fd,
+                                          follow_symlinks=False), made("make_link")),
+            # the device 0:0 names no device at all (as a character device it is the kernel's whiteout)
+            "make_char_device": (lambda: os.mknod(name["make_char_device"], stat.S_IFCHR | 0o600, os.makedev(0, 0),
+                                                  dir_fd=fd), made("make_char_device")),
+            "make_block_device": (lambda: os.mknod(name["make_block_device"], stat.S_IFBLK | 0o600, os.makedev(0, 0),
+                                                   dir_fd=fd), made("make_block_device")),
+            "remove_file": (lambda: os.unlink(name["remove_file"], dir_fd=fd), gone("remove_file")),
+            "remove_folder": (lambda: os.rmdir(name["remove_folder"], dir_fd=fd), gone("remove_folder")),
+        }
+        for kind in WRITE_KINDS:
+            if kind in attempts:
+                outcomes[kind] = _attempt(kind, *attempts[kind])
+    finally:
+        os.close(fd)
+    return outcomes
+
+
+def why_not_proven(record: dict) -> list:
+    """The sentences a person reads when ``record`` is not proven, in order (an empty list when it is): that the
+    plugin was not loaded, each check and each kind of write that did not hold, in plain words, and what they can
+    do. Every word comes from ``WORDS``; the record is read as data, so a record of an older draft reads as not
+    proven with its missing parts named."""
+    if record.get("proven") is True:
+        return []
+    lines = [WORDS["not_loaded"]]
+    for check in RECORD_CHECKS:
+        if record.get(check) is not True:
+            lines.append(WORDS["not_refused"].format(what=WORDS[check]))
+    writes = record.get("writes") if isinstance(record.get("writes"), dict) else {}
+    for kind in WRITE_KINDS:
+        outcome = writes.get(kind, "not_tried")
+        if outcome not in _WRITE_REFUSED:
+            key = outcome if outcome in ("let_through", "refused_elsewhere", "not_tried") else "error"
+            lines.append(WORDS[key].format(what=WORDS[kind]))
+    abi = record.get("landlock_abi")
+    if not isinstance(abi, int) or isinstance(abi, bool) or abi < _MIN_LANDLOCK_ABI:
+        lines.append(WORDS["no_landlock"])
+    if record.get("arch") not in _NR:
+        lines.append(WORDS["other_arch"].format(arch=str(record.get("arch") or "unknown")[:32]))
+    if len(lines) == 1:  # every part held, yet not proven: a step of the wall failed
+        lines.append(WORDS["partial"])
+    lines.append(WORDS["what_to_do"])
+    return lines
+
+
+def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> dict:
     """The record ``wall.v1``: a check the host's own code makes on itself, from inside this process.
 
-    Eight checks are tried; each field is True only when the kernel refused it. ``proven`` is True only when
-    all eight are refused, on a supported arch with Landlock ABI 1 or above, and no step of ``apply_wall``
-    failed in this process. ``landlock_scopes`` names the Landlock scopes ``apply_wall`` put in force (none
+    Eight checks are tried; each field is True only when the kernel refused it. Then each kind of
+    ``WRITE_KINDS`` is tried on ``write_file`` (a file of this user, writable by its mode, that the caller made:
+    the host's canary will do) and in ``write_folder`` (a folder the caller made and gave to
+    ``prepare_write_folder`` before the wall); ``writes`` holds the outcome of each, and ``writes_not_tried``
+    names the kinds that cannot be tried harmlessly, with their reasons. ``proven`` is True only when all eight
+    are refused, every write kind is refused by the part of the wall that holds it, on a supported arch with
+    Landlock ABI 1 or above, and no step of ``apply_wall`` failed in this process; without a write file and
+    folder it is never True. ``landlock_scopes`` names the Landlock scopes ``apply_wall`` put in force (none
     below ABI 6). The record is a self-check, not a proof against a hostile process: it means something only
     when it is made after ``apply_wall`` and before any plugin code is loaded, and when its reader takes it
     only from frames sent before the load. Refuses ``wall_system_unsupported`` where the two system calls
@@ -608,10 +863,13 @@ def probe_wall(canary_path, daemon_pid) -> dict:
         "signal_other_ways": _refused(lambda: _reach_other(daemon_pid)),
         "metadata_change": _refused(lambda: _change_mode(canary)),
         "kernel_surface": _refused(_kernel_surface),
+        "writes": _write_outcomes(write_file, write_folder),
+        "writes_not_tried": dict(WRITES_NOT_TRIED),
         "landlock_abi": _landlock_abi(libc),
         "landlock_scopes": list(_STATE["scopes"]),
         "arch": platform.machine() or "unknown",
     }
     record["proven"] = (all(record[name] for name in RECORD_CHECKS) and record["landlock_abi"] >= _MIN_LANDLOCK_ABI
+                        and all(record["writes"][kind] in _WRITE_REFUSED for kind in WRITE_KINDS)
                         and record["arch"] in _NR and _STATE["failed"] is None)
     return record

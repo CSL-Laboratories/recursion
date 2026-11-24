@@ -26,7 +26,23 @@ Nothing is frozen yet.
 | `transcript.line.v1.json` | 1.0-draft.3 |
 | `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.10 |
 | `session.token.v1.json` | 1.0-draft.1 |
-| `routine.record.v1.json` | 1.0-draft.1 |
+| `routine.record.v1.json` | 1.0-draft.2 |
+
+## A routine record ends with its lease and its budget (Nov 23, 2026)
+
+`routine.record` draft 2; every other schema keeps its draft. The person's admission (a write of the whole
+record) gives it `lease_seconds` and a `budget` of runs; the core keeps `admitted_at`, the `lease` as it
+measures it (`counted` or `wall`), how many runs were `used` and the `last_refusal`. A run asked from the
+record through `run.start`'s one admission path (origin kind `trigger`) is refused `request_invalid` with
+the detail `routine_unknown`, `routine_lease_ended` or `routine_budget_spent` and a plain sentence, and the
+refusal is kept on the record. A change may shorten the lease or lower the budget; one that lengthens or
+raises them is refused `widen_needs_admission`. An origin kind other than `trigger` is refused
+`origin_not_admitted` before anything is written.
+
+| What changed | What it breaks |
+|---|---|
+| Fields `lease_seconds`, `budget`, `admitted_at`, `lease`, `used`, `last_refusal`, all required | A draft 1 record: it has no lease and no budget |
+| Fixtures for the new fields and their three definitions | |
 
 ## The routine record a person writes (Nov 23, 2026)
 

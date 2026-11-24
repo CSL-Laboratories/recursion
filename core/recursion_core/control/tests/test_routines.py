@@ -23,7 +23,7 @@ JOIN_S = 30          # and waits this long for each
 
 def a_record(**changes):
     record = {"record_id": "morning-digest", "plugin": "demo.schedule", "tenant": "default",
-              "engine": "claude_code", "prompt": "Summarise what changed overnight."}
+              "engine": "claude_code", "prompt": "Summarise what changed overnight.", "lease_seconds": 3600}
     record.update(changes)
     return record
 

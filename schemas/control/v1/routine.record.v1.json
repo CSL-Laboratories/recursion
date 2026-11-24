@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "routine.record.v1.json",
   "title": "routine.record.v1: a routine record a person wrote",
-  "x-version": "1.0-draft.1",
-  "description": "The authority a plugin holding 'schedule' asks a run from (host.v1.json x-run-request, record kind 'routine.v1'): WHAT may be started (tenant, engine, prompt) and which plugin may ask for it. WHEN it runs is the plugin's and is not kept here. The core owns the store; only the person writes, changes or removes a record, through the core's own commands, as the owner on the owner-only socket or a paired device (written_by). A plugin's write is refused 'writer_not_allowed' and nothing is stored. record_id, plugin, tenant, engine and prompt are the person's; kind, revision, written_by and written_at are the core's. Every field not listed here is refused.",
+  "x-version": "1.0-draft.2",
+  "description": "The authority a plugin holding 'schedule' asks a run from (host.v1.json x-run-request, record kind 'routine.v1'): WHAT may be started (tenant, engine, prompt) and which plugin may ask for it. WHEN it runs is the plugin's and is not kept here. The core owns the store; only the person writes, changes or removes a record, through the core's own commands, as the owner on the owner-only socket or a paired device (written_by). A plugin's write is refused 'writer_not_allowed' and nothing is stored. record_id, plugin, tenant, engine, prompt, lease_seconds and budget are the person's; kind, revision, written_by, written_at, admitted_at, lease, used and last_refusal are the core's. A run asked from the record is refused once its lease has ended or its budget is spent, and the refusal is kept in last_refusal, where the person reads it. Only the person's new admission (a write of the whole record) gives it a longer lease or a larger budget; a change may only shorten or lower them. Every field not listed here is refused.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -14,8 +14,14 @@
     "tenant",
     "engine",
     "prompt",
+    "lease_seconds",
+    "budget",
     "written_by",
-    "written_at"
+    "written_at",
+    "admitted_at",
+    "lease",
+    "used",
+    "last_refusal"
   ],
   "properties": {
     "kind": {
@@ -55,11 +61,57 @@
       "type": "string",
       "minLength": 1
     },
+    "lease_seconds": {
+      "description": "How long the lease the person gave lasts, in seconds from the admission. null only where the person's settings say that a record written with no lease has none.",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "integer",
+          "minimum": 1
+        }
+      ]
+    },
+    "budget": {
+      "$ref": "#/$defs/budget"
+    },
     "written_by": {
       "$ref": "#/$defs/writer"
     },
     "written_at": {
       "$ref": "common.v1.json#/$defs/timestamp"
+    },
+    "admitted_at": {
+      "description": "When the person last admitted the record whole: its lease and its budget start then.",
+      "$ref": "common.v1.json#/$defs/timestamp"
+    },
+    "lease": {
+      "description": "The lease as the core measures it, or null when the record has none.",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/lease"
+        }
+      ]
+    },
+    "used": {
+      "description": "How many runs were started from the record since its admission.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "last_refusal": {
+      "description": "The last run asked from the record that the core refused, or null.",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/refusal"
+        }
+      ]
     }
   },
   "$defs": {
@@ -80,6 +132,83 @@
         },
         "id": {
           "$ref": "common.v1.json#/$defs/token"
+        }
+      }
+    },
+    "budget": {
+      "description": "How many runs the record may start in one admission.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "limit"
+      ],
+      "properties": {
+        "unit": {
+          "enum": [
+            "runs"
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "lease": {
+      "description": "clock is how the lease is measured: 'counted' (seconds of the machine's monotonic clock summed across restarts within one boot) or 'wall' (the wall clock, never read as earlier than the latest wall time seen). start and ends are seconds on that clock.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clock",
+        "start",
+        "ends"
+      ],
+      "properties": {
+        "clock": {
+          "enum": [
+            "counted",
+            "wall"
+          ]
+        },
+        "start": {
+          "type": "number",
+          "minimum": 0
+        },
+        "ends": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "refusal": {
+      "description": "A run asked from the record and refused: why, when, by which plugin and for which occurrence.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "at",
+        "plugin",
+        "occurrence"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "routine_unknown",
+            "routine_lease_ended",
+            "routine_budget_spent"
+          ]
+        },
+        "at": {
+          "$ref": "common.v1.json#/$defs/timestamp"
+        },
+        "plugin": {
+          "type": "string",
+          "minLength": 1
+        },
+        "occurrence": {
+          "type": "string",
+          "minLength": 1
         }
       }
     }

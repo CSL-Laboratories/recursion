@@ -6,9 +6,22 @@
   "tenant": "default",
   "engine": "claude_code",
   "prompt": "Summarise what changed in the repository overnight.",
+  "lease_seconds": 2592000,
+  "budget": {
+    "unit": "runs",
+    "limit": 100
+  },
   "written_by": {
     "kind": "device",
     "id": "page"
   },
-  "written_at": "2026-11-23T20:00:00.000Z"
+  "written_at": "2026-11-23T20:00:00.000Z",
+  "admitted_at": "2026-11-23T20:00:00.000Z",
+  "lease": {
+    "clock": "counted",
+    "start": 0,
+    "ends": 2592000
+  },
+  "used": 0,
+  "last_refusal": null
 }

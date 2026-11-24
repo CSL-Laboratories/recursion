@@ -1,0 +1,31 @@
+{
+  "kind": "routine.v1",
+  "record_id": "morning-digest",
+  "revision": 1,
+  "plugin": "demo.schedule",
+  "tenant": "default",
+  "engine": "claude_code",
+  "prompt": "Summarise what changed in the repository overnight.",
+  "lease_seconds": 2592000,
+  "budget": {
+    "unit": "runs",
+    "limit": 100
+  },
+  "written_by": {
+    "kind": "owner",
+    "id": "owner"
+  },
+  "written_at": "2026-11-23T20:00:00.000Z",
+  "admitted_at": "2026-11-23T20:00:00.000Z",
+  "lease": {
+    "clock": "counted",
+    "start": 0
+  },
+  "used": 0,
+  "last_refusal": {
+    "code": "routine_lease_ended",
+    "at": "2026-12-23T20:00:01.000Z",
+    "plugin": "demo.schedule",
+    "occurrence": "2026-12-23T20:00:00Z"
+  }
+}

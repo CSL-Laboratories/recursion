@@ -13832,6 +13832,21 @@
       "shows": "Who wrote a routine: a principal that stands for the person."
     },
     {
+      "file": "good/routine.record.v1/h04-a-routine-whose-lease-ended.json",
+      "schema": "routine.record.v1.json",
+      "shows": "A routine whose lease ended: the run asked after it was refused, and the refusal is kept for the person."
+    },
+    {
+      "file": "good/routine.record.v1/h05-a-routine-with-no-lease-on-the-wall-clock.json",
+      "schema": "routine.record.v1.json",
+      "shows": "A routine written with no lease, where the person's settings say that means none."
+    },
+    {
+      "file": "good/routine.record.v1/h06-a-lease-on-the-wall-clock.json",
+      "schema": "routine.record.v1.json#/$defs/lease",
+      "shows": "A lease measured on the wall clock."
+    },
+    {
       "file": "bad/routine.record.v1/b01-a-routine-written-by-a-plugin.json",
       "schema": "routine.record.v1.json",
       "rule": "Only the person writes a routine: a plugin is never its writer.",
@@ -13865,6 +13880,42 @@
       "expect": {
         "keyword": "minLength",
         "at": "/prompt"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/b05-a-budget-in-dollars.json",
+      "schema": "routine.record.v1.json",
+      "rule": "A routine's budget counts runs.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/budget/unit"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/b06-a-lease-on-a-clock-nobody-defined.json",
+      "schema": "routine.record.v1.json",
+      "rule": "A lease is counted or on the wall clock.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/lease/clock"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/b07-a-refusal-nobody-defined.json",
+      "schema": "routine.record.v1.json",
+      "rule": "A kept refusal is one of the start refusals.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/last_refusal/code"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/b08-a-lease-of-no-time.json",
+      "schema": "routine.record.v1.json",
+      "rule": "A lease the person gives lasts at least a second.",
+      "expect": {
+        "keyword": "minimum",
+        "at": "/lease_seconds"
       }
     },
     {
@@ -13940,6 +13991,24 @@
       }
     },
     {
+      "file": "bad/routine.record.v1/m-routine.record.v1.lease-seconds.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'lease_seconds'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.budget.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'budget'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
       "file": "bad/routine.record.v1/m-routine.record.v1.written-by.json",
       "schema": "routine.record.v1.json",
       "rule": "The object described at routine.record.v1.json#/ always carries 'written_by'.",
@@ -13952,6 +14021,42 @@
       "file": "bad/routine.record.v1/m-routine.record.v1.written-at.json",
       "schema": "routine.record.v1.json",
       "rule": "The object described at routine.record.v1.json#/ always carries 'written_at'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.admitted-at.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'admitted_at'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.lease.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'lease'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.used.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'used'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.last-refusal.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'last_refusal'.",
       "expect": {
         "keyword": "required",
         "at": ""
@@ -13982,6 +14087,114 @@
       "expect": {
         "keyword": "required",
         "at": "/written_by"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/u-routine.record.v1.budget.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/budget is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/budget"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.budget.unit.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/budget always carries 'unit'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/budget"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.budget.limit.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/budget always carries 'limit'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/budget"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/u-routine.record.v1.lease.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/lease is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/lease"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.lease.clock.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/lease always carries 'clock'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/lease"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.lease.start.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/lease always carries 'start'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/lease"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.lease.ends.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/lease always carries 'ends'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/lease"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/u-routine.record.v1.refusal.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/refusal is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/last_refusal"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.refusal.code.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/refusal always carries 'code'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/last_refusal"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.refusal.at.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/refusal always carries 'at'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/last_refusal"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.refusal.plugin.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/refusal always carries 'plugin'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/last_refusal"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.refusal.occurrence.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/refusal always carries 'occurrence'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/last_refusal"
       }
     },
     {

@@ -73,6 +73,16 @@ or the other way round) is ``request_invalid`` / ``client_key_reused``, as any r
 request. ``start_params_problem`` is the check of ``tenant``, ``engine`` and ``prompt`` that ``run.start``
 makes, for a caller that must refuse the same values before it starts anything.
 
+Which origins are admitted. ``ADMITTED_RUN_ORIGINS`` is an allow-list of origin kinds: a start whose
+origin's ``kind`` is not on it is refused ``request_invalid`` / ``origin_not_admitted`` before anything is
+written, and a start with no origin is admitted as before. A run asked from a routine record. When the
+API is given the core's routine store (``routines``, ``control/routines.py``), a fresh start whose origin
+is a trigger is first asked of that store (``admit_start``): it is refused ``request_invalid`` with the
+store's code as its detail (``routine_unknown``, ``routine_lease_ended``, ``routine_budget_spent``) and the
+sentence of the one table of words (``text``), or it is charged to the record's budget and goes on. A
+retried start (the same key) is answered as before and charged nothing. With no routine store a trigger
+start is admitted as before.
+
 Stop decisions and launch records are serialised per run, so a slow or hung cleanup on one run never
 queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed during it.
 The registry write is a compare-and-swap on the record's generation, so a stop is also not overwritten by
@@ -90,6 +100,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 
+from recursion_core.control.routines import TEXT as WORDS
 from recursion_core.control.registry import (
     EMPTY, POPULATED, TIMEOUT, KillTree, OwnerLockTable, RunRegistry, StaleGeneration,
 )
@@ -106,6 +117,9 @@ LIST_LIMIT_MAX = 1000  # the most runs one run.list page may ask for
 # How many times a Stop decision whose write came back stale is applied to a fresh read of the record.
 # An empty result that has not landed after the last one answers pending, never stopped.
 STALE_RETRIES = 3
+# The kinds of run origin the one admission path takes. Every other kind is refused (see the module text).
+ADMITTED_RUN_ORIGINS = ("trigger",)
+ORIGIN_NOT_ADMITTED = "origin_not_admitted"
 
 # starter(params) -> {"cgroup"}: the daemon's launch path (route service + cgroup leaf), injected. params
 # carries the API-chosen "run_id", which the starter must launch under.
@@ -138,8 +152,10 @@ def start_params_problem(params: Mapping) -> str | None:
 
 class ControlAPI:
     def __init__(self, registry: RunRegistry, kill_tree: KillTree, starter: Starter, clock: Callable[[], float],
-                 *, confirm_timeout_s: float = 5.0, new_run_id: Callable[[], str] = _new_run_id) -> None:
+                 *, confirm_timeout_s: float = 5.0, new_run_id: Callable[[], str] = _new_run_id,
+                 routines: object | None = None) -> None:
         self._registry, self._kill, self._starter, self._clock = registry, kill_tree, starter, clock
+        self._routines = routines  # the core's routine store, asked before a trigger start (module text)
         self._new_run_id = new_run_id
         self._confirm_timeout_s = confirm_timeout_s
         self._locks_lock = threading.Lock()
@@ -221,6 +237,8 @@ class ControlAPI:
         if problem is not None:
             return {"code": REQUEST_INVALID, "detail": problem}
         origin = dict(origin) if origin is not None else None
+        if origin is not None and origin.get("kind") not in ADMITTED_RUN_ORIGINS:
+            return {"code": REQUEST_INVALID, "detail": ORIGIN_NOT_ADMITTED, "text": WORDS[ORIGIN_NOT_ADMITTED]}
         key = params.get("client_key")
         self._enter_owner()
         try:
@@ -255,6 +273,10 @@ class ControlAPI:
         prior = self._reg("find_start", params["tenant"], key) if start_key is not None else None
         if prior is not None and (prior.get("start_key") != start_key or prior.get("origin") != origin):
             return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
+        if prior is None and origin is not None and self._routines is not None:
+            refusal = self._routines.admit_start(origin)  # the record as it is now; charged when it goes on
+            if refusal is not None:
+                return {"code": REQUEST_INVALID, "detail": refusal["code"], "text": refusal["text"]}
         run_id = prior["run_id"] if prior is not None else self._new_run_id()
         rec = {"run_id": run_id, "tenant": params["tenant"], "engine": params["engine"], "state": "starting",
                "cgroup": None, "started_at": self._clock(), "stop": None, "start_key": start_key}

@@ -22,10 +22,12 @@
     Each saved key and whether the keychain it was saved into is the one that answers now (another one, one made
     after the save, or one that cannot be told), and every use of ``forget``. Asks the bus, never reads a value.
 ``forget <id>``
-    The person's own step for ONE key whose keychain is gone or not the one that answers: removes that key's record
-    and touches no keychain. It asks for the id again on the terminal, takes no option that skips the question and
-    refuses with no terminal; its output says the value may still sit in another keychain, and ``status`` and
-    ``audit`` list every use.
+    The person's own step for ONE key whose value no command can reach from here (its keychain is gone or does not
+    answer): removes that key's record and deletes nothing. It asks for the id again on the terminal, takes no option
+    that skips the question and refuses with no terminal. It refuses (``value_reachable``, nothing changed) while
+    ``remove`` can delete the key where it is: in the owner-only file, or in the keychain that answers. Its output
+    says no keychain that answers here holds the key and the value may still sit in another keychain, and
+    ``status`` and ``audit`` list every use.
 ``audit [--path P ...] [--no-journal]``
     Searches the state folder, the config folder and the journal for every saved value (``audit.py``) and
     names each place a value was found, never the value, and each temp file an interrupted save left in the
@@ -411,7 +413,10 @@ def _remove(args, out, err, store, terminal) -> int:
     else:
         print(f'removed {record.key_id} ({record.provider}, {record.env_name}) from {STORE_TEXT[record.store]}',
               file=out)
-        if 'already_gone' in report:
+        if 'already_gone' in report and record.store == 'owner_file':
+            print(f'note: the value of {record.key_id} was already gone from the owner-only file; its record is '
+                  'removed', file=out)
+        elif 'already_gone' in report:
             print(f'note: the item of {record.key_id} was already gone from that keychain; its record is removed',
                   file=out)
     return 0
@@ -457,8 +462,9 @@ def _forget(args, out, store, terminal) -> int:
     if answer != args.key_id:
         raise KeyStoreError('not_confirmed', f'the record of {args.key_id} was kept')
     store.forget(args.key_id)
-    print(f'forgot the record of {args.key_id}: no keychain was touched, and its value may still sit in another '
-          'keychain; "key status" and "key audit" list this step', file=out)
+    print(f'forgot the record of {args.key_id}: nothing was deleted, and no keychain that answers here holds it; its '
+          'value may still sit in another keychain (the one it was saved into); "key status" and "key audit" list '
+          'this step', file=out)
     return 0
 
 

@@ -115,24 +115,34 @@ KEYCHAIN. One config folder can meet more than one keychain (another session bus
 a keyring of its own, a keyring wiped and made again), and the pin names a backend, not a keychain. So each record of
 a Secret Service save names the keychain its value was saved into: ``keychain``, ``{"collection": <the default
 collection's object path>, "created": <its Created time, seconds>}``, asked of the bus at the save
-(``system.keychain_identity``); a record has no ``keychain`` when the service did not say (and the owner-only file
-needs none: it is the one in the store's folder). ``remove`` of such a record first asks which keychain answers now,
-before anything is changed or recovered:
-- the SAME keychain: the item is deleted; when it was already gone the record is removed all the same, and the
-  removal says so (``report`` gets ``already_gone``);
-- ANOTHER keychain (another collection, or one made before the save): refused ``keychain_other``, nothing changed;
-- one with the record's collection path made AFTER the save (wiped and made again, or another one made since):
-  refused ``keychain_remade``, nothing changed, and the refusal names ``forget``;
-- a record that names no keychain (saved before records named one), or a keychain that does not say which it is:
-  the record's own save, found and deleted there, shows it is the keychain it was saved into (a save id is random
-  per save); when nothing of the id is there the index is written back as it was and the removal is refused
-  ``keychain_unrecorded``, naming ``forget``.
-``forget <id>`` is the person's own step for ONE named key: it removes that key's record (and any unfinished
-operation on it) from the index, touches no keychain and no file, and records its use in the index (``forgotten``:
-the id, when, the store and the keychain the record named). The value may still sit in another keychain. No hook
-or seam reaches it (``hooks.py`` registers the credential source only), and it reads no setting: the command asks
-for the id on the terminal. ``status`` and the audit show each record whose keychain is not the one that answers,
-and every use of ``forget``.
+(``system.keychain_identity``); a record has no ``keychain`` when the service did not say (a ``Created`` of 0 says
+nothing, so two such keychains are never taken for one), and the owner-only file needs none: it is the one in the
+store's folder. ``remove`` of a record first asks where its value is (``_place``), before anything is changed or
+recovered. The identifier is asked first: the keychain that answers is the SAME one when its path and ``Created``
+are the record's. When it is not (or the record or the keychain names none), the record's OWN save is looked for in
+the keychain that answers (``presence`` with the record's save id: a lookup and a listing, nothing changed): a save
+id is random per save, so only the keychain that holds that save can show it, and that keychain is taken for the
+one it was saved into whatever its identifier says. No other item of the id counts. Then:
+- the SAME keychain, or one holding the record's own save: the items of the id are deleted; when none was left the
+  record is removed all the same, and the removal says so (``report`` gets ``already_gone``);
+- ANOTHER keychain (another collection, or one made before the save) without the save: refused ``keychain_other``,
+  nothing changed, and the refusal names the keychain the key was saved into (the last part of its path and the
+  day it was made: neither is secret) and that ``remove`` deletes it where that keychain answers;
+- one with the record's collection path made AFTER the save (wiped and made again, or another one made since)
+  without the save: refused ``keychain_remade``, nothing changed, and the refusal names ``forget``;
+- a record that names no keychain (saved before records named one), or a keychain that does not say which it is,
+  without the save: refused ``keychain_unrecorded``, nothing changed, naming ``forget``.
+Two keychains at one path that say the same ``Created`` (made in the same second) are still taken for one: with
+the item gone from the one that answers, the record is removed and the removal says the item was already gone.
+``forget <id>`` is the person's own step for ONE named key whose value no command can reach from here: it removes
+that key's record (and any unfinished operation on it) from the index, deletes nothing, and records its use in the
+index (``forgotten``: the id, when, the store and the keychain the record named). It refuses ``value_reachable``,
+changing nothing, while ``remove`` can delete the key where it is: a record of the owner-only file, or one whose
+keychain answers or holds its own save (asked as ``remove`` asks); with no keychain of its kind answering here it
+asks nothing. So once it has run, the value may still sit only in another keychain. No hook or seam reaches it
+(``hooks.py`` registers the credential source only), and it reads no setting: the command asks for the id on the
+terminal. ``status`` and the audit show each record whose value is not where ``remove`` can reach it (asked the
+same way), and every use of ``forget``.
 """
 from __future__ import annotations
 
@@ -287,7 +297,7 @@ def _keychain_parsed(entry: dict) -> tuple | None | bool:
     path, created = found['collection'], found['created']
     if not isinstance(path, str) or len(path) > 4096 or _object_path(path) != path:
         return False
-    if type(created) is not int or created < 0:
+    if type(created) is not int or created < 1:      # 0 is never written: a service that says 0 says nothing
         return False
     return path, created
 
@@ -450,6 +460,31 @@ class KeyStore:
         self._write_index(folder, recovered)
         return recovered
 
+    @staticmethod
+    def _place(backend, record: KeyRecord) -> str:
+        """Where ``record``'s value is against the keychain that answers (KEYCHAIN): ``where`` by the identifier,
+        then, when that is not 'same', 'held' when the record's own save is in the keychain that answers. A keychain
+        that cannot be asked raises its typed refusal, and nothing has been changed."""
+        named = record.store == 'secret_service' and record.keychain is not None
+        place = where(record, backend.identity() if named else None)
+        if place != 'same' and backend.name == 'secret_service' and backend.presence(record.key_id, record.save_id):
+            return 'held'
+        return place
+
+    def _out_of_reach(self, index: Index, record: KeyRecord) -> None:
+        """For ``forget``: refuse ``value_reachable`` while ``remove`` can delete the key where it is (KEYCHAIN)."""
+        if record.store == 'owner_file':
+            raise _reachable(record.key_id, 'is in the owner-only file in its folder')
+        try:
+            backend = self._removal_backend(index.backend, index.store_id)
+        except KeyStoreError:
+            return                               # no keychain of its kind answers here: nothing here can reach it
+        place = self._place(backend, record)
+        if place == 'same':
+            raise _reachable(record.key_id, 'was saved into the keychain that answers now')
+        if place == 'held':
+            raise _reachable(record.key_id, 'is in the keychain that answers now (its own save is there)')
+
     # -- commands ----------------------------------------------------------------------------------
     def add(self, key_id: str, provider: str, env_name: str, value: str, *, metered_spend_allowed: bool = False,
             cap_usd: float = 0) -> KeyRecord:
@@ -548,10 +583,9 @@ class KeyStore:
                 self._unnamed(folder, index, key_id)     # a value only the store's own file holds, or key_unknown
                 return None
             backend = self._removal_backend(index.backend, index.store_id)
-            place = 'same' if record is None else where(
-                record, backend.identity() if record.store == 'secret_service' and record.keychain is not None else None)
-            if place in ('other', 'remade'):
-                raise _elsewhere(key_id, place)        # before anything is changed or recovered
+            place = 'same' if record is None else self._place(backend, record)
+            if place not in ('same', 'held'):
+                raise _elsewhere(record, place)        # before anything is changed or recovered
             index = self._recover(folder, index, backend, but=key_id)
             keys = {kid: rec for kid, rec in index.keys.items() if kid != key_id}
             others = {kid: p for kid, p in index.pending.items() if kid != key_id}
@@ -560,9 +594,6 @@ class KeyStore:
             now = _now(self._clock)
             self._write_index(folder, replace(index, pending={**others, key_id: Pending(key_id, 'remove', now, save_id)}))
             found = backend.delete(key_id, folder)   # every value of the id in this store, and no other id's, or it refuses
-            if not found and place in ('unrecorded', 'unknown'):
-                self._write_index(folder, index)       # as it was: which keychain held the value cannot be told
-                raise _elsewhere(key_id, 'unrecorded')
             self._write_index(folder, replace(index, keys=keys, pending=others))
             if not found and record is not None and report is not None:
                 report.append('already_gone')
@@ -570,8 +601,9 @@ class KeyStore:
 
     def forget(self, key_id: str) -> KeyRecord | None:
         """The person's own step for ONE named key (KEYCHAIN): remove its record and any unfinished operation on it
-        from the index, touch no keychain and no file, and record the use. Returns the record, or None when only an
-        unfinished operation named the id."""
+        from the index, delete nothing, and record the use. Refused ``value_reachable``, nothing changed, while
+        ``remove`` can delete the key where it is. Returns the record, or None when only an unfinished operation
+        named the id."""
         problem = v.id_problem(key_id)
         if problem is not None:
             raise KeyStoreError('id_invalid', problem)
@@ -584,6 +616,8 @@ class KeyStore:
             record = index.keys.get(key_id)
             if record is None and key_id not in index.pending:
                 raise KeyStoreError('key_unknown', f'{key_id} is not saved')
+            if record is not None:
+                self._out_of_reach(index, record)
             used = Forgotten(key_id, _now(self._clock), record.store if record is not None else index.backend,
                              record.keychain if record is not None else None)
             self._write_index(folder, replace(
@@ -603,7 +637,14 @@ class KeyStore:
         except KeyStoreError as exc:
             return index, {}, exc.code
         now = backend.identity() if backend.name == 'secret_service' else None
-        return index, {kid: where(record, now) for kid, record in sorted(index.keys.items())}, None
+        places = {}
+        for kid, record in sorted(index.keys.items()):
+            places[kid] = where(record, now)
+            if places[kid] != 'same' and backend.name == 'secret_service':
+                with contextlib.suppress(KeyStoreError):         # a keychain that cannot tell: the identifier's word
+                    if backend.presence(kid, record.save_id):
+                        places[kid] = 'same'                     # its own save is there: see KEYCHAIN
+        return index, places, None
 
     def list(self) -> Index:
         """The index: the pinned backend, every key's record and every unfinished operation. Touches no backend."""
@@ -743,19 +784,34 @@ class KeyStore:
         raise KeyRefused(connection_id, code)
 
 
-def _elsewhere(key_id: str, place: str) -> KeyStoreError:
+def _named(keychain: tuple) -> str:
+    """A keychain as a person can find it: the last part of its collection path and the day it was made (UTC)."""
+    day = time.strftime('%Y-%m-%d', time.gmtime(keychain[1]))
+    return f'the keychain "{keychain[0].rsplit("/", 1)[-1]}" made on {day} (UTC)'
+
+
+def _elsewhere(record: KeyRecord, place: str) -> KeyStoreError:
+    key_id = record.key_id
     step = (f'If its value is gone for good, "key forget {key_id}" removes the record of this one key (yours alone to '
             'take); the value may still sit in another keychain')
     if place == 'other':
-        return KeyStoreError('keychain_other', f'{key_id} was saved into another keychain than the one that answers now; '
-                             'it is removed only where that keychain answers. Nothing was changed')
+        return KeyStoreError('keychain_other', f'{key_id} was saved into another keychain than the one that answers now: '
+                             f'into {_named(record.keychain)}, and the keychain that answers holds no item of it. '
+                             f'Nothing was changed. "key remove {key_id}" where that keychain answers (the session or '
+                             'machine the key was saved on) deletes it')
     if place == 'remade':
         return KeyStoreError('keychain_remade', f'the keychain that answers now was made after {key_id} was saved (wiped '
-                             f'and made again, or another one) and is not the one it was saved into. Nothing was '
-                             f'changed. {step}')
+                             f'and made again, or another one) and holds no item of {key_id}; it was saved into '
+                             f'{_named(record.keychain)}. Nothing was changed. {step}')
     return KeyStoreError('keychain_unrecorded', f'the keychain that answers holds no item of {key_id}, and which keychain '
                          'it was saved into is not known (its record names none, or this keychain does not say which '
                          f'it is). Nothing was changed. {step}')
+
+
+def _reachable(key_id: str, where_it_is: str) -> KeyStoreError:
+    return KeyStoreError('value_reachable', f'{key_id} {where_it_is}, so "key remove {key_id}" deletes it there, with '
+                         'its record (and removes the record alone if its item is already gone). "key forget" is only '
+                         'for a key whose value no command can reach from here. Nothing was changed')
 
 
 def _parse_index(raw: bytes) -> Index | None:

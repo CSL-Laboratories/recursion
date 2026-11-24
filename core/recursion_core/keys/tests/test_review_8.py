@@ -106,7 +106,8 @@ class RemoveTellsTheKeychainsApartTest(Case):
         detail = self.refused(system, 'keychain_other')
         self.assertNotIn('forget', detail)
         self.assertEqual(other.items, {})
-        self.assertEqual([argv for argv, _ in system.calls if argv[0].endswith('secret-tool')], [])
+        self.assertEqual([argv[1] for argv, _ in system.calls if argv[0].endswith('secret-tool')
+                          and argv[1] not in ('lookup', 'search')], [])     # asked whether it holds the save, no more
 
     def test_an_older_keychain_at_the_same_path_is_another_one(self) -> None:
         system, _ = self.keychain((LOGIN, LOGIN_CREATED - 1))
@@ -165,7 +166,8 @@ class ForgetTest(Case):
     def test_forget_removes_one_record_touches_no_keychain_and_is_recorded(self) -> None:
         self.add(self.store(self.system), key_id='other-key', value=OTHER)
         asked = len(self.system.calls)
-        self.assertEqual(self.store(self.system).forget('codex-key').key_id, 'codex-key')
+        elsewhere, _ = self.keychain((SESSION, 1))                     # forget is for a key whose keychain is gone
+        self.assertEqual(self.store(elsewhere).forget('codex-key').key_id, 'codex-key')
         self.assertEqual(self.system.calls[asked:], [])                 # no keychain and no bus was asked
         index = self.store(self.system).list()
         self.assertEqual(set(index.keys), {'other-key'})
@@ -181,7 +183,7 @@ class ForgetTest(Case):
 
     def test_the_command_asks_for_the_id_again_and_nothing_else_takes_the_step(self) -> None:
         terminal = Terminal(['codex-key'])
-        status, out, err = self.main('forget', 'codex-key', terminal=terminal)
+        status, out, err = self.main('forget', 'codex-key', terminal=terminal, system=self.keychain((SESSION, 1))[0])
         self.assertEqual((status, err), (0, ''))
         self.assertIn('Type the id again', terminal.prompts[0])
         self.assertIn('its value may still sit in another keychain', out)
@@ -236,8 +238,9 @@ class StatusAndAuditTest(Case):
 
     def test_status_and_the_audit_list_every_use_of_forget(self) -> None:
         self.add(self.store(self.system), key_id='other-key', value=OTHER)
-        self.store(self.system).forget('codex-key')
-        self.store(self.system).forget('other-key')
+        elsewhere, _ = self.keychain((SESSION, 1))                     # forget is for a key whose keychain is gone
+        self.store(elsewhere).forget('codex-key')
+        self.store(elsewhere).forget('other-key')
         status, out, _ = self.main('status')
         self.assertEqual([line.split(' at ')[0] for line in out.splitlines() if line.startswith('forgotten: ')],
                          ['forgotten: codex-key', 'forgotten: other-key'])

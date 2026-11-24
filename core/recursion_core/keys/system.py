@@ -226,7 +226,8 @@ def keychain_identity(system: System) -> tuple | None:
     in seconds. Read through ``busctl``, else ``dbus-send``; None when neither answers in that shape (a service that
     offers no default collection or no ``Created``). It reads properties only: no item, and nothing secret, so it
     answers while the collection is locked. A collection that was wiped and made again keeps its path and gets a new
-    ``Created``; another keyring (another bus, a container) has its own."""
+    ``Created``; another keyring (another bus, a container) has its own. A ``Created`` of 0 is a service that does
+    not say when the collection was made: two such keychains at one path could not be told apart, so it gives None."""
     for name, ask in (('busctl', _busctl_identity), ('dbus-send', _dbus_send_identity)):
         tool = system.which(name)
         if tool is not None:
@@ -257,7 +258,7 @@ def _busctl_identity(system: System, tool: str) -> tuple | None:
     words = text.split() if text else []
     if len(words) != 2 or words[0] != 't' or not (words[1].isascii() and words[1].isdigit()):
         return None
-    return path, int(words[1])
+    return (path, int(words[1])) if int(words[1]) > 0 else None     # 0: the service does not say
 
 
 def _dbus_send_identity(system: System, tool: str) -> tuple | None:
@@ -273,7 +274,7 @@ def _dbus_send_identity(system: System, tool: str) -> tuple | None:
     words = text.split() if text else []
     if len(words) < 3 or words[-3:-1] != ['variant', 'uint64'] or not (words[-1].isascii() and words[-1].isdigit()):
         return None
-    return path, int(words[-1])
+    return (path, int(words[-1])) if int(words[-1]) > 0 else None   # 0: the service does not say
 
 
 def _call(system: System, argv: list) -> str | None:

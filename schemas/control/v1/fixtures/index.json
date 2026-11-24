@@ -13815,6 +13815,183 @@
         "keyword": "required",
         "at": ""
       }
+    },
+    {
+      "file": "good/routine.record.v1/h01-a-routine-the-owner-wrote.json",
+      "schema": "routine.record.v1.json",
+      "shows": "A routine record the owner wrote: what may be started and which plugin may ask for it."
+    },
+    {
+      "file": "good/routine.record.v1/h02-a-routine-changed-from-a-paired-device.json",
+      "schema": "routine.record.v1.json",
+      "shows": "The same routine after two changes, the last from a paired device."
+    },
+    {
+      "file": "good/routine.record.v1/h03-the-writer.json",
+      "schema": "routine.record.v1.json#/$defs/writer",
+      "shows": "Who wrote a routine: a principal that stands for the person."
+    },
+    {
+      "file": "bad/routine.record.v1/b01-a-routine-written-by-a-plugin.json",
+      "schema": "routine.record.v1.json",
+      "rule": "Only the person writes a routine: a plugin is never its writer.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/written_by/kind"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/b02-a-routine-for-the-host.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The plugin that may ask is a plugin, never the host.",
+      "expect": {
+        "keyword": "not",
+        "at": "/plugin"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/b03-a-record-id-with-a-slash.json",
+      "schema": "routine.record.v1.json",
+      "rule": "A record id is the form run.request names.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/record_id"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/b04-a-routine-with-an-empty-prompt.json",
+      "schema": "routine.record.v1.json",
+      "rule": "A routine names what is started: its prompt is not empty.",
+      "expect": {
+        "keyword": "minLength",
+        "at": "/prompt"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/u-routine.record.v1.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.kind.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'kind'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.record-id.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'record_id'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.revision.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'revision'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.plugin.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'plugin'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.tenant.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'tenant'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.engine.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'engine'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.prompt.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'prompt'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.written-by.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'written_by'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.written-at.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'written_at'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/u-routine.record.v1.writer.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/writer is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/written_by"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.writer.kind.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/writer always carries 'kind'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/written_by"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.writer.id.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/$defs/writer always carries 'id'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/written_by"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/f-routine.record.v1.kind.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The value at /kind is fixed by routine.record.v1.json#/properties/kind.",
+      "expect": {
+        "keyword": "const",
+        "at": "/kind"
+      }
     }
   ]
 }

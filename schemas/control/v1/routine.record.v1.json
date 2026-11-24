@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "routine.record.v1.json",
+  "title": "routine.record.v1: a routine record a person wrote",
+  "x-version": "1.0-draft.1",
+  "description": "The authority a plugin holding 'schedule' asks a run from (host.v1.json x-run-request, record kind 'routine.v1'): WHAT may be started (tenant, engine, prompt) and which plugin may ask for it. WHEN it runs is the plugin's and is not kept here. The core owns the store; only the person writes, changes or removes a record, through the core's own commands, as the owner on the owner-only socket or a paired device (written_by). A plugin's write is refused 'writer_not_allowed' and nothing is stored. record_id, plugin, tenant, engine and prompt are the person's; kind, revision, written_by and written_at are the core's. Every field not listed here is refused.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "record_id",
+    "revision",
+    "plugin",
+    "tenant",
+    "engine",
+    "prompt",
+    "written_by",
+    "written_at"
+  ],
+  "properties": {
+    "kind": {
+      "const": "routine.v1"
+    },
+    "record_id": {
+      "description": "The id a run.request names (host.v1.json x-run-request record_id).",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,64}$"
+    },
+    "revision": {
+      "$ref": "common.v1.json#/$defs/revision"
+    },
+    "plugin": {
+      "description": "The one plugin that may ask for a run from this record.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.-]{1,63}$",
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "[\\r\\n]"
+          },
+          {
+            "const": "host"
+          }
+        ]
+      }
+    },
+    "tenant": {
+      "$ref": "common.v1.json#/$defs/tenant"
+    },
+    "engine": {
+      "type": "string",
+      "minLength": 1
+    },
+    "prompt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "written_by": {
+      "$ref": "#/$defs/writer"
+    },
+    "written_at": {
+      "$ref": "common.v1.json#/$defs/timestamp"
+    }
+  },
+  "$defs": {
+    "writer": {
+      "description": "Who wrote the record last: a principal that stands for the person. The server derives it from the way the request came in; it is never read from the request.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "id"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "owner",
+            "device"
+          ]
+        },
+        "id": {
+          "$ref": "common.v1.json#/$defs/token"
+        }
+      }
+    }
+  }
+}

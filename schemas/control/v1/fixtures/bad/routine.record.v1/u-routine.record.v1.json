@@ -1,0 +1,15 @@
+{
+  "kind": "routine.v1",
+  "record_id": "morning-digest",
+  "revision": 1,
+  "plugin": "demo.schedule",
+  "tenant": "default",
+  "engine": "claude_code",
+  "prompt": "Summarise what changed in the repository overnight.",
+  "written_by": {
+    "kind": "owner",
+    "id": "owner"
+  },
+  "written_at": "2026-11-23T20:00:00.000Z",
+  "colour": "blue"
+}

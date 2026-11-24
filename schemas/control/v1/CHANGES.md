@@ -26,6 +26,22 @@ Nothing is frozen yet.
 | `transcript.line.v1.json` | 1.0-draft.3 |
 | `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.10 |
 | `session.token.v1.json` | 1.0-draft.1 |
+| `routine.record.v1.json` | 1.0-draft.1 |
+
+## The routine record a person writes (Nov 23, 2026)
+
+New file `routine.record.v1.json`, draft 1; every other schema keeps its draft. The record a plugin holding
+`schedule` names in a `run.request` (record kind `routine.v1`, the one kind `host.v1.json` lists) is now a
+record the core keeps: what may be started (`tenant`, `engine`, `prompt`) and the one `plugin` that may ask.
+Only the person writes, changes or removes it, through the core's own commands
+(`recursion_core/control/routines.py`), as the owner or a paired device (`written_by`); any other writer is
+refused `writer_not_allowed` and nothing is stored. A change names the `revision` it read; an older one is
+refused `conflict`.
+
+| What changed | What it breaks |
+|---|---|
+| New schema `routine.record.v1.json` with its fixtures | Nothing: no record of this kind existed |
+| The person's commands answer `ok` or one of `routine_invalid`, `writer_not_allowed`, `routine_unknown`, `conflict`, each with its plain sentence | Nothing on the wire: no control method carries them yet |
 
 ## After two reads of the fifth read's answer (Nov 14, 2026)
 
@@ -604,3 +620,4 @@ A schema leaves draft when every lane in its row has a fixture here that passes.
 | `transcript.line` | TUI, EVENTS |
 | `methods` | CONTROL, MCP, PAGE, TUI, SESSIONS, EVENTS, APPROVALS, WORKSPACE, QUOTA, ROUTING, KEYS, INSTALL, PLUGIN-HOST, DELEGATION |
 | `session.token` | CONTROL, DELEGATION, STOP |
+| `routine.record` | CONTROL, PLUGIN-HOST |

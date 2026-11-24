@@ -81,8 +81,8 @@ from recursion_core.control_transport.framing import MAX_FRAME_BYTES
 from recursion_core.control_transport.unix import UnixControlClient, refuse_remote_bind, require_unix_transport
 
 from .codec import (BUSY_MESSAGE, HELLO_OP, NOT_ADMITTED_MESSAGE, RELAY_OP_PREFIX, RELAY_VERSION, UNAVAILABLE,
-                    Message, ascii_text, copyable_id, daemon_reply, frame_refusal, read_message, relay_error,
-                    write_message)
+                    Message, RefusedFrame, ascii_text, copyable_id, daemon_reply, frame_refusal, read_message,
+                    relay_error, write_message)
 from .pairing import DEVICE_SCOPES, PairingRefused, device_scopes
 from .rights import FULL_RIGHTS, NEEDS_ALL, key_rights, needs
 
@@ -299,6 +299,9 @@ class Relay:
                 if op == HELLO_OP:
                     return self.hello(request), False
                 return relay_error("unknown_relay_op", delivered=False, detail=op[:64], request=request), False
+            if isinstance(request, RefusedFrame):
+                # A body the socket refuses on read: never forwarded, whatever a later duplicate key made of it.
+                return relay_error("bad_frame", delivered=False, detail=request.detail, request=request), False
             missing = needs(self.rights, request)
             if missing is not None:
                 # The relay's own lock: refused here, before the frame can reach the daemon.

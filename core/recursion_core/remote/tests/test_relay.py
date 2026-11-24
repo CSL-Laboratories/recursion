@@ -752,5 +752,83 @@ class RelayMainRightsAndCapsTests(unittest.TestCase):
         self.assertEqual(daemon.seen, [])
 
 
+# Values the control socket refuses on read, each written before a later duplicate of its key.
+HIDDEN_BY_A_DUPLICATE = (b"NaN", b"Infinity", b"1e999", b'"\\ud800"')
+
+
+def hidden_body(value: bytes, request_id: bytes = b"7") -> bytes:
+    return b'{"id":' + request_id + b',"op":"x","a":' + value + b',"a":1}'
+
+
+def framed(body: bytes) -> bytes:
+    return HEADER.pack(len(body)) + body
+
+
+@unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")
+class RelayRefusedBodyTests(unittest.TestCase):
+    def test_a_refused_value_under_a_later_duplicate_key_is_never_forwarded(self) -> None:
+        for value in HIDDEN_BY_A_DUPLICATE:
+            with self.subTest(value=value):
+                daemon = support.SocketDaemon(self)
+                out = io.BytesIO()
+                stream = framed(hidden_body(value)) + frames({"op": "control", "method": "run.list", "params": {},
+                                                              "id": 8})
+                self.assertEqual(Relay(environ=daemon.environ).serve(io.BytesIO(stream), out), EXIT_OK)
+                refused, served = read_all(out.getvalue())
+                self.assertEqual((refused["error"]["code"], refused["error"]["layer"], refused["error"]["delivered"],
+                                  refused["id"]), ("bad_frame", "relay", False, 7))
+                self.assertEqual((served["id"], served["result"]["method"]), (8, "run.list"))
+                self.assertEqual(daemon.server.accepted, 1)
+                self.assertEqual([message["id"] for message in daemon.seen], [8])
+
+    def test_the_refused_body_keeps_only_its_id(self) -> None:
+        for value in HIDDEN_BY_A_DUPLICATE:
+            with self.subTest(value=value):
+                message = codec.read_message(io.BytesIO(framed(hidden_body(value))))
+                self.assertIsInstance(message, codec.RefusedFrame)
+                self.assertEqual(message, {"id": 7})
+        no_id = codec.read_message(io.BytesIO(framed(b'{"op":"x","a":NaN,"a":1}')))
+        self.assertEqual(no_id, {})
+
+    def test_a_refused_body_is_bad_frame_also_for_a_device_key(self) -> None:
+        daemon = support.SocketDaemon(self)
+        relay = Relay(environ=daemon.environ, device_id="dev_phone")
+        reply = relay.handle(codec.read_message(io.BytesIO(framed(hidden_body(b"NaN")))))
+        self.assertEqual((reply["error"]["code"], reply["error"]["delivered"], reply["id"]), ("bad_frame", False, 7))
+        self.assertEqual(daemon.server.accepted, 0)
+
+    def test_an_id_that_cannot_be_framed_again_is_left_out(self) -> None:
+        daemon = support.SocketDaemon(self)
+        out = io.BytesIO()
+        body = b'{"id":"\\udfff","op":"x","a":NaN,"a":1}'
+        self.assertEqual(Relay(environ=daemon.environ).serve(io.BytesIO(framed(body)), out), EXIT_OK)
+        (reply,) = read_all(out.getvalue())
+        self.assertEqual((reply["error"]["code"], reply["error"]["delivered"]), ("bad_frame", False))
+        self.assertNotIn("id", reply)
+        self.assertEqual(daemon.server.accepted, 0)
+
+    def test_a_duplicate_key_alone_or_a_sound_surrogate_pair_is_forwarded_as_the_socket_reads_it(self) -> None:
+        daemon = support.SocketDaemon(self)
+        out = io.BytesIO()
+        bodies = (b'{"id":1,"op":"control","method":"run.list","params":{"a":1,"a":2}}',
+                  b'{"id":2,"op":"control","method":"run.list","params":{"a":"\\ud83d\\ude00","a":3}}',
+                  b'{"id":3,"op":"control","method":"run.list","params":{"a":["\\ud83d\\ude00"]}}')
+        stream = b"".join(framed(body) for body in bodies)
+        self.assertEqual(Relay(environ=daemon.environ).serve(io.BytesIO(stream), out), EXIT_OK)
+        self.assertEqual([reply["result"]["params"] for reply in read_all(out.getvalue())],
+                         [{"a": 2}, {"a": 3}, {"a": ["\U0001f600"]}])
+        self.assertEqual(daemon.server.accepted, 3)
+
+    def test_a_lone_surrogate_in_a_list_or_a_key_under_a_duplicate_is_refused(self) -> None:
+        daemon = support.SocketDaemon(self)
+        out = io.BytesIO()
+        bodies = (b'{"id":1,"op":"x","a":["\\ud800"],"a":1}', b'{"id":2,"op":"x","a":{"\\udc00":1},"a":1}')
+        self.assertEqual(Relay(environ=daemon.environ).serve(io.BytesIO(b"".join(framed(b) for b in bodies)), out),
+                         EXIT_OK)
+        self.assertEqual([(reply["error"]["code"], reply["id"]) for reply in read_all(out.getvalue())],
+                         [("bad_frame", 1), ("bad_frame", 2)])
+        self.assertEqual(daemon.server.accepted, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

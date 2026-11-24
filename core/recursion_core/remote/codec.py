@@ -25,6 +25,7 @@ delivered, and invite a duplicate.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, BinaryIO
 
 from recursion_core.control_transport.errors import FrameError
@@ -44,6 +45,76 @@ DELIVERED_VALUES = (False, "unknown", True)
 # The socket's accept-path frames, as the far client must see them: byte for byte what the socket sent.
 BUSY_MESSAGE: Message = decode_body(BUSY_FRAME[HEADER.size:])
 NOT_ADMITTED_MESSAGE: Message = decode_body(NOT_ADMITTED_FRAME[HEADER.size:])
+
+
+# A JSON escape in the range \uD800-\uDFFF, as the socket's own reader looks for it (framing.decode_body).
+_SURROGATE_ESCAPE = re.compile(rb"\\u[dD][89a-fA-F]")
+
+
+class RefusedFrame(dict):
+    """A whole frame the control socket refuses on read: only its ``id`` is kept, and its ``op`` when that
+    op is one of the relay's own (``relay_``), which the relay answers itself and never forwards.
+
+    ``read_message`` returns it so that the relay can answer that one frame ``bad_frame``, not delivered,
+    with the frame's id, and read the next one. Nothing in it can be forwarded: it holds no method, no
+    params and no op that reaches the daemon.
+    """
+
+    def __init__(self, detail: str, kept: dict[str, Any] | None = None) -> None:
+        super().__init__(kept or {})
+        self.detail = detail
+
+
+def _lone_surrogate(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+def _pairs_hold_a_lone_surrogate(pairs: list[tuple[str, Any]]) -> dict:
+    """``object_pairs_hook``: every key and every string value of an object, those a later duplicate
+    key overwrites included, is looked at before the object is made. Raises on a lone surrogate."""
+    stack: list[Any] = [item for pair in pairs for item in pair]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, str):
+            if _lone_surrogate(value):
+                raise ValueError("lone surrogate")
+        elif isinstance(value, list):
+            stack.extend(value)
+    return dict(pairs)
+
+
+def _hides_a_lone_surrogate(body: bytes) -> bool:
+    """True when a lone-surrogate escape stands anywhere in ``body``, also under a key a later duplicate
+    overwrites, where the socket's own reader no longer sees it."""
+    if not _SURROGATE_ESCAPE.search(body):
+        return False
+    try:
+        json.loads(body.decode("utf-8"), object_pairs_hook=_pairs_hold_a_lone_surrogate)
+    except RecursionError:
+        return True  # cannot be looked at whole: not forwarded
+    except ValueError:
+        return True
+    return False
+
+
+def _refused(body: bytes, exc: Exception) -> RefusedFrame:
+    """The refused frame's id, read with a plain parse only to find it, or ``exc`` when the body is not one
+    JSON object at all (no sound boundary: the caller ends the session)."""
+    try:
+        message = json.loads(body.decode("utf-8"))
+    except (RecursionError, UnicodeDecodeError, ValueError):
+        raise exc from None
+    if not isinstance(message, dict):
+        raise exc from None
+    kept = {"id": message["id"]} if "id" in message else {}
+    op = message.get("op")
+    if type(op) is str and op.startswith(RELAY_OP_PREFIX):
+        kept["op"] = op  # answered by the relay as before: a relay op never reaches the daemon
+    return RefusedFrame("frame_not_json", kept)
 
 
 def read_exact(stream: BinaryIO, n: int) -> bytes | None:
@@ -74,9 +145,13 @@ def read_message(stream: BinaryIO, *, max_bytes: int = MAX_FRAME_BYTES) -> Messa
 
     A whole body that is one JSON object but holds a value the control socket refuses on read (NaN,
     Infinity, a number too large for a float, a lone surrogate written as an escape) leaves the boundary
-    sound. It is returned as ``json.loads`` reads it, so that the relay refuses that one frame
-    (``frame_refusal``: ``bad_frame``, not delivered, its id kept when it can be framed again), sends
-    nothing, and reads the next frame.
+    sound. It is returned as a ``RefusedFrame`` that keeps only the frame's id (and an op of the relay's
+    own, which the relay answers itself and never forwards), so that the relay refuses
+    that one frame (``bad_frame``, not delivered, its id kept when it can be framed again), sends nothing,
+    and reads the next frame. That holds also when a later duplicate key overwrites the refused value
+    (``{"a": NaN, "a": 1}``): a plain parse would return a clean object, and the relay would deliver a
+    frame made from a body the socket refuses. A lone-surrogate escape under an overwritten key is
+    refused the same way, although the socket's own reader keeps only the later value.
     """
     header = read_exact(stream, HEADER.size)
     if header is None:
@@ -88,17 +163,14 @@ def read_message(stream: BinaryIO, *, max_bytes: int = MAX_FRAME_BYTES) -> Messa
     if body is None:
         raise FrameError("frame_truncated")
     try:
-        return decode_body(body)
+        message = decode_body(body)
     except FrameError as exc:
         if str(exc) != "frame_not_json":
             raise
-        try:
-            message = json.loads(body.decode("utf-8"))
-        except (RecursionError, UnicodeDecodeError, ValueError):
-            raise exc from None
-        if not isinstance(message, dict):
-            raise exc from None
-        return message
+        return _refused(body, exc)
+    if _hides_a_lone_surrogate(body):
+        return _refused(body, FrameError("frame_not_json"))
+    return message
 
 
 def write_message(stream: BinaryIO, message: Message, *, max_bytes: int = MAX_FRAME_BYTES) -> None:

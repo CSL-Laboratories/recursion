@@ -88,7 +88,11 @@ restrict,command="/usr/bin/env PYTHONPATH=/path/to/recursion/core /usr/bin/pytho
   client asked for anything but `recursiond relay` (sshd passes the client's command in
   `SSH_ORIGINAL_COMMAND`), so the key cannot be used for a shell or scp through it.
 * `-P` keeps the login's working directory off Python's import path.
-* `--key-label` is the owner's own name for this key; it shows up in the relay's hello.
+* `--key-label` is the owner's own name for this key; it shows up in the relay's hello and names the
+  key's frame window and its lines in the record (below).
+* This line holds watch and Stop only (`read` plus `run.stop`): it names no `--rights`. To give the key
+  more, name the rights on the same line, for example `--rights read,run` or, for everything,
+  `--rights read,run,approve,manage`.
 * sshd's login session sets `XDG_RUNTIME_DIR` to `/run/user/<uid>`, where the daemon's socket is. The
   relay refuses a socket directory that is not a real directory owned by the owner with mode exactly 0700.
 * A login shell that prints anything on stdout breaks the stream; the client reports it as
@@ -97,31 +101,45 @@ restrict,command="/usr/bin/env PYTHONPATH=/path/to/recursion/core /usr/bin/pytho
 
 ### What a relay key reaches
 
-The forced command decides what a key reaches; the client cannot change it. For a paired device, add
-`--device <device id>` and, if the person chose more than the default, `--rights <list>` (words joined
-by commas, in the core's vocabulary):
+The forced command decides what a key reaches; the client cannot change it. Every key holds watch and
+Stop unless its line names more with `--rights <list>` (words joined by commas, in the core's
+vocabulary). For a paired device, add `--device <device id>`; a device is held to what pairing allows:
 
 | The key's rights | What the relay forwards to the daemon |
 |---|---|
-| `--device` alone (the default: `read,run.stop`) | every method of the `read` row (`run.list`, `run.status`, `events.read`, `session.list`, ...), the socket's `ping` and `health`, and `run.stop`; nothing else |
+| no `--rights` (the default of every key, with or without `--device`: `read,run.stop`) | every method of the `read` row (`run.list`, `run.status`, `events.read`, `session.list`, ...), the socket's `ping` and `health`, and `run.stop`; nothing else |
 | `read` | the `read` rows, `ping` and `health`; no Stop |
 | a single method, such as `run.stop` or `run.list` | that method only |
 | `run` (not for a device without a passkey) | the `run` rows: starting, steering and stopping runs and sessions |
 | `approve` (not for a device without a passkey) | showing and answering approvals |
 | `manage` (never for a device) | the `manage` rows (`workspace.publish`) |
-| no `--device` and no `--rights` (the owner's own key) | everything, as before rights existed, a method the table does not have included |
+| `--rights read,run,approve,manage` (never for a device) | everything, a method the table does not have included; only a line that names all four reaches it |
 
 Every other frame is refused by the relay itself, not delivered: `{"code": "scope_refused", "layer":
 "relay", "delivered": false, "detail": "needs_<right>", "method": ..., "needs": ...}`. A method the table
 does not have (`config.set`, `daemon.shutdown`, any other op) needs all four rights (`needs: "all"`,
 detail `method_not_in_table`). The relay's table is a copy of the published method table
 (`schemas/control/v1/methods.table.v1.json`), pinned by a test. `relay_hello`'s answer shows the key's
-`grant`: the device, its rights and the caps.
+`grant`: the device, its rights and the caps; `SshRelayClient.grant` and `RelayAPI.grant` keep it for
+the caller.
 
 Caps on the forwarded stream, each a setting on the same command line: `--max-frames N` frames in any
 `--window-s S` seconds (first values 300 and 60), `--max-frame-bytes N` (first value 1 MiB, the socket's
-own frame). `none` is no limit. Over a cap the frame is refused (`rate_limited`, or `bad_frame` for its
-size), not delivered, and one line is written on stderr.
+own frame). `none` is no limit. A length over the frame cap is refused before its body is read.
+
+The frame window holds for the key, across every session it opens (`--cap-scope key`, the first value):
+the client opens a fresh session per call, and more sessions let no more frames through. A key is named
+by its `--device`, else by its `--key-label`, else it is the one unnamed key (keys with the same label
+share one window). `--cap-scope session` gives each session a window of its own. The windows are kept
+on the daemon's machine, owner-only, in `relay/` under the daemon's state folder
+(`$XDG_STATE_HOME/recursion`, else `~/.local/state/recursion`), one file per key, under a lock.
+
+Over a cap the frame is refused (`rate_limited`, or `bad_frame` for its size), not delivered. Every
+refusal of the rights and the caps is written to the record on the daemon's machine,
+`relay/refusals.jsonl` in the same folder: one JSON line each (what was refused and why, the key, its
+device and label, the client address, the time), newest last, at most `--record-max N` lines kept
+(first value 1000; older lines go first; `none` keeps every line; `0` keeps none). One line is also
+written on stderr, which sshd hands to the client that was refused.
 
 Not yet: the relay still connects to the socket as the owner's uid. Until the daemon checks a paired
 device's rights at its own socket, the relay's table is the only lock between a device's key and the

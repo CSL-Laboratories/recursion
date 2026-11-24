@@ -304,6 +304,8 @@ class SshRelayClient:
             )
         self.target = target
         self.label: dict[str, Any] | None = None
+        # What the relay says this key reaches (its hello's grant: device, rights, caps); None when it gave none.
+        self.grant: dict[str, Any] | None = None
         self._max_frame_bytes = max_frame_bytes
         self._lock = threading.Lock()
         # At most one answer and the end of the stream are ever waiting; more means the far side is out of step.
@@ -321,7 +323,7 @@ class SshRelayClient:
         self._reader.start()
         self._drain.start()
         try:
-            hello = self._handshake(hello_timeout_s)
+            hello, self.grant = self._handshake(hello_timeout_s)
         except BaseException:
             self._close_locked()
             raise
@@ -343,7 +345,8 @@ class SshRelayClient:
             text = bytes(self._stderr_tail).decode("ascii", "replace")
         return "".join(c if c == "\n" or (c.isascii() and c.isprintable()) else "?" for c in text)
 
-    def _handshake(self, timeout_s: float) -> dict[str, Any]:
+    def _handshake(self, timeout_s: float) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """The relay's label and its grant (``None`` when the hello carries none, as an older relay's)."""
         deadline = time.monotonic() + timeout_s
         sent = self._send(encode_frame({"op": HELLO_OP, "relay_version": RELAY_VERSION}), deadline)
         if sent in ("write_timeout", "write_unknown"):
@@ -362,7 +365,8 @@ class SshRelayClient:
         version = relay.get("version")
         if type(version) is not int or version != RELAY_VERSION:
             raise RelayHandshakeFailed("relay_version")
-        return dict(relay)
+        grant = value.get("grant")
+        return dict(relay), (dict(grant) if isinstance(grant, dict) else None)
 
     def _ended(self, fallback: str) -> str:
         """After the stream ended: ``ssh_exit_<code>`` when ssh exited with an error, else ``fallback``."""
@@ -583,6 +587,7 @@ class RelayAPI:
         self.target = target
         self.label: dict[str, Any] | None = None
         self._connect = connect
+        self.grant: dict[str, Any] | None = None  # the grant the relay's hello gave the last session
         self._persistent = persistent
         self._session: Any = None
         self._lock = threading.Lock()
@@ -625,6 +630,7 @@ class RelayAPI:
     def _open(self) -> Any:
         client = self._connect()
         self.label = getattr(client, "label", None)
+        self.grant = getattr(client, "grant", None)
         return client
 
     def _ask(self, client: Any, method: str, params: dict | None) -> dict:

@@ -45,13 +45,14 @@ class SocketDaemon:
 
     It records every request its handler sees (``seen``) and answers with ``handler``, by default an
     ``ok`` that echoes the method and params. ``environ`` points ``XDG_RUNTIME_DIR`` at it, so the relay
-    finds it exactly where it finds the daemon's socket.
+    finds it exactly where it finds the daemon's socket, and ``XDG_STATE_HOME`` at a folder beside it, so
+    that the relay's windows and record live in the test's scratch directory, never in a real home.
     """
 
     def __init__(self, test, *, handler=None, **server_options) -> None:
         self.runtime = scratch_dir(test)
         self.directory = os.path.join(self.runtime, "recursion")
-        self.environ = {"XDG_RUNTIME_DIR": self.runtime}
+        self.environ = {"XDG_RUNTIME_DIR": self.runtime, "XDG_STATE_HOME": os.path.join(self.runtime, "state")}
         self.seen: list[dict] = []
         self._inner = with_ping_health(handler or self.answer)
         self.server = UnixControlServer(self.directory, self._record, **server_options)
@@ -101,11 +102,13 @@ def fake_ssh_prefix() -> tuple[str, ...]:
     return (sys.executable, *flags, str(FAKE_SSH))
 
 
-def fake_ssh_env(runtime: str, *, mode: str = "relay", log: str | None = None, key_label: str | None = "laptop") -> dict:
+def fake_ssh_env(runtime: str, *, mode: str = "relay", log: str | None = None, key_label: str | None = "laptop",
+                 rights: str | None = None) -> dict:
     """The fake ssh's whole environment: no HOME, no agent socket, nothing of the real user's."""
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "XDG_RUNTIME_DIR": runtime,
+        "XDG_STATE_HOME": os.path.join(runtime, "state"),
         "TMPDIR": tempfile.gettempdir(),
         "LANG": "C.UTF-8",
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -115,4 +118,6 @@ def fake_ssh_env(runtime: str, *, mode: str = "relay", log: str | None = None, k
         env["FAKE_SSH_LOG"] = log
     if key_label is not None:
         env["FAKE_SSH_KEY_LABEL"] = key_label
+    if rights is not None:
+        env["FAKE_SSH_RIGHTS"] = rights  # the --rights of the key's forced command
     return env

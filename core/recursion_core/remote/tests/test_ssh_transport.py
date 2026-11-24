@@ -717,7 +717,11 @@ class EndToEndTests(unittest.TestCase):
 
     def test_a_call_reaches_the_far_daemon_with_its_params_unchanged(self) -> None:
         daemon = support.SocketDaemon(self)
-        answer = self.api(daemon).call("session.interrupt", INTERRUPT)
+        # session.interrupt needs run: the forced command of this key names it (--rights read,run).
+        api = RelayAPI(self.target, ssh=support.fake_ssh_prefix(),
+                       env=support.fake_ssh_env(daemon.runtime, log=self.log, rights="read,run"))
+        self.addCleanup(api.close)
+        answer = api.call("session.interrupt", INTERRUPT)
         self.assertEqual(answer, {"code": "ok", "method": "session.interrupt", "params": INTERRUPT})
         self.assertEqual(daemon.seen, [{"op": "control", "method": "session.interrupt", "params": INTERRUPT}])
 
@@ -889,6 +893,16 @@ class EndToEndTests(unittest.TestCase):
             "transport": "ssh", "host": "far.example", "port": 22, "host_key_fingerprint": FINGERPRINT,
             "relay": {"version": 1, "transport": "ssh", "key_label": "laptop", "client_address": "198.51.100.7"},
         })
+
+    def test_the_grant_of_the_relays_hello_is_kept_for_the_caller(self) -> None:
+        from recursion_core.remote.relay import RELAY_MAX_FRAME_BYTES, RELAY_MAX_FRAMES, RELAY_WINDOW_S
+        daemon = support.SocketDaemon(self)
+        api = self.api(daemon)
+        self.assertIsNone(api.grant)
+        api.call("run.list")
+        self.assertEqual(api.grant, {"device": None, "rights": ["read", "run.stop"],
+                                     "caps": {"max_frames": RELAY_MAX_FRAMES, "window_s": RELAY_WINDOW_S,
+                                              "max_frame_bytes": RELAY_MAX_FRAME_BYTES}})
 
 
 if __name__ == "__main__":

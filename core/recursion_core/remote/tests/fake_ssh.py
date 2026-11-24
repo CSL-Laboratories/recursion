@@ -5,7 +5,8 @@ The client runs it as ``<python> fake_ssh.py <ssh options> -- <host> <command>``
 
   relay           be the far side: run the real relay in this process, as sshd runs the owner's forced
                   command (``SSH_ORIGINAL_COMMAND`` is the client's command, ``SSH_CONNECTION`` holds
-                  documentation addresses, ``--key-label`` comes from ``$FAKE_SSH_KEY_LABEL``)
+                  documentation addresses, ``--key-label`` comes from ``$FAKE_SSH_KEY_LABEL`` and
+                  ``--rights`` from ``$FAKE_SSH_RIGHTS``)
   refuse          write what ssh writes for a host key it does not accept, exit 255, read nothing
   banner          write a login banner on stdout (a shell that prints), then run the relay
   hello_then_die  answer the hello as the relay does, read one more frame, exit 255 with no answer
@@ -49,6 +50,8 @@ def main() -> int:
     environ["SSH_CONNECTION"] = "198.51.100.7 50022 192.0.2.10 22"
     label = os.environ.get("FAKE_SSH_KEY_LABEL")
     relay_args = ["relay"] + (["--key-label", label] if label else [])
+    if os.environ.get("FAKE_SSH_RIGHTS"):
+        relay_args += ["--rights", os.environ["FAKE_SSH_RIGHTS"]]
 
     if mode == "refuse":
         sys.stderr.write("Host key verification failed.\r\n")

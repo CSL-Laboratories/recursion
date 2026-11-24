@@ -24,7 +24,7 @@ from typing import Any
 # The core's vocabulary of rights, in its own order (control.credentials.SCOPES).
 RIGHTS = ("read", "run", "approve", "manage")
 ALL_RIGHTS = frozenset(RIGHTS)
-# What a key that names no device holds: everything, exactly what the relay forwarded before rights existed.
+# All four rights together: everything. A relay key holds them only where the person's forced command names them.
 FULL_RIGHTS = RIGHTS
 # What a method the table does not have needs: all four rights together.
 NEEDS_ALL = "all"

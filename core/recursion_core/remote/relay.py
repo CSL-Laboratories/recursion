@@ -25,16 +25,23 @@ What it checks:
 * The key's RIGHTS (``rights.py``), in the core's vocabulary: a frame is forwarded only when they cover
   its method, through the relay's one table of method to right; every other frame is refused
   ``scope_refused`` by the relay itself, not delivered, naming the method and the right it needs, before
-  anything is sent. A key for a paired device (``--device``) holds what the person chose when it was
-  paired, by default watch and Stop (``read`` plus ``run.stop``), checked by ``pairing.device_scopes``.
-  A key that names no device is the owner's own and holds all four rights, which forwards what it
-  always did.
+  anything is sent. Every key holds watch and Stop (``read`` plus ``run.stop``) unless its forced command
+  names other rights (``--rights``). A key for a paired device (``--device``) is held to what pairing
+  allows (``pairing.device_scopes``); a key that names no device holds more only where the person's own
+  forced command names it, all four (``--rights read,run,approve,manage``) included.
 * CAPS on the forwarded stream, each a setting with a first value (the block below): at most
   ``max_frames`` frames forwarded in any ``window_s`` seconds (a sliding window on a monotonic clock),
-  and a frame of at most ``max_frame_bytes``. Over a cap the frame is refused (``rate_limited`` or
-  ``bad_frame``, not delivered) and the refusal is recorded (``record``; ``main`` writes it on stderr,
-  never on stdout). ``None`` (``none`` on the command line) is no limit, a value a person may set; a frame
-  above the socket's own frame size still cannot be read by the socket.
+  and a frame of at most ``max_frame_bytes``. The window holds for the KEY (``cap_scope`` ``key``): every
+  session of one key shares it, kept on the daemon's machine under a lock (``relay_store``), so that
+  opening more sessions lets no more frames through; ``cap_scope`` ``session`` gives each session a
+  window of its own. A key is named by its device, else by its label, else it is the one unnamed key.
+  Over a cap the frame is refused (``rate_limited`` or ``bad_frame``, not delivered). ``None`` (``none``
+  on the command line) is no limit, a value a person may set; a frame above the socket's own frame size
+  still cannot be read by the socket, and a length over the cap is refused before its body is read.
+* THE RECORD: every refusal the rights and the caps make is written to the record on the daemon's
+  machine (``relay/refusals.jsonl`` under the daemon's state folder), at most ``record_max`` lines kept,
+  newest last, and is also told to ``record`` (``main`` writes it on stderr, which sshd hands to the
+  client, never on stdout).
 
 What waits for the core: the relay connects to the socket as the owner's uid, as before. Until the core
 checks rights at its socket (a paired device's identity presented on the connection, and that device's
@@ -73,7 +80,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, BinaryIO, TextIO
 
-from recursion_core.control.client import DEFAULT_TIMEOUT_S, socket_path as default_socket_path
+from recursion_core.control.client import DEFAULT_TIMEOUT_S, socket_path as default_socket_path, state_directory
 from recursion_core.control_transport.errors import (FrameError, InsecureSocketPath, PeerNotAdmitted,
                                                      PlatformNotSupported, RemoteBindRefused, TransportBusy,
                                                      TransportRefused)
@@ -84,7 +91,8 @@ from .codec import (BUSY_MESSAGE, HELLO_OP, NOT_ADMITTED_MESSAGE, RELAY_OP_PREFI
                     Message, RefusedFrame, ascii_text, copyable_id, daemon_reply, frame_refusal, read_message,
                     relay_error, write_message)
 from .pairing import DEVICE_SCOPES, PairingRefused, device_scopes
-from .rights import FULL_RIGHTS, NEEDS_ALL, key_rights, needs
+from .relay_store import KeyWindow, RefusalRecord, relay_folder
+from .rights import NEEDS_ALL, key_rights, needs
 
 # What the client asks sshd to run; under a forced command it arrives as SSH_ORIGINAL_COMMAND.
 RELAY_COMMAND = "recursiond relay"
@@ -99,9 +107,15 @@ _WHOLE = re.compile(r"[0-9]{1,18}")
 # limit) or per Relay; they become rows of the person's settings file when that file is in this tree.
 # A run with no cap forwarded 300 frames in 0.12 s; the first values below allow a burst of that size and
 # then five frames a second on average. The frame size's first value is the socket's own frame (1 MiB).
+# The window holds per key across sessions, or per session (--cap-scope key|session). The record of
+# refusals on the daemon's machine keeps at most RELAY_RECORD_MAX lines (--record-max N|none; 0 keeps none).
 RELAY_MAX_FRAMES = 300
 RELAY_WINDOW_S = 60.0
 RELAY_MAX_FRAME_BYTES = MAX_FRAME_BYTES
+CAP_SCOPES = ("key", "session")
+RELAY_CAP_SCOPE = "key"
+RELAY_RECORD_MAX = 1000
+UNNAMED_KEY = "unnamed"
 
 Connect = Callable[..., Any]
 
@@ -166,15 +180,15 @@ def check_device_id(device_id: object) -> str | None:
 
 
 def relay_rights(rights: Iterable[str] | None, device_id: str | None) -> tuple[str, ...]:
-    """The rights a relay key holds. A device key: what the person chose at pairing, by default
-    ``DEVICE_SCOPES`` (watch and Stop), checked as pairing checks it. A key with no device: all four,
-    unless the owner names fewer."""
+    """The rights a relay key holds: watch and Stop (``DEVICE_SCOPES``) unless the forced command names
+    others. A device key is held to what pairing allows; a key with no device holds what is named, all
+    four included, and nothing more than watch and Stop when nothing is named."""
     if device_id is not None:
         try:
             return device_scopes(DEVICE_SCOPES if rights is None else rights)
         except PairingRefused as exc:
             raise ValueError(f"rights: {exc}") from None
-    return FULL_RIGHTS if rights is None else key_rights(rights)
+    return key_rights(DEVICE_SCOPES if rights is None else rights)
 
 
 class Relay:
@@ -183,8 +197,12 @@ class Relay:
     ``connect(path, timeout_s=...)`` makes the client for one request (``UnixControlClient``; tests inject
     a fake). ``uid`` overrides the expected owner of the socket directory (tests). ``rights`` and
     ``device_id`` are the key's (``relay_rights``). ``max_frames`` per ``window_s`` and ``max_frame_bytes``
-    are the caps (``None`` is no limit); ``clock`` is the window's monotonic clock and ``record(event)``
-    is told every refusal the caps and the rights make (a dict; it may not raise into the relay).
+    are the caps (``None`` is no limit); ``cap_scope`` says whether the window holds per key (shared by
+    every session of the key) or per session; ``clock`` is the window's monotonic clock. Every refusal
+    the caps and the rights make is written to the record on the daemon's machine, at most
+    ``record_max`` lines (``None``: no limit; ``0``: none), and told to ``record(event)`` (a dict; it may
+    not raise into the relay). ``state_dir`` is the daemon's state folder (default:
+    ``control.client.state_directory(environ)``).
     """
 
     def __init__(
@@ -203,6 +221,9 @@ class Relay:
         window_s: float = RELAY_WINDOW_S,
         clock: Callable[[], float] = time.monotonic,
         record: Callable[[dict], Any] | None = None,
+        cap_scope: str = RELAY_CAP_SCOPE,
+        record_max: int | None = RELAY_RECORD_MAX,
+        state_dir: str | None = None,
     ) -> None:
         environ = dict(os.environ if environ is None else environ)
         path = default_socket_path(environ) if socket_path is None else socket_path
@@ -219,6 +240,10 @@ class Relay:
             raise ValueError("window_s must be a positive finite number")
         if not callable(clock) or (record is not None and not callable(record)):
             raise ValueError("clock and record must be callable")
+        if type(cap_scope) is not str or cap_scope not in CAP_SCOPES:
+            raise ValueError("cap_scope must be 'key' or 'session'")
+        self.cap_scope = cap_scope
+        self.record_max = _cap(record_max, "record_max", 0)
         self.device_id = check_device_id(device_id)
         self.rights = relay_rights(rights, self.device_id)
         self.directory = os.path.dirname(self.socket_path)
@@ -237,7 +262,19 @@ class Relay:
         self.window_s = float(window_s)
         self._clock, self._record = clock, record
         self._window_lock = threading.Lock()
-        self._forwarded: deque[float] = deque()  # when each frame forwarded inside the window was let through
+        self._forwarded: deque[float] = deque()  # the window of this session (cap_scope "session")
+        # The key's name on the daemon's machine: its device, else its label, else the one unnamed key.
+        self.key = (f"device-{self.device_id}" if self.device_id is not None
+                    else f"label-{self.key_label}" if self.key_label is not None else UNNAMED_KEY)
+        self._key_window = self._refusal_record = None
+        self.state_folder = None
+        if (self.cap_scope == "key" and self.max_frames is not None) or self.record_max != 0:
+            self.state_folder = relay_folder(state_directory(environ) if state_dir is None else state_dir,
+                                             uid=self._uid)
+            if self.cap_scope == "key" and self.max_frames is not None:
+                self._key_window = KeyWindow(self.state_folder, self.key)
+            if self.record_max != 0:
+                self._refusal_record = RefusalRecord(self.state_folder, self.record_max)
 
     def grant(self) -> dict:
         """What this key reaches, for status: the device, its rights and the caps (``None`` is no limit)."""
@@ -246,6 +283,12 @@ class Relay:
                          "max_frame_bytes": self.max_frame_bytes}}
 
     def _note(self, event: dict) -> None:
+        if self._refusal_record is not None:
+            try:
+                self._refusal_record.add({**event, "at": time.time(), "key": self.key, "device": self.device_id,
+                                          "key_label": self.key_label, "client_address": self.client_address})
+            except Exception:  # noqa: BLE001 - a record that fails never changes an answer
+                pass
         if self._record is None:
             return
         try:
@@ -254,11 +297,15 @@ class Relay:
             pass
 
     def _take_slot(self) -> int | None:
-        """Let one frame through the window and return ``None``, or return how many were already in it."""
+        """Let one frame through the window and return ``None``, or return how many were already in it.
+
+        ``OSError`` when the key's window on the daemon's machine cannot be read or written."""
         if self.max_frames is None:
             return None
         with self._window_lock:
             now = self._clock()
+            if self._key_window is not None:
+                return self._key_window.take(now, self.max_frames, self.window_s)
             while self._forwarded and self._forwarded[0] <= now - self.window_s:
                 self._forwarded.popleft()
             if len(self._forwarded) >= self.max_frames:
@@ -321,7 +368,13 @@ class Relay:
             if refusal == "frame_too_large":
                 self._note({"refused": "bad_frame", "cap": "max_frame_bytes", "value": self.max_frame_bytes})
             return relay_error("bad_frame", delivered=False, detail=refusal, request=request), False
-        seen = self._take_slot()
+        try:
+            seen = self._take_slot()
+        except OSError as exc:
+            # The key's window cannot be read: the cap cannot be shown to hold, so the frame is not sent.
+            self._note({"refused": "rate_limited", "cap": "max_frames", "window": f"unreadable:{type(exc).__name__}"})
+            return relay_error("rate_limited", delivered=False, detail=f"window_unreadable:{type(exc).__name__}",
+                               request=request), False
         if seen is not None:
             self._note({"refused": "rate_limited", "cap": "max_frames", "value": self.max_frames,
                         "window_s": self.window_s, "seen": seen})
@@ -406,6 +459,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-frames", dest="max_frames", default=None)
     parser.add_argument("--window-s", dest="window_s", default=None)
     parser.add_argument("--max-frame-bytes", dest="max_frame_bytes", default=None)
+    parser.add_argument("--cap-scope", dest="cap_scope", choices=list(CAP_SCOPES), default=RELAY_CAP_SCOPE)
+    parser.add_argument("--record-max", dest="record_max", default=None)
     return parser
 
 
@@ -443,10 +498,12 @@ def main(
     connect: Connect = UnixControlClient,
 ) -> int:
     """``relay [--socket PATH] [--key-label NAME] [--device ID] [--rights LIST] [--max-frames N|none]
-    [--window-s S] [--max-frame-bytes N|none]``: serve stdin and stdout until stdin ends.
+    [--window-s S] [--max-frame-bytes N|none] [--cap-scope key|session] [--record-max N|none]``: serve
+    stdin and stdout until stdin ends.
 
-    Nothing but frames is ever written to stdout; refusals go to stderr, which sshd hands to the client,
-    and so does the record of every frame the caps or the rights refused, one line each.
+    Nothing but frames is ever written to stdout. Every frame the caps or the rights refused is written
+    to the record on the daemon's machine, and one line each goes to stderr, which sshd hands to the
+    client; so do the refusals of the start.
     """
     environ = dict(os.environ if environ is None else environ)
     err = sys.stderr if stderr is None else stderr
@@ -455,6 +512,7 @@ def main(
         max_frames = _count_option(args.max_frames, "--max-frames", RELAY_MAX_FRAMES)
         max_frame_bytes = _count_option(args.max_frame_bytes, "--max-frame-bytes", RELAY_MAX_FRAME_BYTES)
         window_s = _window_option(args.window_s)
+        record_max = _count_option(args.record_max, "--record-max", RELAY_RECORD_MAX)
     except _Usage as exc:
         print(f"recursion relay: usage error: {exc}", file=err)
         return EXIT_REFUSED
@@ -465,14 +523,16 @@ def main(
     try:
         relay = Relay(args.socket, environ=environ, key_label=args.key_label, connect=connect,
                       device_id=args.device, rights=_rights_option(args.rights), max_frames=max_frames,
-                      window_s=window_s, max_frame_bytes=max_frame_bytes,
+                      window_s=window_s, max_frame_bytes=max_frame_bytes, cap_scope=args.cap_scope,
+                      record_max=record_max,
                       record=lambda event: print(f"recursion relay: record: {json.dumps(event, sort_keys=True)}",
                                                  file=err, flush=True))
     except (RemoteBindRefused, InsecureSocketPath, PlatformNotSupported, ValueError, OSError) as exc:
         # OSError: a socket directory that cannot be looked at (its parent is a file, or not searchable).
         print(f"recursion relay: refused: {type(exc).__name__}: {exc}", file=err)
         return EXIT_REFUSED
-    for name, value in (("max_frames", relay.max_frames), ("max_frame_bytes", relay.max_frame_bytes)):
+    for name, value in (("max_frames", relay.max_frames), ("max_frame_bytes", relay.max_frame_bytes),
+                        ("record_max", relay.record_max)):
         if value is None:
             print(f"recursion relay: note: {name} is none: no limit", file=err, flush=True)
     return relay.serve(sys.stdin.buffer if stdin is None else stdin, sys.stdout.buffer if stdout is None else stdout)

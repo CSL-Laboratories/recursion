@@ -20,6 +20,7 @@ import threading
 from . import (Daemon, Registry, SystemdUserManager, UserLock, check_operator_linger,
                refuse_engine_user, require_free_threaded, require_posix)
 
+from recursion_core.control.client import state_directory
 from .control_adapter import compose_control
 from .gui import LoopbackGUI
 from .launcher import EngineUnitManager
@@ -36,7 +37,7 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
     refuse_engine_user(os.environ)
     check_operator_linger(getpass.getuser())
     runtime = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}')
-    state = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'recursion'
+    state = Path(state_directory())  # the one rule of the state folder, which the relay reads too
     stopped = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stopped.set())
     signal.signal(signal.SIGINT, lambda *_: stopped.set())

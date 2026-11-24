@@ -31,10 +31,19 @@ today): the earliest lease end ends the routine, and every budget must have room
 
 How the lease is measured is ``LEASE_CLOCK``: ``counted`` (seconds of the machine's monotonic clock,
 summed in the store across every restart of the core within one boot of the machine, so a restart keeps
-the count and a wall clock set back or forward changes nothing; time across a reboot is not counted,
-and where the boot cannot be told the count is kept only while one process runs) or
+the count and a wall clock set back or forward changes nothing; time across a reboot is not counted) or
 ``wall`` (the wall clock, never read as earlier than the latest wall time the store has seen, so a
 clock set back does not reopen an ended lease). A record keeps the clock it was admitted under.
+
+Where the boot cannot be told (``boot_id`` reads none: macOS and Windows today), counted seconds cannot be
+summed across processes or restarts, so the store counts none there and the lease falls back to the wall
+clock: a record is admitted with a ``wall`` lease, and a ``counted`` lease the store meets there is moved
+to the wall clock in the same transaction, to end at the earlier of the counted time it had left and its
+admission's wall time plus its lease. So a lease ends there no later than the wall clock says, across a
+restart and with a second store open on the file, and the record's ``lease`` names the clock that ends it.
+
+What runs today. No daemon composes this store yet: no command of a person reaches it from outside the
+process, and a running daemon starts its runs as before.
 
 A change (``change``) may shorten the lease or lower the budget; one that lengthens the lease or raises
 the budget is refused ``widen_needs_admission``: only the person's new admission widens a record.
@@ -50,7 +59,6 @@ import json
 import re
 import sqlite3
 import time
-import uuid
 from typing import Callable, Iterator, Mapping
 
 __all__ = ["BUDGET_UNITS", "LEASE_CLOCKS", "RECORD_KIND", "TEXT", "WRITER_KINDS", "RoutineStore", "bounds_of"]
@@ -68,6 +76,7 @@ LEASE_CLOCK = "counted"          # how a lease is measured: "counted" or "wall"
 LEASE_MISSING = "refused"        # a record written with no lease: "refused", "default" or "no_lease"
 DEFAULT_LEASE_S = 30 * 24 * 3600  # the lease a record gets when LEASE_MISSING is "default": thirty days
 DEFAULT_BUDGET = {"unit": "runs", "limit": 100}  # the budget a record written with none gets
+BUSY_WAIT_S = 30.0               # how long a command waits for another command's hold on the store, in seconds
 
 # What the person writes; the core writes the rest.
 PERSON_FIELDS = ("record_id", "plugin", "tenant", "engine", "prompt", "lease_seconds", "budget")
@@ -175,23 +184,26 @@ class RoutineStore:
                  monotonic: Callable[[], float] = time.monotonic, boot: Callable[[], str | None] = boot_id,
                  lease_clock: str = LEASE_CLOCK,
                  lease_missing: str = LEASE_MISSING, default_lease_s: int = DEFAULT_LEASE_S,
-                 default_budget: Mapping = DEFAULT_BUDGET) -> None:
+                 default_budget: Mapping = DEFAULT_BUDGET, busy_wait_s: float = BUSY_WAIT_S) -> None:
         if lease_clock not in LEASE_CLOCKS or lease_missing not in ("refused", "default", "no_lease"):
             raise ValueError("lease_clock or lease_missing is not one of its values")
         if type(default_lease_s) is not int or default_lease_s < 1 or not _budget_ok(default_budget):
             raise ValueError("default_lease_s or default_budget is not in its form")
+        if type(busy_wait_s) not in (int, float) or not busy_wait_s >= 0:
+            raise ValueError("busy_wait_s is not a number of seconds")
         self._path = str(path)
         self._wall, self._monotonic = wall, monotonic
         self._clock, self._missing = lease_clock, lease_missing
         self._default_lease_s, self._default_budget = default_lease_s, dict(default_budget)
-        self._boot = boot() or f"process-{uuid.uuid4().hex}"  # a boot that cannot be told is this process
+        self._busy_wait_s = float(busy_wait_s)
+        self._boot = boot() or None  # None: the boot cannot be told, and no counted second is summed (module text)
         with self._write() as db:
             db.execute("CREATE TABLE IF NOT EXISTS routines (record_id TEXT PRIMARY KEY, body TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS clocks (name TEXT PRIMARY KEY, value NOT NULL)")
 
     @contextlib.contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self._path, timeout=30, isolation_level=None)
+        db = sqlite3.connect(self._path, timeout=self._busy_wait_s, isolation_level=None)
         try:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=FULL")
@@ -219,14 +231,31 @@ class RoutineStore:
     def _clocks(self, db: sqlite3.Connection) -> dict:
         """The counted seconds and the latest wall time, both advanced to now and written back."""
         kept = dict(db.execute("SELECT name, value FROM clocks").fetchall())
-        counted, latest = kept.get("counted", 0.0), kept.get("wall", 0.0)
+        counted, latest = kept.get("counted", 0.0), max(kept.get("wall", 0.0), self._wall())
+        if self._boot is None:  # no boot to tell: the count stays as it is kept, and only the wall clock moves
+            db.execute("INSERT OR REPLACE INTO clocks (name, value) VALUES ('wall', ?)", (latest,))
+            return {"counted": counted, "wall": latest}
         reading = self._monotonic()
         if kept.get("boot") == self._boot and reading > kept.get("seen", reading):
             counted += reading - kept["seen"]
-        latest = max(latest, self._wall())
         db.executemany("INSERT OR REPLACE INTO clocks (name, value) VALUES (?, ?)",
                        [("counted", counted), ("wall", latest), ("seen", reading), ("boot", self._boot)])
         return {"counted": counted, "wall": latest}
+
+    def _lease_clock(self) -> str:
+        """The clock a new lease is measured on: the configured one, or the wall clock where no boot is told."""
+        return "wall" if self._boot is None and self._clock == "counted" else self._clock
+
+    def _measured(self, record: dict, now: dict) -> bool:
+        """Where no boot is told, move a counted lease to the wall clock (module text). True when moved."""
+        lease = record.get("lease")
+        if self._boot is not None or lease is None or lease["clock"] != "counted":
+            return False
+        admitted = datetime.datetime.strptime(record["admitted_at"], "%Y-%m-%dT%H:%M:%S.%fZ")
+        by_admission = admitted.replace(tzinfo=datetime.timezone.utc).timestamp() + record["lease_seconds"]
+        ends = min(now["wall"] + (lease["ends"] - now["counted"]), by_admission)
+        record["lease"] = {"clock": "wall", "start": max(0.0, ends - record["lease_seconds"]), "ends": ends}
+        return True
 
     def _stamp(self, record: dict, writer: Mapping) -> None:
         record["written_by"] = {"kind": writer["kind"], "id": writer["id"]}
@@ -264,7 +293,7 @@ class RoutineStore:
             stored = {"kind": RECORD_KIND, **{name: record[name] for name in REQUIRED_PERSON_FIELDS},
                       "lease_seconds": seconds, "budget": dict(record.get("budget", self._default_budget)),
                       "revision": 1 if prior is None else prior["revision"] + 1,
-                      "lease": self._lease(now, seconds, self._clock), "used": 0, "last_refusal": None}
+                      "lease": self._lease(now, seconds, self._lease_clock()), "used": 0, "last_refusal": None}
             self._stamp(stored, writer)
             stored["admitted_at"] = stored["written_at"]
             self._put(db, stored)
@@ -289,6 +318,7 @@ class RoutineStore:
             prior = self._get(db, record_id) if type(record_id) is str else None
             if prior is None:
                 return _refused("routine_unknown", str(record_id)[:64])
+            self._measured(prior, now)
             if type(revision) is not int or revision != prior["revision"]:
                 return _refused("conflict", str(prior["revision"]))
             widened = self._widens(prior, changes)
@@ -297,7 +327,7 @@ class RoutineStore:
             stored = {**prior, **{name: changes[name] for name in changes}, "revision": prior["revision"] + 1}
             if "lease_seconds" in changes:  # a shorter lease from the same start, or a first one from now
                 kept = prior["lease"]
-                stored["lease"] = (self._lease(now, changes["lease_seconds"], self._clock) if kept is None else
+                stored["lease"] = (self._lease(now, changes["lease_seconds"], self._lease_clock()) if kept is None else
                                    {**kept, "ends": kept["start"] + changes["lease_seconds"]})
             self._stamp(stored, writer)
             self._put(db, stored)
@@ -306,7 +336,8 @@ class RoutineStore:
     @staticmethod
     def _widens(prior: Mapping, changes: Mapping) -> str | None:
         """The field of ``changes`` that would give the record a longer lease or a larger budget, or None."""
-        if "lease_seconds" in changes and prior["lease_seconds"] is not None                 and changes["lease_seconds"] > prior["lease_seconds"]:
+        if ("lease_seconds" in changes and prior["lease_seconds"] is not None
+                and changes["lease_seconds"] > prior["lease_seconds"]):
             return "lease_seconds"
         if "budget" in changes and (changes["budget"]["unit"] != prior["budget"]["unit"]
                                     or changes["budget"]["limit"] > prior["budget"]["limit"]):
@@ -327,9 +358,12 @@ class RoutineStore:
     def list(self) -> dict:
         """Every record, by id: each names the plugin that may ask for it, its lease, budget and last refusal."""
         with self._write() as db:
-            self._clocks(db)
-            rows = db.execute("SELECT body FROM routines ORDER BY record_id").fetchall()
-        return {"code": OK, "routines": [json.loads(row[0]) for row in rows]}
+            now = self._clocks(db)
+            records = [json.loads(row[0]) for row in db.execute("SELECT body FROM routines ORDER BY record_id")]
+            for record in records:
+                if self._measured(record, now):
+                    self._put(db, record)
+        return {"code": OK, "routines": records}
 
     def get(self, record_id: str) -> dict | None:
         """The record as it is now, or None."""
@@ -350,6 +384,7 @@ class RoutineStore:
             record = self._get(db, record_id) if type(record_id) is str else None
             if record is None or origin.get("record_kind") != RECORD_KIND:
                 return _refused("routine_unknown", str(record_id)[:64])
+            self._measured(record, now)  # written below on every path: refused or charged
             code = None
             leases, budgets = bounds_of(record)
             if origin.get("plugin") != record["plugin"]:

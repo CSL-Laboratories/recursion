@@ -309,5 +309,119 @@ class WhatIsAskedTest(BoundsCase):
         self.assertEqual(answer["value"]["code"], "started")
 
 
+class WhereTheBootCannotBeToldTest(BoundsCase):
+    """No boot id can be read (macOS and Windows today): the lease still ends, by the wall clock."""
+
+    STEP_S = 20  # the stand-in clocks move this many seconds between two asks
+    ASKS = 30    # and this many asks are made, well past the lease
+
+    def setUp(self):
+        super().setUp()
+        self.boot = None
+
+    def codes_of(self, ask):
+        codes = []
+        for n in range(1, self.ASKS + 1):
+            self.later(self.STEP_S)
+            answer = ask(n)
+            codes.append("started" if answer["code"] == "started" else answer["detail"])
+        return codes
+
+    def assertEndsWithItsLease(self, codes):
+        before = (LEASE_S - 1) // self.STEP_S
+        self.assertEqual(codes, ["started"] * before + ["routine_lease_ended"] * (self.ASKS - before))
+
+    def test_a_counted_lease_ends_with_a_second_store_open_on_the_same_file(self):
+        person = r.RoutineStore(self.path, wall=lambda: self.wall[0], monotonic=lambda: self.mono[0],
+                                boot=lambda: self.boot)
+        d = self.daemon()
+        self.assertEqual(r.LEASE_CLOCK, "counted")
+        self.assertEqual(person.admit(OWNER, a_record())["routine"]["lease"]["clock"], "wall")
+
+        def ask(n):
+            person.list()
+            return d.ask(at(n))
+
+        self.assertEndsWithItsLease(self.codes_of(ask))
+        self.assertEqual(person.get("morning-digest")["lease"]["clock"], "wall")
+        self.assertEqual(person.get("morning-digest")["last_refusal"]["code"], "routine_lease_ended")
+
+    def test_a_counted_lease_ends_across_restarts_of_the_daemon(self):
+        self.daemon().store.admit(OWNER, a_record())
+        self.assertEndsWithItsLease(self.codes_of(lambda n: self.daemon().ask(at(n))))
+
+    def test_a_counted_lease_met_there_ends_no_later_than_the_wall_clock_says(self):
+        self.boot = "boot-1"
+        d = self.daemon()
+        d.store.admit(OWNER, a_record())
+        self.later(LEASE_S // 2)
+        self.assertStarted(d.ask(at(1)))
+        self.later(LEASE_S // 2 + 10, mono=False)  # the machine slept: the wall clock ran, the counted one did not
+        self.boot = None
+        there = self.daemon()
+        self.assertRefusedStart(there.ask(at(2)), "routine_lease_ended")
+        self.assertEqual(there.store.get("morning-digest")["lease"]["clock"], "wall")
+        self.assertEqual(there.starter.calls, [])
+
+
+class TheCountAcrossARestartTest(BoundsCase):
+    def test_a_lease_spent_partly_before_a_restart_and_the_rest_after_ends(self):
+        d = self.daemon()
+        d.store.admit(OWNER, a_record())
+        self.later(LEASE_S - 40)
+        self.assertStarted(d.ask(at(1)))
+        again = self.daemon()
+        self.assertStarted(again.ask(at(2)))
+        self.later(41)
+        self.assertRefusedStart(again.ask(at(3)), "routine_lease_ended")
+        self.assertRefusedStart(self.daemon().ask(at(4)), "routine_lease_ended")
+
+
+class FailingOnce(FakeStarter):
+    """A launch path that fails its first launch and starts every later one."""
+
+    def __call__(self, params):
+        launched = super().__call__(params)
+        if len(self.calls) == 1:
+            raise OSError("the launch path failed")
+        return launched
+
+
+class AFailedLaunchTest(BoundsCase):
+    def test_a_failed_launch_is_charged_once_and_its_retry_nothing(self):
+        d = self.daemon()
+        d.starter = FailingOnce()
+        d.api = ControlAPI(self.registry, FakeKillTree(), d.starter, clock=lambda: 1000.0, new_run_id=self.run_ids,
+                           routines=d.store)
+        d.store.admit(OWNER, a_record(budget={"unit": "runs", "limit": 5}))
+        failed = d.ask(at(1))
+        self.assertNotEqual(failed["code"], "started", failed)
+        self.assertEqual(d.store.get("morning-digest")["used"], 1)
+        retried = d.ask(at(1))
+        self.assertStarted(retried)
+        self.assertEqual(d.store.get("morning-digest")["used"], 1)
+        self.assertEqual(len(d.starter.calls), 2)
+        self.assertStarted(d.ask(at(2)))
+        self.assertEqual(d.store.get("morning-digest")["used"], 2)
+
+
+class TheAllowListTest(BoundsCase):
+    def test_an_origin_with_no_kind_a_near_miss_or_a_kind_that_is_not_a_string_is_refused(self):
+        d = self.daemon()
+        d.store.admit(OWNER, a_record())
+        base = {"plugin": PLUGIN, "record_kind": "routine.v1", "record_id": "morning-digest", "revision": 1,
+                "occurrence": at(1)}
+        origins = [("no kind", dict(base))] + [(repr(kind), {**base, "kind": kind})
+                                               for kind in ("Trigger", "TRIGGER", " trigger", 7, ["trigger"], None)]
+        for n, (label, origin) in enumerate(origins):
+            with self.subTest(origin=label):
+                answer = d.api.call("run.start", {"tenant": "default", "engine": "claude_code", "prompt": "p",
+                                                  "client_key": f"k-{n}"}, origin=origin)
+                self.assertRefusedStart(answer, "origin_not_admitted")
+        self.assertEqual((d.starter.calls, self.registry.list()), ([], []))
+        self.assertEqual(d.store.get("morning-digest")["used"], 0)
+        self.assertIsNone(d.store.get("morning-digest")["last_refusal"])
+
+
 if __name__ == "__main__":
     unittest.main()

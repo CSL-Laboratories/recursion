@@ -229,7 +229,7 @@ class HostProgramTests(unittest.TestCase):
         )
 
     def exchange(self, *messages, states=(False,), real=False, extra=None, secret=False, environ=None,
-                 standin=None, code=0, wall="standin", home=None, files=None):
+                 standin=None, code=0, wall="standin", files=None):
         # Isolated Python runs venv .pth files but ignores PYTHONPATH. This shim passes a probe to
         # main and writes its returned status to a file in the host's working folder, because the
         # host points its own stderr at the null device. The host may start itself again once with a
@@ -270,7 +270,8 @@ class HostProgramTests(unittest.TestCase):
         # standin "dirty": the first restart hands the new image one more variable, so no restart ever
         # comes out clean. standin "fail": the interpreter path the restart uses is a file that is not there.
         # standin "norecord": the kernel's record of the environment cannot be read (os.environ stands in).
-        # wall: see WALL_SHIMS below; home: the stand-in home folder the host's probe takes as its canary.
+        # wall: see WALL_SHIMS below. The host's probe takes a canary file it writes in the working folder
+        # below and removes before any plugin byte runs; canaries_left says what of it is still there.
         startup_code = (
             f"import json, os, sys\nsys.path.insert(0, {str(CORE)!r})\n"
             f"open({str(starts)!r}, 'a').write('x')\n"
@@ -286,7 +287,6 @@ class HostProgramTests(unittest.TestCase):
             "from recursion_core import plugin_host\n"
             "from recursion_core.plugin_security.tests.support import FakeGilProbe\n"
             + WALL_SHIMS[wall]
-            + (f"plugin_host._home = lambda: {home!r}\n" if home is not None else "")
             + bootstrap
             + textwrap.dedent(f"""
                 main = plugin_host.main
@@ -334,6 +334,8 @@ class HostProgramTests(unittest.TestCase):
                     raise
             report = Path(cwd, "host-status.json")
             report = report.read_text() if report.exists() else None
+            self.canaries_left = sorted(
+                name for name in os.listdir(cwd) if name.startswith(".csl-plugin-host-canary"))
         self.stderr = stderr
         self.starts = len(starts.read_text()) if starts.exists() else 0
         self.assertEqual(process.returncode, code, stderr.decode(errors="replace"))
@@ -341,7 +343,7 @@ class HostProgramTests(unittest.TestCase):
         self.assertTrue(replies, stderr.decode(errors="replace"))
         self.hello = replies.pop(0)
         self.assertEqual({key: value for key, value in self.hello.items() if key != "wall"}, HELLO)
-        if code != 0 or wall == "real":
+        if code != 0 or wall in ("real", "noreadfile"):
             return replies, None, None, None
         self.assertIsNotNone(report, "the host wrote no status")
         status, reads, identity = json.loads(report)
@@ -830,7 +832,8 @@ class HostProgramTests(unittest.TestCase):
 
     # THE WALL. The host walls itself in before it reads any message, proves the wall from inside, sends
     # the record in its hello, and answers every load with plugin_wall_unproven when the record is not
-    # proven. The stand-in home holds a canary; the plugin below tries to read it and to make sockets.
+    # proven. The stand-in home holds a canary; the plugin below tries to read it and to make sockets. The
+    # host's own probe reads a canary file of its own in its working folder.
 
     def stand_in_home(self):
         home = self.root / ("home-%d" % next(self.counter))
@@ -845,18 +848,19 @@ class HostProgramTests(unittest.TestCase):
             self.skipTest(why)
         home, canary = self.stand_in_home()
         replies, _, _, _ = self.exchange(HELLO, load(WALL_SOURCE), call(7, command={"canary": str(canary)}), BYE,
-                                         wall="real", home=str(home))
+                                         wall="real")
         self.assertEqual(replies, [result(7, {"canary": "PermissionError", "inet": "PermissionError",
                                               "unix": "PermissionError"})])
         record = self.hello.get("wall")
         self.assertIsInstance(record, dict, self.hello)
         self.assertEqual({name: record[name] for name in RECORD_CHECKS}, dict.fromkeys(RECORD_CHECKS, True))
         self.assertIs(record["proven"], True)
+        self.assertEqual(self.canaries_left, [])
         # The same walled host still answers an ordinary read command, as the in-process loader does.
         loader = PluginLoader(TrustStore({}), {}, ReservedEffects(), CoreHealth(), FakeGilProbe())
         plugin = loader.load(manifest_bytes("01" * 32, source=SOURCE), None, SOURCE)
         command = {"command": "positions", "terms": [1, False, None]}
-        replies, _, _, _ = self.exchange(HELLO, load(), call(7, command=command), BYE, wall="real", home=str(home))
+        replies, _, _, _ = self.exchange(HELLO, load(), call(7, command=command), BYE, wall="real")
         self.assertIs(self.hello["wall"]["proven"], True)
         self.assertEqual(replies, [result(7, plugin.module.operator(command))])
 
@@ -866,7 +870,7 @@ class HostProgramTests(unittest.TestCase):
         ran = home / "plugin-ran"
         source = SOURCE + b"open(%r, 'w').close()\n" % str(ran).encode()
         replies, _, _, _ = self.exchange(HELLO, load(source), call(7, command={"command": "positions"}), load(source),
-                                         BYE, wall="nolandlock", home=str(home))
+                                         BYE, wall="nolandlock")
         self.assertEqual(len(replies), 3, replies)
         for reply in (replies[0], replies[2]):
             self.assert_refusal(reply, None, "plugin_wall_unproven")
@@ -901,7 +905,7 @@ class HostProgramTests(unittest.TestCase):
         replies, _, _, _ = self.exchange(
             dict(HELLO, wall=claimed), dict(HELLO, gil_check="off"), dict(claimed, type="wall"), asking,
             call(7, command={"command": "positions"}), load(source), BYE,
-            wall="nolandlock", home=str(home), environ=environ, files=files)
+            wall="nolandlock", environ=environ, files=files)
         self.assertEqual([(reply["type"], reply["code"]) for reply in replies],
                          [("refusal", "message_invalid"), ("refusal", "message_unknown"),
                           ("refusal", "plugin_wall_unproven"), ("refusal", "call_not_offered"),
@@ -934,6 +938,26 @@ class HostProgramTests(unittest.TestCase):
                             "code; missing: wall_system_unsupported, no_record")
         self.assert_refusal(sent[2], 7, "call_not_offered")
         self.assertEqual(len(sent), 3, sent)
+
+    def test_w5_a_wall_that_leaves_file_reads_open_is_not_proven_and_no_plugin_byte_runs(self):
+        why = _why_no_wall()
+        if why:
+            self.skipTest(why)
+        _, canary = self.stand_in_home()
+        replies, _, _, _ = self.exchange(HELLO, load(WALL_SOURCE), call(7, command={"canary": str(canary)}),
+                                         load(WALL_SOURCE), BYE, wall="noreadfile")
+        self.assertEqual([(reply["type"], reply.get("code")) for reply in replies],
+                         [("refusal", "plugin_wall_unproven"), ("refusal", "call_not_offered"),
+                          ("refusal", "plugin_wall_unproven")], replies)
+        for reply in (replies[0], replies[2]):
+            self.assert_refusal(reply, None, "plugin_wall_unproven")
+            self.assertIn("home_canary", reply["detail"])
+            self.assertTrue(reply["detail"].endswith(", proven"), reply["detail"])
+        record = self.hello.get("wall")
+        self.assertIsInstance(record, dict, self.hello)
+        self.assertIs(record["home_canary"], False)
+        self.assertIs(record["proven"], False)
+        self.assertEqual(self.canaries_left, [])
 
 
 def _why_no_wall():
@@ -974,6 +998,8 @@ STANDIN_RECORD = dict(dict.fromkeys(RECORD_CHECKS, True), landlock_abi=6,
 # and a proven stand-in record, for the tests of the channel, the environment and the GIL rule, several of
 # whose plugins read /proc, which a real wall refuses. "real": the host's own wall on this kernel.
 # "nolandlock": the kernel answers that it has no Landlock, so apply_wall refuses before any change.
+# "noreadfile": a wall whose Landlock step leaves file reads unhandled, so every file stays readable while
+# folders, writes, sockets, programs and signals stay walled as before.
 WALL_SHIMS = {
     "standin": ("from recursion_core.plugin_host import wall_linux as _wall_linux\n"
                 "_wall_linux.apply_wall = lambda paths: None\n"
@@ -981,4 +1007,7 @@ WALL_SHIMS = {
     "real": "",
     "nolandlock": ("from recursion_core.plugin_host import wall_linux as _wall_linux\n"
                    "_wall_linux._landlock_abi = lambda libc: 0\n"),
+    "noreadfile": ("from recursion_core.plugin_host import wall_linux as _wall_linux\n"
+                   "_wall_linux._FS_ABI1 &= ~_wall_linux._FS_READ_FILE\n"
+                   "_wall_linux._FS_READ_FILE = 0\n"),
 }

@@ -12,9 +12,10 @@ which limits what the process can do to the machine.
 
 The wall. Before it reads its first load, the host walls itself in (``wall_linux.apply_wall``, with the
 Python install as the only path it may read) and proves that wall from inside (``wall_linux.probe_wall``,
-with its own home folder as the canary and its starter as the other process); its hello carries the
-record (``wall.v1``). A host whose record is not proven, or whose wall was refused, answers every load
-with ``plugin_wall_unproven`` naming what is missing, loads nothing and runs no plugin byte. Nothing on
+with a canary file it writes in its own working folder just before the wall and its starter as the other
+process); its hello carries the record (``wall.v1``). The canary is gone again before any plugin byte runs.
+A host whose record is not proven, or whose wall was refused, answers every load with
+``plugin_wall_unproven`` naming what is missing, loads nothing and runs no plugin byte. Nothing on
 the channel, in a manifest, in a file or in a setting reaches that step: it runs once, before the host
 reads any message, and nothing here offers a way around it. Outside Linux there is no wall, so no load
 is ever taken there. Until the daemon's reader of this channel exists, do not run a plugin you do not
@@ -83,15 +84,59 @@ def _install_paths():
     return sorted({sys.prefix, sys.base_prefix})
 
 
-def _home():
-    """This user's home folder, the probe's canary: read from the password database before the wall,
-    since the host's environment is empty by then. A home that cannot be read is '' and proves nothing."""
-    try:
-        import pwd
+# The probe's canary: a regular file this host writes in its own working folder just before the wall, named
+# for this process. The probe must find it unreadable behind the wall, so a wall that leaves file reads open
+# is never proven (a folder alone would not show that). It holds nothing of anyone's: one line of its own.
+CANARY_PREFIX = ".csl-plugin-host-canary-"
 
-        return pwd.getpwuid(os.getuid()).pw_dir or ""
-    except (ImportError, KeyError, OSError):
-        return ""
+
+def _canary():
+    """(the canary's path, a call that removes it), or ('', None) when it cannot be made, which proves nothing.
+
+    A walled host can remove no file, so a helper process, forked before the wall and holding only its end
+    of a pipe, removes the canary when the host shuts that pipe after the probe (or when the host ends), and
+    the host waits for it: a plugin finds its working folder as it was."""
+    try:
+        path = os.path.join(os.getcwd(), CANARY_PREFIX + str(os.getpid()))
+        made = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return "", None
+    try:
+        try:
+            os.write(made, b"canary\n")
+        finally:
+            os.close(made)
+        read_end, write_end = os.pipe()
+    except OSError:
+        _remove_quietly(path)
+        return "", None
+    try:
+        helper = os.fork()
+    except OSError:
+        os.close(read_end)
+        os.close(write_end)
+        _remove_quietly(path)
+        return "", None
+    if helper == 0:
+        try:
+            os.close(write_end)
+            os.read(read_end, 1)  # the host shuts its end after the probe, or ends
+            os.unlink(path)
+        finally:
+            os._exit(0)
+    os.close(read_end)
+
+    def remove():
+        os.close(write_end)
+        os.waitpid(helper, 0)
+    return path, remove
+
+
+def _remove_quietly(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _wall():
@@ -100,18 +145,27 @@ def _wall():
     Runs once, before the host reads any message. The refusal is the code of ``apply_wall``'s refusal, or
     the name of what it raised, or '' when the wall applied. The probe runs either way: its checks are
     harmless where they are allowed, and a record that shows them allowed is not proven. Where the probe
-    cannot run at all (not Linux), the record is None."""
-    canary, refused = _home(), ""
+    cannot run at all (not Linux), the record is None. The canary is made only where the wall can be (on
+    Linux; elsewhere the wall refuses before any change) and is removed once the probe has run."""
+    canary, remove = _canary() if sys.platform.startswith("linux") else ("", None)
+    refused = ""
     try:
-        wall_linux.apply_wall(_install_paths())
-    except wall_linux.WallRefused as exc:
-        refused = exc.code
-    except Exception as exc:  # a path that cannot be opened, or any other failure: no wall is in place
-        refused = "apply_wall_" + type(exc).__name__
-    try:
-        record = wall_linux.probe_wall(canary, os.getppid())
-    except Exception:  # wall_system_unsupported, or a probe that cannot run: nothing is proven
-        record = None
+        try:
+            wall_linux.apply_wall(_install_paths())
+        except wall_linux.WallRefused as exc:
+            refused = exc.code
+        except Exception as exc:  # a path that cannot be opened, or any other failure: no wall is in place
+            refused = "apply_wall_" + type(exc).__name__
+        try:
+            record = wall_linux.probe_wall(canary, os.getppid())
+        except Exception:  # wall_system_unsupported, or a probe that cannot run: nothing is proven
+            record = None
+    finally:
+        if remove is not None:
+            try:
+                remove()
+            except OSError:
+                pass
     return record, refused
 
 

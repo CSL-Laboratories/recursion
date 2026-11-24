@@ -48,10 +48,10 @@ def attempt(call):
 mode, out = spec["mode"], {}
 chan = socket.socket(fileno=spec["chan"])
 if mode == "nowall":
-    out["record"] = w.probe_wall(spec["canary"], spec["daemon"])
+    out["record"] = w.probe_wall(spec["canary"], spec["daemon"], write_file=spec["canary"], write_folder=spec["writes"])
 elif mode in ("wall", "wall_missing_canary"):
     out["apply"] = attempt(lambda: w.apply_wall(spec["paths"]))
-    out["record"] = w.probe_wall(spec["canary"], spec["daemon"])
+    out["record"] = w.probe_wall(spec["canary"], spec["daemon"], write_file=spec["canary"], write_folder=spec["writes"])
     if mode == "wall":
         def denied(call):
             try:
@@ -122,7 +122,7 @@ elif mode == "not_linux":
     w.ctypes.CDLL = no_library
     sys.platform = "darwin"
     out["apply"] = attempt(lambda: w.apply_wall(spec["paths"]))
-    out["probe"] = attempt(lambda: w.probe_wall(spec["canary"], spec["daemon"]))
+    out["probe"] = attempt(lambda: w.probe_wall(spec["canary"], spec["daemon"], write_file=spec["canary"], write_folder=spec["writes"]))
     sys.platform = "linux"
     out["status"] = status()
 print(json.dumps(out), flush=True)
@@ -159,6 +159,9 @@ def run_child(mode: str, *, canary_exists: bool = True) -> tuple[dict, str]:
         if canary_exists:
             with open(canary, "w", encoding="utf-8") as handle:
                 handle.write("the daemon's secret, stand-in")
+        writes = os.path.join(folder, "write-probe")  # the folder made for the probe's write kinds, before any wall
+        os.mkdir(writes)
+        wall_linux.prepare_write_folder(writes)
         daemon = subprocess.Popen(_interpreter() + ["-c", "import time; time.sleep(120)"],
                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, cwd=folder,
                                   env={"HOME": home, "TMPDIR": folder})
@@ -166,7 +169,7 @@ def run_child(mode: str, *, canary_exists: bool = True) -> tuple[dict, str]:
         handed_here, handed_there = socket.socketpair()
         try:
             spec = {"core": str(CORE), "mode": mode, "canary": canary, "daemon": daemon.pid,
-                    "chan": theirs.fileno(), "paths": _install_paths()}
+                    "chan": theirs.fileno(), "paths": _install_paths(), "writes": writes}
             socket.send_fds(ours, [b"ping"], [handed_there.fileno()])
             handed_there.close()
             child = subprocess.run(_interpreter() + ["-c", CHILD, json.dumps(spec)], input="question\n",
@@ -300,7 +303,8 @@ class WallDefinitionTests(unittest.TestCase):
 
     def test_the_record_has_exactly_the_fields_of_its_schema(self):
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
-        fields = set(wall_linux.RECORD_CHECKS) | {"landlock_abi", "landlock_scopes", "arch", "proven"}
+        fields = set(wall_linux.RECORD_CHECKS) | {"writes", "writes_not_tried", "landlock_abi", "landlock_scopes",
+                                                  "arch", "proven"}
         self.assertEqual(set(schema["required"]), fields)
         self.assertEqual(set(schema["properties"]), fields)
 

@@ -1,0 +1,32 @@
+{
+  "reads_outside": true,
+  "home_canary": true,
+  "program_start": true,
+  "new_socket": true,
+  "signal_other": true,
+  "signal_other_ways": true,
+  "metadata_change": true,
+  "kernel_surface": true,
+  "writes": {
+    "open_for_write": "let_through",
+    "truncate": "let_through",
+    "create_file": "let_through",
+    "create_folder": "let_through",
+    "make_fifo": "let_through",
+    "make_symlink": "let_through",
+    "make_link": "let_through",
+    "make_char_device": "let_through",
+    "make_block_device": "let_through",
+    "remove_file": "let_through",
+    "remove_folder": "let_through"
+  },
+  "writes_not_tried": {
+    "make_socket_node": "a socket file is made only by binding a new socket, and the wall refuses every new socket first (new_socket)",
+    "device_ioctl": "a device's own commands need a device opened, and the wall lets nothing be opened outside the install, where no device lies (reads_outside)",
+    "move_between_folders": "a move or a link into another folder also makes a name there, which the make kinds show refused"
+  },
+  "landlock_abi": 3,
+  "landlock_scopes": [],
+  "arch": "x86_64",
+  "proven": false
+}

@@ -338,7 +338,7 @@ if mode == "reach":
                             "pipe": sys.stdin.readline().strip()}
     message, fds, _f, _a = socket.recv_fds(chan, 64, 1)
     handed = socket.socket(fileno=fds[0]); handed.sendall(b"answer:" + message); handed.close()
-    out["record"] = w.probe_wall(spec["canary"], daemon)
+    out["record"] = w.probe_wall(spec["canary"], daemon, write_file=spec["canary"], write_folder=spec["writes"])
 
 elif mode.startswith("half_"):
     point = mode[5:]
@@ -362,14 +362,14 @@ elif mode.startswith("half_"):
     out["apply"] = apply(paths)
     w._call, w._no_new_privs = real_call, real_nnp
     out["status"] = status()
-    out["record"] = w.probe_wall(spec["canary"], daemon)
+    out["record"] = w.probe_wall(spec["canary"], daemon, write_file=spec["canary"], write_folder=spec["writes"])
     out["reapply"] = apply(paths)
-    out["proven_after_reapply"] = w.probe_wall(spec["canary"], daemon)["proven"]
+    out["proven_after_reapply"] = w.probe_wall(spec["canary"], daemon, write_file=spec["canary"], write_folder=spec["writes"])["proven"]
 
 elif mode == "twice":
     out["apply"] = apply(paths)
     out["reapply"] = apply(paths)
-    out["proven"] = w.probe_wall(spec["canary"], daemon)["proven"]
+    out["proven"] = w.probe_wall(spec["canary"], daemon, write_file=spec["canary"], write_folder=spec["writes"])["proven"]
 
 elif mode == "weak":
     lc, arch = w._libc(), w._arch()
@@ -384,7 +384,7 @@ elif mode == "weak":
         if hasattr(w, name):
             setattr(w, name, empty)
     w._load_seccomp_filter(lc, arch)
-    out["record"] = w.probe_wall(spec["canary"], daemon)
+    out["record"] = w.probe_wall(spec["canary"], daemon, write_file=spec["canary"], write_folder=spec["writes"])
     out["io_uring_setup"] = res(425 if ARCH == "x86_64" else 425, 0, 0)
 
 elif mode == "threads_native":
@@ -501,6 +501,9 @@ def run_reach_child(mode: str, **extra) -> dict:
         canary = os.path.join(home, "canary")
         with open(canary, "w", encoding="utf-8") as handle:
             handle.write("the daemon's secret, stand-in")
+        writes = os.path.join(folder, "write-probe")  # the folder made for the probe's write kinds, before any wall
+        os.mkdir(writes)
+        wall_linux.prepare_write_folder(writes)
         files = {}
         for name in ("read", "truncate", "meta", "metafd"):
             files[name] = os.path.join(folder, "outside-" + name)
@@ -528,7 +531,8 @@ def run_reach_child(mode: str, **extra) -> dict:
         try:
             spec = dict({"core": str(CORE), "mode": mode, "canary": canary, "daemon": daemon.pid, "dir": folder,
                          "files": files, "ro": ro, "victims": [v.pid for v in victims], "chan": theirs.fileno(),
-                         "metafd": metafd, "num": NUM, "daemon_nice_set": daemon_nice_set, "paths": sorted({sys.base_prefix, sys.prefix})}, **extra)
+                         "metafd": metafd, "num": NUM, "daemon_nice_set": daemon_nice_set, "paths": sorted({sys.base_prefix, sys.prefix}),
+                         "writes": writes}, **extra)
             socket.send_fds(ours, [b"ping"], [handed_there.fileno()])
             handed_there.close()
             _wait_for_cpu(victims[2].pid)  # the spinning victim has used more than the limit's CPU before it is set
@@ -1044,7 +1048,7 @@ class LandlockScopeTests(unittest.TestCase):
                 if number in (445, 446):
                     return 0, 0
                 raise AssertionError(f"an unexpected call {number}")
-            stand_ins = {fn: _refuse for fn in CHECK_FUNCTIONS.values()}
+            stand_ins = dict({fn: _refuse for fn in CHECK_FUNCTIONS.values()}, _write_outcomes=_writes_refused)
             with self.subTest(abi=abi), mock.patch.multiple(
                     wall_linux, _call=fake_call, _landlock_abi=lambda libc: abi, _thread_count=lambda: 1,
                     _no_new_privs=lambda libc: None, _load_seccomp_filter=lambda *a, **k: None,
@@ -1121,12 +1125,18 @@ def _let_through(*_args, **_kwargs):
     return None
 
 
+def _writes_refused(*_args, **_kwargs):
+    """A stand-in for the write kinds: each refused by Landlock (nothing is tried in this process)."""
+    return dict.fromkeys(wall_linux.WRITE_KINDS, "refused_by_landlock")
+
+
 @unittest.skipIf(_why_not_here(), _why_not_here() or "")
 class ProvenNeedsEveryCheckTests(unittest.TestCase):
     """In this process, with every check replaced by a stand-in: nothing is walled and no escape is tried."""
 
     def probe(self, let_through=None, **patches):
         stand_ins = {fn: (_let_through if name == let_through else _refuse) for name, fn in CHECK_FUNCTIONS.items()}
+        stand_ins["_write_outcomes"] = _writes_refused
         with mock.patch.multiple(wall_linux, create=True, **stand_ins, **patches):
             return wall_linux.probe_wall("/nonexistent/canary", 1)
 

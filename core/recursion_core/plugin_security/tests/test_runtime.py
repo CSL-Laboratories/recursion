@@ -94,12 +94,16 @@ _CHILD = textwrap.dedent('''
     import hashlib, json, sys
     sys.path.insert(0, sys.argv[1])
     sys.path.insert(0, sys.argv[2])
-    from recursion_core.plugin_security import (CoreHealth, PluginLoader, Refused, ReservedEffects,
+    from recursion_core.plugin_security import (CoreHealth, Grant, PluginLoader, Refused, ReservedEffects,
         TrustStore, runtime_report)
     from recursion_core.plugin_security.tests.support import manifest_bytes
     plugin = sys.argv[3].encode()
     health = CoreHealth()
-    loader = PluginLoader(TrustStore({}), {}, ReservedEffects(), health)
+    # Both plugins hold an unsigned read grant: one with no permission is refused before it runs
+    # (PLUGIN-HOST PR 1), and these tests are about what running it does.
+    grants = {"demo.plugin": Grant("demo.plugin", hashlib.sha256(plugin).hexdigest(), None, ("read",)),
+              "second.plugin": Grant("second.plugin", hashlib.sha256(b"Y = 2\\n").hexdigest(), None, ("read",))}
+    loader = PluginLoader(TrustStore({}), grants, ReservedEffects(), health)
     out = {"before": runtime_report()}
     try:
         loader.load(manifest_bytes("11" * 32, source=plugin, permissions=("read",)), "", plugin)
@@ -144,6 +148,13 @@ class FreeThreaded314Tests(unittest.TestCase):
             with self.subTest(flags=flags):
                 proc = self._run(list(flags), code, str(CORE_ROOT))
                 self.assertEqual(proc.stdout.strip(), want, proc.stderr)
+
+    def test_the_child_fixture_runs_granted_plugins(self) -> None:
+        """Compiler-independent: the extension tests' fixture really reaches plugin execution."""
+        proc = self._run(["-X", "gil=0"], _CHILD, str(CORE_ROOT), temp_dir(self), "VALUE = 1\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual((out["load"], out["second"], out["poisoned"]), ("ok", "ok", None))
 
     def _build_extension(self) -> str:
         if not CC:

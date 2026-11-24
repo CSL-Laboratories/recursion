@@ -12,6 +12,7 @@ import unittest
 from recursion_core.plugin_security import (
     CoreHealth, Grant, PluginLoader, Refused, ReservedEffects, TrustStore, canonical, parse,
 )
+from recursion_core.plugin_security.loader import NOT_GRANTED
 from recursion_core.plugin_security.tests.support import (
     PLUGIN_SOURCE, FakeGilProbe, Key, manifest_bytes, needs_crypto,
 )
@@ -74,17 +75,24 @@ class SignatureTests(unittest.TestCase):
         self.assertIn("signer_not_on_trusted_list", _codes(loaded.findings))
 
     def test_revoked_key_counts_as_unsigned_and_loses_signed_grant(self) -> None:
+        # PLUGIN-HOST PR 1: left with no permission, the plugin is refused before its code is compiled.
         loader = _loader(self.dev, self.grant, revoked=frozenset({_kid(self.dev)}))
-        loaded = loader.load(self.raw, self.dev.sign(self.raw), PLUGIN_SOURCE)
-        self.assertEqual((loaded.trust, loaded.permissions), ("unsigned", ()))
-        self.assertIn("grant_signer_mismatch", _codes(loaded.findings))
+        with self.assertRaises(Refused) as ctx:
+            loader.load(self.raw, self.dev.sign(self.raw), PLUGIN_SOURCE)
+        self.assertEqual(ctx.exception.code, NOT_GRANTED)
+        self.assertIn("signer_key_revoked", _codes(loader.last_findings))
+        self.assertIn("grant_signer_mismatch", _codes(loader.last_findings))
+        self.assertEqual(loader._active, {})
 
     def test_manifest_tampered_after_signing_loses_grant(self) -> None:
         sig = self.dev.sign(self.raw)
         data = parse(self.raw)
         data["version"] = "1.0.1"
-        loaded = _loader(self.dev, self.grant).load(canonical(data), sig, PLUGIN_SOURCE)
-        self.assertEqual((loaded.trust, loaded.permissions), ("unsigned", ()))
+        loader = _loader(self.dev, self.grant)
+        with self.assertRaises(Refused) as ctx:
+            loader.load(canonical(data), sig, PLUGIN_SOURCE)
+        self.assertEqual(ctx.exception.code, NOT_GRANTED)
+        self.assertIn("signature_invalid", _codes(loader.last_findings))
 
     def test_artifact_bytes_tampered_is_refused(self) -> None:
         loader = _loader(self.dev, self.grant)
@@ -97,9 +105,12 @@ class SignatureTests(unittest.TestCase):
     def test_update_with_new_digest_loses_grant(self) -> None:
         new_source = b"VALUE = 43\n"
         raw = manifest_bytes(self.dev.public, source=new_source)
-        loaded = _loader(self.dev, self.grant).load(raw, self.dev.sign(raw), new_source)
-        self.assertEqual((loaded.trust, loaded.permissions), ("signed", ()))
-        self.assertIn("grant_artifact_mismatch", _codes(loaded.findings))
+        loader = _loader(self.dev, self.grant)
+        with self.assertRaises(Refused) as ctx:
+            loader.load(raw, self.dev.sign(raw), new_source)
+        self.assertEqual(ctx.exception.code, NOT_GRANTED)
+        self.assertIn("signature_valid_trusted_key", _codes(loader.last_findings))
+        self.assertIn("grant_artifact_mismatch", _codes(loader.last_findings))
 
     def test_verified_is_a_label_not_a_gate(self) -> None:
         for label in ("verified", "non_verified", None, "forged-label"):
@@ -131,12 +142,15 @@ class GrantTests(unittest.TestCase):
         cases = [
             (("read", "propose", "order"), ("order", "read"), ("read", "order")),
             (("read",), ("read", "propose", "order"), ("read",)),
-            (("read", "order"), (), ()),
             (("propose", "order"), ("propose",), ("propose",)),
         ]
         for requested, granted, expected in cases:
             with self.subTest(requested=requested, granted=granted):
                 self.assertEqual(self._load(requested, granted).permissions, expected)
+        # An empty intersection is refused before the code is compiled (PLUGIN-HOST PR 1).
+        with self.assertRaises(Refused) as ctx:
+            self._load(("read", "order"), ())
+        self.assertEqual(ctx.exception.code, NOT_GRANTED)
 
     def test_unsigned_order_needs_manual_acknowledged_grant(self) -> None:
         self.assertEqual(self._load(ALL, ALL, signed=False).permissions, ("read", "propose"))
@@ -222,6 +236,10 @@ class DoctorAndGilTests(unittest.TestCase):
             loader.load(self.raw, self.dev.sign(self.raw), PLUGIN_SOURCE)
         self.assertEqual(ctx.exception.code, "core_poisoned_restart_required")
 
+    def _granted(self, source):
+        # Granted, so the plugin's code really runs (an ungranted one is refused before it compiles).
+        return Grant("demo.plugin", hashlib.sha256(source).hexdigest(), _kid(self.dev), ALL)
+
     def test_gil_checked_after_failing_plugin(self) -> None:
         source = b"raise RuntimeError('boom')\n"
         raw = manifest_bytes(self.dev.public, source=source)
@@ -229,7 +247,7 @@ class DoctorAndGilTests(unittest.TestCase):
             with self.subTest(gil_on=gil_on):
                 probe, health = FakeGilProbe([gil_on]), CoreHealth()
                 with self.assertRaises(Refused) as ctx:
-                    _loader(self.dev, None, probe, health=health).load(raw, self.dev.sign(raw), source)
+                    _loader(self.dev, self._granted(source), probe, health=health).load(raw, self.dev.sign(raw), source)
                 self.assertEqual(ctx.exception.code, code)
                 self.assertEqual(probe.calls, 1)
                 self.assertEqual(bool(health.poisoned), gil_on)
@@ -238,8 +256,10 @@ class DoctorAndGilTests(unittest.TestCase):
         source = b"raise SystemExit(3)\n"
         raw = manifest_bytes(self.dev.public, source=source)
         probe = FakeGilProbe([True])
-        with self.assertRaises(Refused):
-            _loader(self.dev, None, probe).load(raw, self.dev.sign(raw), source)
+        with self.assertRaises(Refused) as ctx:
+            _loader(self.dev, self._granted(source), probe).load(raw, self.dev.sign(raw), source)
+        self.assertEqual(ctx.exception.code, "core_poisoned_gil_enabled")
+        self.assertIsInstance(ctx.exception.__cause__, SystemExit)
         self.assertEqual(probe.calls, 1)
 
     def test_poison_after_earlier_good_load_drops_all_permissions(self) -> None:
@@ -258,7 +278,7 @@ class DoctorAndGilTests(unittest.TestCase):
         bad = b"def (:\n"
         raw = manifest_bytes(self.dev.public, source=bad)
         with self.assertRaises(Refused) as ctx:
-            _loader(self.dev, None).load(raw, self.dev.sign(raw), bad)
+            _loader(self.dev, self._granted(bad)).load(raw, self.dev.sign(raw), bad)
         self.assertEqual(ctx.exception.code, "plugin_compile_failed")
         loader = _loader(self.dev, self.grant)
         loader.load(self.raw, self.dev.sign(self.raw), PLUGIN_SOURCE)
@@ -269,16 +289,21 @@ class DoctorAndGilTests(unittest.TestCase):
 
 class CompileOverflowTests(unittest.TestCase):
     """An unsigned plugin and no trusted key. Compiling a plugin and the GIL read after it involve no
-    signature, so this runs where ``cryptography`` is missing too."""
+    signature, so this runs where ``cryptography`` is missing too. The plugin holds an unsigned
+    ``read`` grant: an ungranted one is refused before compiling (PLUGIN-HOST PR 1)."""
+
+    @staticmethod
+    def _grant(source):
+        return Grant("demo.plugin", hashlib.sha256(source).hexdigest(), None, ("read",))
 
     def test_compile_parser_overflow_runs_gil_gate_and_refuses_typed(self) -> None:
         deep = b"~" * 10_000 + b"1"
         # The manifest has to name a developer key; with no signature it is never used to verify.
-        raw = manifest_bytes("11" * 32, source=deep, permissions=())
+        raw = manifest_bytes("11" * 32, source=deep, permissions=("read",))
         for gil_on, expected in ((False, "plugin_compile_failed"), (True, "core_poisoned_gil_enabled")):
             with self.subTest(gil_on=gil_on):
                 probe, health = FakeGilProbe([gil_on]), CoreHealth()
-                loader = _loader(None, None, probe, health=health)
+                loader = _loader(None, self._grant(deep), probe, health=health)
                 with self.assertRaises(Refused) as ctx:
                     loader.load(raw, None, deep)
                 self.assertEqual(ctx.exception.code, expected)
@@ -294,11 +319,11 @@ class CompileOverflowTests(unittest.TestCase):
         deep = b"a" + b".b" * 200_000
         with self.assertRaises(RecursionError):
             compile(deep, "<probe>", "exec", dont_inherit=True)
-        raw = manifest_bytes("11" * 32, source=deep, permissions=())
+        raw = manifest_bytes("11" * 32, source=deep, permissions=("read",))
         for gil_on, expected in ((False, "plugin_compile_failed"), (True, "core_poisoned_gil_enabled")):
             with self.subTest(gil_on=gil_on):
                 probe, health = FakeGilProbe([gil_on]), CoreHealth()
-                loader = _loader(None, None, probe, health=health)
+                loader = _loader(None, self._grant(deep), probe, health=health)
                 with self.assertRaises(Refused) as ctx:
                     loader.load(raw, None, deep)
                 self.assertEqual(ctx.exception.code, expected)

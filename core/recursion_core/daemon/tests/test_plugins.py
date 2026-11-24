@@ -150,9 +150,12 @@ class LoaderPathTests(HostCase):
         self.assertIn('not contained', row['blocker'])
 
     def test_tampered_artifact_is_refused_typed_and_the_next_plugin_still_loads(self):
-        self.install()
-        (self.plugins / 'fixture' / 'plugin.py').write_bytes(fx.OPERATOR_SOURCE + b'TAMPERED = True\n')
         other = b'VALUE = 1\n'
+        fx.write_install(self.config, trusted={'dev': self.key.public},
+                         grants=[fx.grant_for(fx.OPERATOR_SOURCE, key=self.key),
+                                 fx.grant_for(other, key=self.key, plugin_id='fixture.other', permissions=('read',))])
+        fx.write_plugin(self.plugins / 'fixture', fx.OPERATOR_SOURCE, key=self.key)
+        (self.plugins / 'fixture' / 'plugin.py').write_bytes(fx.OPERATOR_SOURCE + b'TAMPERED = True\n')
         fx.write_plugin(self.plugins / 'other', other, key=self.key, plugin_id='fixture.other', permissions=('read',))
         with self.assertLogs('recursion_core.daemon.plugins', 'ERROR') as logs:
             host = self.host()
@@ -176,17 +179,21 @@ class LoaderPathTests(HostCase):
         self.assertEqual([(r['state'], r['code']) for r in host.records],
                          [('refused', 'manifest_fields'), ('refused', 'plugin_file_missing')])
 
-    def test_a_bad_signature_loads_as_unsigned_and_the_signed_grant_gives_it_nothing(self):
+    def test_a_bad_signature_is_unsigned_and_the_signed_grant_leaves_it_unrun(self):
         # 4.3: "A plugin that fails the check loads as unsigned", and the grant is bound to the signer.
-        self.install(signature='00' * 64)
-        host = self.host()
+        # PLUGIN-HOST PR 1: unsigned with no other grant, it has no permission, so none of its code runs.
+        marker = self.tmp / 'plugin-code-ran'
+        self.install(f'open({str(marker)!r}, "w").close()\n'.encode() + fx.OPERATOR_SOURCE, signature='00' * 64)
+        with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
+            host = self.host()
         record, = host.records
-        self.assertEqual((record['state'], record['trust'], record['permissions']), ('loaded', 'unsigned', []))
+        self.assertEqual((record['state'], record['code'], record['plugin_id']),
+                         ('refused', 'plugin_not_granted', 'fixture.operator'))
         self.assertIn('signature_invalid', codes(record))
         self.assertIn('grant_signer_mismatch', codes(record))
-        self.assertIn('panel_permission_required', codes(record))
-        self.assertIn('read_permission_required', codes(record))
-        self.assertEqual((record['provides'], host.registries), ([], ()))
+        self.assertNotIn('compiled', codes(record))
+        self.assertFalse(marker.exists(), 'an ungranted plugin ran')
+        self.assertEqual(host.registries, ())
         self.assertEqual(self.read(host)[0], 503)
 
     def test_what_a_plugin_offers_needs_its_permission(self):
@@ -245,9 +252,18 @@ class LoaderPathTests(HostCase):
         self.assertEqual(host.inventory()['plugins'][0]['permissions'], [])
 
     def test_the_plugin_gets_the_core_boundary_and_no_effect_is_authorized(self):
-        self.install()
+        # R4 finding 7 (PLUGIN-HOST PR 1): bind_core() only with a permission the client serves (order).
         stored, _ = breaker_module.open_breaker_store(self.state, clock=lambda: 0.0)
         self.addCleanup(stored.close)
+        self.install()  # read and panel: loaded, and bind_core() is not called
+        host = self.host(breaker=stored)
+        self.assertEqual(host.records[0]['provides'], ['panels', 'operator_reads'])
+        self.assertIn('core_client_permission_required', codes(host.records[0]))
+        self.assertEqual(host.loader._active['fixture.operator'].module.CORE, [])  # noqa: SLF001
+        host.close()
+
+        everything = ('read', 'panel', 'order')
+        self.install(permissions=everything, granted=everything)
         host = self.host(breaker=stored)
         self.assertEqual(host.records[0]['provides'], ['panels', 'operator_reads', 'core_client'])
         call = host.loader._active['fixture.operator'].module.CORE[0]  # noqa: SLF001 - the client the plugin was handed
@@ -255,12 +271,15 @@ class LoaderPathTests(HostCase):
         def ask(op, **args):
             return parse(call(canonical({'protocol': 'csl-core/v0', 'op': op, 'args': args})))
 
-        self.assertEqual(ask('plugin.permissions', plugin_id='fixture.operator')['result'], {'permissions': ['read', 'panel']})
+        self.assertEqual(ask('plugin.permissions', plugin_id='fixture.operator')['result'],
+                         {'permissions': ['read', 'panel', 'order']})
         self.assertEqual(ask('run.fault', run_id='run-1')['refusal'], {'code': 'host_only'})
         effect = {'schema': 'csl-effect/vNext', 'kind': 'order.submit', 'plugin_id': 'fixture.operator', 'run_id': 'run-1',
                   'connection': 'subscription:login', 'currency': 'USD', 'amount_minor': 1, 'payload': {},
                   'scope': {'account': 'a', 'venue': 'v', 'contract_family': 'f', 'adapter': 'd', 'environment': 'paper'}}
-        self.assertEqual(ask('effect.request', effect=effect)['refusal'], {'code': 'permission_required'})
+        # With order, the effect passes the permission check and stops at the run: nobody bound run-1.
+        # Nothing is drawn and nothing can be approved.
+        self.assertEqual(ask('effect.request', effect=effect)['refusal'], {'code': 'run_unknown'})
         self.assertEqual(len(host.pending_approvals), 0)
         self.assertEqual(host.inventory()['authority_profile'], 'not configured')
 

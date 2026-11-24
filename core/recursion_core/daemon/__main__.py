@@ -9,6 +9,14 @@ Operator plugins are never imported by name. The composition loads each installe
 (``$XDG_CONFIG_HOME/recursion/plugins/<name>/`` and every ``--plugin DIR``) through
 ``plugin_security.PluginLoader`` (``plugins.PluginHost``); a plugin that is refused is listed
 with its finding and the daemon runs without it.
+
+The interpreter (decision D2, Lucas, Nov 12 2026): "The daemon refuses to start without
+``-X gil=0``. If a plugin turns the GIL on later, the daemon keeps Stop and reconciliation alive
+and refuses plugin work; the call that did it answers 503." So ``require_free_threaded`` here is
+the package's build check plus ``plugin_security.require_production_runtime``, which also wants
+``-X gil=0``; at start a refusal stops the daemon before any lock, state, socket or GUI. On every
+sweep the same check runs again, and a refusal there poisons the plugin core (every plugin
+permission reads as none, every core effect refuses) while the sweep, reconciliation and Stop go on.
 """
 import argparse
 import getpass
@@ -18,13 +26,26 @@ from pathlib import Path
 import signal
 import threading
 from . import (Daemon, Registry, SystemdUserManager, UserLock, check_operator_linger,
-               refuse_engine_user, require_free_threaded, require_posix)
+               refuse_engine_user, require_posix)
+from . import require_free_threaded as require_free_threaded_build
+
+from recursion_core.plugin_security import Refused, require_production_runtime
 
 from .control_adapter import compose_control
 from .gui import LoopbackGUI
 from .launcher import EngineUnitManager
 
 log = logging.getLogger('recursion_core.daemon')
+GIL_POISON = 'gil_enabled_during_daemon_run'
+
+
+def require_free_threaded():
+    """Free-threaded CPython 3.14t, started with ``-X gil=0``, with the GIL off (D2); else ``RuntimeError``."""
+    require_free_threaded_build()  # CPython 3.14, Py_GIL_DISABLED, sys._is_gil_enabled() False now
+    try:
+        require_production_runtime()  # and -X gil=0, so no extension import can turn the GIL on later
+    except Refused as exc:
+        raise RuntimeError(f'Requires free-threaded CPython 3.14t with -X gil=0 ({exc.code})') from None
 
 
 def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep_seconds=5):
@@ -55,8 +76,20 @@ def main(*, client=None, door=None, plugins=(), plugin_dirs=(), port=8765, sweep
                 log.info('control API on %s', composed.server.path)
             gui = _start_gui(client, door, plugins, port, announced=False)
             announced = gui is None
+            gil_logged = False
             while not stopped.wait(sweep_seconds):
-                require_free_threaded()
+                if composed is None:
+                    require_free_threaded()
+                else:
+                    # R1 fix-5 (review-R1 combination patch, hunk 14) and D2: plugin work stops, Stop does not.
+                    try:
+                        require_free_threaded()
+                    except RuntimeError:
+                        composed.plugins.health.poison(GIL_POISON)
+                        if not gil_logged:
+                            log.error('GIL enabled in daemon process; plugins stay poisoned off while Stop and '
+                                      'reconciliation continue')
+                            gil_logged = True
                 daemon.sweep()
                 if composed is not None:
                     composed.control.reconcile()

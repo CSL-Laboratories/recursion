@@ -6,13 +6,11 @@ engine table, or is loaded by a daemon. The one-shot driver and the RPC worker a
 module is what both will read Pi's output with.
 
 SOURCES, read and not run (no Pi binary was installed or started): Pi's own protocol pages and code at
-earendil-works/pi@bb65e3e49710fbd14f10c7792d0eaa6e2b2c5923, the commit the vault's verified code map
-(20261028-recursion-frontier-map-pi-02) cites: ``packages/coding-agent/docs/json.md``, ``rpc.md``,
-``rpc-commands.md``, ``message-types.md``; ``src/modes/json-event.ts`` and ``src/modes/print-mode.ts``.
-The vault records 20261028-recursion-frontier-b3-stdio-rpc-02 (section 2.2) and
-20261107-csl712-engine-clis-grounding-01 (V48 to V52) agree with them where they overlap. The package
-the user installs is ``@earendil-works/pi-coding-agent`` (V48); its pin is measured from his install, not
-here. Every fixture in ``fixtures/pi/`` is SYNTHETIC: written by hand from those pages.
+earendil-works/pi@bb65e3e49710fbd14f10c7792d0eaa6e2b2c5923: ``packages/coding-agent/docs/json.md``,
+``rpc.md``, ``rpc-commands.md``, ``message-types.md``; ``src/modes/json-event.ts`` and
+``src/modes/print-mode.ts``. The package the user installs is ``@earendil-works/pi-coding-agent``; its pin
+is measured from the user's install, not here. Every fixture in ``fixtures/pi/`` is SYNTHETIC: written by
+hand from those pages.
 
 WHAT PI WRITES
 
@@ -40,7 +38,7 @@ WHAT THE PARSER DRAFTS (driver.v2 ``$defs/event_draft``; every payload has exact
   ``result.usage`` (the summary's model work, which compaction.ts adds up over one or two calls) are
   each kept once as a ``usage_held`` signal with event.v1's measurements, because event.v1's spans
   (``call``, ``turn``, ``session_total``) have no name for a sum of some calls inside a turn. The
-  driver can draft them unchanged once SPINE names that span (questions.md Q10).
+  driver can draft them unchanged once a span for a sum of some calls inside a turn is named.
 * ``tool.call``: one per ``toolCall`` block of a completed assistant message (the engine asking), and
   one for a ``tool_execution_start`` whose id no block named. ``input_digest`` is SHA-256 over the
   input as RFC 8785 writes it (``rfc8785/v1``); an input outside that form's strict profile is a
@@ -54,12 +52,11 @@ WHAT THE PARSER DRAFTS (driver.v2 ``$defs/event_draft``; every payload has exact
   only from Pi's replay of the argv prompt this stream registered, with the same text.
 
 It drafts no ``engine.output``: that is a span of the run's output file with byte offsets, which a line
-parser is not given; lane EVENTS' tailer writes each line the parser drafts nothing for (a streamed
-``message_update``, for one) as one untrusted ``engine.output`` with its offsets (EVENTS brief, step 6:
-"each line through the driver's parse(line), else one engine.output event"). It drafts no ``limit``:
-no typed limit signal is known for Pi (no oracle). Free
-error text that sounds like a quota makes the one-shot ``result`` a ``short_fault`` (grill Q23), never
-a ``plan_limit``. Facts that are not events (the session id, a refused prompt, a dialog Pi waits on, a
+parser is not given; the tailer that follows the run's output file writes each line the parser drafts
+nothing for (a streamed ``message_update``, for one) as one untrusted ``engine.output`` with its offsets:
+each line goes through the driver's ``parse(line)``, and else becomes one ``engine.output``. It drafts no
+``limit``: no typed limit signal is known for Pi. Free error text that sounds like a quota makes the
+one-shot ``result`` a ``short_fault``, never a ``plan_limit``. Facts that are not events (the session id, a refused prompt, a dialog Pi waits on, a
 settled run, usage that is not one call) are kept as ``signals`` for the driver.
 
 INTERFACE (what the one-shot driver and the RPC worker call; no other lane imports this module yet)
@@ -98,10 +95,13 @@ DEFAULT_EXECUTABLE = "pi"
 MODES = ("json", "rpc")
 
 MAX_INT = 2**53 - 1          # the largest whole number every binary64 reader keeps exact (rfc8785/v1 profile)
-MAX_DEPTH = 64               # of a tool's input
-INPUT_CARRY_MAX = 262144     # UTF-8 bytes of a tool input's text carried in a tool.call; larger is withheld
-TOOL_TEXT_MAX = 65536        # characters of a tool result's text carried in a tool.result; more is cut
-DETAIL_MAX = 500             # characters of engine error text carried in a result's detail
+# The four figures below are named module-level values with their shipped defaults. Each becomes a row of
+# the person's settings file, with this value as its default, when that file lands; nothing reads them
+# from anywhere else.
+MAX_DEPTH = 64               # nesting of a tool's input; becomes a setting
+INPUT_CARRY_MAX = 262144     # UTF-8 bytes of a tool input's text carried in a tool.call; larger is withheld; becomes a setting
+TOOL_TEXT_MAX = 65536        # characters of a tool result's text carried in a tool.result; more is cut; becomes a setting
+DETAIL_MAX = 500             # characters of engine error text carried in a result's detail; becomes a setting
 DIALOGS = ("select", "confirm", "input", "editor")   # extension UI requests Pi waits on (rpc-types.ts)
 PROTOCOL_ERRORS = (   # every PiProtocolError code this module raises
     "assistant_content", "content_block", "duplicate_key", "extension_ui_request", "integer_out_of_range",
@@ -354,7 +354,9 @@ class PiStream:
 
     Several writer threads may call ``prompt`` and ``command`` together. The mint and the pending
     entry are one step under a lock, so two writers never share a token and a delivery is not
-    overwritten. One reader calls ``feed``; the lock is the writers' step, and the stream holds no process.
+    overwritten. ``pending_deliveries`` takes the same lock for its copy, so it may be called from any
+    thread, beside the writers. One reader calls ``feed``, and ``argv_prompt`` runs once before it. The
+    stream holds no process.
 
     ``feed(line)`` reads one record and returns its drafts. ``signals`` collects the facts that are not
     events. The driver writes the lines it is given.
@@ -451,12 +453,15 @@ class PiStream:
         if not isinstance(turn_id, str) or not _TURN.fullmatch(turn_id):
             raise ValueError("turn_id")
         self._argv_registered = True
-        self._pending["argv"] = _Pending("argv", delivery_id, turn_id, "new_turn", text)
+        with self._write_lock:
+            self._pending["argv"] = _Pending("argv", delivery_id, turn_id, "new_turn", text)
         return text
 
     def pending_deliveries(self) -> list[str]:
         """Deliveries written and not (yet) accepted: their outcome is unknown if the worker ends now."""
-        return [p.delivery_id for p in self._pending.values() if p.delivery_id is not None]
+        with self._write_lock:
+            pending = list(self._pending.values())
+        return [p.delivery_id for p in pending if p.delivery_id is not None]
 
     def _need(self, mode: str) -> None:
         if self.mode != mode:

@@ -3,7 +3,7 @@
 has driver.v2's ``event_draft`` shape as SPINE's own reader reads the published schemas; every tool
 input's digest is the one SPINE's ``conformance/rules.py`` computes.
 
-The fixtures are SYNTHETIC (README.md beside them). When Lucas's attended run is captured, its redacted
+The fixtures are SYNTHETIC (README.md beside them). When an attended run of the user's own install is captured, its redacted
 stdout goes beside them under a name without ``synthetic-`` and is replayed the same way.
 
 Run by dotted name: PYTHONPATH=core <python> -m unittest recursion_core.routes.engines.fixtures.pi.test_pi_fixtures

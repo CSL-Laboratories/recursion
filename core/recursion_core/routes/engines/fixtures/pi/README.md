@@ -40,6 +40,6 @@ repository root, for example
 `PYTHONPATH=core <python> -m unittest recursion_core.routes.engines.fixtures.pi.test_pi_fixtures`.
 `unittest discover` does not enter this folder (it has no `__init__.py`).
 
-When Lucas's attended run is captured (his own install, his own sign-in), its redacted stdout and
+When an attended run of the user's own install is captured (the user's own sign-in), its redacted stdout and
 transcript go here under names without `synthetic-`, with their expected drafts, and replay through the
 same `replay` in `test_pi_fixtures.py`.

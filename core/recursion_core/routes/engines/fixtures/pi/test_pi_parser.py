@@ -665,6 +665,40 @@ class RpcModeTest(unittest.TestCase):
         self.assertEqual(len(set(found)), 2400)
         self.assertEqual(len(stream.pending_deliveries()), 2400)
 
+    def test_a_reader_of_the_pending_deliveries_beside_writers_never_fails(self):
+        # Four writers mint prompts while one thread asks for the pending deliveries again and again:
+        # an unguarded walk over the table raised "dictionary changed size during iteration".
+        import threading
+        import time
+        stream = pi.PiStream("rpc", connection_id="api_key:openai-key-1")
+        failures = []
+        done = threading.Event()
+
+        def writer(base):
+            for i in range(3000):
+                stream.prompt("p", delivery_id=f"dlv-{base + i}", turn_id="turn-1", how="new_turn")
+
+        def reader():
+            deadline = time.monotonic() + 60
+            while not done.is_set() and time.monotonic() < deadline:
+                try:
+                    stream.pending_deliveries()
+                except Exception as error:      # the property under test is that none is raised
+                    failures.append(repr(error))
+                    return
+
+        writers = [threading.Thread(target=writer, args=(i * 3000 + 1,)) for i in range(4)]
+        watcher = threading.Thread(target=reader)
+        watcher.start()
+        for thread in writers:
+            thread.start()
+        for thread in writers:
+            thread.join()
+        done.set()
+        watcher.join()
+        self.assertEqual(failures, [])
+        self.assertEqual(len(stream.pending_deliveries()), 12000)
+
     def test_the_writers_refuse_malformed_arguments(self):
         for kwargs in ({"delivery_id": "x", "turn_id": "turn-1", "how": "new_turn"},
                        {"delivery_id": "dlv-1", "turn_id": "turn 1", "how": "new_turn"},

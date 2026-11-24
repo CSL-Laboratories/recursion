@@ -12,10 +12,14 @@ manager, started by ``EngineUnitManager.start_piped``: the launcher's own unit p
 * Stop of a host is ``cgroup.kill`` of its unit (by pidfd where the kernel has no ``cgroup.kill``), never a message
   to it. It waits on nothing the host does: a host that loops and swallows every exception and signal ends the same
   way as any other.
-* A host that ends by itself, or that has not answered a call by its deadline, is ended, its plugin is marked
-  degraded, and a new unit is started for it at once with the same package. The mark goes when the plugin answers a
-  call again, as the in-process operator deadline in ``plugins.py`` does for a plugin in the daemon's process.
-* ``close`` (the daemon's own Stop) ends every host the same way and waits on none.
+* Nothing watches a host between calls. A host that has ended by itself is found by the next call into it, and that
+  call fails with ``ended``; a host that has not answered a call by its deadline is ended, and that call fails with
+  ``timed_out``. Either way its plugin is marked degraded and a new unit is started for it then, with the same
+  package. The mark goes when the plugin answers a call again, as the in-process operator deadline in
+  ``plugins.py`` does for a plugin in the daemon's process.
+* A second ``start`` of a plugin ends its running host before the new one starts.
+* ``stop`` and ``close`` (the daemon's own Stop) end every host the same way and wait on none, a host that is still
+  starting included: its start ends with ``stopped``.
 
 Not here: which plugins go to a host (the daemon still runs every plugin in its own process), the wall around a
 host, and handing a descriptor to a host.
@@ -28,6 +32,7 @@ import math
 import os
 from pathlib import Path
 import re
+import reprlib
 import secrets
 import select
 import socket
@@ -46,7 +51,8 @@ log = logging.getLogger(__name__)
 
 # Each of these two becomes a row of the person's own settings file, read through its one reader. Until that file is
 # at this base each stands here once, as its shipped default. None means no deadline; any other value is a number of
-# seconds above zero.
+# seconds above zero, and a number too large for a float is a wait that no clock reaches. Any other value is refused
+# when the PluginHostUnits is made, before anything starts.
 # plugin_host.call_deadline_s: how long a call into a host may go unanswered before the host is ended and started
 # again. Shipped default: the deadline of an operator call into a plugin in the daemon's process.
 CALL_DEADLINE_S = OPERATOR_DEADLINE_S
@@ -54,17 +60,38 @@ CALL_DEADLINE_S = OPERATOR_DEADLINE_S
 # own start wait.
 START_DEADLINE_S = 10.0
 
+# The longest single wait the platform takes (Python's own figure, not a setting): a longer deadline is waited in
+# slices of it.
+_LONGEST_WAIT_S = threading.TIMEOUT_MAX
+
 HOST_UNIT = re.compile(r'recursion-host-[0-9a-f]{16}\.service')
 HOST_ARGV = ('-X', 'gil=0', '-I', '-m', 'recursion_core.plugin_host')
 STOPPED, ENDED, TIMED_OUT, NOT_STARTED = 'stopped', 'ended', 'timed_out', 'not_started'
 
 
 def _deadline(name, value):
+    """Seconds as a float, or None for no deadline. A whole number too large for a float waits like infinity."""
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-        raise ValueError(f'{name} is a number of seconds above zero, or None for no deadline')
-    return float(value)
+    number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    if not number or value != value or value <= 0 or value == math.inf:
+        raise ValueError(f'{name} = {reprlib.repr(value)} is not a deadline: write a number of seconds above zero, '
+                         'or None for no deadline')
+    try:
+        return float(value)
+    except OverflowError:
+        return math.inf  # more seconds than a float holds: waited in slices, so no clock ever reaches it
+
+
+def _ready(sock, writing, deadline):
+    """True once ``sock`` can be written (or read); False once ``deadline`` has passed first."""
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        wait = min(left, _LONGEST_WAIT_S)
+        if (select.select([], [sock], [], wait)[1] if writing else select.select([sock], [], [], wait)[0]):
+            return True
 
 
 class HostUnavailable(Exception):
@@ -102,8 +129,7 @@ class HostUnit:
             return
         view = memoryview(frame)
         while view:
-            left = deadline - time.monotonic()
-            if left <= 0 or not select.select([], [self._sock], [], left)[1]:
+            if not _ready(self._sock, True, deadline):
                 raise TimeoutError('the host did not read its channel')
             try:
                 view = view[self._sock.send(view, socket.MSG_DONTWAIT):]
@@ -121,13 +147,19 @@ class HostUnit:
                     body = self._buffer[HEADER.size:HEADER.size + length]
                     self._buffer = self._buffer[HEADER.size + length:]
                     return hc.decode(body, sender='host')
-            left = None if deadline is None else deadline - time.monotonic()
-            if left is not None and (left <= 0 or not select.select([self._sock], [], [], left)[0]):
+            if deadline is not None and not _ready(self._sock, False, deadline):
                 raise TimeoutError('the host did not answer')
             chunk = self._sock.recv(1 << 16)
             if not chunk:
                 return None
             self._buffer += chunk
+
+    def wake(self):
+        """Wake a thread of the daemon's that waits on this channel: it reads the end of the channel at once."""
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def close(self):
         try:
@@ -154,6 +186,7 @@ class PluginHostUnits:
         self._turns = {}       # plugin id -> lock: one call at a time on a host's channel
         self._packages = {}    # plugin id -> (manifest, files): what a restart loads again
         self._units = {}       # plugin id -> the running HostUnit
+        self._starting = {}    # plugin id -> the HostUnit whose start is under way
         self._stopped = set()  # plugin ids whose host was stopped: not started again by a call
         self._ended = []       # HostUnits ended and not yet closed
         self._ids = itertools.count(1)
@@ -170,6 +203,12 @@ class PluginHostUnits:
             self._packages[plugin_id] = (bytes(manifest), dict(files))
             turn = self._turns.setdefault(plugin_id, threading.Lock())
         with turn:
+            with self._lock:
+                old = self._units.pop(plugin_id, None)
+            if old is not None:  # a second start: the running host ends first
+                old.stopped = True
+                self._end(old)
+                self._discard(old)  # this start holds the plugin's turn: nothing else reads that channel now
             return self._start(plugin_id)
 
     def unit_of(self, plugin_id):
@@ -218,9 +257,12 @@ class PluginHostUnits:
         with self._lock:
             self._stopped.add(plugin_id)
             host = self._units.pop(plugin_id, None)
+            starting = self._starting.get(plugin_id)
         if host is not None:
             host.stopped = True
             self._end(host)
+        if starting is not None:
+            self._end_start(starting)
 
     def close(self):
         """The daemon's own Stop: every host is ended by the system's kill; none is waited on."""
@@ -228,9 +270,12 @@ class PluginHostUnits:
             self._closed = True
             hosts = list(self._units.values())
             self._units.clear()
+            starting = list(self._starting.values())
         for host in hosts:
             host.stopped = True
             self._end(host)
+        for host in starting:
+            self._end_start(host)
         with self._lock:
             ended, self._ended = self._ended, []
         for host in ended:
@@ -268,6 +313,11 @@ class PluginHostUnits:
         finally:
             theirs.close()  # the daemon keeps no copy of the host's end
         host = HostUnit(plugin_id, unit, ours, process, end)
+        with self._lock:
+            self._starting[plugin_id] = host  # from here stop and close see this host
+            late = self._closed or plugin_id in self._stopped
+        if late:
+            self._end_start(host)
         deadline = None if self._start_deadline_s is None else time.monotonic() + self._start_deadline_s
         try:
             hello = host.receive(deadline)
@@ -279,16 +329,20 @@ class PluginHostUnits:
             host.group = group
             host.send({'type': 'hello', 'channel': hc.CHANNEL, 'gil_check': self._gil_check}, deadline)
             host.send_frame(load, deadline)
-        except (OSError, hc.ChannelRefusal) as exc:
+        except BaseException as exc:
+            with self._lock:
+                self._starting.pop(plugin_id, None)
             self._end(host)
             self._discard(host)
-            raise HostUnavailable(plugin_id, NOT_STARTED, type(exc).__name__) from None
-        except BaseException:
-            self._end(host)
-            self._discard(host)
+            if host.stopped and isinstance(exc, Exception):
+                raise HostUnavailable(plugin_id, STOPPED, 'the host was stopped while it was starting; start the '
+                                      'plugin again to run it') from None
+            if isinstance(exc, (OSError, hc.ChannelRefusal)):
+                raise HostUnavailable(plugin_id, NOT_STARTED, type(exc).__name__) from None
             raise
         with self._lock:
-            if not self._closed and plugin_id not in self._stopped:
+            self._starting.pop(plugin_id, None)
+            if not self._closed and plugin_id not in self._stopped and not host.stopped:
                 self._units[plugin_id] = host
                 return host
         host.stopped = True
@@ -336,6 +390,16 @@ class PluginHostUnits:
             if host in self._ended:
                 self._ended.remove(host)
         host.close()
+
+    def _end_start(self, host):
+        """End a host whose start is under way and wake that start, which then ends with ``stopped``.
+
+        A unit that shows no cgroup yet has run no plugin byte (the package is sent only after the cgroup check):
+        its systemd-run is ended, and the host's own code ends at the end of its channel, which ``wake`` makes.
+        """
+        host.stopped = True
+        self._end(host)
+        host.wake()
 
     def _end(self, host):
         """SIGKILL the unit's whole cgroup now, once. Waits on nothing the host does."""

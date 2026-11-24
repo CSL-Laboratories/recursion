@@ -10,6 +10,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import shlex
 import socket
 import stat
 import subprocess
@@ -205,6 +206,87 @@ class StartAndStopWithoutAManagerTest(unittest.TestCase):
                                            call_deadline_s=good, start_deadline_s=good)
 
 
+    def test_a_deadline_that_is_not_a_value_is_refused_with_what_to_write_instead(self):
+        from recursion_core.daemon import host_units, launcher
+
+        with tempfile.TemporaryDirectory() as scratch:
+            for bad in (0, -0.0, -1, True, '5', float('nan'), float('inf')):
+                for name in ('call_deadline_s', 'start_deadline_s'):
+                    with self.assertRaises(ValueError, msg=(name, bad)) as caught:
+                        host_units.PluginHostUnits(launcher.EngineUnitManager(), Path(scratch), StandInCore(),
+                                                   **{name: bad})
+                    text = str(caught.exception)
+                    self.assertIn(name, text)
+                    self.assertIn('write a number of seconds above zero, or None for no deadline', text)
+
+    def test_a_deadline_longer_than_one_wait_can_take_is_honoured(self):
+        from recursion_core.daemon import host_units, launcher
+
+        with tempfile.TemporaryDirectory() as scratch:
+            for good in (1e12, 10 ** 400, threading.TIMEOUT_MAX * 4):
+                host_units.PluginHostUnits(launcher.EngineUnitManager(), Path(scratch), StandInCore(),
+                                           call_deadline_s=good, start_deadline_s=good)
+        daemon_end, host_end = socket.socketpair()
+        self.addCleanup(host_end.close)
+        host = host_units.HostUnit('stand.in', 'recursion-host-0123456789abcdef.service', daemon_end,
+                                   unittest.mock.Mock(), None)
+        self.addCleanup(host.close)
+        far = time.monotonic() + 1e12
+        host.send_frame(b'abc', far)
+        self.assertEqual(host_end.recv(3), b'abc')
+        host_end.close()
+        self.assertIsNone(host.receive(far))  # the end of the channel, read inside a deadline no wait can take whole
+
+    def test_stop_delivers_the_kill_at_once_and_waits_on_nothing_after_it(self):
+        from recursion_core.daemon import host_units, launcher
+
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            unit = 'recursion-host-0123456789abcdef.service'
+            group = '/user.slice/app.slice/' + unit
+            (root / group.lstrip('/')).mkdir(parents=True)
+            (root / group.lstrip('/') / 'cgroup.kill').write_bytes(b'')
+            manager = launcher.EngineUnitManager(cgroup_root=root)
+            real, kills = manager.kill_cgroup, []
+
+            def timed(*args):
+                kills.append(time.monotonic())
+                return real(*args)
+
+            manager.kill_cgroup = timed
+            units = host_units.PluginHostUnits(manager, root / 'state', StandInCore())
+            daemon_end, host_end = socket.socketpair()
+            self.addCleanup(host_end.close)
+            process = unittest.mock.Mock()
+            process.poll.return_value = None
+            host = host_units.HostUnit('stand.in', unit, daemon_end, process, None)
+            host.group = group
+            units._units['stand.in'] = host
+            began = time.monotonic()
+            units.stop('stand.in')
+            ended = time.monotonic()
+            self.assertEqual(len(kills), 1)
+            self.assertLess(kills[0] - began, 0.25)  # nothing comes before the kill
+            self.assertLess(ended - kills[0], 0.25)  # and nothing is waited on after it
+            units.close()
+
+    def test_kill_cgroup_refuses_a_group_that_is_not_the_units_own(self):
+        from recursion_core.daemon import launcher
+
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            unit = 'recursion-host-0123456789abcdef.service'
+            manager = launcher.EngineUnitManager(cgroup_root=root)
+            for group in ('/user.slice/app.slice/recursion-host-fedcba9876543210.service',
+                          '/user.slice/app.slice/../' + unit, 'user.slice/app.slice/' + unit):
+                with self.subTest(group=group):
+                    folder = root / group.lstrip('/')
+                    folder.mkdir(parents=True, exist_ok=True)
+                    (folder / 'cgroup.kill').write_bytes(b'')
+                    self.assertFalse(manager.kill_cgroup(group, unit))
+                    self.assertEqual((folder / 'cgroup.kill').read_bytes(), b'')
+
+
 @unittest.skipUnless(manager_ready(), 'needs a running systemd --user manager with systemd-run 254 or later')
 class HostUnitsInTheUserManagerTest(unittest.TestCase):
     @classmethod
@@ -238,8 +320,9 @@ class HostUnitsInTheUserManagerTest(unittest.TestCase):
         self.addCleanup(self.end_own_units)
 
     def units(self, **options):
-        units = self.host_units.PluginHostUnits(self.manager, self.state, StandInCore(), python=self.python,
-                                                gil_check=GIL_CHECK, properties=GUARD, **options)
+        options.setdefault('python', self.python)
+        units = self.host_units.PluginHostUnits(self.manager, self.state, StandInCore(), gil_check=GIL_CHECK,
+                                                properties=GUARD, **options)
         self.addCleanup(units.close)
         return units
 
@@ -265,6 +348,59 @@ class HostUnitsInTheUserManagerTest(unittest.TestCase):
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
         return thread, box
+
+    def start_in_thread(self, units, plugin_id, source=POLITE):
+        box = {'began': time.monotonic()}
+
+        def run():
+            try:
+                box['host'] = units.start(plugin_id, *package(source))
+            except BaseException as exc:  # noqa: BLE001 - the test reads what the start ended with
+                box['error'] = exc
+            box['at'] = time.monotonic()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, box
+
+    def stand_in(self, name, line):
+        """A stand-in for the host's interpreter: a script in this test's own folder that ignores its argv."""
+        script = self.root / name
+        script.write_text('#!/bin/sh\n' + line + '\n', encoding='utf-8')
+        script.chmod(0o700)
+        return str(script)
+
+    def mute(self):
+        """An interpreter that never says hello and never reads its channel."""
+        return self.stand_in('mute-python', 'exec sleep 100')
+
+    def wrong_hello(self):
+        """An interpreter whose first message is a hello of another channel."""
+        code = ('import os, time; from recursion_core.plugin_security import host_channel as hc; '
+                'os.write(1, hc.encode({"type": "hello", "channel": "not-this-channel"})); time.sleep(100)')
+        return self.stand_in('wrong-hello-python', 'exec ' + shlex.quote(self.python) + ' -I -c ' + shlex.quote(code))
+
+    def show(self, unit, prop):
+        return subprocess.run(['systemctl', '--user', 'show', '--property=' + prop, '--value', '--', unit],
+                              capture_output=True, text=True, timeout=15).stdout.strip()
+
+    def unloaded(self, unit, timeout_s=5.0):
+        """True once the user manager no longer knows ``unit`` (an ended unit is collected)."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self.show(unit, 'LoadState') == 'not-found':
+                return True
+            time.sleep(0.05)
+        return False
+
+    def active(self, index, timeout_s=15.0):
+        """The unit this test started as its ``index``-th, once the user manager shows it active."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if len(self.started) > index and self.show(self.started[index], 'ActiveState') == 'active':
+                return self.started[index]
+            time.sleep(0.05)
+        self.fail('no unit of this test became active')
 
     def test_the_host_sees_its_standard_input_and_output_as_one_socket_and_the_daemon_keeps_no_copy(self):
         units = self.units()
@@ -395,6 +531,101 @@ class HostUnitsInTheUserManagerTest(unittest.TestCase):
         self.assertTrue(gone(polite.group), polite.group)
         with self.assertRaises(self.host_units.HostUnavailable):
             units.start('polite', *package(POLITE))
+
+    def test_a_second_start_of_a_plugin_ends_its_first_host_and_close_ends_the_second(self):
+        units = self.units()
+        first = units.start('twice', *package(POLITE))
+        second = units.start('twice', *package(POLITE))
+        self.assertTrue(gone(first.group), first.group)
+        self.assertTrue(self.unloaded(first.unit), first.unit)
+        self.assertIs(units.unit_of('twice'), second)
+        self.assertEqual(units.call('twice', 'operator', {'command': 'n'})['value'], {'echo': 'n'})
+        units.close()
+        self.assertTrue(gone(second.group), second.group)
+        self.assertTrue(self.unloaded(second.unit), second.unit)
+
+    def stop_during_a_start(self, stop):
+        units = self.units(python=self.mute(), start_deadline_s=None)
+        thread, box = self.start_in_thread(units, 'mute')
+        unit = self.active(0)
+        began = time.monotonic()
+        stop(units)
+        self.assertLess(time.monotonic() - began, 1.0)  # it waits on nothing the host does
+        thread.join(10)
+        self.assertFalse(thread.is_alive(), 'the start still waits on a host that was stopped')
+        self.assertEqual(getattr(box.get('error'), 'reason', None), 'stopped', box)
+        self.assertTrue(self.unloaded(unit), unit)
+        with self.assertRaises(self.host_units.HostUnavailable) as caught:
+            units.call('mute', 'operator', {'command': 'ok'})
+        self.assertEqual(caught.exception.reason, 'stopped')
+        self.assertEqual(len(self.started), 1)
+
+    def test_stop_ends_a_host_that_is_still_starting_with_no_start_deadline(self):
+        self.stop_during_a_start(lambda units: units.stop('mute'))
+
+    def test_the_daemons_close_ends_a_host_that_is_still_starting_with_no_start_deadline(self):
+        self.stop_during_a_start(lambda units: units.close())
+
+    def test_a_stop_while_the_unit_shows_no_cgroup_ends_its_systemd_run_and_the_start(self):
+        # A unit whose cgroup the manager does not show yet has run no plugin byte. Stop ends its systemd-run and
+        # ends the daemon's end of the channel, so the start ends at once and the host's own code at its channel's end.
+        reader = self.stand_in('reads-to-the-end-python', 'exec ' + shlex.quote(self.python) + ' -I -c '
+                               + shlex.quote('import sys; sys.stdin.buffer.read()'))
+        units = self.units(python=reader, start_deadline_s=None)
+        self.manager.unit_identity = lambda unit: ('', 0)
+        thread, box = self.start_in_thread(units, 'early')
+        unit = self.active(0)
+        units.stop('early')
+        thread.join(10)
+        self.assertFalse(thread.is_alive(), 'the start still waits on a host that was stopped')
+        self.assertEqual(getattr(box.get('error'), 'reason', None), 'stopped', box)
+        self.assertTrue(self.unloaded(unit, timeout_s=10.0), unit)
+
+    def test_a_host_that_never_says_hello_is_ended_at_its_start_deadline(self):
+        units = self.units(python=self.mute(), start_deadline_s=2.0)
+        thread, box = self.start_in_thread(units, 'mute')
+        thread.join(15)
+        self.assertFalse(thread.is_alive(), 'the start outlived its deadline')
+        self.assertEqual(getattr(box.get('error'), 'reason', None), 'not_started', box)
+        took = box['at'] - box['began']
+        self.assertGreaterEqual(took, 2.0)
+        self.assertLess(took, 12.0)
+        self.assertTrue(self.unloaded(self.started[-1]), self.started)
+        self.assertIsNone(units.unit_of('mute'))
+
+    def test_a_host_whose_first_message_is_not_the_channels_hello_is_not_started(self):
+        units = self.units(python=self.wrong_hello(), start_deadline_s=10)
+        with self.assertRaises(self.host_units.HostUnavailable) as caught:
+            units.start('wrong', *package(POLITE))
+        self.assertEqual(caught.exception.reason, 'not_started')
+        self.assertIn('hello', caught.exception.detail)
+        self.assertIsNone(units.unit_of('wrong'))
+        self.assertTrue(self.unloaded(self.started[-1]), self.started)
+
+    def test_a_unit_that_shows_no_control_group_of_its_own_is_not_started(self):
+        units = self.units()
+        real, asked = self.manager.unit_identity, []
+
+        def blank_first(unit):
+            asked.append(unit)
+            return ('', 0) if len(asked) == 1 else real(unit)
+
+        self.manager.unit_identity = blank_first
+        with self.assertRaises(self.host_units.HostUnavailable) as caught:
+            units.start('nogroup', *package(POLITE))
+        self.assertEqual(caught.exception.reason, 'not_started')
+        self.assertIn('control group', caught.exception.detail)
+        self.assertIsNone(units.unit_of('nogroup'))
+        self.assertTrue(self.unloaded(self.started[-1]), self.started)
+
+    def test_a_start_and_a_call_with_deadlines_longer_than_one_wait_can_take_answer(self):
+        for label, seconds in (('1e12', 1e12), ('10**400', 10 ** 400)):
+            with self.subTest(seconds=label):
+                units = self.units(call_deadline_s=seconds, start_deadline_s=seconds)
+                host = units.start('long', *package(POLITE))
+                self.assertEqual(units.call('long', 'operator', {'command': 'n'})['value'], {'echo': 'n'})
+                units.close()
+                self.assertTrue(gone(host.group), host.group)
 
 
 if __name__ == '__main__':

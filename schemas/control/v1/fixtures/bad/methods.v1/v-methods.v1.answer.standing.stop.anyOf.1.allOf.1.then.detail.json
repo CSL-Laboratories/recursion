@@ -1,0 +1,8 @@
+{
+  "method": "standing.stop",
+  "params": {},
+  "answer": {
+    "code": "unsupported",
+    "detail": "store_absent"
+  }
+}

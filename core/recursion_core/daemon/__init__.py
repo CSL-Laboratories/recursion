@@ -56,6 +56,12 @@ RECORDED_KILL_WAIT_S = 2.0
 # operator asks for is always sent.
 STOP_RESEND_BASE_S = 30.0
 STOP_RESEND_MAX_S = 600.0
+# While nothing stands (no run that is not ended), nothing changed in the registry since the last listing of
+# the reserved run units, and that listing found none to stop, the sweep does not list them again: an idle
+# daemon starts no process. A number lists them anyway when that many seconds have passed since the last
+# listing; None (the shipped default) lists only when something changed. It becomes a row of the person's
+# one settings file, with this value as its default.
+IDLE_UNIT_LIST_S = None
 # Why a gone unit with a recorded Stop is not ended: its cgroup could not be read, or the control
 # record that should name the cgroup carries none.
 CGROUP_UNREAD = 'unit gone; the recorded cgroup could not be read'
@@ -767,6 +773,8 @@ class Daemon:
         self.closed = False
         self.clock = clock
         self._stop_resend = {}  # run_id -> (not before, wait) after a stop request that failed
+        # What the registry held at the last listing of the reserved units that found none to stop, and when.
+        self._quiet_at = None   # (registry snapshot, clock) or None: list on the next sweep
 
     def _open(self):
         if self.closed:
@@ -977,11 +985,21 @@ class Daemon:
             # units and unknown units in the reserved namespace are stopped; unrelated
             # user services are never touched.
             live = {r.unit for r in runs if r.state not in TERMINAL}
+            snapshot = tuple(sorted((r.run_id, r.state) for r in runs))
+            quiet = self._quiet_at
+            if (not live and quiet is not None and quiet[0] == snapshot
+                    and (IDLE_UNIT_LIST_S is None or self.clock() - quiet[1] < IDLE_UNIT_LIST_S)):
+                return runs     # nothing stands and nothing changed: no listing, no process
+            self._quiet_at = None
             try:
                 owned = self.manager.owned_units()
             except (OSError, subprocess.SubprocessError):
                 log.exception('listing run units failed; orphans not swept this pass')
+                owned = None
+            if owned is None:
                 owned = set()
+            elif not live and not any(UNIT.fullmatch(unit) for unit in owned):
+                self._quiet_at = (snapshot, self.clock())
             for unit in sorted(owned - live):
                 if UNIT.fullmatch(unit):
                     try:

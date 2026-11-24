@@ -24,8 +24,20 @@ Nothing is frozen yet.
 | `driver.v2.json` | 1.0-draft.4 |
 | `mcp.task.v1.json` | 1.0-draft.6 |
 | `transcript.line.v1.json` | 1.0-draft.3 |
-| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.10 |
+| `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.11 |
 | `session.token.v1.json` | 1.0-draft.1 |
+
+## One view of everything standing, and one Stop of it (Nov 23, 2026)
+
+`methods` draft 11; every other schema keeps its draft. Two methods join the table and the method names, both beta, both answered by the daemon itself beside `run.list`, neither exposed as an MCP tool.
+
+| What changed | What it breaks |
+|---|---|
+| `standing.list`: every standing record of the core's own stores (runs, loaded plugin hosts, pending approvals), each a row of the tagged union `standing_row` with the sentence a person reads; a row of any other kind is counted under `refused`, never dropped; `not_seen` says what no store of the core holds | Nothing: a new name |
+| `standing.stop`: one Stop of everything standing; `stopped` only when every cleanup was seen, else `pending` with what was not and why | Nothing: a new name |
+| Rule (2) and the row rule of `$defs/row`: `standing.stop` joins `run.stop` as a mutating method that takes neither a `command_id` nor a revision (an emergency Stop never needs fresh state) | A checker that allows only `run.stop` to mutate without a key |
+| The published authorizer (`control/scopes.py`): both methods are answered only for the principal kinds owner and device; every other kind is refused `scope_refused`, whatever scopes it holds | Nothing: a new name |
+| The table's version: `1.0-draft.11` | A reader that pins `1.0-draft.10` |
 
 ## After two reads of the fifth read's answer (Nov 14, 2026)
 

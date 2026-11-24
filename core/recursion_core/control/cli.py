@@ -13,6 +13,9 @@ method; the TUI has the same command.
 (``tui.protocol.list_all_runs``), so every run is read even when the daemon pages the list to fit its frame
 (ADV1-5). A list that fits one page prints exactly what the daemon answered.
 
+``standing`` prints the one view of everything standing (``standing.list``); ``stop-all`` asks the one
+Stop of all of it (``standing.stop``), which answers stopped only when every cleanup was seen.
+
 Exit codes: 0 ok/started/stopped, 3 pending (stop not confirmed), 4 run_unknown, 1 other API error,
 2 usage error.
 """
@@ -52,6 +55,8 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--prompt", required=True)
     start.add_argument("--client-key")
     sub.add_parser("conditions")
+    sub.add_parser("standing")     # everything standing: standing.list
+    sub.add_parser("stop-all")     # one Stop of everything standing: standing.stop
     return p
 
 
@@ -73,7 +78,9 @@ def main(argv: list[str], api, out: TextIO | None = None, err: TextIO | None = N
         result = list_all_runs(api.call)
         print(json.dumps(result, sort_keys=True), file=out)
         return _EXIT.get(result.get("code"), EXIT_ERROR)
-    if ns.command in ("status", "stop"):
+    if ns.command in ("standing", "stop-all"):
+        method, params = {"standing": "standing.list", "stop-all": "standing.stop"}[ns.command], {}
+    elif ns.command in ("status", "stop"):
         method, params = f"run.{ns.command}", {"run_id": ns.run_id}
     else:
         method = "run.start"

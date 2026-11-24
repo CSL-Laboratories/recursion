@@ -1,0 +1,8 @@
+{
+  "method": "standing.stop",
+  "params": {},
+  "answer": {
+    "code": "request_invalid",
+    "detail": "standing_not_granted_to_kind"
+  }
+}

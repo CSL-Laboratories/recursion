@@ -52,6 +52,11 @@ recovery Stop never passes here.
    a host-owned run, another plugin's, or one with no owner recorded. The row names no other kind, so an
    internal or agent principal is refused (``questions.md``). A target that cannot be read is refused to a
    session or plugin principal, which may stop only runs it can be shown to own.
+6. ``standing.list`` and ``standing.stop`` (the one view of everything standing and the one Stop of it) are
+   for the principal kinds owner and device only, the page included, each with its row's scope. Every other
+   kind is refused ``standing_not_granted_to_kind`` whatever it holds: a Stop of everything would end a
+   person's routines, and the view shows what other plugins hold. A view narrowed to a caller's own things
+   is not built here.
 
 Every refusal the authorizer makes is ``("scope_refused", detail)``; ``scope_refused`` is the method table's
 code for it, and S5 (``control/hooks.py`` ``Hooks.authorize``) turns the pair into ``{"code", "detail"}``. A
@@ -73,6 +78,8 @@ PAGE_PRINCIPAL_ID = PAGE_DEVICE_ID   # control/hooks.py DEVICE: the page's door;
 # The page's device principal: read, run, approve (the brief's recommended option (a); the owner decides).
 PAGE_SCOPES = frozenset({"read", "run", "approve"})
 STOP_METHOD = "run.stop"
+STANDING_METHODS = frozenset({"standing.list", "standing.stop"})
+STANDING_KINDS = ("owner", "device")
 HOST_OWNER = "host"          # launch.owner of a run the host started (control/hooks.py launch_snapshot)
 
 Verdict = tuple[str, str] | None
@@ -264,6 +271,9 @@ class Authorizer:
             # Its text, as a plain str: no __eq__ or __hash__ of a subclass decides which row applies, so a method
             # name that compares unequal cannot step past the Stop row below (round 6, DeepSeek 5).
             method = str.__str__(method)
+        if type(method) is str and method in STANDING_METHODS and kind not in STANDING_KINDS:
+            # Before the table is read: no row, scope or grant opens these to another kind.
+            return (SCOPE_REFUSED, "standing_not_granted_to_kind")
         scope = self._scope_of(method) if type(method) is str else None
         if scope is None:
             return None if held >= ALL_SCOPES else (SCOPE_REFUSED, "method_not_in_table")

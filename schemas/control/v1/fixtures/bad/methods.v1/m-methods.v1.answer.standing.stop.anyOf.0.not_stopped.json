@@ -1,0 +1,11 @@
+{
+  "method": "standing.stop",
+  "params": {},
+  "answer": {
+    "code": "pending",
+    "stopped": {
+      "run": 1
+    },
+    "text": "Stopped 1 run. 1 could not be seen cleaned up: run run-2 did not empty yet (cgroup_populated). Ask Stop again; if it stays, restart the daemon."
+  }
+}

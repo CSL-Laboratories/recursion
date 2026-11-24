@@ -1165,5 +1165,41 @@ class RegistrantTest(unittest.TestCase):
         self.assertIsNone(scopes.register(Untouchable()))
 
 
+class StandingKindsTest(unittest.TestCase):
+    """The one view of everything standing and its one Stop: owner and device only, the page included."""
+
+    COLUMN = {**SCOPE_COLUMN, "standing.list": "read", "standing.stop": "run"}
+
+    def test_every_other_kind_is_refused_both_methods_whatever_it_holds(self) -> None:
+        holder = Grants({(kind, "x"): {"read", "run", "approve", "manage"}
+                         for kind in ("plugin", "session", "agent", "internal", "other")})
+        for column in (self.COLUMN, SCOPE_COLUMN):   # with the rows and without them
+            auth = authorizer(scope_of=column.get, credentials=holder)
+            for kind in ("plugin", "session", "agent", "internal", "other", "", None):
+                for principal in (Principal(kind, "x"), Principal(kind, "x", False, g(str(kind), "x"))):
+                    for method in ("standing.list", "standing.stop"):
+                        with self.subTest(kind=kind, method=method, grant=principal.grant):
+                            self.assertEqual(auth(principal, method, {}),
+                                             ("scope_refused", "standing_not_granted_to_kind"))
+        auth = authorizer(scope_of=self.COLUMN.get)
+        for name in ("plugin", "session", "agent", "internal", "nobody"):
+            for method in ("standing.list", "standing.stop"):
+                self.assertEqual(auth(PRINCIPALS[name], method, {}),
+                                 ("scope_refused", "standing_not_granted_to_kind"), (name, method))
+
+    def test_owner_and_device_keep_each_row_scope(self) -> None:
+        auth = authorizer(scope_of=self.COLUMN.get)
+        for name in ("owner", "page", "device-run"):
+            for method in ("standing.list", "standing.stop"):
+                self.assertIsNone(auth(PRINCIPALS[name], method, {}), (name, method))
+        self.assertIsNone(auth(PRINCIPALS["device-read"], "standing.list", {}))
+        self.assertEqual(auth(PRINCIPALS["device-read"], "standing.stop", {}), ("scope_refused", "needs_run"))
+
+    def test_the_published_table_gives_the_two_rows_the_scopes_read_and_run(self) -> None:
+        from recursion_core.control import methods
+        self.assertEqual((methods.METHODS["standing.list"].scope, methods.METHODS["standing.stop"].scope),
+                         ("read", "run"))
+
+
 if __name__ == "__main__":
     unittest.main()

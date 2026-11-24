@@ -34,14 +34,14 @@ Only a registered name is dispatched. A name nobody registered is rejected by ar
 as today; it is never treated as a start.
 
 Registration happens once, when the hooks are composed, before any command is parsed; ``freeze()`` then
-closes the table. Two families that claim one name, or a family that claims one of the CLI's five,
+closes the table. Two families that claim one name, or a family that claims one of the CLI's own,
 fail composition.
 """
 from __future__ import annotations
 
 from collections.abc import Callable
 
-BUILT_IN = ('list', 'status', 'stop', 'start', 'conditions')   # control/cli.py's own; never in this table
+BUILT_IN = ('list', 'status', 'stop', 'start', 'conditions', 'standing', 'stop-all')   # control/cli.py's own; never in this table
 
 
 class CommandTableError(Exception):

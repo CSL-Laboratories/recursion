@@ -5325,6 +5325,41 @@
       "shows": "events.follow with projection 'raw' returns the events themselves, with their whole payloads: a caller that wants them says so."
     },
     {
+      "file": "good/methods.v1/h78-standing-list-one-run-and-one-approval.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The view of everything standing: a run and an approval, each with its sentence, and what the view cannot see."
+    },
+    {
+      "file": "good/methods.v1/h79-standing-stop-with-one-run-not-yet-empty.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "One Stop that ended one run and could not yet see the other's cleanup: pending, never stopped."
+    },
+    {
+      "file": "good/methods.v1/h80-standing-list-with-a-row-of-an-unknown-kind.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "A store held a row of a kind this version does not show: the view is not complete and counts the row under refused, never dropping it."
+    },
+    {
+      "file": "good/methods.v1/h81-standing-list-asked-by-a-plugin.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The view of everything standing asked by a principal that is neither the owner nor a device: refused, whatever scopes it holds."
+    },
+    {
+      "file": "good/methods.v1/h82-standing-stop-asked-by-a-plugin.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The one Stop of everything standing asked by a principal that is neither the owner nor a device: refused, whatever scopes it holds."
+    },
+    {
+      "file": "good/methods.v1/h83-standing-list-of-a-table-with-no-daemon.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The view of everything standing asked of a method table that no daemon serves: the daemon answers it itself, so a bare table says not_implemented."
+    },
+    {
+      "file": "good/methods.v1/h84-standing-stop-of-a-table-with-no-daemon.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "shows": "The one Stop of everything standing asked of a method table that no daemon serves: the daemon answers it itself, so a bare table says not_implemented."
+    },
+    {
       "file": "good/methods.v1/n01-session-start-not-built-yet.json",
       "schema": "methods.v1.json#/$defs/exchange",
       "shows": "session.start is in the table and the running daemon has no handler for it yet: 'unsupported', not_implemented, never method_unknown."
@@ -5668,6 +5703,16 @@
       "file": "good/methods.v1/r38-methods-list.json",
       "schema": "methods.v1.json#/$defs/request",
       "shows": "A request of methods.list."
+    },
+    {
+      "file": "good/methods.v1/r39-standing-list.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request for the one view of everything standing."
+    },
+    {
+      "file": "good/methods.v1/r40-standing-stop.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "shows": "A request for the one Stop of everything standing."
     },
     {
       "file": "bad/methods.v1/b01-a-method-that-is-not-in-the-table.json",
@@ -10788,6 +10833,393 @@
       "expect": {
         "keyword": "enum",
         "at": "/params/workspace/mode"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.standing_row.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/standing_row is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/rows/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.standing_row.kind.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/standing_row always carries 'kind'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/rows/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.standing_row.id.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/standing_row always carries 'id'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/rows/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.standing_row.store.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/standing_row always carries 'store'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/rows/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.standing_row.key.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/standing_row always carries 'key'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/rows/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.standing_row.text.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/standing_row always carries 'text'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/rows/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.standing_row.kind.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/rows/0/kind must be one of the values listed at methods.v1.json#/$defs/standing_row/properties/kind.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/rows/0/kind"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.standing.list.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "The object described at methods.v1.json#/$defs/params.standing.list is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.standing.list.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.list.anyOf.0.code.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0 always carries 'code'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.list.anyOf.0.complete.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0 always carries 'complete'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.list.anyOf.0.stores.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0 always carries 'stores'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.list.anyOf.0.refused.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0 always carries 'refused'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.list.anyOf.0.counts.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0 always carries 'counts'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.list.anyOf.0.not_seen.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0 always carries 'not_seen'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.list.anyOf.0.text.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0 always carries 'text'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.list.anyOf.0.rows.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0 always carries 'rows'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/f-methods.v1.answer.standing.list.anyOf.0.code.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/code is fixed by methods.v1.json#/$defs/answer.standing.list/anyOf/0/properties/code.",
+      "expect": {
+        "keyword": "const",
+        "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.standing.list.anyOf.0.stores.items.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0/properties/stores/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/stores/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.list.anyOf.0.stores.items.store.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0/properties/stores/items always carries 'store'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/stores/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.list.anyOf.0.stores.items.state.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0/properties/stores/items always carries 'state'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/stores/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.standing.list.anyOf.0.stores.items.state.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/stores/0/state must be one of the values listed at methods.v1.json#/$defs/answer.standing.list/anyOf/0/properties/stores/items/properties/state.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/stores/0/state"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.standing.list.anyOf.0.refused.items.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0/properties/refused/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/refused/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.list.anyOf.0.refused.items.store.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0/properties/refused/items always carries 'store'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/refused/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.list.anyOf.0.refused.items.code.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0/properties/refused/items always carries 'code'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/refused/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.list.anyOf.0.refused.items.text.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.list/anyOf/0/properties/refused/items always carries 'text'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/refused/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/f-methods.v1.answer.standing.list.anyOf.0.refused.items.code.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/refused/0/code is fixed by methods.v1.json#/$defs/answer.standing.list/anyOf/0/properties/refused/items/properties/code.",
+      "expect": {
+        "keyword": "const",
+        "at": "/answer/refused/0/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.standing.list.anyOf.1.allOf.1.code.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.standing.list/anyOf/1/allOf/1/properties/code.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.params.standing.stop.json",
+      "schema": "methods.v1.json#/$defs/request",
+      "rule": "The object described at methods.v1.json#/$defs/params.standing.stop is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/params"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.standing.stop.anyOf.0.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.stop/anyOf/0 is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.stop.anyOf.0.code.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.stop/anyOf/0 always carries 'code'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.stop.anyOf.0.stopped.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.stop/anyOf/0 always carries 'stopped'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.stop.anyOf.0.not_stopped.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.stop/anyOf/0 always carries 'not_stopped'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.stop.anyOf.0.text.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.stop/anyOf/0 always carries 'text'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.standing.stop.anyOf.0.code.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.standing.stop/anyOf/0/properties/code.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/u-methods.v1.answer.standing.stop.anyOf.0.not_stopped.items.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.stop/anyOf/0/properties/not_stopped/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/not_stopped/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.stop.anyOf.0.not_stopped.items.store.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.stop/anyOf/0/properties/not_stopped/items always carries 'store'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/not_stopped/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.stop.anyOf.0.not_stopped.items.outcome.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.stop/anyOf/0/properties/not_stopped/items always carries 'outcome'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/not_stopped/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.stop.anyOf.0.not_stopped.items.text.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.stop/anyOf/0/properties/not_stopped/items always carries 'text'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/not_stopped/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.standing.stop.anyOf.0.not_stopped.items.outcome.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/not_stopped/0/outcome must be one of the values listed at methods.v1.json#/$defs/answer.standing.stop/anyOf/0/properties/not_stopped/items/properties/outcome.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/not_stopped/0/outcome"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.standing.stop.anyOf.1.allOf.1.code.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/code must be one of the values listed at methods.v1.json#/$defs/answer.standing.stop/anyOf/1/allOf/1/properties/code.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/code"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.standing.list.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.standing.list/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
+      }
+    },
+    {
+      "file": "bad/methods.v1/v-methods.v1.answer.standing.stop.anyOf.1.allOf.1.then.detail.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The value at /answer/detail must be one of the values listed at methods.v1.json#/$defs/answer.standing.stop/anyOf/1/allOf/1/then/properties/detail.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/answer/detail"
       }
     },
     {

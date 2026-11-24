@@ -165,7 +165,7 @@ class _Server(ThreadingMixIn, WSGIServer):
         allowance like any other Stop and tracked until it is done. Its connection was shut when it
         was evicted, so its client sees a closed connection and no answer.
         """
-        stop = (method, path.split("?", 1)[0]) == ("POST", "/stop")
+        stop = method == "POST" and path.split("?", 1)[0] in ("/stop", "/stop-all")
         with self._gate:
             if request not in self._reading and not stop:
                 return False  # evicted: never dispatch a buffered GET/POST past the thread cap

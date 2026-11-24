@@ -1,5 +1,5 @@
 {
-  "table_version": "1.0-draft.10",
+  "table_version": "1.0-draft.11",
   "methods": [
     {
       "name": "run.start",
@@ -1265,6 +1265,60 @@
       "lane": "CONTROL",
       "params": "#/$defs/params.methods.list",
       "result": "#/$defs/answer.methods.list"
+    },
+    {
+      "name": "standing.list",
+      "scope": "read",
+      "mutating": false,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "falls_back": [],
+      "service": null,
+      "page_allowed": true,
+      "mcp": {
+        "exposed": false,
+        "tool": null,
+        "annotations": null
+      },
+      "beta": true,
+      "codes": [
+        "ok",
+        "request_invalid",
+        "unavailable",
+        "scope_refused",
+        "unsupported"
+      ],
+      "lane": "CONTROL",
+      "params": "#/$defs/params.standing.list",
+      "result": "#/$defs/answer.standing.list"
+    },
+    {
+      "name": "standing.stop",
+      "scope": "run",
+      "mutating": true,
+      "idempotency": "none",
+      "precondition": "none",
+      "requires": [],
+      "falls_back": [],
+      "service": null,
+      "page_allowed": true,
+      "mcp": {
+        "exposed": false,
+        "tool": null,
+        "annotations": null
+      },
+      "beta": true,
+      "codes": [
+        "stopped",
+        "pending",
+        "unavailable",
+        "scope_refused",
+        "unsupported"
+      ],
+      "lane": "STOP",
+      "params": "#/$defs/params.standing.stop",
+      "result": "#/$defs/answer.standing.stop"
     }
   ]
 }

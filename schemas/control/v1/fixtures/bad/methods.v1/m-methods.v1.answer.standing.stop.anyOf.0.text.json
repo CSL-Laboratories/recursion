@@ -1,0 +1,20 @@
+{
+  "method": "standing.stop",
+  "params": {},
+  "answer": {
+    "code": "pending",
+    "stopped": {
+      "run": 1
+    },
+    "not_stopped": [
+      {
+        "kind": "run",
+        "id": "run-2",
+        "outcome": "not_stopped",
+        "reason": "cgroup_populated",
+        "text": "run run-2 did not empty yet (cgroup_populated)",
+        "store": "runs"
+      }
+    ]
+  }
+}

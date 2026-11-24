@@ -352,7 +352,7 @@ class PublishedFilesTest(unittest.TestCase):
                         mutating_without_key.append(name)
                     if row["mcp"]["exposed"]:
                         self.assertEqual(row["mcp"]["tool"], "recursion_" + name.replace(".", "_"))
-            self.assertEqual(mutating_without_key, ["run.stop"], "only an emergency Stop may mutate without a key")
+            self.assertEqual(mutating_without_key, ["run.stop", "standing.stop"], "only an emergency Stop may mutate without a key")
             requests = {client.read_json(folder / "fixtures" / entry["file"])["method"]
                         for entry in client.load_index(folder)
                         if entry["schema"].startswith("methods.v1.json#/$defs/") and entry["file"].startswith("good/")

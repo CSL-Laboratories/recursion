@@ -60,9 +60,24 @@ class FakeSystem(System):
         yield done.stdout
 
 
-def busctl(owner: bool = False, activatable: bool = False, kwallet: bool = False):
-    """A stand-in ``busctl``: ``ListNames`` and ``ListActivatableNames`` as ``busctl --user call`` prints them."""
+LOGIN = '/org/freedesktop/secrets/collection/login'
+LOGIN_CREATED = 1_700_000_000     # a made-up creation time, before the tests' clock (TempStoreCase.store)
+
+
+def busctl(owner: bool = False, activatable: bool = False, kwallet: bool = False, chain=None):
+    """A stand-in ``busctl``: ``ListNames`` and ``ListActivatableNames`` as ``busctl --user call`` prints them; with a
+    ``chain``, also the Secret Service's ``ReadAlias default`` and its collection's ``Created`` (``chain.collection``,
+    None for a service that does not say)."""
     def run(argv, input):
+        if chain is not None and ('ReadAlias' in argv or 'get-property' in argv):
+            found = chain.collection
+            if found is None:
+                return Completed(1, b'', b'Call failed: No such method\n')
+            if 'ReadAlias' in argv:
+                return Completed(0, f'o "{found[0]}"\n'.encode(), b'')
+            if found[0] in argv and 'Created' in argv:
+                return Completed(0, f't {found[1]}\n'.encode(), b'')
+            return Completed(1, b'', b'Failed to get property: Unknown object\n')
         names = ['org.freedesktop.DBus']
         if ('ListNames' in argv and owner) or ('ListActivatableNames' in argv and activatable):
             names.append('org.freedesktop.secrets')
@@ -94,6 +109,7 @@ class FakeKeychain:
         self.locked: set = set()      # items in a locked collection
         self.unlock = 'accept'        # accept | cancel
         self.mode = 'ok'              # ok | locked | fail | dismissed | silent (every call exits 1, saying nothing)
+        self.collection = (LOGIN, LOGIN_CREATED)   # which keychain it is, as the bus says (None: it does not say)
         self.after_store = None       # what ``store`` answers AFTER saving (a helper killed once it saved), or None
         self.searched = 'ok'          # ok | fail: what ``search`` does
 
@@ -147,7 +163,8 @@ class FakeKeychain:
 def keychain_system(**kw):
     """A FakeSystem with a session bus, a Secret Service on it, and an in-memory keychain."""
     chain = FakeKeychain()
-    system = FakeSystem(tools={'busctl': busctl(owner=True), 'secret-tool': chain}, bus='unix:path=/fake/bus', **kw)
+    system = FakeSystem(tools={'busctl': busctl(owner=True, chain=chain), 'secret-tool': chain},
+                        bus='unix:path=/fake/bus', **kw)
     return system, chain
 
 
@@ -235,7 +252,11 @@ with open(items_path, 'w') as fh:
 
 _BUSCTL = r'''#!{python} -I
 import sys
-if 'ListNames' in sys.argv:
+if 'ReadAlias' in sys.argv:
+    print('o "/org/freedesktop/secrets/collection/login"')
+elif 'get-property' in sys.argv:
+    print('t 1700000000')
+elif 'ListNames' in sys.argv:
     print('as 2 "org.freedesktop.DBus" "org.freedesktop.secrets"')
 else:
     print('as 1 "org.freedesktop.DBus"')

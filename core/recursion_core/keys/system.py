@@ -216,6 +216,66 @@ def bus_names(system: System) -> set | None:
     return None
 
 
+_SECRETS_PATH = '/org/freedesktop/secrets'
+_COLLECTION = 'org.freedesktop.Secret.Collection'
+
+
+def keychain_identity(system: System) -> tuple | None:
+    """Which keychain the Secret Service saves into now: ``(path, created)``, the object path of its default collection
+    (``ReadAlias("default")``, where ``secret-tool store`` puts an item) and that collection's ``Created`` property,
+    in seconds. Read through ``busctl``, else ``dbus-send``; None when neither answers in that shape (a service that
+    offers no default collection or no ``Created``). It reads properties only: no item, and nothing secret, so it
+    answers while the collection is locked. A collection that was wiped and made again keeps its path and gets a new
+    ``Created``; another keyring (another bus, a container) has its own."""
+    for name, ask in (('busctl', _busctl_identity), ('dbus-send', _dbus_send_identity)):
+        tool = system.which(name)
+        if tool is not None:
+            found = ask(system, tool)
+            if found is not None:
+                return found
+    return None
+
+
+def _object_path(text: str) -> str | None:
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        text = text[1:-1]
+    if text != '/' and text.startswith('/') and not text.endswith('/') and \
+            all(part and all(c.isascii() and (c.isalnum() or c == '_') for c in part) for part in text[1:].split('/')):
+        return text
+    return None
+
+
+def _busctl_identity(system: System, tool: str) -> tuple | None:
+    """``busctl --user call ... ReadAlias s default`` prints ``o "<path>"``; ``get-property ... Created`` ``t <n>``."""
+    text = _call(system, [tool, '--user', 'call', SECRET_SERVICE_NAME, _SECRETS_PATH, 'org.freedesktop.Secret.Service',
+                          'ReadAlias', 's', 'default'])
+    words = text.split() if text else []
+    path = _object_path(words[1]) if len(words) == 2 and words[0] == 'o' else None
+    if path is None:
+        return None
+    text = _call(system, [tool, '--user', 'get-property', SECRET_SERVICE_NAME, path, _COLLECTION, 'Created'])
+    words = text.split() if text else []
+    if len(words) != 2 or words[0] != 't' or not (words[1].isascii() and words[1].isdigit()):
+        return None
+    return path, int(words[1])
+
+
+def _dbus_send_identity(system: System, tool: str) -> tuple | None:
+    """``dbus-send --print-reply`` prints ``object path "<path>"``, then ``variant uint64 <n>``."""
+    text = _call(system, [tool, '--session', '--print-reply', f'--dest={SECRET_SERVICE_NAME}', _SECRETS_PATH,
+                          'org.freedesktop.Secret.Service.ReadAlias', 'string:default'])
+    words = text.split() if text else []
+    path = _object_path(words[-1]) if len(words) >= 3 and words[-3:-1] == ['object', 'path'] else None
+    if path is None:
+        return None
+    text = _call(system, [tool, '--session', '--print-reply', f'--dest={SECRET_SERVICE_NAME}', path,
+                          'org.freedesktop.DBus.Properties.Get', f'string:{_COLLECTION}', 'string:Created'])
+    words = text.split() if text else []
+    if len(words) < 3 or words[-3:-1] != ['variant', 'uint64'] or not (words[-1].isascii() and words[-1].isdigit()):
+        return None
+    return path, int(words[-1])
+
+
 def _call(system: System, argv: list) -> str | None:
     try:
         done = system.run(argv, timeout=BUS_TIMEOUT_S)

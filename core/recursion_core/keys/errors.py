@@ -28,6 +28,7 @@ CODES = (
     # the backend, its pin and the keychain
     'backend_changed', 'backend_not_built', 'keychain_unavailable', 'keychain_locked', 'keychain_failed',
     'keychain_timeout', 'keychain_tool_missing', 'keychain_undetermined', 'keychain_unsupported', 'secret_missing',
+    'keychain_other', 'keychain_remade', 'keychain_unrecorded',
     # spend
     'spend_not_allowed',
 )

@@ -76,10 +76,12 @@ class Report:
     unnamed: int = 0                                 # Secret Service items Recursion saved that no record names
     unnamed_refused: str | None = None               # why those items could not be counted
     owner_file: str = ''                             # the owner-only file's path as the report may print it
+    elsewhere: dict = field(default_factory=dict)    # key id -> where its keychain is, when not the one answering
+    forgotten: list = field(default_factory=list)    # every use of ``key forget``: store.Forgotten
 
     def complete(self) -> bool:
         return not (self.missing or self.unreadable or self.journal_incomplete or self.pending or self.unnamed
-                    or self.unnamed_refused)
+                    or self.unnamed_refused or any(p in ('other', 'remade') for p in self.elsewhere.values()))
 
 
 def default_roots(store: KeyStore) -> list:
@@ -130,6 +132,9 @@ def run(store: KeyStore, *, extra=(), journal: bool = True) -> Report:
         report.unnamed = store.unnamed_items() or 0
     except KeyStoreError as exc:
         report.unnamed_refused = exc.code
+    _, places, _ = store.whereabouts()               # a refused host is already in ``missing``
+    report.elsewhere = {kid: place for kid, place in places.items() if place != 'same'}
+    report.forgotten = list(index.forgotten)
     if not values:
         report.journal = 'not searched (no value to look for)' if journal else 'not searched (--no-journal)'
         report.roots = [str(root) for root in default_roots(store)] + [str(Path(p)) for p in extra]

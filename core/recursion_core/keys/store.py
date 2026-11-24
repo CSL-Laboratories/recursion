@@ -30,8 +30,9 @@ first write. A removal deletes every value saved for the id in the store, whiche
 rollback deletes only the value of the save its intent was written for (ORDER OF WRITES).
 
 THE INDEX FORMAT, version 1: ``{"version": 1, "store_id": <32 hex>, "backend": <store or null>, "keys": {<id>:
-{"provider", "env_name", "created_at", "store", "metered_spend_allowed", "cap_usd", "save_id"}}, "pending":
-{<id>: {"op": "add" | "remove", "started_at", "save_id"}}}``, at most 1 MiB. Anything else is refused
+{"provider", "env_name", "created_at", "store", "metered_spend_allowed", "cap_usd", "save_id"[, "keychain"]}},
+"pending": {<id>: {"op": "add" | "remove", "started_at", "save_id"}}[, "forgotten": [{"key_id", "at", "store"[,
+"keychain"]}, ...]]}``, at most 1 MiB. ``keychain`` and ``forgotten`` are written only when there is one (KEYCHAIN). Anything else is refused
 ``index_invalid``. An intent's ``save_id`` names the save it was written for: the new record's for an add, the
 record's for a remove. An index written before intents carried it (an intent with only ``op`` and ``started_at``) is
 read as it is; see ORDER OF WRITES for what a recovery does with such an intent. A listing says what the index holds;
@@ -109,9 +110,33 @@ no name this store knows, so it can neither release nor remove them (the keychai
 ``application recursion``). ``remove <id>`` of an id a record names deletes every item of the id in the store, whichever
 save stored it. The audit counts every Recursion item in the keychain that neither a record names by its save nor an
 unfinished operation by its id (``unnamed_items``), and is incomplete while there is one.
+
+KEYCHAIN. One config folder can meet more than one keychain (another session bus, a container or an ssh session with
+a keyring of its own, a keyring wiped and made again), and the pin names a backend, not a keychain. So each record of
+a Secret Service save names the keychain its value was saved into: ``keychain``, ``{"collection": <the default
+collection's object path>, "created": <its Created time, seconds>}``, asked of the bus at the save
+(``system.keychain_identity``); a record has no ``keychain`` when the service did not say (and the owner-only file
+needs none: it is the one in the store's folder). ``remove`` of such a record first asks which keychain answers now,
+before anything is changed or recovered:
+- the SAME keychain: the item is deleted; when it was already gone the record is removed all the same, and the
+  removal says so (``report`` gets ``already_gone``);
+- ANOTHER keychain (another collection, or one made before the save): refused ``keychain_other``, nothing changed;
+- one with the record's collection path made AFTER the save (wiped and made again, or another one made since):
+  refused ``keychain_remade``, nothing changed, and the refusal names ``forget``;
+- a record that names no keychain (saved before records named one), or a keychain that does not say which it is:
+  the record's own save, found and deleted there, shows it is the keychain it was saved into (a save id is random
+  per save); when nothing of the id is there the index is written back as it was and the removal is refused
+  ``keychain_unrecorded``, naming ``forget``.
+``forget <id>`` is the person's own step for ONE named key: it removes that key's record (and any unfinished
+operation on it) from the index, touches no keychain and no file, and records its use in the index (``forgotten``:
+the id, when, the store and the keychain the record named). The value may still sit in another keychain. No hook
+or seam reaches it (``hooks.py`` registers the credential source only), and it reads no setting: the command asks
+for the id on the terminal. ``status`` and the audit show each record whose keychain is not the one that answers,
+and every use of ``forget``.
 """
 from __future__ import annotations
 
+import calendar
 import contextlib
 import json
 import logging
@@ -127,7 +152,7 @@ from recursion_core.keys import validate as v
 from recursion_core.keys.backends import OwnerFile, SecretService
 from recursion_core.keys.errors import KeyRefused, KeyStoreError
 from recursion_core.keys.files import Folder, open_folder
-from recursion_core.keys.system import System, detect
+from recursion_core.keys.system import System, _object_path, detect
 
 log = logging.getLogger(__name__)
 
@@ -142,6 +167,10 @@ INDEX_NAME = 'index.json'
 INDEX_MAX = 1 << 20
 INDEX_VERSION = 1
 FIELDS = ('provider', 'env_name', 'created_at', 'store', 'metered_spend_allowed', 'cap_usd', 'save_id')
+KEYCHAIN_FIELD = 'keychain'        # a record's keychain, written only when there is one (KEYCHAIN)
+FORGOTTEN_FIELDS = ('key_id', 'at', 'store')
+# Where a record's keychain is, against the one that answers now (KEYCHAIN):
+WHERE = ('same', 'other', 'remade', 'unrecorded', 'unknown')
 SHOWN = ('key_id', 'provider', 'env_name', 'created_at', 'store', 'metered_spend_allowed', 'cap_usd')
 PENDING_FIELDS = ('op', 'started_at')
 PENDING_FIELDS_SAVED = ('op', 'started_at', 'save_id')     # an intent that names its save (the older shape is read too)
@@ -171,6 +200,7 @@ class KeyRecord:
     metered_spend_allowed: bool
     cap_usd: int | float
     save_id: str
+    keychain: tuple | None = None      # (collection path, created) of the keychain it was saved into; see KEYCHAIN
 
     def spend_allowed(self) -> bool:
         return self.metered_spend_allowed is True and self.cap_usd > 0
@@ -192,11 +222,22 @@ class Pending:
 
 
 @dataclass(frozen=True)
+class Forgotten:
+    """One use of ``forget``: which key's record was removed, when, from which store, and the keychain it named."""
+
+    key_id: str
+    at: str
+    store: str | None
+    keychain: tuple | None = None
+
+
+@dataclass(frozen=True)
 class Index:
     backend: str | None                            # the pinned backend; None while nothing is in the index
     keys: dict                                     # key id -> KeyRecord
     pending: dict = field(default_factory=dict)    # key id -> Pending
     store_id: str | None = None                    # the store's random id; None only before the first save
+    forgotten: tuple = ()                          # every use of ``forget`` (Forgotten), oldest first
 
     def live(self) -> bool:
         return bool(self.keys or self.pending)
@@ -219,13 +260,56 @@ def _now(clock) -> str:
 
 def index_bytes(index: Index) -> bytes:
     """The index file exactly as it is written. Every write carries the store's id (``add`` makes it first)."""
-    keys ={kid: {name: getattr(record, name) for name in FIELDS} for kid, record in sorted(index.keys.items())}
+    keys = {kid: {**{name: getattr(record, name) for name in FIELDS}, **_keychain_json(record.keychain)}
+            for kid, record in sorted(index.keys.items())}
     pending = {kid: {'op': p.op, 'started_at': p.started_at, **({'save_id': p.save_id} if p.save_id else {})}
                for kid, p in sorted(index.pending.items())}
-    body = json.dumps({'version': INDEX_VERSION, 'store_id': index.store_id,
-                       'backend': index.backend if index.live() else None, 'keys': keys, 'pending': pending},
-                      indent=1, ensure_ascii=True)
+    doc = {'version': INDEX_VERSION, 'store_id': index.store_id,
+           'backend': index.backend if index.live() else None, 'keys': keys, 'pending': pending}
+    if index.forgotten:
+        doc['forgotten'] = [{'key_id': f.key_id, 'at': f.at, 'store': f.store, **_keychain_json(f.keychain)}
+                            for f in index.forgotten]
+    body = json.dumps(doc, indent=1, ensure_ascii=True)
     return (body + '\n').encode('ascii')
+
+
+def _keychain_json(keychain: tuple | None) -> dict:
+    return {} if keychain is None else {KEYCHAIN_FIELD: {'collection': keychain[0], 'created': keychain[1]}}
+
+
+def _keychain_parsed(entry: dict) -> tuple | None | bool:
+    """A record's or a use's ``keychain`` as (path, created), None when absent, False when malformed."""
+    if KEYCHAIN_FIELD not in entry:
+        return None
+    found = entry[KEYCHAIN_FIELD]
+    if not isinstance(found, dict) or set(found) != {'collection', 'created'}:
+        return False
+    path, created = found['collection'], found['created']
+    if not isinstance(path, str) or len(path) > 4096 or _object_path(path) != path:
+        return False
+    if type(created) is not int or created < 0:
+        return False
+    return path, created
+
+
+def _epoch(stamp: str) -> int:
+    """Seconds of a record's ``created_at`` (``_now``'s form)."""
+    return calendar.timegm(time.strptime(stamp[:19], '%Y-%m-%dT%H:%M:%S'))
+
+
+def where(record: KeyRecord, now: tuple | None) -> str:
+    """Where ``record``'s keychain is against ``now``, the one that answers (KEYCHAIN): a name from ``WHERE``."""
+    if record.store == 'owner_file':
+        return 'same'                    # the store's own file, in its folder: there is no other
+    if record.keychain is None:
+        return 'unrecorded'
+    if now is None:
+        return 'unknown'
+    if now == record.keychain:
+        return 'same'
+    if now[0] == record.keychain[0] and now[1] > _epoch(record.created_at):
+        return 'remade'
+    return 'other'
 
 
 class KeyStore:
@@ -411,9 +495,10 @@ class KeyStore:
                 raise KeyStoreError('key_exists', f'the owner-only file still holds a value of {key_id} that no saved '
                                     f'key names (its index was lost, emptied or put back); "remove {key_id}" deletes '
                                     'it, then add the key again')
+            keychain = backend.identity() if name == 'secret_service' else None    # which keychain: KEYCHAIN
             now = _now(self._clock)
             record = KeyRecord(key_id, provider, env_name, now, backend.name, metered_spend_allowed, cap_usd,
-                               _random_id())
+                               _random_id(), keychain)
             keys = {**index.keys, key_id: record}
             intent = replace(index, backend=backend.name,
                              pending={**index.pending, key_id: Pending(key_id, 'add', now, record.save_id)})
@@ -441,12 +526,13 @@ class KeyStore:
                 raise
             return record
 
-    def remove(self, key_id: str) -> KeyRecord | None:
+    def remove(self, key_id: str, *, report: list | None = None) -> KeyRecord | None:
         """Delete a key's value from its backend, then its entry from the index.
 
         Returns the key's record, or None when no record named the id: an unfinished operation (an interrupted add)
         whose orphaned value this removal cleared, or a value of the id that the owner-only file held and the index no
-        longer named (see VALUES NO RECORD NAMES).
+        longer named (see VALUES NO RECORD NAMES). A record's keychain is asked first (KEYCHAIN); ``report``, when
+        given, gets ``already_gone`` when the record's keychain held no item of it any more.
         """
         problem = v.id_problem(key_id)
         if problem is not None:
@@ -462,6 +548,10 @@ class KeyStore:
                 self._unnamed(folder, index, key_id)     # a value only the store's own file holds, or key_unknown
                 return None
             backend = self._removal_backend(index.backend, index.store_id)
+            place = 'same' if record is None else where(
+                record, backend.identity() if record.store == 'secret_service' and record.keychain is not None else None)
+            if place in ('other', 'remade'):
+                raise _elsewhere(key_id, place)        # before anything is changed or recovered
             index = self._recover(folder, index, backend, but=key_id)
             keys = {kid: rec for kid, rec in index.keys.items() if kid != key_id}
             others = {kid: p for kid, p in index.pending.items() if kid != key_id}
@@ -469,9 +559,51 @@ class KeyStore:
             save_id = record.save_id if record is not None else (earlier.save_id if earlier is not None else None)
             now = _now(self._clock)
             self._write_index(folder, replace(index, pending={**others, key_id: Pending(key_id, 'remove', now, save_id)}))
-            backend.delete(key_id, folder)     # every value of the id in this store, and no other id's, or it refuses
+            found = backend.delete(key_id, folder)   # every value of the id in this store, and no other id's, or it refuses
+            if not found and place in ('unrecorded', 'unknown'):
+                self._write_index(folder, index)       # as it was: which keychain held the value cannot be told
+                raise _elsewhere(key_id, 'unrecorded')
             self._write_index(folder, replace(index, keys=keys, pending=others))
+            if not found and record is not None and report is not None:
+                report.append('already_gone')
             return record
+
+    def forget(self, key_id: str) -> KeyRecord | None:
+        """The person's own step for ONE named key (KEYCHAIN): remove its record and any unfinished operation on it
+        from the index, touch no keychain and no file, and record the use. Returns the record, or None when only an
+        unfinished operation named the id."""
+        problem = v.id_problem(key_id)
+        if problem is not None:
+            raise KeyStoreError('id_invalid', problem)
+        folder = self._folder(create=False)
+        if folder is None:
+            raise KeyStoreError('key_unknown', f'{key_id} is not saved')
+        with folder, folder.locked():
+            folder.sweep()
+            index = self._read_index(folder)
+            record = index.keys.get(key_id)
+            if record is None and key_id not in index.pending:
+                raise KeyStoreError('key_unknown', f'{key_id} is not saved')
+            used = Forgotten(key_id, _now(self._clock), record.store if record is not None else index.backend,
+                             record.keychain if record is not None else None)
+            self._write_index(folder, replace(
+                index, keys={kid: rec for kid, rec in index.keys.items() if kid != key_id},
+                pending={kid: p for kid, p in index.pending.items() if kid != key_id},
+                forgotten=index.forgotten + (used,)))
+            return record
+
+    def whereabouts(self) -> tuple:
+        """For ``status`` and the audit: ``(index, {key id: a name from WHERE}, refusal code or None)``. Asks the bus
+        which keychain answers (no item is read); a host that no longer offers the pinned backend gives its code."""
+        index = self.list()
+        if not index.keys:
+            return index, {}, None
+        try:
+            backend = self._removal_backend(index.backend, index.store_id)
+        except KeyStoreError as exc:
+            return index, {}, exc.code
+        now = backend.identity() if backend.name == 'secret_service' else None
+        return index, {kid: where(record, now) for kid, record in sorted(index.keys.items())}, None
 
     def list(self) -> Index:
         """The index: the pinned backend, every key's record and every unfinished operation. Touches no backend."""
@@ -611,13 +743,29 @@ class KeyStore:
         raise KeyRefused(connection_id, code)
 
 
+def _elsewhere(key_id: str, place: str) -> KeyStoreError:
+    step = (f'If its value is gone for good, "key forget {key_id}" removes the record of this one key (yours alone to '
+            'take); the value may still sit in another keychain')
+    if place == 'other':
+        return KeyStoreError('keychain_other', f'{key_id} was saved into another keychain than the one that answers now; '
+                             'it is removed only where that keychain answers. Nothing was changed')
+    if place == 'remade':
+        return KeyStoreError('keychain_remade', f'the keychain that answers now was made after {key_id} was saved (wiped '
+                             f'and made again, or another one) and is not the one it was saved into. Nothing was '
+                             f'changed. {step}')
+    return KeyStoreError('keychain_unrecorded', f'the keychain that answers holds no item of {key_id}, and which keychain '
+                         'it was saved into is not known (its record names none, or this keychain does not say which '
+                         f'it is). Nothing was changed. {step}')
+
+
 def _parse_index(raw: bytes) -> Index | None:
     """The index exactly as ``index_bytes`` writes it, or None. Nothing raises with the text attached."""
     try:
         doc = json.loads(raw.decode('ascii'), object_pairs_hook=_pairs, parse_constant=_constant)
     except (ValueError, _Duplicate):
         doc = None
-    if not isinstance(doc, dict) or set(doc) != {'version', 'store_id', 'backend', 'keys', 'pending'}:
+    base = {'version', 'store_id', 'backend', 'keys', 'pending'}
+    if not isinstance(doc, dict) or set(doc) not in (base, base | {'forgotten'}):
         return None
     if type(doc['version']) is not int or doc['version'] != INDEX_VERSION or not _valid_random_id(doc['store_id']):
         return None
@@ -629,7 +777,11 @@ def _parse_index(raw: bytes) -> Index | None:
         return None
     keys = {}
     for key_id, entry in doc['keys'].items():
-        if not v.valid_key_id(key_id) or not isinstance(entry, dict) or set(entry) != set(FIELDS):
+        if not v.valid_key_id(key_id) or not isinstance(entry, dict) \
+                or set(entry) not in (set(FIELDS), set(FIELDS) | {KEYCHAIN_FIELD}):
+            return None
+        keychain = _keychain_parsed(entry)
+        if keychain is False or (keychain is not None and entry['store'] != 'secret_service'):
             return None
         allowed, cap = entry['metered_spend_allowed'], entry['cap_usd']
         if not (v.valid_provider(entry['provider']) and v.valid_env_name(entry['env_name'])
@@ -638,7 +790,7 @@ def _parse_index(raw: bytes) -> Index | None:
                 and _valid_random_id(entry['save_id'])):
             return None
         keys[key_id] = KeyRecord(key_id, entry['provider'], entry['env_name'], entry['created_at'], entry['store'],
-                                 allowed, cap, entry['save_id'])
+                                 allowed, cap, entry['save_id'], keychain)
     if len({record.save_id for record in keys.values()}) != len(keys):
         return None                      # two records naming one save: an index this store never writes
     pending = {}
@@ -651,7 +803,20 @@ def _parse_index(raw: bytes) -> Index | None:
         if 'save_id' in entry and not _valid_random_id(entry['save_id']):
             return None
         pending[key_id] = Pending(key_id, entry['op'], entry['started_at'], entry.get('save_id'))
-    return Index(backend if live else None, keys, pending, doc['store_id'])
+    forgotten = []
+    if 'forgotten' in doc:
+        if not isinstance(doc['forgotten'], list) or not doc['forgotten']:
+            return None
+        for entry in doc['forgotten']:
+            if not isinstance(entry, dict) or set(entry) not in (set(FORGOTTEN_FIELDS),
+                                                                  set(FORGOTTEN_FIELDS) | {KEYCHAIN_FIELD}):
+                return None
+            keychain = _keychain_parsed(entry)
+            if keychain is False or not v.valid_key_id(entry['key_id']) or not v.valid_timestamp(entry['at']) \
+                    or entry['store'] not in (*STORES, None):
+                return None
+            forgotten.append(Forgotten(entry['key_id'], entry['at'], entry['store'], keychain))
+    return Index(backend if live else None, keys, pending, doc['store_id'], tuple(forgotten))
 
 
 class _Duplicate(Exception):

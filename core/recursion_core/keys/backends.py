@@ -29,6 +29,9 @@ check use the first three, so a removal reaches every value ever saved for the i
 ``search --all`` how many items carry ``application recursion`` (any store's), this store's items of one id, or
 the item of one record's save, for the audit. Neither the value nor anything derived from it is ever in the
 helper's arguments or its environment.
+WHICH KEYCHAIN. ``identity`` names the keychain that answers now, by the default collection's path and its
+``Created`` time, asked of the bus (``system.keychain_identity``); the store records it with each save (see
+``store.py``, KEYCHAIN).
 ``lookup`` exits 1 with nothing on its standard error when it finds no unlocked item; anything else that is not
 success is a failure, ``keychain_locked`` when its message says the collection is locked or the unlock prompt
 was dismissed, else ``keychain_failed``. A failure's detail is fixed text: no line a helper printed is ever
@@ -93,6 +96,10 @@ class SecretService:
         if record is None:
             return self._attributes(key_id)
         return self._attributes(key_id) + ['recursion_save', record.save_id, 'recursion_provider', record.provider]
+
+    def identity(self) -> tuple | None:
+        """Which keychain answers now (``system.keychain_identity``): asks the bus, never ``secret-tool``."""
+        return sysmod.keychain_identity(self._system)
 
     def _run(self, argv: list, *, input: bytes | None = None) -> sysmod.Completed:
         code = None

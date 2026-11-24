@@ -18,6 +18,14 @@
     an id no saved key has that the store's own owner-only file still holds, whatever the host offers now (not a
     file the store does not use: another store's while the store has keys in the file, or any while its keys are
     in a keychain; with no saved key at all, the file in its folder is its own).
+``status``
+    Each saved key and whether the keychain it was saved into is the one that answers now (another one, one made
+    after the save, or one that cannot be told), and every use of ``forget``. Asks the bus, never reads a value.
+``forget <id>``
+    The person's own step for ONE key whose keychain is gone or not the one that answers: removes that key's record
+    and touches no keychain. It asks for the id again on the terminal, takes no option that skips the question and
+    refuses with no terminal; its output says the value may still sit in another keychain, and ``status`` and
+    ``audit`` list every use.
 ``audit [--path P ...] [--no-journal]``
     Searches the state folder, the config folder and the journal for every saved value (``audit.py``) and
     names each place a value was found, never the value, and each temp file an interrupted save left in the
@@ -78,7 +86,7 @@ def _absorb_extras(parser: argparse.ArgumentParser) -> None:
 
 
 def configure(parser: argparse.ArgumentParser) -> None:
-    """Give ``parser`` the four key actions. Used by both entries, so they parse alike.
+    """Give ``parser`` the key actions. Used by both entries, so they parse alike.
 
     The parser may be the control CLI's (seam S2), whose usage errors repeat what was typed. So everything after
     ``key`` is parsed by parsers of this module: an unknown word or option is noted (``key_unrecognized``) and the
@@ -107,7 +115,12 @@ def configure(parser: argparse.ArgumentParser) -> None:
     remove.add_argument('key_id', metavar='ID')
     remove.add_argument('--yes', dest='key_yes', action='store_true', help='do not ask first')
     audit = actions.add_parser('audit', allow_abbrev=False, help='look for saved values in state, config and logs')
-    for action_parser in (add, listing, remove, audit):
+    status = actions.add_parser('status', allow_abbrev=False,
+                                help='show whether each key\'s keychain is the one that answers (never a value)')
+    forget = actions.add_parser('forget', allow_abbrev=False,
+                                help='remove the record of one key whose keychain is gone; touches no keychain')
+    forget.add_argument('key_id', metavar='ID')
+    for action_parser in (add, listing, remove, audit, status, forget):
         _absorb_extras(action_parser)
     audit.add_argument('--path', dest='key_paths', action='append', default=[], metavar='PATH',
                        help='also search this file or folder (repeatable)')
@@ -268,6 +281,10 @@ def run(args, out=None, err=None, *, store: KeyStore | None = None, terminal: Te
             return _remove(args, out, err, store, terminal)
         if action == 'audit':
             return _audit(args, out, err, store)
+        if action == 'status':
+            return _status(out, store)
+        if action == 'forget':
+            return _forget(args, out, store, terminal)
     except KeyStoreError as exc:
         return _refused(err, exc, refused)
     except OSError as exc:
@@ -276,7 +293,7 @@ def run(args, out=None, err=None, *, store: KeyStore | None = None, terminal: Te
     except KeyboardInterrupt:
         print('interrupted: nothing more was done (an unfinished save stays on record; "key list" shows it)', file=err)
         return 130
-    print('usage: key add|list|remove|audit', file=err)
+    print('usage: key add|list|remove|audit|status|forget', file=err)
     return 2
 
 
@@ -386,13 +403,62 @@ def _remove(args, out, err, store, terminal) -> int:
                 opened.close()
         if answer.lower() not in ('y', 'yes'):
             raise KeyStoreError('not_confirmed', f'{args.key_id} was not removed')
-    record = store.remove(args.key_id)
+    report = []
+    record = store.remove(args.key_id, report=report)
     if record is None:
         print(f'removed a value of {args.key_id} that no saved key named (an interrupted save, or an index lost, '
               'emptied or put back)', file=out)
     else:
         print(f'removed {record.key_id} ({record.provider}, {record.env_name}) from {STORE_TEXT[record.store]}',
               file=out)
+        if 'already_gone' in report:
+            print(f'note: the item of {record.key_id} was already gone from that keychain; its record is removed',
+                  file=out)
+    return 0
+
+
+PLACE_TEXT = {
+    'same': 'the keychain that answers now',
+    'other': 'ANOTHER keychain than the one that answers now ("key remove" refuses until that one answers)',
+    'remade': 'a keychain the one answering now was made after (wiped and made again, or another one)',
+    'unrecorded': 'a keychain its record does not name (saved before records named one, or the service did not say)',
+    'unknown': 'cannot be told (the keychain that answers does not say which it is)',
+}
+
+
+def _status(out, store) -> int:
+    index, places, refused = store.whereabouts()
+    print(_store_line(index.backend, store), file=out)
+    if refused is not None:
+        print(f'keychain: not asked ({refused})', file=out)
+    for kid in sorted(index.keys):
+        print(f'{kid}  saved into: {PLACE_TEXT.get(places.get(kid), "not asked")}', file=out)
+    for used in index.forgotten:
+        print(f'forgotten: {used.key_id} at {used.at} with "key forget": its record was removed and its value was not '
+              f'deleted; it may still sit in {STORE_TEXT.get(used.store, "its keychain")}', file=out)
+    return 0
+
+
+def _forget(args, out, store, terminal) -> int:
+    problem = v.id_problem(args.key_id)
+    if problem is not None:
+        raise KeyStoreError('id_invalid', problem)
+    opened = None
+    if terminal is None:
+        terminal = opened = Terminal.open()
+    if terminal is None:
+        raise KeyStoreError('no_terminal', 'forget is asked on the terminal only, and there is none; nothing was done')
+    try:
+        answer = terminal.ask(f'Forget the record of {args.key_id}? Its value is not deleted and may still sit in '
+                              'another keychain. Type the id again to go on: ')
+    finally:
+        if opened is not None:
+            opened.close()
+    if answer != args.key_id:
+        raise KeyStoreError('not_confirmed', f'the record of {args.key_id} was kept')
+    store.forget(args.key_id)
+    print(f'forgot the record of {args.key_id}: no keychain was touched, and its value may still sit in another '
+          'keychain; "key status" and "key audit" list this step', file=out)
     return 0
 
 
@@ -425,6 +491,11 @@ def _audit(args, out, err, store) -> int:
               '"application recursion"', file=out)
     if report.unnamed_refused:
         print(f'keychain: its items were not counted ({report.unnamed_refused})', file=out)
+    for key_id, place in sorted(report.elsewhere.items()):
+        print(f'keychain of {key_id}: {PLACE_TEXT[place]}', file=out)
+    for used in report.forgotten:
+        print(f'forgotten: {used.key_id} at {used.at} with "key forget": its value was not deleted and may still sit '
+              f'in {STORE_TEXT.get(used.store, "its keychain")}', file=out)
     for place in report.leftovers:
         print(f'FOUND: a temp file an interrupted save left behind, which may hold part of a key: {place} (the next '
               '"key add" or "key remove" deletes it)', file=out)

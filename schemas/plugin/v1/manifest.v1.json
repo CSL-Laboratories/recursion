@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "manifest.v1.json",
+  "title": "manifest.v1: the plugin manifest, 'csl-plugin-manifest/1'",
+  "x-version": "1.0-draft.1",
+  "description": "The manifest a plugin's developer signs. It is the ten fields of 'csl-plugin-manifest/vNext' (core/recursion_core/plugin_security/manifest.py) with the same meanings, plus three: runtime (how the plugin's code is run), interface (which plugin API it is written against) and files (every file of the package with its SHA-256, so the signature covers the whole package and not only the entry file). The manifest is read as bytes in the restricted canonical form (ASCII, sorted keys, whole numbers, no spaces) and the developer's Ed25519 signature is over those bytes. PROVISIONAL (recommended, not decided): that this contract is frozen as version 1 now, and the five permission names after 'order'. Four rules the parser enforces cannot be written in a schema and are listed in README.md: permissions must be in the order this schema lists them; network_destinations and credential_refs must be sorted; files must contain the entry file, with the digest artifact_sha256 names; and the bytes must be in canonical form. Permissions are only ever appended to the list: an existing name never changes its place or its meaning, so the signed bytes for an existing set of permissions never change.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "plugin_id", "version", "artifact_sha256", "dependency_lock_sha256", "install_scripts", "developer_key", "permissions", "network_destinations", "credential_refs", "runtime", "interface", "files"],
+  "properties": {
+    "schema": {"const": "csl-plugin-manifest/1"},
+    "plugin_id": {
+      "description": "2 to 64 characters: a lower-case letter, then lower-case letters, digits, '_', '.' or '-'. 'host' is the core's own name and no plugin may claim it.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.-]{1,63}$",
+      "not": {"anyOf": [{"const": "host"}, {"pattern": "[\\r\\n]"}]}
+    },
+    "version": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[\\x20-\\x7e]+$", "not": {"pattern": "[\\r\\n]"}},
+    "artifact_sha256": {"$ref": "#/$defs/sha256"},
+    "dependency_lock_sha256": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]},
+    "install_scripts": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[\\x20-\\x7e]{1,200}$", "not": {"pattern": "[\\r\\n]"}}
+    },
+    "developer_key": {
+      "description": "The developer's Ed25519 public key: 64 lower-case hex digits.",
+      "$ref": "#/$defs/sha256"
+    },
+    "permissions": {
+      "description": "What the plugin asks for. The first seven are today's. The last five are new with version 1 and PROVISIONAL, names and order both: surface (it adds themes and layouts; never the approval area), command (it adds commands), subscribe (it is given events), tool (it declares tools), run (it starts runs it owns).",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/permission"}
+    },
+    "network_destinations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+(:[0-9]{1,5})?$", "not": {"pattern": "[\\r\\n]"}}
+    },
+    "credential_refs": {
+      "description": "Names of credentials the plugin asks to use. A name, never a credential.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z][a-z0-9_.:/-]{1,127}$", "not": {"pattern": "[\\r\\n]"}}
+    },
+    "runtime": {
+      "description": "How the plugin's code is run. 'python-inprocess/1': ordinary Python in the daemon's own process and user. That is not a containment boundary.",
+      "enum": ["python-inprocess/1"]
+    },
+    "interface": {
+      "description": "The plugin API the package is written against.",
+      "enum": ["csl-plugin-api/1"]
+    },
+    "files": {
+      "description": "Every file of the package: its path inside the package (forward slashes; no segment starts with a dot, so no '.', no '..' and no absolute path) and its SHA-256.",
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 4096,
+      "propertyNames": {"pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$", "maxLength": 512, "not": {"pattern": "[\\r\\n]"}},
+      "additionalProperties": {"$ref": "#/$defs/sha256"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {"required": ["permissions"], "properties": {"permissions": {"contains": {"const": "network"}}}},
+      "then": {"properties": {"network_destinations": {"minItems": 1}}},
+      "else": {"properties": {"network_destinations": {"maxItems": 0}}}
+    },
+    {
+      "if": {"required": ["permissions"], "properties": {"permissions": {"contains": {"const": "credential"}}}},
+      "then": {"properties": {"credential_refs": {"minItems": 1}}},
+      "else": {"properties": {"credential_refs": {"maxItems": 0}}}
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "not": {"pattern": "[\\r\\n]"}
+    },
+    "permission": {
+      "description": "In canonical order. A manifest and a grant list permissions in this order.",
+      "enum": ["read", "propose", "panel", "network", "credential", "process", "order", "surface", "command", "subscribe", "tool", "run"]
+    }
+  }
+}

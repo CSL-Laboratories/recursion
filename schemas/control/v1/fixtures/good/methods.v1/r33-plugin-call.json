@@ -1,0 +1,10 @@
+{
+  "method": "plugin.call",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "plugin_id": "notes.search",
+    "kind": "command",
+    "name": "reindex",
+    "arguments": {}
+  }
+}

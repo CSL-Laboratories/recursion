@@ -1,7 +1,7 @@
 """Recorded product direction for the same-uid fallback (B17, O69: the signed profile under in-process plugins).
 
 Frozen text shared by the docs and the code. ``tests/test_o69_policy.py`` checks that
-``README.md`` quotes it exactly. This records Lucas's 2026-11-08 direction. The quote
+``README.md`` quotes it exactly. This records the owner's 2026-11-08 direction. The quote
 is not accepted text in CSL-Laboratories/csl-research contracts/PRODUCT.md
 055cc7a5c793b7135e5d0565dc4198cf96230531 (SHA-256
 e64783152f6d67d4ede774dc41d112fe46c2d7536d53cb2c04e71a3566044daf, receipt CSLR-D-011).

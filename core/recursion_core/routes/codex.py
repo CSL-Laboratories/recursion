@@ -27,7 +27,7 @@ Typed limit signals:
   the breaker clock). Codex's default bucket (``limitId`` ``codex``) is credential-wide. Any other
   ``limitId`` is the breaker model key itself: the requested route model is not used, so a notice for
   one bucket does not fence a different model.
-* R3 finding 4 (Lucas, D0, Nov 12: "take the stricter, fail-closed option that the reviewer's test
+* R3 finding 4 (the owner, D0, Nov 12: "take the stricter, fail-closed option that the reviewer's test
   already encodes"): an ``api_key`` route ignores exactly one error of the rate-limit read, the one whose
   message is ``CHATGPT_AUTH_REQUIRED`` byte for byte and which carries no typed ``codexErrorInfo``;
   that text is in the installed binary (the fixture's ``binary_literals``). Every other error of that
@@ -62,7 +62,7 @@ from recursion_core.routes.launch import child_env
 CODEX_CREDENTIAL_ENV = ("CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_API_KEY")
 # The only names an api_key route may select and custody may fill: the user's own API keys. CODEX_ACCESS_TOKEN
 # is a sign-in token, not an API key; Codex uses its own CLI login only and Recursion holds no ChatGPT token
-# (Lucas, Nov 8; PRODUCT.md 3.3, O61), so it is scrubbed and never selectable.
+# (the owner, Nov 8; PRODUCT.md 3.3, O61), so it is scrubbed and never selectable.
 CODEX_API_KEY_ENV = ("CODEX_API_KEY", "OPENAI_API_KEY")
 # Top-level config key ``check_for_update_on_startup: Option<bool>`` (default true), read in openai/codex
 # 8703d32bd0ea5cf26768859a3dd476df906ba053 codex-rs/config/src/config_toml.rs:533 and only consulted by the

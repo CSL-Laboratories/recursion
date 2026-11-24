@@ -360,7 +360,7 @@ class HostProgramTests(unittest.TestCase):
         self.assertTrue(replies, stderr.decode(errors="replace"))
         self.hello = replies.pop(0)
         self.assertEqual({key: value for key, value in self.hello.items() if key != "wall"}, HELLO)
-        if code != 0 or wall in ("real", "noreadfile"):
+        if code != 0 or wall in ("real", "noreadfile", "nowrite", "notruncate", "keepcanary"):
             return replies, None, None, None
         self.assertIsNotNone(report, "the host wrote no status")
         status, reads, identity = json.loads(report)
@@ -1001,6 +1001,63 @@ class HostProgramTests(unittest.TestCase):
         self.assertIs(record["proven"], False)
         self.assertEqual(self.canaries_left, [])
 
+    def test_w6_a_wall_that_leaves_writes_open_is_not_proven_and_no_plugin_byte_runs(self):
+        why = _why_no_wall()
+        if why:
+            self.skipTest(why)
+        from recursion_core.plugin_host import wall_linux
+        for wall in ("nowrite", "notruncate"):
+            with self.subTest(wall=wall), tempfile.TemporaryDirectory(dir=self.root) as outside:
+                victim = Path(outside, "yours.txt")
+                victim.write_text("a person's text, stand-in", encoding="ascii")
+                source = WRITE_SOURCE.replace(b"VICTIM", repr(str(victim)).encode())
+                replies, _, _, _ = self.exchange(HELLO, load(source), call(7, command={}), load(source), BYE,
+                                                 wall=wall)
+                self.assertEqual([(reply["type"], reply.get("code")) for reply in replies],
+                                 [("refusal", "plugin_wall_unproven"), ("refusal", "call_not_offered"),
+                                  ("refusal", "plugin_wall_unproven")], replies)
+                self.assertEqual(victim.read_text(encoding="ascii"), "a person's text, stand-in",
+                                 "no plugin byte ran, so the file outside is whole")
+                record = self.hello["wall"]
+                self.assertIs(record["proven"], False)
+                held = ("refused_by_landlock", "refused_by_filter")
+                self.assertEqual([kind for kind in WRITE_KINDS if record["writes"][kind] not in held],
+                                 ["truncate"] if wall == "notruncate" else list(WRITE_KINDS))
+                for reply in (replies[0], replies[2]):
+                    detail = reply["detail"]
+                    self.assertLessEqual(len(detail), 1000)
+                    self.assertTrue(detail.startswith(wall_linux.WORDS["not_loaded"]), detail)
+                    self.assertIn(wall_linux.WORDS["let_through"].format(what=wall_linux.WORDS["truncate"]), detail)
+                    self.assertIn("writes.truncate", detail)
+                    self.assertTrue(detail.endswith(", proven"), detail)
+                self.assertEqual(self.canaries_left, [], "the canary and the write folder are gone")
+
+    def test_w7_a_canary_left_behind_refuses_every_load(self):
+        why = _why_no_wall()
+        if why:
+            self.skipTest(why)
+        from recursion_core.plugin_host import wall_linux
+        replies, _, _, _ = self.exchange(HELLO, load(WALL_SOURCE), BYE, wall="keepcanary")
+        self.assertEqual([(reply["type"], reply.get("code")) for reply in replies],
+                         [("refusal", "plugin_wall_unproven")], replies)
+        self.assertIs(self.hello["wall"]["proven"], True, "the wall itself holds")
+        self.assertIn("canary_left", replies[0]["detail"])
+        self.assertIn(wall_linux.WORDS["canary_left"], replies[0]["detail"])
+        self.assertEqual(len(self.canaries_left), 2, "the canary and the write folder, both named")
+
+
+# The plugin of the write test: at load it cuts a file outside its folder to nothing (VICTIM is its path).
+WRITE_SOURCE = textwrap.dedent("""
+    import os
+    try:
+        os.truncate(VICTIM, 0)
+    except OSError:
+        pass
+
+    def operator(command):
+        return {}
+    """).encode()
+
 
 def _why_no_wall():
     if not sys.platform.startswith("linux"):
@@ -1034,8 +1091,12 @@ WALL_SOURCE = textwrap.dedent("""
 RECORD_CHECKS = ("reads_outside", "home_canary", "program_start", "new_socket", "signal_other",
                  "signal_other_ways", "metadata_change", "kernel_surface")
 # A proven record as the stand-in wall gives it (and as a daemon might claim one in its own hello).
-STANDIN_RECORD = dict(dict.fromkeys(RECORD_CHECKS, True), landlock_abi=6,
-                      landlock_scopes=["abstract_unix_socket", "signal"], arch="x86_64", proven=True)
+WRITE_KINDS = ("open_for_write", "truncate", "create_file", "create_folder", "make_fifo", "make_symlink",
+               "make_link", "make_char_device", "make_block_device", "remove_file", "remove_folder")
+STANDIN_RECORD = dict(dict.fromkeys(RECORD_CHECKS, True), writes=dict.fromkeys(WRITE_KINDS, "refused_by_landlock"),
+                      writes_not_tried={"make_socket_node": "stand-in", "device_ioctl": "stand-in",
+                                        "move_between_folders": "stand-in"},
+                      landlock_abi=6, landlock_scopes=["abstract_unix_socket", "signal"], arch="x86_64", proven=True)
 # The wall each exchange gives its host, as lines run inside the host before main. "standin": no wall
 # and a proven stand-in record, for the tests of the channel, the environment and the GIL rule, several of
 # whose plugins read /proc, which a real wall refuses. "real": the host's own wall on this kernel.
@@ -1045,11 +1106,20 @@ STANDIN_RECORD = dict(dict.fromkeys(RECORD_CHECKS, True), landlock_abi=6,
 WALL_SHIMS = {
     "standin": ("from recursion_core.plugin_host import wall_linux as _wall_linux\n"
                 "_wall_linux.apply_wall = lambda paths: None\n"
-                f"_wall_linux.probe_wall = lambda canary, pid: {STANDIN_RECORD!r}\n"),
+                f"_wall_linux.probe_wall = lambda canary, pid, **writes: {STANDIN_RECORD!r}\n"),
     "real": "",
     "nolandlock": ("from recursion_core.plugin_host import wall_linux as _wall_linux\n"
                    "_wall_linux._landlock_abi = lambda libc: 0\n"),
     "noreadfile": ("from recursion_core.plugin_host import wall_linux as _wall_linux\n"
                    "_wall_linux._FS_ABI1 &= ~_wall_linux._FS_READ_FILE\n"
                    "_wall_linux._FS_READ_FILE = 0\n"),
+    # "nowrite": a wall whose Landlock step leaves every write right unhandled (reads stay walled).
+    "nowrite": ("from recursion_core.plugin_host import wall_linux as _wall_linux\n"
+                "_wall_linux._FS_ABI1 = (1 << 0) | (1 << 2) | (1 << 3)\n"
+                "_wall_linux._FS_LATER = {5: 1 << 15}\n"),
+    # "notruncate": a wall whose Landlock step leaves only truncation unhandled.
+    "notruncate": ("from recursion_core.plugin_host import wall_linux as _wall_linux\n"
+                   "_wall_linux._FS_LATER = {2: 1 << 13, 5: 1 << 15}\n"),
+    # "keepcanary": the real wall, and a helper that leaves the canary and the write folder behind.
+    "keepcanary": "plugin_host._remove_probe_files = lambda path, folder: None\n",
 }

@@ -275,6 +275,9 @@ WORDS = {
     "no_landlock": "This system's kernel gives the host no Landlock, the part of Linux the sandbox is built on.",
     "other_arch": "The sandbox knows x86_64 and aarch64 machines only; this one is {arch}.",
     "partial": "A step of the sandbox failed while it was being put up, so the host loads nothing.",
+    "canary_left": "The test file or folder the host made for this test was still there after it should have "
+                   "been removed, so a plugin would not find the host's folder as it was.",
+    "more": "More did not hold than fits here; the record the host sent first names each part.",
     "what_to_do": "What you can do: run the plugin host on Linux 5.13 or newer with Landlock turned on (most "
                   "distributions turn it on; otherwise add landlock to the kernel's lsm= boot setting), outside "
                   "any container or security tool that changes what a process may do with files, and start it "

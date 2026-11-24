@@ -13,7 +13,9 @@ which limits what the process can do to the machine.
 The wall. Before it reads its first load, the host walls itself in (``wall_linux.apply_wall``, with the
 Python install as the only path it may read) and proves that wall from inside (``wall_linux.probe_wall``,
 with a canary file it writes in its own working folder just before the wall and its starter as the other
-process); its hello carries the record (``wall.v1``). The canary is gone again before any plugin byte runs.
+process); its hello carries the record (``wall.v1``). The probe also tries each kind of write on that canary and in a
+write folder made beside it for the purpose; both are gone again before any plugin byte runs, and a host that finds
+either still there after its helper ended refuses every load.
 A host whose record is not proven, or whose wall was refused, answers every load with
 ``plugin_wall_unproven`` naming what is missing, loads nothing and runs no plugin byte. Nothing on
 the channel, in a manifest, in a file or in a setting reaches that step: it runs once, before the host
@@ -27,6 +29,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import shutil
 import sys
 import types
 from collections import deque
@@ -87,41 +90,50 @@ def _install_paths():
 # The probe's canary: a regular file this host writes in its own working folder just before the wall, named
 # for this process. The probe must find it unreadable behind the wall, so a wall that leaves file reads open
 # is never proven (a folder alone would not show that). It holds nothing of anyone's: one line of its own.
+# Beside it, the write folder (the same name with WRITE_FOLDER_SUFFIX) is made for the probe's write kinds;
+# the probe also tries the writes on the canary itself.
 CANARY_PREFIX = ".csl-plugin-host-canary-"
+WRITE_FOLDER_SUFFIX = ".d"
 
 
 def _canary():
-    """(the canary's path, a call that removes it), or ('', None) when it cannot be made, which proves nothing.
+    """(the canary's path, the write folder's path, a call that removes both), or ('', '', None) when they
+    cannot be made, which proves nothing.
 
     A walled host can remove no file, so a helper process, forked before the wall and holding only its end
-    of a pipe, removes the canary when the host shuts that pipe after the probe (or when the host ends), and
-    the host waits for it: a plugin finds its working folder as it was."""
+    of a pipe, removes the canary and the write folder (with whatever a weak wall let the probe make in it)
+    when the host shuts that pipe after the probe (or when the host ends), and the host waits for it. The
+    call then answers the names still there (allowed behind the wall: it only looks), so a host whose helper
+    was killed or could not remove them knows it: a plugin must find its working folder as it was."""
     try:
         path = os.path.join(os.getcwd(), CANARY_PREFIX + str(os.getpid()))
         made = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     except OSError:
-        return "", None
+        return "", "", None
+    folder = path + WRITE_FOLDER_SUFFIX
     try:
         try:
             os.write(made, b"canary\n")
         finally:
             os.close(made)
+        os.mkdir(folder, 0o700)
+        wall_linux.prepare_write_folder(folder)
         read_end, write_end = os.pipe()
-    except OSError:
-        _remove_quietly(path)
-        return "", None
+    except (OSError, ValueError):
+        _remove_probe_files(path, folder)
+        return "", "", None
     try:
         helper = os.fork()
     except OSError:
         os.close(read_end)
         os.close(write_end)
-        _remove_quietly(path)
-        return "", None
+        _remove_probe_files(path, folder)
+        return "", "", None
     if helper == 0:
         try:
             os.close(write_end)
             os.read(read_end, 1)  # the host shuts its end after the probe, or ends
-            os.unlink(path)
+            _remove_probe_files(path, folder)
         finally:
             os._exit(0)
     os.close(read_end)
@@ -129,7 +141,14 @@ def _canary():
     def remove():
         os.close(write_end)
         os.waitpid(helper, 0)
-    return path, remove
+        return [os.path.basename(name) for name in (path, folder) if os.path.lexists(name)]
+    return path, folder, remove
+
+
+def _remove_probe_files(path, folder):
+    """The canary and the write folder with all it holds; run by the helper, which the wall does not reach."""
+    _remove_quietly(path)
+    shutil.rmtree(folder, ignore_errors=True)
 
 
 def _remove_quietly(path):
@@ -147,8 +166,8 @@ def _wall():
     harmless where they are allowed, and a record that shows them allowed is not proven. Where the probe
     cannot run at all (not Linux), the record is None. The canary is made only where the wall can be (on
     Linux; elsewhere the wall refuses before any change) and is removed once the probe has run."""
-    canary, remove = _canary() if sys.platform.startswith("linux") else ("", None)
-    refused = ""
+    canary, folder, remove = _canary() if sys.platform.startswith("linux") else ("", "", None)
+    refused, left = "", []
     try:
         try:
             wall_linux.apply_wall(_install_paths())
@@ -157,16 +176,23 @@ def _wall():
         except Exception as exc:  # a path that cannot be opened, or any other failure: no wall is in place
             refused = "apply_wall_" + type(exc).__name__
         try:
-            record = wall_linux.probe_wall(canary, os.getppid())
+            record = wall_linux.probe_wall(canary, os.getppid(), write_file=canary or None,
+                                           write_folder=folder or None)
         except Exception:  # wall_system_unsupported, or a probe that cannot run: nothing is proven
             record = None
     finally:
         if remove is not None:
             try:
-                remove()
+                left = remove()
             except OSError:
-                pass
+                left = ["unknown"]
+    if left:  # the canary or the write folder is still there: a plugin would not find its folder as it was
+        refused = ", ".join(filter(None, [refused, CANARY_LEFT]))
     return record, refused
+
+
+# The refusal named when the canary or the write folder is still there after the helper ended.
+CANARY_LEFT = "canary_left"
 
 
 def _wall_missing(record, refused):
@@ -176,6 +202,9 @@ def _wall_missing(record, refused):
     if type(record) is not dict:
         return missing + ["no_record"]
     missing += [name for name in wall_linux.RECORD_CHECKS if record.get(name) is not True]
+    writes = record.get("writes") if isinstance(record.get("writes"), dict) else {}
+    missing += ["writes." + kind for kind in wall_linux.WRITE_KINDS
+                if writes.get(kind) not in wall_linux.WRITE_OUTCOMES[:2]]
     if record.get("proven") is not True:
         missing.append("proven")
     return missing
@@ -439,9 +468,8 @@ class _Program:
                 self._channel.send(self._failed(message, exc))
 
     def _wall_refusal(self, message):
-        detail = ("the wall around this host is not proven, so it loads nothing and runs no plugin code; "
-                  "missing: " + ", ".join(self._wall_missing))
-        return hc.refusal(message, hc.ChannelRefusal(WALL_UNPROVEN, detail))
+        return hc.refusal(message, hc.ChannelRefusal(WALL_UNPROVEN, _unproven_detail(self._wall_record,
+                                                                                      self._wall_missing)))
 
     @staticmethod
     def _gil_refusal(message):
@@ -493,6 +521,33 @@ class _Program:
             else:
                 self._dispatch(message)
         raise EOFError("plugin channel ended")
+
+
+# The longest detail of a refusal (host.v1.json, the refusal's detail): part of the channel's format.
+_DETAIL_MAX = 1000
+
+
+def _unproven_detail(record, missing):
+    """The detail of a load refused for the wall: the sentences a person reads (wall_linux.WORDS), as many as
+    fit, then the names of what is missing, which always fit and come last."""
+    if type(record) is not dict:  # no record at all (no Linux, or a probe that could not run): the short form
+        return ("the wall around this host is not proven, so it loads nothing and runs no plugin code; "
+                "missing: " + ", ".join(missing))
+    words = wall_linux.why_not_proven(record) or [wall_linux.WORDS["not_loaded"]]
+    if CANARY_LEFT in ", ".join(missing):
+        words.insert(1, wall_linux.WORDS["canary_left"])
+    tail = " Missing: " + ", ".join(missing)
+    room = _DETAIL_MAX - len(tail)
+    kept = []
+    for i, line in enumerate(words):
+        rest = len(words) - i - 1
+        cost = len(" ".join(kept + [line]))
+        if cost + (len(" " + wall_linux.WORDS["more"]) if rest else 0) > room:
+            kept.append(wall_linux.WORDS["more"])
+            break
+        kept.append(line)
+    text = " ".join(kept)
+    return (text[:room] + tail)[-_DETAIL_MAX:] if len(text) > room else text + tail
 
 
 def main(*, gil_probe: GilProbe | None = None) -> dict:

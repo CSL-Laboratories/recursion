@@ -14,7 +14,7 @@ from recursion_core.remote.pairing import PairingGrant, PairingRefused
 from recursion_core.remote.tests import support
 
 
-def grant(device_id: str = "dev_one", scopes=("read", "stop"), label: str = "phone") -> PairingGrant:
+def grant(device_id: str = "dev_one", scopes=("read", "run.stop"), label: str = "phone") -> PairingGrant:
     return PairingGrant("off1", device_id, label, tuple(scopes), 0.0)
 
 
@@ -38,7 +38,7 @@ class DeviceTests(unittest.TestCase):
 
     def test_a_device_gets_its_granted_scopes_and_never_manage(self) -> None:
         self.assertTrue(self.book.admit("dev_one", "read").ok)
-        self.assertTrue(self.book.admit("dev_one", "stop").ok)
+        self.assertTrue(self.book.admit("dev_one", "run.stop").ok)
         for scope in ("manage", "run", "approve", "anything"):
             with self.subTest(scope=scope):
                 decision = self.book.admit("dev_one", scope)
@@ -58,7 +58,7 @@ class DeviceTests(unittest.TestCase):
 
     def test_a_revoked_device_is_refused_next_and_its_connections_are_named(self) -> None:
         self.assertTrue(self.book.connect("dev_one", "conn-a").ok)
-        self.assertTrue(self.book.connect("dev_one", "conn-b", scope="stop").ok)
+        self.assertTrue(self.book.connect("dev_one", "conn-b", scope="run.stop").ok)
         self.assertEqual(set(self.book.revoke("dev_one")), {"conn-a", "conn-b"})
         self.assertEqual(self.book.admit("dev_one", "read").code, "device_revoked")
         self.assertEqual(self.book.connect("dev_one", "conn-c").code, "device_revoked")

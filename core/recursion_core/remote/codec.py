@@ -144,17 +144,22 @@ def ascii_text(text: str, limit: int = 200) -> str:
 
 
 def relay_error(code: str, *, delivered: bool | str, detail: str | None = None,
-                request: Message | None = None) -> Message:
+                request: Message | None = None, fields: dict[str, str] | None = None) -> Message:
     """An error frame of the relay's own; it carries the request's ``id`` when the request had one.
 
     The detail is made ASCII and an ``id`` that cannot be framed again is left out, so that the relay's own
     answer can always be written. An error with no ``id`` answers a frame the relay could not read or copy.
+    ``fields`` adds named words to the error (the refused method and the right it needs), made ASCII and
+    cut like the detail; they never replace ``code``, ``layer``, ``delivered`` or ``detail``.
     """
     if not _is_delivered_value(delivered):
         raise ValueError(f"delivered must be one of {DELIVERED_VALUES!r}")
     error: dict[str, Any] = {"code": code, "layer": RELAY_LAYER, "delivered": delivered}
     if detail:
         error["detail"] = ascii_text(detail)
+    for name, value in (fields or {}).items():
+        if name not in ("code", "layer", "delivered", "detail"):
+            error[name] = ascii_text(str(value), 64)
     reply: Message = {"ok": False, "error": error}
     has_id, value = copyable_id(request)
     if has_id:

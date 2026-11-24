@@ -7,8 +7,9 @@ in-memory models of pairing. Nothing here is registered with the daemon, and not
 
 **What this slice proves, and what it does not.** The tests run the real relay against a real
 `UnixControlServer` behind a fake ssh. They show that the relay is a faithful pipe onto today's socket:
-frames, delivery answers, the busy and not-admitted frames, the reserved Stop slot, command ids. They do
-not prove scopes, device tokens or anything the phone page will need: the socket has no scopes yet
+frames, delivery answers, the busy and not-admitted frames, the reserved Stop slot, command ids, and the
+relay's own lock (a key forwards only what its rights cover) and caps. They do not prove the socket's
+own rights check, device tokens or anything the phone page will need: the socket checks no rights yet
 (lane CONTROL's), and the device store and phone door are later slices.
 
 ## Files
@@ -17,6 +18,7 @@ not prove scopes, device tokens or anything the phone page will need: the socket
 |---|---|
 | `codec.py` | The relay's wire: the socket's own frames on byte streams, and the relay's own frames |
 | `relay.py` | The daemon machine's side, run by sshd as a forced command; `python -P -m recursion_core.remote relay` |
+| `rights.py` | What a relay key may reach: rights in the core's vocabulary and the relay's table of method to right |
 | `ssh_transport.py` | The other machine's side: `RelayAPI(target).call(method, params)`, the same answers as `control.client.SocketAPI` |
 | `pairing.py` | One-time pairing offers (128-bit code, two-minute deadline, single use, five wrong codes lock it, rate limits) |
 | `device_state.py` | A paired device's lifecycle (scopes without manage, expiry, revocation that names live connections) |
@@ -93,6 +95,38 @@ restrict,command="/usr/bin/env PYTHONPATH=/path/to/recursion/core /usr/bin/pytho
   `connect:stream:...` before any request is sent.
 * Tailscale SSH does not run `authorized_keys` forced commands; use OpenSSH (over the overlay if you like).
 
+### What a relay key reaches
+
+The forced command decides what a key reaches; the client cannot change it. For a paired device, add
+`--device <device id>` and, if the person chose more than the default, `--rights <list>` (words joined
+by commas, in the core's vocabulary):
+
+| The key's rights | What the relay forwards to the daemon |
+|---|---|
+| `--device` alone (the default: `read,run.stop`) | every method of the `read` row (`run.list`, `run.status`, `events.read`, `session.list`, ...), the socket's `ping` and `health`, and `run.stop`; nothing else |
+| `read` | the `read` rows, `ping` and `health`; no Stop |
+| a single method, such as `run.stop` or `run.list` | that method only |
+| `run` (not for a device without a passkey) | the `run` rows: starting, steering and stopping runs and sessions |
+| `approve` (not for a device without a passkey) | showing and answering approvals |
+| `manage` (never for a device) | the `manage` rows (`workspace.publish`) |
+| no `--device` and no `--rights` (the owner's own key) | everything, as before rights existed, a method the table does not have included |
+
+Every other frame is refused by the relay itself, not delivered: `{"code": "scope_refused", "layer":
+"relay", "delivered": false, "detail": "needs_<right>", "method": ..., "needs": ...}`. A method the table
+does not have (`config.set`, `daemon.shutdown`, any other op) needs all four rights (`needs: "all"`,
+detail `method_not_in_table`). The relay's table is a copy of the published method table
+(`schemas/control/v1/methods.table.v1.json`), pinned by a test. `relay_hello`'s answer shows the key's
+`grant`: the device, its rights and the caps.
+
+Caps on the forwarded stream, each a setting on the same command line: `--max-frames N` frames in any
+`--window-s S` seconds (first values 300 and 60), `--max-frame-bytes N` (first value 1 MiB, the socket's
+own frame). `none` is no limit. Over a cap the frame is refused (`rate_limited`, or `bad_frame` for its
+size), not delivered, and one line is written on stderr.
+
+Not yet: the relay still connects to the socket as the owner's uid. Until the daemon checks a paired
+device's rights at its own socket, the relay's table is the only lock between a device's key and the
+daemon.
+
 On the machine that drives it, a known_hosts file kept only for this host, holding exactly one line:
 the far host's own public key, copied from the far host (for example from
 `/etc/ssh/ssh_host_ed25519_key.pub`), with its fingerprint read there with `ssh-keygen -lf`. Do not
@@ -118,8 +152,10 @@ that file trusts exactly the expected key for the host and no certificate author
 
 `pairing.OfferBook` and `device_state.DeviceBook` fix the rules the device store and the phone door
 will keep, before either exists. They mint nothing: a redeemed offer is a `PairingGrant`, the request
-to make of the one token authority (lane CONTROL's credentials). Scopes are a non-empty subset of
-read and stop (watch and Stop): there is no passkey here, so run and approve are refused, and manage
+to make of the one token authority (lane CONTROL's credentials). A device's rights are in the core's
+one vocabulary (read, run, approve, manage) plus single methods of the method table, chosen by the
+person per device; the default is watch and Stop, written `read` plus `run.stop`. There is no passkey
+here, so run and approve (whole, or as a single method other than `run.stop`) are refused, and manage
 is refused at every step. A device stays paired at most 30 days, and 7 days if unused. Nothing here
 asks for a second factor, and there is no phone page in this package.
 

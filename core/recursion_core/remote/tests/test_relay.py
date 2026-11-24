@@ -2,7 +2,8 @@
 
 Every test runs against a real ``UnixControlServer`` in a scratch runtime directory (the stand-in daemon in
 ``support``), never the real runtime folder. What these tests prove is the transport: that the relay is a
-faithful pipe onto today's socket. They do not prove scopes or any later security claim.
+faithful pipe onto today's socket, and the relay's own lock and caps in front of it. They do not prove the
+socket's own rights check, which is not built.
 """
 
 from __future__ import annotations
@@ -498,6 +499,257 @@ class NoListenerTests(unittest.TestCase):
                     self.assertNotIn(node.module, self.FORBIDDEN_MODULES, f"{path.name}:{node.lineno}")
                 if isinstance(node, ast.Attribute):
                     self.assertNotIn(node.attr, self.FORBIDDEN_CALLS, f"{path.name}:{node.lineno}")
+
+
+DEVICE_REFUSED = {"config.set": "all", "plugins.install": "all", "daemon.shutdown": "all",
+                  "credentials.read": "all", "run.start": "run", "approval.answer": "approve",
+                  "workspace.publish": "manage"}
+
+
+def control(method, n=None) -> dict:
+    message = {"op": "control", "method": method, "params": {}}
+    if n is not None:
+        message["id"] = n
+    return message
+
+
+@unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")
+class RelayRightsTests(unittest.TestCase):
+    def test_a_device_with_the_default_rights_reaches_the_read_methods_and_stop(self) -> None:
+        daemon = support.SocketDaemon(self)
+        relay = Relay(environ=daemon.environ, device_id="dev_phone")
+        self.assertEqual(relay.rights, ("read", "run.stop"))
+        sent = [control(method, n) for n, method in enumerate(("run.list", "run.status", "events.read",
+                                                               "session.list", "run.stop"))]
+        for request in sent:
+            with self.subTest(method=request["method"]):
+                reply = relay.handle(request)
+                self.assertEqual(reply["result"]["method"], request["method"])
+        self.assertEqual(relay.handle({"op": "ping"}), {"ok": True, "op": "pong"})
+        self.assertEqual(daemon.seen, sent + [{"op": "ping"}])
+
+    def test_a_device_with_the_default_rights_is_refused_by_the_relay_before_any_connection(self) -> None:
+        daemon = support.SocketDaemon(self)
+        events: list[dict] = []
+        relay = Relay(environ=daemon.environ, device_id="dev_phone", record=events.append)
+        for n, (method, right) in enumerate(DEVICE_REFUSED.items()):
+            with self.subTest(method=method):
+                reply = relay.handle(control(method, n))
+                self.assertEqual(reply["id"], n)
+                self.assertEqual({key: reply["error"][key] for key in ("code", "layer", "delivered", "method",
+                                                                       "needs")},
+                                 {"code": "scope_refused", "layer": "relay", "delivered": False, "method": method,
+                                  "needs": right})
+                self.assertEqual(reply["error"]["detail"],
+                                 "method_not_in_table" if right == "all" else f"needs_{right}")
+        self.assertEqual(daemon.server.accepted, 0)
+        self.assertEqual(daemon.seen, [])
+        self.assertEqual([(event["refused"], event["method"], event["needs"]) for event in events],
+                         [("scope_refused", method, right) for method, right in DEVICE_REFUSED.items()])
+
+    def test_an_op_that_is_not_control_needs_all_four_rights(self) -> None:
+        daemon = support.SocketDaemon(self)
+        reply = Relay(environ=daemon.environ, device_id="dev_phone").handle({"op": "x", "id": 2})
+        self.assertEqual((reply["error"]["code"], reply["error"]["needs"], reply["error"]["method"]),
+                         ("scope_refused", "all", "op:x"))
+        self.assertEqual(daemon.server.accepted, 0)
+
+    def test_the_owners_key_names_no_device_and_forwards_what_it_always_did(self) -> None:
+        daemon = support.SocketDaemon(self)
+        relay = Relay(environ=daemon.environ)
+        self.assertEqual(relay.rights, ("read", "run", "approve", "manage"))
+        reply = relay.handle(control("config.set", 1))
+        self.assertEqual(reply["result"]["method"], "config.set")
+        self.assertEqual(daemon.seen, [control("config.set", 1)])
+
+    def test_a_key_with_fewer_rights_named_by_the_owner_is_held_to_them(self) -> None:
+        daemon = support.SocketDaemon(self)
+        relay = Relay(environ=daemon.environ, rights=["read"])
+        self.assertEqual(relay.handle(control("run.stop", 1))["error"]["needs"], "run")
+        self.assertEqual(relay.handle(control("run.list", 2))["result"]["method"], "run.list")
+        self.assertEqual([message["id"] for message in daemon.seen], [2])
+
+    def test_a_device_is_held_to_what_pairing_allows(self) -> None:
+        daemon = support.SocketDaemon(self)
+        for words in (["manage"], ["read", "run"], ["approve"], ["stop"], ["session.stop"], "read", []):
+            with self.subTest(words=words), self.assertRaises(ValueError):
+                Relay(environ=daemon.environ, device_id="dev_phone", rights=words)
+        self.assertEqual(Relay(environ=daemon.environ, device_id="dev_phone", rights=["run.list"]).rights,
+                         ("run.list",))
+        for device in ("", "dev phone", "x" * 65, 7, "dev;rm"):
+            with self.subTest(device=device), self.assertRaises(ValueError):
+                Relay(environ=daemon.environ, device_id=device)
+
+    def test_hello_shows_the_keys_grant(self) -> None:
+        daemon = support.SocketDaemon(self)
+        hello = Relay(environ=daemon.environ, device_id="dev_phone", max_frames=5, window_s=2.5,
+                      max_frame_bytes=None).handle({"op": "relay_hello", "relay_version": 1})
+        self.assertEqual(hello["grant"], {"device": "dev_phone", "rights": ["read", "run.stop"],
+                                          "caps": {"max_frames": 5, "window_s": 2.5, "max_frame_bytes": None}})
+
+
+@unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")
+class RelayCapsTests(unittest.TestCase):
+    def test_over_the_frame_cap_the_relay_refuses_records_and_goes_on(self) -> None:
+        daemon = support.SocketDaemon(self)
+        clock, events = support.FakeClock(), []
+        relay = Relay(environ=daemon.environ, max_frames=3, window_s=10.0, clock=clock, record=events.append)
+        replies = [relay.handle(control("run.list", n)) for n in range(4)]
+        self.assertEqual([reply.get("result", {}).get("method") for reply in replies[:3]], ["run.list"] * 3)
+        self.assertEqual((replies[3]["error"]["code"], replies[3]["error"]["delivered"], replies[3]["id"]),
+                         ("rate_limited", False, 3))
+        self.assertEqual(daemon.server.accepted, 3)
+        self.assertEqual(events, [{"refused": "rate_limited", "cap": "max_frames", "value": 3, "window_s": 10.0,
+                                   "seen": 3}])
+        clock.now += 9.5
+        self.assertEqual(relay.handle(control("run.list", 4))["error"]["code"], "rate_limited")
+        clock.now += 0.5  # the window has moved past the first three
+        self.assertEqual(relay.handle(control("run.list", 5))["result"]["method"], "run.list")
+        self.assertEqual([message["id"] for message in daemon.seen], [0, 1, 2, 5])
+
+    def test_the_window_is_a_setting(self) -> None:
+        daemon = support.SocketDaemon(self)
+        clock = support.FakeClock()
+        relay = Relay(environ=daemon.environ, max_frames=1, window_s=2.0, clock=clock)
+        self.assertIn("result", relay.handle(control("run.list", 1)))
+        clock.now += 1.0
+        self.assertEqual(relay.handle(control("run.list", 2))["error"]["code"], "rate_limited")
+        clock.now += 1.0
+        self.assertIn("result", relay.handle(control("run.list", 3)))
+
+    def test_the_first_value_of_the_frame_cap_is_used_when_none_is_given(self) -> None:
+        from recursion_core.remote.relay import RELAY_MAX_FRAMES
+        daemon = support.SocketDaemon(self)
+        relay = Relay(environ=daemon.environ, clock=support.FakeClock())
+        replies = [relay.handle({"op": "ping", "id": n}) for n in range(RELAY_MAX_FRAMES + 1)]
+        self.assertTrue(all(reply.get("op") == "pong" for reply in replies[:-1]))
+        self.assertEqual(replies[-1]["error"]["code"], "rate_limited")
+        self.assertEqual(daemon.server.accepted, RELAY_MAX_FRAMES)
+
+    def test_no_limit_is_a_value(self) -> None:
+        from recursion_core.remote.relay import RELAY_MAX_FRAMES
+        daemon = support.SocketDaemon(self)
+        relay = Relay(environ=daemon.environ, max_frames=None, clock=support.FakeClock())
+        count = RELAY_MAX_FRAMES + 50
+        replies = [relay.handle({"op": "ping", "id": n}) for n in range(count)]
+        self.assertTrue(all(reply.get("op") == "pong" for reply in replies))
+        self.assertEqual(daemon.server.accepted, count)
+
+    def test_relay_ops_and_refused_frames_are_not_counted(self) -> None:
+        daemon = support.SocketDaemon(self)
+        relay = Relay(environ=daemon.environ, device_id="dev_phone", max_frames=1, clock=support.FakeClock(),
+                      max_frame_bytes=256)
+        for n in range(3):
+            self.assertEqual(relay.handle({"op": "relay_hello", "relay_version": 1, "id": n})["op"], "relay_hello")
+        self.assertEqual(relay.handle(control("config.set", 3))["error"]["code"], "scope_refused")
+        big = {**control("run.list", 4), "params": {"x": "y" * 512}}
+        self.assertEqual(relay.handle(big)["error"]["code"], "bad_frame")
+        self.assertIn("result", relay.handle(control("run.list", 5)))
+        self.assertEqual(relay.handle(control("run.list", 6))["error"]["code"], "rate_limited")
+
+    def test_a_frame_over_the_size_cap_is_refused_and_recorded(self) -> None:
+        daemon = support.SocketDaemon(self)
+        events: list[dict] = []
+        relay = Relay(environ=daemon.environ, max_frame_bytes=128, record=events.append)
+        reply = relay.handle({**control("run.list", 1), "params": {"x": "y" * 512}})
+        self.assertEqual((reply["error"]["code"], reply["error"]["delivered"]), ("bad_frame", False))
+        self.assertEqual(events, [{"refused": "bad_frame", "cap": "max_frame_bytes", "value": 128}])
+        out = io.BytesIO()
+        self.assertEqual(relay.serve(io.BytesIO(HEADER.pack(129) + b"{}"), out), EXIT_STREAM)
+        self.assertEqual(events, [{"refused": "bad_frame", "cap": "max_frame_bytes", "value": 128}] * 2)
+        self.assertEqual(daemon.server.accepted, 0)
+
+    def test_no_size_limit_of_the_relays_own_is_a_value(self) -> None:
+        daemon = support.SocketDaemon(self)
+        relay = Relay(environ=daemon.environ, max_frame_bytes=None)
+        reply = relay.handle({**control("run.list", 1), "params": {"x": "y" * 4096}})
+        self.assertEqual(reply["result"]["params"], {"x": "y" * 4096})
+        small = Relay(environ=daemon.environ, max_frame_bytes=1024)
+        self.assertEqual(small.handle({**control("run.list", 2), "params": {"x": "y" * 4096}})["error"]["code"],
+                         "bad_frame")
+
+    def test_a_record_that_raises_changes_no_answer(self) -> None:
+        daemon = support.SocketDaemon(self)
+
+        def record(event):
+            raise RuntimeError("full disk")
+
+        relay = Relay(environ=daemon.environ, max_frames=0, record=record)
+        self.assertEqual(relay.handle(control("run.list", 1))["error"]["code"], "rate_limited")
+
+    def test_bad_cap_arguments_are_refused(self) -> None:
+        daemon = support.SocketDaemon(self)
+        for kwargs in ({"max_frames": -1}, {"max_frames": 1.5}, {"max_frames": True}, {"max_frames": "3"},
+                       {"window_s": 0}, {"window_s": -1}, {"window_s": float("nan")}, {"window_s": float("inf")},
+                       {"window_s": True}, {"window_s": "1"}, {"clock": 7}, {"record": 7}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                Relay(environ=daemon.environ, **kwargs)
+
+
+@unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")
+class RelayMainRightsAndCapsTests(unittest.TestCase):
+    def run_main(self, args, daemon, *messages):
+        out, err = io.BytesIO(), io.StringIO()
+        code = main(["relay", *args], environ=daemon.environ, stdin=io.BytesIO(frames(*messages)), stdout=out,
+                    stderr=err)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_device_key_on_the_forced_command_is_held_to_watch_and_stop(self) -> None:
+        daemon = support.SocketDaemon(self)
+        code, out, err = self.run_main(["--device", "dev_phone"], daemon, control("run.list", 1),
+                                       control("config.set", 2), control("run.stop", 3))
+        self.assertEqual(code, EXIT_OK)
+        listed, refused, stopped = read_all(out)
+        self.assertEqual(listed["result"]["method"], "run.list")
+        self.assertEqual((refused["id"], refused["error"]["code"]), (2, "scope_refused"))
+        self.assertEqual(stopped["result"]["method"], "run.stop")
+        self.assertEqual([message["id"] for message in daemon.seen], [1, 3])
+        self.assertIn('"refused": "scope_refused"', err)
+
+    def test_rights_named_on_the_forced_command(self) -> None:
+        daemon = support.SocketDaemon(self)
+        code, out, _ = self.run_main(["--device", "dev_phone", "--rights", "run.list"], daemon,
+                                     control("run.list", 1), control("run.stop", 2))
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual([reply.get("error", {}).get("needs") for reply in read_all(out)], [None, "run"])
+        for bad in ("manage", "read,run", "stop", "", "read,,run.stop"):
+            with self.subTest(rights=bad):
+                code, out, err = self.run_main(["--device", "dev_phone", "--rights", bad], daemon,
+                                               control("run.list"))
+                self.assertEqual(code, EXIT_REFUSED)
+                self.assertEqual(out, b"")
+                self.assertIn("recursion relay: refused", err)
+
+    def test_the_frame_cap_on_the_command_line_refuses_records_on_stderr_and_frames_only_on_stdout(self) -> None:
+        daemon = support.SocketDaemon(self)
+        code, out, err = self.run_main(["--max-frames", "2", "--window-s", "3600"], daemon,
+                                       *[control("run.list", n) for n in range(3)])
+        self.assertEqual(code, EXIT_OK)
+        replies = read_all(out)
+        self.assertEqual([reply.get("error", {}).get("code") for reply in replies], [None, None, "rate_limited"])
+        self.assertEqual(len(daemon.seen), 2)
+        self.assertIn('recursion relay: record: {"cap": "max_frames"', err)
+
+    def test_none_on_the_command_line_is_no_limit_and_is_said_once(self) -> None:
+        daemon = support.SocketDaemon(self)
+        code, out, err = self.run_main(["--max-frames", "none", "--max-frame-bytes", "none"], daemon,
+                                       control("run.list", 1))
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(read_all(out)[0]["result"]["method"], "run.list")
+        self.assertEqual(err.count("max_frames is none: no limit"), 1)
+        self.assertEqual(err.count("max_frame_bytes is none: no limit"), 1)
+
+    def test_a_bad_cap_on_the_command_line_is_refused_with_nothing_on_stdout(self) -> None:
+        daemon = support.SocketDaemon(self)
+        for args in (["--max-frames", "-1"], ["--max-frames", "x"], ["--max-frames", "1.5"], ["--max-frames", ""],
+                     ["--window-s", "0"], ["--window-s", "nan"], ["--window-s", "abc"], ["--window-s", "inf"],
+                     ["--max-frame-bytes", "0"], ["--max-frame-bytes", "-5"], ["--max-frame-bytes", "1e3"]):
+            with self.subTest(args=args):
+                code, out, err = self.run_main(args, daemon, control("run.list", 1))
+                self.assertEqual(code, EXIT_REFUSED)
+                self.assertEqual(out, b"")
+                self.assertTrue(err.startswith("recursion relay: "))
+        self.assertEqual(daemon.seen, [])
 
 
 if __name__ == "__main__":

@@ -42,7 +42,7 @@ class SettledValueTests(unittest.TestCase):
         self.assertEqual(getattr(pairing, "PAIRING_MAX_AGE_S", None), MAX_AGE_S)
         self.assertEqual(getattr(pairing, "PAIRING_UNUSED_AGE_S", None), UNUSED_S)
         self.assertEqual(getattr(pairing, "DANGEROUS_ASSERTION_TTL_S", None), ASSERTION_S)
-        self.assertEqual(pairing.DEVICE_SCOPES, ("read", "stop"))
+        self.assertEqual(pairing.DEVICE_SCOPES, ("read", "run.stop"))
         self.assertEqual(getattr(pairing, "DANGEROUS_ACTIONS", None), ("run", "approve"))
         with open(pairing.__file__, encoding="utf-8") as source:
             text = source.read()
@@ -55,9 +55,9 @@ class SettledValueTests(unittest.TestCase):
 
 class ScopeTests(unittest.TestCase):
     def test_a_passkeyless_device_is_granted_only_read_and_stop(self) -> None:
-        self.assertEqual(device_scopes(["stop", "read"]), ("read", "stop"))
-        self.assertEqual(device_scopes(("read", "stop")), ("read", "stop"))
-        for scopes in (["run"], ["approve"], ["read", "run"], ["read", "approve"], ["stop", "approve"]):
+        self.assertEqual(device_scopes(["run.stop", "read"]), ("read", "run.stop"))
+        self.assertEqual(device_scopes(("read", "run.stop")), ("read", "run.stop"))
+        for scopes in (["run"], ["approve"], ["read", "run"], ["read", "approve"], ["run.stop", "approve"]):
             with self.subTest(scopes=scopes), self.assertRaises(PairingRefused) as caught:
                 device_scopes(scopes)
             self.assertEqual(caught.exception.code, "scope_refused")
@@ -69,7 +69,7 @@ class ScopeTests(unittest.TestCase):
                 with self.assertRaises(PairingRefused) as caught:
                     book.issue(scopes=scopes, label="phone")
                 self.assertEqual(caught.exception.code, "scope_refused")
-        self.assertEqual(book.issue(scopes=["read", "stop"], label="phone").scopes, ("read", "stop"))
+        self.assertEqual(book.issue(scopes=["read", "run.stop"], label="phone").scopes, ("read", "run.stop"))
 
 
 class LifetimeTests(unittest.TestCase):
@@ -186,13 +186,13 @@ class AssertionTests(unittest.TestCase):
         clock = support.FakeClock()
         gate = self.gate(clock)
         book = DeviceBook(clock=clock)
-        book.add(grant("dev", scopes=("read", "stop")), expires_at=clock.now + MAX_AGE_S)
+        book.add(grant("dev", scopes=("read", "run.stop")), expires_at=clock.now + MAX_AGE_S)
         issued = gate.issue("run")
         gate.accept(issued, "run")  # the assertion is fresh; it does not grant the scope
         self.assertEqual(book.admit("dev", "run").code, "scope_refused")
         self.assertEqual(book.admit("dev", "approve").code, "scope_refused")
         self.assertTrue(book.admit("dev", "read").ok)
-        self.assertTrue(book.admit("dev", "stop").ok)
+        self.assertTrue(book.admit("dev", "run.stop").ok)
 
     def test_watch_and_stop_are_not_dangerous_and_take_no_assertion(self) -> None:
         gate = self.gate(support.FakeClock())

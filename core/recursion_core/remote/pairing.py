@@ -7,9 +7,12 @@ redemption returns is a ``PairingGrant``: what to ask that authority for, never 
 
 The rules, each with a test that fails without it:
 
-* A device's scopes are a non-empty subset of read and stop (watch and Stop). This package has no
-  passkey, so run and approve are refused. Manage is never granted by pairing
-  (PRODUCT.md 1017-1018, O34; grill Q40), and an unknown scope is refused.
+* A device's rights are in the core's one vocabulary (read, run, approve, manage) plus single methods
+  of the method table (``rights.py``), chosen by the person per device. Without a passkey a device may
+  hold ``read``, single methods whose own right is read, and the one method ``run.stop``: watch and
+  Stop, the default written ``read`` plus ``run.stop`` (``DEVICE_SCOPES``). This package has no passkey,
+  so run and approve, whole or as a single method, are refused. Manage is never granted by pairing
+  (PRODUCT.md 1017-1018, O34; grill Q40), and an unknown word (the old ``stop`` included) is refused.
 * An offer is bound when it is issued to its scopes, its label and its deadline. Redeeming it cannot
   widen or change any of them: the redeemer sends only the offer id and the code.
 * The code is 128 random bits, shown once. Only its SHA-256 is kept, and it is compared in constant
@@ -44,16 +47,19 @@ from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
+from .rights import METHOD_RIGHTS, RightsRefused, key_rights
+
 # Settled pairing values of csl-research record 20261115-csl238-harness-dr-09-phone-pairing-01.
 # One block, and the only place these numbers are named. A pairing lasts at most 30 days, and
 # 7 days if unused. A dangerous action needs a fresh assertion per action, valid 60 seconds.
 # Without a passkey a paired device may watch and Stop only. This package has no passkey, so
-# every device is passkey-less and DEVICE_SCOPES is read and stop only. No action here was
-# marked dangerous; run and approve are treated as the dangerous actions.
+# every device is passkey-less and DEVICE_SCOPES is watch and Stop only, in the core's words: the right
+# read and the one method run.stop. No action here was marked dangerous; run and approve are treated as
+# the dangerous actions.
 PAIRING_MAX_AGE_S = 30 * 24 * 60 * 60
 PAIRING_UNUSED_AGE_S = 7 * 24 * 60 * 60
 DANGEROUS_ASSERTION_TTL_S = 60.0
-DEVICE_SCOPES = ("read", "stop")
+DEVICE_SCOPES = ("read", "run.stop")
 DANGEROUS_ACTIONS = ("run", "approve")
 MANAGE = "manage"
 OFFER_TTL_S = 120.0
@@ -82,11 +88,12 @@ class PairingRefused(Exception):
 
 
 def device_scopes(scopes: Iterable[str]) -> tuple[str, ...]:
-    """A paired device's scopes, checked and in canonical order.
+    """A paired device's rights, checked and in canonical order (``rights.key_rights``).
 
-    ``manage``, and the dangerous actions ``run`` and ``approve``, are ``scope_refused``.
-    There is no passkey in this package, so a device may only watch (``read``) and Stop
-    (``stop``).
+    ``manage``, and the dangerous actions ``run`` and ``approve``, are ``scope_refused``, whole or as a
+    single method of the table whose own right they are (``run.stop`` excepted, the Stop of
+    ``DEVICE_SCOPES``). There is no passkey in this package, so a device may only watch (``read``, and
+    single methods whose right is read) and Stop (``run.stop``).
     """
     if isinstance(scopes, (str, bytes)):
         raise PairingRefused("scope_invalid", "scopes are a list of words, not one string")
@@ -97,15 +104,17 @@ def device_scopes(scopes: Iterable[str]) -> tuple[str, ...]:
     if not items:
         raise PairingRefused("scope_invalid", "a device needs at least one scope")
     for scope in items:
-        if scope == MANAGE:
-            raise PairingRefused("scope_refused", "pairing never grants manage")
-        if scope in DANGEROUS_ACTIONS:
-            raise PairingRefused("scope_refused", "without a passkey a device may only watch and stop")
-        if scope not in DEVICE_SCOPES:
+        if type(scope) is not str:
             raise PairingRefused("scope_invalid", f"unknown scope {scope!r}")
-    if len(set(items)) != len(items):
-        raise PairingRefused("scope_invalid", "a scope is named twice")
-    return tuple(scope for scope in DEVICE_SCOPES if scope in items)
+        right = METHOD_RIGHTS.get(scope, scope)  # a single method stands under its own row's right
+        if right == MANAGE:
+            raise PairingRefused("scope_refused", "pairing never grants manage")
+        if right in DANGEROUS_ACTIONS and scope not in DEVICE_SCOPES:
+            raise PairingRefused("scope_refused", "without a passkey a device may only watch and stop")
+    try:
+        return key_rights(items)
+    except RightsRefused as exc:
+        raise PairingRefused("scope_invalid", str(exc)) from None
 
 
 def pairing_lapsed(paired_at: float, last_accepted_at: float | None, now: float) -> bool:

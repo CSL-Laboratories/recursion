@@ -219,7 +219,9 @@ def _restart_with_clean_environment():
     Clearing os.environ does not touch the block the kernel keeps for the process (it stays readable
     in /proc/self/environ), so the host replaces its own process image before anything else runs, with
     an environment of RESTART_GUARD=1 alone. The channel descriptors are unchanged by this: the new
-    image reads the same standard descriptors. An image that already carries RESTARTED and is still
+    image reads the same standard descriptors. The new image's first word is the interpreter's own
+    path, the one given to execve, so a host started by bare name through PATH keeps its prefix in an
+    environment that has no PATH. An image that already carries RESTARTED and is still
     not clean is refused, and so is a restart that cannot be made. Windows has no such call (it would
     end the starter's handle on this process), so it is not done there and os.environ is cleared in
     main as before.
@@ -229,7 +231,7 @@ def _restart_with_clean_environment():
     if sys.orig_argv[-1:] == [RESTARTED]:
         _refuse_start("environment_not_clean", EXIT_ENVIRONMENT_NOT_CLEAN)
     try:
-        os.execve(sys.executable, [*sys.orig_argv, RESTARTED], {RESTART_GUARD: "1"})
+        os.execve(sys.executable, [sys.executable, *sys.orig_argv[1:], RESTARTED], {RESTART_GUARD: "1"})
     except (OSError, ValueError, TypeError):
         _refuse_start("restart_failed", EXIT_RESTART_FAILED)
 

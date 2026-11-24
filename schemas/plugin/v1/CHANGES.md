@@ -52,9 +52,10 @@ receiver does not know is answered with a typed refusal and the channel stays up
 `event`, `guard` and `surface.update` and the call names `run.request` and `computer.open`, `.act`,
 `.observe` and `.close` are reserved: named, answered 'reserved; not available in this release', never
 built here. The run-origin values `trigger`, `agent` and `packet` are in the reserved list with no field
-yet: on a defined message type, a field for a run origin is refused as any unknown field is
-(`message_invalid`), not answered 'reserved'; on a reserved message type (`event`, `guard`,
-`surface.update`), the reserved answer (`message_reserved`) is given first and the fields are not read.
+yet: a field for a run origin is refused as any unknown field is (`message_invalid`), not answered
+'reserved', only on a defined message type that reaches its right receiver; on a reserved message type
+(`event`, `guard`, `surface.update`), the reserved answer (`message_reserved`) is given first, and on a
+defined message type from the wrong side, `message_wrong_side` is given, both before any field is read.
 No message carries a caller: the
 daemon sets it from the channel. What it breaks: nothing; no schema before it named these messages.
 Forty-nine fixtures prove its rules; `plugin_security/host_channel.py` is its code side and

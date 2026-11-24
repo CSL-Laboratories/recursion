@@ -8,6 +8,10 @@ its own).
 
 The door, in order, on every request:
 
+0. ``REQUEST_METHOD`` and ``PATH_INFO`` are each read once and must be a ``str`` exactly,
+   before anything compares them; otherwise the answer is 400. The checked method is the one
+   the door's steps compare, and ``Host``, ``Origin`` and ``Sec-Fetch-Site`` must be a ``str``
+   exactly too;
 1. ``Host`` must be one of the configured hosts;
 2. any ``Origin`` must be exactly one configured origin (a list or ``null`` is
    refused); a POST must carry one. ``Sec-Fetch-Site``, when sent, must be
@@ -28,6 +32,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from collections.abc import Mapping
 from html import escape
 from typing import Callable
 from urllib.parse import parse_qs, quote
@@ -87,15 +92,36 @@ def _sign_in_cell(value: object) -> str:
 
 
 def withhold_venue_data(value: object) -> object:
-    """Hide venue data unless the control API marks its switch exactly ``on``."""
-    if type(value) is dict:
-        out = {k: withhold_venue_data(v) for k, v in value.items()}
+    """Hide venue data unless the control API marks its switch exactly ``on``.
+
+    Any mapping is read as a dict and any list or tuple as a list, at every depth down to the
+    bound below, and they come back as a dict and a list (C7 finding 4: a tuple of rows or a mapping proxy used to
+    pass through unredacted). Any other value that is not a str, an int (bool included), a
+    float or None (a set, a deque, any other object) is replaced by a fixed marker, never shown.
+    A float is kept whatever its value, NaN and the infinities included, as ``json.loads``
+    gives them; this is a redaction, not a strict-JSON sanitiser. An entry whose key is not a
+    str (JSON gives only str keys) is left out. Anything nested deeper than ``_MAX_DEPTH``
+    containers is replaced by a fixed marker, so a deep answer is drawn, never a crash.
+    """
+    return _withhold(value, 0)
+
+
+_MAX_DEPTH = 64  # containers below the answer's top level; the same bound as gui/panels.py's filter
+
+
+def _withhold(value: object, depth: int) -> object:
+    if depth > _MAX_DEPTH and isinstance(value, (Mapping, list, tuple)):
+        return "[withheld: nested too deeply to show]"
+    if isinstance(value, Mapping):
+        out = {k: _withhold(v, depth + 1) for k, v in value.items() if isinstance(k, str)}
         if "venue_data" in value and value.get("venue_data_switch") != "on":
             out["venue_data"] = "[withheld: venue data switch is off]"
         return out
-    if type(value) is list:
-        return [withhold_venue_data(v) for v in value]
-    return value
+    if isinstance(value, (list, tuple)):
+        return [_withhold(v, depth + 1) for v in value]
+    if value is None or isinstance(value, (str, int, float)):
+        return value
+    return "[withheld: not JSON data]"
 
 
 def _venue_scope_sentence(venue: str) -> str:
@@ -131,28 +157,43 @@ class Application:
         self._origins = frozenset(origins)
 
     # -- door ---------------------------------------------------------------------------
-    def _refusal(self, env: dict) -> str | None:
-        method = env.get("REQUEST_METHOD")
-        if env.get("HTTP_HOST") not in self._hosts:
+    def _refusal(self, env: dict, method) -> str | None:
+        # ``method`` is the request line's method as __call__ read it, once; the environ is not
+        # asked again, so the value checked is the value compared (DeepSeek round 6).
+        if type(method) is not str:
+            return "request_line_invalid"
+        host = env.get("HTTP_HOST")
+        # A str exactly: a subclass could make its own equality and hash match a configured host.
+        if type(host) is not str or host not in self._hosts:
             return "host_not_allowed"
         origin = env.get("HTTP_ORIGIN")
-        if origin is not None and ("," in origin or origin not in self._origins):
+        if origin is not None and (type(origin) is not str or "," in origin or origin not in self._origins):
             return "origin_not_allowed"
         if method == "POST" and origin is None:
             return "origin_required"
         site = env.get("HTTP_SEC_FETCH_SITE")
-        if site is not None and site != "same-origin" and not (method == "GET" and site == "none"):
+        if site is not None and (type(site) is not str
+                                 or (site != "same-origin" and not (method == "GET" and site == "none"))):
             return "cross_site_request"
-        if self._door(env) is not True:
+        try:
+            admitted = self._door(env) is True
+        except Exception:  # noqa: BLE001 - an adapter that cannot answer has not admitted the device
+            admitted = False
+        if not admitted:
             return "device_not_authenticated"
         return None
 
     def __call__(self, env: dict, start_response) -> list[bytes]:
-        refusal = self._refusal(env)
+        # The request line first, before anything compares it: a method or path that is not a str
+        # exactly could raise in, or lie to, a comparison (DeepSeek rounds 4 and 5).
+        method, path = env.get("REQUEST_METHOD"), env.get("PATH_INFO", "")
+        if type(method) is not str or type(path) is not str:
+            return self._send(start_response, "400 Bad Request",
+                              self._page("Bad request", "<p>Bad request: request line</p>"))
+        refusal = self._refusal(env, method)
         if refusal is not None:
             status = "401 Unauthorized" if refusal == "device_not_authenticated" else "403 Forbidden"
             return self._send(start_response, status, self._page("Refused", "<p>Refused: %s</p>" % escape(refusal)))
-        method, path = env.get("REQUEST_METHOD"), env.get("PATH_INFO", "")
         routes = {("GET", "/"): self._home, ("GET", "/read"): self._read, ("GET", "/panel"): self._panel,
                   ("POST", "/action"): self._action, ("POST", "/stop"): self._stop}
         handler = routes.get((method, path))
@@ -162,10 +203,18 @@ class Application:
                               self._page("Not available", "<p>Not available.</p>"))
         try:
             title, body = handler(env)
-            return self._send(start_response, "200 OK", self._page(title, body))
+            html = self._page(title, body)
         except _BadRequest as exc:
             return self._send(start_response, "400 Bad Request",
                               self._page("Bad request", "<p>Bad request: %s</p>" % escape(str(exc))))
+        except Exception as exc:  # noqa: BLE001 - every answer this module gives carries the same headers
+            # Only the exception's type is named, never its text. Nothing here says whether a request
+            # that was sent took effect.
+            return self._send(start_response, "500 Internal Server Error", self._page(
+                "Not available", '<p role="status">Not available: the page could not finish this request '
+                "(%s). It does not know whether anything that was sent took effect; check the run before "
+                "sending it again.</p>" % escape(type(exc).__name__)))
+        return self._send(start_response, "200 OK", html)
 
     @staticmethod
     def _send(start_response, status: str, html: str) -> list[bytes]:

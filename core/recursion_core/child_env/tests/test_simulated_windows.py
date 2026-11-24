@@ -37,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 _FLAG = "--simulate-windows"
@@ -166,11 +167,29 @@ def _run_file(path: str) -> dict:
     }
 
 
+def _core_test_files(root) -> list:
+    """Every ``test_*.py`` directly inside a folder named ``tests`` at any depth under ``<root>/recursion_core/``."""
+
+    return sorted(path for path in Path(root).glob("recursion_core/**/tests/test_*.py") if path.parent.name == "tests")
+
+
+def _windows_refusal_files(root) -> list:
+    """Each gated area's ``test_windows_refusal.py`` and every other one the collector finds, at any depth.
+
+    The other-suites run leaves these files out by name, so a refusal file missing here would be imported by the
+    import-all run and its tests would never run.
+    """
+
+    base = Path(root) / "recursion_core"
+    listed = {base / area / "tests" / "test_windows_refusal.py" for area in REFUSAL_AREAS}
+    return sorted(listed | {path for path in _core_test_files(root) if path.name == "test_windows_refusal.py"})
+
+
 def _import_all(root: str) -> dict:
     """Import every core test module, as the gate's runner does before it can run or skip anything."""
 
     failed: dict = {}
-    paths = sorted(path for path in Path(root).glob("recursion_core/*/tests/test_*.py"))
+    paths = _core_test_files(root)
     for index, path in enumerate(paths):
         try:
             _load(str(path), f"simulated_windows_import_{index}")
@@ -240,8 +259,8 @@ class SimulatedWindowsTests(unittest.TestCase):
         self.assertLess(result["skipped"], result["run"])
 
     def test_windows_refusal_tests_pass_and_skip_nothing_on_simulated_windows(self) -> None:
-        for area in REFUSAL_AREAS:
-            path = CORE / "recursion_core" / area / "tests" / "test_windows_refusal.py"
+        for path in _windows_refusal_files(CORE):
+            area = path.parents[1].relative_to(CORE / "recursion_core").as_posix()
             with self.subTest(area=area):
                 self.assertTrue(path.is_file(), path)
                 result = simulate(str(path))
@@ -250,14 +269,18 @@ class SimulatedWindowsTests(unittest.TestCase):
                 self.assertEqual([], result["skipped_tests"])
 
     def test_the_other_core_suites_have_no_error_or_failure_on_simulated_windows(self) -> None:
-        others = sorted(path for path in CORE.glob("recursion_core/*/tests/test_*.py")
+        others = sorted(path for path in _core_test_files(CORE)
                         if path.parent != HERE and path.name != "test_windows_refusal.py")
         self.assertGreater(len(others), len(REFUSAL_AREAS))
         self.assertLessEqual(set(HOST_LIMITED), {path.relative_to(CORE).as_posix() for path in others})
+        # The gate gives this whole file 180 s. Each child costs about 0.8 s of interpreter start, so the children
+        # run four at a time; each has its own scratch folder, and each is still checked in its own subTest below.
+        with ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as pool:
+            futures = {path: pool.submit(simulate, str(path)) for path in others}
         for path in others:
             suite = path.relative_to(CORE).as_posix()
             with self.subTest(suite=suite):
-                result = simulate(str(path))
+                result = futures[path].result()
                 for kind in ("errors", "failures"):
                     result[kind] = [row for row in result[kind] if row["test"] not in HOST_LIMITED.get(suite, {})]
                 self._assert_clean(result)
@@ -270,6 +293,36 @@ class SimulatedWindowsTests(unittest.TestCase):
         result = simulate("--import-all", str(CORE))
         self.assertGreater(result["imported"], len(REFUSAL_AREAS))
         self.assertEqual({}, result["failed"])
+
+    def test_every_tests_folder_under_the_core_is_covered(self) -> None:
+        # A tests folder deeper than recursion_core/<area>/tests/ (a package's own client/tests, say) is run too.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            made = ("recursion_core/a/tests/test_one.py", "recursion_core/b/client/tests/test_two.py",
+                    "recursion_core/c/d/e/tests/test_three.py", "recursion_core/f/test_four.py")
+            for name in made:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text("", encoding="utf-8")
+            self.assertEqual(sorted(root / name for name in made[:3]), _core_test_files(root))
+        walked = sorted(Path(folder) / name for folder, _, names in os.walk(CORE / "recursion_core")
+                        if Path(folder).name == "tests" for name in names
+                        if name.startswith("test_") and name.endswith(".py"))
+        self.assertEqual(walked, _core_test_files(CORE))
+
+    def test_every_windows_refusal_file_the_collector_finds_is_run(self) -> None:
+        # The other suites leave test_windows_refusal.py out by name, so the refusal runner takes every one the
+        # collector finds, a nested one too; otherwise it would be imported and its tests never run.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            made = ("recursion_core/a/tests/test_windows_refusal.py",
+                    "recursion_core/b/client/tests/test_windows_refusal.py",
+                    "recursion_core/c/d/e/tests/test_windows_refusal.py",
+                    "recursion_core/b/client/tests/test_two.py", "recursion_core/f/test_windows_refusal.py")
+            for name in made:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text("", encoding="utf-8")
+            listed = {root / "recursion_core" / area / "tests" / "test_windows_refusal.py" for area in REFUSAL_AREAS}
+            self.assertEqual(sorted(listed | {root / name for name in made[:3]}), _windows_refusal_files(root))
 
 
 if __name__ == "__main__":

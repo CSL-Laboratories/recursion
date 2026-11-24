@@ -1,0 +1,51 @@
+Dev task 11: order-preserving de-duplication, unhashable items included.
+-- task.json --
+{"id": "dev-11-unique", "cluster": "dev", "created_at": null,
+ "test_command": ["{python}", "-B", "-m", "unittest", "{hidden_modules}"],
+ "timeout_s": 900, "grading_timeout_s": 120}
+-- prompt.md --
+Implement `unique(items, key=None)` in `seqtools/unique.py`.
+
+It returns a list of the first occurrence of each item, in their original order. With `key`, two items are duplicates when `key(item)` is equal. It must also work when the items (or their keys) are unhashable, such as lists.
+-- start/seqtools/__init__.py --
+"""Sequence helpers."""
+-- start/seqtools/unique.py --
+def unique(items, key=None):
+    raise NotImplementedError
+-- hidden/test_unique.py --
+import unittest
+
+from seqtools.unique import unique
+
+
+class UniqueTests(unittest.TestCase):
+    def test_order_kept(self):
+        self.assertEqual(unique([3, 1, 3, 2, 1]), [3, 1, 2])
+
+    def test_key(self):
+        self.assertEqual(unique(["a", "B", "A", "b", "c"], key=str.lower), ["a", "B", "c"])
+
+    def test_unhashable(self):
+        self.assertEqual(unique([[1], [2], [1], [3]]), [[1], [2], [3]])
+
+    def test_iterator(self):
+        self.assertEqual(unique(iter("abca")), ["a", "b", "c"])
+-- solution/seqtools/unique.py --
+def unique(items, key=None):
+    seen = set()
+    seen_unhashable = []
+    out = []
+    for item in items:
+        marker = key(item) if key is not None else item
+        try:
+            if marker in seen:
+                continue
+            seen.add(marker)
+        except TypeError:
+            if marker in seen_unhashable:
+                continue
+            seen_unhashable.append(marker)
+        out.append(item)
+    return out
+-- standin.json --
+{"outcomes": ["solve"]}

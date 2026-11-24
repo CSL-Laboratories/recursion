@@ -299,6 +299,9 @@ class Registry:
         self.db = None
         self._open_error = None
         self._dir_durable = False
+        # Seam S12: ``mark_changed(run_id)``, set at composition when a lane consumes the change marker
+        # (control.hooks). None, the default: nothing is called. See ``_mark``.
+        self.mark_changed = None
         self._sweep_stale_temps()
         try:
             self.path.lstat()
@@ -633,6 +636,7 @@ class Registry:
             db.execute('INSERT INTO runs VALUES (?, ?, 0, ?, ?, ?, ?, ?)',
                        (run_id, f'recursion-run-{run_id}.service', 'starting',
                         boot_id, '', now, now))
+        self._mark(run_id)
         return self.get(run_id)
 
     def all(self):
@@ -661,6 +665,7 @@ class Registry:
                 "WHERE run_id=?", (time.time(), run_id))
             if cursor.rowcount != 1:
                 raise KeyError(run_id)
+        self._mark(run_id)
 
     def state(self, run_id, value, detail=''):
         """Record an observation. A terminal state is never overwritten.
@@ -673,6 +678,7 @@ class Registry:
                        "THEN 'stopping' ELSE ? END, detail=?, updated=? WHERE run_id=? "
                        "AND state NOT IN ('terminated', 'lost_reboot')",
                        (value, value, detail[:500], time.time(), run_id))
+        self._mark(run_id)
 
     # Control-API run records (CSL-798 record shape), one JSON document per run. They share
     # this file and its publish discipline, so a control record and the run row it belongs
@@ -686,6 +692,62 @@ class Registry:
         with self._write() as db:
             db.execute(_CONTROL_TABLE)
             db.execute('INSERT OR REPLACE INTO control_runs VALUES (?, ?)', (run_id, document))
+        self._mark(run_id)
+
+    def _mark(self, run_id):
+        """Seam S12: tell the change marker that this run may have changed. Called only after a write RETURNED
+        NORMALLY (a writer that raises marks nothing), outside the write, possibly with the daemon lock held. The
+        marker never waits and does no I/O; whatever it does cannot raise into the writer, and a mark that is lost
+        is found by the consumer's next scan."""
+        mark = self.mark_changed
+        if mark is not None:
+            try:
+                mark(run_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _has_control_table(self):
+        return self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                               "AND name='control_runs'").fetchone() is not None
+
+    def snapshot(self, run_id):
+        """``(row or None, control_text or None)`` for one run: both tables in ONE hold of the lock, by two point
+        lookups. A run with only a control record has row None; a run with only a daemon row has text None.
+
+        For the consumer of the change marker (seam S12). It reads the FILE, behind the same guard as every
+        read here, so it also finds a control record published by a write that then raised, which is in neither
+        in-memory copy. Parsing and hashing what comes back is done by the caller after this returns.
+        """
+        with self.lock:
+            self._ensure_open()
+            row = self.db.execute('SELECT run_id, unit, stop, state, boot_id, detail '
+                                  'FROM runs WHERE run_id=?', (run_id,)).fetchone()
+            text = None
+            if self._has_control_table():
+                found = self.db.execute('SELECT record FROM control_runs WHERE run_id=?', (run_id,)).fetchone()
+                text = found[0] if found is not None else None
+        if row is not None:
+            a, b, c, d, e, f = row
+            row = Run(a, b, bool(c), d, e, f)
+        return row, text
+
+    def run_ids(self, after, limit):
+        """The run ids present in EITHER table, in order, strictly after ``after`` (None: from the first), at most
+        ``limit``. A seek on each table's primary key for at most ``limit`` ids, merged: no OFFSET, no walk of the
+        whole registry. A missing control table contributes nothing."""
+        if type(limit) is not int or limit < 1:
+            raise ValueError('limit')
+        if after is not None and not isinstance(after, str):
+            raise ValueError('after')
+        start = '' if after is None else after
+        with self.lock:
+            self._ensure_open()
+            ids = {row[0] for row in self.db.execute(
+                'SELECT run_id FROM runs WHERE run_id > ? ORDER BY run_id LIMIT ?', (start, limit))}
+            if self._has_control_table():
+                ids.update(row[0] for row in self.db.execute(
+                    'SELECT run_id FROM control_runs WHERE run_id > ? ORDER BY run_id LIMIT ?', (start, limit)))
+        return sorted(ids)[:limit]
 
     def control_all(self):
         """Every stored control record as (run_id, JSON text). No table yet is no records."""

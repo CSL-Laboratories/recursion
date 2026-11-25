@@ -308,6 +308,9 @@ class ControlAPI:
         kind = origin.get("kind") if origin is not None else None
         admitted_origin = (origin is None or (type(kind) is str and kind in ADMITTED_RUN_ORIGINS
                                               and set(origin) == RUN_ORIGIN_KEYS.get(kind)))
+        # The origin rule is checked first, before the store, the values, the permission or the charge.
+        if not admitted_origin:
+            return {"code": REQUEST_INVALID, "detail": ORIGIN_NOT_ADMITTED, "text": WORDS[ORIGIN_NOT_ADMITTED]}
         if origin is not None and origin.get("kind") in ADMITTED_RUN_ORIGINS and self._routines is None:
             # No routine store: there is no record to run from, so nothing a plugin sends is run (module text).
             return {"code": REQUEST_INVALID, "detail": ROUTINE_STORE_ABSENT, "text": WORDS[ROUTINE_STORE_ABSENT]}
@@ -318,8 +321,6 @@ class ControlAPI:
         problem = start_params_problem({"tenant": "t", "engine": "e", "prompt": "p", **sent} if from_record else params)
         if problem is not None:
             return {"code": REQUEST_INVALID, "detail": problem}
-        if not admitted_origin:
-            return {"code": REQUEST_INVALID, "detail": ORIGIN_NOT_ADMITTED, "text": WORDS[ORIGIN_NOT_ADMITTED]}
         if from_record and set(params) - set(RECORD_START_KEYS):  # what the record does not bind does not travel
             return {"code": REQUEST_INVALID, "detail": ROUTINE_UNBOUND_VALUES, "text": WORDS[ROUTINE_UNBOUND_VALUES]}
         if from_record:  # what the record says, read before the start lock (its tenant names the lock)

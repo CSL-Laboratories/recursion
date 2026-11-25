@@ -143,6 +143,29 @@ class AWrongOriginIsRefusedBeforeAnythingTest(ChargeCase):
         with self.assertRaises(ValueError):  # not a mapping: a fault of the in-process caller
             api.call("run.start", dict(PARAMS), origin=["kind", "trigger"])
 
+    def test_the_origin_rule_is_answered_before_the_store_and_the_values(self):
+        """A wrong origin is answered origin_not_admitted first: with no routine store, and with bad values."""
+        cases = [("an extra key, no routine store", {**ORIGIN, "note": "x"}, PARAMS, False),
+                 ("no plugin, no routine store", {k: v for k, v in ORIGIN.items() if k != "plugin"}, PARAMS, False),
+                 ("kind agent, no prompt", {"kind": "agent"}, {"tenant": "default", "engine": "claude_code"}, True),
+                 ("an extra key, an engine out of its form", {**ORIGIN, "note": "x"},
+                  {"tenant": "default", "engine": "nope", "prompt": "p"}, True)]
+        for label, origin, params, with_store in cases:
+            with self.subTest(origin=label):
+                self.registry = CountingRegistry()
+                real = self.store()
+                real.admit(OWNER, a_record(budget={"unit": "runs", "limit": 1}))
+                store = CountingStore(real)
+                api = self.api(store if with_store else None)
+                store.calls.clear()
+                asked = []
+                answer = api.call("run.start", dict(params, client_key="k1"), origin=origin,
+                                  admit=lambda: asked.append(1) or Permission().held())
+                self.assertEqual((answer["code"], answer["detail"]), ("request_invalid", "origin_not_admitted"))
+                self.assertEqual(answer["text"], r.TEXT["origin_not_admitted"])
+                self.assertEqual((self.registry.puts, store.calls, asked, self.starter.calls), (0, [], [], []))
+                self.assertEqual((real.get("morning-digest")["used"], self.rows()), (0, []))
+
 
 if __name__ == "__main__":
     unittest.main()

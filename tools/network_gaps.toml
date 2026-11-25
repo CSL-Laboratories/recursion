@@ -105,6 +105,13 @@ words = "a process that was running before the run began, or outside the run's p
 example = "a Python program started before the audit, which a test asks through a file to open a connection"
 reason = "The hook is in the processes the run starts; a process outside them is not watched, and asking it to act through a file or a socket of this machine is not a reach of the run. No hook can see it by its nature: only a net outside the processes, such as a run inside a network namespace with no route out, can."
 
+[[gap]]
+id = "G21"
+proof = "static"
+words = "a file beside the scan's own script in `tools/` named like a module it imports"
+example = "tools/json.py or tools/ast.pyc: python3 tools/network_reach.py puts tools/ first on its import path"
+reason = "The scan judges what is under core/; its own folder is not scanned, and a file there named like a module the scan imports runs in the scan itself. It can be built: the scan's script takes its own folder off its import path before it imports anything, as the run-time proof's file does."
+
 [[claim]]
 text = "a later change that adds a call home, a module or a refused construct goes red"
 reason = "Once said; only the kinds the tests plant go red."

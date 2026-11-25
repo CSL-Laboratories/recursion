@@ -522,6 +522,103 @@ class SuiteHookTests(unittest.TestCase):
                         break
                     time.sleep(0.1)
 
+    def test_an_assignment_after_a_double_dash_is_not_taken_for_the_program(self):
+        # env -- a=/sleep bash -c '...' was judged as the program sleep: GNU env reads NAME=value words
+        # after '--' too. The launcher's line is read by an exact grammar; what it does not know is refused.
+        for argv in (["env", "--", "a=/sleep", "bash", "-c", "true"], ["env", "-i", "--", "A=1", "B=/x/sleep", "bash"],
+                     ["/usr/bin/env", "-u", "X", "--", "a=/sleep", "bash"]):
+            with self.subTest(argv=argv):
+                problems = self._starts(argv, allowed=("sleep",))
+                self.assertTrue(any("'bash'" in p and "not watched" in p for p in problems), problems)
+        for argv in (["env", "--", "a-b=/sleep", "bash"], ["env", "1a=/sleep", "bash"], ["env", "./x=/sleep", "bash"],
+                     ["env", "--", "A=1"], ["unshare", "--", "a=/sleep"], ["unshare", "-r", "x=/sleep", "1"]):
+            with self.subTest(argv=argv):
+                self.assertTrue(any("cannot be told" in p for p in self._starts(argv, allowed=("sleep",))), argv)
+        self.assertEqual(self._starts(["env", "--", "A=1", "sleep", "1"], ["env", "-i", "A_1=/x/y", "sleep"],
+                                      allowed=("sleep",)), [])
+        # A real run: bash reaches the test's own loopback listener; the start is refused.
+        listener, port = self._listener()
+        status, out = self._run("import subprocess; subprocess.run(['env', '--', 'a=/sleep', 'bash', '-c', "
+                                "'exec 3<>/dev/tcp/127.0.0.1/%d'])" % port, "--allow-program", "sleep")
+        self.assertEqual(status, 1, out)
+        self.assertIn("'bash'", out)
+
+    def test_a_hooked_child_given_the_events_folder_under_another_spelling_is_still_running(self):
+        # A hooked child given the folder with a trailing '/' wrote its events into it, was counted, and was
+        # then dropped as another process while it ran on and reached the listener after the end.
+        listener, port = self._listener()
+        listener.settimeout(START_SECONDS)
+        with tempfile.TemporaryDirectory(prefix="rc-proof-") as name:
+            pid_file = Path(name) / "child.pid"
+            code = ("import os, subprocess, sys, time\n"
+                    "env = dict(os.environ, RECURSION_AUDIT_DIR=os.environ['RECURSION_AUDIT_DIR'] + '/')\n"
+                    "c = subprocess.Popen([sys.executable, '-c', 'import socket, time; time.sleep(%r); "
+                    "socket.create_connection((\"127.0.0.1\", %d)).close()'], env=env, start_new_session=True)\n"
+                    "events = os.path.join(os.environ['RECURSION_AUDIT_DIR'], 'events-%%d.jsonl' %% c.pid)\n"
+                    "end = time.monotonic() + %r\n"
+                    "while not os.path.exists(events) and time.monotonic() < end:\n"
+                    "    time.sleep(0.05)\n"
+                    "open(%r, 'w').write(str(c.pid))\n") % (IDLE_SECONDS, port, START_SECONDS, str(pid_file))
+            status, out = self._run(code)
+            child = int(pid_file.read_text())
+            try:
+                self.assertEqual(status, 1, out)
+                self.assertIn("still running when the command ended", out)
+            finally:
+                conn, _peer = listener.accept()  # the child's one connection, on the loopback address
+                conn.close()
+                deadline = time.monotonic() + START_SECONDS
+                while time.monotonic() < deadline:  # the child ends by itself after its connection
+                    try:
+                        os.kill(child, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.1)
+        # Each spelling of the folder is counted; a process with no folder setting is another process.
+        with tempfile.TemporaryDirectory(prefix="rc-proof-") as name:
+            for spelling, counted in ((name + "/", True), (name + "/.", True), (name.replace("/", "//"), True),
+                                      (None, False)):
+                env = {k: v for k, v in os.environ.items() if k != "RECURSION_AUDIT_DIR"}
+                if spelling is not None:
+                    env["RECURSION_AUDIT_DIR"] = spelling
+                c = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(%r)" % START_SECONDS], env=env)
+                try:  # Popen returns once the child runs the interpreter, with its own environment
+                    with self.subTest(spelling=spelling):
+                        self.assertEqual(c.pid in self.audit.still_running([c.pid], Path(name)), counted)
+                finally:
+                    c.terminate()
+                    c.wait(timeout=START_SECONDS)
+
+    def test_the_audit_runs_nothing_beside_a_compiled_file_without_source(self):
+        # A compiled file core/json.pyc with no source passed the scan; every process of the audit has core/
+        # on its import path and imported it in place of json, and the audit printed PROVEN while the plant
+        # reached the test's loopback listener.
+        import py_compile
+        import shutil
+        listener, port = self._listener()
+        with tempfile.TemporaryDirectory(prefix="rc-proof-") as name:
+            root = Path(name)
+            (root / "core").mkdir()
+            (root / "tools").mkdir()
+            for rel in ("tools/network_audit.py", "tools/network_audit.toml", "tools/network_reach.py",
+                        "tools/network_reach.toml"):
+                shutil.copy2(ROOT / rel, root / rel)
+            source = root / "plant.py"
+            source.write_text("import socket\nsocket.create_connection(('127.0.0.1', %d)).close()\n" % port,
+                              encoding="utf-8")
+            py_compile.compile(str(source), cfile=str(root / "core" / "json.pyc"), doraise=True)
+            source.unlink()
+            run = subprocess.run([sys.executable, "-B", str(root / "tools" / "network_audit.py"), "--",
+                                  sys.executable, "-B", "-c", "pass"], capture_output=True, text=True,
+                                 timeout=START_SECONDS * 4, cwd=str(root))
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("NOT PROVEN: nothing was run", run.stdout)
+        self.assertIn("core/json.pyc", run.stdout)
+        listener.setblocking(False)
+        with self.assertRaises(BlockingIOError):
+            listener.accept()  # the plant never ran
+        self.assertEqual(self.audit.not_judged(ROOT), [])  # and the checkout itself holds no such place
+
     def _starts(self, *argvs, allowed=(), audit=True):
         events = [(1, "subprocess.Popen", [a[0], list(a), None, {"PATH": None, "audit": audit}]) for a in argvs]
         return self.audit.judge(events, allowed_programs=allowed)
@@ -686,6 +783,8 @@ class ReadmeWordsTests(unittest.TestCase):
     def test_the_readme_says_the_whole_suite_run_is_not_proven_today(self):
         section = " ".join(self._section().split())
         for words in ("Proven today, by the second command", "There may be more",
+                      "Five independent hostile reads of this proof each found a few new ways past it; each was "
+                      "shut or named; more may exist; the list of known ways is in tools/network_gaps.toml.",
                       "On a clean checkout today it prints NOT PROVEN", "is not a proof today"):
             with self.subTest(words=words):
                 self.assertIn(words, section)
@@ -697,7 +796,11 @@ class ReadmeWordsTests(unittest.TestCase):
                       "still running when the command ends makes the run NOT PROVEN",
                       "an abbreviation such as `--split` included",
                       "`RECURSION_AUDIT_MAX_ARGS`, is refused",
-                      "a child forked without a new start is such a process"):
+                      "a child forked without a new start is such a process",
+                      "after a `--` included, is read only as an assignment of a plain name",
+                      "and so is one given the hook's events folder under another spelling",
+                      "Like the second command, it runs nothing while the scan finds such a file or folder",
+                      "a compiled file with no source beside it, an extension module"):
             with self.subTest(words=words):
                 self.assertIn(words, section)
 
@@ -729,6 +832,36 @@ class ReadmeWordsTests(unittest.TestCase):
         with self.assertRaises(BlockingIOError):
             listener.accept()  # the plant never ran
         self.assertEqual(_not_judged(), [])  # and the checkout itself holds no such place
+
+    def test_the_second_command_runs_nothing_beside_a_compiled_file_without_source(self):
+        # core/json.pyc, compiled, with no source: the scan read only '.py' files and passed it, and this
+        # file run as a script printed PROVEN while the daemon children imported it in place of json.
+        import py_compile
+        import shutil
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))  # the loopback address only: nothing leaves this machine
+        listener.listen(4)
+        port = listener.getsockname()[1]
+        with tempfile.TemporaryDirectory(prefix="rc-proof-") as name:
+            root = Path(name)
+            (root / "core" / "tests").mkdir(parents=True)
+            (root / "tools").mkdir()
+            for rel in ("core/tests/test_no_call_home_runtime.py", "tools/network_reach.py", "tools/network_reach.toml"):
+                shutil.copy2(ROOT / rel, root / rel)
+            source = root / "plant.py"
+            source.write_text("import socket\nsocket.create_connection(('127.0.0.1', %d)).close()\n" % port,
+                              encoding="utf-8")
+            py_compile.compile(str(source), cfile=str(root / "core" / "json.pyc"), doraise=True)
+            source.unlink()
+            run = subprocess.run([sys.executable, "-B", str(root / "core" / "tests" / "test_no_call_home_runtime.py"),
+                                  "JudgeTests"], capture_output=True, text=True, timeout=START_SECONDS * 4, cwd=str(root))
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("NOT PROVEN (run-time): nothing was run", run.stdout)
+        self.assertIn("core/json.pyc", run.stdout)
+        listener.setblocking(False)
+        with self.assertRaises(BlockingIOError):
+            listener.accept()  # the plant never ran
 
     def test_a_green_run_prints_no_refusal_meant_for_a_planted_case(self):
         # The second command's own planted cases keep their words to themselves: on a green run the

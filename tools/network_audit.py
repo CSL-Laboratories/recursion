@@ -230,18 +230,28 @@ def _python_unhooked(argv, start):
     return None
 
 
+def _assignment(word):
+    """Whether a word is an assignment of the grammar the audit knows: NAME=value, NAME of letters, digits
+    and '_' (not first a digit). env reads any word that holds '=' before the program as an assignment."""
+    name = word.split("=", 1)[0]
+    return name.isascii() and name.isidentifier()
+
+
 def _inner(argv, row):
-    """The program a launcher (env, unshare) starts: the first argument that is not an option, a value of
-    an option, or (for env) an assignment. None when it cannot be told: an option that is not exactly one
-    of the option words of the launcher's row (an abbreviation of a long option, an option the row does
-    not hold, env's split-string option in any form) makes it not told."""
+    """The program a launcher (env, unshare) starts, read by an exact grammar: the launcher's options (each
+    exactly one of the option words of its row, with the values of those that take one), an optional
+    '--', then for env only its assignments, then the program. None when it cannot be told: an option the
+    row does not hold (an abbreviation of a long option, env's split-string option in any form), a word
+    holding '=' before the program that is not an assignment of a plain name (env reads assignments after
+    '--' too), a program word that holds '=', or no program at all."""
     options, value_options = row["options"], row["value_options"]
     is_env = os.path.basename(argv[0]) == "env"
     i = 1
     while i < len(argv):
         a = argv[i]
         if a == "--":
-            return argv[i + 1:] or None
+            i += 1
+            break
         if a.startswith("--"):
             word = a.split("=", 1)[0]
             if word not in options:
@@ -262,11 +272,15 @@ def _inner(argv, row):
                     break
             i += step
             continue
-        if "=" in a and is_env:
-            i += 1
-            continue
-        return argv[i:]
-    return None
+        break
+    while is_env and i < len(argv) and "=" in argv[i]:
+        if not _assignment(argv[i]):
+            return None  # a word env takes for an assignment that the grammar does not know: not told
+        i += 1
+    rest = argv[i:]
+    if not rest or "=" in rest[0]:
+        return None  # no program, or a program word that holds '=': not told
+    return rest
 
 
 def _judge_start(pid, prog, argv, start, allowed_programs, launchers, problems, depth=0, base=0, pystarts=None):
@@ -398,9 +412,26 @@ def whole_suite_note(problems):
             f"problems above). The README says so; this run names what it could not watch.")
 
 
+def not_judged(root: Path = ROOT):
+    """What the static scan refuses under core/ as a place the interpreter may import in place of a module
+    (or cannot see into): the audit runs nothing while one is there."""
+    import importlib.util
+    try:
+        spec = importlib.util.spec_from_file_location("network_reach", root / "tools" / "network_reach.py")
+        nr = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("network_reach", nr)
+        spec.loader.exec_module(nr)
+        return [f"{f.file}: {f.text}" for f in nr._unseen(root)]
+    except Exception as exc:  # the scan cannot be read: nothing is judged
+        return [f"tools/network_reach.py could not be loaded ({type(exc).__name__}: {exc})"]
+
+
 def still_running(pids, events_dir):
     """The hooked processes that are still running (not ended, not a zombie) and are of this run: what they
-    reach after the run is judged is not watched."""
+    reach after the run is judged is not watched. A live process of the events set is dropped only when
+    its environment can be read and carries no folder setting of the hook at all (its number was given to
+    another process); one whose setting names the folder in any spelling, or whose environment cannot be
+    read, is taken as still running."""
     running = []
     for pid in sorted(pids):
         try:
@@ -414,8 +445,9 @@ def still_running(pids, events_dir):
                 if fh.read().rsplit(b")", 1)[-1].split()[:1] == [b"Z"]:
                     continue
             with open(f"/proc/{pid}/environ", "rb") as fh:
-                if b"RECURSION_AUDIT_DIR=" + os.fsencode(str(events_dir)) + b"\x00" not in fh.read():
-                    continue  # the number was given to another process since
+                if not any(v.startswith(b"RECURSION_AUDIT_DIR=") and len(v) > len(b"RECURSION_AUDIT_DIR=")
+                           for v in fh.read().split(b"\x00")):
+                    continue  # it carries no folder of the hook: the number was given to another process since
         except OSError:
             pass  # cannot be told: it is taken as still running
         running.append(pid)
@@ -432,6 +464,14 @@ def main(argv=None):
         argv = argv[1:]
     command = argv
     suite = not command
+    refused = not_judged(ROOT)
+    if refused:
+        print("NOT PROVEN: nothing was run. Under core/, which is on the import path of every process of "
+              "this run, the static scan (tools/network_reach.py) refuses what it cannot judge:")
+        for line in refused:
+            print(f"  - {line}")
+        print("Take each of these out (or run python3 tools/network_reach.py to read why), then run again.")
+        return 1
     if not command:
         command = [sys.executable, "-B", "-m", "unittest", "discover", "-s", "core/recursion_core",
                    "-t", "core", "-p", "test_*.py"]
@@ -443,6 +483,7 @@ def main(argv=None):
         (hook_dir / "sitecustomize.py").write_text(HOOK, encoding="utf-8")
         events_dir = folder / "events"
         events_dir.mkdir()
+        events_dir = Path(os.path.realpath(events_dir))  # the one spelling the run hands on
         env = dict(os.environ)
         env["RECURSION_AUDIT_DIR"] = str(events_dir)
         env["RECURSION_AUDIT_LAUNCHERS"] = ",".join(sorted(load_launchers(ROOT)))

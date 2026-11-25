@@ -380,12 +380,44 @@ class StaticProofTests(unittest.TestCase):
             (root / "core" / "calendar" / "__init__.py").write_text("x = 1\n", encoding="utf-8")
             return "core/calendar", "beside the package"
 
+        import importlib.machinery
+        import importlib.util
+
+        def compiled(root):
+            # A compiled file with no source named like a standard module: the second command ran it while
+            # printing PROVEN (the scan judged '.py' files only).
+            (root / "core" / "json.pyc").write_bytes(importlib.util.MAGIC_NUMBER + bytes(12))
+            return "core/json.pyc", "no source beside it"
+
+        def compiled_in_package(root):
+            (root / nr.PACKAGE / "daemon" / "planted.pyc").write_bytes(importlib.util.MAGIC_NUMBER + bytes(12))
+            return "core/recursion_core/daemon/planted.pyc", "no source beside it"
+
+        def extension(root):
+            name = "planted" + importlib.machinery.EXTENSION_SUFFIXES[0]
+            (root / nr.PACKAGE / "daemon" / name).write_bytes(b"\x7fELF")
+            return "core/recursion_core/daemon/" + name, "extension module"
+
+        def named_any_suffix(root):
+            (root / nr.PACKAGE / "daemon" / "socket.txt").write_text("x\n", encoding="utf-8")
+            return "core/recursion_core/daemon/socket.txt", "whatever its"
+
+        def folder_in_package(root):
+            (root / nr.PACKAGE / "daemon" / "http").mkdir()
+            return "core/recursion_core/daemon/http", "named like a module"
+
+        def top_any_suffix(root):
+            (root / "core" / "planted.pyc").write_bytes(b"")
+            (root / "core" / "planted.py").write_text("x = 1\n", encoding="utf-8")
+            return "core/planted.pyc", "named like a module"
+
         def shell(root):
             with open(root / nr.PACKAGE / "daemon" / "evidence_ns.sh", "a", encoding="utf-8") as fh:
                 fh.write('curl -s "$URL"\n')
             return "refused (changed-call)", "changed-call"  # the copy is clean: the one changed call is it
 
-        for plant in (coding, beside, named, folder, top_folder, shell):
+        for plant in (coding, beside, named, folder, top_folder, compiled, compiled_in_package, extension,
+                      named_any_suffix, folder_in_package, top_any_suffix, shell):
             with self.subTest(plant=plant.__name__), tempfile.TemporaryDirectory() as tmp:
                 root = _copy_package(Path(tmp))
                 self.assertEqual(nr.check(nr.scan(root), self.listing), [])  # the copy itself is clean

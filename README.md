@@ -43,10 +43,12 @@ Run the proof on your own machine:
   anything outside the package; a call that could reach a network and has no row, or whose text is
   not the text its row holds; a use of a guarded place from a place its row does not name; a
   symbolic link under `core/`, or a compiled file the interpreter would run instead of its source;
-  a file it cannot read; a coding declaration other than utf-8; a Python file directly under
-  `core/`, one named like a standard module anywhere under `core/`, or a folder outside the package,
-  named like a standard module or a listed module (the interpreter may import it in place of that
-  module); a change of a file it cannot parse (its row holds the file's digest).
+  a file it cannot read; a coding declaration other than utf-8; a file the interpreter can import
+  (source, compiled or extension) directly under `core/`, a file or folder named like a standard
+  module anywhere under `core/` whatever its suffix, a compiled file with no source beside it, an
+  extension module (machine code the scan cannot read), or a folder outside the package, named like
+  a standard module or a listed module (the interpreter may import it in place of that module); a
+  change of a file it cannot parse (its row holds the file's digest).
 - `python3 core/tests/test_no_call_home_runtime.py` (Linux, CPython 3.12 or later) starts a daemon
   of its own in a temporary folder, leaves it idle, asks its status and stops it, while the
   interpreter's audit hook watches that it reaches no address and looks up no name; then it starts
@@ -67,16 +69,20 @@ What is proven, and what is not:
   plant (each kind is listed in `core/tests/test_network_reach.py`) goes red there; a way the scan
   cannot see is not caught. Other ways past the proofs exist: the known ones that are not built are
   the rows of `tools/network_gaps.toml`, each with its reason, and each is named in the list below.
-  There may be more.
+  There may be more. Five independent hostile reads of this proof each found a few new ways past it;
+  each was shut or named; more may exist; the list of known ways is in tools/network_gaps.toml.
 - The whole-suite run: the whole test suite can also be run once with the hook in every Python
   process it starts: `python3 tools/network_audit.py`. On a clean checkout today it prints NOT
   PROVEN, and says why: the product's own tests start Python children with `-I` or with a cleared
   environment, which the hook cannot reach (in one run of 2653 passing tests, 176 of 404 Python
   starts did not load the hook on CPython 3.12, and 143 of 377 on the free-threaded 3.14t). So the
   whole-suite run is not a proof today; it
-  names what it could not watch. It names a program that is not Python and refuses one that is not
+  names what it could not watch. Like the second command, it runs nothing while the scan finds such a
+  file or folder under `core/`. It names a program that is not Python and refuses one that is not
   listed in `tools/network_audit.toml`. A program started through another program (`env`,
-  `unshare`) is judged by the program it starts (a split-string option of `env`, also inside a group
+  `unshare`) is judged by the program it starts, its line read by an exact grammar of what the
+  launcher accepts (a word holding `=` before the program, after a `--` included, is read only as an
+  assignment of a plain name to `env`, and any other such word is refused; a split-string option of `env`, also inside a group
   such as `-iS`, is refused, and so is any option of a launcher that is not exactly one of the option
   words of its row in `tools/network_audit.toml`, an abbreviation such as `--split` included; a
   launcher's start with more arguments than the hook looks at, the setting
@@ -84,14 +90,16 @@ What is proven, and what is not:
   `python3.N`), or by its file whatever its name, looked at when it starts, a Python process that
   does not load the hook (started with `-I`, `-S` or `-E`, or with a cleared environment) is
   refused, and a hooked process still running when the command ends makes the run NOT PROVEN (a
-  child forked without a new start is such a process), except in the run-time ways of the list
+  child forked without a new start is such a process, and so is one given the hook's events folder
+  under another spelling), except in the run-time ways of the list
   below. Not watched: code that hides from the hook. That run is not part of the hosted gate.
 - Known ways past the proofs, not built (the rows of `tools/network_gaps.toml`, with their reasons):
   - past the scan: builtins, a frame or a function's globals reached through an object's attributes
     (`len.__self__`); a module of the package used as a path to what that module imports (`from
     recursion_core.daemon.gui import socket`); a network method taken as a value (`c = s.connect`);
     a guarded place reached through an object of its class, or a place that takes its program from
-    its caller; and a name a module row allows is allowed in every file.
+    its caller; a name a module row allows is allowed in every file; and a file beside the scan's
+    own script in `tools/` named like a module it imports.
   - past both: a file the code writes that the interpreter runs at a later start (a `.pth` file, a
     `sitecustomize`); the name-service lookups of pwd and getpass; a file path that reaches a
     network by itself (an automount such as `/net` on macOS, or a Windows network path).

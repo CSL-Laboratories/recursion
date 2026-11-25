@@ -715,11 +715,19 @@ def _unseen(root: Path):
     interpreter follows it, the walk does not), a Python file or a folder the interpreter may import in place
     of a module (a Python file directly under core/; one named like a standard module anywhere under core/;
     a folder outside the package, or a Python file there, named like a standard module or like the top name
-    of a [[module]] row: the tests folder is on the import path of the tests and is not scanned), and a
+    of a [[module]] row: the tests folder is on the import path of the tests and is not scanned), any file
+    the interpreter can import (source, compiled or extension) directly under core/, any file or folder
+    anywhere under core/ named like a standard module whatever its suffix, a compiled file outside
+    __pycache__ with no source beside it, an extension module anywhere (machine code the scan cannot read,
+    imported in place of a source of its name), and a
     compiled file in a __pycache__ folder that the interpreter would run instead of its source. A compiled file for this interpreter is compared with its
     source; one the interpreter would not use (stale) is harmless; one for another interpreter is judged by
     the run of the scan under that interpreter, and an unchecked one is refused under any interpreter."""
+    import importlib.machinery
     import os
+    compiled = tuple(importlib.machinery.BYTECODE_SUFFIXES)
+    extension = tuple(importlib.machinery.EXTENSION_SUFFIXES)
+    importable = tuple(importlib.machinery.all_suffixes())
     out = []
     top = root / PACKAGE.parent
     if not top.is_dir():
@@ -745,6 +753,25 @@ def _unseen(root: Path):
                 out.append(Finding("reach", rel, "<file>", "a folder beside the package named like a module, which "
                                    "the interpreter may import in place of that module", "undecidable", 0))
             elif Path(here).name == "__pycache__" and name in files:
+                pass  # judged below
+            elif name in files and name.endswith(extension):
+                out.append(Finding("reach", rel, "<file>", "an extension module, machine code the scan cannot "
+                                   "read, which the interpreter imports in place of a source of its name",
+                                   "undecidable", 0))
+                continue
+            elif name in files and name.endswith(compiled) and not (Path(here) / (
+                    name[:-len(next(s for s in compiled if name.endswith(s)))] + ".py")).is_file():
+                out.append(Finding("reach", rel, "<file>", "a compiled file with no source beside it, which "
+                                   "the interpreter imports as a module: the scan reads only sources",
+                                   "undecidable", 0))
+                continue
+            elif (name in files and Path(here) == top and name.endswith(importable)) or \
+                    name.split(".")[0] in sys.stdlib_module_names or (outside and name.split(".")[0] in listed):
+                out.append(Finding("reach", rel, "<file>", "a file or folder named like a module (whatever its "
+                                   "suffix), which the interpreter may import in place of that module",
+                                   "undecidable", 0))
+                continue
+            if Path(here).name == "__pycache__" and name in files and not path.is_symlink():
                 why = _compiled_file(path)
                 if why:
                     out.append(Finding("reach", rel, "<file>", f"a compiled file the interpreter would run: {why}",

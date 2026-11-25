@@ -16,7 +16,7 @@ from unittest import mock
 
 from recursion_core.plugin_host import wall_linux
 from recursion_core.plugin_host.tests.test_wall_linux import CORE, _interpreter, _why_not_here
-from recursion_core.plugin_host.tests.test_wall_linux_proof import _schema_errors
+from recursion_core.plugin_host.tests.test_wall_linux_proof import _run_program, _schema_errors
 
 CHILD_TIMEOUT_S = 120  # a bound on one child process of this test; test-side only, not a product figure
 PLANTED_TEXT = b"a file of the test's own, planted for the hand-in\n"
@@ -299,6 +299,90 @@ class DescriptorHandedInAfterTheWallTests(unittest.TestCase):
         self.assertIs(record["proven"], True, result["words"])
         self.assertEqual(head, PLANTED_TEXT[:7])
         self.assertEqual(_schema_errors(record), [])
+
+
+HELPER_CHILD = r"""
+import fcntl, json, mmap, os, socket, struct, sys, time
+spec = json.loads(sys.argv[1])
+sys.path.insert(0, spec["core"])
+from recursion_core.plugin_host import wall_linux as w
+mode, out, helper = spec["mode"], {}, 0
+if mode != "control":
+    page = mmap.mmap(-1, 4096, flags=mmap.MAP_SHARED)  # anonymous and shared: no file, no descriptor
+if mode == "helper":
+    helper = os.fork()  # forked BEFORE the wall, which binds only the process that applies it and what it starts later
+    if helper == 0:
+        deadline = time.monotonic() + spec["wait"]
+        while page[0] == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if page[0] == 1:  # asked by the walled process, through the shared page only
+            with open(spec["planted"], "wb") as handle:
+                handle.write(b"WRITTEN-BY-HELPER")
+            receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            receiver.bind(("127.0.0.1", 0))
+            receiver.settimeout(5)
+            sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sender.sendto(b"helper-after-wall", receiver.getsockname())
+            page[1] = receiver.recv(64) == b"helper-after-wall"
+        os._exit(0)
+try:
+    w.apply_wall(spec["paths"], keep_descriptors=(1, 2))
+    out["apply"] = "applied"
+except w.WallRefused as exc:
+    out["apply"], out["applied"], out["detail"] = exc.code, list(w._STATE["applied"]), exc.detail
+if mode == "helper":
+    page[0] = 1 if out["apply"] == "applied" else 2
+    os.waitpid(helper, 0)
+    out["helper_sent"] = bool(page[1])
+if mode == "fioasync" and out["apply"] == "applied":
+    read_end, write_end = os.pipe()  # made after the wall: no owner can be set on it
+    try:
+        fcntl.ioctl(read_end, 0x5452, struct.pack("i", 1))  # FIOASYNC
+        out["fioasync"] = 0
+    except OSError as exc:
+        out["fioasync"] = exc.errno
+if out["apply"] == "applied":
+    record = w.probe_wall(spec["canary"], spec["daemon"], write_folder=spec["folder"])
+    out.update(record=record, words=w.why_not_proven(record))
+print(json.dumps(out))
+"""
+
+
+@unittest.skipIf(_why_not_here(), _why_not_here() or "")
+class NothingThatRunsBeforeTheWallActsAfterItTests(unittest.TestCase):
+    """A process forked before the wall is not bound by it: apply_wall refuses while one is alive; memory shared and
+    writable of no file is named like a file's, and the record is not proven; signals on every change stay refused."""
+
+    def test_a_helper_forked_before_the_wall_is_refused_before_any_change(self):
+        result, head = run_child(HELPER_CHILD, "helper", wait=CHILD_TIMEOUT_S / 4)
+        self.assertEqual(result["apply"], "wall_children_running", result)
+        self.assertEqual(result["applied"], [], "refused before any change")
+        self.assertEqual(result["detail"], wall_linux.WORDS["child_process"].format(children=1))
+        self.assertIs(result["helper_sent"], False, "the helper was never asked to act")
+        self.assertEqual(head, PLANTED_TEXT[:7], "the planted file is untouched")
+
+    def test_memory_shared_and_writable_of_no_file_is_named_and_not_proven(self):
+        result, _ = run_child(HELPER_CHILD, "map")
+        record = result["record"]
+        self.assertIs(record["proven"], False, "a shared anonymous map is a channel without a descriptor")
+        self.assertTrue(record["memory_maps_open_for_write"], record["memory_maps_open_for_write"])
+        self.assertIn(wall_linux.WORDS["map_open"], result["words"])
+        self.assertEqual(_schema_errors(record), [])
+
+    def test_nothing_shared_and_no_helper_is_proven(self):
+        result, _ = run_child(HELPER_CHILD, "control")
+        self.assertEqual(result["apply"], "applied")
+        self.assertEqual(result["record"]["memory_maps_open_for_write"], [])
+        self.assertIs(result["record"]["proven"], True, result["words"])
+
+    def test_signals_on_every_change_are_refused_in_their_ioctl_form(self):
+        result, _ = run_child(HELPER_CHILD, "fioasync")
+        self.assertEqual(result["fioasync"], 1, "FIOASYNC is answered EPERM by the filter")
+        for arch in ("x86_64", "aarch64"):
+            with self.subTest(arch=arch):
+                program = wall_linux._filter(arch, 3)
+                self.assertEqual(_run_program(program, wall_linux._NR_MORE[arch]["ioctl"], args=(0, 0x5452, 0),
+                                              arch=arch), "eperm")
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "the probe is Linux-only")

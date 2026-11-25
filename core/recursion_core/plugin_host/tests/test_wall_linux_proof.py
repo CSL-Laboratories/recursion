@@ -316,8 +316,13 @@ class KernelListsAfterTheWallTests(unittest.TestCase):
                 b"7f00-7f01 rw-s 00000000 08:01 456 /home/x/shared\n"
                 b"7f02-7f03 rw-s 00000000 00:00 0 \n"
                 b"7f04-7f05 rw-p 00000000 08:01 789 /home/x/private\n"
-                b"7f06-7f07 r--s 00000000 08:01 790 /home/x/readonly\n")
-        self.assertEqual(wall_linux._maps_shared_for_write(text), [{"map": 1}])
+                b"7f06-7f07 r--s 00000000 08:01 790 /home/x/readonly\n"
+                b"7f08-7f09 rw-s 00000000 00:01 1024 /dev/zero (deleted)\n"
+                b"7f0a-7f0b rw-s 00000000 00:01 7 /SYSV00000000 (deleted)\n"
+                b"7f0c-7f0d rw-s 00000000 00:01 9 /memfd:x (deleted)\n")
+        # every map shared and writable, of a file or of memory alone (a process forked before the wall shares it)
+        self.assertEqual(wall_linux._maps_shared_for_write(text), [{"map": 1}, {"map": 2}, {"map": 5}, {"map": 6},
+                                                                   {"map": 7}])
 
 
 SIGNAL_CHILD = r'''

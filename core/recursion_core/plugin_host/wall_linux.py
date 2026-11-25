@@ -106,7 +106,9 @@ immediately before ``landlock_restrict_self`` and after the filter is loaded; mo
 refused ``wall_partial`` with the step (``threads_before_landlock``, ``threads_after_filter``). ``probe_wall``
 counts the threads itself and is never proven with more than one. The refusals before the first change:
 ``wall_system_unsupported`` (not Linux: nothing is tried), ``wall_arch_unsupported``,
-``wall_threads_running``, ``landlock_unavailable``. A failure of the kernel at any step of the wall, and a
+``wall_threads_running``, ``wall_children_running`` (a child process of this one is alive at the wall: the wall
+binds this process and what it starts afterwards, never a process that already runs, which could act for it through
+memory they share), ``landlock_unavailable``. A failure of the kernel at any step of the wall, and a
 second ``apply_wall`` in a process that has already been walled in whole or in part, is refused
 ``wall_partial`` with the step it names: such a process must load nothing, and ``probe_wall`` in it never
 says proven.
@@ -178,9 +180,10 @@ _F_GETOWN_EX = 16             # struct f_owner_ex {int type; pid_t pid}: a pid o
 _SIGURG = 23                  # the same on x86_64 and aarch64; ignored unless a process asks for it
 _RING_PARAMS = 120            # sizeof(struct io_uring_params): the kernel's interface
 _CLOSE_RANGE_TOP = 0xFFFFFFFF  # close_range's last number: every number above the last kept one
-# ioctl commands: another process as the receiver of a socket's signals; a file's attribute flags.
+# ioctl commands: another process as the receiver of a socket's signals; signals on every change of a descriptor
+# (FIOASYNC, the ioctl form of F_SETFL asking O_ASYNC, the same value on x86_64 and aarch64); a file's attribute flags.
 DENIED_IOCTL_COMMANDS = {"FIOSETOWN": 0x8901, "SIOCSPGRP": 0x8902, "FS_IOC_SETFLAGS": 0x40086602,
-                         "FS_IOC_FSSETXATTR": 0x401C5820}
+                         "FS_IOC_FSSETXATTR": 0x401C5820, "FIOASYNC": 0x5452}
 # ioctl commands of a terminal that act on the person's terminal or on the processes of its foreground group
 # (asm-generic/ioctls.h: the same values on x86_64 and aarch64), answered EPERM on every descriptor.
 DENIED_TERMINAL_COMMANDS = {
@@ -332,8 +335,8 @@ HELD_OUTCOMES = ("closed_by_wall", "refused_by_filter", "acted", "error", "not_m
 _HELD_HELD = HELD_OUTCOMES[:2]
 # The kinds the wall does not make, each with the reason (the record's field ``held_objects_not_tried``).
 HELD_NOT_TRIED = {
-    "shared_map": "a map is not a descriptor, so the close step cannot reach it: the record names every map of a file "
-                  "held shared and writable (memory_maps_open_for_write) and is never proven with one, so the wall "
+    "shared_map": "a map is not a descriptor, so the close step cannot reach it: the record names every map held shared and "
+                  "writable, of a file or of memory alone (memory_maps_open_for_write), and is never proven with one, so the wall "
                   "makes none of its own",
     "namespace": "entering a namespace changes the whole process the host runs in, so the wall enters none of its "
                  "own; in a namespace entered before the wall the filter refuses unshare, setns, clone with a "
@@ -420,9 +423,18 @@ WORDS = {
                        "must close every such file before it shuts itself in.",
     "descriptors_unknown": "The plugin host could not see every file it held open, so it could not show that none "
                            "was open for writing.",
-    "map_open": "A file was mapped into memory, shared and writable, when the plugin host shut itself in. The "
-                "sandbox checks a file when it is opened, so writes through such a map still reach the file: the "
-                "host must unmap every such file before it shuts itself in.",
+    "map_open": "A file or a piece of memory was mapped shared and writable when the plugin host shut itself in. "
+                "The sandbox checks a file when it is opened, so writes through such a map still reach the file, "
+                "and memory shared with another process lets that process act for the host outside the sandbox: "
+                "the host must unmap every such map before it shuts itself in.",
+    "child_process": "The plugin host had started another process before it shut itself in ({children} still "
+                     "running). The sandbox holds the process that shuts itself in and what it starts afterwards, "
+                     "never a process that already runs, which could act for the host outside the sandbox, so nothing "
+                     "was loaded. What you can do: start the plugin host as its own program, as the daemon does, and "
+                     "let it start no other process before it shuts itself in.",
+    "children_unknown": "The plugin host could not see whether a process it had started before was still running when "
+                        "it shut itself in, so it could not show that the sandbox holds everything that acts for it, "
+                        "and nothing was loaded.",
     "maps_unknown": "The plugin host could not read the list of its memory maps, so it could not show that no file "
                     "was mapped for writing.",
     "descriptor_after_wall": "A {kind} reached the plugin host after it shut itself in and before it tested "
@@ -542,6 +554,42 @@ def _threads_now() -> int:
     except OSError:
         return 0
     return max(tasks, threading.active_count()) if tasks >= 1 else 0
+
+
+def _stat_state(pid) -> tuple:
+    """(state, parent pid) of a process, from the kernel's ``/proc/<pid>/stat`` (its name may hold spaces)."""
+    with open(f"/proc/{pid}/stat", "rb") as handle:
+        fields = handle.read().rpartition(b")")[2].split()
+    return fields[0].decode("ascii", "replace"), int(fields[1])
+
+
+def _children() -> int:
+    """The live child processes of this process (a zombie, which can no longer act, is not counted), from the kernel's
+    own list of each task's children; where the kernel keeps no such list, from the parent of every process.
+    ``wall_children_running`` with the words of ``children_unknown`` where neither can be read (fail shut)."""
+    me, pids = os.getpid(), set()
+    try:
+        try:
+            for task in os.listdir("/proc/self/task"):
+                with open(f"/proc/self/task/{task}/children", "rb") as handle:
+                    pids.update(int(pid) for pid in handle.read().split())
+        except FileNotFoundError:  # a kernel without the children list
+            for name in os.listdir("/proc"):
+                if name.isdigit():
+                    try:
+                        if _stat_state(name)[1] == me:
+                            pids.add(int(name))
+                    except (OSError, ValueError, IndexError):
+                        continue
+    except (OSError, ValueError) as exc:
+        raise WallRefused("wall_children_running", WORDS["children_unknown"]) from exc
+    live = 0
+    for pid in pids:
+        try:
+            live += _stat_state(pid)[0] != "Z"
+        except (OSError, ValueError, IndexError):
+            continue  # ended since: it can no longer act
+    return live
 
 
 def _alone(step: str, count) -> None:
@@ -726,7 +774,7 @@ def apply_wall(read_only_paths, keep_descriptors=None) -> None:
     ``read_only_paths`` is read whole into a list before the threads are counted, so that reading it cannot
     start a thread the count does not see. Refuses, before any change: ``wall_system_unsupported`` (not Linux;
     nothing is tried), ``wall_arch_unsupported`` (not x86_64 or aarch64), ``wall_threads_running`` (more than
-    one thread), ``landlock_unavailable`` (no Landlock, or an ABI below 1). A bad path raises ``ValueError`` or
+    one thread), ``wall_children_running`` (a child process alive), ``landlock_unavailable`` (no Landlock, or an ABI below 1). A bad path raises ``ValueError`` or
     ``OSError`` before any change as well. A kernel failure at any step, more than one thread immediately before
     ``landlock_restrict_self`` (``threads_before_landlock``) or after the filter (``threads_after_filter``), and a
     second call in a process walled already in whole or in part, is refused ``wall_partial`` with ``step`` set.
@@ -748,6 +796,9 @@ def apply_wall(read_only_paths, keep_descriptors=None) -> None:
     threads = _thread_count()
     if threads != 1:
         raise WallRefused("wall_threads_running", WORDS["second_thread"].format(threads=threads))
+    children = _children()  # one thread: nothing but this call could start one before the wall
+    if children:
+        raise WallRefused("wall_children_running", WORDS["child_process"].format(children=children))
     abi = _landlock_abi(libc)
     if abi < _MIN_LANDLOCK_ABI:
         raise WallRefused("landlock_unavailable", "this kernel gives this process no Landlock (ABI 1, Linux 5.13, at least)")
@@ -918,13 +969,14 @@ def _read_kernel_lists(lists: dict) -> dict:
 
 
 def _maps_shared_for_write(text: bytes) -> list:
-    """Each map of a file (one with an inode) that is shared and writable, as ``{"map": n}`` (its line in the list,
-    from 0): through it a write still reaches the file. Never its name, address or contents."""
+    """Each map that is shared and writable, of a file or of memory alone (an anonymous shared map, System V
+    memory, a memfd), as ``{"map": n}`` (its line in the list, from 0): through it a write still reaches the file, or a
+    process that shares the memory (one forked before the wall) acts on what the walled one writes there. Never its
+    name, address or contents."""
     found = []
     for number, line in enumerate(text.decode("ascii", "replace").splitlines()):
         fields = line.split()
-        if (len(fields) >= 5 and len(fields[1]) == 4 and fields[1][1] == "w" and fields[1][3] == "s" and fields[4] != "0"
-                and not " ".join(fields[5:]).startswith(_ANONYMOUS_SHARED)):
+        if len(fields) >= 5 and len(fields[1]) == 4 and fields[1][1] == "w" and fields[1][3] == "s":
             found.append({"map": number})
     return found
 
@@ -1033,11 +1085,20 @@ def _reach_other(pid) -> None:
                 os.close(read_end)
                 os.close(write_end)
         return act
+    def async_by_ioctl() -> None:  # signals on every change, by the ioctl form, to no owner set here
+        read_end, write_end = os.pipe()
+        on = ctypes.c_int(1)
+        try:
+            _sys(libc, "ioctl", read_end, DENIED_IOCTL_COMMANDS["FIOASYNC"], ctypes.addressof(on))
+        finally:
+            os.close(read_end)
+            os.close(write_end)
     _each_refused(lambda: _sys(libc, "rt_sigqueueinfo", target, 0, ctypes.addressof(info)),
                   owner_of_a_pipe,
                   on_a_pipe(DENIED_FCNTL_COMMANDS["F_SETSIG"], 0),        # the signal an owner gets: 0 is the default
                   on_a_pipe(DENIED_FCNTL_COMMANDS["F_NOTIFY"], 0),        # a pipe is no folder: ENOTDIR if allowed
                   on_a_pipe(_F_SETFL, _O_ASYNC),                          # signals on change, to no owner set here
+                  async_by_ioctl,
                   lambda: _sys(libc, "prlimit64", target, 0, 0, ctypes.addressof(old)))  # RLIMIT_CPU, read only
 
 

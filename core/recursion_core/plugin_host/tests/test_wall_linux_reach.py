@@ -1224,7 +1224,8 @@ class FilterProgramTests(unittest.TestCase):
         self.assertEqual(wall_linux.DENIED_FCNTL_COMMANDS, {"F_SETOWN": 8, "F_SETOWN_EX": 15, "F_SETLEASE": 1024,
                                                             "F_SETSIG": 10, "F_NOTIFY": 1026})
         self.assertEqual(wall_linux.DENIED_IOCTL_COMMANDS, {"FIOSETOWN": 0x8901, "SIOCSPGRP": 0x8902,
-                                                            "FS_IOC_SETFLAGS": 0x40086602, "FS_IOC_FSSETXATTR": 0x401C5820})
+                                                            "FS_IOC_SETFLAGS": 0x40086602, "FS_IOC_FSSETXATTR": 0x401C5820,
+                                                            "FIOASYNC": 0x5452})
         self.assertEqual(wall_linux.NAMESPACE_CLONE_FLAGS, sum(CLONE_NEW.values()))
         self.assertEqual(wall_linux.OLD_LANDLOCK_DENIED_CALLS, ("truncate", "ftruncate", "openat2"))
         for arch in ("x86_64", "aarch64"):

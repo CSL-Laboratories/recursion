@@ -75,7 +75,7 @@
         },
         "description": "One map of a file that the host held shared and writable, by its line in the kernel's list of the process's maps (from 0); never its name, address or contents."
       },
-      "description": "Each map of a file that the host held shared and writable after the wall, read through the kernel's own list of the process's maps, which the wall opened before it was put on and closed before it returned; null when that list could not be read. Landlock checks a file when it is opened, so writes through such a map still reach the file: a proven record holds none. Added in draft 6: a draft 5 record has no such field and is never proven."
+      "description": "Each map, of a file or of memory alone (an anonymous shared map, System V memory, a memfd), that the host held shared and writable after the wall, read through the kernel's own list of the process's maps, which the wall opened before it was put on and closed before it returned; null when that list could not be read. Landlock checks a file when it is opened, so writes through such a map still reach the file, and memory shared with another process (one forked before the wall) lets that process act on what the walled one writes there: a proven record holds none. From this draft's commit on, maps of memory alone are named too. Added in draft 6: a draft 5 record has no such field and is never proven."
     },
     "descriptors_seen_by": {
       "enum": [

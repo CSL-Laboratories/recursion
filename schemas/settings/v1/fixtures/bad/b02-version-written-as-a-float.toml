@@ -1,0 +1,6 @@
+# version written as a float: JSON Schema cannot tell 1.0 from 1, so settings.v1.json accepts this file;
+# the reader takes only the whole number 1, refuses it (settings_unreadable) and keeps every default.
+version = 1.0
+
+[plugin_host]
+gil_check = false

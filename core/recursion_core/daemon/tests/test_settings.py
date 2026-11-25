@@ -901,7 +901,8 @@ class WhatAPluginIsHanded(_Folder):
 class PublishedShape(_Folder):
     def test_the_schema_declares_exactly_the_table(self) -> None:
         schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
-        self.assertEqual({"const": settings.FILE_VERSION}, schema["properties"]["version"])
+        version = schema["properties"]["version"]  # its description says what the schema cannot decide
+        self.assertEqual({"const": settings.FILE_VERSION, "description": version.get("description")}, version)
         kinds = {bool: "boolean", int: "integer", float: "number", str: "string"}
         found = {}
 
@@ -945,13 +946,15 @@ class PublishedShape(_Folder):
     def test_the_good_fixture_is_read_whole_and_the_bad_one_keeps_the_default(self) -> None:
         good = sorted((SCHEMA_DIR / "fixtures" / "good").glob("*.toml"))
         bad = sorted((SCHEMA_DIR / "fixtures" / "bad").glob("*.toml"))
-        self.assertEqual((1, 1), (len(good), len(bad)))
+        self.assertEqual((1, 2), (len(good), len(bad)))
         self.put(good[0].read_text(encoding="utf-8"))
         loaded = settings.load(self.environ)
         self.assertEqual([], self.codes(loaded))
         self.assertEqual({settings.SOURCE_FILE}, {v.source for v in loaded.values.values()})
         self.put(bad[0].read_text(encoding="utf-8"))
         self.assert_default(settings.load(self.environ), settings.OUT_OF_RANGE)
+        self.put(bad[1].read_text(encoding="utf-8"))  # version = 1.0: the schema accepts it, the reader refuses it
+        self.assert_default(settings.load(self.environ), settings.UNREADABLE)
 
 
 class WindowsNoOwnerCheck(_Folder):
@@ -1125,6 +1128,31 @@ class AKeyIsShownWhole(_Folder):
         detail = settings.load(self.environ).notes[0].detail
         self.assertNotIn("x" * 200, detail)
         self.assertIn("...", detail)
+
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class TheVersionTheSchemaCannotTell(_Folder):
+    """JSON Schema compares numbers by value, so the schema cannot refuse version 1.0; it says so, and the reader
+    (which takes only the whole number 1) is what refuses it, with its own words, in a published bad vector."""
+
+    SAYS = "JSON Schema cannot tell 1.0 from 1, so this schema accepts version 1.0; the reader takes only the whole number 1"
+
+    def test_the_schema_accepts_1_0_on_purpose_and_its_version_says_the_reader_takes_only_1(self) -> None:
+        schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
+        version = schema["properties"]["version"]
+        self.assertEqual(version["const"], json.loads("1.0"))  # a parsed 1.0 meets const 1: accepted on purpose
+        self.assertIn(self.SAYS, version.get("description", ""))
+        readme = " ".join((SCHEMA_DIR / "README.md").read_text(encoding="utf-8").split())
+        self.assertIn(self.SAYS, readme)
+
+    def test_the_bad_vector_version_1_0_is_refused_by_the_reader_with_its_words(self) -> None:
+        vector = SCHEMA_DIR / "fixtures" / "bad" / "b02-version-written-as-a-float.toml"
+        self.assertTrue(vector.is_file(), vector)
+        self.put(vector.read_text(encoding="utf-8"))
+        loaded = settings.load(self.environ)
+        self.assert_default(loaded, settings.UNREADABLE)
+        self.assertIn("version must be 1, found 1.0; write `version = 1`", loaded.notes[0].detail)
 
 
 if __name__ == "__main__":

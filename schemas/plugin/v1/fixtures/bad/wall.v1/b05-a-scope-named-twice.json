@@ -75,6 +75,14 @@
     "rows_not_shipped": [],
     "rows_taken_out": []
   },
+  "shared_waits_allowed": [
+    265
+  ],
+  "limits_of_proven": {
+    "shared_futex_wait": "the filter lets through FUTEX_WAIT_BITSET with the wall clock (operation 265), a wait that is not private, because the C library's thread join makes it on a thread's id (the kernel wakes that word in its form that is not private when the thread ends, and refusing it ends the free-threaded interpreter at its first join): another process that maps the same page of a file, a helper started before the wall among them, can learn through it whether this process waits there, one bit at a time; the wait wakes no process, and every wake that is not private is refused",
+    "what_the_process_shows": "a process started before the wall and no longer this one's child is not seen by the probe: it can read this process's command line, which lives in this process's own memory, and its times and state in /proc, which no call of this process changes; the host must start no process before the wall",
+    "page_cache_residency": "another process that maps a file this one reads can learn from the kernel's page cache which pages of the file this process brought into memory, one page at a time"
+  },
   "landlock_abi": 6,
   "landlock_scopes": [
     "signal",

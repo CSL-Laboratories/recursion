@@ -4,6 +4,19 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `wall.v1.json` is `1.0-draft.10` (Nov 25, 2026)
+
+An additive step: every field and value of draft 9 keeps its meaning, and a record that is not proven still
+validates. A record gains `shared_waits_allowed` (every futex form that is not private the allow list in force lets
+through, by its operation; null where no filter was loaded) and `limits_of_proven` (what proven is not true over, each
+with its reason: `shared_futex_wait`, the shared wait named with its forms and the one bit another process that maps
+the same page of a file can learn through it; `what_the_process_shows`, a process started before the wall and no
+longer the host's child is not seen and can read the command line, times and state; `page_cache_residency`, another
+process that maps a file the host reads can learn which pages it brought into memory). A proven record names every
+limit, the shared wait wherever `shared_waits_allowed` is not empty. What it breaks: a draft 9 record that says
+proven does not validate at draft 10. 1 good fixture (`h23`) and 7 bad ones are added; every proven fixture of
+draft 9 gains the two fields, so that each still fails for its own reason only.
+
 ## `wall.v1.json` is `1.0-draft.9` (Nov 25, 2026)
 
 An additive step: every field and value of draft 8 keeps its meaning, and a record that is not proven still

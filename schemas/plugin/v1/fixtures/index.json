@@ -2279,6 +2279,74 @@
         "keyword": "required",
         "at": ""
       }
+    },
+    {
+      "file": "good/wall.v1/h23-a-list-with-no-shared-wait-is-proven-without-that-limit.json",
+      "schema": "wall.v1.json",
+      "shows": "Where the list in force lets no futex wait that is not private through, a proven record names the other limits and not the shared wait."
+    },
+    {
+      "file": "bad/wall.v1/b29-proven-with-a-shared-wait-and-its-limit-not-named.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven record that lets a shared wait through names what it lets another process learn.",
+      "expect": {
+        "keyword": "required",
+        "at": "/limits_of_proven"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b30-proven-with-no-shared-waits-named.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven record names the shared waits of the list in force.",
+      "expect": {
+        "keyword": "type",
+        "at": "/shared_waits_allowed"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.shared-waits-allowed.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names the shared waits it lets through.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.limits-of-proven.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names what it is not proven over.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/u-wall.v1.limits-of-proven.json",
+      "schema": "wall.v1.json",
+      "rule": "The limits of proven are only the ones the schema names.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/limits_of_proven"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.limits-of-proven.what-the-process-shows.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names the limit what the process shows.",
+      "expect": {
+        "keyword": "required",
+        "at": "/limits_of_proven"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.limits-of-proven.page-cache-residency.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names the limit page cache residency.",
+      "expect": {
+        "keyword": "required",
+        "at": "/limits_of_proven"
+      }
     }
   ]
 }

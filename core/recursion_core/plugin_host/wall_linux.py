@@ -67,10 +67,13 @@ and to everything it starts later, and neither can be lifted again from inside:
    and the one wait that is not private which the C library's thread join makes on a thread's id (the kernel wakes
    it so when the thread ends). Every wake and move that is not private is refused: it is keyed by a file's page, so
    it would reach a process that maps the same file, one started before the wall among them, with no map or
-   descriptor the wall could see. A wait wakes no process; what such a process can still learn from it (whether the
-   walled one waits on a page of a file both map) is a limit the record states. What such a
-   process can still read of the walled one (the command line, which lives in the walled process's own memory, and
-   its times) is not seen by the probe: the host must start no process before the wall.
+   descriptor the wall could see. A wait wakes no process; what another process can still learn from it (whether the
+   walled one waits on a page of a file both map) is a limit the record names, with the forms in force
+   (``shared_waits_allowed``, ``limits_of_proven``). What a process started before the wall and no longer this one's
+   child can still read of the walled one (the command line, which lives in the walled process's own memory, its times
+   and state), and which pages of a file the walled one brought into memory, are not seen by the probe either: the
+   record names each in ``limits_of_proven`` (``LIMITS_OF_PROVEN``), ``what_proven_does_not_cover(record)`` gives the
+   words a person reads beside the word proven, and the host must start no process before the wall.
    The filter is an ALLOW LIST: after the refusals above it lets through only the calls named in the list
    ``ALLOW_LIST_FILE`` (``wall_allow_linux.json`` beside this module), each row with its number on each arch, the
    check of its arguments where it is allowed only in part (the checks above, which a row cannot drop or change),
@@ -169,7 +172,8 @@ __all__ = ["ALLOW_LIST_FILE", "CALLER_ONLY_CALLS", "CALLER_ONLY_PRIORITY_CALLS",
            "DENIED_IOCTL_COMMANDS", "DENIED_IPC_CALLS", "DENIED_METADATA_CALLS", "DENIED_SIGNAL_CALLS",
            "ALLOWED_TERMINAL_COMMANDS", "DENIED_TERMINAL_COMMANDS", "HELD_KINDS", "HELD_NOT_TRIED", "HELD_OUTCOMES", "LANDLOCK_SCOPES", "NAMESPACE_CLONE_FLAGS", "OLD_LANDLOCK_DENIED_CALLS", "RECORD_CHECKS", "WORDS",
            "WRITES_NOT_TRIED", "WRITE_FILE_NAME", "WRITE_FOLDER_NAMES", "WRITE_KINDS", "WRITE_OUTCOMES", "WallRefused", "apply_wall",
-           "load_allow_list", "prepare_write_folder", "probe_wall", "why_not_proven"]
+           "load_allow_list", "prepare_write_folder", "probe_wall", "what_proven_does_not_cover", "why_not_proven",
+           "LIMITS_OF_PROVEN"]
 
 # The wall's own definition (not a setting, not a tunable): each call is answered EPERM.
 DENIED_CALLS = (
@@ -415,6 +419,25 @@ HELD_NOT_TRIED = {
                  "fsconfig, fsmount, fspick, mount_setattr, open_tree_attr), and every call newer than the ones it "
                  "names",
 }
+# What 'proven' is NOT true over, each with its reason (the record's field ``limits_of_proven``): what another process
+# can still learn of the walled one. No list of the kernel names such a process, so the probe cannot see it, and a
+# proven record names every one of these (the shared wait only where the list in force lets one through, with its
+# forms). The wall's own definition, not a setting.
+LIMITS_OF_PROVEN = {
+    "shared_futex_wait": "the filter lets through {forms}, a wait that is not private, because the C library's thread "
+                         "join makes it on a thread's id (the kernel wakes that word in its form that is not private "
+                         "when the thread ends, and refusing it ends the free-threaded interpreter at its first join): "
+                         "another process that maps the same page of a file, a helper started before the wall among "
+                         "them, can learn through it whether this process waits there, one bit at a time; the wait "
+                         "wakes no process, and every wake that is not private is refused",
+    "what_the_process_shows": "a process started before the wall and no longer this one's child is not seen by the "
+                              "probe: it can read this process's command line, which lives in this process's own "
+                              "memory, and its times and state in /proc, which no call of this process changes; the "
+                              "host must start no process before the wall",
+    "page_cache_residency": "another process that maps a file this one reads can learn from the kernel's page cache "
+                            "which pages of the file this process brought into memory, one page at a time",
+}
+_FUTEX_FORM_NAMES = {0: "FUTEX_WAIT", 9: "FUTEX_WAIT_BITSET"}  # the kernel's names of its two waits
 _RING_OFF = ("the kernel made no ring of kernel calls for this process before the wall (rings turned off), so there "
              "was none to try")
 
@@ -555,6 +578,20 @@ WORDS = {
     "held_signal_owner": "a pipe set before to signal a process on every change",
     "held_shared_map": "a file mapped shared and writable",
     "held_namespace": "a namespace entered before",
+    "limits_intro": "The plugin host is shown to be shut in, with limits that the test cannot rule out:",
+    "limit_shared_futex_wait": "The sandbox lets through one kind of wait of the kernel that another process can see "
+                               "({forms}), because the system's own threads need it to finish: another process that "
+                               "opens the same file, one started before the plugin host shut itself in among them, can "
+                               "learn whether the host waits there, one bit at a time. It cannot wake the host, and "
+                               "the host cannot wake it.",
+    "limit_what_the_process_shows": "A process started before the plugin host shut itself in, and no longer its child, "
+                                    "is not seen by the test: it can still read the host's command line, its times "
+                                    "and its state.",
+    "limit_page_cache_residency": "Another process that opens a file the plugin host reads can learn which parts of "
+                                  "the file the host read.",
+    "limit_unknown": "The record names a limit that this sandbox does not know ({name}); it is not shown to hold.",
+    "limits_what_to_do": "What you can do: let no process start before the plugin host shuts itself in, as the daemon "
+                         "does.",
     "regular_file": "file",
     "block_device": "disk or other block device",
     "character_device": "terminal or other character device",
@@ -1151,6 +1188,9 @@ def apply_wall(read_only_paths, keep_descriptors=None, allow_list=None) -> None:
         _STATE["allow_in_force"] = {"source": "beside_the_wall" if allow_list is None else "given_by_path",
                                     "shipped": allow["shipped"], "digest": allow["digest"], "rows": len(allow["rows"]),
                                     "rows_not_shipped": list(allow["added"]), "rows_taken_out": list(allow["removed"])}
+        # the waits that are not private the list in force lets through: the record names each and what it can show
+        _STATE["shared_waits"] = sorted(operation for row in allow["rows"] if row["call"] == "futex"
+                                        for operation in row.get("operations", ()) if not operation & _FUTEX_PRIVATE_FLAG)
         _alone("threads_after_filter", _threads_now)
         # what the kernel's own lists say after the wall (None for a list that could not be read: never proven)
         _STATE["seen_at_wall"] = _read_kernel_lists(lists)
@@ -1886,6 +1926,51 @@ def _named_for_write(numbers) -> list:
     return held
 
 
+def _futex_forms(operations) -> str:
+    """The futex forms ``operations`` in words: the kernel's name, the wall clock where asked, and the number."""
+    forms = []
+    for operation in operations:
+        name = _FUTEX_FORM_NAMES.get(operation & ~(_FUTEX_PRIVATE_FLAG | _FUTEX_CLOCK_REALTIME), "the futex form")
+        clock = " with the wall clock" if operation & _FUTEX_CLOCK_REALTIME else ""
+        forms.append(f"{name}{clock} (operation {operation})")
+    return ", ".join(forms)
+
+
+def _limits_of_proven(shared) -> dict:
+    """The record's ``limits_of_proven``: every entry of ``LIMITS_OF_PROVEN`` with its reason, the shared wait only
+    where the list in force lets one through (``shared``, its operations), named with its forms."""
+    limits = {}
+    for name, reason in LIMITS_OF_PROVEN.items():
+        if name == "shared_futex_wait":
+            if shared:
+                limits[name] = reason.format(forms=_futex_forms(shared))
+        else:
+            limits[name] = reason
+    return limits
+
+
+def what_proven_does_not_cover(record: dict) -> list:
+    """The sentences a person reads beside the word proven: each limit the record names in ``limits_of_proven``, in
+    plain words, and what they can do (an empty list where it names none). Every word comes from ``WORDS``; the record
+    is read as data, so a limit this module does not know is named, never passed over."""
+    limits = record.get("limits_of_proven")
+    if not isinstance(limits, dict) or not limits:
+        return []
+    shared = record.get("shared_waits_allowed")
+    operations = [operation for operation in shared if isinstance(operation, int) and not isinstance(operation, bool)
+                  and 0 <= operation <= 0xFFFFFFFF] if isinstance(shared, list) else []
+    lines = [WORDS["limits_intro"]]
+    for name in limits:
+        if name == "shared_futex_wait":
+            lines.append(WORDS["limit_shared_futex_wait"].format(forms=_futex_forms(operations) or "a form not named"))
+        elif name in LIMITS_OF_PROVEN:
+            lines.append(WORDS["limit_" + name])
+        else:
+            lines.append(WORDS["limit_unknown"].format(name=str(name)[:64]))
+    lines.append(WORDS["limits_what_to_do"])
+    return lines
+
+
 def why_not_proven(record: dict) -> list:
     """The sentences a person reads when ``record`` is not proven, in order (an empty list when it is): that the
     plugin was not loaded, each check and each kind of write that did not hold, in plain words, and what they can
@@ -1992,7 +2077,10 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
     only from frames sent before the load. ``allow_list`` names the allow list the filter
     let through (None where no filter was loaded here); ``proven`` needs it to hold no row that is not in the shipped
     list, and ``proven_over`` says what was shown: ``shipped_list`` (proven), ``widened_list`` (every part held, with
-    a list wider than the shipped one: not proven) or None. Refuses ``wall_system_unsupported`` where the two system
+    a list wider than the shipped one: not proven) or None. ``shared_waits_allowed`` names the futex waits that are not
+    private the list in force lets through (None where no filter was loaded here) and ``limits_of_proven`` what
+    'proven' is not true over (``LIMITS_OF_PROVEN``): ``proven`` needs every one named, the shared wait with its forms
+    wherever one is let through; ``what_proven_does_not_cover(record)`` gives its words. Refuses ``wall_system_unsupported`` where the two system
     calls are absent, without trying.
     """
     libc = _libc()
@@ -2028,6 +2116,8 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
         "held_objects_not_tried": held_not_tried,
         "allow_list": None if allow is None else dict(allow, rows_not_shipped=list(allow["rows_not_shipped"]),
                                                       rows_taken_out=list(allow["rows_taken_out"])),
+        "shared_waits_allowed": None if allow is None else list(_STATE.get("shared_waits", [])),
+        "limits_of_proven": _limits_of_proven(_STATE.get("shared_waits", []) if allow is not None else []),
         "landlock_abi": _landlock_abi(libc),
         "landlock_scopes": list(_STATE["scopes"]),
         "arch": platform.machine() or "unknown",
@@ -2040,7 +2130,11 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
                         and threads == 1 and held == [] and maps == []
                         and all(record[name] for name in RECORD_CHECKS) and record["landlock_abi"] >= _MIN_LANDLOCK_ABI
                         and all(record["writes"][kind] in _WRITE_REFUSED for kind in WRITE_KINDS)
-                        and record["arch"] in _NR and _STATE["failed"] is None)
+                        and record["arch"] in _NR and _STATE["failed"] is None
+                        # nothing is proven without its limits named: the shared wait with its forms where one is let
+                        # through, and what another process can still learn of this one
+                        and set(LIMITS_OF_PROVEN) - {"shared_futex_wait"} <= set(record["limits_of_proven"])
+                        and (not record["shared_waits_allowed"] or "shared_futex_wait" in record["limits_of_proven"]))
     # proven speaks for the shipped list only: a row not in it keeps the record from proven, and the record says
     # whether every test held with the list in force all the same
     record["proven"] = held_all and allow is not None and allow["rows_not_shipped"] == []

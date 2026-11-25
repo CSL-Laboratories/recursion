@@ -308,7 +308,8 @@ class WallDefinitionTests(unittest.TestCase):
                                                   "arch", "proven"}
         later = {"threads", "descriptors_open_for_write", "memory_maps_open_for_write", "descriptors_seen_by",
                  "descriptors_unaccounted", "descriptors_kept", "descriptors_not_closed", "held_objects",
-                 "held_objects_not_tried", "allow_list", "proven_over"}  # required of a proven record only
+                 "held_objects_not_tried", "allow_list", "proven_over", "shared_waits_allowed",
+                 "limits_of_proven"}  # required of a proven record only
         self.assertEqual(set(schema["required"]), fields)
         self.assertEqual(set(schema["then"]["required"]), later)
         self.assertEqual(set(schema["properties"]), fields | later)

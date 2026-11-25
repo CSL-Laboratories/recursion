@@ -60,6 +60,9 @@ NOT_COVERED = (
     "a call into the operating system through a foreign-function module (every ctypes event is refused "
     "here; the static proof refuses the modules in shipped source)",
     "what the operating system does by itself (its own name lookups, time and package services)",
+    "what the hook is not told: it sees only what Python code reports to it, so code that replaces a "
+    "module's sys or calls into the operating system directly is not seen; this proof holds only "
+    "together with the static proof (tools/network_reach.py)",
     "plugins: a plugin reaches a network only under a grant a person gave; that proof is the plugin "
     "wall's (core/recursion_core/plugin_security)",
 )
@@ -416,9 +419,23 @@ class ReadmeWordsTests(unittest.TestCase):
                       "python3 tools/network_audit.py", "NOT PROVEN", "Proven before every merge",
                       "Not proven:", "the engines' own traffic", "under a grant you gave",
                       "what the operating system does by itself", "made from a descriptor",
-                      "foreign-function module", "not part of the hosted gate", "Windows"):
+                      "foreign-function module", "not part of the hosted gate", "Windows",
+                      "a later change of a kind those tests plant", "a way the scan cannot see is not caught",
+                      "it does not watch a program started through another listed program",
+                      "a program whose name begins with `python`", "a Python process that does not load the hook",
+                      "code that hides from the hook", "sees only what Python code reports to it",
+                      "holds only together with the static proof", "a file path that reaches a network by itself"):
             with self.subTest(words=words):
                 self.assertIn(words, " ".join(section.split()))
+
+    def test_the_readme_claims_no_more_than_the_tests_hold(self):
+        # Two sentences once claimed more than held: every later call home goes red, and the whole-suite
+        # run names every program that is not Python. Neither may come back.
+        section = " ".join(self._section().split())
+        for claim in ("a later change that adds a call home, a module or a refused construct goes red",
+                      "names every program that is not Python"):
+            with self.subTest(claim=claim):
+                self.assertNotIn(claim, section)
 
     def test_a_green_run_prints_no_refusal_meant_for_a_planted_case(self):
         # The second command's own planted cases keep their words to themselves: on a green run the

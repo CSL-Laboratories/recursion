@@ -227,6 +227,10 @@ def main(argv=None):
         return 1
     print("PROVEN: every address reached or looked up by a watched process was a door on this machine; "
           "the programs that are not Python are named above and are not watched.")
+    print("Not watched by this run: a program started through another listed program (env, unshare), a "
+          "program whose name begins with python, a Python process that does not load the hook (-I, -S, a "
+          "cleared environment), and code that hides from the hook (it sees only what Python code reports; "
+          "the tests themselves are not scanned).")
     return 0
 
 

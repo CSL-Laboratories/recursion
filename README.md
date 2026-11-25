@@ -33,11 +33,16 @@ reach a network is written down there with who supplies its address and the exac
 Run the proof on your own machine:
 
 - `python3 tools/network_reach.py` reads every shipped file by its syntax tree. It prints PROVEN,
-  or NOT PROVEN with each problem: a module that is not on the list; running text as code, or
-  reaching a module or a function by a name built at run time; a foreign-function, private
-  socket or subprocess, zip-import or unpickling module; a log handler that sends over a network;
-  an import of a test module or of anything outside the package; a call that could reach a network
-  and has no row, or whose text is not the text its row holds; a file it cannot read.
+  or NOT PROVEN with each problem: a module that is not on the list, or a name of a listed module
+  that its row does not hold; a private name of another module; running text as code, or reaching
+  a module or a function by a name built at run time (a module or `getattr` handed on as a value
+  included); `help`, `breakpoint`, a change of the places modules are loaded from, or a store into
+  the process environment; a foreign-function, private socket or subprocess, zip-import or
+  unpickling module; a log handler that sends over a network; an import of a test module or of
+  anything outside the package; a call that could reach a network and has no row, or whose text is
+  not the text its row holds; a use of a guarded place from a place its row does not name; a
+  symbolic link under `core/`, or a compiled file the interpreter would run instead of its source;
+  a file it cannot read.
 - `python3 core/tests/test_no_call_home_runtime.py` (Linux, CPython 3.12 or later) starts a daemon
   of its own in a temporary folder, leaves it idle, asks its status and stops it, while the
   interpreter's audit hook watches that it reaches no address and looks up no name; then it starts
@@ -50,18 +55,28 @@ What is proven, and what is not:
 
 - Proven before every merge: the tests of both proofs (`core/tests/test_network_reach.py`, which
   checks what the first command checks and plants each refused kind, and the file of the second
-  command) run in the hosted gate (CPython 3.12 on Linux), so a later change that adds a call home, a module or a refused construct goes red there. The
-  whole test suite can also be run once with the hook in every Python process it starts:
-  `python3 tools/network_audit.py`; it names every program that is not Python and refuses one that
-  is not listed in `tools/network_audit.toml`. That run is not part of the hosted gate.
+  command) run in the hosted gate (CPython 3.12 on Linux). So a later change of a kind those tests
+  plant (each kind is listed in `core/tests/test_network_reach.py`) goes red there; a way the scan
+  cannot see is not caught, and the ways named below are the ones known, not a promise that there
+  is no other. The whole test suite can also be run once with the hook in every Python process it
+  starts: `python3 tools/network_audit.py`. It names a program that is not Python and refuses one
+  that is not listed in `tools/network_audit.toml`, but it does not watch a program started
+  through another listed program (`env`, `unshare`), a program whose name begins with `python`, a
+  Python process that does not load the hook (started with `-I` or `-S`, or with a cleared
+  environment), or code that hides from the hook. That run is not part of the hosted gate.
 - Not proven: the engines' own traffic to the addresses you configured, and anything else an
   engine program reaches by itself; what a plugin does under a grant you gave (the plugin checks'
   proof); what the operating system does by itself (its own name lookups and services); what any
   program the daemon starts reaches by itself (the test runs only its own stand-ins); the traffic
   of a socket made from a descriptor handed in from outside with its family named; a call into the
   operating system through a foreign-function module at run time (the shipped code may not import
-  one, and the run-time test refuses any such call it sees). The test runs on Linux only; Windows
-  and macOS are not covered.
+  one, and the run-time test refuses any such call it sees); what the audit hook is not told: it
+  sees only what Python code reports to it, so code that replaces a module's `sys` or calls into
+  the operating system directly is not seen, the run-time proof of the daemon holds only together
+  with the static proof, and the whole-suite run holds only for code that does not hide from it
+  (the tests themselves are not scanned); a file path that reaches a network by itself (an
+  automount such as `/net` on macOS, or a Windows network path): no rule of the scan and no audit
+  event names it. The test runs on Linux only; Windows and macOS are not covered.
 
 > Governance note: `CONTROL_PLANE.md` and `ANCHOR.md` are the operative authority and scope
 > records. They already describe Recursion v3 (D-017, 2026-09-28); the older claim that they

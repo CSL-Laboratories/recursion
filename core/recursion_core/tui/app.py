@@ -266,6 +266,9 @@ class TuiApp:
         # Each confirmed Stop's ONE step, by number (_STOP_STEPS), set where each thing happens and only ever moved
         # forward (``stop_moved``): no line of the close says of a Stop a step it has not reached.
         self._stop_step: dict[int, str] = {}
+        # A confirmed Stop in its call, with when it began: set by begin() as the Stop leaves the queue (under the
+        # same lock), taken out by the lane once its call returned (``stop_call_over``)
+        self._stop_calls: dict[int, float] = {}
         self.stop_marks = False  # set by a Loop: its api says when a request is written (``on_sent``)
         self._in_call: dict[int, tuple[str, dict]] = {}  # requests other than a Stop a lane is in a call for
         self._not_sent: list[str] = []  # requests a lane did not send because the TUI was closing or had ended
@@ -568,6 +571,8 @@ class TuiApp:
                 if self.closed and asked in self._queued_at_close:
                     self._begun_after_close.add(asked)
                 self._step_to(asked, "begun")
+                if asked in self._stop_step:
+                    self._stop_calls[asked] = time.monotonic()
                 return True
             if self.closed or self.awaiting_stop or ending:
                 if not self.closed:  # once the close line is written it has named it already
@@ -584,6 +589,13 @@ class TuiApp:
 
         with self._lock:
             self._step_to(asked, step)
+
+    def stop_call_over(self, asked: int | None) -> None:
+        """The lane's call for the confirmed Stop numbered ``asked`` returned (answered or failed): it is in its call
+        no longer, so the close does not wait for it."""
+
+        with self._lock:
+            self._stop_calls.pop(asked, None)
 
     def _step_to(self, asked: int | None, step: str) -> None:
         now = self._stop_step.get(asked)
@@ -1759,7 +1771,6 @@ class Loop:
         self._lanes = {"stop": queue.SimpleQueue(), "other": queue.SimpleQueue()}
         self._threads: list[threading.Thread] = []
         self._runner: threading.Thread | None = None  # the thread of run(), once start() made it
-        self._stop_call: float | None = None  # when the Stop lane began the call it is in, if it is in one
         # A transport that cannot say when a request is written: how long after a Stop's call began it is waited for
         self.stop_handover_s = STOP_HANDOVER_S
         self._marks = _takes_on_sent(api)  # the api says when a request is written: a Stop is waited for until then
@@ -1818,8 +1829,6 @@ class Loop:
             # the bound has run out is not begun: the close line has said so (it stays queued in the app).
             if method == "run.stop" and self._deadline is not None and time.monotonic() >= self._deadline:
                 continue
-            if method == "run.stop":  # stamped before begin(): a Stop is at every moment queued or in its call
-                self._stop_call = time.monotonic()
             asked = getattr(done, "asked", None)
             if not self.app.begin(asked, method, params, ending=self._halt.is_set()):
                 continue
@@ -1832,8 +1841,8 @@ class Loop:
             except BaseException as err:  # noqa: BLE001 - KeyboardInterrupt, SystemExit: an answer, so in_flight
                 answer = {"code": p.UNAVAILABLE, "detail": type(err).__name__}  # stays true (#405 r2, DeepSeek L3)
             self._answers.put((done, method, params, answer))  # queued before the call is said over: taken at the end
-            if method == "run.stop":
-                self._stop_call = None
+            if method == "run.stop":  # after its answer is queued: the answer is there when the wait ends
+                self.app.stop_call_over(asked)
             self._wake.set()
 
     def start(self) -> None:
@@ -1856,18 +1865,20 @@ class Loop:
 
     def _stops_handed_over(self) -> bool:
         """Nothing is left that the TUI must still send: no confirmed Stop is queued (one that can still begin is
-        waited for, within the bound), and the Stop the lane is in a call for, if any, has its request written to
-        the daemon (the transport said so), whether it began before the close's wait, during it or after Ctrl-C. A
-        transport that cannot say so: once that call has lasted ``stop_handover_s``."""
+        waited for, within the bound), and every confirmed Stop in its call has its request written to the daemon
+        (the transport said so), whether it began before the close's wait, during it or after Ctrl-C. A Stop's wait
+        ends only on that mark or on the end of its call; the bound is the caller's. A transport that cannot say
+        so: once that call has lasted ``stop_handover_s``. Everything is read under the app's lock, where begin()
+        takes a Stop out of the queue and into its call in one step."""
 
-        began = self._stop_call
         with self.app._lock:
             if any(method == "run.stop" for method, _ in self.app._queued.values()):
                 return False
-            unwritten = any(step == "begun" for step in self.app._stop_step.values())
-        if began is None or not unwritten:
-            return True  # no Stop is in its call, or the one in its call has its request written
-        return not self._marks and time.monotonic() - began >= self.stop_handover_s
+            now = time.monotonic()
+            for n, began in self.app._stop_calls.items():
+                if self.app._stop_step.get(n) == "begun" and (self._marks or now - began < self.stop_handover_s):
+                    return False
+        return True
 
     def shutdown(self, *, leave_hung: bool = False) -> bool:
         """Stop painting at once, then stop the threads. When this returns no paint is under way and

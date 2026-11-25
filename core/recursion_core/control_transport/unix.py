@@ -564,7 +564,8 @@ class UnixControlClient:
         """Send one frame and return its reply; any failure closes the client for good.
 
         ``on_sent``, when given, is called the moment the frame's write returns, before the reply is read: the
-        request has then left this process for the daemon's door.
+        request has then left this process for the daemon's door. An exception of ``on_sent`` is not raised: the
+        write has happened, so the call goes on and its reply is read and returned.
 
         A timeout or partial read leaves the stream mid-frame, so the next read would hand
         back an earlier request's late reply (a Stop's answer as a ping's). The socket is
@@ -589,7 +590,10 @@ class UnixControlClient:
                         raise refusal from None
                     raise
                 if on_sent is not None:
-                    on_sent()
+                    try:  # the request is written: a failure of the hook neither ends the call nor unsays the write
+                        on_sent()
+                    except Exception:  # noqa: BLE001 - the reply is still read and returned
+                        pass
                 response = read_frame(sock, max_bytes=self._max_frame_bytes, deadline=deadline)
                 if response is None:
                     raise ConnectionError("server closed the connection")

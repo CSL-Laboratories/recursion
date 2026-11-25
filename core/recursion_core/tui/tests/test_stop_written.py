@@ -198,5 +198,191 @@ class SocketTransportMarksTheWriteTest(unittest.TestCase):
             self.assertIs(answer.get("delivered"), False)
 
 
+class Door:
+    """A stand-in daemon's door on a Unix socket in the test's own temporary folder. ``closes``: it accepts the
+    connection and closes it before reading anything; ``refuses``: bound and not listening, so the connect is
+    refused; ``answers``: it reads the whole request and answers that the run is stopped. ``got`` is the bytes it
+    received, ``accepted`` the connections it took."""
+
+    def __init__(self, path: str, kind: str) -> None:
+        self.kind, self.got, self.accepted, self.closed = kind, 0, 0, threading.Event()
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(path)
+        if kind != "refuses":
+            self.srv.listen(4)
+            self.thread = threading.Thread(target=self._serve, daemon=True)
+            self.thread.start()
+
+    def _serve(self) -> None:
+        from recursion_core.control_transport.unix import write_frame
+
+        self.srv.settimeout(WAIT_S)
+        try:
+            conn, _ = self.srv.accept()
+        except OSError:
+            return
+        self.accepted += 1
+        with conn:
+            if self.kind == "answers":
+                conn.settimeout(WAIT_S)
+                buf = b""
+                while len(buf) < 4 or len(buf) < 4 + int.from_bytes(buf[:4], "big"):
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                self.got += len(buf)
+                write_frame(conn, {"ok": True, "result": {"code": "stopped", "run_id": "r"}}, max_bytes=1 << 20)
+        self.closed.set()
+
+    def end(self) -> None:
+        self.srv.close()
+        if self.kind != "refuses":
+            self.thread.join(WAIT_S)
+
+
+class StopThroughTheDoor(API):
+    """The stand-in API for every read; each Stop goes through the real SocketAPI and UnixControlClient to the door.
+    Its connect is let go only at Ctrl-C (``gate``), so its call ends after the close line; for the door that closes,
+    the connection is made, the door closes it, and only then is the request written. ``hook``, when given, stands
+    between the transport and the TUI's ``on_sent`` (a fault there)."""
+
+    def __init__(self, path: str, door: Door, gate: threading.Event, hook=None) -> None:
+        from recursion_core.control.client import SocketAPI
+        from recursion_core.control_transport.unix import UnixControlClient
+
+        super().__init__(runs=("r",))
+        self.holds: dict = {}
+        self.hook = hook
+
+        def connect(p, *, timeout_s):
+            gate.wait(WAIT_S)
+            client = UnixControlClient(p, timeout_s=timeout_s)
+            if door.kind == "closes":
+                door.closed.wait(WAIT_S)
+            return client
+
+        self.sock_api = SocketAPI(path, timeout_s=WAIT_S, connect=connect)
+
+    def call(self, method, params, on_sent=None):
+        if method != "run.stop":
+            return super().call(method, params)
+        with self._lock:
+            self.calls.append((method, dict(params)))
+        self.entered.set()
+        hook = on_sent if self.hook is None or on_sent is None else (lambda: self.hook(on_sent))
+        return self.sock_api.call(method, params, on_sent=hook)
+
+
+def _through_a_door(test, kind, *, marked=True, hook=None):
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "control.sock")
+        door, gate = Door(path, kind), threading.Event()
+        test.addCleanup(door.end)
+        api = StopThroughTheDoor(path, door, gate, hook)
+        lines, app, t_ctrl, t_end = drive(api if marked else Unmarked(api), ["s", "y", "q"], then=gate.set)
+        test.assertIsNotNone(t_ctrl)
+        test.assertLess(t_end - t_ctrl, BOUND_S + MARGIN_S, "the prompt came after the bound")
+        # the Stop's call ends just after Ctrl-C: its end ends the wait, the bound is not waited out
+        test.assertLess(t_end - t_ctrl, WAITED_S, "the TUI waited on after the Stop's call had ended")
+        return lines, app, door
+
+
+@unittest.skipUnless(os.name == "posix" and hasattr(socket, "AF_UNIX"), "a Unix socket")
+class CallEndedBeforeItsWriteTest(unittest.TestCase):
+    NOT_SENT = ("after the close line: the Stop of r was not sent: its call ended before its request was written "
+                "(control_api_unavailable); r may still be running" + TAIL.format("r"))
+
+    def test_a_door_that_closes_before_the_write_is_said_not_sent_and_got_nothing(self) -> None:
+        lines, app, door = _through_a_door(self, "closes")
+        self.assertIn("the Stop of r was begun and is not yet written to the daemon", app.end_line)
+        self.assertEqual(lines[-1], self.NOT_SENT)
+        self.assertEqual((door.accepted, door.got), (1, 0))
+
+    def test_a_door_that_refuses_the_connection_is_said_not_sent_and_got_nothing(self) -> None:
+        lines, app, door = _through_a_door(self, "refuses")
+        self.assertEqual(lines[-1], self.NOT_SENT)
+        self.assertEqual((door.accepted, door.got), (0, 0))
+
+    def test_a_transport_that_cannot_say_it_wrote_says_its_call_ended(self) -> None:
+        lines, app, door = _through_a_door(self, "refuses", marked=False)
+        self.assertEqual(lines[-1], "after the close line: the Stop of r: its call ended and did not confirm it "
+                                    "(control_api_unavailable); r may still be running" + TAIL.format("r"))
+        self.assertEqual((door.accepted, door.got), (0, 0))
+
+
+class TheWaitEndsOnlyOnTheMarkTheEndOrTheBoundTest(unittest.TestCase):
+    def test_a_stop_begun_while_the_close_looks_is_waited_for(self) -> None:
+        """The window: the close looks whether every confirmed Stop is handed over while the Stop lane takes the
+        queued Stop and begins its call. Forced with no sleep: the first time the look takes the app's lock, the
+        lane is let take the Stop and begin its call (held before its write) before the lock is taken."""
+
+        api = HeldBeforeTheWrite(("r",), {})
+        app, loop = new_loop(api)
+        app.request("run.stop", {"run_id": "r"})  # a confirmed Stop, queued: the lanes are not started yet
+        real, looker = app._lock, threading.current_thread()
+
+        class Window:
+            armed = True
+
+            def __enter__(self):
+                if Window.armed and threading.current_thread() is looker:
+                    Window.armed = False
+                    lane = threading.Thread(target=loop._lane, args=(loop._lanes["stop"],), daemon=True)
+                    loop._threads.append(lane)
+                    lane.start()
+                    if not api.entered.wait(WAIT_S):  # the Stop is begun and in its call, not yet written
+                        raise AssertionError("the Stop was not begun")
+                return real.__enter__()
+
+            def __exit__(self, *exc):
+                return real.__exit__(*exc)
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        app._lock = Window()
+        try:
+            self.assertFalse(loop._stops_handed_over(), "the wait ended on a Stop begun and not written")
+            self.assertEqual(app._stop_step[next(iter(app._stops_out))], "begun")
+        finally:
+            app._lock = real
+            api.release.set()
+            loop._lanes["stop"].put(None)
+            for thread in loop._threads:
+                thread.join(WAIT_S)
+        self.assertTrue(loop._stops_handed_over(), "a Stop whose call has ended is still waited for")
+
+
+@unittest.skipUnless(os.name == "posix" and hasattr(socket, "AF_UNIX"), "a Unix socket")
+class AHookThatFailsTest(unittest.TestCase):
+    def test_a_hook_that_raises_after_a_whole_write_does_not_end_the_call(self) -> None:
+        from recursion_core.control.client import SocketAPI
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "control.sock")
+            door = Door(path, "answers")
+            self.addCleanup(door.end)
+            marks = []
+
+            def on_sent() -> None:
+                marks.append("written")
+                raise RuntimeError("the hook itself fails")
+
+            answer = SocketAPI(path, timeout_s=WAIT_S).call("run.stop", {"run_id": "r"}, on_sent=on_sent)
+            self.assertEqual(marks, ["written"])
+            self.assertEqual(answer, {"code": "stopped", "run_id": "r"})
+            self.assertTrue(door.closed.wait(WAIT_S))
+            self.assertGreater(door.got, 4)
+
+    def test_a_hook_that_fails_before_the_tuis_mark_does_not_make_a_written_stop_unsent(self) -> None:
+        def fails(on_sent) -> None:
+            raise RuntimeError("the hook itself fails")
+
+        lines, app, door = _through_a_door(self, "answers", hook=fails)
+        self.assertGreater(door.got, 4)
+        self.assertEqual(lines[-1], "after the close line: the Stop of r was sent and answered: r is stopped")
+
+
 if __name__ == "__main__":
     unittest.main()

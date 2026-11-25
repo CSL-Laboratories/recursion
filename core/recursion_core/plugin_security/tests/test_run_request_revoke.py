@@ -17,6 +17,7 @@ from recursion_core.control import api as control_api
 from recursion_core.control.tests.fakes import make_api
 from recursion_core.plugin_security import canonical, parse
 from recursion_core.plugin_security import host_channel as hc
+from recursion_core.plugin_security.signing import key_id
 from recursion_core.plugin_security.tests.support import World, manifest_bytes, needs_crypto
 
 REPO = Path(__file__).resolve().parents[4]
@@ -302,6 +303,45 @@ class RealCoreHeldTests(unittest.TestCase):
         self.assertFalse(poisoner.is_alive())
         with world.core.permission_held("demo.plugin", "schedule") as granted:
             self.assertIs(granted, False)
+
+
+    def test_a_key_revoke_and_a_poison_wait_while_the_loader_holds_the_permission_and_the_next_start_is_refused(self):
+        # The revoke takes the loader's lock on the grants and the poison takes the health
+        # lock; the hold must take both, so each test thread below stays blocked until the block ends.
+        world = World(self, grant_permissions=("read", "order", "schedule"))
+        world.manifest = manifest_bytes(world.developer.public, permissions=("read", "order", "schedule"))
+        world.load()
+        kid = key_id(world.developer.public)
+        api, registry, _kill, starter = make_api()
+        end = hc.DaemonEnd("demo.plugin", world.core, runs=api)
+        turned_off, failures = [], []
+
+        def revoke():
+            try:
+                turned_off.extend(world.loader.revoke_key(kid))
+            except BaseException as exc:  # a failure of the thread is the test's, shown after the join
+                failures.append(repr(exc))
+        revoker = threading.Thread(target=revoke, daemon=True)
+        poisoner = threading.Thread(target=world.health.poison, args=("test",), daemon=True)
+        with world.core.permission_held("demo.plugin", "schedule") as granted:
+            self.assertIs(granted, True)
+            revoker.start()
+            poisoner.start()
+            revoker.join(HELD_WAIT_S)
+            poisoner.join(HELD_WAIT_S)
+            self.assertTrue(revoker.is_alive(), "the revoke returned while the permission was held")
+            self.assertTrue(poisoner.is_alive(), "the poison returned while the permission was held")
+            self.assertIn("order", world.loader.permissions("demo.plugin"))
+            self.assertIsNone(world.health.poisoned)
+        revoker.join(THREAD_WAIT_S)
+        poisoner.join(THREAD_WAIT_S)
+        self.assertFalse(revoker.is_alive())
+        self.assertFalse(poisoner.is_alive())
+        self.assertEqual((failures, turned_off), ([], ["demo.plugin"]))
+        self.assertEqual(world.health.poisoned, "test")
+        refused = end.receive(request())
+        self.assertEqual((refused["type"], refused["code"]), ("refusal", "call_not_offered"))
+        self.assertEqual((starter.calls, registry.list()), ([], []))
 
 
 if __name__ == "__main__":

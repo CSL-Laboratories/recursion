@@ -7988,7 +7988,7 @@
       ]
     },
     "standing_row": {
-      "description": "One record that stands, read from one store of the core. kind is the tag of the union: run, plugin_host or approval on this version. text is the sentence a person reads: what stands and the one thing they can do.",
+      "description": "One record that stands, read from one store of the core. kind is the tag of the union: run, plugin_host, approval or budget on this version. text is the sentence a person reads: what stands and the one thing they can do. A budget row carries spent_minor, the spend recorded against it in the smallest unit of its currency.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -8003,7 +8003,8 @@
           "enum": [
             "run",
             "plugin_host",
-            "approval"
+            "approval",
+            "budget"
           ]
         },
         "id": {
@@ -8029,6 +8030,10 @@
         "digest": {
           "type": "string",
           "minLength": 1
+        },
+        "spent_minor": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     },
@@ -8050,7 +8055,7 @@
     "answer.standing.list": {
       "anyOf": [
         {
-          "description": "Everything the core's own stores hold that stands. complete is false when a store did not answer or held a row of a kind this version does not show; such a row is counted under refused, never dropped. not_seen says what no store of the core holds and so is not shown.",
+          "description": "Everything the core's own stores hold that stands now: runs that are not ended, loaded plugin hosts, approvals that wait for an answer or to be used and are not past their expiry, and the spend recorded against signed budgets. complete is false when a store did not answer or held a row of a kind this version does not show; such a row is counted under refused, never dropped. not_seen says what no store of the core holds and so is not shown.",
           "type": "object",
           "additionalProperties": false,
           "required": [
@@ -8229,7 +8234,7 @@
     "answer.standing.stop": {
       "anyOf": [
         {
-          "description": "One Stop of everything that stands. stopped only when the cleanup of every store was seen; pending lists what was not, and why. stopped counts what ended, by kind.",
+          "description": "One Stop of everything that stands. stopped only when the cleanup of everything Stop ends was seen; pending lists what was not, and why. stopped counts what ended, by kind. still_standing says what Stop does not end and still stands, by store, with its count (or that a busy store was not read); not_seen says what no store of the core holds. The daemon sends both.",
           "type": "object",
           "additionalProperties": false,
           "required": [
@@ -8296,6 +8301,42 @@
             "text": {
               "type": "string",
               "minLength": 1
+            },
+            "still_standing": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "store",
+                  "text"
+                ],
+                "properties": {
+                  "store": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "kind": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "text": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            },
+            "not_seen": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
             }
           }
         },

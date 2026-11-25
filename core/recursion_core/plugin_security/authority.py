@@ -301,6 +301,21 @@ class Authority:
         return {"profile_id": profile["profile_id"], "spent_minor": spent + amount_minor,
                 "remaining_minor": profile["budgets"]["total_minor"] - spent - amount_minor}
 
+    def spent(self, *, wait: bool = True) -> list[tuple[str, int]] | None:
+        """``(profile_id, spent_minor)`` for every profile the ledger has charged, by profile id: the spend
+        recorded against each signed budget. The limit is in the signed profile, which the ledger does not
+        keep. With ``wait=False`` it never waits for the ledger's lock: a ledger busy with a charge answers
+        None. It writes nothing."""
+        if not self._lock.acquire(blocking=wait):
+            return None
+        try:
+            return [(profile_id, int(amount)) for profile_id, amount in self._db.execute(
+                "SELECT p.profile_id, COALESCE(SUM(c.amount_minor), 0) FROM profiles p"
+                " LEFT JOIN charges c ON c.profile_id = p.profile_id GROUP BY p.profile_id"
+                " ORDER BY p.profile_id").fetchall()]
+        finally:
+            self._lock.release()
+
     def close(self) -> None:
         with self._lock:
             self._db.close()

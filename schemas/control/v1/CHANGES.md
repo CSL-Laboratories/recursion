@@ -29,12 +29,12 @@ Nothing is frozen yet.
 
 ## One view of everything standing, and one Stop of it (Nov 23, 2026)
 
-`methods` draft 11; every other schema keeps its draft. Two methods join the table and the method names, both beta, both answered by the daemon itself beside `run.list`, neither exposed as an MCP tool.
+`methods` draft 11; every other schema keeps its draft. Two methods join the table and the method names, both beta, both answered by the daemon itself beside `run.list`, neither exposed as an MCP tool. Both refuse every principal kind but owner and device at a door of their own, with an authorizer registered or not.
 
 | What changed | What it breaks |
 |---|---|
-| `standing.list`: every standing record of the core's own stores (runs, loaded plugin hosts, pending approvals), each a row of the tagged union `standing_row` with the sentence a person reads; a row of any other kind is counted under `refused`, never dropped; `not_seen` says what no store of the core holds | Nothing: a new name |
-| `standing.stop`: one Stop of everything standing; `stopped` only when every cleanup was seen, else `pending` with what was not and why | Nothing: a new name |
+| `standing.list`: what the core's own stores hold that stands now (runs not ended, loaded plugin hosts, approvals that wait and are not past their expiry, the spend recorded against signed budgets), each a row of the tagged union `standing_row` with the sentence a person reads; a row of any other kind is counted under `refused`, never dropped; `not_seen` says what no store of the core holds | Nothing: a new name |
+| `standing.stop`: one Stop of everything standing; `stopped` only when the cleanup of everything it ends was seen, else `pending` with what was not and why; `still_standing` says what it does not end and still stands, and `not_seen` what no store holds | Nothing: a new name |
 | Rule (2) and the row rule of `$defs/row`: `standing.stop` joins `run.stop` as a mutating method that takes neither a `command_id` nor a revision (an emergency Stop never needs fresh state) | A checker that allows only `run.stop` to mutate without a key |
 | The published authorizer (`control/scopes.py`): both methods are answered only for the principal kinds owner and device; every other kind is refused `scope_refused`, whatever scopes it holds | Nothing: a new name |
 | The table's version: `1.0-draft.11` | A reader that pins `1.0-draft.10` |

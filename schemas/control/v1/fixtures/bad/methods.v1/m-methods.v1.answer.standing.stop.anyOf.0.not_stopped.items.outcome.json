@@ -11,10 +11,15 @@
         "kind": "run",
         "id": "run-2",
         "reason": "cgroup_populated",
-        "text": "run run-2 did not empty yet (cgroup_populated)",
+        "text": "run run-2, whose processes may still be running",
         "store": "runs"
       }
     ],
-    "text": "Stopped 1 run. 1 could not be seen cleaned up: run run-2 did not empty yet (cgroup_populated). Ask Stop again; if it stays, restart the daemon."
+    "text": "Stopped 1 run. What Stop could not see ended: run run-2, whose processes may still be running. Ask Stop again; if it stays, restart the daemon. What an engine keeps for later in its own files, its own scheduled tasks for one, is held by no store of Recursion: the list of everything standing does not show it, and Stop does not remove it.",
+    "still_standing": [],
+    "not_seen": [
+      "What an engine keeps for later in its own files, its own scheduled tasks for one, is held by no store of Recursion: the list of everything standing does not show it, and Stop does not remove it.",
+      "Code a loaded plugin starts by itself inside the daemon is held by no store of Recursion: the list of everything standing does not show it, and only a restart of the daemon ends it."
+    ]
   }
 }

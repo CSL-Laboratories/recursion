@@ -11223,6 +11223,33 @@
       }
     },
     {
+      "file": "bad/methods.v1/u-methods.v1.answer.standing.stop.anyOf.0.still_standing.items.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.stop/anyOf/0/properties/still_standing/items is closed: a field nobody defined is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/answer/still_standing/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.stop.anyOf.0.still_standing.items.store.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.stop/anyOf/0/properties/still_standing/items always carries 'store'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/still_standing/0"
+      }
+    },
+    {
+      "file": "bad/methods.v1/m-methods.v1.answer.standing.stop.anyOf.0.still_standing.items.text.json",
+      "schema": "methods.v1.json#/$defs/exchange",
+      "rule": "The object described at methods.v1.json#/$defs/answer.standing.stop/anyOf/0/properties/still_standing/items always carries 'text'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/answer/still_standing/0"
+      }
+    },
+    {
       "file": "good/queue.item.v1/h01-queued-for-the-next-turn.json",
       "schema": "queue.item.v1.json",
       "shows": "A message waiting for the current turn to end."

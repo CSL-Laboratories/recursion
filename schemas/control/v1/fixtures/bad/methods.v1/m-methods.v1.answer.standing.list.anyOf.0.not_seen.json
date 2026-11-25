@@ -40,7 +40,7 @@
         "kind": "approval",
         "id": "ap-1",
         "digest": "sha256:aa",
-        "text": "Approval ap-1 waits for an answer. Nothing it asks for runs until a person answers.",
+        "text": "Approval ap-1 waits for an answer, for 240 more seconds; then it expires by itself. Nothing it asks for runs until it is answered, and this release has no place to answer it.",
         "store": "approvals",
         "key": "approval:ap-1"
       }

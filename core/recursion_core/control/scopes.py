@@ -70,6 +70,7 @@ import logging
 import types
 from collections.abc import Callable
 
+from recursion_core.control import standing
 from recursion_core.control.credentials import ALL_SCOPES, PAGE_DEVICE_ID, SCOPE_REFUSED, CredentialStore, ceiling
 
 log = logging.getLogger(__name__)
@@ -78,8 +79,8 @@ PAGE_PRINCIPAL_ID = PAGE_DEVICE_ID   # control/hooks.py DEVICE: the page's door;
 # The page's device principal: read, run, approve (the brief's recommended option (a); the owner decides).
 PAGE_SCOPES = frozenset({"read", "run", "approve"})
 STOP_METHOD = "run.stop"
-STANDING_METHODS = frozenset({"standing.list", "standing.stop"})
-STANDING_KINDS = ("owner", "device")
+STANDING_METHODS = frozenset(standing.DOOR_METHODS)   # the door of its own: control/standing.py ``door``
+STANDING_KINDS = standing.DOOR_KINDS
 HOST_OWNER = "host"          # launch.owner of a run the host started (control/hooks.py launch_snapshot)
 
 Verdict = tuple[str, str] | None
@@ -273,7 +274,7 @@ class Authorizer:
             method = str.__str__(method)
         if type(method) is str and method in STANDING_METHODS and kind not in STANDING_KINDS:
             # Before the table is read: no row, scope or grant opens these to another kind.
-            return (SCOPE_REFUSED, "standing_not_granted_to_kind")
+            return (SCOPE_REFUSED, standing.DOOR_REFUSED)
         scope = self._scope_of(method) if type(method) is str else None
         if scope is None:
             return None if held >= ALL_SCOPES else (SCOPE_REFUSED, "method_not_in_table")

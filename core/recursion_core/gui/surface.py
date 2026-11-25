@@ -479,8 +479,13 @@ class Application:
             return "Stop not confirmed", ('<p role="status">Stop state: unknown. The control API did not '
                                           "answer (%s). Look at everything standing before assuming it "
                                           "stopped.</p>" % escape(exc.code))
-        return "Stop everything", '<h2>Stop everything</h2><p role="status">%s</p>%s' % (
-            escape(str(data.get("text", ""))), self._response_view(data))
+        # What still stands and what no store holds are said where the person looks after the Stop.
+        notes = [*(item.get("text", "") for item in data.get("not_stopped", ()) if type(item) is dict),
+                 *(item.get("text", "") for item in data.get("still_standing", ()) if type(item) is dict),
+                 *(text for text in data.get("not_seen", ()) if type(text) is str)]
+        return "Stop everything", '<h2>Stop everything</h2><p role="status">%s</p><ul>%s</ul>%s' % (
+            escape(str(data.get("text", ""))), "".join("<li>%s</li>" % escape(str(note)) for note in notes if note),
+            self._response_view(data))
 
     def _stop(self, env: dict) -> tuple[str, str]:
         form = self._form(env, {"run_id", "confirm"})

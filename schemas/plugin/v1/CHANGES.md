@@ -4,6 +4,19 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `wall.v1.json` is `1.0-draft.9` (Nov 25, 2026)
+
+An additive step: every field and value of draft 8 keeps its meaning, and a record that is not proven still
+validates. A record gains `allow_list` (the allow list the seccomp filter let through: `source`, `beside_the_wall` or
+`given_by_path`; `shipped`, true only when every row equals the row pinned in the wall's code; the `digest` and the
+count of its `rows`; `rows_not_shipped`, every call whose row is not a shipped row; `rows_taken_out`, every shipped
+call it holds no row for; null where no filter was loaded) and `proven_over` (`shipped_list` where proven,
+`widened_list` where every other part held with a list holding a row not in the shipped list, else null). A proven
+record needs both: no row not in the shipped list, and `proven_over` `shipped_list`; a record over a widened list is
+never proven and names its rows. What it breaks: a draft 8 record that says proven does not validate at draft 9.
+2 good fixtures (`h21`, `h22`) and 16 bad ones are added; every proven fixture of draft 8 gains the two fields, so
+that each still fails for its own reason only.
+
 ## `wall.v1.json` is `1.0-draft.8` (Nov 24, 2026)
 
 An additive step: every field and value of draft 7 keeps its meaning, and a record that is not proven still

@@ -2125,6 +2125,160 @@
         "keyword": "enum",
         "at": "/descriptors_not_closed/0/kind"
       }
+    },
+    {
+      "file": "good/wall.v1/h21-a-widened-list-is-not-proven-and-says-over-which-list.json",
+      "schema": "wall.v1.json",
+      "shows": "A list with a row not in the shipped list is not proven; where every other part held, the record says it was shown over the widened list and names the row."
+    },
+    {
+      "file": "good/wall.v1/h22-a-list-with-a-row-taken-out-can-be-proven.json",
+      "schema": "wall.v1.json",
+      "shows": "A list that only takes rows out of the shipped list refuses more, so the record can be proven over the shipped list; the row taken out is named."
+    },
+    {
+      "file": "bad/wall.v1/b24-proven-with-a-row-not-in-the-shipped-list.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven record holds no row that is not in the shipped list.",
+      "expect": {
+        "keyword": "maxItems",
+        "at": "/allow_list/rows_not_shipped"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b25-proven-said-over-a-widened-list.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven record is shown over the shipped list.",
+      "expect": {
+        "keyword": "const",
+        "at": "/proven_over"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b26-not-proven-said-over-the-shipped-list.json",
+      "schema": "wall.v1.json",
+      "rule": "A record that is not proven is not said to be shown over the shipped list.",
+      "expect": {
+        "keyword": "not",
+        "at": "/proven_over"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b27-widened-list-with-no-row-named.json",
+      "schema": "wall.v1.json",
+      "rule": "A record shown over a widened list names the rows not in the shipped list.",
+      "expect": {
+        "keyword": "minItems",
+        "at": "/allow_list/rows_not_shipped"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.allow-list.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names the allow list in force.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.proven-over.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall says what it is shown over.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/v-wall.v1.allow-list.source.json",
+      "schema": "wall.v1.json",
+      "rule": "The list's source is one of the two the schema names.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/allow_list/source"
+      }
+    },
+    {
+      "file": "bad/wall.v1/u-wall.v1.allow-list.json",
+      "schema": "wall.v1.json",
+      "rule": "The allow list carries only the fields the schema names.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/allow_list"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.allow-list.source.json",
+      "schema": "wall.v1.json",
+      "rule": "The allow list in force names its source.",
+      "expect": {
+        "keyword": "required",
+        "at": "/allow_list"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.allow-list.shipped.json",
+      "schema": "wall.v1.json",
+      "rule": "The allow list in force names its shipped.",
+      "expect": {
+        "keyword": "required",
+        "at": "/allow_list"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.allow-list.digest.json",
+      "schema": "wall.v1.json",
+      "rule": "The allow list in force names its digest.",
+      "expect": {
+        "keyword": "required",
+        "at": "/allow_list"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.allow-list.rows.json",
+      "schema": "wall.v1.json",
+      "rule": "The allow list in force names its rows.",
+      "expect": {
+        "keyword": "required",
+        "at": "/allow_list"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.allow-list.rows-not-shipped.json",
+      "schema": "wall.v1.json",
+      "rule": "The allow list in force names its rows not shipped.",
+      "expect": {
+        "keyword": "required",
+        "at": "/allow_list"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.allow-list.rows-taken-out.json",
+      "schema": "wall.v1.json",
+      "rule": "The allow list in force names its rows taken out.",
+      "expect": {
+        "keyword": "required",
+        "at": "/allow_list"
+      }
+    },
+    {
+      "file": "bad/wall.v1/v-wall.v1.proven-over.json",
+      "schema": "wall.v1.json",
+      "rule": "What a record is shown over is one of the values the schema names.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/proven_over"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b28-widened-list-with-no-list-named.json",
+      "schema": "wall.v1.json",
+      "rule": "A record shown over a widened list names the list in force.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
     }
   ]
 }

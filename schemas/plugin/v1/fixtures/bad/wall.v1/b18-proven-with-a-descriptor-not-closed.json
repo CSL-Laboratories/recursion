@@ -72,8 +72,17 @@
     "shared_map": "a map is not a descriptor, so the close step cannot reach it",
     "namespace": "entering a namespace changes the whole process the host runs in"
   },
+  "allow_list": {
+    "source": "beside_the_wall",
+    "shipped": true,
+    "digest": "sha256:94d4ef385f716ab4c4e401f4e34269d46fc6876887151ea5c15fb004a04539ea",
+    "rows": 187,
+    "rows_not_shipped": [],
+    "rows_taken_out": []
+  },
   "landlock_abi": 3,
   "landlock_scopes": [],
   "arch": "x86_64",
-  "proven": true
+  "proven": true,
+  "proven_over": "shipped_list"
 }

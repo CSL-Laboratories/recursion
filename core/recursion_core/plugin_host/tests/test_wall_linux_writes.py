@@ -292,12 +292,14 @@ def _record(writes: dict) -> dict:
                                          "_signal_other", "_reach_other", "_change_mode", "_kernel_surface")}
     with mock.patch.multiple(wall_linux, _write_outcomes=lambda *_a, **_k: dict(writes), _landlock_abi=lambda libc: 6,
                              **dict(stand_ins, **ALONE)), \
-            mock.patch.dict(wall_linux._STATE, {"failed": None}):
+            mock.patch.dict(wall_linux._STATE, {"failed": None, "allow_in_force": SHIPPED_IN_FORCE}):
         return wall_linux.probe_wall("/nonexistent/canary", 1)
 
 
 # The process alone, holding nothing open for writing: stand-ins, for the probes run in this process (the runner's own
 # threads and log files are not the record's to judge).
+# the allow list in force as apply_wall names it when the shipped list is loaded: as if walled here
+SHIPPED_IN_FORCE = {"source": "beside_the_wall", "shipped": True, "digest": "sha256:" + "0" * 64, "rows": 187, "rows_not_shipped": [], "rows_taken_out": []}
 ALONE = {"_threads_now": lambda: 1, "_descriptors_open_for_write": lambda: [], "_maps_open_for_write": lambda: [],
          "_walled_here": lambda: True, "_descriptors_unaccounted": lambda: [],
          "_kept_and_not_closed": lambda: ([], []),
@@ -331,7 +333,7 @@ class ProvenNeedsEveryWriteKindTests(unittest.TestCase):
         stand_ins = {fn: _refuse for fn in ("_read_root", "_read_canary", "_start_program", "_open_sockets",
                                              "_signal_other", "_reach_other", "_change_mode", "_kernel_surface")}
         with mock.patch.multiple(wall_linux, _landlock_abi=lambda libc: 6, **dict(stand_ins, **ALONE)), \
-                mock.patch.dict(wall_linux._STATE, {"failed": None}):
+                mock.patch.dict(wall_linux._STATE, {"failed": None, "allow_in_force": SHIPPED_IN_FORCE}):
             record = wall_linux.probe_wall("/nonexistent/canary", 1)
         self.assertEqual(record["writes"], dict.fromkeys(KINDS, "not_tried"))
         self.assertIs(record["proven"], False)
@@ -646,7 +648,7 @@ def _record_with(**alone) -> dict:
                                          "_signal_other", "_reach_other", "_change_mode", "_kernel_surface")}
     with mock.patch.multiple(wall_linux, _write_outcomes=lambda *_a, **_k: dict(writes), _landlock_abi=lambda libc: 3,
                              **dict(stand_ins, **dict(ALONE, **alone))), \
-            mock.patch.dict(wall_linux._STATE, {"failed": None}):
+            mock.patch.dict(wall_linux._STATE, {"failed": None, "allow_in_force": SHIPPED_IN_FORCE}):
         return wall_linux.probe_wall("/nonexistent/canary", 1)
 
 

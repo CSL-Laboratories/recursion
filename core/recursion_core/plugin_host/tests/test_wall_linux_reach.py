@@ -1146,7 +1146,8 @@ class ProvenNeedsEveryCheckTests(unittest.TestCase):
                          _maps_open_for_write=lambda: [], _walled_here=lambda: True,
                          _descriptors_unaccounted=lambda: [], _kept_and_not_closed=lambda: ([], []),
                     _held_objects=lambda: ({k: "not_tried" if k in wall_linux.HELD_NOT_TRIED else "closed_by_wall" for k in wall_linux.HELD_KINDS}, dict(wall_linux.HELD_NOT_TRIED)), _plant_held=lambda: None)  # the runner's own are not judged; as if walled here
-        with mock.patch.multiple(wall_linux, create=True, **stand_ins, **patches):
+        with mock.patch.multiple(wall_linux, create=True, **stand_ins, **patches), \
+                mock.patch.dict(wall_linux._STATE, {"allow_in_force": {"source": "beside_the_wall", "shipped": True, "digest": "sha256:" + "0" * 64, "rows": 187, "rows_not_shipped": [], "rows_taken_out": []}}):
             return wall_linux.probe_wall("/nonexistent/canary", 1)
 
     def test_the_record_holds_the_eight_checks(self):

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "wall.v1.json",
   "title": "wall.v1: what a plugin host proved of its own wall, from inside, before it loaded any plugin byte",
-  "x-version": "1.0-draft.8",
+  "x-version": "1.0-draft.9",
   "description": "A plugin host on Linux applies its wall to itself (Landlock: read and map only the Python install; one seccomp filter: no new socket, no program start, no signal at all, no limit or priority aimed at any process but the caller by the kernel's own form, no System V IPC or POSIX message queue, no lease, no change of a file's mode, owner, times or attributes, no new namespace, among other calls) and then tries eight checks from inside, and each kind of write on a file and in a folder that it made for the purpose before the wall. Each of the eight fields is true only when the kernel refused that check; a check that succeeded, or that failed or raised in another way, is false (fail shut). A target that would make a refusal prove nothing (a daemon pid of another user, a canary of another user) is not refused. 'proven' is true only when the host ran alone in its process (threads is 1), held no file open for writing (descriptors_open_for_write is empty) and no file mapped shared and writable (memory_maps_open_for_write is empty), all eight are refused, every kind of write is refused by the part of the wall that holds it, on x86_64 or aarch64, with Landlock ABI 1 or above, and no step of the wall failed in the process. 'landlock_scopes' names the Landlock scopes the wall put in force (abstract unix sockets and signals, each kept to the domain, from Landlock ABI 6 on; none below). What the record is: a check that the host's own code makes on itself, from inside the process, after the wall and before any plugin code runs. It shows that the named attempts were refused by the kernel at that moment, and code in the same process could write any record; for each kind of write it names which part of the wall refused it, by the kernel's answer. 'proven' covers the kinds in 'writes' only: every other kind the wall claims, or leaves to the host, is named in 'writes_not_tried' with the reason it is not tried. It means something under two conditions only: it is made before the plugin is loaded, and its reader takes it only from frames the host sent before the load (everything later on the channel is the plugin's voice). A host whose record is not proven loads no plugin.",
   "type": "object",
   "additionalProperties": false,
@@ -391,6 +391,63 @@
       },
       "description": "The reason of each kind of held_objects that was not tried. Added in draft 8."
     },
+    "allow_list": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "shipped",
+        "digest",
+        "rows",
+        "rows_not_shipped",
+        "rows_taken_out"
+      ],
+      "properties": {
+        "source": {
+          "enum": [
+            "beside_the_wall",
+            "given_by_path"
+          ],
+          "description": "Where the wall read the list: the file beside the wall, or a path the host gave in its place."
+        },
+        "shipped": {
+          "type": "boolean",
+          "description": "True only when every row of the list equals the row pinned in the wall's own code for the list shipped with it."
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "The digest of the list's rows, one digest per row in the order of the calls' names."
+        },
+        "rows": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The count of the list's rows."
+        },
+        "rows_not_shipped": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+          },
+          "uniqueItems": true,
+          "description": "Every call whose row is not a row of the shipped list: a call added, or a row changed in any part. A proven record holds none."
+        },
+        "rows_taken_out": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+          },
+          "uniqueItems": true,
+          "description": "Every call of the shipped list the list holds no row for: refused by the wall in this process."
+        }
+      },
+      "description": "The allow list the seccomp filter let through: where it was read, whether it is the shipped list, the digest and count of its rows, and every row that differs from the shipped list, by call. Null where no filter was loaded in the process (never proven). Added in draft 9."
+    },
     "landlock_abi": {
       "type": "integer",
       "minimum": 0,
@@ -414,7 +471,15 @@
     },
     "proven": {
       "type": "boolean",
-      "description": "True only when the wall was applied in the host's own process (descriptors_seen_by is kernel_list_after_wall), closed every descriptor the host did not keep (descriptors_kept is a list, descriptors_not_closed is empty), every object of held_objects could not act after the wall (closed_by_wall or refused_by_filter; shared_map and namespace not tried, each with its reason, and the ring not tried only where the kernel made none), the host held no descriptor that the kernel's list after the wall did not hold (descriptors_unaccounted is empty), the host ran alone in its process (threads is 1), held no file open for writing (descriptors_open_for_write is empty) and no file mapped shared and writable (memory_maps_open_for_write is empty), all eight checks are refused, every kind of write in 'writes' is refused by the part of the wall that holds it (refused_by_landlock, or refused_by_filter for truncate alone), on a supported arch, with Landlock ABI 1 or above (and, from ABI 6, both scopes in force), and no step of the wall failed in the process. It covers the kinds in 'writes' only: the kinds in 'writes_not_tried' are not tried, each for the reason given there. A host that gave the probe no file or folder for the writes is never proven."
+      "description": "True only when the wall was applied in the host's own process (descriptors_seen_by is kernel_list_after_wall), closed every descriptor the host did not keep (descriptors_kept is a list, descriptors_not_closed is empty), every object of held_objects could not act after the wall (closed_by_wall or refused_by_filter; shared_map and namespace not tried, each with its reason, and the ring not tried only where the kernel made none), the host held no descriptor that the kernel's list after the wall did not hold (descriptors_unaccounted is empty), the host ran alone in its process (threads is 1), held no file open for writing (descriptors_open_for_write is empty) and no file mapped shared and writable (memory_maps_open_for_write is empty), all eight checks are refused, every kind of write in 'writes' is refused by the part of the wall that holds it (refused_by_landlock, or refused_by_filter for truncate alone), on a supported arch, with Landlock ABI 1 or above (and, from ABI 6, both scopes in force), and no step of the wall failed in the process. It covers the kinds in 'writes' only: the kinds in 'writes_not_tried' are not tried, each for the reason given there. A host that gave the probe no file or folder for the writes is never proven. From draft 9 also: the allow list in force holds no row that is not in the shipped list (allow_list.rows_not_shipped is empty), and proven_over is shipped_list."
+    },
+    "proven_over": {
+      "enum": [
+        "shipped_list",
+        "widened_list",
+        null
+      ],
+      "description": "What the record shows the wall over: shipped_list where it is proven (the shipped list, or one with rows taken out of it); widened_list where every other part held but the list in force holds a row not in the shipped list (never proven: the wall is shown to hold only with those rows let through); null otherwise. Added in draft 9."
     }
   },
   "if": {
@@ -437,7 +502,9 @@
       "descriptors_kept",
       "descriptors_not_closed",
       "held_objects",
-      "held_objects_not_tried"
+      "held_objects_not_tried",
+      "allow_list",
+      "proven_over"
     ],
     "properties": {
       "threads": {
@@ -583,6 +650,17 @@
           "x86_64",
           "aarch64"
         ]
+      },
+      "allow_list": {
+        "type": "object",
+        "properties": {
+          "rows_not_shipped": {
+            "maxItems": 0
+          }
+        }
+      },
+      "proven_over": {
+        "const": "shipped_list"
       }
     },
     "allOf": [
@@ -607,6 +685,56 @@
       }
     ]
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "proven_over": {
+            "const": "widened_list"
+          }
+        },
+        "required": [
+          "proven_over"
+        ]
+      },
+      "then": {
+        "required": [
+          "allow_list"
+        ],
+        "properties": {
+          "allow_list": {
+            "type": "object",
+            "properties": {
+              "rows_not_shipped": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "proven": {
+            "const": false
+          }
+        },
+        "required": [
+          "proven"
+        ]
+      },
+      "then": {
+        "properties": {
+          "proven_over": {
+            "not": {
+              "const": "shipped_list"
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "write_outcome": {
       "enum": [

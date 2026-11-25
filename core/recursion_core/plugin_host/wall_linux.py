@@ -100,9 +100,12 @@ shortens them. The allow list is data: ``apply_wall(..., allow_list=path)`` take
 that a person can widen it knowingly (a row can add a call; it can never allow a call refused by name or drop a
 check). The shipped list is known by its rows, each pinned in this module by its digest (``_SHIPPED_ALLOW_ROWS``):
 a list whose rows differ from the pinned ones, given by path or changed in place beside the wall, is not the
-shipped list, and a change of the shipped list in a later draft changes the pin in the same commit. The record then
-says that the list in force is not the shipped one: 'proven' speaks for the shipped
-list only. Landlock below ABI 4 does not limit TCP and below ABI 6 does not scope signals; the seccomp
+shipped list, and a change of the shipped list in a later draft changes the pin in the same commit. The record names the
+list in force (``allow_list``: read beside the wall or given by path, whether its rows are the shipped ones, the
+digest and the count of its rows, every row it holds that is not in the shipped list and every shipped row it holds
+none of), and a record whose list holds a row not in the shipped list is never proven: where every test held with
+that list it says so (``proven_over`` ``widened_list``), and its words name the rows. 'proven' speaks for the shipped
+list only, or for one with rows taken out of it. Landlock below ABI 4 does not limit TCP and below ABI 6 does not scope signals; the seccomp
 filter shuts both here (``socket``, ``connect`` and every way named above to signal, limit, slow or move
 another process are denied whatever the ABI). Where the kernel's Landlock ABI is 6 or above, the ruleset
 also asks both of the kernel's scopes (``LANDLOCK_SCOPES``: abstract unix sockets and signals, each kept
@@ -443,6 +446,13 @@ WORDS = {
                           "Without a whole list the sandbox cannot know which calls to let through, so it changed "
                           "nothing in this process and no plugin is loaded. Give the sandbox the list shipped beside it, "
                           "or mend the row named.",
+    "list_widened": "The sandbox ran with a list of the kernel calls it lets through that is not the list shipped "
+                    "with it (given in its place, or changed where it lies): it also lets through {calls}. What the "
+                    "test shows does not hold for the sandbox as shipped. What you can do: give the sandbox the list "
+                    "shipped beside it, unchanged, or take those rows out of yours.",
+    "proven_with_widened_list": "Every other test held: the sandbox is shown to hold with {calls} let through as well, "
+                                "and not as shipped; the plugin host loads nothing beside a list wider than the one "
+                                "shipped.",
     "not_loaded": "The plugin was not loaded. Before any plugin code runs, the plugin host shuts itself in and "
                   "then tests that it is shut in; this time the test found a gap, so nothing of the plugin ran.",
     "reads_outside": "reading a folder outside the Python install",
@@ -1055,8 +1065,8 @@ def apply_wall(read_only_paths, keep_descriptors=None, allow_list=None) -> None:
 
     ``allow_list`` is the path of the allow list the filter lets through (None: the list shipped beside the wall,
     ``ALLOW_LIST_FILE``); it is read before any change, and a list that cannot be used is refused
-    ``wall_allow_list_refused`` with the words of ``allow_list_refused``. A list other than the shipped one is named in
-    the record by what it adds and removes.
+    ``wall_allow_list_refused`` with the words of ``allow_list_refused``. The list in force is named in the record (``allow_list``): a
+    row not in the shipped list keeps the record from proven, and a row taken out is named.
     """
     libc = _libc()
     arch = _arch()
@@ -1095,6 +1105,9 @@ def apply_wall(read_only_paths, keep_descriptors=None, allow_list=None) -> None:
         _load_seccomp_filter(libc, arch, abi, allow["rows"])
         _STATE["allow_list"] = {key: allow[key] for key in ("file", "shipped", "added", "removed")}
         _STATE["allow_list"]["rows"] = len(allow["rows"])
+        _STATE["allow_in_force"] = {"source": "beside_the_wall" if allow_list is None else "given_by_path",
+                                    "shipped": allow["shipped"], "digest": allow["digest"], "rows": len(allow["rows"]),
+                                    "rows_not_shipped": list(allow["added"]), "rows_taken_out": list(allow["removed"])}
         _alone("threads_after_filter", _threads_now)
         # what the kernel's own lists say after the wall (None for a list that could not be read: never proven)
         _STATE["seen_at_wall"] = _read_kernel_lists(lists)
@@ -1880,6 +1893,12 @@ def why_not_proven(record: dict) -> list:
             lines.append(WORDS["maps_unknown"])
         else:
             lines.extend(WORDS["map_open"] for _ in maps)
+    allow = record.get("allow_list")
+    if isinstance(allow, dict) and isinstance(allow.get("rows_not_shipped"), list) and allow["rows_not_shipped"]:
+        calls = ", ".join(str(name)[:64] for name in allow["rows_not_shipped"])
+        lines.append(WORDS["list_widened"].format(calls=calls))
+        if record.get("proven_over") == "widened_list":
+            lines.append(WORDS["proven_with_widened_list"].format(calls=calls))
     for check in RECORD_CHECKS:
         if record.get(check) is not True:
             lines.append(WORDS["not_refused"].format(what=WORDS[check]))
@@ -1923,8 +1942,11 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
     folder it is never True. ``landlock_scopes`` names the Landlock scopes ``apply_wall`` put in force (none
     below ABI 6). The record is a self-check, not a proof against a hostile process: it means something only
     when it is made after ``apply_wall`` and before any plugin code is loaded, and when its reader takes it
-    only from frames sent before the load. Refuses ``wall_system_unsupported`` where the two system calls
-    are absent, without trying.
+    only from frames sent before the load. ``allow_list`` names the allow list the filter
+    let through (None where no filter was loaded here); ``proven`` needs it to hold no row that is not in the shipped
+    list, and ``proven_over`` says what was shown: ``shipped_list`` (proven), ``widened_list`` (every part held, with
+    a list wider than the shipped one: not proven) or None. Refuses ``wall_system_unsupported`` where the two system
+    calls are absent, without trying.
     """
     libc = _libc()
     canary = os.fspath(canary_path)
@@ -1936,6 +1958,7 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
     kept, not_closed = _kept_and_not_closed()
     held_objects, held_not_tried = _held_objects()
     maps = seen["maps"] if seen else _maps_open_for_write()
+    allow = _STATE.get("allow_in_force")  # None where apply_wall loaded no filter in this process
     record = {
         "threads": threads,
         "descriptors_open_for_write": held,
@@ -1956,11 +1979,13 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
         "writes_not_tried": dict(WRITES_NOT_TRIED),
         "held_objects": held_objects,
         "held_objects_not_tried": held_not_tried,
+        "allow_list": None if allow is None else dict(allow, rows_not_shipped=list(allow["rows_not_shipped"]),
+                                                      rows_taken_out=list(allow["rows_taken_out"])),
         "landlock_abi": _landlock_abi(libc),
         "landlock_scopes": list(_STATE["scopes"]),
         "arch": platform.machine() or "unknown",
     }
-    record["proven"] = (seen_by == "kernel_list_after_wall" and unaccounted == []
+    held_all = (seen_by == "kernel_list_after_wall" and unaccounted == []
                         and isinstance(kept, list) and not_closed == []
                         and all(held_objects[kind] in _HELD_HELD
                                 or (held_objects[kind] == "not_tried" and held_not_tried.get(kind))
@@ -1969,6 +1994,11 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
                         and all(record[name] for name in RECORD_CHECKS) and record["landlock_abi"] >= _MIN_LANDLOCK_ABI
                         and all(record["writes"][kind] in _WRITE_REFUSED for kind in WRITE_KINDS)
                         and record["arch"] in _NR and _STATE["failed"] is None)
+    # proven speaks for the shipped list only: a row not in it keeps the record from proven, and the record says
+    # whether every test held with the list in force all the same
+    record["proven"] = held_all and allow is not None and allow["rows_not_shipped"] == []
+    record["proven_over"] = ("shipped_list" if record["proven"]
+                             else "widened_list" if held_all and allow is not None else None)
     return record
 
 

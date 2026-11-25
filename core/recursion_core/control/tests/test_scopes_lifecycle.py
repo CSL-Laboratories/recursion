@@ -23,6 +23,9 @@ from recursion_core.control.tests.test_scopes_seams import NEEDS_POSIX, Registry
 
 # A test figure, not a setting: how many start/stop rounds the stress test races.
 RACE_ROUNDS = 3000
+# A test figure: every HELD_EVERY-th round of the race holds its start inside the registry read until the
+# round's stop has returned, so the order is tested on every interpreter, not only where threads run at once.
+HELD_EVERY = 4
 
 PLUGIN = H.Principal("plugin", "plugin.alpha")
 SET_ASIDE = ("control.scopes: a start that began before the last stop was not applied; "
@@ -118,10 +121,11 @@ class LateStartTest(unittest.TestCase):
         self.assertFalse(self.service.ready)
 
 
-def race(rounds: int) -> dict:
+def race(rounds: int, held_every: int = HELD_EVERY) -> dict:
     """A starter and a stopper race for ``rounds`` rounds, then a final stop. A fault is a round whose start
     entered its reads before the stop began and which leaves the service ready or the store attached once
-    both have returned. Returns the counts."""
+    both have returned. Every ``held_every``-th round the start is held inside its registry read until that
+    round's stop has returned (0: no round is held). Returns the counts."""
 
     base = state_with_plugin("scopes-race-")
     try:
@@ -136,9 +140,17 @@ def race(rounds: int) -> dict:
                 return ticks[0]
 
         marks: dict[str, int] = {}
-        context = _Context(state, Registry(), mark=lambda: marks.__setitem__("read", tick()))
+        held = {"on": False, "entered": threading.Event(), "release": threading.Event()}
+
+        def mark() -> None:
+            marks["read"] = tick()
+            if held["on"]:
+                held["entered"].set()
+                held["release"].wait(30)
+
+        context = _Context(state, Registry(), mark=mark)
         gate = threading.Barrier(3, timeout=60)
-        stats = {"rounds": rounds, "faults": 0, "began_before_stop": 0, "applied": 0}
+        stats = {"rounds": rounds, "faults": 0, "began_before_stop": 0, "applied": 0, "held": 0}
         failures: list[BaseException] = []
 
         def starter() -> None:
@@ -155,8 +167,11 @@ def race(rounds: int) -> dict:
             try:
                 for _ in range(rounds):
                     gate.wait()
+                    if held["on"]:
+                        held["entered"].wait(30)
                     marks["stop"] = tick()
                     service.stop(context)
+                    held["release"].set()
                     gate.wait()
             except BaseException as exc:  # noqa: BLE001 - reported by the main thread
                 failures.append(exc)
@@ -167,8 +182,12 @@ def race(rounds: int) -> dict:
         for thread in threads:
             thread.start()
         try:
-            for _ in range(rounds):
+            for index in range(rounds):
                 marks.clear()
+                held["on"] = held_every > 0 and index % held_every == 0
+                stats["held"] += held["on"]
+                held["entered"].clear()
+                held["release"].clear()
                 gate.wait()
                 gate.wait()
                 attached = service.ready or authorizer.held(PLUGIN) != frozenset()

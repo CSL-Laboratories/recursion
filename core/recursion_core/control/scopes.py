@@ -125,7 +125,17 @@ class ScopesService:
     attaches and sets ``ready`` only if no ``stop`` came after its beginning; otherwise it attaches nothing,
     leaves ``ready`` as it is and logs that the start was set aside. ``stop`` detaches and clears ``ready``
     in one step of that order. So once ``stop`` has returned, nothing of a start that began before it can
-    attach, open or use the credential store through the authorizer.
+    attach or use the credential store through the authorizer.
+
+    Just before it opens the store, ``start`` looks at the order once more: a start that a stop has already
+    overtaken by then never opens it (no folder made, no file lock, no sweep). That narrows the window and is
+    not a barrier: a start set aside may have opened the store before it learned of the stop.
+
+    The order holds nothing but the order. Inside it only the count of stops, ``ready`` and the decision are
+    read and written, and the authorizer's ``attach`` is called (it takes only the authorizer's own lock and
+    calls nothing outside it). Nothing is logged, formatted or called back while it is held: a start set
+    aside decides so inside the order and logs its warning after leaving it, so how long ``stop`` waits never
+    depends on a log handler, and a handler may itself call ``stop``.
     """
 
     name = SERVICE_NAME
@@ -145,7 +155,11 @@ class ScopesService:
             if state_dir is None:
                 log.error("control.scopes: no state directory; no credential is honoured")
             else:
-                store = CredentialStore(os.path.join(os.fspath(state_dir), *CREDENTIALS_PATH))
+                path = os.path.join(os.fspath(state_dir), *CREDENTIALS_PATH)
+                with self._order:
+                    overtaken = self._stops != began_after   # a stop already came: open nothing
+                if not overtaken:
+                    store = CredentialStore(path)
         except CredentialStoreError as exc:
             log.error("control.scopes: the credential store cannot be used (%s); no credential is honoured", exc)
         except Exception as exc:  # noqa: BLE001 - a state_dir that is not a path, or cannot be read, honours nothing
@@ -159,18 +173,22 @@ class ScopesService:
             log.error("control.scopes: the control registry cannot be read (%s); no run record is read",
                       type(exc).__name__)
             reader = None
-        with self._order:
-            if self._stops != began_after:
+        run_record = reader if callable(reader) else None
+        with self._order:   # only the order's own state and attach: nothing logged or called back here
+            set_aside = self._stops != began_after
+            if set_aside:
                 # A stop came after this start began: what it read belongs to a lifetime that has ended.
-                if self.ready:
-                    log.warning("control.scopes: a start that began before the last stop was not applied; "
-                                "a later start stands")
-                else:
-                    log.warning("control.scopes: a start that began before the last stop was not applied; "
-                                "the service stays stopped")
-                return
-            self._authorizer.attach(credentials=store, run_record=reader if callable(reader) else None)
-            self.ready = True
+                later_stands = self.ready
+            else:
+                self._authorizer.attach(credentials=store, run_record=run_record)
+                self.ready = True
+        if set_aside:   # said after the order is left, so a log handler never holds a stop
+            if later_stands:
+                log.warning("control.scopes: a start that began before the last stop was not applied; "
+                            "a later start stands")
+            else:
+                log.warning("control.scopes: a start that began before the last stop was not applied; "
+                            "the service stays stopped")
 
     def stop(self, context) -> None:
         with self._order:

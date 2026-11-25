@@ -15,14 +15,24 @@ never a bare ``OSError``.
 The file holds, for each revoked device, its id and the wall-clock time of its revocation, and for each
 connection a revocation named: its id, its device and the wall-clock time the door's disconnect of it came
 (``None``: not yet). A connection id is kept as what the door gave: a ``str``, an ``int`` or a tuple of them.
+
+A missing file is an empty record only while no revocation was ever written in that folder. The first write
+whose record holds a revoked device then writes a mark beside the file, ``.revocations.json.recorded``, all or
+nothing (``replace_file``), under the same lock; a folder without the mark whose record holds a revocation
+(written before the mark existed, or stopped between the two writes) gets it at the next write, which every
+start makes. While the mark is there, a missing file is refused like an unreadable one, so
+deleting the file never lets a revoked phone pair again. ``forget-every-revocation`` (``main``) empties the
+record and removes the mark, the one knowing way to start a new record.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
 import stat
+import sys
 from collections.abc import Hashable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -36,6 +46,10 @@ REVOCATIONS_VERSION = 1                 # a figure of the file's format, not a s
 # first value is named: it becomes the row remote.device.revocations_lock_timeout_s of the person's settings
 # file when that file is in this tree, an argument of FileRevocationStore still winning.
 REVOCATIONS_LOCK_TIMEOUT_S: float = 10.0
+REVOCATIONS_MARK = f".{REVOCATIONS_FILE}.recorded"   # beside the file: revocations were written in it
+MARK_TEXT = (f"Revocations were recorded in {REVOCATIONS_FILE} of this folder. While this file is here, a missing "
+             f"{REVOCATIONS_FILE} refuses every phone.\n").encode("utf-8")
+COMMAND_FORGET = "forget-every-revocation"
 
 
 class RevocationStoreError(Exception):
@@ -122,19 +136,43 @@ class FileRevocationStore:
                                        f"used ({exc}): it must be a folder of the daemon's user, mode 0700") from None
         self.path = os.path.join(folder, REVOCATIONS_FILE)
         self._lock_path = os.path.join(folder, f".{REVOCATIONS_FILE}.lock")
+        self._mark_path = os.path.join(folder, REVOCATIONS_MARK)
+        self._state_dir = state_dir
         self._timeout = float(lock_timeout_s)
         self._uid = os.geteuid()
 
     # -- reading ------------------------------------------------------------------------------------
     def _refused(self, why: str) -> RevocationStoreError:
         return RevocationStoreError(f"{self.path}: {why}; the file must be readable by the daemon's user, or be "
-                                    f"restored from a copy")
+                                    f"restored from a copy (deleting it lets no phone in: a missing record is "
+                                    f"refused too)")
+
+    def _marked(self) -> bool:
+        """Whether the mark is there. Anything in its place that cannot be looked at counts as there."""
+        try:
+            os.lstat(self._mark_path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    def _missing(self) -> RevocationStoreError:
+        command = f"python -m recursion_core.remote.revocation_store --state-dir {self._state_dir} {COMMAND_FORGET}"
+        return RevocationStoreError(
+            f"{self.path} is missing, but revocations were recorded in it ({self._mark_path} says so). Put the "
+            f"file back from a copy; or, to start a new record knowingly, stop the daemon, run `{command}` (it "
+            f"empties the record, so every phone revoked before may pair again), then remove every paired phone "
+            f"and pair each one anew")
 
     def _read(self) -> dict:
-        """The file's document, checked. A missing file is an empty record (the first start)."""
+        """The file's document, checked. A missing file is an empty record only when no revocation was ever
+        written here (no mark); with the mark it is refused."""
         try:
             fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
         except FileNotFoundError:
+            if self._marked():
+                raise self._missing() from None
             return {"version": REVOCATIONS_VERSION, "boot": None, "devices": {}, "connections": []}
         except OSError as exc:
             raise self._refused(f"it cannot be opened ({type(exc).__name__})") from None
@@ -202,6 +240,10 @@ class FileRevocationStore:
                 doc["connections"] = list(kept.values())
                 data = json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
                 replace_file(self.path, data)
+                if doc["devices"] and not self._marked():
+                    # After the record, so that a write of it is never undone by the mark's. A stop between
+                    # the two leaves a record without its mark until the next start's write adds it.
+                    replace_file(self._mark_path, MARK_TEXT)
         except RevocationStoreError:
             raise
         except CredentialStoreError as exc:
@@ -219,3 +261,46 @@ class FileRevocationStore:
 
     def forget(self, conn_ids: Iterable[Hashable]) -> None:
         self._change(None, conn_ids)
+
+    def forget_every_revocation(self) -> None:
+        """Empty the record and remove the mark, whatever the file holds or whether it is there: every phone
+        revoked before may then pair again. The one knowing way to start a new record."""
+        empty = {"version": REVOCATIONS_VERSION, "boot": None, "devices": {}, "connections": []}
+        try:
+            with owner_file_lock(self._lock_path, self._uid, self._timeout):
+                replace_file(self.path, json.dumps(empty, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+                try:
+                    os.unlink(self._mark_path)
+                except FileNotFoundError:
+                    pass
+        except CredentialStoreError as exc:
+            raise RevocationStoreError(f"{self.path}: the record of revoked phones could not be emptied ({exc}); "
+                                       f"the folder must be writable by the daemon's user") from None
+        except OSError as exc:
+            raise RevocationStoreError(f"{self._mark_path}: the record is empty but the mark could not be removed "
+                                       f"({type(exc).__name__}); remove that file by hand") from None
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``python -m recursion_core.remote.revocation_store --state-dir <dir> forget-every-revocation``."""
+    parser = argparse.ArgumentParser(
+        prog="python -m recursion_core.remote.revocation_store",
+        description="The record of revoked phones. forget-every-revocation empties it, so every phone revoked "
+                    "before may pair again: run it with the daemon stopped, then remove every paired phone and pair "
+                    "each one anew.")
+    parser.add_argument("--state-dir", required=True, help="the daemon's state folder")
+    parser.add_argument("command", choices=[COMMAND_FORGET])
+    args = parser.parse_args(argv)
+    try:
+        store = FileRevocationStore(args.state_dir)
+        store.forget_every_revocation()
+    except RevocationStoreError as exc:
+        print(f"nothing was forgotten: {exc}", file=sys.stderr)
+        return 1
+    print(f"the record of revoked phones in {store.path} is now empty: every phone revoked before may pair again; "
+          f"remove every paired phone and pair each one anew")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

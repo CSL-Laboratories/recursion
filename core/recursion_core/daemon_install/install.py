@@ -15,7 +15,9 @@ registry and the stores in it (lane INSTALL's question 3).
 Before any store is made, ``install`` and ``upgrade`` read the file-system type of the folder the stores
 go in from the kernel's mount table (``filesystem_type``) and refuse 9p, overlay and network disks
 (``store_filesystem_unsupported``, ``check_store_ground``), where SQLite's write-ahead log can damage a
-database; a table that cannot be read refuses nothing and the plan says the type was not read.
+database; a table that cannot be read refuses nothing and the plan says the type was not read. The folder
+is read as the kernel resolves it, from opened folders (``store_ground``), and each store made is held to
+the folder opened when its disk was read (``store_ground_changed``).
 
 Each returns a ``Plan`` with the ``systemctl --user`` commands that apply the change. This module
 runs none of them: it starts no process, opens no socket and touches no system unit.
@@ -24,6 +26,7 @@ runs none of them: it starts no process, opens no socket and touches no system u
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import re
 import shlex
@@ -36,7 +39,7 @@ from .layout import (BREAKER_FILE, LEDGER_FILE, REVOCATION_FILE, STATE_FOLDER, S
                      check_dirs, check_private_dir, check_state_root, default_state_home, ensure_dir,
                      ensure_state_root, file_untrusted, held_regular, owned_paths, read_regular_and_stat,
                      replace_regular, still_holds, still_names, unlink_regular, write_exclusive)
-from .layout import _fsync_dir
+from .layout import _MAX_LINKS, _fsync_dir
 from .unit import MARKER, UNIT_NAME, render_unit, state_elsewhere
 
 _UNIT_MODE = 0o644
@@ -61,14 +64,28 @@ _MOUNTINFO = "/proc/self/mountinfo"
 # The values ``check_store_ground`` takes for a refused kind: refuse (the default) or go on, the risk accepted.
 _FILESYSTEM_UNSAFE = ("refuse", "accept_risk")
 # The whole detail of ``store_filesystem_unsupported``. {folder} is the folder whose type was read (the store
-# folder, or its nearest folder that is there, so the findmnt command runs as printed); {quoted} is that folder
-# quoted for a POSIX shell (``shlex.quote``), so the pasted command reads back exactly it. The XDG_STATE_HOME way is
+# folder, or its nearest folder that is there, resolved as the kernel resolves it, so the findmnt command runs
+# as printed); {quoted} is that folder quoted for a POSIX shell (``shlex.quote``), so the pasted command reads
+# back exactly it; a folder holding a control character is shown in one escaped form in both (``_shown``).
+# {link} is empty, or one sentence on a link on the way whose target is not there (``_link_words``). The XDG_STATE_HOME way is
 # for install: an upgrade whose unit names another state folder is still refused ``unit_state_elsewhere``, with
 # that refusal's own ways out.
 _STORE_GROUND = ("Recursion does not create its stores in {folder}: it is on {kind}, where SQLite's write-ahead log "
                  "can damage a database. Put a local disk or volume at {folder} (in a container: mount a volume "
                  "there) and run recursiond install again, or run it with XDG_STATE_HOME set to an absolute folder "
-                 "on a local disk. Check a folder with: findmnt -no FSTYPE -T {quoted}")
+                 "on a local disk.{link} Check a folder with: findmnt -no FSTYPE -T {quoted}")
+# The whole detail of ``store_ground_undecided``: the disk under a store folder cannot be told.
+_UNDECIDED = ("Recursion cannot tell which disk {folder} is on, so it creates no store there: {why}. Make "
+              "every folder on the way to it a folder you can open, with no loop of links, or run recursiond "
+              "install with XDG_STATE_HOME set to an absolute folder on a local disk, then run it again.")
+# The whole details of ``store_ground_changed``: a folder read was moved or replaced before, or while, the
+# stores were made.
+_CHANGED_BEFORE = ("{where} was moved or replaced after its disk was read and before the stores were made, so "
+                   "Recursion made nothing. Leave the folders on the way to it as they are while the command "
+                   "runs, and run it again.")
+_CHANGED_AFTER = ("{path} was made, but not in {where}, the folder whose disk was read ({kind}): a folder on "
+                  "the way was moved or replaced while the stores were made. Check its disk with: findmnt -no "
+                  "FSTYPE -T {quoted}; if it is not a local disk, remove {path}, then run the command again.")
 
 
 @dataclass(frozen=True)
@@ -109,28 +126,131 @@ def plan_commands(action: str) -> tuple[tuple[str, ...], ...]:
     raise InstallRefused("action", repr(action))
 
 
-def _nearest_real(folder: str) -> str:
-    """``folder``'s nearest folder that is there (itself, when it is), with its links resolved."""
-
-    nearest = os.path.abspath(folder)
-    while not os.path.lexists(nearest) and os.path.dirname(nearest) != nearest:
-        nearest = os.path.dirname(nearest)
-    return os.path.realpath(nearest)
+# A folder of the walk is opened as a folder and never through a link at its own name: a link is read
+# (``readlink``) and followed by the walk itself, as the kernel follows it.
+_FOLDER_OPEN = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0))
 
 
-def _unescape(field: str) -> str:
-    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+@dataclass(frozen=True)
+class Ground:
+    """What ``store_ground`` read for one folder of the stores.
+
+    ``where`` is the folder's nearest folder that is there, as the kernel names the folder the walk opened for it;
+    ``below`` the names under it that are not there yet (``ensure_dir`` makes them); ``kind`` its file-system type
+    (None: the mount table was not read); ``link`` and ``target`` a link on the way whose target is not there, and
+    that target ("" when none); ``device`` and ``inode`` the opened folder's, which the stores made are held to.
+    ``fd`` is the opened folder while the caller's ``held`` stack holds it, else -1."""
+
+    folder: str
+    where: str
+    below: tuple[str, ...]
+    kind: str | None
+    link: str = ""
+    target: str = ""
+    device: int = 0
+    inode: int = 0
+    fd: int = -1
 
 
-def filesystem_type(folder: str) -> str | None:
-    """The file-system type of ``folder`` as the kernel's mount table (``/proc/self/mountinfo``) gives it, or
-    None when the table cannot be read or names no mount for it.
+def _undecided(folder: str, why: str) -> InstallRefused:
+    """``store_ground_undecided``: the disk under ``folder`` cannot be told, so nothing is made on it."""
 
-    The folder's nearest folder that is there is resolved (its links followed, as the kernel's table names
-    real paths), and the LONGEST mount point that holds it decides; of two equal ones, the later line (a
-    mount over a mount). Standard library only; nothing is written."""
+    return InstallRefused("store_ground_undecided", _UNDECIDED.format(folder=_shown(folder), why=why))
 
-    real = _nearest_real(folder)
+
+def _walk(folder: str) -> tuple[int, str, tuple[str, ...], str, str]:
+    """Open ``folder``'s nearest folder that is there, resolved as the kernel resolves it, from opened folders.
+
+    From ``/``, one name at a time, each opened relative to the folder opened before it (``dir_fd``): a link is
+    read and its target walked in its place (from ``/`` when the target is absolute), at most ``_MAX_LINKS``
+    links, the kernel's own limit; ``..`` goes up from the folder the walk has reached, never from the text before
+    it, so ``<link>/..`` is the parent of where the link leads. The first name that is not there ends the walk:
+    the names from it on are read as the folders ``ensure_dir`` makes read them (below a folder that is not there
+    no link can stand), and a ``..`` among them walks on from the folder reached. Returns the opened folder (the
+    caller closes it), its path as the walk reached it, the names below it, and the link whose target was not
+    there with that target ("" and "" when none)."""
+
+    if type(folder) is not str or not folder.startswith("/") or "\0" in folder:
+        raise InstallRefused("store_ground_undecided", f"a store folder is an absolute path, not {folder!r}")
+    names = [(name, "") for name in folder.split("/") if name]
+    targets: dict[str, str] = {}
+    links = 0
+    fd, path = os.open("/", _FOLDER_OPEN), "/"
+    try:
+        while names:
+            name, via = names.pop(0)
+            if name == ".":
+                continue
+            if name == "..":
+                if path != "/":
+                    up = os.open("..", _FOLDER_OPEN, dir_fd=fd)
+                    os.close(fd)
+                    fd, path = up, os.path.dirname(path)
+                continue
+            try:
+                below = os.open(name, _FOLDER_OPEN, dir_fd=fd)
+            except FileNotFoundError:
+                rest = [name] + [later for later, _ in names if later != "."]
+                if ".." in rest:
+                    names = [(part, via) for part in os.path.normpath("/".join(rest)).split("/")]
+                    continue
+                return fd, path, tuple(rest), via, targets.get(via, "")
+            except OSError as exc:
+                here = os.path.join(path, name)
+                if exc.errno not in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+                    raise _undecided(folder, f"{_shown(here)} cannot be opened ({errno.errorcode.get(exc.errno, exc.errno)})") from None
+                try:
+                    target = os.readlink(name, dir_fd=fd)
+                except OSError:
+                    raise _undecided(folder, f"{_shown(here)} is not a folder") from None
+                links += 1
+                if links > _MAX_LINKS:
+                    raise _undecided(folder, f"more than {_MAX_LINKS} links on the way") from None
+                targets[here] = target
+                if target.startswith("/"):
+                    root = os.open("/", _FOLDER_OPEN)
+                    os.close(fd)
+                    fd, path = root, "/"
+                names[:0] = [(part, here) for part in target.split("/") if part]
+                continue
+            os.close(fd)
+            fd, path = below, os.path.join(path, name)
+        return fd, path, (), "", ""
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _kernel_name(fd: int, path: str, folder: str) -> str:
+    """The path the kernel gives the opened folder (``/proc/self/fd``), else the walk's own; a folder removed
+    since it was opened is ``store_ground_undecided``."""
+
+    try:
+        name = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        return path
+    if name.endswith(" (deleted)"):
+        raise _undecided(folder, f"{_shown(path)} was removed while its disk was read")
+    return name if name.startswith("/") else path
+
+
+def _point(field: str) -> str | None:
+    """A mount point of the table, normalised once: unescaped, a run of slashes read as one, ``.`` and a trailing
+    slash dropped, ``..`` taken back, so a point of only slashes is ``/``. None for an empty point or one that is
+    not absolute: it holds no folder. The kernel writes the plain form; only a hand-made table writes others."""
+
+    point = _unescape(field)
+    if not point.startswith("/"):
+        return None
+    return os.path.normpath("/" + point.lstrip("/"))
+
+
+def _mount_type(where: str) -> str | None:
+    """The type of the LONGEST normalised mount point that holds ``where`` (of two equal ones the later line: a
+    mount over a mount), or None when the table cannot be read or names no mount for it. Only ``store_ground``
+    calls this: ``where`` is always the kernel's name of a folder it opened."""
+
     try:
         with open(_MOUNTINFO, encoding="utf-8", errors="surrogateescape") as table:
             lines = table.read().splitlines()
@@ -141,43 +261,205 @@ def filesystem_type(folder: str) -> str | None:
         fields = line.split(" ")
         try:
             dash = fields.index("-", 6)
-            point, fstype = _unescape(fields[4]), fields[dash + 1]
+            point, fstype = _point(fields[4]), fields[dash + 1]
         except (ValueError, IndexError):
             continue
-        holds = point == "/" or real == point or real.startswith(point.rstrip("/") + "/")
+        if point is None:
+            continue
+        holds = point == "/" or where == point or where.startswith(point + "/")
         if holds and len(point) >= best:
             best, kind = len(point), fstype
     return kind
 
 
-def check_store_ground(folders, filesystem_unsafe: str = "refuse") -> tuple[str, ...]:
-    """Refuse to make the stores on a refused kind of disk (``REFUSED_FILESYSTEMS``), before anything is made.
+def store_ground(folder: str, held: contextlib.ExitStack | None = None) -> Ground:
+    """THE ONE READING of the disk a store folder is on: every caller in the installer goes through it.
 
-    For each folder: its type is read (``filesystem_type``); a refused kind is ``store_filesystem_unsupported``,
-    the detail naming the folder, the kind and the ways out, unless ``filesystem_unsafe`` is ``accept_risk``:
-    then the step goes on and one line names the folder, the kind and that the risk was accepted. A type that
-    cannot be read refuses nothing: one line says it was not read. Returns those lines."""
+    The folder is walked as the kernel resolves it, from opened folders (``_walk``: links first, then ``..``),
+    to its nearest folder that is there; that folder is opened, and the type is read for the name the kernel
+    gives the opened folder, never for the text written. So every spelling of one place (a trailing or doubled
+    slash, ``.``, ``..`` after a link, a link of the person's own) gives one answer. With ``held``, the opened
+    folder stays open in it (``Ground.fd``) so the stores made can be held to it (``_still_on_ground``,
+    ``_made_on_ground``); without, it is closed before the answer. What cannot be told (a loop of links, a
+    folder on the way that cannot be searched, a name that is not a folder) is ``store_ground_undecided``."""
+
+    fd, path, below, link, target = _walk(folder)
+    try:
+        info = os.fstat(fd)
+        where = _kernel_name(fd, path, folder)
+        ground = Ground(folder, where, below, _mount_type(where), link, target, info.st_dev, info.st_ino,
+                        fd if held is not None else -1)
+    except BaseException:
+        os.close(fd)
+        raise
+    if held is None:
+        os.close(fd)
+    else:
+        held.callback(os.close, fd)
+    return ground
+
+
+def _unescape(field: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _needs_escape(text: str) -> bool:
+    return any(ord(c) < 32 or ord(c) == 127 or 0xDC80 <= ord(c) <= 0xDCFF for c in text)
+
+
+def _escaped(text: str) -> str:
+    """``text`` in a shell's ``$'...'`` form: a control character or an undecodable byte as an escape."""
+
+    out = []
+    for c in text:
+        code = ord(c)
+        if c in "\\'":
+            out.append("\\" + c)
+        elif c == "\n":
+            out.append("\\n")
+        elif c == "\t":
+            out.append("\\t")
+        elif code < 32 or code == 127:
+            out.append(f"\\x{code:02x}")
+        elif 0xDC80 <= code <= 0xDCFF:
+            out.append(f"\\x{code - 0xDC00:02x}")
+        else:
+            out.append(c)
+    return "$'" + "".join(out) + "'"
+
+
+def _shown(path: str) -> str:
+    """A folder as the words name it: as it is, or, when it holds a control character (a newline, a tab) or a
+    byte that is not text, in one escaped form (``_escaped``), the same in the sentence and in the command, so the
+    words stay one line and name the folder exactly."""
+
+    return _escaped(path) if _needs_escape(path) else path
+
+
+def _quoted(path: str) -> str:
+    """The folder as the findmnt command takes it: ``shlex.quote``, or the escaped form ``_shown`` uses."""
+
+    return _escaped(path) if _needs_escape(path) else shlex.quote(path)
+
+
+def _link_words(ground: Ground) -> str:
+    if not ground.link:
+        return ""
+    return (f" {_shown(ground.link)} is a link to {_shown(ground.target)}, which is not there: what is made through "
+            f"it would be made in {_shown(ground.where)}, so that folder's disk was read.")
+
+
+def filesystem_type(folder: str) -> str | None:
+    """The file-system type of ``folder`` as the kernel's mount table (``/proc/self/mountinfo``) gives it, or
+    None when the table cannot be read or names no mount for it: ``store_ground(folder).kind``, read for the
+    nearest folder of it that is there, resolved as the kernel resolves it. Standard library only; nothing is
+    written."""
+
+    return store_ground(folder).kind
+
+
+def _judge(folders, filesystem_unsafe: str = "refuse",
+           held: contextlib.ExitStack | None = None) -> tuple[tuple[str, ...], tuple[Ground, ...]]:
+    """``check_store_ground``, and the grounds read (each through ``store_ground``, held open in ``held``)."""
 
     if filesystem_unsafe not in _FILESYSTEM_UNSAFE:
         raise InstallRefused("filesystem_unsafe", f"filesystem_unsafe is {filesystem_unsafe!r}, not refuse or accept_risk")
-    lines = []
+    lines, grounds, seen = [], [], set()
     for folder in dict.fromkeys(folders):
-        where = _nearest_real(folder)
-        kind = filesystem_type(where)
-        if kind is None:
-            lines.append(f"the file-system type of {where} was not read")
-        elif kind in REFUSED_FILESYSTEMS:
+        ground = store_ground(folder, held)
+        grounds.append(ground)
+        if (ground.device, ground.inode, ground.below) in seen:
+            continue  # the same place written another way: one answer, said once
+        seen.add((ground.device, ground.inode, ground.below))
+        shown = _shown(ground.where)
+        if ground.kind is None:
+            lines.append(f"the file-system type of {shown} was not read{_link_words(ground)}")
+        elif ground.kind in REFUSED_FILESYSTEMS:
             if filesystem_unsafe != "accept_risk":
-                detail = _STORE_GROUND.format(folder=where, kind=kind, quoted=shlex.quote(where))
+                detail = _STORE_GROUND.format(folder=shown, kind=ground.kind, quoted=_quoted(ground.where),
+                                              link=_link_words(ground))
                 raise InstallRefused("store_filesystem_unsupported", detail)
-            lines.append(f"{where} is on {kind}, where SQLite's write-ahead log can damage a database; the risk was accepted")
-    return tuple(lines)
+            lines.append(f"{shown} is on {ground.kind}, where SQLite's write-ahead log can damage a database; the risk "
+                         f"was accepted{_link_words(ground)}")
+    return tuple(lines), tuple(grounds)
+
+
+def check_store_ground(folders, filesystem_unsafe: str = "refuse") -> tuple[str, ...]:
+    """Refuse to make the stores on a refused kind of disk (``REFUSED_FILESYSTEMS``), before anything is made.
+
+    For each folder: its ground is read (``store_ground``: the nearest folder that is there, resolved as the kernel
+    resolves it, and its type); a refused kind is ``store_filesystem_unsupported``, the detail naming the folder
+    read, the kind and the ways out (and a link on the way whose target is not there), unless
+    ``filesystem_unsafe`` is ``accept_risk``: then the step goes on and one line names the folder, the kind and
+    that the risk was accepted. A type that cannot be read refuses nothing: one line says it was not read. A
+    ground that cannot be told is ``store_ground_undecided``. Returns those lines."""
+
+    return _judge(folders, filesystem_unsafe)[0]
+
+
+def _same(info: os.stat_result, ground: Ground) -> bool:
+    return (info.st_dev, info.st_ino) == (ground.device, ground.inode)
+
+
+def _still_on_ground(grounds: tuple[Ground, ...]) -> None:
+    """Before the stores are made: each folder read still names the folder opened for it (``store_ground``).
+    One moved or replaced since (a link put in its place, another folder renamed over it) is
+    ``store_ground_changed``, and nothing is made."""
+
+    for ground in grounds:
+        try:
+            same = _same(os.stat(ground.where), ground)
+        except OSError:
+            same = False
+        if not same:
+            raise InstallRefused("store_ground_changed", _CHANGED_BEFORE.format(where=_shown(ground.where)))
+
+
+def _made_on_ground(grounds: tuple[Ground, ...], made: tuple[str, ...]) -> None:
+    """After the stores are made: each store made now is in the folder opened when its disk was read.
+
+    From the opened folder (``Ground.fd``) the names below it are opened one by one, never through a link, each
+    on the opened folder's device; the store's own entry there must be the file at its path. A store made
+    elsewhere (a folder on the way moved or replaced meanwhile) is ``store_ground_changed``, naming it."""
+
+    by_folder = {ground.folder: ground for ground in grounds}
+    for path in made:
+        ground = by_folder.get(os.path.dirname(path))
+        if ground is None or ground.fd < 0:
+            continue
+        opened, fd, same = [], ground.fd, True
+        try:
+            for name in ground.below:
+                fd = os.open(name, _FOLDER_OPEN, dir_fd=fd)
+                opened.append(fd)
+                if os.fstat(fd).st_dev != ground.device:
+                    same = False
+                    break
+            if same:
+                entry = os.stat(os.path.basename(path), dir_fd=fd, follow_symlinks=False)
+                there = os.stat(path, follow_symlinks=False)
+                same = (entry.st_dev, entry.st_ino) == (there.st_dev, there.st_ino) and entry.st_dev == ground.device
+        except OSError:
+            same = False
+        finally:
+            for each in opened:
+                os.close(each)
+        if not same:
+            raise InstallRefused("store_ground_changed", _CHANGED_AFTER.format(
+                path=_shown(path), where=_shown(ground.where), kind=ground.kind or "a type that was not read",
+                quoted=_quoted(os.path.dirname(path))))
 
 
 def _store_folders(paths: Owned) -> tuple[str, ...]:
     """The folders of every store the step makes: the breaker and revocation stores' and the ledger's."""
 
     return (os.path.dirname(paths.breaker_store), os.path.dirname(paths.revocation_store), os.path.dirname(paths.ledger))
+
+
+def _made_now(made: tuple[tuple[str, str, bool], ...], ledger: tuple[str, bool, str]) -> tuple[str, ...]:
+    """The paths of the stores made by this step: ``ensure_stores``' made now, and the ledger when it was made."""
+
+    return tuple(path for _, path, created in made if created) + ((ledger[0],) if ledger[1] else ())
 
 
 def ensure_stores(paths: Owned) -> tuple[tuple[str, str, bool], ...]:
@@ -594,10 +876,13 @@ def install(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
                 raise InstallRefused("unit_untrusted", f"{why}; `recursiond upgrade` writes it again, ours and 0644")
         check_state_root(paths)  # a chosen place: before anything is made
         check_private_dir(paths.state_root, paths.homes)  # before anything is made
-        ground = check_store_ground(_store_folders(paths))  # before anything is made or opened
+        # before anything is made or opened; each folder read stays open until the answer (``store_ground``)
+        ground, grounds = _judge(_store_folders(paths), held=held)
         found = _found(paths, anchor_public_key, make_anchor)  # before anything is made
+        _still_on_ground(grounds)  # the folders read still name the folders opened: nothing swapped since
         made = ensure_stores(paths)  # first: a unit is never left naming a daemon whose stores are missing
         ledger, anchor = _anchor_and_ledger(paths, anchor_public_key, found, make_anchor, on_anchor_made)
+        _made_on_ground(grounds, _made_now(made, ledger))  # each store made now is where its disk was read
         homes = ensure_dir(paths.state_root, paths.homes, mode=_DIR_MODE)
         check_private_dir(paths.state_root, paths.homes, required=True)  # as made, or as another caller made it
         if present:
@@ -632,7 +917,7 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
     check_dirs(paths.home, paths.unit_dir)
     if not os.path.lexists(paths.unit):
         raise InstallRefused("unit_missing", f"no unit at {paths.unit}; `recursiond install` writes it")
-    with held_regular(paths.unit) as read:  # held open until the answer: its inode is not reused
+    with held_regular(paths.unit) as read, contextlib.ExitStack() as held:  # held open until the answer
         data, info = read
         current = data == unit and not file_untrusted(paths.unit, info)
         why = None if data == unit else state_elsewhere(data, paths.home, paths.state_home)
@@ -640,10 +925,13 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
             raise InstallRefused("unit_state_elsewhere", _elsewhere_detail(paths, data, why))
         check_state_root(paths)  # a chosen place: before anything is made
         check_private_dir(paths.state_root, paths.homes)  # before anything is made
-        ground = check_store_ground(_store_folders(paths))  # before anything is made or opened
+        # before anything is made or opened; each folder read stays open until the answer (``store_ground``)
+        ground, grounds = _judge(_store_folders(paths), held=held)
         found = _found(paths, anchor_public_key, make_anchor)  # before anything is made
+        _still_on_ground(grounds)  # the folders read still name the folders opened: nothing swapped since
         made = ensure_stores(paths)
         ledger, anchor = _anchor_and_ledger(paths, anchor_public_key, found, make_anchor, on_anchor_made)
+        _made_on_ground(grounds, _made_now(made, ledger))  # each store made now is where its disk was read
         homes = ensure_dir(paths.state_root, paths.homes, mode=_DIR_MODE)
         check_private_dir(paths.state_root, paths.homes, required=True)  # as made, or as another caller made it
         if current:

@@ -123,8 +123,12 @@ opens no socket and touches no system unit.
 
 Before any folder, store, custody root or unit is made, `install` and `upgrade` read the file-system type
 of the folder each store goes in (the breaker store's, the revocation store's and the ledger's, under the
-state folder the one resolver names, chosen or default) from `/proc/self/mountinfo`: the longest mount
-point that holds the folder's nearest folder that is there decides. On `9p`, `v9fs`, `drvfs`, `overlay`,
+state folder the one resolver names, chosen or default) from `/proc/self/mountinfo`, through one function,
+`store_ground`: the folder is walked as the kernel resolves it, from opened folders (a link is followed
+before a `..` after it is taken), to its nearest folder that is there, and the type is read for the name
+the kernel gives that opened folder, never for the text written. The mount points are normalised once (an
+empty point holds nothing, a point of only slashes is `/`, a trailing or doubled slash and a `.` are
+dropped) and the longest that holds the folder decides, so every spelling of one place gives one answer. On `9p`, `v9fs`, `drvfs`, `overlay`,
 `nfs`, `nfs4`, `cifs` or `smb3` (`install.REFUSED_FILESYSTEMS`, append-only) they refuse
 `store_filesystem_unsupported` and make nothing, with this one line, `<folder>` the folder whose type was
 read and `<kind>` the type: "Recursion does not create its stores in <folder>: it is on <kind>, where
@@ -134,7 +138,14 @@ folder on a local disk. Check a folder with: findmnt -no FSTYPE -T <folder>", wh
 is quoted for a POSIX shell (`shlex.quote`), so the pasted line checks exactly that folder. The XDG_STATE_HOME way is
 for `install`: an `upgrade` whose unit names another state folder is still refused `unit_state_elsewhere`,
 with that refusal's own ways out. Where the table cannot be read (no `/proc/self/mountinfo`), nothing is
-refused and the plan's `filesystem` lines say the type was not read. A person's setting to accept the
+refused and the plan's `filesystem` lines say the type was not read. A link on the way whose target is not
+there is read where its target would be made, and the line adds one sentence saying so; a folder whose name
+holds a control character is shown in one escaped form (`$'...'`), the same in the sentence and in the
+command. A folder whose disk cannot be told (a loop of links, a folder on the way that cannot be opened) is
+refused `store_ground_undecided`, naming it and the way out. The folders opened stay open until the
+answer: one moved or replaced before the stores are made is refused `store_ground_changed` and nothing is
+made; a store made elsewhere while the stores were made is refused `store_ground_changed`, naming the
+store, how to check its disk and to remove it. A person's setting to accept the
 risk is not read yet; `check_store_ground` takes it as an argument (`accept_risk`), and no caller passes
 it.
 

@@ -6,8 +6,10 @@ it); the machine's own table is never read, and no real mount is made.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import os
+import random
 import re
 import shlex
 import shutil
@@ -15,6 +17,8 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -295,6 +299,297 @@ class MountTableStandInTests(unittest.TestCase):
         for name in CHILD_PINNED:
             source = importlib.import_module(name).__loader__.get_source(name)
             self.assertIn("._MOUNTINFO = sys.argv[2]", source)
+
+
+def _bash_reads(argument):
+    """What bash reads ``argument`` as (``printf`` in place of findmnt), or None where bash is not there."""
+
+    bash = shutil.which("bash")
+    if not bash:
+        return None
+    done = subprocess.run([bash, "-c", "printf '%s\\n' " + argument], capture_output=True, text=True, timeout=60,
+                          env={"PATH": os.environ.get("PATH", os.defpath)})
+    return done.stdout[:-1] if done.returncode == 0 else None
+
+
+# The rounds of the swap run: a test's own count, read from the environment so a long run is taken in pieces.
+SWAP_ROUNDS = int(os.environ.get("RECURSION_GROUND_SWAP_ROUNDS", "20"))
+
+
+@unittest.skipUnless(LINUX, "the installer is Linux-only")
+class GroundAsTheKernelResolvesItTests(unittest.TestCase):
+    """The disk read is the disk the stores land on: the path walked as the kernel walks it, from opened folders,
+    and the stores made held to the folder opened when its disk was read."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="store-ground-kernel-")
+        self.addCleanup(tmp.cleanup)
+        self.case = os.path.realpath(tmp.name)
+        os.chmod(self.case, 0o700)
+        self.home = os.path.join(self.case, "home")
+        os.mkdir(self.home, 0o700)
+        self.table = os.path.join(self.case, "mountinfo")
+        self.mounts([("/", "ext4")])
+        patcher = mock.patch.object(INSTALL, "_MOUNTINFO", self.table, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def mounts(self, rows):
+        lines = [f"{20 + n} 1 0:{20 + n} / {_escape(point)} rw,relatime shared:{n} - {kind} src{n} rw"
+                 for n, (point, kind) in enumerate(rows)]
+        with open(self.table, "w", encoding="utf-8") as out:
+            out.write("\n".join(lines) + "\n")
+
+    def refused(self, kind, call, *args, **kwargs):
+        with self.assertRaises(InstallRefused) as caught:
+            call(*args, **kwargs)
+        self.assertEqual(caught.exception.kind, kind, caught.exception.detail)
+        return caught.exception.detail
+
+    def folder(self, *names):
+        path = os.path.join(self.case, *names)
+        os.makedirs(path, 0o700)
+        return path
+
+    def test_dotdot_after_a_link_is_taken_from_where_the_link_leads(self):
+        self.folder("disk", "ext4dir")
+        nfs = self.folder("disk", "nfs", "plugin-security")
+        os.symlink(os.path.join(self.case, "disk", "ext4dir"), os.path.join(self.case, "link"))
+        self.mounts([("/", "ext4"), (os.path.dirname(nfs), "nfs4")])
+        written = os.path.join(self.case, "link", "..", "nfs", "plugin-security")
+        self.assertEqual(os.path.realpath(written), nfs)  # where the kernel opens it
+        self.assertEqual(INSTALL.filesystem_type(written), "nfs4")
+        self.assertEqual(self.refused("store_filesystem_unsupported", INSTALL.check_store_ground, (written,)),
+                         _message(nfs, "nfs4"))
+
+    def test_a_dangling_link_is_read_where_its_target_would_be_made_and_the_words_say_so(self):
+        s3 = self.folder("s3")
+        os.symlink("gone/state", os.path.join(s3, "state"))
+        self.mounts([("/", "ext4"), (s3, "nfs4")])
+        detail = self.refused("store_filesystem_unsupported", INSTALL.check_store_ground, (os.path.join(s3, "state"),))
+        self.assertTrue(detail.startswith(f"Recursion does not create its stores in {s3}: it is on nfs4, "), detail)
+        self.assertIn(f"{s3}/state is a link to gone/state, which is not there: what is made through it would be "
+                      f"made in {s3}, so that folder's disk was read.", detail)
+        folder = shlex.split(detail.split(COMMAND, 1)[1])[-1]
+        self.assertEqual(folder, s3)  # the findmnt step names the folder the type was read for, which is there
+
+    def test_mount_points_are_normalised_once_before_they_are_ranked(self):
+        m = self.folder("m")
+        for written in (m + "/", m + "//", self.case + "//m", self.case + "/./m", "//" + m.lstrip("/")):
+            with self.subTest(point=written):
+                self.mounts([("/", "ext4"), (written, "nfs4")])  # a trailing slash, doubled slashes, a dot
+                self.assertEqual(INSTALL.filesystem_type(m), "nfs4")
+                self.refused("store_filesystem_unsupported", INSTALL.check_store_ground, (m,))
+        self.mounts([("//", "ext4"), ("/", "overlay")])  # only slashes is /, ranked as /: the later line decides
+        self.assertEqual(INSTALL.filesystem_type(m), "overlay")
+        with open(self.table, "w", encoding="utf-8") as out:
+            out.write("41 36 0:32 /  rw - nfs4 srv:/y rw\n")  # an empty point holds no folder
+        self.assertIsNone(INSTALL.filesystem_type(m))
+        with open(self.table, "w", encoding="utf-8") as out:
+            out.write("20 1 0:20 / / rw - ext4 src0 rw\n41 36 0:32 /  rw - nfs4 srv:/y rw\n")
+        self.assertEqual(INSTALL.filesystem_type(m), "ext4")
+
+    def test_every_spelling_of_one_place_gives_one_answer(self):
+        m = self.folder("m")
+        self.folder("x")
+        os.symlink(self.case, os.path.join(self.home, "case"))
+        self.mounts([("/", "ext4"), (m, "nfs4")])
+        spellings = (m, m + "/", m + "//", m + "/.", self.case + "//m", self.case + "/./m", m + "/../m",
+                     self.case + "/x/../m", os.path.join(self.home, "case", "m"), os.path.join(self.home, "case", "..",
+                     os.path.basename(self.case), "m"), m + "/missing/..")
+        for spelling in spellings:
+            with self.subTest(spelling=spelling):
+                ground = INSTALL.store_ground(spelling)
+                self.assertEqual((ground.where, ground.below, ground.kind), (m, (), "nfs4"))
+                self.assertEqual(self.refused("store_filesystem_unsupported", INSTALL.check_store_ground, (spelling,)),
+                                 _message(m, "nfs4"))
+        self.assertEqual(INSTALL.store_ground(m + "//new/./made").below, ("new", "made"))
+
+    def test_the_words_name_a_folder_with_a_control_character_in_one_escaped_line(self):
+        home = self.folder("st\nate")
+        self.mounts([("/", "ext4"), (home, "9p")])
+        detail = self.refused("store_filesystem_unsupported", install, Roots(home=home), EXEC)
+        self.assertNotIn("\n", detail)
+        shown = "$'" + home.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n") + "'"
+        self.assertEqual(detail.count(shown), 3)  # the sentence twice and the findmnt step: one form
+        self.assertTrue(detail.startswith(f"Recursion does not create its stores in {shown}: it is on 9p, "))
+        read = _bash_reads(detail.split(COMMAND, 1)[1][len("findmnt -no FSTYPE -T "):])
+        if read is not None:
+            self.assertEqual(read, home)
+
+    def test_a_loop_of_links_is_refused_with_words_a_person_can_act_on(self):
+        os.symlink("b", os.path.join(self.case, "a"))
+        os.symlink("a", os.path.join(self.case, "b"))
+        written = os.path.join(self.case, "a", "state")
+        detail = self.refused("store_ground_undecided", INSTALL.check_store_ground, (written,))
+        self.assertTrue(detail.startswith(f"Recursion cannot tell which disk {written} is on, so it creates no store "
+                                          f"there: more than 40 links on the way. "), detail)
+        self.assertIn("XDG_STATE_HOME set to an absolute folder on a local disk", detail)
+
+    def _swap(self, home, other):
+        aside = home + ".judged"
+        os.rename(home, aside)
+        os.symlink(other, home)
+        return aside
+
+    def _other_home(self):
+        nfs = self.folder("nfs")
+        other = self.folder("nfs", "home")
+        for names in ((".local", "state", "recursion", "plugin-security"), (".config", "systemd", "user")):
+            self.folder("nfs", "home", *names)
+        self.mounts([("/", "ext4"), (nfs, "nfs4")])
+        return nfs, other
+
+    def test_a_folder_swapped_after_its_disk_is_read_is_refused_before_anything_is_made(self):
+        nfs, other = self._other_home()
+        before = _tree(nfs)
+        real = INSTALL._found
+
+        def found_then_swapped(*args, **kwargs):
+            answer = real(*args, **kwargs)
+            self._swap(self.home, other)
+            return answer
+
+        with mock.patch.object(INSTALL, "_found", found_then_swapped):
+            detail = self.refused("store_ground_changed", install, Roots(home=self.home), EXEC)
+        self.assertEqual(detail, f"{self.home} was moved or replaced after its disk was read and before the stores "
+                                 "were made, so Recursion made nothing. Leave the folders on the way to it as they "
+                                 "are while the command runs, and run it again.")
+        self.assertEqual(_tree(nfs), before)  # nothing on the refused disk
+
+    def test_a_folder_swapped_while_a_store_is_made_is_refused_naming_the_store(self):
+        nfs, other = self._other_home()
+        real = stores.create_breaker_store
+
+        def swapped_then_made(path):
+            self._swap(self.home, other)
+            return real(path)
+
+        with mock.patch.object(stores, "create_breaker_store", swapped_then_made):
+            detail = self.refused("store_ground_changed", install, Roots(home=self.home), EXEC)
+        made = os.path.join(self.home, ".local", "state", "recursion", "plugin-security", "breaker.sqlite3")
+        self.assertTrue(os.path.isfile(os.path.join(other, ".local", "state", "recursion", "plugin-security",
+                                                    "breaker.sqlite3")))
+        self.assertTrue(detail.startswith(f"{made} was made, but not in {self.home}, the folder whose disk was read "
+                                          "(ext4): "), detail)
+        self.assertIn(f"remove {made}, then run the command again", detail)
+
+    def test_a_folder_swapped_at_any_moment_never_leaves_a_store_on_another_disk_unsaid(self):
+        """SWAP_ROUNDS installs; in each, a thread swaps the home for a link into a refused disk once, at a moment
+        drawn between the start and the end of one install's own measured time, so the swap falls before, between
+        and after the disk is read and the stores are made."""
+
+        def round_folders(name):
+            home = self.folder(name, "home")
+            nfs = self.folder(name, "nfs")
+            other = self.folder(name, "nfs", "home")
+            for names in ((".local", "state", "recursion", "plugin-security"), (".config", "systemd", "user")):
+                os.makedirs(os.path.join(other, *names), 0o700)
+            return home, nfs, other
+
+        home, nfs, other = round_folders("calibration")
+        self.mounts([("/", "ext4"), (nfs, "nfs4")])
+        started = time.perf_counter()
+        install(Roots(home=home), EXEC)
+        took = time.perf_counter() - started  # the window the swap moments are drawn from
+        tally, unsaid, other_refusal = {}, [], 0
+        for n in range(SWAP_ROUNDS):
+            home, nfs, other = round_folders(f"r{n}")
+            self.mounts([("/", "ext4"), (nfs, "nfs4")])
+            stop = threading.Event()
+            delay = random.Random(n).uniform(0, took)
+
+            def swapper():
+                if not stop.wait(delay):
+                    self._swap(home, other)
+
+            thread = threading.Thread(target=swapper)
+            thread.start()
+            try:
+                install(Roots(home=home), EXEC)
+                outcome = "made"
+            except InstallRefused as refusal:
+                outcome = refusal.kind
+            except Exception as exc:  # an error of the swap itself
+                outcome = type(exc).__name__
+            finally:
+                stop.set()
+                thread.join()
+            swapped = os.path.islink(home)
+            tally[(outcome, swapped)] = tally.get((outcome, swapped), 0) + 1
+            on_nfs = [path for path in _tree(nfs) if path.endswith(".sqlite3")]
+            if on_nfs and outcome == "made":
+                unsaid.append((n, on_nfs))
+            elif on_nfs and outcome != "store_ground_changed":
+                other_refusal += 1
+        print(f"\nswap rounds {SWAP_ROUNDS}, window {took:.4f}s: "
+              + ", ".join(f"{k}{' swapped' if s else ''} {v}" for (k, s), v in sorted(tally.items()))
+              + f"; unsaid {len(unsaid)}; a store on the refused stand-in under another refusal: {other_refusal}")
+        self.assertEqual(unsaid, [])
+
+class OneReadingOfTheGroundTests(unittest.TestCase):
+    """Every caller reads the disk through ``store_ground``; none reads the mount table or judges a path by text."""
+
+    TEXT_RESOLVERS = {"abspath", "realpath", "normpath", "lexists", "exists", "isdir"}
+    READERS = ("store_ground", "_walk", "_kernel_name", "_mount_type", "_point", "filesystem_type", "_judge",
+               "check_store_ground", "_still_on_ground", "_made_on_ground")
+
+    def _install_tree(self):
+        with open(INSTALL.__file__, encoding="utf-8") as source:
+            return ast.parse(source.read())
+
+    def _functions(self, tree):
+        return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+    def _names_in(self, node):
+        return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)} | {
+            n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+
+    def test_only_store_ground_reads_the_mount_table(self):
+        functions = self._functions(self._install_tree())
+        for name, node in functions.items():
+            names = self._names_in(node)
+            with self.subTest(function=name):
+                if "_MOUNTINFO" in names:
+                    self.assertEqual(name, "_mount_type")
+                if "_mount_type" in names or "_walk" in names or "_kernel_name" in names:
+                    self.assertEqual(name, "store_ground")
+
+    def test_no_reader_of_the_ground_resolves_a_path_by_text(self):
+        functions = self._functions(self._install_tree())
+        for name in self.READERS:
+            with self.subTest(function=name):
+                calls = {node.func.attr for node in ast.walk(functions[name]) if isinstance(node, ast.Call)
+                         and isinstance(node.func, ast.Attribute)}
+                self.assertEqual(calls & self.TEXT_RESOLVERS - ({"normpath"} if name in ("_walk", "_point") else set()),
+                                 set())
+
+    def test_install_and_upgrade_hold_the_stores_to_the_folder_read(self):
+        functions = self._functions(self._install_tree())
+        for name in ("install", "upgrade"):
+            with self.subTest(function=name):
+                calls = sorted((node.lineno, node.func.id) for node in ast.walk(functions[name])
+                               if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in (
+                                   "_judge", "_still_on_ground", "ensure_stores", "_made_on_ground",
+                                   "check_store_ground"))
+                order = [called for _, called in calls]
+                self.assertEqual(order[:4], ["_judge", "_still_on_ground", "ensure_stores", "_made_on_ground"])
+                self.assertNotIn("check_store_ground", order)
+
+    def test_no_other_module_reads_the_mount_table(self):
+        root = os.path.dirname(recursion_core.__file__)
+        found = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(name for name in dirnames if name not in ("__pycache__", "tests"))
+            for name in sorted(filenames):
+                path = os.path.join(dirpath, name)
+                if not name.endswith(".py") or os.path.samefile(path, INSTALL.__file__):
+                    continue
+                with open(path, encoding="utf-8") as source:
+                    text = source.read()
+                if "mountinfo" in text or "filesystem_type(" in text or "_mount_type(" in text:
+                    found.append(os.path.relpath(path, root))
+        self.assertEqual(found, [])
 
 
 if __name__ == "__main__":

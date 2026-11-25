@@ -782,6 +782,35 @@ class OneStepUnderTheLockTests(unittest.TestCase):
                     if watch.lock.fired():
                         self.assertFalse(answer)
 
+    def test_a_refusal_placed_at_each_step_of_the_take_never_lands_between_its_check_and_its_store(self) -> None:
+        # The network path of confirm keeps the allow inside the take. A refusal of this same
+        # use (a pending twin) is placed just before each take of the gate's lock, from the
+        # request to the return: it lands before the take's veto check (the use is refused and
+        # nothing is kept) or after the store (the use is refused and the allow stands no more),
+        # never between them, where a store would follow a veto.
+        def watched():
+            area, first_uses, watch = self._watched()
+            return area, first_uses, watch, area.gate.request(self._effect("run-1"))
+
+        area, first_uses, watch, twin = watched()
+        before = watch.lock.acquires
+        self.assertEqual(_net(area, first_uses, "run-1"), "approved by the person")
+        steps = watch.lock.acquires - before
+        self.assertGreaterEqual(steps, 3)  # the request, the person's yes, the take
+        for step in range(steps):
+            with self.subTest(step=step):
+                area, first_uses, watch, twin = watched()
+                watch.lock.arm(step, lambda: area.gate.decide(twin[0], twin[1], _OPERATOR, False))
+                with self.assertRaises(Refused) as caught:
+                    _net(area, first_uses, "run-1")
+                self.assertTrue(watch.lock.fired())
+                self.assertEqual(watch.violations, [])
+                self.assertEqual(caught.exception.code, "approval_vetoed")
+                self.assertNotIn(("demo.plugin", _NET), first_uses)
+                self.assertNotIn(_NET, first_uses)
+                self.assertEqual(decide("model", "network", _NET, first_uses=first_uses, plugin_id="demo.plugin",
+                                        run_id="run-1", connection="conn-a"), ASK)
+
 
 class _RetireAnotherAfterTake(ApprovalGate):
     """A gate that retires another approval right after a take returned: with max_retained 1

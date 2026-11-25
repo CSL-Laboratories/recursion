@@ -71,9 +71,12 @@ What is proven, and what is not:
   of 402 Python starts did not load the hook). So the whole-suite run is not a proof today; it
   names what it could not watch. It names a program that is not Python and refuses one that is not
   listed in `tools/network_audit.toml`. A program started through another program (`env`,
-  `unshare`) is judged by the program it starts, only a real interpreter is taken for Python, and a
-  Python process that does not load the hook (started with `-I`, `-S` or `-E`, or with a cleared
-  environment) is refused, except in the run-time ways of the list below. Not watched: code that
+  `unshare`) is judged by the program it starts (a split-string option of `env`, also inside a group
+  such as `-iS`, is refused), only a real interpreter is taken for Python (by its name, or by its file
+  whatever its name, looked at when it starts), a Python process that does not load the hook
+  (started with `-I`, `-S` or `-E`, or with a cleared environment) is refused, and a hooked process
+  still running when the command ends makes the run NOT PROVEN, except in the run-time ways of the
+  list below. Not watched: code that
   hides from the hook. That run is not part of the hosted gate.
 - Known ways past the proofs, not built (the rows of `tools/network_gaps.toml`, with their reasons):
   - past the scan: builtins, a frame or a function's globals reached through an object's attributes
@@ -87,11 +90,9 @@ What is proven, and what is not:
   - past both: a file the code writes that the interpreter runs at a later start (a `.pth` file, a
     `sitecustomize`); the name-service lookups of pwd and getpass; a file path that reaches a
     network by itself (an automount such as `/net` on macOS, or a Windows network path).
-  - past the whole-suite run: a launcher given a split-string option inside a group of short options
-    (`env -iS`); a copy of the interpreter under another program's name, started isolated; a Python
-    child still running when the run ends; a program row allows a name, not a file (a test's script
-    named `sleep`); a child that switches the hook off or writes its own events file; what a unit
-    started by systemd-run runs; the program row claude allows the name of a real engine program.
+  - past the whole-suite run: a program row allows a name, not a file (a test's script named
+    `sleep`); a child that switches the hook off or writes its own events file; what a unit started
+    by systemd-run runs; the program row claude allows the name of a real engine program.
 - Not proven: the engines' own traffic to the addresses you configured, and anything else an
   engine program reaches by itself; what a plugin does under a grant you gave (the plugin checks'
   proof); what the operating system does by itself (its own name lookups and services); what any

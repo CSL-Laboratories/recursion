@@ -85,27 +85,6 @@ example = "an automount such as /net on macOS, or a Windows network path"
 reason = "No rule of the scan and no audit event names it: opening a file is not a reach, and the path can be built at run time."
 
 [[gap]]
-id = "G12"
-proof = "run-time"
-words = "a launcher given a split-string option inside a group of short options"
-example = "env -iS 'bash -c \"...\" /x/sleep'"
-reason = "The audit refuses -S and --split-string only alone; in a group, or as --split-string=..., the last part of the whole command line is judged instead of the program that runs."
-
-[[gap]]
-id = "G13"
-proof = "run-time"
-words = "a copy of the interpreter under another program's name, started isolated"
-example = "the interpreter's file copied as <tmp>/sleep and started with -I"
-reason = "A program allowed by name is not looked at as a file, so the copy is not taken for Python and its -I is not seen."
-
-[[gap]]
-id = "G14"
-proof = "run-time"
-words = "a Python child still running when the run ends"
-example = "a child started in a session of its own that connects after the command has ended"
-reason = "The events are read once, when the command ends; what a child reaches later is not watched."
-
-[[gap]]
 id = "G15"
 proof = "run-time"
 words = "a program row allows a name, not a file"

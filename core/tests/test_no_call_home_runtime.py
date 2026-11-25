@@ -361,6 +361,78 @@ class SuiteHookTests(unittest.TestCase):
                       self.audit.whole_suite_note(["2 Python process(es) did not load the audit hook"]))
         self.assertIsNone(self.audit.whole_suite_note(["process 1: socket.connect to ['192.0.2.7', 443]"]))
 
+    def test_a_split_string_option_inside_a_group_is_refused(self):
+        # env -iS 'bash ... /x/sleep' was judged by the last part of the whole command line (sleep).
+        for argv in (["env", "-iS", "bash -c true /x/sleep"], ["env", "-vS", "bash /x/sleep"],
+                     ["env", "--split-string=bash -c true /x/sleep"], ["/usr/bin/env", "-i", "-S", "bash sleep"]):
+            with self.subTest(argv=argv):
+                self.assertTrue(any("cannot be told" in p for p in self._starts(argv, allowed=("sleep",))), argv)
+        # A value inside a group or after it is not taken for the program.
+        problems = self._starts(["env", "-iu", "sleep", "bash", "-c", "true"], allowed=("sleep",))
+        self.assertTrue(any("'bash'" in p and "not watched" in p for p in problems), problems)
+        self.assertEqual(self._starts(["env", "-iu", "X", "sleep", "1"], ["unshare", "-rS", "0", "sleep", "1"],
+                                      allowed=("sleep",)), [])
+        # A real run: the split-string start is refused (env runs true; nothing is reached).
+        status, out = self._run("import subprocess; subprocess.run(['env', '-iS', 'true /x/sleep'])",
+                                "--allow-program", "sleep")
+        self.assertEqual(status, 1, out)
+        self.assertIn("cannot be told", out)
+
+    def test_a_copy_of_the_interpreter_under_an_allowed_name_is_taken_for_python(self):
+        import shutil
+        with tempfile.TemporaryDirectory(prefix="rc-proof-") as name:
+            copy = Path(name) / "sleep"
+            shutil.copyfile(os.path.realpath(sys.executable), copy)
+            os.chmod(copy, 0o700)
+            # The copy started with -I does not load the hook; the run is refused although sleep is allowed.
+            status, out = self._run("import subprocess; subprocess.run([%r, '-I', '-c', 'pass'])" % str(copy),
+                                    "--allow-program", "sleep")
+            self.assertEqual(status, 1, out)
+            self.assertIn("does not load the audit hook", out)
+            # The same through a launcher.
+            status, out = self._run("import subprocess; subprocess.run(['env', %r, '-I', '-c', 'pass'])"
+                                    % str(copy), "--allow-program", "sleep")
+            self.assertEqual(status, 1, out)
+            self.assertIn("does not load the audit hook", out)
+        # The record of the hook is read: by the program's file, and by an argument's file after a launcher.
+        events = [(1, "subprocess.Popen", ["/t/sleep", ["/t/sleep", "-I", "x"], None,
+                                           {"PATH": None, "audit": True, "py_prog": True, "py_args": []}]),
+                  (2, "subprocess.Popen", ["env", ["env", "/t/sleep", "-I", "x"], None,
+                                           {"PATH": None, "audit": True, "py_prog": False, "py_args": [1]}])]
+        problems = self.audit.judge(events, allowed_programs=("sleep",))
+        self.assertEqual(len([p for p in problems if "does not load the audit hook" in p]), 2, problems)
+        unread = [(1, "subprocess.Popen", ["/t/sleep", ["/t/sleep"], None,
+                                           {"PATH": None, "audit": True, "py_prog": None, "py_args": []}])]
+        self.assertTrue(any("cannot be told" in p for p in self.audit.judge(unread, allowed_programs=("sleep",))))
+
+    def test_a_hooked_process_still_running_when_the_command_ends_is_refused(self):
+        with tempfile.TemporaryDirectory(prefix="rc-proof-") as name:
+            pid_file = Path(name) / "child.pid"
+            code = ("import os, subprocess, sys, time\n"
+                    "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(%r)'])\n"
+                    "events = os.path.join(os.environ['RECURSION_AUDIT_DIR'], 'events-%%d.jsonl' %% c.pid)\n"
+                    "end = time.monotonic() + %r\n"
+                    "while not os.path.exists(events) and time.monotonic() < end:\n"
+                    "    time.sleep(0.05)\n"
+                    "open(%r, 'w').write(str(c.pid))\n") % (IDLE_SECONDS, START_SECONDS, str(pid_file))
+            status, out = self._run(code)
+            child = int(pid_file.read_text())
+            try:
+                self.assertEqual(status, 1, out)
+                self.assertIn("still running when the command ended", out)
+            finally:
+                deadline = time.monotonic() + START_SECONDS
+                while time.monotonic() < deadline:  # the child ends by itself after its sleep
+                    try:
+                        os.kill(child, 0)
+                    except ProcessLookupError:
+                        break
+                    try:
+                        os.waitpid(child, os.WNOHANG)
+                    except ChildProcessError:
+                        pass
+                    time.sleep(0.1)
+
     def _starts(self, *argvs, allowed=(), audit=True):
         events = [(1, "subprocess.Popen", [a[0], list(a), None, {"PATH": None, "audit": audit}]) for a in argvs]
         return self.audit.judge(events, allowed_programs=allowed)
@@ -524,6 +596,14 @@ class ReadmeWordsTests(unittest.TestCase):
         section = " ".join(self._section().split())
         for words in ("Proven today, by the second command", "There may be more",
                       "On a clean checkout today it prints NOT PROVEN", "is not a proof today"):
+            with self.subTest(words=words):
+                self.assertIn(words, section)
+
+    def test_the_readme_says_what_the_audit_now_judges(self):
+        section = " ".join(self._section().split())
+        for words in ("a split-string option of `env`, also inside a group such as `-iS`, is refused",
+                      "by its file whatever its name, looked at when it starts",
+                      "still running when the command ends makes the run NOT PROVEN"):
             with self.subTest(words=words):
                 self.assertIn(words, section)
 

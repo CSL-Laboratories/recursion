@@ -10,8 +10,10 @@ start (through PYTHONPATH); it records every socket connection, bind, name looku
 foreign-function load into the folder. After the command ends, each reached address must be a door on
 this machine: a Unix socket path, or a loopback address. A Python process started with -I, -S, -E or a
 cleared environment does not load the hook, and is refused; so is a run with fewer hooked processes than
-Python starts. Only a real interpreter (python3, python3.N, python3.Nt, or this one by its real path) is
-taken for Python. A program that is not Python is not watched at all: the report names each one, and
+Python starts. A real interpreter is taken for Python: by its name (python3, python3.N, python3.Nt), or by
+its file whatever its name (this interpreter's own file, or a program file that holds the interpreter's
+entry point; the hook looks at the file when the start happens). A hooked process still running when the
+command ends makes the run NOT PROVEN. A program that is not Python is not watched at all: the report names each one, and
 each must be allowed by name (--allow-program, or the list file for the suite); a program that starts
 another (a [[launcher]] row: env, unshare) is judged by the program it starts. Exit status 1
 when an address that is not local was reached or looked up, a program not allowed was started, a
@@ -59,6 +61,49 @@ if _dir:
                 "socket.gethostbyname", "socket.gethostbyname_ex", "socket.gethostbyaddr", "socket.getnameinfo",
                 "subprocess.Popen", "urllib.Request", "http.client.connect", "os.system", "os.posix_spawn",
                 "os.exec")
+    _MAX_ARGS = int(os.environ.get("RECURSION_AUDIT_MAX_ARGS", "64"))
+    _seen_files = {}
+    _this = os.path.realpath(sys.executable)
+    def _py(name, path, cwd):
+        """Whether the file a start runs is a Python interpreter, whatever its name: this interpreter's own
+        file, or a program file that holds the interpreter's entry point. None: it is there and cannot be read."""
+        try:
+            name = os.fsdecode(name)
+        except Exception:
+            return False
+        if not name or "\x00" in name:
+            return False
+        if os.sep in name:
+            base = os.fsdecode(cwd) if isinstance(cwd, (str, bytes, os.PathLike)) else os.getcwd()
+            found = os.path.join(base, name)
+            if not os.path.isfile(found):
+                return False
+        else:
+            found = None
+            for d in (path if path is not None else os.defpath).split(os.pathsep):
+                c = os.path.join(d or ".", name)
+                if os.path.isfile(c) and os.access(c, os.X_OK):
+                    found = c
+                    break
+            if found is None:
+                return False
+        try:
+            real = os.path.realpath(found)
+            st = os.stat(real)
+            key = (real, st.st_size, st.st_mtime_ns)
+            if key in _seen_files:
+                return _seen_files[key]
+            answer = real == _this
+            if not answer:
+                import mmap
+                with open(real, "rb") as fh:
+                    if fh.read(4) == b"\x7fELF" and st.st_size:
+                        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
+                            answer = m.find(b"Py_BytesMain") >= 0 or m.find(b"Py_Main") >= 0
+            _seen_files[key] = answer
+            return answer
+        except Exception:
+            return None
     def _hook(event, args):
         if event.startswith("ctypes."):
             if event in _once:
@@ -68,11 +113,20 @@ if _dir:
             return
         try:
             plain = [_plain(a) for a in args[:3]]
-            if event == "subprocess.Popen":
-                env = args[3] if len(args) > 3 else None
+            if event in ("subprocess.Popen", "os.posix_spawn", "os.exec"):
+                popen = event == "subprocess.Popen"
+                env = (args[3] if len(args) > 3 else None) if popen else (args[2] if len(args) > 2 else None)
                 path = env.get("PATH") if hasattr(env, "get") else os.environ.get("PATH")
-                plain.append({"PATH": path if isinstance(path, str) else None,
-                              "audit": (env.get("RECURSION_AUDIT_DIR") is not None) if hasattr(env, "get") else True})
+                path = path if isinstance(path, str) else None
+                cwd = args[2] if popen and len(args) > 2 else None
+                argv = list(args[1]) if len(args) > 1 and isinstance(args[1], (list, tuple)) else []
+                exe = args[0] if args and args[0] else (argv[0] if argv else None)
+                while len(plain) < 3:
+                    plain.append(None)
+                plain.append({"PATH": path,
+                              "audit": (env.get("RECURSION_AUDIT_DIR") is not None) if hasattr(env, "get") else True,
+                              "py_prog": _py(exe, path, cwd),
+                              "py_args": [k for k in range(1, min(len(argv), _MAX_ARGS)) if _py(argv[k], path, cwd)]})
             line = json.dumps([event, plain])
         except Exception:
             line = json.dumps([event, ["unrecorded"]])
@@ -157,29 +211,45 @@ def _python_unhooked(argv, start):
 def _inner(argv, value_options):
     """The program a launcher (env, unshare) starts: the first argument that is not an option, a value of
     an option, or (for env) an assignment. None when it cannot be told."""
+    is_env = os.path.basename(argv[0]) == "env"
     i = 1
     while i < len(argv):
         a = argv[i]
         if a == "--":
             return argv[i + 1:] or None
-        if a.startswith("-") and a != "-":
-            if a in ("-S", "--split-string") and "env" in os.path.basename(argv[0]):
+        if a.startswith("--"):
+            if is_env and (a == "--split-string" or a.startswith("--split-string=")):
                 return None  # a whole command line in one argument: not judged, refused
-            if a in value_options:
-                i += 2
-                continue
-            i += 1
+            i += 2 if (a in value_options and "=" not in a) else 1
             continue
-        if "=" in a and "env" == os.path.basename(argv[0]):
+        if a == "-" and is_env:
+            i += 1  # env's '-' is -i
+            continue
+        if a.startswith("-") and a != "-":
+            letters = a[1:]
+            if is_env and "S" in letters:
+                return None  # -S inside a group (-iS, -vS) is the same split-string option: refused
+            step = 1
+            for k, letter in enumerate(letters):
+                if "-" + letter in value_options:  # it takes the rest of the group, or the next argument
+                    step = 2 if k == len(letters) - 1 else 1
+                    break
+            i += step
+            continue
+        if "=" in a and is_env:
             i += 1
             continue
         return argv[i:]
     return None
 
 
-def _judge_start(pid, prog, argv, start, allowed_programs, launchers, problems, depth=0):
+def _judge_start(pid, prog, argv, start, allowed_programs, launchers, problems, depth=0, base=0, pystarts=None):
     name = os.path.basename(prog) if prog else "an unnamed program"
-    if prog and is_python(prog):
+    record = start if isinstance(start, dict) else {}
+    by_file = record.get("py_prog") if base == 0 else (base in (record.get("py_args") or ()))
+    if prog and (is_python(prog) or by_file):
+        if pystarts is not None:
+            pystarts.append(pid)
         why = _python_unhooked([prog] + argv[1:], start)
         if why:
             problems.append(f"process {pid}: started the Python program {prog!r}, which does not load the "
@@ -191,10 +261,18 @@ def _judge_start(pid, prog, argv, start, allowed_programs, launchers, problems, 
             problems.append(f"process {pid}: started {name!r}, which starts another program, and which one "
                             f"cannot be told from {argv!r}: refused")
             return
-        # env -i clears the environment: a Python program started by it does not carry the hook.
-        cleared = name == "env" and any(a in ("-i", "--ignore-environment") or a == "-" for a in argv[1:argv.index(inner[0]) if inner[0] in argv else None])
-        _judge_start(pid, inner[0], inner, {"audit": False} if cleared else start, allowed_programs, launchers,
-                     problems, depth + 1)
+        # env -i clears the environment (also inside a group, -vi): a Python program it starts does not
+        # carry the hook.
+        before = [prog] + argv[1:]
+        before = before[1:len(before) - len(inner)]
+        cleared = name == "env" and any(a in ("--ignore-environment", "-") or (a.startswith("-") and not
+                                        a.startswith("--") and "i" in a[1:]) for a in before)
+        _judge_start(pid, inner[0], inner, dict(record, audit=False) if cleared else start, allowed_programs,
+                     launchers, problems, depth + 1, base + len(before) + 1, pystarts)
+        return
+    if prog and record.get("py_prog", False) is None and base == 0:
+        problems.append(f"process {pid}: started {name!r}, whose file could not be read when it started, so "
+                        f"whether it is a Python interpreter cannot be told: refused")
         return
     if name not in allowed_programs:
         problems.append(f"process {pid}: started {name!r}, a program that is not Python and is not "
@@ -202,7 +280,7 @@ def _judge_start(pid, prog, argv, start, allowed_programs, launchers, problems, 
                         f"reaches no network)")
 
 
-def judge(events, allowed_programs=(), launchers=None):
+def judge(events, allowed_programs=(), launchers=None, pystarts=None):
     """Every reach that is not a door on this machine, and every program that is not watched and not
     allowed, as words. A launcher (a program that starts another, such as env or unshare) is judged by
     the program it starts."""
@@ -239,8 +317,10 @@ def judge(events, allowed_programs=(), launchers=None):
                 problems.append(f"process {pid}: started a shell (os.system): what it reaches is not watched")
         elif event.startswith(("subprocess.Popen", "os.posix_spawn", "os.exec")):
             prog, argv = _argv(event, args)
-            start = args[3] if event == "subprocess.Popen" and len(args) > 3 else None
-            _judge_start(pid, prog, argv, start, allowed_programs, launchers, problems)
+            start = args[3] if len(args) > 3 and isinstance(args[3], dict) else None
+            # os.exec keeps its process (and its events file): it is not a new Python start to count.
+            _judge_start(pid, prog, argv, start, allowed_programs, launchers, problems,
+                         pystarts=pystarts if event in ("subprocess.Popen", "os.posix_spawn") else None)
         elif event.startswith("ctypes."):
             problems.append(f"process {pid}: {event}: a foreign-function call; what it reaches is not watched")
     return problems
@@ -286,6 +366,30 @@ def whole_suite_note(problems):
             f"problems above). The README says so; this run names what it could not watch.")
 
 
+def still_running(pids, events_dir):
+    """The hooked processes that are still running (not ended, not a zombie) and are of this run: what they
+    reach after the run is judged is not watched."""
+    running = []
+    for pid in sorted(pids):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            pass
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                if fh.read().rsplit(b")", 1)[-1].split()[:1] == [b"Z"]:
+                    continue
+            with open(f"/proc/{pid}/environ", "rb") as fh:
+                if b"RECURSION_AUDIT_DIR=" + os.fsencode(str(events_dir)) + b"\x00" not in fh.read():
+                    continue  # the number was given to another process since
+        except OSError:
+            pass  # cannot be told: it is taken as still running
+        running.append(pid)
+    return running
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     allowed = []
@@ -313,13 +417,14 @@ def main(argv=None):
                                             ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
         done = subprocess.run(command, cwd=str(ROOT), env=env)
         events, pids = read(events_dir)
-        problems = judge(events, allowed)
+        pystarts = []
+        problems = judge(events, allowed, pystarts=pystarts)
+        running = still_running(pids, events_dir)
+        if running:
+            problems.append(f"{len(running)} hooked process(es) still running when the command ended (pid "
+                            f"{', '.join(str(p) for p in running[:10])}): what they reach later is not watched")
         # Every Python start must have a process that wrote an events file; fewer means some did not load it.
-        starts = 0
-        for _pid, event, args in events:
-            if event in ("subprocess.Popen", "os.posix_spawn"):
-                prog, _a = _argv(event, args)
-                starts += bool(prog and is_python(prog))
+        starts = len(pystarts)
         expected = starts + (1 if command and is_python(command[0]) else 0)
         if len(pids) < expected:
             problems.append(f"{expected - len(pids)} Python process(es) did not load the audit hook "

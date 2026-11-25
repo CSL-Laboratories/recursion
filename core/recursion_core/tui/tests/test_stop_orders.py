@@ -127,7 +127,7 @@ def later(event, seconds=SOON_S):
 
 
 class HandOverTest(unittest.TestCase):
-    def test_t1_a_stop_just_begun_is_waited_for_until_it_has_been_in_its_call_the_hand_over(self) -> None:
+    def test_t1_a_stop_just_begun_is_waited_for_until_its_request_is_written_or_its_call_has_ended(self) -> None:
         api = Held(("r",), {})
         api.holds["r"] = [api.release]
         lines, app, t_ctrl, t_end = drive(api, ["s", "y", "q"])
@@ -153,7 +153,7 @@ class HandOverTest(unittest.TestCase):
         self.assertEqual(api.sent("run.stop"), [{"run_id": "r"}, {"run_id": "r2"}])
         self.assertIn("the Stop of r2 was sent and its answer had not come", app.end_line)
 
-    def test_t7_a_queued_stop_begun_after_ctrl_c_is_held_only_for_the_hand_over(self) -> None:
+    def test_t7_a_queued_stop_begun_after_ctrl_c_is_waited_for_until_its_request_is_written(self) -> None:
         r_answers = threading.Event()
         api = Held(("r", "r2"), {"r": [r_answers]}, signal="r")
         api.holds["r2"] = [api.release]

@@ -464,14 +464,20 @@ class TuiApp:
         written = list(dict.fromkeys(r for n, r in self._stops_out.items() if self._stop_step.get(n) == "written"))
         unwritten = [r for r in begun if r not in written]
         if written:
-            parts.append(f"the Stop of {_runs(written)} was sent and its answer had not come")
+            subject, plural = _queued_said([], written)
+            parts.append(f"{subject} {'were' if plural else 'was'} sent and "
+                         f"{'their answers' if plural else 'its answer'} had not come")
         if unwritten and not self.stop_marks:
-            parts.append(f"the Stop of {_runs(unwritten)}: its call began and its answer had not come; whether it "
-                         f"reached the daemon is not known")
+            subject, plural = _queued_said([], unwritten)
+            parts.append(f"{subject}: {'their calls' if plural else 'its call'} began and "
+                         f"{'their answers' if plural else 'its answer'} had not come; whether "
+                         f"{'they' if plural else 'it'} reached the daemon is not known")
         elif unwritten:
             left = self.close_left() if self.close_left is not None else 0.0
-            parts.append(f"the Stop of {_runs(unwritten)} was begun and is not yet written to the daemon; the TUI "
-                         f"waits for that at most {left:.2f} s and then says what became of it")
+            subject, plural = _queued_said([], unwritten)
+            parts.append(f"{subject} {'were' if plural else 'was'} begun and {'are' if plural else 'is'} not yet "
+                         f"written to the daemon; the TUI waits for that at most {left:.2f} s and then says what "
+                         f"became of {'them' if plural else 'it'}")
         if queued:
             subject, plural = _queued_said(begun, queued)
             it, was = ("they", "were") if plural else ("it", "was")

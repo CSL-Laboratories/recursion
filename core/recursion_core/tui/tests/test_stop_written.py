@@ -5,7 +5,8 @@ transport says so the moment its write returns: ``on_sent``); it does not take a
 says of each Stop only the step it reached: sent (written), answered, ended without being written, begun and not
 yet written when the bound ran out (with what to do), or, for a transport that cannot say when it wrote, only that
 its call began. Also: queued Stops of two runs are said in the plural, and a request of the other lane that is in
-its call at the close is named.
+its call at the close is named. Begun Stops of two runs are said in the plural; a fault of the hook that is not an
+Exception does not end the call.
 
 Stand-ins only: a stand-in API in this process, a scripted terminal, and one socket in a temporary folder of the
 test's own with a stand-in daemon on a thread; no daemon, socket or terminal of a person. Every wait is bounded,
@@ -206,6 +207,7 @@ class Door:
 
     def __init__(self, path: str, kind: str) -> None:
         self.kind, self.got, self.accepted, self.closed = kind, 0, 0, threading.Event()
+        self.path, self.release, self.replied = path, threading.Event(), threading.Event()
         self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.srv.bind(path)
         if kind != "refuses":
@@ -223,7 +225,7 @@ class Door:
             return
         self.accepted += 1
         with conn:
-            if self.kind == "answers":
+            if self.kind in ("answers", "late"):
                 conn.settimeout(WAIT_S)
                 buf = b""
                 while len(buf) < 4 or len(buf) < 4 + int.from_bytes(buf[:4], "big"):
@@ -232,7 +234,13 @@ class Door:
                         break
                     buf += chunk
                 self.got += len(buf)
-                write_frame(conn, {"ok": True, "result": {"code": "stopped", "run_id": "r"}}, max_bytes=1 << 20)
+                if self.kind == "late":
+                    self.release.wait(WAIT_S)
+                try:
+                    write_frame(conn, {"ok": True, "result": {"code": "stopped", "run_id": "r"}}, max_bytes=1 << 20)
+                except OSError:
+                    pass
+                self.replied.set()
         self.closed.set()
 
     def end(self) -> None:
@@ -382,6 +390,153 @@ class AHookThatFailsTest(unittest.TestCase):
         lines, app, door = _through_a_door(self, "answers", hook=fails)
         self.assertGreater(door.got, 4)
         self.assertEqual(lines[-1], "after the close line: the Stop of r was sent and answered: r is stopped")
+
+
+class StopThroughTwoDoors(API):
+    """The stand-in API for every read; a Stop of r goes through the real SocketAPI and UnixControlClient to the door
+    in ``paths["r"]`` and a Stop of r2 to the door in ``paths["r2"]``. Every connect is let go only when ``gate`` is set."""
+
+    def __init__(self, paths: dict, gate: threading.Event) -> None:
+        from recursion_core.control.client import SocketAPI
+        from recursion_core.control_transport.unix import UnixControlClient
+
+        super().__init__(runs=("r", "r2"))
+        self.holds: dict = {}
+
+        def connect(p, *, timeout_s):
+            gate.wait(WAIT_S)
+            return UnixControlClient(p, timeout_s=timeout_s)
+
+        self.apis = {run: SocketAPI(path, timeout_s=WAIT_S, connect=connect) for run, path in paths.items()}
+
+    def call(self, method, params, on_sent=None):
+        if method != "run.stop":
+            return super().call(method, params)
+        with self._lock:
+            self.calls.append((method, dict(params)))
+        self.entered.set()
+        return self.apis[params["run_id"]].call(method, params, on_sent=on_sent)
+
+
+class HookStops(BaseException):
+    """A fault of a layer between the transport and the TUI that is not an Exception."""
+
+
+@unittest.skipUnless(os.name == "posix" and hasattr(socket, "AF_UNIX"), "a Unix socket")
+class AHookThatIsNotAnExceptionTest(unittest.TestCase):
+    def test_a_base_exception_of_the_hook_after_a_whole_write_does_not_end_the_call(self) -> None:
+        from recursion_core.control.client import SocketAPI
+
+        with tempfile.TemporaryDirectory() as tmp:
+            door = Door(os.path.join(tmp, "control.sock"), "answers")
+            self.addCleanup(door.end)
+            marks = []
+
+            def on_sent() -> None:
+                marks.append("written")
+                raise HookStops()
+
+            answer = SocketAPI(door.path, timeout_s=WAIT_S).call("run.stop", {"run_id": "r"}, on_sent=on_sent)
+            self.assertEqual(marks, ["written"])
+            self.assertEqual(answer, {"code": "stopped", "run_id": "r"})
+            self.assertTrue(door.closed.wait(WAIT_S))
+            self.assertGreater(door.got, 4)
+
+    def test_an_interrupt_of_the_hook_is_raised_again_only_after_the_reply_is_read(self) -> None:
+        from recursion_core.control_transport.unix import UnixControlClient
+
+        for interrupt in (KeyboardInterrupt, SystemExit):
+            with self.subTest(interrupt=interrupt.__name__), tempfile.TemporaryDirectory() as tmp:
+                door = Door(os.path.join(tmp, "control.sock"), "late")
+                self.addCleanup(door.end)
+                client = UnixControlClient(door.path, timeout_s=WAIT_S)
+                self.addCleanup(client.close)
+                threading.Timer(0.3, door.release.set).start()  # the daemon answers 0.3 s after the write
+                t0 = time.monotonic()
+
+                def on_sent() -> None:
+                    raise interrupt()
+
+                with self.assertRaises(interrupt):
+                    client.request({"method": "run.stop", "params": {"run_id": "r"}}, on_sent=on_sent)
+                self.assertGreaterEqual(time.monotonic() - t0, 0.3 - 0.05, "the interrupt came before the reply was read")
+                self.assertTrue(door.replied.is_set(), "the interrupt came before the daemon's reply")
+                self.assertGreater(door.got, 4)
+
+    def test_a_base_exception_before_the_tuis_mark_does_not_make_a_written_stop_unsent(self) -> None:
+        def fails(on_sent) -> None:
+            raise HookStops()
+
+        lines, app, door = _through_a_door(self, "answers", hook=fails)
+        self.assertGreater(door.got, 4)
+        self.assertEqual(lines[-1], "after the close line: the Stop of r was sent and answered: r is stopped")
+
+
+class BegunStopsOfTwoRunsTest(unittest.TestCase):
+    """The Stops of two runs begun at the close are said in the plural, every run named, by the helper the queued
+    Stops use; a Stop of one run is said as before."""
+
+    def _app(self, steps: dict, *, marks: bool = True):
+        api = Held(("r", "r2"), {})
+        app, loop = new_loop(api)
+        app.stop_marks = marks
+        for run in ("r", "r2"):
+            app.request("run.stop", {"run_id": run})
+        number = {run: n for n, run in app._stops_out.items()}
+        for run, n in number.items():
+            self.assertTrue(app.begin(n, "run.stop", {"run_id": run}))
+        for run, step in steps.items():
+            app.stop_moved(number[run], step)
+        return app
+
+    UNWRITTEN = (r"the Stops of r and r2 were begun and are not yet written to the daemon; the TUI waits for that at "
+                 r"most [0-9]\.[0-9]{2} s and then says what became of them; ")
+
+    def test_two_begun_stops_not_yet_written_are_said_in_the_plural(self) -> None:
+        self.assertRegex(self._app({})._end_line(), self.UNWRITTEN)
+
+    def test_the_mixed_case_a_call_ended_and_a_stop_begun_is_said_in_the_plural(self) -> None:
+        self.assertRegex(self._app({"r": "ended"})._end_line(), self.UNWRITTEN)
+
+    def test_two_written_stops_are_said_in_the_plural(self) -> None:
+        self.assertIn("the Stops of r and r2 were sent and their answers had not come",
+                      self._app({"r": "written", "r2": "written"})._end_line())
+
+    def test_two_stops_of_a_transport_that_cannot_say_it_wrote_are_said_in_the_plural(self) -> None:
+        self.assertIn("the Stops of r and r2: their calls began and their answers had not come; whether they reached "
+                      "the daemon is not known", self._app({}, marks=False)._end_line())
+
+    def test_one_begun_stop_is_said_in_the_singular(self) -> None:
+        line = self._app({"r2": "written"})._end_line()
+        self.assertRegex(line, r"the Stop of r was begun and is not yet written to the daemon; the TUI waits for that "
+                               r"at most [0-9]\.[0-9]{2} s and then says what became of it; ")
+        self.assertIn("the Stop of r2 was sent and its answer had not come", line)
+
+
+@unittest.skipUnless(os.name == "posix" and hasattr(socket, "AF_UNIX"), "a Unix socket")
+class TheEndOfAStopsCallEndsTheWaitTest(unittest.TestCase):
+    def test_a_stop_refused_after_ctrl_c_and_the_next_one_written_to_a_late_door_return_the_prompt(self) -> None:
+        """r's connect is refused 0.3 s after Ctrl-C (the TUI's tick has ended: its answer is not taken yet), then
+        the queued Stop of r2 is written to a door that answers only after the bound. The prompt comes once r's
+        call has ended and r2's request is written, not at the bound."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            refuses = Door(os.path.join(tmp, "a.sock"), "refuses")
+            late = Door(os.path.join(tmp, "b.sock"), "late")
+            self.addCleanup(refuses.end)
+            self.addCleanup(late.end)
+            gate = threading.Event()
+            api = StopThroughTwoDoors({"r": refuses.path, "r2": late.path}, gate)
+            late.release = api.release  # the drive sets it when it ends
+            lines, app, t_ctrl, t_end = drive(api, ["s", "y", "j", "s", "y", "q"], then=later(gate, 0.3))
+            self.assertIsNotNone(t_ctrl)
+            self.assertGreaterEqual(t_end - t_ctrl, 0.3 - 0.05, "the prompt came before the refused Stop's call ended")
+            self.assertLess(t_end - t_ctrl, WAITED_S, "the TUI waited on after r's call ended and r2 was written")
+            self.assertEqual((refuses.accepted, late.got > 4), (0, True))
+            self.assertTrue(lines[-1].startswith(
+                "after the close line: the Stop of r was not sent: its call ended before its request was written "
+                "(control_api_unavailable); r may still be running; the queued Stop of r2 was sent and its answer "
+                "had not come"), lines[-1])
 
 
 if __name__ == "__main__":

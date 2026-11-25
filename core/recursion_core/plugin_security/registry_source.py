@@ -100,13 +100,19 @@ _FROM_SOURCE = {
 }
 
 
+def printable(text: str) -> str:
+    """``text`` with every character that is not printable written as an escape, so no line can be forged."""
+    return "".join(char if char.isprintable() else
+                   (f"\\x{ord(char):02x}" if ord(char) < 0x100 else f"\\u{ord(char):04x}") for char in str(text))
+
+
 def shown_lines(result: dict) -> list:
     """What a person reads after an install by registry: the label, the requested permissions, the status."""
     lines = [f"Registry label: {result.get('registry_label')} (a label, not a gate).",
              "Requested permissions (requested by the release, not enforced by this install): "
              + (", ".join(result.get("requested_permissions") or ()) or "none") + "."]
     if result.get("status") in ("deprecated", "withdrawn"):
-        reason = (result.get("status_reason") or "no reason given").rstrip(".")
+        reason = printable(result.get("status_reason") or "no reason given").rstrip(".")
         lines.append(f"This release is {result['status']}: {reason}.")
     return lines
 
@@ -114,7 +120,7 @@ def shown_lines(result: dict) -> list:
 def registry_words(code: str, **values: str) -> str:
     """The sentence a person reads for ``code``, with the values filled in."""
     filled = {"given": "", "address": "", "commit": "", "path": ""}
-    filled.update({key: str(value) for key, value in values.items() if value is not None})
+    filled.update({key: printable(str(value)) for key, value in values.items() if value is not None})
     return _WORDS[code].format(**filled)
 
 
@@ -138,8 +144,9 @@ def split_registry(value: object) -> tuple[str, str, str | None]:
         return "pinned", head, tail
     if networked:
         raise _refused("registry_commit_refused", given=value)
-    if _LIST_NAME.fullmatch(value) is not None and not os.path.lexists(value):
-        # A registry named by its name in the list: the list lives in the settings file, not read yet.
+    if _LIST_NAME.fullmatch(value) is not None:
+        # A value of a list name's form is always a name, whatever stands on disk: a folder is written with a
+        # path separator. The list lives in the settings file, not read yet.
         raise _refused("registry_list_not_wired", given=value)
     return "folder", value, None
 
@@ -155,7 +162,7 @@ def _checked_install(config, root, plugin_id, given, commit, **options) -> dict:
             raise
         lines = [registry_words("registry_check_failed", given=given, commit=commit)]
         for item in findings[:_MAX_FINDINGS_SHOWN]:
-            lines.append(f"  {item.path}: {item.code}" + (f" ({item.detail})" if item.detail else ""))
+            lines.append(f"  {printable(item.path)}: {item.code}" + (f" ({printable(item.detail)})" if item.detail else ""))
         if len(findings) > _MAX_FINDINGS_SHOWN:
             lines.append(f"  and {len(findings) - _MAX_FINDINGS_SHOWN} more.")
         raise InstallRefused(exc.code, exc.codes, detail="\n".join(lines), show_detail=True) from None

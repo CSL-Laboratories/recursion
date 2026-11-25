@@ -22,11 +22,17 @@ then one line with the commands that go on, and returns 0.
 ``quarantine list`` shows what is held; ``quarantine accept <id>`` asks one
 question, as unpin does, and installs the held release only on ``yes``;
 ``quarantine drop <id>`` moves the held release into a kept place and names it.
+
+``install --yes`` writes one grant for the requested permissions except
+``order``. ``install --no-grant`` writes none. With neither flag, a terminal
+is asked once and only the answer ``y`` or ``yes`` grants; any other answer,
+and a run that is not a terminal, writes no grant.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -79,6 +85,9 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument("--git", help="local bare repository")
     install.add_argument("--config")
     install.add_argument("--state")
+    install.add_argument("--yes", action="store_true",
+                         help="write one grant for the requested permissions except order")
+    install.add_argument("--no-grant", action="store_true", help="write no grant")
 
     listed = commands.add_parser("list")
     listed.error = _error  # type: ignore[method-assign]
@@ -127,11 +136,42 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None, out=None, err=None, inp=None) -> int:
-    """Run one plugin command. Returns 0, 1 (refused, or a yes not given) or 2 (usage)."""
+def _confirm_grant(stdin, err):
+    """Ask on a terminal. Only ``y`` or ``yes`` returns True. Anything else is no."""
+
+    def confirm(requested, checks):
+        if not getattr(stdin, "isatty", lambda: False)():
+            return False
+        err.write("Requested permissions: %s\n" % ", ".join(requested))
+        for line in checks:
+            err.write("%s\n" % line)
+        err.write("Grant the requested permissions except order? [y/N] ")
+        err.flush()
+        line = stdin.readline()
+        if type(line) is not str:
+            return False
+        return line.strip().lower() in {"y", "yes"}
+
+    return confirm
+
+
+def main(argv: list[str] | None = None, out=None, err=None, inp=None, stdin=None) -> int:
+    """Run one plugin command. Returns 0, 1 (refused, or a yes not given) or 2 (usage).
+
+    ``inp`` and ``stdin`` name the one input stream; ``inp`` is used when both are given.
+    """
+    # A caller that supplies streams is not the operator's terminal. Do not
+    # read the process stdin for the grant question unless that caller passes
+    # one: a captured run must not block, and it must not take a silent yes.
+    given = inp if inp is not None else stdin
+    embedded = out is not None or err is not None or given is not None
     out = sys.stdout if out is None else out
     err = sys.stderr if err is None else err
-    inp = sys.stdin if inp is None else inp
+    # A typed-yes question (a pin, a held release) reads the given stream, else the process stdin.
+    inp = sys.stdin if given is None else given
+    # The grant question reads the given stream; with none, it reads stdin only for a caller
+    # that supplied no stream.
+    stdin = given if given is not None else (io.StringIO("") if embedded else sys.stdin)
     if argv is None:
         argv = sys.argv[1:]
     try:
@@ -159,9 +199,19 @@ def main(argv: list[str] | None = None, out=None, err=None, inp=None) -> int:
 
     try:
         if args.command == "install":
+            if args.yes and args.no_grant:
+                err.write("usage: recursion plugin install (--yes and --no-grant)\n")
+                return 2
+            if args.no_grant:
+                write_grant, confirm = False, None
+            elif args.yes:
+                write_grant, confirm = True, None
+            else:
+                write_grant, confirm = None, _confirm_grant(stdin, err)
             result = install_plugin(_config_dir(args.config), args.registry, args.plugin,
                                     version=args.version, state=_state_dir(args.state), report_kept=report,
-                                    confirm=ask, git_repository=args.git)
+                                    confirm=ask, git_repository=args.git, write_grant=write_grant,
+                                    confirm_grant=confirm)
         elif args.command == "list":
             result = list_plugins(_config_dir(args.config), state=_state_dir(args.state))
         elif args.command == "enable":

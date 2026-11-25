@@ -250,6 +250,7 @@ class LabelLoadTests(unittest.TestCase):
                 grants = [fx.grant_for(self.source, plugin_id=pid, permissions=PERMS)
                           for pid in ('label.x', 'label.lone')]
                 fx.write_install(config, grants=grants, registry_labels={_digest(manifest): 'verified'})
+                fx.ensure_revocation_store(state)
                 with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
                     host = plugins.PluginHost(config, state, gil_probe=FakeGilProbe())
                 self.addCleanup(host.close)

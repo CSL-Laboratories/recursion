@@ -17,6 +17,7 @@ from pathlib import Path
 
 from recursion_core.approvals.hooks import install
 from recursion_core.approvals.queue import ApprovalQueue
+from recursion_core.approvals.tests.test_queue import Ticket
 
 try:
     from recursion_core.control.hooks import Hooks, Principal
@@ -55,7 +56,7 @@ class FakeDriver:
     def tool_call(self, started: threading.Event) -> None:
         approval_id = self.queue.request("engine_tool", self.effect, session_id=self.effect["session_id"],
                                          run_id=self.effect["run_id"], turn_id="turn-0001",
-                                         engine_request_id="toolu_proof")
+                                         engine_request_id="toolu_proof", ticket=Ticket())
         self.approval_id = approval_id
         started.set()
         record = self.queue.wait(approval_id, timeout=30)  # a bound on a broken test, not a deadline of the queue

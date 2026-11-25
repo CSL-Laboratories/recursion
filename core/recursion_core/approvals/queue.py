@@ -12,8 +12,24 @@ and the object the method handlers and the engine drivers call:
   that fails and a caller's own misuse alike (a request made inside another transaction); an interruption
   passes as it is. So does EVENTS' ``CommitUnknown`` (its COMMIT raised): the request may or may not have been
   written, so it is no refusal; its approval id was never returned, and a request that was written and no
-  surface took is offered again by the next start. ``ask(effect, binding)`` is the same for a driver's tool
-  call (the brief's ``request(effect, binding)``).
+  surface took is offered again by the next start. ``ask(effect, binding, ticket=...)`` is the same for a driver's
+  tool call (the brief's ``request(effect, binding)``).
+* THE DRIVER'S TICKET (DRIVER-CC's port withdraw, #432). Every engine request carries the ticket the driver
+  admitted it with (anything with ``publish() -> bool``; the driver's ``PortTicket``); one without is refused
+  ``ticket``, so no driver skips its withdraw, and a plugin's effect carries none. A ticket whose ``publish``
+  attribute raises is refused ``ticket`` before the transaction. ``publish()`` runs inside the store's one
+  write transaction, after every check and after the record is written, before the commit, so a withdrawal
+  that wins first rolls the write back: no record, no event, no binding, nothing offered, nothing a retry or
+  a restart could open later, and the call is refused ``approval_withdrawn`` with the run id as its detail.
+  It must return without waiting on a person, an engine, the network or another request, because that write
+  is held until it returns: a second request and ``approval.list`` wait behind it. A ticket that answers True
+  is spent. The port calls ``publish()`` on it no second time and does not read the ticket again, and the
+  ticket ends exactly once, by publish or by withdraw. A later call with that same ticket is refused
+  ``approval_published`` with the run id as its detail, not ``approval_withdrawn``. If the commit then fails,
+  nothing opens and the call is ``store_unavailable`` with that run id as its detail. An interruption after
+  True and before the commit passes as the interruption and leaves no record; the ticket stays spent, and a
+  retry is ``approval_published``. A kill in that window leaves a published ticket and no record, and there
+  is no caller left to tell.
 * A request counts as SHOWN only once a subscriber took it without raising. One that no subscriber took
   (none was subscribed, or each one failed) is offered again by the next start, once its worker runs.
 * ``wait(approval_id)`` blocks until the request is no longer pending and returns its record: approved,
@@ -90,6 +106,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import weakref
 from typing import Callable
 
 from recursion_core.approvals import model
@@ -124,6 +141,63 @@ def _tell(fn, *args) -> bool:
         log.error("an approval subscriber failed: %s", type(exc).__name__)
         return False
     return True
+
+
+def _publish(ticket, run_id) -> None:
+    """One call of ``ticket.publish()``. Anything but True is a withdrawn request (``approval_withdrawn``, the
+    run as its detail); a ticket whose ``publish`` raises is refused ``ticket``. Either refusal rolls the
+    transaction back, so nothing is written. Not called again once it has answered True."""
+    try:
+        published = ticket.publish()
+    except Exception as exc:  # noqa: BLE001 - the driver's object, not the store: typed, and nothing written
+        raise ApprovalRefused("ticket") from exc
+    if published is not True:
+        raise ApprovalRefused("approval_withdrawn", run_id)
+
+
+class _SpentTickets:
+    """Tickets whose ``publish()`` has answered True, for this process.
+
+    A second call, on this queue or another, must not ask the ticket again: the answer would be False and the
+    port would report a withdrawal of a ticket that is published. The gate is re-entrant so a ticket that
+    calls back into the queue cannot wait for itself. A ticket that can be referenced weakly is not kept
+    alive; one that cannot is kept for the life of the process.
+    """
+
+    def __init__(self) -> None:
+        self._gate = threading.RLock()
+        self._spent: dict[int, object] = {}
+        self._publishing: set[int] = set()
+
+    def publish_once(self, ticket, run_id) -> None:
+        ident = id(ticket)
+        with self._gate:
+            if ident in self._spent:
+                raise ApprovalRefused("approval_published", run_id)
+            if ident in self._publishing:
+                raise ApprovalRefused("ticket")  # publish() called the queue again with this same ticket
+            self._publishing.add(ident)
+            try:
+                _publish(ticket, run_id)
+                self._remember(ticket)
+            finally:
+                self._publishing.discard(ident)
+
+    def _remember(self, ticket) -> None:
+        ident = id(ticket)
+
+        def drop(ref, ident=ident) -> None:
+            with self._gate:  # a reused id must not lose the ticket that now holds it
+                if self._spent.get(ident) is ref:
+                    self._spent.pop(ident, None)
+
+        try:
+            self._spent[ident] = weakref.ref(ticket, drop)
+        except TypeError:  # the ticket cannot be referenced weakly: keep it
+            self._spent[ident] = ticket
+
+
+_SPENT = _SpentTickets()
 
 
 def timestamp_of(seconds: float) -> str:
@@ -360,9 +434,10 @@ class ApprovalQueue:
     # -- requests ----------------------------------------------------------------------------------------
 
     def request(self, source: str, effect: dict, *, session_id=None, run_id=None, turn_id=None,
-                engine_request_id: str | None = None, display: list = ()) -> str:
+                engine_request_id: str | None = None, display: list = (), ticket=None) -> str:
         """A new request; refused with ``ApprovalRefused`` (a typed code) and nothing written if it cannot be
-        made whole. An engine's request names the driver's pending request (``engine_request_id``)."""
+        made whole. An engine's request names the driver's pending request (``engine_request_id``) and carries
+        the driver's port ticket (``ticket``), published inside the commit (THE DRIVER'S TICKET, above)."""
         if self._store is None:
             raise ApprovalRefused("store_absent")
         now = self._clock()
@@ -383,29 +458,46 @@ class ApprovalQueue:
                 raise ApprovalRefused("binding_mismatch")
         elif engine_request_id is not None:
             raise ApprovalRefused("binding_mismatch")  # a plugin's effect has no engine request to bind
+        if (source == "engine_tool") != (ticket is not None):
+            raise ApprovalRefused("ticket")  # an engine's request has the driver's ticket; a plugin's has none
+        if ticket is not None:
+            try:
+                publish = getattr(ticket, "publish", None)
+            except Exception as exc:  # noqa: BLE001 - the driver's object, before the transaction: typed
+                raise ApprovalRefused("ticket") from exc
+            if not callable(publish):
+                raise ApprovalRefused("ticket")
         with self._lock:
             self._done.setdefault(approval_id, threading.Event())
+        spent_run = None
         try:
             with self._store.transaction() as tx:
                 rows.insert(tx, record, binding)
+                if ticket is not None:
+                    _SPENT.publish_once(ticket, record["run_id"])  # inside the commit: nothing is visible before
+                    spent_run = record["run_id"]
         except BaseException as exc:
             with self._lock:
                 self._done.pop(approval_id, None)
             if isinstance(exc, Exception) and not isinstance(exc, (ApprovalRefused, *_OUTCOME_UNKNOWN)):
-                raise ApprovalRefused("store_unavailable") from exc  # nothing was written
+                # detail names the run only once the ticket has answered True: the ticket is already spent
+                raise ApprovalRefused("store_unavailable", spent_run) from exc  # nothing was written
             raise  # an interruption, a refusal, or a COMMIT whose outcome is unknown, as it is
         # Committed. Nothing below can fail this request: wake the deadline worker first, then tell.
         self._wake.set()
         self._offer(record)
         return approval_id
 
-    def ask(self, effect: dict, binding: dict, *, turn_id=None) -> str:
-        """A driver's tool call (the brief's ``request(effect, binding)``): an engine-tool effect, and the
-        driver's side of the binding, ``{"engine_request_id": ...}``. Returns the approval id."""
+    def ask(self, effect: dict, binding: dict, *, ticket=None, turn_id=None) -> str:
+        """A driver's tool call (the brief's ``request(effect, binding)``): an engine-tool effect, the driver's
+        side of the binding, ``{"engine_request_id": ...}``, and the ticket the driver admitted it with
+        (``ticket`` is keyword-only; without one it is refused ``ticket``). Returns the approval id. A
+        withdrawn ticket raises ``approval_withdrawn``; a ticket that already answered True raises
+        ``approval_published``. Both name the run as ``detail``."""
         if type(effect) is not dict or type(binding) is not dict or set(binding) != {"engine_request_id"}:
             raise ApprovalRefused("binding_mismatch")
         return self.request("engine_tool", effect, session_id=effect.get("session_id"), run_id=effect.get("run_id"),
-                            turn_id=turn_id, engine_request_id=binding["engine_request_id"])
+                            turn_id=turn_id, engine_request_id=binding["engine_request_id"], ticket=ticket)
 
     def _offer(self, record: dict, *, only=None) -> bool:
         """Tell the subscribers of a committed request (or only ``only``); remember it as shown only if one

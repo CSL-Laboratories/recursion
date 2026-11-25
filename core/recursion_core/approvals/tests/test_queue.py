@@ -8,6 +8,7 @@ ruling (ii) says; the queue uses only the calls EVENTS' own store also takes (ta
 from __future__ import annotations
 
 import json
+import threading
 import unittest
 from pathlib import Path
 
@@ -40,6 +41,31 @@ class Clock:
         return self.now
 
 
+class Ticket:
+    """A driver's port ticket as the queue sees it (DRIVER-CC's ``routes.driver.PortTicket``, #432): it ends once,
+    published or withdrawn, whichever comes first; ``calls`` counts the queue's ``publish`` calls."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.state = "admitted"
+        self.calls = 0
+
+    def publish(self) -> bool:
+        with self._lock:
+            self.calls += 1
+            if self.state != "admitted":
+                return False
+            self.state = "published"
+            return True
+
+    def withdraw(self) -> bool:
+        with self._lock:
+            if self.state != "admitted":
+                return False
+            self.state = "withdrawn"
+            return True
+
+
 @needs_fakes
 class QueueTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -65,7 +91,8 @@ class QueueTests(unittest.TestCase):
 
     def _engine_request(self, request_id: str = "toolu_1") -> str:
         return self.queue.request("engine_tool", self.engine, session_id=self.engine["session_id"],
-                                  run_id=self.engine["run_id"], turn_id="turn-0001", engine_request_id=request_id)
+                                  run_id=self.engine["run_id"], turn_id="turn-0001", engine_request_id=request_id,
+                                  ticket=Ticket())
 
     def _call(self, queue, method: str, principal: dict, params: dict) -> dict:
         """The dispatcher's part: one transaction, the handler inside it, the callbacks after the commit."""

@@ -634,6 +634,10 @@ class _Run:
         self.made: list[tuple[str, int, str, tuple[int, int], str]] = []
         self.stores: list[tuple[str, int, str, tuple[int, int]]] = []
         self.notes: list[str] = []  # sentences of ``undo`` beside the paths it could not remove
+        # The key made now: its path, the bytes made (None: no key made), whether it was linked, and its folders
+        # as opened before and after it was written (``key_folder``).
+        self.key_path, self.pem, self.key_written = "", None, False
+        self.key_dirs: list[int] = []
 
     def covers(self, paths: Owned) -> bool:
         return all(folder in self.by_folder for folder in _store_folders(paths))
@@ -740,28 +744,80 @@ class _Run:
         self.stores.append((path, fd, name, mine))
         return True
 
-    def key_made(self, path: str, pem: bytes) -> None:
-        """Record the key this step has just written at ``path``: its folder is opened (never through a link at its
-        own name) and held until the answer, and the key is recorded by its identity once the file at its name in
-        that folder is the file at ``path`` holding the bytes this step made (no other caller holds them). ``undo``
-        then removes it through that same folder while its name holds this very file, wherever the folder's path
-        leads by then. A key that cannot be proven so is named in the words of a failure (``_KEY_MOVED``). A key of
-        the person is never made here and never removed."""
+    def key_folder(self, folder: str) -> None:
+        """Open the key's folder (never through a link at its own name) and hold it until the answer, so ``undo``
+        finds the key this step made in it wherever the folder's path leads by then. Called before the key is
+        written and after."""
 
-        folder, name = os.path.dirname(path), os.path.basename(path)
-        try:
+        with contextlib.suppress(OSError):
             fd = os.open(folder, _FOLDER_OPEN)
-        except OSError:
-            self.notes.append(_KEY_MOVED.format(path=_shown(path)))
-            return
-        self.held.callback(os.close, fd)
+            self.held.callback(os.close, fd)
+            self.key_dirs.append(fd)
+
+    def _key_by_path(self) -> tuple[bool, list[str]]:
+        """The key at its path, while the path still names the file read (``held_regular``) and that file holds the
+        bytes this step made: removed through its folder, opened now, renamed aside and compared first
+        (``_take_away``). Returns whether it was removed, and the path it could not remove."""
+
+        folder, name = os.path.dirname(self.key_path), os.path.basename(self.key_path)
         with contextlib.suppress(OSError, InstallRefused):
-            with held_regular(path) as (data, info):
-                entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                if data == pem and (entry.st_dev, entry.st_ino) == (info.st_dev, info.st_ino):
-                    self.made.append(("key", fd, name, (info.st_dev, info.st_ino), path))
-                    return
-        self.notes.append(_KEY_MOVED.format(path=_shown(path)))
+            fd = os.open(folder, _FOLDER_OPEN)
+            try:
+                with held_regular(self.key_path) as (data, info):
+                    entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    if data != self.pem or (entry.st_dev, entry.st_ino) != (info.st_dev, info.st_ino):
+                        return False, []  # another file at the path now: kept
+                    status, at = _take_away(fd, name, (info.st_dev, info.st_ino))
+                    return status == "removed", [os.path.join(folder, at)] if status == "left" else []
+            finally:
+                os.close(fd)
+        return False, []
+
+    def _key_in(self, fd: int) -> tuple[bool, list[str]]:
+        """In an opened key folder the key's path no longer leads to: each file named as the key or as a temporary
+        file of it that holds the bytes this step made (which no other caller holds) is removed (``_take_away``).
+        Returns whether one was removed, and the paths it could not remove. A folder the path still leads to is
+        left to ``_key_by_path``."""
+
+        name = os.path.basename(self.key_path)
+        try:
+            here, there = os.fstat(fd), os.stat(os.path.dirname(self.key_path))
+            if (here.st_dev, here.st_ino) == (there.st_dev, there.st_ino):
+                return False, []
+        except OSError:
+            pass
+        try:
+            names = os.listdir(fd)
+        except OSError:
+            return False, []
+        try:
+            where = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            where = os.path.dirname(self.key_path)
+        removed, left = False, []
+        for entry in names:
+            if entry != name and not (entry.startswith(f".{name}.") and entry.endswith(".tmp")):
+                continue
+            try:
+                handle = os.open(entry, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                                 | getattr(os, "O_CLOEXEC", 0), dir_fd=fd)
+            except OSError:
+                continue
+            try:
+                info = os.fstat(handle)
+                data = os.read(handle, len(self.pem) + 1) if stat.S_ISREG(info.st_mode) else b""
+            except OSError:
+                data = b""
+            finally:
+                os.close(handle)
+            if data != self.pem:
+                continue
+            status, at = _take_away(fd, entry, (info.st_dev, info.st_ino))
+            if status == "removed":
+                removed = True
+            elif status == "left":
+                left.append(os.path.join(where, at))
+        return removed, left
 
     def proven(self, path: str, fd: int, name: str, mine: tuple[int, int] | None) -> tuple[int, int]:
         """The store's entry in its opened folder is on that folder's device, is the file at ``path``, and, made now
@@ -793,12 +849,10 @@ class _Run:
 
         left = []
         for what, fd, name, mine, path in reversed(self.made):
-            if what in ("file", "key"):  # proven to be the very file made at the moment it is removed
+            if what == "file":  # proven to be the very file made at the moment it is removed
                 status, at = _take_away(fd, name, mine)
                 if status == "left":
                     left.append(os.path.join(os.path.dirname(path), at))
-                elif what == "key" and status != "removed":
-                    self.notes.append(_KEY_MOVED.format(path=_shown(path)))
                 continue
             try:
                 info = os.stat(name, dir_fd=fd if fd >= 0 else None, follow_symlinks=False)
@@ -815,6 +869,15 @@ class _Run:
                 pass
             except OSError:
                 left.append(path)
+        if self.pem is not None:  # the key made now, with the ledger made for it (removed above, newest first)
+            removed, kept = self._key_by_path()
+            left += kept
+            for fd in self.key_dirs:
+                found, kept = self._key_in(fd)
+                removed = removed or found
+                left += [where for where in kept if where not in left]
+            if self.key_written and not removed:
+                self.notes.append(_KEY_MOVED.format(path=_shown(self.key_path)))
         return left
 
     def undone(self, exc: BaseException) -> BaseException:
@@ -1016,8 +1079,9 @@ def make_anchor_key(paths: Owned, found: _Found) -> str:
 
 def _make_key(paths: Owned, found: _Found, run: "_Run | None" = None) -> tuple[str, bytes]:
     """``make_anchor_key``, also returning the private key's PEM so a failure later in the same run can
-    tell the key it made from any other. Inside a step (``run``), the key written is proven and recorded by its opened
-    folder (``_Run.key_made``), and the step's undo removes it through that folder."""
+    tell the key it made from any other. Inside a step (``run``), the key's folder is opened before the key is
+    written and after (``_Run.key_folder``), and the step's undo removes the key by its path (``_Run._key_by_path``)
+    or, where the path leads elsewhere by then, by its bytes through those folders (``_Run._key_in``)."""
 
     if found.public is not None:
         raise InstallRefused("anchor_key", "the key is there already")
@@ -1029,13 +1093,17 @@ def _make_key(paths: Owned, found: _Found, run: "_Run | None" = None) -> tuple[s
     pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
                             serialization.NoEncryption())
     public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+    if run is not None:  # the step's undo finds the key by its bytes in the folders opened for it
+        run.key_path, run.pem = paths.anchor_key, pem
+        run.key_folder(paths.authority_dir)
     try:
         write_exclusive(paths.anchor_key, pem, _KEY_MODE)
     except BaseException:
         _remove_key_made(paths.anchor_key, pem)  # linked before the failure; a key another linked first stays
         raise
     if run is not None:
-        run.key_made(paths.anchor_key, pem)  # removed through its folder by the step's undo on a failure
+        run.key_written = True
+        run.key_folder(paths.authority_dir)
     return public, pem
 
 
@@ -1056,19 +1124,20 @@ def _sync_parents(root: str, path: str) -> None:
         cur = parent
 
 
-def _remove_key_made(path: str, pem: bytes) -> None:
+def _remove_key_made(path: str, pem: bytes) -> bool:
     """Remove the key file at ``path`` if it holds ``pem``, the private key this run made (no other caller
     can hold those bytes), and only while the path still names the file read: it is held open, and its
     device and inode are compared with the path's (``still_names``) immediately before the unlink, so a
     key moved onto the path after the read is kept. One window is left: a file moved there between that
     comparison and the unlink (``unlink_regular``'s own lookup and its unlink). Called on a failure: a
-    second failure here leaves the first to be raised."""
+    second failure here leaves the first to be raised. True when it removed the key."""
 
     with contextlib.suppress(OSError, InstallRefused):
         with held_regular(path) as (data, info):
             if data == pem:
                 still_names(path, info)  # another file at the path now: unit_changed, and it is kept
-                unlink_regular(path)
+                return unlink_regular(path)
+    return False
 
 
 def _bound_to(ledger: str, public: str) -> bool:
@@ -1189,8 +1258,8 @@ def _found(paths: Owned, anchor_public_key: str | None, make_anchor: bool) -> _F
 def _anchor_and_ledger(paths: Owned, anchor_public_key: str | None, found: _Found | None,
                        make_anchor: bool, on_anchor_made=None) -> tuple[tuple[str, bool, str], tuple[str, bool] | None]:
     """The ledger step, after the stores. With ``make_anchor``: a fresh profile gets its key, then the
-    ledger bound to it. Inside ``install`` and ``upgrade`` the key made is recorded by its opened folder
-    (``_Run.key_made``) and a failure of the step removes it with the ledger made for it (``_Run.undo``);
+    ledger bound to it. Inside ``install`` and ``upgrade`` the key's folder is opened for the step
+    (``_Run.key_folder``) and a failure of the step removes the key with the ledger made for it (``_Run.undo``);
     ``on_anchor_made`` is then called by the step only when it ended made (``_kept``). Outside a step, a
     failure from the key's link to the ledger's leaves the two agreeing or neither: a ledger already bound to
     the key just made keeps the key with it (and ``on_anchor_made(path)`` is called); with no ledger there,

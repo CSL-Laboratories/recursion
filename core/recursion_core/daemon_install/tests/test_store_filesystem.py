@@ -901,6 +901,31 @@ class GroundAsTheKernelResolvesItTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(paths.anchor_key))
 
 
+    @unittest.skipUnless(backend_available(), "needs the cryptography package")
+    def test_a_swap_of_the_home_while_the_key_is_written_leaves_no_key_and_no_part_of_it(self):
+        layout = importlib.import_module("recursion_core.daemon_install.layout")
+        for holds_key in (False, True):
+            for moment in ("_write_temp", "write_exclusive"):
+                with self.subTest(holds_key=holds_key, moment=moment):
+                    home, nfs, other = self._key_case(f"write-{moment}-{holds_key}", holds_key)
+                    before = _tree(nfs)
+                    module = layout if moment == "_write_temp" else INSTALL
+                    real = getattr(module, moment)
+
+                    def swapped(where, *args, _real=real, _home=home, _other=other, **kwargs):
+                        answer = _real(where, *args, **kwargs)
+                        if os.path.basename(where) == "anchor.key" and not os.path.islink(_home):
+                            self._swap(_home, _other)  # just after the key's temporary write, or just after its link
+                        return answer
+
+                    with mock.patch.object(module, moment, swapped):
+                        with self.assertRaises((InstallRefused, OSError)):
+                            install(Roots(home=home), EXEC, make_anchor=True)
+                    authority = os.path.join(home + ".judged", ".config", "recursion", "authority")
+                    self.assertEqual(os.listdir(authority) if os.path.isdir(authority) else [], [])  # no key, no part
+                    self.assertEqual(_tree(nfs), before)  # the refused place's own key and stores untouched
+
+
 @unittest.skipUnless(LINUX, "the installer is Linux-only")
 class TheReadmeSaysWhatTheInstallerDoesTests(unittest.TestCase):
     """The README's sentences on the key, its ledger and the stores after a failed step are true of the code."""

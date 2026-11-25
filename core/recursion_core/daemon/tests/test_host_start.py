@@ -35,8 +35,14 @@ from recursion_core.plugin_security import host_channel as hc
 from recursion_core.plugin_security.limits import ARTIFACT
 from recursion_core.plugin_security.tests.support import manifest_bytes
 
+try:
+    import jsonschema
+except ImportError:  # some interpreters have none: the record's fields are then checked without it
+    jsonschema = None
+
 LINUX = sys.platform.startswith('linux')
 CORE = Path(__file__).resolve().parents[3]
+WALL_SCHEMA = CORE.parent / 'schemas' / 'plugin' / 'v1' / 'wall.v1.json'
 # A free-threaded build runs the host with its lock check on; a build with the lock can only run it with the check off.
 GIL_CHECK = 'on' if not getattr(sys, '_is_gil_enabled', lambda: True)() else 'off'
 HOSTS_PER_TEST = 4      # the hard count on the hosts one test may start
@@ -383,8 +389,24 @@ class TheHostsOwnRestart(_Folder):
         status, frames, errors = self.child([sys.executable, '-B', '-c', wrap, str(self.core_folder)],
                                             env={'CSL_HOST_TEST_NOT_CLEAN': '1'}, stdin=stdin)
         self.assertEqual(status, 0, errors)
-        self.assertEqual(frames[0], HELLO, frames)
+        # The whole hello: its type and channel, and the wall the host put up before its first frame.
+        self.assertEqual(sorted(frames[0]), ['channel', 'type', 'wall'], frames)
+        self.assertEqual({key: frames[0][key] for key in HELLO}, HELLO, frames)
+        self.assert_a_wall_record(frames[0]['wall'])
         self.assertEqual(frames[1:], [{'type': 'result', 'id': 1, 'value': RESTARTED}], frames)
+
+    def assert_a_wall_record(self, record):
+        """A record of the schema wall.v1 that says proven, or names why it is not."""
+        schema = json.loads(WALL_SCHEMA.read_text(encoding='utf-8'))
+        self.assertIs(type(record), dict, record)
+        self.assertEqual([name for name in schema['required'] if name not in record], [], record)
+        self.assertEqual([name for name in record if name not in schema['properties']], [], record)
+        if jsonschema is not None:
+            jsonschema.Draft202012Validator(schema).validate(record)
+        if record['proven'] is True:
+            self.assertEqual(plugin_host._wall_missing(record, ''), [], record)
+        else:
+            self.assertNotEqual(plugin_host.wall_linux.why_not_proven(record), [], record)
 
     def test_off_linux_a_descriptor_above_a_lowered_limit_is_closed(self):
         code = ('import json, os, resource, sys\n'

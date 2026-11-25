@@ -1155,11 +1155,16 @@ RECORD_CHECKS = ("reads_outside", "home_canary", "program_start", "new_socket", 
                  "signal_other_ways", "metadata_change", "kernel_surface")
 # A proven record as the stand-in wall gives it (and as a daemon might claim one in its own hello).
 WRITE_KINDS = ("open_for_write", "truncate", "create_file", "create_folder", "make_fifo", "make_symlink",
-               "make_link", "make_char_device", "make_block_device", "remove_file", "remove_folder")
+               "make_link", "make_char_device", "make_block_device", "make_socket_node", "remove_file",
+               "remove_folder")
+# The nine kinds the wall names and does not try (wall.v1 draft 5 asks every one of them of a proven record).
+WRITES_NOT_TRIED = ("device_ioctl", "move_between_folders", "rename_within_folder", "change_owner", "change_times",
+                    "change_extended_attributes", "write_through_open_descriptor", "writable_memory_map",
+                    "write_beneath_other_folder")
 STANDIN_RECORD = dict(dict.fromkeys(RECORD_CHECKS, True), writes=dict.fromkeys(WRITE_KINDS, "refused_by_landlock"),
-                      writes_not_tried={"make_socket_node": "stand-in", "device_ioctl": "stand-in",
-                                        "move_between_folders": "stand-in"},
-                      landlock_abi=6, landlock_scopes=["abstract_unix_socket", "signal"], arch="x86_64", proven=True)
+                      writes_not_tried=dict.fromkeys(WRITES_NOT_TRIED, "stand-in"), threads=1,
+                      descriptors_open_for_write=[], landlock_abi=6,
+                      landlock_scopes=["abstract_unix_socket", "signal"], arch="x86_64", proven=True)
 # The wall each exchange gives its host, as lines run inside the host before main. "standin": no wall
 # and a proven stand-in record, for the tests of the channel, the environment and the GIL rule, several of
 # whose plugins read /proc, which a real wall refuses. "real": the host's own wall on this kernel.

@@ -138,7 +138,7 @@
     {"call": "sched_get_priority_min", "x86_64": 147, "aarch64": 126, "reason": "a fact about the process itself or the machine, read only, or a setting of the process's own that reaches no other process and cannot lift the wall (no_new_privs cannot be unset, a filter only added)", "recorded": [], "beyond_recording": "not made by the wall's tests here; a fact about the process itself or the machine, read only"},
     {"call": "sched_getattr", "x86_64": 315, "aarch64": 275, "reason": "a fact about the process itself or the machine, read only, or a setting of the process's own that reaches no other process and cannot lift the wall (no_new_privs cannot be unset, a filter only added)", "recorded": [], "beyond_recording": "not made by the wall's tests here; a fact about the process itself or the machine, read only"},
     {"call": "getpriority", "x86_64": 140, "aarch64": 141, "reason": "a fact about the process itself or the machine, read only, or a setting of the process's own that reaches no other process and cannot lift the wall (no_new_privs cannot be unset, a filter only added)", "recorded": ["cpython-3.12-x86_64", "cpython-3.14t-x86_64"]},
-    {"call": "prctl", "x86_64": 157, "aarch64": 167, "reason": "a fact about the process itself or the machine, read only, or a setting of the process's own that reaches no other process and cannot lift the wall (no_new_privs cannot be unset, a filter only added)", "recorded": ["cpython-3.12-x86_64", "cpython-3.14t-x86_64"]},
+    {"call": "prctl", "x86_64": 157, "aarch64": 167, "reason": "allowed only with an option of prctl_options, each with its reason; the options that set the dumpable state, the name, the memory map's fields or a tracer are refused by name", "recorded": ["cpython-3.12-x86_64", "cpython-3.14t-x86_64"], "check": "prctl_option"},
     {"call": "rt_sigaction", "x86_64": 13, "aarch64": 134, "reason": "the process's own signal handling, timers and waits: a signal to any process is refused by name", "recorded": ["cpython-3.12-x86_64", "cpython-3.14t-x86_64"]},
     {"call": "rt_sigprocmask", "x86_64": 14, "aarch64": 135, "reason": "the process's own signal handling, timers and waits: a signal to any process is refused by name", "recorded": ["cpython-3.12-x86_64", "cpython-3.14t-x86_64"]},
     {"call": "rt_sigreturn", "x86_64": 15, "aarch64": 139, "reason": "the process's own signal handling, timers and waits: a signal to any process is refused by name", "recorded": ["cpython-3.12-x86_64", "cpython-3.14t-x86_64"]},
@@ -189,5 +189,19 @@
     {"call": "setpriority", "x86_64": 141, "aarch64": 140, "check": "priority", "reason": "allowed only when it names one process and that process is the caller", "recorded": ["cpython-3.12-x86_64", "cpython-3.14t-x86_64"]},
     {"call": "ioprio_set", "x86_64": 251, "aarch64": 30, "check": "priority", "reason": "allowed only when it names one process and that process is the caller", "recorded": [], "beyond_recording": "not made by the wall's tests here; allowed only with the arguments the filter reads"},
     {"call": "landlock_create_ruleset", "x86_64": 444, "aarch64": 444, "reason": "the probe reads the kernel's Landlock version after the wall (a query with the version flag); a ruleset made after the wall can only add limits", "recorded": ["cpython-3.12-x86_64", "cpython-3.14t-x86_64"]}
+  ],
+  "prctl_options": [
+    {"option": 1, "name": "PR_SET_PDEATHSIG", "reason": "the signal the kernel sends this process itself when its parent ends"},
+    {"option": 2, "name": "PR_GET_PDEATHSIG", "reason": "read only: a fact about the process itself"},
+    {"option": 3, "name": "PR_GET_DUMPABLE", "reason": "read only: a fact about the process itself"},
+    {"option": 16, "name": "PR_GET_NAME", "reason": "read only: a fact about the process itself (the probe reads it)"},
+    {"option": 21, "name": "PR_GET_SECCOMP", "reason": "read only: a fact about the process itself"},
+    {"option": 23, "name": "PR_CAPBSET_READ", "reason": "read only: a fact about the process itself"},
+    {"option": 30, "name": "PR_GET_TIMERSLACK", "reason": "read only: a fact about the process itself"},
+    {"option": 37, "name": "PR_GET_CHILD_SUBREAPER", "reason": "read only: a fact about the process itself"},
+    {"option": 38, "name": "PR_SET_NO_NEW_PRIVS", "reason": "it can only be set, never unset: the wall sets it itself"},
+    {"option": 39, "name": "PR_GET_NO_NEW_PRIVS", "reason": "read only: a fact about the process itself"},
+    {"option": 40, "name": "PR_GET_TID_ADDRESS", "reason": "read only: a fact about the process itself"},
+    {"option": 42, "name": "PR_GET_THP_DISABLE", "reason": "read only: a fact about the process itself"}
   ]
 }

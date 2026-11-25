@@ -59,6 +59,12 @@ and to everything it starts later, and neither can be lifted again from inside:
      that asks ``O_TRUNC``.
    Every call numbered above the newest call the wall's tables name is answered EPERM, by one comparison (as the
    x32 range is), so a call a newer kernel adds stays refused until the wall names it.
+   ``prctl`` is let through only with an option the allow list names (``prctl_options``, each with its reason);
+   ``DENIED_PRCTL_OPTIONS`` (the dumpable state, the process's name, its memory map's fields, the process allowed to
+   trace it) are refused by name, and the wall sets the process not dumpable as it loads the filter, so no process
+   started before the wall and no longer this one's child reads or writes its memory or its name. What such a
+   process can still read of the walled one (the command line, which lives in the walled process's own memory, and
+   its times) is not seen by the probe: the host must start no process before the wall.
    The filter is an ALLOW LIST: after the refusals above it lets through only the calls named in the list
    ``ALLOW_LIST_FILE`` (``wall_allow_linux.json`` beside this module), each row with its number on each arch, the
    check of its arguments where it is allowed only in part (the checks above, which a row cannot drop or change),
@@ -146,7 +152,7 @@ import struct
 import sys
 import threading
 
-__all__ = ["ALLOW_LIST_FILE", "CALLER_ONLY_CALLS", "CALLER_ONLY_PRIORITY_CALLS", "DENIED_CALLS", "DENIED_FCNTL_COMMANDS",
+__all__ = ["ALLOW_LIST_FILE", "CALLER_ONLY_CALLS", "CALLER_ONLY_PRIORITY_CALLS", "DENIED_CALLS", "DENIED_PRCTL_OPTIONS", "DENIED_FCNTL_COMMANDS",
            "DENIED_IOCTL_COMMANDS", "DENIED_IPC_CALLS", "DENIED_METADATA_CALLS", "DENIED_SIGNAL_CALLS",
            "ALLOWED_TERMINAL_COMMANDS", "DENIED_TERMINAL_COMMANDS", "HELD_KINDS", "HELD_NOT_TRIED", "HELD_OUTCOMES", "LANDLOCK_SCOPES", "NAMESPACE_CLONE_FLAGS", "OLD_LANDLOCK_DENIED_CALLS", "RECORD_CHECKS", "WORDS",
            "WRITES_NOT_TRIED", "WRITE_FILE_NAME", "WRITE_FOLDER_NAMES", "WRITE_KINDS", "WRITE_OUTCOMES", "WallRefused", "apply_wall",
@@ -228,6 +234,8 @@ _UNKNOWN_CALL = 0x40000000 - 1
 ALLOW_LIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wall_allow_linux.json")
 _ALLOW_FORMAT = "wall-allow-list.v1"
 _ALLOW_ROW_KEYS = ("call", "x86_64", "aarch64", "check", "reason", "recorded", "beyond_recording")
+_ALLOW_OPTION_KEYS = ("option", "name", "reason")
+_ALLOW_OPTIONS: dict = {}  # the prctl options of each list read, by its path
 _ALLOW_CHUNK = 250  # allow rows per run of comparisons: a classic BPF jump reaches 255 rows forward at most
 _RESOLVE_NO_SYMLINKS = 0x04  # struct open_how's resolve flag (include/uapi/linux/openat2.h)
 # clone with any of these flags (a new mount, cgroup, uts, ipc, user, pid or network namespace) is refused.
@@ -276,7 +284,7 @@ _NR_MORE = {
         "prlimit64": 302, "sched_setaffinity": 203, "sched_setscheduler": 144, "sched_setparam": 142,
         "sched_setattr": 314, "migrate_pages": 256, "move_pages": 279, "setpriority": 141, "ioprio_set": 251,
         "fcntl": 72, "ioctl": 16, "clone": 56, "clone3": 435, "sendto": 44, "close_range": 436,
-        "truncate": 76, "ftruncate": 77, "openat2": 437, "open": 2, "openat": 257, "personality": 135,
+        "truncate": 76, "ftruncate": 77, "openat2": 437, "open": 2, "openat": 257, "personality": 135, "prctl": 157,
     },
     "aarch64": {
         "fchmod": 52, "fchmodat": 53, "fchmodat2": 452, "fchown": 55, "fchownat": 54, "utimensat": 88,
@@ -289,7 +297,7 @@ _NR_MORE = {
         "prlimit64": 261, "sched_setaffinity": 122, "sched_setscheduler": 119, "sched_setparam": 118,
         "sched_setattr": 274, "migrate_pages": 238, "move_pages": 239, "setpriority": 140, "ioprio_set": 30,
         "fcntl": 25, "ioctl": 29, "clone": 220, "clone3": 435, "sendto": 206, "close_range": 436,
-        "truncate": 45, "ftruncate": 46, "openat2": 437, "openat": 56, "personality": 92,
+        "truncate": 45, "ftruncate": 46, "openat2": 437, "openat": 56, "personality": 92, "prctl": 167,
     },
 }
 _AUDIT_ARCH = {"x86_64": 0xC000003E, "aarch64": 0xC00000B7}
@@ -313,6 +321,11 @@ _FS_MAKE_SOCK = 1 << 9
 _FS_TRUNCATE = 1 << 14
 
 _PR_SET_NO_NEW_PRIVS = 38
+_PR_SET_DUMPABLE = 4
+# prctl options the wall refuses by name, which no row of the allow list may name: the process's dumpable state (no
+# process reads or writes its memory once it is 0), its name (which another process reads in /proc), its memory map's
+# fields, and the process allowed to trace it.
+DENIED_PRCTL_OPTIONS = {"PR_SET_DUMPABLE": 4, "PR_SET_NAME": 15, "PR_SET_MM": 35, "PR_SET_PTRACER": 0x59616D61}
 _SECCOMP_SET_MODE_FILTER, _SECCOMP_FILTER_FLAG_TSYNC = 1, 1
 _BPF_LD_W_ABS, _BPF_JEQ_K, _BPF_JGE_K, _BPF_JSET_K, _BPF_RET_K = 0x20, 0x15, 0x35, 0x45, 0x06
 _EPERM, _ENOSYS = 1, 38                      # Linux errno values (the kernel's, whatever the host Python says)
@@ -474,10 +487,11 @@ WORDS = {
                        "must close every such file before it shuts itself in.",
     "descriptors_unknown": "The plugin host could not see every file it held open, so it could not show that none "
                            "was open for writing.",
-    "map_open": "A file or a piece of memory was mapped shared and writable when the plugin host shut itself in. "
-                "The sandbox checks a file when it is opened, so writes through such a map still reach the file, "
+    "map_open": "A file or a piece of memory was mapped shared when the plugin host shut itself in (writable then, "
+                "or able to be made writable after). The sandbox checks a file when it is opened, so writes through "
+                "such a map still reach the file, "
                 "and memory shared with another process lets that process act for the host outside the sandbox: "
-                "the host must unmap every such map before it shuts itself in.",
+                "the host must unmap every shared map before it shuts itself in.",
     "child_process": "The plugin host had started another process before it shut itself in ({children} still "
                      "running). The sandbox holds the process that shuts itself in and what it starts afterwards, "
                      "never a process that already runs, which could act for the host outside the sandbox, so nothing "
@@ -635,11 +649,18 @@ def _children() -> int:
     except (OSError, ValueError) as exc:
         raise WallRefused("wall_children_running", WORDS["children_unknown"]) from exc
     live = 0
-    for pid in pids:
+    for pid in pids:  # alive while ANY of its tasks is not a zombie: a main thread that ended alone shows Z
         try:
-            live += _stat_state(pid)[0] != "Z"
-        except (OSError, ValueError, IndexError):
+            tasks = os.listdir(f"/proc/{pid}/task")
+        except OSError:
             continue  # ended since: it can no longer act
+        for task in tasks:
+            try:
+                if _stat_state(f"{pid}/task/{task}")[0] != "Z":
+                    live += 1
+                    break
+            except (OSError, ValueError, IndexError):
+                continue
     return live
 
 
@@ -668,6 +689,8 @@ def _required_check(call: str):
         return "priority"
     if call in ("fcntl", "ioctl", "clone", "sendto"):
         return call
+    if call == "prctl":
+        return "prctl_option"
     if call in OLD_LANDLOCK_DENIED_CALLS or call in ("open", "openat"):
         return "landlock_truncate"
     return None
@@ -741,6 +764,25 @@ def _read_allow_list(path: str) -> tuple:
         if not named:
             refuse(f"{where} gives no number on any arch")
         names.add(call)
+    options = data.get("prctl_options", [])
+    if not isinstance(options, list):
+        refuse("its prctl options are not a list")
+    seen_options = set()
+    for index, entry in enumerate(options, 1):
+        where = f"prctl option {index}"
+        if not isinstance(entry, dict) or set(entry) != set(_ALLOW_OPTION_KEYS):
+            refuse(f"{where} is not an option of the wall's form (its keys: {', '.join(_ALLOW_OPTION_KEYS)})")
+        option = entry["option"]
+        if not isinstance(option, int) or isinstance(option, bool) or not 0 <= option <= 0xFFFFFFFF:
+            refuse(f"{where} gives no option number")
+        if not isinstance(entry["reason"], str) or not entry["reason"].strip():
+            refuse(f"{where} ({entry.get('name')}) carries no reason")
+        if option in DENIED_PRCTL_OPTIONS.values():
+            refuse(f"{where} ({entry.get('name')}) names an option the wall refuses by name, which no row can allow")
+        if option in seen_options:
+            refuse(f"{where} names an option an entry above names already")
+        seen_options.add(option)
+    _ALLOW_OPTIONS[path] = tuple(entry["option"] for entry in options)
     return tuple(data["rows"])
 
 
@@ -752,13 +794,18 @@ def load_allow_list(path=None) -> dict:
     shipped = _read_allow_list(ALLOW_LIST_FILE)
     file = ALLOW_LIST_FILE if path is None else os.fspath(path)
     rows = shipped if path is None else _read_allow_list(file)
+    options = _ALLOW_OPTIONS[file]
 
     def key(row):
         return (row["call"], row["x86_64"], row["aarch64"], row.get("check"))
     ours, theirs = {key(row) for row in shipped}, {key(row) for row in rows}
     added = sorted({row["call"] for row in rows if key(row) not in ours})
     removed = sorted({row["call"] for row in shipped if key(row) not in theirs})
-    return {"file": file, "rows": rows, "shipped": not added and not removed, "added": added, "removed": removed}
+    if set(options) != set(_ALLOW_OPTIONS[ALLOW_LIST_FILE]):  # an option added or removed is a change of prctl's row
+        (added if set(options) - set(_ALLOW_OPTIONS[ALLOW_LIST_FILE]) else removed).append("prctl")
+    rows = tuple(dict(row, options=options) if row["call"] == "prctl" else row for row in rows)
+    return {"file": file, "rows": rows, "shipped": not added and not removed, "added": sorted(set(added)),
+            "removed": sorted(set(removed))}
 
 
 def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI, allow_rows=None) -> list[tuple[int, int, int, int]]:
@@ -785,7 +832,7 @@ def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI, allow_rows=None) -
     rows += [(_BPF_JEQ_K, "caller", 0, numbers[name]) for name in CALLER_ONLY_CALLS if name in listed]
     rows += [(_BPF_JEQ_K, label, 0, numbers[name]) for name, label in
              (("setpriority", "prio"), ("ioprio_set", "ioprio"), ("fcntl", "fcntl"), ("ioctl", "ioctl"),
-              ("clone", "clone"), ("sendto", "sendto")) if name in listed]
+              ("clone", "clone"), ("sendto", "sendto"), ("prctl", "prctl")) if name in listed]
     rows.append((_BPF_JEQ_K, "enosys", 0, numbers["clone3"]))
     rows.append((_BPF_JGE_K, "listed", "listed", 0))  # always taken: on to the allow list, past the checks below
     labels: dict[str, int] = {}
@@ -813,6 +860,11 @@ def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI, allow_rows=None) -
           *[(_BPF_JEQ_K, "allow", 0, value) for value in ALLOWED_TERMINAL_COMMANDS.values()],
           (_BPF_JGE_K, "allow", 0, _TERMINAL_RANGE[1]), (_BPF_JGE_K, "deny", "allow", _TERMINAL_RANGE[0]))
     block("clone", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[0]), (_BPF_JSET_K, "deny", "allow", NAMESPACE_CLONE_FLAGS))
+    # prctl: only the options the allow list names (each with its reason); every other option, those refused by
+    # name among them, is answered EPERM
+    prctl_options = listed["prctl"].get("options", ()) if "prctl" in listed else ()
+    block("prctl", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[0]),
+          *[(_BPF_JEQ_K, "allow", 0, option) for option in prctl_options], (_BPF_RET_K, 0, 0, _RET_EPERM))
     block("trunc1", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]), (_BPF_JSET_K, "deny", "allow", _O_TRUNC))
     block("trunc2", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[2]), (_BPF_JSET_K, "deny", "allow", _O_TRUNC))
     block("enosys", (_BPF_RET_K, 0, 0, _RET_ENOSYS))
@@ -883,6 +935,11 @@ def _load_seccomp_filter(libc, arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI,
     _step("no_new_privs_before_filter", lambda: _no_new_privs(libc))
 
     def load():
+        # not dumpable: no process of this user reads or writes this one's memory or its /proc files, whatever
+        # tracer was allowed before; the filter refuses PR_SET_DUMPABLE after the wall
+        if libc.prctl(_PR_SET_DUMPABLE, ctypes.c_ulong(0), ctypes.c_ulong(0), ctypes.c_ulong(0), ctypes.c_ulong(0)) != 0:
+            err = ctypes.get_errno()
+            raise OSError(err, f"prctl(PR_SET_DUMPABLE, 0): {os.strerror(err)}")
         result, err = _call(libc, _NR[arch]["seccomp"], _SECCOMP_SET_MODE_FILTER, _SECCOMP_FILTER_FLAG_TSYNC,
                             ctypes.addressof(fprog))
         if result != 0:  # a positive result is the id of a thread that could not be synced
@@ -1166,23 +1223,51 @@ def _read_kernel_lists(lists: dict) -> dict:
                 if not chunk:
                     break
                 chunks.append(chunk)
-            seen["maps"] = _maps_shared_for_write(b"".join(chunks))
+            seen["maps"] = _maps_shared_own(b"".join(chunks))
         except OSError:
             seen["maps"] = None
     return seen
 
 
 def _maps_shared_for_write(text: bytes) -> list:
-    """Each map that is shared and writable, of a file or of memory alone (an anonymous shared map, System V
-    memory, a memfd), as ``{"map": n}`` (its line in the list, from 0): through it a write still reaches the file, or a
+    """Each map that is shared, writable now or not, of a file or of memory alone (an anonymous shared map, System V
+    memory, a memfd), as ``{"map": n}``: the kernel's list cannot show whether the object was opened for writing, and
+    a shared map read-only at the wall can be made writable after it (its line in the list, from 0): through it a write still reaches the file, or a
     process that shares the memory (one forked before the wall) acts on what the walled one writes there. Never its
     name, address or contents."""
     found = []
     for number, line in enumerate(text.decode("ascii", "replace").splitlines()):
         fields = line.split()
-        if len(fields) >= 5 and len(fields[1]) == 4 and fields[1][1] == "w" and fields[1][3] == "s":
+        if len(fields) >= 5 and len(fields[1]) == 4 and fields[1][3] == "s":
             found.append({"map": number})
     return found
+
+
+def _maps_shared_own(text: bytes) -> list:
+    """``_maps_shared_for_write`` of THIS process's own list: a shared map that is read-only now and that the kernel
+    will not let be made writable (mprotect answers EACCES: its object was not opened for writing, as the C library's
+    gconv-modules.cache is) is not named; every other shared map is. The protection of each map tried is put back at
+    once, before anything else runs (the process has one thread here)."""
+    named = _maps_shared_for_write(text)
+    libc = _libc()
+    libc.mprotect.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    libc.mprotect.restype = ctypes.c_int
+    lines = text.decode("ascii", "replace").splitlines()
+    kept = []
+    for entry in named:
+        fields = lines[entry["map"]].split()
+        perms = fields[1]
+        if perms[1] != "w":
+            start, end = (int(part, 16) for part in fields[0].split("-"))
+            prot = (1 if perms[0] == "r" else 0) | (4 if perms[2] == "x" else 0)
+            ctypes.set_errno(0)
+            if libc.mprotect(start, end - start, prot | 2) != 0:
+                if ctypes.get_errno() == errno.EACCES:
+                    continue  # cannot be made writable: its object was not opened for writing
+            else:
+                libc.mprotect(start, end - start, prot)  # put back
+        kept.append(entry)
+    return kept
 
 
 def _maps_open_for_write():
@@ -1190,7 +1275,7 @@ def _maps_open_for_write():
     process cannot open it: after apply_wall the probe takes what apply_wall read instead)."""
     try:
         with open("/proc/self/maps", "rb") as handle:
-            return _maps_shared_for_write(handle.read())
+            return _maps_shared_own(handle.read())
     except OSError:
         return None
 
@@ -1336,6 +1421,13 @@ def _open_tree_of_root(libc) -> None:
     os.close(_sys(libc, "open_tree", -100, ctypes.addressof(root), os.O_CLOEXEC))
 
 
+def _prctl_same_name(libc) -> None:
+    """prctl PR_SET_NAME with the name the process has (read by PR_GET_NAME): nothing changes where it is allowed."""
+    name = ctypes.create_string_buffer(16)
+    _sys(libc, "prctl", 16, ctypes.addressof(name), 0, 0, 0)
+    _sys(libc, "prctl", DENIED_PRCTL_OPTIONS["PR_SET_NAME"], ctypes.addressof(name), 0, 0, 0)
+
+
 def _kernel_surface() -> None:
     """Calls only this wall refuses, each harmless where it is allowed: io_uring_setup with no entries, the use of
     a ring and an addressed send on a descriptor that names nothing,
@@ -1361,7 +1453,10 @@ def _kernel_surface() -> None:
                 lambda: _lease_on_a_pipe(libc),
                 lambda: _open_tree_of_root(libc),                                   # a descriptor of / if allowed
                 lambda: _kernel("a call the wall does not know", *_call(libc, _UNKNOWN_CALL)),  # ENOSYS if allowed
-                lambda: _sys(libc, "personality", 0xFFFFFFFF)]  # off the allow list: reads the persona if allowed
+                lambda: _sys(libc, "personality", 0xFFFFFFFF),
+                lambda: _prctl_same_name(libc),
+                lambda: _sys(libc, "prctl", DENIED_PRCTL_OPTIONS["PR_SET_PTRACER"], 0, 0, 0, 0),  # no tracer
+                lambda: _sys(libc, "prctl", DENIED_PRCTL_OPTIONS["PR_SET_DUMPABLE"], 0, 0, 0, 0)]  # stays 0  # off the allow list: reads the persona if allowed
     if arch == "x86_64":
         attempts.append(lambda: _kernel("x32 getpid", *_call(libc, _X32_SYSCALL_BIT | 39)))
     try:

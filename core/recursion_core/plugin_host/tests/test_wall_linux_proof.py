@@ -321,7 +321,7 @@ class KernelListsAfterTheWallTests(unittest.TestCase):
                 b"7f0a-7f0b rw-s 00000000 00:01 7 /SYSV00000000 (deleted)\n"
                 b"7f0c-7f0d rw-s 00000000 00:01 9 /memfd:x (deleted)\n")
         # every map shared and writable, of a file or of memory alone (a process forked before the wall shares it)
-        self.assertEqual(wall_linux._maps_shared_for_write(text), [{"map": 1}, {"map": 2}, {"map": 5}, {"map": 6},
+        self.assertEqual(wall_linux._maps_shared_for_write(text), [{"map": 1}, {"map": 2}, {"map": 4}, {"map": 5}, {"map": 6},
                                                                    {"map": 7}])
 
 

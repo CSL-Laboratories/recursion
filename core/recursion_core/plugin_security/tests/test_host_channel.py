@@ -544,9 +544,9 @@ class SpyRuns:
     def __init__(self, api):
         self.api, self.seen = api, []
 
-    def call(self, method, params=None, *, origin=None):
+    def call(self, method, params=None, *, origin=None, admit=None):
         self.seen.append((method, origin))
-        return self.api.call(method, params, origin=origin)
+        return self.api.call(method, params, origin=origin, admit=admit)
 
 
 class RunRequestTests(unittest.TestCase):
@@ -656,7 +656,7 @@ class RunRequestTests(unittest.TestCase):
         self.assert_nothing_started()
         self.assertEqual(self.ask()["value"]["code"], "started")
         asked = [parse(request) for caller, request in self.core.requests]
-        self.assertEqual([(m["op"], m["args"]) for m in asked], [("plugin.permissions", {"plugin_id": "demo.plugin"})])
+        self.assertEqual([(m["op"], m["args"]) for m in asked], [("plugin.permissions", {"plugin_id": "demo.plugin"})] * 2)
         self.assertEqual({caller for caller, _ in self.core.requests}, {"demo.plugin"})
 
     # (5) admitted through run.start's own path; the record is run.start's plus origin

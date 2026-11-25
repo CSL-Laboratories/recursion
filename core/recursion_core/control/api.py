@@ -71,7 +71,19 @@ carries an ``origin`` key is answered as today (the key is ignored and never sto
 record carries another origin than the one asked with (a client's start against a key the daemon derived,
 or the other way round) is ``request_invalid`` / ``client_key_reused``, as any reuse of a key for another
 request. ``start_params_problem`` is the check of ``tenant``, ``engine`` and ``prompt`` that ``run.start``
-makes, for a caller that must refuse the same values before it starts anything.
+makes, for a caller that must refuse the same values before it starts anything. ``start`` refuses an
+origin whose ``kind`` is not in ``RUN_ORIGIN_KEYS`` or whose keys are not exactly that kind's with a
+``ValueError``: only in-process code gives an origin, so a wrong one is a fault of that code, never a
+client's request. ``trigger`` is the one kind written today.
+
+A check taken in one step with the start (``admit``). ``call("run.start", params, origin=..., admit=...)``
+takes ``admit``, a callable that returns a context manager whose value says whether the start may go on
+(the daemon's end of a plugin host's channel gives one that reads the plugin's ``schedule`` permission).
+It is entered under the start's own locks, after the key lookup, and held until the launch intent is
+written, so whatever it reads cannot change between its answer and the record. A ``False`` answer is
+``start_refused`` / ``not_admitted``: nothing is written, the starter is not called, a keyed retry of a
+run already recorded is refused the same way, and nothing is counted. A change that lands after the
+launch intent is written stops nothing already started: Stop is the way to end that run.
 
 Stop decisions and launch records are serialised per run, so a slow or hung cleanup on one run never
 queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed during it.
@@ -88,7 +100,7 @@ import hashlib
 import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 
 from recursion_core.control.registry import (
     EMPTY, POPULATED, TIMEOUT, KillTree, OwnerLockTable, RunRegistry, StaleGeneration,
@@ -98,8 +110,14 @@ STARTED, OK, STOPPED, PENDING = "started", "ok", "stopped", "pending"
 RUN_UNKNOWN, REQUEST_INVALID, START_FAILED, METHOD_UNKNOWN = (
     "run_unknown", "request_invalid", "start_failed", "method_unknown")
 START_UNCONFIRMED, REGISTRY_UNAVAILABLE = "start_unconfirmed", "registry_unavailable"
+START_REFUSED = "start_refused"  # the start's own ``admit`` check answered no; nothing was written
 CODES = frozenset({STARTED, OK, STOPPED, PENDING, RUN_UNKNOWN, REQUEST_INVALID, START_FAILED, METHOD_UNKNOWN,
-                   START_UNCONFIRMED, REGISTRY_UNAVAILABLE})
+                   START_UNCONFIRMED, REGISTRY_UNAVAILABLE, START_REFUSED})
+# The origin kinds a start may be recorded with, each with exactly its keys (host.v1.json x-run-request
+# origin). Part of the run record's format, not a setting.
+RUN_ORIGIN_KEYS = {"trigger": frozenset({"kind", "plugin", "record_kind", "record_id", "revision", "occurrence"})}
+# admit() -> a context manager whose value is True when the start may go on (see the module text).
+Admit = Callable[[], AbstractContextManager]
 SUCCESS_CODES = frozenset({STARTED, OK, STOPPED})
 _PENDING_REASON = {POPULATED: "cgroup_populated", TIMEOUT: "confirm_timeout"}
 LIST_LIMIT_MAX = 1000  # the most runs one run.list page may ask for
@@ -161,13 +179,14 @@ class ControlAPI:
         self._stop_wanted: set[str] = set()  # Stops that arrived before the launch was recorded
         self._failed: set[str] = set()  # starts that raised but whose start_failed write failed
 
-    def call(self, method: str, params: Mapping | None = None, *, origin: Mapping | None = None) -> dict:
-        """One method. ``origin`` is for an in-process ``run.start`` only (see the module text); a surface's
-        request never reaches it."""
-        if origin is not None and method != "run.start":
-            raise ValueError("origin is given only with run.start")
+    def call(self, method: str, params: Mapping | None = None, *, origin: Mapping | None = None,
+             admit: Admit | None = None) -> dict:
+        """One method. ``origin`` and ``admit`` are for an in-process ``run.start`` only (see the module
+        text); a surface's request never reaches them."""
+        if (origin is not None or admit is not None) and method != "run.start":
+            raise ValueError("origin and admit are given only with run.start")
         try:
-            return self._call(method, dict(params or {}), origin)
+            return self._call(method, dict(params or {}), origin, admit)
         except _RegistryError as err:  # every method answers with a typed code (red-team r2 finding 1)
             return {"code": REGISTRY_UNAVAILABLE, "detail": str(err)}
 
@@ -177,11 +196,11 @@ class ControlAPI:
         except Exception as err:
             raise _RegistryError(f"{op}:{type(err).__name__}") from err
 
-    def _call(self, method: str, params: dict, origin: Mapping | None = None) -> dict:
+    def _call(self, method: str, params: dict, origin: Mapping | None = None, admit: Admit | None = None) -> dict:
         if method == "run.list":
             return self.list_runs(params)
         if method == "run.start":
-            return self.start(params, origin=origin)
+            return self.start(params, origin=origin, admit=admit)
         handler = {"run.status": self.status, "run.stop": self.stop}.get(method)
         if handler is None:
             return {"code": METHOD_UNKNOWN, "detail": str(method)}
@@ -216,7 +235,17 @@ class ControlAPI:
         return {"code": OK, "runs": runs}
 
     # -- start --------------------------------------------------------------------------------
-    def start(self, params: Mapping, *, origin: Mapping | None = None) -> dict:
+    def start(self, params: Mapping, *, origin: Mapping | None = None, admit: Admit | None = None) -> dict:
+        if origin is not None:
+            kind = origin.get("kind") if isinstance(origin, Mapping) else None
+            keys = RUN_ORIGIN_KEYS.get(kind) if type(kind) is str else None
+            if keys is None:
+                raise ValueError(f"origin: kind {kind!r} is not one a run is recorded with "
+                                 f"({', '.join(sorted(RUN_ORIGIN_KEYS))})")
+            if set(origin) != keys:
+                raise ValueError(f"origin: a {kind} origin has exactly the keys {', '.join(sorted(keys))}")
+        if admit is not None and not callable(admit):
+            raise ValueError("admit: a callable that returns a context manager")
         problem = start_params_problem(params)
         if problem is not None:
             return {"code": REQUEST_INVALID, "detail": problem}
@@ -225,7 +254,7 @@ class ControlAPI:
         self._enter_owner()
         try:
             if not isinstance(key, str):
-                return self._start(params, origin)  # no key: a fresh run id, nothing to dedupe
+                return self._start(params, origin, admit)  # no key: a fresh run id, nothing to dedupe
             slot_key = (params["tenant"], key)
             with self._locks_lock:
                 slot = self._start_locks.get(slot_key)
@@ -236,7 +265,7 @@ class ControlAPI:
             lock_key = _start_lock_key(slot_key)
             self._locks.acquire(self._local.owner, [lock_key])
             try:
-                return self._start(params, origin)
+                return self._start(params, origin, admit)
             finally:
                 self._locks.release(self._local.owner, [lock_key])
                 with self._locks_lock:
@@ -246,7 +275,7 @@ class ControlAPI:
         finally:
             self._exit_owner()
 
-    def _start(self, params: Mapping, origin: dict | None = None) -> dict:
+    def _start(self, params: Mapping, origin: dict | None = None, admit: Admit | None = None) -> dict:
         key = params.get("client_key")
         start_key = None
         if isinstance(key, str):
@@ -260,7 +289,11 @@ class ControlAPI:
                "cgroup": None, "started_at": self._clock(), "stop": None, "start_key": start_key}
         if origin is not None:
             rec["origin"] = origin
-        with self._run_lock(run_id):
+        # ``admit`` is entered after the key lookup and held until the launch intent is written: what it
+        # reads cannot change between its answer and the record (the module text).
+        with self._run_lock(run_id), (nullcontext(True) if admit is None else admit()) as admitted:
+            if admitted is not True:
+                return {"code": START_REFUSED, "detail": "not_admitted"}
             if prior is not None:  # a retried start is not run twice, across restarts too (11.3, 11.8)
                 answer = self._retry(self._current(prior))
                 if answer is not None:

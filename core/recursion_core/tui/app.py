@@ -44,6 +44,11 @@ CONDITION_ROWS = 4
 # seconds. It is to become the row ``tui.close_bound_s`` of the person's settings file, default 5.0 (the value the
 # Loop's join has always used); until then a Loop takes it from here, and ``Loop.join_timeout_s`` changes it.
 CLOSE_BOUND_S = 5.0
+# After Ctrl-C ends that wait, a Stop the Stop lane is in a call for counts as sent once it has been in that call this
+# many seconds; until then the TUI waits for it, within the bound, so a Stop just begun is not cut off with the
+# process. It is to become the row ``tui.stop_handover_s`` of the person's settings file, default 0.2; until then a
+# Loop takes it from here, and ``Loop.stop_handover_s`` changes it.
+STOP_HANDOVER_S = 0.2
 _TRUNCATED = "⟦truncated⟧"
 _CURSOR = "▏"  # where the command line's cursor is, drawn only when it is not at the end
 SESSION_LIST = object()  # ``TuiApp.pane`` when the output pane shows the session list (review 1 of #405, Sol R1)
@@ -51,6 +56,22 @@ SESSION_LIST = object()  # ``TuiApp.pane`` when the output pane shows the sessio
 
 def _runs(runs) -> str:
     return ", ".join(field(r) for r in runs)
+
+
+def _queued_said(begun, queued) -> tuple[str, bool]:
+    """The queued Stops as said: 'the Stop of r2', and 'another Stop of r' for a run whose Stop is named already (a
+    run confirmed twice); True when that is more than one Stop."""
+
+    seen, new, again = set(begun), [], {}
+    for run in queued:
+        if run in seen:
+            again[run] = again.get(run, 0) + 1
+        else:
+            new.append(run)
+            seen.add(run)
+    parts = [f"the Stop of {_runs(new)}"] if new else []
+    parts += [f"another Stop of {field(r)}" if c == 1 else f"{c} more Stops of {field(r)}" for r, c in again.items()]
+    return " and ".join(parts), len(parts) > 1 or any(c > 1 for c in again.values())
 
 
 def _fmt(params: Mapping) -> str:
@@ -229,6 +250,14 @@ class TuiApp:
         self._answered_at_close: list[str] = []  # runs whose Stop was answered while closing or after the Loop ended
         # Runs whose Stop was answered while closing with an answer that does not confirm it: run id -> what it said
         self._unconfirmed_at_close: dict[str, str] = {}
+        # The confirmed Stops with no answer when the close line was written (number -> run id), which of them were
+        # still queued then, whether that line could only say a queued one is sent if it begins in time, and what
+        # became of them after it: begun by a lane (numbers), and answered (number -> (code, the run answered)).
+        self._open_at_close: dict[int, str] = {}
+        self._queued_at_close: set[int] = set()
+        self._said_if = False
+        self._begun_after_close: set[int] = set()
+        self._answered_after_close: dict[int, tuple[str, object]] = {}
         # Set by a Loop: the seconds left of the close's one bound, and that bound (CLOSE_BOUND_S)
         self.close_left: Callable[[], float] | None = None
         self.close_bound_s: float | None = None
@@ -348,21 +377,25 @@ class TuiApp:
                              f"{self.stop_wait_s:g} s; Ctrl-C closes now")
                 return
             self.closed = True  # the sealed log refuses any later event
+            self._open_at_close = dict(self._stops_out)
+            self._queued_at_close = {n for n in self._stops_out if n in self._queued}
             self.end_line = self._end_line()
             self._emit("close", "operator", self.end_line)
 
     def _stops_begun(self) -> tuple[list[str], list[str]]:
-        """The runs of the confirmed Stops with no answer yet: those a lane has begun, and those still queued."""
+        """The runs of the confirmed Stops with no answer yet: those a lane has begun, and those still queued, one
+        entry per queued Stop (a run confirmed twice is there twice)."""
 
         begun = list(dict.fromkeys(r for n, r in self._stops_out.items() if n not in self._queued))
-        return begun, [r for r in dict.fromkeys(self._stops_out.values()) if r not in begun]
+        return begun, [r for n, r in self._stops_out.items() if n in self._queued]
 
     def _stops_said(self) -> str:
         begun, queued = self._stops_begun()
         parts = [f"the Stop of {_runs(begun)} is sent"] if begun else []
         if queued:
-            behind = f" (it waits behind the Stop of {_runs(begun)})" if begun else ""
-            parts.append(f"the Stop of {_runs(queued)} is not yet begun{behind}")
+            subject, plural = _queued_said(begun, queued)
+            behind = f" ({'they wait' if plural else 'it waits'} behind the Stop of {_runs(begun)})" if begun else ""
+            parts.append(f"{subject} {'are' if plural else 'is'} not yet begun{behind}")
         return " and ".join(parts)
 
     def _answers_come(self) -> str:
@@ -399,16 +432,21 @@ class TuiApp:
         if begun:
             parts.append(f"the Stop of {_runs(begun)} was sent and its answer had not come")
         if queued:
-            behind = f" (it waits behind the Stop of {_runs(begun)})" if begun else ""
+            subject, plural = _queued_said(begun, queued)
+            it, was = ("they", "were") if plural else ("it", "was")
+            behind = f" ({it} {'wait' if plural else 'waits'} behind the Stop of {_runs(begun)})" if begun else ""
             left = self.close_left() if self.close_left is not None else 0.0
             if left > 0:
-                ahead = f"the Stop of {_runs(begun)} ends" if begun else "it begins"
-                parts.append(f"the Stop of {_runs(queued)} was not begun{behind}; it is sent only if {ahead} within "
-                             f"{left:.2f} s, else it is not sent")
+                ahead = f"the Stop of {_runs(begun)} ends" if begun else f"{it} {'begin' if plural else 'begins'}"
+                them = "them" if plural else "it"
+                parts.append(f"{subject} {was} not begun{behind}; {it} {'are' if plural else 'is'} sent only if "
+                             f"{ahead} within {left:.2f} s, else {it} {'are' if plural else 'is'} not sent; the TUI "
+                             f"waits for {them} at most {left:.2f} s and then says what became of {them}")
+                self._said_if = True
             else:
                 bound = f"{self.close_bound_s:g} s " if self.close_bound_s is not None else ""
-                parts.append(f"the Stop of {_runs(queued)} was not begun{behind} and is not sent: the {bound}bound "
-                             f"has run out")
+                parts.append(f"{subject} {was} not begun{behind} and {'are' if plural else 'is'} not sent: the "
+                             f"{bound}bound has run out")
         not_sent = self._not_sent + [f"{m} {_fmt(pa)}".rstrip() for m, pa in self._queued.values()
                                      if m != "run.stop"]
         if not_sent:
@@ -426,6 +464,40 @@ class TuiApp:
             tail = f"look with run status before you trust that {_runs(doubtful)} stopped; " + tail
         return "closed: " + "; ".join(parts) + "; " + tail
 
+    def after_close_line(self) -> str:
+        """What became, after the close line, of each confirmed Stop it named with no answer: an answer that came
+        after it, a queued Stop a lane began after it, and a queued Stop the close line said is sent only if it begins
+        in time and that never began. "" when nothing changed. Read once the Loop has ended."""
+
+        with self._lock:
+            parts, stopped, doubtful = [], set(), []
+            for n, run in self._open_at_close.items():
+                name = f"the {'queued ' if n in self._queued_at_close else ''}Stop of {field(run)}"
+                if n in self._answered_after_close:
+                    code, named = self._answered_after_close[n]
+                    if code == "stopped" and named == run:
+                        parts.append(f"{name} was sent and answered: {field(run)} is stopped")
+                        stopped.add(run)
+                        continue
+                    said = f"{field(code)} for another run" if code == "stopped" else field(code)
+                    parts.append(f"{name} was sent and not confirmed ({said}); {field(run)} may still be running")
+                elif n not in self._queued_at_close:
+                    continue  # sent and with no answer, as the close line said
+                elif n in self._begun_after_close:
+                    parts.append(f"{name} was sent and its answer had not come")
+                elif self._said_if:
+                    bound = f"{self.close_bound_s:g} s " if self.close_bound_s is not None else ""
+                    parts.append(f"{name} was not sent: the {bound}bound ran out")
+                else:
+                    continue  # the close line said already that it is not sent
+                doubtful.append(run)
+            if not parts:
+                return ""
+            doubtful = [r for r in dict.fromkeys(doubtful) if r not in stopped]
+            tail = (f"; look with run status before you trust that {_runs(doubtful)} stopped, and stop "
+                    f"{'it' if len(doubtful) == 1 else 'them'} again if still running") if doubtful else ""
+            return "after the close line: " + "; ".join(parts) + tail
+
     def begin(self, asked: int | None, method: str, params: dict, *, ending: bool = False) -> bool:
         """Called by a Loop's lane before it sends a request: True to send it. A confirmed Stop is always sent, also
         after the TUI closed or the Loop ended (``ending``); any other request is not sent then, and is named on
@@ -434,6 +506,8 @@ class TuiApp:
         with self._lock:
             entry = self._queued.pop(asked, None) if asked is not None else None
             if method == "run.stop":
+                if self.closed and asked in self._queued_at_close:
+                    self._begun_after_close.add(asked)
                 return True
             if self.closed or self.awaiting_stop or ending:
                 if not self.closed:  # once the close line is written it has named it already
@@ -486,7 +560,9 @@ class TuiApp:
         except Exception:  # noqa: BLE001
             kept = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
         with self._lock:
-            if self.closed:  # the TUI ended while the answer was read: it changes nothing
+            if self.closed:  # the TUI ended while the answer was read: it changes nothing, but is kept for the line
+                if asked in self._open_at_close:  # that says what became of a Stop after the close line
+                    self._answered_after_close[asked] = (str(code), kept.get("run_id"))
                 return
             if asked is not None:
                 self._queued.pop(asked, None)
@@ -1597,8 +1673,8 @@ class Loop:
         self._lanes = {"stop": queue.SimpleQueue(), "other": queue.SimpleQueue()}
         self._threads: list[threading.Thread] = []
         self._runner: threading.Thread | None = None  # the thread of run(), once start() made it
-        self._wait_began: float | None = None  # when a tick first saw the close wait for a confirmed Stop
         self._stop_call: float | None = None  # when the Stop lane began the call it is in, if it is in one
+        self.stop_handover_s = STOP_HANDOVER_S  # how long a Stop in its call is waited for after Ctrl-C
         self.frame: list[Row] = []
         self.frames = 0
         app.dispatch = self._dispatch
@@ -1653,10 +1729,10 @@ class Loop:
             # the bound has run out is not begun: the close line has said so (it stays queued in the app).
             if method == "run.stop" and self._deadline is not None and time.monotonic() >= self._deadline:
                 continue
+            if method == "run.stop":  # stamped before begin(): a Stop is at every moment queued or in its call
+                self._stop_call = time.monotonic()
             if not self.app.begin(getattr(done, "asked", None), method, params, ending=self._halt.is_set()):
                 continue
-            if method == "run.stop":
-                self._stop_call = time.monotonic()
             try:
                 answer = call_api(self._api, method, params)
             except BaseException as err:  # noqa: BLE001 - KeyboardInterrupt, SystemExit: an answer, so in_flight
@@ -1684,12 +1760,13 @@ class Loop:
         self.app.end_wait()
         self._wake.set()
 
-    def _hung_stop_only(self) -> bool:
-        """Nothing more can be sent: the Stop lane is in a call it began before the close's wait began, and no
-        confirmed Stop is still queued (one that can still begin is waited for, within the bound)."""
+    def _stops_handed_over(self) -> bool:
+        """Nothing is left that the TUI must still send: no confirmed Stop is queued (one that can still begin is
+        waited for, within the bound), and the Stop the lane is in a call for, if any, has been in it at least
+        ``stop_handover_s``, whether it began before the close's wait, during it or after Ctrl-C."""
 
-        began, waited = self._stop_call, self._wait_began
-        if began is None or waited is None or began >= waited:
+        began = self._stop_call
+        if began is not None and time.monotonic() - began < self.stop_handover_s:
             return False
         with self.app._lock:
             return not any(method == "run.stop" for method, _ in self.app._queued.values())
@@ -1697,8 +1774,8 @@ class Loop:
     def shutdown(self, *, leave_hung: bool = False) -> bool:
         """Stop painting at once, then stop the threads. When this returns no paint is under way and
         none will start, even if a thread is still inside a slow call; True when every thread ended.
-        ``leave_hung`` (the person ended the wait with Ctrl-C): the threads are not waited for while the only
-        Stop out is in a call begun before the wait and no confirmed Stop is queued."""
+        ``leave_hung`` (the person ended the wait with Ctrl-C): the threads are waited for only until every
+        confirmed Stop is handed over (``_stops_handed_over``), within the same bound."""
 
         self.halt()
         deadline = self._close_deadline()  # what is left of the close's one bound, shared by every thread
@@ -1708,10 +1785,12 @@ class Loop:
             self._runner.join(timeout=max(0.0, deadline - time.monotonic()))
         for lane in self._lanes.values():
             lane.put(None)
-        for t in self._threads:
-            if leave_hung and self._hung_stop_only():
+        while True:
+            alive = [t for t in self._threads if t.is_alive()]
+            left = deadline - time.monotonic()
+            if not alive or left <= 0 or (leave_hung and self._stops_handed_over()):
                 break
-            t.join(timeout=max(0.0, deadline - time.monotonic()))
+            alive[0].join(timeout=min(left, self.tick_s) if leave_hung else left)
         # A Stop the lanes sent before they ended has its answer recorded before the app's close line.
         self._take_answers()
         return not any(t.is_alive() for t in self._threads)
@@ -1741,8 +1820,6 @@ class Loop:
             app.press(key, burst=burst)
         self._take_answers()  # 2. API answers
         if app.awaiting_stop and not app.closed:  # a close waits for a confirmed Stop's answer, within its bound
-            if self._wait_began is None:
-                self._wait_began = time.monotonic()
             if time.monotonic() >= self._close_deadline():
                 app.close()
         deadline = time.monotonic() + self.drain_budget_s  # 3. engine output, time-sliced

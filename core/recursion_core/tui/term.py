@@ -345,6 +345,15 @@ def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, al
         if not early:
             leave()
     tell()  # also after the screen hung up
+    after = app.after_close_line()  # what became of a Stop after the close line, once the threads are done with
+    if after and not alt_screen:
+        write(after + "\n")
+    elif after:
+        try:
+            print(after, file=stderr or sys.stderr)
+        except OSError as exc:  # the same hung-up terminal; anything else is raised
+            if exc.errno != errno.EIO:
+                raise
     return 0
 
 

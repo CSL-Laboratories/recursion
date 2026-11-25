@@ -135,7 +135,9 @@ class QueuedStopTest(unittest.TestCase):
             line = close_line(app)
             self.assertRegex(line, r"^closed: the Stop of r was sent and its answer had not come; the Stop of r2 was "
                                    r"not begun \(it waits behind the Stop of r\); it is sent only if the Stop of r "
-                                   r"ends within [0-9]\.[0-9]{2} s, else it is not sent; look with run status before "
+                                   r"ends within [0-9]\.[0-9]{2} s, else it is not sent; the TUI waits for it at "
+                                   r"most [0-9]\.[0-9]{2} s and then says what became of it; look with run "
+                                   r"status before "
                                    r"you trust that r, r2 stopped; every other run keeps going and can be reattached$")
             api.release.set()  # well within what is left of the bound
             self.assertTrue(loop.shutdown())

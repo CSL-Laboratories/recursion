@@ -305,10 +305,10 @@ class WallDefinitionTests(unittest.TestCase):
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
         fields = set(wall_linux.RECORD_CHECKS) | {"writes", "writes_not_tried", "landlock_abi", "landlock_scopes",
                                                   "arch", "proven"}
-        later = {"threads", "descriptors_open_for_write"}  # draft 5: required of a proven record only (additive)
+        later = {"threads", "descriptors_open_for_write", "memory_maps_open_for_write"}  # required of a proven record only
         self.assertEqual(set(schema["required"]), fields)
         self.assertEqual(set(schema["then"]["required"]), later)
-        self.assertEqual(set(schema["properties"]), fields | later)
+        self.assertEqual(set(schema["properties"]), fields | later | {"descriptors_seen_by"})
 
     def test_on_a_system_without_the_two_calls_nothing_is_tried(self):
         if sys.platform.startswith("linux"):

@@ -39,8 +39,7 @@ KIND_RIGHT = {"open_for_write": "write_file", "truncate": "truncate", "create_fi
               "remove_file": "remove_file", "remove_folder": "remove_dir"}
 REFUSED = ("refused_by_landlock", "refused_by_filter")
 NOT_TRIED = ("device_ioctl", "move_between_folders", "rename_within_folder", "change_owner", "change_times",
-             "change_extended_attributes", "write_through_open_descriptor", "writable_memory_map",
-             "write_beneath_other_folder")
+             "change_extended_attributes", "write_through_open_descriptor", "write_beneath_other_folder")
 DEVICES = ("make_char_device", "make_block_device")
 CODE_NAME = re.compile(r"\b[a-z]+_[a-z_]+\b")
 
@@ -130,7 +129,7 @@ class WritesInAChildTests(unittest.TestCase):
         self.assertEqual(record["writes"], dict(dict.fromkeys(KINDS, "refused_by_landlock"), truncate=truncate_by))
         self.assertIs(record["proven"], True)
         self.assertEqual(result["words"], [])
-        self.assertEqual(seen["folder"], ["remove-me", "remove-me.d"], "nothing made, nothing removed")
+        self.assertEqual(seen["folder"], ["remove-me", "remove-me.d", "write-me"], "nothing made, nothing removed")
         self.assert_harmless(seen)
         self.assertEqual(_schema_errors(record), [])
 
@@ -146,7 +145,7 @@ class WritesInAChildTests(unittest.TestCase):
         self.assertIs(record["proven"], False)
         made = sorted(name for kind, name in wall_linux.WRITE_FOLDER_NAMES.items()
                       if not kind.startswith("remove_") and record["writes"][kind] == "let_through")
-        self.assertEqual(seen["folder"], made, "what went through is really there, and both removals took place")
+        self.assertEqual(seen["folder"], sorted(made + ["write-me"]), "what went through is really there, and both removals took place")
         self.assert_harmless(seen)
         words = result["words"]
         self.assertEqual((words[0], words[-1]), (wall_linux.WORDS["not_loaded"], wall_linux.WORDS["what_to_do"]))
@@ -161,7 +160,7 @@ class WritesInAChildTests(unittest.TestCase):
         self.assertEqual([kind for kind in KINDS if record["writes"][kind] not in REFUSED], ["truncate"])
         self.assertEqual(record["writes"]["truncate"], "let_through")
         self.assertIs(record["proven"], False)
-        self.assertEqual(seen["folder"], ["remove-me", "remove-me.d"])
+        self.assertEqual(seen["folder"], ["remove-me", "remove-me.d", "write-me"])
         self.assert_harmless(seen)
         self.assertEqual(result["words"], [wall_linux.WORDS["not_loaded"],
                                            wall_linux.WORDS["let_through"].format(what=wall_linux.WORDS["truncate"]),
@@ -182,7 +181,7 @@ class WritesInAChildTests(unittest.TestCase):
         self.assertIs(record["proven"], False)
         self.assertIn(wall_linux.WORDS["not_tried"].format(what=wall_linux.WORDS["remove_folder"]), result["words"])
         self.assertEqual(record["writes_not_tried"], wall_linux.WRITES_NOT_TRIED)
-        self.assertEqual(seen["folder"], ["remove-me", "remove-me.d"])
+        self.assertEqual(seen["folder"], ["remove-me", "remove-me.d", "write-me"])
 
     def test_unwalled_every_write_kind_goes_through_so_the_probe_is_not_vacuous(self):
         result, seen = run_writes_child(wall=False)
@@ -285,7 +284,7 @@ class WriteOutcomeTests(unittest.TestCase):
                     outcomes = wall_linux._write_outcomes(file, None)
                     self.assertEqual((outcomes["open_for_write"], outcomes["truncate"]), ("not_tried", "not_tried"))
             self.assertEqual(sorted(os.listdir(empty)), [])
-            self.assertEqual(sorted(os.listdir(taken)), ["made-file", "remove-me", "remove-me.d"])
+            self.assertEqual(sorted(os.listdir(taken)), ["made-file", "remove-me", "remove-me.d", "write-me"])
 
 
 def _record(writes: dict) -> dict:
@@ -299,7 +298,7 @@ def _record(writes: dict) -> dict:
 
 # The process alone, holding nothing open for writing: stand-ins, for the probes run in this process (the runner's own
 # threads and log files are not the record's to judge).
-ALONE = {"_threads_now": lambda: 1, "_descriptors_open_for_write": lambda: []}
+ALONE = {"_threads_now": lambda: 1, "_descriptors_open_for_write": lambda: [], "_maps_open_for_write": lambda: []}
 
 
 def _refuse(*_args, **_kwargs):
@@ -567,7 +566,7 @@ class RoundInAChildTests(unittest.TestCase):
         self.assertEqual([kind for kind in KINDS if record["writes"][kind] not in REFUSED], ["make_socket_node"])
         self.assertEqual(record["writes"]["make_socket_node"], "let_through")
         self.assertIs(record["proven"], False)
-        self.assertEqual(seen["folder"], ["made-socket", "remove-me", "remove-me.d"])
+        self.assertEqual(seen["folder"], ["made-socket", "remove-me", "remove-me.d", "write-me"])
         self.assertIn(wall_linux.WORDS["let_through"].format(what=wall_linux.WORDS["make_socket_node"]), result["words"])
 
 

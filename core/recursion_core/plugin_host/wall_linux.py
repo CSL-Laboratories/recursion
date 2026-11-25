@@ -13,7 +13,11 @@ and to everything it starts later, and neither can be lifted again from inside:
    ``prctl(PR_SET_NO_NEW_PRIVS)`` comes first, then ``landlock_restrict_self``. Landlock checks a file when it
    is opened, so a file the process opened for writing BEFORE the wall can still be written through, and a
    file mapped shared and writable before it can still be written through the map: the host closes every
-   such file before the wall, and ``probe_wall`` is never proven while it finds one open for writing.
+   such file before the wall, and ``probe_wall`` is never proven while it finds one open for writing or one
+   mapped shared and writable. ``apply_wall`` opens the kernel's own list of the process's descriptors
+   (``/proc/self/fd``) and of its maps (``/proc/self/maps``) for reading BEFORE the wall, reads both AFTER it,
+   and closes both before it returns, so that no plugin code holds either; the record is built from what it
+   read there.
 2. ONE seccomp filter, loaded with ``SECCOMP_FILTER_FLAG_TSYNC`` so that it reaches every thread of the
    process. It checks the audit arch first (x86_64 and aarch64; a call made under another arch, or the
    x32 range of x86_64, is answered EPERM), then answers EPERM to:
@@ -31,7 +35,13 @@ and to everything it starts later, and neither can be lifted again from inside:
      ``ioprio_set`` (``CALLER_ONLY_PRIORITY_CALLS``) unless they name one process and that is 0;
    - ``fcntl`` with a command of ``DENIED_FCNTL_COMMANDS`` and ``ioctl`` with a command of
      ``DENIED_IOCTL_COMMANDS`` (making another process the receiver of a descriptor's signals, a lease
-     that makes another process's open of a file wait, and a file's attribute flags);
+     that makes another process's open of a file wait, and a file's attribute flags), and ``ioctl`` with a
+     command of ``DENIED_TERMINAL_COMMANDS`` (a terminal's foreground group, its controlling session, its
+     settings, size, lines and input: on a terminal the host inherited, each acts on the person's terminal or
+     on the processes of its foreground group); the terminal commands that only read (``TCGETS``, which
+     ``isatty`` asks, ``TIOCGPGRP``, ``TIOCGSID``, ``TIOCGWINSZ``, ``TIOCMGET``, ``TIOCOUTQ``, ``FIONREAD``) and the
+     ones that touch only the caller's own descriptor (``FIONBIO``, which a socket's ``setblocking`` asks,
+     ``FIOCLEX`` and ``FIONCLEX``) stay allowed;
    - ``clone`` with any flag of ``NAMESPACE_CLONE_FLAGS``; ``clone3`` is answered ENOSYS, so that the C
      library starts threads and children through ``clone``, where the flags can be read;
    - where the kernel's Landlock ABI is below 3 (it cannot refuse a truncation there),
@@ -53,7 +63,8 @@ What the record is: a check that the host's own code makes on itself, from insid
 ``apply_wall`` and BEFORE any plugin code runs. It shows that the named attempts were refused by the
 kernel at that moment, and code in the same process could write any record. Each kind of write
 (``WRITE_KINDS``) is tried on a file and in a folder the caller made for the purpose before the wall, each
-attempt harmless if it goes through, and the record names, per kind, which part of the wall refused it by
+attempt harmless if it goes through (the file is one ``prepare_write_folder`` made itself, reached only through a
+descriptor opened without following a link), and the record names, per kind, which part of the wall refused it by
 the kernel's answer (Landlock answers EACCES, the filter EPERM); a refusal is credited only to the part that
 holds that kind in this process (the filter holds only truncation, and only below Landlock ABI 3), and any
 other refusal is ``refused_elsewhere``, which proves nothing. Whatever a weak wall let the probe make in the
@@ -93,8 +104,8 @@ import threading
 
 __all__ = ["CALLER_ONLY_CALLS", "CALLER_ONLY_PRIORITY_CALLS", "DENIED_CALLS", "DENIED_FCNTL_COMMANDS",
            "DENIED_IOCTL_COMMANDS", "DENIED_IPC_CALLS", "DENIED_METADATA_CALLS", "DENIED_SIGNAL_CALLS",
-           "LANDLOCK_SCOPES", "NAMESPACE_CLONE_FLAGS", "OLD_LANDLOCK_DENIED_CALLS", "RECORD_CHECKS", "WORDS",
-           "WRITES_NOT_TRIED", "WRITE_FOLDER_NAMES", "WRITE_KINDS", "WRITE_OUTCOMES", "WallRefused", "apply_wall",
+           "DENIED_TERMINAL_COMMANDS", "LANDLOCK_SCOPES", "NAMESPACE_CLONE_FLAGS", "OLD_LANDLOCK_DENIED_CALLS", "RECORD_CHECKS", "WORDS",
+           "WRITES_NOT_TRIED", "WRITE_FILE_NAME", "WRITE_FOLDER_NAMES", "WRITE_KINDS", "WRITE_OUTCOMES", "WallRefused", "apply_wall",
            "prepare_write_folder", "probe_wall", "why_not_proven"]
 
 # The wall's own definition (not a setting, not a tunable): each call is answered EPERM.
@@ -136,6 +147,18 @@ DENIED_FCNTL_COMMANDS = {"F_SETOWN": 8, "F_SETOWN_EX": 15, "F_SETLEASE": 1024}
 # ioctl commands: another process as the receiver of a socket's signals; a file's attribute flags.
 DENIED_IOCTL_COMMANDS = {"FIOSETOWN": 0x8901, "SIOCSPGRP": 0x8902, "FS_IOC_SETFLAGS": 0x40086602,
                          "FS_IOC_FSSETXATTR": 0x401C5820}
+# ioctl commands of a terminal that act on the person's terminal or on the processes of its foreground group
+# (asm-generic/ioctls.h: the same values on x86_64 and aarch64), answered EPERM on every descriptor.
+DENIED_TERMINAL_COMMANDS = {
+    "TCSETS": 0x5402, "TCSETSW": 0x5403, "TCSETSF": 0x5404, "TCSETA": 0x5406, "TCSETAW": 0x5407, "TCSETAF": 0x5408,
+    "TCSBRK": 0x5409, "TCXONC": 0x540A, "TCFLSH": 0x540B, "TIOCEXCL": 0x540C, "TIOCNXCL": 0x540D,
+    "TIOCSCTTY": 0x540E, "TIOCSPGRP": 0x5410, "TIOCSTI": 0x5412, "TIOCSWINSZ": 0x5414, "TIOCMBIS": 0x5416,
+    "TIOCMBIC": 0x5417, "TIOCMSET": 0x5418, "TIOCSSOFTCAR": 0x541A, "TIOCCONS": 0x541D, "TIOCSSERIAL": 0x541F,
+    "TIOCPKT": 0x5420, "TIOCNOTTY": 0x5422, "TIOCSETD": 0x5423, "TCSBRKP": 0x5425, "TIOCSBRK": 0x5427,
+    "TIOCCBRK": 0x5428, "TCSETS2": 0x402C542B, "TCSETSW2": 0x402C542C, "TCSETSF2": 0x402C542D,
+    "TIOCSRS485": 0x542F, "TIOCSPTLCK": 0x40045431, "TIOCSIG": 0x40045436, "TIOCVHANGUP": 0x5437,
+    "TIOCGPTPEER": 0x5441, "TIOCSERCONFIG": 0x5453, "TIOCSLCKTRMIOS": 0x5457,
+}
 # clone with any of these flags (a new mount, cgroup, uts, ipc, user, pid or network namespace) is refused.
 NAMESPACE_CLONE_FLAGS = 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000 | 0x10000000 | 0x20000000 | 0x40000000
 # Below Landlock ABI 3 the ruleset cannot refuse a truncation, so these are refused by the filter instead
@@ -256,15 +279,25 @@ WRITES_NOT_TRIED = {
                                   "not this one",
     "write_through_open_descriptor": "Landlock checks a file when it is opened, so a file opened for writing "
                                      "before the wall can still be written through; the probe writes through none, "
-                                     "and names each such file it finds open (descriptors_open_for_write), which "
-                                     "a proven record holds empty",
-    "writable_memory_map": "a file mapped shared and writable before the wall can still be written through the "
-                           "map; the list of the process's maps (/proc/self/maps) is outside what the wall lets "
-                           "the host read, and no other call lists them, so the probe cannot look for one",
+                                     "and names each such file it finds open (descriptors_open_for_write) and each "
+                                     "file mapped shared and writable (memory_maps_open_for_write), which a proven "
+                                     "record holds empty",
     "write_beneath_other_folder": "the probe tries every kind in one folder only: a rule that granted write "
                                   "rights beneath another folder would not show here; apply_wall adds rules with "
                                   "read and execute rights only",
 }
+# The file the probe opens for writing and cuts to its own length: made by prepare_write_folder itself in the write
+# folder, with a mode only the user holds, and reached by the probe only through a descriptor opened without
+# following a link. A file name, not a figure.
+WRITE_FILE_NAME = "write-me"
+_WRITE_FILE_TEXT = b"the probe's own file: opened and cut to its own length, never changed\n"
+# The modes prepare_write_folder gives the folder and the file: only the user holds them. Part of the wall's
+# definition, not a setting (a mode that let another user in would let that user change what the probe tries).
+_WRITE_FOLDER_MODE, _WRITE_FILE_MODE = 0o700, 0o600
+# Shared memory of no file (an anonymous shared map, System V memory, a memfd), as the maps list names it: no file
+# of a person is behind it. Names of the kernel's interface, not figures.
+_ANONYMOUS_SHARED = ("/dev/zero (deleted)", "/SYSV", "/memfd:")
+_READ_CHUNK = 1 << 16  # how much of a kernel list one read takes: a buffer size, which no person would choose
 # The kinds of file that a descriptor open for writing makes the record not proven for (the record's field
 # ``descriptors_open_for_write``): through either, a write reaches what the wall is there to keep.
 _DESCRIPTOR_KINDS = {stat.S_IFREG: "regular_file", stat.S_IFBLK: "block_device"}
@@ -326,6 +359,11 @@ WORDS = {
                        "must close every such file before it shuts itself in.",
     "descriptors_unknown": "The plugin host could not see every file it held open, so it could not show that none "
                            "was open for writing.",
+    "map_open": "A file was mapped into memory, shared and writable, when the plugin host shut itself in. The "
+                "sandbox checks a file when it is opened, so writes through such a map still reach the file: the "
+                "host must unmap every such file before it shuts itself in.",
+    "maps_unknown": "The plugin host could not read the list of its memory maps, so it could not show that no file "
+                    "was mapped for writing.",
     "regular_file": "file",
     "block_device": "disk or other block device",
     "what_to_do": "What you can do: run the plugin host on Linux 5.13 or newer with Landlock turned on (most "
@@ -338,6 +376,9 @@ WORDS = {
 # process, the step that failed, and the Landlock scopes in force. A process with a failed step, or with any
 # step, is never walled again.
 _STATE: dict = {"applied": [], "failed": None, "scopes": [], "landlock_handled": 0, "filter_truncate": False}
+# The folder and the file that prepare_write_folder made in THIS process, each as (device, inode): the probe
+# refuses a folder or a file that is not the one it made.
+_MADE: dict = {}
 
 
 class WallRefused(Exception):
@@ -451,7 +492,9 @@ def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI) -> list[tuple[int,
     block("fcntl", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]),
           *[(_BPF_JEQ_K, "deny", 0, value) for value in DENIED_FCNTL_COMMANDS.values()], (_BPF_RET_K, 0, 0, _RET_ALLOW))
     block("ioctl", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]),
-          *[(_BPF_JEQ_K, "deny", 0, value) for value in DENIED_IOCTL_COMMANDS.values()], (_BPF_RET_K, 0, 0, _RET_ALLOW))
+          *[(_BPF_JEQ_K, "deny", 0, value) for value in DENIED_IOCTL_COMMANDS.values()],
+          *[(_BPF_JEQ_K, "deny", 0, value) for value in DENIED_TERMINAL_COMMANDS.values()],
+          (_BPF_RET_K, 0, 0, _RET_ALLOW))
     block("clone", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[0]), (_BPF_JSET_K, "deny", "allow", NAMESPACE_CLONE_FLAGS))
     block("trunc1", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]), (_BPF_JSET_K, "deny", "allow", _O_TRUNC))
     block("trunc2", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[2]), (_BPF_JSET_K, "deny", "allow", _O_TRUNC))
@@ -599,14 +642,83 @@ def apply_wall(read_only_paths) -> None:
     abi = _landlock_abi(libc)
     if abi < _MIN_LANDLOCK_ABI:
         raise WallRefused("landlock_unavailable", "this kernel gives this process no Landlock (ABI 1, Linux 5.13, at least)")
-    opened = _open_paths(paths)
+    lists = _open_kernel_lists()  # for reading, before the wall; both are closed before this call returns
     try:
-        _apply_landlock(libc, abi, opened)
+        opened = _open_paths(paths)
+        try:
+            _apply_landlock(libc, abi, opened)
+        finally:
+            for fd, _ in opened:
+                os.close(fd)
+        _load_seccomp_filter(libc, arch, abi)
+        _alone("threads_after_filter", _threads_now)
+        # what the kernel's own lists say after the wall (None for a list that could not be read: never proven)
+        _STATE["seen_at_wall"] = _read_kernel_lists(lists)
     finally:
-        for fd, _ in opened:
-            os.close(fd)
-    _load_seccomp_filter(libc, arch, abi)
-    _alone("threads_after_filter", _threads_now)
+        for fd in lists.values():
+            if fd is not None:
+                os.close(fd)
+
+
+def _open_kernel_lists() -> dict:
+    """The kernel's lists of this process's descriptors and maps, opened for reading (None where one cannot be)."""
+    lists = {}
+    for key, path, flags in (("descriptors", "/proc/self/fd", os.O_DIRECTORY), ("maps", "/proc/self/maps", 0)):
+        try:
+            lists[key] = os.open(path, os.O_RDONLY | os.O_CLOEXEC | flags)
+        except OSError:
+            lists[key] = None
+    return lists
+
+
+def _read_kernel_lists(lists: dict) -> dict:
+    """What the two lists say now, read through the descriptors opened before the wall: the descriptors open for
+    writing (named as ``_named_for_write`` names them) and the maps shared and writable of a file; None for a list
+    that could not be read. The two descriptors of the lists themselves are not counted."""
+    seen = {"descriptors": None, "maps": None}
+    if lists.get("descriptors") is not None:
+        try:
+            numbers = sorted(int(name) for name in os.listdir(lists["descriptors"]))
+        except (OSError, ValueError):
+            numbers = None
+        if numbers is not None:
+            ours = {fd for fd in lists.values() if fd is not None}
+            seen["descriptors"] = _named_for_write(number for number in numbers if number not in ours)
+    if lists.get("maps") is not None:
+        try:
+            os.lseek(lists["maps"], 0, os.SEEK_SET)
+            chunks = []
+            while True:
+                chunk = os.read(lists["maps"], _READ_CHUNK)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            seen["maps"] = _maps_shared_for_write(b"".join(chunks))
+        except OSError:
+            seen["maps"] = None
+    return seen
+
+
+def _maps_shared_for_write(text: bytes) -> list:
+    """Each map of a file (one with an inode) that is shared and writable, as ``{"map": n}`` (its line in the list,
+    from 0): through it a write still reaches the file. Never its name, address or contents."""
+    found = []
+    for number, line in enumerate(text.decode("ascii", "replace").splitlines()):
+        fields = line.split()
+        if (len(fields) >= 5 and len(fields[1]) == 4 and fields[1][1] == "w" and fields[1][3] == "s" and fields[4] != "0"
+                and not " ".join(fields[5:]).startswith(_ANONYMOUS_SHARED)):
+            found.append({"map": number})
+    return found
+
+
+def _maps_open_for_write():
+    """The maps of this process shared and writable of a file, read now; None when the list cannot be read (a walled
+    process cannot open it: after apply_wall the probe takes what apply_wall read instead)."""
+    try:
+        with open("/proc/self/maps", "rb") as handle:
+            return _maps_shared_for_write(handle.read())
+    except OSError:
+        return None
 
 
 def _refused(check) -> bool:
@@ -750,15 +862,35 @@ def _kernel_surface() -> None:
 
 
 def prepare_write_folder(write_folder) -> None:
-    """Make, in ``write_folder`` (an EMPTY folder of this user that the caller made for the probe), the file and the
-    folder that the probe's removals try to remove (``WRITE_FOLDER_NAMES``). The caller calls it BEFORE
-    ``apply_wall``, and afterwards removes the whole folder with whatever a weak wall let the probe make in it."""
+    """Make, in ``write_folder`` (an EMPTY folder of this user that the caller made for the probe; it is opened
+    without following a link and its mode is set so that only the user holds it), the file and the folder that the
+    probe's removals try to remove (``WRITE_FOLDER_NAMES``) and the probe's own file (``WRITE_FILE_NAME``), which the
+    probe opens for writing and cuts to its own length. The caller calls it BEFORE ``apply_wall``, and afterwards
+    removes the whole folder with whatever a weak wall let the probe make in it."""
     folder = os.fspath(write_folder)
-    if os.listdir(folder):
-        raise ValueError("the write folder must be empty: a name already there would make a refusal prove nothing")
-    os.close(os.open(os.path.join(folder, WRITE_FOLDER_NAMES["remove_file"]),
-                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
-    os.mkdir(os.path.join(folder, WRITE_FOLDER_NAMES["remove_folder"]), 0o700)
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        found = os.fstat(fd)
+        if found.st_uid != os.geteuid():
+            raise ValueError("the write folder must be this user's own: a refusal in another user's folder would "
+                             "prove nothing")
+        if os.listdir(fd):
+            raise ValueError("the write folder must be empty: a name already there would make a refusal prove nothing")
+        os.fchmod(fd, _WRITE_FOLDER_MODE)  # only the user may change what is in it from now on
+        os.close(os.open(WRITE_FOLDER_NAMES["remove_file"], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                         | os.O_CLOEXEC, _WRITE_FILE_MODE, dir_fd=fd))
+        os.mkdir(WRITE_FOLDER_NAMES["remove_folder"], _WRITE_FOLDER_MODE, dir_fd=fd)
+        made = os.open(WRITE_FILE_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                       _WRITE_FILE_MODE, dir_fd=fd)
+        try:
+            os.write(made, _WRITE_FILE_TEXT)
+            mine = os.fstat(made)
+        finally:
+            os.close(made)
+        _MADE.clear()
+        _MADE.update(folder=(found.st_dev, found.st_ino), file=(mine.st_dev, mine.st_ino))
+    finally:
+        os.close(fd)
 
 
 def _refused_by(kind: str, err) -> str:
@@ -807,15 +939,31 @@ def _kind_in(folder_fd: int, name: str):
     return stat.S_IFMT(found.st_mode)
 
 
-def _write_file_usable(path: str) -> bool:
-    """A regular file of this user with one name only, writable by its mode: a refusal on anything else would prove
-    nothing, and the cut to its own length moves the times of every name the file has."""
+def _own_file_fd(folder_fd: int):
+    """An O_PATH descriptor of the probe's own file in the write folder, opened without following a link, or None
+    when the name is not the file prepare_write_folder made: a regular file of this user with one name only and the
+    mode it was given (and, where it was made in this process, the same file). Everything the probe does to the file
+    goes through this descriptor, so a name changed after this check changes nothing the probe does."""
     try:
-        found = os.lstat(path)
+        fd = os.open(WRITE_FILE_NAME, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=folder_fd)
     except OSError:
-        return False
-    return (stat.S_ISREG(found.st_mode) and found.st_uid == os.geteuid() and found.st_nlink == 1
-            and os.access(path, os.W_OK))
+        return None
+    try:
+        found = os.fstat(fd)
+        usable = (stat.S_ISREG(found.st_mode) and found.st_uid == os.geteuid() and found.st_nlink == 1
+                  and stat.S_IMODE(found.st_mode) == _WRITE_FILE_MODE
+                  and _MADE.get("file", (found.st_dev, found.st_ino)) == (found.st_dev, found.st_ino))
+    except OSError:
+        usable = False
+    if not usable:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _through(fd: int) -> str:
+    """The name the kernel gives the file of descriptor ``fd`` itself (a link that does not follow any other name)."""
+    return f"/proc/self/fd/{fd}"
 
 
 def _write_folder_fd(folder: str):
@@ -829,7 +977,8 @@ def _write_folder_fd(folder: str):
     try:
         found = os.fstat(fd)
         usable = (stat.S_ISDIR(found.st_mode) and found.st_uid == os.geteuid()
-                  and os.access(folder, os.W_OK | os.X_OK) and os.lstat(folder).st_ino == found.st_ino
+                  and stat.S_IMODE(found.st_mode) == _WRITE_FOLDER_MODE
+                  and _MADE.get("folder", (found.st_dev, found.st_ino)) == (found.st_dev, found.st_ino)
                   and _kind_in(fd, WRITE_FOLDER_NAMES["remove_file"]) == stat.S_IFREG
                   and _kind_in(fd, WRITE_FOLDER_NAMES["remove_folder"]) == stat.S_IFDIR
                   and all(_kind_in(fd, name) is None for kind, name in WRITE_FOLDER_NAMES.items()
@@ -844,22 +993,28 @@ def _write_folder_fd(folder: str):
 
 def _write_outcomes(write_file, write_folder) -> dict:
     """The outcome of each kind of ``WRITE_KINDS``, in its order. Each attempt is harmless where it goes through:
-    the file is opened for writing and shut with nothing written, and cut to its own length; the folder gets new
-    names the caller removes, and loses only the two names prepare_write_folder made for that. A kind whose file or
-    folder is not given, or is not one the probe may use, is ``not_tried``."""
+    the probe's own file (``WRITE_FILE_NAME`` in the folder, made by prepare_write_folder) is opened for writing and
+    shut with nothing written, and cut to its own length, both only through a descriptor opened without following a
+    link, never through a name; the folder gets new names the caller removes, and loses only the two names
+    prepare_write_folder made for that. A kind whose folder is not given, or is not one the probe may use, is
+    ``not_tried``. ``write_file`` is accepted for callers of the earlier form and is never opened, sized or written:
+    the probe works only on the file it made itself."""
     outcomes = dict.fromkeys(WRITE_KINDS, "not_tried")
-    if write_file is not None:
-        path = os.fspath(write_file)
-        if _write_file_usable(path):
-            size = os.lstat(path).st_size
-            outcomes["open_for_write"] = _attempt("open_for_write", lambda: os.close(
-                os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NOCTTY | os.O_CLOEXEC)))
-            outcomes["truncate"] = _attempt("truncate", lambda: os.truncate(path, size))
     fd = None if write_folder is None else _write_folder_fd(os.fspath(write_folder))
     if fd is None:
         return outcomes
     name = WRITE_FOLDER_NAMES
     try:
+        own = _own_file_fd(fd)
+        if own is not None:
+            try:
+                size = os.fstat(own).st_size
+                outcomes["open_for_write"] = _attempt("open_for_write", lambda: os.close(
+                    os.open(_through(own), os.O_WRONLY | os.O_NOCTTY | os.O_CLOEXEC)))
+                outcomes["truncate"] = _attempt("truncate", lambda: os.truncate(_through(own), size))
+            finally:
+                os.close(own)
+
         def made(kind):
             return lambda: _kind_in(fd, name[kind]) is not None
 
@@ -911,20 +1066,35 @@ def _descriptors_open_for_write():
     limit = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
     if limit == resource.RLIM_INFINITY or limit < 0:
         return None
-    found, held, number = 0, [], 0
+    found, open_numbers, number = 0, [], 0
     while number < limit and (expected <= 0 or found < expected):
         try:
-            kind = stat.S_IFMT(os.fstat(number).st_mode)
-            flags = fcntl.fcntl(number, fcntl.F_GETFL)
+            os.fstat(number)
+            fcntl.fcntl(number, fcntl.F_GETFL)
         except OSError:
             number += 1
             continue
         found += 1
-        if kind in _DESCRIPTOR_KINDS and (flags & 3) in (os.O_WRONLY, os.O_RDWR):
-            held.append({"descriptor": number, "kind": _DESCRIPTOR_KINDS[kind]})
+        open_numbers.append(number)
         number += 1
     if expected > 0 and found != expected:
         return None
+    return _named_for_write(open_numbers)
+
+
+def _named_for_write(numbers) -> list:
+    """Of the descriptors ``numbers``, each open for writing on a regular file or a block device, as
+    ``{"descriptor": n, "kind": ...}`` in order; a number no longer open is passed over."""
+    import fcntl
+    held = []
+    for number in numbers:
+        try:
+            kind = stat.S_IFMT(os.fstat(number).st_mode)
+            flags = fcntl.fcntl(number, fcntl.F_GETFL)
+        except OSError:
+            continue
+        if kind in _DESCRIPTOR_KINDS and (flags & 3) in (os.O_WRONLY, os.O_RDWR):
+            held.append({"descriptor": number, "kind": _DESCRIPTOR_KINDS[kind]})
     return held
 
 
@@ -949,6 +1119,12 @@ def why_not_proven(record: dict) -> list:
                 kind = entry.get("kind") if isinstance(entry, dict) else None
                 lines.append(WORDS["descriptor_open"].format(
                     kind=WORDS[kind] if kind in _DESCRIPTOR_KINDS.values() else WORDS["regular_file"]))
+    if "memory_maps_open_for_write" in record:
+        maps = record["memory_maps_open_for_write"]
+        if not isinstance(maps, list):
+            lines.append(WORDS["maps_unknown"])
+        else:
+            lines.extend(WORDS["map_open"] for _ in maps)
     for check in RECORD_CHECKS:
         if record.get(check) is not True:
             lines.append(WORDS["not_refused"].format(what=WORDS[check]))
@@ -976,8 +1152,7 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
     regular file or a block device are named (``descriptors_open_for_write``; None when not every descriptor
     could be seen), before the probe opens anything of its own. Eight checks are tried; each field is True only
     when the kernel refused it. Then each kind of
-    ``WRITE_KINDS`` is tried on ``write_file`` (a file of this user, writable by its mode, that the caller made:
-    the host's canary will do) and in ``write_folder`` (a folder the caller made and gave to
+    ``WRITE_KINDS`` is tried on the probe's own file and in ``write_folder`` (a folder the caller made and gave to
     ``prepare_write_folder`` before the wall); ``writes`` holds the outcome of each, and ``writes_not_tried``
     names every kind the probe does not try, with its reason: ``proven`` covers the kinds in ``writes`` only.
     ``proven`` is True only when the process has one thread, no descriptor open for writing, all eight checks
@@ -991,10 +1166,17 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
     """
     libc = _libc()
     canary = os.fspath(canary_path)
-    threads, held = _threads_now(), _descriptors_open_for_write()  # before the probe opens anything of its own
+    threads = _threads_now()  # before the probe opens anything of its own
+    seen = _STATE.get("seen_at_wall")
+    if seen:  # apply_wall ran in this process: the kernel's own lists, read after the wall
+        held, maps, seen_by = seen["descriptors"], seen["maps"], "kernel_list_after_wall"
+    else:
+        held, maps, seen_by = _descriptors_open_for_write(), _maps_open_for_write(), "scan_by_number"
     record = {
         "threads": threads,
         "descriptors_open_for_write": held,
+        "memory_maps_open_for_write": maps,
+        "descriptors_seen_by": seen_by,
         "reads_outside": _refused(_read_root),
         "home_canary": _refused(lambda: _read_canary(canary)),
         "program_start": _refused(_start_program),
@@ -1009,7 +1191,7 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
         "landlock_scopes": list(_STATE["scopes"]),
         "arch": platform.machine() or "unknown",
     }
-    record["proven"] = (threads == 1 and held == []
+    record["proven"] = (threads == 1 and held == [] and maps == []
                         and all(record[name] for name in RECORD_CHECKS) and record["landlock_abi"] >= _MIN_LANDLOCK_ABI
                         and all(record["writes"][kind] in _WRITE_REFUSED for kind in WRITE_KINDS)
                         and record["arch"] in _NR and _STATE["failed"] is None)

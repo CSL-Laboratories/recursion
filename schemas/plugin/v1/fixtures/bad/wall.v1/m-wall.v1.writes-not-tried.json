@@ -1,6 +1,7 @@
 {
   "threads": 1,
   "descriptors_open_for_write": [],
+  "memory_maps_open_for_write": [],
   "reads_outside": true,
   "home_canary": true,
   "program_start": true,

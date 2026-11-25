@@ -1,6 +1,18 @@
 {
   "threads": 1,
-  "descriptors_open_for_write": [],
+  "descriptors_open_for_write": [
+    {
+      "descriptor": 4,
+      "kind": "regular_file"
+    }
+  ],
+  "memory_maps_open_for_write": [
+    {
+      "map": 3,
+      "name": "/home/a-person/notes.txt"
+    }
+  ],
+  "descriptors_seen_by": "kernel_list_after_wall",
   "reads_outside": true,
   "home_canary": true,
   "program_start": true,
@@ -36,5 +48,5 @@
   "landlock_abi": 3,
   "landlock_scopes": [],
   "arch": "x86_64",
-  "proven": true
+  "proven": false
 }

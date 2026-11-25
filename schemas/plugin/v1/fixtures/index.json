@@ -1697,21 +1697,66 @@
       }
     },
     {
-      "file": "bad/wall.v1/m-wall.v1.then.writes-not-tried.writable-memory-map.json",
-      "schema": "wall.v1.json",
-      "rule": "A proven wall names 'writable_memory_map' among the kinds it did not try.",
-      "expect": {
-        "keyword": "required",
-        "at": "/writes_not_tried"
-      }
-    },
-    {
       "file": "bad/wall.v1/m-wall.v1.then.writes-not-tried.write-beneath-other-folder.json",
       "schema": "wall.v1.json",
       "rule": "A proven wall names 'write_beneath_other_folder' among the kinds it did not try.",
       "expect": {
         "keyword": "required",
         "at": "/writes_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b12-proven-with-a-file-mapped-shared-and-writable.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall holds no file mapped shared and writable.",
+      "expect": {
+        "keyword": "maxItems",
+        "at": "/memory_maps_open_for_write"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b13-proven-when-the-maps-could-not-be-read.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall read the list of its maps.",
+      "expect": {
+        "keyword": "type",
+        "at": "/memory_maps_open_for_write"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.memory-maps-open-for-write.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall says which files it held mapped for writing.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/u-wall.v1.memory-maps-open-for-write.0.json",
+      "schema": "wall.v1.json",
+      "rule": "A map entry is closed: a field nobody defined (a file's name, say) is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/memory_maps_open_for_write/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.memory-maps-open-for-write.0.map.json",
+      "schema": "wall.v1.json",
+      "rule": "A map entry always carries 'map'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/memory_maps_open_for_write/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/v-wall.v1.descriptors-seen-by.json",
+      "schema": "wall.v1.json",
+      "rule": "The way the descriptors were seen is kernel_list_after_wall or scan_by_number.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/descriptors_seen_by"
       }
     }
   ]

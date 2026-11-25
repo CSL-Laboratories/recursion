@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "wall.v1.json",
   "title": "wall.v1: what a plugin host proved of its own wall, from inside, before it loaded any plugin byte",
-  "x-version": "1.0-draft.5",
-  "description": "A plugin host on Linux applies its wall to itself (Landlock: read and map only the Python install; one seccomp filter: no new socket, no program start, no signal at all, no limit or priority aimed at any process but the caller by the kernel's own form, no System V IPC or POSIX message queue, no lease, no change of a file's mode, owner, times or attributes, no new namespace, among other calls) and then tries eight checks from inside, and each kind of write on a file and in a folder that it made for the purpose before the wall. Each of the eight fields is true only when the kernel refused that check; a check that succeeded, or that failed or raised in another way, is false (fail shut). A target that would make a refusal prove nothing (a daemon pid of another user, a canary of another user) is not refused. 'proven' is true only when the host ran alone in its process (threads is 1), held no file open for writing (descriptors_open_for_write is empty), all eight are refused, every kind of write is refused by the part of the wall that holds it, on x86_64 or aarch64, with Landlock ABI 1 or above, and no step of the wall failed in the process. 'landlock_scopes' names the Landlock scopes the wall put in force (abstract unix sockets and signals, each kept to the domain, from Landlock ABI 6 on; none below). What the record is: a check that the host's own code makes on itself, from inside the process, after the wall and before any plugin code runs. It shows that the named attempts were refused by the kernel at that moment, and code in the same process could write any record; for each kind of write it names which part of the wall refused it, by the kernel's answer. 'proven' covers the kinds in 'writes' only: every other kind the wall claims, or leaves to the host, is named in 'writes_not_tried' with the reason it is not tried. It means something under two conditions only: it is made before the plugin is loaded, and its reader takes it only from frames the host sent before the load (everything later on the channel is the plugin's voice). A host whose record is not proven loads no plugin.",
+  "x-version": "1.0-draft.6",
+  "description": "A plugin host on Linux applies its wall to itself (Landlock: read and map only the Python install; one seccomp filter: no new socket, no program start, no signal at all, no limit or priority aimed at any process but the caller by the kernel's own form, no System V IPC or POSIX message queue, no lease, no change of a file's mode, owner, times or attributes, no new namespace, among other calls) and then tries eight checks from inside, and each kind of write on a file and in a folder that it made for the purpose before the wall. Each of the eight fields is true only when the kernel refused that check; a check that succeeded, or that failed or raised in another way, is false (fail shut). A target that would make a refusal prove nothing (a daemon pid of another user, a canary of another user) is not refused. 'proven' is true only when the host ran alone in its process (threads is 1), held no file open for writing (descriptors_open_for_write is empty) and no file mapped shared and writable (memory_maps_open_for_write is empty), all eight are refused, every kind of write is refused by the part of the wall that holds it, on x86_64 or aarch64, with Landlock ABI 1 or above, and no step of the wall failed in the process. 'landlock_scopes' names the Landlock scopes the wall put in force (abstract unix sockets and signals, each kept to the domain, from Landlock ABI 6 on; none below). What the record is: a check that the host's own code makes on itself, from inside the process, after the wall and before any plugin code runs. It shows that the named attempts were refused by the kernel at that moment, and code in the same process could write any record; for each kind of write it names which part of the wall refused it, by the kernel's answer. 'proven' covers the kinds in 'writes' only: every other kind the wall claims, or leaves to the host, is named in 'writes_not_tried' with the reason it is not tried. It means something under two conditions only: it is made before the plugin is loaded, and its reader takes it only from frames the host sent before the load (everything later on the channel is the plugin's voice). A host whose record is not proven loads no plugin.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -54,7 +54,35 @@
         },
         "description": "One descriptor of the host open for writing (write only or read and write), by its number and the kind of file; never its name or contents."
       },
-      "description": "Each descriptor the host held open for writing on a regular file or a block device when the probe began, before the probe opened anything of its own; null when the probe could not see every descriptor. Landlock checks a file when it is opened, so writes through a descriptor opened before the wall are not refused: a proven record holds none. Added in draft 5: a draft 4 record has no such field and is never proven."
+      "description": "Each descriptor the host held open for writing on a regular file or a block device after the wall, read through the kernel's own list of the process's descriptors (or, where no wall was applied in the process, found by number when the probe began); null when the probe could not see every descriptor. Landlock checks a file when it is opened, so writes through a descriptor opened before the wall are not refused: a proven record holds none. Added in draft 5: a draft 4 record has no such field and is never proven."
+    },
+    "memory_maps_open_for_write": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "map"
+        ],
+        "properties": {
+          "map": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "description": "One map of a file that the host held shared and writable, by its line in the kernel's list of the process's maps (from 0); never its name, address or contents."
+      },
+      "description": "Each map of a file that the host held shared and writable after the wall, read through the kernel's own list of the process's maps, which the wall opened before it was put on and closed before it returned; null when that list could not be read. Landlock checks a file when it is opened, so writes through such a map still reach the file: a proven record holds none. Added in draft 6: a draft 5 record has no such field and is never proven."
+    },
+    "descriptors_seen_by": {
+      "enum": [
+        "kernel_list_after_wall",
+        "scan_by_number"
+      ],
+      "description": "How the descriptors and maps were found: kernel_list_after_wall (the kernel's own lists, opened before the wall and read after it, every descriptor seen) or scan_by_number (no wall was applied in the process, so the probe looked for itself). Added in draft 6."
     },
     "reads_outside": {
       "type": "boolean",
@@ -182,7 +210,8 @@
         },
         "writable_memory_map": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "description": "Drafts 4 and 5 only, where the probe did not look for a map; from draft 6 such maps are named in memory_maps_open_for_write."
         },
         "write_beneath_other_folder": {
           "type": "string",
@@ -194,7 +223,7 @@
           "description": "Draft 4 only, where the probe did not try a socket file; from draft 5 the kind is tried (writes), and a proven record does not list it here."
         }
       },
-      "description": "Every kind of change that the wall claims to refuse, or leaves to the host, and that the probe does not try, each with the reason it is not tried. 'proven' covers the kinds in 'writes' only; a proven record (draft 5) names every kind of this list: device_ioctl, move_between_folders, rename_within_folder, change_owner, change_times, change_extended_attributes, write_through_open_descriptor, writable_memory_map, write_beneath_other_folder."
+      "description": "Every kind of change that the wall claims to refuse, or leaves to the host, and that the probe does not try, each with the reason it is not tried. 'proven' covers the kinds in 'writes' only; a proven record (draft 5) names every kind of this list: device_ioctl, move_between_folders, rename_within_folder, change_owner, change_times, change_extended_attributes, write_through_open_descriptor, write_beneath_other_folder (draft 6: writable_memory_map is no longer among them, its maps are named)."
     },
     "landlock_abi": {
       "type": "integer",
@@ -219,7 +248,7 @@
     },
     "proven": {
       "type": "boolean",
-      "description": "True only when the host ran alone in its process (threads is 1), held no file open for writing (descriptors_open_for_write is empty), all eight checks are refused, every kind of write in 'writes' is refused by the part of the wall that holds it (refused_by_landlock, or refused_by_filter for truncate alone), on a supported arch, with Landlock ABI 1 or above (and, from ABI 6, both scopes in force), and no step of the wall failed in the process. It covers the kinds in 'writes' only: the kinds in 'writes_not_tried' are not tried, each for the reason given there. A host that gave the probe no file or folder for the writes is never proven."
+      "description": "True only when the host ran alone in its process (threads is 1), held no file open for writing (descriptors_open_for_write is empty) and no file mapped shared and writable (memory_maps_open_for_write is empty), all eight checks are refused, every kind of write in 'writes' is refused by the part of the wall that holds it (refused_by_landlock, or refused_by_filter for truncate alone), on a supported arch, with Landlock ABI 1 or above (and, from ABI 6, both scopes in force), and no step of the wall failed in the process. It covers the kinds in 'writes' only: the kinds in 'writes_not_tried' are not tried, each for the reason given there. A host that gave the probe no file or folder for the writes is never proven."
     }
   },
   "if": {
@@ -235,13 +264,18 @@
   "then": {
     "required": [
       "threads",
-      "descriptors_open_for_write"
+      "descriptors_open_for_write",
+      "memory_maps_open_for_write"
     ],
     "properties": {
       "threads": {
         "const": 1
       },
       "descriptors_open_for_write": {
+        "type": "array",
+        "maxItems": 0
+      },
+      "memory_maps_open_for_write": {
         "type": "array",
         "maxItems": 0
       },
@@ -319,7 +353,6 @@
           "change_times",
           "change_extended_attributes",
           "write_through_open_descriptor",
-          "writable_memory_map",
           "write_beneath_other_folder"
         ],
         "not": {

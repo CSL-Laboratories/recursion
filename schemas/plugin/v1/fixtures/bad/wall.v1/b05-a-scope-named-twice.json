@@ -1,6 +1,7 @@
 {
   "threads": 1,
   "descriptors_open_for_write": [],
+  "memory_maps_open_for_write": [],
   "reads_outside": true,
   "home_canary": true,
   "program_start": true,
@@ -31,7 +32,6 @@
     "change_times": "the filter refuses every call that changes a file's times, by path and by descriptor; the probe tries one call of the filter's list of changes to a file's attributes, a change of mode (metadata_change), and not this one",
     "change_extended_attributes": "the filter refuses every call that sets or removes a file's extended attributes, by path and by descriptor; the probe tries one call of the filter's list of changes to a file's attributes, a change of mode (metadata_change), and not this one",
     "write_through_open_descriptor": "Landlock checks a file when it is opened, so a file opened for writing before the wall can still be written through; the probe writes through none, and names each such file it finds open (descriptors_open_for_write), which a proven record holds empty",
-    "writable_memory_map": "a file mapped shared and writable before the wall can still be written through the map; the list of the process's maps (/proc/self/maps) is outside what the wall lets the host read, and no other call lists them, so the probe cannot look for one",
     "write_beneath_other_folder": "the probe tries every kind in one folder only: a rule that granted write rights beneath another folder would not show here; apply_wall adds rules with read and execute rights only"
   },
   "landlock_abi": 6,

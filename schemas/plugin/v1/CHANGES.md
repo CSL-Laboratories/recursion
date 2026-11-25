@@ -4,6 +4,21 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `wall.v1.json` is `1.0-draft.6` (Nov 24, 2026)
+
+An additive step: every field and value of draft 5 keeps its meaning but one (below), and a record that is not
+proven still validates. A record gains `memory_maps_open_for_write` (each map of a file the host held shared
+and writable after the wall, by its line in the kernel's list of the process's maps, or null when that list
+could not be read) and `descriptors_seen_by` (`kernel_list_after_wall`: the kernel's own lists, opened before
+the wall, read after it and closed before the wall's call returned; or `scan_by_number`: no wall was applied in
+the process). `writes_not_tried` no longer holds `writable_memory_map`: such maps are now looked for and named.
+A proven record now also needs `memory_maps_open_for_write`, and needs it empty. What it breaks: a draft 5
+record that says proven does not validate at draft 6 (it never read the list of its maps). 6 bad fixtures are
+added (`b12`, `b13` and four that prove the new fields closed, required and of their allowed values), the bad
+fixture that proved `writes_not_tried` required `writable_memory_map` is removed with that rule, and the bad
+fixture that proves `threads` required of a proven record gains the new field so that it fails for that one
+reason only.
+
 ## `wall.v1.json` is `1.0-draft.5` (Nov 24, 2026)
 
 An additive step: every field and value of draft 4 keeps its meaning, and a draft 4 record that is not proven

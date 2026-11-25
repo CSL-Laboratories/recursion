@@ -373,6 +373,7 @@ elif mode == "twice":
 
 elif mode == "weak":
     lc, arch = w._libc(), w._arch()
+    rows = w.load_allow_list()["rows"] if hasattr(w, "load_allow_list") else None  # read before Landlock, as apply_wall does
     opened = w._open_paths(paths)
     w._apply_landlock(lc, w._landlock_abi(lc), opened)
     for fd_, _ in opened:
@@ -383,7 +384,8 @@ elif mode == "weak":
                         ("DENIED_IOCTL_COMMANDS", {})):
         if hasattr(w, name):
             setattr(w, name, empty)
-    w._load_seccomp_filter(lc, arch)
+    w._RET_UNLISTED = w._RET_ALLOW  # as weak as the deny list was: every call it does not name let through
+    w._load_seccomp_filter(lc, arch, **({"allow_rows": rows} if rows is not None else {}))
     out["record"] = w.probe_wall(spec["canary"], daemon, write_file=spec["canary"], write_folder=spec["writes"])
     out["io_uring_setup"] = res(425 if ARCH == "x86_64" else 425, 0, 0)
 

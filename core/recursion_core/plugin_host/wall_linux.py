@@ -59,9 +59,18 @@ and to everything it starts later, and neither can be lifted again from inside:
      that asks ``O_TRUNC``.
    Every call numbered above the newest call the wall's tables name is answered EPERM, by one comparison (as the
    x32 range is), so a call a newer kernel adds stays refused until the wall names it.
-   Everything else is allowed. It is a deny list, so ordinary Python keeps working: imports from the
-   install, threads, ``fork``, pipes, and ``recvmsg`` of a socket handed over on an already open
-   channel all stay allowed.
+   The filter is an ALLOW LIST: after the refusals above it lets through only the calls named in the list
+   ``ALLOW_LIST_FILE`` (``wall_allow_linux.json`` beside this module), each row with its number on each arch, the
+   check of its arguments where it is allowed only in part (the checks above, which a row cannot drop or change),
+   and the reason it is allowed; EVERY call the list does not name is answered EPERM, so a call the kernel adds
+   later, or one nobody thought of, is refused by default. The list was derived from the calls the wall's own
+   tests make behind the wall (recorded on CPython 3.12 and the free-threaded 3.14t, x86_64); a row those
+   recordings did not see carries the written reason it is on the list all the same. Ordinary Python keeps
+   working: imports from the install, threads, ``fork``, pipes, and ``recvmsg`` of a socket handed over on an
+   already open channel stay allowed. The list is read when the wall is applied, before its first change, and a
+   list that is missing, unreadable, not of the wall's form, or with a row that carries no reason, names a call
+   the wall refuses by name, drops a check, or gives a number the wall's tables do not reach, is refused
+   ``wall_allow_list_refused`` with words that say which row and what to do: the wall then applies nothing.
 
 Before its first change ``apply_wall`` makes one object of its own of each kind a process can hold from before a
 wall and still use after it (``HELD_KINDS``: a ring of kernel calls, an unconnected datagram socket with a receiver
@@ -80,8 +89,11 @@ a kind the wall does not make is named with its reason (``HELD_NOT_TRIED``), nev
 kernel's list after the wall is kept with each descriptor's identity (device, inode and file type: two sockets differ
 by inode), so a descriptor received after the wall at the number of one closed since is named as one handed in.
 
-The deny list is the wall's own definition, not a setting: there is no row, flag or argument that
-shortens it. Landlock below ABI 4 does not limit TCP and below ABI 6 does not scope signals; the seccomp
+The refusals by name are the wall's own definition, not a setting: there is no row, flag or argument that
+shortens them. The allow list is data: ``apply_wall(..., allow_list=path)`` takes another file in its place, so
+that a person can widen it knowingly (a row can add a call; it can never allow a call refused by name or drop a
+check), and the record then says that the list in force is not the shipped one: 'proven' speaks for the shipped
+list only. Landlock below ABI 4 does not limit TCP and below ABI 6 does not scope signals; the seccomp
 filter shuts both here (``socket``, ``connect`` and every way named above to signal, limit, slow or move
 another process are denied whatever the ABI). Where the kernel's Landlock ABI is 6 or above, the ruleset
 also asks both of the kernel's scopes (``LANDLOCK_SCOPES``: abstract unix sockets and signals, each kept
@@ -125,6 +137,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import json
 import os
 import platform
 import socket
@@ -133,11 +146,11 @@ import struct
 import sys
 import threading
 
-__all__ = ["CALLER_ONLY_CALLS", "CALLER_ONLY_PRIORITY_CALLS", "DENIED_CALLS", "DENIED_FCNTL_COMMANDS",
+__all__ = ["ALLOW_LIST_FILE", "CALLER_ONLY_CALLS", "CALLER_ONLY_PRIORITY_CALLS", "DENIED_CALLS", "DENIED_FCNTL_COMMANDS",
            "DENIED_IOCTL_COMMANDS", "DENIED_IPC_CALLS", "DENIED_METADATA_CALLS", "DENIED_SIGNAL_CALLS",
            "ALLOWED_TERMINAL_COMMANDS", "DENIED_TERMINAL_COMMANDS", "HELD_KINDS", "HELD_NOT_TRIED", "HELD_OUTCOMES", "LANDLOCK_SCOPES", "NAMESPACE_CLONE_FLAGS", "OLD_LANDLOCK_DENIED_CALLS", "RECORD_CHECKS", "WORDS",
            "WRITES_NOT_TRIED", "WRITE_FILE_NAME", "WRITE_FOLDER_NAMES", "WRITE_KINDS", "WRITE_OUTCOMES", "WallRefused", "apply_wall",
-           "prepare_write_folder", "probe_wall", "why_not_proven"]
+           "load_allow_list", "prepare_write_folder", "probe_wall", "why_not_proven"]
 
 # The wall's own definition (not a setting, not a tunable): each call is answered EPERM.
 DENIED_CALLS = (
@@ -211,6 +224,11 @@ ALLOWED_TERMINAL_COMMANDS = {"TCGETS": 0x5401, "TIOCGPGRP": 0x540F, "TIOCOUTQ": 
 _TERMINAL_RANGE = (0x5400, 0x5500)  # the kernel's: type byte 'T' (0x54) with no size or direction bits
 # A call number the kernel will never give a call (the last one below the x32 range): the probe's planted unknown call.
 _UNKNOWN_CALL = 0x40000000 - 1
+# The allow list: data beside this module, read when the wall is applied (see load_allow_list).
+ALLOW_LIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wall_allow_linux.json")
+_ALLOW_FORMAT = "wall-allow-list.v1"
+_ALLOW_ROW_KEYS = ("call", "x86_64", "aarch64", "check", "reason", "recorded", "beyond_recording")
+_ALLOW_CHUNK = 250  # allow rows per run of comparisons: a classic BPF jump reaches 255 rows forward at most
 _RESOLVE_NO_SYMLINKS = 0x04  # struct open_how's resolve flag (include/uapi/linux/openat2.h)
 # clone with any of these flags (a new mount, cgroup, uts, ipc, user, pid or network namespace) is refused.
 NAMESPACE_CLONE_FLAGS = 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000 | 0x10000000 | 0x20000000 | 0x40000000
@@ -258,7 +276,7 @@ _NR_MORE = {
         "prlimit64": 302, "sched_setaffinity": 203, "sched_setscheduler": 144, "sched_setparam": 142,
         "sched_setattr": 314, "migrate_pages": 256, "move_pages": 279, "setpriority": 141, "ioprio_set": 251,
         "fcntl": 72, "ioctl": 16, "clone": 56, "clone3": 435, "sendto": 44, "close_range": 436,
-        "truncate": 76, "ftruncate": 77, "openat2": 437, "open": 2, "openat": 257,
+        "truncate": 76, "ftruncate": 77, "openat2": 437, "open": 2, "openat": 257, "personality": 135,
     },
     "aarch64": {
         "fchmod": 52, "fchmodat": 53, "fchmodat2": 452, "fchown": 55, "fchownat": 54, "utimensat": 88,
@@ -271,7 +289,7 @@ _NR_MORE = {
         "prlimit64": 261, "sched_setaffinity": 122, "sched_setscheduler": 119, "sched_setparam": 118,
         "sched_setattr": 274, "migrate_pages": 238, "move_pages": 239, "setpriority": 140, "ioprio_set": 30,
         "fcntl": 25, "ioctl": 29, "clone": 220, "clone3": 435, "sendto": 206, "close_range": 436,
-        "truncate": 45, "ftruncate": 46, "openat2": 437, "openat": 56,
+        "truncate": 45, "ftruncate": 46, "openat2": 437, "openat": 56, "personality": 92,
     },
 }
 _AUDIT_ARCH = {"x86_64": 0xC000003E, "aarch64": 0xC00000B7}
@@ -299,6 +317,7 @@ _SECCOMP_SET_MODE_FILTER, _SECCOMP_FILTER_FLAG_TSYNC = 1, 1
 _BPF_LD_W_ABS, _BPF_JEQ_K, _BPF_JGE_K, _BPF_JSET_K, _BPF_RET_K = 0x20, 0x15, 0x35, 0x45, 0x06
 _EPERM, _ENOSYS = 1, 38                      # Linux errno values (the kernel's, whatever the host Python says)
 _RET_ALLOW, _RET_EPERM, _RET_ENOSYS = 0x7FFF0000, 0x00050000 | _EPERM, 0x00050000 | _ENOSYS
+_RET_UNLISTED = _RET_EPERM  # the answer to every call the allow list does not name, as to every call refused by name
 _OFF_NR, _OFF_ARCH = 0, 4                     # struct seccomp_data, little-endian
 _OFF_ARG_LOW = (16, 24, 32)                   # the low word of arguments 0, 1 and 2
 _OFF_ARG4 = (48, 52)                          # the low and high words of argument 4 (sendto's address)
@@ -402,6 +421,10 @@ _LANDLOCK_RIGHT = {"open_for_write": _FS_WRITE_FILE, "truncate": _FS_TRUNCATE, "
 # What a person reads when a wall is not proven: ONE table of words (why_not_proven puts them together). The
 # entries named after a check or a kind say what was tried; the others are whole sentences.
 WORDS = {
+    "allow_list_refused": "The sandbox's list of the kernel calls it lets through ({path}) cannot be used: {problem}. "
+                          "Without a whole list the sandbox cannot know which calls to let through, so it changed "
+                          "nothing in this process and no plugin is loaded. Give the sandbox the list shipped beside it, "
+                          "or mend the row named.",
     "not_loaded": "The plugin was not loaded. Before any plugin code runs, the plugin host shuts itself in and "
                   "then tests that it is shut in; this time the test found a gap, so nothing of the plugin ran.",
     "reads_outside": "reading a folder outside the Python install",
@@ -412,9 +435,9 @@ WORDS = {
     "signal_other_ways": "reaching another of your processes in other ways (a queued signal, a pipe's signals, "
                          "its limits)",
     "metadata_change": "changing the permissions of a test file",
-    "kernel_surface": "kernel calls that only this sandbox refuses (among them a call it does not know: it refuses "
-                      "every call newer than the ones it was written to name, so a newer kernel's calls stay shut "
-                      "until it names them)",
+    "kernel_surface": "kernel calls that only this sandbox refuses (among them a call it does not know and a call "
+                      "its list does not name: it refuses every call it was not written to allow, so a newer "
+                      "kernel's calls stay shut until its list names them)",
     "path_is_link": "A folder given to the sandbox ({path}) is a link to another place, or has a link in it. The "
                     "sandbox would let plugins read the place the link points to, not the folder named, so the plugin "
                     "host did not shut itself in and loads nothing. What you can do: give the sandbox the real path "
@@ -636,10 +659,116 @@ def _newest_call(arch: str) -> int:
     return max(dict(_NR[arch], **_NR_MORE[arch]).values())
 
 
-def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI) -> list[tuple[int, int, int, int]]:
+def _required_check(call: str):
+    """The check the filter holds for ``call``'s arguments (None where it is allowed whole): the wall's definition,
+    which a row of the allow list must repeat and can never drop or change."""
+    if call in CALLER_ONLY_CALLS:
+        return "caller_only"
+    if call in CALLER_ONLY_PRIORITY_CALLS:
+        return "priority"
+    if call in ("fcntl", "ioctl", "clone", "sendto"):
+        return call
+    if call in OLD_LANDLOCK_DENIED_CALLS or call in ("open", "openat"):
+        return "landlock_truncate"
+    return None
+
+
+def _refused_by_name() -> set:
+    """Every call the filter refuses by name, which no row of the allow list may name."""
+    return set(DENIED_CALLS + DENIED_METADATA_CALLS + DENIED_SIGNAL_CALLS + DENIED_IPC_CALLS) | {"clone3"}
+
+
+def _read_allow_list(path: str) -> tuple:
+    """The rows of the allow list at ``path``, each checked; ``wall_allow_list_refused`` naming the first fault."""
+    def refuse(problem):
+        raise WallRefused("wall_allow_list_refused", WORDS["allow_list_refused"].format(path=path, problem=problem))
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        refuse(f"it cannot be read ({errno.errorcode.get(exc.errno or 0, exc.errno)})")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        refuse("it is not JSON text")
+    if not isinstance(data, dict) or data.get("format") != _ALLOW_FORMAT or not isinstance(data.get("rows"), list) \
+            or not data["rows"]:
+        refuse(f"it is not a list of the wall's form (an object with format {_ALLOW_FORMAT!r} and a list of rows)")
+    refused = _refused_by_name()
+    taken: dict = {arch: {} for arch in _NR}
+    by_name = {arch: dict(_NR[arch], **_NR_MORE[arch]) for arch in _NR}
+    names = set()
+    for index, row in enumerate(data["rows"], 1):
+        where = f"row {index}"
+        if not isinstance(row, dict) or set(row) - set(_ALLOW_ROW_KEYS):
+            refuse(f"{where} is not a row of the wall's form (its keys: {', '.join(_ALLOW_ROW_KEYS)})")
+        call = row.get("call")
+        if not isinstance(call, str) or not call.isidentifier():
+            refuse(f"{where} names no call")
+        where = f"row {index} ({call})"
+        reason = row.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            refuse(f"{where} carries no reason")
+        recorded, beyond = row.get("recorded", []), row.get("beyond_recording")
+        if not isinstance(recorded, list) or not all(isinstance(tag, str) and tag for tag in recorded):
+            refuse(f"{where} names its recordings in a form the wall does not read")
+        if not recorded and (not isinstance(beyond, str) or not beyond.strip()):
+            refuse(f"{where} was not seen in the recording and carries no written reason to be on the list all the same")
+        if call in names:
+            refuse(f"{where} names a call a row above names already")
+        if call in refused:
+            refuse(f"{where} names a call the wall refuses by name, which no row can allow")
+        if row.get("check") != _required_check(call):
+            refuse(f"{where} must carry the check {_required_check(call)!r} that the wall holds for it, and carries "
+                   f"{row.get('check')!r}")
+        named = False
+        for arch in _NR:
+            if arch not in row:
+                refuse(f"{where} gives no number for {arch} (null where the arch has no such call)")
+            number, top = row[arch], _newest_call(arch)
+            if number is None:
+                continue
+            if not isinstance(number, int) or isinstance(number, bool) or not 0 <= number <= top:
+                refuse(f"{where} gives {arch} the number {number!r}, which the wall's tables do not reach (0 to {top}: "
+                       "a call above them stays refused until the wall names it)")
+            if number in {by_name[arch][name] for name in refused if name in by_name[arch]}:
+                refuse(f"{where} gives {arch} the number of a call the wall refuses by name")
+            if call in by_name[arch] and by_name[arch][call] != number:
+                refuse(f"{where} gives {arch} the number {number}, and the wall's own table gives {by_name[arch][call]}")
+            if number in taken[arch]:
+                refuse(f"{where} gives {arch} the number of {taken[arch][number]}")
+            taken[arch][number], named = call, True
+        if not named:
+            refuse(f"{where} gives no number on any arch")
+        names.add(call)
+    return tuple(data["rows"])
+
+
+def load_allow_list(path=None) -> dict:
+    """The allow list in force: ``rows`` (each checked), ``file`` (the path read), ``shipped`` (True when its rows are
+    the rows of the list shipped beside the wall), ``added`` and ``removed`` (the calls whose rows differ from the
+    shipped list's). ``path`` None reads the shipped list (``ALLOW_LIST_FILE``). The shipped list is read in every
+    case, to name what differs. ``wall_allow_list_refused`` where either cannot be used, naming the fault."""
+    shipped = _read_allow_list(ALLOW_LIST_FILE)
+    file = ALLOW_LIST_FILE if path is None else os.fspath(path)
+    rows = shipped if path is None else _read_allow_list(file)
+
+    def key(row):
+        return (row["call"], row["x86_64"], row["aarch64"], row.get("check"))
+    ours, theirs = {key(row) for row in shipped}, {key(row) for row in rows}
+    added = sorted({row["call"] for row in rows if key(row) not in ours})
+    removed = sorted({row["call"] for row in shipped if key(row) not in theirs})
+    return {"file": file, "rows": rows, "shipped": not added and not removed, "added": added, "removed": removed}
+
+
+def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI, allow_rows=None) -> list[tuple[int, int, int, int]]:
     """The one seccomp program, as (code, jt, jf, k) rows. ``landlock_abi`` below 3 adds the truncation rules.
-    No pid number appears in it: the same program for every process."""
+    ``allow_rows`` are the rows of the allow list (None: the shipped list). No pid number appears in it: the same
+    program for every process."""
     numbers = dict(_NR[arch], **_NR_MORE[arch])
+    if allow_rows is None:
+        allow_rows = load_allow_list()["rows"]
+    listed = {row["call"]: row for row in allow_rows if row.get(arch) is not None}
     rows: list[tuple] = [(_BPF_LD_W_ABS, 0, 0, _OFF_ARCH), (_BPF_JEQ_K, 1, 0, _AUDIT_ARCH[arch]),
                          (_BPF_RET_K, 0, 0, _RET_EPERM), (_BPF_LD_W_ABS, 0, 0, _OFF_NR)]
     if arch == "x86_64":
@@ -651,13 +780,14 @@ def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI) -> list[tuple[int,
     if landlock_abi < _TRUNCATE_ABI:
         rows += [(_BPF_JEQ_K, "deny", 0, numbers[name]) for name in OLD_LANDLOCK_DENIED_CALLS]
         rows += [(_BPF_JEQ_K, label, 0, numbers[name])
-                 for name, label in (("open", "trunc1"), ("openat", "trunc2")) if name in numbers]
-    rows += [(_BPF_JEQ_K, "caller", 0, numbers[name]) for name in CALLER_ONLY_CALLS]
-    rows += [(_BPF_JEQ_K, "prio", 0, numbers["setpriority"]), (_BPF_JEQ_K, "ioprio", 0, numbers["ioprio_set"]),
-             (_BPF_JEQ_K, "fcntl", 0, numbers["fcntl"]), (_BPF_JEQ_K, "ioctl", 0, numbers["ioctl"]),
-             (_BPF_JEQ_K, "clone", 0, numbers["clone"]), (_BPF_JEQ_K, "enosys", 0, numbers["clone3"]),
-             (_BPF_JEQ_K, "sendto", 0, numbers["sendto"])]
-    rows.append((_BPF_RET_K, 0, 0, _RET_ALLOW))
+                 for name, label in (("open", "trunc1"), ("openat", "trunc2")) if name in numbers and name in listed]
+    # a call allowed only in part is let through to its check only where the allow list names it
+    rows += [(_BPF_JEQ_K, "caller", 0, numbers[name]) for name in CALLER_ONLY_CALLS if name in listed]
+    rows += [(_BPF_JEQ_K, label, 0, numbers[name]) for name, label in
+             (("setpriority", "prio"), ("ioprio_set", "ioprio"), ("fcntl", "fcntl"), ("ioctl", "ioctl"),
+              ("clone", "clone"), ("sendto", "sendto")) if name in listed]
+    rows.append((_BPF_JEQ_K, "enosys", 0, numbers["clone3"]))
+    rows.append((_BPF_JGE_K, "listed", "listed", 0))  # always taken: on to the allow list, past the checks below
     labels: dict[str, int] = {}
 
     def block(label, *body):
@@ -688,6 +818,17 @@ def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI) -> list[tuple[int,
     block("enosys", (_BPF_RET_K, 0, 0, _RET_ENOSYS))
     block("allow", (_BPF_RET_K, 0, 0, _RET_ALLOW))
     block("deny", (_BPF_RET_K, 0, 0, _RET_EPERM))
+    # the allow list: each call it names in full (or whose only check is the truncation rule above) is let through;
+    # runs of comparisons, each ending in its own ALLOW, so that every jump stays within reach
+    plain = [row[arch] for row in listed.values() if row.get("check") in (None, "landlock_truncate")]
+    labels["listed"] = len(rows)
+    for run in range(0, len(plain), _ALLOW_CHUNK):
+        label = f"listed_{run}"
+        rows.extend((_BPF_JEQ_K, label, 0, number) for number in plain[run:run + _ALLOW_CHUNK])
+        rows.append((_BPF_JGE_K, 1, 1, 0))  # always taken: past this run's ALLOW, on to the next run
+        labels[label] = len(rows)
+        rows.append((_BPF_RET_K, 0, 0, _RET_ALLOW))
+    rows.append((_BPF_RET_K, 0, 0, _RET_UNLISTED))  # every call the allow list does not name
     program = []
     for i, (code, jt, jf, k) in enumerate(rows):
         jt = labels[jt] - i - 1 if isinstance(jt, str) else jt
@@ -735,8 +876,8 @@ def _no_new_privs(libc) -> None:
         raise OSError(err, f"prctl(PR_SET_NO_NEW_PRIVS): {os.strerror(err)}")
 
 
-def _load_seccomp_filter(libc, arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI) -> None:
-    rows = _filter(arch, landlock_abi)
+def _load_seccomp_filter(libc, arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI, allow_rows=None) -> None:
+    rows = _filter(arch, landlock_abi, allow_rows)
     program = (_SockFilter * len(rows))(*(_SockFilter(*row) for row in rows))
     fprog = _SockFprog(len(rows), ctypes.addressof(program))
     _step("no_new_privs_before_filter", lambda: _no_new_privs(libc))
@@ -820,7 +961,7 @@ def _apply_landlock(libc, abi: int, opened: list[tuple[int, int]]) -> None:
         os.close(ruleset)
 
 
-def apply_wall(read_only_paths, keep_descriptors=None) -> None:
+def apply_wall(read_only_paths, keep_descriptors=None, allow_list=None) -> None:
     """Wall this process in: Landlock (read and map only ``read_only_paths``), then the one seccomp filter.
 
     ``read_only_paths`` is read whole into a list before the threads are counted, so that reading it cannot
@@ -836,6 +977,11 @@ def apply_wall(read_only_paths, keep_descriptors=None) -> None:
     each must be open with no receiver of its signals set, else ``wall_keep_refused`` before any change. Before the
     first change of the wall every other descriptor is closed (step ``close_descriptors``), after one object of each
     kind of ``HELD_KINDS`` is made for the probe to try. None (left out) closes nothing, and the record is never proven.
+
+    ``allow_list`` is the path of the allow list the filter lets through (None: the list shipped beside the wall,
+    ``ALLOW_LIST_FILE``); it is read before any change, and a list that cannot be used is refused
+    ``wall_allow_list_refused`` with the words of ``allow_list_refused``. A list other than the shipped one is named in
+    the record by what it adds and removes.
     """
     libc = _libc()
     arch = _arch()
@@ -855,6 +1001,7 @@ def apply_wall(read_only_paths, keep_descriptors=None) -> None:
     abi = _landlock_abi(libc)
     if abi < _MIN_LANDLOCK_ABI:
         raise WallRefused("landlock_unavailable", "this kernel gives this process no Landlock (ABI 1, Linux 5.13, at least)")
+    allow = load_allow_list(allow_list)  # refused before any change
     kept = None if keep_descriptors is None else _kept(keep_descriptors)  # refused before any change
     for entry in paths:  # a link in a path is refused before any change (and again where the path is opened)
         os.close(_open_through_no_link(entry))
@@ -870,7 +1017,9 @@ def apply_wall(read_only_paths, keep_descriptors=None) -> None:
         finally:
             for fd, _ in opened:
                 os.close(fd)
-        _load_seccomp_filter(libc, arch, abi)
+        _load_seccomp_filter(libc, arch, abi, allow["rows"])
+        _STATE["allow_list"] = {key: allow[key] for key in ("file", "shipped", "added", "removed")}
+        _STATE["allow_list"]["rows"] = len(allow["rows"])
         _alone("threads_after_filter", _threads_now)
         # what the kernel's own lists say after the wall (None for a list that could not be read: never proven)
         _STATE["seen_at_wall"] = _read_kernel_lists(lists)
@@ -1193,8 +1342,9 @@ def _kernel_surface() -> None:
     unshare of nothing, a keyctl operation that does not exist, (x86_64) getpid by its x32 number, clone
     asking a new user namespace with flags the kernel itself rejects, msgctl IPC_STAT of the id -1,
     mq_getsetattr of the descriptor -1, signal 0 to this process itself by its own pid, and a lease on a
-    pipe, open_tree of the root folder (the newer mount calls), and a call number the kernel will never give a call
-    (the filter refuses every number above the newest one its tables name); then clone3, which this wall answers ENOSYS (the kernel's own answer to these arguments is EINVAL)."""
+    pipe, open_tree of the root folder (the newer mount calls), a call number the kernel will never give a call
+    (the filter refuses every number above the newest one its tables name), and personality asked only to read
+    (a call the kernel has and the allow list does not name); then clone3, which this wall answers ENOSYS (the kernel's own answer to these arguments is EINVAL)."""
     libc, arch = _libc(), _arch()
     address = ctypes.create_string_buffer(16)  # a destination address of zeros, never sent: the descriptor is -1
     attempts = [lambda: _sys(libc, "io_uring_setup", 0, 0),
@@ -1210,7 +1360,8 @@ def _kernel_surface() -> None:
                 lambda: _sys(libc, "kill", os.getpid(), 0),                         # signal 0 to itself: ok
                 lambda: _lease_on_a_pipe(libc),
                 lambda: _open_tree_of_root(libc),                                   # a descriptor of / if allowed
-                lambda: _kernel("a call the wall does not know", *_call(libc, _UNKNOWN_CALL))]  # ENOSYS if allowed
+                lambda: _kernel("a call the wall does not know", *_call(libc, _UNKNOWN_CALL)),  # ENOSYS if allowed
+                lambda: _sys(libc, "personality", 0xFFFFFFFF)]  # off the allow list: reads the persona if allowed
     if arch == "x86_64":
         attempts.append(lambda: _kernel("x32 getpid", *_call(libc, _X32_SYSCALL_BIT | 39)))
     try:

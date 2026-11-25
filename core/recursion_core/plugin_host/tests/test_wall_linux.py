@@ -297,7 +297,7 @@ class WallDefinitionTests(unittest.TestCase):
                 for name in wall_linux.DENIED_SIGNAL_CALLS:
                     for target in (4242, 4243, 0, -1):
                         self.assertEqual(_interpret(rows, arch, wall_linux._NR_MORE[arch][name], target), "eperm")
-                self.assertEqual(_interpret(rows, arch, 0, 0), "allow")
+                self.assertEqual(_interpret(rows, arch, {"x86_64": 0, "aarch64": 63}[arch], 0), "allow")
                 self.assertEqual(_interpret(rows, arch, wall_linux._NR[arch]["socket"], 0, audit_arch=0x40000003), "eperm")
                 if arch == "x86_64":  # the x32 calls share the arch value: denied whole
                     self.assertEqual(_interpret(rows, arch, 0x40000000 | 0, 0), "eperm")

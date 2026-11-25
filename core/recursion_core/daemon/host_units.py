@@ -27,7 +27,8 @@ argument: by default the folder this daemon's own code was imported from.
   start. The mark goes when the plugin answers a call again, as the in-process operator deadline in ``plugins.py``
   does for a plugin in the daemon's process.
 * The daemon's own time on a message of the host (a slow core request, say) does not count against the call's
-  deadline: the deadline moves on by that time. And before a call is said to have timed out, a frame the host had
+  deadline: the deadline moves on by that time, up to a bound of its own (plugin_host.call_daemon_time_max_s): past it
+  the call ends ``timed_out`` and says that row. And before a call is said to have timed out, a frame the host had
   already written is read without waiting and taken, so a host that answered in time is never ended as timed out.
 * A call whose own message the channel refuses (an argument name it does not take, say) is not sent: it fails with
   ``CallRefused`` (``call_invalid``), and the host is not touched. ``ended`` is said only of what the host's end
@@ -48,6 +49,7 @@ host, and handing a descriptor to a host.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import itertools
 import logging
 import math
@@ -82,6 +84,12 @@ CALL_DEADLINE_S = OPERATOR_DEADLINE_S
 # plugin_host.start_deadline_s: how long a new host may take to say hello. Shipped default: the engine launcher's
 # own start wait.
 START_DEADLINE_S = 10.0
+# plugin_host.call_daemon_time_max_s: the most of the daemon's own time (its answers to the host's core requests) one
+# call may take; that time moves the call's deadline on, so without a bound a host that keeps the daemon busy would
+# hold the call, its thread and the plugin's turn for ever. Shipped default 300 s. None means no bound: in the person's
+# settings file it is written none, the no-limit word of the settings (NO_LIMIT in code). Past it the call ends
+# timed_out, and its words name this row.
+CALL_DAEMON_TIME_MAX_S = 300.0
 
 # plugin_host.stop_confirm_s: how long Stop waits, after the kill, for the system to show a host's unit ended and not
 # about to start again. Shipped default 5 s. A number of seconds above zero; no limit is NOT offered for this row: a
@@ -108,8 +116,15 @@ CORE_FOLDER = str(Path(__file__).resolve().parents[2])
 STOPPED, ENDED, TIMED_OUT, NOT_STARTED = 'stopped', 'ended', 'timed_out', 'not_started'
 # A host that a new start of its plugin ended: what a call or a start on it ends with. Never counted as degraded.
 REPLACED = 'replaced'
+# What a call ended ``replaced`` says.
+REPLACED_DETAIL = ('a new start of the plugin ended the host this call waited on; the call was not answered and may be '
+                   'sent again')
 # A call the daemon did not send because the channel refuses the daemon's own message (CallRefused).
 CALL_INVALID = 'call_invalid'
+# Every bound a call or a Stop meets, by the row it comes from: the one place an end of a call names its bound.
+ROWS = {'call_deadline_s': 'plugin_host.call_deadline_s', 'start_deadline_s': 'plugin_host.start_deadline_s',
+        'call_daemon_time_max_s': 'plugin_host.call_daemon_time_max_s',
+        'stop_confirm_s': 'plugin_host.stop_confirm_s', 'stop_confirm_poll_s': 'plugin_host.stop_confirm_poll_s'}
 # What a person reads when a call got no answer from its host, by the reason.
 _NO_ANSWER = {TIMED_OUT: 'did not answer the call by its deadline', ENDED: 'ended during the call'}
 
@@ -344,7 +359,8 @@ class PluginHostUnits:
 
     def __init__(self, manager, state_dir, core, *, python=None, gil_check=DEFAULT_GIL_CHECK,
                  call_deadline_s=CALL_DEADLINE_S, start_deadline_s=START_DEADLINE_S, properties=(), core_folder=None,
-                 stop_confirm_s=STOP_CONFIRM_S, stop_confirm_poll_s=STOP_CONFIRM_POLL_S):
+                 stop_confirm_s=STOP_CONFIRM_S, stop_confirm_poll_s=STOP_CONFIRM_POLL_S,
+                 call_daemon_time_max_s=CALL_DAEMON_TIME_MAX_S):
         require_launcher_platform()
         self._manager, self._state, self._core = manager, Path(state_dir), core
         self._python = python or sys.executable
@@ -352,6 +368,7 @@ class PluginHostUnits:
         self._gil_check = gil_check
         self._call_deadline_s = _deadline('call_deadline_s', call_deadline_s)
         self._start_deadline_s = _deadline('start_deadline_s', start_deadline_s)
+        self._call_daemon_time_max_s = _deadline('call_daemon_time_max_s', call_daemon_time_max_s)
         self._stop_confirm_s = _bound('stop_confirm_s', stop_confirm_s)
         self._stop_confirm_poll_s = _bound('stop_confirm_poll_s', stop_confirm_poll_s)
         self._properties = check_piped_properties(properties)
@@ -362,6 +379,7 @@ class PluginHostUnits:
         self._starting = {}    # plugin id -> the HostUnit whose start is under way
         self._replacements = {}  # plugin id -> how many starts have replaced its host: a start begun before is late
         self._stopped = set()  # plugin ids whose host was stopped: not started again by a call
+        self._waiting_starts = {}  # plugin id -> starts entered and not yet holding the turn: a call starts no host
         self._ended = []       # HostUnits ended and not yet closed
         self._ids = itertools.count(1)
         self._closed = False
@@ -388,10 +406,16 @@ class PluginHostUnits:
             self._replacements[plugin_id] = self._replacements.get(plugin_id, 0) + 1
             running = self._units.pop(plugin_id, None)
             starting = self._starting.get(plugin_id)
-        for host in (running, starting):
-            if host is not None:
-                self._replace(host)
+            self._waiting_starts[plugin_id] = self._waiting_starts.get(plugin_id, 0) + 1
+        try:
+            for host in (running, starting):
+                if host is not None:
+                    self._replace(host)
+        except BaseException:
+            self._took_turn(plugin_id)
+            raise
         with turn:
+            self._took_turn(plugin_id)
             if running is not None:
                 self._discard(running)  # this start holds the plugin's turn now: nothing else reads that channel
             with self._lock:
@@ -410,12 +434,21 @@ class PluginHostUnits:
     def call(self, plugin_id, name, args):
         """Call one function of the plugin in its host. Returns the host's ``result`` or ``refusal`` message.
 
-        No answer by the deadline, or the end of the host, ends the host and marks the plugin degraded, and the call
-        raises HostUnavailable at once. A plugin whose host has ended gets a new one with its next call, started
-        inside that call's deadline. A stopped host is not started again here.
+        No answer by the deadline (plugin_host.call_deadline_s), or the end of the host, ends the host and marks the
+        plugin degraded, and the call raises HostUnavailable at once. The deadline moves on by the daemon's own time on
+        the host's core requests, and that time has a bound of its own (plugin_host.call_daemon_time_max_s): past it
+        the call ends ``timed_out`` the same way. Arguments that are not a mapping, or a call whose message the channel
+        refuses, are not sent: CallRefused (``call_invalid``), and the host is not touched. A plugin whose host has
+        ended gets a new one with its next call, started inside that call's deadline. A stopped host is not started
+        again here, and a call that finds no host while a new start of the plugin waits for its turn starts none and
+        ends ``replaced``.
         """
-        message = {'type': 'call', 'id': next(self._ids), 'name': name, 'args': dict(args)}
+        number = next(self._ids)
         try:  # the daemon's own message, checked before anything is sent: a refusal here is the caller's
+            if not isinstance(args, Mapping):
+                raise hc.ChannelRefusal('message_invalid', 'the arguments of a call are a mapping of names to values, '
+                                        f'not {type(args).__name__}')
+            message = {'type': 'call', 'id': number, 'name': name, 'args': dict(args)}
             frame = hc.encode(hc.check_message(message, receiver='host'))
         except hc.ChannelRefusal as exc:
             raise CallRefused(plugin_id, exc.code, exc.detail) from None
@@ -431,6 +464,8 @@ class PluginHostUnits:
                 package = self._packages.get(plugin_id)
                 if package is None:
                     raise HostUnavailable(plugin_id, NOT_STARTED, 'no host was started for this plugin')
+                if host is None and self._waiting_starts.get(plugin_id):
+                    raise HostUnavailable(plugin_id, REPLACED, REPLACED_DETAIL)  # the start runs the new package
             deadline = None if self._call_deadline_s is None else time.monotonic() + self._call_deadline_s
             if host is None:
                 host = self._start(plugin_id, package, deadline)
@@ -446,7 +481,7 @@ class PluginHostUnits:
                     log.error('plugin %s: its host %s %s and was ended. The call was not answered, so it may be sent '
                               'again; a new host is started for the plugin with its next call', plugin_id, host.unit,
                               _NO_ANSWER.get(reason, reason))
-                raise HostUnavailable(plugin_id, reason, gone.detail) from None
+                raise HostUnavailable(plugin_id, reason, REPLACED_DETAIL if reason == REPLACED else gone.detail) from None
             with self._lock:
                 self.degraded.pop(plugin_id, None)
             return answer
@@ -505,14 +540,15 @@ class PluginHostUnits:
                 plugins[plugin_id] = {'life': host.life if host else None, 'unit': host.unit if host else None,
                                       'degraded': self.degraded.get(plugin_id, 0),
                                       'stops_unconfirmed': self.stops_unconfirmed.get(plugin_id, 0)}
-            return {'bounds': {'plugin_host.call_deadline_s': self._call_deadline_s,
-                               'plugin_host.start_deadline_s': self._start_deadline_s,
-                               'plugin_host.stop_confirm_s': self._stop_confirm_s,
-                               'plugin_host.stop_confirm_poll_s': self._stop_confirm_poll_s},
+            return {'bounds': self.bounds(),
                     'plugins': plugins,
                     'stop_unconfirmed': [{'plugin': host.plugin_id, 'unit': host.unit, 'words': host.stop_words}
                                          for host in self.unconfirmed.values()],
                     'strays': list(self.strays)}
+
+    def bounds(self):
+        """Every bound a call or a Stop meets, by the row it comes from (ROWS): what status shows."""
+        return {row: getattr(self, '_' + key) for key, row in ROWS.items()}
 
     def sweep_strays(self):
         """For the daemon's own start: stop every plugin host unit the user manager shows that this PluginHostUnits
@@ -634,6 +670,7 @@ class PluginHostUnits:
     def _exchange(self, host, message, frame, deadline):
         """Send one call (``frame``, checked before) and read until its answer, answering what the host asks of the
         core on the way."""
+        daemon_time = 0.0
         try:
             host.send_frame(frame, deadline)
             while True:
@@ -649,18 +686,35 @@ class PluginHostUnits:
                 began = time.monotonic()
                 reply = host.end.receive(received)
                 reply = None if reply is None else _reply_frame(received, reply)
+                took = time.monotonic() - began
+                daemon_time += took
                 if deadline is not None:
                     # The daemon's own time on the host's message (a slow core request, say) is not the host's: the
                     # call's deadline moves on by it, so a host is never ended for the daemon's slowness.
-                    deadline += time.monotonic() - began
+                    deadline += took
+                most = self._call_daemon_time_max_s
+                if most is not None and daemon_time > most:
+                    raise _HostWentAway(TIMED_OUT, f"the daemon's own time on this host's requests passed its bound of "
+                                        f"{most:g} s ({ROWS['call_daemon_time_max_s']}); the call was not answered "
+                                        'and may be sent again')
                 if reply is not None:
                     host.send_frame(reply, deadline)
         except TimeoutError:
-            raise _HostWentAway(TIMED_OUT) from None
+            raise _HostWentAway(TIMED_OUT, f"the host did not answer by the call's deadline of {self._call_deadline_s:g} "
+                                f"s ({ROWS['call_deadline_s']})") from None
         except hc.ChannelRefusal as exc:
             raise _HostWentAway(ENDED, exc.code) from None
         except OSError as exc:
             raise _HostWentAway(ENDED, type(exc).__name__) from None
+
+    def _took_turn(self, plugin_id):
+        """A start that was waiting for the plugin's turn holds it now (or gave up): one fewer start waits."""
+        with self._lock:
+            left = self._waiting_starts.get(plugin_id, 0) - 1
+            if left > 0:
+                self._waiting_starts[plugin_id] = left
+            else:
+                self._waiting_starts.pop(plugin_id, None)
 
     def _discard(self, host):
         """Close an ended host's channel. Only the holder of the plugin's turn (or ``close``) calls this."""

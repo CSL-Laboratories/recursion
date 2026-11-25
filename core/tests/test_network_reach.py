@@ -8,6 +8,7 @@ way of calling home that a first read of this proof got past it is planted here 
 by its own rule. Run by itself: python3 core/tests/test_network_reach.py
 """
 import importlib.util
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -103,6 +104,39 @@ READ_PLANTS = {
     "18 an address built from character codes": (NEW, "new", "import urllib.request\ndef go():\n    return urllib.request.urlopen(''.join(map(chr, [104, 116, 116, 112])))\n", "refused (unlisted-module)"),
 }
 
+# Every later way past the allow list (24 of them, each of a kind that passed it before the module
+# rows held their names and the guarded rows their callers). Each must now be refused by the rule named
+# last, in a refusal that names the file named after it. B18 (a file path that reaches a network through an
+# automount) is not here: no audit event and no syntax names it, and the README says it is not proven.
+C = "'cu' + 'rl -s ' + u"
+WARM = "daemon/warm.py"
+CLOSURE_PLANTS = {
+    "B01 a listed module's private helper starts a program": (WARM, "new", "import uuid\ndef go(u):\n    return uuid._get_command_stdout('cu' + 'rl', '-s', u)\n", "refused (private-name)", "warm.py"),
+    "B02 inspect.getattr_static by a built name": (WARM, "new", "import inspect, os\ndef go(u):\n    return inspect.getattr_static(os, 'sys' + 'tem')(" + C + ")\n", "refused (built-name)", "warm.py"),
+    "B03 sqlite3 loads native code": (WARM, "new", "import sqlite3, pathlib\ndef go():\n    con = sqlite3.connect(':memory:')\n    con.enable_load_extension(True)\n    con.load_extension(str(pathlib.Path(__file__).with_name('warm.txt')))\n", "refused (foreign-function)", "warm.py"),
+    "B04 a listed module bound to a local name": (WARM, "new", "import shutil\ndef go(u):\n    m = shutil\n    return m.os.system(" + C + ")\n", "refused (built-name)", "warm.py"),
+    "B05 getattr under another name": (WARM, "new", "import os\ndef go(u):\n    g = getattr\n    return g(os, 'sys' + 'tem')(" + C + ")\n", "refused (built-name)", "warm.py"),
+    "B04b a submodule handed on as a value": (WARM, "new", "import os\ndef go(u):\n    m = os.path\n    return m.os.system(" + C + ")\n", "refused (built-name)", "warm.py"),
+    "B05b getattr under another name, on any object": (WARM, "new", "def go(x):\n    g = getattr\n    return g(x, 'sys' + 'tem')\n", "refused (built-name)", "warm.py"),
+    "B06 a symlinked folder out of the package": ("daemon/vendor", "symlink", ("../../extras", "extras/go.py", "import socket\ndef go(h, p):\n    return socket.create_connection((h, p))\n", WARM, "from .vendor.go import go\n"), "symbolic link", "vendor"),
+    "B07 a .txt run as a module by the module's own loader": (WARM, "new", "import pathlib, types\ndef go():\n    p = str(pathlib.Path(__file__).with_name('warm.txt'))\n    m = types.ModuleType('w')\n    type(__loader__)('w', p).exec_module(m)\n    return m\n", "refused (built-name)", "warm.py"),
+    "B08a the import path pointed at the tests folder": (WARM, "new", "import os, sys\nsys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tes' + 'ts'))\nimport calendar\n", "refused (interpreter-hook)", "warm.py"),
+    "B08b a compiled file with an unchecked hash in __pycache__": (WARM, "pyc", ("def go():\n    return None\n", "import socket\nsocket.create_connection(('h', 443))\ndef go():\n    return None\n", "unchecked"), "unchecked hash", "warm.cpython-"),
+    "B08c a compiled file whose time and size match its source but not its code": (WARM, "pyc", ("def go():\n    return 1\n", "def go():\n    return 2\n", "timestamp"), "not the code of its source", "warm.cpython-"),
+    "B09 a listed module's namespace through inspect.getmembers": (WARM, "new", "import inspect, shutil\ndef go(u):\n    return dict(inspect.getmembers(shutil))['os'].system(" + C + ")\n", "refused (unlisted-name)", "warm.py"),
+    "B10 a settings-row helper called from a new place": (WARM, "new", "from recursion_core.child_env.launch import spawn\ndef go(u, env):\n    return spawn(['cu' + 'rl', '-s', u], env)\n", "refused (new-caller)", "warm.py"),
+    "B11 a class's hierarchy to its module": (WARM, "new", "import inspect\nfrom recursion_core.daemon.gui import _Server\ndef go(h):\n    return inspect.getmodule(_Server.__mro__[-2]).socket.gethostbyname(h)\n", "refused (built-name)", "warm.py"),
+    "B12 a string annotation run by typing.get_type_hints": (WARM, "new", "import typing\n@typing.get_type_hints\ndef warm(x: \"__import__('so' + 'cket').create_connection(('h', 443))\"):\n    return x\n", "refused (unlisted-name)", "warm.py"),
+    "B13 a function's code object rewritten": (WARM, "new", "import os\ndef _a(x, c):\n    return x.getcwd(c)\n_a.__code__ = _a.__code__.replace(co_names=('sys' + 'tem',))\ndef go(u):\n    return _a(os, " + C + ")\n", "refused (built-name)", "warm.py"),
+    "B14 a private helper handed to sqlite3 as a callback": (WARM, "new", "import sqlite3, uuid\ndef go(u):\n    con = sqlite3.connect(':memory:')\n    con.create_function('f', -1, uuid._get_command_stdout)\n    return con.execute(\"select f('cu' || 'rl', '-s', ?)\", (u,)).fetchone()\n", "refused (private-name)", "warm.py"),
+    "B15 help() starts the pager the code set": (WARM, "new", "import os\ndef go(u):\n    help(len)\n", "refused (interpreter-hook)", "warm.py"),
+    "B16 a store into the process environment": (WARM, "new", "import os\ndef go(d):\n    os.environ['PYTHON' + 'PATH'] = d\n", "refused (interpreter-hook)", "warm.py"),
+    "B16b os.putenv and os.environ.update": (WARM, "new", "import os\ndef go(d):\n    os.environ.update({'LD_' + 'PRELOAD': d})\n    os.putenv('X', d)\n", "refused (interpreter-hook)", "warm.py"),
+    "B17 a construct row's helper used as getattr from another module": (WARM, "new", "import os\nfrom recursion_core.control.scopes import _attr\ndef go(u):\n    return _attr(os, 'sys' + 'tem', None)(" + C + ")\n", "refused (new-caller)", "warm.py"),
+    "B19 a bound callable called under a second name": ("child_env/launch.py", "replace", [("", "    return popen([executable, *argv[1:]], **kwargs)", "    _p = popen\n    _p(['cu' + 'rl', '-s', u], **kwargs)\n    return popen([executable, *argv[1:]], **kwargs)")], "refused (changed-call)", "launch.py"),
+    "B20 breakpoint() calls what an environment variable names": (WARM, "new", "def go(u):\n    breakpoint(['cu' + 'rl', '-s', u])\n", "refused (interpreter-hook)", "warm.py"),
+}
+
 
 def _copy_package(dst: Path) -> Path:
     shutil.copytree(ROOT / nr.PACKAGE, dst / nr.PACKAGE,
@@ -119,6 +153,29 @@ def _plant(root: Path, rel, mode, body):
     elif mode == "pair":
         path.write_text(body[0], encoding="utf-8")
         (pkg / body[1]).write_text(body[2], encoding="utf-8")
+    elif mode == "symlink":  # body: (link target, a file under core/, its text, an importer, its text)
+        extra = root / "core" / body[1]
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        extra.write_text(body[2], encoding="utf-8")
+        (pkg / body[3]).write_text(body[4], encoding="utf-8")
+        os.symlink(body[0], path)
+    elif mode == "pyc":  # body: (the source, the other source compiled in its place, the kind of compiled file)
+        import py_compile
+        path.write_text(body[0], encoding="utf-8")
+        other = root / "other_source.py"
+        other.write_text(body[1], encoding="utf-8")
+        cache = importlib.util.cache_from_source(str(path))
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        kind = (py_compile.PycInvalidationMode.UNCHECKED_HASH if body[2] == "unchecked"
+                else py_compile.PycInvalidationMode.TIMESTAMP)
+        py_compile.compile(str(other), cfile=cache, dfile=str(path), invalidation_mode=kind, doraise=True)
+        other.unlink()
+        if body[2] == "timestamp":  # the time and size of the real source, as the interpreter checks them
+            st = path.stat()
+            data = bytearray(Path(cache).read_bytes())
+            data[8:12] = (int(st.st_mtime) & 0xFFFFFFFF).to_bytes(4, "little")
+            data[12:16] = (st.st_size & 0xFFFFFFFF).to_bytes(4, "little")
+            Path(cache).write_bytes(bytes(data))
     else:
         text = path.read_text(encoding="utf-8")
         for anchor, old, new in body:
@@ -202,6 +259,40 @@ class StaticProofTests(unittest.TestCase):
                 problems = nr.check(nr.scan(root), self.listing)
                 where = Path(body[1] if mode == "pair" else rel).name  # the file the refusal must name
                 self.assertTrue(any(rule in p and where in p for p in problems), (name, rule, where, problems[:5]))
+
+    def test_every_way_a_closure_read_got_past_the_allow_list_is_refused_by_its_rule(self):
+        self.assertEqual(len(CLOSURE_PLANTS), 24)
+        for name, (rel, mode, body, rule, where) in CLOSURE_PLANTS.items():
+            with self.subTest(plant=name), tempfile.TemporaryDirectory() as tmp:
+                root = _copy_package(Path(tmp))
+                _plant(root, rel, mode, body)
+                problems = nr.check(nr.scan(root), self.listing)
+                self.assertTrue(any(rule in p and where in p for p in problems), (name, rule, where, problems[:5]))
+
+    def test_a_compiled_file_that_is_its_source_is_not_refused(self):
+        # The control of B08b and B08c: the interpreter's own compiled file of an unchanged source.
+        import py_compile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _copy_package(Path(tmp))
+            path = root / nr.PACKAGE / WARM
+            path.write_text("def go():\n    return 1\n", encoding="utf-8")
+            py_compile.compile(str(path), doraise=True)
+            self.assertEqual(nr.check(nr.scan(root), self.listing), [])
+
+    def test_every_module_row_holds_its_names_and_every_guarded_row_its_callers(self):
+        for row in self.listing["module"]:
+            self.assertIn("names", row, row)
+            for name in row["names"]:
+                self.assertFalse(name.startswith("_") and not name.endswith("__"), (row["name"], name))
+        for row in self.listing["construct"]:
+            if not row["function"].startswith("<"):  # a statement of a module, not a place that is called
+                self.assertIn("callers", row, row)
+        for row in self.listing["reach"]:
+            if row["who"] in nr.GUARDED_WHO and not row["function"].startswith("<"):
+                self.assertIn("callers", row, row)
+        listing = _copy_listing(self.listing)
+        listing["module"][0]["names"] = listing["module"][0]["names"] + ["_planted"]
+        self.assertTrue(any("cannot allow the private name '_planted'" in p for p in nr.check(self.findings, listing)))
 
     def test_only_the_modules_of_the_allow_list_are_imported(self):
         rows = self.listing["module"]

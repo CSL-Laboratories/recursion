@@ -17,6 +17,13 @@ syntax tree. It is a list of the ONLY things allowed, not a list of bad things i
 * each import and each reference that can open a connection, look up a name or start a program
   must have a ``[[reach]]`` row that says who supplies the address, and the row holds the exact
   text of every such call, so a call whose arguments change is refused until its row changes;
+* a ``[[module]]`` row also holds the ``names`` the package takes from that module: any other name
+  of an allowed module is refused, and a private name of another module (one that begins with '_')
+  is refused outright;
+* a ``[[construct]]`` row, and a ``[[reach]]`` row whose address comes from a person's settings or
+  command, holds its ``callers``: a call of that place from anywhere else in the package is refused;
+* a symbolic link anywhere under ``core/``, and a compiled file in a ``__pycache__`` folder that the
+  interpreter would run instead of its source, are refused (the scan cannot see what they hold);
 * a finding with no row, a row that covers nothing, a row whose address comes from the code
   itself, a file the scan cannot read, and a scan that finds nothing at all are each a failure.
 """
@@ -74,8 +81,8 @@ NETWORK_METHODS = {
     "getnameinfo", "sock_connect", "subprocess_exec", "subprocess_shell", "urlopen",
     "open_connection", "start_server", "start_tls", "wrap_socket",
 }
-# Modules whose references the scan follows but that reach no network.
-SAFE_MODULES = {"sqlite3"}
+# Modules whose references the scan does not follow. Empty: every module is followed and pinned by name.
+SAFE_MODULES = set()
 # Words that name a person or a machine in a way meant to be kept or sent (point 5).
 IDENTITY_NAMES = ("uuid.getnode", "uuid.uuid1", "socket.gethostname", "socket.getfqdn",
                   "platform.node", "platform.uname", "os.uname")
@@ -101,6 +108,11 @@ CONSTRUCTS = {
     "unpickling": "unpickling or another loader that runs code found in data",
     "network-log-handler": "a log handler that sends records over a network",
     "outside-package": "a shipped module that imports a test module or anything outside the package",
+    "interpreter-hook": "a builtin or a setting that makes the interpreter itself load a module or start a "
+                        "program (help, breakpoint, a store into the process environment, a change of the "
+                        "places modules are loaded from)",
+    "private-name": "a private name of another module (a name that begins with '_' is not that module's "
+                    "promise: uuid._get_command_stdout starts a program)",
 }
 # Modules refused outright: no [[module]] row can allow them.
 REFUSED_MODULES = {
@@ -120,10 +132,22 @@ NETWORK_LOG_HANDLERS = ("logging.handlers.SocketHandler", "logging.handlers.Data
                         "logging.config.listen")
 TEXT_AS_CODE = {"exec": "text-as-code", "eval": "text-as-code", "compile": "text-as-code",
                 "__import__": "built-name", "__builtins__": "built-name", "vars": "built-name",
-                "globals": "built-name", "locals": "built-name"}
+                "globals": "built-name", "locals": "built-name", "__loader__": "built-name",
+                "__spec__": "built-name", "help": "interpreter-hook", "breakpoint": "interpreter-hook"}
 BUILT_NAME_CALLS = {"getattr", "setattr", "hasattr", "delattr"}
 BUILT_NAME_ATTRS = {"__dict__", "__getattribute__", "__builtins__", "__globals__", "__subclasses__",
-                    "__import__"}
+                    "__import__", "__code__", "__mro__", "__bases__", "__base__", "__closure__"}
+# The places modules are loaded from: any use of them in shipped source is refused.
+IMPORT_PATH_NAMES = ("sys.path", "sys.meta_path", "sys.path_hooks", "sys.path_importer_cache")
+# The process environment: read it freely; a store into it reaches every program started later.
+ENV_NAMES = ("os.environ", "os.environb")
+ENV_READS = {"get", "copy", "items", "keys", "values"}
+ENV_STORE_CALLS = ("os.putenv", "os.unsetenv")
+# Methods refused on any object: they load native code into the process.
+REFUSED_METHODS = {"enable_load_extension": "foreign-function", "load_extension": "foreign-function"}
+# Rows whose place is guarded by its callers: every construct row, and a reach row whose address comes from
+# a person's settings or command (a call from elsewhere could hand it an address of its own).
+GUARDED_WHO = ("settings", "command")
 # Calls that load a module by the name in their first argument.
 IMPORT_BY_NAME = {"importlib.import_module", "importlib.util.find_spec", "importlib.__import__",
                   "pkgutil.resolve_name", "operator.attrgetter", "operator.methodcaller"}
@@ -135,7 +159,8 @@ OWN_PACKAGE = "recursion_core"
 
 @dataclass(frozen=True, order=True)
 class Finding:
-    kind: str       # 'reach', 'literal', 'identity', 'module' or 'construct'
+    kind: str       # 'reach', 'literal', 'identity', 'module', 'construct', 'name' (a name taken from a
+                    # module: family = the module) or 'call' (a use of the package's own function: name = it)
     file: str
     function: str
     name: str
@@ -198,13 +223,14 @@ class _Resolver:
     def path(self, dotted: str):
         """Each prefix of a dotted name with the object it is: [(prefix, object), ...] as far as it resolves.
 
-        Only names whose first part is a module outside this package are resolved (the scan never
-        imports the product)."""
+        Only names of the standard library are resolved: the scan never imports the product, and what
+        else is installed must not change what it finds (a module outside the standard library has its
+        names pinned from the import statements instead)."""
         if dotted in self._paths:
             return self._paths[dotted]
         parts = dotted.split(".")
         out = []
-        if parts[0] != OWN_PACKAGE:
+        if parts[0] != OWN_PACKAGE and parts[0] in sys.stdlib_module_names:
             try:
                 obj = importlib.import_module(parts[0])
                 out.append((parts[0], obj))
@@ -247,9 +273,14 @@ class _Scanner(ast.NodeVisitor):
         self.scope: list[str] = []
         self.aliases: dict[str, str] = {}
         self.module_names: set[str] = set()
+        self.imported: set[str] = set()  # every module an import statement names
         self.annotation = 0
         # The package this file is in (for a module and for a package's __init__ alike).
         self.package_parts = list(Path(rel).relative_to(PACKAGE.parent).with_suffix("").parts[:-1])
+        own = list(Path(rel).relative_to(PACKAGE.parent).with_suffix("").parts)
+        self.own_module = ".".join(own[:-1] if own[-1] == "__init__" else own)
+        self.local_defs = {n.name for n in getattr(tree, "body", ())
+                           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
         for node in ast.walk(tree):
             for child in ast.iter_child_nodes(node):
                 child._nr_parent = node
@@ -261,9 +292,18 @@ class _Scanner(ast.NodeVisitor):
                         top = a.name.split(".")[0]
                         self.aliases[top] = top
                     self.module_names.add(a.asname or a.name.split(".")[0])
+                    self.imported.add(a.name)
             elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                self.imported.add(node.module)
                 for a in node.names:
                     self.aliases[a.asname or a.name] = f"{node.module}.{a.name}"
+            elif isinstance(node, ast.ImportFrom) and node.level and node.level - 1 <= len(self.package_parts) - 1:
+                # The package's own name, imported relatively: its uses are followed as calls of the package.
+                base = self.package_parts[:len(self.package_parts) - (node.level - 1)]
+                mod = ".".join(base + (node.module.split(".") if node.module else []))
+                for a in node.names:
+                    if a.name != "*":
+                        self.aliases[a.asname or a.name] = f"{mod}.{a.name}"
 
     # -- helpers
     def _fn(self):
@@ -309,8 +349,29 @@ class _Scanner(ast.NodeVisitor):
                 scope = getattr(scope, "_nr_parent", None)
         if not names or scope is None:
             return []
-        return [ast.unparse(c) for c in ast.walk(scope)
-                if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in names]
+        # A bound name bound again (_p = popen) is the same callable: its calls are pinned too.
+        names, grown = set(names), True
+        while grown:
+            grown = False
+            for c in ast.walk(scope):
+                if isinstance(c, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and isinstance(c.value, ast.Name) \
+                        and c.value.id in names:
+                    for t in (c.targets if isinstance(c, ast.Assign) else [c.target]):
+                        if isinstance(t, ast.Name) and t.id not in names:
+                            names.add(t.id)
+                            grown = True
+        out = []
+        for c in ast.walk(scope):
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in names:
+                out.append(ast.unparse(c))
+            elif isinstance(c, ast.Name) and c.id in names and isinstance(c.ctx, ast.Load):
+                up = getattr(c, "_nr_parent", None)
+                if isinstance(up, ast.Call) and up.func is c:
+                    continue
+                while up is not None and not isinstance(up, ast.stmt):
+                    up = getattr(up, "_nr_parent", None)
+                out.append("handed on: " + (ast.unparse(up) if up is not None else c.id))
+        return out
 
     def _add(self, kind, name, family, node, text=None):
         self.findings.append(Finding(kind, self.rel, self._fn(), name, family, getattr(node, "lineno", 0),
@@ -340,9 +401,79 @@ class _Scanner(ast.NodeVisitor):
         else:
             self._add("module", name, "module", node, text)
 
+    def _own_use(self, dotted, node):
+        """A use of the package's own function or class: recorded so a guarded row can pin its callers."""
+        parent = getattr(node, "_nr_parent", None)
+        how = "called" if isinstance(parent, ast.Call) and parent.func is node else "handed on"
+        self.findings.append(Finding("call", self.rel, self._fn(), dotted, how, getattr(node, "lineno", 0)))
+
+    def _environment(self, env, dotted, node):
+        """True when the use of the process environment is a store (or the environment handed on to be stored)."""
+        parent = getattr(node, "_nr_parent", None)
+        if dotted != env:
+            return dotted[len(env) + 1:].split(".")[0] not in ENV_READS
+        if isinstance(getattr(node, "ctx", None), (ast.Store, ast.Del)):
+            return True
+        if isinstance(parent, ast.Subscript) and parent.value is node:
+            return isinstance(parent.ctx, (ast.Store, ast.Del))
+        return isinstance(parent, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.AugAssign)) and parent.value is node
+
+    def _taken(self, dotted, node):
+        """Each name taken from a module along a dotted name: pinned by the module's row, private ones refused."""
+        parts = dotted.split(".")
+        if parts[0] in (OWN_PACKAGE, "__future__"):
+            return
+        path = _RESOLVER.path(dotted)
+        if parts[0] not in sys.stdlib_module_names and parts[0] not in (OWN_PACKAGE, "__future__"):
+            # Not resolved: the longest prefix an import statement names is the module, the next part its name.
+            for cut in range(len(parts) - 1, 0, -1):
+                if ".".join(parts[:cut]) in self.imported:
+                    attr = parts[cut]
+                    if ".".join(parts[:cut + 1]) in self.imported:
+                        return  # a module of its own
+                    if attr.startswith("_") and not (attr.startswith("__") and attr.endswith("__")):
+                        self._construct("private-name", f"{'.'.join(parts[:cut])}.{attr}", node)
+                    else:
+                        self.findings.append(Finding("name", self.rel, self._fn(), attr, ".".join(parts[:cut]),
+                                                     getattr(node, "lineno", 0)))
+                    return
+            return
+        for i, (prefix, obj) in enumerate(path):
+            if not isinstance(obj, type(sys)) or i + 1 >= len(parts):
+                continue
+            attr = parts[i + 1]
+            nxt = path[i + 1][1] if i + 1 < len(path) else None
+            if isinstance(nxt, type(sys)):
+                continue  # a module of its own: its own row governs it
+            if attr.startswith("_") and not (attr.startswith("__") and attr.endswith("__")):
+                self._construct("private-name", f"{prefix}.{attr}", node)
+            else:
+                self.findings.append(Finding("name", self.rel, self._fn(), attr, prefix, getattr(node, "lineno", 0)))
+
     def _reference(self, dotted, node):
+        if dotted.split(".")[0] == OWN_PACKAGE:
+            self._own_use(dotted, node)
+            return
         if dotted.split(".")[0] in SAFE_MODULES:
             return
+        if dotted in IMPORT_PATH_NAMES or dotted.startswith(tuple(n + "." for n in IMPORT_PATH_NAMES)):
+            self._construct("interpreter-hook", f"{dotted} (the places modules are loaded from)", node)
+            return
+        if dotted in ENV_STORE_CALLS:
+            self._construct("interpreter-hook", f"{dotted} (a store into the process environment)", node)
+            return
+        env = next((n for n in ENV_NAMES if dotted == n or dotted.startswith(n + ".")), None)
+        if env and self._environment(env, dotted, node):
+            self._construct("interpreter-hook", f"{dotted} (a store into the process environment)", node)
+            return
+        whole = _RESOLVER.path(dotted)
+        if isinstance(node, ast.Attribute) and len(whole) == len(dotted.split(".")) and len(whole) > 1 \
+                and isinstance(whole[-1][1], type(sys)) and not getattr(node, "_nr_receiver", False) \
+                and not self._presence_test(node):
+            # A module reached through a dotted name and handed on as a value (m = os.path).
+            self._construct("built-name", f"module {dotted} (handed on as a value)", node)
+            return
+        self._taken(dotted, node)
         if dotted in IDENTITY_NAMES:
             self._add("identity", dotted, "identity", node)
         # Follow the name through the real objects: a module reached through another module's
@@ -439,6 +570,7 @@ class _Scanner(ast.NodeVisitor):
                 self._add("reach", f"from {node.module} import *", "dynamic", node)
                 continue
             dotted = f"{node.module}.{a.name}"
+            self._taken(dotted, node)
             path = _RESOLVER.path(dotted)
             if len(path) == len(dotted.split(".")):
                 obj = path[-1][1]
@@ -481,20 +613,50 @@ class _Scanner(ast.NodeVisitor):
             return
         self.generic_visit(node)
 
+    def _is_module(self, name, target):
+        if name in self.module_names:
+            return True
+        path = _RESOLVER.path(target)
+        return len(path) == len(target.split(".")) and isinstance(path[-1][1], type(sys))
+
+    @staticmethod
+    def _presence_test(node):
+        """A module name only tested for being there (fcntl is None, if termios:, not pwd): nothing is reached."""
+        parent = getattr(node, "_nr_parent", None)
+        if isinstance(parent, ast.Compare):
+            return all(isinstance(op, (ast.Is, ast.IsNot)) for op in parent.ops) and all(
+                isinstance(c, ast.Constant) and c.value is None for c in [parent.left] + parent.comparators if c is not node)
+        if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not):
+            return True
+        if isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)) and parent.test is node:
+            return True
+        return isinstance(parent, ast.BoolOp) and isinstance(getattr(parent, "_nr_parent", None), (ast.If, ast.While, ast.IfExp, ast.Assert, ast.UnaryOp))
+
     def visit_Name(self, node):
-        if isinstance(node.ctx, ast.Load) and node.id in self.aliases:
+        if not isinstance(node.ctx, ast.Load):
+            return
+        parent = getattr(node, "_nr_parent", None)
+        called = isinstance(parent, ast.Call) and parent.func is node
+        if node.id in self.aliases:
             target = self.aliases[node.id]
-            if node.id in self.module_names and family_of(target):
-                self._add("reach", f"{target} (the module as a value)", family_of(target), node)
+            if target.split(".")[0] != OWN_PACKAGE and not getattr(node, "_nr_receiver", False) \
+                    and not self._presence_test(node) and self._is_module(node.id, target):
+                # A module handed on as a value: what is later reached through it is not seen.
+                self._construct("built-name", f"module {target} (handed on as a value)", node)
             else:
                 self._reference(target, node)
-        elif isinstance(node.ctx, ast.Load) and node.id in TEXT_AS_CODE:
+        elif node.id in TEXT_AS_CODE:
             self._construct(TEXT_AS_CODE[node.id], f"{node.id}", node)
+        elif node.id in BUILT_NAME_CALLS and not called:
+            self._construct("built-name", f"{node.id} (handed on as a value)", node)
+        elif node.id in self.local_defs:
+            self._own_use(f"{self.own_module}.{node.id}", node)
 
     def visit_Call(self, node):
         func = node.func
         if isinstance(func, ast.Name) and func.id in BUILT_NAME_CALLS and node.args:
             receiver = node.args[0]
+            receiver._nr_receiver = True  # reported with this call, not again as a module handed on
             name = node.args[1] if len(node.args) > 1 else None
             literal = isinstance(name, ast.Constant) and isinstance(name.value, str)
             if not literal:
@@ -512,6 +674,8 @@ class _Scanner(ast.NodeVisitor):
                 self._construct("built-name", f"{func.id}(<object>, {name.value!r})", node, ast.unparse(node))
         if isinstance(func, ast.Attribute) and self._dotted(func) is None and func.attr in NETWORK_METHODS:
             self._add("reach", f".{func.attr}()", "method", node, ast.unparse(node))
+        if isinstance(func, ast.Attribute) and func.attr in REFUSED_METHODS:
+            self._construct(REFUSED_METHODS[func.attr], f".{func.attr}()", node, ast.unparse(node))
         self.generic_visit(node)
 
     def visit_Constant(self, node):
@@ -543,6 +707,68 @@ def shipped_files(root: Path):
         if "tests" in parts or path.name.startswith("test_") or "__pycache__" in parts:
             continue
         yield path, rel
+
+
+def _unseen(root: Path):
+    """Places the walk of the package cannot see into, refused: a symbolic link anywhere under core/ (the
+    interpreter follows it, the walk does not), and a compiled file in a __pycache__ folder that the
+    interpreter would run instead of its source. A compiled file for this interpreter is compared with its
+    source; one the interpreter would not use (stale) is harmless; one for another interpreter is judged by
+    the run of the scan under that interpreter, and an unchecked one is refused under any interpreter."""
+    import os
+    out = []
+    top = root / PACKAGE.parent
+    if not top.is_dir():
+        return out
+    for here, dirs, files in os.walk(top, followlinks=False):
+        for name in sorted(dirs + files):
+            path = Path(here) / name
+            rel = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                out.append(Finding("reach", rel, "<file>", "a symbolic link the scan does not follow", "undecidable", 0))
+            elif Path(here).name == "__pycache__" and name in files:
+                why = _compiled_file(path)
+                if why:
+                    out.append(Finding("reach", rel, "<file>", f"a compiled file the interpreter would run: {why}",
+                                       "undecidable", 0))
+    return out
+
+
+def _compiled_file(path: Path):
+    """Why a __pycache__ file is refused, or None when the interpreter would never run anything but its source."""
+    import marshal
+    parts = path.name.split(".")
+    if len(parts) < 3 or parts[-1] != "pyc":
+        return "not a compiled module file"
+    source = path.parent.parent / (parts[0] + ".py")
+    data = path.read_bytes()
+    if len(data) < 16:
+        return "too short to be judged"
+    flags = int.from_bytes(data[4:8], "little")
+    if flags & 0b1 and not flags & 0b10:
+        return "it holds an unchecked hash: the interpreter runs it without looking at its source"
+    if not source.is_file():
+        return None  # the interpreter never runs a __pycache__ file without its source
+    if parts[1] != sys.implementation.cache_tag or data[:4] != importlib.util.MAGIC_NUMBER:
+        return None  # judged by the run of the scan under the interpreter it was written for
+    src = source.read_bytes()
+    if flags & 0b1:
+        if data[8:16] != importlib.util.source_hash(src):
+            return None  # stale: the interpreter compiles the source again
+    else:
+        st = source.stat()
+        if int.from_bytes(data[8:12], "little") != (int(st.st_mtime) & 0xFFFFFFFF) or \
+                int.from_bytes(data[12:16], "little") != (st.st_size & 0xFFFFFFFF):
+            return None  # stale: the interpreter compiles the source again
+    opt = 0
+    if len(parts) == 4 and parts[2].startswith("opt-") and parts[2][4:].isdigit():
+        opt = int(parts[2][4:])
+    try:
+        held = marshal.loads(data[16:])
+        made = compile(src, str(source), "exec", dont_inherit=True, optimize=opt)
+    except Exception as exc:
+        return f"it cannot be compared with its source ({type(exc).__name__})"
+    return None if held == made else "its code is not the code of its source"
 
 
 # Files of other kinds the scan can read as data; any other file is refused as undecidable.
@@ -584,6 +810,7 @@ def scan(root: Path = ROOT):
             for m in LITERAL.finditer(text):
                 if path.suffix in (".json", ".jsonl", ".toml"):
                     findings.append(Finding("literal", rel, "<data>", m.group(0), "literal", 0))
+    findings.extend(_unseen(root))
     # A file beside the package that the interpreter runs by itself when it is installed.
     if (root / PACKAGE).is_dir():
         for pattern in INTERPRETER_FILES:
@@ -657,6 +884,31 @@ def check(findings, listing):
     for name, where in allowed.items():
         if name not in used:
             problems.append(f"{where}: allows {name!r}, which no shipped file imports any more: take the row out")
+    # -- the names each allowed module may give
+    taken = {}
+    for f in findings:
+        if f.kind == "name":
+            taken.setdefault(f.family, {}).setdefault(f.name, f)
+    rows_by_name = {row.get("name"): row for row in listing.get("module", [])}
+    for mod in sorted(taken):
+        row = rows_by_name.get(mod)
+        names = set(row.get("names", [])) if row is not None else set()
+        for name in sorted(set(taken[mod]) - names):
+            f = taken[mod][name]
+            problems.append(f"refused (unlisted-name): {mod}.{name} in {f.file} {f.function} (line {f.line}): "
+                            f"only the names of a module's row may be taken from it; read what {name!r} does, "
+                            f"then add it to the names of the row of {mod!r}, or take the use out")
+    for i, row in enumerate(listing.get("module", [])):
+        where = f"module row {i + 1} ({row.get('name')})"
+        if "names" not in row:
+            problems.append(f"{where}: holds no names: a row allows only the names it holds (names = [] for none)")
+        for name in row.get("names", []):
+            if name.startswith("_") and not (name.startswith("__") and name.endswith("__")):
+                problems.append(f"{where}: cannot allow the private name {name!r}: a private name needs a "
+                                f"[[construct]] row (private-name) with its reason and the call")
+            elif name not in taken.get(row.get("name"), {}):
+                problems.append(f"{where}: allows the name {name!r}, which no shipped file takes any more: "
+                                f"take it out of the row")
     # -- the refused constructs
     construct_rows = listing.get("construct", [])
     for i, row in enumerate(construct_rows):
@@ -718,7 +970,43 @@ def check(findings, listing):
                             f"out of the row")
     rkey = lambda r: (r.file, r.function) if isinstance(r, Finding) else (r.get("file"), r.get("function"))
     _pins([f for f in findings if f.kind == "reach"], listing.get("reach", []), "reach", problems, rkey)
+    _callers(findings, listing, problems)
     return problems
+
+
+def _dotted_of(file, function):
+    """The package's own dotted name of a row's place, or None for a place that is not a function."""
+    if not file or not function or function.startswith("<"):
+        return None
+    parts = list(Path(file).relative_to(PACKAGE.parent).with_suffix("").parts)
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts + [function])
+
+
+def _callers(findings, listing, problems):
+    """A guarded row's place may be used only from the places its row names (callers)."""
+    uses = {}
+    for f in findings:
+        if f.kind == "call":
+            uses.setdefault(f.name, set()).add(f"{f.file} {f.function}" + ("" if f.family == "called" else " (handed on)"))
+    rows = [("construct", i, r) for i, r in enumerate(listing.get("construct", []))]
+    rows += [("reach", i, r) for i, r in enumerate(listing.get("reach", [])) if r.get("who") in GUARDED_WHO]
+    for section, i, row in rows:
+        target = _dotted_of(row.get("file"), row.get("function"))
+        if target is None:
+            continue
+        where = f"{section} row {i + 1} ({row.get('file')} {row.get('function')})"
+        if "callers" not in row:
+            problems.append(f"{where}: holds no callers: a guarded row names every place that uses it (callers = [] for none)")
+            continue
+        have = {u for name, us in uses.items() if name == target or name.startswith(target + ".") for u in us}
+        want = set(row.get("callers", []))
+        for u in sorted(have - want):
+            problems.append(f"refused (new-caller): {u} uses {target}, which {where} allows only from "
+                            f"{sorted(want)!r}: read the new use, then add it to the row's callers, or take it out")
+        for u in sorted(want - have):
+            problems.append(f"{where}: names the caller {u!r}, which no longer uses it: take it out of the row")
 
 
 def main(argv=None):

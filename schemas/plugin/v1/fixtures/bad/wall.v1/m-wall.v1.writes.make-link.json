@@ -1,0 +1,92 @@
+{
+  "threads": 1,
+  "descriptors_open_for_write": [],
+  "memory_maps_open_for_write": [],
+  "descriptors_seen_by": "kernel_list_after_wall",
+  "descriptors_counted_by": "kernel_count",
+  "descriptors_unaccounted": [],
+  "descriptors_kept": [
+    {
+      "descriptor": 0,
+      "kind": "character_device"
+    },
+    {
+      "descriptor": 1,
+      "kind": "pipe"
+    },
+    {
+      "descriptor": 2,
+      "kind": "pipe"
+    },
+    {
+      "descriptor": 3,
+      "kind": "socket"
+    }
+  ],
+  "descriptors_not_closed": [],
+  "reads_outside": true,
+  "home_canary": true,
+  "program_start": true,
+  "new_socket": true,
+  "signal_other": true,
+  "signal_other_ways": true,
+  "metadata_change": true,
+  "kernel_surface": true,
+  "writes": {
+    "open_for_write": "refused_by_landlock",
+    "truncate": "refused_by_landlock",
+    "create_file": "refused_by_landlock",
+    "create_folder": "refused_by_landlock",
+    "make_fifo": "refused_by_landlock",
+    "make_symlink": "refused_by_landlock",
+    "make_char_device": "refused_by_landlock",
+    "make_block_device": "refused_by_landlock",
+    "make_socket_node": "refused_by_landlock",
+    "remove_file": "refused_by_landlock",
+    "remove_folder": "refused_by_landlock"
+  },
+  "writes_not_tried": {
+    "device_ioctl": "a device's own commands need a device opened: the wall lets nothing new be opened outside the paths it was given (reads_outside), and the probe opens no device and sends no command to one",
+    "move_between_folders": "the probe tries every kind in one folder, so it moves nothing into another; a move or a link into another folder makes a name there, which Landlock asks as the make rights that the make kinds show refused in the probe's folder",
+    "rename_within_folder": "the probe renames nothing; a rename within one folder makes the new name and removes the old one, which Landlock asks as the make and remove rights that the make and remove kinds show refused",
+    "change_owner": "the filter refuses every call that changes a file's owner, by path and by descriptor; the probe tries one call of the filter's list of changes to a file's attributes, a change of mode (metadata_change), and not this one",
+    "change_times": "the filter refuses every call that changes a file's times, by path and by descriptor; the probe tries one call of the filter's list of changes to a file's attributes, a change of mode (metadata_change), and not this one",
+    "change_extended_attributes": "the filter refuses every call that sets or removes a file's extended attributes, by path and by descriptor; the probe tries one call of the filter's list of changes to a file's attributes, a change of mode (metadata_change), and not this one",
+    "write_through_open_descriptor": "Landlock checks a file when it is opened, so a file opened for writing before the wall can still be written through; the probe writes through none, and names each such file it finds open (descriptors_open_for_write), which a proven record holds empty",
+    "write_beneath_other_folder": "the probe tries every kind in one folder only: a rule that granted write rights beneath another folder would not show here; apply_wall adds rules with read and execute rights only"
+  },
+  "held_objects": {
+    "ring": "closed_by_wall",
+    "datagram_socket": "closed_by_wall",
+    "stream_socket": "closed_by_wall",
+    "signal_owner": "closed_by_wall",
+    "shared_map": "not_tried",
+    "namespace": "not_tried"
+  },
+  "held_objects_not_tried": {
+    "shared_map": "a map is not a descriptor, so the close step cannot reach it",
+    "namespace": "entering a namespace changes the whole process the host runs in"
+  },
+  "allow_list": {
+    "source": "beside_the_wall",
+    "shipped": true,
+    "digest": "sha256:94d4ef385f716ab4c4e401f4e34269d46fc6876887151ea5c15fb004a04539ea",
+    "rows": 187,
+    "rows_not_shipped": [],
+    "rows_taken_out": []
+  },
+  "shared_waits_allowed": [
+    265
+  ],
+  "limits_of_proven": {
+    "shared_futex_wait": "the filter lets through FUTEX_WAIT_BITSET with the wall clock (operation 265), a wait that is not private, because the C library's thread join makes it on a thread's id (refusing it ends the free-threaded interpreter at its first join): it is a channel both ways with any other process on the same machine that maps the same page of a file, a helper started before the wall among them, which learns by waking that page whether this process waits there, and whose wakes end this process's waits there (one run on a test host passed 400 of 400 bits out at 2000 bits a second: a measurement of that run, not a bound); it reaches none of the C library's own joins, which lie in this process's own memory, and every wake that is not private is refused",
+    "process_times": "a process started before the wall and no longer this one's child reads this process's times and state in /proc, which change as this process runs or sleeps: a channel out that no call of this process needs and no list of the kernel names (one run on a test host passed 16 of 16 bits at 20 bits a second: a measurement, not a bound)",
+    "page_cache_residency": "any other process on the same machine that maps a file this one can read learns from the kernel's page cache which of its pages this process brought into memory: a channel out through reading alone, which no row of the allow list shuts (one run on a test host passed 64 of 64 bits in 0.4 seconds on the free-threaded interpreter: a measurement, not a bound)",
+    "what_the_process_shows": "a process started before the wall and no longer this one's child is not seen by the probe: it can read this process's command line, which lives in this process's own memory; the host must start no process before the wall"
+  },
+  "landlock_abi": 3,
+  "landlock_scopes": [],
+  "arch": "x86_64",
+  "proven": true,
+  "proven_over": "shipped_list"
+}

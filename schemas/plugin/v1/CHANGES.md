@@ -4,6 +4,137 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `wall.v1.json` is `1.0-draft.12` (Nov 25, 2026)
+
+`limits_of_proven` gains `process_times` (a process started before the wall reads the host's times and state in
+/proc, a channel out), required of a proven record, and its description and that of `shared_waits_allowed` say what
+each limit is: a way a walled plugin can still signal a cooperating process on the same machine. The shared wait is a
+channel both ways with any process that maps the same page of a file, not one bit. A rate named in a reason is a
+measurement of one run, not a bound. What it breaks: a draft 11 record that says proven does not validate at draft
+12. 1 bad fixture is added; every fixture with limits gains the new one and the reasons of the head.
+
+## `wall.v1.json` is `1.0-draft.11` (Nov 25, 2026)
+
+An additive step: every field and value of draft 10 keeps its meaning, and a record that is not proven still
+validates. A record gains `descriptors_counted_by`: `kernel_count` where the kernel gave the count of the
+descriptors (the size of /proc/self/fd, from Linux 6.2) that the probe's scan by number reached, null where it gave
+none (an older kernel, no /proc), where the probe cannot tell whether it found every descriptor. A proven record
+needs `kernel_count`; where the kernel gives no count, `descriptors_open_for_write` and `descriptors_unaccounted` are
+null. What it breaks: a draft 10 record that says proven does not validate at draft 11, and a record of a kernel
+before 6.2 is no longer proven. 1 good fixture (`h24`) and 3 bad ones are added; every proven fixture of draft 10
+gains the field.
+
+## `wall.v1.json` is `1.0-draft.10` (Nov 25, 2026)
+
+An additive step: every field and value of draft 9 keeps its meaning, and a record that is not proven still
+validates. A record gains `shared_waits_allowed` (every futex form that is not private the allow list in force lets
+through, by its operation; null where no filter was loaded) and `limits_of_proven` (what proven is not true over, each
+with its reason: `shared_futex_wait`, the shared wait named with its forms and the one bit another process that maps
+the same page of a file can learn through it; `what_the_process_shows`, a process started before the wall and no
+longer the host's child is not seen and can read the command line, times and state; `page_cache_residency`, another
+process that maps a file the host reads can learn which pages it brought into memory). A proven record names every
+limit, the shared wait wherever `shared_waits_allowed` is not empty. What it breaks: a draft 9 record that says
+proven does not validate at draft 10. 1 good fixture (`h23`) and 7 bad ones are added; every proven fixture of
+draft 9 gains the two fields, so that each still fails for its own reason only.
+
+## `wall.v1.json` is `1.0-draft.9` (Nov 25, 2026)
+
+An additive step: every field and value of draft 8 keeps its meaning, and a record that is not proven still
+validates. A record gains `allow_list` (the allow list the seccomp filter let through: `source`, `beside_the_wall` or
+`given_by_path`; `shipped`, true only when every row equals the row pinned in the wall's code; the `digest` and the
+count of its `rows`; `rows_not_shipped`, every call whose row is not a shipped row; `rows_taken_out`, every shipped
+call it holds no row for; null where no filter was loaded) and `proven_over` (`shipped_list` where proven,
+`widened_list` where every other part held with a list holding a row not in the shipped list, else null). A proven
+record needs both: no row not in the shipped list, and `proven_over` `shipped_list`; a record over a widened list is
+never proven and names its rows. What it breaks: a draft 8 record that says proven does not validate at draft 9.
+2 good fixtures (`h21`, `h22`) and 16 bad ones are added; every proven fixture of draft 8 gains the two fields, so
+that each still fails for its own reason only.
+
+## `wall.v1.json` is `1.0-draft.8` (Nov 24, 2026)
+
+An additive step: every field and value of draft 7 keeps its meaning, and a record that is not proven still
+validates. A record gains `descriptors_kept` (the descriptors the wall kept when it closed every other one before its
+first change: the host's channel, and 0, 1 and 2 pointed at /dev/null; null where the host named nothing to keep),
+`descriptors_not_closed` (every other descriptor the kernel's list held after the wall), `held_objects` (per kind of
+object a process can hold from before a wall, `ring`, `datagram_socket`, `stream_socket`, `signal_owner`,
+`shared_map` and `namespace`, the outcome of one act tried after the wall: `closed_by_wall`, `refused_by_filter`,
+`acted`, `error`, `not_made` or `not_tried`) and `held_objects_not_tried` (the reason of each kind not tried). A proven
+record needs all four: a keep list, nothing not closed, every kind closed or refused, `shared_map` and `namespace`
+not tried with their reasons, and the ring not tried only where the kernel made none. What it breaks: a draft 7 record
+that says proven does not validate at draft 8. 3 good fixtures (`h18` to `h20`) and 29 bad ones
+are added; every proven fixture of draft 7 gains the four fields, so that each still fails for its own reason only.
+
+## `wall.v1.json` is `1.0-draft.7` (Nov 24, 2026)
+
+An additive step: every field and value of draft 6 keeps its meaning, and a record that is not proven still
+validates. A record gains `descriptors_unaccounted`: every descriptor the host held when the probe began that the
+kernel's list of its descriptors, read after the wall, did not hold (one handed in over a connection held from
+before the wall), by number and by the kind of file the kernel gives it (`regular_file`, `block_device`,
+`character_device`, `pipe`, `socket`, `folder`, `link`, or `other` for an object that is not a file); null where
+no wall was applied in the process or not every descriptor could be seen. A proven record now also needs
+`descriptors_unaccounted`, empty, and `descriptors_seen_by` set to `kernel_list_after_wall`: a record made in a
+process where no wall was applied is never proven. What it breaks: a draft 6 record that says proven does not
+validate at draft 7 (it never accounted for a descriptor received after the wall). 2 good fixtures (`h16`,
+`h17`) and 9 bad ones are added; every proven fixture of draft 6 gains `descriptors_unaccounted` empty (and
+`descriptors_seen_by` where it had none), so that each still fails for its own reason only.
+
+## `wall.v1.json` is `1.0-draft.6` (Nov 24, 2026)
+
+An additive step: every field and value of draft 5 keeps its meaning but one (below), and a record that is not
+proven still validates. A record gains `memory_maps_open_for_write` (each map of a file the host held shared
+and writable after the wall, by its line in the kernel's list of the process's maps, or null when that list
+could not be read) and `descriptors_seen_by` (`kernel_list_after_wall`: the kernel's own lists, opened before
+the wall, read after it and closed before the wall's call returned; or `scan_by_number`: no wall was applied in
+the process). `writes_not_tried` no longer holds `writable_memory_map`: such maps are now looked for and named.
+A proven record now also needs `memory_maps_open_for_write`, and needs it empty. What it breaks: a draft 5
+record that says proven does not validate at draft 6 (it never read the list of its maps). 6 bad fixtures are
+added (`b12`, `b13` and four that prove the new fields closed, required and of their allowed values), the bad
+fixture that proved `writes_not_tried` required `writable_memory_map` is removed with that rule, and the bad
+fixture that proves `threads` required of a proven record gains the new field so that it fails for that one
+reason only.
+
+## `wall.v1.json` is `1.0-draft.5` (Nov 24, 2026)
+
+An additive step: every field and value of draft 4 keeps its meaning, and a draft 4 record that is not proven
+still validates (fixture `h15`). A record gains `threads` (the threads of the host's process when the probe
+began) and `descriptors_open_for_write` (each descriptor held open for writing on a regular file or a block
+device, by number and kind of file, or null when not every descriptor could be seen); `writes` gains
+`make_socket_node` (a socket file made by mknod, now tried); `writes_not_tried` gains `rename_within_folder`,
+`change_owner`, `change_times`, `change_extended_attributes`, `write_through_open_descriptor`,
+`writable_memory_map` and `write_beneath_other_folder`, each with the reason it is not tried, and no longer
+requires `make_socket_node`. A proven record now also needs one thread, no descriptor open for writing, the
+socket kind refused by Landlock, every new kind named as not tried and the socket kind not named so, every
+kind but truncate refused by Landlock (the filter holds truncation only), and both Landlock scopes from ABI 6
+on. What it breaks: a draft 4 record that says proven does not validate at draft 5 (it never counted its
+threads, looked for an open descriptor or tried a socket file). Every wall fixture is brought up to the
+step; 4 good fixtures (`h12` to `h15`) and 20 bad ones are added, and the bad fixture that proved
+`writes_not_tried` required `make_socket_node` is removed with that rule.
+
+## `wall.v1.json` is `1.0-draft.4` (Nov 23, 2026)
+
+A record gains `writes` and `writes_not_tried`, both required. `writes` holds, for each of eleven kinds of
+change (open a file for writing, cut it to its own length, make a file, a folder, a named pipe, a symbolic
+link, a hard link, a character and a block device, remove a file and a folder), the outcome of trying it
+behind the wall on a file and in a folder made for the purpose: `refused_by_landlock`, `refused_by_filter`,
+`refused_elsewhere`, `let_through`, `error` or `not_tried`. `proven` needs every kind refused by the part of
+the wall that holds it (the filter holds only truncation, below Landlock ABI 3); draft 3 called a wall
+proven that left writes open, because it never tried one. `writes_not_tried` names the three kinds the
+probe cannot try harmlessly, each with the check that shows it refused instead. What it breaks: a record
+without the two fields, so a host built on draft 3 reads as not proven and loads nothing until it hands the
+probe a file and a folder. Every wall fixture carries both fields; 4 good fixtures (`h08` to `h11`) and
+21 bad ones hold them.
+
+## `wall.v1.json` is `1.0-draft.3` (Nov 21, 2026)
+
+A record gains `landlock_scopes`, required: the Landlock scopes the wall put in force (`abstract_unix_socket`,
+`signal`), asked from Landlock ABI 6 on and empty below. `kernel_surface` also tries msgctl, mq_getsetattr,
+a signal 0 to the host itself and a lease on a pipe, so a filter that lets any of them through reads not
+proven. The description now says what the record is: a check the host's own code makes on itself before any
+plugin code runs, which means something only when it is made before the load and read only from frames sent
+before it. Draft 2 added `signal_other_ways`, `metadata_change` and `kernel_surface`. What it breaks: a
+record without `landlock_scopes`. Every wall fixture carries the field; one good fixture (`h07`) and three
+bad ones (`b05`, `m-wall.v1.landlock-scopes`, `v-wall.v1.landlock-scopes`) hold it.
+
 ## `revoked-keys.v1.json` is `1.0-draft.2` (Nov 15, 2026)
 
 Its `timestamp` (a list's `issued_at` and `expires_at`, and each key's `revoked_at`) is now the control

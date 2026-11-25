@@ -751,6 +751,8 @@ class CredentialStore:
         token_id, kind, principal_id = _text(token_id), _text(kind), _text(principal_id)   # round 6, DeepSeek 2
         with self._lock:
             self._refresh()
+            # Read once the lock is held AND the file is read: neither waiting for the lock nor a reload that
+            # blocks may make it stale (the Devin thread on #385; round 8 of #385, Sol 1; the integration read, F2).
             now = self._now()   # after the reload, still under the lock, as verify does
             record = self._grants.get(token_id) if isinstance(token_id, str) else None
             if (record is None or record["kind"] != kind or record["id"] != principal_id
@@ -770,7 +772,7 @@ class CredentialStore:
         out: set[str] = set()
         with self._lock:
             self._refresh()
-            now = self._now()   # after the reload, still under the lock
+            now = self._now()   # after the lock and the reload, still under the lock, as in grant_scopes
             for record in self._grants.values():
                 if (record["kind"] == kind and record["id"] == principal_id and record["revoked_at"] is None
                         and (record["expires_at"] is None or now < record["expires_at"])):

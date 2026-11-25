@@ -277,7 +277,8 @@ class DetachWhileCallingTest(unittest.TestCase):
         session = Granted("session", "s1", grant=self.session_grant.token_id)
         authorizer = _DetachedAfterOneRead(scope_of=scopes.table_scope)
         authorizer.attach(credentials=self.store, run_record=None)
-        self.assertIsNone(authorizer(session, "run.list", {}))
+        # session.list, not run.list: a session grant reaches only delegable methods (the integration read of #385).
+        self.assertIsNone(authorizer(session, "session.list", {}))
 
     def test_one_call_reads_the_store_and_the_run_reader_once(self) -> None:
         plugin = H.Principal("plugin", "plugin.alpha")
@@ -863,6 +864,8 @@ class MatrixThroughS5Test(unittest.TestCase):
             for name, (principal, holds) in principals.items():
                 got = hooks.authorize(principal, method, params)
                 want_ok = row.scope in holds and not (method == "run.stop" and name in ("internal", "plugin"))
+                if name == "session" and method not in scopes.SESSION_DELEGABLE and method != "run.stop":
+                    want_ok = False   # session.token.v1's delegable list (the integration read of #385, F1)
                 if (got is None) != want_ok or (got is not None and got["code"] != "scope_refused"):
                     mismatches.append((method, name, got))
                 cells.append(("ok" if got is None else got["code"])[:11].ljust(11))

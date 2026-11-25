@@ -263,6 +263,8 @@ class UnixControlServer:
     when the ordinary ones are all taken: each serves one request, within
     ``reserved_timeout_s``, and only if ``priority`` says so; any other request gets the
     ``busy`` frame, not delivered. The handler still sees every request it is given.
+    At a configured cap, a request whose id could not ride the longest refusal is refused
+    before the handler, even when that request's own answer would have fit.
     """
 
     def __init__(
@@ -283,6 +285,10 @@ class UnixControlServer:
         directory = refuse_remote_bind(directory)
         if not name or "/" in name or name in (".", ".."):
             raise InsecureSocketPath("socket name must be a single path component")
+        if type(max_frame_bytes) is not int or max_frame_bytes < _MIN_FRAME_BYTES:
+            # The id_too_large refusal is a fixed body. A smaller cap would drop it and the
+            # peer would see the connection end instead of a typed answer.
+            raise ValueError(f"max_frame_bytes must be an int of at least {_MIN_FRAME_BYTES}")
         if max_connections < 1:
             raise ValueError("max_connections must be positive")
         if reserved_connections < 0 or (reserved_connections and priority is None):
@@ -487,6 +493,13 @@ class UnixControlServer:
                     self._refuse("max_connections")
                     _send_nowait(conn, BUSY_FRAME)
                     return
+                if "id" in request and not _fits(_LONGEST_FALLBACK, request["id"], self._max_frame_bytes):
+                    # The id is echoed on every answer, the fallbacks below included. An id so long that the
+                    # longest fallback could not carry it within the frame cap is refused here, before any
+                    # handler acts, so no answer of a handled request is ever over the cap or without its id
+                    # (the integration read of #385, F3; the P3 of the same read on #377).
+                    _send_quietly(conn, _ID_TOO_LARGE_REPLY, max_bytes=self._max_frame_bytes)
+                    return
                 try:
                     response = self._handler(request, connection)
                     if not isinstance(response, dict):
@@ -502,12 +515,13 @@ class UnixControlServer:
                     write_frame(conn, response, max_bytes=self._max_frame_bytes)
                 except FrameError:
                     # The request's id stays on the refusal, so the client reads it as this request's answer.
-                    _send_quietly(conn, {"ok": False, "error": {"code": "response_too_large"}, **echo})
+                    _send_quietly(conn, {**_LONGEST_FALLBACK, **echo}, max_bytes=self._max_frame_bytes)
                     return
                 except (TypeError, ValueError):
                     # A handler reply that is not JSON (a non-finite number, an object) must not kill the
                     # worker after the handler acted: the client gets a typed answer, not a silent close.
-                    _send_quietly(conn, {"ok": False, "error": {"code": "internal_error"}, **echo})
+                    _send_quietly(conn, {"ok": False, "error": {"code": "internal_error"}, **echo},
+                                  max_bytes=self._max_frame_bytes)
                     return
                 except OSError:
                     return
@@ -581,10 +595,29 @@ def _is_busy(response: Message) -> bool:
     return response == _BUSY_MESSAGE
 
 
-def _send_quietly(conn: socket.socket, message: Message) -> None:
-    """Best effort, and it never raises: a refusal that cannot be written must not be what ends the worker
-    (the read of #385 by DeepSeek V4.1 Flash, F1)."""
+# The longest answer _serve writes for a request a handler has seen; with the request's id it must fit the cap.
+_LONGEST_FALLBACK: Message = {"ok": False, "error": {"code": "response_too_large"}}
+# Sent when that fallback could not carry the id. Its body is the floor for max_frame_bytes:
+# below it the refusal itself would be dropped.
+_ID_TOO_LARGE_REPLY: Message = {"ok": False, "error": {"code": "bad_frame", "detail": "id_too_large"}}
+_MIN_FRAME_BYTES = len(encode_frame(_ID_TOO_LARGE_REPLY)) - HEADER.size
+
+
+def _fits(message: Message, request_id: object, max_bytes: int) -> bool:
+    """Whether ``message`` with ``request_id`` echoed encodes within ``max_bytes``."""
     try:
+        encode_frame({**message, "id": request_id}, max_bytes=max_bytes)
+    except (FrameError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _send_quietly(conn: socket.socket, message: Message, *, max_bytes: int | None = None) -> None:
+    """Best effort, and it never raises: a refusal that cannot be written must not be what ends the worker
+    (the read of #385 by DeepSeek V4.1 Flash, F1). With ``max_bytes`` a message over that cap is not sent."""
+    try:
+        if max_bytes is not None:
+            encode_frame(message, max_bytes=max_bytes)
         write_frame(conn, message)
     except (OSError, FrameError, TypeError, ValueError):
         pass

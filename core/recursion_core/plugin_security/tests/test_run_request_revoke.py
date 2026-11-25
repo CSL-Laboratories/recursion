@@ -344,5 +344,28 @@ class RealCoreHeldTests(unittest.TestCase):
         self.assertEqual((starter.calls, registry.list()), ([], []))
 
 
+    def test_the_permission_is_read_inside_the_hold_not_before_it(self):
+        # A grant write in progress holds the loader's lock on the grants. A hold entered meanwhile must wait
+        # for it and read the grants after it, so it sees the write; a read taken before the hold would not.
+        world = self.world()
+        granted, failures = [], []
+
+        def hold():
+            try:
+                with world.core.permission_held("demo.plugin", "schedule") as value:
+                    granted.append(value)
+            except BaseException as exc:  # a failure of the thread is the test's, shown after the join
+                failures.append(repr(exc))
+        holder = threading.Thread(target=hold, daemon=True)
+        with world.loader._grants_lock:  # a stand-in for a live withdrawal: the product has none yet
+            holder.start()
+            holder.join(HELD_WAIT_S)
+            self.assertTrue(holder.is_alive(), "the hold returned while a grant write was in progress")
+            del world.loader._active["demo.plugin"]
+        holder.join(THREAD_WAIT_S)
+        self.assertFalse(holder.is_alive())
+        self.assertEqual((failures, granted), ([], [False]))
+
+
 if __name__ == "__main__":
     unittest.main()

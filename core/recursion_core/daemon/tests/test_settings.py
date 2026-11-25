@@ -2079,5 +2079,121 @@ class AKeyIsCappedAndACutKeyCarriesItsDigest(_Folder):
                 self.assertRegex(later.getvalue().splitlines()[0], START_FORM)
 
 
+# Two made-up passwords; a line shown for one must equal the line shown for the other.
+PASSWORDS = ("S3cretpass", "Hunter2pass")
+# Two addresses in one run of text, joined in every way a person may write them: (the form with {} for the
+# secret, the secret's own text around {} where it holds more). Each secret stands in the SECOND address or later.
+JOINED = (
+    ("https://a:x@h1/,https://b:{}@h2/", "{}"),  # a comma
+    ("https://a:x@h1;https://b:{}@h2", "{}"),  # a semicolon, no path
+    ("https://a:x@h1/|ftp://b:{}@h2/", "{}"),  # a pipe
+    ('"https://a:x@h1/","https://b:{}@h2/"', "{}"),  # double quotes
+    ("'https://h1/'+'https://b:{}@h2/'", "{}"),  # single quotes, the first with no sign-in
+    ("[https://a:x@h1/][https://b:{}@h2/]", "{}"),  # brackets
+    ("https://a:x@h1/\nhttps://b:{}@h2/", "{}"),  # a line break
+    ("https://a:x@h1/https://b:{}@h2/", "{}"),  # nothing at all, after a path
+    ("https://a:x@h1https://b:{}@h2", "{}"),  # nothing at all, after the host
+    ("HTTPS://A:X@H1/,POSTGRES://B:{}@H2/DB", "{}"),  # upper-case schemes
+    ("https://a:x@h1/,https://{}@h2/", "{}"),  # a sign-in with no password
+    ("https://a:x@h1/,https://b:{}@q@h2/", "{}@q"),  # an at-sign in the password
+    ("https://a:x@h1/,https://b:{}:q@h2/", "{}:q"),  # a colon in the password
+    ("https://a:x@h1/,https://b:{}%40q%3Ar@h2/", "{}%40q%3Ar"),  # both, percent-escaped
+    ("https://h1/,https://b:{}/q@h2/", "{}/q"),  # a slash in the password
+    ("https://a:x@h1/,https://b:q@{}/r@h2/", "q@{}/r"),  # an at-sign and then a slash in the password
+    ("https://a:x@h1/,https://b:{}%40q%2Fr@h2/x", "{}%40q%2Fr"),  # both, percent-escaped, then a path
+    ("https://h1:8443/,b:{}@h2/", "{}"),  # a sign-in without a scheme after an address
+    ("b:{}@h0,https://a:x@h1/", "{}"),  # a sign-in without a scheme before an address
+    ("a://u:x@h1,b://u:y@h2,c://u:{}@h3", "{}"),  # three addresses, the secret in the third
+)
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class EverySignInOfATextIsTakenOut(_Folder):
+    """The sign-in of every address in a text is taken out, however two addresses are joined, as a value and as
+    a key, shown whole or cut; the digest of a cut key does not move when only a password changes."""
+
+    def test_the_second_of_two_addresses_joined_by_a_comma_or_a_semicolon_shows_no_password(self) -> None:
+        # The case of draft 631's sign-in rule: only the first sign-in of a run was taken out.
+        cases = (("https://a:x@h1/,https://b:{}@h2/", "'https://<sign-in hidden>@h1/,https://<sign-in hidden>@h2/'"),
+                 ("x=https://a:x@h1/;y=postgres://b:{}@h2/db",
+                  "'x=https://<sign-in hidden>@h1/;y=postgres://<sign-in hidden>@h2/db'"))
+        for form, whole in cases:
+            for word in PASSWORDS:
+                text = form.format(word)
+                with self.subTest(form=form, word=word):
+                    for cap in (40, 80, settings.NO_LIMIT):  # as a value
+                        self.assertNotIn(word, settings._shown(text, cap))
+                    self.assertEqual(whole, settings._shown(text, settings.NO_LIMIT))
+                    details = []
+                    for key in (text, text + "p" * 100):  # as a key of the file: shown whole, then cut
+                        self.put(f'version = 1\n"{key}" = 1\n')
+                        details.append(settings.load(self.environ).notes[0].detail)
+                    self.assertTrue(details[0].startswith(whole), details[0])
+                    free = settings._without_sign_in(text + "p" * 100)
+                    self.assertNotIn(word, free)
+                    self.assertIn(f" more, digest {_sha(free)})", details[1])
+                    for detail in details:
+                        self.assertNotIn(word, detail)
+                        self.assertNotIn(_sha(text + "p" * 100), detail)
+            lines = []
+            for word in PASSWORDS:
+                self.put(f'version = 1\n"{form.format(word)}{"p" * 100}" = 1\n')
+                lines.append(settings.load(self.environ).notes[0].detail)
+            self.assertEqual(lines[0], lines[1])  # the digest does not move when only the password changes
+
+    def test_every_sign_in_is_taken_out_however_the_addresses_are_joined(self) -> None:
+        for form, secret in JOINED:
+            with self.subTest(form=form):
+                shown, cut, free = [], [], []
+                for word in PASSWORDS:
+                    text = form.format(word)
+                    for value in (text, ("Ada", text), (("Ada", text),)):
+                        for cap in (40, 80, settings.NO_LIMIT):
+                            line = settings._shown(value, cap)
+                            self.assertNotIn(word, line)
+                            self.assertNotIn(secret.format(word), line)
+                            self.assertNotIn(word[:4], line)
+                    shown.append(settings._shown(text, settings.NO_LIMIT))
+                    key = text + "/" + "q" * 100
+                    cut.append(settings._shown(key, 80, key=8))
+                    self.assertNotIn(_sha(key), cut[-1])
+                    self.assertNotIn(word, cut[-1])
+                    free.append(settings._without_sign_in(key))
+                    self.assertNotIn(word, free[-1])
+                self.assertIn("<sign-in hidden>", shown[0])
+                self.assertEqual(shown[0], shown[1])  # only the password changed: the same line
+                self.assertEqual(cut[0], cut[1])  # and the same digest
+                self.assertEqual(free[0], free[1])
+
+    def test_an_address_with_no_sign_in_keeps_every_character(self) -> None:
+        # What is no sign-in stays: a host and its port, a mail address, an @ in a path after a host.
+        for text in ("https://h1/,https://h2:8443/x", "https://h1/u@mail,ada@example.com", "a@b,https://h2/",
+                     "https://h1/?to=ada@example.com#u@x",
+                     "https://[2001:db8::1]:5432/x,https://h2/@x"):
+            with self.subTest(text=text):
+                self.assertEqual(repr(text), settings._shown(text, settings.NO_LIMIT))
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class ACutKeyNeverCarriesFewerThanTheLeastDigest(_Folder):
+    """A digest is shortened to fit the cap, but never below the least of status.digest_chars."""
+
+    def test_a_key_whose_count_has_six_digits_keeps_the_least_digest_within_the_least_cap(self) -> None:
+        # Each U+200E is shown as its escape of 6 characters, so the count of what is not shown has 6 digits and
+        # the room the cap of 40 leaves beside the key's first characters is 5: the least, 6, stands.
+        key = "\u200e" * 21832
+        least = settings.DECLARED[settings.DIGEST_CHARS].floor
+        pattern = re.compile(r"^(.*)\.\.\. \((\d{6}) more, digest ([0-9a-f]+)\)$")
+        for chars in (6, 8, 64):
+            with self.subTest(chars=chars):
+                shown = settings._shown(key, 40, key=chars)
+                self.assertLessEqual(len(shown), 40, shown)
+                found = pattern.match(shown)
+                self.assertIsNotNone(found, shown)
+                self.assertEqual(least, len(found.group(3)), shown)
+                self.assertEqual(_sha(key, least), found.group(3))
+                self.assertGreater(len(found.group(1)), 1, shown)  # the quote and part of the key
+
+
 if __name__ == "__main__":
     unittest.main()

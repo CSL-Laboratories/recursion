@@ -42,8 +42,9 @@ The rules this module keeps:
   key's first 8 characters, 6 at least), so two keys never read the same; a key that fits is shown whole.
 * NEVER SHOWN, under any cap and under ``"none"``, not in part and not by its length: the value of a
   setting whose name holds a word of the row ``status.hidden_names`` (the first net: by name, whatever the
-  value looks like); the sign-in of a web address, what stands between the scheme and the host, also
-  without a scheme and inside a longer text (``postgres://<sign-in hidden>@db/x``); and a text that looks
+  value looks like); the sign-in of every web address in a text, what stands between the scheme and the
+  host, also without a scheme, inside a longer text (``postgres://<sign-in hidden>@db/x``) and however
+  two addresses are joined (``a://<sign-in hidden>@h1/,b://<sign-in hidden>@h2/``); and a text that looks
   like a key or a password. That look-alike rule is only a second net: it misses a short key, a key of one
   case or of digits only, a UUID, base64 cut by ``+`` or ``/``, and a key split over a list's items, so
   such a value under a name not on the list is shown. Every line is one line: a line break, a control
@@ -259,34 +260,49 @@ def _without_sign_in(text: str) -> str:
 
 
 def _run_without_sign_in(run: str) -> str:
-    """One run of text without a space. With a scheme, the sign-in is what stands between ``://`` and the
-    host: up to the last @ before the path, or, where what stands there is no host and port (a password that
-    holds a /), up to the last @ of the run. Without a scheme it is a name, a colon and what follows, up to
-    the last @ of the run. What cannot be told from a host is hidden too. Each step is one pass over the run."""
+    """One run of text without a space, with the sign-in of EVERY address in it taken out, however the
+    addresses are joined: a comma, a semicolon, a pipe, a quote, a bracket or nothing at all. The run is cut
+    at each ``://`` and each piece is read alone (``_address_without_sign_in`` for a piece that follows a
+    scheme, ``_bare_without_sign_in`` for the text before the first one), so no sign-in hides behind an
+    earlier address. Each step is one pass over its piece."""
 
-    last = run.rfind("@")
-    if last < 0:
+    if "@" not in run:
         return run
-    mark = run.find("://", 0, last)
-    if mark >= 0:
-        begin = mark + 3
-        ends = [i for i in (run.find(c, begin) for c in "/?#") if i >= 0]
-        authority = run[begin:min(ends, default=len(run))]
-        if "@" in authority:
-            end = begin + authority.rfind("@")
-        else:
-            host = authority.split("]", 1)[1] if authority.startswith("[") and "]" in authority else authority
-            if ":" not in host or host.rsplit(":", 1)[1].isdigit() or host.endswith(":"):
-                return run  # a host, or a host and its port: no sign-in, and an @ after it is in the path
-            end = last
-        return run[:begin] + _HIDDEN_SIGN_IN + run[end:]
-    colon = run.find(":", 0, last)
+    head, *rest = run.split("://")
+    return "://".join([_bare_without_sign_in(head), *(_address_without_sign_in(piece) for piece in rest)])
+
+
+def _address_without_sign_in(piece: str) -> str:
+    """What follows one ``://`` up to the next one. The sign-in is what stands between ``://`` and the host, up
+    to the last @ of the piece where what stands before the path holds an @ (a password may hold an @ and then
+    a /) or is no host and port (a password that holds a /). What follows a plain host may hold a sign-in
+    written without a scheme (``_bare_without_sign_in``). What cannot be told from a host is hidden too."""
+
+    if "@" not in piece:
+        return piece
+    ends = [i for i in (piece.find(c) for c in "/?#") if i >= 0]
+    stop = min(ends, default=len(piece))
+    authority = piece[:stop]
+    if "@" in authority:
+        return _HIDDEN_SIGN_IN + piece[piece.rfind("@"):]
+    host = authority.split("]", 1)[1] if authority.startswith("[") and "]" in authority else authority
+    if ":" not in host or host.rsplit(":", 1)[1].isdigit() or host.endswith(":"):
+        return authority + _bare_without_sign_in(piece[stop:])  # a host, or a host and its port, then the rest
+    return _HIDDEN_SIGN_IN + piece[piece.rfind("@"):]
+
+
+def _bare_without_sign_in(text: str) -> str:
+    """A text with no ``://`` in it: a sign-in written without a scheme is a name, a colon and what follows, up
+    to the last @ of the text; an @ with no colon before it (a mail address) is no sign-in."""
+
+    last = text.rfind("@")
+    colon = text.find(":", 0, last) if last >= 0 else -1
     if colon < 0:
-        return run
+        return text
     begin = colon
-    while begin > 0 and (run[begin - 1].isalnum() or run[begin - 1] in ".%+~_-"):
+    while begin > 0 and (text[begin - 1].isalnum() or text[begin - 1] in ".%+~_-"):
         begin -= 1
-    return run[:begin] + _HIDDEN_SIGN_IN + run[last:]
+    return text[:begin] + _HIDDEN_SIGN_IN + text[last:]
 
 
 def _hidden_name(name: str, hidden: object) -> bool:

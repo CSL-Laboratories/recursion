@@ -43,8 +43,9 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
   characters, and never fewer than 6. A key that fits is shown whole.
 - Never shown, under any cap and under `"none"`, not in part and not by its length: the value of a setting
   whose name holds a word of `status.hidden_names` (the first net: by name, whatever the value looks like);
-  the sign-in of a web address, what stands between the scheme and the host, also without a scheme and
-  inside a longer text (`postgres://<sign-in hidden>@db/x`); and a text that looks like a key or a password.
+  the sign-in of every web address in a text, what stands between the scheme and the host, also without a
+  scheme, inside a longer text (`postgres://<sign-in hidden>@db/x`) and however two addresses are joined
+  (`a://<sign-in hidden>@h1/,b://<sign-in hidden>@h2/`); and a text that looks like a key or a password.
   That look-alike rule is only a second net: it misses a short key, a key of one case or of digits only, a
   UUID, base64 cut by `+` or `/`, and a key split over a list's items, so such a value under a name not on
   the list is shown. Put a key only under a setting whose name says so.

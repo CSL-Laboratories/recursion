@@ -32,15 +32,23 @@ today): the earliest lease end ends the routine, and every budget must have room
 How the lease is measured is ``LEASE_CLOCK``: ``counted`` (seconds of the machine's monotonic clock,
 summed in the store across every restart of the core within one boot of the machine, so a restart keeps
 the count and a wall clock set back or forward changes nothing; time across a reboot is not counted) or
-``wall`` (the wall clock, never read as earlier than the latest wall time the store has seen, so a
-clock set back does not reopen an ended lease). A record keeps the clock it was admitted under.
+``wall`` (the wall clock counted forward in the store: each command adds, in its own transaction, the
+seconds the wall clock moved forward since the store's last reading, and nothing when it moved back). So
+a wall clock set back costs a ``wall`` lease nothing beyond its instant: an ended lease stays ended, and a
+running one, or one admitted after the step, ends in its time (only the seconds between the store's last
+reading before the step and its first reading after it go uncounted). A clock set forward ends a lease
+early, the safe side. One reading far in the future ends the leases that run at that moment and no lease
+admitted after it. A record keeps the clock it was admitted under.
 
 Where the boot cannot be told (``boot_id`` reads none: macOS and Windows today), counted seconds cannot be
 summed across processes or restarts, so the store counts none there and the lease falls back to the wall
 clock: a record is admitted with a ``wall`` lease, and a ``counted`` lease the store meets there is moved
-to the wall clock in the same transaction, to end at the earlier of the counted time it had left and its
-admission's wall time plus its lease. So a lease ends there no later than the wall clock says, across a
-restart and with a second store open on the file, and the record's ``lease`` names the clock that ends it.
+to the wall clock in the same transaction, to end at the earlier of the counted time it had left (counted
+on from the wall clock's forward count when the counted seconds were last written) and its admission's wall
+time plus its lease (placed on the forward count by how far the count runs ahead of the wall clock). So a
+lease ends there no later than the wall clock's forward count says, across a restart, with a second store
+open on the file and after a clock set back or a far-future reading, and the record's ``lease`` names the
+clock that ends it whenever it is read: ``get`` moves it and writes it as ``list`` does.
 
 What runs today. No daemon composes this store yet: no command of a person reaches it from outside the
 process, and a running daemon starts its runs as before.
@@ -229,18 +237,25 @@ class RoutineStore:
 
     # -- the two clocks, kept in the store ------------------------------------------------------
     def _clocks(self, db: sqlite3.Connection) -> dict:
-        """The counted seconds and the latest wall time, both advanced to now and written back."""
+        """The counted seconds and the wall clock's forward count, both advanced to now and written back.
+
+        ``wall`` grows by the seconds the wall clock moved forward since the store's last reading
+        (``wall_seen``) and by nothing when it moved back (module text). ``counted_at`` is the forward count
+        when the counted seconds were last written; ``ahead`` is how far the count runs ahead of the reading.
+        """
         kept = dict(db.execute("SELECT name, value FROM clocks").fetchall())
-        counted, latest = kept.get("counted", 0.0), max(kept.get("wall", 0.0), self._wall())
-        if self._boot is None:  # no boot to tell: the count stays as it is kept, and only the wall clock moves
-            db.execute("INSERT OR REPLACE INTO clocks (name, value) VALUES ('wall', ?)", (latest,))
-            return {"counted": counted, "wall": latest}
-        reading = self._monotonic()
-        if kept.get("boot") == self._boot and reading > kept.get("seen", reading):
-            counted += reading - kept["seen"]
-        db.executemany("INSERT OR REPLACE INTO clocks (name, value) VALUES (?, ?)",
-                       [("counted", counted), ("wall", latest), ("seen", reading), ("boot", self._boot)])
-        return {"counted": counted, "wall": latest}
+        reading = self._wall()
+        wall = kept.get("wall_count", reading) + max(0.0, reading - kept.get("wall_seen", reading))
+        rows = [("wall_count", wall), ("wall_seen", reading)]
+        counted, counted_at = kept.get("counted", 0.0), kept.get("counted_at", wall)
+        if self._boot is not None:  # where no boot is told the count stays as it is kept (module text)
+            seen = self._monotonic()
+            if kept.get("boot") == self._boot and seen > kept.get("seen", seen):
+                counted += seen - kept["seen"]
+            counted_at = wall
+            rows += [("counted", counted), ("counted_at", counted_at), ("seen", seen), ("boot", self._boot)]
+        db.executemany("INSERT OR REPLACE INTO clocks (name, value) VALUES (?, ?)", rows)
+        return {"counted": counted, "counted_at": counted_at, "wall": wall, "ahead": wall - reading}
 
     def _lease_clock(self) -> str:
         """The clock a new lease is measured on: the configured one, or the wall clock where no boot is told."""
@@ -252,8 +267,9 @@ class RoutineStore:
         if self._boot is not None or lease is None or lease["clock"] != "counted":
             return False
         admitted = datetime.datetime.strptime(record["admitted_at"], "%Y-%m-%dT%H:%M:%S.%fZ")
-        by_admission = admitted.replace(tzinfo=datetime.timezone.utc).timestamp() + record["lease_seconds"]
-        ends = min(now["wall"] + (lease["ends"] - now["counted"]), by_admission)
+        by_admission = (admitted.replace(tzinfo=datetime.timezone.utc).timestamp() + record["lease_seconds"]
+                        + now["ahead"])  # the admission's wall time, placed on the forward count
+        ends = min(now["counted_at"] + (lease["ends"] - now["counted"]), by_admission)
         record["lease"] = {"clock": "wall", "start": max(0.0, ends - record["lease_seconds"]), "ends": ends}
         return True
 
@@ -366,9 +382,14 @@ class RoutineStore:
         return {"code": OK, "routines": records}
 
     def get(self, record_id: str) -> dict | None:
-        """The record as it is now, or None."""
+        """The record as it is now, or None. A counted lease met where no boot is told is moved and written,
+        as ``list`` does, so the record names the clock that ends it."""
         with self._write() as db:
-            return self._get(db, record_id)
+            now = self._clocks(db)
+            record = self._get(db, record_id)
+            if record is not None and self._measured(record, now):
+                self._put(db, record)
+            return record
 
     # -- the core's check, before a run is started from a record ----------------------------------
     def admit_start(self, origin: Mapping) -> dict | None:

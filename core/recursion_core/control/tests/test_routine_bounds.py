@@ -377,6 +377,144 @@ class TheCountAcrossARestartTest(BoundsCase):
         self.assertRefusedStart(self.daemon().ask(at(4)), "routine_lease_ended")
 
 
+class AWallClockSetWrongTest(BoundsCase):
+    """The wall clock is set back, set forward or read once far in the future (the clocks are stand-ins)."""
+
+    STEP_S = 20   # the stand-in clocks move this many seconds between two asks
+    ASKS = 12     # and this many asks are made, well past the lease
+    YEAR_S = 365 * 24 * 3600
+    # Where a lease is on the wall clock: no boot told (a counted lease falls back to it), or a store told to use it.
+    PLACES = (("no boot told", None, {}), ("boot told, wall lease", "boot-1", {"lease_clock": "wall"}))
+    FAR = (("a hundred years ahead", None), ("the reading 1e13", 10 ** 13))
+
+    def codes_of(self, options, first, record_id="morning-digest"):
+        """Ask every STEP_S seconds, each time from a daemon started again over the same store file."""
+        codes = []
+        for n in range(first, first + self.ASKS):
+            self.later(self.STEP_S)
+            answer = self.daemon(**options).ask(at(n), record_id=record_id)
+            codes.append("started" if answer["code"] == "started" else answer["detail"])
+        return codes
+
+    def assertEndsIn(self, codes, left_s):
+        before = (left_s - 1) // self.STEP_S
+        self.assertEqual(codes, ["started"] * before + ["routine_lease_ended"] * (self.ASKS - before))
+
+    def read_once_far_ahead(self, store, absolute):
+        real = self.wall[0]
+        self.wall[0] = real + 100 * self.YEAR_S if absolute is None else float(absolute)
+        store.list()  # the one bad reading the store takes
+        self.wall[0] = real
+
+    def test_a_clock_set_back_a_year_costs_a_running_lease_nothing_beyond_its_instant(self):
+        for label, boot, options in self.PLACES:
+            with self.subTest(place=label):
+                self.setUp()
+                self.boot = boot
+                d = self.daemon(**options)
+                d.store.admit(OWNER, a_record())
+                self.later(LEASE_S // 2)
+                self.assertStarted(d.ask(at(1)))  # the store reads the clock here
+                self.later(-self.YEAR_S, mono=False)  # the step back: no time passes
+                # Only the seconds between the store's last reading before the step and its first after it go
+                # uncounted: one step of the stand-in clocks here.
+                self.assertEndsIn(self.codes_of(options, 2), LEASE_S - LEASE_S // 2 + self.STEP_S)
+
+    def test_a_lease_admitted_after_a_clock_set_back_ends_in_its_time(self):
+        for label, boot, options in self.PLACES:
+            with self.subTest(place=label):
+                self.setUp()
+                self.boot = boot
+                d = self.daemon(**options)
+                d.store.list()
+                self.later(-3600, mono=False)
+                d.store.admit(OWNER, a_record())
+                self.assertEndsIn(self.codes_of(options, 1), LEASE_S)
+
+    def test_a_clock_set_forward_ends_a_lease_early(self):
+        for label, boot, options in self.PLACES:
+            with self.subTest(place=label):
+                self.setUp()
+                self.boot = boot
+                d = self.daemon(**options)
+                d.store.admit(OWNER, a_record())
+                self.later(LEASE_S // 2)
+                self.assertStarted(d.ask(at(1)))
+                self.later(self.YEAR_S, mono=False)
+                self.assertRefusedStart(d.ask(at(2)), "routine_lease_ended")
+
+    def test_one_far_future_reading_ends_what_runs_then_and_no_lease_admitted_after(self):
+        for label, boot, options in self.PLACES:
+            for far, absolute in self.FAR:
+                with self.subTest(place=label, far=far):
+                    self.setUp()
+                    self.boot = boot
+                    d = self.daemon(**options)
+                    d.store.admit(OWNER, a_record(record_id="before"))
+                    self.later(10)
+                    self.read_once_far_ahead(d.store, absolute)
+                    self.assertRefusedStart(d.ask(at(1), record_id="before"), "routine_lease_ended")
+                    d.store.admit(OWNER, a_record(record_id="after"))
+                    self.assertEndsIn(self.codes_of(options, 2, "after"), LEASE_S)
+
+    def test_a_counted_lease_admitted_after_a_far_future_reading_and_met_where_no_boot_is_told_ends_in_its_time(self):
+        for far, absolute in self.FAR:
+            with self.subTest(far=far):
+                self.setUp()
+                d = self.daemon()
+                self.read_once_far_ahead(d.store, absolute)
+                self.later(10)
+                self.assertEqual(d.store.admit(OWNER, a_record())["routine"]["lease"]["clock"], "counted")
+                self.boot = None
+                self.assertEndsIn(self.codes_of({}, 1), LEASE_S)
+
+    def test_a_routine_removed_and_admitted_again_a_year_after_a_far_future_reading_ends_in_its_time(self):
+        self.boot = None
+        d = self.daemon()
+        self.read_once_far_ahead(d.store, None)
+        d.store.admit(OWNER, a_record())
+        self.later(self.YEAR_S)
+        again = self.daemon()
+        self.assertEqual(again.store.remove(OWNER, "morning-digest")["code"], "ok")
+        again.store.admit(OWNER, a_record())
+        self.assertEndsIn(self.codes_of({}, 1), LEASE_S)
+
+    def test_a_counted_lease_moved_to_the_wall_clock_ends_within_its_lease_of_the_wall_count(self):
+        d = self.daemon()
+        d.store.admit(OWNER, a_record())
+        self.later(LEASE_S - 40)  # counted seconds no command writes
+        self.boot = None
+        self.assertEndsIn(self.codes_of({}, 1), 40)
+        self.setUp()
+        d = self.daemon()
+        d.store.admit(OWNER, a_record())
+        self.later(LEASE_S + 50, wall=False)  # counted seconds no command writes, while the wall clock stands
+        self.boot = None
+        self.daemon().ask(at(1))
+        self.later(LEASE_S, mono=False)
+        self.assertRefusedStart(self.daemon().ask(at(2)), "routine_lease_ended")
+
+    def test_a_counted_lease_moved_after_a_clock_set_back_counts_the_seconds_no_command_wrote(self):
+        d = self.daemon()
+        d.store.admit(OWNER, a_record())
+        self.later(-3600, mono=False)
+        self.later(10)
+        self.assertStarted(d.ask(at(1)))  # ten counted seconds written, the wall clock an hour behind
+        self.later(60)  # counted seconds no command writes
+        self.boot = None
+        self.assertEndsIn(self.codes_of({}, 2), LEASE_S - 70)
+
+    def test_get_names_the_clock_that_ends_the_record_as_list_does(self):
+        self.daemon().store.admit(OWNER, a_record())
+        self.boot = None
+        there = self.daemon().store
+        self.assertEqual(there.get("morning-digest")["lease"]["clock"], "wall")
+        self.boot = "boot-1"
+        self.assertEqual(self.daemon().store.get("morning-digest")["lease"]["clock"], "wall")  # written, not only shown
+        self.assertEqual(there.get("morning-digest"), there.list()["routines"][0])
+        self.assertIsNone(there.get("evening"))
+
+
 class FailingOnce(FakeStarter):
     """A launch path that fails its first launch and starts every later one."""
 

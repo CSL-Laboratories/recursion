@@ -233,6 +233,7 @@ class TuiApp:
         self.close_left: Callable[[], float] | None = None
         self.close_bound_s: float | None = None
         self._wait_said = False  # a key while the close waits has had the notice said again (once)
+        self.wait_cut = False  # Ctrl-C ended the wait: a Stop already out and hung is not waited for any longer
         self.end_line = ""  # the close line once written; the full-screen mode prints it again after the screen
         self.errors: list[str] = []
         self.last_error: Event | None = None  # kept here too, so a bounded log cannot drop it
@@ -837,6 +838,8 @@ class TuiApp:
         if self.closed:
             return
         if key == "ctrl+c":  # the terminal sends Ctrl-C as a key (raw mode); it closes, from any mode
+            if self.awaiting_stop:
+                self.wait_cut = True
             self.close()  # while the TUI waits for a confirmed Stop's answer, this ends the wait: it closes now
             return
         if self.awaiting_stop:  # waiting for a confirmed Stop's answer: only Ctrl-C acts
@@ -1594,6 +1597,8 @@ class Loop:
         self._lanes = {"stop": queue.SimpleQueue(), "other": queue.SimpleQueue()}
         self._threads: list[threading.Thread] = []
         self._runner: threading.Thread | None = None  # the thread of run(), once start() made it
+        self._wait_began: float | None = None  # when a tick first saw the close wait for a confirmed Stop
+        self._stop_call: float | None = None  # when the Stop lane began the call it is in, if it is in one
         self.frame: list[Row] = []
         self.frames = 0
         app.dispatch = self._dispatch
@@ -1650,10 +1655,14 @@ class Loop:
                 continue
             if not self.app.begin(getattr(done, "asked", None), method, params, ending=self._halt.is_set()):
                 continue
+            if method == "run.stop":
+                self._stop_call = time.monotonic()
             try:
                 answer = call_api(self._api, method, params)
             except BaseException as err:  # noqa: BLE001 - KeyboardInterrupt, SystemExit: an answer, so in_flight
                 answer = {"code": p.UNAVAILABLE, "detail": type(err).__name__}  # stays true (#405 r2, DeepSeek L3)
+            if method == "run.stop":
+                self._stop_call = None
             self._answers.put((done, method, params, answer))
             self._wake.set()
 
@@ -1667,14 +1676,31 @@ class Loop:
         self._threads.append(t)
         self._runner = t
 
-    def shutdown(self) -> bool:
-        """Stop painting at once, then stop the threads. When this returns no paint is under way and
-        none will start, even if a thread is still inside a slow call; True when every thread ended."""
+    def halt(self) -> None:
+        """Stop painting at once: when this returns no paint is under way and none will start."""
 
         with self._paint_lock:
             self._halt.set()
         self.app.end_wait()
         self._wake.set()
+
+    def _hung_stop_only(self) -> bool:
+        """Nothing more can be sent: the Stop lane is in a call it began before the close's wait began, and no
+        confirmed Stop is still queued (one that can still begin is waited for, within the bound)."""
+
+        began, waited = self._stop_call, self._wait_began
+        if began is None or waited is None or began >= waited:
+            return False
+        with self.app._lock:
+            return not any(method == "run.stop" for method, _ in self.app._queued.values())
+
+    def shutdown(self, *, leave_hung: bool = False) -> bool:
+        """Stop painting at once, then stop the threads. When this returns no paint is under way and
+        none will start, even if a thread is still inside a slow call; True when every thread ended.
+        ``leave_hung`` (the person ended the wait with Ctrl-C): the threads are not waited for while the only
+        Stop out is in a call begun before the wait and no confirmed Stop is queued."""
+
+        self.halt()
         deadline = self._close_deadline()  # what is left of the close's one bound, shared by every thread
         # The tick under way may still ask a confirmed Stop (a y read just before the end of input): it ends first,
         # so the Stop is queued before the lanes are told to end and is sent.
@@ -1683,6 +1709,8 @@ class Loop:
         for lane in self._lanes.values():
             lane.put(None)
         for t in self._threads:
+            if leave_hung and self._hung_stop_only():
+                break
             t.join(timeout=max(0.0, deadline - time.monotonic()))
         # A Stop the lanes sent before they ended has its answer recorded before the app's close line.
         self._take_answers()
@@ -1713,6 +1741,8 @@ class Loop:
             app.press(key, burst=burst)
         self._take_answers()  # 2. API answers
         if app.awaiting_stop and not app.closed:  # a close waits for a confirmed Stop's answer, within its bound
+            if self._wait_began is None:
+                self._wait_began = time.monotonic()
             if time.monotonic() >= self._close_deadline():
                 app.close()
         deadline = time.monotonic() + self.drain_budget_s  # 3. engine output, time-sliced

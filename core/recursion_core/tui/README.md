@@ -68,7 +68,9 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   anything. Closing (`q`, Ctrl-C, or the terminal ending input) sends no new request and exits 0: a
   request still queued and not begun is not sent, except a Stop you confirmed, which is sent while the close's
   bound lasts. When `q` or Ctrl-C comes while a confirmed Stop has no answer yet, the TUI waits for that answer so
-  the transcript shows it; any other key while it waits says so again, once, and a second Ctrl-C closes at once.
+  the transcript shows it; any other key while it waits says so again, once, and a second Ctrl-C closes at once: the screen is left and the last line printed at that
+  moment, and the TUI's process ends then too, unless a confirmed Stop is still queued: that one is waited for
+  within what is left of the bound, and the last line says how long.
   The whole close, the wait and the end of the TUI's threads together, ends within ONE bound (`CLOSE_BOUND_S` in
   `app.py`, 5 s as shipped; it is to become a row of the settings file). The close line says what became of each
   Stop: answered and confirmed; answered and NOT confirmed (a failed call, `pending`, or an answer for another run:

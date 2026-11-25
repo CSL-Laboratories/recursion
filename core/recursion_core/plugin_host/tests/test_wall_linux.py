@@ -279,7 +279,7 @@ class WallDefinitionTests(unittest.TestCase):
             "socket", "socketpair", "connect", "bind", "listen", "accept", "accept4", "execve", "execveat",
             "ptrace", "process_vm_readv", "process_vm_writev", "pidfd_open", "pidfd_getfd", "pidfd_send_signal",
             "keyctl", "add_key", "request_key", "mount", "umount2", "unshare", "setns", "bpf", "perf_event_open",
-            "userfaultfd", "io_uring_setup"))
+            "userfaultfd", "io_uring_setup", "io_uring_enter", "io_uring_register", "sendmsg", "sendmmsg"))
         self.assertEqual(wall_linux.DENIED_SIGNAL_CALLS, ("kill", "tkill", "tgkill", "rt_sigqueueinfo", "rt_tgsigqueueinfo"))
         for arch, numbers in wall_linux._NR.items():
             with self.subTest(arch=arch):

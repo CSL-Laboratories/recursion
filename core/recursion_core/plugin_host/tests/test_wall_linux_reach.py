@@ -1219,7 +1219,8 @@ class FilterProgramTests(unittest.TestCase):
         self.assertEqual(wall_linux.CALLER_ONLY_CALLS, ("prlimit64", "sched_setaffinity", "sched_setscheduler",
                                                         "sched_setparam", "sched_setattr", "migrate_pages", "move_pages"))
         self.assertEqual(wall_linux.CALLER_ONLY_PRIORITY_CALLS, ("setpriority", "ioprio_set"))
-        self.assertEqual(wall_linux.DENIED_FCNTL_COMMANDS, {"F_SETOWN": 8, "F_SETOWN_EX": 15, "F_SETLEASE": 1024})
+        self.assertEqual(wall_linux.DENIED_FCNTL_COMMANDS, {"F_SETOWN": 8, "F_SETOWN_EX": 15, "F_SETLEASE": 1024,
+                                                            "F_SETSIG": 10, "F_NOTIFY": 1026})
         self.assertEqual(wall_linux.DENIED_IOCTL_COMMANDS, {"FIOSETOWN": 0x8901, "SIOCSPGRP": 0x8902,
                                                             "FS_IOC_SETFLAGS": 0x40086602, "FS_IOC_FSSETXATTR": 0x401C5820})
         self.assertEqual(wall_linux.NAMESPACE_CLONE_FLAGS, sum(CLONE_NEW.values()))
@@ -1247,8 +1248,10 @@ class FilterProgramTests(unittest.TestCase):
                                   ((1, 0), (1, self.OWN), (1, self.OTHER), (2, 0), (3, 0))],
                                  ["allow", "eperm", "eperm", "eperm", "eperm"], "IOPRIO_WHO_PROCESS only, by 0 alone")
                 self.assertEqual([run("fcntl", 3, cmd) for cmd in (8, 15, 1024, 1, 3, 4, 10, 1025)],
-                                 ["eperm", "eperm", "eperm", "allow", "allow", "allow", "allow", "allow"],
-                                 "F_SETOWN, F_SETOWN_EX and F_SETLEASE only")
+                                 ["eperm"] * 3 + ["allow"] * 3 + ["eperm", "allow"],
+                                 "F_SETOWN, F_SETOWN_EX, F_SETLEASE and F_SETSIG only; F_SETFL without O_ASYNC stays")
+                self.assertEqual((run("fcntl", 3, 1026), run("fcntl", 3, 4, 0o20000), run("fcntl", 3, 4, 0o4000)),
+                                 ("eperm", "eperm", "allow"), "F_NOTIFY, and F_SETFL asking O_ASYNC, are refused")
                 self.assertEqual([run("ioctl", 3, cmd) for cmd in (0x8901, 0x8902, 0x40086602, 0x401C5820, 0x5401, 0x80086601)],
                                  ["eperm", "eperm", "eperm", "eperm", "allow", "allow"])
 

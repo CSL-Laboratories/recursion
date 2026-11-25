@@ -24,7 +24,10 @@ and to everything it starts later, and neither can be lifted again from inside:
 2. ONE seccomp filter, loaded with ``SECCOMP_FILTER_FLAG_TSYNC`` so that it reaches every thread of the
    process. It checks the audit arch first (x86_64 and aarch64; a call made under another arch, or the
    x32 range of x86_64, is answered EPERM), then answers EPERM to:
-   - every call of ``DENIED_CALLS`` (sockets, program starts, tracing, keys, mounts, namespaces, bpf, ...);
+   - every call of ``DENIED_CALLS`` (sockets, program starts, tracing, keys, mounts, namespaces, bpf, a ring of
+     kernel calls and its use, a message sent by ``sendmsg`` or ``sendmmsg``, ...), and ``sendto`` with a
+     destination address: a ring or a datagram socket the host held from before the wall can neither submit work
+     nor send to an address of its choosing after it;
    - every call of ``DENIED_METADATA_CALLS``: the mode, owner, times and extended attributes of a file,
      by path and by descriptor (Landlock does not mediate them at any ABI);
    - every call of ``DENIED_SIGNAL_CALLS`` (``kill``, ``tkill``, ``tgkill``, ``rt_sigqueueinfo``,
@@ -41,7 +44,9 @@ and to everything it starts later, and neither can be lifted again from inside:
      that makes another process's open of a file wait, and a file's attribute flags), and ``ioctl`` with a
      command of ``DENIED_TERMINAL_COMMANDS`` (a terminal's foreground group, its controlling session, its
      settings, size, lines and input: on a terminal the host inherited, each acts on the person's terminal or
-     on the processes of its foreground group); the terminal commands that only read (``TCGETS``, which
+     on the processes of its foreground group), and ``fcntl`` with ``F_SETFL`` asking ``O_ASYNC``: with
+     ``F_SETSIG`` and ``F_NOTIFY`` among the refused commands, a walled process cannot choose or start the signals
+     a descriptor sends to an owner set before the wall; the terminal commands that only read (``TCGETS``, which
      ``isatty`` asks, ``TIOCGPGRP``, ``TIOCGSID``, ``TIOCGWINSZ``, ``TIOCMGET``, ``TIOCOUTQ``, ``FIONREAD``) and the
      ones that touch only the caller's own descriptor (``FIONBIO``, which a socket's ``setblocking`` asks,
      ``FIOCLEX`` and ``FIONCLEX``) stay allowed;
@@ -119,7 +124,8 @@ DENIED_CALLS = (
     "pidfd_open", "pidfd_getfd", "pidfd_send_signal",
     "keyctl", "add_key", "request_key",
     "mount", "umount2", "unshare", "setns",
-    "bpf", "perf_event_open", "userfaultfd", "io_uring_setup",
+    "bpf", "perf_event_open", "userfaultfd", "io_uring_setup", "io_uring_enter", "io_uring_register",
+    "sendmsg", "sendmmsg",
 )
 # Every way to send a signal, answered EPERM whatever the target: a pid number outlives its process, and
 # these calls have no form that means 'the caller' (kill with 0 or a negative number reaches a whole group).
@@ -146,7 +152,11 @@ CALLER_ONLY_CALLS = ("prlimit64", "sched_setaffinity", "sched_setscheduler", "sc
 # A priority by (which, who): answered EPERM unless `which` names one process and `who` is 0 (the caller).
 CALLER_ONLY_PRIORITY_CALLS = ("setpriority", "ioprio_set")
 # fcntl commands: another process as the receiver of a descriptor's signals; a lease (F_GETLEASE stays).
-DENIED_FCNTL_COMMANDS = {"F_SETOWN": 8, "F_SETOWN_EX": 15, "F_SETLEASE": 1024}
+# The signal such a receiver gets, and the folder changes that send it: a walled process may not choose either.
+DENIED_FCNTL_COMMANDS = {"F_SETOWN": 8, "F_SETOWN_EX": 15, "F_SETLEASE": 1024, "F_SETSIG": 10, "F_NOTIFY": 1026}
+# fcntl F_SETFL is refused only when its argument asks O_ASYNC (signals on every change of the descriptor); the
+# other flags (O_NONBLOCK, which a socket's setblocking sets) stay allowed. The same values on x86_64 and aarch64.
+_F_SETFL, _O_ASYNC = 4, 0o20000
 # ioctl commands: another process as the receiver of a socket's signals; a file's attribute flags.
 DENIED_IOCTL_COMMANDS = {"FIOSETOWN": 0x8901, "SIOCSPGRP": 0x8902, "FS_IOC_SETFLAGS": 0x40086602,
                          "FS_IOC_FSSETXATTR": 0x401C5820}
@@ -179,6 +189,7 @@ _NR = {
         "pidfd_open": 434, "pidfd_getfd": 438, "pidfd_send_signal": 424, "keyctl": 250, "add_key": 248,
         "request_key": 249, "mount": 165, "umount2": 166, "unshare": 272, "setns": 308, "bpf": 321,
         "perf_event_open": 298, "userfaultfd": 323, "io_uring_setup": 425, "seccomp": 317,
+        "io_uring_enter": 426, "io_uring_register": 427, "sendmsg": 46, "sendmmsg": 307,
     },
     "aarch64": {
         "socket": 198, "socketpair": 199, "connect": 203, "bind": 200, "listen": 201, "accept": 202, "accept4": 242,
@@ -186,6 +197,7 @@ _NR = {
         "pidfd_open": 434, "pidfd_getfd": 438, "pidfd_send_signal": 424, "keyctl": 219, "add_key": 217,
         "request_key": 218, "mount": 40, "umount2": 39, "unshare": 97, "setns": 268, "bpf": 280,
         "perf_event_open": 241, "userfaultfd": 282, "io_uring_setup": 425, "seccomp": 277,
+        "io_uring_enter": 426, "io_uring_register": 427, "sendmsg": 211, "sendmmsg": 269,
     },
 }
 # The numbers of the calls the filter reads beyond the first list (kept apart, so that table stays that list).
@@ -201,7 +213,7 @@ _NR_MORE = {
         "mq_timedsend": 242, "mq_timedreceive": 243, "mq_notify": 244, "mq_getsetattr": 245,
         "prlimit64": 302, "sched_setaffinity": 203, "sched_setscheduler": 144, "sched_setparam": 142,
         "sched_setattr": 314, "migrate_pages": 256, "move_pages": 279, "setpriority": 141, "ioprio_set": 251,
-        "fcntl": 72, "ioctl": 16, "clone": 56, "clone3": 435,
+        "fcntl": 72, "ioctl": 16, "clone": 56, "clone3": 435, "sendto": 44,
         "truncate": 76, "ftruncate": 77, "openat2": 437, "open": 2, "openat": 257,
     },
     "aarch64": {
@@ -214,7 +226,7 @@ _NR_MORE = {
         "mq_timedsend": 182, "mq_timedreceive": 183, "mq_notify": 184, "mq_getsetattr": 185,
         "prlimit64": 261, "sched_setaffinity": 122, "sched_setscheduler": 119, "sched_setparam": 118,
         "sched_setattr": 274, "migrate_pages": 238, "move_pages": 239, "setpriority": 140, "ioprio_set": 30,
-        "fcntl": 25, "ioctl": 29, "clone": 220, "clone3": 435,
+        "fcntl": 25, "ioctl": 29, "clone": 220, "clone3": 435, "sendto": 206,
         "truncate": 45, "ftruncate": 46, "openat2": 437, "openat": 56,
     },
 }
@@ -245,6 +257,7 @@ _EPERM, _ENOSYS = 1, 38                      # Linux errno values (the kernel's,
 _RET_ALLOW, _RET_EPERM, _RET_ENOSYS = 0x7FFF0000, 0x00050000 | _EPERM, 0x00050000 | _ENOSYS
 _OFF_NR, _OFF_ARCH = 0, 4                     # struct seccomp_data, little-endian
 _OFF_ARG_LOW = (16, 24, 32)                   # the low word of arguments 0, 1 and 2
+_OFF_ARG4 = (48, 52)                          # the low and high words of argument 4 (sendto's address)
 
 # The checks of the record, in its order; each is True only when the kernel refused it.
 RECORD_CHECKS = ("reads_outside", "home_canary", "program_start", "new_socket", "signal_other",
@@ -498,7 +511,8 @@ def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI) -> list[tuple[int,
     rows += [(_BPF_JEQ_K, "caller", 0, numbers[name]) for name in CALLER_ONLY_CALLS]
     rows += [(_BPF_JEQ_K, "prio", 0, numbers["setpriority"]), (_BPF_JEQ_K, "ioprio", 0, numbers["ioprio_set"]),
              (_BPF_JEQ_K, "fcntl", 0, numbers["fcntl"]), (_BPF_JEQ_K, "ioctl", 0, numbers["ioctl"]),
-             (_BPF_JEQ_K, "clone", 0, numbers["clone"]), (_BPF_JEQ_K, "enosys", 0, numbers["clone3"])]
+             (_BPF_JEQ_K, "clone", 0, numbers["clone"]), (_BPF_JEQ_K, "enosys", 0, numbers["clone3"]),
+             (_BPF_JEQ_K, "sendto", 0, numbers["sendto"])]
     rows.append((_BPF_RET_K, 0, 0, _RET_ALLOW))
     labels: dict[str, int] = {}
 
@@ -512,7 +526,13 @@ def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI) -> list[tuple[int,
     block("ioprio", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[0]), (_BPF_JEQ_K, "who", "deny", _IOPRIO_WHO_PROCESS))
     block("who", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]), (_BPF_JEQ_K, "allow", "deny", 0))
     block("fcntl", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]),
-          *[(_BPF_JEQ_K, "deny", 0, value) for value in DENIED_FCNTL_COMMANDS.values()], (_BPF_RET_K, 0, 0, _RET_ALLOW))
+          *[(_BPF_JEQ_K, "deny", 0, value) for value in DENIED_FCNTL_COMMANDS.values()],
+          (_BPF_JEQ_K, "setfl", 0, _F_SETFL), (_BPF_RET_K, 0, 0, _RET_ALLOW))
+    block("setfl", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[2]), (_BPF_JSET_K, "deny", "allow", _O_ASYNC))
+    # sendto with no address (send on a connected socket, as the C library's send is made) stays allowed; with one,
+    # a datagram socket held from before the wall would reach an address of its choosing
+    block("sendto", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG4[0]), (_BPF_JEQ_K, 0, "deny", 0),
+          (_BPF_LD_W_ABS, 0, 0, _OFF_ARG4[1]), (_BPF_JEQ_K, "allow", "deny", 0))
     block("ioctl", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]),
           *[(_BPF_JEQ_K, "deny", 0, value) for value in DENIED_IOCTL_COMMANDS.values()],
           *[(_BPF_JEQ_K, "deny", 0, value) for value in DENIED_TERMINAL_COMMANDS.values()],
@@ -829,8 +849,20 @@ def _reach_other(pid) -> None:
         finally:
             os.close(read_end)
             os.close(write_end)
+    def on_a_pipe(command: int, argument: int):
+        def act() -> None:
+            read_end, write_end = os.pipe()
+            try:
+                _sys(libc, "fcntl", read_end, command, argument)
+            finally:
+                os.close(read_end)
+                os.close(write_end)
+        return act
     _each_refused(lambda: _sys(libc, "rt_sigqueueinfo", target, 0, ctypes.addressof(info)),
                   owner_of_a_pipe,
+                  on_a_pipe(DENIED_FCNTL_COMMANDS["F_SETSIG"], 0),        # the signal an owner gets: 0 is the default
+                  on_a_pipe(DENIED_FCNTL_COMMANDS["F_NOTIFY"], 0),        # a pipe is no folder: ENOTDIR if allowed
+                  on_a_pipe(_F_SETFL, _O_ASYNC),                          # signals on change, to no owner set here
                   lambda: _sys(libc, "prlimit64", target, 0, 0, ctypes.addressof(old)))  # RLIMIT_CPU, read only
 
 
@@ -858,13 +890,19 @@ def _lease_on_a_pipe(libc) -> None:
 
 
 def _kernel_surface() -> None:
-    """Calls only this wall refuses, each harmless where it is allowed: io_uring_setup with no entries,
+    """Calls only this wall refuses, each harmless where it is allowed: io_uring_setup with no entries, the use of
+    a ring and an addressed send on a descriptor that names nothing,
     unshare of nothing, a keyctl operation that does not exist, (x86_64) getpid by its x32 number, clone
     asking a new user namespace with flags the kernel itself rejects, msgctl IPC_STAT of the id -1,
     mq_getsetattr of the descriptor -1, signal 0 to this process itself by its own pid, and a lease on a
     pipe; then clone3, which this wall answers ENOSYS (the kernel's own answer to these arguments is EINVAL)."""
     libc, arch = _libc(), _arch()
+    address = ctypes.create_string_buffer(16)  # a destination address of zeros, never sent: the descriptor is -1
     attempts = [lambda: _sys(libc, "io_uring_setup", 0, 0),
+                lambda: _sys(libc, "io_uring_enter", -1, 0, 0, 0, 0, 0),     # no ring: EBADF if allowed
+                lambda: _sys(libc, "io_uring_register", -1, 0, 0, 0),        # no ring: EBADF if allowed
+                lambda: _sys(libc, "sendto", -1, 0, 0, 0, ctypes.addressof(address), 16),  # EBADF if allowed
+                lambda: _sys(libc, "sendmsg", -1, 0, 0),                     # EBADF if allowed
                 lambda: _sys(libc, "unshare", 0),
                 lambda: _sys(libc, "keyctl", 0x7FFFFFFF, 0, 0, 0, 0),
                 lambda: _sys(libc, "clone", 0x10000000 | 0x00000200, 0, 0, 0, 0),  # CLONE_NEWUSER|CLONE_FS: EINVAL

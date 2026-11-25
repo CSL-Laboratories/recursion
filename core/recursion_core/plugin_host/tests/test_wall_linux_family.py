@@ -53,6 +53,94 @@ print(json.dumps(out))
 '''
 
 
+USE_CHILD = r'''
+import ctypes, errno, fcntl, json, os, socket, sys
+spec = json.loads(sys.argv[1])
+sys.path.insert(0, spec["core"])
+from recursion_core.plugin_host import wall_linux as w
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+numbers = dict(w._NR[w._arch()], **w._NR_MORE[w._arch()])
+def call(name, *args):
+    ctypes.set_errno(0)
+    result = libc.syscall(ctypes.c_long(numbers.get(name, {"io_uring_setup": 425, "io_uring_enter": 426,
+                                                           "io_uring_register": 427}.get(name, -1))),
+                          *(ctypes.c_long(a) for a in args))
+    return 0 if result >= 0 else ctypes.get_errno()
+def errno_of(act):
+    try:
+        act()
+    except OSError as exc:
+        return exc.errno
+    return 0
+out, mode = {}, spec["mode"]
+# planted before the wall: objects of the child's own only (a ring, loopback and unix-path receivers of its own, a
+# pipe and a folder whose signal owner is the test's stand-in process)
+if mode == "ring":
+    params = ctypes.create_string_buffer(120)
+    ctypes.set_errno(0)
+    ring = libc.syscall(ctypes.c_long(425), ctypes.c_long(1), ctypes.c_long(ctypes.addressof(params)))
+    out["ring_made"] = ring >= 0
+elif mode == "datagram":
+    inet_receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    inet_receiver.bind(("127.0.0.1", 0))
+    inet_receiver.setblocking(False)
+    unix_path = os.path.join(spec["top"], "receiver")
+    unix_receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    unix_receiver.bind(unix_path)
+    unix_receiver.setblocking(False)
+    inet_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    unix_sender = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+elif mode == "owner":
+    read_end, write_end = os.pipe()
+    folder = os.open(spec["top"], os.O_RDONLY | os.O_DIRECTORY)
+    for fd in (read_end, folder):
+        fcntl.fcntl(fd, fcntl.F_SETOWN, spec["daemon"])
+w.apply_wall(spec["paths"])
+if mode == "ring":
+    out["enter"] = call("io_uring_enter", ring, 0, 0, 0, 0, 0)
+    out["register"] = call("io_uring_register", ring, 0, 0, 0)  # IORING_REGISTER_BUFFERS of nothing
+elif mode == "datagram":
+    out["inet_sendto"] = errno_of(lambda: inet_sender.sendto(b"after the wall", inet_receiver.getsockname()))
+    out["unix_sendto"] = errno_of(lambda: unix_sender.sendto(b"after the wall", unix_path))
+    out["inet_sendmsg"] = errno_of(lambda: inet_sender.sendmsg([b"after"], [], 0, inet_receiver.getsockname()))
+    out["received"] = sum(errno_of(lambda: r.recv(64)) == 0 for r in (inet_receiver, unix_receiver))
+elif mode == "owner":
+    out["setsig"] = errno_of(lambda: fcntl.fcntl(read_end, 10, 10))
+    out["async"] = errno_of(lambda: fcntl.fcntl(read_end, fcntl.F_SETFL, os.O_ASYNC))
+    out["notify"] = errno_of(lambda: fcntl.fcntl(folder, 1026, 0x4 | 0x80000000))  # DN_CREATE | DN_MULTISHOT
+    out["nonblocking"] = errno_of(lambda: os.set_blocking(read_end, False))  # the flags a process needs stay
+record = w.probe_wall(spec["canary"], spec["daemon"], write_folder=spec["folder"])
+out.update(record=record)
+print(json.dumps(out))
+'''
+
+
+@unittest.skipIf(_why_not_here(), _why_not_here() or "")
+class HeldObjectsCannotActTests(unittest.TestCase):
+    """An object the host held from before the wall: its use after the wall is refused by the filter (EPERM), and
+    the record, which probes each refusal after the wall, is proven only with them in force."""
+
+    def test_a_ring_made_before_the_wall_cannot_submit_or_register_after_it(self):
+        result, _ = run_child(USE_CHILD, "ring")
+        if not result["ring_made"]:
+            self.skipTest("this kernel makes no ring for this process (io_uring disabled)")
+        self.assertEqual((result["enter"], result["register"]), (1, 1), result)
+        self.assertIs(result["record"]["proven"], True)
+
+    def test_a_datagram_socket_made_before_the_wall_cannot_send_to_an_address_after_it(self):
+        result, _ = run_child(USE_CHILD, "datagram")
+        self.assertEqual((result["inet_sendto"], result["unix_sendto"], result["inet_sendmsg"]), (1, 1, 1), result)
+        self.assertEqual(result["received"], 0, "no datagram reached either receiver")
+        self.assertIs(result["record"]["proven"], True)
+
+    def test_a_signal_owner_set_before_the_wall_gets_no_signal_chosen_after_it(self):
+        result, _ = run_child(USE_CHILD, "owner")
+        self.assertEqual((result["setsig"], result["async"], result["notify"]), (1, 1, 1), result)
+        self.assertEqual(result["nonblocking"], 0, "a descriptor's other flags stay the process's to set")
+        self.assertIs(result["record"]["proven"], True)
+
+
 def run_child(code: str, mode: str, **extra) -> tuple:
     """Run ``code`` walled in a child with a write folder, a canary and a stand-in daemon of the test's own; the
     child's last line of output (JSON) and the first bytes of the planted file afterwards."""

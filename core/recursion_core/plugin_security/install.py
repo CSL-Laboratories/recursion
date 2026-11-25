@@ -337,7 +337,10 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
     report = check_registry(registry_root)
     codes = report.codes()
     if codes:
-        raise InstallRefused(codes[0], codes)
+        refusal = InstallRefused(codes[0], codes)
+        # Each finding names its file and rule; a caller that shows them (the install by registry) can.
+        refusal.findings = list(report.errors)
+        raise refusal
     # A signature anywhere in the registry that could not be verified refuses the
     # whole install. Unknown must not read as valid, and nothing is written.
     if any(item.code == "signature_unchecked" for item in report.notes):

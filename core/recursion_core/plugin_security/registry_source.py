@@ -5,7 +5,8 @@ at that one commit with the git read of ``git_source`` (the git program only, in
 that is removed on every path) and hands that tree to ``install_plugin`` as its registry root, so every
 check of the registry, the entry, the index, the digests and the signature is the one the install of a
 registry folder makes. ``--registry <folder>`` installs from a registry folder already on disk, as
-before. An address is a local bare repository, its ``file://`` address, or an ``https://`` address.
+before. An address is a local bare repository or its ``file://`` address, and the commit must be on
+the registry's default branch; an ``https://`` address is refused until that proof is built for it.
 
 Nothing is written into the profile before every check has passed, and a refusal writes nothing: the
 scratch folder goes, and the profile is as it was. A registry that cannot be read is said to be so, and
@@ -18,7 +19,7 @@ import os
 import re
 
 from .git_source import SourceRefused, registry_address, registry_checkout
-from .install import InstallRefused, install_plugin
+from .install import InstallRefused, _refuse_by_arguments, install_plugin
 
 __all__ = ["install_from_registry", "list_not_wired", "registry_words", "shown_lines", "split_registry"]
 
@@ -51,7 +52,7 @@ _WORDS = {
         "commit id>: a branch, a tag or a short id can move, so it is not read."),
     "registry_address_refused": (
         "The registry address {given} is not one this install reads. Use a local bare repository's "
-        "folder, its file:// address, or an https:// address, each followed by @<full commit>."),
+        "folder or its file:// address, followed by @<full commit>."),
     "registry_unreachable": (
         "The registry {given} could not be read at commit {commit}: the address did not answer, the "
         "commit is not there, or the fetch took longer than this install waits. Check the address and "
@@ -59,6 +60,14 @@ _WORDS = {
     "registry_link_refused": (
         "The registry {given} holds a link or a submodule at {path}, so it is not read: a registry "
         "is files only. Nothing was installed. Ask the registry's keepers, or name another registry."),
+    "registry_commit_not_published": (
+        "The commit {commit} is not on the default branch of the registry {address}, so it is not one "
+        "that registry published: a commit served by its id alone can come from someone else's copy. "
+        "Nothing was installed. Name a commit on the registry's default branch."),
+    "registry_transport_unproven": (
+        "This recursion does not read an https:// registry yet: the proof that a commit is one the "
+        "registry published is not built for a network address. Nothing was fetched. Make a local "
+        "copy with git clone --mirror <address> <folder> and name --registry <folder>@<full commit>."),
     "registry_too_large": (
         "The registry {given} at commit {commit} holds more files or more bytes than this install "
         "reads. Nothing was installed. Name another registry."),
@@ -83,6 +92,8 @@ _FROM_SOURCE = {
     "registry_link_refused": "registry_link_refused",
     "source_symlink_escapes": "registry_link_refused",
     "registry_too_large": "registry_too_large",
+    "registry_commit_not_published": "registry_commit_not_published",
+    "registry_transport_unproven": "registry_transport_unproven",
     "source_install_script": "registry_install_script",
     "source_path_escapes": "registry_path_refused",
     "source_not_regular": "registry_not_regular",
@@ -157,6 +168,8 @@ def install_from_registry(config: os.PathLike | str, plugin_id: str, *, registry
 
     ``install_options`` are ``install_plugin``'s own keywords and are passed on unchanged.
     """
+    # The id and the version first, from the arguments alone: no registry is named, fetched or read for them.
+    _refuse_by_arguments(plugin_id, version)
     kind, address, commit = split_registry(registry)
     if kind == "folder":
         result = _checked_install(config, address, plugin_id, registry, None, version=version, state=state,

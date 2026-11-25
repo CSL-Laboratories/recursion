@@ -709,6 +709,22 @@ def _lexists(path: Path) -> bool:
     return os.path.lexists(path)
 
 
+def _refuse_by_arguments(plugin_id: object, version: object) -> None:
+    """Refuse a reserved or malformed id, or a version that is not text, from the arguments alone.
+
+    It reads nothing: an install that calls it first refuses such an id before any byte of a registry or
+    of a git source is read, so a broken registry cannot hide the reason.
+    """
+    if type(plugin_id) is str and plugin_id in _STORE_RESERVED_IDS:
+        raise InstallRefused("plugin_id_reserved",
+                             detail=f"The name {plugin_id} is kept for the install's own files and is never a "
+                                    f"plugin id. Pick another plugin id.", show_detail=True)
+    if not _plugin_id_ok(plugin_id) or plugin_id in _PROFILE_NAMES:
+        raise InstallRefused("plugin_not_in_registry")
+    if version is not None and type(version) is not str:
+        raise InstallRefused("release_not_in_registry")
+
+
 def _plugin_id_ok(value: object) -> bool:
     return (type(value) is str and _PLUGIN_ID.fullmatch(value) is not None and value != "host"
             and value not in _STORE_RESERVED_IDS

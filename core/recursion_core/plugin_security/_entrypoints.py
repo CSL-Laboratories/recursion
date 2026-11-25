@@ -24,8 +24,8 @@ question, as unpin does, and installs the held release only on ``yes``;
 ``quarantine drop <id>`` moves the held release into a kept place and names it.
 
 ``install <plugin_id> --registry <address>@<full commit>`` reads the registry's tree at that commit
-(a local bare repository, its ``file://`` address, or an ``https://`` address) and installs from it
-with the same checks; ``--registry <folder>`` reads a registry folder on disk. The id may be given as
+(a local bare repository or its ``file://`` address; the commit must be on the registry's default
+branch) and installs from it with the same checks; ``--registry <folder>`` reads a registry folder on disk. The id may be given as
 the one word after ``install`` or with ``--plugin``. With no registry named the install refuses
 ``registry_not_named`` and says how to name one.
 

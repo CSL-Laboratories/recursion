@@ -21,8 +21,8 @@ from recursion_core.plugin_security import ConnectionBreaker, Refused, create_br
 
 | Call | Returns | Refusals (`Refused.code`) |
 |---|---|---|
-| `create_breaker_store(path, *, sqlite_wal_bug="refuse")` | `None`. Installer step: creates the store (0600, WAL) | `store_sqlite_wal_bug`, `FileExistsError` if `path` exists (it never replaces a store) |
-| `ConnectionBreaker(store_path, *, clock=time.monotonic, probe_lease_seconds=300.0, sqlite_wal_bug="refuse")` | the breaker | `breaker_store_missing`, `breaker_store_invalid`, `store_sqlite_wal_bug` |
+| `create_breaker_store(path, *, sqlite_wal_bug="refuse")` | `None`. Installer step: creates the store (0600, WAL) | in this order: `store_sqlite_wal_bug_unknown_choice` (a choice that is neither `refuse` nor `accept_risk`, on every SQLite), `FileExistsError` if `path` exists (it never replaces a store; on every SQLite), `store_sqlite_wal_bug` |
+| `ConnectionBreaker(store_path, *, clock=time.monotonic, probe_lease_seconds=300.0, sqlite_wal_bug="refuse")` | the breaker | `breaker_store_missing`, `store_sqlite_wal_bug_unknown_choice`, `store_sqlite_wal_bug`, `breaker_store_invalid` |
 | `bind_run(run_id, connection, plugin_id, provider, model_version)` | `None`. Same binding again is a no-op | `invalid_run_id`, `invalid_connection`, `invalid_plugin_id`, `invalid_provider`, `invalid_model_version`, `run_connection_mismatch`, `run_binding_mismatch` |
 | `check(run_id, connection, plugin_id)` | `{"provider": ..., "model_version": ...}` | `run_unknown`, `run_not_owned`, `run_connection_mismatch`, `run_faulted`, `connection_tripped` |
 | `report(connection, event_type)` | `True` when it tripped the connection; `False` for the core's own `core_timeout`, `core_deadline`, `caller_cancelled` | `invalid_connection`, `untyped_breaker_event` |

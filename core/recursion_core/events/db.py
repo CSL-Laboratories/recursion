@@ -102,8 +102,10 @@ LOG = logging.getLogger(__name__)
 
 __all__ = [
     'APPLICATION_ID', 'CommitUnknown', 'EVENT_SCHEMA', 'EVENT_TYPES', 'EventStore', 'FakeStore', 'LockOrderError',
-    'Receipt', 'ReceiptExists', 'SCHEMA_VERSION', 'SQLITE_WAL_BUG', 'SQLITE_WAL_RESET_REPAIRED', 'StoreError',
-    'in_transaction', 'require_no_transaction', 'sqlite_wal_affected', 'sqlite_wal_refusal',
+    'Receipt', 'ReceiptExists', 'SCHEMA_VERSION', 'SQLITE_WAL_BUG', 'SQLITE_WAL_BUG_CHOICES',
+    'SQLITE_WAL_BUG_UNKNOWN_CHOICE', 'SQLITE_WAL_RESET_REPAIRED', 'StoreError', 'in_transaction',
+    'require_no_transaction', 'sqlite_wal_accepted', 'sqlite_wal_affected', 'sqlite_wal_choice_refusal',
+    'sqlite_wal_refusal',
 ]
 
 APPLICATION_ID = 0x52634576      # 'RcEv' in the file header: a file that is not this store is refused
@@ -150,6 +152,8 @@ class StoreError(RuntimeError):
 # lines, since 3.45.0 to 3.50.6 and 3.51.0 to 3.51.2 sit above repaired numbers of other lines and are not repaired.
 
 SQLITE_WAL_BUG = 'store_sqlite_wal_bug'     # the typed refusal of every store
+SQLITE_WAL_BUG_UNKNOWN_CHOICE = 'store_sqlite_wal_bug_unknown_choice'  # a choice that is neither of the two
+SQLITE_WAL_BUG_CHOICES = ('refuse', 'accept_risk')  # the setting's two texts (the settings row allows the same)
 SQLITE_WAL_FIRST = (3, 7, 0)                 # WAL, and the bug with it, begins here
 SQLITE_WAL_REPAIRED_FROM = (3, 53, 0)        # every release from here carries the repair
 # (major, minor) -> the first patch release of that line that carries the repair; a line not in the table has none.
@@ -198,25 +202,51 @@ def sqlite_wal_affected(version: str) -> bool:
     return repaired is None or parts[2] < repaired
 
 
+def sqlite_wal_choice_refusal(choice: object) -> str | None:
+    """None when ``choice`` is one of the setting's two texts, else the message of its
+    ``store_sqlite_wal_bug_unknown_choice`` refusal. It never looks at the SQLite version: a choice that is not a
+    value of the setting is refused on every SQLite, before the version is tested."""
+    if type(choice) is str and choice in SQLITE_WAL_BUG_CHOICES:
+        return None
+    return (f'The choice {choice!r} is not a value of the setting stores.sqlite_wal_bug, so no store is opened or '
+            "made. Write 'refuse' (the default: a store refuses to open on an SQLite with the WAL reset bug) or "
+            "'accept_risk' (a store opens on it anyway, at your own risk). The setting lives in "
+            '$XDG_CONFIG_HOME/recursion/settings.toml, as sqlite_wal_bug in the table [stores], for the daemon\'s '
+            'own stores; a program that calls a store itself passes sqlite_wal_bug="refuse" or '
+            'sqlite_wal_bug="accept_risk".')
+
+
 def sqlite_wal_refusal(choice: str = 'refuse') -> str | None:
-    """None when a store may open on this Python's SQLite, else the message of its ``store_sqlite_wal_bug`` refusal.
+    """None when a store may open on this Python's SQLite, else the message of its refusal.
 
     ``choice`` is the person's own setting ``stores.sqlite_wal_bug`` as the daemon read it: 'refuse' (the default) or
-    'accept_risk'; any other value refuses. With 'accept_risk' the store opens and a WARNING names the loaded
-    version, at each open."""
+    'accept_risk'. Any other value refuses on every SQLite, before the version is tested, with the message of
+    ``sqlite_wal_choice_refusal`` (a store raises it as ``store_sqlite_wal_bug_unknown_choice``). With 'accept_risk'
+    the store opens; it writes its WARNING only once its open has succeeded (``sqlite_wal_accepted``)."""
+    unknown = sqlite_wal_choice_refusal(choice)
+    if unknown is not None:
+        return unknown
     found = sqlite3.sqlite_version
-    affected = sqlite_wal_affected(found)
-    if choice == 'accept_risk':
-        state = 'has the WAL reset bug' if affected else 'is not affected; the setting is not needed'
-        LOG.warning("stores.sqlite_wal_bug = 'accept_risk': a store opens on SQLite %s, which %s; the person "
-                    'accepted the risk', found, state)
-        return None
-    if not affected:
+    if choice == 'accept_risk' or not sqlite_wal_affected(found):
         return None
     return _SQLITE_WAL_HAS_THE_BUG.format(found=found) + _SQLITE_WAL_REST
 
 
+def sqlite_wal_accepted(choice: str) -> None:
+    """After a store's open has succeeded: with 'accept_risk', the WARNING that names the loaded SQLite, whether it
+    is affected, and that the person accepted the risk (at each open; a failed open writes none)."""
+    if choice != 'accept_risk':
+        return
+    found = sqlite3.sqlite_version
+    state = 'has the WAL reset bug' if sqlite_wal_affected(found) else 'is not affected; the setting is not needed'
+    LOG.warning("stores.sqlite_wal_bug = 'accept_risk': a store opens on SQLite %s, which %s; the person "
+                'accepted the risk', found, state)
+
+
 def _refuse_sqlite_wal_bug(choice: str) -> None:
+    message = sqlite_wal_choice_refusal(choice)
+    if message is not None:
+        raise StoreError(SQLITE_WAL_BUG_UNKNOWN_CHOICE, message)
     message = sqlite_wal_refusal(choice)
     if message is not None:
         raise StoreError(SQLITE_WAL_BUG, message)
@@ -527,6 +557,7 @@ class EventStore:
             os.close(self._lock_fd)
             self._lock_fd = None
             raise
+        sqlite_wal_accepted(sqlite_wal_bug)      # only once the open has succeeded
 
     # -- opening
 
@@ -1057,6 +1088,7 @@ class FakeStore(EventStore):
         self._log = log
         self.fail_commit = False
         self._open()
+        sqlite_wal_accepted(sqlite_wal_bug)      # only once the open has succeeded
 
     def _before_commit(self) -> None:
         if self.fail_commit:

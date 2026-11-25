@@ -244,8 +244,13 @@ class LoaderPathTests(HostCase):
         self.assertIn('signature_valid_trusted_key', codes(record))
         self.assertIn('active', codes(record))
         self.assertEqual(record['containment'], 'in process, same uid: not contained')
-        # Loaded from bytes by the loader, never imported by name.
-        self.assertEqual([m for m in set(sys.modules) - before if 'fixture' in m or m.startswith('csl_plugin')], [])
+        # Loaded from bytes by the loader, never imported by name from a folder: the one module of the
+        # plugin in sys.modules is its own package, served from the verified bytes, with no file behind it.
+        module = host.loader._active['fixture.operator'].module
+        self.assertEqual([m for m in set(sys.modules) - before if 'fixture' in m or m.startswith('csl_plugin')],
+                         [module.__name__])
+        self.assertIsNone(getattr(module, '__file__', None))
+        self.assertIsNone(module.__spec__.origin)
         self.assertEqual(host.loader.permissions('fixture.operator'), ('read', 'panel'))
         registry, = host.registries
         self.assertEqual([p['id'] for p in registry['panels']], ['fixture.positions', 'fixture.health'])

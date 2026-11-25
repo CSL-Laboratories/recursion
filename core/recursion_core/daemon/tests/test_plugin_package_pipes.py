@@ -124,8 +124,8 @@ class PipeAtPackageFileTests(HostCase):
         self.assert_refused_at_once(pipe, 'plugin_file_untrusted', 'manifest.json')
 
     def test_a_pipe_swapped_in_at_plugin_py_after_verification_is_refused_without_blocking(self):
-        # plugin.py differs from its digest, so the verified bytes do not hold it and the host reads
-        # it again; a pipe put in its place between the two reads must not block that read.
+        # plugin.py differs from its digest. The host never reads it again: a pipe put in its place
+        # after verification is a changed folder, refused at once, and nothing blocks.
         (self.package / 'plugin.py').write_bytes(self.source + b'\n# changed\n')
         real = plugins.verify_package
         pipe = self.package / 'plugin.py'
@@ -136,7 +136,9 @@ class PipeAtPackageFileTests(HostCase):
             os.mkfifo(pipe, 0o600)
             return result
 
-        self.assert_refused_at_once(pipe, 'plugin_file_untrusted', 'plugin.py', verify=then_swap)
+        self.assert_refused_at_once(pipe, 'package_changed_while_checked',
+                                    "the plugin's files changed while they were being checked "
+                                    "(1 path(s) differ, the first: plugin.py)", verify=then_swap)
 
     def test_a_pipe_at_a_listed_file_other_than_the_entry_is_package_file_missing(self):
         (self.package / 'notes' / 'index.py').unlink()

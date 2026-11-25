@@ -9,8 +9,13 @@ The daemon never imports a plugin module by name. ``PluginHost`` reads each inst
 through ``verify_package`` and hands the verified bytes to ``plugin_security.PluginLoader``, which
 checks the manifest, the artifact digest, the signature against this install's trusted keys and
 the installer's grant before any plugin code runs. An extra, missing or changed file is not
-accepted as signed. A scope environment other than ``paper`` is refused unless that read was a
-whole signed version-1 package. A plugin the loader refuses stays out, its typed refusal and
+accepted as signed. What runs is what was verified: the loader is handed the ``VerifiedPackage``
+itself, compiles plugin.py from its bytes and serves every listed module the plugin imports from
+its own package from them too, never from the folder again. A folder whose files changed while
+they were checked, or between the check and the load, is refused and nothing of it is loaded. A
+file the plugin opens by its path at run time is read from disk and is not covered by the
+signature; the record and the inventory say so (``path_reads``). A scope environment other than
+``paper`` is refused unless that read was a whole signed version-1 package. A plugin the loader refuses stays out, its typed refusal and
 findings are kept,
 and the daemon runs without it. Nothing here is a containment boundary: a loaded plugin is
 ordinary Python in the daemon's process and uid (``plugin_security/README.md``).
@@ -68,7 +73,7 @@ from recursion_core.plugin_security import (ApprovalGate, Authority, CoreHealth,
                                             PluginLoader, Refused, ReservedEffects, TrustStore,
                                             create_revocation_store)
 from recursion_core.plugin_security.manifest import MAX_MANIFEST_BYTES, PERMISSIONS_V1, developer_key_id_ok
-from recursion_core.plugin_security.package import verify_package
+from recursion_core.plugin_security.package import package_changes, verify_package
 from recursion_core.plugin_security.signing import backend_available
 
 from .breaker import STORE_DIR
@@ -102,6 +107,16 @@ OPERATOR_TIMED_OUT = 'unavailable: operator plugin timed out'
 # files are digest-checked by verify_package; whatever else plugin.py imports runs under the
 # same grant.
 UNVERIFIED_IMPORTS = 'plugin_imported_unverified_modules'
+# The plugin's own package (``from . import x``) is served from the verified bytes and is not
+# reported here; a module from outside it is.
+PACKAGE_CHANGED = 'package_changed_while_checked'
+PACKAGE_CHANGED_TEXT = ("the plugin's files changed while they were being checked (%d path(s) differ, the first: %s), "
+                        "so nothing of it was loaded and none of its code ran: install the plugin again from its "
+                        "source, then load it again.")
+PATH_READS_NOT_COVERED = ("not covered: a file this plugin opens by its path while it runs is read from disk, not "
+                          "from the verified package, and its signature says nothing about it; its code (plugin.py "
+                          "and every listed module it imports from its own package) and what it reads through "
+                          "importlib.resources come from the bytes that were verified")
 # Not reported: the daemon's own package and its signature backend, whose submodules the host's
 # own signature check can import for the first time while a plugin loads.
 _HOST_PACKAGES = frozenset({'recursion_core', 'cryptography'})
@@ -156,16 +171,19 @@ def _first_imports(before, own=None):
     """Non-stdlib modules in ``sys.modules`` now that were not in ``before``, sorted.
 
     Left out: the standard library (top-level name in ``sys.stdlib_module_names``), the host's
-    packages (``_HOST_PACKAGES``), the plugin's own module object ``own`` under any name, and a
-    submodule whose parent package is itself listed (the package's entry covers it). A module that
-    was already imported before the load is not listed: its code did not first run for this plugin.
+    packages (``_HOST_PACKAGES``), the plugin's own module object ``own`` under any name, the
+    modules of ``own``'s package (served from its verified bytes), and a submodule whose parent
+    package is itself listed (the package's entry covers it). A module that was already imported
+    before the load is not listed: its code did not first run for this plugin.
 
     A finding, not a control: it reads names. A module named like a standard-library one, an import
     the plugin removes from ``sys.modules`` again, and an import made later inside a call are not
     seen, and an import made by another daemon thread during the load is attributed to this plugin.
     """
+    inside = getattr(own, '__name__', None) if getattr(own, '__path__', None) is not None else None
     fresh = {name for name, module in list(sys.modules.items())
              if name not in before and module is not None and module is not own
+             and not (inside and name.startswith(inside + '.'))
              and name.partition('.')[0] not in sys.stdlib_module_names
              and name.partition('.')[0] not in _HOST_PACKAGES}
     return sorted(name for name in fresh
@@ -197,6 +215,11 @@ def _read_owned(path, limit, *, missing_ok=False):
             return handle.read(limit + 1)
     finally:
         os.close(fd)
+
+
+def _shown_paths(paths):
+    """How many paths differ, and the first of them as plain ASCII, for PACKAGE_CHANGED_TEXT."""
+    return len(paths), ascii(paths[0])[1:-1] if paths else '-'
 
 
 def _owned_directory(path):
@@ -379,19 +402,23 @@ class PluginHost:
                 if absent is None:
                     raise _package_refusal(exc) from None
                 raise Refused(absent[-1]['code'], absent[-1]['detail']) from None
+            # A file changed while it was read and checked, or since: nothing of it is loaded.
+            changed = verified.changed_while_checked or package_changes(source, verified)
+            if changed:
+                raise PluginRefused(PACKAGE_CHANGED, PACKAGE_CHANGED_TEXT % _shown_paths(changed))
             # The entry file's own mismatch stays the loader's artifact_digest_mismatch. Every other
             # changed, added or missing file is not accepted as signed: the signature is withheld.
-            # A version-1 package whose trusted signature lists a file that is not a regular file in
-            # this folder is refused package_file_missing, by the loader's own presence check.
-            artifact = verified.files.get(ARTIFACT)
-            if artifact is None:
-                artifact = _read_owned(source / ARTIFACT, MAX_ARTIFACT_BYTES, missing_ok=True)
+            # A version-1 package whose trusted signature lists a file that is not among its
+            # verified files is refused package_file_missing, by the loader's own presence check.
+            # plugin.py is never read again: its bytes are the ones verify_package read.
+            artifact = verified.files.get(ARTIFACT, verified.entry)
             if verified.missing:
-                absent = self._absent_listed_file(source, verified.manifest.raw, verified.signature, artifact)
+                absent = self._absent_listed_file(source, verified.manifest.raw, verified.signature, artifact,
+                                                  package=verified)
                 if absent is not None:
                     raise Refused(absent[-1]['code'], absent[-1]['detail'])
             signature = verified.signature if verified.intact else None
-            loaded = self.loader.load(verified.manifest.raw, signature, artifact, package_dir=source)
+            loaded = self.loader.load(verified.manifest.raw, signature, artifact, package=verified)
         except (PluginRefused, Refused) as exc:
             if absent is not None:
                 findings = list(absent[:-1])
@@ -408,7 +435,9 @@ class PluginHost:
         record.update(plugin_id=loaded.plugin_id, state='loaded', code=None, trust=loaded.trust,
                       signer_key_id=loaded.signer_key_id, registry_label=loaded.registry_label,
                       permissions=list(loaded.permissions), artifact_sha256=loaded.artifact_sha256,
-                      findings=list(loaded.findings), provides=[], containment='in process, same uid: not contained')
+                      findings=list(loaded.findings), provides=[], containment='in process, same uid: not contained',
+                      package_sha256=verified.files_sha256, loaded_sha256=loaded.files_sha256,
+                      path_reads=PATH_READS_NOT_COVERED)
         self._verified[loaded.plugin_id] = verified
         if not verified.intact:
             record['findings'].append(_finding(
@@ -422,12 +451,13 @@ class PluginHost:
                  loaded.plugin_id, loaded.trust, ','.join(loaded.permissions) or '-', ','.join(record['provides']) or '-')
         return record
 
-    def _absent_listed_file(self, source, *read):
+    def _absent_listed_file(self, source, *read, package=None):
         """The loader's findings when a trusted signature lists a file that is not a regular file in
         ``source``, ending in its ``package_file_missing`` refusal; otherwise None.
 
         ``read`` is (manifest bytes, signature, entry bytes or None). With none given (``verify_package``
         refused), they are read here, and a file that cannot be read leaves that refusal standing.
+        With ``package`` (the ``verify_package`` result) presence is looked up in its verified files.
         ``doctor`` runs verify and admit only: no plugin code runs and nothing is loaded.
         """
         if not read:
@@ -439,7 +469,10 @@ class PluginHost:
                 return None
             signature = None if signature is None else signature.decode('ascii', 'replace').strip()
             read = (manifest, signature, artifact)
-        findings = self.loader.doctor(*read, package_dir=source)
+        if package is not None:
+            findings = self.loader.doctor(*read, package=package)
+        else:
+            findings = self.loader.doctor(*read, package_dir=source)
         if findings and (findings[-1]['code'], findings[-1]['severity']) == ('package_file_missing', 'refuse'):
             return findings
         return None
@@ -519,7 +552,8 @@ class PluginHost:
         return {'plugins': plugins, 'verification': self.verification, 'core_poisoned': self.health.poisoned,
                 'authority_profile': self.authority_state, 'approvals_drawn': len(self.pending_approvals),
                 'approval_surface': 'none: no surface can approve or veto yet, so no effect is authorized',
-                'containment': 'none: plugins run in the daemon process and uid'}
+                'containment': 'none: plugins run in the daemon process and uid',
+                'path_reads': PATH_READS_NOT_COVERED}
 
     def route_records(self):
         """The plugin rows of the GUI's inventory: what loaded, what was refused and why."""
@@ -527,7 +561,8 @@ class PluginHost:
         for record in self.records:
             name = record['plugin_id'] or Path(record['source']).name
             if record['state'] == 'loaded':
-                note = 'loaded %s; permissions: %s; provides: %s; in process, not contained' % (
+                note = ('loaded %s; permissions: %s; provides: %s; in process, not contained; files it opens by '
+                        'path are not covered by its signature') % (
                     record['trust'], ', '.join(self.loader.permissions(record['plugin_id'])) or 'none',
                     ', '.join(record['provides']) or 'nothing')
                 degraded = self._degraded_fields(record['plugin_id'])
@@ -632,6 +667,8 @@ class PluginHost:
         return 504, {'error': OPERATOR_TIMED_OUT}
 
     def close(self):
+        if self.loader is not None:
+            self.loader.close()
         for item in (self.authority, self._trust):
             if item is not None:
                 item.close()

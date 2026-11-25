@@ -101,8 +101,111 @@ _LIST_RESULT_KEYS = ('status', 'code', 'detail')
 
 
 def _wire_size(value):
-    """Bytes ``value`` takes in a control frame (``framing.encode_frame``'s JSON settings)."""
-    return len(json.dumps(value, separators=(',', ':'), ensure_ascii=False, default=str).encode('utf-8'))
+    """Bytes ``value`` takes with the control frame's JSON separators.
+
+    ``surrogatepass`` counts a lone surrogate instead of raising, and a non-finite float is
+    counted as its dump text. ``framing.encode_frame`` refuses both, so a route result is
+    rewritten with ``_frame_scalar`` before an answer carries it. Other text keeps the same
+    length as a strict UTF-8 encode.
+    """
+    return len(json.dumps(value, separators=(',', ':'), ensure_ascii=False, default=str).encode(
+        'utf-8', 'surrogatepass'))
+
+
+def _frame_scalar(value):
+    """A value ``framing.encode_frame`` can send. ``value`` itself is not changed.
+
+    A lone surrogate code point becomes one U+FFFD. A non-finite float becomes None.
+    A list, a tuple or an object is walked. When nothing needs that, ``value`` is returned
+    as it stands, so a clean result stays the same object.
+
+    Two object keys can frame to one text (two keys that differ only in lone surrogates, or
+    a lone surrogate and a key that already holds U+FFFD). Every member stays on the answer: a key
+    that was not rewritten keeps its name, and a rewritten key that meets a name already
+    taken gets a counted mark, ``~2``, then ``~3``, until the name is free.
+
+    The walk is an explicit stack. A call per nesting level raised ``RecursionError``
+    out of ``run.list`` on a result the frame encoder can send.
+    """
+    def frame_text(text):
+        if any('\ud800' <= char <= '\udfff' for char in text):
+            return ''.join('\ufffd' if '\ud800' <= char <= '\udfff' else char for char in text)
+        return text
+
+    if isinstance(value, str):
+        return frame_text(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if not isinstance(value, (dict, list, tuple)):
+        return value
+
+    # ``pending`` stops a cyclic object from walking forever. A repeated object is left as it is.
+    framed = {}
+    pending = set()
+    stack = [('visit', value)]
+    while stack:
+        kind, node = stack.pop()
+        if kind == 'visit':
+            if id(node) in framed:
+                continue
+            if isinstance(node, str):
+                framed[id(node)] = frame_text(node)
+            elif isinstance(node, float):
+                framed[id(node)] = node if math.isfinite(node) else None
+            elif isinstance(node, dict):
+                if id(node) in pending:
+                    framed[id(node)] = node
+                    continue
+                pending.add(id(node))
+                stack.append(('dict', node))
+                for key, item in node.items():
+                    stack.append(('visit', item))
+                    if isinstance(key, str):
+                        stack.append(('visit', key))
+            elif isinstance(node, (list, tuple)):
+                if id(node) in pending:
+                    framed[id(node)] = node
+                    continue
+                pending.add(id(node))
+                stack.append(('seq', node))
+                for item in node:
+                    stack.append(('visit', item))
+            else:
+                framed[id(node)] = node
+        elif kind == 'dict':
+            pending.discard(id(node))
+            changed = False
+            for key, item in node.items():
+                new_key = framed[id(key)] if isinstance(key, str) else key
+                new_item = framed[id(item)]
+                if new_key is not key or new_item is not item:
+                    changed = True
+                    break
+            if not changed:
+                framed[id(node)] = node
+                continue
+            out = {}
+            kept = {key for key in node if isinstance(key, str) and framed[id(key)] is key}
+            for key, item in node.items():
+                new_key = framed[id(key)] if isinstance(key, str) else key
+                if new_key is not key:
+                    base, count = new_key, 1
+                    while new_key in out or new_key in kept:
+                        count += 1
+                        new_key = f'{base}~{count}'
+                out[new_key] = framed[id(item)]
+            framed[id(node)] = out
+        else:
+            pending.discard(id(node))
+            changed = False
+            built = []
+            for item in node:
+                new_item = framed[id(item)]
+                if new_item is not item:
+                    changed = True
+                built.append(new_item)
+            framed[id(node)] = node if not changed else type(node)(built)
+    return framed[id(value)]
 
 
 def _fit_chars(short, key, *, force=False):
@@ -258,6 +361,25 @@ def _clear_result_temp(tmp):
         os.rmdir(tmp)
 
 
+def _discard_opened_result_temp(tmp):
+    """Remove a result temp this write opened, after that write failed.
+
+    A regular file or a symlink is unlinked. A directory is left in place, so a
+    planted directory and its entries stay. The result stays in memory either way.
+    A failure to remove the temp does not replace that in-memory result.
+    """
+    try:
+        info = os.lstat(tmp)
+    except OSError:
+        return
+    if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+        return
+    try:
+        os.unlink(tmp)
+    except OSError:
+        return
+
+
 # -- registry ------------------------------------------------------------------------------------
 class ControlRecordInvalid(ValueError):
     """A stored control record is not a JSON object for the run it is filed under."""
@@ -306,13 +428,23 @@ class RoutesUnreadable(Exception):
     pass
 
 
+def _json_object(pairs):
+    """One JSON object. A key that appears twice is refused, at whatever depth it sits."""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise RoutesUnreadable('routes file has a repeated member')
+        obj[key] = value
+    return obj
+
+
 def load_routes(path):
     """Read the operator's route file: ``{"routes": {"<engine>": {...}}}``, or {} when there is none.
 
     Each entry is the route part of a ``recursion.route/v0`` request (model, connection, and the
     engine's own fields) plus ``deadline_s`` and an optional absolute ``binary``. Nothing is
-    defaulted: an engine with no entry cannot be started. The file must be a regular file of
-    ours that no one else can write.
+    defaulted: an engine with no entry cannot be started. A repeated key in any object is refused.
+    The file must be a regular file of ours that no one else can write.
     """
     require_launcher_platform()  # the owner check below needs a uid
     path = Path(path)
@@ -323,8 +455,8 @@ def load_routes(path):
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
         raise RoutesUnreadable('routes file must be an operator-owned regular file, not group/other writable')
     try:
-        data = json.loads(path.read_text(encoding='utf-8'))
-    except (OSError, ValueError) as exc:
+        data = json.loads(path.read_text(encoding='utf-8'), object_pairs_hook=_json_object)
+    except (OSError, ValueError, RecursionError) as exc:
         raise RoutesUnreadable(f'routes file unreadable: {type(exc).__name__}') from None
     routes = data.get('routes') if isinstance(data, dict) else None
     if not isinstance(routes, dict):
@@ -549,7 +681,7 @@ class RouteStarter:
                     try:
                         result = self._service.handle(request)
                     except Exception as exc:  # noqa: BLE001 - a route bug must not leave the start waiting
-                        log.exception('route request for %s failed', ctx.run_id)
+                        log.error('route request for %s failed (%s)', ctx.run_id, type(exc).__name__)
                         result = route_contract.result(ctx.run_id, route_contract.ENGINE_ERROR,
                                                        detail=f'route failure: {type(exc).__name__}')
                     except BaseException as exc:  # an interrupt or SystemExit from the callback (E34)
@@ -626,21 +758,27 @@ class RouteStarter:
                 log.error('handles for %s stayed open after an interrupt', ctx.run_id)
 
     def _record_result(self, run_id, result):
+        tmp = None
+        opened = False
         try:
             path = self._state / 'runs' / run_id / 'result.json'
             tmp = path.with_name('result.json.tmp')
             # A stale or planted file is replaced: opening a FIFO here would wait for a reader.
             # An empty planted directory is removed too. The result is durable only when this write
-            # succeeds; otherwise it is kept in memory.
+            # succeeds; otherwise it is kept in memory. A temp this write opened is removed on that
+            # failure when it is a regular file or a symlink. A directory at that name is left.
             _clear_result_temp(tmp)
             fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            opened = True
             with os.fdopen(fd, 'w', encoding='utf-8') as handle:
                 json.dump(result, handle, sort_keys=True)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, path)
-        except (OSError, TypeError, ValueError):
-            log.exception('route result for %s was not written', run_id)
+        except (OSError, TypeError, ValueError) as exc:
+            log.error('route result for %s was not written (%s)', run_id, type(exc).__name__)
+            if opened:
+                _discard_opened_result_temp(tmp)
             with self._lock:
                 self.results[run_id] = result
 
@@ -655,8 +793,8 @@ class RouteStarter:
                 try:
                     if self._daemon.reconcile(ctx.run_id).state in TERMINAL:
                         return
-                except Exception:  # noqa: BLE001
-                    log.exception('observing %s after its result failed', ctx.run_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.error('observing %s after its result failed (%s)', ctx.run_id, type(exc).__name__)
                     break
                 time.sleep(0.2)
             process.fence(reason)
@@ -805,8 +943,8 @@ class DaemonControl:
             return self.daemon.registry.get(run_id)
         except KeyError:
             return None
-        except Exception:  # noqa: BLE001 - an unreadable registry is reported, never guessed around
-            log.exception('daemon registry read for %s failed', run_id)
+        except Exception as exc:  # noqa: BLE001 - an unreadable registry is reported, never guessed around
+            log.error('daemon registry read for %s failed (%s)', run_id, type(exc).__name__)
             return False
 
     def _observe(self, run, *, full):
@@ -826,6 +964,9 @@ class DaemonControl:
                 run['state'] = {'terminated': ENDED, 'lost_reboot': LOST_REBOOT}.get(row.state, 'unknown')
         result = self._result(run_id) if isinstance(run_id, str) else None
         if result is not None:
+            # Counted surrogates still sit in the answer. The frame encode refuses them, and a
+            # non-finite float, and the socket worker does not turn that into an error reply.
+            result = _frame_scalar(result)
             run['result'] = _status_result(result) if full else {k: result.get(k) for k in ('status', 'code', 'detail')}
         if full and isinstance(run_id, str):
             # run.status carries the tail of the engine's stdout, so every surface that can read a
@@ -856,13 +997,18 @@ class DaemonControl:
             with _open_regular(self._state / 'runs' / run_id / 'stdout.jsonl') as handle:
                 size = os.fstat(handle.fileno()).st_size
                 start = max(0, size - OUTPUT_TAIL_BYTES)
+                # A nonzero start is mid-line unless the byte just before the window is a newline.
+                aligned = not start
+                if start:
+                    handle.seek(start - 1)
+                    aligned = handle.read(1) == b'\n'
                 handle.seek(start)
                 data = handle.read(OUTPUT_TAIL_BYTES)
         except FileNotFoundError:
             return None  # the run never reached a launch
         except OSError as exc:
             return {'unavailable': type(exc).__name__}
-        if start:  # the window opens mid-line: drop the partial first line
+        if start and not aligned:  # mid-line: drop the partial first line; a line start is kept
             data = data[data.find(b'\n') + 1:] if b'\n' in data else b''
         cut = data.rfind(b'\n')
         whole = data if not live else data[:cut + 1]  # a last line with no newline is complete once the engine is gone

@@ -17,9 +17,12 @@ later work):
 * ``answer_call(message, handlers)``: the receiving side of a ``call``. A reserved name is refused
   ``call_reserved`` and an unknown one ``call_unknown`` before any handler is looked up, so nothing
   runs; a name on the list whose arguments are not exactly its own is refused ``call_args_invalid``.
-  ``call`` and ``result`` travel both ways: the daemon calls a plugin's function by name, and a
-  plugin's host calls a broker handle by name (every reserved call name is one of those, so a
+  ``call`` and ``result`` are defined both ways: the daemon is to call a plugin's function by name,
+  and a plugin's host calls a broker handle by name (every reserved call name is one of those, so a
   reserved name arriving at the daemon is refused ``call_reserved`` before any other check of it).
+  What is true AT THIS HEAD: the daemon's end sends no call (``DaemonEnd`` has no call of its own);
+  the daemon's own call of a plugin's function through this channel is later work, and until it is
+  built ``daemon/plugins.py`` calls those functions in its own process.
 * ``DaemonEnd``: the daemon's side of one channel, opened for ONE loaded plugin. The caller of every
   ``core`` message is that plugin, bound once from ``CoreService.client_for``; nothing in a message
   can name another, and a ``core`` message that tries is refused ``caller_forged`` before the core
@@ -27,6 +30,17 @@ later work):
   core's. ``DaemonEnd.load`` sends a load only for that plugin.
 * ``HostEnd``: the host's side of one channel: it answers the daemon's calls and takes a ``result``
   only for an id it called.
+* The order of a channel, held by both ends alike: a ``bye`` ends the channel at any time, also
+  before the ``hello``; after a ``bye`` every later message is refused ``message_invalid`` and the end
+  that took it sends nothing more (``HostEnd.call`` and ``DaemonEnd.load`` raise ``ValueError``); a
+  second ``hello`` is refused ``message_invalid``. These two ends make no other message wait for the
+  ``hello``; whether a program above an end takes a message that comes before it is that program's own rule.
+* Threads: one end may be used from several threads at once. What an end keeps (the next call id,
+  the table of open calls, whether a ``hello`` or a ``bye`` came) is under ONE lock of that end, in
+  ``call``, ``load`` and ``receive``. No plugin function and no core request runs while the lock is
+  held, so a handler that calls on its own end never waits on it.
+* ``receive`` keeps the message it is handed, without a copy: the caller hands the message over and
+  does not change it afterwards. ``decode`` makes a new object for every frame it reads.
 * Frame size: a ``load`` frame (daemon to host only) may be as large as the daemon's largest package
   needs (``MAX_LOAD_FRAME_BYTES``, computed from the package sizes in ``limits.py``, which the
   daemon reads); every other
@@ -40,6 +54,7 @@ import base64
 import binascii
 import json
 import re
+import threading
 from typing import Any, Callable, Mapping
 
 from recursion_core.control_transport.errors import FrameError
@@ -82,7 +97,9 @@ RESERVED_CALL_NAMES = ("run.request", "computer.open", "computer.act", "computer
                        "net.request", "net.connect")
 RESERVED_MESSAGE_TYPES = ("event", "guard", "surface.update")
 RESERVED_RUN_ORIGINS = ("trigger", "agent", "packet")
-# Every function the daemon calls on a plugin -> (message, call name). host.v1.json x-inventory.
+# Every function daemon/plugins.py calls on a plugin today, in the daemon's own process -> the message that
+# is to carry it once the daemon calls through this channel, and its call name. host.v1.json x-inventory.
+# At this head no end here sends these calls: the daemon's own call through the channel is later work.
 INVENTORY: dict[str, tuple[str, str | None]] = {
     "registry": ("call", "registry"),
     "operator": ("call", "operator"),
@@ -105,6 +122,14 @@ _PLUGIN_ID_MAX = 64
 _PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*")
 # Fields a core message might use to name a caller. None is ever read: naming one is a forgery.
 _CALLER_FIELDS = frozenset({"caller", "plugin_id", "principal", "plugin", "owner"})
+# The words a person reads when the channel's order stops something (module header).
+_ENDED = "the channel ended with a bye: no message after it is taken; open a new channel to go on"
+_ENDED_SEND = "the channel ended with a bye: nothing more is sent on it; open a new channel to go on"
+_SECOND_HELLO = "hello: this channel's hello came already; each side sends one hello, first"
+_IDS_USED = (f"every call id up to {MAX_ID} is used on this channel, so no call is made; "
+             "open a new channel to call again")
+_SYSTEM_EXIT = ("SystemExit: the plugin's function tried to end the host process; the call is refused and the "
+                "host goes on. A plugin's function returns a value or raises an exception; it never ends the process.")
 
 
 def _b64_len(size: int) -> int:
@@ -120,9 +145,18 @@ MAX_LOAD_FRAME_BYTES = _b64_len(MAX_MANIFEST_BYTES) + _b64_len(MAX_ARTIFACT_BYTE
 
 
 class ChannelRefusal(Exception):
-    """A typed refusal on the channel: ``code`` is one of ``REFUSAL_CODES``."""
+    """A typed refusal on the channel: ``code`` is one of ``REFUSAL_CODES``.
+
+    A refusal of ours is made only with a code on that list: any other code is a ``ValueError`` here, so
+    no end sends a word the schema does not define. A refusal that ARRIVES with a code not on the list is
+    still read as a refusal (``check_message`` holds only the code's form): a newer peer may know a newer
+    code, and the list is append-only.
+    """
 
     def __init__(self, code: str, detail: str = "") -> None:
+        if type(code) is not str or code not in REFUSAL_CODES:
+            raise ValueError(f"{code!r} is not a refusal code of {CHANNEL}: a refusal is made only with one of "
+                             "REFUSAL_CODES (host.v1.json x-refusal-codes)")
         super().__init__(f"{code}: {detail}" if detail else code)
         self.code, self.detail = code, detail
 
@@ -276,13 +310,38 @@ def refusal(message: object, exc: ChannelRefusal) -> dict:
     return {"type": "refusal", "id": _id_of(message), "code": exc.code, "detail": exc.detail[:1000]}
 
 
+def _not_json(value: object) -> str | None:
+    """None when ``value`` can be written as a frame's JSON (as ``framing.encode_frame`` writes it), else
+    the name of what cannot be."""
+    found: list[str] = []
+
+    def default(obj: object) -> object:
+        found.append(type(obj).__name__)
+        raise TypeError("not JSON")
+
+    try:
+        json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False, default=default).encode("utf-8")
+    except UnicodeEncodeError:
+        return "str (it holds a lone surrogate)"
+    except RecursionError:
+        return "a value nested too deep"
+    except TypeError:
+        return found[0] if found else "dict (a key that is not text, a number, true, false or null)"
+    except ValueError as exc:
+        return "a value that holds itself" if "ircular" in str(exc) else "float (NaN or infinity)"
+    return None
+
+
 def answer_call(message: dict, handlers: Mapping[str, Callable[..., Any]]) -> dict:
     """The receiving side's answer to one checked ``call`` message: a ``result`` or a ``refusal``.
 
     ``handlers`` maps a call name to the plugin function that answers it. A reserved name and a name
     not on the list are refused before ``handlers`` is looked at, so nothing runs; so is a name on the
     list whose arguments are not exactly its own. A handler that raises is ``call_failed``, naming
-    only the exception's type.
+    only the exception's type. A handler that raises ``SystemExit`` (it tried to end the host process)
+    is ``call_failed`` too, with words that say so, and the host goes on; ``KeyboardInterrupt`` still
+    passes. A handler whose value cannot be written as JSON (a set, bytes, a date, NaN) is
+    ``call_failed`` naming the value's type, so the sending loop never meets it.
     """
     name, args = message["name"], message["args"]
     try:
@@ -297,14 +356,55 @@ def answer_call(message: dict, handlers: Mapping[str, Callable[..., Any]]) -> di
             raise ChannelRefusal("call_not_offered", name)
         try:
             value = handler(*(args[arg] for arg in CALL_NAMES[name]))
+        except SystemExit:
+            raise ChannelRefusal("call_failed", _SYSTEM_EXIT) from None
         except Exception as exc:  # noqa: BLE001 - the plugin's failure is answered typed, never guessed around
             raise ChannelRefusal("call_failed", type(exc).__name__) from None
+        problem = _not_json(value)
+        if problem is not None:
+            raise ChannelRefusal("call_failed", f"{problem}: the function returned a value that cannot be written as "
+                                 "JSON; a call returns plain JSON (objects with text keys, lists, text, finite "
+                                 "numbers, true, false, null)")
     except ChannelRefusal as exc:
         return refusal(message, exc)
     return {"type": "result", "id": message["id"], "value": value}
 
 
-class DaemonEnd:
+class _Order:
+    """What both ends hold alike: the channel's order and the one lock of an end (module header)."""
+
+    def __init__(self, receiver: str) -> None:
+        self._receiver, self._lock, self._hello, self._ended = receiver, threading.Lock(), False, False
+
+    def _take(self, message: object, settle: Callable[[dict], None] | None = None) -> dict | None:
+        """``message`` checked and taken in the channel's order, or ``ChannelRefusal``.
+
+        ``None`` for a ``hello`` or a ``bye`` (nothing to answer). After a ``bye`` every message is refused,
+        whatever its form. ``settle(checked)`` runs under the end's lock for every other message.
+        """
+        try:
+            checked, form = check_message(message, receiver=self._receiver), None
+        except ChannelRefusal as exc:
+            checked, form = None, exc
+        with self._lock:
+            if self._ended:
+                raise ChannelRefusal("message_invalid", _ENDED)
+            if form is not None:
+                raise form
+            if checked["type"] == "bye":
+                self._ended = True
+                return None
+            if checked["type"] == "hello":
+                if self._hello:
+                    raise ChannelRefusal("message_invalid", _SECOND_HELLO)
+                self._hello = True
+                return None
+            if settle is not None:
+                settle(checked)
+        return checked
+
+
+class DaemonEnd(_Order):
     """The daemon's side of the channel of one loaded plugin.
 
     ``core`` is the core service (``CoreService``); its client is taken once, here, for
@@ -314,29 +414,47 @@ class DaemonEnd:
     rest (``hello``, ``refusal``, ``bye``). The daemon offers no call of its own in this release: a
     host's call is ``call_reserved``, ``call_unknown`` or ``call_not_offered``, and nothing runs. This
     end sends no call either, so every ``result`` is for an id it never called and is refused
-    ``message_invalid``, as at a host.
+    ``message_invalid``, as at a host. The channel's order (``bye``, a second ``hello``) and the one lock
+    are as the module header says; the core request runs outside the lock.
     """
 
     def __init__(self, plugin_id: str, core: Any) -> None:
         if type(plugin_id) is not str or not _PLUGIN_ID.fullmatch(plugin_id) or plugin_id == HOST:
             raise ValueError("a plugin host's channel is opened for one plugin id, never for the host")
+        super().__init__("daemon")
         self.plugin_id = plugin_id
         self._core = core.client_for(plugin_id)
 
     def load(self, plugin_id: str, manifest: bytes, files: Mapping[str, bytes]) -> bytes:
         """The frame of one ``load`` for this channel's plugin; any other plugin id is refused (one channel
-        per loaded plugin), and a package that does not fit one load frame is ``load_too_large``."""
+        per loaded plugin). The channel holds the package sizes itself: a manifest over ``MAX_MANIFEST_BYTES``
+        or a file over ``MAX_ARTIFACT_BYTES`` is ``load_too_large`` before any frame is built, and so is a
+        package that does not fit one load frame. After a ``bye`` nothing is sent (``ValueError``)."""
         if plugin_id != self.plugin_id:
             raise ValueError("one channel per loaded plugin: a load names the plugin the channel was opened for")
+        with self._lock:
+            if self._ended:
+                raise ValueError(_ENDED_SEND)
+        if len(manifest) > MAX_MANIFEST_BYTES:
+            raise ChannelRefusal("load_too_large", f"the manifest holds {len(manifest)} bytes; a manifest holds at most "
+                                 f"{MAX_MANIFEST_BYTES} (MAX_MANIFEST_BYTES), so no load is sent")
+        for path, data in files.items():
+            if len(data) > MAX_ARTIFACT_BYTES:
+                raise ChannelRefusal("load_too_large", f"the file {str(path)[:512]!r} holds {len(data)} bytes; a package "
+                                     f"file holds at most {MAX_ARTIFACT_BYTES} (MAX_ARTIFACT_BYTES), so no load is sent")
         message = {"type": "load", "plugin_id": plugin_id, "manifest_b64": base64.b64encode(manifest).decode("ascii"),
                    "files": {path: base64.b64encode(data).decode("ascii") for path, data in files.items()}}
         return encode(check_message(message, receiver="host"))
 
     def receive(self, message: object) -> dict | None:
+        """The answer to one message from the host, or ``None``. The caller hands ``message`` over: it is kept
+        as it is, without a copy, and the caller does not change it afterwards."""
         try:
-            checked = check_message(message, receiver="daemon")
+            checked = self._take(message)
         except ChannelRefusal as exc:
             return refusal(message, exc)
+        if checked is None:
+            return None
         if checked["type"] == "call":
             return answer_call(checked, {})
         if checked["type"] == "result":
@@ -348,36 +466,52 @@ class DaemonEnd:
         return {"type": "core", "id": checked["id"], "bytes_b64": base64.b64encode(answer).decode("ascii")}
 
 
-class HostEnd:
+class HostEnd(_Order):
     """The host's side of one channel.
 
     ``handlers`` maps a call name to the plugin function that answers it. ``call`` makes a call the host
-    sends the daemon (a broker handle by name, once one is built) and keeps its id open; ``receive``
-    answers a daemon ``call`` through ``answer_call`` and takes a ``result`` only for an id it has open:
-    a result for an id this host never called, or one already answered, is refused. What an open call
-    got back (its ``result`` or ``refusal``) is kept in ``answers`` under its id.
+    sends the daemon (a broker handle by name, once one is built) and keeps its id open; an id past
+    ``MAX_ID`` is never handed out (``ValueError``). ``receive`` answers a daemon ``call`` through
+    ``answer_call`` and takes a ``result`` only for an id it has open: a result for an id this host never
+    called, or one already answered, is refused. What an open call got back (its ``result`` or
+    ``refusal``) is kept in ``answers`` under its id. At this head this end drops a ``core`` answer and a
+    ``load``: ``receive`` checks them and returns ``None``, and nothing of them is kept; the host program
+    above this end takes them. The channel's order (``bye``, a second ``hello``) and the one lock are as
+    the module header says; a handler runs outside the lock.
     """
 
     def __init__(self, handlers: Mapping[str, Callable[..., Any]]) -> None:
+        super().__init__("host")
         self._handlers, self._open, self._next_id = handlers, set(), 0
         self.answers: dict[int, dict] = {}
 
     def call(self, name: str, args: Mapping[str, Any] | None = None) -> dict:
-        message = {"type": "call", "id": self._next_id, "name": name, "args": dict(args or {})}
-        self._open.add(self._next_id)
-        self._next_id += 1
-        return message
+        with self._lock:
+            if self._ended:
+                raise ValueError(_ENDED_SEND)
+            if self._next_id > MAX_ID:
+                raise ValueError(_IDS_USED)
+            id_ = self._next_id
+            self._next_id += 1
+            self._open.add(id_)
+        return {"type": "call", "id": id_, "name": name, "args": dict(args or {})}
 
-    def receive(self, message: object) -> dict | None:
-        try:
-            checked = check_message(message, receiver="host")
-            if checked["type"] == "call":
-                return answer_call(checked, self._handlers)
-            if checked["type"] == "result" and checked["id"] not in self._open:
-                raise ChannelRefusal("message_invalid", f"result: id {checked['id']} answers no call this host sent")
-        except ChannelRefusal as exc:
-            return refusal(message, exc)
+    def _settle(self, checked: dict) -> None:
+        """Under the end's lock: a result or a refusal for an open call is taken, and only once."""
+        if checked["type"] == "result" and checked["id"] not in self._open:
+            raise ChannelRefusal("message_invalid", f"result: id {checked['id']} answers no call this host sent")
         if checked["type"] in ("result", "refusal") and checked["id"] in self._open:
             self._open.discard(checked["id"])
             self.answers[checked["id"]] = checked
+
+    def receive(self, message: object) -> dict | None:
+        """The answer to one message from the daemon, or ``None``. The caller hands ``message`` over: it is
+        kept as it is, without a copy (``answers`` holds that very object), and the caller does not change it
+        afterwards."""
+        try:
+            checked = self._take(message, self._settle)
+        except ChannelRefusal as exc:
+            return refusal(message, exc)
+        if checked is not None and checked["type"] == "call":
+            return answer_call(checked, self._handlers)
         return None

@@ -4,6 +4,20 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `host.v1.json` is `1.0-draft.3` (2026-11-24)
+
+The root of the file now applies its seven message forms (`oneOf` over `$defs`): before, an outside
+validator pointed at the file accepted any value at all. The texts say what is true at this head: the
+daemon's end sends no call, and the daemon's own call of a plugin's function through the channel is later
+work. The channel's order is written down: a `bye` ends the channel at any time, also before the `hello`;
+after a `bye` every later message is refused `message_invalid`; a second `hello` is refused
+`message_invalid`. An id is a whole number written without a fraction; the schema cannot decide that, and
+says so. A refusal of ours uses only a listed code, while an arriving refusal with an unlisted code is
+still read as a refusal. `call_failed` also answers a function that tried to end the host process and a
+value that cannot be written as JSON; `load_too_large` also answers a manifest or a file over its own
+size. What it breaks: a value that matches none of the seven forms no longer validates at the root; no
+message definition changed.
+
 ## `host.v1.json` is `1.0-draft.2` (2026-11-18)
 
 `call` and `result` travel both ways: the daemon calls a plugin's function by name, and a plugin's host

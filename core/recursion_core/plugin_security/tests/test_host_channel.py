@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import ast
 import base64
+import datetime
 import json
+import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -22,6 +25,11 @@ from recursion_core.plugin_security.limits import ARTIFACT, MAX_ARTIFACT_BYTES, 
 from recursion_core.plugin_security import PROTOCOL, canonical, parse
 from recursion_core.plugin_security import host_channel as hc
 from recursion_core.plugin_security.tests.support import World, effect, needs_crypto
+
+try:
+    import jsonschema  # hosted CI installs it; the free-threaded interpreter has none
+except ImportError:  # pragma: no cover - the root's form is still held below without it
+    jsonschema = None
 
 REPO = Path(__file__).resolve().parents[4]
 SCHEMA = REPO / "schemas" / "plugin" / "v1" / "host.v1.json"
@@ -672,6 +680,378 @@ class RealCoreTests(unittest.TestCase):
         world.load()
         end = hc.DaemonEnd("demo.plugin", world.core)
         self.assertEqual(self.ask(end, "run.fault", run_id="run-1")["refusal"], {"code": "host_only"})
+
+
+def published_plugin_schemas() -> dict:
+    """Every schema of schemas/plugin/v1 by its file name, as an outside client reads them."""
+    folder = SCHEMA.parent
+    found = {}
+    for path in sorted(folder.glob("*.json")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "$schema" in data:
+            found[path.name] = data
+    return found
+
+
+def good_host_fixtures() -> list:
+    index = json.loads((FIXTURES / "index.json").read_text(encoding="utf-8"))["fixtures"]
+    return [row["file"] for row in index if row["file"].startswith("good/host.v1/")]
+
+
+class AtThisHeadTests(unittest.TestCase):
+    """The texts say what is true at this head: the daemon's end sends no call; its own call is later work."""
+
+    OLD = "the daemon calls a plugin's function by name"
+
+    def test_the_header_the_inventory_and_the_schema_say_the_daemon_sends_no_call_at_this_head(self):
+        s = schema()
+        texts = {"module header": " ".join(hc.__doc__.split()), "schema": s["description"],
+                 "inventory": s["x-inventory"]["about"], "call": s["$defs"]["call"]["description"]}
+        for where, text in texts.items():
+            with self.subTest(where=where):
+                self.assertNotIn(self.OLD, text)
+                self.assertIn("later work", text)
+        self.assertIn("What is true AT THIS HEAD: the daemon's end sends no call", texts["module header"])
+        self.assertIn("at this head the daemon's end sends no call", s["description"])
+        self.assertIn("at this head the daemon's end sends no call", s["x-inventory"]["about"])
+        source = Path(hc.__file__).read_text(encoding="utf-8")
+        self.assertIn("At this head no end here sends these calls", source)
+        self.assertEqual([name for name in dir(hc.DaemonEnd) if "call" in name.lower()], [])
+
+
+class WholeNumberIdTests(unittest.TestCase):
+    """An id written 1.0 is refused; the schema says a whole number has no fraction and that it cannot decide it."""
+
+    def test_an_id_with_a_fraction_is_refused_and_the_schema_says_why_it_cannot_decide(self):
+        cases = {"call": (call("registry", id_=1.0), "host"), "core": ({"type": "core", "id": 1.0, "bytes_b64": ""}, "daemon"),
+                 "result": ({"type": "result", "id": 1.0, "value": 1}, "host"),
+                 "refusal": ({"type": "refusal", "id": 1.0, "code": "call_unknown", "detail": ""}, "daemon")}
+        for kind, (message, receiver) in cases.items():
+            with self.subTest(kind=kind):
+                with self.assertRaises(hc.ChannelRefusal) as caught:
+                    hc.check_message(message, receiver=receiver)
+                self.assertEqual((caught.exception.code, caught.exception.detail), ("message_invalid", f"{kind}: id"))
+        decoded = hc.decode(b'{"type":"call","id":1.0,"name":"registry","args":{}}')
+        self.assertEqual(hc.HostEnd({"registry": lambda: 1}).receive(decoded)["code"], "message_invalid")
+        self.assertEqual(hc.check_message(call("registry", id_=1), receiver="host")["id"], 1)
+        text = schema()["$defs"]["id"]["description"]
+        self.assertIn("A whole number written without a fraction: 1, never 1.0.", text)
+        self.assertIn("JSON Schema cannot decide this", text)
+        self.assertIn("both ends refuse it 'message_invalid'", text)
+        if jsonschema is not None:
+            self.assertTrue(jsonschema.Draft202012Validator(schema()["$defs"]["id"]).is_valid(1.0))
+
+
+class PackageSizeTests(unittest.TestCase):
+    """The channel holds the package sizes itself: an oversize manifest or file is load_too_large before any frame."""
+
+    def assert_too_large(self, plugin_id, manifest, files, limit_name):
+        end = hc.DaemonEnd(plugin_id, FakeCore())
+        with self.assertRaises(hc.ChannelRefusal) as caught:
+            end.load(plugin_id, manifest, files)
+        self.assertEqual(caught.exception.code, "load_too_large")
+        self.assertIn(limit_name, caught.exception.detail)
+        self.assertIn("no load is sent", caught.exception.detail)
+
+    def test_a_manifest_over_its_size_is_load_too_large_though_the_frame_would_fit(self):
+        self.assert_too_large("demo.plugin", b"m" * (MAX_MANIFEST_BYTES + 1), {ARTIFACT: b""}, "MAX_MANIFEST_BYTES")
+        self.assert_too_large("demo.plugin", b"m" * (MAX_MANIFEST_BYTES + 1000), {ARTIFACT: b"x"}, "MAX_MANIFEST_BYTES")
+
+    def test_a_file_over_its_size_is_load_too_large_though_the_frame_would_fit(self):
+        self.assert_too_large("ab", b"m" * MAX_MANIFEST_BYTES, {ARTIFACT: b"x" * (MAX_ARTIFACT_BYTES + 45)},
+                              "MAX_ARTIFACT_BYTES")
+        self.assert_too_large("p" + "a" * 63, b"{}", {ARTIFACT: b"x" * (MAX_ARTIFACT_BYTES + 1)}, "MAX_ARTIFACT_BYTES")
+
+    def test_a_manifest_and_a_file_at_their_sizes_still_load(self):
+        end = hc.DaemonEnd("demo.plugin", FakeCore())
+        frame = end.load("demo.plugin", b"m" * MAX_MANIFEST_BYTES, {ARTIFACT: b"x"})
+        self.assertEqual(hc.decode(frame[4:], sender="daemon")["type"], "load")
+
+
+class SystemExitTests(unittest.TestCase):
+    """A handler that raises SystemExit is call_failed with words that say so; KeyboardInterrupt still passes."""
+
+    def test_a_handler_that_tries_to_end_the_process_is_answered_and_the_host_goes_on(self):
+        def leave():
+            raise SystemExit(7)
+        host = hc.HostEnd({"registry": leave, "surfaces": lambda: ["ok"]})
+        answer = host.receive(call("registry"))
+        self.assertEqual((answer["type"], answer["id"], answer["code"]), ("refusal", 7, "call_failed"))
+        self.assertIn("tried to end the host process", answer["detail"])
+        self.assertIn("the host goes on", answer["detail"])
+        self.assertEqual(host.receive(call("surfaces", id_=8)), {"type": "result", "id": 8, "value": ["ok"]})
+        self.assertIn("SystemExit", schema()["x-refusal-codes"]["call_failed"])
+
+    def test_keyboard_interrupt_still_passes(self):
+        def stop():
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            hc.HostEnd({"registry": stop}).receive(call("registry"))
+
+
+class RefusalCodeTests(unittest.TestCase):
+    """A refusal of ours is made only with a listed code; an arriving one with an unknown code stays as it is."""
+
+    def test_a_refusal_of_ours_cannot_carry_a_code_outside_the_list(self):
+        for code in ("not_a_real_code", "", None, "Call_Failed"):
+            with self.subTest(code=code):
+                with self.assertRaises(ValueError) as caught:
+                    hc.ChannelRefusal(code)
+                self.assertIn("REFUSAL_CODES", str(caught.exception))
+        for code in hc.REFUSAL_CODES:
+            with self.subTest(code=code):
+                self.assertEqual(hc.ChannelRefusal(code, "d").code, code)
+
+    def test_an_arriving_refusal_with_a_newer_code_is_still_read_and_the_schema_says_why(self):
+        newer = {"type": "refusal", "id": 0, "code": "a_code_of_a_later_release", "detail": ""}
+        self.assertEqual(hc.check_message(dict(newer), receiver="daemon"), newer)
+        host = hc.HostEnd({})
+        sent = host.call("net.request")
+        self.assertIsNone(host.receive(dict(newer, id=sent["id"])))
+        self.assertEqual(host.answers[sent["id"]]["code"], "a_code_of_a_later_release")
+        s = schema()
+        self.assertIn("a newer peer may know a newer code", s["description"])
+        self.assertIn("a newer peer may know a newer code", s["$defs"]["refusal"]["properties"]["code"]["description"])
+
+
+class NotJsonValueTests(unittest.TestCase):
+    """A handler's value that cannot be written as JSON is call_failed naming the type; sending never breaks."""
+
+    def test_a_value_that_is_not_json_is_call_failed_naming_its_type(self):
+        itself = []
+        itself.append(itself)
+        cases = [({1, 2}, "set"), (b"bytes", "bytes"), (datetime.date(2026, 11, 24), "date"),
+                 (float("nan"), "float"), (float("inf"), "float"), ({"k": [frozenset()]}, "frozenset"),
+                 ({(1, 2): 1}, "dict"), ("\ud800", "str"), (itself, "a value that holds itself")]
+        for value, named in cases:
+            with self.subTest(value=repr(value)[:40]):
+                answer = hc.HostEnd({"registry": lambda value=value: value}).receive(call("registry"))
+                self.assertEqual((answer["type"], answer["id"], answer["code"]), ("refusal", 7, "call_failed"))
+                self.assertTrue(answer["detail"].startswith(named), answer["detail"])
+                self.assertIn("cannot be written as JSON", answer["detail"])
+                self.assertEqual(hc.decode(hc.encode(answer)[4:]), answer)  # the sending loop goes on
+        good = hc.HostEnd({"registry": lambda: {"panels": [1, 2.5, "x", None, True]}}).receive(call("registry"))
+        self.assertEqual(hc.decode(hc.encode(good)[4:]), good)
+
+
+class OrderTests(unittest.TestCase):
+    """The channel's order, held by both ends alike: bye at any time ends it; nothing after it; one hello."""
+
+    def ends(self):
+        core = FakeCore()
+        return [("daemon", hc.DaemonEnd("demo.plugin", core), core), ("host", hc.HostEnd({"registry": lambda: 1}), core)]
+
+    def later_messages(self, side):
+        load = {"type": "load", "plugin_id": "demo.plugin", "manifest_b64": b64(b"{}"), "files": {ARTIFACT: b64(b"x")}}
+        common = [{"type": "hello", "channel": hc.CHANNEL}, call("registry"), {"type": "bye", "reason": "again"},
+                  {"type": "refusal", "id": 0, "code": "call_unknown", "detail": ""}, [], {"type": "telemetry"}]
+        return common + ([{"type": "core", "id": 1, "bytes_b64": b64(b"{}")}] if side == "daemon"
+                         else [{"type": "result", "id": 0, "value": 1}, load])
+
+    def test_a_bye_before_the_hello_ends_the_channel_and_every_later_message_is_refused(self):
+        for side, end, core in self.ends():
+            with self.subTest(side=side):
+                if side == "host":
+                    end.call("net.request")
+                self.assertIsNone(end.receive({"type": "bye", "reason": "stopping"}))
+                for message in self.later_messages(side):
+                    with self.subTest(side=side, message=message):
+                        answer = end.receive(message)
+                        self.assertEqual((answer["type"], answer["code"]), ("refusal", "message_invalid"))
+                        self.assertIn("ended with a bye", answer["detail"])
+                        self.assertIn("open a new channel", answer["detail"])
+                self.assertEqual(core.requests, [])
+                with self.assertRaises(ValueError) as caught:
+                    end.call("net.request") if side == "host" else end.load("demo.plugin", b"{}", {ARTIFACT: b"x"})
+                self.assertIn("nothing more is sent", str(caught.exception))
+                if side == "host":
+                    self.assertEqual(end.answers, {})
+
+    def test_a_bye_after_other_messages_ends_the_channel_too(self):
+        for side, end, core in self.ends():
+            with self.subTest(side=side):
+                self.assertIsNone(end.receive({"type": "hello", "channel": hc.CHANNEL}))
+                self.assertEqual(end.receive(call("credential.request"))["code"], "call_unknown")
+                self.assertIsNone(end.receive({"type": "bye", "reason": "done"}))
+                self.assertIn("ended with a bye", end.receive(call("registry"))["detail"])
+
+    def test_a_second_hello_is_refused_and_the_channel_stays_up(self):
+        for side, end, core in self.ends():
+            with self.subTest(side=side):
+                self.assertIsNone(end.receive({"type": "hello", "channel": hc.CHANNEL}))
+                for _ in range(2):
+                    answer = end.receive({"type": "hello", "channel": hc.CHANNEL})
+                    self.assertEqual((answer["type"], answer["id"], answer["code"]), ("refusal", None, "message_invalid"))
+                    self.assertIn("hello came already", answer["detail"])
+                after = end.receive(call("registry"))  # answered as before: a result, or call_not_offered at the daemon
+                self.assertEqual(after["code"] if side == "daemon" else after["type"],
+                                 "call_not_offered" if side == "daemon" else "result")
+
+    def test_the_schema_and_the_docstrings_say_exactly_this_order(self):
+        s = schema()
+        bye, hello = s["$defs"]["bye"]["description"], s["$defs"]["hello"]["description"]
+        self.assertIn("at any time, also before the hello: the channel ends", bye)
+        self.assertIn("every later message is refused 'message_invalid'", bye)
+        self.assertIn("second hello is refused 'message_invalid'", hello)
+        self.assertIn("bye (each side, at any time, also before the hello: the channel ends; after a bye every later "
+                      "message is refused 'message_invalid'", s["description"])
+        header = " ".join(hc.__doc__.split())
+        self.assertIn("a ``bye`` ends the channel at any time, also before the ``hello``; after a ``bye`` every later "
+                      "message is refused ``message_invalid``", header)
+        self.assertIn("a second ``hello`` is refused ``message_invalid``", header)
+        for end in (hc.DaemonEnd, hc.HostEnd):
+            with self.subTest(end=end.__name__):
+                self.assertIn("The channel's order (``bye``, a second ``hello``)", " ".join(end.__doc__.split()))
+
+
+class HostEndDropsTests(unittest.TestCase):
+    """At this head the host's end drops a core answer and a load; the host program above it takes them."""
+
+    def test_a_core_answer_and_a_load_are_dropped_and_the_docstring_says_so(self):
+        host = hc.HostEnd({})
+        load = {"type": "load", "plugin_id": "demo.plugin", "manifest_b64": b64(b"{}"), "files": {ARTIFACT: b64(b"x")}}
+        for message in ({"type": "core", "id": 1, "bytes_b64": b64(b"{}")}, load):
+            with self.subTest(type=message["type"]):
+                self.assertIsNone(host.receive(message))
+        self.assertEqual(host.answers, {})
+        doc = " ".join(hc.HostEnd.__doc__.split())
+        self.assertIn("At this head this end drops a ``core`` answer and a ``load``", doc)
+        self.assertIn("the host program above this end takes them", doc)
+
+
+class IdRangeTests(unittest.TestCase):
+    """An id past the largest allowed is never handed out: the call refuses first."""
+
+    def test_the_call_after_the_largest_id_refuses_and_hands_out_nothing(self):
+        host = hc.HostEnd({})
+        host._next_id = hc.MAX_ID
+        last = host.call("registry")
+        self.assertEqual(last["id"], hc.MAX_ID)
+        self.assertEqual(hc.check_message(last, receiver="host"), last)
+        with self.assertRaises(ValueError) as caught:
+            host.call("registry")
+        self.assertIn("open a new channel", str(caught.exception))
+        self.assertEqual(host._open, {hc.MAX_ID})
+        self.assertIsNone(host.receive({"type": "result", "id": hc.MAX_ID, "value": 1}))
+        self.assertEqual(host.answers[hc.MAX_ID]["value"], 1)
+
+
+class ThreadTests(unittest.TestCase):
+    """One end may be used from two threads: ids and the table of open calls are under one lock."""
+
+    CALLS = 200_000  # the reproducer's count per thread; a test figure, not a setting
+    TRIALS = 3
+
+    def setUp(self):
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)  # switch threads as often as the interpreter allows: a race shows sooner
+        self.addCleanup(sys.setswitchinterval, interval)
+
+    def run_together(self, work, count=2):
+        barrier, errors = threading.Barrier(count), []
+
+        def run(i):
+            try:
+                barrier.wait()
+                work(i)
+            except BaseException as exc:  # noqa: BLE001 - reported below, never lost in the thread
+                errors.append(exc)
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+
+    def test_two_threads_calling_on_one_end_get_400000_distinct_ids_in_each_of_three_trials(self):
+        for trial in range(self.TRIALS):
+            with self.subTest(trial=trial):
+                host, got = hc.HostEnd({}), [[], []]
+
+                def work(i):
+                    keep, make = got[i].append, host.call
+                    for _ in range(self.CALLS):
+                        keep(make("registry")["id"])
+                self.run_together(work)
+                ids = got[0] + got[1]
+                self.assertEqual(len(ids), 2 * self.CALLS)
+                self.assertEqual(len(set(ids)), 2 * self.CALLS)
+                self.assertEqual(host._open, set(ids))
+
+    def test_two_threads_answering_the_same_open_calls_take_each_answer_once(self):
+        host = hc.HostEnd({})
+        ids = [host.call("registry")["id"] for _ in range(self.CALLS // 2)]
+        taken, refused = [0, 0], [0, 0]
+
+        def work(i):
+            for id_ in ids:
+                if host.receive({"type": "result", "id": id_, "value": i}) is None:
+                    taken[i] += 1
+                else:
+                    refused[i] += 1
+        self.run_together(work)
+        self.assertEqual(sum(taken), len(ids))
+        self.assertEqual(sum(refused), len(ids))
+        self.assertEqual(len(host.answers), len(ids))
+        self.assertEqual(host._open, set())
+
+    def test_a_handler_that_calls_on_its_own_end_never_waits_on_its_lock(self):
+        host = hc.HostEnd({})
+        host._handlers = {"registry": lambda: host.call("net.request")["id"]}
+        done = []
+        worker = threading.Thread(target=lambda: done.append(host.receive(call("registry"))), daemon=True)
+        worker.start()
+        worker.join(30)  # a test's own bound, not a setting
+        self.assertFalse(worker.is_alive(), "a handler waited on its own end's lock")
+        self.assertEqual(done[0]["type"], "result")
+
+
+class HandOverTests(unittest.TestCase):
+    """receive keeps the dict it is handed, without a copy; the real read path never hands the same dict twice."""
+
+    def test_the_caller_hands_the_message_over_and_decode_makes_a_new_one_for_every_frame(self):
+        for end in (hc.DaemonEnd, hc.HostEnd):
+            with self.subTest(end=end.__name__):
+                doc = " ".join(end.receive.__doc__.split())
+                self.assertIn("The caller hands ``message`` over", doc)
+                self.assertIn("without a copy", doc)
+        host = hc.HostEnd({})
+        sent = host.call("net.request")
+        body = hc.encode({"type": "result", "id": sent["id"], "value": {"status": 200}})[4:]
+        first, second = hc.decode(body), hc.decode(body)
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        self.assertIsNot(first["value"], second["value"])
+        self.assertIsNone(host.receive(first))
+        self.assertIs(host.answers[sent["id"]], first)  # kept as handed over: no copy
+
+
+class SchemaRootTests(unittest.TestCase):
+    """The published schema's root applies its seven message forms: an outside validator decides by the type."""
+
+    BAD = ([], {}, "x", {"type": "hello", "channel": "wrong"}, {"type": "bye"}, {"type": "telemetry"},
+           {"type": "event"})
+
+    def test_the_root_is_one_of_the_seven_message_forms(self):
+        s = schema()
+        self.assertEqual(s.get("oneOf"), [{"$ref": f"#/$defs/{kind}"} for kind in s["x-message-types"]])
+        self.assertIn("THE ROOT: a message is valid at the root of this file when it is one of the seven message forms",
+                      s["description"])
+
+    @unittest.skipIf(jsonschema is None, "jsonschema not installed")
+    def test_every_good_vector_passes_at_the_root_and_wrong_ones_fail_there_by_a_draft_2020_12_validator(self):
+        from referencing import Registry, Resource
+        from referencing.jsonschema import DRAFT202012
+        schemas = published_plugin_schemas()
+        registry = Registry().with_resources((name, Resource(contents=doc, specification=DRAFT202012))
+                                             for name, doc in schemas.items())
+        validator = jsonschema.Draft202012Validator(schemas["host.v1.json"], registry=registry)
+        for file in good_host_fixtures():
+            with self.subTest(file=file):
+                self.assertEqual(list(validator.iter_errors(json.loads((FIXTURES / file).read_text(encoding="utf-8")))), [])
+        for value in self.BAD:
+            with self.subTest(value=value):
+                self.assertFalse(validator.is_valid(value))
 
 
 if __name__ == "__main__":

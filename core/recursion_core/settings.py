@@ -526,7 +526,7 @@ def load(environ) -> Loaded:
             close = difflib.get_close_matches(name, known, n=1, cutoff=0.8)  # text only; never applied
             hint = f"; did you mean {close[0]}?" if close else ""
             notes.append(Note(UNKNOWN_KEY, f"{_shown(name, cap, key=True)} is not a setting this version knows; it is "
-                                           f"skipped{hint}", warns=True))
+                                           f"skipped; remove it or check its spelling{hint}", warns=True))
         else:
             value, reason = _taken(row, found)
             if reason is None:

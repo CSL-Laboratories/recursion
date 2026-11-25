@@ -37,7 +37,7 @@ GIL_CHECK = 'on' if not getattr(sys, '_is_gil_enabled', lambda: True)() else 'of
 # A plugin that will not end by itself: every signal a polite stop sends is ignored, and its loop swallows every
 # exception, SystemExit and KeyboardInterrupt included.
 HOSTILE = b'''
-import os, signal, stat, time
+import os, resource, signal, stat, time
 for _number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
     signal.signal(_number, signal.SIG_IGN)
 
@@ -50,13 +50,15 @@ def operator(command):
         os._exit(0)
     if command == "fds":
         found = []
-        for name in sorted(os.listdir("/proc/self/fd"), key=int):
+        # The wall refuses the listing of /proc/self/fd, so each number up to the process's own limit is asked.
+        soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        for number in range(soft if soft != resource.RLIM_INFINITY else os.sysconf("SC_OPEN_MAX")):
             try:
-                info = os.fstat(int(name))
+                info = os.fstat(number)
             except OSError:
                 continue
             if stat.S_ISSOCK(info.st_mode):
-                found.append([info.st_dev, info.st_ino, int(name)])
+                found.append([info.st_dev, info.st_ino, number])
         return found
     while True:
         try:

@@ -12,14 +12,18 @@ check that nothing it writes is ever run or called signed:
   ``importlib.resources`` all come from the verified bytes, whatever the folder holds afterwards;
   an import of a module of the plugin's package that the manifest does not list is refused;
 * the record names the digest of the bytes loaded, equal to the digest verified, and says that a
-  file the plugin opens by its path is not covered.
+  file the plugin opens by its path is not covered;
+* an error report, a warning and a source lookup of the plugin's code show the verified lines,
+  never a file planted in the working folder or a sys.path folder under its code's name.
 
 The stress test runs a swapper thread against many thousands of verify-and-load rounds.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
+import linecache
 import os
 from pathlib import Path
 import py_compile
@@ -31,7 +35,9 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import unittest
+import warnings
 from unittest import mock
 
 from recursion_core.daemon import plugins
@@ -535,6 +541,143 @@ class LoaderTakesOnlyTheVerifiedPackageTests(unittest.TestCase):
             loader.load(moved.manifest.raw, moved.signature, moved.files[ENTRY_FILE], package=moved)
         self.assertEqual(getattr(caught.exception, "code", None), CHANGED)
         self.assertEqual(package_module.package_changes(plugin, verified), ())
+
+
+BOOM_ENTRY = SERVED_ENTRY + b"""
+
+def boom():
+    from .lib import boom as module
+    module.boom()
+
+
+def entry_boom():
+    raise RuntimeError('the verified line of the entry')
+
+
+def warn():
+    from .lib import boom as module
+    return module.warn()
+"""
+
+BOOM_MODULE = b"""import warnings
+
+
+def boom():
+    raise RuntimeError('the verified line of lib/boom.py')
+
+
+def warn():
+    warnings.warn('the verified warning of lib/boom.py', UserWarning, stacklevel=1)
+"""
+
+# What a stranger plants under a code name: a line for every line number the plugin's code has.
+PLANTED = b"".join(b"PLANTED_BY_A_STRANGER = %d\n" % number for number in range(1, 41))
+# The name a served module's code had before: a relative path, opened by the line cache.
+OLD_MODULE_NAME = "<plugin %s>/lib/boom.py" % PLUGIN_ID
+
+
+@unittest.skipUnless(LINUX, "the plugin install path checks ownership by uid")
+@needs_crypto
+class ErrorReportsShowTheVerifiedLinesTests(unittest.TestCase):
+    """A file planted in the daemon's working folder or a sys.path folder under the name of the
+    plugin's code is never shown as the signed plugin's source; the verified lines are."""
+
+    def setUp(self):
+        key = Key()
+        self.root = _tree(self)
+        self.work, self.on_path = _tree(self), _tree(self)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.work)
+        sys.path.insert(0, str(self.on_path))
+        self.addCleanup(sys.path.remove, str(self.on_path))
+        self.files = dict(GOOD, **{ENTRY_FILE: BOOM_ENTRY, "lib/later.py": b"LATER = 'verified'\n",
+                                   "lib/boom.py": BOOM_MODULE})
+        _sign_listed(self, key, self.root, self.files)
+        self.host = _host(self, self.root)
+        self.record, = self.host.records
+        self.assertEqual(self.record.get("state"), "loaded", self.record)
+        self.assertEqual(self.record["trust"], "signed")
+        self.module = self.host.loader._active[PLUGIN_ID].module
+        self.plant(OLD_MODULE_NAME)
+
+    def plant(self, name: str) -> None:
+        """Write the stranger's text at ``name``, relative to the working folder and a sys.path folder."""
+        for folder in (self.work, self.on_path):
+            target = folder / name
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(PLANTED)
+            except (IsADirectoryError, FileExistsError, NotADirectoryError):
+                pass  # the name is a folder of an earlier plant: nothing can be read there
+
+    def raised(self, call) -> RuntimeError:
+        """The error ``call`` raises, with its traceback (assertRaises would drop it), after a
+        stranger's file is planted under the name of every plugin frame in it."""
+        try:
+            call()
+        except RuntimeError as exc:
+            error = exc
+        else:
+            self.fail("no error was raised")
+        frames = traceback.extract_tb(error.__traceback__)
+        self.assertTrue([frame for frame in frames if frame.filename.startswith("<plugin")], frames)
+        # The longest name first: a module's name may run through a folder named like the entry.
+        for name in sorted({frame.filename for frame in frames if frame.filename.startswith("<plugin")},
+                           key=len, reverse=True):
+            self.plant(name)
+        return error
+
+    def report(self, call) -> str:
+        error = self.raised(call)
+        linecache.checkcache()
+        return "".join(traceback.format_exception(error))
+
+    def test_an_error_in_a_served_module_shows_the_verified_lines_not_a_planted_file(self):
+        text = self.report(self.module.boom)
+        self.assertNotIn("PLANTED_BY_A_STRANGER", text)
+        self.assertIn("raise RuntimeError('the verified line of lib/boom.py')", text)
+        self.assertIn("module.boom()", text)  # the entry's own frame, from its verified lines
+        self.assertIn('File "<plugin demo.plugin #', text)
+
+    def test_an_error_in_the_entry_shows_its_verified_line(self):
+        text = self.report(self.module.entry_boom)
+        self.assertNotIn("PLANTED_BY_A_STRANGER", text)
+        self.assertIn("raise RuntimeError('the verified line of the entry')", text)
+
+    def test_with_the_line_cache_cleared_no_planted_file_is_shown(self):
+        error = self.raised(self.module.boom)
+        linecache.clearcache()  # another part of the process may clear it: the name alone holds
+        text = "".join(traceback.format_exception(error))
+        self.assertNotIn("PLANTED_BY_A_STRANGER", text)
+        self.assertIn("the verified line of lib/boom.py", text)  # the message, not a source line
+
+    def test_a_warning_shows_the_verified_line(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.module.warn()
+        warning, = caught
+        self.plant(warning.filename)
+        linecache.checkcache()
+        text = warnings.formatwarning(warning.message, warning.category, warning.filename, warning.lineno)
+        self.assertNotIn("PLANTED_BY_A_STRANGER", text)
+        self.assertIn("warnings.warn('the verified warning of lib/boom.py', UserWarning, stacklevel=1)", text)
+
+    def test_a_source_lookup_gives_the_verified_source(self):
+        self.report(self.module.boom)
+        served = sys.modules[self.module.__name__ + ".lib.boom"]
+        self.plant(served.boom.__code__.co_filename)
+        linecache.checkcache()
+        self.assertEqual(inspect.getsource(served.boom),
+                         "def boom():\n    raise RuntimeError('the verified line of lib/boom.py')\n")
+
+    def test_the_lines_leave_the_cache_when_the_plugin_is_taken_out(self):
+        self.report(self.module.boom)
+        prefix = "<plugin %s #%s" % (PLUGIN_ID, self.module.__name__.rpartition("_")[2])
+        names = sorted(name for name in linecache.cache if str(name).startswith(prefix))
+        self.assertEqual(names, sorted(prefix + suffix for suffix in
+                                       (">", ": second.py>", ": lib/__init__.py>", ": lib/late.py>", ": lib/boom.py>")))
+        self.host.loader.close()
+        self.assertEqual([name for name in linecache.cache if str(name).startswith(prefix)], [])
 
 
 STRESS_ENTRY = b"""try:

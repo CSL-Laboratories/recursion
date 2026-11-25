@@ -38,6 +38,7 @@ import importlib.machinery
 import importlib.util
 import io
 import itertools
+import linecache
 import os
 import stat
 import sys
@@ -172,6 +173,28 @@ class _VerifiedReader:
         return self._root
 
 
+def _code_name(package_name: str, plugin_id: str, path: str | None = None) -> str:
+    """The name a plugin's code is compiled under, the name an error report shows for its lines:
+    ``<plugin ID #N>`` for the entry, ``<plugin ID #N: PATH>`` for a listed module, N the load's
+    own number. It begins with '<' and ends with '>', a name the line cache (tracebacks, warnings,
+    the debugger, inspect) never opens as a file, so no file planted in the working folder or a
+    sys.path folder is ever shown as the plugin's source."""
+    return "<plugin %s #%s%s>" % (plugin_id, package_name.rpartition("_")[2], "" if path is None else ": " + path)
+
+
+def _remember_lines(code_name: str, source: bytes) -> None:
+    """Put the verified lines in the line cache under ``code_name``, so that an error report shows
+    the lines that were checked. The entry has no time, so the cache never compares it with a file."""
+    try:
+        text = importlib.util.decode_source(source)
+    except (SyntaxError, UnicodeError, LookupError):
+        return  # compile() refuses these bytes too
+    lines = io.StringIO(text).readlines()  # split as the tokenizer counts lines: at a newline only
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    linecache.cache[code_name] = (len(source), None, lines, code_name)
+
+
 class _PackageImports:
     """One loaded plugin's own package: its modules are compiled from the verified bytes only."""
 
@@ -179,7 +202,23 @@ class _PackageImports:
         self.name, self.plugin_id = name, plugin_id
         self.files = dict(files)  # path -> bytes, a private copy of what was verified
         self.served: dict[str, str] = {}  # listed path -> SHA-256 of the bytes compiled from it
+        self.code_names: set[str] = set()  # the names its code was compiled under, in the line cache
         self._lock = threading.Lock()
+
+    def code_name(self, path: str | None = None) -> str:
+        """The code name of the entry (``path`` None) or of a listed module, with its verified
+        lines put in the line cache under it until the package is taken out (``forget_lines``)."""
+        name = _code_name(self.name, self.plugin_id, path)
+        with self._lock:
+            self.code_names.add(name)
+        _remember_lines(name, self.files[ENTRY_FILE if path is None else path])
+        return name
+
+    def forget_lines(self) -> None:
+        with self._lock:
+            names, self.code_names = self.code_names, set()
+        for name in names:
+            linecache.cache.pop(name, None)
 
     def locate(self, fullname: str):
         """(listed path or None, is a package) for a module of this package, or None if unlisted."""
@@ -208,7 +247,7 @@ class _PackageImports:
         source = self.files[path]
         with self._lock:
             self.served[path] = hashlib.sha256(source).hexdigest()
-        exec(compile(source, "<plugin %s>/%s" % (self.plugin_id, path), "exec", dont_inherit=True), module.__dict__)
+        exec(compile(source, self.code_name(path), "exec", dont_inherit=True), module.__dict__)
 
     def is_package(self, fullname: str) -> bool:
         where = None if fullname == self.name else self.locate(fullname)
@@ -250,7 +289,9 @@ class _VerifiedFinder:
 
     def drop(self, name: str) -> None:
         with self._lock:
-            self._packages.pop(name, None)
+            package = self._packages.pop(name, None)
+        if package is not None:
+            package.forget_lines()
         for module_name in [key for key in list(sys.modules) if key == name or key.startswith(name + ".")]:
             sys.modules.pop(module_name, None)
 
@@ -506,7 +547,8 @@ class PluginLoader:
                     manifest_bytes, signature, artifact, registry_label, findings, package_dir, package)
                 if manifest.plugin_id in self._active:
                     raise Refused("plugin_already_active", manifest.plugin_id)
-                code = compile(artifact, "<plugin %s>" % manifest.plugin_id, "exec", dont_inherit=True)
+                name = _FINDER.new_name(manifest.plugin_id)
+                code = compile(artifact, _code_name(name, manifest.plugin_id), "exec", dont_inherit=True)
                 findings.append(_finding("stage", "compiled", "info"))
             except (Refused, SyntaxError, ValueError, RecursionError, MemoryError) as exc:
                 # No plugin code ran, but the rule is a GIL read after every load attempt.
@@ -518,7 +560,7 @@ class PluginLoader:
                 raise Refused("plugin_compile_failed", type(exc).__name__) from None
             files = dict(package.files) if package is not None else {}
             files[ENTRY_FILE] = artifact  # digest-checked above: the bytes compiled into ``code``
-            return self._activate(manifest, trust, kid, label, perms, code, findings, files)
+            return self._activate(manifest, trust, kid, label, perms, code, findings, files, name)
 
     def close(self) -> None:
         """Take this loader's plugin packages out of the import system (the modules stay alive
@@ -547,11 +589,13 @@ class PluginLoader:
         self.last_findings = tuple(findings)
         return True
 
-    def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings, files) -> LoadedPlugin:
+    def _activate(self, manifest: Manifest, trust, kid, label, perms, code, findings, files,
+                  name: str) -> LoadedPlugin:
         before = set(sys.modules)
         # The entry is a package whose modules come only from ``files``: the finder serves
         # ``from . import x`` from these bytes, never from the folder.
-        imports = _PackageImports(_FINDER.new_name(manifest.plugin_id), manifest.plugin_id, files)
+        imports = _PackageImports(name, manifest.plugin_id, files)
+        imports.code_name()  # the entry's verified lines, for its error reports
         imports.served[ENTRY_FILE] = hashlib.sha256(files[ENTRY_FILE]).hexdigest()
         module = importlib.util.module_from_spec(importlib.machinery.ModuleSpec(imports.name, imports, is_package=True))
         _FINDER.add(imports)

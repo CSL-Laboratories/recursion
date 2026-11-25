@@ -168,7 +168,8 @@ def _owned_directory(path):
 def read_install(directory):
     """Parse ``install.json``. With no file: no trusted key and no grant, so nothing gets a permission.
 
-    ``developer_key_id`` is null or ``ed25519:`` plus 32 lower-case hex; a grant may name the five version-1 permissions.
+    ``developer_key_id`` and ``order_after_revoked_key`` are each null or ``ed25519:`` plus 32 lower-case hex; a grant
+    may name the five version-1 permissions.
     """
     raw = _read_owned(Path(directory) / INSTALL_FILE, MAX_INSTALL_BYTES, missing_ok=True)
     if raw is None:
@@ -196,7 +197,7 @@ def read_install(directory):
                 or not isinstance(perms, list) or any(p not in PERMISSIONS_V1 for p in perms)
                 or not (signer is None or isinstance(signer, str))
                 or type(item.get('unsigned_order_acknowledged', False)) is not bool
-                or not (item.get('order_after_revoked_key') is None or isinstance(item['order_after_revoked_key'], str))
+                or not developer_key_id_ok(item.get('order_after_revoked_key'))
                 or not (generation is None or type(generation) is int)
                 or not developer_key_id_ok(item.get('developer_key_id'))
                 or item['plugin_id'] in grants):

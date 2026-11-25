@@ -34,7 +34,8 @@ FIXTURES = PLUGIN_SCHEMAS / "fixtures"
 SANDBOXED = "python-sandboxed/1"
 INPROCESS = "python-inprocess/1"
 WASM_TEXT = "wasm-component/1 is reserved for a later release; this release runs python-sandboxed/1 only."
-UNKNOWN_TEXT = "unknown runtime; this release runs python-sandboxed/1 only"
+UNKNOWN_TEXT = ("unknown runtime; this release accepts python-sandboxed/1, and python-inprocess/1 until 1.1.0 "
+                "with the finding runtime_inprocess_retiring; write python-sandboxed/1 as the manifest's runtime")
 RESERVED_PERMISSIONS = ("schedule", "memory", "computer")
 RESERVED_RECORD_KINDS = ("trigger.v1", "agent.v1", "memory.lesson.v1", "work.packet.v1", "node.v1")
 NOT_FROZEN = "reserved is not frozen: a reserved name may be corrected until the first build that answers it"

@@ -48,6 +48,12 @@ _RUNTIME_SANDBOXED = "python-sandboxed/1"
 
 PACKAGE_FILE_MISSING_TEXT = ("%s is listed in the signed manifest but is not a regular file in the plugin's folder: "
                              "install the package again from its source, or ask its developer for a whole package.")
+PACKAGE_FOLDER_NOT_A_FOLDER_TEXT = ("the plugin's folder is missing, is a symbolic link or is not a folder, and the loader "
+                                    "follows no link in a package, so the plugin was not loaded and none of its code ran: "
+                                    "give the folder itself, or install the package again from its source.")
+GRANT_UNBOUND_TEXT = ("The grant for this plugin in install.json names no developer key ID (developer_key_id), so the "
+                      "plugin was not loaded and none of its code ran. Make the grant again with developer_key_id set "
+                      "to this plugin's developer key ID, then load the plugin again.")
 
 
 class CoreHealth:
@@ -88,9 +94,36 @@ def _finding(stage: str, code: str, severity: str, detail: str = "") -> dict:
     return {"stage": stage, "code": code, "severity": severity, "detail": detail}
 
 
+# Where the system opens a folder relative to another without following a link (POSIX), the walk holds
+# each folder open, so a folder swapped for a link between two steps is not followed either.
+_WALK_BY_FD = (os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd
+               and os.stat in os.supports_follow_symlinks
+               and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW"))
+
+
+def _package_folder_present(directory: Path) -> bool:
+    """True when the package folder itself is a folder, not a symbolic link."""
+    try:
+        return stat.S_ISDIR(directory.lstat().st_mode)
+    except OSError:
+        return False
+
+
 def _package_file_present(directory: Path, path: str) -> bool:
-    """Check a listed path for a regular file, without following symlinks within the package."""
+    """Check a listed path for a regular file, following no symbolic link: not the package folder
+    itself and none within it.
+
+    With ``_WALK_BY_FD`` each folder is opened relative to the one before it with ``O_NOFOLLOW``
+    and held open, so a folder replaced by a link between two steps is not followed. Elsewhere
+    each step is an ``lstat`` of the path, the package folder included; a folder replaced between
+    two of them is then the caller's to rule out (the daemon loads only an operator-owned folder
+    that is not group or other writable).
+    """
     *parents, name = path.split("/")
+    if _WALK_BY_FD:
+        return _package_file_present_by_fd(directory, parents, name)
+    if not _package_folder_present(directory):
+        return False
     try:
         for part in parents:
             directory = directory / part
@@ -99,6 +132,22 @@ def _package_file_present(directory: Path, path: str) -> bool:
         return stat.S_ISREG((directory / name).lstat().st_mode)
     except OSError:
         return False
+
+
+def _package_file_present_by_fd(directory: Path, parents: list, name: str) -> bool:
+    flags = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    opened: list[int] = []
+    try:
+        opened.append(os.open(directory, flags))
+        for part in parents:
+            opened.append(os.open(part, flags, dir_fd=opened[-1]))
+        return stat.S_ISREG(os.stat(name, dir_fd=opened[-1], follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+    finally:
+        for fd in opened:
+            os.close(fd)
 
 
 class PluginLoader:
@@ -194,6 +243,8 @@ class PluginLoader:
         trust, kid, reason = self._trust.classify(manifest, signature)
         findings.append(_finding("verify", reason, "info" if trust == "signed" else "warn", trust))
         if trust == "signed":
+            if package_dir is not None and not _package_folder_present(package_dir):
+                raise Refused("package_file_missing", PACKAGE_FOLDER_NOT_A_FOLDER_TEXT)
             for path, _ in manifest.files:
                 # Bytes alone can supply the entry. With a directory, require the listed file there too.
                 if package_dir is None:
@@ -220,10 +271,10 @@ class PluginLoader:
         perms, dropped = effective_permissions(manifest, trust, kid, grant, revoked, generation)
         for code, detail in dropped:
             findings.append(_finding("admit", code, "warn", detail))
-        if (trust != "signed" and grant is not None and grant.signer_key_id is None
+        # A manual grant bound to no developer key, signed manifest or not: refused before any code runs.
+        if (grant is not None and grant.signer_key_id is None
                 and _bound_developer_key(grant) is None and manifest.permissions and not perms):
-            raise Refused("grant_unbound", "Make the grant again with developer_key_id "
-                                           "in install.json set to this plugin's developer key ID.")
+            raise Refused("grant_unbound", GRANT_UNBOUND_TEXT)
         for perm in ("process", "network", "credential"):
             if perm in perms:
                 findings.append(_finding("admit", perm + "_granted", "warn",
@@ -240,7 +291,8 @@ class PluginLoader:
              registry_label: str | None = None, *, package_dir: Path | None = None) -> LoadedPlugin:
         """Load an entry artifact and check signed manifests' listed files in package_dir.
 
-        Entry bytes supply the entry file when no directory is given.
+        Entry bytes supply the entry file when no directory is given. package_dir itself must be
+        a folder, not a symbolic link, and no link inside it is followed.
         """
         with self._lock:
             self._health.require_healthy()

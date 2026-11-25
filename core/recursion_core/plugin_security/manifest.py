@@ -89,7 +89,8 @@ _RESERVED_RUNTIMES = MappingProxyType({
     "wasm-component/1": "wasm-component/1 is reserved for a later release; this release runs python-sandboxed/1 only.",
     "data/1": "data/1 is reserved; not run in this release.",
 })
-_UNKNOWN_RUNTIME = "unknown runtime; this release runs python-sandboxed/1 only"
+_UNKNOWN_RUNTIME = ("unknown runtime; this release accepts python-sandboxed/1, and python-inprocess/1 until 1.1.0 "
+                    "with the finding runtime_inprocess_retiring; write python-sandboxed/1 as the manifest's runtime")
 # Permission names reserved for a later release, refused permission_reserved in either form of manifest.
 # They are not in PERMISSIONS or PERMISSIONS_V1, and nothing grants them.
 _RESERVED_PERMISSIONS = frozenset({"schedule", "memory", "computer"})
@@ -567,21 +568,26 @@ class Grant:
     # user turned order back on for; with neither it is unbound and grants nothing, in
     # either manifest form: the user grants again, for the key the manifest names now.
     # The loader refuses an unbound manual grant when the plugin requests permissions.
-    # Null, or a key id (``ed25519:`` and 32 lower-case hex). Anything else is refused.
+    # Null, or a key id (``ed25519:`` and 32 lower-case hex). Anything else is refused, and
+    # ``order_after_revoked_key`` is held to the same shape.
     developer_key_id: str | None = None
 
     def __post_init__(self) -> None:
         if not developer_key_id_ok(self.developer_key_id):
             raise Refused("grant_invalid", "developer_key_id")
+        if not developer_key_id_ok(self.order_after_revoked_key):
+            raise Refused("grant_invalid", "order_after_revoked_key: null, or a developer key ID "
+                                           "(ed25519: and 32 lower-case hex digits)")
 
 
 def _bound_developer_key(grant: Grant) -> str | None:
     """The developer key id a grant names for itself: ``developer_key_id`` when set; for a
     manual grant (no signer) otherwise ``order_after_revoked_key``; else None. A signed grant
-    is bound through its signer, so its ``order_after_revoked_key`` is not read here."""
+    is bound through its signer, so its ``order_after_revoked_key`` is not read here. A value
+    that is not a key id is no binding."""
     if grant.developer_key_id is not None:
         return grant.developer_key_id
-    if grant.signer_key_id is None:
+    if grant.signer_key_id is None and developer_key_id_ok(grant.order_after_revoked_key):
         return grant.order_after_revoked_key
     return None
 

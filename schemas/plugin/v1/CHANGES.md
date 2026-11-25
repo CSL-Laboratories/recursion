@@ -7,8 +7,11 @@ it in `README.md` has a passing fixture in `fixtures/`.
 ## Loader admission
 
 A plugin that requests permissions with an unbound manual grant is refused `grant_unbound`
-before its code runs. A signed version 1 load is refused `package_file_missing` when a file
-listed in the manifest is absent. The refusal names the first missing path in manifest path order.
+before its code runs, whether its manifest is signed or not. An `order_after_revoked_key` that is
+not a developer key ID binds nothing and is refused where a grant is read. A signed version 1 load
+is refused `package_file_missing` when a file listed in the manifest is absent. The refusal names
+the first missing path in manifest path order. When the package folder itself is missing, is a
+symbolic link or is not a folder, the refusal says that instead.
 
 ## `manifest.v1.json` is `1.0-draft.2` (2026-11-18)
 

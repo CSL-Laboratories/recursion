@@ -383,8 +383,10 @@ class LoaderBindingTests(unittest.TestCase):
         finally:
             self.assertFalse(marker.exists(), "plugin code ran before the refusal")
         self.assertEqual(ctx.exception.code, "grant_unbound")
-        self.assertEqual(str(ctx.exception), "grant_unbound: Make the grant again with developer_key_id "
-                                             "in install.json set to this plugin's developer key ID.")
+        self.assertEqual(str(ctx.exception), "grant_unbound: The grant for this plugin in install.json names no "
+                                             "developer key ID (developer_key_id), so the plugin was not loaded and "
+                                             "none of its code ran. Make the grant again with developer_key_id set to "
+                                             "this plugin's developer key ID, then load the plugin again.")
 
     def test_an_unbound_manual_grant_can_load_a_plugin_that_asks_for_nothing(self) -> None:
         grant = Grant("demo.plugin", DIGEST, None, ALL, True)
@@ -402,8 +404,10 @@ class LoaderBindingTests(unittest.TestCase):
         finally:
             self.assertFalse(marker.exists(), "plugin code ran before the refusal")
         self.assertEqual(ctx.exception.code, "grant_unbound")
-        self.assertEqual(str(ctx.exception), "grant_unbound: Make the grant again with developer_key_id "
-                                             "in install.json set to this plugin's developer key ID.")
+        self.assertEqual(str(ctx.exception), "grant_unbound: The grant for this plugin in install.json names no "
+                                             "developer key ID (developer_key_id), so the plugin was not loaded and "
+                                             "none of its code ran. Make the grant again with developer_key_id set to "
+                                             "this plugin's developer key ID, then load the plugin again.")
 
     def test_a_stale_bound_manual_grant_still_loads_with_no_permissions(self) -> None:
         marker = Path(temp_dir(self)) / "plugin-code-ran"

@@ -576,5 +576,203 @@ class VetoIsFinalTests(unittest.TestCase):
                           "allow standing for a vetoed digest": 0, "later use let go unasked": 0})
 
 
+class _WatchedLock:
+    """A stand-in for the gate's lock. It says which thread holds it, counts how often it was
+    taken, and can run one action just before the n-th next time it is taken: a refusal placed
+    at an exact step of the code under test, with no thread and no luck."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._holder = None
+        self.acquires = 0
+        self._armed = None
+
+    def held(self) -> bool:
+        return self._holder == threading.get_ident()
+
+    def arm(self, before_acquire: int, action) -> None:
+        """Run ``action`` just before the lock is taken ``before_acquire`` takes from now (0: the next)."""
+        self._armed = (self.acquires + before_acquire, action)
+
+    def fired(self) -> bool:
+        return self._armed is None
+
+    def __enter__(self):
+        number, self.acquires = self.acquires, self.acquires + 1
+        if self._armed is not None and self._armed[0] == number:
+            action, self._armed = self._armed[1], None
+            action()
+        self._lock.acquire()
+        self._holder = threading.get_ident()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._holder = None
+        self._lock.release()
+
+
+class _Watch:
+    """Puts the stand-in lock into a gate, and makes its veto set and the record's allows refuse
+    to be read or written by a thread that does not hold that lock."""
+
+    def __init__(self, gate: ApprovalGate, first_uses: NetworkFirstUses) -> None:
+        self.gate = gate
+        self.lock = _WatchedLock()
+        self.violations: list[str] = []
+        self.stores = 0
+        gate._lock = self.lock
+        gate._vetoed = _GuardedSet(self)
+        first_uses._allows = _GuardedAllows(self)
+
+    def need_the_lock(self, what: str) -> None:
+        if not self.lock.held():
+            self.violations.append(what + " ran without the gate's lock")
+            raise AssertionError(self.violations[-1])
+
+
+class _GuardedSet(set):
+    def __init__(self, watch: _Watch) -> None:
+        super().__init__()
+        self._watch = watch
+
+    def __contains__(self, item) -> bool:
+        self._watch.need_the_lock("a veto check")
+        return super().__contains__(item)
+
+    def add(self, item) -> None:
+        self._watch.need_the_lock("a veto")
+        super().add(item)
+
+
+class _GuardedDigests(set):
+    def __init__(self, watch: _Watch) -> None:
+        super().__init__()
+        self._watch = watch
+
+    def __iter__(self):
+        self._watch.need_the_lock("a read of the allows")
+        return super().__iter__()
+
+    def add(self, digest) -> None:
+        self._watch.need_the_lock("the store of an allow")
+        if set.__contains__(self._watch.gate._vetoed, digest):
+            self._watch.violations.append("an allow was stored for a digest already vetoed")
+            raise AssertionError(self._watch.violations[-1])
+        self._watch.stores += 1
+        super().add(digest)
+
+
+class _GuardedAllows(dict):
+    def __init__(self, watch: _Watch) -> None:
+        super().__init__()
+        self._watch = watch
+
+    def setdefault(self, key, default=None):
+        self._watch.need_the_lock("the store of an allow")
+        if not dict.__contains__(self, key):
+            dict.__setitem__(self, key, _GuardedDigests(self._watch))
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        self._watch.need_the_lock("a read of the allows")
+        return dict.get(self, key, default)
+
+    def items(self):
+        self._watch.need_the_lock("a read of the allows")
+        return dict.items(self)
+
+    def __getitem__(self, key):
+        self._watch.need_the_lock("a read of the allows")
+        return dict.__getitem__(self, key)
+
+    def __contains__(self, key) -> bool:
+        self._watch.need_the_lock("a read of the allows")
+        return dict.__contains__(self, key)
+
+    def __iter__(self):
+        self._watch.need_the_lock("a read of the allows")
+        return dict.__iter__(self)
+
+
+def _peek(first_uses: NetworkFirstUses) -> dict:
+    """The allows as they are, read without any guard (a test's view of the record)."""
+    return {key: set(set.copy(value)) for key, value in dict.items(first_uses._allows)}
+
+
+class OneStepUnderTheLockTests(unittest.TestCase):
+    """The veto check and the store of an allow are one step under the gate's lock, and the
+    go answer is given under it: placed at exact steps, with no thread and no luck."""
+
+    @staticmethod
+    def _watched():
+        area, first_uses = _Area(), NetworkFirstUses()
+        return area, first_uses, _Watch(area.gate, first_uses)
+
+    @staticmethod
+    def _effect(run_id: str) -> dict:
+        return confirmation_effect("network", _NET, plugin_id="demo.plugin", run_id=run_id, connection="conn-a")
+
+    def test_every_veto_check_and_every_store_and_every_go_answer_holds_the_gates_lock(self) -> None:
+        area, first_uses, watch = self._watched()
+        self.assertEqual(_net(area, first_uses, "run-1"), "approved by the person")
+        self.assertGreaterEqual(watch.stores, 1)
+        self.assertEqual(set(_peek(first_uses)), {("demo.plugin", _NET)})
+        answers = {
+            "confirm": lambda: _net(area, first_uses, "run-2") == "destination approved since the daemon started",
+            "decide": lambda: decide("model", "network", _NET, first_uses=first_uses, plugin_id="demo.plugin",
+                                     run_id="run-3", connection="conn-a") == GO,
+            "stands": lambda: first_uses.stands("demo.plugin", _NET, run_id="run-4", connection="conn-a"),
+            "pair": lambda: ("demo.plugin", _NET) in first_uses,
+            "destination": lambda: _NET in first_uses,
+        }
+        for name, answer in answers.items():
+            with self.subTest(answer=name):
+                before = watch.lock.acquires
+                self.assertTrue(answer())
+                self.assertGreater(watch.lock.acquires, before)  # the go answer took the gate's lock
+        self.assertEqual(watch.violations, [])
+
+    def test_a_refusal_placed_at_each_step_of_the_keep_never_lands_between_its_check_and_its_store(self) -> None:
+        for step in range(4):
+            with self.subTest(step=step):
+                area, first_uses, watch = self._watched()
+                gate, effect = area.gate, self._effect("run-1")
+                twin = gate.request(effect)  # a pending approval of this same use
+                approval_id, digest = gate.request(effect)
+                gate.decide(approval_id, digest, _OPERATOR, True)
+                gate.take(approval_id, effect)
+                # The person refuses the twin just before the lock is taken for the step-th time.
+                watch.lock.arm(step, lambda: gate.decide(twin[0], twin[1], _OPERATOR, False))
+                code = None
+                try:
+                    first_uses.record(gate, approval_id, effect)
+                except Refused as refused:
+                    code = refused.code
+                self.assertEqual(watch.violations, [])
+                if step == 0:
+                    self.assertTrue(watch.lock.fired())
+                    self.assertEqual(code, "approval_vetoed")
+                if code is not None:
+                    self.assertEqual(_peek(first_uses), {})
+
+    def test_a_refusal_placed_before_the_go_answer_is_seen_by_it(self) -> None:
+        for step in range(3):
+            for name in ("stands", "decide"):
+                with self.subTest(step=step, answer=name):
+                    area, first_uses, watch = self._watched()
+                    self.assertEqual(_net(area, first_uses, "run-2"), "approved by the person")
+                    twin = area.gate.request(self._effect("run-1"))
+                    watch.lock.arm(step, lambda: area.gate.decide(twin[0], twin[1], _OPERATOR, False))
+                    if name == "stands":
+                        answer = first_uses.stands("demo.plugin", _NET, run_id="run-1", connection="conn-a")
+                    else:
+                        answer = decide("model", "network", _NET, first_uses=first_uses, plugin_id="demo.plugin",
+                                        run_id="run-1", connection="conn-a") == GO
+                    self.assertEqual(watch.violations, [])
+                    if step == 0:
+                        self.assertTrue(watch.lock.fired())
+                        self.assertFalse(answer)
+
+
 if __name__ == "__main__":
     unittest.main()

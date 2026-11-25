@@ -141,7 +141,7 @@ class StartAndStopWithoutAManagerTest(unittest.TestCase):
                      '--property=Delegate=yes', '--property=TasksMax=8', '--working-directory=/w',
                      *('--property=' + item for item in launcher.STOP_PROPERTIES)):
             self.assertIn(item, head)
-        self.assertFalse([item for item in head if 'RemainAfterExit' in item], head)
+        self.assertEqual([item for item in head if 'RemainAfterExit' in item], ['--property=RemainAfterExit=no'], head)
         self.assertIs(options['stdin'], one)
         self.assertIs(options['stdout'], one)
         self.assertTrue(options['close_fds'])

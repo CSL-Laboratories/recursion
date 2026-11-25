@@ -137,6 +137,13 @@ class ProcessManager:
                 child.kill()
         return True
 
+    def unit_state(self, unit, timeout_s):
+        """What the system shows of the stand-in's unit: gone once its child has ended."""
+        for name, child, _ in self.children:
+            if name == unit and child.poll() is None:
+                return {'LoadState': 'loaded', 'ActiveState': 'active', 'SubState': 'running', 'Job': ''}
+        return {'LoadState': 'not-found', 'ActiveState': 'inactive', 'SubState': 'dead', 'Job': ''}
+
     def errors(self):
         return {path.name: path.read_bytes()[-2000:] for path in self.logs.iterdir()}
 
@@ -188,6 +195,10 @@ class ThreadManager:
     def kill_cgroup(self, group, unit):
         self.hang_up(unit)
         return True
+
+    def unit_state(self, unit, timeout_s):
+        """What the system shows of the stand-in's unit after its kill: gone (the stand-in has no process)."""
+        return {'LoadState': 'not-found', 'ActiveState': 'inactive', 'SubState': 'dead', 'Job': ''}
 
     def hang_up(self, unit):
         for name, end in self.ends:

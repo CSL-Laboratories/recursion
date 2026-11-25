@@ -112,6 +112,10 @@ class Hosts:
                     pass
         return True
 
+    def unit_state(self, unit, timeout_s):
+        """What the system shows of the stand-in's unit after its kill: gone (the stand-in has no process)."""
+        return {'LoadState': 'not-found', 'ActiveState': 'inactive', 'SubState': 'dead', 'Job': ''}
+
     def hang_up_all(self):
         self.stop.set()
         for name, end in self.ends:

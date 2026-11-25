@@ -13,7 +13,13 @@ argument: by default the folder this daemon's own code was imported from.
   a host that read nothing more is released the same way.
 * Stop of a host is ``cgroup.kill`` of its unit (by pidfd where the kernel has no ``cgroup.kill``), never a message
   to it. It waits on nothing the host does: a host that loops and swallows every exception and signal ends the same
-  way as any other.
+  way as any other. Then Stop PROVES it: within its bound (plugin_host.stop_confirm_s) it reads what the system shows
+  of the unit until the unit is gone, or inactive with no restart pending and no start queued. A host is recorded
+  ended only then, from what the system shows, never from the daemon's own intent. Past the bound the daemon asks the
+  system's own stop of the unit, records the host's Stop as unconfirmed, says so in the log and in ``status``, and
+  ``status`` reads such a unit again each time until the system shows it ended. A host unit carries only the
+  properties the launcher's allow list names (``launcher.PIPED_UNIT_ALLOWED``), and ``Restart=no`` is written last,
+  so nothing can make the system start a host again after its Stop.
 * Nothing watches a host between calls. A host that has ended by itself is found by the next call into it, and that
   call fails with ``ended``; a host that has not answered a call by its deadline is ended, and that call fails with
   ``timed_out``. Either way the call fails at once, within its own deadline, its plugin is marked degraded, and a
@@ -30,8 +36,12 @@ argument: by default the folder this daemon's own code was imported from.
 * A second ``start`` of a plugin ends its running host before it waits for the plugin's turn, as ``stop`` does: a
   call that waits on that host (one with no deadline, say) ends at once with ``replaced``, and so does a start of
   the plugin still under way. Then the new host starts.
-* ``stop`` and ``close`` (the daemon's own Stop) end every host the same way and wait on none, a host that is still
-  starting included: its start ends with ``stopped``.
+* ``stop`` and ``close`` (the daemon's own Stop) end every host the same way, a host that is still starting
+  included (its start ends with ``stopped``), and wait on no host: only on the system's proof, all of them within one
+  bound.
+* ``sweep_strays``, for the daemon's own start: a plugin host unit that this daemon did not start (left by an earlier
+  life) and that the system shows active, starting again or queued is stopped by the system's stop and reported, so
+  a host never outlives the daemon's Stop unseen.
 
 Not here: which plugins go to a host (the daemon still runs every plugin in its own process), the wall around a
 host, and handing a descriptor to a host.
@@ -57,7 +67,7 @@ from recursion_core.control_transport.framing import HEADER
 from recursion_core.plugin_host import DEFAULT_GIL_CHECK, START_CODE, START_REFUSED
 from recursion_core.plugin_security import host_channel as hc
 
-from .launcher import _unit_path_ok, check_piped_properties, private_dir, require_launcher_platform
+from .launcher import _unit_path_ok, check_piped_properties, private_dir, require_launcher_platform, unit_shows_ended
 from .plugins import OPERATOR_DEADLINE_S
 
 log = logging.getLogger(__name__)
@@ -72,6 +82,16 @@ CALL_DEADLINE_S = OPERATOR_DEADLINE_S
 # plugin_host.start_deadline_s: how long a new host may take to say hello. Shipped default: the engine launcher's
 # own start wait.
 START_DEADLINE_S = 10.0
+
+# plugin_host.stop_confirm_s: how long Stop waits, after the kill, for the system to show a host's unit ended and not
+# about to start again. Shipped default 5 s. A number of seconds above zero; no limit is NOT offered for this row: a
+# Stop with no bound on its proof is no Stop.
+STOP_CONFIRM_S = 5.0
+# plugin_host.stop_confirm_poll_s: how long Stop waits between two reads of the unit's state while it waits for that
+# proof. Shipped default 0.05 s, a number of seconds above zero.
+STOP_CONFIRM_POLL_S = 0.05
+# What a host's record of its life says: one of these, in this order. ``ended`` is said only from what the system shows.
+STARTING, RUNNING, ENDING, LIFE_ENDED, UNCONFIRMED = 'starting', 'running', 'ending', 'ended', 'unconfirmed'
 
 # The longest single wait the platform takes (Python's own figure, not a setting): a longer deadline is waited in
 # slices of it. poll takes at most a C int of milliseconds (the platform's own figure, not a setting).
@@ -106,6 +126,30 @@ def _deadline(name, value):
         return float(value)
     except OverflowError:
         return math.inf  # more seconds than a float holds: waited in slices, so no clock ever reaches it
+
+
+def _bound(name, value):
+    """Seconds as a float for a bound that must hold: None, and a number no clock reaches, are refused."""
+    try:
+        seconds = None if value is None else _deadline(name, value)
+    except ValueError:
+        seconds = None
+    if seconds is None or seconds == math.inf:
+        raise ValueError(f'{name} = {reprlib.repr(value)} is not a bound: write a number of seconds above zero. No '
+                         'limit is not offered here: a Stop with no bound on its proof is no Stop')
+    return seconds
+
+
+def _shown(state):
+    """What the system showed of a unit, in words."""
+    if not state:
+        return 'nothing that could be read'
+    if state.get('LoadState') == 'not-found':
+        return 'the unit gone'
+    text = f"the unit {state.get('ActiveState') or '?'} ({state.get('SubState') or '?'})"
+    if str(state.get('Job', '')).strip():
+        text += ' with a job queued'
+    return text
 
 
 def _core_folder(value):
@@ -187,7 +231,9 @@ class HostUnit:
     def __init__(self, plugin_id, unit, sock, process, end):
         self.plugin_id, self.unit, self.group = plugin_id, unit, ''
         self.end = end  # host_channel.DaemonEnd: answers what the host asks of the core
-        self.ended = self.stopped = self.replaced = False
+        self.ended = self.stopped = self.replaced = False  # ended: the kill was given (the life says what is shown)
+        self.life = STARTING  # the host's one record of its life: starting, running, ending, ended or unconfirmed
+        self.stop_words = ''  # what a person reads when the system did not confirm this host's Stop
         self.refusals = []  # refusals that answered no call (a load the host refused, say)
         self._sock, self._process = sock, process
         self._buffer = b''
@@ -297,7 +343,8 @@ class PluginHostUnits:
     """The daemon's plugin hosts on Linux: ``start``, ``call``, ``stop`` and ``close``, one host per plugin."""
 
     def __init__(self, manager, state_dir, core, *, python=None, gil_check=DEFAULT_GIL_CHECK,
-                 call_deadline_s=CALL_DEADLINE_S, start_deadline_s=START_DEADLINE_S, properties=(), core_folder=None):
+                 call_deadline_s=CALL_DEADLINE_S, start_deadline_s=START_DEADLINE_S, properties=(), core_folder=None,
+                 stop_confirm_s=STOP_CONFIRM_S, stop_confirm_poll_s=STOP_CONFIRM_POLL_S):
         require_launcher_platform()
         self._manager, self._state, self._core = manager, Path(state_dir), core
         self._python = python or sys.executable
@@ -305,6 +352,8 @@ class PluginHostUnits:
         self._gil_check = gil_check
         self._call_deadline_s = _deadline('call_deadline_s', call_deadline_s)
         self._start_deadline_s = _deadline('start_deadline_s', start_deadline_s)
+        self._stop_confirm_s = _bound('stop_confirm_s', stop_confirm_s)
+        self._stop_confirm_poll_s = _bound('stop_confirm_poll_s', stop_confirm_poll_s)
         self._properties = check_piped_properties(properties)
         self._lock = threading.Lock()
         self._turns = {}       # plugin id -> lock: one call at a time on a host's channel
@@ -317,6 +366,11 @@ class PluginHostUnits:
         self._ids = itertools.count(1)
         self._closed = False
         self.degraded = {}     # plugin id -> calls that ended with no answer since the last answer
+        self._lives = {}       # plugin id -> its latest HostUnit, whose life status shows
+        self._made = set()     # the unit of every host started in this life: sweep_strays leaves these alone
+        self.unconfirmed = {}  # unit -> HostUnit whose Stop the system has not confirmed (status reads it again)
+        self.stops_unconfirmed = {}  # plugin id -> how many of its hosts' Stops were not confirmed within the bound
+        self.strays = []       # words of every host unit of an earlier life that sweep_strays found and stopped
 
     # -- the public calls ----------------------------------------------------------------------
     def start(self, plugin_id, manifest, files):
@@ -398,29 +452,25 @@ class PluginHostUnits:
             return answer
 
     def stop(self, plugin_id):
-        """End the host of ``plugin_id`` by the system's kill of its unit. Sends it nothing and waits on nothing."""
+        """End the host of ``plugin_id`` by the system's kill of its unit, then prove it within the Stop bound
+        (plugin_host.stop_confirm_s): the host is recorded ended only when the system shows its unit ended and not
+        about to start again, else its Stop is recorded unconfirmed and said so. Sends the host nothing and waits on
+        nothing it does."""
         with self._lock:
             self._stopped.add(plugin_id)
             host = self._units.pop(plugin_id, None)
             starting = self._starting.get(plugin_id)
-        if host is not None:
-            host.stopped = True
-            self._end(host)
-        if starting is not None:
-            self._end_start(starting)
+        self._end_all([host] if host is not None else [], [starting] if starting is not None else [])
 
     def close(self):
-        """The daemon's own Stop: every host is ended by the system's kill; none is waited on."""
+        """The daemon's own Stop: every host is ended by the system's kill, then proven ended as ``stop`` does, all
+        within one Stop bound; no host is waited on."""
         with self._lock:
             self._closed = True
             hosts = list(self._units.values())
             self._units.clear()
             starting = list(self._starting.values())
-        for host in hosts:
-            host.stopped = True
-            self._end(host)
-        for host in starting:
-            self._end_start(host)
+        self._end_all(hosts, starting)
         with self._lock:
             ended, self._ended = self._ended, []
         for host in ended:
@@ -434,6 +484,67 @@ class PluginHostUnits:
             else:
                 with self._lock:
                     self._ended.append(host)  # a call still holds it; that call closes it
+
+    def status(self):
+        """What a person reads of the plugin hosts: each plugin's latest host by its life (starting, running, ending,
+        ended or unconfirmed) and its unit, the calls with no answer since its last answer, how many of its hosts'
+        Stops the system did not confirm in time; every host whose Stop is still unconfirmed, with the words that say
+        so; the strays ``sweep_strays`` found; and the bounds by the rows they come from. A host whose Stop is
+        unconfirmed is read again here first: it is said to be ended only once the system shows it so."""
+        with self._lock:
+            pending = list(self.unconfirmed.values())
+        for host in pending:
+            if unit_shows_ended(self._unit_state(host.unit, time.monotonic() + self._stop_confirm_s)):
+                with self._lock:
+                    host.life, host.stop_words = LIFE_ENDED, ''
+                    self.unconfirmed.pop(host.unit, None)
+        with self._lock:
+            plugins = {}
+            for plugin_id in set(self._lives) | set(self.degraded) | set(self.stops_unconfirmed):
+                host = self._lives.get(plugin_id)
+                plugins[plugin_id] = {'life': host.life if host else None, 'unit': host.unit if host else None,
+                                      'degraded': self.degraded.get(plugin_id, 0),
+                                      'stops_unconfirmed': self.stops_unconfirmed.get(plugin_id, 0)}
+            return {'bounds': {'plugin_host.call_deadline_s': self._call_deadline_s,
+                               'plugin_host.start_deadline_s': self._start_deadline_s,
+                               'plugin_host.stop_confirm_s': self._stop_confirm_s,
+                               'plugin_host.stop_confirm_poll_s': self._stop_confirm_poll_s},
+                    'plugins': plugins,
+                    'stop_unconfirmed': [{'plugin': host.plugin_id, 'unit': host.unit, 'words': host.stop_words}
+                                         for host in self.unconfirmed.values()],
+                    'strays': list(self.strays)}
+
+    def sweep_strays(self):
+        """For the daemon's own start: stop every plugin host unit the user manager shows that this PluginHostUnits
+        did not start and that is active, starting again or queued, and report it. Returns the words of each (also
+        kept for ``status``), so a host of an earlier life can never outlive the daemon's Stop unseen."""
+        try:
+            names = self._manager.listed_units('recursion-host-*.service', self._stop_confirm_s)
+        except Exception as exc:  # noqa: BLE001 - said to the person, never dropped
+            found = [f'the daemon could not list the plugin host units ({type(exc).__name__}), so a host of an earlier '
+                     'life may still run: look with systemctl --user list-units recursion-host-*']
+            log.error('%s', found[0])
+        else:
+            found = []
+            for name in names:
+                with self._lock:
+                    ours = name in self._made
+                if ours or not HOST_UNIT.fullmatch(name):
+                    continue
+                before = self._unit_state(name, time.monotonic() + self._stop_confirm_s)
+                if unit_shows_ended(before):
+                    continue
+                did = self._system_stop(name)
+                after = self._unit_state(name, time.monotonic() + self._stop_confirm_s)
+                words = (f'a plugin host unit {name} that this daemon did not start was found with {_shown(before)}; '
+                         f'the daemon {did}, and the system now shows {_shown(after)}')
+                if not unit_shows_ended(after):
+                    words += f'. Do not trust that host: stop it with systemctl --user stop {name}'
+                log.error('%s', words)
+                found.append(words)
+        with self._lock:
+            self.strays.extend(found)
+        return found
 
     # -- inside ------------------------------------------------------------------------------
     def _start(self, plugin_id, package, limit=None):
@@ -465,6 +576,8 @@ class PluginHostUnits:
         host = HostUnit(plugin_id, unit, ours, process, end)
         with self._lock:
             self._starting[plugin_id] = host  # from here stop and close see this host
+            self._lives[plugin_id] = host
+            self._made.add(unit)
             late = self._closed or plugin_id in self._stopped
             if self._replacements.get(plugin_id, 0) != replacements:
                 host.replaced = late = True
@@ -508,6 +621,7 @@ class PluginHostUnits:
             self._starting.pop(plugin_id, None)
             if not self._closed and plugin_id not in self._stopped and not host.stopped:
                 self._units[plugin_id] = host
+                host.life = RUNNING
                 return host
         host.stopped = True
         self._end(host)
@@ -556,31 +670,103 @@ class PluginHostUnits:
         host.close()
 
     def _replace(self, host):
-        """End a host that a new start of its plugin replaces, and wake whoever waits on its channel."""
+        """End a host that a new start of its plugin replaces, wake whoever waits on its channel, then prove it."""
         host.replaced = host.stopped = True
-        self._end(host)
+        first = self._kill(host)
         host.wake()
+        if first:
+            self._confirm(host)
 
-    def _end_start(self, host):
-        """End a host whose start is under way and wake that start, which then ends with ``stopped``.
+    def _end_start(self, host, deadline=None):
+        """End a host whose start is under way and wake that start, which then ends with ``stopped``; then prove it.
 
         A unit that shows no cgroup yet has run no plugin byte (the package is sent only after the cgroup check):
         its systemd-run is ended, and the host's own code ends at the end of its channel, which ``wake`` makes.
         """
         host.stopped = True
-        self._end(host)
+        first = self._kill(host)
         host.wake()
+        if first:
+            self._confirm(host, deadline)
 
-    def _end(self, host):
-        """SIGKILL the unit's whole cgroup now, once. Waits on nothing the host does."""
+    def _end_all(self, hosts, starting):
+        """``stop`` and ``close``: kill every host first, then prove each ended, all within ONE Stop bound."""
+        deadline = time.monotonic() + self._stop_confirm_s
+        killed = []
+        for host in hosts:
+            host.stopped = True
+            if self._kill(host):
+                killed.append(host)
+        for host in starting:
+            host.stopped = True
+            if self._kill(host):
+                killed.append(host)
+            host.wake()
+        for host in killed:
+            self._confirm(host, deadline)
+
+    def _end(self, host, deadline=None):
+        """SIGKILL the unit's whole cgroup now, once, then prove it ended (``_confirm``). Waits on nothing the host
+        does."""
+        if self._kill(host):
+            self._confirm(host, deadline)
+
+    def _unit_state(self, unit, deadline):
+        """What the system shows of ``unit``, read by ``deadline`` (one read is given at least the poll's time); a read
+        that fails shows nothing, which is never taken as ended."""
+        try:
+            return dict(self._manager.unit_state(unit, max(deadline - time.monotonic(), self._stop_confirm_poll_s)))
+        except Exception:  # noqa: BLE001 - nothing shown is never ended
+            return {}
+
+    def _system_stop(self, unit):
+        """The system's own stop of ``unit`` within the Stop bound, in words of what the daemon did."""
+        try:
+            self._manager.stop_unit(unit, self._stop_confirm_s)
+        except Exception as exc:  # noqa: BLE001 - said in the words, never dropped
+            return f'asked the system to stop it, which failed ({type(exc).__name__})'
+        return 'asked the system to stop it'
+
+    def _confirm(self, host, deadline=None):
+        """After the kill: True once the system shows the unit ended and not about to start again, read until
+        ``deadline`` (by default the Stop bound from now). Past it the unit is stopped by the system's own stop, and the
+        host's Stop is recorded unconfirmed and said so, in the log and in ``status``; never dropped silently."""
+        if deadline is None:
+            deadline = time.monotonic() + self._stop_confirm_s
+        while True:
+            state = self._unit_state(host.unit, deadline)
+            if unit_shows_ended(state):
+                with self._lock:
+                    host.life = LIFE_ENDED  # said only from what the system shows
+                return True
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            time.sleep(min(self._stop_confirm_poll_s, left))
+        did = self._system_stop(host.unit)
+        after = self._unit_state(host.unit, time.monotonic() + self._stop_confirm_s)
+        words = (f'the daemon ended the host of {host.plugin_id} but could not confirm within {self._stop_confirm_s:g} s '
+                 f'(plugin_host.stop_confirm_s) that the system will not start it again: the system showed '
+                 f'{_shown(state)}. The daemon then {did} ({host.unit}), and the system now shows {_shown(after)}. Do '
+                 'not trust this host until the status shows it ended')
+        with self._lock:
+            host.life, host.stop_words = UNCONFIRMED, words
+            self.unconfirmed[host.unit] = host
+            self.stops_unconfirmed[host.plugin_id] = self.stops_unconfirmed.get(host.plugin_id, 0) + 1
+        log.error('plugin %s: %s', host.plugin_id, words)
+        return False
+
+    def _kill(self, host):
+        """SIGKILL the unit's whole cgroup now, once. True for the one caller that gave the kill."""
         with self._lock:
             first, host.ended = not host.ended, True
             if self._units.get(host.plugin_id) is host:
                 del self._units[host.plugin_id]
             if first:
                 self._ended.append(host)
+                host.life = ENDING
         if not first:
-            return
+            return False
         group = host.group
         if not group:
             try:
@@ -594,3 +780,4 @@ class PluginHostUnits:
             os.rmdir(self._state / 'plugin-hosts' / host.unit[len('recursion-host-'):-len('.service')])
         except OSError:
             pass
+        return True

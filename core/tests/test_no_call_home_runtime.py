@@ -401,6 +401,35 @@ class IdleDaemonTests(unittest.TestCase):
             self.assertEqual(_digest(bins), before)  # the stand-ins that ran are the test's own, unchanged
 
 
+class ReadmeWordsTests(unittest.TestCase):
+    """The words a person reads first say what the commands print, what is proven and what is not."""
+
+    def _section(self):
+        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        start = text.index("## What Recursion connects to")
+        end = min(i for i in (text.find("\n## ", start + 4), text.find("\n> ", start)) if i > 0)
+        return text[start:end]
+
+    def test_the_readme_names_the_commands_and_what_is_not_proven(self):
+        section = self._section()
+        for words in ("python3 tools/network_reach.py", "python3 core/tests/test_no_call_home_runtime.py",
+                      "python3 tools/network_audit.py", "NOT PROVEN", "Proven before every merge",
+                      "Not proven:", "the engines' own traffic", "under a grant you gave",
+                      "what the operating system does by itself", "made from a descriptor",
+                      "foreign-function module", "not part of the hosted gate", "Windows"):
+            with self.subTest(words=words):
+                self.assertIn(words, " ".join(section.split()))
+
+    def test_a_green_run_prints_no_refusal_meant_for_a_planted_case(self):
+        # The second command's own planted cases keep their words to themselves: on a green run the
+        # person reads no NOT PROVEN line of a hook that saw nothing.
+        run = subprocess.run([sys.executable, "-B", str(Path(__file__).resolve()), "SuiteHookTests", "JudgeTests"],
+                             capture_output=True, text=True, timeout=START_SECONDS * 4, cwd=str(ROOT))
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertNotIn("the hook saw no process at all", run.stdout)
+        self.assertIn("Not covered by this proof:", run.stdout)
+
+
 class ConfiguredEngineTests(unittest.TestCase):
     def test_the_only_address_reached_is_the_one_the_person_configured(self):
         from recursion_core.child_env.launch import spawn

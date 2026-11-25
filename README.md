@@ -26,17 +26,42 @@ browser view on the loopback address `127.0.0.1`. It starts the engine programs 
 with only the addresses you configured; what an engine program reaches on its own is that
 program's setting (Codex is started with its update check turned off). A plugin reaches a network
 only under a grant you gave; that proof belongs to the plugin checks in
-`core/recursion_core/plugin_security/`, not to this list. Every place in the shipped code that
-could reach a network is written down, with who supplies its address, in `tools/network_reach.toml`.
+`core/recursion_core/plugin_security/`, not to this list. The shipped code may import only the
+modules listed with their reasons in `tools/network_reach.toml`, and every place in it that could
+reach a network is written down there with who supplies its address and the exact text of each call.
 
 Run the proof on your own machine:
 
-- `python3 tools/network_reach.py` reads every shipped file by its syntax tree and fails on any
-  call that could reach a network and has no row in the list, or whose address would come from
-  the code itself.
-- `python3.14t -X gil=0 core/tests/test_no_call_home_runtime.py` starts a daemon of its own in a
-  temporary folder, leaves it idle, asks its status and stops it, while the interpreter's audit
-  hook watches that it reaches no address and looks up no name.
+- `python3 tools/network_reach.py` reads every shipped file by its syntax tree. It prints PROVEN,
+  or NOT PROVEN with each problem: a module that is not on the list; running text as code, or
+  reaching a module or a function by a name built at run time; a foreign-function, private
+  socket or subprocess, zip-import or unpickling module; a log handler that sends over a network;
+  an import of a test module or of anything outside the package; a call that could reach a network
+  and has no row, or whose text is not the text its row holds; a file it cannot read.
+- `python3 core/tests/test_no_call_home_runtime.py` (Linux, CPython 3.12 or later) starts a daemon
+  of its own in a temporary folder, leaves it idle, asks its status and stops it, while the
+  interpreter's audit hook watches that it reaches no address and looks up no name; then it starts
+  a stand-in engine at an address it configured and checks that only that address is reached. It
+  prints PROVEN (run-time) or NOT PROVEN, and the list of what it does not cover. The daemon itself
+  runs only on free-threaded CPython 3.14t; on another interpreter the test stands in for that one
+  check, and the rest of the daemon runs as shipped.
+
+What is proven, and what is not:
+
+- Proven before every merge: the tests of both proofs (`core/tests/test_network_reach.py`, which
+  checks what the first command checks and plants each refused kind, and the file of the second
+  command) run in the hosted gate (CPython 3.12 on Linux), so a later change that adds a call home, a module or a refused construct goes red there. The
+  whole test suite can also be run once with the hook in every Python process it starts:
+  `python3 tools/network_audit.py`; it names every program that is not Python and refuses one that
+  is not listed in `tools/network_audit.toml`. That run is not part of the hosted gate.
+- Not proven: the engines' own traffic to the addresses you configured, and anything else an
+  engine program reaches by itself; what a plugin does under a grant you gave (the plugin checks'
+  proof); what the operating system does by itself (its own name lookups and services); what any
+  program the daemon starts reaches by itself (the test runs only its own stand-ins); the traffic
+  of a socket made from a descriptor handed in from outside with its family named; a call into the
+  operating system through a foreign-function module at run time (the shipped code may not import
+  one, and the run-time test refuses any such call it sees). The test runs on Linux only; Windows
+  and macOS are not covered.
 
 > Governance note: `CONTROL_PLANE.md` and `ANCHOR.md` are the operative authority and scope
 > records. They already describe Recursion v3 (D-017, 2026-09-28); the older claim that they

@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "session.v1.json",
+  "title": "session.v1: one session and its turns",
+  "x-version": "1.0-draft.3",
+  "description": "PUBLIC record, and the row lane SESSIONS stores. Meanings that are frozen with this record: a RUN is one supervised unit with its own Stop. A TURN is one input and the engine's work until it yields. With a driver that declares multi_turn, several turns of a session share one run_id (one worker stays alive between turns); with any other driver each turn has its own run. Stop acts on a run. Interrupt acts on a turn. A session has at most one live unit. 'idle' with a worker that is alive is a persistent worker waiting for input; 'live' is a turn in progress; 'stop_pending' is a Stop that is not confirmed, and no new turn starts while it lasts; 'ended' is final. A turn's result is stored with the turn: a run's result file is the run's, not a turn's, because several turns can share one run. No token, cookie or key appears in this record.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["session_id", "created_at", "tenant", "principal", "parent_session_id", "spawn_kind", "state", "workspace", "route", "engine_session_id", "worker", "active_turn_id", "turns", "budget", "revision"],
+  "properties": {
+    "session_id": {"$ref": "common.v1.json#/$defs/session_id"},
+    "created_at": {"$ref": "common.v1.json#/$defs/timestamp"},
+    "tenant": {"$ref": "common.v1.json#/$defs/tenant"},
+    "principal": {
+      "description": "Who started the session.",
+      "$ref": "common.v1.json#/$defs/principal"
+    },
+    "parent_session_id": {
+      "description": "The session this one was forked from or is a child of; null for a root.",
+      "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/session_id"}]
+    },
+    "spawn_kind": {
+      "description": "root: started by a user. fork: a copy of the parent at one of its turns. child: started by the parent session itself (delegation).",
+      "enum": ["root", "fork", "child"]
+    },
+    "state": {"enum": ["idle", "live", "stop_pending", "ended"]},
+    "workspace": {
+      "description": "null when the session has no workspace: its units then run in the engine's own home, as run.start does today.",
+      "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/workspace"}]
+    },
+    "route": {"$ref": "common.v1.json#/$defs/route"},
+    "engine_session_id": {
+      "description": "The engine's own id for the conversation, used to resume or fork it; null until the engine reports one. Untrusted text.",
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "worker": {
+      "description": "The session's unit, or null when it has none. alive is what the daemon last knew of that unit.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["run_id", "alive"],
+      "properties": {
+        "run_id": {"$ref": "common.v1.json#/$defs/run_id"},
+        "alive": {"type": "boolean"}
+      }
+    },
+    "active_turn_id": {
+      "description": "The turn in progress, or null.",
+      "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/turn_id"}]
+    },
+    "turns": {
+      "description": "Every turn of the session, oldest first. index starts at 0 and rises by one.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/turn"}
+    },
+    "budget": {
+      "description": "The same type as in the run record. cap_usd 0 is the default and means nothing may be spent.",
+      "$ref": "common.v1.json#/$defs/budget"
+    },
+    "revision": {"$ref": "common.v1.json#/$defs/revision"}
+  },
+  "allOf": [
+    {
+      "if": {"required": ["spawn_kind"], "properties": {"spawn_kind": {"const": "root"}}},
+      "then": {"properties": {"parent_session_id": {"type": "null"}}},
+      "else": {"properties": {"parent_session_id": {"type": "string"}}}
+    },
+    {
+      "if": {"required": ["state"], "properties": {"state": {"const": "idle"}}},
+      "then": {"properties": {"active_turn_id": {"type": "null"}}}
+    },
+    {
+      "if": {"required": ["state"], "properties": {"state": {"const": "live"}}},
+      "then": {"properties": {"active_turn_id": {"type": "string"}, "worker": {"type": "object"}}}
+    },
+    {
+      "if": {"required": ["state"], "properties": {"state": {"const": "stop_pending"}}},
+      "then": {"properties": {"worker": {"type": "object"}}}
+    },
+    {
+      "if": {"required": ["state"], "properties": {"state": {"const": "ended"}}},
+      "then": {"properties": {"active_turn_id": {"type": "null"}, "worker": {"type": "null"}}}
+    }
+  ],
+  "$defs": {
+    "turn_state": {
+      "description": "queued: accepted, and the engine's work has not begun. running: in progress. ended: the engine yielded. interrupted: an interrupt ended it. failed: it could not start or the engine failed. stopped: a Stop ended its run.",
+      "enum": ["queued", "running", "interrupted", "ended", "failed", "stopped"]
+    },
+    "turn_outcome": {
+      "description": "How a turn came to its end, in more detail than its state. For state 'ended': candidate_done (the engine says the work is done and the check of that has not run), done (the work is done), waiting (the engine yielded and waits for the user), paused (the turn was set aside to be continued). For the other final states the outcome is the same word as the state: interrupted, failed, stopped.",
+      "enum": ["candidate_done", "done", "waiting", "paused", "interrupted", "failed", "stopped"]
+    },
+    "turn_result": {
+      "description": "The result of one turn. code is null when the turn succeeded and a typed code when it did not. detail may carry engine text and is untrusted. result_ref names where the turn's final text is kept, or is null when it is not kept.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "detail", "result_ref"],
+      "properties": {
+        "code": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/code_word"}]},
+        "detail": {"type": "string"},
+        "result_ref": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/token"}]}
+      }
+    },
+    "turn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["turn_id", "index", "run_id", "state", "started_at", "ended_at", "outcome", "result", "expires_at"],
+      "properties": {
+        "turn_id": {"$ref": "common.v1.json#/$defs/turn_id"},
+        "index": {"type": "integer", "minimum": 0},
+        "run_id": {
+          "description": "The run the turn's work happens in; null until the turn is bound to one.",
+          "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/run_id"}]
+        },
+        "state": {"$ref": "#/$defs/turn_state"},
+        "started_at": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/timestamp"}]},
+        "ended_at": {"anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/timestamp"}]},
+        "outcome": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/turn_outcome"}]},
+        "result": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/turn_result"}]},
+        "expires_at": {
+          "description": "When the turn's result can no longer be read; null means for as long as the session's record is kept.",
+          "anyOf": [{"type": "null"}, {"$ref": "common.v1.json#/$defs/timestamp"}]
+        }
+      },
+      "allOf": [
+        {
+          "if": {"required": ["state"], "properties": {"state": {"const": "queued"}}},
+          "then": {"properties": {"started_at": {"type": "null"}, "ended_at": {"type": "null"}, "outcome": {"type": "null"}, "result": {"type": "null"}}}
+        },
+        {
+          "if": {"required": ["state"], "properties": {"state": {"const": "running"}}},
+          "then": {"properties": {"run_id": {"type": "string"}, "started_at": {"type": "string"}, "ended_at": {"type": "null"}, "outcome": {"type": "null"}, "result": {"type": "null"}}}
+        },
+        {
+          "if": {"required": ["state"], "properties": {"state": {"const": "ended"}}},
+          "then": {"properties": {"run_id": {"type": "string"}, "started_at": {"type": "string"}, "ended_at": {"type": "string"}, "outcome": {"enum": ["candidate_done", "done", "waiting", "paused"]}, "result": {"type": "object", "properties": {"code": {"type": "null"}}}}}
+        },
+        {
+          "if": {"required": ["state"], "properties": {"state": {"const": "interrupted"}}},
+          "then": {"properties": {"run_id": {"type": "string"}, "started_at": {"type": "string"}, "ended_at": {"type": "string"}, "outcome": {"const": "interrupted"}}}
+        },
+        {
+          "if": {"required": ["state"], "properties": {"state": {"const": "stopped"}}},
+          "then": {"properties": {"run_id": {"type": "string"}, "started_at": {"type": "string"}, "ended_at": {"type": "string"}, "outcome": {"const": "stopped"}}}
+        },
+        {
+          "if": {"required": ["state"], "properties": {"state": {"const": "failed"}}},
+          "then": {"properties": {"ended_at": {"type": "string"}, "outcome": {"const": "failed"}, "result": {"type": "object", "properties": {"code": {"type": "string"}}}}}
+        }
+      ]
+    }
+  }
+}

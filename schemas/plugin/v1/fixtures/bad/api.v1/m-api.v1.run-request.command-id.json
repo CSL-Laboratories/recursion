@@ -1,0 +1,7 @@
+{
+  "tenant": "t1",
+  "prompt": "Summarise the notes added this week.",
+  "workspace": {
+    "path": "/home/dev/notes"
+  }
+}

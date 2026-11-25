@@ -1,0 +1,193 @@
+{
+  "source": "run",
+  "view": {
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "tenant": "t1",
+    "engine": "claude_code",
+    "state": "running",
+    "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/recursion-run-run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7.service",
+    "started_at": 1794555600.25,
+    "stop": null,
+    "start_key": {
+      "client_key": "k-1",
+      "engine": "claude_code",
+      "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
+    },
+    "generation": 2,
+    "cgroup_marker": "cg-3c1f6f0a2b7d4e5f8a9b0c1d2e3f4a5b",
+    "members": [],
+    "stop_attestation": null,
+    "principal": {
+      "kind": "owner",
+      "id": "local"
+    },
+    "launch": {
+      "route_entry": null,
+      "route_decision": null,
+      "workspace": null,
+      "containment_level": null,
+      "session_id": null,
+      "turn_id": null,
+      "owner": "host",
+      "budget": {
+        "cap_usd": 0
+      }
+    },
+    "observed": {
+      "state": "running",
+      "detail": "",
+      "unit": "recursion-run-run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7.service",
+      "stop_requested": false
+    }
+  },
+  "events": [
+    {
+      "seq": 1,
+      "session_id": "run:run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": null,
+      "time": "2026-11-13T07:33:58.120Z",
+      "type": "state.changed",
+      "source": "core",
+      "trust": "trusted",
+      "payload": {
+        "entity": "run",
+        "entity_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "post_image": {
+          "daemon_row": null,
+          "control_record": {
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "tenant": "t1",
+            "engine": "claude_code",
+            "state": "starting",
+            "cgroup": null,
+            "started_at": 1794555600.25,
+            "stop": null,
+            "start_key": {
+              "client_key": "k-1",
+              "engine": "claude_code",
+              "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
+            },
+            "generation": 1,
+            "cgroup_marker": null,
+            "members": [],
+            "stop_attestation": null,
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "launch": {
+              "route_entry": null,
+              "route_decision": null,
+              "workspace": null,
+              "containment_level": null,
+              "session_id": null,
+              "turn_id": null,
+              "owner": "host",
+              "budget": {
+                "cap_usd": 0
+              }
+            }
+          }
+        },
+        "post_image_sha256": "45188083c94f8489455d91b854931294e567a663a33039b430b3ec933686d03a",
+        "reason": "snapshot",
+        "coalesced": null
+      }
+    },
+    {
+      "seq": 2,
+      "session_id": "run:run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": null,
+      "time": "2026-11-13T07:33:58.412Z",
+      "type": "state.changed",
+      "source": "core",
+      "trust": "trusted",
+      "payload": {
+        "entity": "run",
+        "entity_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+        "post_image": {
+          "daemon_row": null,
+          "control_record": {
+            "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+            "tenant": "t1",
+            "engine": "claude_code",
+            "state": "running",
+            "cgroup": "/user.slice/user-1000.slice/user@1000.service/app.slice/recursion-run-run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7.service",
+            "started_at": 1794555600.25,
+            "stop": null,
+            "start_key": {
+              "client_key": "k-1",
+              "engine": "claude_code",
+              "prompt_sha256": "aba9e3c9f5edce8cac37dd5d817e4d33fdf3ca5bc0672e5f9e3bedb604c6aad3"
+            },
+            "generation": 2,
+            "cgroup_marker": "cg-3c1f6f0a2b7d4e5f8a9b0c1d2e3f4a5b",
+            "members": [],
+            "stop_attestation": null,
+            "principal": {
+              "kind": "owner",
+              "id": "local"
+            },
+            "launch": {
+              "route_entry": null,
+              "route_decision": null,
+              "workspace": null,
+              "containment_level": null,
+              "session_id": null,
+              "turn_id": null,
+              "owner": "host",
+              "budget": {
+                "cap_usd": 0
+              }
+            }
+          }
+        },
+        "post_image_sha256": "cf69f7353188d72273b4c81200fee1f27bdadba7c206b8687d4f08441324efd3",
+        "reason": "commit",
+        "coalesced": null
+      }
+    },
+    {
+      "seq": 3,
+      "session_id": "run:run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+      "turn_id": null,
+      "time": "2026-11-13T07:34:02.074Z",
+      "type": "engine.output",
+      "source": "engine",
+      "trust": "untrusted",
+      "payload": {
+        "stream": "stdout",
+        "text": "Reading the tests.\n",
+        "offset_start": 0,
+        "offset_end": 19
+      }
+    }
+  ],
+  "pending_approval_ids": [
+    "apr-00c5"
+  ],
+  "task": {
+    "task_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "source": "run",
+    "session_id": null,
+    "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "turn_id": null,
+    "status": "working",
+    "outcome": null,
+    "cancel_requested": false,
+    "status_message": null,
+    "pending_approval_ids": [],
+    "created_at": null,
+    "updated_at": "2026-11-13T07:33:58.412Z",
+    "expires_at": null,
+    "poll_interval_ms": 1000,
+    "result": null
+  },
+  "expect": [
+    "pending_approval_ids",
+    "status"
+  ]
+}

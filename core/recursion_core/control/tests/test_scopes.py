@@ -849,6 +849,30 @@ class RoundSixScopesTest(unittest.TestCase):
         self.assertEqual(asked, [str, str])
 
 
+class ExactStrPrincipalTest(unittest.TestCase):
+    """A kind or an id whose type is a str subclass counts as no kind and no id."""
+
+    def test_a_kind_or_id_that_is_a_str_subclass_holds_nothing_and_stops_nothing(self) -> None:
+        # Codex P2, scopes.py kind and id: __eq__ on a str subclass answered owner, internal, device or page,
+        # while the ceiling read the underlying text. page_scopes stays the default.
+        class Liar(str):
+            def __eq__(self, other):
+                return True if other in ("owner", "internal", "device", "page") else str.__eq__(self, other)
+
+            __hash__ = str.__hash__
+
+        auth = authorizer()
+        kind_liar = Principal(Liar("plugin"), "plugin.alpha")
+        self.assertEqual(auth.held(kind_liar), frozenset())
+        self.assertEqual(auth(kind_liar, "run.stop", {"run_id": "run-host"}), ("scope_refused", "needs_run"))
+        self.assertEqual(auth.held(Principal("device", Liar("evil"))), frozenset())
+        self.assertEqual(auth(Principal("device", Liar("evil")), "approval.answer", {}), ("scope_refused", "needs_approve"))
+        plugin = Principal("plugin", "plugin.alpha")   # a {read, run} grant still stops only its own run
+        self.assertIsNone(auth(plugin, "run.stop", {"run_id": "run-alpha"}))
+        for run_id in ("run-host", "run-beta", "run-noowner", "run-emptyowner", "run-legacy", "run-not-recorded"):
+            self.assertEqual(auth(plugin, "run.stop", {"run_id": run_id}), ("scope_refused", "run_not_owned"), run_id)
+
+
 class RoundSevenScopesTest(unittest.TestCase):
     """The round-7 read of #377 by Codex GPT-6.1 Sol, 1 (STRICT): a metaclass answering __dict__ hid a declared
     grant from getattr_static, so its reader's AttributeError read as an absent grant."""

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import errno
 import ipaddress
+import math
+import numbers
 import os
 import re
 import socket
@@ -260,6 +262,27 @@ def check_peer(sock: socket.socket, getter: PeerCredGetter, expected_uid: int) -
     return cred
 
 
+def _seconds(name: str, value: object) -> float:
+    """``value`` as float seconds, if it is a finite, positive real number (an int, a float or another
+    ``numbers.Real``, never a bool); else ``ValueError``. Zero, a negative or NaN served nothing, and NaN killed
+    a worker in ``settimeout`` (the reads of #407 by DeepSeek: round 2 F3, round 3 N3 and N4)."""
+
+    message = f"{name} must be a finite, positive real number of seconds (an int or a float, not a bool)"
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(message)
+    # Converted to a plain float ONCE, and that float is what is checked and kept: a subclass's own __float__ could
+    # answer NaN after its value passed, and a tiny or huge real converts to 0.0 or overflows (round 1 of #407,
+    # Codex GPT-6.1 Sol R1). Whatever that conversion raises is a ValueError (round 4: DeepSeek F2, Sol 1); an
+    # interrupt is not an Exception and still propagates.
+    try:
+        seconds = float(value)
+    except Exception:  # noqa: BLE001 - a real number that cannot be converted is not a number of seconds
+        raise ValueError(message) from None
+    if not math.isfinite(seconds) or not seconds > 0:
+        raise ValueError(message)
+    return seconds
+
+
 class UnixControlServer:
     """Owner-only AF_UNIX listener that hands each frame to ``handler`` and writes its reply.
 
@@ -316,6 +339,10 @@ class UnixControlServer:
             raise ValueError("reserved_connections must be an int")
         if reserved_connections < 0 or (reserved_connections and priority is None):
             raise ValueError("reserved_connections needs a priority test and cannot be negative")
+        idle_timeout_s = _seconds("idle_timeout_s", idle_timeout_s)
+        # Checked only when it is used: a server with no reserved slots ignores it, as before.
+        if reserved_connections:
+            reserved_timeout_s = _seconds("reserved_timeout_s", reserved_timeout_s)
         self.directory = directory
         self._path = refuse_remote_bind(os.path.join(directory, name))
         self._handler = handler
@@ -396,6 +423,11 @@ class UnixControlServer:
             except OSError:
                 pass
         for worker in workers:
+            # A worker the accept loop has added but not yet started cannot be joined (nor can this thread, if a
+            # handler shuts the server down): joining raised, and the listener and its lock were never released
+            # (the round-2 read of #407 by DeepSeek, F2; the same on master). Its connection was shut above.
+            if worker.ident is None or worker is threading.current_thread():
+                continue
             worker.join(timeout=self._idle_timeout_s + 1.0)
         with self._lock:
             sock, self._sock = self._sock, None
@@ -557,11 +589,29 @@ class UnixControlServer:
                 if reserved:
                     return  # one priority request per reserved connection
         finally:
-            conn.close()
+            # The slot is freed before the connection is closed, so a client that has seen the close finds it
+            # free: a Stop sent right after it is served, not refused busy. The worker and its socket stay in
+            # the server's sets until the socket is disposed of, so a server shutting down meanwhile still finds,
+            # shuts and joins them (the round-1 reads of #407: Astra R2, Sol R1). A release that fails is recorded
+            # (``conn_close_failed``) and the descriptor it left open, if any, is released directly, so no socket
+            # stays open untracked; then the worker leaves the sets (round 2, DeepSeek F4; round 3, N2). The slots
+            # bound the handlers that run; a worker that has freed its slot and not yet disposed of its socket is
+            # not counted, so for a moment there can be several such tails.
             slots.release()
-            with self._lock:
-                self._workers.discard(threading.current_thread())
-                self._conns.discard(conn)
+            try:
+                conn.close()
+            except OSError:
+                self._refuse("conn_close_failed")
+                try:
+                    fd = conn.detach()   # -1 once the descriptor is already gone
+                    if fd >= 0:
+                        os.close(fd)
+                except OSError:
+                    pass
+            finally:
+                with self._lock:
+                    self._workers.discard(threading.current_thread())
+                    self._conns.discard(conn)
 
 
     def _is_priority(self, request: Message) -> bool:

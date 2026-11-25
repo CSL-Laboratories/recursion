@@ -488,6 +488,7 @@ class Adv2InventoryTests(Adv2HostCase):
         class Conn:
             class peer:
                 pid = -1  # no /proc entry: read as inside a run unit, fails closed
+                uid = os.geteuid()  # the owner; the bad pid is what refuses
         for method in ('route.list', 'plugin.list'):
             answer = control.handle({'op': 'control', 'method': method, 'params': None}, Conn)
             self.assertEqual(answer['error']['code'], 'scope_refused')

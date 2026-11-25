@@ -251,17 +251,19 @@ def load(environ) -> Loaded:
         note = Note(UNREADABLE, f"{path} {why}; every default is in force", warns=True)
         return Loaded(str(path), MappingProxyType(values), (note,))
     notes: list[Note] = []
+    # A key is named whole in its note (only values pass through _shown and its cut), so two long keys that
+    # differ late read apart.
     for name, found in _flatten({k: v for k, v in (doc or {}).items() if k != "version"}):
         row = DECLARED.get(name)
         if found is _QUOTED:
-            notes.append(Note(UNKNOWN_KEY, f"{_shown(name)} is a quoted key that holds a dot, not a setting; it is "
+            notes.append(Note(UNKNOWN_KEY, f"{name!r} is a quoted key that holds a dot, not a setting; it is "
                                            "skipped; write it without the quotes", warns=True))
         elif row is None:
             known = sorted({*DECLARED, *(n.rsplit(".", 1)[0] for n in DECLARED)})  # its keys and its tables
             close = difflib.get_close_matches(name, known, n=1, cutoff=0.8)  # text only; never applied
             hint = f"; did you mean {close[0]}?" if close else ""
-            notes.append(Note(UNKNOWN_KEY, f"{_shown(name)} is not a setting this version knows; it is skipped{hint}",
-                              warns=True))
+            notes.append(Note(UNKNOWN_KEY, f"{name!r} is not a setting this version knows; it is skipped; remove it "
+                                           f"or check its spelling{hint}", warns=True))
         elif not _fits(row, found):
             notes.append(Note(OUT_OF_RANGE, f"{name}: found {_shown(found)}; allowed: {_allowed(row)}; "
                                             f"the default {_shown(row.default)} stays in force"))

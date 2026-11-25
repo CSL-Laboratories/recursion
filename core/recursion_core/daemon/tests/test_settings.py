@@ -1037,7 +1037,8 @@ class ATableAndAKeyReadUnderTheFullDottedName(_Folder):
                 loaded = self.read(text)
                 self.assert_default(loaded, settings.UNKNOWN_KEY)
                 self.assertNotIn(FULL_NAME, loaded.values)
-                self.assertEqual("'engines' is not a setting this version knows; it is skipped", loaded.notes[0].detail)
+                self.assertEqual("'engines' is not a setting this version knows; it is skipped; remove it or check "
+                                 "its spelling", loaded.notes[0].detail)
 
 
 
@@ -1089,6 +1090,41 @@ class TheStartLinesWhateverLoggingHeldBefore(_Folder):
                         self.assertEqual(1, len(found), shown)
                         self.assertRegex(found[0], form)
             self.assertIn(starts[0], caller.getvalue().splitlines())  # the caller's own handler is kept
+
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class AKeyIsShownWhole(_Folder):
+    """Only values are cut in a note; a key is named whole, so two long keys that differ late read apart."""
+
+    def test_two_unknown_keys_of_100_characters_that_differ_after_character_90_give_two_notes(self) -> None:
+        first, second = "a" * 100, "a" * 90 + "b" * 10
+        self.put(f"version = 1\n[plugin_host]\n{first} = false\n{second} = false\n")
+        details = [note.detail for note in settings.load(self.environ).notes]
+        self.assertEqual(2, len(set(details)), details)
+        for key, detail in zip((first, second), details):
+            self.assertTrue(detail.startswith(f"'plugin_host.{key}' is not a setting this version knows; it is "
+                                              "skipped; remove it or check its spelling"), detail)
+
+    def test_two_long_quoted_keys_that_differ_late_give_two_notes_with_the_whole_key(self) -> None:
+        first, second = "a" * 90 + ".b", "a" * 90 + ".c"
+        self.put(f'version = 1\n"{first}" = 1\n"{second}" = 1\n')
+        details = [note.detail for note in settings.load(self.environ).notes]
+        self.assertEqual(2, len(set(details)), details)
+        for key, detail in zip((first, second), details):
+            self.assertTrue(detail.startswith(f"'{key}' is a quoted key that holds a dot"), detail)
+
+    def test_the_note_for_an_unknown_key_says_what_to_do_and_keeps_the_nearest_known_key(self) -> None:
+        self.put("version = 1\n[plugin_host]\ngil_chek = false\n")
+        self.assertEqual("'plugin_host.gil_chek' is not a setting this version knows; it is skipped; remove it or "
+                         "check its spelling; did you mean plugin_host.gil_check?",
+                         settings.load(self.environ).notes[0].detail)
+
+    def test_a_value_is_still_cut_in_its_note(self) -> None:
+        self.put('version = 1\n[plugin_host]\ngil_check = "' + "x" * 200 + '"\n')
+        detail = settings.load(self.environ).notes[0].detail
+        self.assertNotIn("x" * 200, detail)
+        self.assertIn("...", detail)
 
 
 if __name__ == "__main__":

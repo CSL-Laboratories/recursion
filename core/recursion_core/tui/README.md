@@ -65,8 +65,25 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
 ## Behaviour
 
 - Opening reads `run.list`. Attaching (`a`/Enter, or `status RUN`) reads `run.status`. Neither starts
-  anything. Closing (`q`, Ctrl-C, or the terminal ending input) sends nothing and exits 0: a request
-  still queued and not begun is not sent, a Stop included; runs keep going, and reopening reattaches. An API client that cannot be built is `control_api_unavailable` on
+  anything. Closing (`q`, Ctrl-C, or the terminal ending input) sends no new request and exits 0: a
+  request still queued and not begun is not sent, except a Stop you confirmed, which is sent while the close's
+  bound lasts. When `q` or Ctrl-C comes while a confirmed Stop has no answer yet, the TUI waits for that answer so
+  the transcript shows it; any other key while it waits says so again, once, and a second Ctrl-C closes at once: the screen is left and the last line printed at that
+  moment. The TUI's process ends then too, as soon as nothing is left that it must still send: the Stop it is
+  in a call for counts as sent once it has been in that call `STOP_HANDOVER_S` (0.2 s as shipped; it is to
+  become a row of the settings file), whether it began before the wait, during it or after the Ctrl-C; a
+  confirmed Stop still queued (behind a hung Stop, of another run or of the same run confirmed twice) is waited
+  for within what is left of the bound and is never dropped to end sooner. The last line then says that the TUI
+  waits for it and at most how long, and when the wait is over one more line says what became of each Stop
+  that changed after the close line: sent and answered, sent and not confirmed, sent with no answer yet, or not
+  sent because the bound ran out, each not confirmed with `run status` as what to do.
+  The whole close, the wait and the end of the TUI's threads together, ends within ONE bound (`CLOSE_BOUND_S` in
+  `app.py`, 5 s as shipped; it is to become a row of the settings file). The close line says what became of each
+  Stop: answered and confirmed; answered and NOT confirmed (a failed call, `pending`, or an answer for another run:
+  the run may still be running); sent with no answer yet; or not begun, which is sent only if the Stop ahead of it
+  ends within what is left of the bound, and else is not sent. Each run whose Stop is not confirmed is named with
+  `run status` as what to do. In full screen the close line is printed again after the screen is left. It also
+  names every other request not sent; other runs keep going, and reopening reattaches. An API client that cannot be built is `control_api_unavailable` on
   stderr with exit 1, as in the CLI.
 - Keys (all from the keymap, so a binding file can change them; `?` lists the ones in force, and the
   prompt row's hints follow the keymap):

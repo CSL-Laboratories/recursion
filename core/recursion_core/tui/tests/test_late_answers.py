@@ -1,5 +1,4 @@
-"""Draft TUI-A of the Liaison's follow-up list (Nov 16, 2:42 PM; the triage of the Nov 15 sweeps against master
-ff3f8071): Stop, Start and stale state stay true across late answers. T1: a Start queued behind a read was sent
+"""Stop, Start and stale state stay true across late answers. T1: a Start queued behind a read was sent
 after q and ``Loop.shutdown``. T2: a ``run.list`` or ``run.status`` asked before a confirmed Stop showed the run
 running again. T3: an answer to another method (a Stop) ended a stale status. T4: one clock sample that was no
 number (NaN) at a list left the view fresh for ever. T23: run.start's ``start_unconfirmed`` was REFUSED, though
@@ -118,7 +117,7 @@ class QueuedRequestAfterCloseTest(unittest.TestCase):  # T1
             app.close()
             loop.shutdown()
 
-    def test_a_lane_begins_no_request_once_the_tui_ended_a_stop_included(self) -> None:
+    def test_a_lane_begins_no_request_once_the_tui_ended_but_a_confirmed_stop(self) -> None:
         api = API()
         app = new_app(api)
         loop = Loop(app, api)
@@ -129,7 +128,7 @@ class QueuedRequestAfterCloseTest(unittest.TestCase):  # T1
         for lane in loop._lanes.values():
             lane.put(None)
             loop._lane(lane)
-        self.assertEqual(api.calls, [])
+        self.assertEqual(api.calls, [("run.stop", {"run_id": "r"})])
 
     def test_a_lane_sends_what_is_queued_while_the_tui_is_open(self) -> None:  # holds
         api = API()

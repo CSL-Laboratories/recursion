@@ -297,6 +297,29 @@ def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, al
         painter, reader = InlinePainter(app.color), LogReader(app)
         loop = Loop(app, api, sink=lambda frame: write(painter.paint(reader.new_lines(), app.live_rows())),
                     render=lambda: [], size=size)
+    told = [False]
+
+    def tell() -> None:  # after the alternate screen: stderr may be another stream that still works (a log file)
+        if not alt_screen or told[0]:
+            return
+        told[0] = True
+        err = stderr or sys.stderr
+        try:
+            for line in app.errors:  # the error log survives leaving the alternate screen
+                print(f"error: {line}", file=err)
+            if "the Stop of" in app.end_line:  # what became of a Stop: the last frame only said it was waited for
+                print(app.end_line, file=err)
+        except OSError as exc:  # the same hung-up terminal; anything else is raised
+            if exc.errno != errno.EIO:
+                raise
+
+    def leave() -> None:
+        write(PASTE_OFF)
+        if alt_screen:
+            write("\x1b[?25h\x1b[?1049l")
+        else:
+            write(painter.end(reader.new_lines()))
+
     try:
         with terminal.cbreak():
             write(PASTE_ON)
@@ -310,21 +333,26 @@ def interactive(api, stdout: TextIO, environ: Mapping[str, str], terminal, *, al
     except KeyboardInterrupt:
         pass  # a SIGINT from outside closes, below, like q: nothing is sent
     finally:
-        # The loop paints nothing once shutdown() returns, even if its thread is still busy; the app
-        # takes no event after close, so close is the last event whatever that thread does next.
-        loop.shutdown()
+        # The loop paints nothing once halt() returns, even if its thread is still busy; the app takes no
+        # event after close, so close is the last event whatever that thread does next.
+        halt = getattr(loop, "halt", None)  # a stand-in loop without it keeps the order of before
+        early = app.closed and halt is not None  # q, Ctrl-C or the bound: the last line is written
+        if early:  # the person sees it at once: nothing is painted after halt(), and no thread is joined yet
+            halt()
+            leave()
+            tell()
+        loop.shutdown(**({"leave_hung": True} if app.wait_cut else {}))
         if not app.closed:
             app.close()
-        write(PASTE_OFF)
-        if alt_screen:
-            write("\x1b[?25h\x1b[?1049l")
-        else:
-            write(painter.end(reader.new_lines()))
-    if alt_screen:  # also after the screen hung up: stderr may be another stream that still works (a log file)
-        err = stderr or sys.stderr
+        if not early:
+            leave()
+    tell()  # also after the screen hung up
+    after = app.after_close_line()  # what became of a Stop after the close line, once the threads are done with
+    if after and not alt_screen:
+        write(after + "\n")
+    elif after:
         try:
-            for line in app.errors:  # the error log survives leaving the alternate screen
-                print(f"error: {line}", file=err)
+            print(after, file=stderr or sys.stderr)
         except OSError as exc:  # the same hung-up terminal; anything else is raised
             if exc.errno != errno.EIO:
                 raise

@@ -27,6 +27,7 @@ from recursion_core.plugin_security import (
 POSIX_ONLY = "the stores and the settings file's owner check need a POSIX system"
 ANCHOR = "11" * 32  # a public value in the anchor's format; nothing signs with it or verifies against it
 REST = ("Recursion does not open its stores with it. Use a Python whose SQLite is 3.53.0 or later, or "
+        "3.52.0 or later on the 3.52 line, "
         "3.51.3 or later on the 3.51 line, 3.50.7 or later on the 3.50 line, or 3.44.6 or later on the "
         "3.44 line. Check the daemon's interpreter with: "
         "~/.local/lib/recursion/venv/bin/python3.14t -c \"import sqlite3; print(sqlite3.sqlite_version)\" "

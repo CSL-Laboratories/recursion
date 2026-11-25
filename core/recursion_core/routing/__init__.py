@@ -1,6 +1,6 @@
 """Routing: a default engine, a routing config the user writes, and a per-task hand pick that always wins.
 
-Lane ROUTING: the config (``config``: the ``routing.json`` file, its schema in
+The package holds the config (``config``: the ``routing.json`` file, its schema in
 ``schema/routing_config.v1.json``, and the loader's cross-field rules), the pure decision
 (``router.decide``, with ``explain`` and ``next_after_limit``) and detection (``detect``). Nothing here is
 wired into the daemon yet: no start path calls it, nothing is registered, nothing is launched, written or

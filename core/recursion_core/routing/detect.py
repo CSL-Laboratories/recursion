@@ -136,8 +136,9 @@ def breaker_view(breaker) -> Callable[[str], str]:
     connection); this function only reads, and starts no cooldown. Whatever wires detection into the start
     path must therefore have the breaker restore the stored trip of every configured connection before it
     relies on this view to let a connection through. Without that, a connection tripped before a restart
-    reads ``open`` and stays refused, because no cooldown ever starts, until a start that reaches the
-    breaker's admission directly or a hand reset clears it.
+    reads ``open`` and stays refused, because no cooldown ever starts, until the breaker restores the trip.
+    A start that reaches the breaker's admission restores it (and is itself refused); the trip clears in
+    the store only through a successful probe after the cooldown.
     """
     def state(key: str) -> str:
         current = breaker.state(key)

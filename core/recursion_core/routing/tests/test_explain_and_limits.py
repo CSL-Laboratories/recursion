@@ -1,5 +1,5 @@
 """explain() says why a decision came out as it did; next_after_limit() never moves a task to a route the user
-did not list (lane ROUTING, slice 2)."""
+did not list."""
 
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 """Detection: an engine is routable only with a launchable route, a connection that is not fenced and, for a
-key route or recursion_loop, a key that is present and opted in (lane ROUTING, slice 2).
+key route or recursion_loop, a key that is present and opted in.
 
 The sources are plain functions here; the daemon's breaker is the route contract's in-memory
 ``ConnectionBreaker`` (the same class the daemon's durable breaker wraps), and the daemon's own pre-launch

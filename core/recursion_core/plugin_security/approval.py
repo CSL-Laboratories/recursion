@@ -42,7 +42,8 @@ restart: ``request``, ``decide`` and ``take`` look for a refused record of the s
 transaction. A record that cannot be read (a torn write), or an effect the approval
 record cannot hold, is refused ``record_invalid`` (its detail names the rule) and never
 approved; a store that cannot be written is refused ``store_unavailable``, and nothing
-was done. The operator's answer is kept as the principal ``OPERATOR_PRINCIPAL``
+was done; a store that has failed (it refuses every use until it is opened again) is refused
+``store_failed``. The operator's answer is kept as the principal ``OPERATOR_PRINCIPAL``
 (approval.v1 names an owner or a device as the one who answered, and nothing else).
 
 The daemon does not yet give its gate the store: until that join, the product's
@@ -56,8 +57,10 @@ veto.
 while its newest approval is unanswered, and ``stalled`` once that approval is still
 unanswered at its stall time (by default the deadline). An approval ends at the earlier
 of its deadline and its stall time: from then on it can be neither answered nor taken,
-so a stalled run never proceeds. Every code the gate answers has its sentence in the one
-table ``SAYS``: what happened, and the one thing to do.
+so a stalled run never proceeds. With a store, both are the gate's own figures when the record is read: a
+gate made with a shorter deadline or stall time ends a record it reads at its request time plus the
+shorter figure, and a longer figure never makes an ended approval live again. Every code the gate
+answers has its sentence in the one table ``SAYS``: what happened, and the one thing to do.
 
 State is bounded (without a store). A terminal approval (used, vetoed or expired) drops its effect bytes
 and keeps only its digest and state as a replay tombstone; at most ``max_retained``
@@ -142,6 +145,8 @@ SAYS = {
                       "read, so nothing was done. Ask for the action again; if it is refused again, its details "
                       "do not fit an approval record.",
     "store_unavailable": "The approval store could not be written, so nothing was done. Try again later.",
+    "store_failed": "The approval store failed, so nothing was done, and it refuses everything until it is "
+                    "opened again. Open the store again, then try again.",
     "effect_noncanonical": _MALFORMED,
     "effect_fields": _MALFORMED,
     "effect_kind": _MALFORMED,
@@ -412,7 +417,8 @@ class ApprovalGate:
         """``work(tx)`` inside one transaction of the store. A store that cannot be written is
         ``store_unavailable`` (nothing was written); an effect the approval record cannot hold, or a record
         that cannot be read, is ``record_invalid`` with the rule as its detail. A commit whose outcome is
-        unknown is raised as it is, as the approval queue does."""
+        unknown is raised as it is, as the approval queue does; a store that has failed (the event store's own
+        code ``store_failed``: it refuses every use until it is opened again) is ``store_failed``."""
         _, model, _, _, unknown = _durable()
         try:
             with self._store.transaction() as tx:
@@ -424,6 +430,8 @@ class ApprovalGate:
         except unknown:
             raise
         except Exception as exc:  # noqa: BLE001 - a store's own failure becomes the gate's typed refusal
+            if isinstance(exc, RuntimeError) and str(exc) == "store_failed":
+                raise Refused("store_failed") from exc
             raise Refused("store_unavailable", type(exc).__name__) from exc
 
     def _vetoed_in(self, tx, digest: str) -> bool:
@@ -442,10 +450,16 @@ class ApprovalGate:
 
     def _reloaded(self, tx, held: dict, now: int) -> dict:
         """A record as it stands now: a pending one whose deadline has come, or an approved one found past
-        it, is written ``expired`` (with ``approval.answered``) before anything reads it, for good."""
+        it, is written ``expired`` (with ``approval.answered``) before anything reads it, for good. Its end is
+        the earlier of its own deadline and its request time plus this gate's end, so a deadline or stall
+        time made shorter since the request takes effect at once."""
         rows, model, timestamp_of, milliseconds, _ = _durable()
         changed = model.expire_if_due(held, timestamp_of(now))
-        if changed is None and held["state"] == "approved" and now * 1000 >= milliseconds(held["expires_at"]):
+        ended = now * 1000 >= milliseconds(held["requested_at"]) + self._end * 1000
+        if changed is None and held["state"] == "pending" and ended:
+            changed = model.expire_if_due(held, held["expires_at"])  # ended by this gate's shorter figure
+        if changed is None and held["state"] == "approved" and (
+                ended or now * 1000 >= milliseconds(held["expires_at"])):
             # approval.v1 keeps no answer on an expired record; the approval.answered event of the approval
             # still says who approved it.
             changed = dict(held, state="expired", answered_by=None, answer=None, answered_at=None)
@@ -469,7 +483,7 @@ class ApprovalGate:
         return self._reloaded(tx, held, now)
 
     def _request_kept(self, effect: dict, raw: bytes, digest: str) -> tuple[str, str]:
-        rows, model, timestamp_of, _, _ = _durable()
+        rows, model, timestamp_of, _, unknown = _durable()
         with self._lock:
             approval_id = "apr-" + secrets.token_hex(16)
             now = self._clock()
@@ -496,6 +510,10 @@ class ApprovalGate:
         except Refused as refused:
             # Committed and drawn, so the request stands; left unmarked, the queue offers it again.
             log.error("approval %s was drawn but not marked shown: %s", approval_id, refused.code)
+        except unknown:
+            # The request committed before the draw; whether the mark did is not known, and the store now
+            # refuses every use (``store_failed``) until it is opened again.
+            log.error("approval %s was drawn; whether it was marked shown is not known", approval_id)
         return approval_id, digest
 
     def _decide_kept(self, approval_id: str, digest: str, approve: bool) -> str:

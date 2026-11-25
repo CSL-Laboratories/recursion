@@ -10,6 +10,7 @@ test it names must fail against it.
 
 from __future__ import annotations
 
+import contextlib
 import pathlib
 import re
 import tempfile
@@ -36,6 +37,10 @@ needs_store = unittest.skipUnless(FakeStore is not None, "the shared fake of the
 
 def _note(**payload) -> dict:
     return effect(kind="note.post", amount=0, payload=payload or {"intent": "a"})
+
+
+def _run(run_id: str, intent: str) -> dict:
+    return effect(kind="note.post", amount=0, run_id=run_id, payload={"intent": intent})
 
 
 def _rows(store) -> dict:
@@ -279,7 +284,7 @@ class MemoryGateRunStateTests(unittest.TestCase):
 
 @needs_store
 class RoundOnTheKeptGateTests(unittest.TestCase):
-    """The cases a hostile read of the kept gate met: each was red before this round."""
+    """Cases each red before this change."""
 
     def setUp(self) -> None:
         self.store = FakeStore()
@@ -418,6 +423,115 @@ class RoundOnTheKeptGateTests(unittest.TestCase):
 
     def test_the_deadline_is_one_value_the_queue_reads_too(self) -> None:
         self.assertIs(queue_module.DEADLINE_SECONDS["plugin_effect"], gate_module.APPROVAL_DEADLINE_SECONDS)
+
+
+class _FailsAfterTheDraw:
+    """A stand-in store: the shared fake, whose commits can be made to end with an unknown outcome, as the event
+    store's COMMIT does when it raises; from then on every transaction is refused ``store_failed`` until the
+    store is opened again, as the event store's are."""
+
+    def __init__(self, store) -> None:
+        self.store = store
+        self.fail_next = False
+        self.failed = False
+
+    def register_tables(self, *declared) -> None:
+        self.store.register_tables(*declared)
+
+    @contextlib.contextmanager
+    def transaction(self):
+        from recursion_core.events.db import CommitUnknown, StoreError
+        if self.failed:
+            raise StoreError("store_failed")
+        with self.store.transaction() as tx:
+            yield tx
+        if self.fail_next:
+            self.fail_next, self.failed = False, True
+            raise CommitUnknown("commit_outcome_unknown")
+
+
+@needs_store
+class StallAndStoreRoundTests(unittest.TestCase):
+    """Cases each red before this change: a deadline or stall time made shorter between a request and its
+    answer, and a store whose commit ends with an unknown outcome after the prompt was drawn."""
+
+    def setUp(self) -> None:
+        self.store = FakeStore()
+        self.addCleanup(self.store.close)
+        self.clock = Clock()
+        self.declared = False
+
+    def gate(self, store=None, draw=None, **figures) -> ApprovalGate:
+        gate = ApprovalGate(draw or (lambda *drawn: None), authenticate, self.clock, store=store or self.store,
+                            declare_tables=not self.declared, **figures)
+        self.declared = True
+        return gate
+
+    def outcome(self, call, *args) -> tuple:
+        try:
+            return ("ok", call(*args))
+        except Refused as refused:
+            return ("refused", refused.code)
+
+    def test_stall_changed_between_request_and_answer(self) -> None:
+        for shorter in ({"stall_seconds": 4}, {"ttl_seconds": 4}):
+            with self.subTest(shorter=shorter):
+                self.setUp()
+                first = self.gate(ttl_seconds=10)  # the default stall: the deadline
+                unanswered, digest = first.request(_run("run-a", "a"))
+                answered, answered_digest = first.request(_run("run-b", "b"))
+                first.decide(answered, answered_digest, OPERATOR_TOKEN, True)
+                self.clock.now += 5  # past the shorter figure, inside the old deadline
+                after = self.gate(**dict({"ttl_seconds": 10}, **shorter))
+                self.assertEqual(after.run_state("run-a")["state"], "stalled")
+                self.assertEqual(self.outcome(after.decide, unanswered, digest, OPERATOR_TOKEN, True),
+                                 ("refused", "approval_expired"))
+                self.assertEqual(self.outcome(after.take, answered, _run("run-b", "b")), ("refused", "approval_expired"))
+                self.assertEqual(after.run_state("run-b")["state"], "stalled")
+                self.assertEqual({state for state, _ in _rows(self.store).values()}, {"expired"})
+                longer = self.gate(ttl_seconds=10)  # the longer figure again: an ended approval stays ended
+                self.assertEqual(self.outcome(longer.decide, unanswered, digest, OPERATOR_TOKEN, True),
+                                 ("refused", "approval_expired"))
+                self.assertEqual(longer.run_state("run-a")["state"], "stalled")
+
+    def test_a_longer_stall_after_the_request_never_makes_an_ended_approval_live(self) -> None:
+        first = self.gate(ttl_seconds=10, stall_seconds=4)
+        unanswered, digest = first.request(_note(intent="unanswered"))
+        answered, answered_digest = first.request(_note(intent="answered"))
+        first.decide(answered, answered_digest, OPERATOR_TOKEN, True)
+        self.clock.now += 5
+        for after in (self.gate(ttl_seconds=10), self.gate(ttl_seconds=60, stall_seconds=60)):
+            self.assertEqual(after.run_state("run-1")["state"], "stalled")
+            self.assertEqual(self.outcome(after.decide, unanswered, digest, OPERATOR_TOKEN, True),
+                             ("refused", "approval_expired"))
+            self.assertEqual(self.outcome(after.take, answered, _note(intent="answered")),
+                             ("refused", "approval_expired"))
+
+    def test_an_unknown_commit_after_the_draw_is_caught_and_a_failed_store_says_so(self) -> None:
+        store = _FailsAfterTheDraw(self.store)
+        drawn: list = []
+
+        def draw(*shown) -> None:
+            drawn.append(shown)
+            store.fail_next = True  # the commit that marks it shown ends with an unknown outcome
+
+        gate = self.gate(store, draw)
+        with self.assertLogs(gate_module.log, "ERROR"):
+            approval_id, digest = gate.request(_note())
+        self.assertEqual(len(drawn), 1)
+        self.assertEqual(_rows(self.store)[approval_id][0], "pending")  # committed before the draw
+        for call, args in ((gate.request, (_note(intent="b"),)),
+                           (gate.decide, (approval_id, digest, OPERATOR_TOKEN, True)),
+                           (gate.take, (approval_id, _note())), (gate.run_state, ("run-1",)),
+                           (gate.is_vetoed, (digest,))):
+            with self.subTest(call=call.__name__):
+                self.assertEqual(self.outcome(call, *args), ("refused", "store_failed"))
+        self.assertEqual(len(drawn), 1)  # nothing more is drawn
+        words = gate_module.words_for("store_failed")
+        self.assertIn("opened again", words)
+        self.assertNotIn("later", words)
+        self.assertEqual(gate_module.words_for("store_unavailable"),
+                         "The approval store could not be written, so nothing was done. Try again later.")
 
 
 class _ApproveExpiredOnReload(ApprovalGate):

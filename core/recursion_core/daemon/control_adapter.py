@@ -53,7 +53,7 @@ import threading
 import time
 import uuid
 
-from recursion_core.control.api import ControlAPI
+from recursion_core.control.api import ROUTINE_STORE_ABSENT, ControlAPI
 from recursion_core.control.client import socket_directory
 from recursion_core.control.registry import InMemoryRunRegistry, StaleGeneration
 from recursion_core.control_transport import UnixControlServer, with_ping_health
@@ -1303,7 +1303,13 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
     service = RouteService(adapters, breaker if breaker is not None else route_breaker, clock)
     starter = RouteStarter(service, routes, daemon, state_dir, breaker=breaker,
                            breaker_unavailable=breaker_unavailable)
-    api = ControlAPI(registry, UnitKillTree(daemon), starter, time.time, confirm_timeout_s=confirm_timeout_s)
+    routines = None  # no routine store is composed yet (control/routines.py): a plugin's start is refused
+    api = ControlAPI(registry, UnitKillTree(daemon), starter, time.time, confirm_timeout_s=confirm_timeout_s,
+                     routines=routines)
+    if routines is None:
+        log.warning('plugins cannot start runs: this daemon has no routine store, so every run a plugin asks '
+                    'for is refused (%s) until a routine store is configured; start runs yourself until then',
+                    ROUTINE_STORE_ABSENT)
     control = DaemonControl(api, registry, daemon, starter, state_dir, routes=routes, plugins=plugins,
                             breaker=breaker, breaker_store='durable' if breaker is not None
                             else f'unavailable: {breaker_unavailable}')

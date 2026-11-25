@@ -26,6 +26,55 @@ Nothing is frozen yet.
 | `transcript.line.v1.json` | 1.0-draft.3 |
 | `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.10 |
 | `session.token.v1.json` | 1.0-draft.1 |
+| `routine.record.v1.json` | 1.0-draft.3 |
+
+## A start from a routine record runs what the record says (Nov 24, 2026)
+
+`routine.record` draft 3; every other schema keeps its draft. A run asked from a record (origin kind
+`trigger`, with the core's routine store given to `run.start`'s one admission path) runs the record's
+`tenant`, `engine` and `prompt`, never the caller's. The caller may leave them out; a value it sends that is
+not the record's is refused `request_invalid` with the detail `routine_differs`, whose sentence names which
+of the three differs and never the prompt's text. The record keeps `prompt_sha256` beside its prompt; a
+prompt in the store that no longer matches it is refused `routine_changed`. Neither is charged to the
+budget; both are kept in `last_refusal`, which names the values that differed (`differs`). A kept refusal
+carries `plugin` and `occurrence` only when each is a value in its form; otherwise the field is absent.
+
+| What changed | What it breaks |
+|---|---|
+| Field `prompt_sha256`, required | A draft 2 record: it has no digest |
+| `last_refusal`: codes `routine_changed` and `routine_differs`; field `differs`; `plugin` and `occurrence` no longer required, each held to its form | A draft 2 refusal with an empty or a made-up plugin or occurrence |
+| Fixtures: every whole record carries its digest; the two that removed `plugin` and `occurrence` from a refusal are gone (each is now a good record), and seven are new | |
+
+## A routine record ends with its lease and its budget (Nov 23, 2026)
+
+`routine.record` draft 2; every other schema keeps its draft. The person's admission (a write of the whole
+record) gives it `lease_seconds` and a `budget` of runs; the core keeps `admitted_at`, the `lease` as it
+measures it (`counted` or `wall`), how many runs were `used` and the `last_refusal`. A run asked from the
+record through `run.start`'s one admission path (origin kind `trigger`) is refused `request_invalid` with
+the detail `routine_unknown`, `routine_lease_ended` or `routine_budget_spent` and a plain sentence, and the
+refusal is kept on the record. A change may shorten the lease or lower the budget; one that lengthens or
+raises them is refused `widen_needs_admission`. An origin kind other than `trigger` is refused
+`origin_not_admitted` before anything is written.
+
+| What changed | What it breaks |
+|---|---|
+| Fields `lease_seconds`, `budget`, `admitted_at`, `lease`, `used`, `last_refusal`, all required | A draft 1 record: it has no lease and no budget |
+| Fixtures for the new fields and their three definitions | |
+
+## The routine record a person writes (Nov 23, 2026)
+
+New file `routine.record.v1.json`, draft 1; every other schema keeps its draft. The record a plugin holding
+`schedule` names in a `run.request` (record kind `routine.v1`, the one kind `host.v1.json` lists) is now a
+record the core keeps: what may be started (`tenant`, `engine`, `prompt`) and the one `plugin` that may ask.
+Only the person writes, changes or removes it, through the core's own commands
+(`recursion_core/control/routines.py`), as the owner or a paired device (`written_by`); any other writer is
+refused `writer_not_allowed` and nothing is stored. A change names the `revision` it read; an older one is
+refused `conflict`.
+
+| What changed | What it breaks |
+|---|---|
+| New schema `routine.record.v1.json` with its fixtures | Nothing: no record of this kind existed |
+| The person's commands answer `ok` or one of `routine_invalid`, `writer_not_allowed`, `routine_unknown`, `conflict`, each with its plain sentence | Nothing on the wire: no control method carries them yet |
 
 ## After two reads of the fifth read's answer (Nov 14, 2026)
 
@@ -604,3 +653,4 @@ A schema leaves draft when every lane in its row has a fixture here that passes.
 | `transcript.line` | TUI, EVENTS |
 | `methods` | CONTROL, MCP, PAGE, TUI, SESSIONS, EVENTS, APPROVALS, WORKSPACE, QUOTA, ROUTING, KEYS, INSTALL, PLUGIN-HOST, DELEGATION |
 | `session.token` | CONTROL, DELEGATION, STOP |
+| `routine.record` | CONTROL, PLUGIN-HOST |

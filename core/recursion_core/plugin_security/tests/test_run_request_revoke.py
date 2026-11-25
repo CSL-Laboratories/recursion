@@ -222,11 +222,15 @@ class OriginKindTests(unittest.TestCase):
         api, registry, _kill, starter = make_api()
         wrong = [{"kind": "agent"}, {"kind": "packet", "x": 1}, {}, {"kind": 5}, {"kind": None},
                  trigger_origin(extra=1), {k: v for k, v in trigger_origin().items() if k != "occurrence"}]
-        for origin in wrong:
+        for origin in wrong:  # refused with a typed answer and its words, before anything is written
             with self.subTest(origin=origin):
-                with self.assertRaises(ValueError):
-                    api.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p",
-                                           "client_key": "key-0001"}, origin=origin)
+                answer = api.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p",
+                                                "client_key": "key-0001"}, origin=origin)
+                self.assertEqual((answer["code"], answer["detail"]), ("request_invalid", "origin_not_admitted"))
+                self.assertTrue(answer["text"])
+        with self.assertRaises(ValueError):  # not a mapping: a fault of the in-process caller
+            api.call("run.start", {"tenant": "t1", "engine": "codex", "prompt": "p", "client_key": "key-0001"},
+                     origin=["kind", "trigger"])
         self.assertEqual((registry.list(), starter.calls), ([], []))
 
     def test_the_trigger_origin_is_accepted_and_its_keys_are_the_channels(self):

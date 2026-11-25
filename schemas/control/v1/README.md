@@ -34,6 +34,7 @@ where someone ran them (see "Checking the fixtures").
 | `methods.v1.json` | public | The method table's schema: a row for each of thirty-eight methods, and the params and every answer of each | CONTROL and each lane that owns a method |
 | `methods.table.v1.json` | data | The table itself: for each method its scope, whether it mutates, its key and precondition, the driver flags it needs, its page and MCP marks, every code it can answer | lane SPINE, on request |
 | `session.token.v1.json` | private | The grant the daemon keeps for a session token, and the form of the token. Never sent | CONTROL |
+| `routine.record.v1.json` | storage | A routine record a person wrote: what a plugin holding `schedule` may ask a run of, and which plugin may ask. Kept by the core; only the person writes it | CONTROL, PLUGIN-HOST |
 
 `fixtures/good/<schema>/` holds records that must validate; `fixtures/bad/<schema>/` holds records
 that must be refused. `fixtures/index.json` lists every one and says what it shows, or which rule it
@@ -328,6 +329,7 @@ Each of these has a fixture, so a change shows up as a failing fixture, not as a
 | `driver.v2`: the shapes of `start`, `handle` and `fork` | `driver.v2.json` | DRIVER-CC |
 | Scopes, page marks and MCP marks of the thirty-two methods that are new | `methods.table.v1.json` | CONTROL, PAGE, MCP |
 | The delegable methods of a session token | `session.token.v1.json` | CONTROL, DELEGATION |
+| The fields of a routine record, the kinds of its writer, and the refusal codes of the person's commands | `routine.record.v1.json` | CONTROL, PLUGIN-HOST |
 | The doctor report's checks | `methods.v1.json` | INSTALL |
 | The kinds of `principal` | `common.v1.json` | CONTROL |
 | `causation_id` is a loose reference; money is a JSON number | `event.v1.json`, `common.v1.json` | EVENTS, QUOTA |

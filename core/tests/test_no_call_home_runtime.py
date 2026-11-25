@@ -433,6 +433,86 @@ class SuiteHookTests(unittest.TestCase):
                         pass
                     time.sleep(0.1)
 
+    def _listener(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))  # the loopback address only: nothing leaves this machine
+        listener.listen(4)
+        return listener, listener.getsockname()[1]
+
+    def test_an_option_of_a_launcher_that_is_not_one_of_its_words_is_refused(self):
+        # env --split 'bash ... /x/sleep' was judged by the last part of the whole command line (sleep):
+        # GNU env takes any unambiguous abbreviation of a long option.
+        for argv in (["env", "--split", "bash -c true /x/sleep"], ["env", "--s=bash /x/sleep"],
+                     ["env", "--ignore-env", "sleep", "1"], ["env", "--u", "X", "sleep"],
+                     ["env", "-a", "x", "sleep"], ["unshare", "--map-root", "sleep", "1"],
+                     ["unshare", "-x", "sleep", "1"]):
+            with self.subTest(argv=argv):
+                self.assertTrue(any("cannot be told" in p for p in self._starts(argv, allowed=("sleep",))), argv)
+        self.assertEqual(self._starts(["env", "--ignore-environment", "--unset", "X", "sleep", "1"],
+                                      ["env", "--unset=X", "-0v", "sleep"],
+                                      ["unshare", "--map-root-user", "--wd", "/tmp", "--", "sleep", "1"],
+                                      allowed=("sleep",)), [])
+        # A launcher whose row names no option words refuses every option.
+        self.assertIsNone(self.audit._inner(["env", "-i", "sleep"], {"options": set(), "value_options": set()}))
+        # A real run: the abbreviated split option; the reach goes to the test's own loopback listener.
+        listener, port = self._listener()
+        status, out = self._run("import subprocess; subprocess.run(['env', '--split', 'bash -c "
+                                "\"exec 3<>/dev/tcp/127.0.0.1/%d\" /x/sleep'])" % port, "--allow-program", "sleep")
+        self.assertEqual(status, 1, out)
+        self.assertIn("cannot be told", out)
+
+    def test_a_launcher_with_more_arguments_than_the_hook_looks_at_is_refused(self):
+        import shutil
+        bound = int(os.environ.get("RECURSION_AUDIT_MAX_ARGS", "64"))
+        listener, port = self._listener()
+        with tempfile.TemporaryDirectory(prefix="rc-proof-") as name:
+            copy = Path(name) / "sleep"
+            shutil.copyfile(os.path.realpath(sys.executable), copy)
+            os.chmod(copy, 0o700)
+            # env with more assignments than the bound, then a copy of the interpreter under an allowed name,
+            # started with -I: the copy lay past the arguments the hook looked at and was judged by its name.
+            argv = ["env"] + ["A%d=1" % k for k in range(bound + 6)] + [
+                str(copy), "-I", "-c", "import socket; socket.create_connection(('127.0.0.1', %d)).close()" % port]
+            status, out = self._run("import subprocess; subprocess.run(%r)" % argv, "--allow-program", "sleep")
+            self.assertEqual(status, 1, out)
+            self.assertIn("were not all looked at", out)
+        events = [(1, "subprocess.Popen", ["env", ["env", "A=1", "sleep"], None,
+                                           {"PATH": None, "audit": True, "py_prog": False, "py_args": [],
+                                            "py_args_cut": True}])]
+        problems = self.audit.judge(events, allowed_programs=("sleep",))
+        self.assertTrue(any("were not all looked at" in p for p in problems), problems)
+
+    def test_a_forked_child_still_running_when_the_command_ends_is_refused(self):
+        # The command forks (no new start); the child reaches the test's loopback listener after the
+        # command ended. The child keeps the hook and gets an events file of its own at the fork.
+        listener, port = self._listener()
+        listener.settimeout(START_SECONDS)
+        with tempfile.TemporaryDirectory(prefix="rc-proof-") as name:
+            pid_file = Path(name) / "child.pid"
+            code = ("import os, socket, time\n"
+                    "pid = os.fork()\n"
+                    "if pid == 0:\n"
+                    "    time.sleep(%r)\n"
+                    "    socket.create_connection(('127.0.0.1', %d)).close()\n"
+                    "    os._exit(0)\n"
+                    "open(%r, 'w').write(str(pid))\n") % (IDLE_SECONDS, port, str(pid_file))
+            status, out = self._run(code)
+            child = int(pid_file.read_text())
+            try:
+                self.assertEqual(status, 1, out)
+                self.assertIn("still running when the command ended", out)
+            finally:
+                conn, _peer = listener.accept()  # the child's one connection, on the loopback address
+                conn.close()
+                deadline = time.monotonic() + START_SECONDS
+                while time.monotonic() < deadline:  # the child ends by itself after its connection
+                    try:
+                        os.kill(child, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.1)
+
     def _starts(self, *argvs, allowed=(), audit=True):
         events = [(1, "subprocess.Popen", [a[0], list(a), None, {"PATH": None, "audit": audit}]) for a in argvs]
         return self.audit.judge(events, allowed_programs=allowed)
@@ -603,7 +683,10 @@ class ReadmeWordsTests(unittest.TestCase):
         section = " ".join(self._section().split())
         for words in ("a split-string option of `env`, also inside a group such as `-iS`, is refused",
                       "by its file whatever its name, looked at when it starts",
-                      "still running when the command ends makes the run NOT PROVEN"):
+                      "still running when the command ends makes the run NOT PROVEN",
+                      "an abbreviation such as `--split` included",
+                      "`RECURSION_AUDIT_MAX_ARGS`, is refused",
+                      "a child forked without a new start is such a process"):
             with self.subTest(words=words):
                 self.assertIn(words, section)
 

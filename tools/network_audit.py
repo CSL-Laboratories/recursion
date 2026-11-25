@@ -13,9 +13,12 @@ cleared environment does not load the hook, and is refused; so is a run with few
 Python starts. A real interpreter is taken for Python: by its name (python3, python3.N, python3.Nt), or by
 its file whatever its name (this interpreter's own file, or a program file that holds the interpreter's
 entry point; the hook looks at the file when the start happens). A hooked process still running when the
-command ends makes the run NOT PROVEN. A program that is not Python is not watched at all: the report names each one, and
+command ends makes the run NOT PROVEN, a child forked without a new start included (the hook gives it an
+events file of its own at the fork). A program that is not Python is not watched at all: the report names each one, and
 each must be allowed by name (--allow-program, or the list file for the suite); a program that starts
-another (a [[launcher]] row: env, unshare) is judged by the program it starts. Exit status 1
+another (a [[launcher]] row: env, unshare) is judged by the program it starts; an option of it that is
+not exactly one of its row's option words, or a start with more arguments than the hook looks at
+(RECURSION_AUDIT_MAX_ARGS), is refused. Exit status 1
 when an address that is not local was reached or looked up, a program not allowed was started, a
 foreign-function module was loaded, or no process was seen at all (a hook that saw nothing is a broken
 hook).
@@ -133,12 +136,24 @@ if _dir:
                               "audit": (env.get("RECURSION_AUDIT_DIR") is not None) if hasattr(env, "get") else True,
                               "py_prog": _py(exe, path, cwd),
                               "py_args": [k for k in range(1, min(len(argv), _MAX_ARGS)) if _py(argv[k], path, cwd)]
-                                          if _launcher(exe) else []})
+                                          if _launcher(exe) else [],
+                              "py_args_cut": bool(_launcher(exe) and len(argv) > _MAX_ARGS)})
             line = json.dumps([event, plain])
         except Exception:
             line = json.dumps([event, ["unrecorded"]])
         with _lock:
             _out.write(line + "\n")
+    def _forked():
+        # A child forked without a new start keeps this hook: it gets an events file of its own, so the run
+        # counts it and sees whether it is still running when the command ends.
+        global _out, _lock
+        _lock = threading.Lock()
+        try:
+            _out = open(os.path.join(_dir, "events-%d.jsonl" % os.getpid()), "a", buffering=1, encoding="utf-8")
+            _out.write(json.dumps(["os.fork.child", [os.getppid()]]) + "\n")
+        except Exception:
+            pass
+    os.register_at_fork(after_in_child=_forked)
     sys.addaudithook(_hook)
 '''
 
@@ -215,9 +230,12 @@ def _python_unhooked(argv, start):
     return None
 
 
-def _inner(argv, value_options):
+def _inner(argv, row):
     """The program a launcher (env, unshare) starts: the first argument that is not an option, a value of
-    an option, or (for env) an assignment. None when it cannot be told."""
+    an option, or (for env) an assignment. None when it cannot be told: an option that is not exactly one
+    of the option words of the launcher's row (an abbreviation of a long option, an option the row does
+    not hold, env's split-string option in any form) makes it not told."""
+    options, value_options = row["options"], row["value_options"]
     is_env = os.path.basename(argv[0]) == "env"
     i = 1
     while i < len(argv):
@@ -225,19 +243,20 @@ def _inner(argv, value_options):
         if a == "--":
             return argv[i + 1:] or None
         if a.startswith("--"):
-            if is_env and (a == "--split-string" or a.startswith("--split-string=")):
-                return None  # a whole command line in one argument: not judged, refused
-            i += 2 if (a in value_options and "=" not in a) else 1
+            word = a.split("=", 1)[0]
+            if word not in options:
+                return None  # not an option word of the row: what the launcher makes of it is not told
+            i += 2 if (word in value_options and "=" not in a) else 1
             continue
         if a == "-" and is_env:
             i += 1  # env's '-' is -i
             continue
         if a.startswith("-") and a != "-":
             letters = a[1:]
-            if is_env and "S" in letters:
-                return None  # -S inside a group (-iS, -vS) is the same split-string option: refused
             step = 1
             for k, letter in enumerate(letters):
+                if "-" + letter not in options:
+                    return None  # a letter the row does not hold (env's -S among them): not told
                 if "-" + letter in value_options:  # it takes the rest of the group, or the next argument
                     step = 2 if k == len(letters) - 1 else 1
                     break
@@ -263,6 +282,11 @@ def _judge_start(pid, prog, argv, start, allowed_programs, launchers, problems, 
                             f"audit hook ({why}): what it reaches is not watched")
         return
     if name in launchers:
+        if record.get("py_args_cut"):
+            problems.append(f"process {pid}: started {name!r} with {len(argv)} arguments, more than the hook "
+                            f"looks at (RECURSION_AUDIT_MAX_ARGS): its arguments were not all looked at, so "
+                            f"which program it starts cannot be told for sure: refused")
+            return
         inner = _inner([prog] + argv[1:], launchers[name])
         if not inner or depth > 8:
             problems.append(f"process {pid}: started {name!r}, which starts another program, and which one "
@@ -353,14 +377,15 @@ def load_programs(root: Path = ROOT):
 
 
 def load_launchers(root: Path = ROOT):
-    """The programs that start another program, each with the options that take a value: no row allows
-    one of them by name; each is judged by the program it starts."""
+    """The programs that start another program, each with its exact option words and the options that take
+    a value: no row allows one of them by name; each is judged by the program it starts."""
     try:
         with open(root / PROGRAMS_FILE, "rb") as fh:
             rows = tomllib.load(fh).get("launcher", [])
     except OSError:
         return {}
-    return {row["name"]: set(row.get("value_options", [])) for row in rows}
+    return {row["name"]: {"options": set(row.get("options", [])), "value_options": set(row.get("value_options", []))}
+            for row in rows}
 
 
 def whole_suite_note(problems):
@@ -434,9 +459,11 @@ def main(argv=None):
         # Every Python start must have a process that wrote an events file; fewer means some did not load it.
         starts = len(pystarts)
         expected = starts + (1 if command and is_python(command[0]) else 0)
-        if len(pids) < expected:
-            problems.append(f"{expected - len(pids)} Python process(es) did not load the audit hook "
-                            f"({expected} started, {len(pids)} seen): what they reached is not watched")
+        forked = {pid for pid, event, _args in events if event == "os.fork.child"}
+        seen = len(pids - forked)  # a forked child has a file of its own but is not a start
+        if seen < expected:
+            problems.append(f"{expected - seen} Python process(es) did not load the audit hook "
+                            f"({expected} started, {seen} seen): what they reached is not watched")
     kinds, hosts, programs = {}, set(), {}
     for _pid, event, args in events:
         kinds[event] = kinds.get(event, 0) + 1

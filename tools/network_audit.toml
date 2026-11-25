@@ -28,15 +28,26 @@ name = "systemd-run"
 reason = "Starts a unit under the user manager (or a test's stand-in for it); it talks to the user manager by a local socket."
 
 # A [[launcher]] is a program that starts another program. No [[program]] row may allow one: the audit
-# reads its arguments and judges the program it starts by the same rule. value_options are the options
-# of the launcher that take a value (so the value is not taken for the program).
+# reads its arguments and judges the program it starts by the same rule. options are the exact option
+# words of the launcher the audit reads (a short option by its letter, a long one by its whole word,
+# with or without '=value'); any other option, an abbreviation of a long one included, makes which
+# program it starts not told, and the start is refused. value_options are the options that take the
+# next argument as their value (so the value is not taken for the program).
 
 [[launcher]]
 name = "env"
+options = ["-i", "--ignore-environment", "-0", "--null", "-u", "--unset", "-C", "--chdir", "-v", "--debug",
+           "--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"]
 value_options = ["-u", "--unset", "-C", "--chdir"]
-reason = "Runs a stand-in under a cleared environment in the child_env tests."
+reason = "Runs a stand-in under a cleared environment in the child_env tests. Its split-string option (-S, --split-string) is not among the options: it hands a whole command line in one argument, which the audit does not judge."
 
 [[launcher]]
 name = "unshare"
-value_options = ["-S", "--setuid", "-G", "--setgid", "-R", "--root", "-w", "--wd"]
-reason = "Runs a Python child of the test in namespaces of its own (test_adv1_socket_cli_gui)."
+options = ["-m", "--mount", "-u", "--uts", "-i", "--ipc", "-n", "--net", "-p", "--pid", "-U", "--user",
+           "-C", "--cgroup", "-T", "--time", "-f", "--fork", "-r", "--map-root-user", "-c", "--map-current-user",
+           "--map-user", "--map-group", "--map-auto", "--map-users", "--map-groups", "--kill-child",
+           "--mount-proc", "--propagation", "--setgroups", "--keep-caps", "-R", "--root", "-w", "--wd",
+           "-S", "--setuid", "-G", "--setgid", "--monotonic", "--boottime"]
+value_options = ["-S", "--setuid", "-G", "--setgid", "-R", "--root", "-w", "--wd", "--map-user", "--map-group",
+                 "--map-users", "--map-groups", "--propagation", "--setgroups", "--monotonic", "--boottime"]
+reason = "Runs a Python child of the test in namespaces of its own (test_adv1_socket_cli_gui). Its options are those of util-linux 2.39; an option with an optional value takes it only after '='."

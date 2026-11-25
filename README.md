@@ -75,12 +75,15 @@ What is proven, and what is not:
   names what it could not watch. It names a program that is not Python and refuses one that is not
   listed in `tools/network_audit.toml`. A program started through another program (`env`,
   `unshare`) is judged by the program it starts (a split-string option of `env`, also inside a group
-  such as `-iS`, is refused), a program is taken for Python by its name (`python3`, `python3.N`), or
-  by its file whatever its name, looked at when it starts, a Python process that does not load the hook
-  (started with `-I`, `-S` or `-E`, or with a cleared environment) is refused, and a hooked process
-  still running when the command ends makes the run NOT PROVEN, except in the run-time ways of the
-  list below. Not watched: code that
-  hides from the hook. That run is not part of the hosted gate.
+  such as `-iS`, is refused, and so is any option of a launcher that is not exactly one of the option
+  words of its row in `tools/network_audit.toml`, an abbreviation such as `--split` included; a
+  launcher's start with more arguments than the hook looks at, the setting
+  `RECURSION_AUDIT_MAX_ARGS`, is refused), a program is taken for Python by its name (`python3`,
+  `python3.N`), or by its file whatever its name, looked at when it starts, a Python process that
+  does not load the hook (started with `-I`, `-S` or `-E`, or with a cleared environment) is
+  refused, and a hooked process still running when the command ends makes the run NOT PROVEN (a
+  child forked without a new start is such a process), except in the run-time ways of the list
+  below. Not watched: code that hides from the hook. That run is not part of the hosted gate.
 - Known ways past the proofs, not built (the rows of `tools/network_gaps.toml`, with their reasons):
   - past the scan: builtins, a frame or a function's globals reached through an object's attributes
     (`len.__self__`); a module of the package used as a path to what that module imports (`from

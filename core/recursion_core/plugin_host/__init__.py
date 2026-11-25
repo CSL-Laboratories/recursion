@@ -224,6 +224,31 @@ def _remove_quietly(path):
         pass
 
 
+def _signal_descriptors():
+    """The descriptors this process holds that would let the kernel send a signal for it, by number: those with
+    an owner for signals (F_GETOWN is not 0) or with the asynchronous flag (O_ASYNC) set. Linux only, and read
+    before the wall, while /proc/self/fd is readable; ["unknown"] when the descriptors cannot be listed. The
+    owner is a property of the open file, so whoever shares it (the starter, the other end of a pipe) may have
+    set it; a walled process that sets the asynchronous flag on such a descriptor makes the kernel signal that
+    owner when the descriptor is ready."""
+    import fcntl
+
+    try:
+        listed = sorted(int(name) for name in os.listdir("/proc/self/fd"))
+    except OSError:
+        return ["unknown"]
+    found = []
+    for descriptor in listed:
+        try:
+            owner = fcntl.fcntl(descriptor, fcntl.F_GETOWN)
+            flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+        except OSError:  # the listing's own descriptor, already shut
+            continue
+        if owner != 0 or flags & os.O_ASYNC:
+            found.append(str(descriptor))
+    return found
+
+
 def _wall():
     """Wall this process in, then probe the wall from inside: (the wall.v1 record or None, the refusal).
 
@@ -231,9 +256,13 @@ def _wall():
     the name of what it raised, or '' when the wall applied. The probe runs either way: its checks are
     harmless where they are allowed, and a record that shows them allowed is not proven. Where the probe
     cannot run at all (not Linux), the record is None. The canary is made only where the wall can be (on
-    Linux; elsewhere the wall refuses before any change) and is removed once the probe has run."""
+    Linux; elsewhere the wall refuses before any change) and is removed once the probe has run. A descriptor
+    held at the wall with an owner for signals or the asynchronous flag set is named in the refusal
+    (``descriptor_signals.<number>``), so the host loads nothing: through it a plugin could make the kernel
+    signal another process."""
     canary, folder, remove = _canary() if sys.platform.startswith("linux") else ("", "", None)
     refused, left = "", []
+    signals = _signal_descriptors() if sys.platform.startswith("linux") else []
     try:
         try:
             wall_linux.apply_wall(_install_paths())
@@ -252,6 +281,8 @@ def _wall():
                 left = remove()
             except OSError:
                 left = ["unknown"]
+    if signals:  # a descriptor through which the walled host could make the kernel signal another process
+        refused = ", ".join(filter(None, [refused] + [SIGNAL_DESCRIPTOR + "." + name for name in signals]))
     if left:  # the canary or the write folder is still there: a plugin would not find its folder as it was
         refused = ", ".join(filter(None, [refused, CANARY_LEFT]))
     return record, refused
@@ -259,6 +290,20 @@ def _wall():
 
 # The refusal named when the canary or the write folder is still there after the helper ended.
 CANARY_LEFT = "canary_left"
+# The refusal named, with the descriptor's number after a dot, for a descriptor held at the wall that could
+# make the kernel signal another process (see _signal_descriptors).
+SIGNAL_DESCRIPTOR = "descriptor_signals"
+_SIGNAL_TEXT = (
+    "The plugin host held a descriptor ({descriptors}) that can make the kernel send a signal to another "
+    "process (an owner for signals or the asynchronous flag was set on it before the host shut itself in), "
+    "and the sandbox does not keep a plugin from using it, so nothing was loaded. What you can do: start the "
+    "plugin host as the daemon does; whatever starts it must not set an owner for signals (F_SETOWN) or the "
+    "asynchronous flag (O_ASYNC) on a descriptor it hands to the host.")
+_FILTER_ONLY_TEXT = (
+    "The wall's record says that its filter, not Landlock, refused {what}, on a kernel whose Landlock (ABI "
+    "{abi}) refuses that by itself, so the record shows the filter and not the part of the sandbox that holds "
+    "files, and nothing was loaded. What you can do: start the plugin host again; if it is still refused, keep "
+    "this message, as the host's own proof never gives such a record.")
 
 
 def _wall_missing(record, refused):
@@ -269,11 +314,26 @@ def _wall_missing(record, refused):
         return missing + ["no_record"]
     missing += [name for name in wall_linux.RECORD_CHECKS if record.get(name) is not True]
     writes = record.get("writes") if isinstance(record.get("writes"), dict) else {}
+    abi = record.get("landlock_abi")
     missing += ["writes." + kind for kind in wall_linux.WRITE_KINDS
-                if writes.get(kind) not in wall_linux.WRITE_OUTCOMES[:2]]
+                if writes.get(kind) not in _refused_by_wall(kind, abi)]
     if record.get("proven") is not True:
         missing.append("proven")
     return missing
+
+
+def _refused_by_wall(kind, abi):
+    """The outcomes of ``kind`` that show this wall refused it, at the Landlock ABI ``abi`` the record names.
+
+    Where Landlock handles a kind by itself, only Landlock's refusal shows the wall: the filter holds
+    truncation only, and only below the ABI that first handles it (wall_linux._TRUNCATE_ABI, a fact of the
+    kernel's interface, not a setting). A record that credits the filter anywhere else shows the filter and
+    not the part of the wall that holds files. An ABI that is not a whole number reads as one that handles
+    truncation (the stricter reading)."""
+    below = type(abi) is int and abi < wall_linux._TRUNCATE_ABI
+    if kind == "truncate" and below:
+        return wall_linux.WRITE_OUTCOMES[:2]
+    return wall_linux.WRITE_OUTCOMES[:1]
 
 
 def _environment_is_clean():
@@ -647,6 +707,17 @@ def _unproven_detail(record, missing):
     words = wall_linux.why_not_proven(record) or [wall_linux.WORDS["not_loaded"]]
     if CANARY_LEFT in ", ".join(missing):
         words.insert(1, wall_linux.WORDS["canary_left"])
+    named = [name.split(".", 1)[1] for name in ", ".join(missing).split(", ")
+             if name.startswith(SIGNAL_DESCRIPTOR + ".")]
+    if named:
+        words.insert(1, _SIGNAL_TEXT.format(descriptors=", ".join(named)))
+    writes = record.get("writes") if isinstance(record.get("writes"), dict) else {}
+    filtered = [kind for kind in wall_linux.WRITE_KINDS
+                if "writes." + kind in missing and writes.get(kind) == "refused_by_filter"]
+    if filtered:
+        what = (wall_linux.WORDS[filtered[0]] if len(filtered) == 1
+                else "%d kinds of write, each named at the end" % len(filtered))
+        words.insert(1, _FILTER_ONLY_TEXT.format(what=what, abi=record.get("landlock_abi")))
     tail = " Missing: " + ", ".join(missing)
     room = _DETAIL_MAX - len(tail)
     kept = []

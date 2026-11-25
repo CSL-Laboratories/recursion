@@ -12,6 +12,7 @@ the hosts it may start and a time each child may run, and ends every child it st
 from __future__ import annotations
 
 import base64
+import fcntl
 import json
 import logging
 import os
@@ -60,6 +61,22 @@ def operator(command):
     return {"core": sys.modules["recursion_core"].__file__, "argv_tail": sys.orig_argv[-2:], "path0": sys.path[0]}
 '''
 LAST_WORD = b'import sys\n\ndef operator(command):\n    return sys.orig_argv[-1]\n'
+# A plugin that sets the asynchronous flag on every descriptor it can, then answers with their numbers.
+ASYNC = (b'import fcntl, os\n\ndef operator(command):\n    found = []\n    for fd in range(64):\n'
+         b'        try:\n            fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_ASYNC)\n'
+         b'        except OSError:\n            continue\n        found.append(fd)\n    return found\n')
+# A stand-in for another process: it writes a marker file when a signal reaches it, and ends by itself.
+STAND_IN = ('import signal, sys, time\n'
+            'def got(signum, frame):\n'
+            '    with open(sys.argv[1], "w") as out:\n'
+            '        out.write(str(signum))\n'
+            'signal.signal(signal.SIGIO, got)\n'
+            'signal.signal(signal.SIGUSR1, got)\n'
+            'print("ready", flush=True)\n'
+            'end = time.monotonic() + float(sys.argv[2])\n'
+            'while time.monotonic() < end:\n'
+            '    time.sleep(0.05)\n')
+SIGNAL_WAIT_S = 2       # how long a signal the kernel sent may take to show in the stand-in's marker file
 
 
 def b64(data):
@@ -426,6 +443,113 @@ class TheHostsOwnRestart(_Folder):
                               timeout=CHILD_LIMIT_S)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(json.loads(done.stdout), {'alive': False})
+
+
+@unittest.skipUnless(LINUX, 'the asynchronous flag and the wall are Linux only')
+class AHostHandedADescriptorThatCanSignal(_Folder):
+    """A descriptor handed to the host with an owner for signals: the host refuses every load, so no plugin can
+    set the asynchronous flag on it and make the kernel signal that owner. Every process here is the test's own
+    and is ended by it; the owner is a stand-in that only writes a marker file."""
+
+    def setUp(self):
+        super().setUp()
+        self.core_folder = copy_core(self.tmp / 'lib')
+
+    def stand_in(self):
+        marker = self.tmp / 'signalled'
+        process = subprocess.Popen([sys.executable, '-B', '-I', '-c', STAND_IN, str(marker), str(CHILD_LIMIT_S)],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, cwd=self.tmp)
+        self.addCleanup(self.end, process)
+        self.assertEqual(process.stdout.readline(), b'ready\n')
+        return process.pid, marker
+
+    def end(self, process):
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=CHILD_LIMIT_S)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+    def owned_pipe(self, owner):
+        """A pipe whose read end has ``owner`` as its owner for signals and no asynchronous flag."""
+        read_end, write_end = os.pipe()
+        fcntl.fcntl(read_end, fcntl.F_SETOWN, owner)
+        return read_end, write_end
+
+    @staticmethod
+    def signalled(marker):
+        end = time.monotonic() + SIGNAL_WAIT_S
+        while time.monotonic() < end and not marker.exists():
+            time.sleep(0.05)
+        return marker.exists()
+
+    @staticmethod
+    def read_frame(stream):
+        head = stream.read(HEADER.size)
+        if len(head) < HEADER.size:
+            return None
+        (length,) = HEADER.unpack(head)
+        return hc.decode(stream.read(length), sender='host')
+
+    def test_a_descriptor_with_an_owner_or_the_flag_is_named(self):
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, read_end)
+        self.addCleanup(os.close, write_end)
+        self.assertNotIn(str(read_end), plugin_host._signal_descriptors())
+        fcntl.fcntl(read_end, fcntl.F_SETOWN, os.getpid())  # no flag set: nothing is ever sent
+        self.assertIn(str(read_end), plugin_host._signal_descriptors())
+        self.assertNotIn(str(write_end), plugin_host._signal_descriptors())
+        fcntl.fcntl(write_end, fcntl.F_SETFL, fcntl.fcntl(write_end, fcntl.F_GETFL) | os.O_ASYNC)  # no owner
+        self.assertIn(str(write_end), plugin_host._signal_descriptors())
+
+    def test_the_host_refuses_every_load_and_the_owner_gets_no_signal(self):
+        owner, marker = self.stand_in()
+        read_end, write_end = self.owned_pipe(owner)
+        wrap = 'import sys\nsys.path.insert(0, sys.argv[1])\nfrom recursion_core.plugin_host import main\nmain()\n'
+        host = subprocess.Popen([sys.executable, '-B', '-c', wrap, str(self.core_folder)], stdin=read_end,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.tmp, env={})
+        os.close(read_end)
+        self.addCleanup(self.end, host)
+        timer = threading.Timer(CHILD_LIMIT_S, host.kill)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with os.fdopen(write_end, 'wb', buffering=0) as writer:
+            for message in (dict(HELLO, gil_check='off'), load_message(ASYNC),
+                            {'type': 'call', 'id': 1, 'name': 'operator', 'args': {'command': 'x'}}):
+                writer.write(hc.encode(message))
+            frames = []
+            while not any(frame.get('id') == 1 for frame in frames):
+                frame = self.read_frame(host.stdout)
+                if frame is None:
+                    break
+                frames.append(frame)
+            writer.write(hc.encode(BYE))  # new data on the owned pipe: a flag set by a plugin would signal now
+        host.wait(timeout=CHILD_LIMIT_S)
+        self.assertIn('wall', frames[0], frames)
+        refused = [frame for frame in frames if frame.get('type') == 'refusal']
+        self.assertNotEqual(refused, [], frames)
+        detail = refused[0]['detail']
+        self.assertIn(plugin_host.SIGNAL_DESCRIPTOR + '.', detail)
+        self.assertIn('the asynchronous flag (O_ASYNC) on a descriptor it hands to the host', detail)
+        self.assertFalse(self.signalled(marker), frames)
+
+    def test_without_the_host_the_same_descriptor_signals_its_owner(self):
+        # The control: a plain process (no host, no wall) sets the flag on such a descriptor, and the kernel
+        # signals the owner when data comes; so the test above can see a signal when one is sent.
+        owner, marker = self.stand_in()
+        read_end, write_end = self.owned_pipe(owner)
+        code = ('import fcntl, os\nfcntl.fcntl(0, fcntl.F_SETFL, fcntl.fcntl(0, fcntl.F_GETFL) | os.O_ASYNC)\n'
+                'print("set", flush=True)\nos.read(0, 1)\n')
+        child = subprocess.Popen([sys.executable, '-B', '-I', '-c', code], stdin=read_end, stdout=subprocess.PIPE,
+                                 cwd=self.tmp)
+        os.close(read_end)
+        self.addCleanup(self.end, child)
+        self.assertEqual(child.stdout.readline(), b'set\n')
+        os.write(write_end, b'x')
+        os.close(write_end)
+        child.wait(timeout=CHILD_LIMIT_S)
+        self.assertTrue(self.signalled(marker))
 
 
 @unittest.skipUnless(LINUX, 'plugin host units are Linux only')

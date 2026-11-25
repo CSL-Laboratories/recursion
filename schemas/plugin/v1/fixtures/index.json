@@ -2200,6 +2200,33 @@
         "keyword": "required",
         "at": "/writes_not_tried"
       }
+    },
+    {
+      "file": "bad/wall.v1/b12-proven-crediting-truncation-to-the-filter-at-abi-3.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall (draft 6) at Landlock ABI 3 or above credits a truncation to the filter, which holds truncation only below ABI 3.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/writes/truncate"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b13-proven-at-abi-6-crediting-every-write-to-the-filter.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall at Landlock ABI 6 credits every kind of write to the filter: the record shows the filter and not the wall.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/writes/open_for_write"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b14-proven-below-abi-3-with-truncation-refused-elsewhere.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall below Landlock ABI 3 names a truncation refused elsewhere: below ABI 3 the filter or Landlock must refuse it.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/writes/truncate"
+      }
     }
   ]
 }

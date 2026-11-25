@@ -711,7 +711,9 @@ class RoundSchemaTests(unittest.TestCase):
 
     def test_a_proven_record_credits_only_truncation_to_the_filter(self):
         h01 = _fixture("h01-a-proven-wall.json")
-        self.assertEqual(_schema_errors(dict(h01, writes=dict(h01["writes"], truncate="refused_by_filter"))), [])
+        # Below Landlock ABI 3 the filter holds truncation (h09); from ABI 3 on Landlock does, as for every kind.
+        self.assertEqual(_schema_errors(_fixture("h09-below-abi-3-the-filter-refuses-truncation.json")), [])
+        self.assertNotEqual(_schema_errors(dict(h01, writes=dict(h01["writes"], truncate="refused_by_filter"))), [])
         for kind in KINDS:
             if kind != "truncate":
                 with self.subTest(kind=kind):

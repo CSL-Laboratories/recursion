@@ -4,6 +4,17 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `wall.v1.json` is `1.0-draft.6` (Nov 24, 2026)
+
+A proven record now needs truncation refused by Landlock from Landlock ABI 3 on, as every other kind of write
+already is. The filter holds truncation only below ABI 3, where Landlock cannot refuse it, so a record that
+credits the filter with a truncation at ABI 3 or above shows the filter and not the wall. What it breaks: a
+draft 5 record that says proven at ABI 3 or above with `truncate` as `refused_by_filter` does not validate at
+draft 6 (the host's own probe never gives one). Three bad fixtures are added: `b12` (truncation credited to
+the filter at ABI 3), `b13` (every kind of write credited to the filter at ABI 6) and `b14` (truncation
+refused elsewhere below ABI 3, which proves the rule for truncation below ABI 3 now that `b06`, at ABI 3, is
+refused by the new rule too).
+
 ## `wall.v1.json` is `1.0-draft.5` (Nov 24, 2026)
 
 An additive step: every field and value of draft 4 keeps its meaning, and a draft 4 record that is not proven

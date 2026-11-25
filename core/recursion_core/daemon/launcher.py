@@ -364,6 +364,29 @@ class UnitEngineProcess:
                     pass
 
 
+def _bind_plugin_run(ctx, principal, engine):
+    """Bind ``ctx`` through ``PluginHost.start_plugin_run``. A refusal code, or None.
+
+    The launcher does not import the plugin host (that host imports this module). The
+    starter puts the host and the minted principal on the context. An interruption is
+    not turned into a refusal: it propagates, and ``ctx.bound`` stays false.
+    """
+    host = getattr(ctx, 'plugin_host', None)
+    start = getattr(host, 'start_plugin_run', None)
+    if not callable(start):
+        return 'plugin'
+    try:
+        start(principal, ctx.run_id, ctx.admitted[0], engine, ctx.admitted[1])
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        code = getattr(exc, 'code', None)
+        if type(code) is not str or not code:
+            raise
+        return code
+    return None
+
+
 class ProductionLauncher:
     """``launcher(argv, *, env, shell=False) -> EngineProcess`` for one engine's route adapter."""
 
@@ -437,7 +460,13 @@ class ProductionLauncher:
             # without one, the launch is refused: an engine is never started unbound beside a breaker.
             raise refused('breaker_admission_missing')
         if ctx.breaker is not None and ctx.admitted is not None and not ctx.bound:
-            error = ctx.breaker.bind_run(ctx.run_id, ctx.admitted[0], self.engine, ctx.admitted[1])
+            principal = getattr(ctx, 'plugin_principal', None)
+            if principal is not None:
+                # A launch made for a minted plugin principal. DurableRouteBreaker.bind_run records
+                # host; start_plugin_run is the path that records the plugin.
+                error = _bind_plugin_run(ctx, principal, self.engine)
+            else:
+                error = ctx.breaker.bind_run(ctx.run_id, ctx.admitted[0], self.engine, ctx.admitted[1])
             if error is not None:
                 raise refused('breaker_bind_failed:' + error)
             ctx.bound = True

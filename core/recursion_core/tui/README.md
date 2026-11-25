@@ -70,8 +70,11 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
   bound lasts. When `q` or Ctrl-C comes while a confirmed Stop has no answer yet, the TUI waits for that answer so
   the transcript shows it; any other key while it waits says so again, once, and a second Ctrl-C closes at once: the screen is left and the last line printed at that
   moment. The TUI's process ends then too, as soon as nothing is left that it must still send: the Stop it is
-  in a call for counts as sent once it has been in that call `STOP_HANDOVER_S` (0.2 s as shipped; it is to
-  become a row of the settings file), whether it began before the wait, during it or after the Ctrl-C; a
+  in a call for counts as sent only once the transport has written its request to the daemon's door (it says
+  so the moment its write returns), whether it began before the wait, during it or after the Ctrl-C, and the
+  TUI waits for that within the bound; a transport that cannot say so is waited for `STOP_HANDOVER_S` after
+  the Stop's call began (0.2 s as shipped; it is to become a row of the settings file), and the words then say
+  only that its call began; a
   confirmed Stop still queued (behind a hung Stop, of another run or of the same run confirmed twice) is waited
   for within what is left of the bound and is never dropped to end sooner. The last line then says that the TUI
   waits for it and at most how long, and when the wait is over one more line says what became of each Stop

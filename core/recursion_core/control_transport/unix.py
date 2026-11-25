@@ -560,8 +560,14 @@ class UnixControlClient:
             raise
         self._sock: socket.socket | None = sock
 
-    def request(self, message: Message) -> Message:
+    def request(self, message: Message, *, on_sent=None) -> Message:
         """Send one frame and return its reply; any failure closes the client for good.
+
+        ``on_sent``, when given, is called the moment the frame's write returns, before the reply is read: the
+        request has then left this process for the daemon's door. A fault of ``on_sent`` of any kind does not end
+        the call: the write has happened, so the order is (1) the write, (2) the hook, (3) the reply read and
+        checked, (4) only then, of a ``KeyboardInterrupt`` or ``SystemExit`` the hook raised, that one raised
+        again; every other fault of the hook is dropped.
 
         A timeout or partial read leaves the stream mid-frame, so the next read would hand
         back an earlier request's late reply (a Stop's answer as a ping's). The socket is
@@ -585,6 +591,13 @@ class UnixControlClient:
                     if refusal is not None:
                         raise refusal from None
                     raise
+                interrupt = None
+                if on_sent is not None:
+                    try:  # the request is written: a failure of the hook neither ends the call nor unsays the write
+                        on_sent()
+                    except BaseException as err:  # noqa: BLE001 - the reply is still read; an interrupt is raised after it
+                        if isinstance(err, (KeyboardInterrupt, SystemExit)):
+                            interrupt = err
                 response = read_frame(sock, max_bytes=self._max_frame_bytes, deadline=deadline)
                 if response is None:
                     raise ConnectionError("server closed the connection")
@@ -593,6 +606,8 @@ class UnixControlClient:
                     raise refusal
                 if "id" in message and response.get("id") != message["id"]:
                     raise FrameError("reply_id_mismatch")
+                if interrupt is not None:
+                    raise interrupt
             except BaseException:
                 self._sock = None
                 sock.close()

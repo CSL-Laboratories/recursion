@@ -54,7 +54,10 @@ class SocketAPI:
             self.path = None
         self._timeout_s, self._connect = timeout_s, connect
 
-    def call(self, method: str, params: dict | None = None) -> dict:
+    def call(self, method: str, params: dict | None = None, *, on_sent=None) -> dict:
+        """One request. ``on_sent``, when given, is called the moment its frame is written to the daemon's socket
+        (never when the connect or the write fails)."""
+
         if self.path is None:
             return {"code": UNAVAILABLE, "delivered": False, "detail": "platform_unsupported"}
         try:
@@ -64,7 +67,8 @@ class SocketAPI:
         except (OSError, TransportRefused) as err:
             return {"code": UNAVAILABLE, "delivered": False, "detail": f"connect:{type(err).__name__}"}
         try:
-            reply = client.request({"op": "control", "method": method, "params": dict(params or {})})
+            message = {"op": "control", "method": method, "params": dict(params or {})}
+            reply = client.request(message) if on_sent is None else client.request(message, on_sent=on_sent)
         except TransportBusy:
             return {"code": UNAVAILABLE, "delivered": False, "detail": "busy"}
         except PeerNotAdmitted:  # refused at accept (a peer inside a run unit): no handler saw the request

@@ -19,6 +19,7 @@ CALL_S = 0.5     # the call deadline of the stalled-read test (a test figure)
 STOP_S = 0.2     # its Stop bound (a test figure)
 STALL_S = 3.0    # how long the stalled stand-in's read of a unit takes when nothing bounds it (a test figure)
 SLACK_S = 1.0    # how far past the call's deadline that call may end (a test figure)
+WINDOW_S = 0.3   # the restarts window of the windowed test (a test figure)
 
 
 class StalledIdentity(tc.Hosts):
@@ -173,6 +174,80 @@ class AStartInsideACallThatFails(tc._Units):
         self.assertLessEqual(hosts.bounds[0], CALL_S)  # what was left of the call's deadline, no figure of its own
         self.assertEqual(units.degraded, {'stand.in': 2})
         self.assertIsNone(units.unit_of('stand.in'))
+
+
+@unittest.skipUnless(hs.LINUX, 'plugin host units are Linux only')
+class TheHostsACallStartsAreCounted(tc._Units):
+    def end_then_call(self, units, hosts):
+        """The running host ends by itself, and a call finds that out: ended."""
+        hosts.kill_cgroup('', units.unit_of('stand.in').unit)
+        with self.assertLogs(host_units.log, 'ERROR'):
+            with self.assertRaises(host_units.HostUnavailable) as caught:
+                units.call('stand.in', 'operator', {'command': 'x'})
+        self.assertEqual(caught.exception.reason, 'ended')
+
+    def answered(self, units, number):
+        answer = units.call('stand.in', 'operator', {'command': 'x'})
+        self.assertEqual((answer['type'], answer['value']), ('result', number))
+
+    def test_calls_start_no_more_hosts_than_the_rows_allow_and_a_start_counts_again(self):
+        hosts = tc.Hosts(self, ['answers'])
+        units = self.units(hosts, call_deadline_s=5, start_deadline_s=5, restarts_max=2, restarts_window_s=None)
+        units.start('stand.in', *hs.package(hs.POLITE))
+        for number in (2, 3):  # two hosts started again by calls: the most the row allows
+            self.end_then_call(units, hosts)
+            self.answered(units, number)
+        self.end_then_call(units, hosts)
+        with self.assertRaises(host_units.HostUnavailable) as caught:
+            units.call('stand.in', 'operator', {'command': 'x'})
+        self.assertEqual(caught.exception.reason, 'not_started')
+        detail = caught.exception.detail
+        for words in ('a call started a new host for this plugin 2 times since its last start',
+                      'plugin_host.restarts_max', 'plugin_host.restarts_window_s', 'this call starts none',
+                      'was not answered', 'Start the plugin again'):
+            self.assertIn(words, detail)
+        self.assertEqual(len(hosts.started), 3)  # no host for the refused call
+        self.assertEqual(units.degraded, {'stand.in': 2})
+        units.start('stand.in', *hs.package(hs.POLITE))  # a start counts again from nothing
+        self.answered(units, 4)
+
+    def test_the_window_lets_a_call_start_a_host_again_once_it_has_passed(self):
+        hosts = tc.Hosts(self, ['answers'])
+        units = self.units(hosts, call_deadline_s=5, start_deadline_s=5, restarts_max=1, restarts_window_s=WINDOW_S)
+        units.start('stand.in', *hs.package(hs.POLITE))
+        self.end_then_call(units, hosts)
+        self.answered(units, 2)
+        self.end_then_call(units, hosts)
+        with self.assertRaises(host_units.HostUnavailable) as caught:
+            units.call('stand.in', 'operator', {'command': 'x'})
+        self.assertIn(f'1 times within {WINDOW_S:g} s', caught.exception.detail)
+        self.assertIn('send the call again once that window has passed', caught.exception.detail)
+        time.sleep(WINDOW_S)
+        self.answered(units, 3)
+
+    def test_the_rows_have_their_defaults_none_is_no_bound_and_other_values_are_refused(self):
+        hosts = tc.Hosts(self, ['answers'])
+        self.assertEqual((host_units.RESTARTS_MAX, host_units.RESTARTS_WINDOW_S), (5, 60.0))
+        shown = self.units(hosts).status()['bounds']
+        self.assertEqual((shown['plugin_host.restarts_max'], shown['plugin_host.restarts_window_s']), (5, 60.0))
+        free = self.units(hosts, restarts_max=None, restarts_window_s=None).bounds()
+        self.assertEqual((free['plugin_host.restarts_max'], free['plugin_host.restarts_window_s']), (None, None))
+        self.assertEqual(self.units(hosts, restarts_max=0).bounds()['plugin_host.restarts_max'], 0)
+        for name, bad in (('restarts_max', -1), ('restarts_max', True), ('restarts_max', 1.5), ('restarts_max', '5'),
+                          ('restarts_window_s', 0), ('restarts_window_s', -1), ('restarts_window_s', True),
+                          ('restarts_window_s', float('nan')), ('restarts_window_s', '5')):
+            with self.subTest(name=name, value=bad):
+                with self.assertRaises(ValueError) as caught:
+                    host_units.PluginHostUnits(hosts, self.state, hs.StandInCore(), **{name: bad})
+                self.assertIn(name, str(caught.exception))
+
+    def test_with_no_bound_every_call_starts_a_host_again_as_before(self):
+        hosts = tc.Hosts(self, ['answers'])
+        units = self.units(hosts, call_deadline_s=5, start_deadline_s=5, restarts_max=None)
+        units.start('stand.in', *hs.package(hs.POLITE))
+        for number in (2, 3, 4):
+            self.end_then_call(units, hosts)
+            self.answered(units, number)
 
 
 if __name__ == '__main__':

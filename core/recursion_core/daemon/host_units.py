@@ -25,7 +25,9 @@ argument: by default the folder this daemon's own code was imported from.
   ``timed_out``. Either way the call fails at once, within its own deadline, its plugin is marked degraded, and a
   new unit is started for it with the plugin's next call, inside that call's deadline, with the package of its last
   start. The mark goes when the plugin answers a call again, as the in-process operator deadline in ``plugins.py``
-  does for a plugin in the daemon's process.
+  does for a plugin in the daemon's process. The calls of one plugin start at most plugin_host.restarts_max such
+  hosts within plugin_host.restarts_window_s: past it a call starts none and ends ``not_started`` with words that name
+  both rows, until the window has passed or the plugin is started again.
 * The daemon's own time on a message of the host (a slow core request, say) does not count against the call's
   deadline: the deadline moves on by that time, up to a bound of its own (plugin_host.call_daemon_time_max_s): past it
   the call ends ``timed_out`` and says that row. And before a call is said to have timed out, a frame the host had
@@ -97,6 +99,16 @@ START_DEADLINE_S = 10.0
 # timed_out, and its words name this row.
 CALL_DAEMON_TIME_MAX_S = 300.0
 
+# plugin_host.restarts_max: how many new hosts the calls of one plugin may start (each after its host ended by itself,
+# or was ended for no answer) within plugin_host.restarts_window_s; past it a call starts none and ends not_started with
+# words that name both rows, and a start of the plugin counts again from nothing. Shipped default 5; a whole number, 0
+# or more (0: a call never starts a host again). None means no bound: in the person's settings file it is written
+# none, the no-limit word of the settings (NO_LIMIT in code).
+RESTARTS_MAX = 5
+# plugin_host.restarts_window_s: the window over which those starts are counted. Shipped default 60 s; a number of
+# seconds above zero, or None for no window: every such start since the plugin's last start counts.
+RESTARTS_WINDOW_S = 60.0
+
 # plugin_host.stop_confirm_s: how long Stop waits, after the kill, for the system to show a host's unit ended and not
 # about to start again. Shipped default 5 s. A number of seconds above zero; no limit is NOT offered for this row: a
 # Stop with no bound on its proof is no Stop.
@@ -130,7 +142,8 @@ CALL_INVALID = 'call_invalid'
 # Every bound a call or a Stop meets, by the row it comes from: the one place an end of a call names its bound.
 ROWS = {'call_deadline_s': 'plugin_host.call_deadline_s', 'start_deadline_s': 'plugin_host.start_deadline_s',
         'call_daemon_time_max_s': 'plugin_host.call_daemon_time_max_s',
-        'stop_confirm_s': 'plugin_host.stop_confirm_s', 'stop_confirm_poll_s': 'plugin_host.stop_confirm_poll_s'}
+        'stop_confirm_s': 'plugin_host.stop_confirm_s', 'stop_confirm_poll_s': 'plugin_host.stop_confirm_poll_s',
+        'restarts_max': 'plugin_host.restarts_max', 'restarts_window_s': 'plugin_host.restarts_window_s'}
 # What a person reads when a call got no answer from its host, by the reason.
 _NO_ANSWER = {TIMED_OUT: 'did not answer the call by its deadline', ENDED: 'ended during the call'}
 
@@ -159,6 +172,14 @@ def _bound(name, value):
         raise ValueError(f'{name} = {reprlib.repr(value)} is not a bound: write a number of seconds above zero. No '
                          'limit is not offered here: a Stop with no bound on its proof is no Stop')
     return seconds
+
+
+def _count(name, value):
+    """A whole number, 0 or more, or None for no bound."""
+    if value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 0):
+        return value
+    raise ValueError(f'{name} = {reprlib.repr(value)} is not a count: write a whole number, 0 or more, or None for no '
+                     'bound')
 
 
 def _shown(state):
@@ -374,7 +395,8 @@ class PluginHostUnits:
     def __init__(self, manager, state_dir, core, *, python=None, gil_check=DEFAULT_GIL_CHECK,
                  call_deadline_s=CALL_DEADLINE_S, start_deadline_s=START_DEADLINE_S, properties=(), core_folder=None,
                  stop_confirm_s=STOP_CONFIRM_S, stop_confirm_poll_s=STOP_CONFIRM_POLL_S,
-                 call_daemon_time_max_s=CALL_DAEMON_TIME_MAX_S):
+                 call_daemon_time_max_s=CALL_DAEMON_TIME_MAX_S, restarts_max=RESTARTS_MAX,
+                 restarts_window_s=RESTARTS_WINDOW_S):
         require_launcher_platform()
         self._manager, self._state, self._core = manager, Path(state_dir), core
         self._python = python or sys.executable
@@ -385,6 +407,8 @@ class PluginHostUnits:
         self._call_daemon_time_max_s = _deadline('call_daemon_time_max_s', call_daemon_time_max_s)
         self._stop_confirm_s = _bound('stop_confirm_s', stop_confirm_s)
         self._stop_confirm_poll_s = _bound('stop_confirm_poll_s', stop_confirm_poll_s)
+        self._restarts_max = _count('restarts_max', restarts_max)
+        self._restarts_window_s = _deadline('restarts_window_s', restarts_window_s)
         self._properties = check_piped_properties(properties)
         self._lock = threading.Lock()
         self._turns = {}       # plugin id -> lock: one call at a time on a host's channel
@@ -394,6 +418,7 @@ class PluginHostUnits:
         self._replacements = {}  # plugin id -> how many starts have replaced its host: a start begun before is late
         self._stopped = set()  # plugin ids whose host was stopped: not started again by a call
         self._waiting_starts = {}  # plugin id -> starts entered and not yet holding the turn: a call starts no host
+        self._restarts = {}    # plugin id -> when each host a call started since the plugin's last start began
         self._ended = []       # HostUnits ended and not yet closed
         self._ids = itertools.count(1)
         self._closed = False
@@ -416,6 +441,7 @@ class PluginHostUnits:
             if self._closed:
                 raise HostUnavailable(plugin_id, STOPPED, 'the daemon is closing')
             self._stopped.discard(plugin_id)
+            self._restarts.pop(plugin_id, None)  # a start counts the hosts its calls start again from nothing
             turn = self._turns.setdefault(plugin_id, threading.Lock())
             self._replacements[plugin_id] = self._replacements.get(plugin_id, 0) + 1
             running = self._units.pop(plugin_id, None)
@@ -480,6 +506,11 @@ class PluginHostUnits:
                     raise HostUnavailable(plugin_id, NOT_STARTED, 'no host was started for this plugin')
                 if host is None and self._waiting_starts.get(plugin_id):
                     raise HostUnavailable(plugin_id, REPLACED, REPLACED_DETAIL)  # the start runs the new package
+                if host is None:
+                    refused = self._restart_refused(plugin_id)
+                    if refused:  # no host and no answer: degraded, as every call with no answer
+                        self.degraded[plugin_id] = self.degraded.get(plugin_id, 0) + 1
+                        raise HostUnavailable(plugin_id, NOT_STARTED, refused)
             deadline = None if self._call_deadline_s is None else time.monotonic() + self._call_deadline_s
             if host is None:
                 try:
@@ -738,6 +769,27 @@ class PluginHostUnits:
             raise _HostWentAway(ENDED, exc.code + (f': {exc.detail}' if exc.detail else '')) from None
         except OSError as exc:
             raise _HostWentAway(ENDED, type(exc).__name__) from None
+
+    def _restart_refused(self, plugin_id):
+        """Words that refuse a call's start of a new host past plugin_host.restarts_max within
+        plugin_host.restarts_window_s, or '' when the call may start one (and it is counted). The caller holds the
+        lock."""
+        most, window = self._restarts_max, self._restarts_window_s
+        if most is None:
+            return ''
+        now = time.monotonic()
+        began = [at for at in self._restarts.get(plugin_id, []) if window is None or now - at < window]
+        if len(began) < most:
+            self._restarts[plugin_id] = [*began, now]
+            return ''
+        self._restarts[plugin_id] = began
+        timed = window is not None and window != math.inf
+        return (f'a call started a new host for this plugin {len(began)} times '
+                + (f'within {window:g} s' if timed else 'since its last start')
+                + f", the most {ROWS['restarts_max']} allows within {ROWS['restarts_window_s']}, so this call starts "
+                'none and was not answered. Start the plugin again'
+                + (', or send the call again once that window has passed' if timed else '')
+                + '; if its host keeps ending, look at why before you raise those rows')
 
     def _took_turn(self, plugin_id):
         """A start that was waiting for the plugin's turn holds it now (or gave up): one fewer start waits."""

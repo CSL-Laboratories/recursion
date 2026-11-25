@@ -385,6 +385,104 @@ class NothingThatRunsBeforeTheWallActsAfterItTests(unittest.TestCase):
                                               arch=arch), "eperm")
 
 
+FILTER_CHILD = r"""
+import ctypes, json, os, sys
+spec = json.loads(sys.argv[1])
+sys.path.insert(0, spec["core"])
+from recursion_core.plugin_host import wall_linux as w
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+mode, out = spec["mode"], {}
+def call(number, *args):
+    ctypes.set_errno(0)
+    result = libc.syscall(ctypes.c_long(number), *(ctypes.c_long(a) for a in args))
+    if result >= 0:
+        os.close(result) if result > 2 else None
+        return 0
+    return ctypes.get_errno()
+if mode in ("link", "link_inside"):
+    try:
+        w.apply_wall([spec["link"] if mode == "link" else os.path.join(spec["link"], "inside")], keep_descriptors=(1, 2))
+        out["apply"] = "applied"
+    except w.WallRefused as exc:
+        out["apply"], out["applied"], out["detail"] = exc.code, list(w._STATE["applied"]), exc.detail
+    print(json.dumps(out))
+    sys.exit(0)
+try:
+    os.unshare(os.CLONE_NEWUSER | os.CLONE_NEWNS)  # entered BEFORE the wall: a namespace of the child's own
+    out["namespace"] = True
+except (OSError, AttributeError):
+    out["namespace"] = False
+if mode == "walled":
+    w.apply_wall(spec["paths"], keep_descriptors=(1, 2))
+fstype, root, empty = (ctypes.create_string_buffer(s) for s in (b"tmpfs", b"/", b""))
+a = ctypes.addressof
+out["fsopen"] = call(430, a(fstype), 0)               # a filesystem context only: nothing is mounted
+out["fspick"] = call(433, -100, a(root), 0)
+out["open_tree"] = call(428, -100, a(root), 0)        # a descriptor of a path only (no clone)
+out["fsconfig"] = call(431, -1, 0, 0, 0, 0)           # no context: EBADF if allowed
+out["fsmount"] = call(432, -1, 0, 0)                  # no context: EBADF if allowed
+out["move_mount"] = call(429, -1, a(empty), -1, a(empty), 0)
+out["mount_setattr"] = call(442, -1, a(empty), 0, 0, 0)
+out["unknown"] = call(w._UNKNOWN_CALL) if hasattr(w, "_UNKNOWN_CALL") else call(0x40000000 - 1)
+print(json.dumps(out))
+"""
+MOUNT_CALLS = ("fsopen", "fspick", "open_tree", "fsconfig", "fsmount", "move_mount", "mount_setattr")
+
+
+@unittest.skipIf(_why_not_here(), _why_not_here() or "")
+class TheFilterRefusesWhatItDoesNotNameTests(unittest.TestCase):
+    """Every mount call, a call the tables do not know, every terminal command but those that read, and a read-only path
+    that is a link."""
+
+    def test_the_newer_mount_calls_are_refused_in_a_namespace_entered_before_the_wall(self):
+        control, _ = run_child(FILTER_CHILD, "control")
+        if not control["namespace"]:
+            self.skipTest("this kernel gives this user no namespace of its own")
+        self.assertEqual((control["fsopen"], control["open_tree"]), (0, 0), "let through with no wall (the control)")
+        result, _ = run_child(FILTER_CHILD, "walled")
+        self.assertTrue(result["namespace"])
+        self.assertEqual({name: result[name] for name in MOUNT_CALLS}, dict.fromkeys(MOUNT_CALLS, 1), result)
+
+    def test_a_call_the_tables_do_not_know_is_refused(self):
+        control, _ = run_child(FILTER_CHILD, "control")
+        result, _ = run_child(FILTER_CHILD, "walled")
+        self.assertEqual((control["unknown"], result["unknown"]), (38, 1), "ENOSYS from the kernel, EPERM from the wall")
+        for arch in ("x86_64", "aarch64"):
+            with self.subTest(arch=arch):
+                program, top = wall_linux._filter(arch, 3), max(dict(wall_linux._NR[arch], **wall_linux._NR_MORE[arch]).values())
+                for number in (top + 1, top + 100, 0x40000000 - 1):
+                    self.assertEqual(_run_program(program, number, arch=arch), "eperm", number)
+                self.assertEqual(_run_program(program, wall_linux._NR_MORE[arch]["openat"], arch=arch), "allow")
+                for name in MOUNT_CALLS + ("open_tree_attr",):
+                    self.assertEqual(_run_program(program, {"fsopen": 430, "fspick": 433, "open_tree": 428, "fsconfig": 431,
+                                                            "fsmount": 432, "move_mount": 429, "mount_setattr": 442,
+                                                            "open_tree_attr": 467}[name], arch=arch), "eperm", name)
+
+    def test_every_terminal_command_but_those_that_read_is_refused(self):
+        for arch in ("x86_64", "aarch64"):
+            program, ioctl = wall_linux._filter(arch, 3), wall_linux._NR_MORE[arch]["ioctl"]
+            with self.subTest(arch=arch):
+                for value in (0x541C, 0x5433, 0x5434, 0x5435, 0x545B, 0x5400, 0x54FF, 0x5460):
+                    self.assertEqual(_run_program(program, ioctl, args=(0, value, 0), arch=arch), "eperm", hex(value))
+                for value in (0x5401, 0x540F, 0x5411, 0x5413, 0x5415, 0x541B, 0x5421, 0x5429, 0x5450, 0x5451, 0x5500,
+                              0x80086601):
+                    self.assertEqual(_run_program(program, ioctl, args=(0, value, 0), arch=arch), "allow", hex(value))
+
+    def test_a_read_only_path_that_is_a_link_is_refused_before_any_change(self):
+        with tempfile.TemporaryDirectory() as top:
+            real = os.path.join(top, "real")
+            os.makedirs(os.path.join(real, "inside"))
+            link = os.path.join(top, "link")
+            os.symlink(real, link)
+            for mode in ("link", "link_inside"):
+                with self.subTest(mode=mode):
+                    result, _ = run_child(FILTER_CHILD, mode, link=link)
+                    self.assertEqual((result["apply"], result["applied"]), ("wall_path_is_link", []), result)
+                    shown = link if mode == "link" else os.path.join(link, "inside")
+                    self.assertEqual(result["detail"], wall_linux.WORDS["path_is_link"].format(path=shown))
+
+
 @unittest.skipUnless(sys.platform.startswith("linux"), "the probe is Linux-only")
 class NoWallInItsOwnProcessTests(unittest.TestCase):
     """A record made where apply_wall did not run in the process is never proven, even when every part of it holds

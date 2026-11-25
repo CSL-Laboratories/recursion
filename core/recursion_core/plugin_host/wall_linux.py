@@ -24,7 +24,8 @@ and to everything it starts later, and neither can be lifted again from inside:
 2. ONE seccomp filter, loaded with ``SECCOMP_FILTER_FLAG_TSYNC`` so that it reaches every thread of the
    process. It checks the audit arch first (x86_64 and aarch64; a call made under another arch, or the
    x32 range of x86_64, is answered EPERM), then answers EPERM to:
-   - every call of ``DENIED_CALLS`` (sockets, program starts, tracing, keys, mounts, namespaces, bpf, a ring of
+   - every call of ``DENIED_CALLS`` (sockets, program starts, tracing, keys, every mount call: mount, umount2 and the newer
+     open_tree, move_mount, fsopen, fsconfig, fsmount, fspick, mount_setattr and open_tree_attr; namespaces, bpf, a ring of
      kernel calls and its use, a message sent by ``sendmsg`` or ``sendmmsg``, ...), and ``sendto`` with a
      destination address: a ring or a datagram socket the host held from before the wall can neither submit work
      nor send to an address of its choosing after it;
@@ -49,12 +50,15 @@ and to everything it starts later, and neither can be lifted again from inside:
      a descriptor sends to an owner set before the wall; the terminal commands that only read (``TCGETS``, which
      ``isatty`` asks, ``TIOCGPGRP``, ``TIOCGSID``, ``TIOCGWINSZ``, ``TIOCMGET``, ``TIOCOUTQ``, ``FIONREAD``) and the
      ones that touch only the caller's own descriptor (``FIONBIO``, which a socket's ``setblocking`` asks,
-     ``FIOCLEX`` and ``FIONCLEX``) stay allowed;
+     ``FIOCLEX`` and ``FIONCLEX``) stay allowed (``ALLOWED_TERMINAL_COMMANDS``), and every other command of the
+     terminal range (0x5400 to 0x54FF), named or not, is answered EPERM;
    - ``clone`` with any flag of ``NAMESPACE_CLONE_FLAGS``; ``clone3`` is answered ENOSYS, so that the C
      library starts threads and children through ``clone``, where the flags can be read;
    - where the kernel's Landlock ABI is below 3 (it cannot refuse a truncation there),
      ``OLD_LANDLOCK_DENIED_CALLS`` (a truncation by path and by descriptor) and an ``open`` or ``openat``
      that asks ``O_TRUNC``.
+   Every call numbered above the newest call the wall's tables name is answered EPERM, by one comparison (as the
+   x32 range is), so a call a newer kernel adds stays refused until the wall names it.
    Everything else is allowed. It is a deny list, so ordinary Python keeps working: imports from the
    install, threads, ``fork``, pipes, and ``recvmsg`` of a socket handed over on an already open
    channel all stay allowed.
@@ -131,7 +135,7 @@ import threading
 
 __all__ = ["CALLER_ONLY_CALLS", "CALLER_ONLY_PRIORITY_CALLS", "DENIED_CALLS", "DENIED_FCNTL_COMMANDS",
            "DENIED_IOCTL_COMMANDS", "DENIED_IPC_CALLS", "DENIED_METADATA_CALLS", "DENIED_SIGNAL_CALLS",
-           "DENIED_TERMINAL_COMMANDS", "HELD_KINDS", "HELD_NOT_TRIED", "HELD_OUTCOMES", "LANDLOCK_SCOPES", "NAMESPACE_CLONE_FLAGS", "OLD_LANDLOCK_DENIED_CALLS", "RECORD_CHECKS", "WORDS",
+           "ALLOWED_TERMINAL_COMMANDS", "DENIED_TERMINAL_COMMANDS", "HELD_KINDS", "HELD_NOT_TRIED", "HELD_OUTCOMES", "LANDLOCK_SCOPES", "NAMESPACE_CLONE_FLAGS", "OLD_LANDLOCK_DENIED_CALLS", "RECORD_CHECKS", "WORDS",
            "WRITES_NOT_TRIED", "WRITE_FILE_NAME", "WRITE_FOLDER_NAMES", "WRITE_KINDS", "WRITE_OUTCOMES", "WallRefused", "apply_wall",
            "prepare_write_folder", "probe_wall", "why_not_proven"]
 
@@ -142,7 +146,8 @@ DENIED_CALLS = (
     "ptrace", "process_vm_readv", "process_vm_writev",
     "pidfd_open", "pidfd_getfd", "pidfd_send_signal",
     "keyctl", "add_key", "request_key",
-    "mount", "umount2", "unshare", "setns",
+    "mount", "umount2", "open_tree", "move_mount", "fsopen", "fsconfig", "fsmount", "fspick", "mount_setattr", "open_tree_attr",
+    "unshare", "setns",
     "bpf", "perf_event_open", "userfaultfd", "io_uring_setup", "io_uring_enter", "io_uring_register",
     "sendmsg", "sendmmsg",
 )
@@ -195,7 +200,18 @@ DENIED_TERMINAL_COMMANDS = {
     "TIOCCBRK": 0x5428, "TCSETS2": 0x402C542B, "TCSETSW2": 0x402C542C, "TCSETSF2": 0x402C542D,
     "TIOCSRS485": 0x542F, "TIOCSPTLCK": 0x40045431, "TIOCSIG": 0x40045436, "TIOCVHANGUP": 0x5437,
     "TIOCGPTPEER": 0x5441, "TIOCSERCONFIG": 0x5453, "TIOCSLCKTRMIOS": 0x5457,
+    "TIOCLINUX": 0x541C, "TCSETX": 0x5433, "TCSETXF": 0x5434, "TCSETXW": 0x5435, "TIOCSERSETMULTI": 0x545B,
 }
+# The commands of the terminal range (0x5400 to 0x54FF, asm-generic/ioctls.h) that only read, or that touch only the
+# caller's own descriptor: the only ones of the range the filter lets through. Every other command of the range, named
+# above or not, is answered EPERM, so a setter the kernel adds to the range later stays refused.
+ALLOWED_TERMINAL_COMMANDS = {"TCGETS": 0x5401, "TIOCGPGRP": 0x540F, "TIOCOUTQ": 0x5411, "TIOCGWINSZ": 0x5413,
+                             "TIOCMGET": 0x5415, "FIONREAD": 0x541B, "FIONBIO": 0x5421, "TIOCGSID": 0x5429,
+                             "FIONCLEX": 0x5450, "FIOCLEX": 0x5451}
+_TERMINAL_RANGE = (0x5400, 0x5500)  # the kernel's: type byte 'T' (0x54) with no size or direction bits
+# A call number the kernel will never give a call (the last one below the x32 range): the probe's planted unknown call.
+_UNKNOWN_CALL = 0x40000000 - 1
+_RESOLVE_NO_SYMLINKS = 0x04  # struct open_how's resolve flag (include/uapi/linux/openat2.h)
 # clone with any of these flags (a new mount, cgroup, uts, ipc, user, pid or network namespace) is refused.
 NAMESPACE_CLONE_FLAGS = 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000 | 0x10000000 | 0x20000000 | 0x40000000
 # Below Landlock ABI 3 the ruleset cannot refuse a truncation, so these are refused by the filter instead
@@ -214,6 +230,8 @@ _NR = {
         "request_key": 249, "mount": 165, "umount2": 166, "unshare": 272, "setns": 308, "bpf": 321,
         "perf_event_open": 298, "userfaultfd": 323, "io_uring_setup": 425, "seccomp": 317,
         "io_uring_enter": 426, "io_uring_register": 427, "sendmsg": 46, "sendmmsg": 307,
+        "open_tree": 428, "move_mount": 429, "fsopen": 430, "fsconfig": 431, "fsmount": 432, "fspick": 433,
+        "mount_setattr": 442, "open_tree_attr": 467,
     },
     "aarch64": {
         "socket": 198, "socketpair": 199, "connect": 203, "bind": 200, "listen": 201, "accept": 202, "accept4": 242,
@@ -222,6 +240,8 @@ _NR = {
         "request_key": 218, "mount": 40, "umount2": 39, "unshare": 97, "setns": 268, "bpf": 280,
         "perf_event_open": 241, "userfaultfd": 282, "io_uring_setup": 425, "seccomp": 277,
         "io_uring_enter": 426, "io_uring_register": 427, "sendmsg": 211, "sendmmsg": 269,
+        "open_tree": 428, "move_mount": 429, "fsopen": 430, "fsconfig": 431, "fsmount": 432, "fspick": 433,
+        "mount_setattr": 442, "open_tree_attr": 467,
     },
 }
 # The numbers of the calls the filter reads beyond the first list (kept apart, so that table stays that list).
@@ -340,7 +360,9 @@ HELD_NOT_TRIED = {
                   "makes none of its own",
     "namespace": "entering a namespace changes the whole process the host runs in, so the wall enters none of its "
                  "own; in a namespace entered before the wall the filter refuses unshare, setns, clone with a "
-                 "namespace flag, mount and umount2, and the newer mount calls are not refused by name",
+                 "namespace flag and every mount call by name (mount, umount2, open_tree, move_mount, fsopen, "
+                 "fsconfig, fsmount, fspick, mount_setattr, open_tree_attr), and every call newer than the ones it "
+                 "names",
 }
 _RING_OFF = ("the kernel made no ring of kernel calls for this process before the wall (rings turned off), so there "
              "was none to try")
@@ -390,7 +412,13 @@ WORDS = {
     "signal_other_ways": "reaching another of your processes in other ways (a queued signal, a pipe's signals, "
                          "its limits)",
     "metadata_change": "changing the permissions of a test file",
-    "kernel_surface": "kernel calls that only this sandbox refuses",
+    "kernel_surface": "kernel calls that only this sandbox refuses (among them a call it does not know: it refuses "
+                      "every call newer than the ones it was written to name, so a newer kernel's calls stay shut "
+                      "until it names them)",
+    "path_is_link": "A folder given to the sandbox ({path}) is a link to another place, or has a link in it. The "
+                    "sandbox would let plugins read the place the link points to, not the folder named, so the plugin "
+                    "host did not shut itself in and loads nothing. What you can do: give the sandbox the real path "
+                    "of the folder, with every link in it resolved.",
     "open_for_write": "opening a test file for writing (nothing was written)",
     "truncate": "cutting a test file to its own length (nothing was cut off)",
     "create_file": "making a new file in a test folder",
@@ -603,6 +631,11 @@ def _alone(step: str, count) -> None:
                           f"{', '.join(_STATE['applied']) or 'nothing'}", step=step)
 
 
+def _newest_call(arch: str) -> int:
+    """The highest call number the wall's own tables name for ``arch``: read from the tables, never typed."""
+    return max(dict(_NR[arch], **_NR_MORE[arch]).values())
+
+
 def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI) -> list[tuple[int, int, int, int]]:
     """The one seccomp program, as (code, jt, jf, k) rows. ``landlock_abi`` below 3 adds the truncation rules.
     No pid number appears in it: the same program for every process."""
@@ -611,6 +644,7 @@ def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI) -> list[tuple[int,
                          (_BPF_RET_K, 0, 0, _RET_EPERM), (_BPF_LD_W_ABS, 0, 0, _OFF_NR)]
     if arch == "x86_64":
         rows.append((_BPF_JGE_K, "deny", 0, _X32_SYSCALL_BIT))
+    rows.append((_BPF_JGE_K, "deny", 0, _newest_call(arch) + 1))  # a call the tables do not know: refused by default
     rows += [(_BPF_JEQ_K, "deny", 0, numbers[name]) for name in DENIED_CALLS]
     rows += [(_BPF_JEQ_K, "deny", 0, numbers[name]) for name in DENIED_METADATA_CALLS if name in numbers]
     rows += [(_BPF_JEQ_K, "deny", 0, numbers[name]) for name in DENIED_SIGNAL_CALLS + DENIED_IPC_CALLS]
@@ -646,7 +680,8 @@ def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI) -> list[tuple[int,
     block("ioctl", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]),
           *[(_BPF_JEQ_K, "deny", 0, value) for value in DENIED_IOCTL_COMMANDS.values()],
           *[(_BPF_JEQ_K, "deny", 0, value) for value in DENIED_TERMINAL_COMMANDS.values()],
-          (_BPF_RET_K, 0, 0, _RET_ALLOW))
+          *[(_BPF_JEQ_K, "allow", 0, value) for value in ALLOWED_TERMINAL_COMMANDS.values()],
+          (_BPF_JGE_K, "allow", 0, _TERMINAL_RANGE[1]), (_BPF_JGE_K, "deny", "allow", _TERMINAL_RANGE[0]))
     block("clone", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[0]), (_BPF_JSET_K, "deny", "allow", NAMESPACE_CLONE_FLAGS))
     block("trunc1", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]), (_BPF_JSET_K, "deny", "allow", _O_TRUNC))
     block("trunc2", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[2]), (_BPF_JSET_K, "deny", "allow", _O_TRUNC))
@@ -715,15 +750,32 @@ def _load_seccomp_filter(libc, arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI)
     _STATE["filter_truncate"] = landlock_abi < _TRUNCATE_ABI  # what the loaded program refuses, for the record
 
 
+def _open_through_no_link(entry) -> int:
+    """An O_PATH descriptor of ``entry`` opened through no link in any part of it (openat2 with RESOLVE_NO_SYMLINKS,
+    which every kernel with Landlock has); ``wall_path_is_link`` where a part is a link."""
+    path = os.fspath(entry)
+    if not isinstance(path, str) or not os.path.isabs(path):
+        raise ValueError(f"a wall path must be an absolute path: {path!r}")
+    how = ctypes.create_string_buffer(struct.pack("<QQQ", os.O_PATH | os.O_CLOEXEC, 0, _RESOLVE_NO_SYMLINKS), 24)
+    name = ctypes.create_string_buffer(os.fsencode(path))
+    libc = _libc()  # the C library directly: an open of a path only, which changes nothing
+    ctypes.set_errno(0)
+    fd = libc.syscall(ctypes.c_long(_NR_MORE[_arch()]["openat2"]), ctypes.c_long(-100), ctypes.c_long(ctypes.addressof(name)),
+                      ctypes.c_long(ctypes.addressof(how)), ctypes.c_long(24))
+    err = ctypes.get_errno()
+    if fd < 0:
+        if err == errno.ELOOP:
+            raise WallRefused("wall_path_is_link", WORDS["path_is_link"].format(path=path))
+        raise OSError(err, f"{path}: {os.strerror(err)}")
+    return fd
+
+
 def _open_paths(read_only_paths) -> list[tuple[int, int]]:
     """(fd, allowed rights) for each path, all opened before any change; nothing is left open on a raise."""
     opened: list[tuple[int, int]] = []
     try:
         for entry in read_only_paths:
-            path = os.fspath(entry)
-            if not isinstance(path, str) or not os.path.isabs(path):
-                raise ValueError(f"a wall path must be an absolute path: {path!r}")
-            fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
+            fd = _open_through_no_link(entry)
             opened.append((fd, 0))
             is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
             opened[-1] = (fd, _FS_EXECUTE | _FS_READ_FILE | (_FS_READ_DIR if is_dir else 0))
@@ -775,7 +827,8 @@ def apply_wall(read_only_paths, keep_descriptors=None) -> None:
     start a thread the count does not see. Refuses, before any change: ``wall_system_unsupported`` (not Linux;
     nothing is tried), ``wall_arch_unsupported`` (not x86_64 or aarch64), ``wall_threads_running`` (more than
     one thread), ``wall_children_running`` (a child process alive), ``landlock_unavailable`` (no Landlock, or an ABI below 1). A bad path raises ``ValueError`` or
-    ``OSError`` before any change as well. A kernel failure at any step, more than one thread immediately before
+    ``OSError`` before any change as well, and a path that is a link, or has a link in any part of it, is refused
+    ``wall_path_is_link`` (the wall would grant the place the link points to, not the one named). A kernel failure at any step, more than one thread immediately before
     ``landlock_restrict_self`` (``threads_before_landlock``) or after the filter (``threads_after_filter``), and a
     second call in a process walled already in whole or in part, is refused ``wall_partial`` with ``step`` set.
 
@@ -803,6 +856,8 @@ def apply_wall(read_only_paths, keep_descriptors=None) -> None:
     if abi < _MIN_LANDLOCK_ABI:
         raise WallRefused("landlock_unavailable", "this kernel gives this process no Landlock (ABI 1, Linux 5.13, at least)")
     kept = None if keep_descriptors is None else _kept(keep_descriptors)  # refused before any change
+    for entry in paths:  # a link in a path is refused before any change (and again where the path is opened)
+        os.close(_open_through_no_link(entry))
     _plant_held()
     if kept is not None:
         _step("close_descriptors", lambda: _close_all_but(kept))
@@ -1125,13 +1180,21 @@ def _lease_on_a_pipe(libc) -> None:
         os.close(write_end)
 
 
+def _open_tree_of_root(libc) -> None:
+    """open_tree of the root folder with no flag (no clone, no mount): where it is allowed it gives a descriptor of a
+    path only, closed at once; it needs no privilege, so a refusal is the filter's."""
+    root = ctypes.create_string_buffer(b"/")
+    os.close(_sys(libc, "open_tree", -100, ctypes.addressof(root), os.O_CLOEXEC))
+
+
 def _kernel_surface() -> None:
     """Calls only this wall refuses, each harmless where it is allowed: io_uring_setup with no entries, the use of
     a ring and an addressed send on a descriptor that names nothing,
     unshare of nothing, a keyctl operation that does not exist, (x86_64) getpid by its x32 number, clone
     asking a new user namespace with flags the kernel itself rejects, msgctl IPC_STAT of the id -1,
     mq_getsetattr of the descriptor -1, signal 0 to this process itself by its own pid, and a lease on a
-    pipe; then clone3, which this wall answers ENOSYS (the kernel's own answer to these arguments is EINVAL)."""
+    pipe, open_tree of the root folder (the newer mount calls), and a call number the kernel will never give a call
+    (the filter refuses every number above the newest one its tables name); then clone3, which this wall answers ENOSYS (the kernel's own answer to these arguments is EINVAL)."""
     libc, arch = _libc(), _arch()
     address = ctypes.create_string_buffer(16)  # a destination address of zeros, never sent: the descriptor is -1
     attempts = [lambda: _sys(libc, "io_uring_setup", 0, 0),
@@ -1145,7 +1208,9 @@ def _kernel_surface() -> None:
                 lambda: _sys(libc, "msgctl", -1, 2, 0),                             # IPC_STAT of no queue: EINVAL
                 lambda: _sys(libc, "mq_getsetattr", -1, 0, 0),                      # no descriptor: EBADF
                 lambda: _sys(libc, "kill", os.getpid(), 0),                         # signal 0 to itself: ok
-                lambda: _lease_on_a_pipe(libc)]
+                lambda: _lease_on_a_pipe(libc),
+                lambda: _open_tree_of_root(libc),                                   # a descriptor of / if allowed
+                lambda: _kernel("a call the wall does not know", *_call(libc, _UNKNOWN_CALL))]  # ENOSYS if allowed
     if arch == "x86_64":
         attempts.append(lambda: _kernel("x32 getpid", *_call(libc, _X32_SYSCALL_BIT | 39)))
     try:

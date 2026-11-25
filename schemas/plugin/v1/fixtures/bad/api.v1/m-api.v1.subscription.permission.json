@@ -1,0 +1,7 @@
+{
+  "types": [
+    "turn.ended",
+    "usage",
+    "result"
+  ]
+}

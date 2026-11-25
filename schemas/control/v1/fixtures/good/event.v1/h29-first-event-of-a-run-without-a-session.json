@@ -1,0 +1,34 @@
+{
+  "seq": 1,
+  "session_id": "run:run-0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+  "run_id": "run-0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+  "turn_id": null,
+  "time": "2026-11-13T07:34:29.073Z",
+  "type": "state.changed",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "entity": "run",
+    "entity_id": "run-0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+    "post_image": {
+      "daemon_row": null,
+      "control_record": {
+        "run_id": "run-0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+        "tenant": "t1",
+        "engine": "claude_code",
+        "state": "starting",
+        "cgroup": null,
+        "started_at": 1794555600.25,
+        "stop": null,
+        "start_key": null,
+        "generation": 1,
+        "cgroup_marker": null,
+        "members": [],
+        "stop_attestation": null
+      }
+    },
+    "post_image_sha256": "41215a3d231328f1d8b1326d9a8f5dd378e648ea5e2c87c865c581f4ee195d23",
+    "reason": "snapshot",
+    "coalesced": null
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "method": "session.turn",
+  "params": {
+    "command_id": "tui-7c1e.0042",
+    "text": "Now update the changelog.",
+    "expected_revision": 6
+  }
+}

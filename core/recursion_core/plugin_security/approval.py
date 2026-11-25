@@ -45,6 +45,13 @@ apart from the tombstones, so a burst of other approvals cannot evict a veto and
 its finality. Each entry is one SHA-256 hex digest (no effect bytes), and the set grows
 only by one per distinct digest the operator vetoes: only the ``operator_ui`` principal
 can add to it, never a plugin request.
+
+An allow that outlives one use (a caller's record of what the person approved) is kept
+and read only through the gate's own critical section: ``keep`` stores it for one
+approval this gate gave and that was taken, in the same section as the veto check, and
+``standing`` answers for it in the same section as the veto check of the use asked
+about. A veto takes the same lock, so it lands before the store (which then refuses)
+or after it (and ``standing`` answers no): never between the check and the store.
 """
 
 from __future__ import annotations
@@ -56,7 +63,7 @@ import secrets
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Iterable
 
 from .canonical import canonical, parse
 from .errors import Refused
@@ -256,3 +263,41 @@ class ApprovalGate:
         after ``take``, so a veto acknowledged before the commit refuses it (R4-1)."""
         with self._lock:
             return digest in self._vetoed
+
+    def keep(self, approval_id: str, effect: dict, store: Callable[[str], None]) -> str:
+        """Store an allow for one taken approval, in the same critical section as the veto check.
+
+        ``store(digest)`` runs under the gate's lock, and only when ``approval_id`` was given
+        by this gate for exactly this effect, was taken (``used``) and its digest is not
+        vetoed; otherwise nothing runs and the call refuses (``approval_required``,
+        ``approval_digest_mismatch``, ``approval_vetoed`` or ``approval_not_taken`` with the
+        approval's state). ``store`` must not call back into the gate.
+        """
+        raw = check_effect(effect)
+        digest = hashlib.sha256(raw).hexdigest()
+        with self._lock:
+            item = self._approvals.get(approval_id)
+            if item is None:
+                raise Refused("approval_required")
+            if item.digest != digest:
+                raise Refused("approval_digest_mismatch")
+            if digest in self._vetoed:
+                raise Refused("approval_vetoed")
+            if item.state != "used":
+                raise Refused("approval_not_taken", item.state)
+            store(digest)
+            return digest
+
+    def standing(self, effect: dict | None, sources: Callable[[], Iterable[str]]) -> bool:
+        """Whether an allow kept with ``keep`` stands, in the same critical section as the veto check.
+
+        True only when at least one digest ``sources()`` names is not vetoed and, when an
+        effect is given, that effect's own digest is not vetoed either: a veto of the use
+        asked about, or of every approval behind the allow, makes it stand no more.
+        ``sources`` runs under the gate's lock and must not call back into the gate.
+        """
+        digest = None if effect is None else effect_digest(effect)
+        with self._lock:
+            if digest is not None and digest in self._vetoed:
+                return False
+            return any(source not in self._vetoed for source in sources())

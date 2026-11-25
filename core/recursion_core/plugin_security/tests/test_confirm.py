@@ -7,9 +7,13 @@ the time pass or does nothing.
 
 from __future__ import annotations
 
+import os
+import random
+import threading
 import unittest
 
 from recursion_core.plugin_security import ApprovalGate, Refused, canonical
+from recursion_core.plugin_security import confirm as confirm_module
 from recursion_core.plugin_security.confirm import (
     ASK, GO, NetworkFirstUses, confirm, confirmation_effect, decide,
 )
@@ -122,7 +126,7 @@ class RuleTests(unittest.TestCase):
         area, first_uses = _Area(), NetworkFirstUses()
         self.assertEqual(area.use("network", "model", first_uses=first_uses), "approved by the person")
         self.assertEqual(decide("model", "network", _TARGETS["network"], first_uses=first_uses,
-                                plugin_id="demo.plugin"), GO)
+                                plugin_id="demo.plugin", run_id="run-1", connection="conn-a"), GO)
         self.assertEqual(area.use("network", "model", first_uses=first_uses),
                          "destination approved since the daemon started")
         self.assertEqual(len(area.drawn), 1)
@@ -156,7 +160,8 @@ class RuleTests(unittest.TestCase):
         for plugin_id, expected_answer in (("plugin.a", GO), ("plugin.b", GO), ("plugin.c", ASK), (None, ASK)):
             with self.subTest(plugin_id=plugin_id):
                 self.assertEqual(decide("model", "network", _TARGETS["network"], first_uses=first_uses,
-                                        plugin_id=plugin_id), expected_answer)
+                                        plugin_id=plugin_id, run_id="run-1", connection="conn-a"),
+                                 expected_answer)
 
     def test_a_network_approval_never_lets_a_credential_or_a_program_of_the_same_name_go(self) -> None:
         shared = "shared.example-name"
@@ -310,6 +315,246 @@ class RuleTests(unittest.TestCase):
                             target=args["target"], plugin_id="demo.plugin", run_id="run-1",
                             connection="conn-a", lifted=args["lifted"], first_uses=NetworkFirstUses())
                 self.assertEqual(area.drawn, [])
+
+
+# The rounds of the thread run below: a test figure, not a product one. The shipped first
+# value is 20000; CSL_CONFIRM_STRESS_ROUNDS sets another for one run.
+_STRESS_ROUNDS = int(os.environ.get("CSL_CONFIRM_STRESS_ROUNDS", "20000"))
+# The widest spin, in empty loop turns, before the refusing thread refuses: a test figure.
+_STRESS_SPIN = int(os.environ.get("CSL_CONFIRM_STRESS_SPIN", "40"))
+_NET = _TARGETS["network"]
+
+
+def _kept(first_uses: NetworkFirstUses, plugin_id: str = "demo.plugin") -> set:
+    """The digests kept behind one allow, read as they are (a test's view of the record)."""
+    return set(getattr(first_uses, "_allows", {}).get((plugin_id, _NET), ()))
+
+
+class _VetoAtTheStore(ApprovalGate):
+    """A gate where the person refuses a twin approval of the same use (the same digest,
+    still pending) at the last moment before the allow is kept: right after the gate
+    answered a veto check, or just before the one critical section that keeps it."""
+
+    twin: tuple[str, str] | None = None
+
+    def _refuse_the_twin(self) -> None:
+        if self.twin is not None:
+            twin, self.twin = self.twin, None
+            self.decide(twin[0], twin[1], _OPERATOR, False)
+
+    def is_vetoed(self, digest: str) -> bool:
+        answer = super().is_vetoed(digest)
+        self._refuse_the_twin()
+        return answer
+
+    def keep(self, approval_id, effect, store):
+        self._refuse_the_twin()
+        return super().keep(approval_id, effect, store)
+
+
+class _SnapshotAtVeto(ApprovalGate):
+    """A gate that notes which digests the record kept at the moment a veto lands."""
+
+    first_uses: NetworkFirstUses | None = None
+    kept_at_veto: set | None = None
+
+    def decide(self, approval_id, digest, credential, approve):
+        state = super().decide(approval_id, digest, credential, approve)
+        if not approve and self.first_uses is not None:
+            self.kept_at_veto = _kept(self.first_uses)
+        return state
+
+
+def _gate(area: _Area, cls=ApprovalGate) -> ApprovalGate:
+    gate = cls(lambda i, d, raw: area.drawn.append((i, d, raw)),
+               lambda credential: "operator_ui" if credential == _OPERATOR else None,
+               area.clock, ttl_seconds=_TTL)
+    area.gate = gate
+    return gate
+
+
+def _net(area: _Area, first_uses: NetworkFirstUses, run_id: str, **kw) -> str:
+    return confirm(area.gate, area.wait, origin="model", handle="network", target=kw.pop("target", _NET),
+                   plugin_id=kw.pop("plugin_id", "demo.plugin"), run_id=run_id, connection="conn-a",
+                   first_uses=first_uses, **kw)
+
+
+class VetoIsFinalTests(unittest.TestCase):
+    """A veto is final for its use, whatever happens after it and on whatever thread."""
+
+    def test_a_refused_use_stays_refused_after_another_run_is_approved(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        area.answer = "refuse"
+        with self.assertRaises(Refused):
+            _net(area, first_uses, "run-1")
+        area.answer = "approve"
+        self.assertEqual(_net(area, first_uses, "run-2"), "approved by the person")
+        self.assertEqual(len(area.drawn), 2)
+        # The retry of the refused use is refused without asking, though run-2 was allowed.
+        with self.assertRaises(Refused) as again:
+            _net(area, first_uses, "run-1")
+        self.assertEqual((again.exception.code, again.exception.detail),
+                         ("approval_vetoed", confirm_module.VETOED_WORDS))
+        self.assertEqual(len(area.drawn), 2)
+        self.assertEqual(decide("model", "network", _NET, first_uses=first_uses, plugin_id="demo.plugin",
+                                run_id="run-1", connection="conn-a"), ASK)
+        # A use no veto covers goes on run-2's allow.
+        self.assertEqual(_net(area, first_uses, "run-3"), "destination approved since the daemon started")
+        self.assertEqual(len(area.drawn), 2)
+
+    def test_a_refusal_landing_at_the_store_keeps_nothing(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        gate = _gate(area, _VetoAtTheStore)
+        effect = confirmation_effect("network", _NET, plugin_id="demo.plugin", run_id="run-1", connection="conn-a")
+        gate.twin = gate.request(effect)
+        digest = gate.twin[1]
+        with self.assertRaises(Refused) as caught:
+            _net(area, first_uses, "run-1")
+        self.assertEqual(caught.exception.code, "approval_vetoed")
+        self.assertIsNone(gate.twin)
+        self.assertTrue(gate.is_vetoed(digest))
+        self.assertNotIn(("demo.plugin", _NET), first_uses)
+        self.assertEqual(_kept(first_uses), set())
+        drawn = len(area.drawn)
+        with self.assertRaises(Refused) as again:
+            _net(area, first_uses, "run-1")
+        self.assertEqual(again.exception.code, "approval_vetoed")
+        self.assertEqual(len(area.drawn), drawn)
+
+    def test_a_veto_after_the_allow_was_kept_takes_effect_at_once(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        effect = confirmation_effect("network", _NET, plugin_id="demo.plugin", run_id="run-1", connection="conn-a")
+        twin = area.gate.request(effect)
+        self.assertEqual(_net(area, first_uses, "run-1"), "approved by the person")
+        self.assertIn(("demo.plugin", _NET), first_uses)
+        area.gate.decide(twin[0], twin[1], _OPERATOR, False)  # the refusal comes after the allow was kept
+        drawn = len(area.drawn)
+        with self.assertRaises(Refused) as again:
+            _net(area, first_uses, "run-1")
+        self.assertEqual((again.exception.code, again.exception.detail),
+                         ("approval_vetoed", confirm_module.VETOED_WORDS))
+        self.assertEqual(len(area.drawn), drawn)
+        # The only approval behind the allow is vetoed: the allow stands no more, so another
+        # run of that plugin is asked again.
+        self.assertNotIn(("demo.plugin", _NET), first_uses)
+        self.assertNotIn(_NET, first_uses)
+        self.assertEqual(_net(area, first_uses, "run-2"), "approved by the person")
+        self.assertEqual(len(area.drawn), drawn + 1)
+
+    def test_an_allow_is_kept_only_for_an_approval_the_gate_gave_and_that_was_taken(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        # The record of an earlier form, with no approval at all, keeps nothing.
+        with self.assertRaises((TypeError, Refused)):
+            first_uses.record("demo.plugin", _NET)
+        self.assertNotIn(("demo.plugin", _NET), first_uses)
+        self.assertEqual(decide("model", "network", _NET, first_uses=first_uses, plugin_id="demo.plugin",
+                                run_id="run-1", connection="conn-a"), ASK)
+        effect = confirmation_effect("network", _NET, plugin_id="demo.plugin", run_id="run-1", connection="conn-a")
+        cases = []
+        with self.assertRaises(Refused) as unknown:
+            first_uses.record(area.gate, "apr_" + "0" * 32, effect)
+        cases.append(unknown.exception.code)
+        approval_id, digest = area.gate.request(effect)
+        area.gate.decide(approval_id, digest, _OPERATOR, True)
+        with self.assertRaises(Refused) as untaken:
+            first_uses.record(area.gate, approval_id, effect)
+        cases.append((untaken.exception.code, untaken.exception.detail))
+        area.gate.take(approval_id, effect)
+        other = confirmation_effect("network", _NET, plugin_id="other.plugin", run_id="run-1", connection="conn-a")
+        with self.assertRaises(Refused) as mismatch:
+            first_uses.record(area.gate, approval_id, other)
+        cases.append(mismatch.exception.code)
+        credential = confirmation_effect("credential", _NET, plugin_id="demo.plugin", run_id="run-1",
+                                         connection="conn-a")
+        with self.assertRaises(Refused) as not_network:
+            first_uses.record(area.gate, approval_id, credential)
+        cases.append(not_network.exception.code)
+        self.assertEqual(cases, ["approval_required", ("approval_not_taken", "approved"),
+                                 "approval_digest_mismatch", "allow_not_network"])
+        self.assertNotIn(_NET, first_uses)
+        first_uses.record(area.gate, approval_id, effect)  # the taken approval: kept
+        self.assertIn(("demo.plugin", _NET), first_uses)
+        self.assertNotIn(("other.plugin", _NET), first_uses)
+
+    def test_a_record_answers_for_one_gate_only(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        self.assertEqual(_net(area, first_uses, "run-1"), "approved by the person")
+        other = _Area()
+        with self.assertRaises(Refused) as caught:
+            _net(other, first_uses, "run-1")
+        self.assertEqual(caught.exception.code, "first_uses_other_gate")
+        self.assertEqual(other.drawn, [])
+
+    def test_a_target_that_holds_a_secret_is_refused_before_anything_is_drawn(self) -> None:
+        for target in ("https://user:secret-token@api.example.com:443", "user:secret-token@api.example.com:443",
+                       "user@api.example.com", "https://api.example.com/v1?access_token=secret-token",
+                       "api.example.com:443/v1?api_key=secret-token", "https://api.example.com/#token=secret-token",
+                       "https://api.example.com/v1?page=2&Signature=secret-token"):
+            with self.subTest(target=target):
+                area, first_uses = _Area(), NetworkFirstUses()
+                with self.assertRaises(Refused) as caught:
+                    _net(area, first_uses, "run-1", target=target)
+                self.assertEqual((caught.exception.code, caught.exception.detail),
+                                 ("target_holds_secret", confirm_module.SECRET_TARGET_WORDS))
+                self.assertNotIn("secret-token", str(caught.exception))
+                self.assertEqual(area.drawn, [])
+                self.assertEqual(area.waited, 0)
+                self.assertNotIn(target, first_uses)
+        for target in ("api.example.com:443", "https://api.example.com:443/v1/items?page=2", "[::1]:8443"):
+            with self.subTest(target=target):
+                area = _Area()
+                self.assertEqual(_net(area, NetworkFirstUses(), "run-1", target=target), "approved by the person")
+
+    def test_thread_run_a_veto_is_final_whatever_the_order(self) -> None:
+        """One thread confirms a use while another refuses its twin, round after round."""
+        rnd = random.Random(603)
+        stored_after_veto = standing = unasked = not_vetoed = 0
+        for _ in range(_STRESS_ROUNDS):
+            area, first_uses = _Area(), NetworkFirstUses()
+            gate = _gate(area, _SnapshotAtVeto)
+            gate.first_uses = first_uses
+            effect = confirmation_effect("network", _NET, plugin_id="demo.plugin", run_id="run-1",
+                                         connection="conn-a")
+            twin = gate.request(effect)
+            spin = rnd.randint(0, _STRESS_SPIN)
+
+            def confirming() -> None:
+                try:
+                    _net(area, first_uses, "run-1")
+                except Refused:
+                    pass
+
+            def refusing() -> None:
+                for _ in range(spin):
+                    pass
+                gate.decide(twin[0], twin[1], _OPERATOR, False)
+
+            threads = [threading.Thread(target=confirming), threading.Thread(target=refusing)]
+            rnd.shuffle(threads)
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            if not gate.is_vetoed(twin[1]):
+                not_vetoed += 1
+            if twin[1] in _kept(first_uses) and twin[1] not in (gate.kept_at_veto or set()):
+                stored_after_veto += 1
+            if ("demo.plugin", _NET) in first_uses:
+                standing += 1
+            drawn = len(area.drawn)
+            try:
+                confirm(gate, lambda i, d: None, origin="model", handle="network", target=_NET,
+                        plugin_id="demo.plugin", run_id="run-1", connection="conn-a", first_uses=first_uses)
+                unasked += 1
+            except Refused as refused:
+                if refused.code != "approval_vetoed" or len(area.drawn) != drawn:
+                    unasked += 1
+        self.assertEqual({"rounds": _STRESS_ROUNDS, "not vetoed": not_vetoed,
+                          "allow kept after the veto": stored_after_veto,
+                          "allow standing for a vetoed digest": standing,
+                          "later use let go unasked": unasked},
+                         {"rounds": _STRESS_ROUNDS, "not vetoed": 0, "allow kept after the veto": 0,
+                          "allow standing for a vetoed digest": 0, "later use let go unasked": 0})
 
 
 if __name__ == "__main__":

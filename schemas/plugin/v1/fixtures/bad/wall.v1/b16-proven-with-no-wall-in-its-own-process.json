@@ -3,6 +3,7 @@
   "descriptors_open_for_write": [],
   "memory_maps_open_for_write": [],
   "descriptors_seen_by": "scan_by_number",
+  "descriptors_counted_by": "kernel_count",
   "descriptors_unaccounted": [],
   "descriptors_kept": [
     {

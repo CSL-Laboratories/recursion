@@ -4,6 +4,17 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `wall.v1.json` is `1.0-draft.11` (Nov 25, 2026)
+
+An additive step: every field and value of draft 10 keeps its meaning, and a record that is not proven still
+validates. A record gains `descriptors_counted_by`: `kernel_count` where the kernel gave the count of the
+descriptors (the size of /proc/self/fd, from Linux 6.2) that the probe's scan by number reached, null where it gave
+none (an older kernel, no /proc), where the probe cannot tell whether it found every descriptor. A proven record
+needs `kernel_count`; where the kernel gives no count, `descriptors_open_for_write` and `descriptors_unaccounted` are
+null. What it breaks: a draft 10 record that says proven does not validate at draft 11, and a record of a kernel
+before 6.2 is no longer proven. 1 good fixture (`h24`) and 3 bad ones are added; every proven fixture of draft 10
+gains the field.
+
 ## `wall.v1.json` is `1.0-draft.10` (Nov 25, 2026)
 
 An additive step: every field and value of draft 9 keeps its meaning, and a record that is not proven still

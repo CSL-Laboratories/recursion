@@ -305,10 +305,11 @@ class KernelListsAfterTheWallTests(unittest.TestCase):
         self.assertEqual(head, b"mmmmmmm")
         self.assertEqual(_schema_errors(record), [])
 
-    def test_a_descriptor_above_a_lowered_limit_is_seen_where_the_kernel_gives_no_count(self):
+    def test_a_descriptor_above_a_lowered_limit_is_never_proven_where_the_kernel_gives_no_count(self):
         result, _ = run_list_child("high")
         record = result["record"]
-        self.assertIn({"descriptor": 900, "kind": "regular_file"}, record["descriptors_open_for_write"] or [])
+        self.assertIsNone(record["descriptors_open_for_write"], "with no count from the kernel the probe cannot tell")
+        self.assertIsNone(record["descriptors_counted_by"])
         self.assertIs(record["proven"], False)
 
     def test_the_maps_list_is_read_by_its_fields(self):

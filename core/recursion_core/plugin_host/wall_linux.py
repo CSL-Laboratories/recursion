@@ -18,7 +18,8 @@ and to everything it starts later, and neither can be lifted again from inside:
    (``/proc/self/fd``) and of its maps (``/proc/self/maps``) for reading BEFORE the wall, reads both AFTER it,
    and closes both before it returns, so that no plugin code holds either; the record is built from what it
    read there. ``probe_wall`` then names every descriptor the process holds at the probe's own moment (found by
-   number, up to the kernel's own count of them where the kernel gives one): a descriptor that the kernel's list
+   number, up to the kernel's own count of them; where the kernel gives no count, from Linux 6.2 on, it cannot tell
+   whether it saw every one, and the record says so and is never proven): a descriptor that the kernel's list
    did not hold after the wall (one handed in over a connection held from before it) is named, by kind, and
    keeps the record from proven, as does a record made in a process where ``apply_wall`` did not run.
 2. ONE seccomp filter, loaded with ``SECCOMP_FILTER_FLAG_TSYNC`` so that it reaches every thread of the
@@ -536,6 +537,10 @@ WORDS = {
                        "must close every such file before it shuts itself in.",
     "descriptors_unknown": "The plugin host could not see every file it held open, so it could not show that none "
                            "was open for writing.",
+    "descriptors_uncounted": "This system's kernel gives no count of the files and connections a process holds open "
+                             "(Linux before 6.2 gives none, and none is given without /proc), so the plugin host could "
+                             "not tell whether it found every one, and nothing was loaded. What you can do: run the "
+                             "plugin host on Linux 6.2 or newer, with /proc mounted.",
     "map_open": "A file or a piece of memory was mapped shared when the plugin host shut itself in (writable then, "
                 "or able to be made writable after). The sandbox checks a file when it is opened, so writes through "
                 "such a map still reach the file, "
@@ -1778,7 +1783,7 @@ def _descriptors_open_for_write():
     """Each descriptor of this process open for writing on a regular file or a block device, as
     ``{"descriptor": n, "kind": ...}`` in its order, or None when not every descriptor could be seen: those held
     now, and, where apply_wall ran in this process, every one the kernel's list held after the wall."""
-    numbers, seen = _descriptors_now(), _STATE.get("seen_at_wall")
+    numbers, seen = _descriptors_now(), _STATE.get("seen_at_wall")  # None where the kernel gives no count
     at_wall = seen.get("numbers") if seen else []
     if numbers is None or at_wall is None:
         return None
@@ -1864,25 +1869,33 @@ def _held_objects() -> tuple:
     return outcomes, reasons
 
 
+def _descriptor_count() -> int:
+    """The kernel's count of this process's descriptors: the size of /proc/self/fd (a stat, from Linux 6.2), or 0
+    where the kernel gives none (an older kernel, no /proc, or a stat refused)."""
+    try:
+        return os.stat("/proc/self/fd").st_size
+    except OSError:
+        return 0
+
+
 def _descriptors_now():
     """The numbers of every descriptor this process holds now, in order, or None when not every one could be seen.
 
     The list of descriptors (/proc/self/fd) is outside what the wall lets the process read, so they are found by
-    number with ``fstat`` and ``fcntl(F_GETFL)``, which the wall does not refuse: up to the count the kernel
-    gives as the size of /proc/self/fd (a stat, from Linux 6.2), or, where that size is 0, up to the hard limit
-    of open files (a descriptor numbered above a hard limit lowered after it was opened is then not seen; the
-    probe adds the kernel's own list read after the wall for every descriptor held then)."""
+    number with ``fstat`` and ``fcntl(F_GETFL)``, which the wall does not refuse, up to the count the kernel gives
+    (``_descriptor_count``). Where the kernel gives no count, a scan cannot tell whether it saw every one (a
+    descriptor numbered above a hard limit lowered after it was made is not found below that limit), so the answer
+    is None: cannot count is cannot tell, and cannot tell is never proven."""
     import fcntl
     import resource
-    try:
-        expected = os.stat("/proc/self/fd").st_size
-    except OSError:
-        expected = 0
+    expected = _descriptor_count()
+    if expected <= 0:
+        return None
     limit = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
     if limit == resource.RLIM_INFINITY or limit < 0:
         return None
     found, open_numbers, number = 0, [], 0
-    while number < limit and (expected <= 0 or found < expected):
+    while number < limit and found < expected:
         try:
             os.fstat(number)
             fcntl.fcntl(number, fcntl.F_GETFL)
@@ -1892,7 +1905,7 @@ def _descriptors_now():
         found += 1
         open_numbers.append(number)
         number += 1
-    if expected > 0 and found != expected:
+    if found != expected:
         return None
     return open_numbers
 
@@ -1992,6 +2005,8 @@ def why_not_proven(record: dict) -> list:
                 kind = entry.get("kind") if isinstance(entry, dict) else None
                 lines.append(WORDS["descriptor_open"].format(
                     kind=WORDS[kind] if kind in _DESCRIPTOR_KINDS.values() else WORDS["regular_file"]))
+    if "descriptors_counted_by" in record and record["descriptors_counted_by"] != "kernel_count":
+        lines.append(WORDS["descriptors_uncounted"])
     if record.get("descriptors_seen_by") == "scan_by_number":
         lines.append(WORDS["no_wall_here"])
     if isinstance(record.get("descriptors_unaccounted"), list):
@@ -2058,7 +2073,9 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
     probe opens anything of its own: those open for writing on a regular file or a block device are named
     (``descriptors_open_for_write``; None when not every descriptor could be seen), and so is every descriptor
     that the kernel's list read after the wall did not hold (``descriptors_unaccounted``, by kind; None where no
-    wall was applied in this process or not every descriptor could be seen). Eight checks are tried; each field is True only
+    wall was applied in this process or not every descriptor could be seen). ``descriptors_counted_by`` is
+    ``kernel_count`` where the kernel gave the count the scan reached, else None: then the probe cannot tell whether
+    it found every descriptor, and the record is never proven. Eight checks are tried; each field is True only
     when the kernel refused it. Then each kind of
     ``WRITE_KINDS`` is tried on the probe's own file and in ``write_folder`` (a folder the caller made and gave to
     ``prepare_write_folder`` before the wall); ``writes`` holds the outcome of each, and ``writes_not_tried``
@@ -2090,6 +2107,7 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
     # wall did not hold (handed in since), and the ones open for writing, now or at the wall
     unaccounted, held, seen = _descriptors_unaccounted(), _descriptors_open_for_write(), _STATE.get("seen_at_wall")
     seen_by = "kernel_list_after_wall" if _walled_here() else "scan_by_number"
+    counted_by = "kernel_count" if _descriptor_count() > 0 else None  # no count: the probe cannot tell
     kept, not_closed = _kept_and_not_closed()
     held_objects, held_not_tried = _held_objects()
     maps = seen["maps"] if seen else _maps_open_for_write()
@@ -2099,6 +2117,7 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
         "descriptors_open_for_write": held,
         "memory_maps_open_for_write": maps,
         "descriptors_seen_by": seen_by,
+        "descriptors_counted_by": counted_by,
         "descriptors_unaccounted": unaccounted,
         "descriptors_kept": kept,
         "descriptors_not_closed": not_closed,
@@ -2122,7 +2141,7 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
         "landlock_scopes": list(_STATE["scopes"]),
         "arch": platform.machine() or "unknown",
     }
-    held_all = (seen_by == "kernel_list_after_wall" and unaccounted == []
+    held_all = (seen_by == "kernel_list_after_wall" and counted_by == "kernel_count" and unaccounted == []
                         and isinstance(kept, list) and not_closed == []
                         and all(held_objects[kind] in _HELD_HELD
                                 or (held_objects[kind] == "not_tried" and held_not_tried.get(kind))

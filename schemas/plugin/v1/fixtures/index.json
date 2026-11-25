@@ -2347,6 +2347,38 @@
         "keyword": "required",
         "at": "/limits_of_proven"
       }
+    },
+    {
+      "file": "good/wall.v1/h24-a-kernel-that-gives-no-count-is-not-proven.json",
+      "schema": "wall.v1.json",
+      "shows": "Where the kernel gives no count of the descriptors, the probe cannot tell whether it found every one: the record says so and is not proven."
+    },
+    {
+      "file": "bad/wall.v1/b31-proven-when-the-kernel-gave-no-count.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven record was made where the kernel gave the count of the descriptors.",
+      "expect": {
+        "keyword": "const",
+        "at": "/descriptors_counted_by"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.descriptors-counted-by.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall says how it knew it found every descriptor.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/v-wall.v1.descriptors-counted-by.json",
+      "schema": "wall.v1.json",
+      "rule": "How the descriptors were counted is one of the values the schema names.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/descriptors_counted_by"
+      }
     }
   ]
 }

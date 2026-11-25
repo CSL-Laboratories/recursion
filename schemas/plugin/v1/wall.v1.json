@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "wall.v1.json",
   "title": "wall.v1: what a plugin host proved of its own wall, from inside, before it loaded any plugin byte",
-  "x-version": "1.0-draft.10",
+  "x-version": "1.0-draft.11",
   "description": "A plugin host on Linux applies its wall to itself (Landlock: read and map only the Python install; one seccomp filter: no new socket, no program start, no signal at all, no limit or priority aimed at any process but the caller by the kernel's own form, no System V IPC or POSIX message queue, no lease, no change of a file's mode, owner, times or attributes, no new namespace, among other calls) and then tries eight checks from inside, and each kind of write on a file and in a folder that it made for the purpose before the wall. Each of the eight fields is true only when the kernel refused that check; a check that succeeded, or that failed or raised in another way, is false (fail shut). A target that would make a refusal prove nothing (a daemon pid of another user, a canary of another user) is not refused. 'proven' is true only when the host ran alone in its process (threads is 1), held no file open for writing (descriptors_open_for_write is empty) and no file mapped shared and writable (memory_maps_open_for_write is empty), all eight are refused, every kind of write is refused by the part of the wall that holds it, on x86_64 or aarch64, with Landlock ABI 1 or above, and no step of the wall failed in the process. 'landlock_scopes' names the Landlock scopes the wall put in force (abstract unix sockets and signals, each kept to the domain, from Landlock ABI 6 on; none below). What the record is: a check that the host's own code makes on itself, from inside the process, after the wall and before any plugin code runs. It shows that the named attempts were refused by the kernel at that moment, and code in the same process could write any record; for each kind of write it names which part of the wall refused it, by the kernel's answer. 'proven' covers the kinds in 'writes' only: every other kind the wall claims, or leaves to the host, is named in 'writes_not_tried' with the reason it is not tried. It means something under two conditions only: it is made before the plugin is loaded, and its reader takes it only from frames the host sent before the load (everything later on the channel is the plugin's voice). A host whose record is not proven loads no plugin.",
   "type": "object",
   "additionalProperties": false,
@@ -83,6 +83,13 @@
         "scan_by_number"
       ],
       "description": "How the descriptors and maps were found: kernel_list_after_wall (the kernel's own lists, opened before the wall and read after it, every descriptor seen) or scan_by_number (no wall was applied in the process, so the probe looked for itself). A proven record says kernel_list_after_wall: from draft 7, a record made where no wall was applied in the process is never proven. Added in draft 6."
+    },
+    "descriptors_counted_by": {
+      "enum": [
+        "kernel_count",
+        null
+      ],
+      "description": "How the probe knew it had found every descriptor held at its moment: kernel_count (the kernel's own count, the size of /proc/self/fd from Linux 6.2, which the scan by number must reach); null where the kernel gave no count (an older kernel, no /proc): the probe cannot tell whether it found every one, and the record is never proven. Added in draft 11."
     },
     "descriptors_unaccounted": {
       "type": [
@@ -503,7 +510,7 @@
     },
     "proven": {
       "type": "boolean",
-      "description": "True only when the wall was applied in the host's own process (descriptors_seen_by is kernel_list_after_wall), closed every descriptor the host did not keep (descriptors_kept is a list, descriptors_not_closed is empty), every object of held_objects could not act after the wall (closed_by_wall or refused_by_filter; shared_map and namespace not tried, each with its reason, and the ring not tried only where the kernel made none), the host held no descriptor that the kernel's list after the wall did not hold (descriptors_unaccounted is empty), the host ran alone in its process (threads is 1), held no file open for writing (descriptors_open_for_write is empty) and no file mapped shared and writable (memory_maps_open_for_write is empty), all eight checks are refused, every kind of write in 'writes' is refused by the part of the wall that holds it (refused_by_landlock, or refused_by_filter for truncate alone), on a supported arch, with Landlock ABI 1 or above (and, from ABI 6, both scopes in force), and no step of the wall failed in the process. It covers the kinds in 'writes' only: the kinds in 'writes_not_tried' are not tried, each for the reason given there. A host that gave the probe no file or folder for the writes is never proven. From draft 9 also: the allow list in force holds no row that is not in the shipped list (allow_list.rows_not_shipped is empty), and proven_over is shipped_list. From draft 10 also: the record names what proven is not true over (limits_of_proven, every limit; shared_futex_wait wherever shared_waits_allowed is not empty)."
+      "description": "True only when the wall was applied in the host's own process (descriptors_seen_by is kernel_list_after_wall), closed every descriptor the host did not keep (descriptors_kept is a list, descriptors_not_closed is empty), every object of held_objects could not act after the wall (closed_by_wall or refused_by_filter; shared_map and namespace not tried, each with its reason, and the ring not tried only where the kernel made none), the host held no descriptor that the kernel's list after the wall did not hold (descriptors_unaccounted is empty), the host ran alone in its process (threads is 1), held no file open for writing (descriptors_open_for_write is empty) and no file mapped shared and writable (memory_maps_open_for_write is empty), all eight checks are refused, every kind of write in 'writes' is refused by the part of the wall that holds it (refused_by_landlock, or refused_by_filter for truncate alone), on a supported arch, with Landlock ABI 1 or above (and, from ABI 6, both scopes in force), and no step of the wall failed in the process. It covers the kinds in 'writes' only: the kinds in 'writes_not_tried' are not tried, each for the reason given there. A host that gave the probe no file or folder for the writes is never proven. From draft 9 also: the allow list in force holds no row that is not in the shipped list (allow_list.rows_not_shipped is empty), and proven_over is shipped_list. From draft 10 also: the record names what proven is not true over (limits_of_proven, every limit; shared_futex_wait wherever shared_waits_allowed is not empty). From draft 11 also: the kernel gave the count of the descriptors (descriptors_counted_by is kernel_count)."
     },
     "proven_over": {
       "enum": [
@@ -538,7 +545,8 @@
       "allow_list",
       "proven_over",
       "shared_waits_allowed",
-      "limits_of_proven"
+      "limits_of_proven",
+      "descriptors_counted_by"
     ],
     "properties": {
       "threads": {
@@ -704,6 +712,9 @@
           "what_the_process_shows",
           "page_cache_residency"
         ]
+      },
+      "descriptors_counted_by": {
+        "const": "kernel_count"
       }
     },
     "allOf": [

@@ -15,6 +15,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import types
 import unittest
 from unittest import mock
 
@@ -30,12 +32,15 @@ RIGHT = {"write_file": 1 << 1, "remove_dir": 1 << 4, "remove_file": 1 << 5, "mak
          "make_block": 1 << 11, "make_sym": 1 << 12, "refer": 1 << 13, "truncate": 1 << 14}
 EVERY_WRITE = sum(RIGHT.values())
 KINDS = ("open_for_write", "truncate", "create_file", "create_folder", "make_fifo", "make_symlink", "make_link",
-         "make_char_device", "make_block_device", "remove_file", "remove_folder")
+         "make_char_device", "make_block_device", "make_socket_node", "remove_file", "remove_folder")
 KIND_RIGHT = {"open_for_write": "write_file", "truncate": "truncate", "create_file": "make_reg",
               "create_folder": "make_dir", "make_fifo": "make_fifo", "make_symlink": "make_sym", "make_link": "make_reg",
-              "make_char_device": "make_char", "make_block_device": "make_block", "remove_file": "remove_file",
-              "remove_folder": "remove_dir"}
+              "make_char_device": "make_char", "make_block_device": "make_block", "make_socket_node": "make_sock",
+              "remove_file": "remove_file", "remove_folder": "remove_dir"}
 REFUSED = ("refused_by_landlock", "refused_by_filter")
+NOT_TRIED = ("device_ioctl", "move_between_folders", "rename_within_folder", "change_owner", "change_times",
+             "change_extended_attributes", "write_through_open_descriptor", "writable_memory_map",
+             "write_beneath_other_folder")
 DEVICES = ("make_char_device", "make_block_device")
 CODE_NAME = re.compile(r"\b[a-z]+_[a-z_]+\b")
 
@@ -80,7 +85,8 @@ def run_writes_child(*, drop: int = 0, wall: bool = True, abi_cap: int = 0, give
                     "paths": sorted({sys.base_prefix, sys.prefix}), "file": canary if give else None,
                     "folder": folder if give else None, "drop": drop, "abi_cap": abi_cap, "wall": wall}
             child = subprocess.run(_interpreter() + ["-c", CHILD, json.dumps(spec)], capture_output=True, text=True,
-                                   timeout=CHILD_TIMEOUT_S, cwd=top, env={"HOME": home, "TMPDIR": top})
+                                   stdin=subprocess.DEVNULL, timeout=CHILD_TIMEOUT_S, cwd=top,
+                                   env={"HOME": home, "TMPDIR": top})
         finally:
             daemon.kill()
             daemon.wait()
@@ -286,8 +292,14 @@ def _record(writes: dict) -> dict:
     stand_ins = {fn: _refuse for fn in ("_read_root", "_read_canary", "_start_program", "_open_sockets",
                                          "_signal_other", "_reach_other", "_change_mode", "_kernel_surface")}
     with mock.patch.multiple(wall_linux, _write_outcomes=lambda *_a, **_k: dict(writes), _landlock_abi=lambda libc: 6,
-                             **stand_ins), mock.patch.dict(wall_linux._STATE, {"failed": None}):
+                             **dict(stand_ins, **ALONE)), \
+            mock.patch.dict(wall_linux._STATE, {"failed": None}):
         return wall_linux.probe_wall("/nonexistent/canary", 1)
+
+
+# The process alone, holding nothing open for writing: stand-ins, for the probes run in this process (the runner's own
+# threads and log files are not the record's to judge).
+ALONE = {"_threads_now": lambda: 1, "_descriptors_open_for_write": lambda: []}
 
 
 def _refuse(*_args, **_kwargs):
@@ -316,7 +328,7 @@ class ProvenNeedsEveryWriteKindTests(unittest.TestCase):
     def test_a_probe_given_no_file_or_folder_is_never_proven(self):
         stand_ins = {fn: _refuse for fn in ("_read_root", "_read_canary", "_start_program", "_open_sockets",
                                              "_signal_other", "_reach_other", "_change_mode", "_kernel_surface")}
-        with mock.patch.multiple(wall_linux, _landlock_abi=lambda libc: 6, **stand_ins), \
+        with mock.patch.multiple(wall_linux, _landlock_abi=lambda libc: 6, **dict(stand_ins, **ALONE)), \
                 mock.patch.dict(wall_linux._STATE, {"failed": None}):
             record = wall_linux.probe_wall("/nonexistent/canary", 1)
         self.assertEqual(record["writes"], dict.fromkeys(KINDS, "not_tried"))
@@ -329,7 +341,7 @@ class WriteDefinitionTests(unittest.TestCase):
         self.assertEqual(wall_linux.WRITE_KINDS, KINDS)
         self.assertEqual(wall_linux.WRITE_OUTCOMES, ("refused_by_landlock", "refused_by_filter", "refused_elsewhere",
                                                      "let_through", "error", "not_tried"))
-        self.assertEqual(sorted(wall_linux.WRITES_NOT_TRIED), ["device_ioctl", "make_socket_node", "move_between_folders"])
+        self.assertEqual(sorted(wall_linux.WRITES_NOT_TRIED), sorted(NOT_TRIED))
         self.assertEqual({kind: RIGHT[name] for kind, name in KIND_RIGHT.items()}, wall_linux._LANDLOCK_RIGHT)
         self.assertEqual(set(wall_linux.WRITE_FOLDER_NAMES), set(KINDS) - {"open_for_write", "truncate"})
         self.assertEqual(len(set(wall_linux.WRITE_FOLDER_NAMES.values())), len(wall_linux.WRITE_FOLDER_NAMES))
@@ -337,14 +349,20 @@ class WriteDefinitionTests(unittest.TestCase):
     def test_the_schema_holds_every_kind_and_proven_needs_each(self):
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
         writes = schema["properties"]["writes"]
-        self.assertEqual(tuple(writes["required"]), KINDS)
+        draft4 = tuple(kind for kind in KINDS if kind != "make_socket_node")  # the kinds every record carries
+        self.assertEqual(tuple(writes["required"]), draft4)
         self.assertEqual(set(writes["properties"]), set(KINDS))
         self.assertIs(writes["additionalProperties"], False)
         self.assertEqual(tuple(schema["$defs"]["write_outcome"]["enum"]), wall_linux.WRITE_OUTCOMES)
         self.assertEqual(tuple(schema["$defs"]["write_refused"]["enum"]), REFUSED)
+        self.assertEqual(schema["$defs"]["landlock_refused"]["enum"], ["refused_by_landlock"])
         self.assertEqual(schema["then"]["properties"]["writes"]["properties"],
-                         {kind: {"$ref": "#/$defs/write_refused"} for kind in KINDS})
-        self.assertEqual(set(schema["properties"]["writes_not_tried"]["required"]), set(wall_linux.WRITES_NOT_TRIED))
+                         {kind: {"$ref": "#/$defs/write_refused" if kind == "truncate" else "#/$defs/landlock_refused"}
+                          for kind in KINDS})
+        self.assertEqual(schema["then"]["properties"]["writes"]["required"], ["make_socket_node"])
+        not_tried = schema["properties"]["writes_not_tried"]
+        self.assertEqual(set(not_tried["required"]) | set(schema["then"]["properties"]["writes_not_tried"]["required"]),
+                         set(wall_linux.WRITES_NOT_TRIED), "a proven record names every kind the probe does not try")
         self.assertIn("writes", schema["required"])
         self.assertIn("writes_not_tried", schema["required"])
 
@@ -383,6 +401,340 @@ class WordsTests(unittest.TestCase):
         held = dict(dict.fromkeys(wall_linux.RECORD_CHECKS, True), landlock_abi=3, arch="x86_64", proven=False,
                     writes=dict.fromkeys(KINDS, "refused_by_landlock"))
         self.assertEqual(wall_linux.why_not_proven(held), [W["not_loaded"], W["partial"], W["what_to_do"]])
+
+
+# A second thread, a file held open for writing, a socket file and the kinds not tried: each keeps a record from
+# proven, and the record says why. Walls in CHILD interpreters only, each in a temporary folder of the test's own.
+CHILD_ROUND = r'''
+import json, os, sys, threading
+spec = json.loads(sys.argv[1])
+sys.path.insert(0, spec["core"])
+from recursion_core.plugin_host import wall_linux as w
+if spec["abi_cap"]:
+    real_abi = w._landlock_abi
+    w._landlock_abi = lambda libc: min(real_abi(libc), spec["abi_cap"])
+status_fd = os.open("/proc/self/status", os.O_RDONLY | os.O_CLOEXEC)  # opened before any wall, for reading only
+def status():
+    text = os.pread(status_fd, 65536, 0).decode()
+    rows = dict(line.split(":", 1) for line in text.splitlines() if ":" in line)
+    return {key: rows[key].strip() for key in ("NoNewPrivs", "Seccomp") if key in rows}
+gate, started = threading.Event(), []
+def start_thread():
+    worker = threading.Thread(target=gate.wait)
+    worker.start()
+    started.append(worker)
+mode, out, paths = spec["mode"], {}, spec["paths"]
+if mode == "generator_thread":      # a thread starts while the argument itself is read
+    def lazy():
+        start_thread()
+        yield from spec["paths"]
+    paths = lazy()
+elif mode == "fspath_thread":       # a thread starts while the paths are opened, after the first count
+    class Late:
+        def __init__(self, path):
+            self.path = path
+        def __fspath__(self):
+            if not started:
+                start_thread()
+            return self.path
+    paths = [Late(path) for path in spec["paths"]]
+elif mode == "thread_in_filter":    # a thread starts after Landlock, while the filter is built
+    real_filter = w._filter
+    def filter_then_thread(*args, **kwargs):
+        start_thread()
+        return real_filter(*args, **kwargs)
+    w._filter = filter_then_thread
+held = os.open(spec["held"], os.O_WRONLY | os.O_CLOEXEC) if mode == "descriptor" else None
+try:
+    w.apply_wall(paths)
+    out["apply"] = {"code": "applied", "step": ""}
+except w.WallRefused as exc:
+    out["apply"] = {"code": exc.code, "step": exc.step, "detail": exc.detail}
+out["status"] = status()
+if mode == "thread_before_probe":   # a thread starts after the wall, before the probe
+    start_thread()
+record = w.probe_wall(spec["canary"], spec["daemon"], write_file=spec["canary"], write_folder=spec["folder"])
+out.update(record=record, words=w.why_not_proven(record), threads_started=len(started), held=held)
+if held is not None:
+    try:
+        os.ftruncate(held, 0)
+        out["ftruncate"] = "let_through"
+    except OSError as exc:
+        out["ftruncate"] = exc.errno
+gate.set()
+for worker in started:
+    worker.join()
+print(json.dumps(out))
+'''
+HELD_TEXT = "a file the host held open, stand-in"
+
+
+def run_round_child(mode: str, *, abi_cap: int = 0) -> tuple[dict, dict]:
+    """(the child's JSON line, what the test saw afterwards) for one child that walls itself in ``mode``."""
+    with tempfile.TemporaryDirectory() as top:
+        home = os.path.join(top, "home")
+        os.mkdir(home)
+        canary = os.path.join(home, "canary")
+        with open(canary, "w", encoding="utf-8") as handle:
+            handle.write("the host's test file, stand-in")
+        folder = os.path.join(top, "write-probe")
+        os.mkdir(folder)
+        wall_linux.prepare_write_folder(folder)
+        held = os.path.join(top, "held")
+        with open(held, "w", encoding="utf-8") as handle:
+            handle.write(HELD_TEXT)
+        daemon = subprocess.Popen(_interpreter() + ["-c", "import time; time.sleep(120)"], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, cwd=top, env={"HOME": home, "TMPDIR": top})
+        try:
+            spec = {"core": str(CORE), "mode": mode, "canary": canary, "daemon": daemon.pid, "held": held,
+                    "paths": sorted({sys.base_prefix, sys.prefix}), "folder": folder, "abi_cap": abi_cap}
+            child = subprocess.run(_interpreter() + ["-c", CHILD_ROUND, json.dumps(spec)], capture_output=True,
+                                   text=True, stdin=subprocess.DEVNULL, timeout=CHILD_TIMEOUT_S, cwd=top,
+                                   env={"HOME": home, "TMPDIR": top})
+        finally:
+            daemon.kill()
+            daemon.wait()
+        with open(held, encoding="utf-8") as handle:
+            seen = {"held": handle.read(), "top": sorted(os.listdir(top))}
+    lines = child.stdout.strip().splitlines()
+    if child.returncode != 0 or not lines:
+        raise AssertionError(f"the child ({mode}) ended {child.returncode}: {child.stderr[-1500:]}")
+    return json.loads(lines[-1]), seen
+
+
+UNWALLED = {"NoNewPrivs": "0", "Seccomp": "0"}
+
+
+@unittest.skipIf(_why_not_here(), _why_not_here() or "")
+class RoundInAChildTests(unittest.TestCase):
+
+    def test_a_thread_started_while_the_argument_is_read_is_refused_before_any_change(self):
+        result, _ = run_round_child("generator_thread")
+        self.assertEqual(result["threads_started"], 1)
+        self.assertEqual(result["apply"]["code"], "wall_threads_running")
+        self.assertEqual(result["apply"]["detail"], wall_linux.WORDS["second_thread"].format(threads=2))
+        self.assertEqual(result["status"], UNWALLED, "nothing was walled, in part or whole")
+        self.assertIs(result["record"]["proven"], False)
+        self.assertEqual(result["record"]["threads"], 2)
+
+    def test_a_thread_started_while_the_paths_are_opened_is_refused_before_landlock(self):
+        result, _ = run_round_child("fspath_thread")
+        self.assertEqual(result["threads_started"], 1)
+        self.assertEqual((result["apply"]["code"], result["apply"]["step"]), ("wall_partial", "threads_before_landlock"))
+        self.assertEqual(result["status"]["Seccomp"], "0", "no filter was loaded")
+        self.assertIs(result["record"]["proven"], False)
+        self.assertIn(wall_linux.WORDS["second_thread"].format(threads=2), result["words"])
+
+    def test_a_thread_started_after_landlock_is_refused_after_the_filter(self):
+        result, _ = run_round_child("thread_in_filter")
+        self.assertEqual(result["threads_started"], 1)
+        self.assertEqual((result["apply"]["code"], result["apply"]["step"]), ("wall_partial", "threads_after_filter"))
+        self.assertIs(result["record"]["proven"], False)
+
+    def test_a_thread_started_after_the_wall_keeps_the_record_from_proven(self):
+        result, _ = run_round_child("thread_before_probe")
+        self.assertEqual(result["apply"]["code"], "applied")
+        record = result["record"]
+        self.assertEqual(record["threads"], 2)
+        self.assertTrue(all(record[name] for name in wall_linux.RECORD_CHECKS), "every check still holds")
+        self.assertIs(record["proven"], False)
+        self.assertEqual(result["words"][:2], [wall_linux.WORDS["not_loaded"],
+                                               wall_linux.WORDS["second_thread"].format(threads=2)])
+        self.assertEqual(_schema_errors(record), [])
+
+    def test_a_file_held_open_for_writing_keeps_the_record_from_proven_and_is_named(self):
+        result, seen = run_round_child("descriptor")
+        self.assertEqual(result["apply"]["code"], "applied")
+        record = result["record"]
+        self.assertEqual(record["descriptors_open_for_write"], [{"descriptor": result["held"], "kind": "regular_file"}])
+        self.assertIs(record["proven"], False)
+        self.assertIn(wall_linux.WORDS["descriptor_open"].format(kind=wall_linux.WORDS["regular_file"]), result["words"])
+        self.assertEqual(_schema_errors(record), [])
+        if record["landlock_abi"] >= 3:  # what the record says is true: Landlock does not hold a file opened before
+            self.assertEqual(result["ftruncate"], "let_through")
+            self.assertEqual(seen["held"], "", "the stand-in held open was cut through its descriptor")
+
+    def test_below_abi_3_the_filter_refuses_a_truncation_through_a_held_descriptor(self):
+        result, seen = run_round_child("descriptor", abi_cap=2)
+        self.assertEqual(result["record"]["landlock_abi"], 2)
+        self.assertEqual(result["ftruncate"], errno.EPERM)
+        self.assertEqual(seen["held"], HELD_TEXT)
+        self.assertIs(result["record"]["proven"], False)
+
+    def test_a_wall_that_leaves_socket_files_open_is_not_proven_and_names_the_kind(self):
+        result, seen = run_writes_child(drop=RIGHT["make_sock"])
+        record = result["record"]
+        self.assertEqual([kind for kind in KINDS if record["writes"][kind] not in REFUSED], ["make_socket_node"])
+        self.assertEqual(record["writes"]["make_socket_node"], "let_through")
+        self.assertIs(record["proven"], False)
+        self.assertEqual(seen["folder"], ["made-socket", "remove-me", "remove-me.d"])
+        self.assertIn(wall_linux.WORDS["let_through"].format(what=wall_linux.WORDS["make_socket_node"]), result["words"])
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "the probe is Linux-only")
+class RoundInThisProcessTests(unittest.TestCase):
+    """Nothing is walled here: the counts and the scan run on this process, unwalled, or with stand-ins."""
+
+    def test_the_threads_are_counted_by_a_stat_the_wall_does_not_refuse(self):
+        gate = threading.Event()
+        worker = threading.Thread(target=gate.wait)
+        before = (wall_linux._threads_now(), len(os.listdir("/proc/self/task")))
+        worker.start()
+        try:
+            during = (wall_linux._threads_now(), len(os.listdir("/proc/self/task")))
+        finally:
+            gate.set()
+            worker.join()
+        self.assertEqual(before[0], before[1])
+        self.assertEqual(during[0], during[1])
+        self.assertEqual(during[0], before[0] + 1)
+
+    def test_a_descriptor_open_for_writing_is_found_and_one_for_reading_or_a_pipe_is_not(self):
+        with tempfile.TemporaryDirectory() as top:
+            path = os.path.join(top, "f")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("x")
+            write_fd, read_fd = os.open(path, os.O_WRONLY), os.open(path, os.O_RDONLY)
+            pipe_read, pipe_write = os.pipe()
+            try:
+                held = wall_linux._descriptors_open_for_write()
+            finally:
+                for fd in (write_fd, read_fd, pipe_read, pipe_write):
+                    os.close(fd)
+        self.assertIsInstance(held, list)
+        numbers = [entry["descriptor"] for entry in held]
+        self.assertIn({"descriptor": write_fd, "kind": "regular_file"}, held)
+        for fd in (read_fd, pipe_read, pipe_write):
+            self.assertNotIn(fd, numbers)
+
+    def test_when_not_every_descriptor_is_seen_the_answer_is_none(self):
+        real_stat = os.stat
+
+        def larger(path, *args, **kwargs):
+            found = real_stat(path, *args, **kwargs)
+            if path == "/proc/self/fd":
+                return types.SimpleNamespace(st_size=found.st_size + 1000)
+            return found
+        with mock.patch.object(wall_linux.os, "stat", larger), \
+                mock.patch("resource.getrlimit", lambda which: (256, 256)):
+            self.assertIsNone(wall_linux._descriptors_open_for_write())
+
+    def test_a_write_file_with_a_second_name_is_not_tried(self):
+        with tempfile.TemporaryDirectory() as top:
+            path, other = os.path.join(top, "f"), os.path.join(top, "g")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("x")
+            os.link(path, other)
+            outcomes = wall_linux._write_outcomes(path, None)
+        self.assertEqual((outcomes["open_for_write"], outcomes["truncate"]), ("not_tried", "not_tried"))
+
+    def test_a_second_thread_is_refused_in_words_from_the_table_before_any_change(self):
+        state = {"applied": [], "failed": None, "scopes": [], "landlock_handled": 0, "filter_truncate": False}
+        with mock.patch.dict(wall_linux._STATE, state), mock.patch.object(wall_linux, "_thread_count", lambda: 3):
+            with self.assertRaises(wall_linux.WallRefused) as caught:
+                wall_linux.apply_wall([sys.prefix])
+            self.assertEqual(wall_linux._STATE["applied"], [])
+        self.assertEqual(caught.exception.code, "wall_threads_running")
+        self.assertEqual(caught.exception.detail, wall_linux.WORDS["second_thread"].format(threads=3))
+
+
+def _record_with(**alone) -> dict:
+    writes = dict(dict.fromkeys(KINDS, "refused_by_landlock"))
+    stand_ins = {fn: _refuse for fn in ("_read_root", "_read_canary", "_start_program", "_open_sockets",
+                                         "_signal_other", "_reach_other", "_change_mode", "_kernel_surface")}
+    with mock.patch.multiple(wall_linux, _write_outcomes=lambda *_a, **_k: dict(writes), _landlock_abi=lambda libc: 3,
+                             **dict(stand_ins, **dict(ALONE, **alone))), \
+            mock.patch.dict(wall_linux._STATE, {"failed": None}):
+        return wall_linux.probe_wall("/nonexistent/canary", 1)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "the probe is Linux-only")
+class RoundRecordTests(unittest.TestCase):
+    """In this process, with every check and every write kind replaced by a stand-in: nothing is walled."""
+
+    def test_alone_and_holding_nothing_is_proven(self):
+        record = _record_with()
+        self.assertEqual((record["threads"], record["descriptors_open_for_write"]), (1, []))
+        self.assertIs(record["proven"], True)
+
+    def test_a_second_thread_or_a_held_file_or_an_unseen_descriptor_is_not_proven_and_says_why(self):
+        W = wall_linux.WORDS
+        held = [{"descriptor": 7, "kind": "block_device"}]
+        for alone, words in (({"_threads_now": lambda: 2}, [W["second_thread"].format(threads=2)]),
+                             ({"_threads_now": lambda: 0}, [W["threads_unknown"]]),
+                             ({"_descriptors_open_for_write": lambda: held},
+                              [W["descriptor_open"].format(kind=W["block_device"])]),
+                             ({"_descriptors_open_for_write": lambda: None}, [W["descriptors_unknown"]])):
+            with self.subTest(words=words):
+                record = _record_with(**alone)
+                self.assertIs(record["proven"], False)
+                self.assertEqual(wall_linux.why_not_proven(record), [W["not_loaded"]] + words + [W["what_to_do"]])
+
+    def test_the_kinds_not_tried_are_the_tables_and_no_tried_kind_is_among_them(self):
+        record = _record_with()
+        self.assertEqual(tuple(record["writes_not_tried"]), NOT_TRIED)
+        self.assertEqual(record["writes_not_tried"], wall_linux.WRITES_NOT_TRIED)
+        for kind, reason in record["writes_not_tried"].items():
+            with self.subTest(kind=kind):
+                self.assertIn(reason, set(wall_linux.WRITES_NOT_TRIED.values()))
+        self.assertEqual(set(record["writes_not_tried"]) & set(record["writes"]), set())
+        self.assertEqual(set(record["writes_not_tried"]) & set(wall_linux.WRITE_KINDS), set())
+        self.assertEqual(tuple(record["writes"]), KINDS)
+
+    def test_below_abi_3_ftruncate_is_refused_by_the_program_and_from_abi_3_it_is_not(self):
+        from recursion_core.plugin_host.tests.test_wall_linux_reach import _run_program
+        for arch, number in (("x86_64", 77), ("aarch64", 46)):
+            with self.subTest(arch=arch):
+                self.assertEqual(_run_program(wall_linux._filter(arch, 2), number, arch=arch), "eperm")
+                self.assertEqual(_run_program(wall_linux._filter(arch, 3), number, arch=arch), "allow")
+
+
+def _fixture(name: str) -> dict:
+    return json.loads((SCHEMA.parent / "fixtures" / "good" / "wall.v1" / name).read_text(encoding="utf-8"))
+
+
+class RoundSchemaTests(unittest.TestCase):
+
+    def setUp(self):
+        try:
+            import jsonschema  # noqa: F401
+        except ImportError:
+            self.skipTest("jsonschema is not installed for this interpreter")
+
+    def test_a_proven_record_at_abi_6_carries_both_scopes(self):
+        h02 = _fixture("h02-a-proven-wall-on-aarch64.json")
+        self.assertEqual((h02["landlock_abi"], h02["landlock_scopes"]), (6, ["abstract_unix_socket", "signal"]))
+        self.assertEqual(_schema_errors(h02), [])
+        self.assertNotEqual(_schema_errors(dict(h02, landlock_scopes=[])), [])
+        self.assertNotEqual(_schema_errors(dict(h02, landlock_scopes=["signal"])), [])
+        self.assertEqual(_schema_errors(dict(h02, landlock_abi=5, landlock_scopes=[])), [])
+
+    def test_a_proven_record_credits_only_truncation_to_the_filter(self):
+        h01 = _fixture("h01-a-proven-wall.json")
+        self.assertEqual(_schema_errors(dict(h01, writes=dict(h01["writes"], truncate="refused_by_filter"))), [])
+        for kind in KINDS:
+            if kind != "truncate":
+                with self.subTest(kind=kind):
+                    self.assertNotEqual(_schema_errors(dict(h01, writes=dict(h01["writes"], **{kind: "refused_by_filter"}))), [])
+
+    def test_a_proven_record_ran_alone_and_held_no_file_and_names_every_kind_not_tried(self):
+        h01 = _fixture("h01-a-proven-wall.json")
+        self.assertEqual(_schema_errors(h01), [])
+        for change in ({"threads": 2}, {"descriptors_open_for_write": [{"descriptor": 3, "kind": "regular_file"}]},
+                       {"descriptors_open_for_write": None},
+                       {"writes_not_tried": {k: v for k, v in h01["writes_not_tried"].items() if k != "change_owner"}},
+                       {"writes": {k: v for k, v in h01["writes"].items() if k != "make_socket_node"}}):
+            with self.subTest(change=sorted(change)):
+                self.assertNotEqual(_schema_errors(dict(h01, **change)), [])
+        for name in ("threads", "descriptors_open_for_write"):
+            with self.subTest(missing=name):
+                self.assertNotEqual(_schema_errors({k: v for k, v in h01.items() if k != name}), [])
+
+    def test_a_draft_4_record_that_is_not_proven_still_validates(self):
+        older = _fixture("h15-a-draft-4-record-that-is-not-proven-still-reads.json")
+        self.assertNotIn("threads", older)
+        self.assertIn("make_socket_node", older["writes_not_tried"])
+        self.assertEqual(_schema_errors(older), [])
 
 
 if __name__ == "__main__":

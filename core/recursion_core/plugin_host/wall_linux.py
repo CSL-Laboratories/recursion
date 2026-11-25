@@ -9,8 +9,11 @@ and to everything it starts later, and neither can be lifted again from inside:
 
 1. A Landlock ruleset that handles every file-system right the kernel's Landlock ABI knows and allows only
    reading, listing and mapping for execution beneath the paths given (the Python install), and nothing
-   else: no write anywhere, no read of anything outside those paths. ``prctl(PR_SET_NO_NEW_PRIVS)`` comes
-   first, then ``landlock_restrict_self``.
+   else: no file opened after the wall can be written, no read of anything outside those paths.
+   ``prctl(PR_SET_NO_NEW_PRIVS)`` comes first, then ``landlock_restrict_self``. Landlock checks a file when it
+   is opened, so a file the process opened for writing BEFORE the wall can still be written through, and a
+   file mapped shared and writable before it can still be written through the map: the host closes every
+   such file before the wall, and ``probe_wall`` is never proven while it finds one open for writing.
 2. ONE seccomp filter, loaded with ``SECCOMP_FILTER_FLAG_TSYNC`` so that it reaches every thread of the
    process. It checks the audit arch first (x86_64 and aarch64; a call made under another arch, or the
    x32 range of x86_64, is answered EPERM), then answers EPERM to:
@@ -32,7 +35,8 @@ and to everything it starts later, and neither can be lifted again from inside:
    - ``clone`` with any flag of ``NAMESPACE_CLONE_FLAGS``; ``clone3`` is answered ENOSYS, so that the C
      library starts threads and children through ``clone``, where the flags can be read;
    - where the kernel's Landlock ABI is below 3 (it cannot refuse a truncation there),
-     ``OLD_LANDLOCK_DENIED_CALLS`` and an ``open`` or ``openat`` that asks ``O_TRUNC``.
+     ``OLD_LANDLOCK_DENIED_CALLS`` (a truncation by path and by descriptor) and an ``open`` or ``openat``
+     that asks ``O_TRUNC``.
    Everything else is allowed. It is a deny list, so ordinary Python keeps working: imports from the
    install, threads, ``fork``, pipes, and ``recvmsg`` of a socket handed over on an already open
    channel all stay allowed.
@@ -53,13 +57,18 @@ attempt harmless if it goes through, and the record names, per kind, which part 
 the kernel's answer (Landlock answers EACCES, the filter EPERM); a refusal is credited only to the part that
 holds that kind in this process (the filter holds only truncation, and only below Landlock ABI 3), and any
 other refusal is ``refused_elsewhere``, which proves nothing. Whatever a weak wall let the probe make in the
-folder is the caller's to remove, with the folder. The kinds that cannot be tried harmlessly are named in
-the record with their reasons (``WRITES_NOT_TRIED``). It means something under two conditions only: it is made before the plugin is loaded,
+folder is the caller's to remove, with the folder. 'proven' covers the kinds of ``WRITE_KINDS`` only: every
+other kind the wall claims, or leaves to the host, is named in the record with the reason it is not tried
+(``WRITES_NOT_TRIED``), and the record names the threads of the process and each descriptor it holds open for
+writing, either of which keeps it from proven. It means something under two conditions only: it is made before the plugin is loaded,
 and its reader takes it only from frames the host sent before the load (everything later on the channel
 is the plugin's voice).
 
-Landlock limits only the calling thread, so ``apply_wall`` refuses ``wall_threads_running`` before any
-change when the process has more than one thread. The refusals before the first change:
+Landlock limits only the calling thread, so ``apply_wall`` reads its whole argument into a list first and
+then counts the threads: more than one is refused ``wall_threads_running`` before any change. It counts again
+immediately before ``landlock_restrict_self`` and after the filter is loaded; more than one thread there is
+refused ``wall_partial`` with the step (``threads_before_landlock``, ``threads_after_filter``). ``probe_wall``
+counts the threads itself and is never proven with more than one. The refusals before the first change:
 ``wall_system_unsupported`` (not Linux: nothing is tried), ``wall_arch_unsupported``,
 ``wall_threads_running``, ``landlock_unavailable``. A failure of the kernel at any step of the wall, and a
 second ``apply_wall`` in a process that has already been walled in whole or in part, is refused
@@ -129,9 +138,10 @@ DENIED_IOCTL_COMMANDS = {"FIOSETOWN": 0x8901, "SIOCSPGRP": 0x8902, "FS_IOC_SETFL
                          "FS_IOC_FSSETXATTR": 0x401C5820}
 # clone with any of these flags (a new mount, cgroup, uts, ipc, user, pid or network namespace) is refused.
 NAMESPACE_CLONE_FLAGS = 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000 | 0x10000000 | 0x20000000 | 0x40000000
-# Below Landlock ABI 3 the ruleset cannot refuse a truncation, so these are refused by the filter instead,
-# with an open or openat that asks O_TRUNC (openat2 carries its flags in a struct the filter cannot read).
-OLD_LANDLOCK_DENIED_CALLS = ("truncate", "openat2")
+# Below Landlock ABI 3 the ruleset cannot refuse a truncation, so these are refused by the filter instead
+# (by path and by descriptor), with an open or openat that asks O_TRUNC (openat2 carries its flags in a struct
+# the filter cannot read).
+OLD_LANDLOCK_DENIED_CALLS = ("truncate", "ftruncate", "openat2")
 # The kernel's Landlock scopes (struct landlock_ruleset_attr, field ``scoped``), asked from ABI 6 on.
 LANDLOCK_SCOPES = {"abstract_unix_socket": 1 << 0, "signal": 1 << 1}
 
@@ -166,7 +176,7 @@ _NR_MORE = {
         "prlimit64": 302, "sched_setaffinity": 203, "sched_setscheduler": 144, "sched_setparam": 142,
         "sched_setattr": 314, "migrate_pages": 256, "move_pages": 279, "setpriority": 141, "ioprio_set": 251,
         "fcntl": 72, "ioctl": 16, "clone": 56, "clone3": 435,
-        "truncate": 76, "openat2": 437, "open": 2, "openat": 257,
+        "truncate": 76, "ftruncate": 77, "openat2": 437, "open": 2, "openat": 257,
     },
     "aarch64": {
         "fchmod": 52, "fchmodat": 53, "fchmodat2": 452, "fchown": 55, "fchownat": 54, "utimensat": 88,
@@ -179,7 +189,7 @@ _NR_MORE = {
         "prlimit64": 261, "sched_setaffinity": 122, "sched_setscheduler": 119, "sched_setparam": 118,
         "sched_setattr": 274, "migrate_pages": 238, "move_pages": 239, "setpriority": 140, "ioprio_set": 30,
         "fcntl": 25, "ioctl": 29, "clone": 220, "clone3": 435,
-        "truncate": 45, "openat2": 437, "openat": 56,
+        "truncate": 45, "ftruncate": 46, "openat2": 437, "openat": 56,
     },
 }
 _AUDIT_ARCH = {"x86_64": 0xC000003E, "aarch64": 0xC00000B7}
@@ -199,6 +209,7 @@ _MIN_LANDLOCK_ABI = 1                        # Linux 5.13
 # The Landlock rights the write kinds of the probe need (include/uapi/linux/landlock.h).
 _FS_WRITE_FILE, _FS_REMOVE_DIR, _FS_REMOVE_FILE, _FS_MAKE_CHAR = 1 << 1, 1 << 4, 1 << 5, 1 << 6
 _FS_MAKE_DIR, _FS_MAKE_REG, _FS_MAKE_FIFO, _FS_MAKE_BLOCK, _FS_MAKE_SYM = 1 << 7, 1 << 8, 1 << 10, 1 << 11, 1 << 12
+_FS_MAKE_SOCK = 1 << 9
 _FS_TRUNCATE = 1 << 14
 
 _PR_SET_NO_NEW_PRIVS = 38
@@ -215,30 +226,59 @@ RECORD_CHECKS = ("reads_outside", "home_canary", "program_start", "new_socket", 
 # The kinds of change the probe tries behind the wall, in its order (the record's field ``writes``), each on the
 # write file or in the write folder that the caller made for the purpose before the wall.
 WRITE_KINDS = ("open_for_write", "truncate", "create_file", "create_folder", "make_fifo", "make_symlink",
-               "make_link", "make_char_device", "make_block_device", "remove_file", "remove_folder")
+               "make_link", "make_char_device", "make_block_device", "make_socket_node", "remove_file",
+               "remove_folder")
 # The outcome of one kind; only the first two are refusals of this wall, and proven needs one of them for every kind.
 WRITE_OUTCOMES = ("refused_by_landlock", "refused_by_filter", "refused_elsewhere", "let_through", "error", "not_tried")
 _WRITE_REFUSED = WRITE_OUTCOMES[:2]
-# The kinds of change the wall refuses that the probe cannot try harmlessly on its own, each with its reason
-# (the record's field ``writes_not_tried``).
+# The kinds of change the wall claims to refuse, or leaves to the host, that the probe does NOT try, each with
+# the reason (the record's field ``writes_not_tried``). 'proven' covers the kinds of ``WRITE_KINDS`` only: every
+# other kind is named here, so that none is covered in silence.
 WRITES_NOT_TRIED = {
-    "make_socket_node": "a socket file is made only by binding a new socket, and the wall refuses every new "
-                        "socket first (new_socket)",
-    "device_ioctl": "a device's own commands need a device opened, and the wall lets nothing be opened outside "
-                    "the install, where no device lies (reads_outside)",
-    "move_between_folders": "a move or a link into another folder also makes a name there, which the make kinds "
-                            "show refused",
+    "device_ioctl": "a device's own commands need a device opened: the wall lets nothing new be opened outside "
+                    "the paths it was given (reads_outside), and the probe opens no device and sends no command "
+                    "to one",
+    "move_between_folders": "the probe tries every kind in one folder, so it moves nothing into another; a move "
+                            "or a link into another folder makes a name there, which Landlock asks as the make "
+                            "rights that the make kinds show refused in the probe's folder",
+    "rename_within_folder": "the probe renames nothing; a rename within one folder makes the new name and "
+                            "removes the old one, which Landlock asks as the make and remove rights that the make "
+                            "and remove kinds show refused",
+    "change_owner": "the filter refuses every call that changes a file's owner, by path and by descriptor; the "
+                    "probe tries one call of the filter's list of changes to a file's attributes, a change of "
+                    "mode (metadata_change), and not this one",
+    "change_times": "the filter refuses every call that changes a file's times, by path and by descriptor; the "
+                    "probe tries one call of the filter's list of changes to a file's attributes, a change of "
+                    "mode (metadata_change), and not this one",
+    "change_extended_attributes": "the filter refuses every call that sets or removes a file's extended "
+                                  "attributes, by path and by descriptor; the probe tries one call of the filter's "
+                                  "list of changes to a file's attributes, a change of mode (metadata_change), and "
+                                  "not this one",
+    "write_through_open_descriptor": "Landlock checks a file when it is opened, so a file opened for writing "
+                                     "before the wall can still be written through; the probe writes through none, "
+                                     "and names each such file it finds open (descriptors_open_for_write), which "
+                                     "a proven record holds empty",
+    "writable_memory_map": "a file mapped shared and writable before the wall can still be written through the "
+                           "map; the list of the process's maps (/proc/self/maps) is outside what the wall lets "
+                           "the host read, and no other call lists them, so the probe cannot look for one",
+    "write_beneath_other_folder": "the probe tries every kind in one folder only: a rule that granted write "
+                                  "rights beneath another folder would not show here; apply_wall adds rules with "
+                                  "read and execute rights only",
 }
+# The kinds of file that a descriptor open for writing makes the record not proven for (the record's field
+# ``descriptors_open_for_write``): through either, a write reaches what the wall is there to keep.
+_DESCRIPTOR_KINDS = {stat.S_IFREG: "regular_file", stat.S_IFBLK: "block_device"}
 # The names the probe uses in the write folder: the two that prepare_write_folder makes for the removals, and the
 # ones the make kinds try to create (absent before the probe; whatever a weak wall let it make stays there for the
 # caller to remove). File names, not figures.
 WRITE_FOLDER_NAMES = {"remove_file": "remove-me", "remove_folder": "remove-me.d", "create_file": "made-file",
                       "create_folder": "made-folder", "make_fifo": "made-fifo", "make_symlink": "made-symlink",
-                      "make_link": "made-link", "make_char_device": "made-char", "make_block_device": "made-block"}
+                      "make_link": "made-link", "make_char_device": "made-char", "make_block_device": "made-block",
+                      "make_socket_node": "made-socket"}
 _LANDLOCK_RIGHT = {"open_for_write": _FS_WRITE_FILE, "truncate": _FS_TRUNCATE, "create_file": _FS_MAKE_REG,
                    "create_folder": _FS_MAKE_DIR, "make_fifo": _FS_MAKE_FIFO, "make_symlink": _FS_MAKE_SYM,
                    "make_link": _FS_MAKE_REG, "make_char_device": _FS_MAKE_CHAR, "make_block_device": _FS_MAKE_BLOCK,
-                   "remove_file": _FS_REMOVE_FILE, "remove_folder": _FS_REMOVE_DIR}
+                   "make_socket_node": _FS_MAKE_SOCK, "remove_file": _FS_REMOVE_FILE, "remove_folder": _FS_REMOVE_DIR}
 
 # What a person reads when a wall is not proven: ONE table of words (why_not_proven puts them together). The
 # entries named after a check or a kind say what was tried; the others are whole sentences.
@@ -263,6 +303,7 @@ WORDS = {
     "make_link": "giving a test file a second name (a hard link)",
     "make_char_device": "making a character device file in a test folder",
     "make_block_device": "making a block device file in a test folder",
+    "make_socket_node": "making a socket file in a test folder",
     "remove_file": "deleting a test file",
     "remove_folder": "deleting a test folder",
     "not_refused": "Not shown to be refused: {what}.",
@@ -278,6 +319,18 @@ WORDS = {
     "canary_left": "The test file or folder the host made for this test was still there after it should have "
                    "been removed, so a plugin would not find the host's folder as it was.",
     "more": "More did not hold than fits here; the record the host sent first names each part.",
+    "second_thread": "The plugin host was not alone in its process when it shut itself in ({threads} threads "
+                     "ran), and the sandbox holds only a process that runs alone, so nothing was loaded. What you "
+                     "can do: start the plugin host as its own program, as the daemon does.",
+    "threads_unknown": "The plugin host could not count the threads of its process, so it could not show that it "
+                       "was alone when it shut itself in, and nothing was loaded.",
+    "descriptor_open": "A {kind} was held open for writing when the plugin host shut itself in. The sandbox checks "
+                       "a file when it is opened, so it does not refuse writes through one opened before: the host "
+                       "must close every such file before it shuts itself in.",
+    "descriptors_unknown": "The plugin host could not see every file it held open, so it could not show that none "
+                           "was open for writing.",
+    "regular_file": "file",
+    "block_device": "disk or other block device",
     "what_to_do": "What you can do: run the plugin host on Linux 5.13 or newer with Landlock turned on (most "
                   "distributions turn it on; otherwise add landlock to the kernel's lsm= boot setting), outside "
                   "any container or security tool that changes what a process may do with files, and start it "
@@ -343,6 +396,28 @@ def _thread_count() -> int:
     except OSError as exc:
         raise WallRefused("wall_threads_running", "the thread count of this process cannot be read") from exc
     return max(tasks, threading.active_count())
+
+
+def _threads_now() -> int:
+    """The threads of this process, counted in a way the wall does not refuse: the kernel gives the task folder
+    two links plus one per thread (a stat, which Landlock does not mediate), and ``threading`` knows its own.
+    0 when they cannot be counted (fail shut: never proven, never walled)."""
+    try:
+        tasks = os.stat("/proc/self/task").st_nlink - 2
+    except OSError:
+        return 0
+    return max(tasks, threading.active_count()) if tasks >= 1 else 0
+
+
+def _alone(step: str, count) -> None:
+    """``wall_partial`` naming ``step`` unless the process has one thread now: a thread here would sit outside
+    Landlock, which limits only the calling thread."""
+    threads = count()
+    if threads != 1:
+        _STATE["failed"] = step
+        words = WORDS["second_thread"].format(threads=threads) if threads else WORDS["threads_unknown"]
+        raise WallRefused("wall_partial", f"{words} The wall is not whole; applied before this step: "
+                          f"{', '.join(_STATE['applied']) or 'nothing'}", step=step)
 
 
 def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI) -> list[tuple[int, int, int, int]]:
@@ -492,6 +567,7 @@ def _apply_landlock(libc, abi: int, opened: list[tuple[int, int]]) -> None:
                 libc, _SYS_LANDLOCK_ADD_RULE, ruleset, _LANDLOCK_RULE_PATH_BENEATH, ctypes.addressof(rule), 0)),
                 changes=False)
         _step("no_new_privs", lambda: _no_new_privs(libc))
+        _alone("threads_before_landlock", _thread_count)
         _step("landlock_restrict_self", lambda: _kernel("landlock_restrict_self", *_call(
             libc, _SYS_LANDLOCK_RESTRICT_SELF, ruleset, 0)))
         _STATE["scopes"] = scopes
@@ -503,11 +579,13 @@ def _apply_landlock(libc, abi: int, opened: list[tuple[int, int]]) -> None:
 def apply_wall(read_only_paths) -> None:
     """Wall this process in: Landlock (read and map only ``read_only_paths``), then the one seccomp filter.
 
-    Refuses, before any change: ``wall_system_unsupported`` (not Linux; nothing is tried),
-    ``wall_arch_unsupported`` (not x86_64 or aarch64), ``wall_threads_running`` (more than one thread),
-    ``landlock_unavailable`` (no Landlock, or an ABI below 1). A bad path raises ``ValueError`` or
-    ``OSError`` before any change as well. A kernel failure at any step, and a second call in a process
-    walled already in whole or in part, is refused ``wall_partial`` with ``step`` set.
+    ``read_only_paths`` is read whole into a list before the threads are counted, so that reading it cannot
+    start a thread the count does not see. Refuses, before any change: ``wall_system_unsupported`` (not Linux;
+    nothing is tried), ``wall_arch_unsupported`` (not x86_64 or aarch64), ``wall_threads_running`` (more than
+    one thread), ``landlock_unavailable`` (no Landlock, or an ABI below 1). A bad path raises ``ValueError`` or
+    ``OSError`` before any change as well. A kernel failure at any step, more than one thread immediately before
+    ``landlock_restrict_self`` (``threads_before_landlock``) or after the filter (``threads_after_filter``), and a
+    second call in a process walled already in whole or in part, is refused ``wall_partial`` with ``step`` set.
     """
     libc = _libc()
     arch = _arch()
@@ -517,19 +595,21 @@ def apply_wall(read_only_paths) -> None:
         raise WallRefused("wall_partial", f"apply_wall has run in this process already (applied: {done}{failed}); "
                           "a wall is applied once, and a process walled in part must load nothing",
                           step=_STATE["failed"] or "already_walled")
+    paths = list(read_only_paths)  # the whole argument, read before the threads are counted
     threads = _thread_count()
     if threads != 1:
-        raise WallRefused("wall_threads_running", f"the wall is applied by a process of one thread; this one has {threads}")
+        raise WallRefused("wall_threads_running", WORDS["second_thread"].format(threads=threads))
     abi = _landlock_abi(libc)
     if abi < _MIN_LANDLOCK_ABI:
         raise WallRefused("landlock_unavailable", "this kernel gives this process no Landlock (ABI 1, Linux 5.13, at least)")
-    opened = _open_paths(read_only_paths)
+    opened = _open_paths(paths)
     try:
         _apply_landlock(libc, abi, opened)
     finally:
         for fd, _ in opened:
             os.close(fd)
     _load_seccomp_filter(libc, arch, abi)
+    _alone("threads_after_filter", _threads_now)
 
 
 def _refused(check) -> bool:
@@ -731,12 +811,14 @@ def _kind_in(folder_fd: int, name: str):
 
 
 def _write_file_usable(path: str) -> bool:
-    """A regular file of this user, writable by its mode: a refusal on anything else would prove nothing."""
+    """A regular file of this user with one name only, writable by its mode: a refusal on anything else would prove
+    nothing, and the cut to its own length moves the times of every name the file has."""
     try:
         found = os.lstat(path)
     except OSError:
         return False
-    return stat.S_ISREG(found.st_mode) and found.st_uid == os.geteuid() and os.access(path, os.W_OK)
+    return (stat.S_ISREG(found.st_mode) and found.st_uid == os.geteuid() and found.st_nlink == 1
+            and os.access(path, os.W_OK))
 
 
 def _write_folder_fd(folder: str):
@@ -800,6 +882,9 @@ def _write_outcomes(write_file, write_folder) -> dict:
                                                   dir_fd=fd), made("make_char_device")),
             "make_block_device": (lambda: os.mknod(name["make_block_device"], stat.S_IFBLK | 0o600, os.makedev(0, 0),
                                                    dir_fd=fd), made("make_block_device")),
+            # a socket file made by mknod is a name only: nothing listens on it
+            "make_socket_node": (lambda: os.mknod(name["make_socket_node"], stat.S_IFSOCK | 0o600, dir_fd=fd),
+                                 made("make_socket_node")),
             "remove_file": (lambda: os.unlink(name["remove_file"], dir_fd=fd), gone("remove_file")),
             "remove_folder": (lambda: os.rmdir(name["remove_folder"], dir_fd=fd), gone("remove_folder")),
         }
@@ -811,6 +896,41 @@ def _write_outcomes(write_file, write_folder) -> dict:
     return outcomes
 
 
+def _descriptors_open_for_write():
+    """Each descriptor of this process open for writing on a regular file or a block device, as
+    ``{"descriptor": n, "kind": ...}`` in its order, or None when not every descriptor could be seen.
+
+    The list of descriptors (/proc/self/fd) is outside what the wall lets the process read, so they are found by
+    number with ``fstat`` and ``fcntl(F_GETFL)``, which the wall does not refuse: up to the count the kernel
+    gives as the size of /proc/self/fd (a stat, from Linux 6.2), or, where that size is 0, up to the hard limit
+    of open files (a descriptor numbered above a hard limit lowered after it was opened is then not seen).
+    The kind of file is named, never its name or its contents."""
+    import fcntl
+    import resource
+    try:
+        expected = os.stat("/proc/self/fd").st_size
+    except OSError:
+        expected = 0
+    limit = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+    if limit == resource.RLIM_INFINITY or limit < 0:
+        return None
+    found, held, number = 0, [], 0
+    while number < limit and (expected <= 0 or found < expected):
+        try:
+            kind = stat.S_IFMT(os.fstat(number).st_mode)
+            flags = fcntl.fcntl(number, fcntl.F_GETFL)
+        except OSError:
+            number += 1
+            continue
+        found += 1
+        if kind in _DESCRIPTOR_KINDS and (flags & 3) in (os.O_WRONLY, os.O_RDWR):
+            held.append({"descriptor": number, "kind": _DESCRIPTOR_KINDS[kind]})
+        number += 1
+    if expected > 0 and found != expected:
+        return None
+    return held
+
+
 def why_not_proven(record: dict) -> list:
     """The sentences a person reads when ``record`` is not proven, in order (an empty list when it is): that the
     plugin was not loaded, each check and each kind of write that did not hold, in plain words, and what they can
@@ -819,6 +939,19 @@ def why_not_proven(record: dict) -> list:
     if record.get("proven") is True:
         return []
     lines = [WORDS["not_loaded"]]
+    threads = record.get("threads")
+    if "threads" in record and threads != 1:
+        known = isinstance(threads, int) and not isinstance(threads, bool) and threads > 1
+        lines.append(WORDS["second_thread"].format(threads=threads) if known else WORDS["threads_unknown"])
+    if "descriptors_open_for_write" in record:
+        held = record["descriptors_open_for_write"]
+        if not isinstance(held, list):
+            lines.append(WORDS["descriptors_unknown"])
+        else:
+            for entry in held:
+                kind = entry.get("kind") if isinstance(entry, dict) else None
+                lines.append(WORDS["descriptor_open"].format(
+                    kind=WORDS[kind] if kind in _DESCRIPTOR_KINDS.values() else WORDS["regular_file"]))
     for check in RECORD_CHECKS:
         if record.get(check) is not True:
             lines.append(WORDS["not_refused"].format(what=WORDS[check]))
@@ -842,11 +975,15 @@ def why_not_proven(record: dict) -> list:
 def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> dict:
     """The record ``wall.v1``: a check the host's own code makes on itself, from inside this process.
 
-    Eight checks are tried; each field is True only when the kernel refused it. Then each kind of
+    First the threads of the process are counted (``threads``) and its descriptors open for writing on a
+    regular file or a block device are named (``descriptors_open_for_write``; None when not every descriptor
+    could be seen), before the probe opens anything of its own. Eight checks are tried; each field is True only
+    when the kernel refused it. Then each kind of
     ``WRITE_KINDS`` is tried on ``write_file`` (a file of this user, writable by its mode, that the caller made:
     the host's canary will do) and in ``write_folder`` (a folder the caller made and gave to
     ``prepare_write_folder`` before the wall); ``writes`` holds the outcome of each, and ``writes_not_tried``
-    names the kinds that cannot be tried harmlessly, with their reasons. ``proven`` is True only when all eight
+    names every kind the probe does not try, with its reason: ``proven`` covers the kinds in ``writes`` only.
+    ``proven`` is True only when the process has one thread, no descriptor open for writing, all eight checks
     are refused, every write kind is refused by the part of the wall that holds it, on a supported arch with
     Landlock ABI 1 or above, and no step of ``apply_wall`` failed in this process; without a write file and
     folder it is never True. ``landlock_scopes`` names the Landlock scopes ``apply_wall`` put in force (none
@@ -857,7 +994,10 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
     """
     libc = _libc()
     canary = os.fspath(canary_path)
+    threads, held = _threads_now(), _descriptors_open_for_write()  # before the probe opens anything of its own
     record = {
+        "threads": threads,
+        "descriptors_open_for_write": held,
         "reads_outside": _refused(_read_root),
         "home_canary": _refused(lambda: _read_canary(canary)),
         "program_start": _refused(_start_program),
@@ -872,7 +1012,8 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
         "landlock_scopes": list(_STATE["scopes"]),
         "arch": platform.machine() or "unknown",
     }
-    record["proven"] = (all(record[name] for name in RECORD_CHECKS) and record["landlock_abi"] >= _MIN_LANDLOCK_ABI
+    record["proven"] = (threads == 1 and held == []
+                        and all(record[name] for name in RECORD_CHECKS) and record["landlock_abi"] >= _MIN_LANDLOCK_ABI
                         and all(record["writes"][kind] in _WRITE_REFUSED for kind in WRITE_KINDS)
                         and record["arch"] in _NR and _STATE["failed"] is None)
     return record

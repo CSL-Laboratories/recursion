@@ -1939,15 +1939,6 @@
       }
     },
     {
-      "file": "bad/wall.v1/m-wall.v1.writes-not-tried.make-socket-node.json",
-      "schema": "wall.v1.json",
-      "rule": "The object at /writes_not_tried always carries 'make_socket_node'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/writes_not_tried"
-      }
-    },
-    {
       "file": "bad/wall.v1/m-wall.v1.writes-not-tried.device-ioctl.json",
       "schema": "wall.v1.json",
       "rule": "The object at /writes_not_tried always carries 'device_ioctl'.",
@@ -2008,6 +1999,206 @@
       "expect": {
         "keyword": "enum",
         "at": "/writes/truncate"
+      }
+    },
+    {
+      "file": "good/wall.v1/h12-a-second-thread-is-not-a-wall.json",
+      "schema": "wall.v1.json",
+      "shows": "The host had a second thread when it shut itself in: Landlock holds only the thread that asked, so the record is not proven, whatever the checks say."
+    },
+    {
+      "file": "good/wall.v1/h13-a-file-held-open-for-writing-is-not-a-wall.json",
+      "schema": "wall.v1.json",
+      "shows": "The host held a file open for writing before the wall: writes through it are not refused, so the record names the descriptor and is not proven."
+    },
+    {
+      "file": "good/wall.v1/h14-descriptors-not-all-seen-is-not-a-wall.json",
+      "schema": "wall.v1.json",
+      "shows": "The probe could not see every descriptor of the host: null, and not proven."
+    },
+    {
+      "file": "good/wall.v1/h15-a-draft-4-record-that-is-not-proven-still-reads.json",
+      "schema": "wall.v1.json",
+      "shows": "Draft 5 is additive: a draft 4 record that is not proven (no threads, no descriptors, the socket kind named as not tried) still validates and still reads as not proven."
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.threads.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names its threads.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.descriptors-open-for-write.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names the descriptors it held open for writing.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/f-wall.v1.then.threads.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall ran alone in its process: one thread.",
+      "expect": {
+        "keyword": "const",
+        "at": "/threads"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b07-proven-with-a-file-held-open-for-writing.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall held no file open for writing.",
+      "expect": {
+        "keyword": "maxItems",
+        "at": "/descriptors_open_for_write"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b08-proven-when-not-every-descriptor-was-seen.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall saw every descriptor it held.",
+      "expect": {
+        "keyword": "type",
+        "at": "/descriptors_open_for_write"
+      }
+    },
+    {
+      "file": "bad/wall.v1/u-wall.v1.descriptors-open-for-write.0.json",
+      "schema": "wall.v1.json",
+      "rule": "A descriptor entry is closed: a field nobody defined (a file's name, say) is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/descriptors_open_for_write/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.descriptors-open-for-write.0.descriptor.json",
+      "schema": "wall.v1.json",
+      "rule": "A descriptor entry always carries 'descriptor'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/descriptors_open_for_write/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.descriptors-open-for-write.0.kind.json",
+      "schema": "wall.v1.json",
+      "rule": "A descriptor entry always carries 'kind'.",
+      "expect": {
+        "keyword": "required",
+        "at": "/descriptors_open_for_write/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/v-wall.v1.descriptors-open-for-write.0.kind.json",
+      "schema": "wall.v1.json",
+      "rule": "The kind of a descriptor is regular_file or block_device.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/descriptors_open_for_write/0/kind"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.writes.make-socket-node.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall (draft 5) tried making a socket file.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b09-proven-naming-the-socket-kind-as-not-tried.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall does not name a kind it tried as not tried.",
+      "expect": {
+        "keyword": "not",
+        "at": "/writes_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b10-proven-crediting-a-make-to-the-filter.json",
+      "schema": "wall.v1.json",
+      "rule": "The filter holds truncation only: a proven wall credits no other kind to it.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/writes/create_file"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b11-proven-at-abi-6-without-its-scopes.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall at Landlock ABI 6 or above has both scopes in force.",
+      "expect": {
+        "keyword": "minItems",
+        "at": "/landlock_scopes"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.writes-not-tried.rename-within-folder.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names 'rename_within_folder' among the kinds it did not try.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.writes-not-tried.change-owner.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names 'change_owner' among the kinds it did not try.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.writes-not-tried.change-times.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names 'change_times' among the kinds it did not try.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.writes-not-tried.change-extended-attributes.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names 'change_extended_attributes' among the kinds it did not try.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.writes-not-tried.write-through-open-descriptor.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names 'write_through_open_descriptor' among the kinds it did not try.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.writes-not-tried.writable-memory-map.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names 'writable_memory_map' among the kinds it did not try.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes_not_tried"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.writes-not-tried.write-beneath-other-folder.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names 'write_beneath_other_folder' among the kinds it did not try.",
+      "expect": {
+        "keyword": "required",
+        "at": "/writes_not_tried"
       }
     }
   ]

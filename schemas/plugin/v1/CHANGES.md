@@ -4,6 +4,23 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `wall.v1.json` is `1.0-draft.5` (Nov 24, 2026)
+
+An additive step: every field and value of draft 4 keeps its meaning, and a draft 4 record that is not proven
+still validates (fixture `h15`). A record gains `threads` (the threads of the host's process when the probe
+began) and `descriptors_open_for_write` (each descriptor held open for writing on a regular file or a block
+device, by number and kind of file, or null when not every descriptor could be seen); `writes` gains
+`make_socket_node` (a socket file made by mknod, now tried); `writes_not_tried` gains `rename_within_folder`,
+`change_owner`, `change_times`, `change_extended_attributes`, `write_through_open_descriptor`,
+`writable_memory_map` and `write_beneath_other_folder`, each with the reason it is not tried, and no longer
+requires `make_socket_node`. A proven record now also needs one thread, no descriptor open for writing, the
+socket kind refused by Landlock, every new kind named as not tried and the socket kind not named so, every
+kind but truncate refused by Landlock (the filter holds truncation only), and both Landlock scopes from ABI 6
+on. What it breaks: a draft 4 record that says proven does not validate at draft 5 (it never counted its
+threads, looked for an open descriptor or tried a socket file). Every wall fixture is brought up to the
+step; 4 good fixtures (`h12` to `h15`) and 20 bad ones are added, and the bad fixture that proved
+`writes_not_tried` required `make_socket_node` is removed with that rule.
+
 ## `wall.v1.json` is `1.0-draft.4` (Nov 23, 2026)
 
 A record gains `writes` and `writes_not_tried`, both required. `writes` holds, for each of eleven kinds of

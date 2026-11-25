@@ -50,7 +50,7 @@ NUM = {
                "lchown": 94, "utime": 132, "utimes": 235, "futimesat": 261, "fchownat": 260, "fchmodat": 268,
                "fchmodat2": 452, "utimensat": 280, "setxattr": 188, "lsetxattr": 189, "fsetxattr": 190,
                "removexattr": 197, "lremovexattr": 198, "fremovexattr": 199, "setxattrat": 463,
-               "removexattrat": 466, "file_setattr": 469, "truncate": 76, "openat2": 437, "clone": 56,
+               "removexattrat": 466, "file_setattr": 469, "truncate": 76, "ftruncate": 77, "openat2": 437, "clone": 56,
                "clone3": 435, "openat": 257, "open": 2, "fcntl": 72, "ioctl": 16, "prlimit64": 302,
                "setpriority": 141, "sched_setaffinity": 203, "sched_setscheduler": 144, "sched_setparam": 142,
                "read": 0, "getpid": 39, "kill": 62, "tkill": 200, "tgkill": 234,
@@ -62,7 +62,7 @@ NUM = {
                 "migrate_pages": 238, "move_pages": 239, "fchmod": 52, "fchown": 55, "fchownat": 54,
                 "fchmodat": 53, "fchmodat2": 452, "utimensat": 88, "setxattr": 5, "lsetxattr": 6, "fsetxattr": 7,
                 "removexattr": 14, "lremovexattr": 15, "fremovexattr": 16, "setxattrat": 463,
-                "removexattrat": 466, "file_setattr": 469, "truncate": 45, "openat2": 437, "clone": 220,
+                "removexattrat": 466, "file_setattr": 469, "truncate": 45, "ftruncate": 46, "openat2": 437, "clone": 220,
                 "clone3": 435, "openat": 56, "fcntl": 25, "ioctl": 29, "prlimit64": 261, "setpriority": 140,
                 "sched_setaffinity": 122, "sched_setscheduler": 119, "sched_setparam": 118, "read": 63,
                 "getpid": 172, "kill": 129, "tkill": 130, "tgkill": 131,
@@ -1051,6 +1051,7 @@ class LandlockScopeTests(unittest.TestCase):
             stand_ins = dict({fn: _refuse for fn in CHECK_FUNCTIONS.values()}, _write_outcomes=_writes_refused)
             with self.subTest(abi=abi), mock.patch.multiple(
                     wall_linux, _call=fake_call, _landlock_abi=lambda libc: abi, _thread_count=lambda: 1,
+                    _threads_now=lambda: 1, _descriptors_open_for_write=lambda: [],
                     _no_new_privs=lambda libc: None, _load_seccomp_filter=lambda *a, **k: None,
                     _STATE={"applied": [], "failed": None, "scopes": []}, **stand_ins):
                 wall_linux.apply_wall([sys.prefix])
@@ -1137,6 +1138,7 @@ class ProvenNeedsEveryCheckTests(unittest.TestCase):
     def probe(self, let_through=None, **patches):
         stand_ins = {fn: (_let_through if name == let_through else _refuse) for name, fn in CHECK_FUNCTIONS.items()}
         stand_ins["_write_outcomes"] = _writes_refused
+        stand_ins.update(_threads_now=lambda: 1, _descriptors_open_for_write=lambda: [])  # the runner's own are not judged
         with mock.patch.multiple(wall_linux, create=True, **stand_ins, **patches):
             return wall_linux.probe_wall("/nonexistent/canary", 1)
 
@@ -1218,7 +1220,7 @@ class FilterProgramTests(unittest.TestCase):
         self.assertEqual(wall_linux.DENIED_IOCTL_COMMANDS, {"FIOSETOWN": 0x8901, "SIOCSPGRP": 0x8902,
                                                             "FS_IOC_SETFLAGS": 0x40086602, "FS_IOC_FSSETXATTR": 0x401C5820})
         self.assertEqual(wall_linux.NAMESPACE_CLONE_FLAGS, sum(CLONE_NEW.values()))
-        self.assertEqual(wall_linux.OLD_LANDLOCK_DENIED_CALLS, ("truncate", "openat2"))
+        self.assertEqual(wall_linux.OLD_LANDLOCK_DENIED_CALLS, ("truncate", "ftruncate", "openat2"))
         for arch in ("x86_64", "aarch64"):
             with self.subTest(arch=arch):
                 for name, number in NUM[arch].items():

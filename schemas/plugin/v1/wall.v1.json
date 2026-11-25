@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "wall.v1.json",
   "title": "wall.v1: what a plugin host proved of its own wall, from inside, before it loaded any plugin byte",
-  "x-version": "1.0-draft.4",
-  "description": "A plugin host on Linux applies its wall to itself (Landlock: read and map only the Python install; one seccomp filter: no new socket, no program start, no signal at all, no limit or priority aimed at any process but the caller by the kernel's own form, no System V IPC or POSIX message queue, no lease, no change of a file's mode, owner, times or attributes, no new namespace, among other calls) and then tries eight checks from inside, and each kind of write on a file and in a folder that it made for the purpose before the wall. Each of the eight fields is true only when the kernel refused that check; a check that succeeded, or that failed or raised in another way, is false (fail shut). A target that would make a refusal prove nothing (a daemon pid of another user, a canary of another user) is not refused. 'proven' is true only when all eight are refused, every kind of write is refused by the part of the wall that holds it, on x86_64 or aarch64, with Landlock ABI 1 or above, and no step of the wall failed in the process. 'landlock_scopes' names the Landlock scopes the wall put in force (abstract unix sockets and signals, each kept to the domain, from Landlock ABI 6 on; none below). What the record is: a check that the host's own code makes on itself, from inside the process, after the wall and before any plugin code runs. It shows that the named attempts were refused by the kernel at that moment, and code in the same process could write any record; for each kind of write it names which part of the wall refused it, by the kernel's answer. It means something under two conditions only: it is made before the plugin is loaded, and its reader takes it only from frames the host sent before the load (everything later on the channel is the plugin's voice). A host whose record is not proven loads no plugin.",
+  "x-version": "1.0-draft.5",
+  "description": "A plugin host on Linux applies its wall to itself (Landlock: read and map only the Python install; one seccomp filter: no new socket, no program start, no signal at all, no limit or priority aimed at any process but the caller by the kernel's own form, no System V IPC or POSIX message queue, no lease, no change of a file's mode, owner, times or attributes, no new namespace, among other calls) and then tries eight checks from inside, and each kind of write on a file and in a folder that it made for the purpose before the wall. Each of the eight fields is true only when the kernel refused that check; a check that succeeded, or that failed or raised in another way, is false (fail shut). A target that would make a refusal prove nothing (a daemon pid of another user, a canary of another user) is not refused. 'proven' is true only when the host ran alone in its process (threads is 1), held no file open for writing (descriptors_open_for_write is empty), all eight are refused, every kind of write is refused by the part of the wall that holds it, on x86_64 or aarch64, with Landlock ABI 1 or above, and no step of the wall failed in the process. 'landlock_scopes' names the Landlock scopes the wall put in force (abstract unix sockets and signals, each kept to the domain, from Landlock ABI 6 on; none below). What the record is: a check that the host's own code makes on itself, from inside the process, after the wall and before any plugin code runs. It shows that the named attempts were refused by the kernel at that moment, and code in the same process could write any record; for each kind of write it names which part of the wall refused it, by the kernel's answer. 'proven' covers the kinds in 'writes' only: every other kind the wall claims, or leaves to the host, is named in 'writes_not_tried' with the reason it is not tried. It means something under two conditions only: it is made before the plugin is loaded, and its reader takes it only from frames the host sent before the load (everything later on the channel is the plugin's voice). A host whose record is not proven loads no plugin.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -23,6 +23,39 @@
     "proven"
   ],
   "properties": {
+    "threads": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The threads of the host's process when the probe began (0 when they could not be counted). Landlock holds only the thread that asked for it, so a proven record has 1. Added in draft 5: a draft 4 record has no such field and is never proven."
+    },
+    "descriptors_open_for_write": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "descriptor",
+          "kind"
+        ],
+        "properties": {
+          "descriptor": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "kind": {
+            "enum": [
+              "regular_file",
+              "block_device"
+            ]
+          }
+        },
+        "description": "One descriptor of the host open for writing (write only or read and write), by its number and the kind of file; never its name or contents."
+      },
+      "description": "Each descriptor the host held open for writing on a regular file or a block device when the probe began, before the probe opened anything of its own; null when the probe could not see every descriptor. Landlock checks a file when it is opened, so writes through a descriptor opened before the wall are not refused: a proven record holds none. Added in draft 5: a draft 4 record has no such field and is never proven."
+    },
     "reads_outside": {
       "type": "boolean",
       "description": "True only when the kernel refused it: reading the root folder, which is outside the allowed paths. A check that succeeded, failed for another reason or raised is false."
@@ -99,6 +132,9 @@
         "make_block_device": {
           "$ref": "#/$defs/write_outcome"
         },
+        "make_socket_node": {
+          "$ref": "#/$defs/write_outcome"
+        },
         "remove_file": {
           "$ref": "#/$defs/write_outcome"
         },
@@ -106,21 +142,16 @@
           "$ref": "#/$defs/write_outcome"
         }
       },
-      "description": "The outcome of each kind of change the probe tries behind the wall, each on a file or in a folder that the host made for the purpose before the wall, each harmless where it goes through: open_for_write (opened for writing, nothing written), truncate (cut to its own length), create_file, create_folder, make_fifo, make_symlink, make_link (a second name for a file), make_char_device and make_block_device (the device 0:0, which names no device), remove_file and remove_folder (a file and a folder made for that). A refusal is credited only to the part of the wall that holds the kind in the host: Landlock, which answers EACCES and holds a kind where its ruleset handles the kind's right, and the seccomp filter, which answers EPERM and holds only truncate, below Landlock ABI 3. A refusal by anything else (a file's own flags, another security layer) is refused_elsewhere and proves nothing; a layer that gives the same answer as a part of the wall cannot be told apart from it."
+      "description": "The outcome of each kind of change the probe tries behind the wall, each on a file or in a folder that the host made for the purpose before the wall, each harmless where it goes through: open_for_write (opened for writing, nothing written), truncate (cut to its own length), create_file, create_folder, make_fifo, make_symlink, make_link (a second name for a file), make_char_device and make_block_device (the device 0:0, which names no device), make_socket_node (a socket file made by mknod, a name that nothing listens on; added in draft 5, required of a proven record), remove_file and remove_folder (a file and a folder made for that). A refusal is credited only to the part of the wall that holds the kind in the host: Landlock, which answers EACCES and holds a kind where its ruleset handles the kind's right, and the seccomp filter, which answers EPERM and holds only truncate, below Landlock ABI 3. A refusal by anything else (a file's own flags, another security layer) is refused_elsewhere and proves nothing; a layer that gives the same answer as a part of the wall cannot be told apart from it."
     },
     "writes_not_tried": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "make_socket_node",
         "device_ioctl",
         "move_between_folders"
       ],
       "properties": {
-        "make_socket_node": {
-          "type": "string",
-          "minLength": 1
-        },
         "device_ioctl": {
           "type": "string",
           "minLength": 1
@@ -128,9 +159,42 @@
         "move_between_folders": {
           "type": "string",
           "minLength": 1
+        },
+        "rename_within_folder": {
+          "type": "string",
+          "minLength": 1
+        },
+        "change_owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "change_times": {
+          "type": "string",
+          "minLength": 1
+        },
+        "change_extended_attributes": {
+          "type": "string",
+          "minLength": 1
+        },
+        "write_through_open_descriptor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "writable_memory_map": {
+          "type": "string",
+          "minLength": 1
+        },
+        "write_beneath_other_folder": {
+          "type": "string",
+          "minLength": 1
+        },
+        "make_socket_node": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Draft 4 only, where the probe did not try a socket file; from draft 5 the kind is tried (writes), and a proven record does not list it here."
         }
       },
-      "description": "The kinds of change the wall refuses that the probe cannot try harmlessly on its own, each with its reason, which names the check that shows it refused instead."
+      "description": "Every kind of change that the wall claims to refuse, or leaves to the host, and that the probe does not try, each with the reason it is not tried. 'proven' covers the kinds in 'writes' only; a proven record (draft 5) names every kind of this list: device_ioctl, move_between_folders, rename_within_folder, change_owner, change_times, change_extended_attributes, write_through_open_descriptor, writable_memory_map, write_beneath_other_folder."
     },
     "landlock_abi": {
       "type": "integer",
@@ -155,7 +219,7 @@
     },
     "proven": {
       "type": "boolean",
-      "description": "True only when all eight checks are refused, every kind of write in 'writes' is refused by the part of the wall that holds it (refused_by_landlock or refused_by_filter), on a supported arch, with Landlock ABI 1 or above, and no step of the wall failed in the process. A host that gave the probe no file or folder for the writes is never proven."
+      "description": "True only when the host ran alone in its process (threads is 1), held no file open for writing (descriptors_open_for_write is empty), all eight checks are refused, every kind of write in 'writes' is refused by the part of the wall that holds it (refused_by_landlock, or refused_by_filter for truncate alone), on a supported arch, with Landlock ABI 1 or above (and, from ABI 6, both scopes in force), and no step of the wall failed in the process. It covers the kinds in 'writes' only: the kinds in 'writes_not_tried' are not tried, each for the reason given there. A host that gave the probe no file or folder for the writes is never proven."
     }
   },
   "if": {
@@ -169,7 +233,18 @@
     ]
   },
   "then": {
+    "required": [
+      "threads",
+      "descriptors_open_for_write"
+    ],
     "properties": {
+      "threads": {
+        "const": 1
+      },
+      "descriptors_open_for_write": {
+        "type": "array",
+        "maxItems": 0
+      },
       "reads_outside": {
         "const": true
       },
@@ -195,40 +270,62 @@
         "const": true
       },
       "writes": {
+        "required": [
+          "make_socket_node"
+        ],
         "properties": {
           "open_for_write": {
-            "$ref": "#/$defs/write_refused"
+            "$ref": "#/$defs/landlock_refused"
           },
           "truncate": {
             "$ref": "#/$defs/write_refused"
           },
           "create_file": {
-            "$ref": "#/$defs/write_refused"
+            "$ref": "#/$defs/landlock_refused"
           },
           "create_folder": {
-            "$ref": "#/$defs/write_refused"
+            "$ref": "#/$defs/landlock_refused"
           },
           "make_fifo": {
-            "$ref": "#/$defs/write_refused"
+            "$ref": "#/$defs/landlock_refused"
           },
           "make_symlink": {
-            "$ref": "#/$defs/write_refused"
+            "$ref": "#/$defs/landlock_refused"
           },
           "make_link": {
-            "$ref": "#/$defs/write_refused"
+            "$ref": "#/$defs/landlock_refused"
           },
           "make_char_device": {
-            "$ref": "#/$defs/write_refused"
+            "$ref": "#/$defs/landlock_refused"
           },
           "make_block_device": {
-            "$ref": "#/$defs/write_refused"
+            "$ref": "#/$defs/landlock_refused"
+          },
+          "make_socket_node": {
+            "$ref": "#/$defs/landlock_refused"
           },
           "remove_file": {
-            "$ref": "#/$defs/write_refused"
+            "$ref": "#/$defs/landlock_refused"
           },
           "remove_folder": {
-            "$ref": "#/$defs/write_refused"
+            "$ref": "#/$defs/landlock_refused"
           }
+        }
+      },
+      "writes_not_tried": {
+        "required": [
+          "rename_within_folder",
+          "change_owner",
+          "change_times",
+          "change_extended_attributes",
+          "write_through_open_descriptor",
+          "writable_memory_map",
+          "write_beneath_other_folder"
+        ],
+        "not": {
+          "required": [
+            "make_socket_node"
+          ]
         }
       },
       "landlock_abi": {
@@ -240,7 +337,28 @@
           "aarch64"
         ]
       }
-    }
+    },
+    "allOf": [
+      {
+        "if": {
+          "properties": {
+            "landlock_abi": {
+              "minimum": 6
+            }
+          },
+          "required": [
+            "landlock_abi"
+          ]
+        },
+        "then": {
+          "properties": {
+            "landlock_scopes": {
+              "minItems": 2
+            }
+          }
+        }
+      }
+    ]
   },
   "$defs": {
     "write_outcome": {
@@ -259,7 +377,13 @@
         "refused_by_landlock",
         "refused_by_filter"
       ],
-      "description": "A kind of write refused by the part of the wall that holds it."
+      "description": "A kind of write refused by the part of the wall that holds it; refused_by_filter is taken for truncate alone (the filter holds no other kind)."
+    },
+    "landlock_refused": {
+      "enum": [
+        "refused_by_landlock"
+      ],
+      "description": "A kind of write that only Landlock holds, refused by it."
     }
   }
 }

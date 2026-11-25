@@ -64,11 +64,28 @@ LOGIN = '/org/freedesktop/secrets/collection/login'
 LOGIN_CREATED = 1_700_000_000     # a made-up creation time, before the tests' clock (TempStoreCase.store)
 
 
+def search_items_reply(found, locked) -> bytes:
+    """The Secret Service's ``SearchItems`` reply as ``busctl --user call`` prints it: the signature, then the unlocked
+    items' paths and the locked items' paths, each array as its length and its quoted paths. Paths only: no secret."""
+    words, number = ['aoao'], 0
+    for group in ([key for key in found if key not in locked], [key for key in found if key in locked]):
+        words.append(str(len(group)))
+        for _ in group:
+            number += 1
+            words.append(f'"{LOGIN}/{number}"')
+    return (' '.join(words) + '\n').encode()
+
+
 def busctl(owner: bool = False, activatable: bool = False, kwallet: bool = False, chain=None):
     """A stand-in ``busctl``: ``ListNames`` and ``ListActivatableNames`` as ``busctl --user call`` prints them; with a
     ``chain``, also the Secret Service's ``ReadAlias default`` and its collection's ``Created`` (``chain.collection``,
-    None for a service that does not say)."""
+    None for a service that does not say), and its ``SearchItems`` over ``chain``'s items (locked ones too; a chain in
+    mode ``fail`` is a service that is not there)."""
     def run(argv, input):
+        if chain is not None and 'SearchItems' in argv:
+            if chain.mode == 'fail':
+                return Completed(1, b'', b'Call failed: The name org.freedesktop.secrets was not provided\n')
+            return Completed(0, search_items_reply(chain._matches(argv[argv.index('a{ss}') + 2:]), chain.locked), b'')
         if chain is not None and ('ReadAlias' in argv or 'get-property' in argv):
             found = chain.collection
             if found is None:
@@ -86,6 +103,11 @@ def busctl(owner: bool = False, activatable: bool = False, kwallet: bool = False
         text = f'as {len(names)} ' + ' '.join(f'"{name}"' for name in names) + '\n'
         return Completed(0, text.encode(), b'')
     return run
+
+
+def bus_searches(system) -> int:
+    """How many times the store asked the stand-in bus which items carry an item's attributes (``SearchItems``)."""
+    return sum(1 for argv, _ in system.calls if 'SearchItems' in argv or any('SearchItems' in w for w in argv))
 
 
 def attribute_pairs(words) -> dict:
@@ -251,8 +273,17 @@ with open(items_path, 'w') as fh:
 '''
 
 _BUSCTL = r'''#!{python} -I
-import sys
-if 'ReadAlias' in sys.argv:
+import json, os, sys
+STATE = {state!r}
+if 'SearchItems' in sys.argv:
+    words = sys.argv[sys.argv.index('a{{ss}}') + 2:]
+    query = dict(zip(words[0::2], words[1::2])).items()
+    path = os.path.join(STATE, 'items.json')
+    items = json.load(open(path)) if os.path.exists(path) else {{}}
+    found = [k for k in items if query <= dict(zip(k.split(chr(31))[0::2], k.split(chr(31))[1::2])).items()]
+    print('aoao %d %s 0' % (len(found), ' '.join('"/org/freedesktop/secrets/collection/login/%d"' % (n + 1)
+                                                  for n in range(len(found)))))
+elif 'ReadAlias' in sys.argv:
     print('o "/org/freedesktop/secrets/collection/login"')
 elif 'get-property' in sys.argv:
     print('t 1700000000')
@@ -272,7 +303,7 @@ def fake_tools(folder: Path, *, secret_tool=True, busctl_tool=True) -> tuple:
     if secret_tool:
         programs['secret-tool'] = _SECRET_TOOL.format(python=sys.executable, state=str(state))
     if busctl_tool:
-        programs['busctl'] = _BUSCTL.format(python=sys.executable)
+        programs['busctl'] = _BUSCTL.format(python=sys.executable, state=str(state))
     for name, text in programs.items():
         path = bin_dir / name
         path.write_text(text)

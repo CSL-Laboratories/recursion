@@ -106,8 +106,7 @@ class RemoveTellsTheKeychainsApartTest(Case):
         detail = self.refused(system, 'keychain_other')
         self.assertNotIn('forget', detail)
         self.assertEqual(other.items, {})
-        self.assertEqual([argv[1] for argv, _ in system.calls if argv[0].endswith('secret-tool')
-                          and argv[1] not in ('lookup', 'search')], [])     # asked whether it holds the save, no more
+        self.assertEqual([argv for argv, _ in system.calls if argv[0].endswith('secret-tool')], [])
 
     def test_an_older_keychain_at_the_same_path_is_another_one(self) -> None:
         system, _ = self.keychain((LOGIN, LOGIN_CREATED - 1))

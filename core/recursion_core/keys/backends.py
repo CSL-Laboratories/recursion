@@ -31,7 +31,10 @@ the item of one record's save, for the audit. Neither the value nor anything der
 helper's arguments or its environment.
 WHICH KEYCHAIN. ``identity`` names the keychain that answers now, by the default collection's path and its
 ``Created`` time, asked of the bus (``system.keychain_identity``); the store records it with each save (see
-``store.py``, KEYCHAIN).
+``store.py``, KEYCHAIN). ``has_item`` says whether an item of an id (of one save) is there, locked or not, by asking
+the service over the bus for the items that carry its attributes (``system.keychain_items``): the answer is the
+items' paths, never a secret, and no unlock prompt is raised, so ``status``, ``forget`` and the refusals of
+``remove`` learn where a key is without reading its value.
 ``lookup`` exits 1 with nothing on its standard error when it finds no unlocked item; anything else that is not
 success is a failure, ``keychain_locked`` when its message says the collection is locked or the unlock prompt
 was dismissed, else ``keychain_failed``. A failure's detail is fixed text: no line a helper printed is ever
@@ -144,6 +147,17 @@ class SecretService:
         if not self._absent(look):
             raise _failure('lookup', look)
         return self._listed(words) > 0
+
+    def has_item(self, key_id: str, save_id: str | None = None) -> bool:
+        """True when an item of ``key_id`` (of that save, when ``save_id`` is given) is in the Secret Service, in any
+        collection, locked or not; False when there is none. Asked over the session bus by the item's attributes
+        (``system.keychain_items``): only item paths come back, never a secret, and no unlock prompt is raised. A
+        service that cannot be asked so raises ``keychain_failed``: nothing is read in place of it."""
+        found = sysmod.keychain_items(self._system, self._saved(key_id, save_id))
+        if found is None:
+            raise KeyStoreError('keychain_failed', 'the Secret Service could not be asked over the session bus which '
+                                'items it holds (busctl or dbus-send did not answer)')
+        return found > 0
 
     def count(self, key_id: str | None = None, record=None) -> int:
         """How many items ``search --all`` lists, locked ones too: with ``key_id`` and a record, the item that record's

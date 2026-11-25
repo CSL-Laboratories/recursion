@@ -20,14 +20,16 @@
     in a keychain; with no saved key at all, the file in its folder is its own).
 ``status``
     Each saved key and whether the keychain it was saved into is the one that answers now (another one, one made
-    after the save, or one that cannot be told), and every use of ``forget``. Asks the bus, never reads a value.
+    after the save, or one that cannot be told), and every use of ``forget``. Asks the bus which keychain answers
+    and which items it holds (their paths, never a secret), never reads a value.
 ``forget <id>``
     The person's own step for ONE key whose value no command can reach from here (its keychain is gone or does not
     answer): removes that key's record and deletes nothing. It asks for the id again on the terminal, takes no option
     that skips the question and refuses with no terminal. It refuses (``value_reachable``, nothing changed) while
-    ``remove`` can delete the key where it is: in the owner-only file, or in the keychain that answers. Its output
-    says no keychain that answers here holds the key and the value may still sit in another keychain, and
-    ``status`` and ``audit`` list every use.
+    ``remove`` can delete the key where it is: in the owner-only file, or in the keychain that answers, a value an
+    interrupted save left there included; and, with its own code, while a keychain that answers here cannot be
+    asked. It reads no value. Its output says no keychain that answers here holds the key and the value may still
+    sit in another keychain, and ``status``, ``audit`` and a later ``remove`` of the id name every use.
 ``audit [--path P ...] [--no-journal]``
     Searches the state folder, the config folder and the journal for every saved value (``audit.py``) and
     names each place a value was found, never the value, and each temp file an interrupted save left in the

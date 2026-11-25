@@ -16,7 +16,8 @@ from recursion_core.keys import system as sysmod
 from recursion_core.keys.errors import KeyStoreError
 from recursion_core.keys.store import KeyStore
 from recursion_core.keys.system import Completed
-from recursion_core.keys.tests.support import LOGIN, LOGIN_CREATED, OTHER, FakeSystem, file_system, needs_posix
+from recursion_core.keys.tests.support import (LOGIN, LOGIN_CREATED, OTHER, FakeSystem, bus_searches, file_system,
+                                               needs_posix)
 from recursion_core.keys.tests.test_review_8 import SAVED, SESSION, Case, Terminal
 
 
@@ -97,8 +98,8 @@ class OwnSaveProofTest(Round):
     def test_another_empty_keychain_is_only_asked_whether_it_holds_the_save(self) -> None:
         system, other = self.keychain((SESSION, LOGIN_CREATED + 5))
         self.refused(system, 'keychain_other')
-        self.assertTrue(tool_actions(system))
-        self.assertEqual(set(tool_actions(system)), {'lookup', 'search'})       # nothing that changes an item
+        self.assertTrue(bus_searches(system))                                   # asked over the bus by attributes
+        self.assertEqual(tool_actions(system), [])                              # nothing that reads or changes an item
         self.assertEqual(other.items, {})
 
     def test_a_record_naming_no_keychain_counts_only_its_own_save(self) -> None:
@@ -139,7 +140,7 @@ class ForgetOnlyWhenOutOfReachTest(Round):
     def test_forget_refuses_while_its_own_save_is_in_the_keychain_that_answers(self) -> None:
         system, _ = self.sharing((SESSION, LOGIN_CREATED + 5))
         self.assertIn('"key remove codex-key"', self.forget_refused(self.store(system)))
-        self.assertEqual(set(tool_actions(system)), {'lookup'})
+        self.assertEqual(tool_actions(system), [])
 
     def test_forget_refuses_a_key_in_the_owner_only_file(self) -> None:
         store = self.file_store()
@@ -161,7 +162,7 @@ class ForgetOnlyWhenOutOfReachTest(Round):
         self.assertIn('no keychain that answers here holds it', out)
         self.assertIn('its value may still sit in another keychain', out)
         self.assertEqual((chain.items, len(self.chain.items)), ({}, 1))
-        self.assertEqual(set(tool_actions(other)), {'lookup', 'search'})
+        self.assertEqual(tool_actions(other), [])
 
     def test_with_no_keychain_answering_at_all_forget_is_the_way_out(self) -> None:
         self.assertEqual(self.store(file_system()).forget('codex-key').key_id, 'codex-key')

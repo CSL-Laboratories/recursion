@@ -277,6 +277,61 @@ def _dbus_send_identity(system: System, tool: str) -> tuple | None:
     return (path, int(words[-1])) if int(words[-1]) > 0 else None   # 0: the service does not say
 
 
+def keychain_items(system: System, attributes: list) -> int | None:
+    """How many items of the Secret Service carry every pair of ``attributes`` (a flat list: a name, then its value),
+    in any collection and locked ones too: the service's ``SearchItems``, asked through ``busctl``, else ``dbus-send``.
+    It answers with the items' object paths only (unlocked, then locked), never with a secret, and it opens no session
+    and raises no unlock prompt: so it learns that an item is there without reading its value. None when neither tool
+    answers in that shape."""
+    pairs = list(zip(attributes[0::2], attributes[1::2]))
+    for name, ask in (('busctl', _busctl_items), ('dbus-send', _dbus_send_items)):
+        tool = system.which(name)
+        if tool is not None:
+            found = ask(system, tool, pairs)
+            if found is not None:
+                return found
+    return None
+
+
+def _busctl_items(system: System, tool: str, pairs: list) -> int | None:
+    """``busctl --user call ... SearchItems a{ss} <n> <name> <value> ...`` prints the reply's signature, then each
+    array as its length and its quoted paths: ``aoao 1 "<path>" 0``."""
+    text = _call(system, [tool, '--user', 'call', SECRET_SERVICE_NAME, _SECRETS_PATH, 'org.freedesktop.Secret.Service',
+                          'SearchItems', 'a{ss}', str(len(pairs)), *[word for pair in pairs for word in pair]])
+    words = text.split() if text else []
+    if words[:1] == ['aoao']:
+        words = words[1:]
+    total = 0
+    for _ in range(2):                           # the unlocked items, then the locked ones
+        if words[:1] == ['ao']:
+            words = words[1:]
+        if not words or not (words[0].isascii() and words[0].isdigit()):
+            return None
+        length = int(words[0])
+        paths, words = words[1:1 + length], words[1 + length:]
+        if len(paths) != length or not all(path[:1] == '"' and _object_path(path) for path in paths):
+            return None
+        total += length
+    return None if words else total
+
+
+def _dbus_send_items(system: System, tool: str, pairs: list) -> int | None:
+    """``dbus-send --print-reply`` prints a ``method return`` line, then two ``array [`` ... ``]`` blocks of
+    ``object path "<path>"`` lines (the unlocked items, then the locked ones)."""
+    if any(',' in word for pair in pairs for word in pair):
+        return None                              # its dict argument is split at commas: such a word cannot be asked
+    text = _call(system, [tool, '--session', '--print-reply', f'--dest={SECRET_SERVICE_NAME}', _SECRETS_PATH,
+                          'org.freedesktop.Secret.Service.SearchItems',
+                          'dict:string:string:' + ','.join(word for pair in pairs for word in pair)])
+    lines = [line.split() for line in (text or '').splitlines()[1:] if line.strip()]
+    if not text or [words for words in lines if words in (['array', '['], [']'])] != [['array', '['], [']']] * 2:
+        return None
+    paths = [words for words in lines if words not in (['array', '['], [']'])]
+    if not all(len(words) == 3 and words[:2] == ['object', 'path'] and _object_path(words[2]) for words in paths):
+        return None
+    return len(paths)
+
+
 def _call(system: System, argv: list) -> str | None:
     try:
         done = system.run(argv, timeout=BUS_TIMEOUT_S)

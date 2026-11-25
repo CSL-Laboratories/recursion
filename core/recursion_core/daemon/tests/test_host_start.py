@@ -12,6 +12,7 @@ the hosts it may start and a time each child may run, and ends every child it st
 from __future__ import annotations
 
 import base64
+import errno
 import fcntl
 import json
 import logging
@@ -20,6 +21,7 @@ from pathlib import Path
 import resource
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -77,6 +79,15 @@ STAND_IN = ('import signal, sys, time\n'
             'while time.monotonic() < end:\n'
             '    time.sleep(0.05)\n')
 SIGNAL_WAIT_S = 2       # how long a signal the kernel sent may take to show in the stand-in's marker file
+# Numbers of the kernel's interface that Python's fcntl does not name: set an owner with its kind; two of the kinds.
+F_SETOWN_EX, F_OWNER_TID, F_OWNER_PGRP, F_GETOWN_EX = 15, 0, 2, 16
+# A wrap for the host: a stand-in kernel that cannot read the owner of descriptor 0 (the null device at the wall).
+OWNER_UNREADABLE = ('import errno, fcntl\n_fcntl = fcntl.fcntl\n\n'
+                    'def _owner_unreadable(descriptor, command, *arg):\n'
+                    '    if descriptor == 0 and command in (fcntl.F_GETOWN, %d):\n'
+                    '        raise OSError(errno.EINVAL, "a stand-in kernel that cannot read this owner")\n'
+                    '    return _fcntl(descriptor, command, *arg)\n\n'
+                    'fcntl.fcntl = _owner_unreadable\n' % F_GETOWN_EX)
 
 
 def b64(data):
@@ -458,7 +469,8 @@ class AHostHandedADescriptorThatCanSignal(_Folder):
     def stand_in(self):
         marker = self.tmp / 'signalled'
         process = subprocess.Popen([sys.executable, '-B', '-I', '-c', STAND_IN, str(marker), str(CHILD_LIMIT_S)],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, cwd=self.tmp)
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, cwd=self.tmp,
+                                   start_new_session=True)  # a group of its own, whose number is its own
         self.addCleanup(self.end, process)
         self.assertEqual(process.stdout.readline(), b'ready\n')
         return process.pid, marker
@@ -533,6 +545,103 @@ class AHostHandedADescriptorThatCanSignal(_Folder):
         self.assertIn(plugin_host.SIGNAL_DESCRIPTOR + '.', detail)
         self.assertIn('the asynchronous flag (O_ASYNC) on a descriptor it hands to the host', detail)
         self.assertFalse(self.signalled(marker), frames)
+
+    def test_an_owner_of_every_kind_is_named(self):
+        # F_GETOWN gives a process group as a negative number, which Python's fcntl takes for an error.
+        owner, _ = self.stand_in()
+        for kind, command, value in (('process', fcntl.F_SETOWN, owner), ('process group', fcntl.F_SETOWN, -owner),
+                                     ('thread', F_SETOWN_EX, struct.pack('ii', F_OWNER_TID, owner)),
+                                     ('group by kind', F_SETOWN_EX, struct.pack('ii', F_OWNER_PGRP, owner))):
+            with self.subTest(kind):
+                read_end, write_end = os.pipe()
+                self.addCleanup(os.close, read_end)
+                self.addCleanup(os.close, write_end)
+                fcntl.fcntl(read_end, command, value)
+                self.assertIn(str(read_end), plugin_host._signal_descriptors())
+                self.assertNotIn(str(write_end), plugin_host._signal_descriptors())
+
+    def test_a_group_owner_with_the_flag_already_set_is_named(self):
+        owner, _ = self.stand_in()
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, read_end)
+        self.addCleanup(os.close, write_end)  # shut first: a signal it makes reaches only the stand-in's group
+        fcntl.fcntl(read_end, fcntl.F_SETOWN, -owner)
+        fcntl.fcntl(read_end, fcntl.F_SETFL, fcntl.fcntl(read_end, fcntl.F_GETFL) | os.O_ASYNC)
+        self.assertIn(str(read_end), plugin_host._signal_descriptors())
+
+    def test_a_descriptor_whose_owner_cannot_be_read_is_named(self):
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, read_end)
+        self.addCleanup(os.close, write_end)
+        real = fcntl.fcntl
+
+        def owner_unreadable(descriptor, command, *arg):  # a stand-in kernel that cannot read this owner
+            if descriptor == read_end and command in (fcntl.F_GETOWN, F_GETOWN_EX):
+                raise OSError(errno.EINVAL, 'a stand-in kernel that cannot read this owner')
+            return real(descriptor, command, *arg)
+
+        with unittest.mock.patch.object(fcntl, 'fcntl', owner_unreadable):
+            self.assertIn(str(read_end), plugin_host._signal_descriptors())
+            unreadable = []
+            self.assertNotIn(str(read_end), plugin_host._signal_descriptors(unreadable))
+            self.assertEqual(unreadable, [str(read_end)])
+        with unittest.mock.patch.object(os, 'listdir', side_effect=PermissionError(errno.EACCES, 'stand-in')):
+            unreadable = []
+            self.assertEqual(plugin_host._signal_descriptors(unreadable), [])
+            self.assertEqual(unreadable, ['unknown'])
+        self.assertNotIn(str(read_end), plugin_host._signal_descriptors())
+
+    def refusal_detail(self, read_end, write_end, before=''):
+        """Start the host with ``read_end`` (shut here) as its standard input, send it a load of ASYNC and a call,
+        then new data on the pipe (a flag a plugin set would signal now); the detail of its first refusal, or
+        '' when it refused nothing."""
+        wrap = before + 'import sys\nsys.path.insert(0, sys.argv[1])\nfrom recursion_core.plugin_host import main\nmain()\n'
+        host = subprocess.Popen([sys.executable, '-B', '-c', wrap, str(self.core_folder)], stdin=read_end,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.tmp, env={})
+        os.close(read_end)
+        self.addCleanup(self.end, host)
+        timer = threading.Timer(CHILD_LIMIT_S, host.kill)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with os.fdopen(write_end, 'wb', buffering=0) as writer:
+            for message in (dict(HELLO, gil_check='off'), load_message(ASYNC),
+                            {'type': 'call', 'id': 1, 'name': 'operator', 'args': {'command': 'x'}}):
+                writer.write(hc.encode(message))
+            frames = []
+            while not any(frame.get('id') == 1 for frame in frames):
+                frame = self.read_frame(host.stdout)
+                if frame is None:
+                    break
+                frames.append(frame)
+            writer.write(hc.encode(BYE))
+        host.wait(timeout=CHILD_LIMIT_S)
+        self.assertIn('wall', frames[0], frames)
+        refused = [frame['detail'] for frame in frames if frame.get('type') == 'refusal']
+        return refused[0] if refused else ''
+
+    def test_a_descriptor_owned_by_a_process_group_refuses_every_load_and_the_group_gets_no_signal(self):
+        owner, marker = self.stand_in()
+        read_end, write_end = os.pipe()
+        fcntl.fcntl(read_end, fcntl.F_SETOWN, -owner)  # the stand-in's group
+        detail = self.refusal_detail(read_end, write_end)
+        self.assertIn(plugin_host.SIGNAL_DESCRIPTOR + '.', detail)
+        self.assertIn('a process, a process group or a thread', detail)
+        self.assertFalse(self.signalled(marker), detail)
+
+    def test_a_descriptor_owned_by_a_thread_refuses_every_load_and_the_thread_gets_no_signal(self):
+        owner, marker = self.stand_in()
+        read_end, write_end = os.pipe()
+        fcntl.fcntl(read_end, F_SETOWN_EX, struct.pack('ii', F_OWNER_TID, owner))  # the stand-in's main thread
+        detail = self.refusal_detail(read_end, write_end)
+        self.assertIn(plugin_host.SIGNAL_DESCRIPTOR + '.', detail)
+        self.assertFalse(self.signalled(marker), detail)
+
+    def test_a_descriptor_whose_owner_cannot_be_read_refuses_every_load(self):
+        read_end, write_end = os.pipe()
+        detail = self.refusal_detail(read_end, write_end, OWNER_UNREADABLE)
+        self.assertIn('descriptor_unreadable.0', detail)
+        self.assertIn('hand it only descriptors it can read', detail)
+        self.assertNotIn(plugin_host.SIGNAL_DESCRIPTOR + '.', detail)
 
     def test_without_the_host_the_same_descriptor_signals_its_owner(self):
         # The control: a plain process (no host, no wall) sets the flag on such a descriptor, and the kernel

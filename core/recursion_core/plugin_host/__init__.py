@@ -224,28 +224,45 @@ def _remove_quietly(path):
         pass
 
 
-def _signal_descriptors():
-    """The descriptors this process holds that would let the kernel send a signal for it, by number: those with
-    an owner for signals (F_GETOWN is not 0) or with the asynchronous flag (O_ASYNC) set. Linux only, and read
-    before the wall, while /proc/self/fd is readable; ["unknown"] when the descriptors cannot be listed. The
-    owner is a property of the open file, so whoever shares it (the starter, the other end of a pipe) may have
-    set it; a walled process that sets the asynchronous flag on such a descriptor makes the kernel signal that
-    owner when the descriptor is ready."""
-    import fcntl
+# The fcntl command that reads a descriptor's owner for signals together with its kind (struct f_owner_ex: the
+# kind, then the id, which is 0 when no owner is set). A number of the kernel's interface, not a setting. F_GETOWN
+# is not used: it gives a process group as a negative number, which Python's fcntl takes for an error.
+_F_GETOWN_EX = 16
 
+
+def _signal_descriptors(unreadable=None):
+    """The descriptors this process holds that would let the kernel send a signal for it, by number: those with
+    an owner for signals of any kind (a process, a process group or a thread, read with F_GETOWN_EX) or with the
+    asynchronous flag (O_ASYNC) set. Linux only, and read before the wall from /proc/self/fd, the kernel's own
+    list of them, so a descriptor of any number is seen. A descriptor whose flags or owner cannot be read, and
+    "unknown" when the descriptors cannot be listed, go into ``unreadable`` when a list is given, else among the
+    others: either way the start is refused, never taken on trust. The owner is a property of the open file, so
+    whoever shares it (the starter, the other end of a pipe) may have set it; a walled process that sets the
+    asynchronous flag on such a descriptor makes the kernel signal that owner when the descriptor is ready."""
+    import errno
+    import fcntl
+    import struct
+
+    found, cannot = [], []
     try:
         listed = sorted(int(name) for name in os.listdir("/proc/self/fd"))
     except OSError:
-        return ["unknown"]
-    found = []
+        listed, cannot = [], ["unknown"]
     for descriptor in listed:
         try:
-            owner = fcntl.fcntl(descriptor, fcntl.F_GETOWN)
-            flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
-        except OSError:  # the listing's own descriptor, already shut
+            if fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ASYNC:
+                found.append(str(descriptor))
+                continue
+            _kind, owner = struct.unpack("ii", fcntl.fcntl(descriptor, _F_GETOWN_EX, bytes(8)))
+        except OSError as exc:
+            if exc.errno != errno.EBADF:  # EBADF: the listing's own descriptor, already shut
+                cannot.append(str(descriptor))
             continue
-        if owner != 0 or flags & os.O_ASYNC:
+        if owner != 0:
             found.append(str(descriptor))
+    if unreadable is None:
+        return found + cannot
+    unreadable.extend(cannot)
     return found
 
 
@@ -259,10 +276,12 @@ def _wall():
     Linux; elsewhere the wall refuses before any change) and is removed once the probe has run. A descriptor
     held at the wall with an owner for signals or the asynchronous flag set is named in the refusal
     (``descriptor_signals.<number>``), so the host loads nothing: through it a plugin could make the kernel
-    signal another process."""
+    signal another process. A descriptor whose owner or flags cannot be read is named as well
+    (``descriptor_unreadable.<number>``): the start is refused, never taken on trust."""
     canary, folder, remove = _canary() if sys.platform.startswith("linux") else ("", "", None)
     refused, left = "", []
-    signals = _signal_descriptors() if sys.platform.startswith("linux") else []
+    unreadable = []
+    signals = _signal_descriptors(unreadable) if sys.platform.startswith("linux") else []
     try:
         try:
             wall_linux.apply_wall(_install_paths())
@@ -281,8 +300,9 @@ def _wall():
                 left = remove()
             except OSError:
                 left = ["unknown"]
-    if signals:  # a descriptor through which the walled host could make the kernel signal another process
-        refused = ", ".join(filter(None, [refused] + [SIGNAL_DESCRIPTOR + "." + name for name in signals]))
+    if signals or unreadable:  # a descriptor through which the walled host could (or might) make the kernel signal
+        refused = ", ".join(filter(None, [refused] + [SIGNAL_DESCRIPTOR + "." + name for name in signals]
+                                   + [UNREADABLE_DESCRIPTOR + "." + name for name in unreadable]))
     if left:  # the canary or the write folder is still there: a plugin would not find its folder as it was
         refused = ", ".join(filter(None, [refused, CANARY_LEFT]))
     return record, refused
@@ -293,12 +313,22 @@ CANARY_LEFT = "canary_left"
 # The refusal named, with the descriptor's number after a dot, for a descriptor held at the wall that could
 # make the kernel signal another process (see _signal_descriptors).
 SIGNAL_DESCRIPTOR = "descriptor_signals"
+# The refusal named, with the descriptor's number after a dot ("unknown" when the descriptors cannot be listed),
+# for a descriptor held at the wall whose owner for signals or flags cannot be read.
+UNREADABLE_DESCRIPTOR = "descriptor_unreadable"
 _SIGNAL_TEXT = (
     "The plugin host held a descriptor ({descriptors}) that can make the kernel send a signal to another "
     "process (an owner for signals or the asynchronous flag was set on it before the host shut itself in), "
     "and the sandbox does not keep a plugin from using it, so nothing was loaded. What you can do: start the "
-    "plugin host as the daemon does; whatever starts it must not set an owner for signals (F_SETOWN) or the "
-    "asynchronous flag (O_ASYNC) on a descriptor it hands to the host.")
+    "plugin host as the daemon does; whatever starts it must not set an owner for signals of any kind (a "
+    "process, a process group or a thread: F_SETOWN or F_SETOWN_EX) or the asynchronous flag (O_ASYNC) on a "
+    "descriptor it hands to the host.")
+_UNREADABLE_TEXT = (
+    "The plugin host could not read who gets the signals of a descriptor it held ({descriptors}), or its flags, "
+    "so it could not tell whether a plugin could make the kernel send a signal to another process through it, "
+    "and nothing was loaded. What you can do: start the plugin host as the daemon does, on a Linux kernel that "
+    "reads a descriptor's owner with its kind (F_GETOWN_EX, Linux 2.6.32 and later); whatever starts it must "
+    "hand it only descriptors it can read.")
 _FILTER_ONLY_TEXT = (
     "The wall's record says that its filter, not Landlock, refused {what}, on a kernel whose Landlock (ABI "
     "{abi}) refuses that by itself, so the record shows the filter and not the part of the sandbox that holds "
@@ -707,10 +737,10 @@ def _unproven_detail(record, missing):
     words = wall_linux.why_not_proven(record) or [wall_linux.WORDS["not_loaded"]]
     if CANARY_LEFT in ", ".join(missing):
         words.insert(1, wall_linux.WORDS["canary_left"])
-    named = [name.split(".", 1)[1] for name in ", ".join(missing).split(", ")
-             if name.startswith(SIGNAL_DESCRIPTOR + ".")]
-    if named:
-        words.insert(1, _SIGNAL_TEXT.format(descriptors=", ".join(named)))
+    for code, text in ((UNREADABLE_DESCRIPTOR, _UNREADABLE_TEXT), (SIGNAL_DESCRIPTOR, _SIGNAL_TEXT)):
+        named = [name.split(".", 1)[1] for name in ", ".join(missing).split(", ") if name.startswith(code + ".")]
+        if named:
+            words.insert(1, text.format(descriptors=", ".join(named)))
     writes = record.get("writes") if isinstance(record.get("writes"), dict) else {}
     filtered = [kind for kind in wall_linux.WRITE_KINDS
                 if "writes." + kind in missing and writes.get(kind) == "refused_by_filter"]

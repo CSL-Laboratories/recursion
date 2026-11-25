@@ -50,9 +50,10 @@ def operator(command):
         os._exit(0)
     if command == "fds":
         found = []
-        # The wall refuses the listing of /proc/self/fd, so each number up to the process's own limit is asked.
-        soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-        for number in range(soft if soft != resource.RLIM_INFINITY else os.sysconf("SC_OPEN_MAX")):
+        # The wall refuses the listing of /proc/self/fd, so each number below the largest bound the system
+        # reports is asked: a descriptor above a soft limit lowered after it was opened is still seen.
+        bounds = [limit for limit in resource.getrlimit(resource.RLIMIT_NOFILE) if limit != resource.RLIM_INFINITY]
+        for number in range(max(bounds + [os.sysconf("SC_OPEN_MAX")])):
             try:
                 info = os.fstat(number)
             except OSError:

@@ -1,8 +1,9 @@
 """Control API client over the daemon's owner-only Unix socket (CSL-798 / CSL-738 composition).
 
-``SocketAPI.call(method, params)`` has the same shape as ``ControlAPI.call``, so the CLI (and any
-other surface on this machine) prints what the daemon answered and adds nothing. One connection per
-call: the transport closes a client after any failure, and a CLI makes one call.
+``SocketAPI.call(method, params)`` has the same shape as ``ControlAPI.call``. One connection per
+call: the transport closes a client after any failure. ``start``, ``status`` and ``stop`` each make
+one call and the CLI prints that answer verbatim. ``list`` and ``conditions`` call once per
+``run.list`` page and print one joined answer (``conditions`` reshaped to labels).
 
 When the daemon cannot be reached, or does not answer, the result is ``control_api_unavailable`` with
 what is known about delivery. A Stop that got no answer is never reported as stopped (PRODUCT.md

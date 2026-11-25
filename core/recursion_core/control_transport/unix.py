@@ -169,11 +169,12 @@ def _is_host(address: str) -> bool:
 
 
 def ensure_private_dir(directory: str) -> None:
-    """Create ``directory`` as 0700, or check an existing one is ours, real and 0700.
+    """Create ``directory`` and chmod it to 0700, or check an existing one is ours, real and exactly 0700.
 
-    An existing directory that is a symlink, belongs to another uid, or whose permission bits are
-    not exactly 0700 (any group or other bit, or an owner bit missing, such as 0500) is refused, not
-    repaired: the caller picked the wrong place.
+    ``os.mkdir`` is masked by the process umask, so a directory this function creates is chmod'd to
+    0700 before the check below. An existing directory is not chmod'd. One that is a symlink, belongs
+    to another uid, or whose permission bits are not exactly 0700 (any group or other bit, or an
+    owner bit missing, such as 0500) is refused, not repaired: the caller picked the wrong place.
     """
     require_unix_transport()
     try:

@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from .canonical import parse
-from .errors import Refused, refuse_sqlite_wal_bug
+from .errors import Refused, refuse_sqlite_wal_bug, sqlite_wal_accepted
 from .signing import key_id, parse_public_key, verify
 
 __all__ = [
@@ -123,7 +123,7 @@ _REVOCATION_MAGIC = "csl-revocation-store/v0"
 
 def create_revocation_store(path: str, *, sqlite_wal_bug: str = "refuse") -> None:
     """Installer step: create the durable revoked-key store. Refuses if it exists."""
-    refuse_sqlite_wal_bug(sqlite_wal_bug)
+    refuse_sqlite_wal_bug(sqlite_wal_bug, creating=path)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(fd)
     db = sqlite3.connect(path, isolation_level=None)
@@ -135,6 +135,7 @@ def create_revocation_store(path: str, *, sqlite_wal_bug: str = "refuse") -> Non
         db.execute("INSERT INTO meta VALUES ('magic', ?)", (_REVOCATION_MAGIC,))
     finally:
         db.close()
+    sqlite_wal_accepted(sqlite_wal_bug)  # only once the store is made
 
 
 # A key id in the form ``signing.key_id`` gives it. ``revoke`` stores nothing else, so
@@ -224,6 +225,7 @@ class TrustStore:
             except sqlite3.Error:
                 db.close()
                 raise Refused("revocation_store_invalid") from None
+        sqlite_wal_accepted(sqlite_wal_bug)  # only once the open has succeeded
         return db
 
     @property

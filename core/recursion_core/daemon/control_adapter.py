@@ -62,7 +62,7 @@ from recursion_core.gui.client import ControlClient
 from recursion_core.plugin_security import Refused
 from recursion_core.routes import ClaudeCodeAdapter, CodexAdapter, ConnectionBreaker, RouteService
 from recursion_core.routes import contract as route_contract
-from recursion_core.events.db import SQLITE_WAL_BUG
+from recursion_core.events.db import SQLITE_WAL_BUG, SQLITE_WAL_BUG_UNKNOWN_CHOICE
 from recursion_core.settings import owner_only_file
 
 from . import RUN_ID, TERMINAL
@@ -1258,13 +1258,18 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
 
     ``sqlite_wal_bug`` is the person's setting ``stores.sqlite_wal_bug`` from the daemon's one load at start:
     every store opened here takes it (on an SQLite with the WAL reset bug a store refuses unless it is
-    'accept_risk').
+    'accept_risk'). It is given only here, never in ``plugin_options``: such a key is refused with a
+    ``TypeError`` before any store is made, so the breaker store and the plugin host never take two choices.
     """
     require_launcher_platform()  # Windows: typed PlatformUnsupported; no socket, token file or state is made
     environ = dict(os.environ if environ is None else environ)
     manager = daemon.manager
     if not isinstance(manager, EngineUnitManager):
         raise TypeError('compose_control needs an EngineUnitManager')
+    if 'sqlite_wal_bug' in (plugin_options or {}):
+        raise TypeError('compose_control takes the choice for an SQLite with the WAL reset bug once, as '
+                        'compose_control(..., sqlite_wal_bug=...), and every store opened here takes it; take '
+                        "the key 'sqlite_wal_bug' out of plugin_options. No store was made.")
     state_dir = Path(state_dir)
     if routes is None:
         config = Path(environ.get('XDG_CONFIG_HOME') or str(Path.home() / '.config')) / 'recursion' / ROUTES_FILE
@@ -1289,7 +1294,7 @@ def compose_control(daemon, state_dir, *, environ=None, routes=None, clock=time.
         breaker_unavailable = exc.code if isinstance(exc, Refused) else type(exc).__name__
         log.error('breaker store cannot be opened (%s): every start is refused; reads and Stop still work',
                   breaker_unavailable)
-        if breaker_unavailable == SQLITE_WAL_BUG:
+        if breaker_unavailable in (SQLITE_WAL_BUG, SQLITE_WAL_BUG_UNKNOWN_CHOICE):
             log.error('%s', exc.detail)  # what to do, as the store said it
     else:
         breaker = DurableRouteBreaker(route_breaker, stored)

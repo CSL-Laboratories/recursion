@@ -9,6 +9,7 @@ a test makes lives in its own temporary folder.
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 from pathlib import Path
 import sqlite3
@@ -150,7 +151,7 @@ class TheFourStoresOpenPaths(unittest.TestCase):
 
     def test_the_default_is_refuse(self) -> None:
         for name in OPENERS:
-            for given in ({}, {"sqlite_wal_bug": "refuse"}, {"sqlite_wal_bug": "acept_risk"}):
+            for given in ({}, {"sqlite_wal_bug": "refuse"}):
                 with self.subTest(store=name, given=given):
                     self.assert_refused(name, "3.45.1", **given)
 
@@ -459,6 +460,204 @@ class TheChoiceReachesEveryStoreTheHostOpens(unittest.TestCase):
                 self.assertEqual((inspect.Parameter.KEYWORD_ONLY, "refuse"), (parameter.kind, parameter.default))
         private = inspect.signature(TrustStore._open_store).parameters["sqlite_wal_bug"]
         self.assertEqual("refuse", private.default)
+
+
+UNKNOWN = "store_sqlite_wal_bug_unknown_choice"
+NOT_VALUES = ("acept_risk", "ACCEPT_RISK", "accept_risk ", "", "refused", None, True)
+DB_LOGGER = "recursion_core.events.db"
+class _StoreFolders(unittest.TestCase):
+    """The folders and openers of TheFourStoresOpenPaths, without its tests."""
+    setUp = TheFourStoresOpenPaths.setUp
+    folder = TheFourStoresOpenPaths.folder
+    prepared = TheFourStoresOpenPaths.prepared
+    open_only = TheFourStoresOpenPaths.open_only
+
+
+# The three installer steps, each given the path it makes exclusively and the person's choice as a keyword.
+CREATORS = {
+    "authority ledger": lambda path, **kw: create_ledger(str(path), ANCHOR, **kw),
+    "breaker store": lambda path, **kw: create_breaker_store(str(path), **kw),
+    "revocation store": lambda path, **kw: create_revocation_store(str(path), **kw),
+}
+
+
+@unittest.skipUnless(hasattr(os, "geteuid") and os.name == "posix", POSIX_ONLY)
+class AChoiceThatIsNotAValueIsRefusedOnEverySqlite(_StoreFolders):
+    """A choice other than 'refuse' and 'accept_risk' has a refusal of its own on every SQLite version, before the
+    version is tested, and its words name the value given, the two allowed and where the setting lives."""
+
+    def test_every_store_refuses_a_value_the_setting_does_not_have_on_every_version(self) -> None:
+        for name in OPENERS:
+            for version in ("3.51.3", "3.53.0", "3.45.1", "3.52.0"):
+                for given in NOT_VALUES:
+                    with self.subTest(store=name, version=version, given=given):
+                        folder = self.prepared(name)
+                        before = _listing(folder)
+                        made = mock.patch.object(D.tempfile, "mkdtemp", wraps=D.tempfile.mkdtemp)
+                        tested = mock.patch.object(D, "sqlite_wal_affected", wraps=D.sqlite_wal_affected)
+                        with stub(version), made as mkdtemp, tested as affected, \
+                                self.assertNoLogs(DB_LOGGER, "WARNING"), \
+                                self.assertRaises((Refused, D.StoreError)) as caught:
+                            _close(self.open_only(name, folder, sqlite_wal_bug=given))
+                        code, detail = code_and_detail(caught.exception)
+                        self.assertEqual(UNKNOWN, code)
+                        self.assertEqual(D.sqlite_wal_choice_refusal(given), detail)
+                        self.assertEqual(0, affected.call_count, "refused before the version is tested")
+                        self.assertEqual(before, _listing(folder), "no file is created")
+                        self.assertEqual(0, mkdtemp.call_count, "no folder is made for a fake store")
+
+    def test_the_words_name_the_value_given_the_two_values_and_where_the_setting_lives(self) -> None:
+        message = D.sqlite_wal_choice_refusal("acept_risk")
+        self.assertEqual(
+            "The choice 'acept_risk' is not a value of the setting stores.sqlite_wal_bug, so no store is opened or "
+            "made. Write 'refuse' (the default: a store refuses to open on an SQLite with the WAL reset bug) or "
+            "'accept_risk' (a store opens on it anyway, at your own risk). The setting lives in "
+            "$XDG_CONFIG_HOME/recursion/settings.toml, as sqlite_wal_bug in the table [stores], for the daemon's "
+            'own stores; a program that calls a store itself passes sqlite_wal_bug="refuse" or '
+            'sqlite_wal_bug="accept_risk".', message)
+        self.assertIn("The choice None is", D.sqlite_wal_choice_refusal(None))
+        for value in D.SQLITE_WAL_BUG_CHOICES:
+            self.assertIsNone(D.sqlite_wal_choice_refusal(value))
+        with stub("3.51.3"):
+            self.assertEqual(message, D.sqlite_wal_refusal("acept_risk"))
+
+    def test_the_two_values_are_the_settings_rows_own(self) -> None:
+        self.assertEqual(("refuse", "accept_risk"), D.SQLITE_WAL_BUG_CHOICES)
+        self.assertEqual(settings.DECLARED["stores.sqlite_wal_bug"].allowed, D.SQLITE_WAL_BUG_CHOICES)
+
+    def test_the_composition_logs_what_to_write_instead_when_the_breaker_store_refuses_the_value(self) -> None:
+        from recursion_core.daemon import control_adapter as ca
+        words = D.sqlite_wal_choice_refusal("acept_risk")
+
+        def host(*args, **kwargs):
+            raise _Reached()
+        daemon = mock.Mock(manager=mock.Mock(spec=ca.EngineUnitManager))
+        state = self.root / "state"
+        with mock.patch.object(ca, "DurableRunRegistry"), \
+                mock.patch.object(ca, "open_breaker_store", side_effect=Refused(UNKNOWN, words)), \
+                mock.patch.object(ca, "PluginHost", side_effect=host), \
+                self.assertLogs("recursion_core.daemon", "ERROR") as logs, self.assertRaises(_Reached):
+            ca.compose_control(daemon, state, environ={"XDG_CONFIG_HOME": str(self.root / "config"),
+                                                       "HOME": str(self.root)},
+                               routes={}, sqlite_wal_bug="acept_risk")
+        self.assertIn(words, [record.getMessage() for record in logs.records])
+
+
+@unittest.skipUnless(hasattr(os, "geteuid") and os.name == "posix", POSIX_ONLY)
+class TheWarningIsWrittenOnlyAfterTheOpenHasSucceeded(_StoreFolders):
+    """With 'accept_risk' the warning comes at each open that succeeded, with the same words; a failed open writes
+    no such line."""
+
+    def test_a_second_exclusive_create_writes_no_warning_and_the_first_one_still_does(self) -> None:
+        for name, create in CREATORS.items():
+            with self.subTest(store=name):
+                path = self.folder() / "store.sqlite3"
+                with stub("3.45.1"):
+                    with self.assertLogs(DB_LOGGER, "WARNING") as logs:
+                        create(path, sqlite_wal_bug="accept_risk")
+                    self.assertEqual(
+                        ["stores.sqlite_wal_bug = 'accept_risk': a store opens on SQLite 3.45.1, which has the WAL "
+                         "reset bug; the person accepted the risk"],
+                        [record.getMessage() for record in logs.records])
+                    with self.assertNoLogs(DB_LOGGER, "WARNING"), self.assertRaises(FileExistsError):
+                        create(path, sqlite_wal_bug="accept_risk")
+
+    def test_an_open_that_fails_writes_no_warning(self) -> None:
+        cases = {
+            "authority ledger, opened": ("ledger.sqlite3",
+                                         lambda path: Authority(ANCHOR, str(path), lambda: 0,
+                                                                sqlite_wal_bug="accept_risk")),
+            "breaker store, opened": ("breaker.sqlite3",
+                                      lambda path: ConnectionBreaker(str(path), sqlite_wal_bug="accept_risk")),
+            "revocation store, opened": ("revoked.sqlite3",
+                                         lambda path: TrustStore({}, revocation_store=str(path),
+                                                                 sqlite_wal_bug="accept_risk")),
+        }
+        for name, (file_name, opener) in cases.items():
+            with self.subTest(store=name):
+                path = self.folder() / file_name
+                path.write_bytes(b"not a store")
+                os.chmod(path, 0o600)
+                with stub("3.45.1"), self.assertNoLogs(DB_LOGGER, "WARNING"), self.assertRaises(Refused):
+                    _close(opener(path))
+        with self.subTest(store="event store, in use"):
+            path = self.folder() / "events.sqlite3"
+            with stub("3.45.1"):
+                with self.assertLogs(DB_LOGGER, "WARNING"):
+                    first = D.EventStore(path, sqlite_wal_bug="accept_risk")
+                self.addCleanup(first.close)
+                with self.assertNoLogs(DB_LOGGER, "WARNING"), self.assertRaises(D.StoreError) as caught:
+                    _close(D.EventStore(path, sqlite_wal_bug="accept_risk"))
+            self.assertEqual("store_in_use", caught.exception.code)
+
+    def test_the_words_say_when_the_loaded_sqlite_is_not_affected(self) -> None:
+        with stub("3.53.0"), self.assertLogs(DB_LOGGER, "WARNING") as logs:
+            _close(D.FakeStore(sqlite_wal_bug="accept_risk"))
+        self.assertEqual(["stores.sqlite_wal_bug = 'accept_risk': a store opens on SQLite 3.53.0, which is not "
+                          "affected; the setting is not needed; the person accepted the risk"],
+                         [record.getMessage() for record in logs.records])
+
+
+@unittest.skipUnless(hasattr(os, "geteuid") and os.name == "posix", POSIX_ONLY)
+class AnExistingFileIsTheFirstObstacleOfAnInstallerStep(_StoreFolders):
+    """On every SQLite an installer step given a path that is already there raises the FileExistsError of its
+    exclusive create, not the SQLite refusal, and leaves the file as it was."""
+
+    def test_an_existing_file_raises_file_exists_on_every_version_and_is_untouched(self) -> None:
+        for name, create in CREATORS.items():
+            for version in ("3.45.1", "3.52.0", "3.51.3"):
+                for given in ({}, {"sqlite_wal_bug": "refuse"}, {"sqlite_wal_bug": "accept_risk"}):
+                    with self.subTest(store=name, version=version, given=given):
+                        folder = self.folder()
+                        path = folder / "store.sqlite3"
+                        path.write_bytes(b"kept")
+                        os.chmod(path, 0o600)
+                        with stub(version), self.assertNoLogs(DB_LOGGER, "WARNING"), \
+                                self.assertRaises(FileExistsError) as caught:
+                            create(path, **given)
+                        self.assertEqual((errno.EEXIST, str(path)), (caught.exception.errno, caught.exception.filename))
+                        self.assertEqual(b"kept", path.read_bytes())
+                        self.assertEqual(["store.sqlite3"], _listing(folder))
+
+    def test_a_link_that_leads_nowhere_is_already_there_too(self) -> None:
+        for name, create in CREATORS.items():
+            with self.subTest(store=name):
+                folder = self.folder()
+                path = folder / "store.sqlite3"
+                os.symlink(folder / "nowhere", path)
+                with stub("3.45.1"), self.assertRaises(FileExistsError):
+                    create(path)
+                self.assertEqual(["store.sqlite3"], _listing(folder))
+
+    def test_a_value_the_setting_does_not_have_is_told_before_the_existing_file(self) -> None:
+        for name, create in CREATORS.items():
+            with self.subTest(store=name):
+                path = self.folder() / "store.sqlite3"
+                path.write_bytes(b"kept")
+                with stub("3.51.3"), self.assertRaises(Refused) as caught:
+                    create(path, sqlite_wal_bug="acept_risk")
+                self.assertEqual(UNKNOWN, caught.exception.code)
+
+
+@unittest.skipUnless(hasattr(os, "geteuid") and os.name == "posix", POSIX_ONLY)
+class TheChoiceIsGivenToTheCompositionOnce(_PersonsOwnFolder):
+    """The key 'sqlite_wal_bug' in plugin_options is refused with a TypeError before any store is made."""
+
+    def test_the_key_in_plugin_options_is_refused_and_no_store_is_made(self) -> None:
+        from recursion_core.daemon import control_adapter as ca
+        daemon = mock.Mock(manager=mock.Mock(spec=ca.EngineUnitManager))
+        for options, keyword in (({"sqlite_wal_bug": "accept_risk"}, {"sqlite_wal_bug": "refuse"}),
+                                 ({"sqlite_wal_bug": "refuse"}, {}),
+                                 ({"sqlite_wal_bug": "accept_risk", "gil_probe": None}, {"sqlite_wal_bug": "accept_risk"})):
+            with self.subTest(options=options, keyword=keyword):
+                state = self.tmp / f"state-{len(options)}-{len(keyword)}-{options['sqlite_wal_bug']}"
+                with stub("3.51.3"), mock.patch.object(ca, "DurableRunRegistry"), \
+                        self.assertRaises(TypeError) as caught:
+                    ca.compose_control(daemon, state, environ=self.environ, routes={}, plugin_options=options,
+                                       **keyword)
+                self.assertIn("plugin_options", str(caught.exception))
+                self.assertIn("compose_control(..., sqlite_wal_bug=...)", str(caught.exception))
+                self.assertFalse(os.path.lexists(state), "no store and no folder of the state is made")
 
 
 if __name__ == "__main__":

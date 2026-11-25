@@ -304,10 +304,12 @@ class LinkWayOutEverywhereTests(_KeptCase):
         self.assertEqual(b"sig\n", target.read_bytes())
         store = self.state / "plugin-security" / "revoked.sqlite3"
         store.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(store, store.with_name("revoked.sqlite3.kept"))
         store.symlink_to(target)
         self.assertEqual((1, f"refused: revocation_store_invalid\n{_link(store)}\n", ""),
                          self.main(self.argv("install", self.roots["beta"], "fixture.beta")))
         os.unlink(store)
+        os.rename(store.with_name("revoked.sqlite3.kept"), store)
         self.assertEqual(0, self.main(self.argv("install", self.roots["beta"], "fixture.beta"))[0])
 
 

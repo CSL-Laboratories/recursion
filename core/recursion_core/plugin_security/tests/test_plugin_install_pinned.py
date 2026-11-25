@@ -102,6 +102,7 @@ class _PinCase(ProfileCase):
         from recursion_core.daemon.tests import plugin_fixture as fx
 
         fx.write_install(self.config, trusted=trusted or {"developer": signer.public})
+        fx.ensure_revocation_store(self.state)
         self.release("signed", key=signer, signature="real", version=version)
         result = self.install()
         self.assertEqual(("signed", "signature_valid_trusted_key"), (result["trust"], result["signature"]))
@@ -123,6 +124,7 @@ class PinWrittenTests(_PinCase):
 
         signer = Key()
         fx.write_install(self.config, trusted={"developer": signer.public})
+        fx.ensure_revocation_store(self.state)
         self.release("signed", key=signer, signature="real")
         result = self.install()
         self.assertEqual(1, result["generation"])
@@ -143,6 +145,7 @@ class PinWrittenTests(_PinCase):
                          .read_text(encoding="utf-8"))
         from recursion_core.daemon.tests import plugin_fixture as fx
         fx.write_install(self.config)
+        fx.ensure_revocation_store(self.state)
         self.write_live(good)
         self.assertEqual({"notes.search"}, set(plugins.read_install(self.config / "plugins")["grants"]))
         self.assertEqual([], self.listed()["plugins"])
@@ -346,6 +349,7 @@ class UpgradeTests(_PinCase):
         data = json.loads((FIXTURES / "good" / "install.v1" / "h01-one-trusted-key-one-grant.json")
                           .read_text(encoding="utf-8"))
         fx.write_install(self.config)
+        fx.ensure_revocation_store(self.state)
         self.write_live(data)
         if installed:
             # The grant's digest is the SHA-256 of no bytes: an empty plugin.py.
@@ -388,6 +392,7 @@ class UpgradeTests(_PinCase):
         data = json.loads((FIXTURES / "good" / "install.v1" / "h03-manual-grant-to-an-unsigned-plugin.json")
                           .read_text(encoding="utf-8"))
         fx.write_install(self.config)
+        fx.ensure_revocation_store(self.state)
         self.write_live(data)
         self.release("unsigned")
         self.install()

@@ -43,6 +43,8 @@ class LiveCase(PublishCase):
         path = live / "install.json"
         path.write_bytes((json.dumps(data) + "\n").encode("utf-8"))
         os.chmod(path, 0o600)
+        from recursion_core.daemon.tests import plugin_fixture as fx
+        fx.ensure_revocation_store(self.state)
 
     def read_live(self):
         return json.loads((self.live() / "install.json").read_text(encoding="utf-8"))

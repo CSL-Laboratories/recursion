@@ -268,6 +268,7 @@ class TextsSayWhatHappensTests(_AnswerCase):
 
         signer = Key()
         fx.write_install(self.config, trusted={"developer": signer.public})
+        fx.ensure_revocation_store(self.state)
         self.release("signed", key=signer, signature="real")
         self.install()
         self.release("beta", plugin_id=BETA)

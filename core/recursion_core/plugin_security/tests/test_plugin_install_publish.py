@@ -452,6 +452,8 @@ class TrustRuleTests(PublishCase):
         os.chmod(live, 0o700)
         (live / "install.json").write_bytes(b"{}\n")
         os.chmod(live / "install.json", 0o600)
+        from recursion_core.daemon.tests import plugin_fixture as fx
+        fx.ensure_revocation_store(self.state)
         for name in ("manifest.json", "plugin.py"):
             (live / "fixture.unsigned" / name).write_bytes((release / name).read_bytes())
             os.chmod(live / "fixture.unsigned" / name, 0o600)
@@ -505,6 +507,8 @@ class TrustRuleTests(PublishCase):
         os.chmod(self.config.parent, 0o700)
         (live / "install.json").write_bytes((json.dumps({"grants": [grant]}) + "\n").encode("utf-8"))
         os.chmod(live / "install.json", 0o600)
+        from recursion_core.daemon.tests import plugin_fixture as fx
+        fx.ensure_revocation_store(self.state)
 
     def _grants_now(self):
         from recursion_core.daemon import plugins as daemon_plugins

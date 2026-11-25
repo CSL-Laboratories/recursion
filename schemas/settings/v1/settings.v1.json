@@ -60,6 +60,12 @@
           },
           "default": [],
           "description": "The settings whose value is shown although the name holds a word of status.hidden_names, each named whole as status shows it (such as db.api_token); empty as shipped. Each start and each status that uses this list says so in a note that names those settings. A text that looks like a key or password and the sign-in of an address stay hidden in such a value."
+        },
+        "digest_chars": {
+          "type": "integer",
+          "minimum": 6,
+          "default": 8,
+          "description": "How many hex characters of the SHA-256 digest of a key's whole text a key cut at the cap carries in a note, so two long keys that differ only past the cap read apart; a key that fits the cap carries none. The least is 6, since below it two keys read the same too often; past 64, the whole digest, nothing more is shown, so 64 is the advised most."
         }
       },
       "additionalProperties": true

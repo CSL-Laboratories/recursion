@@ -11,6 +11,7 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
 | `status.value_max_chars` | integer, or the string `"none"` | `80` | The most characters of one value that status, the start log and a note show; what is past it is cut and counted, a list shows the names that fit and how many more, and "none" shows every value whole. The least is 40, so the words that say what is cut or hidden always fit. |
 | `status.hidden_names` | list of strings | `["key", "keys", "token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "credential", "credentials"]` | The words that hide a setting's value: status, the start log and a note never show the value of a setting whose name holds one of them, whatever the value looks like (a name's words stand between dots, underscores and dashes). The words a settings file lists are added to these shipped words, which no settings file can take away; an empty list keeps the shipped words alone. To show one setting's value anyway, name that setting in status.shown_names. |
 | `status.shown_names` | list of strings | `[]` | The settings whose value is shown although the name holds a word of status.hidden_names, each named whole as status shows it (such as db.api_token); empty as shipped. Each start and each status that uses this list says so in a note that names those settings. A text that looks like a key or password and the sign-in of an address stay hidden in such a value. |
+| `status.digest_chars` | integer, 6 or more (64 advised at most) | `8` | How many hex characters of the SHA-256 digest of a key's whole text a key cut at the cap carries in a note, so two long keys that differ only past the cap read apart; a key that fits the cap carries none. The least is 6, since below it two keys read the same too often; past 64, the whole digest, nothing more is shown, so 64 is the advised most. |
 
 ## What holds for the file
 
@@ -35,7 +36,9 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
   any advice, and every note; it takes no argument and writes nothing. The daemon logs the same lines at start.
 - Every value those lines and the notes show passes one cap, `status.value_max_chars` (40 or more): a text
   past it is cut, with the count of characters not shown; a list shows the names that fit whole and how
-  many more; `"none"` shows every value whole.
+  many more; `"none"` shows every value whole. A key of the file is capped the same way: a key that is cut
+  carries the first `status.digest_chars` hex characters (8 as shipped) of the SHA-256 of its whole
+  text, said to be a digest, so two keys never read the same; a key that fits is shown whole.
 - Never shown, under any cap and under `"none"`, not in part and not by its length: the value of a setting
   whose name holds a word of `status.hidden_names` (the first net: by name, whatever the value looks like);
   the sign-in of a web address, what stands between the scheme and the host, also without a scheme and

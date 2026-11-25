@@ -11,6 +11,7 @@ import collections
 import contextlib
 import copy
 import functools
+import hashlib
 import inspect
 import io
 import json
@@ -117,7 +118,8 @@ class TheFileAndItsDefaults(_Folder):
                           "status.hidden_names = ['key', 'keys', 'token', 'tokens', 'secret', 'secrets', 'password'], "
                           "and 4 more (default ['key', 'keys', 'token', 'tokens', 'secret', 'secrets', 'password'], "
                           "and 4 more; source: default)",
-                          "status.shown_names = [] (default []; source: default)"],
+                          "status.shown_names = [] (default []; source: default)",
+                          "status.digest_chars = 8 (default 8; source: default; advised: at most 64)"],
                          settings.lines(loaded))
 
     def test_a_dotted_key_is_the_same_setting(self) -> None:
@@ -1606,7 +1608,7 @@ class NoSecretAndOneLineInEveryShownValue(_Folder):
             with self.subTest(name=name[-4:]):
                 self.put(f"version = 1\n{name} = 1\n")
                 details.append(settings.load(self.environ).notes[0].detail)
-                self.assertRegex(details[-1], r"^'(x\.)?k+\.\.\. \(\d+ more, digest [0-9a-f]{6}\) is ")
+                self.assertRegex(details[-1], r"^'(x\.)?k+\.\.\. \(\d+ more, digest [0-9a-f]{8}\) is ")
         self.assertEqual(4, len(set(details)))
         big = "k" * 60000
         self.put(f"version = 1\n{big} = 1\n")
@@ -1833,6 +1835,159 @@ class TheVersionTheSchemaCannotTell(_Folder):
         loaded = settings.load(self.environ)
         self.assert_default(loaded, settings.UNREADABLE)
         self.assertIn("version must be 1, found 1.0; write `version = 1`", loaded.notes[0].detail)
+
+
+def _sha(text: str, chars: int = 8) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:chars]
+
+
+START_FORM = r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} \[" + str(os.getpid()) + r"\] (INFO|WARNING) recursion_core\.daemon: "
+UNKNOWN_WORDS = " is not a setting this version knows; it is skipped; remove it or check its spelling"
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class AKeyIsCappedAndACutKeyCarriesItsDigest(_Folder):
+    """The two rounds joined: a key is capped like every shown value and a cut key carries the first characters
+    of the SHA-256 of its whole text (the row status.digest_chars); a key that looks like a key carries its
+    ordinal only; each start line keeps its time and process id, once per start, on the stderr of the moment."""
+
+    def start(self, err: io.StringIO) -> None:
+        TheStartLinesWhateverLoggingHeldBefore.start(self, err)
+
+    def bare_logging(self, handlers=()) -> None:
+        root, own = logging.getLogger(), logging.getLogger("recursion_core.daemon")
+        kept = (root.handlers[:], root.level, own.handlers[:], own.level)
+
+        def restore() -> None:
+            root.handlers[:], own.handlers[:] = kept[0], kept[2]
+            root.setLevel(kept[1])
+            own.setLevel(kept[3])
+        self.addCleanup(restore)
+        root.handlers[:] = list(handlers)
+        own.handlers[:] = []
+
+    def test_the_join_two_long_keys_read_apart_a_hidden_value_shows_nothing_and_each_start_line_keeps_time_and_pid(self) -> None:
+        # One test that is red when either half is cut: the start lines' time and process id, or the cap's
+        # digest of a cut key and its hidden value.
+        first, second = "a" * 100, "a" * 90 + "b" * 10
+        secret = "plainsecret14c"
+        row = settings.Setting("test.api_key", str, "plain default", "A key.")
+        rows = settings.SETTINGS + (row,)
+        self.put(f'version = 1\n{first} = 1\n{second} = 1\n[test]\napi_key = "{secret}"\n')
+        self.bare_logging()
+        err = io.StringIO()
+        with mock.patch.multiple(settings, SETTINGS=rows, DECLARED=MappingProxyType({r.name: r for r in rows})):
+            self.start(err)
+        shown = err.getvalue().splitlines()
+        mine = [line for line in shown if "settings file: " in line or "settings: " in line]
+        self.assertTrue(mine, shown)
+        for line in mine:
+            self.assertRegex(line, START_FORM)
+        notes = [line for line in mine if UNKNOWN_WORDS in line]
+        self.assertEqual(2, len(notes), mine)
+        self.assertEqual(2, len(set(notes)))
+        for key, line in zip((first, second), notes):
+            self.assertIn(f"digest {_sha(key)})", line)
+            self.assertNotIn(key, line)
+        valued = [line for line in mine if "test.api_key = " in line]
+        self.assertEqual(1, len(valued), mine)
+        self.assertIn(f"test.api_key = {SHOWN_NAME} (default {SHOWN_NAME}; source: settings file)", valued[0])
+        self.assertNotIn(secret, err.getvalue())
+        self.assertNotIn(str(len(secret)), valued[0].split("recursion_core.daemon: ", 1)[1])
+
+    def test_two_long_keys_that_differ_past_the_cap_read_apart_under_every_cap_and_whole_under_none(self) -> None:
+        first, second = "a" * 100, "a" * 90 + "b" * 10
+        for cap in [*range(40, 131), '"none"']:
+            with self.subTest(cap=cap):
+                self.put(f"version = 1\n{first} = 1\n{second} = 1\n[status]\nvalue_max_chars = {cap}\n")
+                details = [note.detail for note in settings.load(self.environ).notes]
+                self.assertEqual(2, len(set(details)), details)
+                for key, detail in zip((first, second), details):
+                    head = detail[:-len(UNKNOWN_WORDS)]
+                    self.assertTrue(detail.endswith(UNKNOWN_WORDS), detail)
+                    if cap == '"none"' or len(repr(key)) <= cap:
+                        self.assertEqual(repr(key), head)
+                    else:
+                        self.assertLessEqual(len(head), cap)
+                        self.assertTrue(head.endswith(f" more, digest {_sha(key)})"), head)
+        big = "k" * 60000
+        self.put(f"version = 1\n{big} = 1\n")
+        detail = settings.load(self.environ).notes[0].detail
+        self.assertTrue(detail.endswith(UNKNOWN_WORDS), detail)
+        self.assertLessEqual(len(detail) - len(UNKNOWN_WORDS), 80)  # the cap plus the note's own words
+        self.assertIn(f"digest {_sha(big)})", detail)
+
+    def test_the_digest_length_is_the_row_status_digest_chars(self) -> None:
+        key = "k" * 99 + "a"
+        self.put(f"version = 1\n{key} = 1\n")
+        loaded = settings.load(self.environ)
+        self.assertIn("status.digest_chars = 8 (default 8; source: default; advised: at most 64)",
+                      settings.lines(loaded))
+        self.assertIn(f"digest {_sha(key)})", loaded.notes[0].detail)
+        for chars, shown in ((6, 6), (12, 12), (64, 64), (65, 64), (1000, 64)):
+            with self.subTest(chars=chars):
+                self.put(f"version = 1\n{key} = 1\n[status]\ndigest_chars = {chars}\n")
+                loaded = settings.load(self.environ)
+                self.assertEqual(chars, loaded["status.digest_chars"])
+                self.assertRegex(loaded.notes[0].detail, r"digest " + _sha(key, shown) + r"\)")
+                outside = "; outside the advice" if chars > 64 else ""
+                self.assertIn(f"status.digest_chars = {chars} (default 8; source: settings file; advised: at most 64"
+                              f"{outside})", settings.lines(loaded))
+        for found, why in (("5", "found 5; a value below 6 has no meaning; "), ('"none"', "found 'none'; ")):
+            with self.subTest(found=found):
+                self.put(f"version = 1\n{key} = 1\n[status]\ndigest_chars = {found}\n")
+                loaded = settings.load(self.environ)
+                self.assertEqual(8, loaded["status.digest_chars"])
+                self.assertIn(f"status.digest_chars: {why}allowed: a whole number of 6 or more; the default 8 "
+                              "stays in force", [note.detail for note in loaded.notes])
+                self.assertIn(f"digest {_sha(key)})", loaded.notes[0].detail)
+
+    def test_a_key_that_looks_like_a_key_carries_its_ordinal_only_equal_between_two_starts(self) -> None:
+        short, long_ = "ghp_" + "A1b2" * 10, "ghp_" + "C3d4" * 30
+        text = f"version = 1\n{short} = 1\nplain = 1\n{long_} = 1\n"
+        self.put(text)
+        once = [note.detail for note in settings.load(self.environ).notes]
+        twice = [note.detail for note in settings.load(self.environ).notes]
+        self.assertEqual(once, twice)  # two starts of the same file show the same lines
+        hidden = [d for d in once if d.startswith("<hidden key-like name")]
+        self.assertEqual(2, len(hidden), once)
+        self.assertNotEqual(hidden[0], hidden[1])  # two hidden names read apart
+        self.assertEqual(hidden[0].replace(" 1 of this file", " N of this file"),
+                         hidden[1].replace(" 2 of this file", " N of this file"))  # only the ordinal differs
+        self.assertTrue(hidden[0].startswith("<hidden key-like name 1 of this file> is not a setting"), hidden[0])
+        for detail in hidden:
+            for piece in (short, long_, "ghp_", "A1b2", "C3d4", str(len(short)), str(len(long_)), "digest"):
+                self.assertNotIn(piece, detail)
+
+    def test_a_second_start_in_one_process_with_no_earlier_handler_writes_each_start_line_once(self) -> None:
+        self.put(OFF)
+        self.bare_logging()
+        err = io.StringIO()
+        self.start(err)
+        self.start(err)
+        shown = err.getvalue().splitlines()
+        for start in (f"settings file: {self.file}",
+                      "settings: plugin_host.gil_check = false (default true; source: settings file)"):
+            found = [line for line in shown if line.endswith(start)]
+            self.assertEqual(2, len(found), shown)  # one line on each of the two starts
+            for line in found:
+                self.assertRegex(line, START_FORM)
+
+    def test_the_daemons_handler_writes_to_the_stderr_of_the_moment(self) -> None:
+        self.put(OFF)
+        for earlier in (False, True):
+            with self.subTest(earlier=earlier):
+                caller = logging.StreamHandler(io.StringIO())
+                self.bare_logging([caller] if earlier else [])
+                first = io.StringIO()
+                self.start(first)
+                first.close()  # the host shuts the stderr it had at start
+                later = io.StringIO()
+                with mock.patch.object(sys, "stderr", later):
+                    logging.getLogger("recursion_core.daemon").info("a line after the start")
+                self.assertIn("a line after the start", later.getvalue())
+                self.assertNotIn("Logging error", later.getvalue())
+                self.assertRegex(later.getvalue().splitlines()[0], START_FORM)
 
 
 if __name__ == "__main__":

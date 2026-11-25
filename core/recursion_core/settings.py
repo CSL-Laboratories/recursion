@@ -36,7 +36,9 @@ The rules this module keeps:
 * ONE CAP ON A SHOWN VALUE. Every value status, the start log or a note shows passes ``_shown``, whose one
   return goes through the cap of the row ``status.value_max_chars`` (80 characters as shipped, 40 at least;
   ``"none"`` shows every value whole): a text past it is cut and the characters not shown are counted, and
-  a list keeps the names that fit whole and counts the rest.
+  a list keeps the names that fit whole and counts the rest. A key of the file is capped the same way; a key
+  that is cut carries the first characters of the SHA-256 of its whole text, said to be a digest (the row
+  ``status.digest_chars``, 8 as shipped), so two keys never read the same; a key that fits is shown whole.
 * NEVER SHOWN, under any cap and under ``"none"``, not in part and not by its length: the value of a
   setting whose name holds a word of the row ``status.hidden_names`` (the first net: by name, whatever the
   value looks like); the sign-in of a web address, what stands between the scheme and the host, also
@@ -99,10 +101,14 @@ _NO_LIMIT_TEXT = "none"
 VALUE_MAX_CHARS = "status.value_max_chars"  # the row of the one cap on a shown value
 HIDDEN_NAMES = "status.hidden_names"  # the row of the words of a name whose value is never shown
 SHOWN_NAMES = "status.shown_names"  # the row of the settings shown although their name holds such a word
+DIGEST_CHARS = "status.digest_chars"  # the row of how many hex characters of a cut key's digest are shown
 # The words put in place of what is never shown; each fits the least cap, so no cap cuts them.
 _HIDDEN_KEY = "<hidden: looks like a key or password>"
 _HIDDEN_NAME = f"<hidden: name in {HIDDEN_NAMES}>"
 _HIDDEN_SIGN_IN = "<sign-in hidden>"
+# A key of the file that looks like a key or a password: its ordinal among such keys by the file's order, equal
+# between two starts of the same file; no digest, no length and no character of its text.
+_HIDDEN_KEY_NAME = "<hidden key-like name {} of this file>"
 # A text is never shown when it holds a run of this many letters and digits of two kinds or more, a known
 # key prefix or a password label followed by this many more characters, or a PEM block. Each figure is to
 # become a row of the settings file.
@@ -116,7 +122,6 @@ _KEY_LABEL = re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|bearer|tok
 _KEY_PREFIX = re.compile(r"(?<![A-Za-z0-9])(?:%s)[A-Za-z0-9_.+/=-]{%d,}"
                          % ("|".join(re.escape(prefix) for prefix in _KEY_PREFIXES), _KEY_TAIL))
 _SPACE = re.compile(r"(\s+)")
-_KEY_DIGEST_BYTES = 3  # a key that is cut carries this many bytes of a digest of its whole text, in hex; to become a row
 _Advice = tuple[int | float | None, int | float | None]  # (at least, at most)
 
 
@@ -163,12 +168,20 @@ _SHOWN_NAMES_ROW = Setting(
     "whole as status shows it (such as db.api_token); empty as shipped. Each start and each status that uses "
     "this list says so in a note that names those settings. A text that looks like a key or password and the "
     "sign-in of an address stay hidden in such a value.")
+_DIGEST_CHARS_ROW = Setting(
+    DIGEST_CHARS, int, 8,
+    "How many hex characters of the SHA-256 digest of a key's whole text a key cut at the cap carries in "
+    "a note, so two long keys that differ only past the cap read apart; a key that fits the cap carries n"
+    "one. The least is 6, since below it two keys read the same too often; past 64, the whole digest, not"
+    "hing more is shown, so 64 is the advised most.",
+    floor=6, advice=(None, 64))
 SETTINGS: tuple[Setting, ...] = (
     Setting("plugin_host.gil_check", bool, True,
             "Whether each plugin host makes its GIL check; on by default, and a person may turn it off."),
     _VALUE_MAX_CHARS_ROW,
     _HIDDEN_NAMES_ROW,
     _SHOWN_NAMES_ROW,
+    _DIGEST_CHARS_ROW,
 )
 DECLARED = MappingProxyType({row.name: row for row in SETTINGS})
 
@@ -320,10 +333,11 @@ def _piece(value: object) -> str:
     return _one_line(f"a {type(value).__name__}")
 
 
-def _digest(text: str) -> str:
-    """A short digest of the whole ``text``, so that two keys cut at the same place never read the same."""
+def _digest(text: str, chars: int) -> str:
+    """The first ``chars`` hex characters of the SHA-256 of the whole ``text`` as the file holds it (UTF-8), so
+    that two keys cut at the same place never read the same."""
 
-    return hashlib.blake2s(text.encode("utf-8", "surrogatepass"), digest_size=_KEY_DIGEST_BYTES).hexdigest()
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:chars]
 
 
 def _cut(text: str, cap: object, rest: int, names: bool, digest: str = "") -> str:
@@ -341,7 +355,7 @@ def _cut(text: str, cap: object, rest: int, names: bool, digest: str = "") -> st
     return f"{text[:keep]}{said(len(text) - keep)}"
 
 
-def _shown(value: object, cap: object = None, hidden: bool = False, key: bool = False) -> str:
+def _shown(value: object, cap: object = None, hidden: bool = False, key: bool | int = False) -> str:
     """The one way a value becomes text for a person in this module: status, the start log and every note.
 
     Each branch computes text; the one return passes it through the cap, ``cap`` characters (the row
@@ -351,7 +365,8 @@ def _shown(value: object, cap: object = None, hidden: bool = False, key: bool = 
     ``status.hidden_names``) the value is never shown; the sign-in of an address and a text that looks like a
     key or a password are never shown either (``_piece``): the look-alike rule is only a second net. With
     ``key`` (the value is a key of the file) a cut text carries a short digest of the whole key, so that two
-    keys cut at the same place never read the same; a key that fits the cap is shown whole."""
+    keys cut at the same place never read the same; a key that fits the cap is shown whole. The digest has as
+    many hex characters as ``key`` says (the row ``status.digest_chars``), its shipped value when True."""
 
     cap = _VALUE_MAX_CHARS_ROW.default if cap is None else cap
     text, names, rest = (_HIDDEN_NAME if hidden else _piece(value)), [], 0
@@ -366,7 +381,8 @@ def _shown(value: object, cap: object = None, hidden: bool = False, key: bool = 
             names.append(piece)
         rest = len(value) - len(names)
         text = "[" + ", ".join(names) + "]"
-    return _cut(text, cap, rest, bool(names), _digest(str.__str__(value)) if key and isinstance(value, str) else "")
+    chars = _DIGEST_CHARS_ROW.default if key is True else key
+    return _cut(text, cap, rest, bool(names), _digest(str.__str__(value), chars) if key and isinstance(value, str) else "")
 
 
 def _allows_no_limit(row: Setting) -> bool:
@@ -516,16 +532,25 @@ def load(environ) -> Loaded:
     cap = _before_notes(flat, _VALUE_MAX_CHARS_ROW)
     names = _before_notes(flat, _HIDDEN_NAMES_ROW)
     shown = _before_notes(flat, _SHOWN_NAMES_ROW)
+    chars = _before_notes(flat, _DIGEST_CHARS_ROW)
+    hidden_keys = 0
+
+    def key_text(name: str) -> str:  # a key shown is capped with its digest; a key hidden carries its ordinal only
+        nonlocal hidden_keys
+        if _looks_like_a_key(_without_sign_in(name)):
+            hidden_keys += 1
+            return _HIDDEN_KEY_NAME.format(hidden_keys)
+        return _shown(name, cap, key=chars)
     for name, found in flat:
         row = DECLARED.get(name)
         if found is _QUOTED:
-            notes.append(Note(UNKNOWN_KEY, f"{_shown(name, cap, key=True)} is a quoted key that holds a dot, not a setting; "
+            notes.append(Note(UNKNOWN_KEY, f"{key_text(name)} is a quoted key that holds a dot, not a setting; "
                                            "it is skipped; write it without the quotes", warns=True))
         elif row is None:
             known = sorted({*DECLARED, *(n.rsplit(".", 1)[0] for n in DECLARED)})  # its keys and its tables
             close = difflib.get_close_matches(name, known, n=1, cutoff=0.8)  # text only; never applied
             hint = f"; did you mean {close[0]}?" if close else ""
-            notes.append(Note(UNKNOWN_KEY, f"{_shown(name, cap, key=True)} is not a setting this version knows; it is "
+            notes.append(Note(UNKNOWN_KEY, f"{key_text(name)} is not a setting this version knows; it is "
                                            f"skipped; remove it or check its spelling{hint}", warns=True))
         else:
             value, reason = _taken(row, found)

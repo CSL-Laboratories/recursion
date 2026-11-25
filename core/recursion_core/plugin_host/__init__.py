@@ -4,8 +4,8 @@ What this host is and is not. Plugin code runs in this very process. Every frame
 plugin's voice: the plugin can read the daemon's next message and write any frame this host may write,
 by the channel's two descriptors, and neither a guard in this module nor a wall around the process can
 keep it from those descriptors. The guards here (one plugin and one load per host, nothing before hello,
-core requests only from the plugin's own thread) keep an honest plugin in order; they are not a
-boundary. The boundary is on the daemon's side, which must check every request that arrives on the
+core requests only from the plugin's own thread and one at a time) keep an honest plugin in order; they
+are not a boundary. The boundary is on the daemon's side, which must check every request that arrives on the
 channel against that plugin's grant and must take no result on trust (the daemon's reader of this
 channel is a later draft and that rule is its first requirement), and the wall around the process,
 which limits what the process can do to the machine. With this draft alone, do not run a plugin you
@@ -235,7 +235,7 @@ class _Program:
         self._core_ids = count()
         self._thread = get_ident()
         self._plugin_id = self._module = None
-        self._greeted = self._closed = self._gil_latched = False
+        self._greeted = self._closed = self._gil_latched = self._core_pending = False
         self._gil_check, self._gil = DEFAULT_GIL_CHECK, "unknown"
 
     def status(self) -> dict:
@@ -243,6 +243,12 @@ class _Program:
         return {"gil_check": self._gil_check, "gil": self._gil, "accepting_work": not self._gil_latched}
 
     def serve(self):
+        """Send this host's hello, then answer the daemon until the channel ends.
+
+        The channel ends at the end of input, or at the daemon's bye at ANY time, also before the
+        daemon's hello and while a core request waits: the host then sends nothing more (its own
+        hello is already out), reads no later frame and returns, so nothing after a bye is taken.
+        """
         self._channel.send({"type": "hello", "channel": hc.CHANNEL})
         while not self._closed:
             message = self._deferred.popleft() if self._deferred else self._read_peer()
@@ -343,25 +349,40 @@ class _Program:
         return None
 
     def _relay_core(self, request: bytes) -> bytes:
+        """Send one core request for the plugin and return the daemon's answer.
+
+        Core requests do not nest. While one waits for its answer, a second one on the same thread
+        (plugin code that a trace function or a signal handler runs inside that wait) is refused at the
+        plugin's own call before anything is sent or read, so it never waits on the channel or on a
+        lock below it; the first request still gets its own answer, and a request made after it
+        returns is sent as usual.
+        """
         if get_ident() != self._thread:
             raise RuntimeError("core requests run on the plugin dispatch thread")
+        if self._core_pending:
+            raise RuntimeError("core requests do not nest: an earlier core request of this plugin is still "
+                               "waiting for its answer; make this request after that one returns")
         if self._closed:
             raise EOFError("plugin channel ended")
         if type(request) is not bytes:
             raise TypeError("core requests are bytes")
         id_ = next(self._core_ids)
-        self._channel.send({"type": "core", "id": id_, "bytes_b64": base64.b64encode(request).decode("ascii")})
-        while (message := self._read_peer()) is not None:
-            kind = message["type"]
-            if kind == "core" and message["id"] == id_:
-                return base64.b64decode(message["bytes_b64"])
-            if kind == "refusal" and message["id"] == id_:
-                raise hc.ChannelRefusal(message["code"], message["detail"])
-            if kind in ("call", "load"):
-                self._deferred.append(message)
-            else:
-                self._dispatch(message)
-        raise EOFError("plugin channel ended")
+        self._core_pending = True
+        try:
+            self._channel.send({"type": "core", "id": id_, "bytes_b64": base64.b64encode(request).decode("ascii")})
+            while (message := self._read_peer()) is not None:
+                kind = message["type"]
+                if kind == "core" and message["id"] == id_:
+                    return base64.b64decode(message["bytes_b64"])
+                if kind == "refusal" and message["id"] == id_:
+                    raise hc.ChannelRefusal(message["code"], message["detail"])
+                if kind in ("call", "load"):
+                    self._deferred.append(message)
+                else:
+                    self._dispatch(message)
+            raise EOFError("plugin channel ended")
+        finally:
+            self._core_pending = False
 
 
 def main(*, gil_probe: GilProbe | None = None) -> dict:

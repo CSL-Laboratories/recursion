@@ -47,7 +47,7 @@ class AdmitsAsAsked:
     store (control/tests/test_routine_*.py test the store): every trigger start is admitted with the values
     it was asked with, nothing is charged and nothing is kept."""
 
-    def admit_start(self, origin, asked=None, *, charge=True, reread=False, launching=None):
+    def admit_start(self, origin, asked=None, *, charge=True, reread=False, launching=None, key=None):
         answer = {"code": "ok", "start": dict(asked or {})}
         if launching is not None:
             answer["run_id"] = launching()
@@ -55,6 +55,15 @@ class AdmitsAsAsked:
 
     def launched(self, origin, run_id):
         return True
+
+    def recorded(self, origin, run_id):
+        return True
+
+    def give_back(self, origin, run_id):
+        return True
+
+    def settle(self, recorded):
+        return []
 
 
 def make_api(kill: FakeKillTree | None = None, registry=None, starter=None, routines=None):

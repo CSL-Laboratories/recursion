@@ -80,7 +80,12 @@ API is given the core's routine store (``routines``, ``control/routines.py``), a
 is a trigger is first asked of that store (``admit_start``): it is refused ``request_invalid`` with the
 store's code as its detail (``routine_unknown``, ``routine_lease_ended``, ``routine_budget_spent``) and the
 sentence of the one table of words (``text``), or it is charged to the record's budget and goes on. A
-retried start (the same key) is answered as before and charged nothing. With no routine store there is
+retried start (the same key) is answered as before and charged nothing. A charge is for a run that
+exists: the charge is held with the run id until the launch record is stored (``recorded``); when that
+record cannot be stored (the put raises or meets a newer generation) the charge is given back before the
+answer (``give_back``), which says the run was not started and nothing was charged; a same-key start sent
+while the charge is still held takes it; and when the API is built over the store, a charge whose run the
+registry does not hold is given back (``settle``, ``control/routines.py``). With no routine store there is
 no record to run from, so a trigger start is refused ``request_invalid`` / ``routine_store_absent`` before
 anything is written or charged, its sentence saying what is missing and what the person can do; the
 daemon says once in its start lines that plugins cannot start runs until a routine store is configured.
@@ -98,8 +103,9 @@ What travels with a start from a record: only what the record binds. A key of th
 ``tenant``, ``engine``, ``prompt`` and ``client_key`` (``RECORD_START_KEYS``) is refused ``request_invalid``
 / ``routine_unbound_values`` before the store is asked, never handed to the starter. While a start the
 store admitted is being launched the store holds its run id (``admit_start``'s ``launching``, given back
-with ``launched`` once that start answers), so a person's change or removal of the record in that moment
-answers which runs may still start with the values the record had before (``control/routines.py``).
+with ``launched`` once that start answers, before its start lock is let go), so a person's change or
+removal of the record in that moment answers which runs may still start with the values the record had
+before (``control/routines.py``).
 
 Stop decisions and launch records are serialised per run, so a slow or hung cleanup on one run never
 queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed during it.
@@ -199,6 +205,11 @@ class ControlAPI:
         self._stale_stops: set[str] = set()
         self._stop_wanted: set[str] = set()  # Stops that arrived before the launch was recorded
         self._failed: set[str] = set()  # starts that raised but whose start_failed write failed
+        if routines is not None:  # the daemon starts: a charge whose run is not in the run list goes back
+            routines.settle(self._run_recorded)
+
+    def _run_recorded(self, run_id: str) -> bool:
+        return self._registry.get(run_id) is not None
 
     def call(self, method: str, params: Mapping | None = None, *, origin: Mapping | None = None) -> dict:
         """One method. ``origin`` is for an in-process ``run.start`` only (see the module text); a surface's
@@ -294,15 +305,19 @@ class ControlAPI:
             try:
                 return self._start(params, origin, held)
             finally:
+                self._let_go(origin, held)  # before the start lock: a same-key retry is held after this (module text)
                 self._locks.release(self._local.owner, [lock_key])
                 with self._locks_lock:
                     slot[1] -= 1
                     if slot[1] == 0 and self._start_locks.get(slot_key) is slot:
                         del self._start_locks[slot_key]
         finally:
-            for run_id in held:  # this start has answered: its launch call returned or never came
-                self._routines.launched(origin, run_id)
+            self._let_go(origin, held)
             self._exit_owner()
+
+    def _let_go(self, origin: dict | None, held: list) -> None:
+        while held:  # this start has answered: its launch call returned or never came
+            self._routines.launched(origin, held.pop())
 
     def _start(self, params: Mapping, origin: dict | None = None, held: list | None = None) -> dict:
         held = [] if held is None else held
@@ -318,7 +333,8 @@ class ControlAPI:
             # The record as it is now, in the transaction that charges it: still the values read above.
             # Its run id is made in that transaction and held there until this start answers.
             refusal = self._routines.admit_start(origin, {name: params[name] for name in RUN_VALUES}, reread=True,
-                                                 launching=self._new_run_id)
+                                                 launching=self._new_run_id,
+                                                 key=(params["tenant"], key) if isinstance(key, str) else None)
             if refusal["code"] != OK:
                 return {"code": REQUEST_INVALID, "detail": refusal["code"], "text": refusal["text"]}
             held.append(refusal["run_id"])
@@ -348,8 +364,19 @@ class ControlAPI:
                     rec = current
             # Launch intent, then keep the committed snapshot (its generation) on this record. A later
             # outage must not leave Stop holding a copy that has no generation.
-            if self._commit(rec) != "ok":
-                raise _RegistryError("put:StaleGeneration")
+            charged = prior is None and bool(held)  # charged here, with no run record yet (module text)
+            try:
+                failure = None if self._commit(rec) == "ok" else "put:StaleGeneration"
+            except _RegistryError as err:
+                if not charged:
+                    raise
+                failure = str(err)
+            if failure is not None:
+                if charged:
+                    return self._unrecorded(origin, held, run_id, failure)
+                raise _RegistryError(failure)
+            if charged:
+                self._routines.recorded(origin, run_id)  # the record is stored: the charge stands for it
             self._failed.discard(run_id)
         try:
             handle = self._starter({**params, "run_id": run_id})
@@ -385,6 +412,14 @@ class ControlAPI:
             if not self._put_running(current, cgroup):
                 return {"code": START_UNCONFIRMED, "run_id": run_id, "detail": "registry_unavailable"}
             return {"code": STARTED, "run": current, "duplicate": False}
+
+    def _unrecorded(self, origin: dict, held: list, run_id: str, detail: str) -> dict:
+        """The launch record of a start charged here could not be stored: give the charge back, then answer."""
+        given = self._routines.give_back(origin, run_id)
+        if given:
+            held.remove(run_id)  # its hold went with the charge
+        words = WORDS["start_unrecorded" if given else "start_unrecorded_held"].format(detail=detail)
+        return {"code": REGISTRY_UNAVAILABLE, "detail": detail, "charged": not given, "text": words}
 
     def _retry(self, prior: dict) -> dict | None:
         """Answer a same-key retry from the existing record, or None to relaunch it. Caller holds the run lock.

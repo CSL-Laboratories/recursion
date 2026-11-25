@@ -25,7 +25,23 @@ The lease and the budget. ``admit`` is the person's admission: it gives the reco
 afresh. ``ControlAPI`` asks ``admit_start`` before it starts a run whose origin is a trigger: a run is
 refused, and the refusal kept on the record (``last_refusal``) where the person reads it, once the
 lease has ended or the budget is spent; otherwise the start is charged to the budget in the same
-transaction, so of many starts at once no more than the budget are taken. ``bounds_of`` gives the
+transaction, so of many starts at once no more than the budget are taken.
+
+A charge is for a run that exists. The charge of a start is a row of the store (``charges``) that names
+the run id the start is launched under, made in the transaction that charges it (``admit_start`` given
+``launching``), with the tenant and client key the start was sent with. The row is the charge: ``used``
+moves only with it, one up when it is made and one down when it is given back. The API stores the run's
+launch record and then drops the row (``recorded``): the charge stands for a run that is in the run list.
+When the launch record cannot be stored, the API gives the charge back in one transaction with its row
+(``give_back``) before it answers, so nothing was charged and ``last_refusal`` is not touched. A start sent
+again with the same client key while a row of its key is held (the give-back could not be written, or the
+process ended between the charge and the record) takes that row and its run id and is not charged again,
+the budget not read a second time. When the API is built over the store (the daemon starts), every row
+whose run id the run list does not hold is given back (``settle``), with one warning line that names the
+routine and the run id; a row whose run is in the list is dropped and its charge stands. A new admission
+of the record starts its budget afresh and drops its rows; a removal drops them with the record. So
+``used`` counts the runs in the run list and the starts between their charge and their record, never a
+start whose run was not recorded. ``bounds_of`` gives the
 leases a record is bound to and the budgets a start is charged to, each as a list (one entry each
 today): the earliest lease end ends the routine, and every budget must have room.
 
@@ -75,7 +91,10 @@ that run id in the store, in the same transaction that charges the start (or che
 the API says that start has answered (``launched``). A person's ``change`` or ``remove`` of the record in
 that moment still answers ``ok``, and its answer carries ``starting``: the run ids that may still start
 with the values the record had before, and a sentence that says so and what the person can do (stop the
-run). An answer without ``starting`` means that no start admitted before it was still being launched. A
+run). The API lets a start's hold go before it lets go of the start's lock, so a same-key start that
+launches the run again under the same run id is held again only after the earlier hold is gone, and no
+late release of the earlier start can take the later start's hold away. An answer without ``starting``
+means that no start admitted before it was still being launched. A
 run already launched is in the run list with the values it started with; the person stops it there.
 
 What runs today. No daemon composes this store yet: no command of a person reaches it from outside the
@@ -93,6 +112,7 @@ import contextlib
 import datetime
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import time
@@ -125,6 +145,8 @@ CHANGEABLE = ("plugin", "tenant", "engine", "prompt", "lease_seconds", "budget")
 _RECORD_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")   # host.v1.json x-run-request record_id
 _PLUGIN = re.compile(r"[a-z][a-z0-9_.-]{1,63}")     # common.v1.json $defs/owner, less 'host'
 _LABEL = re.compile(r"[A-Za-z0-9._:-]{1,128}")      # common.v1.json $defs/token
+
+_log = logging.getLogger(__name__)
 
 OK = "ok"
 # Every sentence a person reads about a routine: what happened, and the one thing they can do.
@@ -162,6 +184,15 @@ TEXT = {
     "routine_removed_while_starting": "The routine was removed, but a run started from it a moment before was "
                                       "still being launched and may run with what the routine said before "
                                       "({runs}). Stop that run if you do not want it.",
+    "start_unrecorded": "The run could not be recorded, so it was not started: the daemon could not write its "
+                        "run list ({detail}). Nothing was charged to the routine; send the start again.",
+    "start_unrecorded_held": "The run could not be recorded, so it was not started: the daemon could not write "
+                             "its run list ({detail}), and could not give the routine its charge back yet. The "
+                             "charge is held for this start: send the start again with the same key and it is "
+                             "charged once; if no run is recorded for it, it is given back when the daemon "
+                             "starts again.",
+    "charge_given_back": "A charge for run {run_id}, which was never recorded, was given back to the routine "
+                         "{record_id}. No run was started for it, so there is nothing for you to do.",
     "routine_changed": "This routine changed while a run was being started from it, or was changed in its "
                        "store by something other than your own commands, so no run was started and nothing "
                        "was charged. Read the routine, and write it again if it does not say what you want.",
@@ -271,6 +302,9 @@ class RoutineStore:
             db.execute("CREATE TABLE IF NOT EXISTS clocks (name TEXT PRIMARY KEY, value NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS launching (record_id TEXT NOT NULL, run_id TEXT NOT NULL, "
                        "PRIMARY KEY (record_id, run_id))")
+            # A charge whose run record is not stored yet: the row is the charge (module text).
+            db.execute("CREATE TABLE IF NOT EXISTS charges (record_id TEXT NOT NULL, run_id TEXT NOT NULL, "
+                       "tenant TEXT, client_key TEXT, PRIMARY KEY (record_id, run_id))")
 
     @contextlib.contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -376,6 +410,7 @@ class RoutineStore:
             self._stamp(stored, writer)
             stored["admitted_at"] = stored["written_at"]
             self._put(db, stored)
+            db.execute("DELETE FROM charges WHERE record_id = ?", (record["record_id"],))  # a fresh budget
         return {"code": OK, "routine": stored}
 
     def change(self, writer: object, record_id: object, changes: object, *, revision: object) -> dict:
@@ -436,6 +471,7 @@ class RoutineStore:
             if type(record_id) is not str or self._get(db, record_id) is None:
                 return _refused("routine_unknown", str(record_id)[:64])
             db.execute("DELETE FROM routines WHERE record_id = ?", (record_id,))
+            db.execute("DELETE FROM charges WHERE record_id = ?", (record_id,))
             starting = self._starting(db, record_id)
         return _told({"code": OK, "removed": record_id}, starting, "routine_removed_while_starting")
 
@@ -455,6 +491,58 @@ class RoutineStore:
         except sqlite3.Error:
             return False
         return True
+
+    def recorded(self, origin: Mapping, run_id: str) -> bool:
+        """The launch record of ``run_id`` is stored: its charge stands, and its row is dropped (module text).
+        False when the store cannot be written; the row then stays until ``settle`` finds the run listed."""
+        try:
+            with self._write() as db:
+                db.execute("DELETE FROM charges WHERE record_id = ? AND run_id = ?", (origin.get("record_id"), run_id))
+        except sqlite3.Error:
+            return False
+        return True
+
+    def give_back(self, origin: Mapping, run_id: str) -> bool:
+        """No launch record of ``run_id`` was stored: its charge, its row and its hold go in one transaction.
+        True when nothing of it is charged any more; False when the store cannot be written (the row is held)."""
+        try:
+            with self._write() as db:
+                self._give_back(db, origin.get("record_id"), run_id)
+        except sqlite3.Error:
+            return False
+        return True
+
+    def _give_back(self, db: sqlite3.Connection, record_id: str, run_id: str) -> bool:
+        """One step on one row: the row goes, and ``used`` goes down by one only if the row was there."""
+        db.execute("DELETE FROM launching WHERE record_id = ? AND run_id = ?", (record_id, run_id))
+        if db.execute("DELETE FROM charges WHERE record_id = ? AND run_id = ?", (record_id, run_id)).rowcount != 1:
+            return False
+        record = self._get(db, record_id)
+        if record is not None and record["used"] > 0:
+            record["used"] -= 1
+            self._put(db, record)
+        return True
+
+    def settle(self, recorded: Callable[[str], bool]) -> list:
+        """Give back every charge whose run id ``recorded`` says the run list does not hold; drop the row of
+        one it holds. Called when the API is built over this store (module text). A row ``recorded`` cannot
+        answer for (it raises) is left as it is. Answers the ``(record_id, run_id)`` given back."""
+        with self._write() as db:
+            rows = db.execute("SELECT record_id, run_id FROM charges ORDER BY record_id, run_id").fetchall()
+        given = []
+        for record_id, run_id in rows:
+            try:
+                listed = bool(recorded(run_id))
+            except Exception:
+                continue
+            with self._write() as db:
+                if listed:
+                    db.execute("DELETE FROM charges WHERE record_id = ? AND run_id = ?", (record_id, run_id))
+                elif self._give_back(db, record_id, run_id):
+                    given.append((record_id, run_id))
+        for record_id, run_id in given:
+            _log.warning(TEXT["charge_given_back"].format(run_id=run_id, record_id=record_id))
+        return given
 
     def list(self) -> dict:
         """Every record, by id: each names the plugin that may ask for it, its lease, budget and last refusal."""
@@ -478,7 +566,8 @@ class RoutineStore:
 
     # -- the core's check, before a run is started from a record ----------------------------------
     def admit_start(self, origin: Mapping, asked: Mapping | None = None, *, charge: bool = True,
-                    reread: bool = False, launching: Callable[[], str] | None = None) -> dict:
+                    reread: bool = False, launching: Callable[[], str] | None = None,
+                    key: tuple | None = None) -> dict:
         """Whether a start from ``origin``'s record may go on, and what it runs: ``{"code": "ok", "start":
         {...}}`` with the record's ``tenant``, ``engine`` and ``prompt``, else the refusal.
 
@@ -492,7 +581,10 @@ class RoutineStore:
         record changed in between: ``routine_changed``, not the caller's ``routine_differs``. Which refusals
         are kept on the record as ``last_refusal``, and why two are not, is in the module text. With
         ``launching``, the start's run id is made by it in the same transaction and held until ``launched``
-        (the answer carries it as ``run_id``), so a change or removal in between names it.
+        (the answer carries it as ``run_id``), so a change or removal in between names it. With ``charge`` and
+        ``launching`` the charge is a row naming that run id and ``key`` (the start's tenant and client key);
+        a row of the same ``key`` already held is taken instead, with its run id, and nothing is charged again
+        (module text).
         """
         asked = {} if asked is None else asked
         record_id = origin.get("record_id")
@@ -502,6 +594,11 @@ class RoutineStore:
             if record is None or origin.get("record_kind") != RECORD_KIND:
                 return _refused("routine_unknown", str(record_id)[:64])  # not kept: module text
             self._measured(record, now)  # written below on every path: refused or charged
+            taken = None  # the run id of a charge of this start's key that is still held (module text)
+            if charge and launching is not None and key is not None and type(key[1]) is str:
+                row = db.execute("SELECT run_id FROM charges WHERE record_id = ? AND tenant = ? AND client_key = ? "
+                                 "ORDER BY run_id", (record_id, key[0], key[1])).fetchone()
+                taken = row[0] if row is not None else None
             code, differs = None, ()
             leases, budgets = bounds_of(record)
             if origin.get("plugin") != record["plugin"]:
@@ -512,16 +609,22 @@ class RoutineStore:
                 code, differs = ("routine_changed", ()) if reread else ("routine_differs", _differs(record, asked))
             elif charge and any(now[lease["clock"]] >= lease["ends"] for lease in leases):
                 code = "routine_lease_ended"
-            elif charge and any(budget["used"] >= budget["limit"] for budget in budgets):
+            elif charge and taken is None and any(budget["used"] >= budget["limit"] for budget in budgets):
                 code = "routine_budget_spent"
             if code is not None:
+                if taken is not None:  # no run will be recorded under the held charge: it goes back with its row
+                    db.execute("DELETE FROM charges WHERE record_id = ? AND run_id = ?", (record_id, taken))
+                    record["used"] = max(record["used"] - 1, 0)
                 record["last_refusal"] = _kept_refusal(code, _instant(self._wall()), origin, differs)
                 self._put(db, record)
                 return _refused(code, record_id, differs)
-            if charge:
+            if charge and taken is None:
                 record["used"] += 1
             self._put(db, record)
-            run_id = launching() if launching is not None else None
+            run_id = taken if taken is not None else launching() if launching is not None else None
+            if charge and taken is None and run_id is not None:
+                db.execute("INSERT INTO charges (record_id, run_id, tenant, client_key) VALUES (?, ?, ?, ?)",
+                           (record_id, run_id, *(key if key is not None else (None, None))))
             if run_id is not None:
                 db.execute("INSERT OR REPLACE INTO launching (record_id, run_id) VALUES (?, ?)", (record_id, run_id))
         answer = {"code": OK, "start": {name: record[name] for name in RUN_VALUES}}

@@ -161,8 +161,8 @@ class ChangingStore:
     def __init__(self, store, when):
         self.store, self.when, self.reads = store, when, 0
 
-    def admit_start(self, origin, asked=None, *, charge=True, reread=False, launching=None):
-        answer = self.store.admit_start(origin, asked, charge=charge, reread=reread, launching=launching)
+    def admit_start(self, origin, asked=None, *, charge=True, reread=False, launching=None, key=None):
+        answer = self.store.admit_start(origin, asked, charge=charge, reread=reread, launching=launching, key=key)
         if not charge and not reread:
             self.reads += 1
             if self.reads == self.when:
@@ -172,6 +172,15 @@ class ChangingStore:
 
     def launched(self, origin, run_id):
         return self.store.launched(origin, run_id)
+
+    def recorded(self, origin, run_id):
+        return self.store.recorded(origin, run_id)
+
+    def give_back(self, origin, run_id):
+        return self.store.give_back(origin, run_id)
+
+    def settle(self, recorded):
+        return self.store.settle(recorded)
 
 
 class EveryWayToTheLaunchTest(WhatRunsCase):

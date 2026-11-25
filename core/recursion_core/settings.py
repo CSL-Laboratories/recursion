@@ -33,6 +33,23 @@ The rules this module keeps:
   from this environment would take, with their defaults, sources, any advice and any notes. It takes no argument
   and writes nothing. The daemon that holds the one-daemon lock records the path and its values in its
   log at start, with the process id and a time on each line.
+* ONE CAP ON A SHOWN VALUE. Every value status, the start log or a note shows passes ``_shown``, whose one
+  return goes through the cap of the row ``status.value_max_chars`` (80 characters as shipped, 40 at least;
+  ``"none"`` shows every value whole): a text past it is cut and the characters not shown are counted, and
+  a list keeps the names that fit whole and counts the rest.
+* NEVER SHOWN, under any cap and under ``"none"``, not in part and not by its length: the value of a
+  setting whose name holds a word of the row ``status.hidden_names`` (the first net: by name, whatever the
+  value looks like); the sign-in of a web address, what stands between the scheme and the host, also
+  without a scheme and inside a longer text (``postgres://<sign-in hidden>@db/x``); and a text that looks
+  like a key or a password. That look-alike rule is only a second net: it misses a short key, a key of one
+  case or of digits only, a UUID, base64 cut by ``+`` or ``/``, and a key split over a list's items, so
+  such a value under a name not on the list is shown. Every line is one line: a line break, a control
+  character or a direction or format character is shown escaped (``\\n``, ``\\u202e``).
+* A FILE ADDS AND NEVER TAKES AWAY. The words of ``status.hidden_names`` a file lists are added to the
+  shipped words, which no file can take away; an empty or missing list keeps the shipped words alone. A
+  setting named whole in ``status.shown_names`` is shown although its name holds such a word, and every
+  start and every status says so in the note ``settings_shown_anyway``; the look-alike rule and the
+  sign-in rule still hide what they find in its value.
 
 Read at daemon start in this build; a later reload may call ``load`` again. ``load`` keeps no state between
 calls. ``SETTINGS`` is append-only: a row is added, never renamed or given another meaning.
@@ -41,8 +58,10 @@ calls. ``SETTINGS`` is append-only: a row is added, never renamed or given anoth
 from __future__ import annotations
 
 import difflib
+import hashlib
 import math
 import os
+import re
 import stat
 import sys
 import tomllib
@@ -60,6 +79,7 @@ UNREADABLE = "settings_unreadable"
 UNKNOWN_KEY = "settings_unknown_key"
 OUT_OF_RANGE = "settings_value_out_of_range"
 NOT_READ_HERE = "settings_not_read_on_this_system"
+SHOWN_ANYWAY = "settings_shown_anyway"  # a setting named in status.shown_names is shown although its name hides it
 WARNED = "warning: "  # what begins the line of a note that warns, in the start log and in the command
 EXIT_WARNED = 1      # the command's end when a note warns: a key, a table or the whole file skipped (2: usage)
 
@@ -76,6 +96,27 @@ class _NoLimit:
 
 NO_LIMIT = _NoLimit()
 _NO_LIMIT_TEXT = "none"
+VALUE_MAX_CHARS = "status.value_max_chars"  # the row of the one cap on a shown value
+HIDDEN_NAMES = "status.hidden_names"  # the row of the words of a name whose value is never shown
+SHOWN_NAMES = "status.shown_names"  # the row of the settings shown although their name holds such a word
+# The words put in place of what is never shown; each fits the least cap, so no cap cuts them.
+_HIDDEN_KEY = "<hidden: looks like a key or password>"
+_HIDDEN_NAME = f"<hidden: name in {HIDDEN_NAMES}>"
+_HIDDEN_SIGN_IN = "<sign-in hidden>"
+# A text is never shown when it holds a run of this many letters and digits of two kinds or more, a known
+# key prefix or a password label followed by this many more characters, or a PEM block. Each figure is to
+# become a row of the settings file.
+_KEY_RUN = 20
+_KEY_TAIL = 8
+_KEY_PREFIXES = ("sk-", "sk_", "pk_", "rk_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
+                 "glpat-", "xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-", "AKIA", "ASIA", "AIza", "ya29.",
+                 "hf_", "npm_", "pypi-")
+_KEY_RUN_TEXT = re.compile("[A-Za-z0-9]{%d,}" % _KEY_RUN)
+_KEY_LABEL = re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|bearer|token)\b\s*[:=]?\s*\S{%d,}" % _KEY_TAIL)
+_KEY_PREFIX = re.compile(r"(?<![A-Za-z0-9])(?:%s)[A-Za-z0-9_.+/=-]{%d,}"
+                         % ("|".join(re.escape(prefix) for prefix in _KEY_PREFIXES), _KEY_TAIL))
+_SPACE = re.compile(r"(\s+)")
+_KEY_DIGEST_BYTES = 3  # a key that is cut carries this many bytes of a digest of its whole text, in hex; to become a row
 _Advice = tuple[int | float | None, int | float | None]  # (at least, at most)
 
 
@@ -84,7 +125,8 @@ class Setting:
     """One setting with a TOML type and a default.
 
     A list row uses a tuple of strings for its default. For numeric rows, floor is the first
-    meaningful value, advice gives optional inclusive bounds, and allow_no_limit opts in to "none".
+    meaningful value, advice gives optional inclusive bounds, and allow_no_limit opts in to "none". A list
+    row with adds keeps its shipped words: the words of the file are added to them, never put in their place.
     """
 
     name: str
@@ -94,14 +136,39 @@ class Setting:
     floor: int | float | None = None
     allow_no_limit: bool = False
     advice: _Advice | None = None
+    adds: bool = False
 
 
 # Append-only. The type is bool, int, float, str or list. A row that loosens safety has the safe value as
 # its default, so a file that cannot be read as a whole, which leaves every default in force, can never
 # loosen anything.
+_VALUE_MAX_CHARS_ROW = Setting(
+    VALUE_MAX_CHARS, int, 80,
+    "The most characters of one value that status, the start log and a note show; what is past it is cut "
+    'and counted, a list shows the names that fit and how many more, and "none" shows every value whole. '
+    "The least is 40, so the words that say what is cut or hidden always fit.",
+    floor=40, allow_no_limit=True)
+_HIDDEN_NAMES_ROW = Setting(
+    HIDDEN_NAMES, list, ("key", "keys", "token", "tokens", "secret", "secrets", "password", "passwords", "passwd",
+                         "credential", "credentials"),
+    "The words that hide a setting's value: status, the start log and a note never show the value of a setting "
+    "whose name holds one of them, whatever the value looks like (a name's words stand between dots, "
+    "underscores and dashes). The words a settings file lists are added to these shipped words, which no "
+    "settings file can take away; an empty list keeps the shipped words alone. To show one setting's value "
+    "anyway, name that setting in status.shown_names.",
+    adds=True)
+_SHOWN_NAMES_ROW = Setting(
+    SHOWN_NAMES, list, (),
+    "The settings whose value is shown although the name holds a word of status.hidden_names, each named "
+    "whole as status shows it (such as db.api_token); empty as shipped. Each start and each status that uses "
+    "this list says so in a note that names those settings. A text that looks like a key or password and the "
+    "sign-in of an address stay hidden in such a value.")
 SETTINGS: tuple[Setting, ...] = (
     Setting("plugin_host.gil_check", bool, True,
             "Whether each plugin host makes its GIL check; on by default, and a person may turn it off."),
+    _VALUE_MAX_CHARS_ROW,
+    _HIDDEN_NAMES_ROW,
+    _SHOWN_NAMES_ROW,
 )
 DECLARED = MappingProxyType({row.name: row for row in SETTINGS})
 
@@ -154,23 +221,152 @@ def owner_only_file(info: os.stat_result) -> bool:
     return stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022
 
 
-def _shown(value: object) -> str:
+def _looks_like_a_key(text: str) -> bool:
+    """The second net: a text taken for a key or a password by its look. It misses many keys (a short one, one
+    of a single case or of digits only, a UUID, base64 cut by + or /, a key split over a list's items); the
+    first net is the name of the setting (``_hidden_name``)."""
+
+    if "-----BEGIN" in text or _KEY_LABEL.search(text) or _KEY_PREFIX.search(text):
+        return True
+    return any(sum((any(c.islower() for c in run), any(c.isupper() for c in run), any(c.isdigit() for c in run))) >= 2
+               for run in _KEY_RUN_TEXT.findall(text))
+
+
+def _without_sign_in(text: str) -> str:
+    """``text`` with the sign-in of every web address in it replaced by words that say so; the rest stays."""
+
+    if "@" not in text:
+        return text
+    return "".join(_run_without_sign_in(run) for run in _SPACE.split(text))
+
+
+def _run_without_sign_in(run: str) -> str:
+    """One run of text without a space. With a scheme, the sign-in is what stands between ``://`` and the
+    host: up to the last @ before the path, or, where what stands there is no host and port (a password that
+    holds a /), up to the last @ of the run. Without a scheme it is a name, a colon and what follows, up to
+    the last @ of the run. What cannot be told from a host is hidden too. Each step is one pass over the run."""
+
+    last = run.rfind("@")
+    if last < 0:
+        return run
+    mark = run.find("://", 0, last)
+    if mark >= 0:
+        begin = mark + 3
+        ends = [i for i in (run.find(c, begin) for c in "/?#") if i >= 0]
+        authority = run[begin:min(ends, default=len(run))]
+        if "@" in authority:
+            end = begin + authority.rfind("@")
+        else:
+            host = authority.split("]", 1)[1] if authority.startswith("[") and "]" in authority else authority
+            if ":" not in host or host.rsplit(":", 1)[1].isdigit() or host.endswith(":"):
+                return run  # a host, or a host and its port: no sign-in, and an @ after it is in the path
+            end = last
+        return run[:begin] + _HIDDEN_SIGN_IN + run[end:]
+    colon = run.find(":", 0, last)
+    if colon < 0:
+        return run
+    begin = colon
+    while begin > 0 and (run[begin - 1].isalnum() or run[begin - 1] in ".%+~_-"):
+        begin -= 1
+    return run[:begin] + _HIDDEN_SIGN_IN + run[last:]
+
+
+def _hidden_name(name: str, hidden: object) -> bool:
+    """Whether the setting ``name`` holds a word of ``hidden`` (the row ``status.hidden_names``). Its words stand
+    between dots, underscores and dashes, and before a capital that follows a small letter; case is not
+    compared. By name only, whatever the value looks like."""
+
+    listed = {str(word).lower() for word in hidden}
+    words = re.findall(r"[a-z0-9]+", re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name).lower())
+    return any(word in listed for word in words)
+
+
+def _hides(name: str, hidden: object, shown: object) -> bool:
+    """Whether the value of the setting ``name`` is hidden by its name: the name holds a word of ``hidden``
+    (the row ``status.hidden_names``) and is not named in ``shown`` (the row ``status.shown_names``)."""
+
+    return name not in shown and _hidden_name(name, hidden)
+
+
+def _one_line(text: str) -> str:
+    """``text`` with every character that is not printable (a line break, a control character, a direction or
+    format character) written as its escape, so a line never becomes two and never reads as another."""
+
+    if text.isprintable():
+        return text
+    return "".join(c if c.isprintable() else str.__repr__(c)[1:-1] for c in text)
+
+
+def _piece(value: object) -> str:
+    """The whole text of one value before the cap. Only ``_shown`` calls it (and it calls itself for a list in
+    a list); a value of a kind added later gets its text here and meets the cap in ``_shown``."""
+
     if value is NO_LIMIT:
         return "no limit"
-    if isinstance(value, tuple):  # a validated list of names
-        return "[" + ", ".join(repr(name) for name in value) + "]"
+    if isinstance(value, tuple):  # a validated list of names; a list inside one is shown the same way
+        return "[" + ", ".join(_piece(name) for name in value) + "]"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
-        text = repr(value)
-    elif isinstance(value, (int, float)):
+        text = _without_sign_in(str.__str__(value))  # its own text: never a subclass's __str__ or __repr__
+        if _looks_like_a_key(text):  # never shown, not in part and not by its length, whatever the cap
+            return _HIDDEN_KEY
+        return repr(text)
+    if isinstance(value, (int, float)):
         try:
-            text = repr(value)
+            return (float.__repr__ if isinstance(value, float) else int.__repr__)(value)
         except ValueError:  # a whole number past the interpreter's digit limit cannot be printed
-            text = "a whole number too long to show"
-    else:
-        text = f"a {type(value).__name__}"
-    return text if len(text) <= 80 else text[:77] + "..."
+            return "a whole number too long to show"
+    return _one_line(f"a {type(value).__name__}")
+
+
+def _digest(text: str) -> str:
+    """A short digest of the whole ``text``, so that two keys cut at the same place never read the same."""
+
+    return hashlib.blake2s(text.encode("utf-8", "surrogatepass"), digest_size=_KEY_DIGEST_BYTES).hexdigest()
+
+
+def _cut(text: str, cap: object, rest: int, names: bool, digest: str = "") -> str:
+    if rest:  # the names that fit were chosen with room for this count
+        return f"{text}, and {rest} more" if names else f"a list of {rest}, too long to show"
+    if cap is NO_LIMIT or len(text) <= cap:
+        return text
+
+    def said(more: int) -> str:
+        if digest:  # a key: how much more, and the digest of its whole text
+            return f"... ({more} more, digest {digest})"
+        return f"... ({more} more character{'' if more == 1 else 's'} not shown)"
+
+    keep = max(0, cap - len(said(len(text))))  # the count fits inside the cap
+    return f"{text[:keep]}{said(len(text) - keep)}"
+
+
+def _shown(value: object, cap: object = None, hidden: bool = False, key: bool = False) -> str:
+    """The one way a value becomes text for a person in this module: status, the start log and every note.
+
+    Each branch computes text; the one return passes it through the cap, ``cap`` characters (the row
+    ``status.value_max_chars``, its shipped value when None; NO_LIMIT shows it whole). A text past the cap is
+    cut and the characters not shown are counted, the count inside the cap; a list keeps the names that fit
+    whole, never cut inside a name, and counts the rest. With ``hidden`` (the setting's name holds a word of
+    ``status.hidden_names``) the value is never shown; the sign-in of an address and a text that looks like a
+    key or a password are never shown either (``_piece``): the look-alike rule is only a second net. With
+    ``key`` (the value is a key of the file) a cut text carries a short digest of the whole key, so that two
+    keys cut at the same place never read the same; a key that fits the cap is shown whole."""
+
+    cap = _VALUE_MAX_CHARS_ROW.default if cap is None else cap
+    text, names, rest = (_HIDDEN_NAME if hidden else _piece(value)), [], 0
+    if not hidden and isinstance(value, tuple) and value and cap is not NO_LIMIT and len(text) > cap:
+        room = cap - len(f", and {len(value)} more")
+        width = 2  # the two brackets
+        for name in value:
+            piece = _piece(name)
+            width += len(piece) + (2 if names else 0)
+            if width > room:
+                break
+            names.append(piece)
+        rest = len(value) - len(names)
+        text = "[" + ", ".join(names) + "]"
+    return _cut(text, cap, rest, bool(names), _digest(str.__str__(value)) if key and isinstance(value, str) else "")
 
 
 def _allows_no_limit(row: Setting) -> bool:
@@ -178,11 +374,27 @@ def _allows_no_limit(row: Setting) -> bool:
 
 
 def _allowed(row: Setting) -> str:
-    kind = {bool: "true or false", int: "a whole number", float: "a number",
+    kind = {bool: "true or false", int: "a whole number", float: "a finite number",
             str: "a text", list: "a list of strings"}[row.type]
+    floor = row.floor is not None and row.type in (int, float)
+    if floor:
+        kind += f" of {_shown(row.floor)} or more"
     if _allows_no_limit(row):
-        return f'{kind} or "{_NO_LIMIT_TEXT}" for no limit'
+        return f'{kind}{"," if floor else ""} or "{_NO_LIMIT_TEXT}" for no limit'
     return kind
+
+
+def _taken(row: Setting, found: object) -> tuple[object | None, str | None]:
+    """The value in force for ``found``, or None and the reason it is refused."""
+
+    value = _accepted(row, found)
+    if value is None:
+        return None, f"allowed: {_allowed(row)}"
+    if row.floor is not None and type(value) in (int, float) and value < row.floor:
+        return None, f"a value below {_shown(row.floor)} has no meaning; allowed: {_allowed(row)}"
+    if row.adds and isinstance(value, tuple):  # the file's words are added; the shipped ones are never taken away
+        value = tuple(dict.fromkeys((*row.default, *value)))
+    return value, None
 
 
 def _accepted(row: Setting, value: object) -> object | None:
@@ -264,6 +476,19 @@ def _read(path: Path) -> tuple[dict | None, str | None]:
     return doc, None
 
 
+def _before_notes(flat: list, shipped: Setting) -> object:
+    """The value of the row ``shipped`` this file sets (the cap on a shown value, the hidden names), read
+    before any note is written; else the row's default."""
+
+    row = DECLARED.get(shipped.name)
+    held = shipped.default if row is None else row.default
+    for name, found in flat:
+        if row is not None and name == shipped.name:
+            value, why = _taken(row, found)
+            held = held if why is not None else value
+    return held
+
+
 def _defaults() -> dict:
     return {row.name: Value(row.name, row.default, row.default, SOURCE_DEFAULT, row.advice) for row in SETTINGS}
 
@@ -287,40 +512,46 @@ def load(environ) -> Loaded:
         note = Note(UNREADABLE, f"{path} {why}; every default is in force", warns=True)
         return Loaded(str(path), MappingProxyType(values), (note,))
     notes: list[Note] = []
-    for name, found in _flatten({k: v for k, v in (doc or {}).items() if k != "version"}):
+    flat = list(_flatten({k: v for k, v in (doc or {}).items() if k != "version"}))
+    cap = _before_notes(flat, _VALUE_MAX_CHARS_ROW)
+    names = _before_notes(flat, _HIDDEN_NAMES_ROW)
+    shown = _before_notes(flat, _SHOWN_NAMES_ROW)
+    for name, found in flat:
         row = DECLARED.get(name)
         if found is _QUOTED:
-            notes.append(Note(UNKNOWN_KEY, f"{_shown(name)} is a quoted key that holds a dot, not a setting; it is "
-                                           "skipped; write it without the quotes", warns=True))
+            notes.append(Note(UNKNOWN_KEY, f"{_shown(name, cap, key=True)} is a quoted key that holds a dot, not a setting; "
+                                           "it is skipped; write it without the quotes", warns=True))
         elif row is None:
             known = sorted({*DECLARED, *(n.rsplit(".", 1)[0] for n in DECLARED)})  # its keys and its tables
             close = difflib.get_close_matches(name, known, n=1, cutoff=0.8)  # text only; never applied
             hint = f"; did you mean {close[0]}?" if close else ""
-            notes.append(Note(UNKNOWN_KEY, f"{_shown(name)} is not a setting this version knows; it is skipped{hint}",
-                              warns=True))
+            notes.append(Note(UNKNOWN_KEY, f"{_shown(name, cap, key=True)} is not a setting this version knows; it is "
+                                           f"skipped{hint}", warns=True))
         else:
-            value = _accepted(row, found)
-            if value is None:
-                reason = f"allowed: {_allowed(row)}"
-            elif row.floor is not None and type(value) in (int, float) and value < row.floor:
-                reason = f"a value below {_shown(row.floor)} has no meaning"
-            else:
+            value, reason = _taken(row, found)
+            if reason is None:
                 values[name] = Value(name, value, row.default, SOURCE_FILE, row.advice)
                 continue
-            notes.append(Note(OUT_OF_RANGE, f"{name}: found {_shown(found)}; {reason}; "
-                                            f"the default {_shown(row.default)} stays in force"))
+            hide = _hides(name, names, shown)
+            notes.append(Note(OUT_OF_RANGE, f"{name}: found {_shown(found, cap, hide)}; {reason}; "
+                                            f"the default {_shown(row.default, cap, hide)} stays in force"))
+    if shown:  # said at every start and in every status while the list is in use
+        notes.append(Note(SHOWN_ANYWAY, f"the value of each setting named in {SHOWN_NAMES} is shown even where its "
+                                        f"name holds a word of {HIDDEN_NAMES}: {_shown(shown, cap)}; a text that "
+                                        "looks like a key or password and the sign-in of an address stay hidden; "
+                                        f"take a name out of {SHOWN_NAMES} to hide its value again"))
     return Loaded(str(path), MappingProxyType(values), tuple(notes))
 
 
-def _shown_advice(v: Value) -> str:
+def _shown_advice(v: Value, cap: object) -> str:
     if v.advice is None:
         return ""
     lower, upper = v.advice
     bounds = []
     if lower is not None:
-        bounds.append(f"at least {_shown(lower)}")
+        bounds.append(f"at least {_shown(lower, cap)}")
     if upper is not None:
-        bounds.append(f"at most {_shown(upper)}")
+        bounds.append(f"at most {_shown(upper, cap)}")
     if not bounds:
         return ""
     text = f"; advised: {', '.join(bounds)}"
@@ -335,10 +566,18 @@ def _shown_advice(v: Value) -> str:
 def lines(loaded: Loaded) -> list[str]:
     """What status and the daemon's start log show: each setting, its value, default, source and advice, then the notes."""
 
-    # A future secret row must show set or not set here and keep raw values out of notes.
-    out = [f"{v.name} = {_shown(v.value)} (default {_shown(v.default)}; source: {v.source}{_shown_advice(v)})"
-           for v in loaded.values.values()]
-    return out + [f"{WARNED if note.warns else ''}note {note}" for note in loaded.notes]
+    # A row whose name holds a word of status.hidden_names shows words in place of its value and default,
+    # unless status.shown_names names it.
+    held = loaded.values.get(VALUE_MAX_CHARS)
+    cap = _VALUE_MAX_CHARS_ROW.default if held is None else held.value
+    kept = loaded.values.get(HIDDEN_NAMES)
+    names = _HIDDEN_NAMES_ROW.default if kept is None else kept.value
+    anyway = loaded.values.get(SHOWN_NAMES)
+    shown = _SHOWN_NAMES_ROW.default if anyway is None else anyway.value
+    out = [_one_line(f"{v.name} = {_shown(v.value, cap, hide)} (default {_shown(v.default, cap, hide)}; "
+                     f"source: {v.source}{_shown_advice(v, cap)})")
+           for v in loaded.values.values() for hide in (_hides(v.name, names, shown),)]
+    return out + [_one_line(f"{WARNED if note.warns else ''}note {note}") for note in loaded.notes]
 
 
 def main(argv: list[str] | None = None, environ=None, out=None, err=None) -> int:
@@ -351,7 +590,7 @@ def main(argv: list[str] | None = None, environ=None, out=None, err=None) -> int
               "writes nothing)", file=err)
         return 2
     loaded = load(os.environ if environ is None else environ)
-    print(f"settings file: {loaded.path or 'none'}", file=out)
+    print(_one_line(f"settings file: {loaded.path or 'none'}"), file=out)
     uid = os.geteuid() if hasattr(os, "geteuid") else None
     owner = "<your user id>" if uid is None else uid
     whose = (f"{uid} is the user id of the account that ran this command" if uid is not None else

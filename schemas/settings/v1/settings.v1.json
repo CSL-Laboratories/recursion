@@ -22,6 +22,46 @@
         }
       },
       "additionalProperties": true
+    },
+    "status": {
+      "type": "object",
+      "properties": {
+        "value_max_chars": {
+          "type": "integer",
+          "minimum": 40,
+          "default": 80,
+          "description": "The most characters of one value that status, the start log and a note show; what is past it is cut and counted, a list shows the names that fit and how many more, and \"none\" shows every value whole. The least is 40, so the words that say what is cut or hidden always fit."
+        },
+        "hidden_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "key",
+            "keys",
+            "token",
+            "tokens",
+            "secret",
+            "secrets",
+            "password",
+            "passwords",
+            "passwd",
+            "credential",
+            "credentials"
+          ],
+          "description": "The words that hide a setting's value: status, the start log and a note never show the value of a setting whose name holds one of them, whatever the value looks like (a name's words stand between dots, underscores and dashes). The words a settings file lists are added to these shipped words, which no settings file can take away; an empty list keeps the shipped words alone. To show one setting's value anyway, name that setting in status.shown_names."
+        },
+        "shown_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "The settings whose value is shown although the name holds a word of status.hidden_names, each named whole as status shows it (such as db.api_token); empty as shipped. Each start and each status that uses this list says so in a note that names those settings. A text that looks like a key or password and the sign-in of an address stay hidden in such a value."
+        }
+      },
+      "additionalProperties": true
     }
   },
   "additionalProperties": true

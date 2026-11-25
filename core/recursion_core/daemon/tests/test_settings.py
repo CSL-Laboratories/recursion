@@ -112,7 +112,12 @@ class TheFileAndItsDefaults(_Folder):
         self.assertIs(loaded["plugin_host.gil_check"], False)
         self.assertEqual(settings.SOURCE_FILE, loaded.values["plugin_host.gil_check"].source)
         self.assertEqual([], self.codes(loaded))
-        self.assertEqual(["plugin_host.gil_check = false (default true; source: settings file)"],
+        self.assertEqual(["plugin_host.gil_check = false (default true; source: settings file)",
+                          "status.value_max_chars = 80 (default 80; source: default)",
+                          "status.hidden_names = ['key', 'keys', 'token', 'tokens', 'secret', 'secrets', 'password'], "
+                          "and 4 more (default ['key', 'keys', 'token', 'tokens', 'secret', 'secrets', 'password'], "
+                          "and 4 more; source: default)",
+                          "status.shown_names = [] (default []; source: default)"],
                          settings.lines(loaded))
 
     def test_a_dotted_key_is_the_same_setting(self) -> None:
@@ -349,7 +354,7 @@ class OwnerOnlyAndWrongFiles(_Folder):
                 self.put(text)
                 loaded = settings.load(self.environ)
                 self.assert_default(loaded, settings.UNKNOWN_KEY)  # one note, for a whole table too
-                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[len(loaded.values):])
 
     def test_the_command_ends_non_zero_when_a_key_or_table_was_skipped(self) -> None:
         for case, (text, _) in UNKNOWN.items():
@@ -372,7 +377,7 @@ class OwnerOnlyAndWrongFiles(_Folder):
             with self.subTest(case=self.put_broken(case)):
                 loaded = settings.load(self.environ)
                 self.assert_default(loaded, settings.UNREADABLE)
-                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[len(loaded.values):])
 
     def test_the_command_ends_non_zero_for_a_file_that_cannot_be_read_as_a_whole(self) -> None:
         for case in BROKEN:
@@ -440,7 +445,8 @@ class OwnerOnlyAndWrongFiles(_Folder):
                     self.assertEqual(expect, loaded["test.limit"])
                     self.assertEqual(codes, self.codes(loaded))
                     if codes:
-                        reason = "a value below 1 has no meaning" if found == "0" else "allowed: a whole number"
+                        reason = ("a value below 1 has no meaning; " if found == "0" else "") + \
+                            "allowed: a whole number of 1 or more"
                         self.assertEqual(f"test.limit: found {found}; {reason}; the default 5 stays in force",
                                          loaded.notes[0].detail)
 
@@ -474,7 +480,7 @@ class LimitsNamesAndAdvice(_Folder):
                 self.assertEqual([], self.codes(loaded))
 
     def test_a_row_must_opt_in_to_no_limit(self) -> None:
-        for kind, default, allowed in ((int, 5, "a whole number"), (float, 5.0, "a number"),
+        for kind, default, allowed in ((int, 5, "a whole number"), (float, 5.0, "a finite number"),
                                        (bool, True, "true or false")):
             with self.subTest(kind=kind):
                 row = settings.Setting("test.limit", kind, default, "A test row.")
@@ -503,7 +509,7 @@ class LimitsNamesAndAdvice(_Folder):
                 loaded = self.read(row, text)
                 self.assertEqual(5.0, loaded[row.name])
                 self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
-                self.assertIn('allowed: a number or "none" for no limit;', loaded.notes[0].detail)
+                self.assertIn('allowed: a finite number or "none" for no limit;', loaded.notes[0].detail)
 
     def test_a_string_array_is_in_force(self) -> None:
         row = settings.Setting("test.names", list, ("fallback",), "Names.")
@@ -575,7 +581,8 @@ class LimitsNamesAndAdvice(_Folder):
         self.assertEqual(5, loaded[row.name])
         self.assertEqual(settings.SOURCE_DEFAULT, loaded.values[row.name].source)
         self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
-        self.assertEqual("test.length: found -1; a value below 0 has no meaning; the default 5 stays in force",
+        self.assertEqual("test.length: found -1; a value below 0 has no meaning; allowed: a whole number of 0 or more; "
+                         "the default 5 stays in force",
                          loaded.notes[0].detail)
         loaded = self.read(row, "0")
         self.assertEqual(0, loaded[row.name])
@@ -607,7 +614,8 @@ class LimitsNamesAndAdvice(_Folder):
         self.assertEqual(1.5, loaded[row.name])
         self.assertEqual(settings.SOURCE_DEFAULT, loaded.values[row.name].source)
         self.assertEqual([settings.OUT_OF_RANGE], self.codes(loaded))
-        self.assertEqual("test.span: found -0.5; a value below 0 has no meaning; the default 1.5 stays in force",
+        self.assertEqual("test.span: found -0.5; a value below 0 has no meaning; allowed: a finite number of 0 or "
+                         "more; the default 1.5 stays in force",
                          loaded.notes[0].detail)
         loaded = self.read(row, "0.0")
         self.assertEqual(0.0, loaded[row.name])
@@ -1103,7 +1111,7 @@ class PublishedShape(_Folder):
     def test_the_schema_declares_exactly_the_table(self) -> None:
         schema = json.loads((SCHEMA_DIR / "settings.v1.json").read_text(encoding="utf-8"))
         self.assertEqual({"const": settings.FILE_VERSION}, schema["properties"]["version"])
-        kinds = {bool: "boolean", int: "integer", float: "number", str: "string"}
+        kinds = {bool: "boolean", int: "integer", float: "number", str: "string", list: "array"}
         found = {}
 
         def walk(props: dict, prefix: str) -> None:
@@ -1117,7 +1125,8 @@ class PublishedShape(_Folder):
                                            part.get("minimum"), part.get("maximum"))
 
         walk(schema["properties"], "")
-        expect = {r.name: (kinds[r.type], r.default, r.says, r.floor, None) for r in settings.SETTINGS}
+        expect = {r.name: (kinds[r.type], list(r.default) if r.type is list else r.default, r.says, r.floor, None)
+                  for r in settings.SETTINGS}
         self.assertEqual(expect, found)
 
     def test_the_schema_describes_the_readers_version_type(self) -> None:
@@ -1153,6 +1162,465 @@ class PublishedShape(_Folder):
         self.assertEqual({settings.SOURCE_FILE}, {v.source for v in loaded.values.values()})
         self.put(bad[0].read_text(encoding="utf-8"))
         self.assert_default(settings.load(self.environ), settings.OUT_OF_RANGE)
+
+
+CAP_KEY = "status.value_max_chars"
+# Stand-ins built at run time, so that no text of this file has the shape of a key. (the text, its part that
+# must never be shown)
+KEY_LIKE = (
+    ("s" + "k-proj-" + "Zq7Lm2Xc9Vb4Nn8Kk1Jj6Hh3", "Zq7Lm2Xc9Vb4Nn8Kk1Jj6Hh3"),
+    ("gh" + "p_" + "a1b2c3d4e5f6g7h8", "a1b2c3d4e5f6g7h8"),
+    ("AK" + "IA" + "QWERTYUIOP123456", "QWERTYUIOP123456"),
+    ("-----" + "BEGIN OPENSSH PRIVATE KEY----- " + "b3BlbnNzaC1rZXktdjE", "b3BlbnNzaC1rZXktdjE"),
+    ("pass" + "word = " + "hunter2hunter2", "hunter2hunter2"),
+    ("Bear" + "er " + "eyJhbGciOiJIUzI1NiJ9", "eyJhbGciOiJIUzI1NiJ9"),
+    ("Q2hhbmdl" + "IHRoaXMgYmVmb3JlIHVzZQ", "Q2hhbmdlIHRoaXMgYmVmb3JlIHVzZQ"),
+)
+ORDINARY = ("Ada", "plugin_host.gil_check", "csl-238-settings-no-limit-list-20261121", "/home/user2/projects/foo",
+            "123e4567-e89b-12d3-a456-426614174000", "internationalization", "a token budget of 5", "")
+class OneCapOnEveryShownValue(_Folder):
+    """No value status, the start log or a note shows escapes the one cap, and no key-like text is shown."""
+
+    def declared(self, *rows: settings.Setting):
+        return mock.patch.multiple(settings, SETTINGS=rows,
+                                   DECLARED=MappingProxyType({row.name: row for row in rows}))
+
+    def test_the_two_lists_of_the_reproduction_stay_within_the_cap(self) -> None:
+        three = settings._shown(("x" * 30,) * 3)
+        name = "'" + "x" * 30 + "'"
+        self.assertEqual(f"[{name}, {name}], and 1 more", three)
+        sixty = settings._shown(tuple("y" * 30 for _ in range(60)))
+        name = "'" + "y" * 30 + "'"
+        self.assertEqual(f"[{name}], and 59 more", sixty)
+        self.assertEqual((80, 47), (len(three), len(sixty)))
+
+    def test_a_text_a_number_and_a_list_at_the_cap_and_one_past(self) -> None:
+        self.assertEqual(repr("a" * 78), settings._shown("a" * 78))  # 80 characters with its quotes
+        cut = settings._shown("a" * 79)
+        self.assertEqual(repr("a" * 79)[:46] + "... (35 more characters not shown)", cut)
+        self.assertEqual(80, len(cut))
+        self.assertEqual(repr("a" * 500)[:45] + "... (457 more characters not shown)", settings._shown("a" * 500))
+        self.assertEqual("9" * 80, settings._shown(int("9" * 80)))
+        self.assertEqual("9" * 46 + "... (35 more characters not shown)", settings._shown(int("9" * 81)))
+        b, c = "'" + "b" * 36 + "'", "'" + "c" * 36 + "'"
+        self.assertEqual(f"[{b}, {c}]", settings._shown(("b" * 36, "c" * 36)))  # 2 + 38 + 2 + 38 = 80
+        self.assertEqual(f"[{b}], and 1 more", settings._shown(("b" * 36, "c" * 37)))
+        self.assertEqual("['" + "d" * 76 + "']", settings._shown(("d" * 76,)))
+        self.assertEqual("a list of 1, too long to show", settings._shown(("d" * 77,)))
+        self.assertEqual("... (1 more character not shown)", settings._shown(7, 0))
+
+    def test_no_limit_shows_every_value_whole(self) -> None:
+        for value in ("a" * 500, int("9" * 300), tuple("y" * 30 for _ in range(60))):
+            with self.subTest(value=type(value).__name__):
+                self.assertNotIn(" more", settings._shown(value, settings.NO_LIMIT))
+        self.assertEqual(repr("a" * 500), settings._shown("a" * 500, settings.NO_LIMIT))
+        self.assertEqual(2040, len(settings._shown(tuple("y" * 30 for _ in range(60)), settings.NO_LIMIT)))
+
+    def test_every_kind_and_every_branch_passes_the_one_cap(self) -> None:
+        import datetime
+        values = (settings.NO_LIMIT, True, False, 7, -2.5, float("inf"), 10 ** 200, int("f" * 4000, 16),
+                  "z" * 500, KEY_LIKE[0][0], (), ("Ada",) * 40, tuple("y" * 30 for _ in range(60)),
+                  (("a" * 40, "b" * 40), ("c" * 40,)), ["x"] * 50, {"k": "v" * 100}, datetime.date(2026, 11, 24),
+                  object())
+        for cap in (0, 1, 5, 40, 80, 200):
+            for value in values:
+                with self.subTest(cap=cap, value=type(value).__name__):
+                    shown = settings._shown(value, cap)
+                    whole = settings._shown(value, settings.NO_LIMIT)
+                    # within the cap; under a cap shorter than the count itself, only the count is shown
+                    self.assertLessEqual(len(shown), max(cap, 40), shown)
+                    self.assertEqual(len(whole) > cap, shown != whole)
+                    if shown != whole:
+                        self.assertRegex(shown, r"\(\d+ more characters? not shown\)$|, and \d+ more$|"
+                                                r"^a list of \d+, too long to show$")
+
+    def test_every_row_type_meets_the_cap_in_status(self) -> None:
+        rows = (settings.DECLARED[CAP_KEY],
+                settings.Setting("test.flag", bool, True, "A flag."),
+                settings.Setting("test.limit", int, 10 ** 100, "A limit.", allow_no_limit=True),
+                settings.Setting("test.span", float, 1.5, "A span."),
+                settings.Setting("test.word", str, "w" * 300, "A word."),
+                settings.Setting("test.names", list, tuple("n" * 30 for _ in range(60)), "Names."))
+        for cap, cut in (("40", True), ("80", True), ('"none"', False)):
+            with self.subTest(cap=cap):
+                self.put(f"version = 1\n[status]\nvalue_max_chars = {cap}\n")
+                with self.declared(*rows):
+                    shown = settings.lines(settings.load(self.environ))
+                self.assertEqual(len(rows), len(shown))
+                for line in shown[2:3] + shown[4:]:  # the long whole number, text and list
+                    self.assertEqual(cut, " more" in line or "too long to show" in line, line)
+                if cut:
+                    self.assertTrue(all(len(line) < 2 * 80 + 80 for line in shown), shown)
+                else:
+                    self.assertIn("w" * 300, shown[4])
+
+    def test_the_one_cap_is_the_only_way_out_of_shown(self) -> None:
+        tree = ast.parse(inspect.getsource(settings))
+        funcs = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+        returns = [node for node in ast.walk(funcs["_shown"]) if isinstance(node, ast.Return)]
+        self.assertEqual(1, len(returns))
+        self.assertEqual("_cut", returns[0].value.func.id)
+        users = {name for name, func in funcs.items() for node in ast.walk(func)
+                 if isinstance(node, ast.Name) and node.id in ("_piece", "_cut")}
+        self.assertEqual({"_shown", "_piece"}, users)  # _piece calls itself for a list inside a list
+        outside = [sub.id for node in tree.body if not isinstance(node, ast.FunctionDef)
+                   for sub in ast.walk(node) if isinstance(sub, ast.Name) and sub.id in ("_piece", "_cut", "repr")]
+        self.assertEqual([], outside)
+        texts = {name for name, func in funcs.items() for node in ast.walk(func)
+                 if isinstance(node, ast.Name) and node.id == "repr"}
+        self.assertEqual({"_piece"}, texts)  # no other function turns a value into text of its own
+
+    def test_the_cap_is_a_row_of_the_one_file_with_80_and_no_limit(self) -> None:
+        row = settings.DECLARED[CAP_KEY]
+        self.assertIn(row, settings.SETTINGS)
+        self.assertEqual((int, 80, 40, True), (row.type, row.default, row.floor, row.allow_no_limit))
+        self.assertIn("none", row.says)
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_the_file_sets_the_cap_of_every_line_and_note(self) -> None:
+        rows = (settings.DECLARED[CAP_KEY], settings.Setting("test.word", str, "w" * 50, "A word."),
+                settings.Setting("test.limit", int, 5, "A limit."))
+        word = "'wwwww... (46 more characters not shown)"
+        self.put('version = 1\n[status]\nvalue_max_chars = 40\n[test]\nlimit = "' + "y" * 50 + '"\n')
+        with self.declared(*rows):
+            shown = settings.lines(settings.load(self.environ))
+        self.assertEqual([f"{CAP_KEY} = 40 (default 80; source: settings file)",
+                          f"test.word = {word} (default {word}; source: default)",
+                          "test.limit = 5 (default 5; source: default)",
+                          "note settings_value_out_of_range: test.limit: found 'yyyyy... (46 more characters not "
+                          "shown); allowed: a whole number; the default 5 stays in force"], shown)
+        self.put('version = 1\n[status]\nvalue_max_chars = "none"\n[test]\nlimit = "' + "y" * 50 + '"\n')
+        with self.declared(*rows):
+            shown = settings.lines(settings.load(self.environ))
+        self.assertIn(repr("w" * 50), shown[1])
+        self.assertIn(repr("y" * 50), shown[3])
+        self.assertNotIn("not shown", "\n".join(shown))
+
+    def test_a_text_that_looks_like_a_key_is_never_shown_even_in_part(self) -> None:
+        for text, secret in KEY_LIKE:
+            for value in (text, ("Ada", text), (("Ada", text),), "a note: " + text):
+                for cap in (80, 10, settings.NO_LIMIT):
+                    with self.subTest(text=text[:6], value=type(value).__name__, cap=cap):
+                        shown = settings._shown(value, cap)
+                        if cap is settings.NO_LIMIT:
+                            self.assertIn("<hidden: looks like a key or password>", shown)
+                        for i in range(len(secret) - 5):
+                            self.assertNotIn(secret[i:i + 6], shown)
+
+    def test_an_ordinary_text_is_shown(self) -> None:
+        for text in ORDINARY:
+            with self.subTest(text=text):
+                self.assertEqual(repr(text), settings._shown(text, settings.NO_LIMIT))
+                self.assertEqual(repr(text), settings._shown((text,), settings.NO_LIMIT)[1:-1])
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_a_key_in_the_file_is_in_no_line_of_status_or_a_note(self) -> None:
+        text, secret = KEY_LIKE[0]
+        rows = (settings.DECLARED[CAP_KEY], settings.Setting("test.word", str, "usual", "A word."),
+                settings.Setting("test.limit", int, 5, "A limit."), settings.Setting("test.names", list, (), "Names."))
+        self.put(f'version = 1\n[status]\nvalue_max_chars = "none"\n[test]\nword = "{text}"\nlimit = "{text}"\n'
+                 f'names = ["Ada", "{text}"]\n')
+        out = io.StringIO()
+        with self.declared(*rows):
+            self.assertEqual(0, settings.main([], self.environ, out, io.StringIO()))
+        printed = out.getvalue()
+        for i in range(len(secret) - 5):
+            self.assertNotIn(secret[i:i + 6], printed)
+        self.assertIn("test.names = ['Ada', <hidden: looks like a key or password>]", printed)
+        self.assertEqual(3, printed.count("<hidden: looks like a key or password>"))
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_a_note_says_the_floor_and_no_limit_in_what_is_allowed(self) -> None:
+        row = settings.Setting("test.limit", int, 5, "A limit.", floor=1, allow_no_limit=True)
+        for found, reason in (("0", "a value below 1 has no meaning; "), ("2.5", ""), ("true", "")):
+            with self.subTest(found=found):
+                self.put(f"version = 1\n[test]\nlimit = {found}\n")
+                with self.declared(row):
+                    loaded = settings.load(self.environ)
+                self.assertEqual(f'test.limit: found {found}; {reason}allowed: a whole number of 1 or more, or "none" '
+                                 "for no limit; the default 5 stays in force", loaded.notes[0].detail)
+
+
+HIDDEN_KEY = "status.hidden_names"
+SHOWN_NAMES_KEY = "status.shown_names"
+SHOWN_KEY = "<hidden: looks like a key or password>"
+SHOWN_NAME = "<hidden: name in status.hidden_names>"
+# Made-up addresses, built at run time: (the text, its part that must never be shown, what a person reads)
+SIGNED_IN = (
+    ("postgres://" + "admin:" + "S3cr3tP4ss" + "@db/x", "S3cr3tP4ss", "'postgres://<sign-in hidden>@db/x'"),
+    ("https://user:" + "hunter2pass" + "@example.com/", "hunter2pass", "'https://<sign-in hidden>@example.com/'"),
+    ("connect to https://ada:" + "Pw9xQ" + "@example.com:8443/a and wait", "Pw9xQ",
+     "'connect to https://<sign-in hidden>@example.com:8443/a and wait'"),
+    ("admin:" + "S3cr3tP4ss" + "@db.example.com:5432/x", "S3cr3tP4ss", "'<sign-in hidden>@db.example.com:5432/x'"),
+    ("https://" + "adalogin" + "@example.com", "adalogin", "'https://<sign-in hidden>@example.com'"),
+    ("redis://u:" + "p@ss@w0rd" + "@cache:6379", "p@ss@w0rd", "'redis://<sign-in hidden>@cache:6379'"),
+    ("https://u:" + "pa/ss" + "@host/x", "pa/ss", "'https://<sign-in hidden>@host/x'"),
+    ("ftp://ada%3A" + "S3cr3t" + "@files", "S3cr3t", "'ftp://<sign-in hidden>@files'"),
+)
+NO_SIGN_IN = ("https://example.com:8443/path", "https://example.com/u@mail", "ada@example.com", "a:b c@d")
+class NoSecretAndOneLineInEveryShownValue(_Folder):
+    """A start line never shows a secret and never becomes two lines."""
+
+    def declared(self, *rows: settings.Setting):
+        return mock.patch.multiple(settings, SETTINGS=rows,
+                                   DECLARED=MappingProxyType({row.name: row for row in rows}))
+
+    def test_the_sign_in_of_an_address_is_never_shown_and_the_rest_is(self) -> None:
+        for text, secret, whole in SIGNED_IN:
+            for cap in (40, 80, settings.NO_LIMIT):
+                for value in (text, ("Ada", text), (("Ada", text),)):
+                    with self.subTest(text=whole, cap=cap, value=type(value).__name__):
+                        shown = settings._shown(value, cap)
+                        self.assertNotIn(secret, shown)
+                        self.assertNotIn(secret[:4], shown)
+            self.assertEqual(whole, settings._shown(text, settings.NO_LIMIT))
+            self.assertEqual(f"['Ada', {whole}]", settings._shown(("Ada", text), settings.NO_LIMIT))
+        for text in NO_SIGN_IN:
+            with self.subTest(text=text):
+                self.assertEqual(repr(text), settings._shown(text, settings.NO_LIMIT))
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_an_address_in_the_file_is_shown_without_its_sign_in_in_every_line(self) -> None:
+        text, secret, whole = SIGNED_IN[0]
+        rows = (settings.DECLARED[CAP_KEY], settings.Setting("test.word", str, "usual", "A word."),
+                settings.Setting("test.limit", int, 5, "A limit."), settings.Setting("test.names", list, (), "Names."))
+        for cap in ("80", '"none"'):
+            with self.subTest(cap=cap):
+                self.put(f'version = 1\n[status]\nvalue_max_chars = {cap}\n[test]\nword = "{text}"\nlimit = "{text}"\n'
+                         f'names = ["Ada", "{text}"]\n')
+                out = io.StringIO()
+                with self.declared(*rows):
+                    self.assertEqual(0, settings.main([], self.environ, out, io.StringIO()))
+                printed = out.getvalue()
+                self.assertNotIn(secret, printed)
+                self.assertIn(f"test.word = {whole} (default 'usual'; source: settings file)", printed)
+                self.assertIn(f"test.names = ['Ada', {whole}]", printed)
+                self.assertIn(f"test.limit: found {whole}; allowed: a whole number;", printed)
+
+    def test_the_hidden_names_are_a_row_with_the_shipped_words(self) -> None:
+        row = settings.DECLARED[HIDDEN_KEY]
+        self.assertIn(row, settings.SETTINGS)
+        self.assertEqual((list, None), (row.type, row.floor))
+        for word in ("key", "keys", "token", "tokens", "secret", "secrets", "password", "passwords", "passwd",
+                     "credential", "credentials"):
+            self.assertIn(word, row.default)
+        for name, hidden in (("a.api_key", True), ("a.sessionToken", True), ("db.PASSWORD", True),
+                             ("a.secret-path", True), ("a.monkey", False), ("a.keyring", False),
+                             ("a.tokenizer", False), (CAP_KEY, False), (HIDDEN_KEY, False)):
+            with self.subTest(name=name):
+                self.assertEqual(hidden, settings._hidden_name(name, row.default))
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_a_value_under_a_hidden_name_is_never_shown_whatever_it_looks_like(self) -> None:
+        rows = (settings.DECLARED[CAP_KEY], settings.DECLARED[HIDDEN_KEY],
+                settings.Setting("test.api_key", str, "plain default", "A key."),
+                settings.Setting("test.sessionToken", int, 7, "A number."),
+                settings.Setting("test.tokens", list, ("ada",), "Names."),
+                settings.Setting("test.monkey", str, "plain monkey", "A word."))
+        self.put('version = 1\n[status]\nvalue_max_chars = "none"\n[test]\napi_key = "plainword"\n'
+                 'sessionToken = "eleven"\ntokens = ["lin"]\nmonkey = "plainword too"\n')
+        with self.declared(*rows):
+            shown = settings.lines(settings.load(self.environ))
+        self.assertEqual([f"test.api_key = {SHOWN_NAME} (default {SHOWN_NAME}; source: settings file)",
+                          f"test.sessionToken = {SHOWN_NAME} (default {SHOWN_NAME}; source: default)",
+                          f"test.tokens = {SHOWN_NAME} (default {SHOWN_NAME}; source: settings file)",
+                          "test.monkey = 'plainword too' (default 'plain monkey'; source: settings file)",
+                          f"note settings_value_out_of_range: test.sessionToken: found {SHOWN_NAME}; allowed: a "
+                          f"whole number; the default {SHOWN_NAME} stays in force"], shown[2:])
+        for word in ("'plainword'", "plain default", "eleven", "'lin'", "'ada'"):
+            self.assertNotIn(word, "\n".join(shown))
+        # the file's words are added to the shipped ones, and are read before any note is written
+        self.put('version = 1\n[status]\nhidden_names = ["monkey"]\n[test]\napi_key = 7\nmonkey = 8\n')
+        with self.declared(*rows):
+            shown = settings.lines(settings.load(self.environ))
+        self.assertIn(f"test.api_key = {SHOWN_NAME} (default {SHOWN_NAME}; source: default)", shown)
+        self.assertIn(f"note settings_value_out_of_range: test.monkey: found {SHOWN_NAME}; allowed: a text; the "
+                      f"default {SHOWN_NAME} stays in force", shown)
+        self.assertIn(f"note settings_value_out_of_range: test.api_key: found {SHOWN_NAME}; allowed: a text; "
+                      f"the default {SHOWN_NAME} stays in force", shown)
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_a_persons_words_are_added_to_the_shipped_ones_which_stay(self) -> None:
+        rows = (settings.DECLARED[CAP_KEY], settings.DECLARED[HIDDEN_KEY],
+                settings.Setting("test.api_key", str, "plain default", "A key."),
+                settings.Setting("test.passphrase", str, "plain phrase", "A phrase."),
+                settings.Setting("test.monkey", str, "plain monkey", "A word."))
+        shipped = settings.DECLARED[HIDDEN_KEY].default
+        self.put('version = 1\n[status]\nvalue_max_chars = "none"\nhidden_names = ["passphrase", "key"]\n[test]\n'
+                 'api_key = "plainword"\npassphrase = "plainphrase"\nmonkey = "plainmonkey"\n')
+        with self.declared(*rows):
+            loaded = settings.load(self.environ)
+            shown = settings.lines(loaded)
+        self.assertEqual(shipped + ("passphrase",), loaded[HIDDEN_KEY])
+        self.assertEqual(settings.SOURCE_FILE, loaded.values[HIDDEN_KEY].source)
+        self.assertEqual([], self.codes(loaded))
+        self.assertIn(f"test.api_key = {SHOWN_NAME} (default {SHOWN_NAME}; source: settings file)", shown)
+        self.assertIn(f"test.passphrase = {SHOWN_NAME} (default {SHOWN_NAME}; source: settings file)", shown)
+        self.assertIn("test.monkey = 'plainmonkey' (default 'plain monkey'; source: settings file)", shown)
+        for word in ("plainword", "plain default", "plainphrase", "plain phrase"):
+            self.assertNotIn(word, "\n".join(shown))
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_an_empty_or_missing_list_keeps_the_shipped_words_alone(self) -> None:
+        rows = (settings.DECLARED[CAP_KEY], settings.DECLARED[HIDDEN_KEY],
+                settings.Setting("test.api_key", str, "plain default", "A key."),
+                settings.Setting("test.apiToken", str, "plain token", "A token."))
+        shipped = settings.DECLARED[HIDDEN_KEY].default
+        for hidden, source in (("hidden_names = []\n", settings.SOURCE_FILE), ("", settings.SOURCE_DEFAULT)):
+            with self.subTest(hidden=hidden):
+                self.put(f'version = 1\n[status]\n{hidden}[test]\napi_key = "plainword"\napiToken = "plainword"\n')
+                with self.declared(*rows):
+                    loaded = settings.load(self.environ)
+                    shown = "\n".join(settings.lines(loaded))
+                self.assertEqual((shipped, source), (loaded[HIDDEN_KEY], loaded.values[HIDDEN_KEY].source))
+                self.assertEqual([], self.codes(loaded))
+                for word in ("plainword", "plain default", "plain token"):
+                    self.assertNotIn(word, shown)
+                self.assertEqual(2, shown.count(f" = {SHOWN_NAME} (default {SHOWN_NAME}; source: settings file)"))
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_a_name_in_shown_names_is_shown_and_every_start_says_so(self) -> None:
+        hidden_row, shown_row = settings.DECLARED[HIDDEN_KEY], settings.DECLARED[SHOWN_NAMES_KEY]
+        self.assertIn(shown_row, settings.SETTINGS)
+        self.assertEqual((list, ()), (shown_row.type, shown_row.default))
+        for said in ("status.hidden_names", "empty as shipped", "says so in a note", "stay hidden"):
+            self.assertIn(said, shown_row.says)
+        for said in ("added to these shipped words", "no settings file can take away", "an empty list keeps",
+                     "status.shown_names"):
+            self.assertIn(said, hidden_row.says)
+        rows = (settings.DECLARED[CAP_KEY], hidden_row, shown_row,
+                settings.Setting("test.api_key", str, "plain default", "A key."),
+                settings.Setting("test.apiToken", str, "plain token", "A token."))
+        said = ("note settings_shown_anyway: the value of each setting named in status.shown_names is shown even "
+                "where its name holds a word of status.hidden_names: ['test.api_key']; a text that looks like a key "
+                "or password and the sign-in of an address stay hidden; take a name out of status.shown_names to "
+                "hide its value again")
+        self.put('version = 1\n[status]\nvalue_max_chars = "none"\nshown_names = ["test.api_key"]\n[test]\n'
+                 'api_key = "plainword"\napiToken = "plainword too"\n')
+        out = io.StringIO()
+        with self.declared(*rows):
+            loaded = settings.load(self.environ)
+            shown = settings.lines(loaded)
+            self.assertEqual(0, settings.main([], self.environ, out, io.StringIO()))
+        self.assertEqual([settings.SHOWN_ANYWAY], self.codes(loaded))
+        self.assertIn("test.api_key = 'plainword' (default 'plain default'; source: settings file)", shown)
+        self.assertIn(f"test.apiToken = {SHOWN_NAME} (default {SHOWN_NAME}; source: settings file)", shown)
+        self.assertNotIn("plainword too", "\n".join(shown))
+        self.assertEqual(said, shown[-1])
+        self.assertIn(said, out.getvalue().splitlines())
+        # under a name shown anyway, the sign-in of an address stays hidden
+        text, secret, whole = SIGNED_IN[0]
+        self.put('version = 1\n[status]\nshown_names = ["test.api_key"]\n[test]\n'
+                 f'api_key = "{text}"\n')
+        with self.declared(*rows):
+            shown = settings.lines(settings.load(self.environ))
+        self.assertIn(f"test.api_key = {whole} (default 'plain default'; source: settings file)", shown)
+        self.assertNotIn(secret, "\n".join(shown))
+        self.assertEqual(said, shown[-1])
+
+    def test_a_hidden_text_does_not_say_its_length(self) -> None:
+        for text, _ in KEY_LIKE:
+            for value in (text, text * 3, ("Ada", text)):
+                with self.subTest(text=text[:6], value=type(value).__name__):
+                    shown = settings._shown(value, settings.NO_LIMIT)
+                    self.assertIn(SHOWN_KEY, shown)
+                    self.assertNotIn(str(len(text)), shown)
+
+    def test_the_look_alike_rule_is_a_second_net_and_the_words_say_so(self) -> None:
+        for text in ("x." + "sk-" + "abcdefgh12", "(" + "sk-" + "abcdefgh)", "a.b." + "gh" + "p_" + "a1b2c3d4e5"):
+            with self.subTest(text=text):
+                self.assertEqual(SHOWN_KEY, settings._shown(text, settings.NO_LIMIT))
+        readme = (SCHEMA_DIR / "README.md").read_text(encoding="utf-8")
+        for words in (settings.__doc__, readme):
+            for said in ("second net", "a short key", "status.hidden_names", "<sign-in hidden>"):
+                self.assertIn(said, words)
+
+    def test_no_value_can_break_or_disguise_a_line(self) -> None:
+        class Text(str):
+            def __repr__(self):
+                return "1\nplugin_host.gil_check = true"
+
+            def __str__(self):
+                return "2\nplugin_host.gil_check = true"
+
+        class Number(int):
+            def __repr__(self):
+                return "3\nplugin_host.gil_check = true"
+
+        odd = type("Odd\nplugin_host.gil_check = true", (), {})
+        values = (Text("ada"), Number(5), odd(), "a\nb", "a\rb", "abc\u202edcba", "a\u2066b\u2069", "a\x1b[2Jb",
+                  "a\u2028b", "a\x85b", "a\x00b", "a\tb", "\ufeffa", ("Ada", "a\nb"))
+        for i, value in enumerate(values):
+            for cap in (40, settings.NO_LIMIT):
+                with self.subTest(i=i, cap=cap):
+                    shown = settings._shown(value, cap)
+                    self.assertTrue(shown.isprintable(), ascii(shown))
+        self.assertEqual("'ada'", settings._shown(Text("ada"), settings.NO_LIMIT))
+        self.assertEqual("5", settings._shown(Number(5), settings.NO_LIMIT))
+        self.assertEqual("'abc\\u202edcba'", settings._shown("abc\u202edcba", settings.NO_LIMIT))
+        word = settings.Value("test.word", Text("ada"), odd(), settings.SOURCE_DEFAULT)
+        loaded = settings.Loaded("/x", MappingProxyType({"test.word": word}), (settings.Note("x", "a\nb\u202ec"),))
+        self.assertEqual(["test.word = 'ada' (default a Odd\\nplugin_host.gil_check = true; source: default)",
+                          "note x: a\\nb\\u202ec"], settings.lines(loaded))
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_the_settings_file_line_is_one_line(self) -> None:
+        environ = dict(self.environ, XDG_CONFIG_HOME=self.environ["XDG_CONFIG_HOME"] + "/a\nb")
+        out = io.StringIO()
+        self.assertEqual(0, settings.main([], environ, out, io.StringIO()))
+        first = out.getvalue().splitlines()[0]
+        self.assertTrue(first.startswith("settings file: "), first)
+        self.assertTrue(first.endswith("/a\\nb/recursion/settings.toml"), first)
+
+    def test_at_its_least_the_cap_holds_every_word_that_says_what_is_cut_or_hidden(self) -> None:
+        row = settings.DECLARED[CAP_KEY]
+        self.assertEqual(40, row.floor)
+        self.assertIn("The least is 40", row.says)
+        values = ("a" * 300000, "\x00" * 70000, int("9" * 4000), tuple(str(i) for i in range(100000)),
+                  tuple("n" * 60 for _ in range(100000)), KEY_LIKE[0][0], SIGNED_IN[0][0], settings.NO_LIMIT)
+        for i, value in enumerate(values):
+            with self.subTest(i=i):
+                shown = settings._shown(value, row.floor)
+                self.assertLessEqual(len(shown), row.floor, shown)
+        for words in (SHOWN_KEY, SHOWN_NAME, settings._shown("x", row.floor, True)):
+            self.assertLessEqual(len(words), row.floor)
+        self.assertEqual(SHOWN_NAME, settings._shown("x", row.floor, True))
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_a_cap_below_its_least_keeps_the_default_and_says_why(self) -> None:
+        self.put("version = 1\n[status]\nvalue_max_chars = 39\n")
+        loaded = settings.load(self.environ)
+        self.assertEqual(80, loaded[CAP_KEY])
+        self.assertEqual('status.value_max_chars: found 39; a value below 40 has no meaning; allowed: a whole '
+                         'number of 40 or more, or "none" for no limit; the default 80 stays in force',
+                         loaded.notes[0].detail)
+
+    @unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+    def test_a_cut_key_carries_a_digest_of_its_whole_text(self) -> None:
+        one, two = "k" * 99 + "a", "k" * 99 + "b"
+        details = []
+        for name in (one, two, f'"x.{one}"', f'"x.{two}"'):
+            with self.subTest(name=name[-4:]):
+                self.put(f"version = 1\n{name} = 1\n")
+                details.append(settings.load(self.environ).notes[0].detail)
+                self.assertRegex(details[-1], r"^'(x\.)?k+\.\.\. \(\d+ more, digest [0-9a-f]{6}\) is ")
+        self.assertEqual(4, len(set(details)))
+        big = "k" * 60000
+        self.put(f"version = 1\n{big} = 1\n")
+        out = io.StringIO()
+        self.assertEqual(settings.EXIT_WARNED, settings.main([], self.environ, out, io.StringIO()))
+        notes = [line for line in out.getvalue().splitlines() if "not a setting" in line]
+        self.assertEqual(1, len(notes))
+        self.assertLess(len(notes[0]), 200, notes[0])
+        self.assertLessEqual(len(settings._shown(big * 5, 40, key=True)), 40)
+        self.put("version = 1\nkkk = 1\n")
+        detail = settings.load(self.environ).notes[0].detail
+        self.assertTrue(detail.startswith("'kkk' is not a setting this version knows; it is skipped"), detail)
+        self.assertNotIn("digest", detail)
+        self.put(f'version = 1\n{one} = 1\n[status]\nvalue_max_chars = "none"\n')
+        detail = settings.load(self.environ).notes[0].detail
+        self.assertTrue(detail.startswith(f"'{one}' is not a setting this version knows"), detail)
+        self.assertNotIn("digest", detail)
 
 
 class WindowsNoOwnerCheck(_Folder):

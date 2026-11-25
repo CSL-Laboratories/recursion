@@ -242,5 +242,30 @@ class AssertionTests(unittest.TestCase):
         gate.accept(issued, "run")
 
 
+class PairingLinkGrammarTests(unittest.TestCase):
+    HOST = ".".join(["a" * 63] * 4)  # 255 characters: the longest host the grammar allows
+
+    def test_the_longest_link_the_grammar_allows_is_accepted_and_named(self) -> None:
+        self.assertEqual(len(self.HOST), 255)
+        link = pairing.pairing_link(f"https://{self.HOST}:65535/", "o" * 64, "c" * 64)
+        self.assertEqual(link, f"https://{self.HOST}:65535/pair#offer={'o' * 64}&code={'c' * 64}")
+        self.assertEqual(len(link), pairing.PAIRING_LINK_MAX_CHARS)
+        self.assertEqual(pairing.PAIRING_LINK_MAX_CHARS, 415)
+
+    def test_a_port_of_six_digits_is_refused(self) -> None:
+        for port in ("100000", "065535", "000001"):
+            with self.subTest(port=port):
+                with self.assertRaises(PairingRefused) as caught:
+                    pairing.pairing_link(f"https://far.example:{port}", "o" * 8, "c" * 8)
+                self.assertEqual(caught.exception.code, "origin_invalid")
+
+    def test_an_offer_id_or_a_code_of_65_characters_is_refused(self) -> None:
+        for offer_id, code in (("o" * 65, "c" * 64), ("o" * 64, "c" * 65)):
+            with self.subTest(offer_id=len(offer_id), code=len(code)):
+                with self.assertRaises(PairingRefused) as caught:
+                    pairing.pairing_link("https://far.example", offer_id, code)
+                self.assertEqual(caught.exception.code, "offer_invalid")
+
+
 if __name__ == "__main__":
     unittest.main()

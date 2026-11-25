@@ -17,6 +17,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -903,6 +904,80 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(api.grant, {"device": None, "rights": ["read", "run.stop"],
                                      "caps": {"max_frames": RELAY_MAX_FRAMES, "window_s": RELAY_WINDOW_S,
                                               "max_frame_bytes": RELAY_MAX_FRAME_BYTES}})
+
+
+class Lingers(PipeProc):
+    """A child that does not end when its stdin closes: only a kill ends it (a far side that stalls)."""
+
+    def wait(self, timeout=None) -> int:
+        if not self._killed.is_set() and timeout is not None and not self._killed.wait(timeout):
+            raise subprocess.TimeoutExpired("ssh", timeout)
+        return super().wait()
+
+
+class ReplyIdAndCloseGraceTests(unittest.TestCase):
+    REQUEST = {"op": "control", "method": "run.stop", "params": {"run_id": "r"}, "id": 1}
+
+    def setUp(self) -> None:
+        directory = support.scratch_dir(self)
+        self.target = target_for(support.write_known_hosts(directory, [f"far.example {TYPE} {BLOB}"]))
+
+    def client(self, proc: PipeProc, **options) -> SshRelayClient:
+        client = SshRelayClient(self.target, spawn=lambda argv, **kwargs: proc, **options)
+        self.addCleanup(client.close)
+        return client
+
+    def timed(self, call):
+        """``call``'s outcome (an exception is returned) and the seconds it took, under the watchdog."""
+        outcome: list = []
+
+        def run() -> None:
+            try:
+                outcome.append(call())
+            except BaseException as exc:  # noqa: BLE001 - handed back to the test
+                outcome.append(exc)
+
+        started = time.monotonic()
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(SHORT_WATCHDOG_S)
+        self.assertFalse(worker.is_alive(), "the call outlived the watchdog")
+        return outcome[0], time.monotonic() - started
+
+    def test_a_reply_id_must_equal_the_requests_in_type_and_value(self) -> None:
+        cases = ((None, {}), (1, {"id": True}), (1, {"id": 1.0}), (True, {"id": 1}), (1, {}), (1, {"id": 2}),
+                 ("1", {"id": 1}), ([1], {"id": [True]}), ({"n": 1}, {"id": {"n": 1.0}}))
+        for sent, extra in cases:
+            with self.subTest(sent=sent, reply=extra):
+                client = self.client(PipeProc(answers=[{"ok": True, "result": {"code": "ok"}, **extra}]))
+                with self.assertRaises(RelayDeliveryUnknown) as caught:
+                    client.request({**self.REQUEST, "id": sent})
+                self.assertEqual(caught.exception.detail, "request:reply_id_mismatch")
+                self.assertTrue(client.closed)
+
+    def test_a_reply_with_the_very_same_id_is_the_answer(self) -> None:
+        for sent in (None, 1, 1.5, "1", True, [1, "a"], {"n": 1}):
+            with self.subTest(sent=sent):
+                client = self.client(PipeProc(answers=[{"ok": True, "result": {"code": "ok"}, "id": sent}]))
+                self.assertEqual(client.request({**self.REQUEST, "id": sent})["result"], {"code": "ok"})
+
+    def test_the_close_grace_is_a_setting_that_bounds_a_stalled_far_side(self) -> None:
+        # The first value, 5 s, would hold the request 5.1 s past a deadline of 0.1 s, and an idle close 5 s.
+        client = self.client(Lingers(), timeout_s=0.1, close_grace_s=0.2)
+        failure, took = self.timed(lambda: client.request(self.REQUEST))
+        self.assertIsInstance(failure, RelayDeliveryUnknown)
+        self.assertEqual(failure.detail, "request:timeout")
+        self.assertLess(took, 2.0)
+        idle = self.client(Lingers(), close_grace_s=0)
+        _, took = self.timed(idle.close)
+        self.assertLess(took, 2.0)
+        self.assertTrue(idle.closed)
+
+    def test_the_close_grace_takes_only_a_number_of_seconds(self) -> None:
+        self.assertEqual(ssh_transport.CLOSE_GRACE_S, 5.0)
+        for bad in (-0.1, True, float("nan"), float("inf"), "1"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                SshRelayClient(self.target, spawn=lambda argv, **kwargs: PipeProc(), close_grace_s=bad)
 
 
 if __name__ == "__main__":

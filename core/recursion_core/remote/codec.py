@@ -215,12 +215,19 @@ def ascii_text(text: str, limit: int = 200) -> str:
     return text.encode("ascii", "backslashreplace").decode("ascii")[:limit]
 
 
+# The word an error's detail ends with when the relay left the request's id out so that its answer fits a frame.
+ID_LEFT_OUT = "id_left_out"
+
+
 def relay_error(code: str, *, delivered: bool | str, detail: str | None = None,
-                request: Message | None = None, fields: dict[str, str] | None = None) -> Message:
+                request: Message | None = None, fields: dict[str, str] | None = None,
+                max_bytes: int = MAX_FRAME_BYTES) -> Message:
     """An error frame of the relay's own; it carries the request's ``id`` when the request had one.
 
     The detail is made ASCII and an ``id`` that cannot be framed again is left out, so that the relay's own
     answer can always be written. An error with no ``id`` answers a frame the relay could not read or copy.
+    An ``id`` that can be framed alone but leaves the whole error over ``max_bytes`` is left out too, and the
+    detail then ends with ``id_left_out`` (``without_id``): a refusal is written whatever the id's size.
     ``fields`` adds named words to the error (the refused method and the right it needs), made ASCII and
     cut like the detail; they never replace ``code``, ``layer``, ``delivered`` or ``detail``.
     """
@@ -235,8 +242,24 @@ def relay_error(code: str, *, delivered: bool | str, detail: str | None = None,
     reply: Message = {"ok": False, "error": error}
     has_id, value = copyable_id(request)
     if has_id:
+        if frame_refusal({**reply, "id": value}, max_bytes=max_bytes) is not None:
+            return without_id({**reply, "id": value})
         reply["id"] = value
     return reply
+
+
+def without_id(reply: Message) -> Message:
+    """The relay's own error ``reply`` with its ``id`` left out and its detail saying so (``id_left_out``).
+
+    For an answer that does not fit a frame only because of the id it copied. The client reads a relay
+    error with no id as the relay's own refusal of that request, and the detail tells why the id is missing.
+    """
+    error = dict(reply["error"])
+    detail = error.get("detail")
+    error["detail"] = f"{detail};{ID_LEFT_OUT}" if detail else ID_LEFT_OUT
+    shorter = {key: value for key, value in reply.items() if key != "id"}
+    shorter["error"] = error
+    return shorter
 
 
 def relay_error_of(reply: Message) -> dict[str, Any] | None:

@@ -89,7 +89,7 @@ from recursion_core.control_transport.unix import UnixControlClient, refuse_remo
 
 from .codec import (BUSY_MESSAGE, HELLO_OP, NOT_ADMITTED_MESSAGE, RELAY_OP_PREFIX, RELAY_VERSION, UNAVAILABLE,
                     Message, RefusedFrame, ascii_text, copyable_id, daemon_reply, frame_refusal, read_message,
-                    relay_error, write_message)
+                    relay_error, relay_error_of, without_id, write_message)
 from .pairing import DEVICE_SCOPES, PairingRefused, device_scopes
 from .relay_store import KeyWindow, RefusalRecord, relay_folder
 from .rights import NEEDS_ALL, key_rights, needs
@@ -116,6 +116,9 @@ CAP_SCOPES = ("key", "session")
 RELAY_CAP_SCOPE = "key"
 RELAY_RECORD_MAX = 1000
 UNNAMED_KEY = "unnamed"
+# A frame the relay may read (a --max-frame-bytes above the socket's frame) that the socket client refuses
+# before a byte is sent: refused here, not delivered.
+SOCKET_FRAME_TOO_LARGE = "frame_too_large_for_socket"
 
 Connect = Callable[..., Any]
 
@@ -337,8 +340,10 @@ class Relay:
         (``bad_frame``); anything unexpected after that is "delivery unknown"."""
         return self._handle(request)[0]
 
-    def _handle(self, request: Message) -> tuple[Message, bool]:
-        """The answer, and whether the request may have reached the daemon (the socket was connected)."""
+    def _handle(self, request: Message) -> tuple[Message, bool | str]:
+        """The answer, and what is known of the request's delivery, in the words ``delivered`` takes:
+        ``True`` only when a reply of the daemon was read for it, ``"unknown"`` when it may have reached the
+        daemon and no reply was read, ``False`` when nothing was sent."""
         if not isinstance(request, dict):
             return relay_error("bad_frame", delivered=False, detail="frame_not_object"), False
         try:
@@ -361,10 +366,14 @@ class Relay:
             return self._forward(request)
         except Exception as exc:  # noqa: BLE001 - a relay that fails must still answer, and truthfully
             return relay_error("relay_internal_error", delivered="unknown", detail=type(exc).__name__,
-                               request=request), True
+                               request=request), "unknown"
 
-    def _forward(self, request: Message) -> tuple[Message, bool]:
+    def _forward(self, request: Message) -> tuple[Message, bool | str]:
         refusal = frame_refusal(request, max_bytes=self._max_frame_bytes)
+        if refusal is None and self._max_frame_bytes > MAX_FRAME_BYTES and frame_refusal(request) is not None:
+            # Over the socket's own frame (a protocol figure): the socket client would refuse it before
+            # writing a byte, so it is not delivered, and is said so here rather than "unknown" after a connect.
+            refusal = SOCKET_FRAME_TOO_LARGE
         if refusal is not None:
             if refusal == "frame_too_large":
                 self._note({"refused": "bad_frame", "cap": "max_frame_bytes", "value": self.max_frame_bytes})
@@ -398,11 +407,12 @@ class Relay:
         except (OSError, TransportRefused) as exc:
             # The frame may have been written and acted on: never report it as not delivered.
             return relay_error(UNAVAILABLE, delivered="unknown", detail=f"request:{type(exc).__name__}",
-                               request=request), True
+                               request=request), "unknown"
         finally:
             client.close()
         if not isinstance(reply, dict):
-            return relay_error(UNAVAILABLE, delivered="unknown", detail="request:invalid_reply", request=request), True
+            return relay_error(UNAVAILABLE, delivered="unknown", detail="request:invalid_reply",
+                               request=request), "unknown"
         return daemon_reply(reply), True
 
     def serve(self, stdin: BinaryIO, stdout: BinaryIO) -> int:
@@ -420,17 +430,30 @@ class Relay:
                 return EXIT_STREAM
             if request is None:
                 return EXIT_OK
-            reply, reached = self._handle(request)
+            reply, delivered = self._handle(request)
             try:
                 write_message(stdout, reply, max_bytes=self._max_frame_bytes)
             except (FrameError, ValueError) as exc:
-                # The answer cannot be framed. If the daemon had the request, it may have carried it out.
-                code = "response_too_large" if isinstance(exc, FrameError) else "response_not_encodable"
-                if not self._write_quietly(stdout, relay_error(code, delivered=True if reached else False,
-                                                               request=request)):
+                if not self._write_quietly(stdout, self._unframed(reply, request, delivered, exc)):
                     return EXIT_STREAM
             except OSError:
                 return EXIT_STREAM
+
+    def _unframed(self, reply: Message, request: Message, delivered: bool | str, exc: Exception) -> Message:
+        """What is written in place of an answer that cannot be framed.
+
+        The relay's own error that does not fit only because of the id it copied is written without the id,
+        its detail saying so, so that the first reason stands (a refusal stays that refusal). Any other
+        answer becomes ``response_too_large`` (or ``response_not_encodable``) with what is known of the
+        request: ``delivered`` true only when the daemon's reply was read, ``"unknown"`` when the request may
+        have reached the daemon and no reply was read, false when nothing was sent.
+        """
+        if relay_error_of(reply) is not None and "id" in reply:
+            shorter = without_id(reply)
+            if frame_refusal(shorter, max_bytes=self._max_frame_bytes) is None:
+                return shorter
+        code = "response_too_large" if isinstance(exc, FrameError) else "response_not_encodable"
+        return relay_error(code, delivered=delivered, request=request)
 
     @staticmethod
     def _write_quietly(stdout: BinaryIO, message: Message) -> bool:

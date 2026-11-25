@@ -1240,5 +1240,95 @@ class RelaySizeCapUnreadTests(unittest.TestCase):
         self.assertEqual(daemon.server.accepted, 0)
 
 
+class ResetAfterConnect:
+    """A socket client whose connection exists and whose request then fails: the frame may have been written."""
+
+    def __init__(self, path, timeout_s):
+        pass
+
+    def request(self, message):
+        raise ConnectionResetError("reset after the connection existed")
+
+    def close(self):
+        pass
+
+
+def of_body(fields: dict, length: int) -> dict:
+    """``fields`` with an ``id`` of letters, so that the frame's body is ``length`` bytes (the frame limit counts
+    the body)."""
+    return {**fields, "id": "A" * (length - (len(encode_frame({**fields, "id": ""})) - HEADER.size))}
+
+
+def served(relay: Relay, request: dict) -> tuple[int, list[dict]]:
+    out = io.BytesIO()
+    code = relay.serve(io.BytesIO(encode_frame(request, max_bytes=1 << 30)), out)
+    return code, read_all(out.getvalue())
+
+
+@unittest.skipUnless(POSIX, "the relay needs the AF_UNIX control socket (POSIX)")
+class RelayDeliveredWordTests(unittest.TestCase):
+    """``delivered`` is true only when a reply of the daemon was read; every request gets an answer frame."""
+
+    def test_a_failed_request_whose_answer_is_too_large_is_unknown_never_delivered(self) -> None:
+        daemon = support.SocketDaemon(self)
+        for limit in (512, MAX_FRAME_BYTES):
+            with self.subTest(limit=limit):
+                relay = Relay(environ=daemon.environ, connect=ResetAfterConnect, max_frame_bytes=limit,
+                              max_frames=None, record_max=0)
+                code, answers = served(relay, of_body({"op": "ping"}, limit))
+                self.assertEqual(code, EXIT_OK)
+                self.assertEqual(answers, [{"ok": False, "error": {
+                    "code": codec.UNAVAILABLE, "layer": "relay", "delivered": "unknown",
+                    "detail": "request:ConnectionResetError;" + codec.ID_LEFT_OUT}}])
+
+    def test_an_answer_too_large_even_without_its_id_keeps_delivery_unknown(self) -> None:
+        daemon = support.SocketDaemon(self)
+        relay = Relay(environ=daemon.environ, connect=ResetAfterConnect, max_frame_bytes=64, max_frames=None,
+                      record_max=0)
+        request = of_body({"op": "ping"}, 64)
+        code, answers = served(relay, request)
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(answers, [codec.relay_error("response_too_large", delivered="unknown", request=request)])
+
+    def test_a_request_at_the_frame_limit_still_gets_its_refusal_not_delivered(self) -> None:
+        daemon = support.SocketDaemon(self)
+        for length in (MAX_FRAME_BYTES, MAX_FRAME_BYTES - 4):
+            with self.subTest(length=length):
+                code, answers = served(Relay(environ=daemon.environ, max_frames=None, record_max=0),
+                                       of_body({"op": "x"}, length))
+                self.assertEqual(code, EXIT_OK)
+                self.assertEqual(len(answers), 1)
+                self.assertNotIn("id", answers[0])
+                error = answers[0]["error"]
+                self.assertEqual((error["code"], error["delivered"]), ("scope_refused", False))
+                self.assertEqual(error["detail"], "method_not_in_table;" + codec.ID_LEFT_OUT)
+        self.assertEqual(daemon.seen, [])
+
+    def test_a_frame_over_the_sockets_own_frame_is_refused_unsent(self) -> None:
+        daemon = support.SocketDaemon(self)
+        connects: list[str] = []
+
+        def connect(path, timeout_s):
+            connects.append(path)
+            raise AssertionError("must not connect")
+
+        relay = Relay(environ=daemon.environ, connect=connect, max_frame_bytes=2 * MAX_FRAME_BYTES,
+                      max_frames=None, record_max=0)
+        reply = relay.handle({"op": "ping", "params": {"x": "y" * (MAX_FRAME_BYTES + 1)}, "id": 9})
+        self.assertEqual(reply, codec.relay_error("bad_frame", delivered=False, detail="frame_too_large_for_socket",
+                                                  request={"id": 9}))
+        self.assertEqual(connects, [])
+
+    def test_an_id_that_leaves_the_error_over_the_frame_is_left_out_and_said(self) -> None:
+        request = {"id": "i" * 600}
+        self.assertEqual(codec.relay_error("bad_frame", delivered=False, detail="frame_too_large", request=request,
+                                           max_bytes=512),
+                         {"ok": False, "error": {"code": "bad_frame", "layer": "relay", "delivered": False,
+                                                 "detail": "frame_too_large;" + codec.ID_LEFT_OUT}})
+        self.assertEqual(codec.relay_error("bad_frame", delivered=False, request=request, max_bytes=512)["error"]
+                         ["detail"], codec.ID_LEFT_OUT)
+        self.assertEqual(codec.relay_error("bad_frame", delivered=False, request=request)["id"], "i" * 600)
+
+
 if __name__ == "__main__":
     unittest.main()

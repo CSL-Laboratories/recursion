@@ -76,7 +76,14 @@ _LABEL = re.compile(r"[!-~](?:[ -~]{0,62}[!-~])?")
 _DNS_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _ORIGIN = re.compile(rf"https://(?P<host>{_DNS_LABEL}(?:\.{_DNS_LABEL})*|\[(?P<ipv6>[0-9A-Fa-f:.]+)\])"
                      r"(?::(?P<port>[0-9]{1,5}))?/?")
-_TOKEN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# The link's grammar, as a format (not a setting): a host of at most 255 characters, a port of at most five
+# digits, an offer id and a code of at most 64 URL-safe characters each. The longest link it allows is
+# https://, the host, :65535, /pair#offer=, the offer id, &code= and the code: PAIRING_LINK_MAX_CHARS.
+_HOST_MAX_CHARS = 255
+_TOKEN_MAX_CHARS = 64
+_TOKEN = re.compile(rf"[A-Za-z0-9_-]{{1,{_TOKEN_MAX_CHARS}}}")
+PAIRING_LINK_MAX_CHARS = (len("https://") + _HOST_MAX_CHARS + len(":65535") + len("/pair#offer=") + _TOKEN_MAX_CHARS
+                          + len("&code=") + _TOKEN_MAX_CHARS)
 
 
 class PairingRefused(Exception):
@@ -153,7 +160,7 @@ def pairing_link(origin: str, offer_id: str, code: str) -> str:
     that answers it is a later slice.
     """
     match = _ORIGIN.fullmatch(origin) if isinstance(origin, str) else None
-    if match is None or len(match.group("host")) > 255:
+    if match is None or len(match.group("host")) > _HOST_MAX_CHARS:
         raise PairingRefused("origin_invalid", "the pairing origin is https://host[:port] and nothing else")
     if match.group("ipv6") is not None:
         try:

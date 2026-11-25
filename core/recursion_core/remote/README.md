@@ -49,7 +49,10 @@ same-uid process can claim anything in a frame, so the relay puts no label into 
 
 ## What a surface sees
 
-`RelayAPI.call` answers as `SocketAPI.call` does, with one more hop:
+`RelayAPI.call` answers as `SocketAPI.call` does, with one more hop. `delivered` says whether the request
+was carried out: `true`, yes (a reply of the daemon was read for it); `false`, no (nothing of it reached
+the daemon); `"unknown"`, not known (it may have reached the daemon and no reply came back): sending it
+again may carry it out a second time, so read the run's status first.
 
 | Answer | When |
 |---|---|
@@ -60,7 +63,8 @@ same-uid process can claim anything in a frame, so the relay puts no label into 
 | `delivered: false`, `detail: "request:frame_too_large"` | the request does not fit a frame; nothing was written |
 | `delivered: false`, `detail: "request:write_timeout"` or `"request:write:..."` | the write failed with bytes still unsent: the far side stopped reading until the deadline's kill ended the write, or ssh stopped reading; the relay acts only on whole frames |
 | `delivered: "unknown"`, `detail: "request:write_unknown"` | the write did not show its outcome by the deadline: every byte may have gone out, so it is not reported as unsent |
-| `delivered: false`, `detail: "relay:..."` | the relay refused the frame itself (`relay:frame_too_large`, `relay:frame_not_encodable:...`) |
+| `delivered: false`, `detail: "relay:..."` | the relay refused the frame itself (`relay:frame_too_large`, `relay:frame_not_encodable:...`, `relay:frame_too_large_for_socket` when the relay's `--max-frame-bytes` is above the socket's frame) |
+| a detail ending `;id_left_out` | the relay's answer did not fit a frame with the request's id copied, so the id was left out; the answer is that request's all the same |
 | `delivered: "unknown"` | the request may have been written whole and no complete answer came back: read the run's status before retrying |
 
 The request's deadline covers both writing it and waiting for the answer (each wait gets only what is

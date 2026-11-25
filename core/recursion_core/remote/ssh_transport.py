@@ -45,6 +45,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import math
 import queue
 import re
 import struct
@@ -66,6 +67,9 @@ from .relay import RELAY_COMMAND
 HELLO_TIMEOUT_S = 30.0
 # The relay waits up to the socket client's own deadline for the daemon; the SSH hop gets a margin on top.
 DEFAULT_TIMEOUT_S = SOCKET_TIMEOUT_S + 15.0
+# How long ending a session waits for ssh to exit, and for the writer and the readers to stop, before it kills:
+# a setting per client (``close_grace_s``); it becomes a row of the person's settings file when that file is
+# in this tree. This is its first value, the one place it is named.
 CLOSE_GRACE_S = 5.0
 STDERR_TAIL_BYTES = 4096
 STOP_METHOD = "run.stop"
@@ -262,6 +266,17 @@ def _kill(proc: Any) -> None:
         pass
 
 
+def _same_id(got: object, sent: object) -> bool:
+    """Whether a reply's id is the request's: of the same type and equal at every level (JSON values)."""
+    if type(got) is not type(sent):
+        return False
+    if isinstance(sent, dict):
+        return got.keys() == sent.keys() and all(_same_id(got[key], sent[key]) for key in sent)
+    if isinstance(sent, list):
+        return len(got) == len(sent) and all(_same_id(a, b) for a, b in zip(got, sent))
+    return got == sent
+
+
 def _positive(value: object, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
         raise ValueError(f"{name} must be a positive number")
@@ -274,9 +289,11 @@ class SshRelayClient:
     The session is up once the relay has answered its hello; any failure before that is
     ``RelayHandshakeFailed`` (not delivered). A failure of the stream after a request was written whole
     closes the session for good, and is ``RelayDeliveryUnknown``. When the caller's message carries an
-    ``id``, the answer must carry the same one, except for the relay's own refusal of a frame it could not
-    read or copy, which carries none. ``spawn`` (``subprocess.Popen``) and ``ssh`` (the argv prefix) are
-    injectable, so tests run a fake ssh and never a real one.
+    ``id``, the answer must carry the same one, equal in type and in value (``None`` only for ``None``, never
+    a boolean for a number, never ``1.0`` for ``1``), except for the relay's own refusal of a frame it could
+    not read or copy, which carries none. ``close_grace_s`` is how long ending the session waits before it
+    kills (``None``: ``CLOSE_GRACE_S``; ``0``: kill at once). ``spawn`` (``subprocess.Popen``) and ``ssh``
+    (the argv prefix) are injectable, so tests run a fake ssh and never a real one.
     """
 
     def __init__(
@@ -289,9 +306,15 @@ class SshRelayClient:
         hello_timeout_s: float = HELLO_TIMEOUT_S,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         max_frame_bytes: int = MAX_FRAME_BYTES,
+        close_grace_s: float | None = None,
     ) -> None:
         if not isinstance(target, SshTarget):
             raise TypeError("target must be an SshTarget")
+        if close_grace_s is not None and (isinstance(close_grace_s, bool)
+                                          or not isinstance(close_grace_s, (int, float))
+                                          or not math.isfinite(close_grace_s) or close_grace_s < 0):
+            raise ValueError("close_grace_s must be a finite number of seconds, 0 or more, or None for the first value")
+        self._close_grace_s = close_grace_s
         if type(max_frame_bytes) is not int or max_frame_bytes < 1:
             raise ValueError("max_frame_bytes must be a positive integer")
         hello_timeout_s = _positive(hello_timeout_s, "hello_timeout_s")
@@ -338,6 +361,9 @@ class SshRelayClient:
     @property
     def closed(self) -> bool:
         return self._proc is None
+
+    def _grace(self) -> float:
+        return CLOSE_GRACE_S if self._close_grace_s is None else self._close_grace_s
 
     def last_stderr(self) -> str:
         """What ssh (or the relay) last wrote on stderr, printable ASCII only: for the operator, never parsed."""
@@ -412,7 +438,7 @@ class SshRelayClient:
             error = relay_error_of(reply)
             if error is not None and "id" not in reply:
                 return self._relay_refusal(error, reply)  # the relay's own; it could not copy an id
-            if "id" in message and reply.get("id") != message["id"]:
+            if "id" in message and not ("id" in reply and _same_id(reply["id"], message["id"])):
                 self._close_locked()
                 raise RelayDeliveryUnknown("request:reply_id_mismatch")
             if error is not None:
@@ -491,8 +517,8 @@ class SshRelayClient:
         timed_out = not done.wait(max(0.0, deadline - time.monotonic()))
         if timed_out:
             _kill(proc)
-            done.wait(CLOSE_GRACE_S)
-        writer.join(CLOSE_GRACE_S)
+            done.wait(self._grace())
+        writer.join(self._grace())
         if not final:
             return "write_unknown"  # still running after the kill and its grace: nothing shown either way
         all_sent, error = final[0]
@@ -512,13 +538,13 @@ class SshRelayClient:
         except (OSError, ValueError):
             pass
         try:
-            code = proc.wait(timeout=CLOSE_GRACE_S)
+            code = proc.wait(timeout=self._grace())
         except subprocess.TimeoutExpired:
             _kill(proc)
             code = proc.wait()
         for thread in (self._reader, self._drain):
             if thread is not threading.current_thread():
-                thread.join(timeout=CLOSE_GRACE_S)
+                thread.join(timeout=self._grace())
         for stream in (proc.stdout, proc.stderr):
             try:
                 stream.close()

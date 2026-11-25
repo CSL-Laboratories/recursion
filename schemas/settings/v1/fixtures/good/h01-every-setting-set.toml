@@ -1,0 +1,18 @@
+# Every setting of version 1, each set to a value of its own type.
+version = 1
+
+[plugin_host]
+# The person turned the check off; the reason can stay beside it.
+gil_check = false
+
+[plugin_memory]
+plugins = ["demo.notes"]
+max_bytes_per_plugin = 1048576
+max_item_bytes = "none"
+max_items_per_plugin = 500
+list_page_max = 50
+calls_per_minute = 600
+sync = "normal"
+wal_max_bytes = 4194304
+record_each_write = false
+record_key_text = true

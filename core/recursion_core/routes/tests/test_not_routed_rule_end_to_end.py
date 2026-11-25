@@ -18,7 +18,9 @@ import copy
 import os
 import pathlib
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 from recursion_core.routes import contract as c
 from recursion_core.routes.breaker import ConnectionBreaker
@@ -27,7 +29,7 @@ from recursion_core.routes.service import RouteService
 from recursion_core.routes.tests.fakes import FakeClock, FakeLauncher
 from recursion_core.routing import router
 from recursion_core.routing.tests.fixtures import CONFIG, ROUTES, config, detection
-from recursion_core.subscription_routes import WrapperInstall, check_route, measure_package_pin
+from recursion_core.subscription_routes import WrapperInstall, check_route, measure_package_pin, policy
 
 NOT_POSIX = os.name == "nt" or not hasattr(os, "geteuid")
 OPERATOR_HOME = "/home/operator"
@@ -54,6 +56,13 @@ class RuleNamingPiEndToEndTest(unittest.TestCase):
         self.root = pathlib.Path(tmp.name)
         self.home = self.root / "route-home"
         self.home.mkdir(mode=0o700)
+        # The route check also refuses a route home inside the passwd home of the user running the test. The
+        # fixture's operator home is fake, so the passwd lookup answers that one for the length of each test:
+        # a scratch folder below the real home (a TMPDIR there) is then no operator home.
+        stand_in = types.SimpleNamespace(getpwuid=lambda uid: types.SimpleNamespace(pw_dir=OPERATOR_HOME))
+        patcher = mock.patch.object(policy, "pwd", stand_in)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.clock = FakeClock()
         self.launcher = FakeLauncher(lambda argv, env: [{"ok": True}], self.clock)
         self.parent = {"PATH": "/usr/bin", "HOME": OPERATOR_HOME}
@@ -69,8 +78,10 @@ class RuleNamingPiEndToEndTest(unittest.TestCase):
     def pin(self) -> WrapperInstall:
         pkg = self.root / "pin"
         pkg.mkdir()
-        pkg.joinpath("launcher.js").write_text("launcher\n", encoding="ascii")
-        pkg.joinpath("lib.js").write_text("lib\n", encoding="ascii")
+        os.chmod(pkg, 0o700)   # the process umask does not decide the mode of the package
+        for name, text in (("launcher.js", "launcher\n"), ("lib.js", "lib\n")):
+            pkg.joinpath(name).write_text(text, encoding="ascii")
+            os.chmod(pkg / name, 0o600)
         launcher = str(pkg / "launcher.js")
         return WrapperInstall(launcher, str(pkg), measure_package_pin(launcher, str(pkg)))
 
@@ -111,6 +122,42 @@ class RuleNamingPiEndToEndTest(unittest.TestCase):
         res = self.start(decision, None)
         self.assertEqual((res["status"], res.get("code")), ("ok", None))
         self.assertEqual(len(self.launcher.calls), 1)
+
+
+class RuleNamingPiUnderUmask002Test(RuleNamingPiEndToEndTest):
+    """The same cases with a group-writable default: the package the test pins is still private."""
+
+    def setUp(self) -> None:
+        self.addCleanup(os.umask, os.umask(0o002))
+        super().setUp()
+
+
+class RuleNamingPiUnderUmask077Test(RuleNamingPiEndToEndTest):
+    def setUp(self) -> None:
+        self.addCleanup(os.umask, os.umask(0o077))
+        super().setUp()
+
+
+class RuleNamingPiScratchInThePasswdHomeTest(RuleNamingPiEndToEndTest):
+    """The same cases with the scratch folder (TMPDIR) inside the passwd home of the user running them.
+
+    The test makes its own stand-in for that home and points the passwd lookup at it before the fixture runs;
+    the machine's real home is never written.
+    """
+
+    def setUp(self) -> None:
+        outer = tempfile.TemporaryDirectory()
+        self.addCleanup(outer.cleanup)
+        passwd_home = os.path.join(os.path.realpath(outer.name), "passwd-home")
+        scratch = os.path.join(passwd_home, "tmp")
+        os.makedirs(scratch, mode=0o700)
+        stand_in = types.SimpleNamespace(getpwuid=lambda uid: types.SimpleNamespace(pw_dir=passwd_home))
+        for patcher in (mock.patch.object(policy, "pwd", stand_in), mock.patch.object(tempfile, "tempdir", scratch)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        super().setUp()
+        # The layout is the one under test: the route home lies inside the passwd home of this stand-in.
+        self.assertTrue(os.path.realpath(self.home).startswith(passwd_home + os.sep), self.home)
 
 
 if __name__ == "__main__":

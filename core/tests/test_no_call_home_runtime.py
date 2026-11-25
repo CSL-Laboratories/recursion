@@ -188,7 +188,8 @@ class SuiteHookTests(unittest.TestCase):
 
     def test_a_local_door_passes(self):
         status, out = self._run("import sys; sys.audit('socket.connect', None, ('127.0.0.1', 9)); "
-                                "sys.audit('socket.getaddrinfo', 'localhost', 9, 0, 0, 0)")
+                                "sys.audit('socket.getaddrinfo', 'localhost', 9, 0, 0, 0); "
+                                "sys.audit('http.client.connect', None, '127.0.0.1', 9)")
         self.assertEqual(status, 0, out)
         self.assertIn("PROVEN", out)
 
@@ -196,7 +197,8 @@ class SuiteHookTests(unittest.TestCase):
         # The events are raised by hand with sys.audit: nothing is looked up and nothing is sent.
         for code in ("import sys; sys.audit('socket.getaddrinfo', 'reports.example.com', 443, 0, 0, 0)",
                      "import sys; sys.audit('socket.connect', None, ('192.0.2.7', 443))",
-                     "import sys; sys.audit('urllib.Request', 'https://reports.example.com/', None, {}, 'GET')"):
+                     "import sys; sys.audit('urllib.Request', 'https://reports.example.com/', None, {}, 'GET')",
+                     "import sys; sys.audit('http.client.connect', None, 'reports.example.com', 443)"):
             with self.subTest(code=code):
                 status, out = self._run(code)
                 self.assertEqual(status, 1, out)

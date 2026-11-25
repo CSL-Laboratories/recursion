@@ -90,7 +90,9 @@ def judge(events):
             if not (isinstance(sockaddr, list) and sockaddr and _is_local_host(sockaddr[0])):
                 problems.append(f"process {pid}: {event} of {sockaddr}")
         elif event in ("urllib.Request", "http.client.connect"):
-            target = args[0] if args else None
+            # http.client.connect is raised with (connection, host, port); urllib.Request with (url, ...).
+            target = (args[1] if len(args) > 1 else None) if event == "http.client.connect" else (
+                args[0] if args else None)
             host = target if event == "http.client.connect" else None
             if host is None and isinstance(target, str):
                 from urllib.parse import urlsplit
@@ -132,11 +134,18 @@ def main(argv=None):
         done = subprocess.run(command, cwd=str(ROOT), env=env)
         events, pids = read(events_dir)
         problems = judge(events)
-    kinds = {}
-    for _pid, event, _args in events:
+    kinds, hosts = {}, set()
+    for _pid, event, args in events:
         kinds[event] = kinds.get(event, 0) + 1
+        if event in ("socket.connect", "socket.sendto", "socket.bind") and len(args) > 1                 and isinstance(args[1], list) and args[1]:
+            hosts.add(str(args[1][0]))
+        elif event in ("socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr") and args:
+            hosts.add(str(args[0]))
+        elif event == "http.client.connect" and len(args) > 1:
+            hosts.add(str(args[1]))
     print(f"command exit status {done.returncode}; Python processes seen by the hook: {len(pids)}; "
           f"events: {', '.join(f'{k} {v}' for k, v in sorted(kinds.items())) or 'none'}")
+    print(f"hosts and addresses seen: {', '.join(sorted(hosts)) or 'none'} (Unix socket paths not shown)")
     for p in problems:
         print(p)
     if not pids:

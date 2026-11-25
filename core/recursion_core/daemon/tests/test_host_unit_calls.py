@@ -116,6 +116,12 @@ class Hosts:
         """What the system shows of the stand-in's unit after its kill: gone (the stand-in has no process)."""
         return {'LoadState': 'not-found', 'ActiveState': 'inactive', 'SubState': 'dead', 'Job': ''}
 
+    def unit_states(self, units, timeout_s):
+        """One read of every unit of ``units``, as the user manager's: what ``unit_state`` shows of each, with its
+        control group."""
+        return {unit: {**self.unit_state(unit, timeout_s), 'ControlGroup': '/stand-in.slice/' + unit}
+                for unit in units}
+
     def hang_up_all(self):
         self.stop.set()
         for name, end in self.ends:

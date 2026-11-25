@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -44,6 +45,10 @@ OWN_LAST = ['--property=KillMode=control-group', '--property=Delegate=yes', '--p
 SHORT = 0.3   # the Stop bound of the tests that wait it out (a test figure)
 POLL = 0.02   # the poll of those tests (a test figure)
 SLACK = 2.0   # how much past the bound a Stop of these stand-ins may take (a test figure)
+HANG_BOUND = 0.5   # the Stop bound of the test whose user manager answers nothing (a test figure)
+HANG_POLL = 0.05   # its poll, the shipped plugin_host.stop_confirm_poll_s (a test figure)
+HANG_SLACK = 0.25  # how much past three bounds and one poll that Stop may take: the test's own threads (a test figure)
+HANG_COUNTS = (3, 10, 50)  # the counts of hosts that Stop is timed with (a test figure)
 
 
 def piped_command(properties):
@@ -65,15 +70,16 @@ class FakeSystem:
     the cgroup kill hangs that end up. What the system shows of a unit: ``running`` before the kill, ``after_kill``
     after it, ``after_stop`` after the system's own stop; ``states`` names a unit's state outright."""
 
-    def __init__(self, test, *, after_kill=GONE, after_stop=GONE, hello=True):
+    def __init__(self, test, *, after_kill=GONE, after_stop=GONE, hello=True, limit=None):
         self.after_kill, self.after_stop, self.hello = after_kill, after_stop, hello
+        self.limit = hs.HOSTS_PER_TEST if limit is None else limit  # the hard count on the hosts of one test
         self.killed, self.stops, self.reads, self.ends, self.started = [], [], [], [], []
         self.states, self.listed, self.fail_reads = {}, [], False
         self.stop_requests, self.stop_waits = [], False  # each request of the system's stop; whether it waits it out
         test.addCleanup(self.hang_up_all)
 
     def start_piped(self, unit, argv, channel, *, properties=(), working_directory=None):
-        if len(self.started) >= hs.HOSTS_PER_TEST:
+        if len(self.started) >= self.limit:
             raise AssertionError('this test started more hosts than its count allows')
         self.started.append(unit)
         end = channel.dup()
@@ -114,6 +120,12 @@ class FakeSystem:
             return dict(self.after_stop)
         return dict(self.after_kill if unit in self.killed else RUNNING)
 
+    def unit_states(self, units, timeout_s):
+        """One read of every unit of ``units``, as the user manager's: what ``unit_state`` shows of each, with its
+        control group."""
+        return {unit: {**self.unit_state(unit, timeout_s), 'ControlGroup': '/stand-in.slice/' + unit}
+                for unit in units}
+
     def stop_units(self, units, timeout_s):
         self.stop_requests.append(list(units))
         self.stops.extend(units)
@@ -130,6 +142,59 @@ class FakeSystem:
             except OSError:
                 pass
             end.close()
+
+
+class SilentSystem(FakeSystem):
+    """A stand-in user manager that answers nothing: every read of the units and the system's stop take their whole
+    bound and then time out, as subprocess does."""
+
+    def __init__(self, test, **options):
+        super().__init__(test, **options)
+        self.state_reads = []  # the units of each read of the system, one list per read
+        self.identity_hangs = False  # once set, a read of a unit's control group hangs too
+
+    def unit_identity(self, unit, timeout_s=None):
+        if not self.identity_hangs:
+            return super().unit_identity(unit, timeout_s)
+        self.state_reads.append([unit])
+        time.sleep(hs.CHILD_LIMIT_S if timeout_s is None else timeout_s)
+        raise subprocess.TimeoutExpired(['systemctl'], timeout_s)
+
+    def unit_state(self, unit, timeout_s):
+        self.state_reads.append([unit])
+        time.sleep(timeout_s)
+        raise subprocess.TimeoutExpired(['systemctl'], timeout_s)
+
+    def unit_states(self, units, timeout_s):
+        self.state_reads.append(list(units))
+        time.sleep(timeout_s)
+        raise subprocess.TimeoutExpired(['systemctl'], timeout_s)
+
+    def stop_units(self, units, timeout_s):
+        self.stop_requests.append(list(units))
+        time.sleep(timeout_s)
+        raise subprocess.TimeoutExpired(['systemctl'], timeout_s)
+
+
+class HeldLaunch(FakeSystem):
+    """A stand-in user manager that holds each start inside the making of its unit until the test lets it go."""
+
+    def __init__(self, test, **options):
+        super().__init__(test, **options)
+        self.inside, self.go = threading.Event(), threading.Event()
+        test.addCleanup(self.go.set)
+
+    def start_piped(self, unit, argv, channel, **options):
+        process = super().start_piped(unit, argv, channel, **options)
+        self.inside.set()
+        self.go.wait(hs.CHILD_LIMIT_S)
+        return process
+
+
+def plugin_ids(count):
+    """``count`` plugin ids of letters only."""
+    letters = 'abcdefghijklmnopqrstuvwxyz'
+    return [f'stand.h{letters[number // 26]}{letters[number % 26]}' for number in range(count)]
 
 
 @unittest.skipUnless(LINUX, 'the launcher is Linux only')
@@ -329,6 +394,73 @@ class StopProvesTheHostEnded(_Folder):
         self.assertEqual([host.life for host in hosts], ['unconfirmed'] * 3)
         for host in hosts:
             self.assertIn('The daemon then asked the system to stop it (' + host.unit + ')', host.stop_words)
+
+    def test_the_daemons_stop_waits_three_bounds_and_one_poll_at_most_whatever_the_count_of_hosts(self):
+        took = {}
+        for count in HANG_COUNTS:
+            with self.subTest(hosts=count):
+                system = SilentSystem(self, limit=count)
+                units = self.units(system, stop_confirm_s=HANG_BOUND, stop_confirm_poll_s=HANG_POLL)
+                hosts = [units.start(name, *hs.package(hs.POLITE, name)) for name in plugin_ids(count)]
+                began = time.monotonic()
+                with self.assertLogs(host_units.log, logging.ERROR):
+                    units.close()
+                took[count] = time.monotonic() - began
+                self.assertLess(took[count], 3 * HANG_BOUND + HANG_POLL + HANG_SLACK, took)
+                self.assertEqual([sorted(request) for request in system.stop_requests],
+                                 [sorted(host.unit for host in hosts)])  # one system stop for all of them
+                self.assertEqual({host.life for host in hosts}, {'unconfirmed'})
+                for host in hosts:
+                    self.assertIn('the system showed nothing that could be read', host.stop_words)
+                    self.assertIn('The daemon then asked the system to stop it, which failed (TimeoutExpired)',
+                                  host.stop_words)
+        print(f'\nSTOP-TIMES bound={HANG_BOUND} poll={HANG_POLL} ' + ' '.join(f'{count}:{value:.2f}s'
+                                                                           for count, value in took.items()))
+
+    def test_hosts_still_starting_add_no_bound_per_host_to_the_daemons_stop(self):
+        took = {}
+        for count in HANG_COUNTS:
+            with self.subTest(starting=count):
+                system = SilentSystem(self, limit=count, hello=False)
+                units = self.units(system, stop_confirm_s=HANG_BOUND, stop_confirm_poll_s=HANG_POLL,
+                                   start_deadline_s=None)
+                names = plugin_ids(count)
+                starts = [hs.in_thread(lambda name=name: units.start(name, *hs.package(hs.POLITE, name)))
+                          for name in names]
+                deadline = time.monotonic() + hs.CHILD_LIMIT_S
+                while len(units._starting) < count and time.monotonic() < deadline:
+                    time.sleep(HANG_POLL)
+                self.assertEqual(len(units._starting), count)  # no control group known of any of them yet
+                system.identity_hangs = True
+                began = time.monotonic()
+                with self.assertLogs(host_units.log, logging.ERROR):
+                    units.close()
+                took[count] = time.monotonic() - began
+                self.assertLess(took[count], 3 * HANG_BOUND + HANG_POLL + HANG_SLACK, took)
+                for thread, box in starts:
+                    thread.join(hs.CHILD_LIMIT_S)
+                    self.assertEqual(box['error'].reason, 'stopped')
+                self.assertEqual([sorted(request) for request in system.stop_requests], [sorted(system.started)])
+        print(f'\nSTARTING-STOP-TIMES bound={HANG_BOUND} poll={HANG_POLL} ' + ' '.join(
+            f'{count}:{value:.2f}s' for count, value in took.items()))
+
+    def test_a_start_that_begins_after_the_daemons_stop_is_refused_and_one_inside_it_ends_its_host(self):
+        system = HeldLaunch(self)
+        units = self.units(system)
+        thread, box = hs.in_thread(lambda: units.start('stand.in', *hs.package(hs.POLITE)))
+        self.assertTrue(system.inside.wait(hs.CHILD_LIMIT_S))
+        units.close()  # the system is making the unit of stand.in: the daemon has not recorded that host yet
+        with self.assertRaises(host_units.HostUnavailable) as refused:
+            units.start('stand.two', *hs.package(hs.POLITE, 'stand.two'))
+        self.assertEqual((refused.exception.reason, refused.exception.detail), ('stopped', 'the daemon is closing'))
+        (unit,) = system.started  # the refused start made no unit
+        system.go.set()
+        thread.join(hs.CHILD_LIMIT_S)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(box['error'].reason, 'stopped')
+        self.assertEqual(system.killed, [unit])  # its own start ended it, by the kill
+        self.assertIsNone(units.unit_of('stand.in'))
+        self.assertEqual(units.status()['plugins']['stand.in']['life'], 'ended')  # and proved it
 
     def test_the_stop_bound_is_a_number_of_seconds_and_no_limit_is_not_offered(self):
         self.assertEqual(host_units.STOP_CONFIRM_S, 5.0)

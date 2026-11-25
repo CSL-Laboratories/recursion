@@ -40,10 +40,16 @@ argument: by default the folder this daemon's own code was imported from.
   call that waits on that host (one with no deadline, say) ends at once with ``replaced``, and so does a start of
   the plugin still under way. Then the new host starts.
 * ``stop`` and ``close`` (the daemon's own Stop) end every host the same way, a host that is still starting
-  included (its start ends with ``stopped``), and wait on no host, only on the system's proof. The proof of every
-  host shares one bound; the hosts it did not confirm get ONE system stop together, within a second bound, and one
-  more read each, within a third. So the daemon's Stop takes at most three bounds, whatever the count of hosts, and
-  one bound more for each host still starting whose control group the system had not yet shown (its kill reads it).
+  included (its start ends with ``stopped``), and wait on no host, only on the system's proof. Each read they make
+  of the system is ONE read of every unit it asks about (``EngineUnitManager.unit_states``), never one read per host.
+  The control groups of the hosts still starting that the system had not yet shown are read in one such read, and
+  the proof of every host is one such read each round, all within one bound (plugin_host.stop_confirm_s); a read
+  begun at that bound's end is given one poll (plugin_host.stop_confirm_poll_s). The hosts it did not confirm get ONE
+  system stop together, within a second bound, and ONE more read of all of them, within a third. So the daemon's
+  Stop waits at most three Stop bounds and one poll, whatever the count of hosts; both are rows of the settings. A
+  start that begins after the daemon's Stop has begun is refused (``stopped``, 'the daemon is closing'). A start whose
+  unit the system was making as that Stop began ends that host itself, by the same kill and proof, as soon as it
+  records it, and ends ``stopped``; the daemon's Stop does not wait for it.
 * A start inside a call is held to what is left of the call's deadline in the read of the unit's control group and
   in the wait for the host's hello, or to the start deadline where the call has none (the launcher's one read of
   systemd-run's version, made once per manager, keeps the manager's own wait).
@@ -192,6 +198,14 @@ def _shown(state):
     if str(state.get('Job', '')).strip():
         text += ' with a job queued'
     return text
+
+
+def _group_shown(state, unit):
+    """The control group a read of the system shows for ``unit`` (checked as unit_identity checks it), or ''."""
+    group = state.get('ControlGroup', '') if isinstance(state, Mapping) else ''
+    if not isinstance(group, str) or not group.startswith('/') or '..' in Path(group).parts or Path(group).name != unit:
+        return ''
+    return group
 
 
 def _core_folder(value):
@@ -553,9 +567,12 @@ class PluginHostUnits:
         self._end_all([host] if host is not None else [], [starting] if starting is not None else [])
 
     def close(self):
-        """The daemon's own Stop: every host is ended by the system's kill, then proven ended as ``stop`` does. The
-        proof of every host shares one Stop bound; the hosts it did not confirm get one system stop together and one
-        more read each, so the whole set takes at most three bounds; no host is waited on."""
+        """The daemon's own Stop: every host is ended by the system's kill, then proven ended as ``stop`` does. Each
+        read of the system is one read of all the units it asks about: the proof of every host shares one Stop bound
+        (plugin_host.stop_confirm_s, a read begun at its end given one poll, plugin_host.stop_confirm_poll_s); the
+        hosts it did not confirm get one system stop together and one more read of all of them, each within one more
+        bound. So the whole set waits at most three Stop bounds and one poll, whatever its count; no host is waited
+        on. A start that begins after this is refused; one whose unit was being made ends that host itself."""
         with self._lock:
             self._closed = True
             hosts = list(self._units.values())
@@ -584,8 +601,9 @@ class PluginHostUnits:
         unconfirmed is read again here first: it is said to be ended only once the system shows it so."""
         with self._lock:
             pending = list(self.unconfirmed.values())
+        shown = self._unit_states([host.unit for host in pending], time.monotonic() + self._stop_confirm_s)
         for host in pending:
-            if unit_shows_ended(self._unit_state(host.unit, time.monotonic() + self._stop_confirm_s)):
+            if unit_shows_ended(shown[host.unit]):  # one read of all of them, within one Stop bound
                 with self._lock:
                     host.life, host.stop_words = LIFE_ENDED, ''
                     self.unconfirmed.pop(host.unit, None)
@@ -828,17 +846,21 @@ class PluginHostUnits:
             self._confirm(host, deadline)
 
     def _end_all(self, hosts, starting):
-        """``stop`` and ``close``: kill every host first, then prove them ended together (``_confirm_all``): at most
-        three Stop bounds for the whole set."""
+        """``stop`` and ``close``: kill every host first, then prove them ended together (``_confirm_all``). The
+        control groups of the hosts still starting that the system had not yet shown are read in ONE read, after the
+        running hosts are killed and within the same bound as the proof: at most three Stop bounds and one poll for
+        the whole set, whatever its count."""
         deadline = time.monotonic() + self._stop_confirm_s
         killed = []
         for host in hosts:
             host.stopped = True
             if self._kill(host):
                 killed.append(host)
+        unknown = [host.unit for host in starting if not host.group]
+        shown = self._unit_states(unknown, deadline) if unknown else {}
         for host in starting:
             host.stopped = True
-            if self._kill(host):
+            if self._kill(host, shown.get(host.unit)):
                 killed.append(host)
             host.wake()
         if killed:
@@ -858,6 +880,18 @@ class PluginHostUnits:
         except Exception:  # noqa: BLE001 - nothing shown is never ended
             return {}
 
+    def _unit_states(self, units, deadline):
+        """What the system shows of each unit of ``units``, in ONE read by ``deadline`` (given at least the poll's
+        time): a dict by unit. A read that fails shows nothing of any of them, which is never taken as ended."""
+        units = list(units)
+        if not units:
+            return {}
+        try:
+            shown = self._manager.unit_states(units, max(deadline - time.monotonic(), self._stop_confirm_poll_s))
+            return {unit: dict(shown.get(unit) or {}) for unit in units}
+        except Exception:  # noqa: BLE001 - nothing shown is never ended
+            return {unit: {} for unit in units}
+
     def _system_stop(self, units):
         """The system's own stop of ``units``, ONE request for all of them within the Stop bound, in words of what the
         daemon did."""
@@ -872,18 +906,20 @@ class PluginHostUnits:
         return self._confirm_all([host], deadline)
 
     def _confirm_all(self, hosts, deadline=None):
-        """After the kill: read what the system shows of each host's unit until it shows the unit ended and not about
-        to start again, every host within ONE ``deadline`` (by default the Stop bound from now). Past it the units not
-        shown ended get ONE system stop together (within the Stop bound) and then one more read each (all within one
-        more bound), and each such host's Stop is recorded unconfirmed and said so, in the log and in ``status``; never
-        dropped silently. So the set takes at most three bounds, whatever its count (a read begun at a bound's end is
-        still given one poll). True when every host was shown ended."""
+        """After the kill: read what the system shows of the hosts' units, ONE read of all of them each round, until
+        each shows its unit ended and not about to start again, every host within ONE ``deadline`` (by default the Stop
+        bound from now; a read begun at its end is given one poll). Past it the units not shown ended get ONE system
+        stop together (within the Stop bound) and then ONE more read of all of them (within one more bound), and each
+        such host's Stop is recorded unconfirmed and said so, in the log and in ``status``; never dropped silently. So
+        the set waits at most three Stop bounds and one poll, whatever its count. True when every host was shown
+        ended."""
         if deadline is None:
             deadline = time.monotonic() + self._stop_confirm_s
         pending, shown = list(hosts), {}
         while pending:
+            states = self._unit_states([host.unit for host in pending], deadline)
             for host in list(pending):
-                state = shown[host.unit] = self._unit_state(host.unit, deadline)
+                state = shown[host.unit] = states[host.unit]
                 if unit_shows_ended(state):
                     with self._lock:
                         host.life = LIFE_ENDED  # said only from what the system shows
@@ -895,9 +931,9 @@ class PluginHostUnits:
         if not pending:
             return True
         did = self._system_stop([host.unit for host in pending])
-        last = time.monotonic() + self._stop_confirm_s
+        last = self._unit_states([host.unit for host in pending], time.monotonic() + self._stop_confirm_s)
         for host in pending:
-            after = self._unit_state(host.unit, last)
+            after = last[host.unit]
             words = (f'the daemon ended the host of {host.plugin_id} but could not confirm within '
                      f'{self._stop_confirm_s:g} s (plugin_host.stop_confirm_s) that the system will not start it again: '
                      f'the system showed {_shown(shown[host.unit])}. The daemon then {did} ({host.unit}), and the system '
@@ -909,8 +945,10 @@ class PluginHostUnits:
             log.error('plugin %s: %s', host.plugin_id, words)
         return False
 
-    def _kill(self, host):
-        """SIGKILL the unit's whole cgroup now, once. True for the one caller that gave the kill."""
+    def _kill(self, host, shown=None):
+        """SIGKILL the unit's whole cgroup now, once. True for the one caller that gave the kill. ``shown``: what one
+        read of the system already showed of the unit (``_end_all``), whose control group is taken with no read of its
+        own."""
         with self._lock:
             first, host.ended = not host.ended, True
             if self._units.get(host.plugin_id) is host:
@@ -921,7 +959,9 @@ class PluginHostUnits:
         if not first:
             return False
         group = host.group
-        if not group:
+        if not group and shown is not None:
+            group = _group_shown(shown, host.unit)
+        elif not group:
             try:
                 group, _ = self._manager.unit_identity(host.unit, timeout_s=self._stop_confirm_s)
             except Exception:  # noqa: BLE001 - no cgroup known: the unit never ran

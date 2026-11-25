@@ -345,6 +345,27 @@ class EngineUnitManager(SystemdUserManager):
                                unit], check=True, text=True, capture_output=True, timeout=timeout_s).stdout
         return dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
 
+    def unit_states(self, units, timeout_s):
+        """What systemd shows of each unit of ``units`` now, in ONE read within ``timeout_s``: a dict by unit of what
+        ``unit_state`` reads of one (LoadState, ActiveState, SubState and Job) and its ControlGroup, blank for none. A
+        read that fails raises (OSError or SubprocessError), and so does one that does not show every unit it was asked
+        about (ValueError): the caller takes it as nothing shown of any of them."""
+        units = list(units)
+        if not units:
+            return {}
+        text = subprocess.run(['systemctl', '--user', 'show',
+                               '--property=Id,LoadState,ActiveState,SubState,Job,ControlGroup', '--', *units],
+                              check=True, text=True, capture_output=True, timeout=timeout_s).stdout
+        shown = {}
+        for block in text.split('\n\n'):
+            props = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+            if props.get('Id'):
+                shown[props.pop('Id')] = props
+        missing = [unit for unit in units if unit not in shown]
+        if missing:
+            raise ValueError(f'the system showed nothing of {missing[0]}')
+        return {unit: shown[unit] for unit in units}
+
     def stop_units(self, units, timeout_s):
         """The system's own stop of every unit of ``units`` in ONE request, by each unit's kill rules (the launcher's:
         the whole control group), which also cancels a start the system has queued for it. Waits at most ``timeout_s``

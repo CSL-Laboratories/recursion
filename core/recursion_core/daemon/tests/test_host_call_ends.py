@@ -211,6 +211,22 @@ class TheHostsACallStartsAreCounted(tc._Units):
         units.start('stand.in', *hs.package(hs.POLITE))  # a start counts again from nothing
         self.answered(units, 4)
 
+    def test_a_start_of_the_plugin_counts_the_hosts_its_calls_start_again_from_nothing(self):
+        hosts = tc.Hosts(self, ['answers'])
+        units = self.units(hosts, call_deadline_s=5, start_deadline_s=5, restarts_max=1, restarts_window_s=None)
+        units.start('stand.in', *hs.package(hs.POLITE))
+        self.end_then_call(units, hosts)
+        self.answered(units, 2)  # one host started again by a call: the most the row allows
+        self.end_then_call(units, hosts)
+        with self.assertRaises(host_units.HostUnavailable) as caught:
+            units.call('stand.in', 'operator', {'command': 'x'})
+        self.assertEqual(caught.exception.reason, 'not_started')
+        units.start('stand.in', *hs.package(hs.POLITE))
+        self.answered(units, 3)
+        self.end_then_call(units, hosts)
+        self.answered(units, 4)  # a call may start a host again: the start counted from nothing
+        self.assertEqual(len(hosts.started), 4)
+
     def test_the_window_lets_a_call_start_a_host_again_once_it_has_passed(self):
         hosts = tc.Hosts(self, ['answers'])
         units = self.units(hosts, call_deadline_s=5, start_deadline_s=5, restarts_max=1, restarts_window_s=WINDOW_S)

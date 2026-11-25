@@ -144,6 +144,12 @@ class ProcessManager:
                 return {'LoadState': 'loaded', 'ActiveState': 'active', 'SubState': 'running', 'Job': ''}
         return {'LoadState': 'not-found', 'ActiveState': 'inactive', 'SubState': 'dead', 'Job': ''}
 
+    def unit_states(self, units, timeout_s):
+        """One read of every unit of ``units``, as the user manager's: what ``unit_state`` shows of each, with its
+        control group."""
+        return {unit: {**self.unit_state(unit, timeout_s), 'ControlGroup': '/stand-in.slice/' + unit}
+                for unit in units}
+
     def errors(self):
         return {path.name: path.read_bytes()[-2000:] for path in self.logs.iterdir()}
 
@@ -199,6 +205,12 @@ class ThreadManager:
     def unit_state(self, unit, timeout_s):
         """What the system shows of the stand-in's unit after its kill: gone (the stand-in has no process)."""
         return {'LoadState': 'not-found', 'ActiveState': 'inactive', 'SubState': 'dead', 'Job': ''}
+
+    def unit_states(self, units, timeout_s):
+        """One read of every unit of ``units``, as the user manager's: what ``unit_state`` shows of each, with its
+        control group."""
+        return {unit: {**self.unit_state(unit, timeout_s), 'ControlGroup': '/stand-in.slice/' + unit}
+                for unit in units}
 
     def hang_up(self, unit):
         for name, end in self.ends:

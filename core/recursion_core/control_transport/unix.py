@@ -560,8 +560,11 @@ class UnixControlClient:
             raise
         self._sock: socket.socket | None = sock
 
-    def request(self, message: Message) -> Message:
+    def request(self, message: Message, *, on_sent=None) -> Message:
         """Send one frame and return its reply; any failure closes the client for good.
+
+        ``on_sent``, when given, is called the moment the frame's write returns, before the reply is read: the
+        request has then left this process for the daemon's door.
 
         A timeout or partial read leaves the stream mid-frame, so the next read would hand
         back an earlier request's late reply (a Stop's answer as a ping's). The socket is
@@ -585,6 +588,8 @@ class UnixControlClient:
                     if refusal is not None:
                         raise refusal from None
                     raise
+                if on_sent is not None:
+                    on_sent()
                 response = read_frame(sock, max_bytes=self._max_frame_bytes, deadline=deadline)
                 if response is None:
                     raise ConnectionError("server closed the connection")

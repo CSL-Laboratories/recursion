@@ -52,9 +52,11 @@ class API:
         self.hold_status = False
         self._lock = threading.Lock()
 
-    def call(self, method, params):
+    def call(self, method, params, on_sent=None):
         with self._lock:
             self.calls.append((method, dict(params)))
+        if on_sent is not None:  # a stand-in has no transport: its request is written when it is taken
+            on_sent()
         if method == "run.list":
             return {"code": "ok", "runs": [{"run_id": r, "state": s} for r, s in self.state.items()]}
         if method == "run.status":

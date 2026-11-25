@@ -20,6 +20,7 @@ Stop never waits behind an output flood or a slow read and never needs an input 
 from __future__ import annotations
 
 import collections
+import inspect
 import json
 import queue
 import threading
@@ -44,11 +45,18 @@ CONDITION_ROWS = 4
 # seconds. It is to become the row ``tui.close_bound_s`` of the person's settings file, default 5.0 (the value the
 # Loop's join has always used); until then a Loop takes it from here, and ``Loop.join_timeout_s`` changes it.
 CLOSE_BOUND_S = 5.0
-# After Ctrl-C ends that wait, a Stop the Stop lane is in a call for counts as sent once it has been in that call this
-# many seconds; until then the TUI waits for it, within the bound, so a Stop just begun is not cut off with the
-# process. It is to become the row ``tui.stop_handover_s`` of the person's settings file, default 0.2; until then a
-# Loop takes it from here, and ``Loop.stop_handover_s`` changes it.
+# After Ctrl-C ends that wait, the TUI waits, within that bound, until the request of the Stop the Stop lane is in a
+# call for is written to the daemon's door: the transport says so the moment its write returns (``on_sent``). A
+# transport that cannot say so (an api whose ``call`` takes no ``on_sent``) is waited for at most this many seconds
+# after the Stop's call began, and the words then say only that its call began, never that it was sent. It is to
+# become the row ``tui.stop_handover_s`` of the person's settings file, default 0.2; until then a Loop takes it from
+# here, and ``Loop.stop_handover_s`` changes it.
 STOP_HANDOVER_S = 0.2
+# The steps of a confirmed Stop, in the only order it moves in (an order, not a figure): asked and queued; begun by a
+# lane; its request written to the daemon's door; then answered, or ended (an answer that does not confirm it came
+# while its request was never said to be written).
+_STOP_STEPS = {"queued": 0, "begun": 1, "written": 2, "ended": 3, "answered": 3}
+_READS = frozenset({"run.list", "run.status"})  # a read in its call at close is only a display: it is not named
 _TRUNCATED = "⟦truncated⟧"
 _CURSOR = "▏"  # where the command line's cursor is, drawn only when it is not at the end
 SESSION_LIST = object()  # ``TuiApp.pane`` when the output pane shows the session list (review 1 of #405, Sol R1)
@@ -58,9 +66,23 @@ def _runs(runs) -> str:
     return ", ".join(field(r) for r in runs)
 
 
+def _runs_and(runs) -> str:
+    names = [field(r) for r in runs]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _takes_on_sent(api) -> bool:
+    """True when ``api.call`` takes ``on_sent``: its transport says when a request is written to the daemon."""
+
+    try:
+        return "on_sent" in inspect.signature(api.call).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _queued_said(begun, queued) -> tuple[str, bool]:
-    """The queued Stops as said: 'the Stop of r2', and 'another Stop of r' for a run whose Stop is named already (a
-    run confirmed twice); True when that is more than one Stop."""
+    """The queued Stops as said: 'the Stop of r2', 'the Stops of r2 and r3', and 'another Stop of r' for a run whose
+    Stop is named already (a run confirmed twice); True when that is more than one Stop."""
 
     seen, new, again = set(begun), [], {}
     for run in queued:
@@ -69,9 +91,9 @@ def _queued_said(begun, queued) -> tuple[str, bool]:
         else:
             new.append(run)
             seen.add(run)
-    parts = [f"the Stop of {_runs(new)}"] if new else []
+    parts = [f"the Stop{'s' if len(new) > 1 else ''} of {_runs_and(new)}"] if new else []
     parts += [f"another Stop of {field(r)}" if c == 1 else f"{c} more Stops of {field(r)}" for r, c in again.items()]
-    return " and ".join(parts), len(parts) > 1 or any(c > 1 for c in again.values())
+    return " and ".join(parts), len(parts) > 1 or len(new) > 1 or any(c > 1 for c in again.values())
 
 
 def _fmt(params: Mapping) -> str:
@@ -241,6 +263,11 @@ class TuiApp:
         self._queued: dict[int, tuple[str, dict]] = {}
         self._lane_begins = False  # set by a Loop, whose lanes call begin(): only then is a queued request known
         self._stops_out: dict[int, str] = {}  # confirmed Stops asked and not yet answered: number -> run id
+        # Each confirmed Stop's ONE step, by number (_STOP_STEPS), set where each thing happens and only ever moved
+        # forward (``stop_moved``): no line of the close says of a Stop a step it has not reached.
+        self._stop_step: dict[int, str] = {}
+        self.stop_marks = False  # set by a Loop: its api says when a request is written (``on_sent``)
+        self._in_call: dict[int, tuple[str, dict]] = {}  # requests other than a Stop a lane is in a call for
         self._not_sent: list[str] = []  # requests a lane did not send because the TUI was closing or had ended
         # Set by a Loop: a close with a confirmed Stop not yet answered first waits for that answer, at most this
         # many seconds (the Loop's own bound), so the transcript records it. None (no Loop): a close is at once.
@@ -254,6 +281,7 @@ class TuiApp:
         # still queued then, whether that line could only say a queued one is sent if it begins in time, and what
         # became of them after it: begun by a lane (numbers), and answered (number -> (code, the run answered)).
         self._open_at_close: dict[int, str] = {}
+        self._unwritten_at_close: set[int] = set()  # begun and not yet written when the close line was written
         self._queued_at_close: set[int] = set()
         self._said_if = False
         self._begun_after_close: set[int] = set()
@@ -379,6 +407,7 @@ class TuiApp:
             self.closed = True  # the sealed log refuses any later event
             self._open_at_close = dict(self._stops_out)
             self._queued_at_close = {n for n in self._stops_out if n in self._queued}
+            self._unwritten_at_close = {n for n in self._stops_out if self._stop_step.get(n) == "begun"}
             self.end_line = self._end_line()
             self._emit("close", "operator", self.end_line)
 
@@ -429,8 +458,17 @@ class TuiApp:
             parts.append(f"the Stop of {field(run)} was not confirmed ({said}, above); {field(run)} may still be "
                          f"running")
         begun, queued = self._stops_begun()
-        if begun:
-            parts.append(f"the Stop of {_runs(begun)} was sent and its answer had not come")
+        written = list(dict.fromkeys(r for n, r in self._stops_out.items() if self._stop_step.get(n) == "written"))
+        unwritten = [r for r in begun if r not in written]
+        if written:
+            parts.append(f"the Stop of {_runs(written)} was sent and its answer had not come")
+        if unwritten and not self.stop_marks:
+            parts.append(f"the Stop of {_runs(unwritten)}: its call began and its answer had not come; whether it "
+                         f"reached the daemon is not known")
+        elif unwritten:
+            left = self.close_left() if self.close_left is not None else 0.0
+            parts.append(f"the Stop of {_runs(unwritten)} was begun and is not yet written to the daemon; the TUI "
+                         f"waits for that at most {left:.2f} s and then says what became of it")
         if queued:
             subject, plural = _queued_said(begun, queued)
             it, was = ("they", "were") if plural else ("it", "was")
@@ -452,6 +490,10 @@ class TuiApp:
         if not_sent:
             parts.append(f"{len(not_sent)} queued request{'s' if len(not_sent) != 1 else ''} not sent "
                          f"({'; '.join(not_sent)})")
+        for m, pa in self._in_call.values():
+            if m not in _READS and m not in s.SESSION_METHODS:
+                parts.append(f"the request {m} {_fmt(pa)}".rstrip() + " was in its call; whether it reached the "
+                             "daemon is not known; look with run list")
         if not parts:
             return "closed: no request sent; runs keep going and can be reattached"
         if answered and not (unconfirmed or begun or queued or not_sent):
@@ -471,8 +513,10 @@ class TuiApp:
 
         with self._lock:
             parts, stopped, doubtful = [], set(), []
+            bound = f"{self.close_bound_s:g} s " if self.close_bound_s is not None else ""
             for n, run in self._open_at_close.items():
                 name = f"the {'queued ' if n in self._queued_at_close else ''}Stop of {field(run)}"
+                step = self._stop_step.get(n)
                 if n in self._answered_after_close:
                     code, named = self._answered_after_close[n]
                     if code == "stopped" and named == run:
@@ -480,13 +524,28 @@ class TuiApp:
                         stopped.add(run)
                         continue
                     said = f"{field(code)} for another run" if code == "stopped" else field(code)
-                    parts.append(f"{name} was sent and not confirmed ({said}); {field(run)} may still be running")
-                elif n not in self._queued_at_close:
+                    if step != "ended":
+                        parts.append(f"{name} was sent and not confirmed ({said}); {field(run)} may still be running")
+                    elif self.stop_marks:
+                        parts.append(f"{name} was not sent: its call ended before its request was written ({said}); "
+                                     f"{field(run)} may still be running")
+                    else:
+                        parts.append(f"{name}: its call ended and did not confirm it ({said}); {field(run)} may "
+                                     f"still be running")
+                elif n not in self._queued_at_close and n not in self._unwritten_at_close:
                     continue  # sent and with no answer, as the close line said
-                elif n in self._begun_after_close:
-                    parts.append(f"{name} was sent and its answer had not come")
+                elif n in self._begun_after_close or n in self._unwritten_at_close:
+                    if step == "written":
+                        parts.append(f"{name} was sent and its answer had not come")
+                    elif not self.stop_marks:
+                        if n in self._unwritten_at_close:
+                            continue  # its call began, as the close line said
+                        parts.append(f"{name}: its call began and its answer had not come; whether it reached the "
+                                     f"daemon is not known")
+                    else:
+                        parts.append(f"{name} was begun and its request was not written to the daemon when the "
+                                     f"{bound}bound ran out; it may not have reached the daemon")
                 elif self._said_if:
-                    bound = f"{self.close_bound_s:g} s " if self.close_bound_s is not None else ""
                     parts.append(f"{name} was not sent: the {bound}bound ran out")
                 else:
                     continue  # the close line said already that it is not sent
@@ -508,13 +567,28 @@ class TuiApp:
             if method == "run.stop":
                 if self.closed and asked in self._queued_at_close:
                     self._begun_after_close.add(asked)
+                self._step_to(asked, "begun")
                 return True
             if self.closed or self.awaiting_stop or ending:
                 if not self.closed:  # once the close line is written it has named it already
                     self._not_sent.append(f"{method} {_fmt(params)}".rstrip() if entry is None else
                                           f"{entry[0]} {_fmt(entry[1])}".rstrip())
                 return False
+            if asked is not None:
+                self._in_call[asked] = (method, dict(params))
             return True
+
+    def stop_moved(self, asked: int | None, step: str) -> None:
+        """The confirmed Stop numbered ``asked`` reached ``step`` (a Loop's lane and the transport say so the moment
+        it happens): kept only when it is further on than the step the Stop is at; a step never moves back."""
+
+        with self._lock:
+            self._step_to(asked, step)
+
+    def _step_to(self, asked: int | None, step: str) -> None:
+        now = self._stop_step.get(asked)
+        if now is not None and _STOP_STEPS[step] > _STOP_STEPS[now]:
+            self._stop_step[asked] = step
 
     def end_wait(self) -> None:
         """A Loop ended: a close from now on is at once (there is no tick left to wait in)."""
@@ -541,6 +615,8 @@ class TuiApp:
                 self._queued[asked] = (method, dict(params))
             if method == "run.stop":
                 self._stops_out[asked] = str(params.get("run_id"))
+                # With no Loop the dispatch sends it at once: there is no queue or lane whose steps could be said.
+                self._stop_step[asked] = "queued" if self._lane_begins else "written"
             self._emit("request", "operator", f"request {method} {_fmt(params)}".rstrip())
             self.dispatch(method, params, _Done(self, asked))
 
@@ -560,6 +636,10 @@ class TuiApp:
         except Exception:  # noqa: BLE001
             kept = {"code": p.UNAVAILABLE, "detail": "answer_not_object"}
         with self._lock:
+            self._in_call.pop(asked, None)
+            if asked in self._stop_step:  # only a "stopped" for this very run, or an answer to a written request
+                confirmed = code == "stopped" and kept.get("run_id") == params.get("run_id")
+                self._step_to(asked, "answered" if confirmed or self._stop_step[asked] == "written" else "ended")
             if self.closed:  # the TUI ended while the answer was read: it changes nothing, but is kept for the line
                 if asked in self._open_at_close:  # that says what became of a Stop after the close line
                     self._answered_after_close[asked] = (str(code), kept.get("run_id"))
@@ -1628,12 +1708,18 @@ class TuiApp:
         self.last_error = self._emit("error", "recursion", f"error {len(self.errors)}: {line}")
 
 
-def call_api(api, method: str, params: dict) -> dict:
-    """One control API call. A transport failure becomes a typed answer, not a crash."""
+def call_api(api, method: str, params: dict, on_sent: Callable[[], None] | None = None) -> dict:
+    """One control API call. A transport failure becomes a typed answer, not a crash. ``on_sent`` (an api that
+    takes it) is called the moment the request is written to the daemon."""
 
     try:
         # run.list follows next_after to the last page, as the CLI's list does (ADV1-5).
-        answer = p.list_all_runs(api.call, params) if method == "run.list" else api.call(method, dict(params))
+        if method == "run.list":
+            answer = p.list_all_runs(api.call, params)
+        elif on_sent is None:
+            answer = api.call(method, dict(params))
+        else:
+            answer = api.call(method, dict(params), on_sent=on_sent)
     except Exception as err:  # the API client's own failure is shown as unavailable, never as success
         return {"code": p.UNAVAILABLE, "detail": type(err).__name__}
     if not isinstance(answer, dict):
@@ -1674,7 +1760,10 @@ class Loop:
         self._threads: list[threading.Thread] = []
         self._runner: threading.Thread | None = None  # the thread of run(), once start() made it
         self._stop_call: float | None = None  # when the Stop lane began the call it is in, if it is in one
-        self.stop_handover_s = STOP_HANDOVER_S  # how long a Stop in its call is waited for after Ctrl-C
+        # A transport that cannot say when a request is written: how long after a Stop's call began it is waited for
+        self.stop_handover_s = STOP_HANDOVER_S
+        self._marks = _takes_on_sent(api)  # the api says when a request is written: a Stop is waited for until then
+        app.stop_marks = self._marks
         self.frame: list[Row] = []
         self.frames = 0
         app.dispatch = self._dispatch
@@ -1731,15 +1820,20 @@ class Loop:
                 continue
             if method == "run.stop":  # stamped before begin(): a Stop is at every moment queued or in its call
                 self._stop_call = time.monotonic()
-            if not self.app.begin(getattr(done, "asked", None), method, params, ending=self._halt.is_set()):
+            asked = getattr(done, "asked", None)
+            if not self.app.begin(asked, method, params, ending=self._halt.is_set()):
                 continue
+            on_sent = None
+            if method == "run.stop" and self._marks:
+                def on_sent(asked=asked) -> None:  # the transport's write returned: the request has left
+                    self.app.stop_moved(asked, "written")
             try:
-                answer = call_api(self._api, method, params)
+                answer = call_api(self._api, method, params, on_sent)
             except BaseException as err:  # noqa: BLE001 - KeyboardInterrupt, SystemExit: an answer, so in_flight
                 answer = {"code": p.UNAVAILABLE, "detail": type(err).__name__}  # stays true (#405 r2, DeepSeek L3)
+            self._answers.put((done, method, params, answer))  # queued before the call is said over: taken at the end
             if method == "run.stop":
                 self._stop_call = None
-            self._answers.put((done, method, params, answer))
             self._wake.set()
 
     def start(self) -> None:
@@ -1762,14 +1856,18 @@ class Loop:
 
     def _stops_handed_over(self) -> bool:
         """Nothing is left that the TUI must still send: no confirmed Stop is queued (one that can still begin is
-        waited for, within the bound), and the Stop the lane is in a call for, if any, has been in it at least
-        ``stop_handover_s``, whether it began before the close's wait, during it or after Ctrl-C."""
+        waited for, within the bound), and the Stop the lane is in a call for, if any, has its request written to
+        the daemon (the transport said so), whether it began before the close's wait, during it or after Ctrl-C. A
+        transport that cannot say so: once that call has lasted ``stop_handover_s``."""
 
         began = self._stop_call
-        if began is not None and time.monotonic() - began < self.stop_handover_s:
-            return False
         with self.app._lock:
-            return not any(method == "run.stop" for method, _ in self.app._queued.values())
+            if any(method == "run.stop" for method, _ in self.app._queued.values()):
+                return False
+            unwritten = any(step == "begun" for step in self.app._stop_step.values())
+        if began is None or not unwritten:
+            return True  # no Stop is in its call, or the one in its call has its request written
+        return not self._marks and time.monotonic() - began >= self.stop_handover_s
 
     def shutdown(self, *, leave_hung: bool = False) -> bool:
         """Stop painting at once, then stop the threads. When this returns no paint is under way and

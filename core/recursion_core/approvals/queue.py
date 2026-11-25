@@ -67,7 +67,10 @@ and the object the method handlers and the engine drivers call:
   launched while a stop withdraws and joins, none a stop has read is forgotten, and no start clears the wake
   a stop's worker is still waiting on. The lock is re-entrant, so a call on the thread that is inside a start or
   a stop never waits for itself, wherever it lands: a subscriber the start calls (recovery tells the answered
-  ones, the start's offering the requested ones), or a signal handler.
+  ones, the start's offering the requested ones), which is told with ``_lock`` released and no store transaction
+  open. A signal handler is not covered: ``start`` and ``stop`` must not be called from one. It can land while
+  this thread holds ``_lock``, an Event's own lock or a store transaction a worker is waiting for, and the call
+  then waits for ever.
   - A ``stop`` there runs at once, joins every worker and stands: a start counts the stops its own thread makes
     from the moment it is called, and one that sees a stop publishes no worker after it (one that had published
     ends stopped). A stop another thread made while this start waited for it is not this start's to undo.
@@ -110,6 +113,7 @@ from recursion_core.approvals import model
 from recursion_core.approvals import store as rows
 from recursion_core.approvals.model import ApprovalRefused
 from recursion_core.approvals.record import SURFACES, binding_problem, milliseconds
+from recursion_core.plugin_security.approval import APPROVAL_DEADLINE_SECONDS
 
 try:  # EVENTS' store: a COMMIT that raised may or may not have been made durable
     from recursion_core.events.db import CommitUnknown as _CommitUnknown
@@ -121,8 +125,9 @@ __all__ = ["DEADLINE_SECONDS", "ApprovalQueue", "timestamp_of"]
 
 log = logging.getLogger(__name__)
 
-# PROVISIONAL: the brief's question (b) to Lucas, not yet answered.
-DEADLINE_SECONDS = {"engine_tool": 15 * 60, "plugin_effect": 300}
+# PROVISIONAL: the brief's question (b) to Lucas, not yet answered. A plugin effect's deadline is the gate's one
+# named value, so the gate and the queue cannot disagree on it.
+DEADLINE_SECONDS = {"engine_tool": 15 * 60, "plugin_effect": APPROVAL_DEADLINE_SECONDS}
 RETRY_SECONDS = 1.0  # the deadline worker's pause after a failure before it tries again
 _CONSUME_ATTEMPTS = 12  # a consumption refused by a concurrent writer is read again this many times (about 0.4 s)
 
@@ -332,7 +337,7 @@ class ApprovalQueue:
         launched (its start failed) has nothing to join and is let go; were it to launch late, its generation is
         gone and it returns at once. One at a time with ``start`` (under ``_lifecycle``), so no start publishes
         or launches a worker while this withdraws and joins. Called on a thread already inside a start or stop (a
-        subscriber, a signal handler), which holds the re-entrant ``_lifecycle``, it runs at once, and a start it
+        subscriber), which holds the re-entrant ``_lifecycle``, it runs at once, and a start it
         ran inside publishes nothing after it. Called on a deadline worker's thread it is refused with
         ``RuntimeError`` and changes nothing: a worker cannot join itself, and one waiting there for
         ``_lifecycle`` could be waiting on a stop joining it."""

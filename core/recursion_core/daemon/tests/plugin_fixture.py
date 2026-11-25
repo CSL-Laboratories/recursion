@@ -72,10 +72,26 @@ def write_plugin(directory, source=OPERATOR_SOURCE, *, key=None, manifest=None, 
     return manifest
 
 
+def _owner_only_folders(path):
+    """Make ``path`` and every missing folder above it owner-only. The mode is set on each folder as it is
+    made, not left to the process mask; a folder that is already there is left as it is."""
+    path = Path(path)
+    missing = []
+    while not os.path.lexists(path):
+        missing.append(path)
+        path = path.parent
+    for folder in reversed(missing):
+        folder.mkdir(mode=0o700)
+        os.chmod(folder, 0o700)
+
+
 def write_install(config_dir, *, trusted=None, grants=(), **extra):
-    """Write ``plugins/install.json`` under ``config_dir`` (``$XDG_CONFIG_HOME/recursion``)."""
+    """Write ``plugins/install.json`` under ``config_dir`` (``$XDG_CONFIG_HOME/recursion``).
+
+    Every folder it makes is owner-only whatever the process mask is, as the installer makes them.
+    """
     plugins = Path(config_dir) / 'plugins'
-    plugins.mkdir(parents=True, mode=0o700, exist_ok=True)
+    _owner_only_folders(plugins)
     os.chmod(plugins, 0o700)
     path = plugins / 'install.json'
     path.write_text(json.dumps({'trusted_keys': dict(trusted or {}), 'grants': list(grants), **extra}))

@@ -1221,6 +1221,14 @@ class ComposedDaemonTest(unittest.TestCase):
         self.assertEqual(self.units.started, [])
         self.assertEqual(path.read_bytes(), b'not a breaker store')
 
+    def test_the_daemon_says_once_at_start_that_plugins_cannot_start_runs_without_a_routine_store(self):
+        with self.assertLogs('recursion_core.daemon.control_adapter', 'WARNING') as logs:
+            _, composed = self.boot()
+        said = [line for line in logs.output if 'routine store' in line]
+        self.assertEqual(len(said), 1, logs.output)
+        for words in ('plugins cannot start runs', 'until a routine store is configured', 'routine_store_absent'):
+            self.assertIn(words, said[0])
+
     # -- restart ---------------------------------------------------------------------------------
     def test_restart_recovers_runs_and_reports_what_happened_while_the_daemon_was_down(self):
         _, composed = self.boot()

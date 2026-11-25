@@ -161,14 +161,17 @@ class ChangingStore:
     def __init__(self, store, when):
         self.store, self.when, self.reads = store, when, 0
 
-    def admit_start(self, origin, asked=None, *, charge=True, reread=False):
-        answer = self.store.admit_start(origin, asked, charge=charge, reread=reread)
+    def admit_start(self, origin, asked=None, *, charge=True, reread=False, launching=None):
+        answer = self.store.admit_start(origin, asked, charge=charge, reread=reread, launching=launching)
         if not charge and not reread:
             self.reads += 1
             if self.reads == self.when:
                 revision = self.store.get("morning-digest")["revision"]
                 self.store.change(OWNER, "morning-digest", {"prompt": "Only the failures."}, revision=revision)
         return answer
+
+    def launched(self, origin, run_id):
+        return self.store.launched(origin, run_id)
 
 
 class EveryWayToTheLaunchTest(WhatRunsCase):

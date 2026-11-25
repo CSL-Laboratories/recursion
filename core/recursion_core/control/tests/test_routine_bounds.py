@@ -300,13 +300,14 @@ class WhatIsAskedTest(BoundsCase):
         self.assertEqual(d.store.get("morning-digest")["used"], 0)
         self.assertStarted(d.api.call("run.start", {"tenant": "default", "engine": "claude_code", "prompt": "p"}))
 
-    def test_a_trigger_start_with_no_routine_store_is_admitted_as_before(self):
+    def test_a_trigger_start_with_no_routine_store_is_refused_and_starts_nothing(self):
         api = ControlAPI(self.registry, FakeKillTree(), FakeStarter(), clock=lambda: 1000.0, new_run_id=run_ids())
         end = hc.DaemonEnd(PLUGIN, Granting(), runs=api)
         args = {"record_kind": "routine.v1", "record_id": "nowhere", "revision": 1, "occurrence": at(1),
                 "tenant": "default", "engine": "claude_code", "prompt": "p"}
         answer = end.receive({"type": "call", "id": 1, "name": "run.request", "args": args})
-        self.assertEqual(answer["value"]["code"], "started")
+        self.assertEqual((answer["value"]["code"], answer["value"]["detail"]),
+                         ("request_invalid", "routine_store_absent"))
 
 
 class WhereTheBootCannotBeToldTest(BoundsCase):

@@ -80,8 +80,10 @@ API is given the core's routine store (``routines``, ``control/routines.py``), a
 is a trigger is first asked of that store (``admit_start``): it is refused ``request_invalid`` with the
 store's code as its detail (``routine_unknown``, ``routine_lease_ended``, ``routine_budget_spent``) and the
 sentence of the one table of words (``text``), or it is charged to the record's budget and goes on. A
-retried start (the same key) is answered as before and charged nothing. With no routine store a trigger
-start is admitted as before.
+retried start (the same key) is answered as before and charged nothing. With no routine store there is
+no record to run from, so a trigger start is refused ``request_invalid`` / ``routine_store_absent`` before
+anything is written or charged, its sentence saying what is missing and what the person can do; the
+daemon says once in its start lines that plugins cannot start runs until a routine store is configured.
 
 What a trigger start runs, when the API is given the routine store: what the record says, never what the
 caller sends. Before the start lock is taken, the store is asked (charging nothing) for the record's
@@ -91,6 +93,13 @@ start goes on with the record's three values. Every way to the one launch call r
 record inside the start lock: a fresh start in the transaction that charges it, and the relaunch of a
 same-key start whose launch failed (charged once already) in a check that charges nothing. A same-key
 retry answered from the run it already has launches nothing.
+
+What travels with a start from a record: only what the record binds. A key of the caller's other than
+``tenant``, ``engine``, ``prompt`` and ``client_key`` (``RECORD_START_KEYS``) is refused ``request_invalid``
+/ ``routine_unbound_values`` before the store is asked, never handed to the starter. While a start the
+store admitted is being launched the store holds its run id (``admit_start``'s ``launching``, given back
+with ``launched`` once that start answers), so a person's change or removal of the record in that moment
+answers which runs may still start with the values the record had before (``control/routines.py``).
 
 Stop decisions and launch records are serialised per run, so a slow or hung cleanup on one run never
 queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed during it.
@@ -130,6 +139,10 @@ STALE_RETRIES = 3
 # The kinds of run origin the one admission path takes. Every other kind is refused (see the module text).
 ADMITTED_RUN_ORIGINS = ("trigger",)
 ORIGIN_NOT_ADMITTED = "origin_not_admitted"
+ROUTINE_STORE_ABSENT = "routine_store_absent"      # a trigger start where no routine store is given
+ROUTINE_UNBOUND_VALUES = "routine_unbound_values"  # a start from a record that carries what it does not bind
+# What a start from a record carries: the record's values (each checked against it) and the caller's key.
+RECORD_START_KEYS = RUN_VALUES + ("client_key",)
 
 # starter(params) -> {"cgroup"}: the daemon's launch path (route service + cgroup leaf), injected. params
 # carries the API-chosen "run_id", which the starter must launch under.
@@ -244,6 +257,9 @@ class ControlAPI:
     # -- start --------------------------------------------------------------------------------
     def start(self, params: Mapping, *, origin: Mapping | None = None) -> dict:
         origin = dict(origin) if origin is not None else None
+        if origin is not None and origin.get("kind") in ADMITTED_RUN_ORIGINS and self._routines is None:
+            # No routine store: there is no record to run from, so nothing a plugin sends is run (module text).
+            return {"code": REQUEST_INVALID, "detail": ROUTINE_STORE_ABSENT, "text": WORDS[ROUTINE_STORE_ABSENT]}
         # A trigger start with the routine store runs the record's values: the caller may leave them out.
         from_record = (origin is not None and self._routines is not None
                        and origin.get("kind") in ADMITTED_RUN_ORIGINS)
@@ -253,16 +269,19 @@ class ControlAPI:
             return {"code": REQUEST_INVALID, "detail": problem}
         if origin is not None and origin.get("kind") not in ADMITTED_RUN_ORIGINS:
             return {"code": REQUEST_INVALID, "detail": ORIGIN_NOT_ADMITTED, "text": WORDS[ORIGIN_NOT_ADMITTED]}
+        if from_record and set(params) - set(RECORD_START_KEYS):  # what the record does not bind does not travel
+            return {"code": REQUEST_INVALID, "detail": ROUTINE_UNBOUND_VALUES, "text": WORDS[ROUTINE_UNBOUND_VALUES]}
         if from_record:  # what the record says, read before the start lock (its tenant names the lock)
             read = self._routines.admit_start(origin, sent, charge=False)
             if read["code"] != OK:
                 return {"code": REQUEST_INVALID, "detail": read["code"], "text": read["text"]}
             params = {**params, **read["start"]}
         key = params.get("client_key")
+        held = []  # the run ids the routine store holds while this start launches them (module text)
         self._enter_owner()
         try:
             if not isinstance(key, str):
-                return self._start(params, origin)  # no key: a fresh run id, nothing to dedupe
+                return self._start(params, origin, held)  # no key: a fresh run id, nothing to dedupe
             slot_key = (params["tenant"], key)
             with self._locks_lock:
                 slot = self._start_locks.get(slot_key)
@@ -273,7 +292,7 @@ class ControlAPI:
             lock_key = _start_lock_key(slot_key)
             self._locks.acquire(self._local.owner, [lock_key])
             try:
-                return self._start(params, origin)
+                return self._start(params, origin, held)
             finally:
                 self._locks.release(self._local.owner, [lock_key])
                 with self._locks_lock:
@@ -281,9 +300,12 @@ class ControlAPI:
                     if slot[1] == 0 and self._start_locks.get(slot_key) is slot:
                         del self._start_locks[slot_key]
         finally:
+            for run_id in held:  # this start has answered: its launch call returned or never came
+                self._routines.launched(origin, run_id)
             self._exit_owner()
 
-    def _start(self, params: Mapping, origin: dict | None = None) -> dict:
+    def _start(self, params: Mapping, origin: dict | None = None, held: list | None = None) -> dict:
+        held = [] if held is None else held
         key = params.get("client_key")
         start_key = None
         if isinstance(key, str):
@@ -294,10 +316,13 @@ class ControlAPI:
             return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
         if prior is None and origin is not None and self._routines is not None:
             # The record as it is now, in the transaction that charges it: still the values read above.
-            refusal = self._routines.admit_start(origin, {name: params[name] for name in RUN_VALUES}, reread=True)
+            # Its run id is made in that transaction and held there until this start answers.
+            refusal = self._routines.admit_start(origin, {name: params[name] for name in RUN_VALUES}, reread=True,
+                                                 launching=self._new_run_id)
             if refusal["code"] != OK:
                 return {"code": REQUEST_INVALID, "detail": refusal["code"], "text": refusal["text"]}
-        run_id = prior["run_id"] if prior is not None else self._new_run_id()
+            held.append(refusal["run_id"])
+        run_id = prior["run_id"] if prior is not None else held[0] if held else self._new_run_id()
         rec = {"run_id": run_id, "tenant": params["tenant"], "engine": params["engine"], "state": "starting",
                "cgroup": None, "started_at": self._clock(), "stop": None, "start_key": start_key}
         if origin is not None:
@@ -310,9 +335,10 @@ class ControlAPI:
                 if origin is not None and self._routines is not None:
                     # A relaunch runs again: the record must still say what it runs (charged once already).
                     refusal = self._routines.admit_start(origin, {name: params[name] for name in RUN_VALUES},
-                                                         charge=False, reread=True)
+                                                         charge=False, reread=True, launching=lambda: run_id)
                     if refusal["code"] != OK:
                         return {"code": REQUEST_INVALID, "detail": refusal["code"], "text": refusal["text"]}
+                    held.append(run_id)
                 # The run already has a generation. A relaunch has to CAS that generation; a blind put
                 # would be a stale write and is refused.
                 current = self._current(prior)

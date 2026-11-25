@@ -42,9 +42,27 @@ def run_ids():
     return lambda: f"run-{next(n)}"
 
 
-def make_api(kill: FakeKillTree | None = None, registry=None, starter=None):
+class AdmitsAsAsked:
+    """A stand-in for the routine store, for tests of the channel and the start path rather than of the
+    store (control/tests/test_routine_*.py test the store): every trigger start is admitted with the values
+    it was asked with, nothing is charged and nothing is kept."""
+
+    def admit_start(self, origin, asked=None, *, charge=True, reread=False, launching=None):
+        answer = {"code": "ok", "start": dict(asked or {})}
+        if launching is not None:
+            answer["run_id"] = launching()
+        return answer
+
+    def launched(self, origin, run_id):
+        return True
+
+
+def make_api(kill: FakeKillTree | None = None, registry=None, starter=None, routines=None):
+    """A control API over fakes. A trigger start needs a routine store; ``routines`` defaults to the
+    stand-in above."""
     registry, kill, starter = registry or InMemoryRunRegistry(), kill or FakeKillTree(), starter or FakeStarter()
-    api = ControlAPI(registry, kill, starter, clock=lambda: 1000.0, new_run_id=run_ids())
+    api = ControlAPI(registry, kill, starter, clock=lambda: 1000.0, new_run_id=run_ids(),
+                     routines=AdmitsAsAsked() if routines is None else routines)
     return api, registry, kill, starter
 
 

@@ -70,6 +70,14 @@ A kept refusal carries the plugin and the occurrence it was asked with only when
 form (a plugin id; an occurrence as ``run.request`` takes it, a UTC instant to the second); otherwise the
 field is absent, never an empty or a made-up value.
 
+While a start is launched. ``admit_start`` given ``launching`` (a callable that makes the run id) holds
+that run id in the store, in the same transaction that charges the start (or checks its relaunch), until
+the API says that start has answered (``launched``). A person's ``change`` or ``remove`` of the record in
+that moment still answers ``ok``, and its answer carries ``starting``: the run ids that may still start
+with the values the record had before, and a sentence that says so and what the person can do (stop the
+run). An answer without ``starting`` means that no start admitted before it was still being launched. A
+run already launched is in the run list with the values it started with; the person stops it there.
+
 What runs today. No daemon composes this store yet: no command of a person reaches it from outside the
 process, and a running daemon starts its runs as before.
 
@@ -140,6 +148,20 @@ TEXT = {
     "routine_differs": "The plugin asked this routine for a run with another {what} than the routine you "
                        "admitted, so no run was started and nothing was charged. The request is kept on the "
                        "routine; if you want that run, write the routine again with it.",
+    "routine_store_absent": "A plugin asked to start a run from a routine, but this daemon has no routine "
+                            "store, so no run was started and nothing was charged. Plugins cannot start runs "
+                            "until a routine store is configured; until then, start the run yourself from "
+                            "your own Recursion.",
+    "routine_unbound_values": "The plugin sent values with its request that the routine you admitted does not "
+                              "name, so no run was started and nothing was charged. A run from a routine "
+                              "carries only its tenant, engine and prompt; if you want another run, start it "
+                              "yourself or write the routine again.",
+    "routine_changed_while_starting": "The routine was changed, but a run started from it a moment before was "
+                                      "still being launched and may run with what the routine said before "
+                                      "({runs}). Stop that run if you do not want it.",
+    "routine_removed_while_starting": "The routine was removed, but a run started from it a moment before was "
+                                      "still being launched and may run with what the routine said before "
+                                      "({runs}). Stop that run if you do not want it.",
     "routine_changed": "This routine changed while a run was being started from it, or was changed in its "
                        "store by something other than your own commands, so no run was started and nothing "
                        "was charged. Read the routine, and write it again if it does not say what you want.",
@@ -247,6 +269,8 @@ class RoutineStore:
         with self._write() as db:
             db.execute("CREATE TABLE IF NOT EXISTS routines (record_id TEXT PRIMARY KEY, body TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS clocks (name TEXT PRIMARY KEY, value NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS launching (record_id TEXT NOT NULL, run_id TEXT NOT NULL, "
+                       "PRIMARY KEY (record_id, run_id))")
 
     @contextlib.contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -388,7 +412,8 @@ class RoutineStore:
                                    {**kept, "ends": kept["start"] + changes["lease_seconds"]})
             self._stamp(stored, writer)
             self._put(db, stored)
-        return {"code": OK, "routine": stored}
+            starting = self._starting(db, record_id)
+        return _told({"code": OK, "routine": stored}, starting, "routine_changed_while_starting")
 
     @staticmethod
     def _widens(prior: Mapping, changes: Mapping) -> str | None:
@@ -402,7 +427,8 @@ class RoutineStore:
         return None
 
     def remove(self, writer: object, record_id: object) -> dict:
-        """Remove a record at once: nothing reads it after this answer."""
+        """Remove a record at once: no start is admitted from it after this answer. A start admitted from it
+        just before may still be launching with its values; the answer then names it (module text)."""
         problem = writer_problem(writer)
         if problem is not None:
             return _refused(problem)
@@ -410,7 +436,25 @@ class RoutineStore:
             if type(record_id) is not str or self._get(db, record_id) is None:
                 return _refused("routine_unknown", str(record_id)[:64])
             db.execute("DELETE FROM routines WHERE record_id = ?", (record_id,))
-        return {"code": OK, "removed": record_id}
+            starting = self._starting(db, record_id)
+        return _told({"code": OK, "removed": record_id}, starting, "routine_removed_while_starting")
+
+    @staticmethod
+    def _starting(db: sqlite3.Connection, record_id: str) -> list:
+        """The run ids admitted from ``record_id`` whose start has not answered yet (module text)."""
+        return [row[0] for row in db.execute("SELECT run_id FROM launching WHERE record_id = ? ORDER BY run_id",
+                                             (record_id,))]
+
+    def launched(self, origin: Mapping, run_id: str) -> bool:
+        """The start of ``run_id``, admitted from ``origin``'s record, has answered: the store stops holding it.
+        False when the store cannot be written; the run id is then still named as one that may start."""
+        try:
+            with self._write() as db:
+                db.execute("DELETE FROM launching WHERE record_id = ? AND run_id = ?",
+                           (origin.get("record_id"), run_id))
+        except sqlite3.Error:
+            return False
+        return True
 
     def list(self) -> dict:
         """Every record, by id: each names the plugin that may ask for it, its lease, budget and last refusal."""
@@ -434,7 +478,7 @@ class RoutineStore:
 
     # -- the core's check, before a run is started from a record ----------------------------------
     def admit_start(self, origin: Mapping, asked: Mapping | None = None, *, charge: bool = True,
-                    reread: bool = False) -> dict:
+                    reread: bool = False, launching: Callable[[], str] | None = None) -> dict:
         """Whether a start from ``origin``'s record may go on, and what it runs: ``{"code": "ok", "start":
         {...}}`` with the record's ``tenant``, ``engine`` and ``prompt``, else the refusal.
 
@@ -446,7 +490,9 @@ class RoutineStore:
         charged) nothing is charged and the lease and budget are not read. With ``reread``, ``asked`` holds
         the values this start read from the record a moment before, so a value that differs now means the
         record changed in between: ``routine_changed``, not the caller's ``routine_differs``. Which refusals
-        are kept on the record as ``last_refusal``, and why two are not, is in the module text.
+        are kept on the record as ``last_refusal``, and why two are not, is in the module text. With
+        ``launching``, the start's run id is made by it in the same transaction and held until ``launched``
+        (the answer carries it as ``run_id``), so a change or removal in between names it.
         """
         asked = {} if asked is None else asked
         record_id = origin.get("record_id")
@@ -475,7 +521,20 @@ class RoutineStore:
             if charge:
                 record["used"] += 1
             self._put(db, record)
-        return {"code": OK, "start": {name: record[name] for name in RUN_VALUES}}
+            run_id = launching() if launching is not None else None
+            if run_id is not None:
+                db.execute("INSERT OR REPLACE INTO launching (record_id, run_id) VALUES (?, ?)", (record_id, run_id))
+        answer = {"code": OK, "start": {name: record[name] for name in RUN_VALUES}}
+        if run_id is not None:
+            answer["run_id"] = run_id
+        return answer
+
+
+def _told(answer: dict, starting: list, code: str) -> dict:
+    """A change's or removal's ``ok``, with the runs that may still start with the old values when any."""
+    if starting:
+        answer.update(starting=starting, text=TEXT[code].format(runs=", ".join(starting)))
+    return answer
 
 
 def _changed(record: Mapping) -> bool:

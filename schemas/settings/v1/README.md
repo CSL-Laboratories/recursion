@@ -11,7 +11,7 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
 | `status.value_max_chars` | integer, or the string `"none"` | `80` | The most characters of one value that status, the start log and a note show; what is past it is cut and counted, a list shows the names that fit and how many more, and "none" shows every value whole. The least is 40, so the words that say what is cut or hidden always fit. |
 | `status.hidden_names` | list of strings | `["key", "keys", "token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "credential", "credentials"]` | The words that hide a setting's value: status, the start log and a note never show the value of a setting whose name holds one of them, whatever the value looks like (a name's words stand between dots, underscores and dashes). The words a settings file lists are added to these shipped words, which no settings file can take away; an empty list keeps the shipped words alone. To show one setting's value anyway, name that setting in status.shown_names. |
 | `status.shown_names` | list of strings | `[]` | The settings whose value is shown although the name holds a word of status.hidden_names, each named whole as status shows it (such as db.api_token); empty as shipped. Each start and each status that uses this list says so in a note that names those settings. A text that looks like a key or password and the sign-in of an address stay hidden in such a value. |
-| `status.digest_chars` | integer, 6 or more (64 advised at most) | `8` | How many hex characters of the SHA-256 digest of a key's text, with the sign-in of any address in it taken out, a key cut at the cap carries in a note, so two long keys that differ only past the cap read apart; a key that fits the cap carries none. The least is 6, since below it two keys read the same too often; past 64, the whole digest, nothing more is shown, so 64 is the advised most. A cut key carries only as many as fit the cap beside its first 8 characters, and never fewer than 6. |
+| `status.digest_chars` | integer, 6 or more (64 advised at most) | `8` | How many hex characters of the SHA-256 digest of a key's text, with what the sign-in rule hides taken out, a key cut at the cap carries in a note, so two long keys that differ only past the cap read apart; a key that fits the cap carries none. The least is 6, since below it two keys read the same too often; past 64, the whole digest, nothing more is shown, so 64 is the advised most. A cut key carries only as many as fit the cap beside its first 8 characters, and never fewer than 6. |
 
 ## What holds for the file
 
@@ -38,17 +38,22 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
   past it is cut, with the count of characters not shown; a list shows the names that fit whole and how
   many more; `"none"` shows every value whole. A key of the file is capped the same way: a key that is cut
   carries the first `status.digest_chars` hex characters (8 as shipped) of the SHA-256 of its text
-  with the sign-in of any address taken out, said to be a digest, so two keys never read the same and
-  nothing of a sign-in enters the hash; it carries only as many as fit the cap beside the key's first 8
+  after the sign-in rule's hiding (below), said to be a digest, so two keys never read the same and
+  nothing that rule hides enters the hash; it carries only as many as fit the cap beside the key's first 8
   characters, and never fewer than 6. A key that fits is shown whole.
 - Never shown, under any cap and under `"none"`, not in part and not by its length: the value of a setting
   whose name holds a word of `status.hidden_names` (the first net: by name, whatever the value looks like);
-  the sign-in of every web address in a text, what stands between the scheme and the host, also without a
-  scheme, inside a longer text (`postgres://<sign-in hidden>@db/x`) and however two addresses are joined
-  (`a://<sign-in hidden>@h1/,b://<sign-in hidden>@h2/`); and a text that looks like a key or a password.
-  That look-alike rule is only a second net: it misses a short key, a key of one case or of digits only, a
-  UUID, base64 cut by `+` or `/`, and a key split over a list's items, so such a value under a name not on
-  the list is shown. Put a key only under a setting whose name says so.
+  a text that looks like a key or a password; and a sign-in, by one rule on each run of text without a space
+  (the sign-in rule): where a colon stands before the run's last @, everything from the first colon of the
+  run to that last @ is hidden, with the name just before the colon, unless the colon begins a scheme mark
+  (`://`), whose scheme stays (`postgres://<sign-in hidden>@db/x`, `<sign-in hidden>@db/x`). So when a text
+  holds an address and an at-sign, everything between the first scheme mark and the last at-sign of that
+  run is hidden; a host or a path can be hidden with it (two joined addresses show as
+  `a://<sign-in hidden>@h2/`, and `https://h/u@mail` as `https://<sign-in hidden>@mail`). The sign-in rule
+  misses a password that holds a space and an address written wholly percent-escaped. The look-alike rule
+  is only a second net: it misses a short key, a key of one case or of digits only, a UUID, base64 cut by
+  `+` or `/`, and a key split over a list's items, so such a value under a name not on the list is shown.
+  Put a key only under a setting whose name says so.
 - A settings file adds words to `status.hidden_names` and never takes the shipped words away; an empty
   list keeps them alone. A setting named whole in `status.shown_names` is shown although its name holds
   such a word, and every start and every status says so in the note `settings_shown_anyway`; the

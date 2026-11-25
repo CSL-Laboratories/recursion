@@ -37,16 +37,21 @@ The rules this module keeps:
   return goes through the cap of the row ``status.value_max_chars`` (80 characters as shipped, 40 at least;
   ``"none"`` shows every value whole): a text past it is cut and the characters not shown are counted, and
   a list keeps the names that fit whole and counts the rest. A key of the file is capped the same way; a key
-  that is cut carries the first characters of the SHA-256 of its text with the sign-in of any address taken
-  out, said to be a digest (the row ``status.digest_chars``, 8 as shipped, as many as fit the cap beside the
+  that is cut carries the first characters of the SHA-256 of its text after the sign-in rule's hiding
+  (below), said to be a digest (the row ``status.digest_chars``, 8 as shipped, as many as fit the cap beside the
   key's first 8 characters, 6 at least), so two keys never read the same; a key that fits is shown whole.
 * NEVER SHOWN, under any cap and under ``"none"``, not in part and not by its length: the value of a
   setting whose name holds a word of the row ``status.hidden_names`` (the first net: by name, whatever the
-  value looks like); the sign-in of every web address in a text, what stands between the scheme and the
-  host, also without a scheme, inside a longer text (``postgres://<sign-in hidden>@db/x``) and however
-  two addresses are joined (``a://<sign-in hidden>@h1/,b://<sign-in hidden>@h2/``); and a text that looks
-  like a key or a password. That look-alike rule is only a second net: it misses a short key, a key of one
-  case or of digits only, a UUID, base64 cut by ``+`` or ``/``, and a key split over a list's items, so
+  value looks like); a text that looks like a key or a password; and a sign-in, by one rule on each run of
+  text without a space (the sign-in rule): where a colon stands before the run's last @, everything from the
+  first colon of the run to that last @ is hidden, with the name just before the colon, unless the colon
+  begins a scheme mark (``://``), whose scheme stays (``postgres://<sign-in hidden>@db/x``,
+  ``<sign-in hidden>@db/x``). So when a text holds an address and an at-sign, everything between the first
+  scheme mark and the last at-sign of that run is hidden; a host or a path can be hidden with it (two
+  joined addresses show as ``a://<sign-in hidden>@h2/``, and ``https://h/u@mail`` as
+  ``https://<sign-in hidden>@mail``). The sign-in rule misses a password that holds a space and an address
+  written wholly percent-escaped. The look-alike rule is only a second net: it misses a short key, a key of
+  one case or of digits only, a UUID, base64 cut by ``+`` or ``/``, and a key split over a list's items, so
   such a value under a name not on the list is shown. Every line is one line: a line break, a control
   character or a direction or format character is shown escaped (``\\n``, ``\\u202e``).
 * A FILE ADDS AND NEVER TAKES AWAY. The words of ``status.hidden_names`` a file lists are added to the
@@ -175,8 +180,8 @@ _SHOWN_NAMES_ROW = Setting(
     "sign-in of an address stay hidden in such a value.")
 _DIGEST_CHARS_ROW = Setting(
     DIGEST_CHARS, int, 8,
-    "How many hex characters of the SHA-256 digest of a key's text, with the sign-in of any address in it "
-    "taken out, a key cut at the cap carries in a note, so two long keys that differ only past the cap read "
+    "How many hex characters of the SHA-256 digest of a key's text, with what the sign-in rule hides taken "
+    "out, a key cut at the cap carries in a note, so two long keys that differ only past the cap read "
     "apart; a key that fits the cap carries none. The least is 6, since below it two keys read the same too "
     "often; past 64, the whole digest, nothing more is shown, so 64 is the advised most. A cut key carries "
     "only as many as fit the cap beside its first 8 characters, and never fewer than 6.",
@@ -252,7 +257,8 @@ def _looks_like_a_key(text: str) -> bool:
 
 
 def _without_sign_in(text: str) -> str:
-    """``text`` with the sign-in of every web address in it replaced by words that say so; the rest stays."""
+    """``text`` with what the sign-in rule hides in each run without a space (``_run_without_sign_in``)
+    replaced by words that say so; the rest stays."""
 
     if "@" not in text:
         return text
@@ -260,49 +266,25 @@ def _without_sign_in(text: str) -> str:
 
 
 def _run_without_sign_in(run: str) -> str:
-    """One run of text without a space, with the sign-in of EVERY address in it taken out, however the
-    addresses are joined: a comma, a semicolon, a pipe, a quote, a bracket or nothing at all. The run is cut
-    at each ``://`` and each piece is read alone (``_address_without_sign_in`` for a piece that follows a
-    scheme, ``_bare_without_sign_in`` for the text before the first one), so no sign-in hides behind an
-    earlier address. Each step is one pass over its piece."""
+    """One run of text without a space, by one rule that errs on the side of hiding: where a colon stands
+    before the run's LAST @, everything from the first colon of the run to that last @ is hidden, with the
+    name just before the colon, unless the colon begins a scheme mark (``://``), whose scheme stays. So when
+    a run holds an address and an at-sign, everything between the first scheme mark and the last at-sign is
+    hidden, whatever stands between (slashes, colons, hashes, question marks, further scheme marks, further
+    addresses); a host or a path can be hidden with it. An @ with no colon before it (a mail address) is no
+    sign-in. One pass over the run."""
 
-    if "@" not in run:
-        return run
-    head, *rest = run.split("://")
-    return "://".join([_bare_without_sign_in(head), *(_address_without_sign_in(piece) for piece in rest)])
-
-
-def _address_without_sign_in(piece: str) -> str:
-    """What follows one ``://`` up to the next one. The sign-in is what stands between ``://`` and the host, up
-    to the last @ of the piece where what stands before the path holds an @ (a password may hold an @ and then
-    a /) or is no host and port (a password that holds a /). What follows a plain host may hold a sign-in
-    written without a scheme (``_bare_without_sign_in``). What cannot be told from a host is hidden too."""
-
-    if "@" not in piece:
-        return piece
-    ends = [i for i in (piece.find(c) for c in "/?#") if i >= 0]
-    stop = min(ends, default=len(piece))
-    authority = piece[:stop]
-    if "@" in authority:
-        return _HIDDEN_SIGN_IN + piece[piece.rfind("@"):]
-    host = authority.split("]", 1)[1] if authority.startswith("[") and "]" in authority else authority
-    if ":" not in host or host.rsplit(":", 1)[1].isdigit() or host.endswith(":"):
-        return authority + _bare_without_sign_in(piece[stop:])  # a host, or a host and its port, then the rest
-    return _HIDDEN_SIGN_IN + piece[piece.rfind("@"):]
-
-
-def _bare_without_sign_in(text: str) -> str:
-    """A text with no ``://`` in it: a sign-in written without a scheme is a name, a colon and what follows, up
-    to the last @ of the text; an @ with no colon before it (a mail address) is no sign-in."""
-
-    last = text.rfind("@")
-    colon = text.find(":", 0, last) if last >= 0 else -1
+    last = run.rfind("@")
+    colon = run.find(":", 0, last) if last > 0 else -1
     if colon < 0:
-        return text
-    begin = colon
-    while begin > 0 and (text[begin - 1].isalnum() or text[begin - 1] in ".%+~_-"):
-        begin -= 1
-    return text[:begin] + _HIDDEN_SIGN_IN + text[last:]
+        return run
+    if run.startswith("://", colon):
+        begin = colon + 3  # the scheme and its mark stay
+    else:  # a sign-in written without a scheme: the name before the colon is hidden with it
+        begin = colon
+        while begin > 0 and (run[begin - 1].isalnum() or run[begin - 1] in ".%+~_-"):
+            begin -= 1
+    return run[:begin] + _HIDDEN_SIGN_IN + run[last:]
 
 
 def _hidden_name(name: str, hidden: object) -> bool:
@@ -356,7 +338,8 @@ def _piece(value: object) -> str:
 
 def _digest(text: str, chars: int) -> str:
     """The first ``chars`` hex characters of the SHA-256 of ``text`` (UTF-8), so that two keys cut at the same
-    place never read the same. ``_shown`` gives it the key's text with the sign-in of any address taken out."""
+    place never read the same. ``_shown`` gives it the key's text after the sign-in rule's hiding
+    (``_without_sign_in``), so nothing that rule hides enters the hash."""
 
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:chars]
 
@@ -388,9 +371,9 @@ def _shown(value: object, cap: object = None, hidden: bool = False, key: bool | 
     whole, never cut inside a name, and counts the rest. With ``hidden`` (the setting's name holds a word of
     ``status.hidden_names``) the value is never shown; the sign-in of an address and a text that looks like a
     key or a password are never shown either (``_piece``): the look-alike rule is only a second net. With
-    ``key`` (the value is a key of the file) a cut text carries a short digest of the key's text with the
-    sign-in of any address taken out, so that two keys cut at the same place never read the same and nothing
-    of a sign-in enters the hash; a key that fits the cap is shown whole. The digest has as many hex characters
+    ``key`` (the value is a key of the file) a cut text carries a short digest of the key's text after the
+    sign-in rule's hiding, so that two keys cut at the same place never read the same and nothing that rule
+    hides enters the hash; a key that fits the cap is shown whole. The digest has as many hex characters
     as ``key`` says (the row ``status.digest_chars``), its shipped value when True, or as fit the cap beside the
     key's first characters, never fewer than the row's least."""
 

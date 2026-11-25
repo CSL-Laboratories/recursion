@@ -112,11 +112,11 @@ def refuse_remote_bind(address: object) -> str:
     if not isinstance(address, str):
         raise RemoteBindRefused(f"remote_bind_refused: {type(address).__name__} is not an AF_UNIX path")
     if _URL_SCHEME.match(address) and not address.startswith("unix://"):
-        raise RemoteBindRefused(f"remote_bind_refused: {address!r}")
+        raise RemoteBindRefused(f"remote_bind_refused: {_shown(address)}")
     if address.startswith("unix://"):
         address = address[len("unix://"):]
     if _HOST_PORT.match(address) or _is_host(address):
-        raise RemoteBindRefused(f"remote_bind_refused: {address!r}")
+        raise RemoteBindRefused(f"remote_bind_refused: {_shown(address)}")
     if not address or address.startswith("\0"):
         raise InsecureSocketPath("abstract or empty socket names are refused; use a 0700 directory")
     if "\0" in address:
@@ -126,6 +126,22 @@ def refuse_remote_bind(address: object) -> str:
     if len(os.fsencode(address)) > _MAX_SUN_PATH:
         raise InsecureSocketPath("socket path is longer than sun_path allows")
     return address
+
+
+def _shown(address: str) -> str:
+    """``address`` as a refusal may print it: quoted, so a line break cannot start a new log line, and with any
+    userinfo before the last ``@`` replaced (sweep s7 D11).
+
+    A token in the query, the fragment, or the path is not userinfo and is still printed.
+    """
+    # A plain str, so a subclass cannot turn the redaction off by overriding partition or rsplit.
+    address = str.__str__(address)
+    head, sep, tail = str.rpartition(address, "@")
+    if not sep:
+        return repr(address)
+    scheme, scheme_sep, _rest = str.partition(head, "://")
+    prefix = (scheme + scheme_sep) if scheme_sep else ""
+    return repr(prefix + "<userinfo>@" + tail)
 
 
 def require_unix_transport() -> None:
@@ -162,13 +178,17 @@ def ensure_private_dir(directory: str) -> None:
         os.mkdir(directory, 0o700)
     except FileExistsError:
         pass
-    st = os.lstat(directory)
+    try:
+        st = os.lstat(directory)
+    except FileNotFoundError:
+        raise InsecureSocketPath(f"{directory!r} went away while it was being checked") from None
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        raise InsecureSocketPath(f"{directory} is not a real directory")
+        raise InsecureSocketPath(f"{directory!r} is not a real directory")
     if st.st_uid != os.geteuid():
-        raise InsecureSocketPath(f"{directory} is owned by uid {st.st_uid}")
+        raise InsecureSocketPath(f"{directory!r} is owned by uid {st.st_uid}")
     if st.st_mode & 0o077:
-        raise InsecureSocketPath(f"{directory} has mode {stat.S_IMODE(st.st_mode):04o}, want 0700")
+        # Quoted: a directory name holding a line break must not print as two lines (sweep s7 D12).
+        raise InsecureSocketPath(f"{directory!r} has mode {stat.S_IMODE(st.st_mode):04o}, want 0700")
 
 
 def _acquire_lock(path: str) -> int:
@@ -185,15 +205,17 @@ def _acquire_lock(path: str) -> int:
     try:
         fd = os.open(path, flags, 0o600)
     except OSError as exc:
-        raise InsecureSocketPath(f"{path} cannot be opened as our lock file: {exc}") from exc
+        detail = exc.strerror or exc.errno
+        raise InsecureSocketPath(
+            f"{path!r} cannot be opened as our lock file: [{exc.errno}] {detail}") from exc
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
-            raise InsecureSocketPath(f"{path} exists and is not our lock file")
+            raise InsecureSocketPath(f"{path!r} exists and is not our lock file")
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise InsecureSocketPath(f"{path} is held: another server is starting or live") from exc
+            raise InsecureSocketPath(f"{path!r} is held: another server is starting or live") from exc
     except BaseException:
         os.close(fd)
         raise
@@ -206,7 +228,7 @@ def _clear_stale_socket(path: str) -> None:
     except FileNotFoundError:
         return
     if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.geteuid():
-        raise InsecureSocketPath(f"{path} exists and is not our socket")
+        raise InsecureSocketPath(f"{path!r} exists and is not our socket")
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         probe.settimeout(1.0)
@@ -218,7 +240,7 @@ def _clear_stale_socket(path: str) -> None:
         return
     finally:
         probe.close()
-    raise InsecureSocketPath(f"{path} is live: another server is listening")
+    raise InsecureSocketPath(f"{path!r} is live: another server is listening")
 
 
 def check_peer(sock: socket.socket, getter: PeerCredGetter, expected_uid: int) -> PeerCred:
@@ -289,8 +311,14 @@ class UnixControlServer:
         reserved_timeout_s: float = RESERVED_TIMEOUT_S,
     ) -> None:
         directory = refuse_remote_bind(directory)
-        if not name or "/" in name or name in (".", ".."):
-            raise InsecureSocketPath("socket name must be a single path component")
+        if (
+            not name
+            or "/" in name
+            or name in (".", "..")
+            or not name.isascii()
+            or not name.isprintable()
+        ):
+            raise InsecureSocketPath("socket name must be a single printable path component")
         if type(max_frame_bytes) is not int or max_frame_bytes < _MIN_FRAME_BYTES:
             # A cap that cannot carry the server's own fallback, or the id_too_large refusal,
             # is refused before startup. A smaller cap would drop that reply and the peer
@@ -357,7 +385,7 @@ class UnixControlServer:
                 os.chmod(self._path, 0o600)
                 st = os.lstat(self._path)
                 if not stat.S_ISSOCK(st.st_mode) or st.st_uid != self._uid:
-                    raise InsecureSocketPath(f"{self._path} changed under us after bind")
+                    raise InsecureSocketPath(f"{self._path!r} changed under us after bind")
                 sock.listen(socket.SOMAXCONN)
                 sock.settimeout(_ACCEPT_POLL_S)
             except BaseException:

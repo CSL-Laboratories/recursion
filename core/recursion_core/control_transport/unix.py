@@ -47,6 +47,12 @@ PeerCredGetter = Callable[[socket.socket], PeerCred]
 
 DEFAULT_SOCKET_NAME = "control.sock"
 MAX_CONNECTIONS = 16
+# How many of the latest refusal reasons ``UnixControlServer.refused`` keeps (sweep s7 D09: every refused peer
+# was appended and nothing was ever dropped). A diagnostic, not a count of refusals.
+REFUSED_KEPT = 128
+# A stored reason is a diagnostic, kept up to REFUSED_KEPT times. The stored text is at most
+# this many characters, so one huge message cannot pin mebibytes of history.
+REFUSED_REASON_MAX = 512
 # Whole-frame deadline: each request must arrive complete within this long of the server
 # being ready for it (connect or previous reply), however the bytes are spaced.
 IDLE_TIMEOUT_S = 30.0
@@ -291,8 +297,12 @@ class UnixControlServer:
             # would see the connection end instead of a typed answer. At a cap of 32 the
             # 50-byte fallback was written anyway (sweep s7 D19).
             raise ValueError(f"max_frame_bytes must be an int of at least {_MIN_FRAME_BYTES}")
-        if max_connections < 1:
-            raise ValueError("max_connections must be positive")
+        # Counts are exact ints (sweep s7 D08: 1.5, NaN and infinity passed, and a 1.5 semaphore granted eight
+        # slots); a bool is not a count.
+        if type(max_connections) is not int or max_connections < 1:
+            raise ValueError("max_connections must be a positive int")
+        if type(reserved_connections) is not int:
+            raise ValueError("reserved_connections must be an int")
         if reserved_connections < 0 or (reserved_connections and priority is None):
             raise ValueError("reserved_connections needs a priority test and cannot be negative")
         idle_timeout_s = _seconds("idle_timeout_s", idle_timeout_s)
@@ -414,6 +424,19 @@ class UnixControlServer:
 
     def _refuse(self, reason: str) -> None:
         with self._lock:
+            # Make room before the append. A reader that does not take the lock then never
+            # sees more than REFUSED_KEPT rows, and an interrupt before the append cannot
+            # leave one past the cap. The list object stays the one constructed.
+            # A keep of 0 or below retains nothing: ``del [:-0]`` would delete nothing.
+            keep = REFUSED_KEPT
+            if type(keep) is not int or keep <= 0:
+                del self.refused[:]
+                return
+            if len(reason) > REFUSED_REASON_MAX:
+                reason = reason[:REFUSED_REASON_MAX]
+            extra = len(self.refused) + 1 - keep
+            if extra > 0:
+                del self.refused[:extra]
             self.refused.append(reason)
 
     def _accept_loop(self) -> None:

@@ -28,11 +28,16 @@ from recursion_core.plugin_security.tests.test_manifest_v1 import NOTES_SOURCE, 
 FAKE_KEY = "11" * 32
 UNBOUND = ("grant_unbound: The grant for this plugin in install.json names no developer key ID (developer_key_id), "
            "so the plugin was not loaded and none of its code ran. Make the grant again with developer_key_id set "
-           "to this plugin's developer key ID, then load the plugin again.")
+           "to this plugin's developer key ID, then load the plugin again. This manifest is not signed, so the ID "
+           "is never taken from it: the plugin's developer gives it (ed25519: and 32 lower-case hex digits).")
+UNBOUND_SIGNED = ("grant_unbound: The grant for this plugin in install.json names no developer key ID "
+                  "(developer_key_id), so the plugin was not loaded and none of its code ran. Its manifest is signed "
+                  "by a key on this install's trusted list, developer key ID %s: make the grant again with "
+                  "signer_key_id and developer_key_id set to %s, then load the plugin again.")
 FOLDER = ("package_file_missing: the plugin's folder is missing, is a symbolic link or is not a folder, and the "
           "loader follows no link in a package, so the plugin was not loaded and none of its code ran: give the "
           "folder itself, or install the package again from its source.")
-UNKNOWN = ("unknown runtime; this release accepts python-sandboxed/1, and python-inprocess/1 until 1.1.0 with the "
+UNKNOWN = ("unknown runtime %s; this release accepts python-sandboxed/1, and python-inprocess/1 until 1.1.0 with the "
            "finding runtime_inprocess_retiring; write python-sandboxed/1 as the manifest's runtime")
 NOT_KEY_IDS = ("not-a-key", "", "ed25519:", "ed25519:" + "AB" * 16, "ed25519:" + "ab" * 16 + " ")
 POSIX = unittest.skipUnless(os.name == "posix", "symbolic links and the install reader's file checks are POSIX here")
@@ -68,7 +73,7 @@ class SignedManifestWithAnUnboundManualGrantTests(unittest.TestCase):
                 loader.load(raw, self.dev.sign(raw), source)
         finally:
             self.assertFalse(marker.exists(), "plugin code ran before the refusal")
-        self.assertEqual(str(ctx.exception), UNBOUND)
+        self.assertEqual(str(ctx.exception), UNBOUND_SIGNED % (self.kid, self.kid))
         self.assertEqual(loader.doctor(raw, self.dev.sign(raw), source)[-1]["code"], "grant_unbound")
 
     def test_a_signed_manifest_asking_a_permission_with_an_unbound_manual_grant_is_refused(self) -> None:
@@ -153,7 +158,7 @@ class TheRuntimeRefusalSaysWhatThisReleaseAcceptsTests(unittest.TestCase):
     def test_an_unknown_runtime_is_refused_with_the_runtimes_this_release_accepts(self) -> None:
         with self.assertRaises(Refused) as ctx:
             parse_manifest(v1(runtime="python-subprocess/1"))
-        self.assertEqual((ctx.exception.code, ctx.exception.detail), ("manifest_runtime", UNKNOWN))
+        self.assertEqual((ctx.exception.code, ctx.exception.detail), ("manifest_runtime", UNKNOWN % '"python-subprocess/1"'))
 
     def test_what_the_refusal_names_as_accepted_is_accepted(self) -> None:
         for runtime in ("python-sandboxed/1", "python-inprocess/1"):

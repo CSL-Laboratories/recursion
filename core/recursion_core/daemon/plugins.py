@@ -64,7 +64,8 @@ from recursion_core.gui.panels import panel_registry
 from recursion_core.plugin_security import (ApprovalGate, Authority, CoreHealth, CoreService, GilProbe, Grant,
                                             PluginLoader, Refused, ReservedEffects, TrustStore,
                                             create_revocation_store)
-from recursion_core.plugin_security.manifest import MAX_MANIFEST_BYTES, PERMISSIONS_V1, developer_key_id_ok
+from recursion_core.plugin_security.manifest import (GRANT_KEY_ID_RULES, MAX_MANIFEST_BYTES, PERMISSIONS_V1,
+                                                     SHOWN_VALUE_CHARS)
 from recursion_core.plugin_security.signing import backend_available
 
 from .breaker import STORE_DIR
@@ -100,6 +101,13 @@ UNVERIFIED_IMPORTS = 'plugin_imported_unverified_modules'
 # Not reported: the daemon's own package and its signature backend, whose submodules the host's
 # own signature check can import for the first time while a plugin loads.
 _HOST_PACKAGES = frozenset({'recursion_core', 'cryptography'})
+
+
+SIGNER_KEY_ID_INVALID_TEXT = (
+    'the grant for %s in %s has a signer_key_id that is not a developer key ID. A grant is read only when its keys '
+    'are null or a key ID of the form ed25519: and 32 lower-case hex digits, so a hand edit cannot make a plugin run '
+    'outside the rules for its grant. Set signer_key_id to null or to the developer key ID, or make the grant again '
+    'with the install command; no plugin was loaded and none of its code ran.')
 
 
 class PluginRefused(Exception):
@@ -168,10 +176,11 @@ def _owned_directory(path):
 def read_install(directory):
     """Parse ``install.json``. With no file: no trusted key and no grant, so nothing gets a permission.
 
-    ``developer_key_id`` and ``order_after_revoked_key`` are each null or ``ed25519:`` plus 32 lower-case hex; a grant
-    may name the five version-1 permissions.
+    ``signer_key_id``, ``developer_key_id`` and ``order_after_revoked_key`` are each null or ``ed25519:`` plus 32
+    lower-case hex, read by the one table ``GRANT_KEY_ID_RULES``; a grant may name the five version-1 permissions.
     """
-    raw = _read_owned(Path(directory) / INSTALL_FILE, MAX_INSTALL_BYTES, missing_ok=True)
+    path = Path(directory) / INSTALL_FILE
+    raw = _read_owned(path, MAX_INSTALL_BYTES, missing_ok=True)
     if raw is None:
         return {'trusted_keys': {}, 'grants': {}, 'reserved': ReservedEffects(), 'authority_anchor': None}
     try:
@@ -195,12 +204,15 @@ def read_install(directory):
         generation = item.get('order_after_revocation_generation')
         if (not isinstance(item['plugin_id'], str) or not isinstance(item['artifact_sha256'], str)
                 or not isinstance(perms, list) or any(p not in PERMISSIONS_V1 for p in perms)
-                or not (signer is None or isinstance(signer, str))
                 or type(item.get('unsigned_order_acknowledged', False)) is not bool
-                or not developer_key_id_ok(item.get('order_after_revoked_key'))
                 or not (generation is None or type(generation) is int)
-                or not developer_key_id_ok(item.get('developer_key_id'))
                 or item['plugin_id'] in grants):
+            raise PluginRefused('plugin_install_config_invalid', 'grant value')
+        refused = [name for name, rule in GRANT_KEY_ID_RULES.items() if not rule(item.get(name))]
+        if 'signer_key_id' in refused:
+            raise PluginRefused('plugin_install_config_invalid', SIGNER_KEY_ID_INVALID_TEXT % (
+                ascii(item['plugin_id'])[:SHOWN_VALUE_CHARS], path))
+        if refused:
             raise PluginRefused('plugin_install_config_invalid', 'grant value')
         grants[item['plugin_id']] = Grant(item['plugin_id'], item['artifact_sha256'], signer, tuple(perms),
                                           item.get('unsigned_order_acknowledged', False),

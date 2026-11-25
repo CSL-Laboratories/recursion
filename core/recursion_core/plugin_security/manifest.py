@@ -35,6 +35,7 @@ PRODUCT.md 4.1 and 4.3 (at 055cc7a5, CSLR-D-011), as implemented here:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -89,7 +90,7 @@ _RESERVED_RUNTIMES = MappingProxyType({
     "wasm-component/1": "wasm-component/1 is reserved for a later release; this release runs python-sandboxed/1 only.",
     "data/1": "data/1 is reserved; not run in this release.",
 })
-_UNKNOWN_RUNTIME = ("unknown runtime; this release accepts python-sandboxed/1, and python-inprocess/1 until 1.1.0 "
+_UNKNOWN_RUNTIME = ("unknown runtime %s; this release accepts python-sandboxed/1, and python-inprocess/1 until 1.1.0 "
                     "with the finding runtime_inprocess_retiring; write python-sandboxed/1 as the manifest's runtime")
 # Permission names reserved for a later release, refused permission_reserved in either form of manifest.
 # They are not in PERMISSIONS or PERMISSIONS_V1, and nothing grants them.
@@ -151,6 +152,35 @@ MAX_MANIFEST_BYTES = 64 * 1024
 def developer_key_id_ok(value: object) -> bool:
     """True for null or a key id. Any other shape is not a developer key id."""
     return value is None or (type(value) is str and _KEY_ID.fullmatch(value) is not None)
+
+
+# install.json's grant fields that name a key, and the one rule that reads each: null or a key id
+# (install.v1.json's key_id). read_install (daemon/plugins.py) and Grant both read through this table,
+# so no reader of a key id can disagree with another; a test fails when the install schema calls a
+# grant field a key id that is not here.
+GRANT_KEY_ID_RULES = MappingProxyType({
+    "developer_key_id": developer_key_id_ok,
+    "order_after_revoked_key": developer_key_id_ok,
+    "signer_key_id": developer_key_id_ok,
+})
+_KEY_ID_SHAPE = "null, or a developer key ID (ed25519: and 32 lower-case hex digits)"
+_GRANT_KEY_ID_REFUSED = MappingProxyType({
+    "developer_key_id": "developer_key_id",
+    "order_after_revoked_key": "order_after_revoked_key: " + _KEY_ID_SHAPE,
+    "signer_key_id": "signer_key_id: " + _KEY_ID_SHAPE,
+})
+# How much of a refused value a refusal shows, in characters, after it is made ASCII. A settings row to
+# come; until then this one value is used by every refusal here that shows a value.
+SHOWN_VALUE_CHARS = 100
+
+
+def _shown(value: object) -> str:
+    """A refused value as ASCII JSON, cut to SHOWN_VALUE_CHARS characters."""
+    try:
+        text = json.dumps(value, ensure_ascii=True)
+    except (TypeError, ValueError, RecursionError):
+        text = ascii(value)
+    return text[:SHOWN_VALUE_CHARS]
 
 
 @dataclass(frozen=True)
@@ -304,7 +334,7 @@ def parse_manifest(raw: bytes) -> Manifest:
     if type(runtime) is str and runtime in _RESERVED_RUNTIMES:
         raise Refused("runtime_reserved", _RESERVED_RUNTIMES[runtime])
     if type(runtime) is not str or runtime not in _RUNTIMES_V1:
-        raise Refused("manifest_runtime", _UNKNOWN_RUNTIME)
+        raise Refused("manifest_runtime", _UNKNOWN_RUNTIME % _shown(runtime))
     if type(data["interface"]) is not str or data["interface"] not in _INTERFACES_V1:
         raise Refused("manifest_interface", "only csl-plugin-api/1 is defined")
     files = _parse_files(data["files"], data["artifact_sha256"])
@@ -569,15 +599,13 @@ class Grant:
     # either manifest form: the user grants again, for the key the manifest names now.
     # The loader refuses an unbound manual grant when the plugin requests permissions.
     # Null, or a key id (``ed25519:`` and 32 lower-case hex). Anything else is refused, and
-    # ``order_after_revoked_key`` is held to the same shape.
+    # ``order_after_revoked_key`` and ``signer_key_id`` are held to the same shape (GRANT_KEY_ID_RULES).
     developer_key_id: str | None = None
 
     def __post_init__(self) -> None:
-        if not developer_key_id_ok(self.developer_key_id):
-            raise Refused("grant_invalid", "developer_key_id")
-        if not developer_key_id_ok(self.order_after_revoked_key):
-            raise Refused("grant_invalid", "order_after_revoked_key: null, or a developer key ID "
-                                           "(ed25519: and 32 lower-case hex digits)")
+        for name, rule in GRANT_KEY_ID_RULES.items():
+            if not rule(getattr(self, name)):
+                raise Refused("grant_invalid", _GRANT_KEY_ID_REFUSED[name])
 
 
 def _bound_developer_key(grant: Grant) -> str | None:
@@ -587,7 +615,7 @@ def _bound_developer_key(grant: Grant) -> str | None:
     that is not a key id is no binding."""
     if grant.developer_key_id is not None:
         return grant.developer_key_id
-    if grant.signer_key_id is None and developer_key_id_ok(grant.order_after_revoked_key):
+    if grant.signer_key_id is None and GRANT_KEY_ID_RULES["order_after_revoked_key"](grant.order_after_revoked_key):
         return grant.order_after_revoked_key
     return None
 
@@ -619,12 +647,13 @@ class ReservedEffects:
         for host in hosts:
             if not host_in_normal_form(host):
                 raise Refused("plugin_install_config_invalid",
-                              "reserved host %s is not in normal form (%s)" % (ascii(host)[:100], _RESERVED_SHAPE))
+                              "reserved host %s is not in normal form (%s)" % (ascii(host)[:SHOWN_VALUE_CHARS],
+                                                                                 _RESERVED_SHAPE))
         for prefix in prefixes:
             if type(prefix) is not str or not _CRED_PREFIX.fullmatch(prefix):
                 raise Refused("plugin_install_config_invalid",
                               "reserved credential prefix %s is not in normal form (lower case, as a "
-                              "credential name begins)" % ascii(prefix)[:100])
+                              "credential name begins)" % ascii(prefix)[:SHOWN_VALUE_CHARS])
         object.__setattr__(self, "hosts", frozenset(hosts))
         object.__setattr__(self, "credential_prefixes", prefixes)
 

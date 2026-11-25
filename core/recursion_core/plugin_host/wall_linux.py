@@ -98,7 +98,10 @@ by inode), so a descriptor received after the wall at the number of one closed s
 The refusals by name are the wall's own definition, not a setting: there is no row, flag or argument that
 shortens them. The allow list is data: ``apply_wall(..., allow_list=path)`` takes another file in its place, so
 that a person can widen it knowingly (a row can add a call; it can never allow a call refused by name or drop a
-check), and the record then says that the list in force is not the shipped one: 'proven' speaks for the shipped
+check). The shipped list is known by its rows, each pinned in this module by its digest (``_SHIPPED_ALLOW_ROWS``):
+a list whose rows differ from the pinned ones, given by path or changed in place beside the wall, is not the
+shipped list, and a change of the shipped list in a later draft changes the pin in the same commit. The record then
+says that the list in force is not the shipped one: 'proven' speaks for the shipped
 list only. Landlock below ABI 4 does not limit TCP and below ABI 6 does not scope signals; the seccomp
 filter shuts both here (``socket``, ``connect`` and every way named above to signal, limit, slow or move
 another process are denied whatever the ABI). Where the kernel's Landlock ABI is 6 or above, the ruleset
@@ -143,6 +146,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import json
 import os
 import platform
@@ -236,6 +240,7 @@ _ALLOW_FORMAT = "wall-allow-list.v1"
 _ALLOW_ROW_KEYS = ("call", "x86_64", "aarch64", "check", "reason", "recorded", "beyond_recording")
 _ALLOW_OPTION_KEYS = ("option", "name", "reason")
 _ALLOW_OPTIONS: dict = {}  # the prctl options of each list read, by its path
+_ALLOW_DIGESTS: dict = {}  # the digest of each row of each list read (see _row_digest), by its path and the row's call
 _ALLOW_CHUNK = 250  # allow rows per run of comparisons: a classic BPF jump reaches 255 rows forward at most
 _RESOLVE_NO_SYMLINKS = 0x04  # struct open_how's resolve flag (include/uapi/linux/openat2.h)
 # clone with any of these flags (a new mount, cgroup, uts, ipc, user, pid or network namespace) is refused.
@@ -783,29 +788,42 @@ def _read_allow_list(path: str) -> tuple:
             refuse(f"{where} names an option an entry above names already")
         seen_options.add(option)
     _ALLOW_OPTIONS[path] = tuple(entry["option"] for entry in options)
+    _ALLOW_DIGESTS[path] = {row["call"]: _row_digest(row, options) for row in data["rows"]}
     return tuple(data["rows"])
 
 
-def load_allow_list(path=None) -> dict:
-    """The allow list in force: ``rows`` (each checked), ``file`` (the path read), ``shipped`` (True when its rows are
-    the rows of the list shipped beside the wall), ``added`` and ``removed`` (the calls whose rows differ from the
-    shipped list's). ``path`` None reads the shipped list (``ALLOW_LIST_FILE``). The shipped list is read in every
-    case, to name what differs. ``wall_allow_list_refused`` where either cannot be used, naming the fault."""
-    shipped = _read_allow_list(ALLOW_LIST_FILE)
-    file = ALLOW_LIST_FILE if path is None else os.fspath(path)
-    rows = shipped if path is None else _read_allow_list(file)
-    options = _ALLOW_OPTIONS[file]
+def _row_digest(row: dict, options=()) -> str:
+    """The digest of one row of an allow list: its JSON with the keys sorted, no spaces and ASCII only (prctl's row
+    with the list's prctl options in it, since they are part of what it lets through), SHA-256, the first 32 hex
+    digits. A row changed in any part, its reason too, has another digest."""
+    body = dict(row, prctl_options=list(options)) if row.get("call") == "prctl" else row
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(text.encode("ascii")).hexdigest()[:32]
 
-    def key(row):
-        return (row["call"], row["x86_64"], row["aarch64"], row.get("check"))
-    ours, theirs = {key(row) for row in shipped}, {key(row) for row in rows}
-    added = sorted({row["call"] for row in rows if key(row) not in ours})
-    removed = sorted({row["call"] for row in shipped if key(row) not in theirs})
-    if set(options) != set(_ALLOW_OPTIONS[ALLOW_LIST_FILE]):  # an option added or removed is a change of prctl's row
-        (added if set(options) - set(_ALLOW_OPTIONS[ALLOW_LIST_FILE]) else removed).append("prctl")
+
+def _list_digest(digests: dict) -> str:
+    """The digest of a whole list: SHA-256 of one line ``call=digest`` per row, in the order of the calls' names."""
+    text = "".join(f"{call}={digest}\n" for call, digest in sorted(digests.items()))
+    return "sha256:" + hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
+def load_allow_list(path=None) -> dict:
+    """The allow list in force: ``rows`` (each checked), ``file`` (the path read), ``shipped`` (True only when its
+    rows, and its prctl options, are the rows pinned in this module, ``_SHIPPED_ALLOW_ROWS``: a list changed beside the
+    wall in any row is not the shipped list), ``added`` (the calls whose row is not a pinned row: a new call, or a row
+    changed in any part), ``removed`` (the pinned calls it holds no row for) and ``digest`` (of its rows, see
+    ``_list_digest``). ``path`` None reads the list beside the wall (``ALLOW_LIST_FILE``), which is read in every case.
+    ``wall_allow_list_refused`` where either cannot be used, naming the fault."""
+    rows = _read_allow_list(ALLOW_LIST_FILE)
+    file = ALLOW_LIST_FILE if path is None else os.fspath(path)
+    if path is not None:
+        rows = _read_allow_list(file)
+    options, digests = _ALLOW_OPTIONS[file], _ALLOW_DIGESTS[file]
+    added = sorted(call for call, digest in digests.items() if _SHIPPED_ALLOW_ROWS.get(call) != digest)
+    removed = sorted(call for call in _SHIPPED_ALLOW_ROWS if call not in digests)
     rows = tuple(dict(row, options=options) if row["call"] == "prctl" else row for row in rows)
-    return {"file": file, "rows": rows, "shipped": not added and not removed, "added": sorted(set(added)),
-            "removed": sorted(set(removed))}
+    return {"file": file, "rows": rows, "shipped": not added and not removed, "added": added, "removed": removed,
+            "digest": _list_digest(digests)}
 
 
 def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI, allow_rows=None) -> list[tuple[int, int, int, int]]:
@@ -1952,3 +1970,198 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
                         and all(record["writes"][kind] in _WRITE_REFUSED for kind in WRITE_KINDS)
                         and record["arch"] in _NR and _STATE["failed"] is None)
     return record
+
+
+# The rows of the shipped allow list, pinned: each row's digest by its call, in the list's order (see _row_digest).
+# load_allow_list calls a list the shipped one only when its rows equal these, so a list changed beside the wall is
+# not the shipped list. A change of wall_allow_linux.json changes this table in the same commit, where a diff shows
+# it; test_wall_linux_list checks the two against each other.
+_SHIPPED_ALLOW_ROWS = {
+    "brk": "304602ca7d9acd78e2a101fc9a0ca7ca",
+    "mmap": "ce6aa96307569d6b6b29b38f63558965",
+    "munmap": "642f5192c884b10f0cb7e4f2358e92dc",
+    "mremap": "b1a240497ee93e253e59bb71c3d1653f",
+    "mprotect": "5db07d705bd605a5aae21a8f6c21b9ea",
+    "madvise": "7a501bcf76f00356b02d2282efe499c7",
+    "msync": "c94c741843a1f364aeb4f663126cadb4",
+    "mincore": "eaec37edfd57a6a61b8bbf76e8620766",
+    "mlock": "1738580067b92c67e00c47e92a0f153f",
+    "munlock": "2ef6b614e1bbc8de9e260128fff7e551",
+    "get_mempolicy": "ad3d6ee5723ba4a2394eb29fd357a79b",
+    "map_shadow_stack": "07925c8f426c236f07cf44d5ccd908c0",
+    "read": "fa70a9aafefcb1dadc92caccc4076ba5",
+    "write": "db8f350b4aff283a51d9764d6472c4a3",
+    "pread64": "db477ca6ac1408a5f8aee16592dbb116",
+    "pwrite64": "811be25734b6a6fc152c1e9a482cdaf1",
+    "readv": "9bb425b71bc750a630d6b76cd9a02703",
+    "writev": "a931cfaa9d92bd85687f94d2c5141022",
+    "preadv": "8a802032f3723cf139ad6694fcf00a4d",
+    "pwritev": "383b23e54ea4216415f99ae1e2783370",
+    "preadv2": "94fd7c3dfd88c8a4f2a9d31d501ac473",
+    "pwritev2": "21c715ea24561c959da60c47386e1bd0",
+    "open": "e76a4cad0e112191d835e3e6122def0d",
+    "openat": "f09f8d2e039a3f0002324cf6ab991258",
+    "openat2": "049c0531c48463ec00b525a6f595c437",
+    "creat": "ca4067f0483e3b88e35997f1891cbd6a",
+    "newfstatat": "cace9269a4068285ace6871a43e02d00",
+    "fstat": "7992c4c06bdb939ed634cb6408037f8e",
+    "stat": "1b0e1e0adece7c5eed43029b0fbd6ba4",
+    "lstat": "849daad2bd9e5776edbce8deff0e4e5b",
+    "statx": "5a94bf895a04a3f7a771e965ed24eea3",
+    "statfs": "073b7ffac86d9837b1b0b99fc91f10de",
+    "fstatfs": "335396926b451b7722a09b39950555c0",
+    "access": "24c037d393a4fbcfd6d8d985462f59f8",
+    "faccessat": "484cb723f6a6022ffc6773f02ed22d83",
+    "faccessat2": "3f559cdbf93d225774f64a236b6af06f",
+    "readlink": "a79f946895d594742eb3cfda94bc8640",
+    "readlinkat": "820324135c8a6f724130f79eca4a98e0",
+    "getdents": "3df12c104f405ed250320df2a45c25a4",
+    "getdents64": "d331af7e9599d0d87c0b7c4a6d9fd8c7",
+    "getcwd": "4fd3e8abced18bef2441a74bccbf6454",
+    "chdir": "076ad72fd0cd14ec24e2f47f240d1104",
+    "fchdir": "7231a10e4c7556db30d29af7c71b7131",
+    "truncate": "5f0d6e65f605f197f1ba8a929157376d",
+    "ftruncate": "585a0e2eb94ae45eb53d0fd5714c6209",
+    "fallocate": "5b9d24d6ee28bf08807cc3ee3e1f5ce0",
+    "fsync": "fa53354db85fd9f35a6acaf2e95e5ad8",
+    "fdatasync": "130b317821deb777cecd625df5ad0e7a",
+    "sync_file_range": "1fbbd29269d0adb8653245a317fe859e",
+    "fadvise64": "bef83c980bfd6301155c2ea8d7421312",
+    "readahead": "72895c90ff3b5efc1dd441082ffb71f5",
+    "getxattr": "be9cb4fed8b6f1a1492a8e1349a5ab66",
+    "lgetxattr": "8848680b85c6e71d5dcdae7558e32177",
+    "fgetxattr": "c72e77386bc6f2b49ca9f03e47cb698e",
+    "listxattr": "de395c1fca79c3f3996f8af966925382",
+    "llistxattr": "fe0d2bcd1bb884716564a336e3499370",
+    "flistxattr": "a31f483f86546392dcec7f7e833a699c",
+    "umask": "4f2453c64f8d76ce848418e4458bc521",
+    "sendfile": "12a0aabb315ecc8ecbfd319f2a1e9b20",
+    "copy_file_range": "673c78fb551840c62c0823ec2fb6bee0",
+    "splice": "9cb8ccbebb5f47fe2835acad3e2f313b",
+    "tee": "f4ff5503f10640df76e8e0581e19b95b",
+    "mkdir": "835b5fc932d4441b1e0fc8d36e6f8310",
+    "mkdirat": "979dd10466cf30fd300ea10ee73b866b",
+    "rmdir": "3c7433792d78a709e7f514a28a3ad826",
+    "unlink": "d54b75d207df8d426d63c41dcc46b3e8",
+    "unlinkat": "7ac64a9120f0f9582f30ae1c5c6ec780",
+    "rename": "ee1fdb45bf11c343fb1ead99d41242c8",
+    "renameat": "1dec98faaecbffdbf3325e2fec53938b",
+    "renameat2": "ace1f71d227da5d3a34bb5069bbc05ac",
+    "link": "b54d86a7c490cb0ba78a75e5cc475d84",
+    "linkat": "345016e86764bdb06f8008d062a7e485",
+    "symlink": "26b11245e114409fed4ace78a342be67",
+    "symlinkat": "63fe6f608fe50ddda352afe9fd45384c",
+    "mknod": "c8f3bd6b1ea53148c8815084e05da150",
+    "mknodat": "2506775b8e21d9eef625eb1a2392d136",
+    "close": "27a80650537bbe631097fc9c4a7358d2",
+    "close_range": "670ec230bd75405cb84b384cab59de4d",
+    "dup": "d1851b408b9e073fc665db98bbf1ec7b",
+    "dup2": "19205ee0248a2ad118eddf5f77f8e7cb",
+    "dup3": "be08234a0c443a239407b672d311bfd4",
+    "lseek": "7af592653fe41baa8fcfd84dca93615b",
+    "pipe": "cb05b258fb06b2992774f5ba3d15a189",
+    "pipe2": "eda0cb11962cb950d21493236a57b78c",
+    "poll": "9b11b9cf43d2717efe74e80a4fb6fa0b",
+    "ppoll": "a89b81618f79f6631d03e7ebe95925fb",
+    "select": "52e4afe244793eb9e36169696f707654",
+    "pselect6": "b4118e0fd167f68c5fbed9190d120ba0",
+    "epoll_create": "220435748629134fe47637069e98820f",
+    "epoll_create1": "2a09b38b3430d225cdac98ded2040488",
+    "epoll_ctl": "11d74ba4ebd76551fc256e9589201f81",
+    "epoll_wait": "0b2651cecd3b83caf7e9a287be4030f3",
+    "epoll_pwait": "be73bac22ae7cfd4f7eeb1e40a65383d",
+    "epoll_pwait2": "4cd1c3f122f0bd6e038b0d565bb26548",
+    "eventfd": "6833b53ead7017453f39b3f53319431c",
+    "eventfd2": "e993607a3c958ee3ca813807a22359bf",
+    "fork": "ad00be437e6185db7f26f1d89303aabf",
+    "vfork": "df70e573ee0e828fb10ab2a033e36691",
+    "wait4": "aef88a74ca2a4c1ad27b35f4693e0520",
+    "waitid": "f765de0ee6aedfc549abb3bb5334136f",
+    "exit": "c2bf319ea486614117392930760b908c",
+    "exit_group": "dd16b41df9115668b893a219d9e34397",
+    "set_tid_address": "92b56e045b3b0828097b5af3d202e05f",
+    "set_robust_list": "d8f14e61f6f76b811d31d06ee7864711",
+    "rseq": "1394934400097497932b119ad41d40ee",
+    "futex": "e06220d7c9056bf137966cb1d0cc9cd5",
+    "sched_yield": "81863b21f349df5131e5e9400f45378e",
+    "arch_prctl": "3e898cf59d8a5f3e7f6e6f97e08fc69f",
+    "getpid": "f7c21d36ae3649870b3f19ca7a7a5472",
+    "getppid": "7f6bdfe1ace5e21a56de852174dbea34",
+    "gettid": "72b5388f4890e1d19ca574c255f6370e",
+    "getpgrp": "a2cc30f36bbf79f90f752ce3ce887deb",
+    "getpgid": "bef80ef261e7d2fd48acbb8bdcd34433",
+    "getsid": "c7d0ba34c845ae5f475900feed8f7368",
+    "getuid": "77f3c0f91e2a7bf43234a36aad1be2a6",
+    "geteuid": "88c7464558b97015ad6c74cad8c859e4",
+    "getgid": "86e4da6043244afabf95cbe55219ade0",
+    "getegid": "fc303e0ba43f12deb1c3a08cde64423b",
+    "getresuid": "a03b5566f74eed573531cb146da95529",
+    "getresgid": "65d24f4524a9776f3ee2cb1f18e2aecf",
+    "getgroups": "ca71f36c36dd353154b62319005723ac",
+    "capget": "a56cb2f019ee3bc3e7a369fbd5fcea77",
+    "uname": "b51117120d45ad86e054e398a6b59c2d",
+    "sysinfo": "417b03006cb4153437878e3431970b6b",
+    "getrusage": "5cb7538454e68a41c14fbd903eb80be5",
+    "times": "6cc3bc6729ae963575a318f207432c90",
+    "getrlimit": "8b8f4690e57f7ac19446d1547e1eea61",
+    "getcpu": "7c18d9513cf5ff70318e40fc98b5561a",
+    "getrandom": "b6864109c46fb40e4c1270eef0bb64a4",
+    "sched_getaffinity": "0490dc91934c01d4aa3ed482b55488e4",
+    "sched_getparam": "7c899f43210d96f465c238eaf54c83d5",
+    "sched_getscheduler": "9123fc3fe757fd4dbbebae3a02106bb5",
+    "sched_get_priority_max": "ad6cb02e48fd41681a33e370abec5dce",
+    "sched_get_priority_min": "cecac680c3c353be85e7105218191195",
+    "sched_getattr": "ad691cf90e601317b9ea4378421d226b",
+    "getpriority": "8ba7c1a638aaa822b2a5af1a9341cec0",
+    "prctl": "132949ffdaf967c9f0ee8befa1bd4e8c",
+    "rt_sigaction": "ada905a27b42f96d36360a563d4bc35b",
+    "rt_sigprocmask": "669abcefae77e1f08726e590c01e9a81",
+    "rt_sigreturn": "09d4c0486b338765c8f028f94a7ec9f0",
+    "rt_sigpending": "884f2b00612db6d670e716cbb688db36",
+    "rt_sigsuspend": "869d4de7fb259d29e31fb2a4b3100a93",
+    "rt_sigtimedwait": "bc7946a4a5324be6bacb954223eaa5b7",
+    "sigaltstack": "e4964bfb8bcb173a5e8d19a063ded149",
+    "pause": "ae4dae4523727af158afbd4c9f560c6b",
+    "restart_syscall": "26cae8ccb47bb50058ca25931884fc8e",
+    "alarm": "c4d75376b21c5d0b67d86d31317941bc",
+    "setitimer": "ebe1d77fdf1bd0fbdab7f4b863e68a14",
+    "getitimer": "ee43f757823d429b5944d8392f0295ba",
+    "timer_create": "81d74b2ea1df4a5913f12cc028b1eecc",
+    "timer_settime": "3d0436481a901bde748b728b0bbd6ca5",
+    "timer_gettime": "89677faa87cf9694f00638320f681ec4",
+    "timer_getoverrun": "a394b63c4d762fb09365c8c56553c46d",
+    "timer_delete": "902650be2786e62a46afd742ae980885",
+    "timerfd_create": "8d90c1747c4b9afe80413ca3bd29a911",
+    "timerfd_settime": "bb0fad12ab2777c8f3b9cc1336bf780e",
+    "timerfd_gettime": "c2813b8cd8846a16cce415b6fd99acc6",
+    "signalfd": "fae42d2a8446556273db69c5e6a1a604",
+    "signalfd4": "523ed7dd045573dcabf74499f2bf206e",
+    "clock_gettime": "bfb48f8379fe885e3338fe9063c47ad6",
+    "clock_getres": "4f2c9381649b314699449b1e9b6d967f",
+    "gettimeofday": "65adac95fd5e3f73189f9e261dde31ce",
+    "time": "1ca517033c077b24ac42bae934dc0477",
+    "nanosleep": "58f7503b09969841526efac55c1d9afc",
+    "clock_nanosleep": "285233666fdec9699086bd78c15dc952",
+    "recvfrom": "e351cfa66d535c0106d9cf0bcb02d8a3",
+    "recvmsg": "d792f6aae34b53eb34ff882824afb2ad",
+    "recvmmsg": "695322ff094dd406a9b11289eff5c572",
+    "shutdown": "5a1c1c808fa6ac3e2fccb9c41fbcb2c6",
+    "getsockname": "59ba57bf5e60e829ef82d669668794a6",
+    "getpeername": "9796f02da989e278bd5fa5693f811ac1",
+    "getsockopt": "76bae278be2ab662bfbb474cb4d207c8",
+    "setsockopt": "4790cb7d4bbfb97718a34a68056a88ab",
+    "clone": "9692770aa8ac7200f8dfff71c07a8f71",
+    "fcntl": "689b8bab5310522f104f8ac11d6c5be4",
+    "ioctl": "7b5148ff97930569d904f72a2120ae9c",
+    "sendto": "8d8f7f951c65e96b17577293028b515e",
+    "prlimit64": "32d1d03681c8a705f027df8b7668e398",
+    "sched_setaffinity": "d5c6db692c40c6bc5af925298f8efc94",
+    "sched_setscheduler": "8550b2cc2f974e97572190d9a420bed5",
+    "sched_setparam": "ab00fc303e4803908b810428a031975f",
+    "sched_setattr": "2a8be870e2bffcf637dc55baf6d19996",
+    "migrate_pages": "ae9844d4bf4618c61d8d625cb2a67851",
+    "move_pages": "fc43946542d527046daf07648d42062b",
+    "setpriority": "6b514e84fa8a49738859b325cbc4b62d",
+    "ioprio_set": "3e432d7c39d27629d948c45484427b5a",
+    "landlock_create_ruleset": "46fc5934f1cdb46fb725fc2f91d25250",
+}

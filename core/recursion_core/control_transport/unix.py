@@ -96,8 +96,9 @@ class TransportClient(Protocol):
 def refuse_remote_bind(address: object) -> str:
     """Return ``address`` as an absolute socket path, or raise a typed refusal.
 
-    Tuples, ints, URLs and ``host:port`` strings are network addresses and raise
-    ``RemoteBindRefused``. Abstract-namespace names (leading NUL) have no filesystem
+    Tuples, ints, non-Unix URLs and ``host:port`` strings are network addresses and raise
+    ``RemoteBindRefused``. Local ``unix://`` URLs are unwrapped and checked as paths.
+    Abstract-namespace names (leading NUL) have no filesystem
     permissions and relative paths depend on the cwd; both raise ``InsecureSocketPath``.
     """
     if isinstance(address, (tuple, list, int)) or isinstance(address, bool):
@@ -170,14 +171,19 @@ def _is_host(address: str) -> bool:
 def ensure_private_dir(directory: str) -> None:
     """Create ``directory`` as 0700, or check an existing one is ours, real and 0700.
 
-    An existing directory that is a symlink, belongs to another uid, or grants any group or
-    other bit is refused, not repaired: the caller picked the wrong place.
+    An existing directory that is a symlink, belongs to another uid, or whose permission bits are
+    not exactly 0700 (any group or other bit, or an owner bit missing, such as 0500) is refused, not
+    repaired: the caller picked the wrong place.
     """
     require_unix_transport()
     try:
         os.mkdir(directory, 0o700)
     except FileExistsError:
         pass
+    else:
+        # mkdir applies the process umask, so a mask of 0200 would leave 0500 and the
+        # exact-0700 check below would refuse a directory this function just made.
+        os.chmod(directory, 0o700)
     try:
         st = os.lstat(directory)
     except FileNotFoundError:
@@ -186,7 +192,7 @@ def ensure_private_dir(directory: str) -> None:
         raise InsecureSocketPath(f"{directory!r} is not a real directory")
     if st.st_uid != os.geteuid():
         raise InsecureSocketPath(f"{directory!r} is owned by uid {st.st_uid}")
-    if st.st_mode & 0o077:
+    if (st.st_mode & 0o7777) != 0o700:   # exactly 0700, including setuid/setgid/sticky: 0500 and 02700 were accepted
         # Quoted: a directory name holding a line break must not print as two lines (sweep s7 D12).
         raise InsecureSocketPath(f"{directory!r} has mode {stat.S_IMODE(st.st_mode):04o}, want 0700")
 

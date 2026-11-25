@@ -1250,10 +1250,12 @@ class ConnectionBoundTests(_TmpCase):
         self.assertTrue(_wait_for(lambda: _new_peer_served(srv.path)))
 
     def test_busy_client_between_frames_keeps_its_slot_within_the_deadline(self) -> None:
-        srv = self.server(idle_timeout_s=0.6)
+        # 4 x 0.5 s > one 1.5 s deadline: the clock restarts per request. Each pause keeps a full second of
+        # margin, so a scheduling stall of a pause (0.8 s in sweep s7 D16's witness) no longer drops the client.
+        srv = self.server(idle_timeout_s=1.5)
         with UnixControlClient(srv.path) as client:
-            for _ in range(4):  # 4 x 0.3 s > one deadline: the clock restarts per request
-                time.sleep(0.3)
+            for _ in range(4):
+                time.sleep(0.5)
                 self.assertEqual(client.request({"op": "ping"})["op"], "pong")
 
     def test_idle_peer_is_dropped_and_gives_its_slot_back(self) -> None:

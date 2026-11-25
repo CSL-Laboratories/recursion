@@ -1364,7 +1364,9 @@ SIGNED_IN = (
     ("https://u:" + "pa/ss" + "@host/x", "pa/ss", "'https://<sign-in hidden>@host/x'"),
     ("ftp://ada%3A" + "S3cr3t" + "@files", "S3cr3t", "'ftp://<sign-in hidden>@files'"),
 )
-NO_SIGN_IN = ("https://example.com:8443/path", "ada@example.com", "a:b c@d")
+NO_SIGN_IN = ("https://example.com:8443/path",)
+# Everything before the last @ of a run is hidden: of a mail address only the part after the @ is shown.
+BEFORE_THE_AT_SIGN = (("ada@example.com", "'<sign-in hidden>@example.com'"), ("a:b c@d", "'a:b <sign-in hidden>@d'"))
 # A path that holds an @ after a host: from the scheme mark to the last @ is hidden, the host with it (the safe side).
 PAST_THE_HOST = (("https://example.com/u@mail", "'https://<sign-in hidden>@mail'"),)
 class NoSecretAndOneLineInEveryShownValue(_Folder):
@@ -1387,7 +1389,7 @@ class NoSecretAndOneLineInEveryShownValue(_Folder):
         for text in NO_SIGN_IN:
             with self.subTest(text=text):
                 self.assertEqual(repr(text), settings._shown(text, settings.NO_LIMIT))
-        for text, whole in PAST_THE_HOST:
+        for text, whole in PAST_THE_HOST + BEFORE_THE_AT_SIGN:
             with self.subTest(text=text):
                 self.assertEqual(whole, settings._shown(text, settings.NO_LIMIT))
 
@@ -2121,9 +2123,10 @@ class EverySignInOfATextIsTakenOut(_Folder):
 
     def test_the_second_of_two_addresses_joined_by_a_comma_or_a_semicolon_shows_no_password(self) -> None:
         # The case of draft 631's sign-in rule: only the first sign-in of a run was taken out.
-        # From the first scheme mark to the last @ of the run is hidden: the first host sat before it.
+        # Everything before the last @ of the run is hidden but a scheme at its very start: the first host sat
+        # before it, and so did the label 'x=', which stands before the scheme.
         cases = (("https://a:x@h1/,https://b:{}@h2/", "'https://<sign-in hidden>@h2/'"),
-                 ("x=https://a:x@h1/;y=postgres://b:{}@h2/db", "'x=https://<sign-in hidden>@h2/db'"))
+                 ("x=https://a:x@h1/;y=postgres://b:{}@h2/db", "'<sign-in hidden>@h2/db'"))
         for form, whole in cases:
             for word in PASSWORDS:
                 text = form.format(word)
@@ -2173,14 +2176,15 @@ class EverySignInOfATextIsTakenOut(_Folder):
                 self.assertEqual(free[0], free[1])
 
     def test_an_address_with_no_sign_in_keeps_every_character(self) -> None:
-        # What is no sign-in stays: a host and its port, a mail address with no colon before it.
-        for text in ("https://h1/,https://h2:8443/x", "a@b,https://h2/"):
+        # A run with no @ stays whole: hosts and their ports.
+        for text in ("https://h1/,https://h2:8443/x",):
             with self.subTest(text=text):
                 self.assertEqual(repr(text), settings._shown(text, settings.NO_LIMIT))
 
     def test_a_host_or_a_path_before_the_last_at_sign_is_hidden_with_it(self) -> None:
-        # The safe side: from the first scheme mark to the last @ of the run is hidden, whatever stands between.
+        # The safe side: everything before the last @ of the run is hidden but a scheme at its very start.
         for text, whole in (("https://h1/u@mail,ada@example.com", "'https://<sign-in hidden>@example.com'"),
+                            ("a@b,https://h2/", "'<sign-in hidden>@b,https://h2/'"),
                             ("https://h1/?to=ada@example.com#u@x", "'https://<sign-in hidden>@x'"),
                             ("https://[2001:db8::1]:5432/x,https://h2/@x", "'https://<sign-in hidden>@x'"),
                             ("https://h:8080/u@mail", "'https://<sign-in hidden>@mail'")):
@@ -2311,6 +2315,164 @@ class AGeneratedPasswordNeverReachesALine(unittest.TestCase):
                     if leaked or line != before:
                         self.fail(f"form {form!r}, password {password!r}: {leaked} in {line!r}")
         self.assertEqual(len(GENERATED_FORMS) * GENERATED_DRAWS, drawn)
+
+
+# Sign-ins with no scheme at the very start of their run: (the form with {} for the made-up secret, the parts of
+# the form that must never be shown, the line shown whole as a value). Everything before the last @ is hidden.
+BEFORE_THE_LAST_AT_SIGN = (
+    ("Us!rQ:{}@h/x", ("Us!", "rQ"), "'<sign-in hidden>@h/x'"),  # a mark in the user name, then a password
+    ("Us{}!rQ:QZJa@h/x", ("Us", "rQ", "QZJa"), "'<sign-in hidden>@h/x'"),  # the secret in the user name
+    ("ab/CD+{}=:QZJa@h/x", ("ab/CD", "QZJa"), "'<sign-in hidden>@h/x'"),  # a slash, a plus, an equals sign
+    ("x=Us${}:QZJa@h/x", ("x=Us", "QZJa"), "'<sign-in hidden>@h/x'"),  # a label, then a dollar sign
+    ("{}@github.com/org/repo", (), "'<sign-in hidden>@github.com/org/repo'"),  # a token as the user, no colon
+    ("{}@dbhost:5432", (), "'<sign-in hidden>@dbhost:5432'"),  # the colon only after the last @, a port
+    ("{}@github.com:org/repo.git", (), "'<sign-in hidden>@github.com:org/repo.git'"),  # the scp form
+    ("{}@h1,https://UsrQ:QZJa@h2/", ("UsrQ", "QZJa", "h1,"), "'<sign-in hidden>@h2/'"),  # a token before a scheme
+    ("x;{}@h0.example.com", ("x;",), "'<sign-in hidden>@h0.example.com'"),  # a label and a token
+    ("h0.example.com/db?x=1*{}@h1.example.com", ("h0.", "db?x"), "'<sign-in hidden>@h1.example.com'"),  # a host
+    ("url=https://UsrQ:{}@h/x", ("url=", "UsrQ"), "'<sign-in hidden>@h/x'"),  # a label before a scheme
+)
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class EverythingBeforeTheLastAtSignIsHidden(_Folder):
+    """With no scheme at the very start of a run, nothing before its last @ is shown: not a user name or a part
+    of it, not a token used as the user name, not a label or an earlier host; as a value and as a key, shown
+    whole or cut, and the digest of a cut key does not move with what is hidden."""
+
+    def assert_hidden(self, line: str, form: str, parts: tuple[str, ...], word: str) -> None:
+        self.assertNotIn(word, line)
+        self.assertNotIn(word[:3], line)
+        for part in parts:
+            self.assertNotIn(part, line)
+
+    def test_as_a_value(self) -> None:
+        for form, parts, whole in BEFORE_THE_LAST_AT_SIGN:
+            for word in PASSWORDS:
+                text = form.format(word)
+                with self.subTest(form=form, word=word):
+                    for value in (text, ("Ada", text), (("Ada", text),)):
+                        for cap in (40, 80, settings.NO_LIMIT):
+                            self.assert_hidden(settings._shown(value, cap), form, parts, word)
+                    self.assertEqual(whole, settings._shown(text, settings.NO_LIMIT))
+
+    def test_as_a_key_shown_whole(self) -> None:
+        for form, parts, whole in BEFORE_THE_LAST_AT_SIGN:
+            details = []
+            for word in PASSWORDS:
+                with self.subTest(form=form, word=word):
+                    self.put(f'version = 1\n"{form.format(word)}" = 1\n')
+                    details.append(settings.load(self.environ).notes[0].detail)
+                    self.assertTrue(details[-1].startswith(whole), details[-1])
+                    self.assert_hidden(details[-1], form, parts, word)
+            with self.subTest(form=form):
+                self.assertEqual(details[0], details[1])  # only the secret changed: the same line
+
+    def test_as_a_key_cut_the_digest_holds_still_while_only_the_hidden_part_changes(self) -> None:
+        for form, parts, whole in BEFORE_THE_LAST_AT_SIGN:
+            details = []
+            for word in PASSWORDS:
+                key = form.format(word) + "/" + "p" * 100  # a slash: '5432' and the p's are no key-like run
+                with self.subTest(form=form, word=word):
+                    self.put(f'version = 1\n"{key}" = 1\n')
+                    details.append(settings.load(self.environ).notes[0].detail)
+                    self.assert_hidden(details[-1], form, parts, word)
+                    self.assertIn(f" more, digest {_sha(settings._without_sign_in(key))})", details[-1])
+                    self.assertNotIn(_sha(key), details[-1])
+            with self.subTest(form=form):
+                self.assertEqual(details[0], details[1])  # the digest does not move when only the secret changes
+
+
+class WhatEndsARun(unittest.TestCase):
+    """A run ends at every white-space character as Python counts them, and at nothing else: a zero-width
+    character inside a sign-in does not end its run, so the sign-in stays hidden whole."""
+
+    def test_every_white_space_character_ends_a_run_and_nothing_else_does(self) -> None:
+        for code in range(0x110000):
+            char = chr(code)
+            if bool(settings._SPACE.fullmatch(char)) != char.isspace():
+                self.fail(f"U+{code:04X}: ends a run {bool(settings._SPACE.fullmatch(char))}, white space "
+                          f"{char.isspace()}")
+
+    def test_a_zero_width_character_does_not_end_a_run(self) -> None:
+        for mark in tuple(chr(code) for code in (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF)):
+            with self.subTest(mark=f"U+{ord(mark):04X}"):
+                self.assertEqual("'https://<sign-in hidden>@h/x'",
+                                 settings._shown(f"https://UsrQ:QZ{mark}Ja@h/x", settings.NO_LIMIT))
+                self.assertEqual("'<sign-in hidden>@h/x'", settings._shown(f"Us{mark}rQ@h/x", settings.NO_LIMIT))
+
+    def test_white_space_ends_a_run_and_the_run_after_it_is_read_alone(self) -> None:
+        for mark in tuple(chr(code) for code in (0x20, 0x09, 0x0A, 0xA0, 0x2028, 0x1F)):
+            with self.subTest(mark=f"U+{ord(mark):04X}"):
+                line = settings._shown(f"Us{mark}rQ@h/x", settings.NO_LIMIT)
+                self.assertTrue(line.endswith("<sign-in hidden>@h/x'"), line)
+                self.assertNotIn("rQ", line)
+
+
+# The generated test of the one rule: made-up secrets from every ASCII letter, digit and mark (the scheme mark drawn
+# as one), as user names with and without a colon and as passwords, after a scheme, a label or nothing, in 1, 2 or 5
+# addresses joined by any ASCII mark or by nothing; a set count of draws from one seed.
+GENERATED_RUN_ALPHABET = tuple(string.ascii_letters + string.digits + string.punctuation) + ("://",)
+GENERATED_RUN_DRAWS = 50000
+GENERATED_RUN_SEED = 7295
+GENERATED_RUN_LONGEST = 40
+GENERATED_RUN_SCHEMES = ("", "", "https", "postgres", "postgresql+psycopg", "jdbc:postgresql", "redis", "git+ssh",
+                         "mongodb+srv", "amqps")
+GENERATED_RUN_LABELS = ("", "", "url=", "dsn:", "x;")
+GENERATED_RUN_FORMS = ("UsrQ:{p}@", "{s}:{p}@", "{s}@", ":{p}@", "")  # the last: no sign-in
+GENERATED_RUN_PATHS = ("", "/db", ":5432/x", "/x?y=1")
+# The scheme and its mark a run may begin with, as the module's words say it, written here again.
+A_SCHEME_AT_THE_START = re.compile(r"[A-Za-z0-9+.-]+://")
+
+
+class NothingBeforeTheLastAtSignReachesALine(unittest.TestCase):
+    """In every generated draw no run of 3 characters of what stood before the last @ (the scheme at the very start
+    aside) stands in a line shown for it (a value whole and at the cap of 40, a key cut at 80 and at 40) that the
+    line of a stand-in lacks, where the stand-in is the same text with all of that part written as one '~'; and
+    every such line, a cut key's digest with it, is the stand-in's line."""
+
+    @staticmethod
+    def lines(text: str) -> tuple[str, ...]:
+        key = text + "/" + "q" * 100
+        return (settings._shown(text, settings.NO_LIMIT), settings._shown(text, 40),
+                settings._shown(key, 80, key=8), settings._shown(key, 40, key=6))
+
+    def test_no_run_of_what_stood_before_the_last_at_sign_reaches_a_line_and_no_digest_moves(self) -> None:
+        draw = random.Random(GENERATED_RUN_SEED)
+
+        def secret() -> str:
+            return "".join(draw.choice(GENERATED_RUN_ALPHABET) for _ in range(draw.randint(1, GENERATED_RUN_LONGEST)))
+
+        seen = collections.Counter()
+        for _ in range(GENERATED_RUN_DRAWS):
+            parts = [draw.choice(GENERATED_RUN_LABELS)]
+            for i in range(draw.choice((1, 2, 5))):
+                if i:
+                    parts.append(draw.choice(("",) + tuple(string.punctuation)))
+                scheme, form = draw.choice(GENERATED_RUN_SCHEMES), draw.choice(GENERATED_RUN_FORMS)
+                seen[f"form {form!r}"] += 1
+                parts.append((scheme + "://" if scheme else "") + form.format(s=secret(), p=secret())
+                             + f"h{i}.example.com" + draw.choice(GENERATED_RUN_PATHS))
+            text = "".join(parts)
+            last = text.rfind("@")
+            start = A_SCHEME_AT_THE_START.match(text)
+            begin = start.end() if start else 0
+            if last <= begin:
+                seen["nothing before an @"] += 1
+                continue
+            seen["a scheme at the start" if start else "no scheme at the start"] += 1
+            hidden = text[begin:last]
+            runs = {hidden[i:i + 3] for i in range(len(hidden) - 2)}
+            stand_in = self.lines(text[:begin] + "~" + text[last:])
+            for line, before in zip(self.lines(text), stand_in):
+                leaked = sorted(run for run in runs if run in line and run not in before)
+                if leaked or line != before:
+                    self.fail(f"text {text!r}: {leaked} in {line!r}, the stand-in's line {before!r}")
+        self.assertEqual(GENERATED_RUN_DRAWS, seen["nothing before an @"] + seen["a scheme at the start"]
+                         + seen["no scheme at the start"])
+        kinds = ["a scheme at the start", "no scheme at the start"] + [f"form {f!r}" for f in GENERATED_RUN_FORMS]
+        for drawn in kinds:
+            self.assertGreater(seen[drawn], 0, drawn)
 
 
 if __name__ == "__main__":

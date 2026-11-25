@@ -43,14 +43,19 @@ The rules this module keeps:
 * NEVER SHOWN, under any cap and under ``"none"``, not in part and not by its length: the value of a
   setting whose name holds a word of the row ``status.hidden_names`` (the first net: by name, whatever the
   value looks like); a text that looks like a key or a password; and a sign-in, by one rule on each run of
-  text without a space (the sign-in rule): where a colon stands before the run's last @, everything from the
-  first colon of the run to that last @ is hidden, with the name just before the colon, unless the colon
-  begins a scheme mark (``://``), whose scheme stays (``postgres://<sign-in hidden>@db/x``,
-  ``<sign-in hidden>@db/x``). So when a text holds an address and an at-sign, everything between the first
-  scheme mark and the last at-sign of that run is hidden; a host or a path can be hidden with it (two
-  joined addresses show as ``a://<sign-in hidden>@h2/``, and ``https://h/u@mail`` as
-  ``https://<sign-in hidden>@mail``). The sign-in rule misses a password that holds a space and an address
-  written wholly percent-escaped. The look-alike rule is only a second net: it misses a short key, a key of
+  text (the sign-in rule). A run is what stands between two white-space characters as Python counts them
+  (``str.isspace``: a space, a tab, a line break, a no-break space, U+2028, U+001C to U+001F and the
+  others); a zero-width character such as U+200B does not end a run. In a run that holds an @, everything
+  before its LAST @ is hidden, except a scheme and its mark at the very start of the run (ASCII letters,
+  digits, ``+``, ``.`` and ``-``, then ``://``), which stay: ``postgres://<sign-in hidden>@db/x``,
+  ``<sign-in hidden>@db/x``. Nothing else before that @ is shown: not a user name or a part of it, not a
+  label, not the host or the path of an earlier address (two joined addresses show as
+  ``a://<sign-in hidden>@h2/``, ``https://h/u@mail`` as ``https://<sign-in hidden>@mail`` and
+  ``url=a://u:p@h`` as ``<sign-in hidden>@h``); what follows the last @ is shown. Everything before the last
+  at-sign of a run is hidden; of an email address only the part after the at-sign is shown. The sign-in
+  rule misses a sign-in that holds white space (the run ends there, and what stands before it is shown), an
+  address written wholly percent-escaped, and a secret written as the scheme at the very start of a run.
+  The look-alike rule is only a second net: it misses a short key, a key of
   one case or of digits only, a UUID, base64 cut by ``+`` or ``/``, and a key split over a list's items, so
   such a value under a name not on the list is shown. Every line is one line: a line break, a control
   character or a direction or format character is shown escaped (``\\n``, ``\\u202e``).
@@ -132,6 +137,7 @@ _KEY_LABEL = re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|bearer|tok
 _KEY_PREFIX = re.compile(r"(?<![A-Za-z0-9])(?:%s)[A-Za-z0-9_.+/=-]{%d,}"
                          % ("|".join(re.escape(prefix) for prefix in _KEY_PREFIXES), _KEY_TAIL))
 _SPACE = re.compile(r"(\s+)")
+_SCHEME_AT_START = re.compile(r"[A-Za-z0-9+.-]+://")  # the scheme and its mark a run may begin with
 _Advice = tuple[int | float | None, int | float | None]  # (at least, at most)
 
 
@@ -257,8 +263,9 @@ def _looks_like_a_key(text: str) -> bool:
 
 
 def _without_sign_in(text: str) -> str:
-    """``text`` with what the sign-in rule hides in each run without a space (``_run_without_sign_in``)
-    replaced by words that say so; the rest stays."""
+    """``text`` with what the sign-in rule hides in each run (``_run_without_sign_in``) replaced by words that
+    say so; the rest stays. A run ends at every white-space character as Python counts them (``str.isspace``);
+    a zero-width character does not end a run."""
 
     if "@" not in text:
         return text
@@ -266,24 +273,20 @@ def _without_sign_in(text: str) -> str:
 
 
 def _run_without_sign_in(run: str) -> str:
-    """One run of text without a space, by one rule that errs on the side of hiding: where a colon stands
-    before the run's LAST @, everything from the first colon of the run to that last @ is hidden, with the
-    name just before the colon, unless the colon begins a scheme mark (``://``), whose scheme stays. So when
-    a run holds an address and an at-sign, everything between the first scheme mark and the last at-sign is
-    hidden, whatever stands between (slashes, colons, hashes, question marks, further scheme marks, further
-    addresses); a host or a path can be hidden with it. An @ with no colon before it (a mail address) is no
-    sign-in. One pass over the run."""
+    """One run of text with no white space in it, by one rule that errs on the side of hiding: everything
+    before the run's LAST @ is hidden, except a scheme and its mark at the very start of the run
+    (``_SCHEME_AT_START``: ASCII letters, digits, ``+``, ``.`` and ``-``, then ``://``), which stay. Nothing
+    else before that @ is shown: not a user name or a part of it, not a label, not a host or a path of an
+    earlier address. What follows the last @ is shown. So of a mail address only the part after the @ is
+    shown; a run with no @, or with nothing before its last @ but such a scheme, stays whole."""
 
     last = run.rfind("@")
-    colon = run.find(":", 0, last) if last > 0 else -1
-    if colon < 0:
+    if last < 0:
         return run
-    if run.startswith("://", colon):
-        begin = colon + 3  # the scheme and its mark stay
-    else:  # a sign-in written without a scheme: the name before the colon is hidden with it
-        begin = colon
-        while begin > 0 and (run[begin - 1].isalnum() or run[begin - 1] in ".%+~_-"):
-            begin -= 1
+    scheme = _SCHEME_AT_START.match(run)  # it holds no @, so it ends at or before the last @
+    begin = scheme.end() if scheme else 0
+    if begin == last:
+        return run
     return run[:begin] + _HIDDEN_SIGN_IN + run[last:]
 
 

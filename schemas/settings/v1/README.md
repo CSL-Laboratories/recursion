@@ -43,14 +43,19 @@ is its shape once parsed (JSON Schema, Draft 2020-12), tagged `1.0-draft.1`.
   characters, and never fewer than 6. A key that fits is shown whole.
 - Never shown, under any cap and under `"none"`, not in part and not by its length: the value of a setting
   whose name holds a word of `status.hidden_names` (the first net: by name, whatever the value looks like);
-  a text that looks like a key or a password; and a sign-in, by one rule on each run of text without a space
-  (the sign-in rule): where a colon stands before the run's last @, everything from the first colon of the
-  run to that last @ is hidden, with the name just before the colon, unless the colon begins a scheme mark
-  (`://`), whose scheme stays (`postgres://<sign-in hidden>@db/x`, `<sign-in hidden>@db/x`). So when a text
-  holds an address and an at-sign, everything between the first scheme mark and the last at-sign of that
-  run is hidden; a host or a path can be hidden with it (two joined addresses show as
-  `a://<sign-in hidden>@h2/`, and `https://h/u@mail` as `https://<sign-in hidden>@mail`). The sign-in rule
-  misses a password that holds a space and an address written wholly percent-escaped. The look-alike rule
+  a text that looks like a key or a password; and a sign-in, by one rule on each run of text (the sign-in
+  rule). A run is what stands between two white-space characters as Python counts them (a space, a tab, a
+  line break, a no-break space, U+2028, U+001C to U+001F and the others); a zero-width character such as
+  U+200B does not end a run. In a run that holds an @, everything before its last @ is hidden, except a
+  scheme and its mark at the very start of the run (ASCII letters, digits, `+`, `.` and `-`, then `://`),
+  which stay: `postgres://<sign-in hidden>@db/x`, `<sign-in hidden>@db/x`. Nothing else before that @ is
+  shown: not a user name or a part of it, not a label, not the host or the path of an earlier address (two
+  joined addresses show as `a://<sign-in hidden>@h2/`, `https://h/u@mail` as
+  `https://<sign-in hidden>@mail` and `url=a://u:p@h` as `<sign-in hidden>@h`); what follows the last @ is
+  shown. Everything before the last at-sign of a run is hidden; of an email address only the part after
+  the at-sign is shown. The sign-in rule misses a sign-in that holds white space (the run ends there, and
+  what stands before it is shown), an address written wholly percent-escaped, and a secret written as the
+  scheme at the very start of a run. The look-alike rule
   is only a second net: it misses a short key, a key of one case or of digits only, a UUID, base64 cut by
   `+` or `/`, and a key split over a list's items, so such a value under a name not on the list is shown.
   Put a key only under a setting whose name says so.

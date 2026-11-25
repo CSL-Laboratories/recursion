@@ -256,9 +256,10 @@ class _ReadCounting(Mapping):
 
 
 class ReviewRegressionTests(unittest.TestCase):
-    """The first reads of #399 (05a5d13d): Codex gpt-6.1-sol R1-R2, DeepSeek V4.1 Flash F1-F10."""
+    """Edge cases of the answers: a wait on the breaker's retry time, a primary never offered again, a route with no
+    model anywhere, refusal details that are code words, a task read once, and a snapshot that cannot be walked."""
 
-    def test_wait_uses_breaker_retry_when_vendor_reset_is_null(self) -> None:  # sol R1, ds F1
+    def test_wait_uses_breaker_retry_when_vendor_reset_is_null(self) -> None:
         cfg = with_limits({"on_limit": "wait"})
         decision = router.decide(cfg, SENTRY, {})
         result = c.result("review", c.PLAN_LIMIT, limit=c.limit_signal("connection", "review.typed"), retry_at=7000.0)
@@ -267,7 +268,7 @@ class ReviewRegressionTests(unittest.TestCase):
                         retry_at=7000.0)
         self.assertEqual(router.next_after_limit(cfg, decision, zero)["until"], 0.0)  # an explicit zero is kept
 
-    def test_primary_not_reoffered_without_notice(self) -> None:  # sol R2
+    def test_primary_not_reoffered_without_notice(self) -> None:
         primary = copy.deepcopy(ROUTES["claude_code"]["route"])
         cfg = with_limits({"on_limit": "fallback", "fallback": [primary, CODEX]})
         decision = router.decide(cfg, SENTRY, {})
@@ -275,14 +276,14 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(answer["route"]["engine"], "codex")
         self.assertEqual(answer["skipped"][0]["skipped"], "already_tried")
 
-    def test_same_engine_and_connection_other_model_still_allowed(self) -> None:  # sol R2
+    def test_same_engine_and_connection_other_model_still_allowed(self) -> None:
         other = copy.deepcopy(ROUTES["claude_code"]["route"])
         other["model"] = "claude-model-b"
         cfg = with_limits({"on_limit": "fallback", "fallback": [other, CODEX]})
         decision = router.decide(cfg, SENTRY, {})
         self.assertEqual(router.next_after_limit(cfg, decision, LIMIT)["route"], other)
 
-    def test_a_route_with_no_model_anywhere_is_not_routable(self) -> None:  # ds F2
+    def test_a_route_with_no_model_anywhere_is_not_routable(self) -> None:
         routes = copy.deepcopy(ROUTES)
         del routes["claude_code"]["route"]["model"]
         cfg = config(routes=routes)
@@ -299,7 +300,7 @@ class ReviewRegressionTests(unittest.TestCase):
         raw["default"]["model"] = "m-default"
         self.assertEqual(router.decide(config(raw, routes=routes), SENTRY, {})["model"], "m-default")
 
-    def test_every_refusal_detail_is_code_words(self) -> None:  # ds F3
+    def test_every_refusal_detail_is_code_words(self) -> None:
         cases = [{"hand_pick": {"engine": "bogus", "model": None}}, {"hand_pick": {"engine": "pi", "model": ""}},
                  {"hand_pick": {"engine": "pi", "model": "two words"}}, {"task_kind": 5}, {"tags": ["a", ""]},
                  {"task_kind": None}, {"hand_pick": {"engine": "pi", "model": None}},
@@ -311,7 +312,7 @@ class ReviewRegressionTests(unittest.TestCase):
                 self.assertEqual(answer["code"], "request_invalid")
                 self.assertTrue(all(CODE_WORD.fullmatch(part) for part in answer["detail"].split(":")), answer["detail"])
 
-    def test_explain_reads_the_task_once(self) -> None:  # ds F4
+    def test_explain_reads_the_task_once(self) -> None:
         task = _ReadCounting()
         out = router.explain(config(), SENTRY, task)
         self.assertEqual(task.reads, 1)
@@ -319,19 +320,19 @@ class ReviewRegressionTests(unittest.TestCase):
         chosen = [r["id"] for r in out["rules"] if r["outcome"] == "chosen"]
         self.assertEqual((chosen, out["default"]["outcome"]), (["review-to-codex"], "not_reached"))
 
-    def test_a_bad_hand_pick_is_explained_as_not_reached(self) -> None:  # ds F5
+    def test_a_bad_hand_pick_is_explained_as_not_reached(self) -> None:
         out = router.explain(config(), SENTRY, {"hand_pick": {"engine": "codex", "model": None, "x": 1}})
         rows = {(r["outcome"], r["reason"]) for r in out["rules"]} | {(out["default"]["outcome"], out["default"]["reason"])}
         self.assertEqual(rows, {("not_reached", "bad_hand_pick")})
 
-    def test_next_after_limit_takes_decides_answer_only(self) -> None:  # ds F6
+    def test_next_after_limit_takes_decides_answer_only(self) -> None:
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {})
         for wrong in (router.route_decision(d), None, {}, "decision"):
             self.assertEqual(router.next_after_limit(cfg, wrong, LIMIT), {"action": "none", "reason": "no_decision"}, wrong)
         self.assertEqual(router.next_after_limit(cfg, d, LIMIT)["action"], "switch")
 
-    def test_a_snapshot_that_cannot_be_walked_is_malformed(self) -> None:  # ds F10
+    def test_a_snapshot_that_cannot_be_walked_is_malformed(self) -> None:
         class Hostile(Mapping):
             def __getitem__(self, key):
                 raise KeyError(key)
@@ -345,14 +346,14 @@ class ReviewRegressionTests(unittest.TestCase):
         d = router.decide(config(), {"engines": Hostile()}, {})
         self.assertEqual((d["ok"], d["reason"]), (False, "detection_malformed"))
 
-    def test_small_interface_gaps(self) -> None:  # ds F10; second reads: sol C2, C3
+    def test_small_interface_gaps(self) -> None:
         self.assertEqual(routing.EXPLAIN_PARAMS, ("session_id", "engine", "hand_pick", "task_kind", "tags"))
         self.assertIn("EXPLAIN_PARAMS", routing.__all__)
         for active in ("codex", b"codex"):
             with self.assertRaises(TypeError):
                 detect.detect(config(), active=active)
 
-    def test_a_rule_without_model_is_skipped_or_refused(self) -> None:  # second reads: sol C1
+    def test_a_rule_without_model_is_skipped_or_refused(self) -> None:
         routes = copy.deepcopy(ROUTES)
         del routes["codex"]["route"]["model"]
         raw = copy.deepcopy(CONFIG)
@@ -369,9 +370,10 @@ class ReviewRegressionTests(unittest.TestCase):
 
 
 class ReviewTwoRegressionTests(unittest.TestCase):
-    """The second reads of #399 (d857ebb5): DeepSeek V4.1 Flash R1-R7."""
+    """A null hand pick, a null attempts list, an invalid limits block, an exhausted fallback list and anything that
+    cannot be read is refused or answered with a typed word, never raised."""
 
-    def test_a_null_hand_pick_is_refused_alike_everywhere(self) -> None:  # ds R1
+    def test_a_null_hand_pick_is_refused_alike_everywhere(self) -> None:
         cfg = config()
         task = {"task_kind": "review", "hand_pick": None}
         d = router.decide(cfg, SENTRY, task)
@@ -379,7 +381,7 @@ class ReviewTwoRegressionTests(unittest.TestCase):
         self.assertEqual(router.explain(cfg, SENTRY, task)["decision"], d)
         self.assertEqual(router.explain_answer(cfg, SENTRY, task), {"code": "request_invalid", "detail": "hand_pick"})
 
-    def test_a_null_attempts_list_and_a_decision_in_name_only(self) -> None:  # ds R2
+    def test_a_null_attempts_list_and_a_decision_in_name_only(self) -> None:
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {})
         out = router.next_after_limit(cfg, d, {**LIMIT, "limit_notice": {"attempts": None}})
@@ -388,7 +390,7 @@ class ReviewTwoRegressionTests(unittest.TestCase):
                         {**d, "connection": None}, {**d, "connection": {"kind": "subscription"}},
                         {k: v for k, v in d.items() if k != "rule"}):
             self.assertEqual(router.next_after_limit(cfg, partial, LIMIT), {"action": "none", "reason": "no_decision"}, partial)
-        # Third reads, sol 1: each member alone, and a connection that is not a mapping or has no kind.
+        # Each member alone, and a connection that is not a mapping or has no kind.
         for missing in ("reason", "rule", "engine", "model", "connection"):
             partial = {k: v for k, v in d.items() if k != missing}
             self.assertEqual(router.next_after_limit(cfg, partial, LIMIT), {"action": "none", "reason": "no_decision"}, missing)
@@ -398,7 +400,7 @@ class ReviewTwoRegressionTests(unittest.TestCase):
         refused = router.decide(cfg, SENTRY, {"hand_pick": {"engine": "pi", "model": None}})
         self.assertEqual(router.next_after_limit(cfg, refused, LIMIT), {"action": "none", "reason": "no_route"})
 
-    def test_an_invalid_routes_json_limits_block_falls_back_to_ask(self) -> None:  # ds R3
+    def test_an_invalid_routes_json_limits_block_falls_back_to_ask(self) -> None:
         for bad in ({"on_limit": "sometimes"}, {"on_limit": "ask", "x": 1}, []):
             with self.subTest(bad):
                 routes = copy.deepcopy(ROUTES)
@@ -408,7 +410,7 @@ class ReviewTwoRegressionTests(unittest.TestCase):
                 self.assertEqual(router.next_after_limit(cfg, d, LIMIT),
                                  {"action": "ask", "reason": "on_limit_ask", "choices": []})
 
-    def test_an_exhausted_list_names_each_listed_route_once_in_order(self) -> None:  # ds R4
+    def test_an_exhausted_list_names_each_listed_route_once_in_order(self) -> None:
         pi = copy.deepcopy(ROUTES["pi"]["route"])
         order = [CODEX, OPENCODE, pi]
         cfg = with_limits({"on_limit": "fallback", "fallback": order})
@@ -419,7 +421,7 @@ class ReviewTwoRegressionTests(unittest.TestCase):
         self.assertEqual(out["skipped"], [{"place": n, **route_limits.describe(r), "skipped": "already_tried"}
                                           for n, r in enumerate(order, 1)])
 
-    def test_a_task_that_cannot_be_read_is_refused(self) -> None:  # ds R5
+    def test_a_task_that_cannot_be_read_is_refused(self) -> None:
         class Hostile(dict):
             def __init__(self, broken: str) -> None:
                 super().__init__(task_kind="review")
@@ -439,7 +441,7 @@ class ReviewTwoRegressionTests(unittest.TestCase):
             self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "bad_task", "task"), broken)
             self.assertEqual(router.explain(config(), SENTRY, Hostile(broken))["decision"], d)
 
-    def test_route_decision_of_anything_but_a_routed_decision_is_none(self) -> None:  # ds R7; third reads N4
+    def test_route_decision_of_anything_but_a_routed_decision_is_none(self) -> None:
         for value in (None, 5, "x", {}, {"ok": False}, {"ok": True}):
             self.assertIsNone(router.route_decision(value), value)
         d = router.decide(config(), SENTRY, {})
@@ -447,7 +449,7 @@ class ReviewTwoRegressionTests(unittest.TestCase):
             self.assertIsNone(router.route_decision({k: v for k, v in d.items() if k != missing}), missing)
         self.assertEqual(router.route_decision(d)["chosen"]["engine"], "claude_code")
 
-    def test_a_hand_pick_that_cannot_be_read_is_refused(self) -> None:  # third reads, sol 2
+    def test_a_hand_pick_that_cannot_be_read_is_refused(self) -> None:
         class HostileGet(dict):
             def get(self, key, default=None):
                 raise RuntimeError("hand_pick get")
@@ -490,15 +492,16 @@ class _Unreadable(Mapping):
 
 
 class ReviewThreeRegressionTests(unittest.TestCase):
-    """The third reads of #399 (1bf3254d): DeepSeek V4.1 Flash N1-N5 (Sol's two are beside the code they pin)."""
+    """A detection object, params, a decision or a limit result that cannot be read gives a typed refusal or no
+    decision, never an exception."""
 
-    def test_a_detection_object_that_cannot_be_read_refuses_every_task(self) -> None:  # ds N1
+    def test_a_detection_object_that_cannot_be_read_refuses_every_task(self) -> None:
         for broken in ("contains", "getitem"):
             self.assertEqual(router.snapshot(_Unreadable(broken)), (None, "detection_malformed"), broken)
             d = router.decide(config(), _Unreadable(broken), {})
             self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "default_engine_unavailable", "detection_malformed"))
 
-    def test_explain_answer_refuses_params_it_cannot_read(self) -> None:  # ds N2
+    def test_explain_answer_refuses_params_it_cannot_read(self) -> None:
         for broken in ("contains", "iter", "getitem"):
             self.assertEqual(router.explain_answer(config(), SENTRY, _Unreadable(broken)),
                              {"code": "request_invalid", "detail": "params"}, broken)
@@ -509,14 +512,14 @@ class ReviewThreeRegressionTests(unittest.TestCase):
         self.assertEqual(router.explain_answer(config(), SENTRY, {"hand_pick": HostileHand(engine="codex", model=None)}),
                          {"code": "request_invalid", "detail": "hand_pick"})
 
-    def test_a_decision_with_an_engine_decide_never_gives_is_no_decision(self) -> None:  # ds N3
+    def test_a_decision_with_an_engine_decide_never_gives_is_no_decision(self) -> None:
         cfg = config()  # the default route has no limits of its own, so routes.json's are looked up by engine
         d = router.decide(cfg, SENTRY, {})
         for odd in ({**d, "engine": ["codex"]}, {**d, "engine": None}, {**d, "model": ["m"]}):
             self.assertEqual(router.next_after_limit(cfg, odd, LIMIT), {"action": "none", "reason": "no_decision"}, odd)
         self.assertEqual(router.next_after_limit(cfg, d, LIMIT)["action"], "ask")
 
-    def test_a_limit_result_that_cannot_be_read_is_not_a_limit(self) -> None:  # ds N5; fourth reads E, sol's later N5
+    def test_a_limit_result_that_cannot_be_read_is_not_a_limit(self) -> None:
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {})
         self.assertEqual(router.next_after_limit(cfg, d, _Unreadable("all")), {"action": "none", "reason": "not_a_limit"})
@@ -543,7 +546,7 @@ class ReviewThreeRegressionTests(unittest.TestCase):
             self.assertEqual(router.next_after_limit(wait, dw, FailsOn(member)), not_a_limit, member)
         self.assertEqual(router.next_after_limit(cfg, d, FailsOn("limit_notice")), not_a_limit)  # the switch path's
         # The nested reads too: the vendor's signal and the notice. An attempt in it that cannot be read is dropped
-        # like any other non-attempt (sixth read, F2), so the limit itself still leads where the user listed.
+        # like any other non-attempt, so the limit itself still leads where the user listed.
         self.assertEqual(router.next_after_limit(wait, dw, {"code": c.PLAN_LIMIT, "limit": Broken()}), not_a_limit)
         self.assertEqual(router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit_notice": Broken()}), not_a_limit)
         self.assertEqual(router.next_after_limit(cfg, d, {"code": c.PLAN_LIMIT, "limit_notice": {"attempts": [Broken()]}})["action"],
@@ -551,9 +554,10 @@ class ReviewThreeRegressionTests(unittest.TestCase):
 
 
 class ReviewFourRegressionTests(unittest.TestCase):
-    """The fourth reads of #399 (477fa308): DeepSeek V4.1 Flash A-F and I (E is beside N5's test)."""
+    """A decision that cannot be read or has a wrong-typed member is no decision; a missing snapshot is
+    detection_unavailable; an attempt with a structured connection counts as tried."""
 
-    def test_route_decision_of_an_unreadable_or_wrong_typed_decision_is_none(self) -> None:  # ds A, B
+    def test_route_decision_of_an_unreadable_or_wrong_typed_decision_is_none(self) -> None:
         class UnreadableDecision(dict):
             def __getitem__(self, key):
                 raise RuntimeError("getitem")
@@ -568,7 +572,7 @@ class ReviewFourRegressionTests(unittest.TestCase):
             self.assertIsNone(router.route_decision({**d, member: value}), (member, value))
         self.assertEqual(router.route_decision(d)["chosen"]["model"], "claude-model-a")
 
-    def test_next_after_limit_answers_no_decision_for_a_decision_it_cannot_read(self) -> None:  # ds C, D
+    def test_next_after_limit_answers_no_decision_for_a_decision_it_cannot_read(self) -> None:
         class UnreadableDecision(dict):
             def __getitem__(self, key):
                 raise RuntimeError("getitem")
@@ -584,14 +588,14 @@ class ReviewFourRegressionTests(unittest.TestCase):
         connection = UnwalkableConnection(kind="subscription", id="claude-main")
         self.assertEqual(router.next_after_limit(cfg, {**d, "connection": connection}, LIMIT), no_decision)
 
-    def test_a_missing_snapshot_is_detection_unavailable(self) -> None:  # ds F
+    def test_a_missing_snapshot_is_detection_unavailable(self) -> None:
         for missing in (None, 5, "engines", ["engines"]):
             self.assertEqual(router.snapshot(missing), (None, "detection_unavailable"), missing)
         d = router.decide(config(), None, {})
         self.assertEqual((d["ok"], d["code"], d["reason"]), (False, "default_engine_unavailable", "detection_unavailable"))
         self.assertEqual(router.snapshot({"engines": []}), (None, "detection_malformed"))
 
-    def test_an_attempt_with_a_structured_connection_counts_as_tried(self) -> None:  # ds I
+    def test_an_attempt_with_a_structured_connection_counts_as_tried(self) -> None:
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {})
         structured = {"engine": "codex", "model": CODEX["model"], "connection": dict(CODEX["connection"])}
@@ -600,13 +604,15 @@ class ReviewFourRegressionTests(unittest.TestCase):
 
 
 class ReviewFiveRegressionTests(unittest.TestCase):
-    """The fifth read of #399 (30073846): DeepSeek V4.1 Flash A-G."""
+    """Each member of a decision is read inside the guard and has the type decide gives it; a bare connection word in
+    attempts counts as tried; a wait time is a time or the retry time; ok is exactly True or False; attempts that are
+    not a list name no attempt."""
 
     def setUp(self) -> None:
         self.cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         self.d = router.decide(self.cfg, SENTRY, {})
 
-    def test_next_after_limit_reads_each_member_inside_the_guard(self) -> None:  # ds A
+    def test_next_after_limit_reads_each_member_inside_the_guard(self) -> None:
         class FailsOn(dict):
             def __init__(self, member: str, values) -> None:
                 super().__init__(values)
@@ -621,7 +627,7 @@ class ReviewFiveRegressionTests(unittest.TestCase):
             self.assertEqual(router.next_after_limit(self.cfg, FailsOn(member, decision), LIMIT),
                              {"action": "none", "reason": "no_decision"}, member)
 
-    def test_a_connection_that_iterates_but_cannot_be_indexed_is_no_decision(self) -> None:  # ds B
+    def test_a_connection_that_iterates_but_cannot_be_indexed_is_no_decision(self) -> None:
         class Unindexable(Mapping):
             def __getitem__(self, key):
                 raise RuntimeError("connection getitem")
@@ -634,7 +640,7 @@ class ReviewFiveRegressionTests(unittest.TestCase):
         self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "connection": Unindexable()}, LIMIT),
                          {"action": "none", "reason": "no_decision"})
 
-    def test_route_decision_refuses_members_dict_would_accept(self) -> None:  # ds C
+    def test_route_decision_refuses_members_dict_would_accept(self) -> None:
         class Row:  # indexable like a candidate, but not a mapping
             def __getitem__(self, key):
                 return "x"
@@ -643,7 +649,7 @@ class ReviewFiveRegressionTests(unittest.TestCase):
                               ("candidates", (c for c in self.d["candidates"])), ("candidates", [Row()])):
             self.assertIsNone(router.route_decision({**self.d, member: value}), member)
 
-    def test_a_bare_connection_word_in_attempts_counts_as_tried(self) -> None:  # ds D
+    def test_a_bare_connection_word_in_attempts_counts_as_tried(self) -> None:
         word = route_limits.describe(CODEX)["connection"]
         for attempts in ([word], word):  # a list of words, or the one word on its own
             out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": attempts}})
@@ -652,7 +658,7 @@ class ReviewFiveRegressionTests(unittest.TestCase):
         out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": ["subscription:other"]}})
         self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"))
 
-    def test_a_wait_until_is_a_time_or_the_retry_time(self) -> None:  # ds E
+    def test_a_wait_until_is_a_time_or_the_retry_time(self) -> None:
         cfg = with_limits({"on_limit": "wait"})
         d = router.decide(cfg, SENTRY, {})
 
@@ -665,14 +671,14 @@ class ReviewFiveRegressionTests(unittest.TestCase):
         self.assertEqual(until(0.0, 7000.0), 0.0)
         self.assertEqual(until(5000, 7000.0), 5000)
 
-    def test_ok_must_be_exactly_true_or_false(self) -> None:  # ds F
+    def test_ok_must_be_exactly_true_or_false(self) -> None:
         for ok in (1, "yes", None):
             self.assertIsNone(router.route_decision({**self.d, "ok": ok}), ok)
             self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "ok": ok}, LIMIT),
                              {"action": "none", "reason": "no_decision"}, ok)
         self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "ok": False}, LIMIT), {"action": "none", "reason": "no_route"})
 
-    def test_attempts_that_are_not_a_list_are_no_attempts(self) -> None:  # ds G
+    def test_attempts_that_are_not_a_list_are_no_attempts(self) -> None:
         for notice in ({"attempts": 5}, {"attempts": {"a": 1}}, {"attempts": [5, None]}, ["x"]):
             out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": notice})
             self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), notice)
@@ -727,14 +733,16 @@ class _EvilFloatInt(int):
 
 
 class ReviewSixRegressionTests(unittest.TestCase):
-    """The sixth read of #399 (7bbd59be): DeepSeek V4.1 Flash F1-F6."""
+    """Values that cannot be compared or formatted, and words that are str subclasses, give no decision and no
+    attempt; an unreadable attempts entry is dropped without the limit; a wait time is finite; a published
+    connection has its kind and id."""
 
     def setUp(self) -> None:
         self.cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         self.d = router.decide(self.cfg, SENTRY, {})
         self.word = route_limits.describe(CODEX)["connection"]
 
-    def test_values_that_cannot_be_compared_or_formatted_are_no_decision(self) -> None:  # ds F1
+    def test_values_that_cannot_be_compared_or_formatted_are_no_decision(self) -> None:
         rule = router.decide(self.cfg, SENTRY, {"task_kind": "review"})
         no_decision = {"action": "none", "reason": "no_decision"}
         for decision in ({**self.d, "reason": _EvilEq()}, {**rule, "rule": _EvilEq()}, {**self.d, "reason": ["config"]},
@@ -744,14 +752,14 @@ class ReviewSixRegressionTests(unittest.TestCase):
             self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT), no_decision, decision)
         self.assertIsNone(router.route_decision({**self.d, "reason": _EvilEq()}))
 
-    def test_an_attempt_whose_parts_are_not_words_is_not_an_attempt(self) -> None:  # ds F1
+    def test_an_attempt_whose_parts_are_not_words_is_not_an_attempt(self) -> None:
         for entry in ({"engine": _EvilEq(), "model": "y", "connection": "z"},
                       {"engine": _EvilEq(), "model": CODEX["model"], "connection": self.word},
                       {"engine": "codex", "model": CODEX["model"], "connection": 5}):
             out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [entry]}})
             self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), entry)
 
-    def test_an_unreadable_attempts_entry_is_dropped_not_the_limit(self) -> None:  # ds F2
+    def test_an_unreadable_attempts_entry_is_dropped_not_the_limit(self) -> None:
         class GetRaises(dict):
             def get(self, key, default=None):
                 raise RuntimeError("get")
@@ -760,12 +768,12 @@ class ReviewSixRegressionTests(unittest.TestCase):
         self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"))
         out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [unreadable, self.word]}})
         self.assertEqual((out["action"], out["reason"]), ("ask", "fallback_exhausted"))
-        # Round 7, F3: a list or tuple that cannot be iterated is dropped like an entry, not the limit with it.
+        # A list or tuple that cannot be iterated is dropped like an entry, not the limit with it.
         for attempts in (_EvilIterList([self.word]), _EvilIterTuple((self.word,))):
             out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": attempts}})
             self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), type(attempts))
 
-    def test_a_wait_until_is_finite(self) -> None:  # ds F3
+    def test_a_wait_until_is_finite(self) -> None:
         cfg = with_limits({"on_limit": "wait"})
         d = router.decide(cfg, SENTRY, {})
 
@@ -779,19 +787,19 @@ class ReviewSixRegressionTests(unittest.TestCase):
             self.assertIsNone(until(odd, float("nan")), type(odd))
             self.assertIsNone(until(None, odd), type(odd))
         self.assertEqual(until(5000, None), 5000)
-        self.assertEqual(until(-5.0, 7000.0), -5.0)  # round 7, F4: a time already past is passed through as given
+        self.assertEqual(until(-5.0, 7000.0), -5.0)  # a time already past is passed through as given
 
-    def test_route_decision_needs_the_connections_kind_and_id(self) -> None:  # ds F5
+    def test_route_decision_needs_the_connections_kind_and_id(self) -> None:
         for connection in ({}, {"kind": "subscription"}, {"id": "claude-main"}):
             self.assertIsNone(router.route_decision({**self.d, "connection": connection}), connection)
 
-    def test_an_attempt_naming_only_its_connection_counts_as_tried(self) -> None:  # ds F6
+    def test_an_attempt_naming_only_its_connection_counts_as_tried(self) -> None:
         out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": [{"connection": self.word}]}})
         self.assertEqual((out["action"], out["reason"], out["skipped"][0]["skipped"]), ("ask", "fallback_exhausted", "already_tried"))
 
-    # F1's class one step further: a member that IS a str (a subclass) passes an isinstance check and can still
+    # One step further: a member that IS a str (a subclass) passes an isinstance check and can still
     # raise, or answer anything, when compared or formatted outside the guard.
-    def test_a_decision_word_that_is_a_str_subclass_is_no_decision(self) -> None:  # ds F1
+    def test_a_decision_word_that_is_a_str_subclass_is_no_decision(self) -> None:
         rule = router.decide(self.cfg, SENTRY, {"task_kind": "review"})
         conn = self.d["connection"]
         for decision in ({**self.d, "reason": _AlwaysEqStr("config")}, {**rule, "rule": _EvilEqStr(rule["rule"])},
@@ -801,7 +809,7 @@ class ReviewSixRegressionTests(unittest.TestCase):
             self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT), {"action": "none", "reason": "no_decision"},
                              decision)
 
-    def test_an_attempt_word_that_is_a_str_subclass_is_read_as_its_text(self) -> None:  # ds F1
+    def test_an_attempt_word_that_is_a_str_subclass_is_read_as_its_text(self) -> None:
         m, conn = CODEX["model"], CODEX["connection"]
         for entry in ({"engine": _EvilEqStr("codex"), "model": m, "connection": self.word},
                       {"engine": "codex", "model": _EvilEqStr(m), "connection": self.word},
@@ -812,12 +820,12 @@ class ReviewSixRegressionTests(unittest.TestCase):
             self.assertEqual((out["action"], out["reason"], out["skipped"][0]["skipped"]),
                              ("ask", "fallback_exhausted", "already_tried"), entry)
 
-    def test_a_limit_code_that_is_a_str_subclass_is_not_a_limit(self) -> None:  # ds F1
+    def test_a_limit_code_that_is_a_str_subclass_is_not_a_limit(self) -> None:
         for code in (_EvilEqStr(c.PLAN_LIMIT), _AlwaysEqStr("x")):
             self.assertEqual(router.next_after_limit(self.cfg, self.d, {**LIMIT, "code": code}),
                              {"action": "none", "reason": "not_a_limit"}, type(code))
 
-    def test_route_decision_needs_plain_words(self) -> None:  # ds F5: what next_after_limit refuses is not published
+    def test_route_decision_needs_plain_words(self) -> None:  # what next_after_limit refuses is not published
         conn = self.d["connection"]
         for odd in ({"connection": {**conn, "kind": 5}}, {"connection": {**conn, "id": None}},
                     {"connection": {**conn, "kind": _EvilFormatStr(conn["kind"])}}, {"reason": _AlwaysEqStr("x")},
@@ -863,8 +871,9 @@ class _LikeAMapping:
 
 
 class ReviewSevenRegressionTests(unittest.TestCase):
-    """The seventh read of #399 (ece6c127): DeepSeek V4.1 Flash F1-F5 (F3 and F4 are also in the round-6 tests above;
-    F5 is a comment)."""
+    """Words of the task and of the detection that are str subclasses are read as their text; tags that cannot be
+    read are refused; route_decision publishes only what JSON takes; a mapping or a set of attempts names no
+    attempt."""
 
     def setUp(self) -> None:
         self.cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
@@ -883,8 +892,8 @@ class ReviewSevenRegressionTests(unittest.TestCase):
         elif isinstance(value, str):
             self.assertIs(type(value), str, repr(value))
 
-    # F1: round 6's class one entry point further out, the task's own words.
-    def test_a_task_word_that_is_a_str_subclass_is_read_as_its_text(self) -> None:  # ds F1
+    # The same fault one entry point further out: the task's own words.
+    def test_a_task_word_that_is_a_str_subclass_is_read_as_its_text(self) -> None:
         cfg = config()
         for odd_type in (_EvilHashStr, _EvilEqStr, _AlwaysEqStr):
             for plain, odd in (({"task_kind": "review"}, {"task_kind": odd_type("review")}),
@@ -905,14 +914,14 @@ class ReviewSevenRegressionTests(unittest.TestCase):
                     self.assertEqual(answer, router.explain_answer(cfg, SENTRY, plain))
                     self.assert_plain(answer)
 
-    def test_tags_that_cannot_be_read_are_refused(self) -> None:  # ds F1
+    def test_tags_that_cannot_be_read_are_refused(self) -> None:
         cfg, task = config(), {"tags": _EvilIterList(["cheap"])}
         decision = router.decide(cfg, SENTRY, task)
         self.assertEqual((decision["ok"], decision["code"], decision["reason"]), (False, "bad_task", "tags"))
         self.assertEqual(router.explain(cfg, SENTRY, task)["decision"], decision)
         self.assertEqual(router.explain_answer(cfg, SENTRY, task), {"code": "request_invalid", "detail": "bad_task:tags"})
 
-    def test_explain_answer_never_compares_a_name_or_an_engine_it_has_not_checked(self) -> None:  # ds F1
+    def test_explain_answer_never_compares_a_name_or_an_engine_it_has_not_checked(self) -> None:
         cfg, hand = config(), {"engine": "codex", "model": None}
         want = router.explain_answer(cfg, SENTRY, {"engine": "codex", "hand_pick": hand})
         self.assertEqual(want["code"], "ok")
@@ -928,7 +937,7 @@ class ReviewSevenRegressionTests(unittest.TestCase):
         self.assertEqual(answer, {"code": "request_invalid", "detail": "zz"})
         self.assert_plain(answer)
 
-    def test_a_detection_word_that_is_a_str_subclass_is_read_as_its_text(self) -> None:  # ds F1
+    def test_a_detection_word_that_is_a_str_subclass_is_read_as_its_text(self) -> None:
         cfg = config()
         others = {engine: entry for engine, entry in SENTRY["engines"].items() if engine != "pi"}
         self.assertEqual(SENTRY["engines"]["pi"], {"routable": False, "reason": "not_on_path"})
@@ -947,8 +956,8 @@ class ReviewSevenRegressionTests(unittest.TestCase):
         self.assertEqual(router.explain_answer(cfg, signed_out, {"task_kind": "chat"}),
                          {"code": "request_invalid", "detail": "default_engine_unavailable:signed_out"})
 
-    # F2: the record route_decision publishes is what the run record keeps and the event carries.
-    def test_route_decision_publishes_only_what_json_takes(self) -> None:  # ds F2
+    # The record route_decision publishes is what the run record keeps and the event carries.
+    def test_route_decision_publishes_only_what_json_takes(self) -> None:
         cfg = config()
         for task in ({}, {"task_kind": "search"}, {"hand_pick": {"engine": "opencode", "model": "m-1"}},
                      {"hand_pick": {"engine": "codex", "model": None}}):
@@ -978,8 +987,8 @@ class ReviewSevenRegressionTests(unittest.TestCase):
                            ("a hand pick that only iterates and indexes", {"hand_pick": _LikeAMapping(("engine", "model"), "codex")})):
             self.assertIsNone(router.route_decision({**self.d, **odd}), label)
 
-    # F3's neighbour: what is not a list or tuple names no attempt, whatever it holds.
-    def test_attempts_in_a_mapping_or_a_set_are_no_attempts(self) -> None:  # ds F3
+    # What is not a list or tuple names no attempt, whatever it holds.
+    def test_attempts_in_a_mapping_or_a_set_are_no_attempts(self) -> None:
         for attempts in ({self.word: 1}, {self.word}, frozenset({self.word})):
             out = router.next_after_limit(self.cfg, self.d, {**LIMIT, "limit_notice": {"attempts": attempts}})
             self.assertEqual((out["action"], out["route"]["engine"]), ("switch", "codex"), attempts)
@@ -1024,17 +1033,17 @@ class _Engines(Mapping):
 
 
 class ReviewEightRegressionTests(unittest.TestCase):
-    """The eighth read of #399 (5feab1b1): DeepSeek V4.1 Flash F1-F2, as the Liaison's ruling 7 has them (F3 is
-    answered in the lane's report)."""
+    """A task whose reading raises is refused even for an absent member, and two snapshot keys that read as one
+    engine make the snapshot unusable."""
 
-    def test_a_task_whose_reading_raises_is_refused_even_for_an_absent_member(self) -> None:  # ds F1
+    def test_a_task_whose_reading_raises_is_refused_even_for_an_absent_member(self) -> None:
         cfg = config()
         decision = router.decide(cfg, SENTRY, _NothingPresent())
         self.assertEqual((decision["ok"], decision["code"], decision["reason"]), (False, "bad_task", "task"))
         self.assertEqual(router.explain(cfg, SENTRY, _NothingPresent())["decision"], decision)
         self.assertTrue(router.decide(cfg, SENTRY, {})["ok"])  # the same task as a plain dict routes
 
-    def test_two_keys_that_read_as_one_engine_make_the_snapshot_unusable(self) -> None:  # ds F2
+    def test_two_keys_that_read_as_one_engine_make_the_snapshot_unusable(self) -> None:
         cfg = config()
         refused = {"routable": False, "reason": "signed_out"}
         routable = {"routable": True, "reason": None}
@@ -1051,7 +1060,7 @@ class ReviewEightRegressionTests(unittest.TestCase):
 
 class _GoesOnSecondAsking(dict):
     """A decision (or connection) whose one member goes the second time its presence is asked: a member deleted
-    while the decision is read (sol's stateful witness)."""
+    while the decision is read."""
 
     def __init__(self, values, key):
         super().__init__(values)
@@ -1072,10 +1081,10 @@ class _UnformattableId(str):
 
 
 class DisappearingMemberTests(unittest.TestCase):
-    """The fifth Codex read of #399 (gpt-6.1-sol, 477fa308..8984581e), change 1: a required member that goes while
-    the decision is read (sol's stateful_case, by its names)."""
+    """A required member that goes while the decision is read makes it no decision, and a primary is not offered
+    again when a member disappears."""
 
-    def test_a_required_member_lost_while_reading_is_no_decision(self) -> None:  # sol 1
+    def test_a_required_member_lost_while_reading_is_no_decision(self) -> None:
         cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         d = router.decide(cfg, SENTRY, {})
         for key in ("reason", "rule", "engine", "model"):
@@ -1087,7 +1096,7 @@ class DisappearingMemberTests(unittest.TestCase):
                 else:
                     self.assertEqual(actual, router.next_after_limit(cfg, d, LIMIT))
 
-    def test_a_primary_cannot_be_reoffered_when_a_member_disappears(self) -> None:  # sol 1
+    def test_a_primary_cannot_be_reoffered_when_a_member_disappears(self) -> None:
         primary = copy.deepcopy(ROUTES["claude_code"]["route"])
         cfg = with_limits({"on_limit": "fallback", "fallback": [primary, CODEX]})
         d = router.decide(cfg, SENTRY, {})
@@ -1105,25 +1114,25 @@ class DisappearingMemberTests(unittest.TestCase):
 
 
 class RequiredRegressionTests(unittest.TestCase):
-    """The fifth Codex read of #399, changes 2 and 3: two rules that no test pinned (sol's required_regressions,
-    by its names)."""
+    """route_decision refuses a connection id that is a str subclass; next_after_limit refuses a reason decide
+    never gives."""
 
     def setUp(self) -> None:
         self.cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
         self.decision = router.decide(self.cfg, SENTRY, {})
 
-    def test_route_decision_refuses_a_connection_id_str_subclass(self) -> None:  # sol 2
+    def test_route_decision_refuses_a_connection_id_str_subclass(self) -> None:
         conn = self.decision["connection"]
         decision = {**self.decision, "connection": {**conn, "id": _UnformattableId(conn["id"])}}
         self.assertIsNone(router.route_decision(decision))
 
-    def test_next_after_limit_refuses_unknown_reason(self) -> None:  # sol 3
+    def test_next_after_limit_refuses_unknown_reason(self) -> None:
         self.assertEqual(router.next_after_limit(self.cfg, {**self.decision, "reason": "learned"}, LIMIT),
                          {"action": "none", "reason": "no_decision"})
 
 
 class SweepRegressionTests(unittest.TestCase):
-    """The Nov 15 integration sweep of #399 against master (gpt-6.1-sol, s6-int-399): its F2, by its name."""
+    """Rules after a chosen or refused rule are not reached, whatever their conditions."""
 
     def test_f2_rules_after_a_chosen_rule_are_not_reached(self) -> None:
         out = router.explain(config(), SENTRY, {"task_kind": "review"})
@@ -1153,7 +1162,8 @@ class _AskingDeletes(dict):
 
 
 class DeepSeekNineRegressionTests(unittest.TestCase):
-    """The ninth DeepSeek read of #399 (a65df75d): its F1 and F2."""
+    """A connection that is not a mapping is never walked, and each member's value is read from one walk of the
+    decision and of its connection."""
 
     def setUp(self) -> None:
         self.cfg = with_limits({"on_limit": "fallback", "fallback": [CODEX]})
@@ -1161,7 +1171,7 @@ class DeepSeekNineRegressionTests(unittest.TestCase):
         self.control = router.next_after_limit(self.cfg, self.d, LIMIT)
         self.assertEqual(self.control["action"], "switch")
 
-    def test_a_connection_that_is_not_a_mapping_is_never_walked(self) -> None:  # ds r9 F1
+    def test_a_connection_that_is_not_a_mapping_is_never_walked(self) -> None:
         walked = []
 
         class Counted:
@@ -1176,17 +1186,17 @@ class DeepSeekNineRegressionTests(unittest.TestCase):
                          {"action": "none", "reason": "no_decision"})
         self.assertEqual(walked, [])
 
-    def test_each_members_value_is_read_where_its_presence_is_asked(self) -> None:  # ds r9 F2, its G2
+    def test_each_members_value_is_read_where_its_presence_is_asked(self) -> None:
         decision = _AskingDeletes(self.d, asked="model", deleted="engine")  # engine is already read by then
         self.assertEqual(router.next_after_limit(self.cfg, decision, LIMIT), self.control)
 
-    def test_the_connections_members_are_read_from_its_one_walk(self) -> None:  # ds r9 F2, its G4
+    def test_the_connections_members_are_read_from_its_one_walk(self) -> None:
         connection = _AskingDeletes(self.d["connection"], asked="kind", deleted="id")  # nothing asks it again
         self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "connection": connection}, LIMIT), self.control)
 
 
 class GrokTenRegressionTests(unittest.TestCase):
-    """The Grok read of #399, round 10 (3a0236af): its R1, a listed route the daemon refuses before launch."""
+    """A listed route the daemon refuses before launch is passed over for the next one."""
 
     def setUp(self) -> None:
         self.refused = {**copy.deepcopy(CODEX), "model": "codex-model-refused"}
@@ -1196,7 +1206,7 @@ class GrokTenRegressionTests(unittest.TestCase):
     def refusal(entry):
         return "launch_refused" if entry["route"]["model"] == "codex-model-refused" else None
 
-    def test_a_listed_route_the_daemon_refuses_is_passed_over_for_the_next(self) -> None:  # grok r10 R1
+    def test_a_listed_route_the_daemon_refuses_is_passed_over_for_the_next(self) -> None:
         cfg = with_limits({"on_limit": "fallback", "fallback": [self.refused, self.second]})
         out = router.next_after_limit(cfg, router.decide(cfg, SENTRY, {}), LIMIT, SENTRY, route_refusal=self.refusal)
         self.assertEqual((out["action"], out["place"], out["route"]["model"]), ("switch", 2, "codex-model-b"))
@@ -1205,7 +1215,7 @@ class GrokTenRegressionTests(unittest.TestCase):
         out = router.next_after_limit(cfg, router.decide(cfg, SENTRY, {}), LIMIT, SENTRY, route_refusal=self.refusal)
         self.assertEqual((out["action"], out["reason"]), ("ask", "fallback_exhausted"))
 
-    def test_a_refusal_source_that_raises_passes_the_route_over(self) -> None:  # grok r10 R1, as detect has it
+    def test_a_refusal_source_that_raises_passes_the_route_over(self) -> None:  # as detect has it
         def raising(entry):
             raise RuntimeError("made-up refusal source")
         cfg = with_limits({"on_limit": "fallback", "fallback": [self.second]})
@@ -1213,7 +1223,7 @@ class GrokTenRegressionTests(unittest.TestCase):
         self.assertEqual((out["action"], out["skipped"][0]["skipped"]), ("ask", "detection_source_failed"))
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "the daemon's own refusals are read on Linux only")
-    def test_the_daemons_refusal_passes_a_helper_key_route_over(self) -> None:  # grok r10's witness
+    def test_the_daemons_refusal_passes_a_helper_key_route_over(self) -> None:
         helper = {"engine": "claude_code", "model": "helper-model",
                   "connection": {"kind": "api_key", "id": "anthropic-helper", "key_source": "api_key_helper"}}
         raw = {"version": 1,

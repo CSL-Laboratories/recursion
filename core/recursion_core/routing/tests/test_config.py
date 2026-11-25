@@ -453,9 +453,8 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, "catalog_conflict")
 
     def test_a_key_of_a_provider_outside_the_vendor_list_leaves_loading_alone(self) -> None:
-        # The key store keeps and lists a key of any well-formed provider (the Liaison's ruling of 6:03 PM,
-        # Nov 14, on KEYS' K14; KEYS' draft lists nous and refuseless beside routing's six). Such a key is
-        # catalogued, no login can name its vendor yet (questions.md Q15), and the routing file still loads.
+        # The key store keeps and lists a key of any well-formed provider (it lists nous and refuseless beside
+        # routing's six). Such a key is catalogued, no login can name its vendor, and the routing file still loads.
         keys = {**KEYS, "nous-main": {"provider": "nous"}, "refuseless-1": {"provider": "refuseless"},
                 "other-1": {"provider": "acme"}}
         self.assertEqual(rc.catalog(ROUTES, keys)["nous-main"], {"vendor": "nous", "kind": "api_key"})

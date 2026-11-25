@@ -1,6 +1,6 @@
 """Detection: which engines a routing decision may use, built from what the daemon already knows.
 
-An engine is ROUTABLE when (my brief, step 3):
+An engine is ROUTABLE when all of these hold:
 
 * it has a loaded route (``routes.json``, as ``load_routes`` gave it) that the daemon would not refuse
   before launch (``route_unsupported``, ``route_unbindable``: the same functions ``route.list`` and the
@@ -10,7 +10,7 @@ An engine is ROUTABLE when (my brief, step 3):
   read is ``breaker_unknown``, because a start on it is refused until the store reads; a breaker whose
   ``state()`` raises is ``detection_source_failed``, like any source that raises: unroutable either way);
 * for a key route (``connection.kind`` ``api_key``) and for ``recursion_loop``, its key is present in the
-  key store and opted in to spending (grill Q44: a key route with no opt-in never spends).
+  key store and opted in to spending (a key route with no opt-in never spends).
 
 The answer is the snapshot ``router.decide`` takes: ``{"engines": {engine: {"routable", "reason"}}}``, one
 entry for every engine the config may name, each reason a typed code. Nothing here launches, writes,
@@ -22,12 +22,10 @@ The sources are passed in, so that this module depends on none of them and its t
   ``daemon_route_refusal(breaker)`` gives the daemon's own (it imports the daemon, Linux only);
 * ``breaker_state(connection_key) -> "closed" | "half_open" | "open" | "unknown"``: ``breaker_view``
   turns the daemon's breaker into one;
-* ``key_state(connection_id) -> "ready" | "absent" | "not_opted_in"``: lane KEYS' key store answers it
-  once its first pull request lands; until then a test passes a plain function;
+* ``key_state(connection_id) -> "ready" | "absent" | "not_opted_in"``: the key store answers it
+  (``key_state_from`` builds one from the store's metadata); a test passes a plain function;
 * ``active``: the engines whose adapter the engine table can launch, or None to leave that check to
   ``routes.json`` (the daemon loads an entry only for an engine it has an adapter for).
-
-LAUNCH-CHECK's detection snapshot replaces the first condition (the route part) when it lands.
 """
 
 from __future__ import annotations
@@ -131,6 +129,15 @@ def breaker_view(breaker) -> Callable[[str], str]:
     breaker has it (the durable one), is True, False, or None when its store could not be read. A trip
     kept in the store reads ``open`` while the in-memory state is still ``closed``; an unreadable store
     reads ``unknown``.
+
+    A trip kept by an earlier daemon therefore reads ``open`` for as long as the breaker's in-memory state
+    is ``closed``, that is, until the breaker restores the trip. The cooldown of such a trip begins only
+    when the breaker restores it (the durable breaker does so when it first admits a request on that
+    connection); this function only reads, and starts no cooldown. Whatever wires detection into the start
+    path must therefore have the breaker restore the stored trip of every configured connection before it
+    relies on this view to let a connection through. Without that, a connection tripped before a restart
+    reads ``open`` and stays refused, because no cooldown ever starts, until a start that reaches the
+    breaker's admission directly or a hand reset clears it.
     """
     def state(key: str) -> str:
         current = breaker.state(key)

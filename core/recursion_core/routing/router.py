@@ -269,7 +269,7 @@ def _word_or_null(value: object) -> bool:
 def route_decision(decision: Mapping) -> dict | None:
     """The control schema's ``route_decision`` (common.v1: chosen, reason, candidates, hand_pick) for a routed
     decision, or None for a refusal. This is what the run record keeps and the ``route.decision`` event
-    carries; the start path that stores it is a later slice. Anything else (an object that is not a routed
+    carries; nothing stores it yet. Anything else (an object that is not a routed
     decision, one whose ``ok`` is not exactly True, one whose members are missing or of a type ``decide`` never
     gives, a subclass of ``str`` among them, or one that cannot be read) answers None, never an ``Exception``; a
     ``BaseException`` such as ``KeyboardInterrupt`` stops the caller. Every member published is rebuilt from the
@@ -388,19 +388,19 @@ def explain_answer(config: Config, detection: object, params: object) -> dict:
     """``route.explain``'s answer in its published shape and nothing more (methods.v1 ``answer.route.explain``,
     #368 at 16dea486): ``{"code": "ok", "decision": <route_decision>}`` for a routed task, else
     ``{"code": "request_invalid", "detail": ...}``. The detail is routing's own code, with ``:`` and the reason
-    when there is one, as the Liaison ruled for routing's refusals at 3:11 PM, Nov 14, until SPINE's schema
-    revision gives them a code of their own. ``explain()``'s rule-by-rule outcomes are not returned (the
-    Liaison's ruling of 4:20 PM): they wait for that same revision.
+    when there is one, until the control schema gives routing's refusals a code of their own.
+    ``explain()``'s rule-by-rule outcomes are not returned: the published answer has no place for them until
+    that schema revision.
 
     The params' ``task_kind``, ``tags`` and ``hand_pick`` are the task; ``session_id`` is the caller's to
     resolve and is not read here. A member the method does not have is refused with its name as the detail
     (``params`` when the name is not a code word); params that cannot be read are refused ``params``, and a
     hand pick that cannot be read ``hand_pick``, never raised through.
     ``hand_pick`` carries both ``engine`` and ``model`` (common.v1). An ``engine`` with a ``hand_pick`` of
-    another engine is refused, ``engine_and_hand_pick_differ`` (the Liaison's ruling of 4:20 PM); with a hand
+    another engine is refused, ``engine_and_hand_pick_differ``; with a hand
     pick of the same engine, the hand pick decides. An ``engine`` alone is refused, ``engine_named_not_routed``:
     a start that names its engine is not routed (it launches that engine's ``routes.json`` entry), so there
-    is no routing decision to explain (questions.md Q16).
+    is no routing decision to explain.
     """
     if not isinstance(params, Mapping):
         return {"code": "request_invalid", "detail": "params"}
@@ -517,7 +517,7 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
                      route_refusal: object = None) -> dict:
     """What a limit on a decided route leads to: the next route the user listed, or ask; never anything else.
 
-    Four arguments (the brief writes two; the limits are read from the config, so it is passed too):
+    Four arguments (the limits are read from the config, so the config is passed too):
     ``config``, the Config the decision was made with (for a run in flight, that one, not a reloaded file);
     ``decision``, ``decide``'s own answer (a ``route_decision``, anything else without ``ok``, an ``ok`` that is
     neither True nor False, a routed mapping without decide's ``reason``, ``rule``, ``engine``, ``model`` and
@@ -541,7 +541,7 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
     A switch is only ever to a route in the user's own fallback list for the decided route (the loader has
     already refused a list that names a login not configured for its engine), in the user's order, passing
     over a route already tried and, when ``detection`` is given, one whose engine is not routable. The
-    switch is a new run that the caller (SESSIONS) starts; this function starts nothing. A hand pick is
+    switch is a new run that the caller starts; this function starts nothing. A hand pick is
     never switched away from on its own: the user chose that route for this task, so the answer is ask.
     """
     # The decision, read inside one guard into plain data (each member once for presence and once for its value):
@@ -632,7 +632,7 @@ def next_after_limit(config: Config, decision: Mapping, limit: Mapping, detectio
                 skipped.append({"place": place, **route_limits.describe(route), "skipped": why})
                 continue
         if route_refusal is not None:
-            try:  # the daemon's own pre-launch refusal of this route, as the entry it would launch (Grok r10 R1)
+            try:  # the daemon's own pre-launch refusal of this route, as the entry it would launch
                 why = route_refusal({"route": copy.deepcopy(route)})
             except Exception:  # noqa: BLE001 - a refusal source that raises: the route is not taken, as detect has it
                 why = "detection_source_failed"

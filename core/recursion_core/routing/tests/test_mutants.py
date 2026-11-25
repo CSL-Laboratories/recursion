@@ -69,7 +69,6 @@ MUTANTS = {
         '        if lg.vendor == "anthropic" and lg.kind == "subscription" and set(lg.engines) != {"claude_code"}:\n',
         "        if False:\n",
         {"test_engine_vendor_compatibility", "test_loader_cross_field_rules"}),
-    # Slice 2.
     "M10 a hand-picked run switched to a listed fallback at a limit": (
         ROUTER,
         '    if decision["reason"] == "hand_pick":\n        return {"action": "ask", "reason": "hand_pick", "choices": choices}\n',
@@ -147,8 +146,7 @@ MUTANTS = {
         "parsed = json.loads(text, object_pairs_hook=_no_duplicate_members)",
         "parsed = json.loads(text)",
         {"test_a_member_named_twice_is_refused"}),
-    # Slice 2, after #371 passed its reads: route.explain's published answer, and a key store that keeps keys of
-    # providers routing does not list.
+    # route.explain's published answer, and a key store that keeps keys of providers routing does not list.
     "M25 an engine with a hand pick of another engine: the hand pick taken silently": (
         ROUTER,
         "        if type(engine) is not str or type(hand_engine) is not str or hand_engine != engine:\n"
@@ -175,7 +173,9 @@ MUTANTS = {
         '            raise ConfigError("key_metadata_invalid", key_id)\n'
         '        put(key_id, meta["provider"], "api_key", "key store")\n',
         {"test_a_key_of_a_provider_outside_the_vendor_list_leaves_loading_alone"}),
-    # The first reads of #399 (05a5d13d): each guard they found unprotected or missing.
+    # Guards on the answers' inputs and words: a null vendor reset, the tried routes, a route with no model, a bad
+    # hand pick, a task read once, a null tags member, a snapshot that cannot be walked, a decision that is not
+    # decide's, a refusal detail that is not a code word.
     "M34 a null vendor reset read as no deadline": (
         ROUTER,
         "        if not _is_time(until):  # absent, null or not a time: the route service's retry time, if it is one\n",
@@ -235,7 +235,8 @@ MUTANTS = {
         'raise _Refuse("bad_hand_pick", "hand_pick_model")',
         'raise _Refuse("bad_hand_pick", "hand_pick.model")',
         {"test_every_refusal_detail_is_code_words"}),
-    # The second reads of #399 (d857ebb5): sol C1-C3 (their M45-M47 as proposed), DeepSeek R1-R7.
+    # A matching rule with no model, active engine ids, the star exports, a null hand pick, attempts that are not a
+    # list, a decision in name only, an invalid limits block, a listed route walked once, a task that cannot be read.
     "M45 a matching rule with no model routed": (
         ROUTER,
         "        eng, model = rule.route.engine, model_of(rule.route.model, rule.route.engine)\n"
@@ -258,7 +259,7 @@ MUTANTS = {
         '    if not present["hand_pick"]:\n',
         "    if hand is None:\n",
         {"test_a_null_hand_pick_is_refused_alike_everywhere", "test_a_present_null_condition_is_refused_not_read_as_absent"}),
-    # Round 7 re-expressed M49: the attempts list is now copied in a guard of its own, so a null one cannot raise
+    # M49: the attempts list is copied in a guard of its own, so a null one cannot raise
     # either way; what the type check still decides is that a mapping or a set names no attempt.
     "M49 attempts that are not a list or tuple read as one": (
         ROUTER,
@@ -285,14 +286,15 @@ MUTANTS = {
         "    except Exception:  # noqa: BLE001 - a task that cannot be read is refused, never raised through\n",
         "    except ZeroDivisionError:\n",
         {"test_a_task_that_cannot_be_read_is_refused"}),
-    # M54, re-pointed in the fourth answer: route_decision's body is now one guard, so removing its isinstance
+    # M54: route_decision's body is one guard, so removing its isinstance
     # alone answers None through the guard; the mutant removes the guard instead (None and an unreadable object).
     "M54 route_decision raising on what it cannot read": (
         ROUTER,
         "    except Exception:  # noqa: BLE001 - a decision that cannot be read is not a routed decision\n",
         "    except ZeroDivisionError:\n",
         {"test_route_decision_of_an_unreadable_or_wrong_typed_decision_is_none"}),
-    # The third reads of #399 (1bf3254d): sol 1-2 (its M55-M60 as proposed), DeepSeek N1-N5.
+    # A routed decision with a member missing or mistyped, and a hand pick, params, detection object or limit
+    # result that cannot be read: each is refused or answered, never raised.
     "M55 reason missing from a routed decision accepted": (
         ROUTER,
         '("reason", "rule", "engine", "model")',
@@ -339,7 +341,7 @@ MUTANTS = {
         '        return {"action": "none", "reason": "no_decision"}  # an engine or model decide never gives\n',
         "        pass\n",
         {"test_a_decision_with_an_engine_decide_never_gives_is_no_decision"}),
-    # M64, re-pointed in the fourth answer: a missing member now answers None through the guard's KeyError as
+    # M64: a missing member answers None through the guard's KeyError as
     # well, so the mutant removes the type check, which a list reason or model passes through without raising.
     "M64 route_decision publishing members of a type decide never gives": (
         ROUTER,
@@ -351,7 +353,7 @@ MUTANTS = {
         "    except Exception:  # noqa: BLE001 - a limit result that cannot be read is not a limit: no blind retry\n",
         "    except ZeroDivisionError:\n",
         {"test_a_limit_result_that_cannot_be_read_is_not_a_limit"}),
-    # The fourth reads of #399 (477fa308): DeepSeek C-D, F and I (A-B are M54 and M64, E is M65's wider test).
+    # next_after_limit on a decision it cannot read, a missing snapshot, an attempt's structured connection.
     "M66 next_after_limit raising on a decision it cannot read": (
         ROUTER,
         "    except Exception:  # noqa: BLE001 - a decision that cannot be read is not decide's answer\n",
@@ -369,7 +371,8 @@ MUTANTS = {
         "    if isinstance(value, Mapping):\n        return f\"{_plain(value.get('kind'))}:{_plain(value.get('id'))}\"\n",
         "",
         {"test_an_attempt_with_a_structured_connection_counts_as_tried"}),
-    # The fifth read of #399 (30073846): DeepSeek A-G (A and B are pinned by M66's wider killers).
+    # What is not a mapping or a list is not published, a bare connection word counts as tried, a wait time is a
+    # time, ok is exactly True or False, and an attempts word is not read as its characters.
     "M69 a connection that is not a mapping published": (
         ROUTER,
         "            return None  # not a mapping: one that only iterates and indexes like one is not decide's\n",
@@ -415,7 +418,8 @@ MUTANTS = {
         "        if isinstance(tried, str):\n            tried = [tried]  # one bare kind:id word, never its characters\n",
         "",
         {"test_a_bare_connection_word_in_attempts_counts_as_tried"}),
-    # The sixth read of #399 (7bbd59be): DeepSeek F1-F6 (F4 is a sentence).
+    # Words decide never gives, an unreadable attempts entry, a wait time of NaN or an infinity, a published
+    # connection with its kind and id, an attempt naming only its connection, an attempt whose parts are not words.
     "M78 a reason, rule or connection decide never gives used": (
         ROUTER,
         '        return {"action": "none", "reason": "no_decision"}  # a reason, rule or connection decide never gives\n',
@@ -447,8 +451,8 @@ MUTANTS = {
         "            return None  # parts that are not words: compared later, they could name nothing (or raise)\n",
         "            pass\n",
         {"test_an_attempt_whose_parts_are_not_words_is_not_an_attempt"}),
-    # The sixth read's F1 and F5 one step further (a str subclass passes isinstance), and F3's own check, which
-    # raised on an int too large for a float or one whose conversion raises.
+    # One step further (a str subclass passes isinstance), and the check of a time, which raised on an int too
+    # large for a float or one whose conversion raises.
     "M84 a time of a number subclass converted": (
         ROUTER,
         "    if type(value) is not int and type(value) is not float:\n",
@@ -499,7 +503,8 @@ MUTANTS = {
         "        if type(reason) is not str or reason not in REASONS or type(engine) is not str or type(model) is not str:\n",
         "        if reason not in REASONS or not isinstance(engine, str) or not isinstance(model, str):\n",
         {"test_route_decision_needs_plain_words"}),
-    # Round 7 (ece6c127): DeepSeek F1-F3, each rule this answer adds removed one at a time.
+    # Words of the task, the hand pick and the detection that are str subclasses, tags that cannot be read, and the
+    # shape route_decision publishes: each rule removed one at a time.
     "M94 a task kind that is a str subclass kept as it is": (
         ROUTER,
         '    kind = _plain(kind) if present["task_kind"] else None\n',
@@ -566,7 +571,7 @@ MUTANTS = {
         "        except Exception:  # noqa: BLE001 - a list or tuple subclass whose iterating raises holds no attempt\n",
         "        except ZeroDivisionError:\n",
         {"test_an_unreadable_attempts_entry_is_dropped_not_the_limit"}),
-    # Round 8 (5feab1b1), as ruling 7 has it: what F1's corrected sentence says, and F2's rule.
+    # An absent task member is still read; two keys that read as one engine make the snapshot unusable.
     "M107 an absent task member left unread, against what the sentence says": (
         ROUTER,
         'kind, tags, hand = task.get("task_kind"), task.get("tags"), task.get("hand_pick")',
@@ -578,7 +583,7 @@ MUTANTS = {
         '                return None, "detection_malformed"\n',
         "",
         {"test_two_keys_that_read_as_one_engine_make_the_snapshot_unusable"}),
-    # The fifth Codex read (gpt-6.1-sol, 477fa308..8984581e): its changes 1-3.
+    # A member's presence asked once, a connection id that is a str subclass, a reason decide never gives.
     "M109 a member's presence asked again after its value was read": (
         ROUTER,
         'any(read[key] is _MISSING for key in ("reason", "rule", "engine", "model"))',
@@ -594,7 +599,7 @@ MUTANTS = {
         '(type(read["reason"]) is not str or read["reason"] not in REASONS)',
         '(type(read["reason"]) is not str)',
         {"test_next_after_limit_refuses_unknown_reason"}),
-    # The Nov 15 integration sweep against master (gpt-6.1-sol): its F2.
+    # Rules after the chosen or refused route are not explained by their own conditions.
     "M112 rules after the chosen or refused route explained by their own conditions": (
         ROUTER,
         "        elif done:  # the route was chosen or refused before this rule: routing never looked at its conditions\n"
@@ -602,7 +607,7 @@ MUTANTS = {
         "",
         {"test_f2_rules_after_a_chosen_rule_are_not_reached",
          "test_rules_after_a_refused_rule_are_not_reached_whatever_their_conditions"}),
-    # The ninth DeepSeek read (a65df75d): its F2, the two shapes it found unpinned (its G2 and G4).
+    # Each member's presence is asked from one walk of the decision and of its connection.
     "M114 every member's presence asked before any value is read": (
         ROUTER,
         '        read = {key: decision[key] if key in decision else _MISSING for key in ("engine", "model", "reason", "rule")}\n',
@@ -614,7 +619,7 @@ MUTANTS = {
         'conn = {key: connection[key] if key in names else _MISSING for key in ("kind", "id")}',
         'conn = {key: connection[key] if key in connection else _MISSING for key in ("kind", "id")}',
         {"test_the_connections_members_are_read_from_its_one_walk"}),
-    # The Grok read of round 10 (3a0236af): its R1.
+    # A listed route the daemon refuses before launch is passed over.
     "M116 a listed route the daemon refuses before launch switched to": (
         ROUTER,
         "            if why is not None:\n"

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import os
 import random
+import sys
 import threading
+import time
 import unittest
 
 from recursion_core.plugin_security import ApprovalGate, Refused, canonical
@@ -323,6 +325,7 @@ _STRESS_ROUNDS = int(os.environ.get("CSL_CONFIRM_STRESS_ROUNDS", "20000"))
 # The widest spin, in empty loop turns, before the refusing thread refuses: a test figure.
 _STRESS_SPIN = int(os.environ.get("CSL_CONFIRM_STRESS_SPIN", "40"))
 _NET = _TARGETS["network"]
+_GIL = getattr(sys, "_is_gil_enabled", lambda: True)()
 
 
 def _kept(first_uses: NetworkFirstUses, plugin_id: str = "demo.plugin") -> set:
@@ -353,16 +356,24 @@ class _VetoAtTheStore(ApprovalGate):
 
 
 class _SnapshotAtVeto(ApprovalGate):
-    """A gate that notes which digests the record kept at the moment a veto lands."""
+    """A gate that notes which digests the record kept at the instant a veto lands (inside
+    the gate's lock), and when a take has returned (so that a refusal can be timed at the
+    store)."""
 
     first_uses: NetworkFirstUses | None = None
     kept_at_veto: set | None = None
+    taken = False
 
-    def decide(self, approval_id, digest, credential, approve):
-        state = super().decide(approval_id, digest, credential, approve)
-        if not approve and self.first_uses is not None:
+    def take(self, approval_id, effect):
+        digest = super().take(approval_id, effect)
+        self.taken = True
+        return digest
+
+    def _retire(self, approval_id, item, state):
+        # Runs under the gate's lock: the note is taken in the same instant the veto lands.
+        if state == "vetoed" and self.first_uses is not None:
             self.kept_at_veto = _kept(self.first_uses)
-        return state
+        super()._retire(approval_id, item, state)
 
 
 def _gate(area: _Area, cls=ApprovalGate) -> ApprovalGate:
@@ -517,14 +528,22 @@ class VetoIsFinalTests(unittest.TestCase):
                                          connection="conn-a")
             twin = gate.request(effect)
             spin = rnd.randint(0, _STRESS_SPIN)
+            # Half the rounds time the refusal at the store: it waits until the take returned.
+            aimed = rnd.random() < 0.5
+            done = []
 
             def confirming() -> None:
                 try:
                     _net(area, first_uses, "run-1")
                 except Refused:
                     pass
+                finally:
+                    done.append(True)
 
             def refusing() -> None:
+                while aimed and not gate.taken and not done:
+                    if _GIL:
+                        time.sleep(0)  # with a GIL, a bare spin would hold the lock the other thread needs
                 for _ in range(spin):
                     pass
                 gate.decide(twin[0], twin[1], _OPERATOR, False)

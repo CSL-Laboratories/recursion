@@ -4,7 +4,7 @@ Recursion is published from a clean, single-commit history that contains only th
 product. The private history — which retains removed workstreams, private content, and local
 paths — is never published.
 
-Agents must not rewrite history (`AGENTS.md` rules 1 and 4). The commands below are run by the owner.
+Agents must not rewrite history (`AGENTS.md` rules 1 and 4). The commands below are run by a founder.
 The push is irreversible for the destination repository; do it deliberately.
 
 ## Preconditions

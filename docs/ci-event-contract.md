@@ -178,7 +178,7 @@ Without `queue: max`, a concurrency group keeps at most one pending run, and a n
 
 **Identical-head duplicates.**
 
-- [DEC] Founder decision **B2 = NO**: do not cancel an identical-head pending twin. Source: Linear CSL-356 comment 15995b76, 2026-10-20, "Relayed by the CI-lane session from the owner in chat". It is an attributed relay, not a personal receipt, and it is scoped to the sibling repository's cancel controller.
+- [DEC] Founder decision **B2 = NO**: do not cancel an identical-head pending twin. Source: Linear CSL-356 comment 15995b76, 2026-10-20, "Relayed by the CI-lane session from [the owner] in chat". It is an attributed relay, not a personal receipt, and it is scoped to the sibling repository's cancel controller.
 - Recursion has no cancel controller. Its native `ci.yml` concurrency cancels **any** older run in the PR group, including identical-head twins, and keeps the newest (section 3.1, observed three times). [SRC] [OBS]
 - Native concurrency never cancels the newest run in a group, so the head always gets a `linux` from a surviving run unless a later event supersedes it. B2's liveness concern (a cancelled twin leaving a head with no completing run) therefore does not arise in the same form. [INF]
 - Whether B2 should constrain recursion is an open question for the founders; nothing here changes it.

@@ -77,7 +77,7 @@ RECORD_KEYS = {"comment": {"op", "body"}, "reply": {"op", "comment_id", "body"},
 # .github/) or .env, and the agent-instruction and MCP-config basenames, match at any depth;
 # .claude/ holds Claude Code session settings. The source design's tools/required_ci_gate.py
 # entry is dropped (no such file here). experiments/**/fixtures is left out: CONTROL_PLANE.md leaves it open.
-# Founder decisions on CSL-414 (the owner, 2026-10-21): the review loop's own test suites are protected
+# Founder decisions on CSL-414 (Lucas, 2026-10-21): the review loop's own test suites are protected
 # so a writer cannot weaken the checks on its own loop, and credential files and directories are
 # protected pre-emptively although none exist here (.git-credentials is covered by .git*).
 # Exact paths from the repository root.

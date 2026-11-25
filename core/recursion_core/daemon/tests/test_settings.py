@@ -1040,5 +1040,56 @@ class ATableAndAKeyReadUnderTheFullDottedName(_Folder):
                 self.assertEqual("'engines' is not a setting this version knows; it is skipped", loaded.notes[0].detail)
 
 
+
+@unittest.skipUnless(hasattr(os, "geteuid"), POSIX_ONLY)
+class TheStartLinesWhateverLoggingHeldBefore(_Folder):
+    """A root logger an embedding caller or a test host set up first: the daemon's start lines still carry the
+    time and the process id and are written at INFO, and the caller's own handler keeps receiving them."""
+
+    def start(self, err: io.StringIO) -> None:
+        from recursion_core.daemon import __main__ as daemon_main
+        with mock.patch.dict(os.environ, self.environ), \
+                mock.patch.object(sys, "stderr", err), \
+                mock.patch.object(daemon_main, "require_posix"), \
+                mock.patch.object(daemon_main, "require_free_threaded"), \
+                mock.patch.object(daemon_main, "refuse_engine_user"), \
+                mock.patch.object(daemon_main, "check_operator_linger"), \
+                mock.patch.object(daemon_main.signal, "signal"), \
+                mock.patch.object(daemon_main, "UserLock"), \
+                mock.patch.object(daemon_main, "Registry", side_effect=_ReachedTheLock), \
+                self.assertRaises(_ReachedTheLock):
+            daemon_main.main()
+
+    def test_a_root_handler_set_up_first_at_info_or_warning_leaves_both_lines_with_time_and_process_id(self) -> None:
+        self.put(OFF)
+        root, own = logging.getLogger(), logging.getLogger("recursion_core.daemon")
+        kept = (root.handlers[:], root.level, own.handlers[:], own.level)
+
+        def restore() -> None:
+            root.handlers[:], own.handlers[:] = kept[0], kept[2]
+            root.setLevel(kept[1])
+            own.setLevel(kept[3])
+        self.addCleanup(restore)
+        form = r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} \[" + str(os.getpid()) + r"\] INFO recursion_core\.daemon: "
+        starts = (f"settings file: {self.file}",
+                  "settings: plugin_host.gil_check = false (default true; source: settings file)")
+        for level in (logging.INFO, logging.WARNING):
+            caller = io.StringIO()
+            bare = logging.StreamHandler(caller)
+            bare.setFormatter(logging.Formatter("%(message)s"))
+            root.handlers[:] = [bare]
+            root.setLevel(level)
+            for attempt in ("a first start", "a second start in the same process"):
+                with self.subTest(root=logging.getLevelName(level), attempt=attempt):
+                    err = io.StringIO()
+                    self.start(err)
+                    shown = err.getvalue().splitlines()
+                    for start in starts:
+                        found = [line for line in shown if line.endswith(start)]
+                        self.assertEqual(1, len(found), shown)
+                        self.assertRegex(found[0], form)
+            self.assertIn(starts[0], caller.getvalue().splitlines())  # the caller's own handler is kept
+
+
 if __name__ == "__main__":
     unittest.main()

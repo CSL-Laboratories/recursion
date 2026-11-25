@@ -796,6 +796,111 @@ class GroundAsTheKernelResolvesItTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(paths.revocation_store))
 
 
+    def _key_case(self, name, holds_key):
+        """A home and a refused place that holds stores (and, with ``holds_key``, a key and its ledger)."""
+
+        base = self.folder(name)
+        home, nfs = os.path.join(base, "home"), os.path.join(base, "nfs")
+        other = os.path.join(nfs, "home")
+        for each in (home, other):
+            os.makedirs(os.path.join(each, ".config", "systemd", "user"), 0o700)
+        self.mounts([("/", "ext4")])
+        install(Roots(home=other), EXEC, make_anchor=holds_key)
+        os.unlink(owned_paths(Roots(home=other)).unit)
+        self.mounts([("/", "ext4"), (nfs, "nfs4")])
+        return home, nfs, other
+
+    @unittest.skipUnless(backend_available(), "needs the cryptography package")
+    def test_a_run_refused_after_a_swap_of_the_home_removes_the_key_it_made(self):
+        for holds_key in (False, True):
+            for moment in ("ensure_ledger", "_made_on_ground"):
+                with self.subTest(holds_key=holds_key, moment=moment):
+                    home, nfs, other = self._key_case(f"key-{moment}-{holds_key}", holds_key)
+                    before = _tree(nfs)
+                    real = getattr(INSTALL, moment)
+
+                    def swapped(*args, _real=real, _home=home, _other=other, **kwargs):
+                        self._swap(_home, _other)
+                        return _real(*args, **kwargs)
+
+                    with mock.patch.object(INSTALL, moment, swapped):
+                        detail = self.refused("store_ground_changed", install, Roots(home=home), EXEC, make_anchor=True)
+                    authority = os.path.join(home + ".judged", ".config", "recursion", "authority")
+                    self.assertEqual(os.listdir(authority) if os.path.isdir(authority) else [], [])  # no key, no part
+                    self.assertEqual(_tree(nfs), before)  # the refused place's own key and stores untouched
+                    self.assertEqual(len(detail.splitlines()), 1, detail)
+
+    @unittest.skipUnless(backend_available(), "needs the cryptography package")
+    def test_a_persons_key_is_never_removed_by_a_refused_run(self):
+        paths = owned_paths(Roots(home=self.home))
+        install(Roots(home=self.home), EXEC, make_anchor=True)
+        os.unlink(paths.unit)
+        with open(paths.anchor_key, "rb") as kept:
+            key = kept.read()
+        bound = INSTALL._ledger_anchor(paths.ledger)
+        nfs, other = self._holding_stores()
+
+        def back():
+            if os.path.islink(self.home):
+                os.unlink(self.home)
+                os.rename(self.home + ".judged", self.home)
+            if os.path.lexists(paths.unit):
+                os.unlink(paths.unit)
+
+        for moment in ("_anchor_and_ledger", "_made_on_ground", "unit", "second"):
+            with self.subTest(moment=moment):
+                if moment == "unit":
+                    with self._failing_unit():
+                        with self.assertRaises(OSError):
+                            install(Roots(home=self.home), EXEC, make_anchor=True)
+                elif moment == "second":
+                    os.unlink(paths.revocation_store)  # the first makes it, and the second runs meanwhile
+                    plan, second = self._second_inside_first(make_anchor=True)
+                    self.assertEqual(getattr(second, "kind", second), "install_running")
+                else:
+                    real = getattr(INSTALL, moment)
+
+                    def swapped(*args, _real=real, **kwargs):
+                        self._swap(self.home, other)
+                        return _real(*args, **kwargs)
+
+                    with mock.patch.object(INSTALL, moment, swapped):
+                        self.refused("store_ground_changed", install, Roots(home=self.home), EXEC, make_anchor=True)
+                back()
+                with open(paths.anchor_key, "rb") as kept:
+                    self.assertEqual(kept.read(), key)  # the person's key, byte for byte
+                self.assertEqual(INSTALL._ledger_anchor(paths.ledger), bound)
+
+    @unittest.skipUnless(backend_available(), "needs the cryptography package")
+    def test_the_words_name_the_key_a_refused_run_made_and_could_not_remove(self):
+        paths = owned_paths(Roots(home=self.home))
+        real_rename = os.rename
+
+        def kept_key(src, dst, *args, **kwargs):
+            if os.fspath(src) == os.path.basename(paths.anchor_key):
+                raise PermissionError(1, "Operation not permitted", src)
+            return real_rename(src, dst, *args, **kwargs)
+
+        with self._failing_unit(), mock.patch("os.rename", kept_key):
+            with self.assertRaises(OSError) as caught:
+                install(Roots(home=self.home), EXEC, make_anchor=True)
+        note = " ".join(getattr(caught.exception, "__notes__", ()))
+        self.assertIn(f"This run could not remove what it made at {paths.anchor_key}", note)
+        self.assertEqual(len(note.splitlines()), 1)
+        self.assertTrue(os.path.isfile(paths.anchor_key))
+        os.unlink(paths.anchor_key)
+        moved = os.path.join(self.case, "moved.key")
+        with self._failing_unit(lambda: os.rename(paths.anchor_key, moved)):  # another program moves it away
+            with self.assertRaises(OSError) as caught:
+                install(Roots(home=self.home), EXEC, make_anchor=True)
+        note = " ".join(getattr(caught.exception, "__notes__", ()))
+        self.assertIn(f"The authority key this run made at {paths.anchor_key} was moved or replaced while the "
+                      "command ran, so this run could not remove it", note)
+        self.assertEqual(len(note.splitlines()), 1)
+        self.assertTrue(os.path.isfile(moved))
+        self.assertFalse(os.path.lexists(paths.anchor_key))
+
+
 class OneReadingOfTheGroundTests(unittest.TestCase):
     """Every caller reads the disk through ``store_ground``; none reads the mount table or judges a path by text."""
 

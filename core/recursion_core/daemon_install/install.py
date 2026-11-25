@@ -502,6 +502,10 @@ _mkdir = os.mkdir
 # The sentence added to a failure after which this step could not remove all it made.
 _NOT_CLEANED = (" This run could not remove what it made at {paths}: remove {it} once nothing uses {it}, then run "
                 "the command again.")
+# The sentence added to a failure when the key this step made is no longer at its name, so it was not removed.
+_KEY_MOVED = (" The authority key this run made at {path} was moved or replaced while the command ran, so this run "
+              "could not remove it: what is at {path} now is left as it is, and the key moved away is not bound to a "
+              "ledger; remove it wherever it was moved, then run the command again.")
 
 
 def _remove_entry(fd: int, name: str, mine: tuple[int, int]) -> None:
@@ -629,7 +633,7 @@ class _Run:
         # (what, opened folder or -1, name or path, (device, inode), path), in the order made
         self.made: list[tuple[str, int, str, tuple[int, int], str]] = []
         self.stores: list[tuple[str, int, str, tuple[int, int]]] = []
-        self.key: tuple[str, bytes] | None = None
+        self.notes: list[str] = []  # sentences of ``undo`` beside the paths it could not remove
 
     def covers(self, paths: Owned) -> bool:
         return all(folder in self.by_folder for folder in _store_folders(paths))
@@ -736,6 +740,29 @@ class _Run:
         self.stores.append((path, fd, name, mine))
         return True
 
+    def key_made(self, path: str, pem: bytes) -> None:
+        """Record the key this step has just written at ``path``: its folder is opened (never through a link at its
+        own name) and held until the answer, and the key is recorded by its identity once the file at its name in
+        that folder is the file at ``path`` holding the bytes this step made (no other caller holds them). ``undo``
+        then removes it through that same folder while its name holds this very file, wherever the folder's path
+        leads by then. A key that cannot be proven so is named in the words of a failure (``_KEY_MOVED``). A key of
+        the person is never made here and never removed."""
+
+        folder, name = os.path.dirname(path), os.path.basename(path)
+        try:
+            fd = os.open(folder, _FOLDER_OPEN)
+        except OSError:
+            self.notes.append(_KEY_MOVED.format(path=_shown(path)))
+            return
+        self.held.callback(os.close, fd)
+        with contextlib.suppress(OSError, InstallRefused):
+            with held_regular(path) as (data, info):
+                entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if data == pem and (entry.st_dev, entry.st_ino) == (info.st_dev, info.st_ino):
+                    self.made.append(("key", fd, name, (info.st_dev, info.st_ino), path))
+                    return
+        self.notes.append(_KEY_MOVED.format(path=_shown(path)))
+
     def proven(self, path: str, fd: int, name: str, mine: tuple[int, int] | None) -> tuple[int, int]:
         """The store's entry in its opened folder is on that folder's device, is the file at ``path``, and, made now
         or seen before (``mine``), is that same file; else ``store_ground_changed``."""
@@ -766,10 +793,12 @@ class _Run:
 
         left = []
         for what, fd, name, mine, path in reversed(self.made):
-            if what == "file":  # proven to be the very file made at the moment it is removed
+            if what in ("file", "key"):  # proven to be the very file made at the moment it is removed
                 status, at = _take_away(fd, name, mine)
                 if status == "left":
                     left.append(os.path.join(os.path.dirname(path), at))
+                elif what == "key" and status != "removed":
+                    self.notes.append(_KEY_MOVED.format(path=_shown(path)))
                 continue
             try:
                 info = os.stat(name, dir_fd=fd if fd >= 0 else None, follow_symlinks=False)
@@ -786,22 +815,18 @@ class _Run:
                 pass
             except OSError:
                 left.append(path)
-        if self.key is not None:
-            key, pem = self.key
-            _remove_key_made(key, pem)
-            with contextlib.suppress(OSError, InstallRefused):
-                with held_regular(key) as (data, _):
-                    if data == pem:
-                        left.append(key)
         return left
 
     def undone(self, exc: BaseException) -> BaseException:
         """``exc`` after ``undo``: an ``InstallRefused`` with one sentence naming what could not be removed."""
 
         left = self.undo()
-        if not left:
+        words = "".join(self.notes)
+        if left:
+            words = _NOT_CLEANED.format(paths=", ".join(_shown(path) for path in left),
+                                        it="it" if len(left) == 1 else "them") + words
+        if not words:
             return exc
-        words = _NOT_CLEANED.format(paths=", ".join(_shown(path) for path in left), it="it" if len(left) == 1 else "them")
         if isinstance(exc, InstallRefused):
             return InstallRefused(exc.kind, exc.detail + words)
         if hasattr(exc, "add_note"):
@@ -989,9 +1014,10 @@ def make_anchor_key(paths: Owned, found: _Found) -> str:
     return _make_key(paths, found)[0]
 
 
-def _make_key(paths: Owned, found: _Found) -> tuple[str, bytes]:
+def _make_key(paths: Owned, found: _Found, run: "_Run | None" = None) -> tuple[str, bytes]:
     """``make_anchor_key``, also returning the private key's PEM so a failure later in the same run can
-    tell the key it made from any other."""
+    tell the key it made from any other. Inside a step (``run``), the key written is proven and recorded by its opened
+    folder (``_Run.key_made``), and the step's undo removes it through that folder."""
 
     if found.public is not None:
         raise InstallRefused("anchor_key", "the key is there already")
@@ -1008,6 +1034,8 @@ def _make_key(paths: Owned, found: _Found) -> tuple[str, bytes]:
     except BaseException:
         _remove_key_made(paths.anchor_key, pem)  # linked before the failure; a key another linked first stays
         raise
+    if run is not None:
+        run.key_made(paths.anchor_key, pem)  # removed through its folder by the step's undo on a failure
     return public, pem
 
 
@@ -1177,11 +1205,11 @@ def _anchor_and_ledger(paths: Owned, anchor_public_key: str | None, found: _Foun
         return (ledger[0], ledger[1], NEEDS_BACKEND if ledger[2] == NEEDS_ANCHOR else ledger[2]), None
     if found.public is not None:  # found with its ledger: a ledger gone since the look is refused, never made anew
         return _ensure_ledger(paths, found.public, create=False), (paths.anchor_key, False)
-    public, pem = _make_key(paths, found)
     run = _RUN.get()
     if run is not None and run.covers(paths):  # the step removes the key with the ledger on a failure
-        run.key = (paths.anchor_key, pem)
+        public, pem = _make_key(paths, found, run)
         return ensure_ledger(paths, public), (paths.anchor_key, True)
+    public, pem = _make_key(paths, found)
     try:
         ledger = ensure_ledger(paths, public)
     except BaseException:

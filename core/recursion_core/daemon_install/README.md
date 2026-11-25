@@ -25,7 +25,7 @@ that is there, which must meet the same rule. Below, `<state>` is `$XDG_STATE_HO
 | path | install | upgrade | uninstall |
 | --- | --- | --- | --- |
 | `<state>/plugin-security/breaker.sqlite3` and `revoked.sqlite3` (the breaker store and the revocation store, where the daemon opens them) | creates each missing one through `plugin_security.stores` (0600), before the unit; one already there must pass `stores.open_store` and is left as it is; a refusal keeps the store's code (`breaker_store_untrusted`, `revocation_store_invalid`, ...), and a store that cannot be made or put in place (a full disk, an I/O error at its final link) is `store_not_created` | the same | stay (question 3: deleting them would reset every runtime revocation) |
-| `~/.config/systemd/user/recursion-daemon.service` | creates it (0644); the same bytes already there change nothing; other bytes refuse `unit_differs`, and a unit another user owns or that group or world can write refuses `unit_untrusted` (owner and mode bits of the file read; POSIX ACLs are not read); a unit removed while it is read refuses `unit_missing`, and one replaced then `unit_changed` (run the command again; the path is checked while the file read is still open); all before any store is made; and a unit found that is removed, replaced or rewritten in place while the stores are made refuses `unit_missing` or `unit_changed` at the answer, with the stores already made | rewrites it (also when its bytes are current but another user could change it); missing refuses `unit_missing`, before any store is made; a unit whose `[Service]` section sets `XDG_STATE_HOME` to another folder, reads an `EnvironmentFile`, passes the user manager's `XDG_STATE_HOME`, or cannot be read so, refuses `unit_state_elsewhere`, before anything is made and with the unit left as it is (replacing it would point the daemon at another state folder, without its revocations and breaker trips); a current unit it keeps that is removed, replaced or rewritten in place while the stores are made refuses `unit_missing` or `unit_changed` at the answer | removes it if its first line is this installer's marker (`unit_not_ours` otherwise), while it holds the file it read and after the path was checked to name it (`unit_changed` if it was replaced meanwhile; the removal itself is by name, so a file put there in the few statements after that check is the one removed; one already gone counts as removed by the other caller); refuses `unit_enabled` while `default.target.wants/` links it |
+| `~/.config/systemd/user/recursion-daemon.service` | creates it (0644); the same bytes already there change nothing; other bytes refuse `unit_differs`, and a unit another user owns or that group or world can write refuses `unit_untrusted` (owner and mode bits of the file read; POSIX ACLs are not read); a unit removed while it is read refuses `unit_missing`, and one replaced then `unit_changed` (run the command again; the path is checked while the file read is still open); all before any store is made; and a unit found that is removed, replaced or rewritten in place while the stores are made refuses `unit_missing` or `unit_changed` at the answer, and the step then removes what it made (stores found are left as they are) | rewrites it (also when its bytes are current but another user could change it); missing refuses `unit_missing`, before any store is made; a unit whose `[Service]` section sets `XDG_STATE_HOME` to another folder, reads an `EnvironmentFile`, passes the user manager's `XDG_STATE_HOME`, or cannot be read so, refuses `unit_state_elsewhere`, before anything is made and with the unit left as it is (replacing it would point the daemon at another state folder, without its revocations and breaker trips); a current unit it keeps that is removed, replaced or rewritten in place while the stores are made refuses `unit_missing` or `unit_changed` at the answer | removes it if its first line is this installer's marker (`unit_not_ours` otherwise), while it holds the file it read and after the path was checked to name it (`unit_changed` if it was replaced meanwhile; the removal itself is by name, so a file put there in the few statements after that check is the one removed; one already gone counts as removed by the other caller); refuses `unit_enabled` while `default.target.wants/` links it |
 | `<state>/homes` (the route homes' custody root: the launcher makes each route home in it, and `setup.route_home.check` refuses a root that is missing or not owner-only) | creates it (0700) if missing, after the stores and before the unit; one already there must be ours, open to nobody else at all, and readable, writable and searchable by its owner (`folder_untrusted`, before anything is made); the root as made, or as another caller made it meanwhile, is held to the same rule before the unit is written (a umask that takes the owner's bits, or another caller's 0755, is `folder_untrusted` and leaves no new unit) | the same | stays, with the route homes and their logins in it |
 | `~/.config`, `~/.config/systemd`, `~/.config/systemd/user`, and `~/.local`, `~/.local/state` (by default) or the chosen place, `<state>`, `.../plugin-security` | creates the missing ones (0700); existing ones stay as they are | the same | stay: other units share them, and the state folder holds the run registry |
 | `~/.config/recursion/authority/anchor.key` (the install's own authority key) and its folder | makes the key (0600, folder 0700) on a profile with no key and no ledger, then the ledger bound to it; a key, ledger and `authority_anchor` that agree are left as they are; a disagreement is `authority_anchor_disagrees`, before anything is written (below) | the same | stay |
@@ -50,6 +50,15 @@ the command binds the authority ledger to the install's own key (below). A calle
 neither `anchor_public_key` nor `make_anchor` gets `needs the anchor key, which recursiond install makes` and no `ledger.sqlite3`; one
 that passes a key creates the ledger through `plugin_security.stores.create_ledger`.
 
+One install or upgrade of a profile runs at a time: the step locks the profile's home folder (`flock` on the
+opened folder, never through a link) from its first judgment to its last link, and lets it go at the answer.
+A second step of the same profile waits `install.INSTALL_LOCK_WAIT` seconds (0, the default: not at all;
+None: as long as the first runs; a settings row to come), looking again every `install.INSTALL_LOCK_POLL`
+seconds, and is then refused `install_running`, with nothing made: "another install of this profile is
+running (recursiond install or upgrade for <home>), so this one made nothing. Let it end, then run the
+command again." Where the home cannot be locked (a platform or disk that keeps no such locks) the step goes
+on and one of the plan's `filesystem` lines says so.
+
 ### The install's own authority key
 
 The owner answered that the ledger's anchor is the install's own key. On a profile with no key and no
@@ -60,13 +69,23 @@ a fresh temporary name made with `O_EXCL` and `O_NOFOLLOW`, linked into place ex
 `ledger.sqlite3` bound to its public half, and prints one line on stderr: "Made this install's own
 authority key (owner-only, <path>); it signs your order permissions on this machine and never leaves it.
 Losing it means making new permissions; it is not recoverable." The key is never printed, logged or
-answered, and no copy is made anywhere. The line is printed as soon as the key and its ledger are both in
-place, before the later steps, so a later step that fails does not hide it. A failure between the key and
-the ledger leaves the two agreeing or neither: a ledger already bound to the key just made keeps the key
-with it (the line is printed), and with no ledger there the key is removed again, only while the path
-still names the file read (a key moved onto the path after that read is kept; a file moved there between
-the last comparison and the unlink is not seen). Only a process ended between the two (a power cut, a kill)
-can leave the key alone. The folders made on the way to the key are synced in their parents before the
+answered, and no copy is made anywhere. The line is printed only at the end of a step that ended made,
+so it is said only for a key that is kept. A step (`install` or `upgrade`) that fails after it began to make
+the stores removes what it made, newest first: the stores, the folders made for them, the custody root, and
+a key made now together with the ledger made for it. The key is recorded when it is written: its folder is
+opened, never through a link at its own name, and held until the answer, and the key is recorded by its
+identity once the file at its name in that folder is the file at the key's path holding the bytes this step
+made. Each file is removed through the folder it was made in, and only while its name holds the very file
+made: it is renamed to a fresh name of the run in that folder, compared with the identity recorded, and only
+then unlinked (another program's file found so is put back at its name and kept), wherever the folder's path
+leads by then. A path the step could not remove is named in one more sentence of the same line, and a key no
+longer at its name (moved or replaced while the command ran) in another, which says that what is at the path
+now is left as it is. A key of the person, found with its ledger, is never removed. The folders made by path
+for the key and the unit are left. Only a process ended between the key and the ledger (a power cut, a kill)
+can leave the key alone, which the next run refuses with the ways on (below). `make_anchor_key` called on its
+own removes the key again after a failure that follows its link, only while the path still names the file
+read (a key moved onto the path after that read is kept; a file moved there between the last comparison and
+the unlink is not seen). The folders made on the way to the key are synced in their parents before the
 key is written. A key found with its ledger never gets a new ledger: a ledger gone between the look and
 the ledger step is refused `authority_anchor_disagrees`, and the key is left as it is.
 

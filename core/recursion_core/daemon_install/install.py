@@ -1189,14 +1189,16 @@ def _found(paths: Owned, anchor_public_key: str | None, make_anchor: bool) -> _F
 def _anchor_and_ledger(paths: Owned, anchor_public_key: str | None, found: _Found | None,
                        make_anchor: bool, on_anchor_made=None) -> tuple[tuple[str, bool, str], tuple[str, bool] | None]:
     """The ledger step, after the stores. With ``make_anchor``: a fresh profile gets its key, then the
-    ledger bound to it. A failure from the key's link to the ledger's leaves the two agreeing or neither:
-    a ledger already bound to the key just made keeps the key with it; with no ledger there, the key is
-    removed again (``_remove_key_made``); a ledger there that is not bound to it, or cannot be read, keeps
-    the key too, so this run leaves no ledger without its key. A process ended between the two can still
-    leave the key alone, which the next run refuses with the ways on. ``on_anchor_made(path)`` is called
-    once the key made now is kept, before any later step, so a later failure does not hide it. A key that
-    was found (with its ledger, ``find_anchor``) never gets a new ledger: one gone since the look is
-    ``authority_anchor_disagrees``, the key and whatever moved the ledger left as they are."""
+    ledger bound to it. Inside ``install`` and ``upgrade`` the key made is recorded by its opened folder
+    (``_Run.key_made``) and a failure of the step removes it with the ledger made for it (``_Run.undo``);
+    ``on_anchor_made`` is then called by the step only when it ended made (``_kept``). Outside a step, a
+    failure from the key's link to the ledger's leaves the two agreeing or neither: a ledger already bound to
+    the key just made keeps the key with it (and ``on_anchor_made(path)`` is called); with no ledger there,
+    the key is removed again (``_remove_key_made``); a ledger there that is not bound to it, or cannot be
+    read, keeps the key too. A process ended between the two can still leave the key alone, which the next
+    run refuses with the ways on. A key that was found (with its ledger, ``find_anchor``) never gets a new
+    ledger: one gone since the look is ``authority_anchor_disagrees``, the key and whatever moved the ledger
+    left as they are."""
 
     if not make_anchor:
         return ensure_ledger(paths, anchor_public_key), None

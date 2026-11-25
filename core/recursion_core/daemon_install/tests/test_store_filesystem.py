@@ -901,6 +901,26 @@ class GroundAsTheKernelResolvesItTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(paths.anchor_key))
 
 
+@unittest.skipUnless(LINUX, "the installer is Linux-only")
+class TheReadmeSaysWhatTheInstallerDoesTests(unittest.TestCase):
+    """The README's sentences on the key, its ledger and the stores after a failed step are true of the code."""
+
+    def test_the_readme_says_what_a_failed_step_does_with_the_key_its_ledger_and_the_stores(self):
+        with open(os.path.join(os.path.dirname(INSTALL.__file__), "README.md"), encoding="utf-8") as handle:
+            text = " ".join(handle.read().split())
+        for old in ("before the later steps, so a later step that fails does not hide it",
+                    "a ledger already bound to the key just made keeps the key with it",
+                    "with the stores already made"):
+            self.assertNotIn(old, text)
+        for new in ("The line is printed only at the end of a step that ended made",
+                    "a key made now together with the ledger made for it",
+                    "only while its name holds the very file made",
+                    "A key of the person, found with its ledger, is never removed",
+                    "another install of this profile is running",
+                    "and the step then removes what it made (stores found are left as they are)"):
+            self.assertIn(new, text)
+
+
 class OneReadingOfTheGroundTests(unittest.TestCase):
     """Every caller reads the disk through ``store_ground``; none reads the mount table or judges a path by text."""
 

@@ -28,8 +28,10 @@
     that skips the question and refuses with no terminal. It refuses (``value_reachable``, nothing changed) while
     ``remove`` can delete the key where it is: in the owner-only file, or in the keychain that answers, a value an
     interrupted save left there included; and, with its own code, while a keychain that answers here cannot be
-    asked. It reads no value. Its output says no keychain that answers here holds the key and the value may still
-    sit in another keychain, and ``status``, ``audit`` and a later ``remove`` of the id name every use.
+    asked. It reads no value from a keychain; with the owner-only file it reads that file (which holds the values)
+    to learn which ids it has, and shows none. Its output says no keychain that answers here holds the key and the
+    value may still sit in another keychain, and ``status``, ``audit`` and a later ``remove`` of the id name every
+    use.
 ``audit [--path P ...] [--no-journal]``
     Searches the state folder, the config folder and the journal for every saved value (``audit.py``) and
     names each place a value was found, never the value, and each temp file an interrupted save left in the

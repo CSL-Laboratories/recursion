@@ -148,9 +148,11 @@ names (an interrupted save), while the owner-only file or the keychain that answ
 which keychain it offers, KWallet without its Secret Service interface) or that fails to answer is refused with its
 own code and changes nothing: it may hold the value. Only with no keychain of its kind answering here at all does
 it go on without asking. So once it has run, no place that answers here holds the value; it may still sit only in a
-keychain that does not answer here, and ``remove`` of that id says so. Nothing ``forget``, ``status`` or a refusal of
-``remove`` asks reads a value (``has_item``). No hook or seam reaches it (``hooks.py`` registers the credential
-source only), and it reads no setting: the command asks for the id on the terminal. ``status`` and the audit show
+keychain that does not answer here, and ``remove`` of that id says so. ``forget``, ``status`` and the refusals of
+``remove`` read no value from a keychain (``has_item``); with the owner-only file, ``forget`` and the refusals of
+``remove`` read that file (which holds the values) to learn which ids it has, and show none. No hook or seam
+reaches it (``hooks.py`` registers the credential source only), and it reads no setting: the command asks for the
+id on the terminal. ``status`` and the audit show
 each record whose value is not where ``remove`` can reach it (asked the same way), and every use of ``forget``.
 """
 from __future__ import annotations
@@ -483,7 +485,8 @@ class KeyStore:
     def _out_of_reach(self, folder: Folder, index: Index, key_id: str, record: KeyRecord | None) -> None:
         """For ``forget``: refuse while any place that answers here may still hold the value (KEYCHAIN):
         ``value_reachable`` while ``remove`` can delete it where it is, and a keychain that answers and cannot be asked
-        with its own code. Nothing is changed and no value is read."""
+        with its own code, a search that fails too. Nothing is changed. It reads no value from a keychain; with the
+        owner-only file it reads that file (which holds the values) to learn which ids it has, and shows none."""
         if record is not None and record.store == 'owner_file':
             raise _reachable(key_id, 'is in the owner-only file in its folder')
         unasked = None
@@ -500,11 +503,21 @@ class KeyStore:
                 if key_id in backend.ids(folder):
                     raise _reachable(key_id, 'has a value in the owner-only file in its folder, which an unfinished '
                                      'save left there', UNFINISHED)
-            elif backend.has_item(key_id):
+                return
+        try:
+            reached = backend.has_item(key_id) if record is None else None
+            place = self._place(backend, record) if record is not None else None
+        except KeyStoreError as exc:
+            if exc.code != 'keychain_failed':
+                raise
+            unasked = exc
+        if unasked is not None:
+            raise _unasked(key_id, unasked)      # outside the handler: no __context__
+        if record is None:
+            if reached:
                 raise _reachable(key_id, 'has an item in the keychain that answers now, which an unfinished save left '
                                  'there', UNFINISHED)
             return
-        place = self._place(backend, record)
         if place == 'same':
             raise _reachable(key_id, 'was saved into the keychain that answers now')
         if place == 'held':
@@ -843,10 +856,17 @@ UNFINISHED = 'and clears the unfinished operation'
 UNASKED = ('keychain_tool_missing', 'keychain_undetermined', 'keychain_unsupported')
 
 
+# When forget may be run again, for the refusals whose cause may pass; the others' details say what to do.
+AGAIN = {'keychain_failed': 'once the Secret Service answers on the session bus',
+         'keychain_undetermined': 'once busctl or dbus-send answers on the session bus'}
+
+
 def _unasked(key_id: str, exc: KeyStoreError) -> KeyStoreError:
-    return KeyStoreError(exc.code, f'{key_id} may still be in a keychain that answers here, which cannot be asked now '
-                         f'({exc.detail}). "key forget" is only for a key whose value no command can reach from here. '
-                         'Nothing was changed')
+    where = ('a keychain, for a keychain may answer here and it' if exc.code == 'keychain_undetermined' else
+             'a keychain that answers here, which')
+    again = f'. Run "key forget {key_id}" again {AGAIN[exc.code]}' if exc.code in AGAIN else ''
+    return KeyStoreError(exc.code, f'{key_id} may still be in {where} cannot be asked now ({exc.detail}). "key forget" '
+                         f'is only for a key whose value no command can reach from here. Nothing was changed{again}')
 
 
 def _unknown(index: Index, key_id: str) -> KeyStoreError:

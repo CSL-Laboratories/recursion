@@ -1187,8 +1187,9 @@ class ReentryTests(unittest.TestCase):
                 self.assertEqual(line.get("code"), "end_reentered")
                 self.assertIn("entered again by the thread that is inside it already", line["words"])
                 self.assertIn("nothing was taken or sent", line["words"])
-                self.assertIn("Make this request after that code has returned, or hand it to another thread",
-                              line["words"])
+                self.assertIn("Make this request after that code has returned; another thread may make it instead, "
+                              "but do not wait for its answer from inside that code", line["words"])
+                self.assertNotIn("hand it to another thread", line["words"])
                 self.assertEqual(line["answer"], self.ANSWER[name])
                 self.assertEqual(line["after"], self.AFTER[name])
 
@@ -1251,6 +1252,21 @@ class LockWalkTests(unittest.TestCase):
     """Every line run under an end's lock touches only the end's own plain values: nothing a caller gave runs there."""
 
     ALLOWED_CALLS = {"self._open.add", "self._open.discard", "settle"}
+    # The names under which a caller's objects reach an end. Under the lock such a name may only be handed on to
+    # settle or kept as the value written into the end's dict of answers: never compared, hashed, formatted, read
+    # into or iterated.
+    CALLER_NAMES = {"message", "checked", "name", "args", "plugin_id", "manifest", "files", "handlers", "core"}
+    # Plain values of the end's own or read before the lock (an exact str, an exact int or None, a flag).
+    PLAIN_NAMES = {"busy", "stop", "kind", "id_", "keep", "ended", "form", "settle", "MAX_ID", "_STOP_ENDED",
+                   "_STOP_FORM", "_STOP_SECOND_HELLO", "_STOP_SETTLE", "_ENDED_SEND", "_IDS_USED"}
+
+    def plain_operand(self, node):
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, ast.Name):
+            return node.id in self.PLAIN_NAMES
+        return (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self"
+                and node.attr.startswith("_"))
 
     def locked_statements(self):
         tree = ast.parse(Path(hc.__file__).read_text(encoding="utf-8"))
@@ -1278,6 +1294,32 @@ class LockWalkTests(unittest.TestCase):
                                                         ast.YieldFrom, ast.Assert, ast.Delete, ast.Import))
                         if isinstance(node, ast.Call):
                             self.assertIn(ast.unparse(node.func), self.ALLOWED_CALLS)
+
+    def test_under_the_lock_nothing_a_caller_handed_in_is_compared_read_or_iterated(self):
+        found = self.locked_statements()
+        for fname, stmts in found.items():
+            for stmt in stmts:
+                kept = set()
+                for node in ast.walk(stmt):
+                    if isinstance(node, ast.Call) and ast.unparse(node.func) == "settle":
+                        kept.update(id(arg) for arg in node.args if isinstance(arg, ast.Name))
+                    if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                            and ast.unparse(node.targets[0]).startswith("self._answers[")
+                            and isinstance(node.value, ast.Name)):
+                        kept.add(id(node.value))
+                for node in ast.walk(stmt):
+                    with self.subTest(function=fname, line=getattr(node, "lineno", stmt.lineno), node=ast.unparse(node)):
+                        if isinstance(node, ast.Name) and node.id in self.CALLER_NAMES:
+                            self.assertIn(id(node), kept, "a caller's object is used under the lock, not only kept")
+                        if isinstance(node, ast.Compare) and not all(isinstance(op, (ast.Is, ast.IsNot))
+                                                                     for op in node.ops):
+                            for operand in [node.left, *node.comparators]:
+                                self.assertTrue(self.plain_operand(operand), "a comparison of a value that is not plain")
+                        if isinstance(node, ast.Subscript):
+                            self.assertEqual(ast.unparse(node.value), "self._answers")
+                            self.assertIsInstance(node.ctx, ast.Store)
+                            self.assertTrue(self.plain_operand(node.slice))
+                        self.assertNotIsInstance(node, (ast.For, ast.comprehension, ast.Starred, ast.FormattedValue))
 
     def test_every_line_run_under_the_lock_reaches_no_code_but_the_ends_own(self):
         found = self.locked_statements()
@@ -1308,6 +1350,13 @@ class LockWalkTests(unittest.TestCase):
                 elif event == "c_call":
                     c_calls.append(arg)
 
+        class Key(str):
+            def __eq__(self, other):
+                return str.__eq__(self, other)
+
+            def __hash__(self):
+                return str.__hash__(self)
+
         def scenario():
             hello = {"type": "hello", "channel": hc.CHANNEL}
             host.receive(hello)
@@ -1317,6 +1366,11 @@ class LockWalkTests(unittest.TestCase):
             host.receive({"type": "refusal", "id": second, "code": "call_failed", "detail": ""})
             host.receive({"type": "result", "id": 999, "value": 1})
             host.receive({"type": "refusal", "id": None, "code": "message_invalid", "detail": ""})
+            third = host.call("registry")["id"]
+            host.receive({Key("type"): "result", Key("id"): third, Key("value"): 1})
+            host.receive({Key("type"): "bye"})
+            host.receive({"type": "bye", Key("reason"): "done"})
+            daemon.receive({Key("type"): "core", Key("id"): 3, Key("bytes_b64"): "e30="})
             host.receive(call("registry"))
             host.receive({"type": "nope"})
             host.receive(load)
@@ -1343,6 +1397,89 @@ class LockWalkTests(unittest.TestCase):
         self.assertTrue(all(code is hc.HostEnd._settle.__code__ for code in frames))
         own = [id(end._lock) for end in ends] + [id(host._open)]
         self.assertEqual([repr(fn) for fn in c_calls if id(getattr(fn, "__self__", None)) not in own], [])
+
+
+class PlainFieldNameTests(unittest.TestCase):
+    """A message's field names are plain text: nothing of a caller's key runs under an end's lock."""
+
+    BOUND = 60  # seconds a request may take before the test calls it a wait on the lock: a test's own bound
+
+    def test_a_message_whose_field_names_are_not_plain_text_is_refused_before_any_of_it_is_read(self):
+        class Key(str):
+            pass
+        for receiver in ("host", "daemon"):
+            for message in ({Key("type"): "bye", "reason": "x"}, {"type": "bye", Key("reason"): "x"},
+                            {"type": "bye", "reason": "x", 1: 2}, {"type": "hello", "channel": hc.CHANNEL, None: 0}):
+                with self.subTest(receiver=receiver, message=message):
+                    with self.assertRaises(hc.ChannelRefusal) as caught:
+                        hc.check_message(message, receiver=receiver)
+                    self.assertEqual(caught.exception.code, "message_invalid")
+                    self.assertIn("field names are plain text", caught.exception.detail)
+                    self.assertIn("Build the message with plain str keys, as decode does.", caught.exception.detail)
+        host = hc.HostEnd({})
+        open_id = host.call("registry")["id"]
+        answer = host.receive({Key("type"): "bye", Key("reason"): "x"})
+        self.assertEqual((answer["code"], answer["id"]), ("message_invalid", None))
+        self.assertIsNone(host.receive({"type": "result", "id": open_id, "value": 1}), "the channel did not end")
+        self.assertEqual(sorted(host.answers), [open_id])
+        self.assertEqual(hc.decode(hc.encode({"type": "bye", "reason": "x"})[4:]), {"type": "bye", "reason": "x"})
+
+    def run_bounded(self, fn):
+        out, errors = {}, []
+
+        def target():
+            try:
+                out["value"] = fn()
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(self.BOUND)
+        self.assertFalse(thread.is_alive(), f"a request waited on the end's lock past {self.BOUND} s")
+        self.assertEqual(errors, [])
+        return out["value"]
+
+    def key_class(self, end, inner, runs):
+        class Key(str):
+            def __eq__(self, other):
+                held = lock_held(end)
+                try:
+                    inner()
+                    error = None
+                except BaseException as exc:  # noqa: BLE001 - reported by the test
+                    error = type(exc).__name__
+                runs.append((held, error))
+                return str.__eq__(self, other)
+
+            def __hash__(self):
+                runs.append((lock_held(end), "hash"))
+                return str.__hash__(self)
+        return Key
+
+    def test_a_text_subclass_key_whose_comparison_makes_a_request_never_runs_under_the_lock(self):
+        runs = []
+        host = hc.HostEnd({})
+        first, second = host.call("registry")["id"], host.call("registry")["id"]
+        Key = self.key_class(host, lambda: host.call("registry"), runs)
+        answer = self.run_bounded(lambda: host.receive({Key("type"): "result", Key("id"): first, Key("value"): 1}))
+        self.assertEqual(answer["code"], "message_invalid")
+        self.assertEqual([run for run in runs if run[0]], [], "a key's own code ran under the end's lock")
+        self.assertEqual([run for run in runs if run[1] not in (None, "hash")], [], "a request outside it was refused")
+        self.assertTrue({first, second} <= host._open)
+        self.assertEqual(host.answers, {})
+
+        runs.clear()
+
+        class Core:
+            def client_for(self, caller):
+                return lambda request: b'{"ok":true}'
+        daemon = hc.DaemonEnd("demo.plugin", Core())
+        Key = self.key_class(daemon, lambda: daemon.load("demo.plugin", b"{}", {ARTIFACT: b"x"}), runs)
+        answer = self.run_bounded(lambda: daemon.receive({Key("type"): "core", Key("id"): 3, Key("bytes_b64"): "e30="}))
+        self.assertEqual(answer["code"], "message_invalid")
+        self.assertEqual([run for run in runs if run[0]], [], "a key's own code ran under the end's lock")
+        self.assertEqual([run for run in runs if run[1] not in (None, "hash")], [], "a request outside it was refused")
+        self.assertFalse(daemon._ended)
 
 
 if __name__ == "__main__":

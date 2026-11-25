@@ -8,3 +8,7 @@ gil_check = false
 [status]
 # Show each value to 120 characters.
 value_max_chars = 120
+# Add one word of your own; the shipped words stay.
+hidden_names = ["pin"]
+# Show no setting under a hidden name anyway.
+shown_names = []

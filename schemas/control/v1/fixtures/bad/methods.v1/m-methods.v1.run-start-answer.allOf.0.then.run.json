@@ -1,0 +1,13 @@
+{
+  "answer": {
+    "code": "started",
+    "duplicate": true
+  },
+  "method": "run.start",
+  "params": {
+    "client_key": "capture-2",
+    "engine": "claude_code",
+    "prompt": "helper=0 fast=1",
+    "tenant": "t1"
+  }
+}

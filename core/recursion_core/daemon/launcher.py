@@ -187,6 +187,38 @@ def _unit_path_ok(path):
     return os.path.isabs(text) and all(ch in _PATH_SAFE for ch in text) and '..' not in Path(text).parts
 
 
+# What a piped unit (a plugin host) needs from systemd and a caller's property may not change: name, and why.
+_STOP_WHY = 'Stop ends a host by the kill of its whole control group, which the launcher sets up'
+PIPED_UNIT_OWN = {
+    'RemainAfterExit': 'with it the unit stays active after the host has ended and systemd-run keeps its copy of the '
+                       'channel open, so the daemon would never see the host end',
+    'KillMode': _STOP_WHY, 'Delegate': _STOP_WHY,
+    **{item.partition('=')[0]: _STOP_WHY for item in STOP_PROPERTIES},
+    'Type': 'the start waits for the host process itself to run, as the launcher sets it',
+    'StandardInput': "the channel is the unit's standard input and output",
+    'StandardOutput': "the channel is the unit's standard input and output",
+}
+
+
+class PipedUnitPropertyRefused(ValueError):
+    """A caller's property that a piped unit cannot carry. ``name``: the property's name."""
+
+    def __init__(self, name, why):
+        super().__init__(f'a plugin host unit cannot carry the property {name}: {why}. Take {name} out of the '
+                         'properties given to the plugin hosts')
+        self.name = name
+
+
+def check_piped_properties(properties):
+    """The caller's properties for a piped unit as a tuple; one that would change what the unit needs is refused."""
+    items = tuple(properties)
+    for item in items:
+        name = str(item).partition('=')[0].strip()
+        if name in PIPED_UNIT_OWN:
+            raise PipedUnitPropertyRefused(name, PIPED_UNIT_OWN[name])
+    return items
+
+
 class EngineUnitManager(SystemdUserManager):
     """``SystemdUserManager`` whose run units carry the #916 Stop properties and file stdio."""
 
@@ -218,6 +250,39 @@ class EngineUnitManager(SystemdUserManager):
         if cwd is not None:
             command.append('--working-directory=' + str(cwd))
         self._call([*command, '--', *argv])
+
+    def start_piped(self, unit, argv, channel, *, properties=(), working_directory=None):
+        """Start ``unit`` with ``channel`` (one socket) as its standard input and output; return systemd-run's process.
+
+        The unit path ``start`` builds (``KillMode=control-group``, ``Delegate=yes``, ``STOP_PROPERTIES``, the argv
+        verbatim) with ``--pipe``: systemd-run hands the unit its own standard input and output and stays running
+        until the unit has ended, then exits. So such a unit carries no ``RemainAfterExit=yes``: with it the unit stays
+        active after its process ends, and systemd-run, with its copy of the channel, stays too. ``--collect`` unloads
+        the unit once it has ended, killed or not. ``_call`` is not used: it waits for systemd-run to return.
+        """
+        if not argv:
+            raise ValueError('Empty launch')
+        properties = check_piped_properties(properties)  # a property that conflicts is refused by name
+        self.require_verbatim_argv()
+        command = ['systemd-run', '--user', '--quiet', '--unit=' + unit, '--service-type=exec',
+                   '--expand-environment=no', '--pipe', '--collect',
+                   '--property=KillMode=control-group', '--property=Delegate=yes']
+        command += ['--property=' + item for item in (*STOP_PROPERTIES, *properties)]
+        if working_directory is not None:
+            command.append('--working-directory=' + str(working_directory))
+        return subprocess.Popen([*command, '--', *argv], stdin=channel, stdout=channel,
+                                stderr=subprocess.DEVNULL, close_fds=True)
+
+    def kill_cgroup(self, group, unit):
+        """SIGKILL every process in ``unit``'s cgroup ``group`` now. True when a kill was delivered.
+
+        ``cgroup.kill`` where the kernel has it, otherwise by pidfd to each pid still in the cgroup (the path a
+        recorded Stop already takes). Waits for nothing: the processes are gone once the kernel has delivered it.
+        """
+        if (not isinstance(group, str) or not group.startswith('/') or '..' in Path(group).parts
+                or Path(group).name != unit):
+            return False
+        return self._kill_recorded_cgroup(self.cgroup_root / group.lstrip('/'), group)
 
     def require_verbatim_argv(self):
         """Refuse the launch unless this systemd-run can hand the engine its argv unchanged (ADV1-11).

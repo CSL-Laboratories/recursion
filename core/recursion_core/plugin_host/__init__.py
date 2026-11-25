@@ -65,17 +65,77 @@ _LOCALE_NAME, _LOCALE_VALUES = "LC_CTYPE", ("C.UTF-8", "C.utf8", "UTF-8")
 
 # How many restarts there are is decided by the mechanism, not by a figure: a restart appends this one
 # word to the command line, and an image that carries it never restarts again. A host whose block is
-# still not clean after its one restart ends in one typed refusal. A starter that writes the word itself
-# can only get that refusal, never a host that runs plugin code with the starter's variables.
+# still not clean after its one restart ends in one typed refusal. Where the kernel's record can be
+# read, a starter that writes the word itself gets only that refusal, never a host that runs plugin code
+# with the starter's variables. Where it cannot be read, such a starter whose os.environ holds the marker
+# and at most one locale value of the kind the interpreter's locale step writes gets a running host: that
+# one value is the starter's own, and main clears it from os.environ before any plugin code runs. No
+# other variable gets past that check.
 RESTARTED = "--restarted-once"
 
 # A host that cannot start clean says so on the channel (START_REFUSED, with the detail named below) and
 # ends with one of these statuses. They are named parts of this program's interface, not settings:
 # 71 (sysexits EX_OSERR) the restart could not be made; 78 (EX_CONFIG) the environment was not clean
 # after the restart. 0 is a clean end and 1 an internal failure of the host.
+# 66 (EX_NOINPUT) the folder handed for Recursion's own code is not one that holds it (see START_CODE).
 START_REFUSED = "host_start_refused"
 EXIT_RESTART_FAILED = 71
 EXIT_ENVIRONMENT_NOT_CLEAN = 78
+EXIT_FOLDER_REFUSED = 66
+
+# What the daemon reads when a restart could not find this host's own code (the detail begins with the
+# word restart_failed, as for every restart that could not be made).
+RESTART_NOT_FOUND = (
+    "restart_failed: the plugin host could not start again without the environment it was started with, "
+    "because Recursion's own code was found only through that environment (PYTHONPATH), so no plugin code "
+    "ran. Start the host with the folder that holds Recursion's code as its argument, as the daemon does, "
+    "or reinstall Recursion by its recipe.")
+FOLDER_REFUSED = "core_folder_not_usable"
+_FOLDER_TEXT = (
+    ": the plugin host could not start because the folder it was given for Recursion's own code is not "
+    "an absolute folder that holds that code, so no plugin code ran. Reinstall Recursion by its recipe, or "
+    "give the daemon's plugin hosts the folder that holds recursion_core. The folder given: ")
+# The channel's own limit on a refusal's detail (host_channel), not a setting.
+_DETAIL_MAX = 1000
+
+# How the daemon starts a host: python -I -c START_CODE <folder>. Isolated mode (-I) reads no variable of
+# the environment, PYTHONPATH among them, and puts neither the working folder nor a script's folder on the
+# import path; so the folder that holds Recursion's own code (the one with recursion_core in it) is handed
+# as the one argument after this code and is never taken from the environment. This code puts that folder
+# first on the import path, in the first image and in the image of the restart alike (the restart keeps
+# the argv). A folder that is not absolute, is not a folder or holds no recursion_core is refused on the
+# channel (START_REFUSED, detail FOLDER_REFUSED and the words above) and the host ends with
+# EXIT_FOLDER_REFUSED; it writes those two frames itself, because the channel's codec is part of the code it
+# could not find. The code holds no dollar sign and no percent sign, so no launcher reads a variable or a
+# specifier into it.
+START_CODE = "\n".join((
+    "import os, sys",
+    "folder = sys.argv[1] if len(sys.argv) > 1 else ''",
+    "start = None",
+    "if os.path.isabs(folder) and os.path.isdir(os.path.join(folder, 'recursion_core')):",
+    "    sys.path.insert(0, folder)",
+    "    try:",
+    "        from recursion_core.plugin_host import start",
+    "    except ImportError:",
+    "        start = None",
+    "if start is None:",
+    "    import json, struct",
+    "    detail = (%r + repr(folder))[:%d]" % (FOLDER_REFUSED + _FOLDER_TEXT, _DETAIL_MAX),
+    "    frames = b''",
+    "    for message in ({'type': 'hello', 'channel': %r}," % hc.CHANNEL,
+    "                    {'type': 'refusal', 'id': None, 'code': %r, 'detail': detail}):" % START_REFUSED,
+    "        body = json.dumps(message).encode()",
+    "        frames += struct.pack(%r, len(body)) + body" % HEADER.format,
+    "    try:",
+    "        while frames:",
+    "            frames = frames[os.write(1, frames):]",
+    "    except OSError:",
+    "        pass",
+    "    raise SystemExit(%d)" % EXIT_FOLDER_REFUSED,
+    "start(folder)",
+    "",
+))
+_handed_folder = None  # the folder START_CODE was given; None when the host was started another way
 
 # A host whose own wall is not proven answers every load with this refusal and runs no plugin byte.
 WALL_UNPROVEN = "plugin_wall_unproven"
@@ -236,16 +296,47 @@ def _environment_is_clean():
 
 
 def _refuse_start(detail, status):
-    """Say on the starter's own standard output that this host cannot start clean, then end with status."""
+    """Say on the starter's own standard output that this host cannot start clean, then end with status.
+
+    The hello and the refusal go in one write, so a daemon that reads the hello finds the refusal with it."""
     try:
-        for message in ({"type": "hello", "channel": hc.CHANNEL},
-                        hc.refusal(None, hc.ChannelRefusal(START_REFUSED, detail))):
-            data = hc.encode(hc.check_message(message, receiver="daemon"))
-            while data:
-                data = data[os.write(1, data):]
+        data = b"".join(hc.encode(hc.check_message(message, receiver="daemon"))
+                        for message in ({"type": "hello", "channel": hc.CHANNEL},
+                                        hc.refusal(None, hc.ChannelRefusal(START_REFUSED, detail))))
+        while data:
+            data = data[os.write(1, data):]
     except OSError:
         pass  # the write side is not there; the exit status still says it
     raise SystemExit(status)
+
+
+def _found_after_restart():
+    """True when the restarted image, which holds no variable but the marker, finds this very package.
+
+    The restarted image has the same argv, so the same flags and the folder START_CODE puts first; what it
+    loses is every variable, and the variable that adds folders to the import path is PYTHONPATH (isolated
+    mode reads none). So its import path is this one without PYTHONPATH's folders, the handed folder kept,
+    and each finder on sys.meta_path is asked with that path, as the restarted image would ask it."""
+    taken = set()
+    if not (sys.flags.isolated or sys.flags.ignore_environment):
+        taken = {os.path.abspath(entry) for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep) if entry}
+    if _handed_folder is not None:
+        taken.discard(os.path.abspath(_handed_folder))
+    path = [entry for entry in sys.path if os.path.abspath(entry) not in taken]
+    own = os.path.realpath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    saved = sys.path[:]
+    sys.path[:] = path
+    try:
+        for finder in sys.meta_path:
+            find = getattr(finder, "find_spec", None)
+            spec = find(__name__.partition(".")[0], None) if find is not None else None
+            if spec is not None:
+                return own in {os.path.realpath(place) for place in spec.submodule_search_locations or ()}
+    except Exception:  # noqa: BLE001 - a finder that cannot answer: the restart cannot be shown to find it
+        return False
+    finally:
+        sys.path[:] = saved
+    return False
 
 
 def _restart_with_clean_environment():
@@ -257,15 +348,22 @@ def _restart_with_clean_environment():
     image reads the same standard descriptors. The new image's first word is the interpreter's own
     path, the one given to execve, so a host started by bare name through PATH keeps its prefix in an
     environment that has no PATH. An image that already carries RESTARTED and is still
-    not clean is refused, and so is a restart that cannot be made. Windows has no such call (it would
-    end the starter's handle on this process), so it is not done there and os.environ is cleared in
-    main as before.
+    not clean is refused, and so is a restart that cannot be made: one whose image would not find this
+    host's own code (RESTART_NOT_FOUND), and one whose channel descriptors cannot be kept open across it.
+    Windows has no such call (it would end the starter's handle on this process), so it is not done there
+    and os.environ is cleared in main as before.
     """
     if os.name == "nt" or _environment_is_clean():
         return
     if sys.orig_argv[-1:] == [RESTARTED]:
         _refuse_start("environment_not_clean", EXIT_ENVIRONMENT_NOT_CLEAN)
+    if not _found_after_restart():
+        _refuse_start(RESTART_NOT_FOUND, EXIT_RESTART_FAILED)
     try:
+        # The channel is descriptors 0 and 1. A starter may have left them close-on-exec, and execve would
+        # then close them: the new image would have no channel and could say nothing.
+        os.set_inheritable(0, True)
+        os.set_inheritable(1, True)
         os.execve(sys.executable, [sys.executable, *sys.orig_argv[1:], RESTARTED], {RESTART_GUARD: "1"})
     except (OSError, ValueError, TypeError):
         _refuse_start("restart_failed", EXIT_RESTART_FAILED)
@@ -293,9 +391,20 @@ def _close_inherited():
 
     import resource
 
-    _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    limit = os.sysconf("SC_OPEN_MAX") if hard == resource.RLIM_INFINITY else hard
-    os.closerange(first, limit)
+    # A descriptor can sit above a limit the starter lowered, so the range ends past the largest of the
+    # limits, the system's own figure and the highest descriptor the platform lists (/dev/fd on macOS and
+    # the BSDs).
+    bounds = [limit for limit in resource.getrlimit(resource.RLIMIT_NOFILE) if limit != resource.RLIM_INFINITY]
+    try:
+        bounds.append(os.sysconf("SC_OPEN_MAX"))
+    except (OSError, ValueError):
+        pass
+    for listing in ("/dev/fd", "/proc/self/fd"):
+        try:
+            bounds.extend(int(entry) + 1 for entry in os.listdir(listing) if entry.isdigit())
+        except OSError:
+            pass
+    os.closerange(first, max(bounds, default=first))
 
 
 class _Channel:
@@ -529,10 +638,6 @@ class _Program:
         raise EOFError("plugin channel ended")
 
 
-# The longest detail of a refusal (host.v1.json, the refusal's detail): part of the channel's format.
-_DETAIL_MAX = 1000
-
-
 def _unproven_detail(record, missing):
     """The detail of a load refused for the wall: the sentences a person reads (wall_linux.WORDS), as many as
     fit, then the names of what is missing, which always fit and come last."""
@@ -554,6 +659,16 @@ def _unproven_detail(record, missing):
         kept.append(line)
     text = " ".join(kept)
     return (text[:room] + tail)[-_DETAIL_MAX:] if len(text) > room else text + tail
+
+
+def start(folder):
+    """The entry of START_CODE: run the host with Recursion's own code taken from ``folder``.
+
+    ``folder`` is on the import path already. ``main`` is read here, at the call, so a stand-in for it
+    is the one that runs."""
+    global _handed_folder
+    _handed_folder = folder
+    return main()
 
 
 def main(*, gil_probe: GilProbe | None = None) -> dict:

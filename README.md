@@ -60,10 +60,12 @@ What is proven, and what is not:
   cannot see is not caught, and the ways named below are the ones known, not a promise that there
   is no other. The whole test suite can also be run once with the hook in every Python process it
   starts: `python3 tools/network_audit.py`. It names a program that is not Python and refuses one
-  that is not listed in `tools/network_audit.toml`, but it does not watch a program started
-  through another listed program (`env`, `unshare`), a program whose name begins with `python`, a
-  Python process that does not load the hook (started with `-I` or `-S`, or with a cleared
-  environment), or code that hides from the hook. That run is not part of the hosted gate.
+  that is not listed in `tools/network_audit.toml`. A program started through another program
+  (`env`, `unshare`) is judged by the program it starts, only a real interpreter is taken for
+  Python, and a Python process that does not load the hook (started with `-I`, `-S` or `-E`, or
+  with a cleared environment) is refused. Not watched: code that hides from the hook, and what a
+  unit started by `systemd-run` runs (`systemd-run` keeps its row). That run is not part of the
+  hosted gate.
 - Not proven: the engines' own traffic to the addresses you configured, and anything else an
   engine program reaches by itself; what a plugin does under a grant you gave (the plugin checks'
   proof); what the operating system does by itself (its own name lookups and services); what any

@@ -8,10 +8,6 @@ name = "claude"
 reason = "The engine name the daemon tests give their stand-in engine units (test_adv1_*, test_composition); the tests run with no real engine configured."
 
 [[program]]
-name = "env"
-reason = "Runs a stand-in under a cleared environment in the child_env tests."
-
-[[program]]
 name = "safe-dummy-engine"
 reason = "A stand-in engine a subscription_routes test writes in its temporary folder."
 
@@ -31,6 +27,16 @@ reason = "The user manager's control program (or a test's stand-in for it); it t
 name = "systemd-run"
 reason = "Starts a unit under the user manager (or a test's stand-in for it); it talks to the user manager by a local socket."
 
-[[program]]
+# A [[launcher]] is a program that starts another program. No [[program]] row may allow one: the audit
+# reads its arguments and judges the program it starts by the same rule. value_options are the options
+# of the launcher that take a value (so the value is not taken for the program).
+
+[[launcher]]
+name = "env"
+value_options = ["-u", "--unset", "-C", "--chdir"]
+reason = "Runs a stand-in under a cleared environment in the child_env tests."
+
+[[launcher]]
 name = "unshare"
+value_options = ["-S", "--setuid", "-G", "--setgid", "-R", "--root", "-w", "--wd"]
 reason = "Runs a Python child of the test in namespaces of its own (test_adv1_socket_cli_gui)."

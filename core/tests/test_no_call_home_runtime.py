@@ -346,6 +346,49 @@ class SuiteHookTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("NOT PROVEN", out.getvalue())
 
+    def _starts(self, *argvs, allowed=(), audit=True):
+        events = [(1, "subprocess.Popen", [a[0], list(a), None, {"PATH": None, "audit": audit}]) for a in argvs]
+        return self.audit.judge(events, allowed_programs=allowed)
+
+    def test_a_program_started_through_a_launcher_is_judged_by_the_program_it_starts(self):
+        # env and unshare start any program: no row allows them; the program they start is judged.
+        for argv in (["env", "bash", "-c", "true"], ["/usr/bin/env", "-u", "X", "A=1", "bash"],
+                     ["unshare", "--", "bash", "-c", "true"], ["unshare", "-r", "-w", "/tmp", "bash"],
+                     ["env", "unshare", "bash"]):
+            with self.subTest(argv=argv):
+                problems = self._starts(argv, allowed=("sleep",))
+                self.assertTrue(any("'bash'" in p and "not watched" in p for p in problems), problems)
+        for argv in (["env", "-S", "bash -c true"], ["env"], ["unshare", "-r"]):
+            with self.subTest(argv=argv):
+                self.assertTrue(any("cannot be told" in p for p in self._starts(argv)), argv)
+        self.assertEqual(self._starts(["env", "A=1", "sleep", "1"], ["unshare", "-r", "--", "sleep", "1"],
+                                      allowed=("sleep",)), [])
+        self.assertNotIn("env", self.audit.load_programs(ROOT))
+        self.assertNotIn("unshare", self.audit.load_programs(ROOT))
+
+    def test_only_a_real_interpreter_is_taken_for_python(self):
+        for prog in ("python-helper", "/tmp/x/python-anything", "pythonista", "./python3.12-wrapper"):
+            with self.subTest(prog=prog):
+                self.assertFalse(self.audit.is_python(prog))
+                self.assertTrue(any("not watched" in p for p in self._starts([prog, "x"])), prog)
+        for prog in ("python3", "python3.12", "/usr/bin/python3.14t", sys.executable):
+            with self.subTest(prog=prog):
+                self.assertTrue(self.audit.is_python(prog))
+                self.assertEqual(self._starts([prog, "x.py"]), [])
+
+    def test_a_python_process_that_does_not_load_the_hook_is_refused(self):
+        for argv in ([sys.executable, "-I", "-c", "pass"], [sys.executable, "-S", "x.py"],
+                     [sys.executable, "-BE", "x.py"], [sys.executable, "-X", "gil=0", "-I", "x.py"],
+                     ["env", "-i", sys.executable, "x.py"]):
+            with self.subTest(argv=argv):
+                self.assertTrue(any("does not load the audit hook" in p for p in self._starts(argv)), argv)
+        self.assertTrue(any("does not load the audit hook" in p
+                            for p in self._starts([sys.executable, "x.py"], audit=False)))
+        # A real run: a hooked child starts a Python grandchild with -I; the whole run is NOT PROVEN.
+        status, out = self._run("import subprocess, sys; subprocess.run([sys.executable, '-I', '-c', 'pass'])")
+        self.assertEqual(status, 1, out)
+        self.assertIn("does not load the audit hook", out)
+
 
 @unittest.skipUnless(DAEMON_RUNS_HERE, "the daemon runs only on Linux CPython")
 class IdleDaemonTests(unittest.TestCase):
@@ -421,8 +464,8 @@ class ReadmeWordsTests(unittest.TestCase):
                       "what the operating system does by itself", "made from a descriptor",
                       "foreign-function module", "not part of the hosted gate", "Windows",
                       "a later change of a kind those tests plant", "a way the scan cannot see is not caught",
-                      "it does not watch a program started through another listed program",
-                      "a program whose name begins with `python`", "a Python process that does not load the hook",
+                      "is judged by the program it starts", "only a real interpreter is taken for Python",
+                      "a Python process that does not load the hook",
                       "code that hides from the hook", "sees only what Python code reports to it",
                       "holds only together with the static proof", "a file path that reaches a network by itself"):
             with self.subTest(words=words):

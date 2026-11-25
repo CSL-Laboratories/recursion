@@ -38,17 +38,26 @@ again: once the person refuses a use, that same use is refused with ``approval_v
 without asking again, whatever any other run of that plugin was allowed, and nothing that
 happens after the refusal, in any order and on any thread, keeps an allow for it.
 
-``NetworkFirstUses`` is the record of the allows. Its one way in is ``record``, which
-keeps an allow for one approval the gate gave and that was taken, inside the gate's own
-critical section (``ApprovalGate.keep``): the veto check and the store are one step, so a
-refusal lands either before the store (then nothing is kept and the use is refused) or
-after it. An allow stands only while at least one approval behind it is not vetoed, and
-``decide`` lets a network use go only when it names the plugin, the run and the
-connection, an allow stands for that plugin and destination and no veto covers that use
-(``ApprovalGate.standing``, the same critical section); otherwise it asks, and the gate
-refuses a vetoed use without drawing it. A record answers for one gate only. It lives in
+``NetworkFirstUses`` is the record of the allows, and the gate keeps them: an allow is
+kept only as the effect of the person's yes to one approval. ``confirm`` asks the gate
+for that approval with the record's place for its allow, and the gate's ``take`` keeps
+the allow in the same critical section as its veto check, so a refusal lands either
+before the store (then nothing is kept and the use is refused) or after it, and nothing
+can come between the take and the store. ``record`` keeps the allow of an approval
+taken earlier, once per approval. The gate counts only the allows it kept, never a list
+a caller holds. An allow stands only while at least one approval behind it is not
+vetoed, and ``decide`` lets a network use go only when it names the plugin, the run and
+the connection, an allow stands for that plugin and destination and no veto covers that
+use (``ApprovalGate.standing``, the same critical section); otherwise it asks, and the
+gate refuses a vetoed use without drawing it. The digest of each use asked about is
+computed once and kept beside the allow. A record answers for one gate only. It lives in
 memory only: the daemon makes a new, empty one at each start, so a restart asks again.
 The plugin and the destination are compared exactly as given.
+
+A use let go before a refusal is not withdrawn by it, however long the caller holds the
+go answer before it acts, unless the caller makes the last check: ``confirm_use`` hands
+back a ``Use`` whose ``check()``, called just before the act, refuses with
+``approval_vetoed`` a use the person refused since the answer.
 """
 
 from __future__ import annotations
@@ -61,7 +70,8 @@ from .approval import ApprovalGate, EFFECT_SCHEMA, SCOPE_FIELDS
 from .canonical import canonical, parse
 from .errors import Refused
 
-__all__ = ["ASK", "GO", "HANDLES", "ORIGINS", "NetworkFirstUses", "confirm", "confirmation_effect", "decide"]
+__all__ = ["ASK", "GO", "HANDLES", "ORIGINS", "NetworkFirstUses", "Use", "confirm", "confirm_use",
+           "confirmation_effect", "decide"]
 
 ASK = "ask"
 GO = "go"
@@ -108,9 +118,23 @@ class NetworkFirstUses:
     def __init__(self) -> None:
         self._bind_lock = threading.Lock()
         self._gate: ApprovalGate | None = None
-        # (plugin_id, destination) -> the digests of the taken approvals behind the allow.
-        # Written only inside the gate's critical section (ApprovalGate.keep).
-        self._allows: dict[tuple[str, str], set[str]] = {}
+        # The record's own book in its gate: the gate keeps the allows under it, each as the
+        # effect of the person's yes; the record keeps no list of its own.
+        self._book = object()
+
+    @property
+    def _allows(self) -> dict[tuple[str, str], set[str]]:
+        """A copy of the allows the gate kept for this record, (plugin, destination) -> digests.
+        For status and tests: writing into it changes nothing, and it lets nothing go."""
+        gate = self._bound()
+        return {} if gate is None else gate._kept_copy(self._book)
+
+    def _key(self, plugin_id: str, destination: str) -> tuple[object, tuple[str, str]]:
+        return self._book, (plugin_id, destination)
+
+    def _use(self, plugin_id: str, destination: str, run_id: str, connection: str):
+        return (run_id, connection), lambda: confirmation_effect("network", destination, plugin_id=plugin_id,
+                                                                 run_id=run_id, connection=connection)
 
     def _bind(self, gate: ApprovalGate) -> None:
         with self._bind_lock:
@@ -142,31 +166,27 @@ class NetworkFirstUses:
                 or type(copy.get("plugin_id")) is not str:
             raise Refused("allow_not_network")
         self._bind(gate)
-        key = (copy["plugin_id"], payload["target"])
-
-        def store(digest: str) -> None:
-            self._allows.setdefault(key, set()).add(digest)
-
-        gate.keep(approval_id, copy, store)
+        gate.keep(approval_id, copy, self._key(copy["plugin_id"], payload["target"]))
 
     def stands(self, plugin_id: str, destination: str, *, run_id: str, connection: str) -> bool:
         """Whether this one use may go unasked: an allow stands and no veto covers the use."""
         gate = self._bound()
         if gate is None:
             return False
-        effect = confirmation_effect("network", destination, plugin_id=plugin_id, run_id=run_id,
-                                     connection=connection)
-        key = (plugin_id, destination)
-        return gate.standing(effect, lambda: tuple(self._allows.get(key, ())))
+        use, effect = self._use(plugin_id, destination, run_id, connection)
+        return gate.standing(self._key(plugin_id, destination), use, effect)
+
+    def _use_digest(self, plugin_id: str, destination: str, run_id: str, connection: str) -> str:
+        use, effect = self._use(plugin_id, destination, run_id, connection)
+        return self._bound()._use_digest(self._key(plugin_id, destination), use, effect)[0]
 
     def __contains__(self, key: object) -> bool:
         gate = self._bound()
         if gate is None:
             return False
         if type(key) is tuple:
-            return gate.standing(None, lambda: tuple(self._allows.get(key, ())))
-        return gate.standing(None, lambda: tuple(digest for (_, destination), digests in self._allows.items()
-                                                 if destination == key for digest in digests))
+            return gate.standing((self._book, key))
+        return gate.standing_any(self._book, lambda entry: entry[1] == key)
 
 
 def _check_destination(target: str) -> None:
@@ -226,6 +246,67 @@ def confirmation_effect(handle: str, target: str, *, plugin_id: str, run_id: str
     }
 
 
+class Use:
+    """One use let go, as ``confirm_use`` answers it: why it may go, and the last check before the act.
+
+    The go answer is a point in time. ``check()`` asks the gate again, under its lock and
+    just before the caller acts, whether the person refused this use since the answer: it
+    raises ``approval_vetoed`` if so (then the caller does not act) and returns ``reason``
+    otherwise. A use that goes because its plugin's origin is ``person`` or because it is
+    lifted consults no veto, as ``decide`` says, so its check only returns ``reason``.
+    """
+
+    __slots__ = ("reason", "_gate", "_digest")
+
+    def __init__(self, reason: str, gate: ApprovalGate | None, digest: Callable[[], str] | None) -> None:
+        self.reason = reason
+        self._gate = gate
+        self._digest = digest
+
+    def check(self) -> str:
+        if self._gate is not None and self._digest is not None and self._gate.is_vetoed(self._digest()):
+            raise Refused("approval_vetoed", VETOED_WORDS)
+        return self.reason
+
+
+def confirm_use(gate: ApprovalGate, wait: Callable[[str, str], None], *, origin: str | None, handle: str,
+                target: str, plugin_id: str, run_id: str, connection: str, lifted: bool = False,
+                first_uses: NetworkFirstUses) -> Use:
+    """Let one use go, asking the person first when ``decide`` says so, and hand back its ``Use``.
+
+    Raises as ``confirm`` does. The caller calls the ``Use``'s ``check()`` just before it acts.
+    """
+    origin = _check(origin, handle, target, lifted)
+    if handle == "network":
+        _check_destination(target)
+        first_uses._bind(gate)
+    if decide(origin, handle, target, lifted=lifted, first_uses=first_uses, plugin_id=plugin_id,
+              run_id=run_id, connection=connection) == GO:
+        if origin == "person":
+            return Use(PERSON, None, None)
+        if lifted:
+            return Use(LIFTED, None, None)
+        return Use(KNOWN_DESTINATION, gate,
+                   lambda: first_uses._use_digest(plugin_id, target, run_id, connection))
+    effect = confirmation_effect(handle, target, plugin_id=plugin_id, run_id=run_id, connection=connection)
+    keep = first_uses._key(plugin_id, target) if handle == "network" else None
+    try:
+        approval_id, digest = gate.request(effect, keep=keep)
+        wait(approval_id, digest)
+        # For a network use the take also keeps the allow of this yes, in the same critical
+        # section as its veto check: the take and the store are one step of the gate.
+        gate.take(approval_id, effect)
+        if gate.is_vetoed(digest):
+            # A refusal of this same use that the person gave after the take returned is
+            # final too, as the core's commit section asks it; an allow kept for it stands no more.
+            raise Refused("approval_vetoed")
+    except Refused as refused:
+        if refused.code == "approval_vetoed":
+            raise Refused("approval_vetoed", VETOED_WORDS) from None
+        raise
+    return Use(APPROVED, gate, lambda: digest)
+
+
 def confirm(gate: ApprovalGate, wait: Callable[[str, str], None], *, origin: str | None, handle: str,
             target: str, plugin_id: str, run_id: str, connection: str, lifted: bool = False,
             first_uses: NetworkFirstUses) -> str:
@@ -236,33 +317,7 @@ def confirm(gate: ApprovalGate, wait: Callable[[str, str], None], *, origin: str
     Raises ``target_holds_secret`` for a network target that looks like it carries a
     secret, before anything is drawn; the gate's ``Refused`` when the approval is refused,
     timed out or not given; and ``approval_vetoed`` when the person refused this same use,
-    before this call or during it: then nothing is kept.
+    before this call or during it: then no allow stands for it.
     """
-    origin = _check(origin, handle, target, lifted)
-    if handle == "network":
-        _check_destination(target)
-        first_uses._bind(gate)
-    if decide(origin, handle, target, lifted=lifted, first_uses=first_uses, plugin_id=plugin_id,
-              run_id=run_id, connection=connection) == GO:
-        if origin == "person":
-            return PERSON
-        if lifted:
-            return LIFTED
-        return KNOWN_DESTINATION
-    effect = confirmation_effect(handle, target, plugin_id=plugin_id, run_id=run_id, connection=connection)
-    try:
-        approval_id, digest = gate.request(effect)
-        wait(approval_id, digest)
-        gate.take(approval_id, effect)
-        if handle == "network":
-            # The veto check and the store are one step, inside the gate's critical section.
-            first_uses.record(gate, approval_id, effect)
-        elif gate.is_vetoed(digest):
-            # A refusal of this same use that the person gave after the take returned is
-            # final too, as the core's commit section asks it.
-            raise Refused("approval_vetoed")
-    except Refused as refused:
-        if refused.code == "approval_vetoed":
-            raise Refused("approval_vetoed", VETOED_WORDS) from None
-        raise
-    return APPROVED
+    return confirm_use(gate, wait, origin=origin, handle=handle, target=target, plugin_id=plugin_id,
+                       run_id=run_id, connection=connection, lifted=lifted, first_uses=first_uses).reason

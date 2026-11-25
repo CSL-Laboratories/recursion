@@ -354,6 +354,10 @@ class _VetoAtTheStore(ApprovalGate):
         self._refuse_the_twin()
         return super().keep(approval_id, effect, store)
 
+    def take(self, approval_id, effect):
+        self._refuse_the_twin()
+        return super().take(approval_id, effect)
+
 
 class _SnapshotAtVeto(ApprovalGate):
     """A gate that notes which digests the record kept at the instant a veto lands (inside
@@ -622,7 +626,10 @@ class _Watch:
         self.stores = 0
         gate._lock = self.lock
         gate._vetoed = _GuardedSet(self)
-        first_uses._allows = _GuardedAllows(self)
+        if hasattr(gate, "_allows") and hasattr(first_uses, "_book"):
+            gate._allows[first_uses._book] = _GuardedAllows(self)  # the gate keeps the allows
+        else:
+            first_uses._allows = _GuardedAllows(self)
 
     def need_the_lock(self, what: str) -> None:
         if not self.lock.held():
@@ -772,6 +779,214 @@ class OneStepUnderTheLockTests(unittest.TestCase):
                     if step == 0:
                         self.assertTrue(watch.lock.fired())
                         self.assertFalse(answer)
+                    if watch.lock.fired():
+                        self.assertFalse(answer)
+
+
+class _RetireAnotherAfterTake(ApprovalGate):
+    """A gate that retires another approval right after a take returned: with max_retained 1
+    the tombstone of the approval just taken is evicted at once."""
+
+    def take(self, approval_id, effect):
+        digest = super().take(approval_id, effect)
+        other = confirmation_effect("process", "/usr/bin/true", plugin_id="other.plugin", run_id="run-x",
+                                    connection="conn-x")
+        retired = self.request(other)
+        self.decide(retired[0], retired[1], _OPERATOR, False)
+        return digest
+
+
+class AnAllowOnlyByAYesTests(unittest.TestCase):
+    """An allow stands only as the effect of the person's yes to that very request."""
+
+    def _nothing_stands(self, first_uses: NetworkFirstUses, run_id: str = "run-1") -> None:
+        self.assertEqual(_kept(first_uses), set())
+        self.assertNotIn(("demo.plugin", _NET), first_uses)
+        self.assertNotIn(_NET, first_uses)
+        self.assertFalse(first_uses.stands("demo.plugin", _NET, run_id=run_id, connection="conn-a"))
+        self.assertEqual(decide("model", "network", _NET, first_uses=first_uses, plugin_id="demo.plugin",
+                                run_id=run_id, connection="conn-a"), ASK)
+
+    @staticmethod
+    def _effect(run_id: str = "run-1", connection: str = "conn-a") -> dict:
+        return confirmation_effect("network", _NET, plugin_id="demo.plugin", run_id=run_id, connection=connection)
+
+    def test_a_direct_write_into_the_record_never_makes_an_allow_stand(self) -> None:
+        from recursion_core.plugin_security.approval import effect_digest
+        for written in ("anything", effect_digest(self._effect())):
+            with self.subTest(written=written[:12]):
+                area, first_uses = _Area(), NetworkFirstUses()
+                # The record is bound to the gate by one approved use of another destination.
+                self.assertEqual(_net(area, first_uses, "run-1", target="other.example.com:443"),
+                                 "approved by the person")
+                try:
+                    first_uses._allows[("demo.plugin", _NET)] = {written}
+                except (AttributeError, TypeError):
+                    pass
+                self.assertNotIn(("demo.plugin", _NET), first_uses)
+                self.assertNotIn(_NET, first_uses)
+                self.assertEqual(decide("model", "network", _NET, first_uses=first_uses, plugin_id="demo.plugin",
+                                        run_id="run-1", connection="conn-a"), ASK)
+                # The next use is asked, not let go.
+                area.answer = "nothing"
+                drawn = len(area.drawn)
+                with self.assertRaises(Refused) as caught:
+                    _net(area, first_uses, "run-1")
+                self.assertEqual(caught.exception.code, "approval_not_granted")
+                self.assertEqual(len(area.drawn), drawn + 1)
+
+    def test_one_yes_keeps_one_allow_and_is_never_replayed_into_another_record(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        effect = self._effect()
+        approval_id, digest = area.gate.request(effect)
+        area.gate.decide(approval_id, digest, _OPERATOR, True)
+        area.gate.take(approval_id, effect)
+        first_uses.record(area.gate, approval_id, effect)  # the one allow of this yes
+        self.assertIn(("demo.plugin", _NET), first_uses)
+        other = NetworkFirstUses()
+        for record in (first_uses, other):
+            with self.subTest(record="same" if record is first_uses else "another"):
+                with self.assertRaises(Refused) as caught:
+                    record.record(area.gate, approval_id, effect)
+                self.assertEqual(caught.exception.code, "approval_replayed")
+        self._nothing_stands(other)
+        # A yes taken by confirm keeps its allow there and nowhere else.
+        third = NetworkFirstUses()
+        self.assertEqual(_net(area, third, "run-2"), "approved by the person")
+        (taken_id, _, _), = area.drawn[-1:]
+        with self.assertRaises(Refused) as caught:
+            other.record(area.gate, taken_id, self._effect("run-2"))
+        self.assertEqual(caught.exception.code, "approval_replayed")
+        self._nothing_stands(other, "run-2")
+
+    def test_no_allow_without_a_yes_given_for_this_request(self) -> None:
+        cases = {}
+        # No answer (the default), and the time passing.
+        for answer in ("nothing", "time_out"):
+            area, first_uses = _Area(answer), NetworkFirstUses()
+            with self.assertRaises(Refused) as caught:
+                _net(area, first_uses, "run-1")
+            cases[answer] = (caught.exception.code, caught.exception.detail)
+            self._nothing_stands(first_uses)
+        # A refusal, then a retry of the same use.
+        area, first_uses = _Area("refuse"), NetworkFirstUses()
+        for attempt in ("first", "retry"):
+            with self.assertRaises(Refused) as caught:
+                _net(area, first_uses, "run-1")
+            cases["refuse " + attempt] = caught.exception.code
+        area.answer = "approve"
+        with self.assertRaises(Refused) as caught:
+            _net(area, first_uses, "run-1")
+        cases["refuse then yes"] = caught.exception.code
+        self._nothing_stands(first_uses)
+        # A yes for another request with the same words.
+        area, first_uses = _Area(), NetworkFirstUses()
+        twin = area.gate.request(self._effect())
+        area.wait = lambda approval_id, digest: area.gate.decide(twin[0], twin[1], _OPERATOR, True)
+        with self.assertRaises(Refused) as caught:
+            _net(area, first_uses, "run-1")
+        cases["yes for another request"] = (caught.exception.code, caught.exception.detail)
+        with self.assertRaises(Refused) as caught:
+            first_uses.record(area.gate, twin[0], self._effect())
+        cases["the other request's yes, not taken"] = (caught.exception.code, caught.exception.detail)
+        self._nothing_stands(first_uses)
+        # A yes that the request's end overtakes before the take.
+        area, first_uses = _Area(), NetworkFirstUses()
+
+        def yes_then_the_end(approval_id: str, digest: str) -> None:
+            area.gate.decide(approval_id, digest, _OPERATOR, True)
+            area.clock.now += _TTL
+
+        area.wait = yes_then_the_end
+        with self.assertRaises(Refused) as caught:
+            _net(area, first_uses, "run-1")
+        cases["yes, then the request's end"] = caught.exception.code
+        self._nothing_stands(first_uses)
+        # A yes, then a restart before the store: the new gate and record know no approval.
+        area = _Area()
+        effect = self._effect()
+        approval_id, digest = area.gate.request(effect)
+        area.gate.decide(approval_id, digest, _OPERATOR, True)
+        restarted, first_uses = _Area(), NetworkFirstUses()
+        with self.assertRaises(Refused) as caught:
+            restarted.gate.take(approval_id, effect)
+        cases["restart, take"] = caught.exception.code
+        with self.assertRaises(Refused) as caught:
+            first_uses.record(restarted.gate, approval_id, effect)
+        cases["restart, record"] = caught.exception.code
+        self._nothing_stands(first_uses)
+        self.assertEqual(cases, {
+            "nothing": ("approval_not_granted", "pending"), "time_out": ("approval_not_granted", "pending"),
+            "refuse first": "approval_not_granted", "refuse retry": "approval_vetoed",
+            "refuse then yes": "approval_vetoed",
+            "yes for another request": ("approval_not_granted", "pending"),
+            "the other request's yes, not taken": ("approval_not_taken", "approved"),
+            "yes, then the request's end": "approval_expired",
+            "restart, take": "approval_required", "restart, record": "approval_required"})
+
+    def test_decide_asks_when_the_run_or_the_connection_is_not_named(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        self.assertEqual(_net(area, first_uses, "run-1"), "approved by the person")
+        for run_id, connection in ((None, "conn-a"), ("run-1", None), (None, None)):
+            with self.subTest(run_id=run_id, connection=connection):
+                self.assertEqual(decide("model", "network", _NET, first_uses=first_uses, plugin_id="demo.plugin",
+                                        run_id=run_id, connection=connection), ASK)
+        self.assertEqual(decide("model", "network", _NET, first_uses=first_uses, plugin_id="demo.plugin",
+                                run_id="run-1", connection="conn-a"), GO)
+
+    def test_the_take_and_its_allow_are_one_step_whatever_the_gate_retires_between(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        area.gate = _RetireAnotherAfterTake(lambda i, d, raw: area.drawn.append((i, d, raw)),
+                                            lambda credential: "operator_ui" if credential == _OPERATOR else None,
+                                            area.clock, ttl_seconds=_TTL, max_retained=1)
+        self.assertEqual(_net(area, first_uses, "run-1"), "approved by the person")
+        self.assertIn(("demo.plugin", _NET), first_uses)
+        drawn = len(area.drawn)
+        self.assertEqual(_net(area, first_uses, "run-2"), "destination approved since the daemon started")
+        self.assertEqual(len(area.drawn), drawn)
+
+    def test_a_kept_use_digest_is_never_used_for_a_different_use(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        self.assertEqual(_net(area, first_uses, "run-2"), "approved by the person")
+        # Go answers for uses that differ from the one refused below in one field each.
+        for run_id, connection in (("run-3", "conn-a"), ("run-1", "conn-b")):
+            self.assertTrue(first_uses.stands("demo.plugin", _NET, run_id=run_id, connection=connection))
+        twin = area.gate.request(self._effect("run-1", "conn-a"))
+        area.gate.decide(twin[0], twin[1], _OPERATOR, False)
+        for _ in range(2):
+            self.assertFalse(first_uses.stands("demo.plugin", _NET, run_id="run-1", connection="conn-a"))
+            self.assertEqual(decide("model", "network", _NET, first_uses=first_uses, plugin_id="demo.plugin",
+                                    run_id="run-1", connection="conn-a"), ASK)
+        for run_id, connection in (("run-3", "conn-a"), ("run-1", "conn-b"), ("run-2", "conn-a")):
+            with self.subTest(run_id=run_id, connection=connection):
+                self.assertTrue(first_uses.stands("demo.plugin", _NET, run_id=run_id, connection=connection))
+        with self.assertRaises(Refused) as caught:
+            _net(area, first_uses, "run-1")
+        self.assertEqual(caught.exception.code, "approval_vetoed")
+
+    def test_a_refusal_after_the_go_answer_stops_the_act_at_its_check(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        self.assertEqual(_net(area, first_uses, "run-2"), "approved by the person")
+        kw = dict(origin="model", target=_NET, plugin_id="demo.plugin", connection="conn-a", first_uses=first_uses)
+        use = confirm_module.confirm_use(area.gate, area.wait, handle="network", run_id="run-1", **kw)
+        self.assertEqual(use.reason, "destination approved since the daemon started")
+        asked = confirm_module.confirm_use(area.gate, area.wait, handle="credential", run_id="run-1", **kw)
+        self.assertEqual(asked.reason, "approved by the person")
+        other = confirm_module.confirm_use(area.gate, area.wait, handle="network", run_id="run-3", **kw)
+        for handle in ("network", "credential"):
+            twin = area.gate.request(confirmation_effect(handle, _NET, plugin_id="demo.plugin", run_id="run-1",
+                                                         connection="conn-a"))
+            area.gate.decide(twin[0], twin[1], _OPERATOR, False)  # the refusal lands after the go answer
+        for name, refused in (("network", use), ("credential", asked)):
+            with self.subTest(use=name):
+                with self.assertRaises(Refused) as caught:
+                    refused.check()
+                self.assertEqual((caught.exception.code, caught.exception.detail),
+                                 ("approval_vetoed", confirm_module.VETOED_WORDS))
+        self.assertEqual(other.check(), "destination approved since the daemon started")
+        person = confirm_module.confirm_use(area.gate, area.wait, handle="network", run_id="run-1",
+                                            **dict(kw, origin="person"))
+        self.assertEqual(person.check(), "origin person")
 
 
 if __name__ == "__main__":

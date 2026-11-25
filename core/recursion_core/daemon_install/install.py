@@ -258,8 +258,9 @@ def _mount_type(where: str) -> str | None:
     calls this: ``where`` is always the kernel's name of a folder it opened."""
 
     try:
-        with open(_MOUNTINFO, encoding="utf-8", errors="surrogateescape") as table:
-            lines = table.read().splitlines()
+        # As the kernel writes it: only a newline ends a line; a carriage return is part of a field (newline="").
+        with open(_MOUNTINFO, encoding="utf-8", errors="surrogateescape", newline="") as table:
+            lines = table.read().split("\n")
     except (OSError, ValueError):
         return None
     best, kind = -1, None
@@ -310,11 +311,16 @@ def _unescape(field: str) -> str:
 
 
 def _needs_escape(text: str) -> bool:
-    return any(ord(c) < 32 or ord(c) == 127 or 0xDC80 <= ord(c) <= 0xDCFF for c in text)
+    """True when ``text`` holds a character that is not a plain printable one (``str.isprintable``): a control
+    character of either range, a line or paragraph separator, a format character, a byte that is not text."""
+
+    return not text.isprintable()
 
 
 def _escaped(text: str) -> str:
-    """``text`` in a shell's ``$'...'`` form: a control character or an undecodable byte as an escape."""
+    """``text`` in a shell's ``$'...'`` form: every character that is not a plain printable one as an escape
+    (``\\n``, ``\\t``; ``\\xHH`` for a control character below 128 and for a byte that is not text; ``\\uHHHH``
+    or ``\\UHHHHHHHH`` for any other), so the words stay one line whatever the folder's name holds."""
 
     out = []
     for c in text:
@@ -325,18 +331,20 @@ def _escaped(text: str) -> str:
             out.append("\\n")
         elif c == "\t":
             out.append("\\t")
-        elif code < 32 or code == 127:
-            out.append(f"\\x{code:02x}")
         elif 0xDC80 <= code <= 0xDCFF:
             out.append(f"\\x{code - 0xDC00:02x}")
+        elif code < 128 and not c.isprintable():
+            out.append(f"\\x{code:02x}")
+        elif not c.isprintable():
+            out.append(f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}")
         else:
             out.append(c)
     return "$'" + "".join(out) + "'"
 
 
 def _shown(path: str) -> str:
-    """A folder as the words name it: as it is, or, when it holds a control character (a newline, a tab) or a
-    byte that is not text, in one escaped form (``_escaped``), the same in the sentence and in the command, so the
+    """A folder as the words name it: as it is, or, when it holds a character that is not a plain printable one
+    (a newline, a tab, a line separator, a byte that is not text), in one escaped form (``_escaped``), the same in the sentence and in the command, so the
     words stay one line and name the folder exactly."""
 
     return _escaped(path) if _needs_escape(path) else path

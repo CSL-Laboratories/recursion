@@ -647,6 +647,24 @@ class GroundAsTheKernelResolvesItTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(paths.revocation_store))
 
 
+    def test_a_folder_named_with_any_character_that_is_not_printable_gives_one_line_of_words(self):
+        disk = self.folder("nfs")
+        self.mounts([("/", "ext4"), (disk, "nfs4")])
+        for name, shown in (("n\x85x", "n\\u0085x"), ("u\u2028x", "u\\u2028x"), ("p\u2029x", "p\\u2029x"),
+                            ("c\x9b31mx", "c\\u009b31mx"), ("z\u200bx", "z\\u200bx")):
+            with self.subTest(name=ascii(name)):
+                folder = self.folder("nfs", name)
+                detail = self.refused("store_filesystem_unsupported", INSTALL.check_store_ground, (folder,))
+                self.assertEqual(len(detail.splitlines()), 1, ascii(detail))
+                self.assertNotIn(name[1], detail)
+                self.assertIn("$'" + os.path.join(disk, shown) + "'", detail)
+
+    def test_a_mount_point_holding_a_carriage_return_is_read_as_the_kernel_writes_it(self):
+        point = self.folder("m\rp")
+        self.mounts([("/", "ext4"), (point, "nfs4")])  # the kernel escapes only space, tab, newline and backslash
+        self.assertEqual(INSTALL.filesystem_type(self.folder("m\rp", "plugin-security")), "nfs4")
+        self.assertEqual(INSTALL.filesystem_type(point), "nfs4")
+
 class OneReadingOfTheGroundTests(unittest.TestCase):
     """Every caller reads the disk through ``store_ground``; none reads the mount table or judges a path by text."""
 

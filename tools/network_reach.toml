@@ -1,0 +1,636 @@
+# The list of every place in the shipped package (core/recursion_core, tests not included) where
+# the code can open a connection, look up a name, start a program, or reach code by a name decided
+# at run time; and every literal address in it. tools/network_reach.py checks this file against a
+# scan of the syntax tree: a finding with no row, a row that covers nothing, and a row whose address
+# comes from the code itself are each a failure.
+#
+# who: settings = an address in your own settings or engine configuration; command = an address you
+# give in a command; plugin-grant = only under a grant you gave the plugin; local = a door on this
+# machine only (a Unix socket in your own folders, or the loopback address); none = no address at all.
+# No row says that an address comes from the code: Recursion sends nothing to its makers.
+#
+# Plugins: a plugin reaches a network only under a grant you gave. The proof of that belongs to the
+# plugin wall (core/recursion_core/plugin_security), not to this list.
+
+[[literal]]
+file = "core/recursion_core/child_env/policy.py"
+function = "<module>"
+names = ["0.0.0.0", "api.anthropic.com", "api.anthropic.com", "api.openai.com", "auth.openai.com", "chatgpt.com", "claude.ai", "mcp-proxy.anthropic.com", "platform.claude.com"]
+reason = "The engines' own provider hosts and 0.0.0.0/0, kept only to COMPARE against a proxy or base address the person set (a NO_PROXY entry that would let an engine host bypass the proxy is refused). Never connected to: policy.py has no network call at all, and a test holds it so."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/child_env/policy.py"
+function = "_loopback_host"
+names = ["localhost"]
+reason = "The name localhost, compared against a host the person set; never looked up."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/control_transport/unix.py"
+function = "_is_host"
+names = ["localhost"]
+reason = "The name localhost, compared to refuse a host where a Unix socket path is wanted; never looked up."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/daemon/__main__.py"
+function = "_start_gui"
+names = ["127.0.0.1", "127.0.0.1"]
+reason = "The loopback address in a log line about the browser view."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.gui"
+names = ["127.0.0.1", "http://127.0.0.1:"]
+reason = "The loopback address the evidence harness uses to reach its own daemon on this machine."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.main"
+names = ["127.0.0.1"]
+reason = "The loopback address the evidence harness uses to reach its own daemon on this machine."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.prepare"
+names = ["127.0.0.1"]
+reason = "The loopback address the evidence harness uses to reach its own daemon on this machine."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/daemon/gui.py"
+function = "LoopbackGUI.__enter__"
+names = ["127.0.0.1", "127.0.0.1"]
+reason = "The loopback address the browser view listens on: this machine only."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-error-500-quota-text.jsonl"
+function = "<data>"
+names = ["https://api.example.invalid/v1/responses"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-error-no-status.jsonl"
+function = "<data>"
+names = ["https://api.example.invalid/v1/responses"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-limit-429-http-date.jsonl"
+function = "<data>"
+names = ["https://api.example.invalid/v1/responses"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-limit-429-no-reset.jsonl"
+function = "<data>"
+names = ["https://api.example.invalid/v1/responses"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-limit-429-retry-after-ms.jsonl"
+function = "<data>"
+names = ["https://api.example.invalid/v1/responses"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-limit-429.jsonl"
+function = "<data>"
+names = ["https://api.example.invalid/v1/responses"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routes/engines/fixtures/opencode/synthetic-v1-noise.jsonl"
+function = "<data>"
+names = ["https://example.invalid/s/abc"]
+reason = "Recorded engine output used by tests as data; example.invalid is a reserved name no lookup can find, and the file is never read as an address."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/routing/schema/routing_config.v1.json"
+function = "<data>"
+names = ["https://json-schema.org/draft/2020-12/schema"]
+reason = "The schema's own identifier ($schema). Never fetched: the routing loader checks the file by its own code, the routing package has no network call, and a test holds it so."
+fetched = false
+
+[[literal]]
+file = "core/recursion_core/subscription_routes/own_loop.py"
+function = "_loopback_url"
+names = ["127.0.0.1"]
+reason = "The loopback address in the words of a refusal (use 127.0.0.1 or ::1)."
+fetched = false
+
+[[reach]]
+file = "core/recursion_core/cgroup_leaf/__init__.py"
+function = "<module>"
+names = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module so that an engine run can be started in its own cgroup leaf."
+
+[[reach]]
+file = "core/recursion_core/cgroup_leaf/__init__.py"
+function = "LeafRun._spawn"
+names = ["subprocess.Popen"]
+who = "settings"
+address = "the engine program the person configured, and whatever that program itself is set to reach"
+says = "Starts the engine program you configured for a run, inside its own cgroup leaf. Recursion hands it no network address; the engine reaches only the provider you signed it in to."
+
+[[reach]]
+file = "core/recursion_core/cgroup_leaf/__init__.py"
+function = "require_linux_calls"
+names = ["getattr(<module>, <a name decided at run time>)"]
+who = "none"
+address = "none"
+says = "Asks the os module whether the Linux calls the launcher needs exist (literal names); reaches nothing."
+
+[[reach]]
+file = "core/recursion_core/child_env/launch.py"
+function = "<module>"
+names = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for the one engine start below."
+
+[[reach]]
+file = "core/recursion_core/child_env/launch.py"
+function = "spawn"
+names = ["subprocess.Popen"]
+who = "settings"
+address = "the engine program the person configured"
+says = "Starts one engine program you configured, with exactly the checked environment; Recursion adds no address to it."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "<module>"
+names = ["import importlib.util"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_approvals_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_control_mcp_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_control_scopes"
+names = ["importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_events_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_gui_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_keys_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_launch_check_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_plugin_security_host_hooks"
+names = ["importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_plugin_security_sign_hooks"
+names = ["importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_quota_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_remote_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_routes_driver_hooks"
+names = ["importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_routing_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_sessions_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_setup_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/hooks.py"
+function = "_load_workspace_hooks"
+names = ["importlib.util.find_spec", "importlib.util.find_spec"]
+who = "none"
+address = "none"
+says = "Looks up an optional part of Recursion itself by a literal module name and imports it with a literal statement; nothing is fetched and no address is involved."
+
+[[reach]]
+file = "core/recursion_core/control/operator_reads_socket.py"
+function = "<module>"
+names = ["import socket"]
+who = "local"
+address = "a Unix socket in the person's runtime folder"
+says = "Uses Unix sockets for the operator read door on this machine only."
+
+[[reach]]
+file = "core/recursion_core/control/operator_reads_socket.py"
+function = "OperatorReadsClient._call"
+names = [".connect()", "socket.socket"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Connects to the operator read door on this machine, a Unix socket in your own runtime folder; it never leaves the machine."
+
+[[reach]]
+file = "core/recursion_core/control/operator_reads_socket.py"
+function = "OperatorReadsServer.start"
+names = [".bind()", "socket.socket"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Opens the operator read door, a Unix socket in your own runtime folder that only your user may use."
+
+[[reach]]
+file = "core/recursion_core/control/operator_reads_socket.py"
+function = "_clear_stale"
+names = [".connect()", "socket.socket"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Checks whether an old operator read door in your runtime folder still answers before it is replaced."
+
+[[reach]]
+file = "core/recursion_core/control_transport/framing.py"
+function = "<module>"
+names = ["import socket"]
+who = "local"
+address = "a Unix socket the control door already opened"
+says = "Reads and writes frames on the control door's own Unix socket."
+
+[[reach]]
+file = "core/recursion_core/control_transport/peercred.py"
+function = "<module>"
+names = ["import socket"]
+who = "local"
+address = "a Unix socket the control door already opened"
+says = "Asks the kernel which user is on the other end of a Unix socket of the control door."
+
+[[reach]]
+file = "core/recursion_core/control_transport/unix.py"
+function = "<module>"
+names = ["import socket", "socket.socket"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Defines the control door as a Unix socket on this machine only."
+
+[[reach]]
+file = "core/recursion_core/control_transport/unix.py"
+function = "UnixControlClient.__init__"
+names = [".connect()", "socket.socket"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Connects a command of yours to the control door, a Unix socket in your own runtime folder."
+
+[[reach]]
+file = "core/recursion_core/control_transport/unix.py"
+function = "UnixControlServer.start"
+names = [".bind()", "socket.socket"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Opens the control door, a Unix socket in your own runtime folder that only your user may use."
+
+[[reach]]
+file = "core/recursion_core/control_transport/unix.py"
+function = "_clear_stale_socket"
+names = [".connect()", "socket.socket"]
+who = "local"
+address = "a Unix socket path in the person's runtime folder"
+says = "Checks whether an old control door in your runtime folder still answers before it is replaced."
+
+[[reach]]
+file = "core/recursion_core/daemon/__init__.py"
+function = "<module>"
+names = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for the two local service programs below."
+
+[[reach]]
+file = "core/recursion_core/daemon/__init__.py"
+function = "SystemdUserManager._call"
+names = ["subprocess.run"]
+who = "none"
+address = "none"
+says = "Runs systemctl --user on this machine to start, stop or read your own run services; no address is involved."
+
+[[reach]]
+file = "core/recursion_core/daemon/__init__.py"
+function = "check_operator_linger"
+names = ["subprocess.run"]
+who = "none"
+address = "none"
+says = "Runs loginctl on this machine to read whether your user lingers; no address is involved."
+
+[[reach]]
+file = "core/recursion_core/daemon/engine_exec.py"
+function = "main"
+names = ["os.execve"]
+who = "settings"
+address = "the engine program the person configured"
+says = "Replaces this small helper with the engine program you configured, with the environment read from its file."
+
+[[reach]]
+file = "core/recursion_core/daemon/engine_user.py"
+function = "<module>"
+names = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for the local probe below."
+
+[[reach]]
+file = "core/recursion_core/daemon/engine_user.py"
+function = "check_engine_no_user_manager"
+names = ["subprocess.run"]
+who = "none"
+address = "none"
+says = "Runs loginctl and systemctl on this machine to read the engine user's state; no address is involved."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "<module>"
+names = ["import http.client", "import socket", "import subprocess"]
+who = "local"
+address = "the loopback address and a port the harness itself binds, and Unix sockets in a temporary folder"
+says = "An evidence harness a person runs by hand: it starts a daemon of its own and talks to it only on this machine."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.gui"
+names = ["http.client.HTTPConnection"]
+who = "local"
+address = "the loopback address and a port the harness itself binds, and Unix sockets in a temporary folder"
+says = "An evidence harness a person runs by hand: it starts a daemon of its own and talks to it only on this machine."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.install_test_plugins"
+names = ["import cryptography.hazmat.primitives.asymmetric.ed25519", "import cryptography.hazmat.primitives.serialization", "import cryptography.hazmat.primitives.serialization"]
+who = "none"
+address = "none"
+says = "Signs the harness's test plugin with the cryptography library; that library opens no connection."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.prepare"
+names = [".bind()", "socket.socket"]
+who = "local"
+address = "the loopback address and a port the harness itself binds, and Unix sockets in a temporary folder"
+says = "An evidence harness a person runs by hand: it starts a daemon of its own and talks to it only on this machine."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.run"
+names = ["subprocess.run"]
+who = "local"
+address = "the loopback address and a port the harness itself binds, and Unix sockets in a temporary folder"
+says = "An evidence harness a person runs by hand: it starts a daemon of its own and talks to it only on this machine."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_e2e.py"
+function = "Harness.start_daemon"
+names = ["subprocess.Popen"]
+who = "local"
+address = "the loopback address and a port the harness itself binds, and Unix sockets in a temporary folder"
+says = "An evidence harness a person runs by hand: it starts a daemon of its own and talks to it only on this machine."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_ns.sh"
+function = "<file>"
+names = ["a .sh file the scan cannot read"]
+who = "local"
+address = "a session bus socket in the person's runtime folder"
+says = "A shell wrapper a person runs by hand for the evidence harness: it starts a local session bus and a user service manager and runs the harness; it names no network address."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_standin_engine.py"
+function = "<module>"
+names = ["import subprocess"]
+who = "none"
+address = "none"
+says = "A stand-in engine for the evidence harness: it starts a local sleeping child and reaches no network."
+
+[[reach]]
+file = "core/recursion_core/daemon/evidence_standin_engine.py"
+function = "main"
+names = ["subprocess.Popen"]
+who = "none"
+address = "none"
+says = "A stand-in engine for the evidence harness: it starts a local sleeping child and reaches no network."
+
+[[reach]]
+file = "core/recursion_core/daemon/gui.py"
+function = "<module>"
+names = ["import socket", "import socketserver.ThreadingMixIn", "import wsgiref.simple_server.WSGIRequestHandler", "import wsgiref.simple_server.WSGIServer"]
+who = "local"
+address = "the loopback address 127.0.0.1 and the port of --gui-port"
+says = "The browser view listens on the loopback address of this machine only, on the port you give with --gui-port."
+
+[[reach]]
+file = "core/recursion_core/daemon/gui.py"
+function = "_Handler"
+names = ["wsgiref.simple_server.WSGIRequestHandler"]
+who = "local"
+address = "the loopback address 127.0.0.1 and the port of --gui-port"
+says = "The browser view listens on the loopback address of this machine only, on the port you give with --gui-port."
+
+[[reach]]
+file = "core/recursion_core/daemon/gui.py"
+function = "_Server"
+names = ["socketserver.ThreadingMixIn", "wsgiref.simple_server.WSGIServer"]
+who = "local"
+address = "the loopback address 127.0.0.1 and the port of --gui-port"
+says = "The browser view listens on the loopback address of this machine only, on the port you give with --gui-port."
+
+[[reach]]
+file = "core/recursion_core/daemon/launcher.py"
+function = "<module>"
+names = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for its error types; the run services are started through systemctl."
+
+[[reach]]
+file = "core/recursion_core/plugin_security/loader.py"
+function = "<module>"
+names = ["import importlib.machinery"]
+who = "plugin-grant"
+address = "only what the person granted the plugin"
+says = "Runs the code of a plugin you installed, after its signature and grant checks; a plugin reaches a network only under a grant you gave."
+
+[[reach]]
+file = "core/recursion_core/plugin_security/loader.py"
+function = "PluginLoader._activate"
+names = ["builtins.exec"]
+who = "plugin-grant"
+address = "only what the person granted the plugin"
+says = "Runs the code of a plugin you installed, after its signature and grant checks; a plugin reaches a network only under a grant you gave."
+
+[[reach]]
+file = "core/recursion_core/plugin_security/loader.py"
+function = "PluginLoader.load"
+names = ["builtins.compile"]
+who = "plugin-grant"
+address = "only what the person granted the plugin"
+says = "Runs the code of a plugin you installed, after its signature and grant checks; a plugin reaches a network only under a grant you gave."
+
+[[reach]]
+file = "core/recursion_core/plugin_security/signing.py"
+function = "<module>"
+names = ["import cryptography.exceptions", "import cryptography.hazmat.primitives.asymmetric.ed25519"]
+who = "none"
+address = "none"
+says = "Checks plugin signatures with the cryptography library; that library opens no connection."
+
+[[reach]]
+file = "core/recursion_core/routes/tools/attended_codex.py"
+function = "<module>"
+names = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for the attended tool below."
+
+[[reach]]
+file = "core/recursion_core/routes/tools/attended_codex.py"
+function = "_run"
+names = ["subprocess.run"]
+who = "command"
+address = "the codex program the person names on the command line"
+says = "A tool you run by hand: it starts the codex program you name, with its update check turned off, to print its version and its schema into a scratch folder."
+
+[[reach]]
+file = "core/recursion_core/subscription_routes/own_loop.py"
+function = "<module>"
+names = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for the engine start below."
+
+[[reach]]
+file = "core/recursion_core/subscription_routes/own_loop.py"
+function = "_spawn_checked"
+names = ["subprocess.Popen"]
+who = "settings"
+address = "the engine program and the loopback proxy the person configured"
+says = "Starts the engine program you configured for your own loop route, with a checked environment; a proxy, if any, must be a loopback address you set."
+
+[[reach]]
+file = "core/recursion_core/subscription_routes/validated_launch.py"
+function = "<module>"
+names = ["import subprocess"]
+who = "none"
+address = "none"
+says = "Imports the process module for the engine start below."
+
+[[reach]]
+file = "core/recursion_core/subscription_routes/validated_launch.py"
+function = "spawn_route_process.launch"
+names = ["subprocess.Popen"]
+who = "settings"
+address = "the engine program the person configured"
+says = "Starts the engine program of a route you configured, with the checked environment; Recursion adds no address to it."
+
+[[reach]]
+file = "core/recursion_core/tui/keymap.py"
+function = "Keymap.default"
+names = [".bind()"]
+who = "none"
+address = "none"
+says = "Binds a key to an action in the terminal view; the word bind here names a key, not a network door."
+
+[[reach]]
+file = "core/recursion_core/tui/keymap.py"
+function = "load"
+names = [".bind()"]
+who = "none"
+address = "none"
+says = "Binds a key to an action in the terminal view; the word bind here names a key, not a network door."

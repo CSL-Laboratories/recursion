@@ -286,15 +286,23 @@ class HostUnit:
                     self._buffer = self._buffer[HEADER.size + length:]
                     return hc.decode(body, sender='host')
             if self._at_end:
-                return None
+                return self._end_of_channel()
             if deadline is not None and not _ready(self._sock, False, deadline):
                 if not self._read_written():
                     raise TimeoutError('the host did not answer')
                 continue
             chunk = self._sock.recv(1 << 16)
             if not chunk:
-                return None
+                self._at_end = True
+                return self._end_of_channel()
             self._buffer += chunk
+
+    def _end_of_channel(self):
+        """None at the end of the channel; a frame cut short there is refused as ``frame_truncated``."""
+        if self._buffer:
+            left, self._buffer = len(self._buffer), b''
+            raise hc.ChannelRefusal('message_invalid', f'frame_truncated: the channel ended {left} bytes into a frame')
+        return None
 
     def _read_written(self):
         """Read what the host has already written, without waiting, up to one whole frame. True if anything came."""
@@ -468,7 +476,13 @@ class PluginHostUnits:
                     raise HostUnavailable(plugin_id, REPLACED, REPLACED_DETAIL)  # the start runs the new package
             deadline = None if self._call_deadline_s is None else time.monotonic() + self._call_deadline_s
             if host is None:
-                host = self._start(plugin_id, package, deadline)
+                try:
+                    host = self._start(plugin_id, package, deadline)
+                except HostUnavailable as exc:
+                    if exc.reason == NOT_STARTED:  # no answer by the call's deadline: degraded, whatever the cause
+                        with self._lock:
+                            self.degraded[plugin_id] = self.degraded.get(plugin_id, 0) + 1
+                    raise
             try:
                 answer = self._exchange(host, message, frame, deadline)
             except _HostWentAway as gone:
@@ -484,6 +498,8 @@ class PluginHostUnits:
                 raise HostUnavailable(plugin_id, reason, REPLACED_DETAIL if reason == REPLACED else gone.detail) from None
             with self._lock:
                 self.degraded.pop(plugin_id, None)
+            if host.ended:  # ended during the call (a Stop): this call holds the turn, so it closes the host's channel
+                self._discard(host)
             return answer
 
     def stop(self, plugin_id):
@@ -703,7 +719,7 @@ class PluginHostUnits:
             raise _HostWentAway(TIMED_OUT, f"the host did not answer by the call's deadline of {self._call_deadline_s:g} "
                                 f"s ({ROWS['call_deadline_s']})") from None
         except hc.ChannelRefusal as exc:
-            raise _HostWentAway(ENDED, exc.code) from None
+            raise _HostWentAway(ENDED, exc.code + (f': {exc.detail}' if exc.detail else '')) from None
         except OSError as exc:
             raise _HostWentAway(ENDED, type(exc).__name__) from None
 

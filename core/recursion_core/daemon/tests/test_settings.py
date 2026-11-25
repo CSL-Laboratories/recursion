@@ -85,6 +85,19 @@ class _Folder(unittest.TestCase):
     def codes(self, loaded) -> list[str]:
         return [note.code for note in loaded.notes]
 
+    def rows(self, loaded, *names: str) -> list[str]:
+        """The lines of the listing that show the settings named by key, in the listing's order.
+
+        A row declared elsewhere adds no line here; the whole listing is pinned in one test only,
+        test_the_whole_listing_is_pinned_line_for_line."""
+        return [line for line in settings.lines(loaded)
+                if any(line.startswith(f"{name} = ") for name in names)]
+
+    def notes(self, loaded) -> list[str]:
+        """The note lines of the listing: every line that is not the line of a declared setting, chosen by key."""
+        return [line for line in settings.lines(loaded)
+                if not any(line.startswith(f"{name} = ") for name in loaded.values)]
+
     def assert_default(self, loaded, *codes: str) -> None:
         self.assertIs(loaded["plugin_host.gil_check"], True)
         self.assertEqual(settings.SOURCE_DEFAULT, loaded.values["plugin_host.gil_check"].source)
@@ -111,7 +124,21 @@ class TheFileAndItsDefaults(_Folder):
         self.assertEqual(settings.SOURCE_FILE, loaded.values["plugin_host.gil_check"].source)
         self.assertEqual([], self.codes(loaded))
         self.assertEqual(["plugin_host.gil_check = false (default true; source: settings file)"],
-                         settings.lines(loaded))
+                         self.rows(loaded, "plugin_host.gil_check"))
+
+    def test_the_whole_listing_is_pinned_line_for_line(self) -> None:
+        """The one place the whole output of the listing is pinned. A row added to SETTINGS changes the lines
+        expected here and no other test of the listing: each of the others compares the lines of its own rows."""
+        row = "plugin_host.gil_check = true (default true; source: default)"
+        self.assertEqual([row], settings.lines(settings.load(self.environ)))
+        self.put(OFF)
+        self.assertEqual(["plugin_host.gil_check = false (default true; source: settings file)"],
+                         settings.lines(settings.load(self.environ)))
+        self.put(OFF + "unknown = 1\n")
+        self.assertEqual(["plugin_host.gil_check = false (default true; source: settings file)",
+                          "warning: note settings_unknown_key: 'plugin_host.unknown' is not a setting this "
+                          "version knows; it is skipped"],
+                         settings.lines(settings.load(self.environ)))
 
     def test_a_dotted_key_is_the_same_setting(self) -> None:
         self.put("version = 1\nplugin_host.gil_check = false\n")
@@ -347,7 +374,7 @@ class OwnerOnlyAndWrongFiles(_Folder):
                 self.put(text)
                 loaded = settings.load(self.environ)
                 self.assert_default(loaded, settings.UNKNOWN_KEY)  # one note, for a whole table too
-                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+                self.assertEqual([f"warning: note {loaded.notes[0]}"], self.notes(loaded))
 
     def test_the_command_ends_non_zero_when_a_key_or_table_was_skipped(self) -> None:
         for case, (text, _) in UNKNOWN.items():
@@ -370,7 +397,7 @@ class OwnerOnlyAndWrongFiles(_Folder):
             with self.subTest(case=self.put_broken(case)):
                 loaded = settings.load(self.environ)
                 self.assert_default(loaded, settings.UNREADABLE)
-                self.assertEqual([f"warning: note {loaded.notes[0]}"], settings.lines(loaded)[1:])
+                self.assertEqual([f"warning: note {loaded.notes[0]}"], self.notes(loaded))
 
     def test_the_command_ends_non_zero_for_a_file_that_cannot_be_read_as_a_whole(self) -> None:
         for case in BROKEN:

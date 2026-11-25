@@ -665,6 +665,137 @@ class GroundAsTheKernelResolvesItTests(unittest.TestCase):
         self.assertEqual(INSTALL.filesystem_type(self.folder("m\rp", "plugin-security")), "nfs4")
         self.assertEqual(INSTALL.filesystem_type(point), "nfs4")
 
+    def _second_inside_first(self, make_anchor=False):
+        """The fixed order of two installs of one profile at once: the first has made the breaker store and is about
+        to make the revocation store when the second runs whole. Returns the first's plan and the second's answer."""
+
+        second = []
+        real = stores.create_revocation_store
+
+        def the_second_meanwhile(path):
+            if not second:
+                second.append(None)
+                try:
+                    second[0] = install(Roots(home=self.home), EXEC, make_anchor=make_anchor)
+                except InstallRefused as refusal:
+                    second[0] = refusal
+            return real(path)
+
+        with mock.patch.object(stores, "create_revocation_store", the_second_meanwhile):
+            plan = install(Roots(home=self.home), EXEC, make_anchor=make_anchor)
+        return plan, second[0]
+
+    def _one_at_a_time(self, make_anchor):
+        paths = owned_paths(Roots(home=self.home))
+        plan, second = self._second_inside_first(make_anchor)
+        self.assertIsInstance(second, InstallRefused)
+        self.assertEqual(second.kind, "install_running", second.detail)
+        self.assertEqual(second.detail, f"another install of this profile is running (recursiond install or upgrade "
+                                        f"for {self.home}), so this one made nothing. Let it end, then run the command "
+                                        "again.")
+        self.assertTrue(plan.changed)
+        kept = [paths.breaker_store, paths.revocation_store, paths.unit]
+        if make_anchor:
+            kept += [paths.ledger, paths.anchor_key]
+        for path in kept:
+            self.assertTrue(os.path.isfile(path), path)  # nothing the first made and reported was removed
+        before = _tree(self.home)
+        self.assertFalse(install(Roots(home=self.home), EXEC, make_anchor=make_anchor).changed)  # all found again
+        self.assertEqual(_tree(self.home), before)
+
+    def test_a_second_install_of_one_profile_while_the_first_runs_is_refused_and_removes_nothing(self):
+        self._one_at_a_time(False)
+
+    @unittest.skipUnless(backend_available(), "needs the cryptography package")
+    def test_a_second_install_of_one_profile_with_the_key_is_refused_and_removes_nothing(self):
+        self._one_at_a_time(True)
+
+    def test_a_second_upgrade_of_one_profile_while_the_first_runs_is_refused(self):
+        install(Roots(home=self.home), EXEC)
+        os.unlink(owned_paths(Roots(home=self.home)).revocation_store)
+        second = []
+        real = stores.create_revocation_store
+
+        def the_second_meanwhile(path):
+            if not second:
+                second.append(None)
+                try:
+                    second[0] = upgrade(Roots(home=self.home), EXEC)
+                except InstallRefused as refusal:
+                    second[0] = refusal
+            return real(path)
+
+        with mock.patch.object(stores, "create_revocation_store", the_second_meanwhile):
+            upgrade(Roots(home=self.home), EXEC)
+        self.assertEqual(getattr(second[0], "kind", second[0]), "install_running")
+
+    def test_the_second_waits_for_the_first_as_long_as_the_setting_says(self):
+        with mock.patch.object(INSTALL, "INSTALL_LOCK_WAIT", 0.3):
+            started = time.monotonic()
+            plan, second = self._second_inside_first()
+            waited = time.monotonic() - started
+        self.assertEqual(getattr(second, "kind", second), "install_running")
+        self.assertGreaterEqual(waited, 0.3)  # it waited the setting's time for the first, then was refused
+        self.assertTrue(plan.changed)
+        paths = owned_paths(Roots(home=self.home))
+        first_in, let_go, answers = threading.Event(), threading.Event(), {}
+        real = stores.create_breaker_store
+        os.unlink(paths.unit)
+        os.unlink(paths.breaker_store)
+
+        def held_first(path):
+            first_in.set()
+            let_go.wait(60)
+            return real(path)
+
+        def run(name):
+            try:
+                answers[name] = install(Roots(home=self.home), EXEC).changed
+            except BaseException as exc:  # noqa: BLE001 -- the answer is read below
+                answers[name] = exc
+
+        with mock.patch.object(stores, "create_breaker_store", held_first), \
+                mock.patch.object(INSTALL, "INSTALL_LOCK_WAIT", None):
+            first = threading.Thread(target=run, args=("first",))
+            first.start()
+            self.assertTrue(first_in.wait(60))
+            second_run = threading.Thread(target=run, args=("second",))
+            second_run.start()
+            second_run.join(0.3)
+            self.assertTrue(second_run.is_alive())  # waiting for the first, with no time limit
+            let_go.set()
+            first.join(60)
+            second_run.join(60)
+        self.assertEqual(answers, {"first": True, "second": False})  # the second found what the first made
+
+    def test_a_failed_run_removes_a_store_only_while_its_name_holds_the_very_file_it_made(self):
+        """Another program puts its own file at the store's name at the moment the failed run looks at what it made:
+        that file is kept, never taken for the run's own."""
+
+        paths = owned_paths(Roots(home=self.home))
+        failing, placed = [], []
+        real_stat = os.stat
+
+        def another_at_the_name(path, *args, **kwargs):
+            answer = real_stat(path, *args, **kwargs)
+            if (failing and not placed and kwargs.get("dir_fd") is not None
+                    and "breaker.sqlite3" in os.fspath(path)):
+                placed.append(path)
+                others = os.path.join(paths.store_dir, "others.part")
+                with open(others, "wb") as out:
+                    out.write(b"another's")
+                os.rename(others, paths.breaker_store)
+            return answer
+
+        with self._failing_unit(lambda: failing.append(1)), mock.patch("os.stat", another_at_the_name):
+            with self.assertRaises(OSError):
+                install(Roots(home=self.home), EXEC)
+        self.assertTrue(placed)
+        with open(paths.breaker_store, "rb") as kept:
+            self.assertEqual(kept.read(), b"another's")
+        self.assertFalse(os.path.lexists(paths.revocation_store))
+
+
 class OneReadingOfTheGroundTests(unittest.TestCase):
     """Every caller reads the disk through ``store_ground``; none reads the mount table or judges a path by text."""
 

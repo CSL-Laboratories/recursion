@@ -37,6 +37,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import time
 from dataclasses import dataclass
 
 from .errors import InstallRefused
@@ -92,6 +93,17 @@ _CHANGED_AFTER = ("{path} does not lead to the store in {where}, the folder whos
                   "folder on the way was moved or replaced while the stores were made, so Recursion removes "
                   "what this run made. Leave the folders on the way to it as they are while the command runs, "
                   "and run it again. See where it leads now with: findmnt -no FSTYPE -T {quoted}")
+# How long a second install or upgrade of one profile waits for the first to end, in seconds: 0 (the default)
+# refuses it at once, None waits as long as the first runs. A module value of the draft: a settings row to come.
+INSTALL_LOCK_WAIT: float | None = 0.0
+# How often a waiting install or upgrade looks again whether the first has ended, in seconds; a settings row to come.
+INSTALL_LOCK_POLL = 0.05
+# The whole detail of ``install_running``: another install or upgrade of the same profile holds its lock.
+_RUNNING = ("another install of this profile is running (recursiond install or upgrade for {home}), so this one made "
+            "nothing. Let it end, then run the command again.")
+# The plan's line when the profile cannot be locked here (a disk that keeps no such locks): the step goes on.
+_UNLOCKED = ("{home} could not be locked for this step ({why}), so it ran without the profile's lock: run one "
+             "install or upgrade of this profile at a time")
 
 
 @dataclass(frozen=True)
@@ -429,6 +441,40 @@ def _still_on_ground(grounds: tuple[Ground, ...]) -> None:
             raise InstallRefused("store_ground_changed", _CHANGED_BEFORE.format(where=_shown(ground.where)))
 
 
+def _lock_profile(paths: Owned, held: contextlib.ExitStack) -> str:
+    """One install or upgrade of a profile at a time: the profile's home folder is opened and locked (``flock``)
+    for the whole step, from its first judgment to its last link, and let go at the answer (``held``). A second
+    step of the same profile waits ``INSTALL_LOCK_WAIT`` seconds for the first to end, looking again every
+    ``INSTALL_LOCK_POLL`` seconds, and is then ``install_running`` with nothing made. Returns "" when locked, or the
+    plan's line saying why the home could not be locked (a platform or disk that keeps no such locks): the step
+    then goes on, and that line says to run one at a time."""
+
+    try:
+        import fcntl
+    except ImportError:
+        return _UNLOCKED.format(home=_shown(paths.home), why="this platform has no flock")
+    try:
+        fd = os.open(paths.home, _FOLDER_OPEN | getattr(os, "O_NONBLOCK", 0))  # the resolved home, never a link
+    except OSError as exc:
+        return _UNLOCKED.format(home=_shown(paths.home), why=errno.errorcode.get(exc.errno, str(exc.errno)))
+    deadline = None if INSTALL_LOCK_WAIT is None else time.monotonic() + INSTALL_LOCK_WAIT
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if deadline is not None and time.monotonic() >= deadline:
+                os.close(fd)
+                raise InstallRefused("install_running", _RUNNING.format(home=_shown(paths.home))) from None
+            time.sleep(INSTALL_LOCK_POLL if deadline is None else max(0.0, min(INSTALL_LOCK_POLL,
+                                                                                deadline - time.monotonic())))
+            continue
+        except OSError as exc:
+            os.close(fd)
+            return _UNLOCKED.format(home=_shown(paths.home), why=errno.errorcode.get(exc.errno, str(exc.errno)))
+        held.callback(os.close, fd)  # closing the folder lets the lock go, after everything else the step holds
+        return ""
+
+
 def _store_folders(paths: Owned) -> tuple[str, ...]:
     """The folders of every store the step makes: the breaker and revocation stores' and the ledger's."""
 
@@ -465,6 +511,45 @@ def _remove_entry(fd: int, name: str, mine: tuple[int, int]) -> None:
         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
         if (info.st_dev, info.st_ino) == mine:
             os.unlink(name, dir_fd=fd)
+
+
+def _take_away(fd: int, name: str, mine: tuple[int, int]) -> tuple[str, str]:
+    """Remove the file ``name`` of the opened folder ``fd`` only if, at the moment it is removed, it is the very
+    file ``mine`` this run made: the entry is first renamed to a fresh name of this run in the same folder, where
+    no other program puts a file, and the file at that name is compared with ``mine``; only then is it unlinked. A
+    file of another program found so is put back at its name (never over a file put there since) and kept.
+    Returns ("removed", ""), ("gone", "") when nothing is at the name, ("other", "") when another file is there,
+    or ("left", the name the run's file is at) when it could not be removed."""
+
+    aside = f".{name}.{secrets.token_hex(8)}.gone"
+    try:
+        os.rename(name, aside, src_dir_fd=fd, dst_dir_fd=fd)
+    except FileNotFoundError:
+        return "gone", ""
+    except OSError:
+        return "left", name
+    try:
+        info = os.stat(aside, dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return "left", aside
+    if (info.st_dev, info.st_ino) == mine:
+        try:
+            os.unlink(aside, dir_fd=fd)
+        except FileNotFoundError:
+            return "gone", ""
+        except OSError:
+            return "left", aside
+        return "removed", ""
+    try:  # another program's file: back at its name, never over one put there since
+        os.link(aside, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+        os.unlink(aside, dir_fd=fd)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.stat(name, dir_fd=fd, follow_symlinks=False)
+            return "other", ""
+        with contextlib.suppress(OSError):
+            os.rename(aside, name, src_dir_fd=fd, dst_dir_fd=fd)
+    return "other", ""
 
 
 def _open_store(path: str, magic: str, *, check_only: bool = False) -> None:
@@ -681,6 +766,11 @@ class _Run:
 
         left = []
         for what, fd, name, mine, path in reversed(self.made):
+            if what == "file":  # proven to be the very file made at the moment it is removed
+                status, at = _take_away(fd, name, mine)
+                if status == "left":
+                    left.append(os.path.join(os.path.dirname(path), at))
+                continue
             try:
                 info = os.stat(name, dir_fd=fd if fd >= 0 else None, follow_symlinks=False)
             except FileNotFoundError:
@@ -690,11 +780,8 @@ class _Run:
                 continue
             if (info.st_dev, info.st_ino) != mine:
                 continue  # another file or folder at the name now: not this step's, left as it is
-            try:
-                if what == "file":
-                    os.unlink(name, dir_fd=fd)
-                else:
-                    os.rmdir(name, dir_fd=fd if fd >= 0 else None)
+            try:  # a folder: rmdir removes it only while it is empty
+                os.rmdir(name, dir_fd=fd if fd >= 0 else None)
             except FileNotFoundError:
                 pass
             except OSError:
@@ -733,6 +820,7 @@ def _in_run(paths: Owned):
         yield run
         return
     with contextlib.ExitStack() as held:
+        _lock_profile(paths, held)  # one step of this profile at a time
         run = _Run(_judge(_store_folders(paths), "accept_risk", held)[1], held)
         token = _RUN.set(run)
         try:
@@ -1132,6 +1220,7 @@ def install(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
     unit = render_unit(exec_args, paths.state_home if paths.chosen else None).encode()
     check_dirs(paths.home, paths.unit_dir)
     with contextlib.ExitStack() as held:  # a unit found stays open until the answer: its inode is not reused
+        unlocked = _lock_profile(paths, held)  # one install or upgrade of this profile at a time, to the answer
         present = os.path.lexists(paths.unit)
         if present:
             read = held.enter_context(held_regular(paths.unit))  # checked against the path while open
@@ -1145,6 +1234,7 @@ def install(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
         check_private_dir(paths.state_root, paths.homes)  # before anything is made
         # before anything is made or opened; each folder read stays open until the answer (``store_ground``)
         ground, grounds = _judge(_store_folders(paths), held=held)
+        ground += (unlocked,) if unlocked else ()
         found = _found(paths, anchor_public_key, make_anchor)  # before anything is made
         _still_on_ground(grounds)  # the folders read still name the folders opened: nothing swapped since
         run = _Run(grounds, held)  # the stores made through the folders opened, and undone on a failure
@@ -1197,7 +1287,9 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
     check_dirs(paths.home, paths.unit_dir)
     if not os.path.lexists(paths.unit):
         raise InstallRefused("unit_missing", f"no unit at {paths.unit}; `recursiond install` writes it")
-    with held_regular(paths.unit) as read, contextlib.ExitStack() as held:  # held open until the answer
+    with contextlib.ExitStack() as held:  # the unit read is held open until the answer
+        unlocked = _lock_profile(paths, held)  # one install or upgrade of this profile at a time, to the answer
+        read = held.enter_context(held_regular(paths.unit))
         data, info = read
         current = data == unit and not file_untrusted(paths.unit, info)
         why = None if data == unit else state_elsewhere(data, paths.home, paths.state_home)
@@ -1207,6 +1299,7 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
         check_private_dir(paths.state_root, paths.homes)  # before anything is made
         # before anything is made or opened; each folder read stays open until the answer (``store_ground``)
         ground, grounds = _judge(_store_folders(paths), held=held)
+        ground += (unlocked,) if unlocked else ()
         found = _found(paths, anchor_public_key, make_anchor)  # before anything is made
         _still_on_ground(grounds)  # the folders read still name the folders opened: nothing swapped since
         run = _Run(grounds, held)  # the stores made through the folders opened, and undone on a failure

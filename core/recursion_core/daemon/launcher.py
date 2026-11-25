@@ -208,6 +208,8 @@ PIPED_UNIT_ALLOWED = (
     ('CPUQuota', 'a bound on the processor time the host may take'),
     ('CPUWeight', "the host's share of the processor beside other units"),
     ('TasksMax', 'a bound on the processes and threads of the host'),
+    ('RuntimeMaxSec', 'a bound on how long the host may run: past it the system stops the host, and Restart=no, '
+                      'written last, keeps it stopped, so a bound on its life never brings an ended host back'),
     ('IOWeight', "the host's share of the disks beside other units"),
 )
 _PIPED_ALLOWED_NAMES = frozenset(name for name, _ in PIPED_UNIT_ALLOWED)
@@ -343,10 +345,11 @@ class EngineUnitManager(SystemdUserManager):
                                unit], check=True, text=True, capture_output=True, timeout=timeout_s).stdout
         return dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
 
-    def stop_unit(self, unit, timeout_s):
-        """The system's own stop of ``unit``, by the unit's kill rules (the launcher's: the whole control group), which
-        also cancels a start the system has queued for it. Waits at most ``timeout_s``."""
-        subprocess.run(['systemctl', '--user', 'stop', '--', unit], check=True, text=True, capture_output=True,
+    def stop_units(self, units, timeout_s):
+        """The system's own stop of every unit of ``units`` in ONE request, by each unit's kill rules (the launcher's:
+        the whole control group), which also cancels a start the system has queued for it. Waits at most ``timeout_s``
+        for all of them together."""
+        subprocess.run(['systemctl', '--user', 'stop', '--', *units], check=True, text=True, capture_output=True,
                        timeout=timeout_s)
 
     def listed_units(self, pattern, timeout_s):

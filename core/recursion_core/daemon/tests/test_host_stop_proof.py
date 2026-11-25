@@ -69,6 +69,7 @@ class FakeSystem:
         self.after_kill, self.after_stop, self.hello = after_kill, after_stop, hello
         self.killed, self.stops, self.reads, self.ends, self.started = [], [], [], [], []
         self.states, self.listed, self.fail_reads = {}, [], False
+        self.stop_requests, self.stop_waits = [], False  # each request of the system's stop; whether it waits it out
         test.addCleanup(self.hang_up_all)
 
     def start_piped(self, unit, argv, channel, *, properties=(), working_directory=None):
@@ -113,8 +114,11 @@ class FakeSystem:
             return dict(self.after_stop)
         return dict(self.after_kill if unit in self.killed else RUNNING)
 
-    def stop_unit(self, unit, timeout_s):
-        self.stops.append(unit)
+    def stop_units(self, units, timeout_s):
+        self.stop_requests.append(list(units))
+        self.stops.extend(units)
+        if self.stop_waits:  # a manager that does not answer: the request takes its whole bound
+            time.sleep(timeout_s)
 
     def listed_units(self, pattern, timeout_s):
         return list(self.listed)
@@ -160,6 +164,17 @@ class AHostUnitTakesOnlyTheAllowedProperties(_Folder):
             launcher.check_piped_properties(('Restart=always',))
         self.assertIn('the system starts the host again after Stop has killed it', str(caught.exception))
         self.assertNotIn('ask for Restart to be added', str(caught.exception))
+
+    def test_the_bounds_the_real_unit_tests_give_every_host_are_taken(self):
+        # The real-unit tests (test_host_units.GUARD) give every host these; a gate with no user manager skips those
+        # tests, so this one holds the list to them without a user manager.
+        from recursion_core.daemon.tests import test_host_units as hu
+        self.assertEqual(launcher.check_piped_properties(hu.GUARD), hu.GUARD)
+        host_units.PluginHostUnits(FakeSystem(self), self.state, hs.StandInCore(), properties=hu.GUARD)
+        head = piped_command(hu.GUARD)
+        for item in hu.GUARD:
+            self.assertIn('--property=' + item, head)
+        self.assertLess(head.index('--property=RuntimeMaxSec=120'), head.index('--property=Restart=no'))
 
     def test_each_property_on_the_list_reaches_the_unit_and_has_its_reason(self):
         names = [name for name, _ in launcher.PIPED_UNIT_ALLOWED]
@@ -299,6 +314,21 @@ class StopProvesTheHostEnded(_Folder):
         self.assertLess(took, SHORT * 2)  # one bound for both, never one each
         self.assertEqual(sorted(system.stops), sorted(host.unit for host in hosts))
         self.assertEqual([host.life for host in hosts], ['unconfirmed', 'unconfirmed'])
+
+    def test_the_daemons_stop_asks_one_system_stop_for_every_unconfirmed_host_so_three_bounds_at_most(self):
+        system = FakeSystem(self)
+        units = self.units(system)
+        hosts = [units.start(name, *hs.package(hs.POLITE, name)) for name in ('stand.one', 'stand.two', 'stand.six')]
+        system.fail_reads = system.stop_waits = True  # the manager answers nothing, and its stop takes its bound
+        began = time.monotonic()
+        with self.assertLogs(host_units.log, logging.ERROR):
+            units.close()
+        took = time.monotonic() - began
+        self.assertEqual([sorted(request) for request in system.stop_requests], [sorted(h.unit for h in hosts)])
+        self.assertLess(took, SHORT * 3)  # the proof, the one stop and the last reads: never a bound per host
+        self.assertEqual([host.life for host in hosts], ['unconfirmed'] * 3)
+        for host in hosts:
+            self.assertIn('The daemon then asked the system to stop it (' + host.unit + ')', host.stop_words)
 
     def test_the_stop_bound_is_a_number_of_seconds_and_no_limit_is_not_offered(self):
         self.assertEqual(host_units.STOP_CONFIRM_S, 5.0)

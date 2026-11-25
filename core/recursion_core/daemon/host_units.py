@@ -38,8 +38,9 @@ argument: by default the folder this daemon's own code was imported from.
   call that waits on that host (one with no deadline, say) ends at once with ``replaced``, and so does a start of
   the plugin still under way. Then the new host starts.
 * ``stop`` and ``close`` (the daemon's own Stop) end every host the same way, a host that is still starting
-  included (its start ends with ``stopped``), and wait on no host: only on the system's proof, all of them within one
-  bound.
+  included (its start ends with ``stopped``), and wait on no host, only on the system's proof. The proof of every
+  host shares one bound; the hosts it did not confirm get ONE system stop together, within a second bound, and one
+  more read each, within a third. So the daemon's Stop takes at most three bounds, whatever the count of hosts.
 * ``sweep_strays``, for the daemon's own start: a plugin host unit that this daemon did not start (left by an earlier
   life) and that the system shows active, starting again or queued is stopped by the system's stop and reported, so
   a host never outlives the daemon's Stop unseen.
@@ -514,8 +515,9 @@ class PluginHostUnits:
         self._end_all([host] if host is not None else [], [starting] if starting is not None else [])
 
     def close(self):
-        """The daemon's own Stop: every host is ended by the system's kill, then proven ended as ``stop`` does, all
-        within one Stop bound; no host is waited on."""
+        """The daemon's own Stop: every host is ended by the system's kill, then proven ended as ``stop`` does. The
+        proof of every host shares one Stop bound; the hosts it did not confirm get one system stop together and one
+        more read each, so the whole set takes at most three bounds; no host is waited on."""
         with self._lock:
             self._closed = True
             hosts = list(self._units.values())
@@ -586,7 +588,7 @@ class PluginHostUnits:
                 before = self._unit_state(name, time.monotonic() + self._stop_confirm_s)
                 if unit_shows_ended(before):
                     continue
-                did = self._system_stop(name)
+                did = self._system_stop([name])
                 after = self._unit_state(name, time.monotonic() + self._stop_confirm_s)
                 words = (f'a plugin host unit {name} that this daemon did not start was found with {_shown(before)}; '
                          f'the daemon {did}, and the system now shows {_shown(after)}')
@@ -760,7 +762,8 @@ class PluginHostUnits:
             self._confirm(host, deadline)
 
     def _end_all(self, hosts, starting):
-        """``stop`` and ``close``: kill every host first, then prove each ended, all within ONE Stop bound."""
+        """``stop`` and ``close``: kill every host first, then prove them ended together (``_confirm_all``): at most
+        three Stop bounds for the whole set."""
         deadline = time.monotonic() + self._stop_confirm_s
         killed = []
         for host in hosts:
@@ -772,8 +775,8 @@ class PluginHostUnits:
             if self._kill(host):
                 killed.append(host)
             host.wake()
-        for host in killed:
-            self._confirm(host, deadline)
+        if killed:
+            self._confirm_all(killed, deadline)
 
     def _end(self, host, deadline=None):
         """SIGKILL the unit's whole cgroup now, once, then prove it ended (``_confirm``). Waits on nothing the host
@@ -789,41 +792,55 @@ class PluginHostUnits:
         except Exception:  # noqa: BLE001 - nothing shown is never ended
             return {}
 
-    def _system_stop(self, unit):
-        """The system's own stop of ``unit`` within the Stop bound, in words of what the daemon did."""
+    def _system_stop(self, units):
+        """The system's own stop of ``units``, ONE request for all of them within the Stop bound, in words of what the
+        daemon did."""
         try:
-            self._manager.stop_unit(unit, self._stop_confirm_s)
+            self._manager.stop_units(list(units), self._stop_confirm_s)
         except Exception as exc:  # noqa: BLE001 - said in the words, never dropped
             return f'asked the system to stop it, which failed ({type(exc).__name__})'
         return 'asked the system to stop it'
 
     def _confirm(self, host, deadline=None):
-        """After the kill: True once the system shows the unit ended and not about to start again, read until
-        ``deadline`` (by default the Stop bound from now). Past it the unit is stopped by the system's own stop, and the
-        host's Stop is recorded unconfirmed and said so, in the log and in ``status``; never dropped silently."""
+        """``_confirm_all`` of one host."""
+        return self._confirm_all([host], deadline)
+
+    def _confirm_all(self, hosts, deadline=None):
+        """After the kill: read what the system shows of each host's unit until it shows the unit ended and not about
+        to start again, every host within ONE ``deadline`` (by default the Stop bound from now). Past it the units not
+        shown ended get ONE system stop together (within the Stop bound) and then one more read each (all within one
+        more bound), and each such host's Stop is recorded unconfirmed and said so, in the log and in ``status``; never
+        dropped silently. So the set takes at most three bounds, whatever its count (a read begun at a bound's end is
+        still given one poll). True when every host was shown ended."""
         if deadline is None:
             deadline = time.monotonic() + self._stop_confirm_s
-        while True:
-            state = self._unit_state(host.unit, deadline)
-            if unit_shows_ended(state):
-                with self._lock:
-                    host.life = LIFE_ENDED  # said only from what the system shows
-                return True
+        pending, shown = list(hosts), {}
+        while pending:
+            for host in list(pending):
+                state = shown[host.unit] = self._unit_state(host.unit, deadline)
+                if unit_shows_ended(state):
+                    with self._lock:
+                        host.life = LIFE_ENDED  # said only from what the system shows
+                    pending.remove(host)
             left = deadline - time.monotonic()
-            if left <= 0:
+            if not pending or left <= 0:
                 break
             time.sleep(min(self._stop_confirm_poll_s, left))
-        did = self._system_stop(host.unit)
-        after = self._unit_state(host.unit, time.monotonic() + self._stop_confirm_s)
-        words = (f'the daemon ended the host of {host.plugin_id} but could not confirm within {self._stop_confirm_s:g} s '
-                 f'(plugin_host.stop_confirm_s) that the system will not start it again: the system showed '
-                 f'{_shown(state)}. The daemon then {did} ({host.unit}), and the system now shows {_shown(after)}. Do '
-                 'not trust this host until the status shows it ended')
-        with self._lock:
-            host.life, host.stop_words = UNCONFIRMED, words
-            self.unconfirmed[host.unit] = host
-            self.stops_unconfirmed[host.plugin_id] = self.stops_unconfirmed.get(host.plugin_id, 0) + 1
-        log.error('plugin %s: %s', host.plugin_id, words)
+        if not pending:
+            return True
+        did = self._system_stop([host.unit for host in pending])
+        last = time.monotonic() + self._stop_confirm_s
+        for host in pending:
+            after = self._unit_state(host.unit, last)
+            words = (f'the daemon ended the host of {host.plugin_id} but could not confirm within '
+                     f'{self._stop_confirm_s:g} s (plugin_host.stop_confirm_s) that the system will not start it again: '
+                     f'the system showed {_shown(shown[host.unit])}. The daemon then {did} ({host.unit}), and the system '
+                     f'now shows {_shown(after)}. Do not trust this host until the status shows it ended')
+            with self._lock:
+                host.life, host.stop_words = UNCONFIRMED, words
+                self.unconfirmed[host.unit] = host
+                self.stops_unconfirmed[host.plugin_id] = self.stops_unconfirmed.get(host.plugin_id, 0) + 1
+            log.error('plugin %s: %s', host.plugin_id, words)
         return False
 
     def _kill(self, host):

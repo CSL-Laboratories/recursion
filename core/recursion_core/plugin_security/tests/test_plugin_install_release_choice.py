@@ -89,7 +89,7 @@ class ReleaseChoiceTests(ProfileCase):
     def test_a_plugin_id_the_profile_uses_is_refused_before_any_write(self):
         self.write_registry("install.json")
         self.assertEqual([], self.codes_of(self.registry))
-        self.assert_refused_and_nothing_written("plugin_not_in_registry", "install.json")
+        self.assert_refused_and_nothing_written("plugin_id_reserved", "install.json")
         self.assertFalse(self.config.exists())
 
     # (P9) the pinned install.v1 fixtures, and developer_key_id kept.

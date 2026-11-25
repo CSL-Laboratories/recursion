@@ -1,13 +1,14 @@
-"""Install, list and remove a plugin from a local registry folder.
+"""Install, list, remove, enable, disable and roll back a plugin.
 
-Nothing here fetches, enables, disables or rolls back. A generation is one
-complete copy of the profile the daemon already reads. Generations live beside
-``plugins/``, never inside it: the daemon treats every directory there as a
-plugin, including a dot directory.
+A generation is one complete copy of the profile the daemon already reads.
+Generations live beside ``plugins/``, never inside it: the daemon treats every
+directory there as a plugin, including a dot directory.
 
     <config>/plugin-generations/<n>/install.json
+    <config>/plugin-generations/<n>/.disabled
     <config>/plugin-generations/<n>/<plugin_id>/{manifest.json,plugin.py,manifest.sig?}
     <config>/plugin-generations/current
+    <config>/plugin-generations/.parent-<n>
 
 ``current`` is an ASCII integer and a newline, matching ``^[1-9][0-9]*\\n$``.
 It is written only after generation ``n`` is complete. The live ``plugins/``
@@ -15,8 +16,8 @@ tree is published after that. ``plugin-generations/.publishing`` names, in the
 same form, the generation a command publishes, and on a second line the
 generation ``current`` named before it, when there was one. It is written and
 synced before that generation is renamed into place, so before any live folder
-changes, and removed once the live tree holds it whole. The next list, install
-or remove finishes that publish when ``.publishing`` names ``current``, and
+changes, and removed once the live tree holds it whole. The next list, install,
+remove, enable, disable or rollback finishes that publish when ``.publishing`` names ``current``, and
 drops ``.publishing`` when it does not. A ``.publishing`` that is not in that
 form refuses with the steps that end the refusal.
 
@@ -47,10 +48,33 @@ after the move carries every such line; ``list`` names every kept place that hol
 that cannot be moved aside (a folder without write permission) puts back what was moved, leaves no kept
 folder and refuses with the steps that end the refusal. Every refusal caused by a link prints those steps
 too; no link is followed. Older
-generations stay on disk so a later command can point ``current`` at one and
-publish it. This module does not do that. A generation that ``current`` does
+generations stay on disk. ``.parent-<n>`` names the generation that was
+current when generation ``n`` was written, and is absent for the first. It
+lives beside the generations, never inside one, so a generation is the exact
+tree its publish copies into ``plugins/``. Rollback publishes that
+generation, never one a rollback already left, by the same record and the same
+proof as every publish. A generation that ``current`` does
 not name (a stop between its rename and the pointer) is left as it is; the next
 command takes the number after every generation on disk.
+
+``.disabled``, when present, is sorted plugin ids, one per line. The name
+starts with a dot, so it is not a plugin id: a plugin may be named
+``disabled``. A generation that still has the older regular file ``disabled``
+is read the same way. A directory of that name is the plugin, not the list.
+The list lives in the generation only. Publish omits those plugin directories
+from ``plugins/`` and does not copy the file. Grants and labels stay in
+``install.json``. ``install.json`` matches the plugin-id grammar and is the
+record the daemon reads, so that id is refused before a generation is
+published. A disabled plugin stays listed. Enable and disable each write one
+generation. A disabled plugin's folder is out of ``plugins/`` by design, so every
+command reads it, and the list, from the current generation.
+
+A local bare git repository is read only when ``git_repository`` is passed.
+The entry's https repository is a name. This module does not fetch it. The
+file bytes are checked against the manifest digest before the profile lock
+and again before the generation is written. Nothing from the fetched tree is
+executed. With no ``git_repository`` and no vendored ``plugin.py``, the install
+refuses ``source_unavailable`` and does not fetch.
 
 The live ``plugins/`` tree is the truth. Every command reads the trusted keys,
 grants, reserved names and labels from the live ``install.json`` the daemon
@@ -108,6 +132,7 @@ A read or write the system refuses (a full or read-only disk, no permission) rai
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import functools
 import hashlib
@@ -120,6 +145,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .errors import Refused
+from .git_source import SourceRefused, fetch_plugin_source
 from .loader import CoreHealth, PluginLoader
 from .manifest import PERMISSIONS, Grant, ReservedEffects, TrustStore, parse_manifest
 from .registry import check_registry, platform_gap
@@ -130,8 +156,9 @@ try:
 except ImportError:  # Windows: every command refuses platform_unsupported before it opens a file
     fcntl = None
 
-__all__ = ["FilesystemRefused", "InstallRefused", "NothingChanged", "install_plugin", "list_plugins",
-           "quarantine_accept", "quarantine_drop", "quarantine_list", "remove_plugin", "unpin_plugin"]
+__all__ = ["FilesystemRefused", "InstallRefused", "NothingChanged", "disable_plugin", "enable_plugin",
+           "install_plugin", "list_plugins", "quarantine_accept", "quarantine_drop", "quarantine_list",
+           "remove_plugin", "rollback_generation", "unpin_plugin"]
 
 _PLUGIN_ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
 _CURRENT = re.compile(r"[1-9][0-9]*\n")
@@ -149,6 +176,10 @@ _LABELS = frozenset({"verified", "non_verified"})
 _INSTALL_KEYS = frozenset({"trusted_keys", "grants", "reserved", "authority_anchor", "registry_labels", "pins"})
 # A pin: the key a plugin was installed signed by, and that release's version.
 _PIN_KEYS = frozenset({"signer_key_id", "version"})
+# Names this store writes beside plugin directories that also match a plugin id.
+# install.json stays: the daemon reads it by this name. The disabled-id list
+# does not: it is ".disabled", which cannot be a plugin id.
+_STORE_RESERVED_IDS = frozenset({"install.json"})
 _GRANT_KEYS = frozenset({
     "plugin_id", "artifact_sha256", "signer_key_id", "permissions", "unsigned_order_acknowledged",
     "order_after_revoked_key", "order_after_revocation_generation", "developer_key_id",
@@ -177,7 +208,7 @@ _DEVELOPER_CHECKS = (
 
 
 class InstallRefused(Exception):
-    """The install, list or remove did not change the profile. ``code`` is stable."""
+    """The command did not finish a new profile. ``code`` is stable."""
 
     def __init__(self, code: str, codes: list[str] | None = None, detail: str = "", *,
                  show_detail: bool = False) -> None:
@@ -254,6 +285,8 @@ class Snapshot:
     pins: dict | None = None
     # True when the file read held ``pins``: every later write keeps the key, also as an empty map.
     pins_held: bool = False
+    # The generation's disabled-id list. Publish leaves these plugins out of plugins/.
+    disabled: frozenset = field(default_factory=frozenset)
 
     def reserved(self) -> ReservedEffects:
         return ReservedEffects(frozenset(self.hosts), tuple(self.prefixes))
@@ -262,8 +295,12 @@ class Snapshot:
 @_typed_refusals
 def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, plugin_id: str, *,
                    version: str | None = None, state: os.PathLike | str | None = None, wait: bool = True,
-                   report_kept=None, confirm=None) -> dict:
+                   git_repository: str | None = None, report_kept=None, confirm=None) -> dict:
     """Check ``registry_root``, then write the release as the next generation.
+
+    ``git_repository`` is a local bare path. The fetch, and every refusal of
+    that fetch, finishes before the profile lock. A refusal does not fall
+    back to a vendored ``plugin.py``.
 
     ``report_kept``, when given, is called with each line that names a kept place the moment it is made.
     ``confirm`` is asked one question and returns the user's answer; only ``yes`` moves a pin to another
@@ -279,16 +316,26 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
     # whole install. Unknown must not read as valid, and nothing is written.
     if any(item.code == "signature_unchecked" for item in report.notes):
         raise InstallRefused("signature_backend_unavailable")
+    if type(plugin_id) is str and plugin_id in _STORE_RESERVED_IDS:
+        raise InstallRefused("plugin_id_reserved")
     if not _plugin_id_ok(plugin_id) or plugin_id in _PROFILE_NAMES:
         raise InstallRefused("plugin_not_in_registry")
     if version is not None and type(version) is not str:
         raise InstallRefused("release_not_in_registry")
     chosen = _select(report, plugin_id, version)
-    if chosen.artifact is None:
+    artifact = chosen.artifact
+    fetched = False
+    if git_repository is not None or artifact is None:
+        artifact = _fetch_named(git_repository, chosen)
+        fetched = True
+    if artifact is None:
         raise InstallRefused("source_unavailable")
+    manifest = _parsed_manifest(chosen.manifest)
+    if hashlib.sha256(artifact).hexdigest() != manifest.artifact_sha256:
+        raise InstallRefused("source_digest_mismatch" if fetched else "artifact_digest_mismatch")
     fd = _lock(config_path, wait=wait)
     try:
-        return _install_locked(config_path, chosen, plugin_id, state, report_kept, confirm)
+        return _install_locked(config_path, chosen, plugin_id, state, artifact, fetched, report_kept, confirm)
     finally:
         os.close(fd)
 
@@ -331,13 +378,134 @@ def remove_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLi
         # The pin stays: a removed plugin installed again unsigned is refused the same way.
         kept = Snapshot(snapshot.trusted_keys, grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
                         _labels_for(snapshot.labels, plugins), plugins, snapshot.developer_key_ids,
-                        pins=snapshot.pins, pins_held=snapshot.pins_held)
+                        pins=snapshot.pins, pins_held=snapshot.pins_held, disabled=snapshot.disabled - {plugin_id})
         notes = []
         generation = _commit(config_path, kept, notes, report_kept, removing=plugin_id)
         result = {"command": "remove", "plugin_id": plugin_id, "generation": generation, "plugins": _rows(kept)}
         return _with_notes(result, notes)
     finally:
         os.close(fd)
+
+
+@_typed_refusals
+def enable_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLike | str | None = None,
+                  wait: bool = True, report_kept=None) -> dict:
+    """Publish one installed plugin again. An unknown id writes nothing."""
+    return _set_disabled(config, plugin_id, disable=False, state=state, wait=wait, report_kept=report_kept)
+
+
+@_typed_refusals
+def disable_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLike | str | None = None,
+                   wait: bool = True, report_kept=None) -> dict:
+    """Hide one installed plugin from ``plugins/``. The generation keeps its bytes."""
+    return _set_disabled(config, plugin_id, disable=True, state=state, wait=wait, report_kept=report_kept)
+
+
+@_typed_refusals
+def rollback_generation(config: os.PathLike | str, *, state: os.PathLike | str | None = None,
+                        wait: bool = True) -> dict:
+    """Point ``current`` at the generation that was current when this one was written.
+
+    The first generation, and a profile with no generation, refuse
+    ``rollback_unavailable`` and write nothing. A missing parent directory
+    refuses ``generation_missing`` before the pointer moves. The publish is the
+    one every command makes: the live tree is proven against both generations
+    before anything moves, and ``.publishing`` names both before the pointer is
+    written, so if publishing raises after the pointer is written, the next list
+    publishes that generation. A generation a rollback already left stays on
+    disk and is not published again.
+    """
+    _require_platform()
+    del state
+    config_path = Path(config)
+    fd = _lock(config_path, wait=wait)
+    try:
+        _finish_publish(config_path)
+        current = _read_current(config_path)
+        if current is None or current < 2:
+            raise InstallRefused("rollback_unavailable")
+        root = config_path / "plugin-generations"
+        replaced = root / str(current)
+        parent = _read_parent(root, current)
+        if parent is None or parent >= current:
+            raise InstallRefused("generation_missing" if parent is None else "generation_unreadable")
+        dest = root / str(parent)
+        if not _lexists(dest):
+            raise InstallRefused("generation_missing")
+        _require_owned_dir(dest, "generation_missing")
+        snapshot = _read_profile(dest, missing_install_ok=False)
+        sources = [dest, replaced]
+        # Every live entry the swap would move, and the live install.json, are proven before anything moves.
+        _check_live(config_path)
+        _check_install_file(config_path, sources)
+        _check_publish(config_path, sources, set(snapshot.plugins))
+        _atomic_replace(root, _PUBLISHING, f"{parent}\n{current}\n".encode("ascii"))
+        _write_pointer(root, parent)
+        kept = _copy_generation_to_live(config_path, parent, sources)
+        _clear_marker(root)
+        _refuse_kept(kept)
+        return {"command": "rollback", "generation": parent, "plugins": _rows(snapshot)}
+    finally:
+        os.close(fd)
+
+
+@_typed_refusals
+def _set_disabled(config: os.PathLike | str, plugin_id: str, *, disable: bool,
+                  state: os.PathLike | str | None, wait: bool, report_kept=None) -> dict:
+    _require_platform()
+    del state
+    config_path = Path(config)
+    if not _plugin_id_ok(plugin_id):
+        raise InstallRefused("plugin_not_installed")
+    fd = _lock(config_path, wait=wait)
+    try:
+        _finish_publish(config_path)
+        snapshot = _load_snapshot(config_path)
+        if plugin_id not in snapshot.plugins:
+            raise InstallRefused("plugin_not_installed")
+        if disable:
+            if plugin_id in snapshot.disabled:
+                raise InstallRefused("plugin_already_disabled")
+            disabled = snapshot.disabled | {plugin_id}
+            command = "disable"
+        else:
+            if plugin_id not in snapshot.disabled:
+                raise InstallRefused("plugin_not_disabled")
+            disabled = snapshot.disabled - {plugin_id}
+            command = "enable"
+        # Everything else the live install.json holds is carried unchanged: keys, grants, pins.
+        updated = dataclasses.replace(snapshot, disabled=disabled)
+        notes = []
+        generation = _commit(config_path, updated, notes, report_kept)
+        result = {"command": command, "plugin_id": plugin_id, "generation": generation, "plugins": _rows(updated)}
+        return _with_notes(result, notes)
+    finally:
+        os.close(fd)
+
+
+def _fetch_named(git_repository: str | None, chosen) -> bytes:
+    """Fetch the named commit. Refuse before creating a profile file."""
+    if git_repository is None or chosen.source_commit is None or chosen.source_path is None:
+        raise InstallRefused("source_unavailable")
+    manifest = _parsed_manifest(chosen.manifest)
+    if chosen.artifact_sha256 != manifest.artifact_sha256:
+        raise InstallRefused("release_artifact_digest_mismatch")
+    if chosen.manifest_sha256 != hashlib.sha256(chosen.manifest).hexdigest():
+        raise InstallRefused("release_manifest_digest_mismatch")
+    repository = git_repository if type(git_repository) is str else os.fspath(git_repository)
+    try:
+        return fetch_plugin_source(
+            repository, chosen.source_commit, chosen.source_path,
+            expected_sha256=manifest.artifact_sha256, install_scripts=manifest.install_scripts)
+    except SourceRefused as exc:
+        raise InstallRefused(exc.code) from None
+
+
+def _parsed_manifest(raw: bytes):
+    try:
+        return parse_manifest(raw)
+    except Refused as exc:
+        raise InstallRefused(exc.code, detail=exc.detail) from None
 
 
 @_typed_refusals
@@ -378,7 +546,7 @@ def unpin_plugin(config: os.PathLike | str, plugin_id: str, *, state: os.PathLik
         grants.pop(plugin_id, None)
         updated = Snapshot(snapshot.trusted_keys, grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
                            snapshot.labels, snapshot.plugins, snapshot.developer_key_ids, pins=pins,
-                           pins_held=snapshot.pins_held)
+                           pins_held=snapshot.pins_held, disabled=snapshot.disabled)
         notes = []
         generation = _commit(config_path, updated, notes, report_kept)
         result = {"command": "unpin", "plugin_id": plugin_id, "generation": generation, "plugins": _rows(updated)}
@@ -504,6 +672,7 @@ def _lexists(path: Path) -> bool:
 
 def _plugin_id_ok(value: object) -> bool:
     return (type(value) is str and _PLUGIN_ID.fullmatch(value) is not None and value != "host"
+            and value not in _STORE_RESERVED_IDS
             and value not in (".", "..") and "/" not in value and "\\" not in value)
 
 
@@ -523,16 +692,19 @@ def _select(report, plugin_id: str, version: str | None):
     raise InstallRefused("release_not_in_registry")
 
 
-def _install_locked(config: Path, chosen, plugin_id: str, state, report_kept=None, confirm=None) -> dict:
+def _install_locked(config: Path, chosen, plugin_id: str, state, artifact: bytes, fetched: bool,
+                    report_kept=None, confirm=None) -> dict:
     manifest = parse_manifest(chosen.manifest)
     if manifest.plugin_id != plugin_id or not _plugin_id_ok(manifest.plugin_id):
         raise InstallRefused("release_plugin_id_mismatch")
     if chosen.label not in _LABELS:
         raise InstallRefused("release_label")
+    if hashlib.sha256(artifact).hexdigest() != manifest.artifact_sha256:
+        raise InstallRefused("source_digest_mismatch" if fetched else "artifact_digest_mismatch")
     signature_text = chosen.signature_text
     _finish_publish(config)
     snapshot = _load_snapshot(config)
-    trust_name, reason, grants, findings, signer = _admit(snapshot, manifest, signature_text, chosen.artifact,
+    trust_name, reason, grants, findings, signer = _admit(snapshot, manifest, signature_text, artifact,
                                                            chosen.label, state)
     refused = [item for item in findings if item.get("severity") == "refuse"]
     if refused:
@@ -541,22 +713,23 @@ def _install_locked(config: Path, chosen, plugin_id: str, state, report_kept=Non
     if manifest.plugin_id in snapshot.pins and trust_name == "signed" and running is not None:
         asks = _asks_for_more(parse_manifest(running.manifest), manifest)
         if asks:
-            return _hold(config, chosen, manifest, asks)
+            return _hold(config, chosen, manifest, asks, artifact)
     pins = dict(snapshot.pins)
     pin = _next_pin(snapshot, manifest, trust_name, signer, reason, signature_text, confirm, config, grants)
     if pin is not None:
         pins[manifest.plugin_id] = pin
     plugins = dict(snapshot.plugins)
-    plugins[manifest.plugin_id] = StoredPlugin(chosen.manifest, chosen.artifact, chosen.signature)
+    plugins[manifest.plugin_id] = StoredPlugin(chosen.manifest, artifact, chosen.signature)
     labels = _labels_for(snapshot.labels, plugins)
     labels[hashlib.sha256(chosen.manifest).hexdigest()] = chosen.label
     updated = Snapshot(dict(snapshot.trusted_keys), grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
-                       labels, plugins, snapshot.developer_key_ids, pins=pins, pins_held=snapshot.pins_held)
+                       labels, plugins, snapshot.developer_key_ids, pins=pins, pins_held=snapshot.pins_held,
+                       disabled=snapshot.disabled - {manifest.plugin_id})
     notes = []
     generation = _commit(config, updated, notes, report_kept)
     # What the written install.json gives this plugin, as the loader's admit step computed it from those grants.
     effective = next((item["detail"] for item in findings if item.get("code") == "effective_permissions"), "")
-    return _with_notes({
+    result = _with_notes({
         "command": "install",
         "plugin_id": manifest.plugin_id,
         "version": manifest.version,
@@ -571,6 +744,9 @@ def _install_locked(config: Path, chosen, plugin_id: str, state, report_kept=Non
         "findings": findings,
         "requested_permissions": list(manifest.permissions),
     }, notes)
+    if fetched:
+        result["fetched"] = True
+    return result
 
 
 @_typed_refusals
@@ -671,7 +847,8 @@ def quarantine_accept(config: os.PathLike | str, plugin_id: str, *, state: os.Pa
         labels = _labels_for(snapshot.labels, plugins)
         labels[hashlib.sha256(files["manifest.json"]).hexdigest()] = label
         updated = Snapshot(dict(snapshot.trusted_keys), grants, snapshot.hosts, snapshot.prefixes, snapshot.anchor,
-                           labels, plugins, developer_key_ids, pins=pins, pins_held=snapshot.pins_held)
+                           labels, plugins, developer_key_ids, pins=pins, pins_held=snapshot.pins_held,
+                           disabled=snapshot.disabled - {plugin_id})
         notes = []
         generation = _commit(config_path, updated, notes, report_kept)
         notes.extend(_drop_held_copy(held, files))
@@ -725,7 +902,7 @@ def _asks_for_more(running, release) -> list:
             for what in more]
 
 
-def _hold(config: Path, chosen, manifest, asks: list) -> dict:
+def _hold(config: Path, chosen, manifest, asks: list, artifact: bytes) -> dict:
     """Keep the checked files of a release that asks for more under ``plugin-quarantine/<id>/<version>/``.
 
     Nothing is installed and no generation is written. A release held before for this plugin is moved into a
@@ -734,7 +911,7 @@ def _hold(config: Path, chosen, manifest, asks: list) -> dict:
     plugin_id, version = manifest.plugin_id, manifest.version
     if _VERSION_DIR.fullmatch(version) is None:
         raise InstallRefused("release_version")
-    files = {"manifest.json": chosen.manifest, "plugin.py": chosen.artifact,
+    files = {"manifest.json": chosen.manifest, "plugin.py": artifact,
              _HELD_LABEL: f"{chosen.label}\n".encode("ascii")}
     if chosen.signature is not None:
         files["manifest.sig"] = chosen.signature
@@ -925,11 +1102,14 @@ def _rows(snapshot: Snapshot) -> list[dict]:
     for plugin in snapshot.plugins.values():
         manifest = parse_manifest(plugin.manifest)
         digest = hashlib.sha256(plugin.manifest).hexdigest()
-        rows.append({
+        row = {
             "plugin_id": manifest.plugin_id,
             "version": manifest.version,
             "registry_label": snapshot.labels.get(digest, "unlisted"),
-        })
+        }
+        if manifest.plugin_id in snapshot.disabled:
+            row["enabled"] = False
+        rows.append(row)
     rows.sort(key=lambda row: row["plugin_id"])
     return rows
 
@@ -1431,6 +1611,8 @@ def _commit(config: Path, snapshot: Snapshot, notes: list | None = None, report=
         # The record names this generation and the one it replaces, synced before any live folder changes.
         record = f"{number}\n" if current is None else f"{number}\n{current}\n"
         _atomic_replace(root, _PUBLISHING, record.encode("ascii"))
+        # After every check: a refused command leaves the generations folder as it was.
+        _write_parent(root, number, current)
         os.rename(partial, dest)
         _sync_dir(root)
         _write_pointer(root, number)
@@ -1444,6 +1626,8 @@ def _commit(config: Path, snapshot: Snapshot, notes: list | None = None, report=
             _carry(exc, lines)
         if _lexists(partial) and not _lexists(dest):
             _remove_at(partial)
+        if not _lexists(dest) and _lexists(root / f".parent-{number}"):
+            _remove_at(root / f".parent-{number}")
         raise
     _refuse_kept(kept, lines if report is None else ())
     return number
@@ -1461,6 +1645,36 @@ def _next_number(root: Path, current: int | None) -> int:
 
 def _write_pointer(root: Path, number: int) -> None:
     _atomic_replace(root, "current", f"{number}\n".encode("ascii"))
+
+
+def _write_parent(root: Path, number: int, parent: int | None) -> None:
+    """Record, beside the generations, the generation that was current when generation ``number`` was written.
+
+    The record is ``.parent-<number>``. It is written and synced after every check of the command and before
+    generation ``number`` is renamed into place; a record left by an earlier try at the same number is
+    replaced, or removed for the first.
+    """
+    name = f".parent-{number}"
+    if parent is None:
+        if _lexists(root / name):
+            _remove_at(root / name)
+            _sync_dir(root)
+        return
+    _atomic_replace(root, name, f"{parent}\n".encode("ascii"))
+
+
+def _read_parent(root: Path, number: int) -> int | None:
+    path = root / f".parent-{number}"
+    if not _lexists(path):
+        return None
+    raw = _read_file(path, 64)
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        raise InstallRefused("generation_unreadable") from None
+    if _CURRENT.fullmatch(text) is None:
+        raise InstallRefused("generation_unreadable")
+    return int(text)
 
 
 def _copy_generation_to_live(config: Path, generation: int, sources: list) -> list:
@@ -1489,7 +1703,10 @@ def _copy_generation_to_live(config: Path, generation: int, sources: list) -> li
     os.chmod(stage, 0o700)
     try:
         snapshot = _read_profile(source, missing_install_ok=False)
-        _write_profile(stage, snapshot)
+        visible = {plugin_id: plugin for plugin_id, plugin in snapshot.plugins.items()
+                   if plugin_id not in snapshot.disabled}
+        published = dataclasses.replace(snapshot, plugins=visible, disabled=frozenset())
+        _write_profile(stage, published)
         plugins = config / "plugins"
         if not _lexists(plugins):
             plugins.mkdir(mode=0o700)
@@ -1604,17 +1821,26 @@ def _load_snapshot(config: Path, removing: str | None = None) -> Snapshot:
     """
     current = _read_current(config)
     written = None
+    generation = None
     if current is not None:
         path = config / "plugin-generations" / str(current)
         if not _lexists(path):
             raise InstallRefused("generation_missing")
-        written = _read_profile(path, missing_install_ok=False).plugins
+        generation = _read_profile(path, missing_install_ok=False)
+        written = generation.plugins
     live = config / "plugins"
     if not _lexists(live):
         return Snapshot(pins={})
     if live.is_symlink():
         raise _link_refusal(live, "plugin_directory_untrusted")
     snapshot = _read_profile(live, missing_install_ok=True, written=written, removing=removing)
+    if generation is not None and generation.disabled:
+        # A disabled plugin's folder is out of plugins/ by design: the current generation holds it and the list.
+        plugins = dict(snapshot.plugins)
+        for plugin_id in sorted(generation.disabled):
+            plugins.setdefault(plugin_id, generation.plugins[plugin_id])
+        snapshot.plugins = plugins
+        snapshot.disabled = generation.disabled
     if snapshot.pins is None:
         snapshot.pins = _pins_from_grants(snapshot)
     return snapshot
@@ -1698,9 +1924,50 @@ def _read_profile(directory: Path, *, missing_install_ok: bool, written: dict | 
         if written is not None and plugin != written.get(name):
             raise _changed_way_out(path, plugin, written.get(name))
         plugins[name] = plugin
+    # The disabled-id list lives in a generation only; the live tree never holds it.
+    disabled = frozenset() if missing_install_ok else _read_disabled(directory, plugins, missing_install_ok=False)
     return Snapshot(parsed["trusted_keys"], parsed["grants"], parsed["hosts"], parsed["prefixes"],
                     parsed["anchor"], parsed["labels"], plugins, parsed["developer_key_ids"], pins=parsed["pins"],
-                    pins_held=parsed["pins"] is not None)
+                    pins_held=parsed["pins"] is not None, disabled=disabled)
+
+
+def _disabled_list_path(directory: Path) -> Path | None:
+    """The disabled-id list, if this generation has one.
+
+    ``.disabled`` is not a plugin id. An older generation may name the same
+    list ``disabled``. A directory of that name is a plugin, not the list.
+    """
+    modern = directory / ".disabled"
+    if _lexists(modern):
+        return modern
+    legacy = directory / "disabled"
+    if not _lexists(legacy):
+        return None
+    if stat.S_ISDIR(os.lstat(legacy).st_mode):
+        return None
+    return legacy
+
+
+def _read_disabled(directory: Path, plugins: dict, *, missing_install_ok: bool) -> frozenset:
+    """Read the generation's disabled-id list. A missing file means none are disabled."""
+    path = _disabled_list_path(directory)
+    if path is None:
+        return frozenset()
+    raw = _read_file(path, _MAX_INSTALL)
+    code = "install_unreadable" if missing_install_ok else "generation_unreadable"
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        raise InstallRefused(code) from None
+    if not text or not text.endswith("\n") or "\n\n" in text:
+        raise InstallRefused(code)
+    lines = text[:-1].split("\n")
+    if lines != sorted(lines) or len(set(lines)) != len(lines):
+        raise InstallRefused(code)
+    for line in lines:
+        if not _plugin_id_ok(line) or line not in plugins:
+            raise InstallRefused(code)
+    return frozenset(lines)
 
 
 def _changed_way_out(path: Path, plugin: StoredPlugin, mine: StoredPlugin | None) -> InstallRefused:
@@ -1840,7 +2107,13 @@ def _write_profile(directory: Path, snapshot: Snapshot) -> None:
         if plugin.signature is not None:
             _write_file(plugin_dir / "manifest.sig", plugin.signature)
         _sync_dir(plugin_dir)
+    if snapshot.disabled:
+        _write_file(directory / ".disabled", _disabled_bytes(snapshot.disabled))
     _sync_dir(directory)
+
+
+def _disabled_bytes(disabled: frozenset) -> bytes:
+    return "".join(f"{plugin_id}\n" for plugin_id in sorted(disabled)).encode("ascii")
 
 
 def _dump_install(snapshot: Snapshot) -> bytes:

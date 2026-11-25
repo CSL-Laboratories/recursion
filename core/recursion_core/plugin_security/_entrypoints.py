@@ -1,4 +1,4 @@
-"""Command line for ``recursion plugin install``, ``list``, ``remove``, ``unpin`` and ``quarantine``.
+"""Command line for ``recursion plugin``.
 
 The program name is ``recursion``. A refusal prints ``refused: CODE`` on stderr
 and returns 1; a refusal that says how to end it prints that sentence on the
@@ -7,7 +7,9 @@ prints one line on stderr for each plugin, saying which and where. A read or
 write the system refuses (a full or read-only disk, no permission, a path that
 is not a folder) prints ``refused: filesystem_refused``
 and the system's message, with no traceback, and returns 1. A usage error
-returns 2. Nothing here fetches.
+returns 2. ``install --git`` reads one local bare repository. The entry URL
+is not fetched. Nothing from the fetched tree is executed. ``enable``,
+``disable`` and ``rollback`` are one command each.
 
 ``unpin <id>``, and an install that would move a pin to another trusted key,
 ask one question on stderr and read one line: only the typed word ``yes`` goes
@@ -30,8 +32,9 @@ import os
 import sys
 from pathlib import Path
 
-from .install import (InstallRefused, NothingChanged, install_plugin, list_plugins, quarantine_accept,
-                      quarantine_drop, quarantine_list, remove_plugin, unpin_plugin)
+from .install import (InstallRefused, NothingChanged, disable_plugin, enable_plugin, install_plugin,
+                      list_plugins, quarantine_accept, quarantine_drop, quarantine_list, remove_plugin,
+                      rollback_generation, unpin_plugin)
 
 __all__ = ["main"]
 
@@ -73,6 +76,7 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument("--registry", required=True)
     install.add_argument("--plugin", required=True)
     install.add_argument("--version")
+    install.add_argument("--git", help="local bare repository")
     install.add_argument("--config")
     install.add_argument("--state")
 
@@ -86,6 +90,23 @@ def _parser() -> argparse.ArgumentParser:
     remove.add_argument("--plugin", required=True)
     remove.add_argument("--config")
     remove.add_argument("--state")
+
+    enable = commands.add_parser("enable")
+    enable.error = _error  # type: ignore[method-assign]
+    enable.add_argument("--plugin", required=True)
+    enable.add_argument("--config")
+    enable.add_argument("--state")
+
+    disable = commands.add_parser("disable")
+    disable.error = _error  # type: ignore[method-assign]
+    disable.add_argument("--plugin", required=True)
+    disable.add_argument("--config")
+    disable.add_argument("--state")
+
+    rollback = commands.add_parser("rollback")
+    rollback.error = _error  # type: ignore[method-assign]
+    rollback.add_argument("--config")
+    rollback.add_argument("--state")
 
     unpin = commands.add_parser("unpin")
     unpin.error = _error  # type: ignore[method-assign]
@@ -116,7 +137,7 @@ def main(argv: list[str] | None = None, out=None, err=None, inp=None) -> int:
     try:
         args = _parser().parse_args(argv)
     except _Usage as exc:
-        err.write(f"usage: recursion plugin install|list|remove ({exc})\n")
+        err.write(f"usage: recursion plugin install|list|remove|enable|disable|rollback|unpin|quarantine ({exc})\n")
         return 2
     said = []
 
@@ -140,9 +161,17 @@ def main(argv: list[str] | None = None, out=None, err=None, inp=None) -> int:
         if args.command == "install":
             result = install_plugin(_config_dir(args.config), args.registry, args.plugin,
                                     version=args.version, state=_state_dir(args.state), report_kept=report,
-                                    confirm=ask)
+                                    confirm=ask, git_repository=args.git)
         elif args.command == "list":
             result = list_plugins(_config_dir(args.config), state=_state_dir(args.state))
+        elif args.command == "enable":
+            result = enable_plugin(_config_dir(args.config), args.plugin, state=_state_dir(args.state),
+                                   report_kept=report)
+        elif args.command == "disable":
+            result = disable_plugin(_config_dir(args.config), args.plugin, state=_state_dir(args.state),
+                                    report_kept=report)
+        elif args.command == "rollback":
+            result = rollback_generation(_config_dir(args.config), state=_state_dir(args.state))
         elif args.command == "unpin":
             result = unpin_plugin(_config_dir(args.config), args.plugin_id, state=_state_dir(args.state),
                                   report_kept=report, confirm=ask)

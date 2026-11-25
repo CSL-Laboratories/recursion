@@ -2,18 +2,30 @@
 
 1. The daemon is started in a temporary folder with a configuration folder of its own that names no
    engine, left idle, asked for its status, and stopped. The audit hook (sys.addaudithook) records
-   every socket, name lookup and program start. Not one connection to a network address and not one
-   name lookup may appear; the only sockets are the local doors (the control door's Unix socket in
-   the temporary runtime folder, and the loopback browser view on a port the test lets the system
-   choose); the only programs started are the test's own stand-ins for systemctl and loginctl.
+   every socket, name lookup, program start and foreign-function call. Not one connection to a
+   network address and not one name lookup may appear; the only sockets are the local doors (the
+   control door's Unix socket in the temporary runtime folder, and the loopback browser view on a port
+   the test lets the system choose); the only programs started are the test's own stand-ins for
+   systemctl and loginctl, by their full path in the test's folder or by name under a PATH that holds
+   only that folder; the stand-ins are unchanged after the run. The daemon refuses every interpreter
+   but free-threaded CPython 3.14t; on any other CPython (the hosted gate runs 3.12) the test stands
+   in for that one interpreter check, so that the same daemon code runs before every merge.
 2. A stand-in engine is started through the product's own launch path with a base address the
    person configured: a listener of the test on the loopback address. The product itself opens no
    connection; the only address it hands the engine is that one, and the engine reaches exactly it.
 
+What the hook cannot see, and what this proof therefore does not cover (NOT_COVERED below): what a
+program started by the daemon reaches by itself (here only the test's own stand-ins run, and they
+reach nothing); the traffic of a socket made from a descriptor (refused here when its family is not
+named; with its family named it is seen only as a new socket, and this test hands the daemon no
+descriptor); a call into the operating system through a foreign-function module (every ctypes event
+is refused here, and the static proof refuses the modules); what the operating system does by itself.
+
 Nothing leaves this machine: every address in this file is a loopback address or a path inside a
 temporary folder the test made. The idle time is a setting: RECURSION_PROOF_IDLE_SECONDS (shipped
-first value below). Run by itself: python3.14t -X gil=0 core/tests/test_no_call_home_runtime.py
+first value below). Run by itself: python3 core/tests/test_no_call_home_runtime.py
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -35,19 +47,35 @@ if str(CORE) not in sys.path:
 IDLE_SECONDS = float(os.environ.get("RECURSION_PROOF_IDLE_SECONDS", "3"))
 START_SECONDS = float(os.environ.get("RECURSION_PROOF_START_SECONDS", "30"))
 
-REAL_DAEMON = (sys.platform.startswith("linux") and sys.implementation.name == "cpython"
-               and sys.version_info[:2] >= (3, 14) and bool(sysconfig.get_config_var("Py_GIL_DISABLED")))
+FREE_THREADED_314 = (sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 14)
+                     and bool(sysconfig.get_config_var("Py_GIL_DISABLED")))
+DAEMON_RUNS_HERE = sys.platform.startswith("linux") and sys.implementation.name == "cpython"
 
-# The audit events that can reach a network, look up a name, or start a program.
+# What this proof does not cover, in the words a person reads (printed after a run of this file).
+NOT_COVERED = (
+    "what a program the daemon starts reaches by itself (only the test's own stand-ins run here, and "
+    "they reach nothing; an engine's own traffic is the engine's setting)",
+    "the traffic of a socket made from a descriptor with its family named (seen only as a new socket; "
+    "the test hands the daemon no descriptor, and one with no family named is refused)",
+    "a call into the operating system through a foreign-function module (every ctypes event is refused "
+    "here; the static proof refuses the modules in shipped source)",
+    "what the operating system does by itself (its own name lookups, time and package services)",
+    "plugins: a plugin reaches a network only under a grant a person gave; that proof is the plugin "
+    "wall's (core/recursion_core/plugin_security)",
+)
+
+# The audit events that can reach a network, look up a name, start a program or call foreign code.
 WATCHED = ("socket.", "subprocess.", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork",
            "os.forkpty", "pty.", "urllib.", "http.", "ftplib.", "smtplib.", "imaplib.", "poplib.",
-           "nntplib.", "telnetlib.", "webbrowser.", "ssl.", "ctypes.dlopen")
+           "nntplib.", "telnetlib.", "webbrowser.", "ssl.", "ctypes.")
 LOOKUPS = {"socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyname_ex", "socket.gethostbyaddr",
            "socket.getnameinfo", "socket.getfqdn"}
 
-# The hook the daemon child installs before anything of the product is imported.
+# The hook the daemon child installs before anything of the product is imported. With the environment
+# setting RECURSION_PROOF_STAND_IN_INTERPRETER_CHECK=1 (set by this test only where the interpreter is
+# not free-threaded 3.14t) the daemon's one interpreter check is stood in for before the daemon runs.
 BOOT = r'''
-import json, sys, threading
+import json, os, sys, threading
 _out = open(sys.argv[1], "a", buffering=1, encoding="utf-8")
 _lock = threading.Lock()
 _watched = tuple(json.loads(sys.argv[2]))
@@ -68,12 +96,20 @@ def _plain(value):
 def _hook(event, args):
     if event.startswith(_watched):
         try:
-            line = json.dumps([event, [_plain(a) for a in args[:3]]])
+            plain = [_plain(a) for a in args[:3]]
+            if event == "subprocess.Popen":
+                env = args[3] if len(args) > 3 else None
+                path = env.get("PATH") if hasattr(env, "get") else os.environ.get("PATH")
+                plain.append({"PATH": path if isinstance(path, str) else _plain(path)})
+            line = json.dumps([event, plain])
         except Exception as exc:
             line = json.dumps([event, ["unrecorded: " + type(exc).__name__]])
         with _lock:
             _out.write(line + "\n")
 sys.addaudithook(_hook)
+if os.environ.get("RECURSION_PROOF_STAND_IN_INTERPRETER_CHECK") == "1":
+    import recursion_core.daemon as _daemon
+    _daemon.require_free_threaded = lambda: None
 sys.argv = ["recursion_core.daemon"] + sys.argv[3:]
 import runpy
 runpy.run_module("recursion_core.daemon", run_name="__main__", alter_sys=True)
@@ -97,6 +133,20 @@ def read_events(path: Path):
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _program_allowed(args, allowed_programs):
+    """A program start is allowed only for a stand-in named by its full path, or by its bare name under
+    a PATH that is exactly the stand-in's own folder (a program of the same name elsewhere is refused)."""
+    program = args[0] if args and args[0] else (args[1][0] if len(args) > 1 and args[1] else None)
+    program = str(program)
+    if program in allowed_programs:
+        return True
+    extra = args[3] if len(args) > 3 and isinstance(args[3], dict) else {}
+    path = extra.get("PATH")
+    if "/" not in program and isinstance(path, str) and os.pathsep not in path:
+        return os.path.join(path, program) in allowed_programs
+    return False
 
 
 def judge(events, *, tmp: Path, allowed_programs=(), allowed_addresses=()):
@@ -123,14 +173,19 @@ def judge(events, *, tmp: Path, allowed_programs=(), allowed_addresses=()):
             problems.append(f"a socket was bound to a door that is not local: {address}")
         elif event == "socket.__new__":
             family = args[1] if len(args) > 1 else None
-            if family not in (int(socket.AF_UNIX), int(socket.AF_INET), -1):
+            if family == -1:
+                problems.append("a socket was made from a descriptor with no family named: what it reaches "
+                                "is not seen by the hook")
+            elif family not in (int(socket.AF_UNIX), int(socket.AF_INET)):
                 problems.append(f"a socket of family {family} was made")
         elif event == "subprocess.Popen":
-            program = args[0] if args and args[0] else (args[1][0] if len(args) > 1 and args[1] else None)
-            if not any(str(program) == p or str(program).endswith("/" + p) for p in allowed_programs):
-                problems.append(f"a program was started that is not one of the test's stand-ins: {program}")
+            if not _program_allowed(args, allowed_programs):
+                problems.append(f"a program was started that is not one of the test's stand-ins (what it "
+                                f"reaches is not seen by the hook): {args[:2]}")
         elif event.startswith(("os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "pty.")):
             problems.append(f"a program was started outside the checked launch: {event} {args}")
+        elif event.startswith("ctypes."):
+            problems.append(f"a foreign-function call (what it reaches is not seen by the hook): {event}")
         elif event.startswith(("urllib.", "http.", "ftplib.", "smtplib.", "imaplib.", "poplib.", "nntplib.",
                                "telnetlib.", "webbrowser.", "ssl.")):
             problems.append(f"a network library was used: {event} {args}")
@@ -147,25 +202,88 @@ def _stand_in_bin(tmp: Path) -> Path:
     return bins
 
 
+def _digest(folder: Path):
+    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(folder.iterdir())}
+
+
+def _hooked_child(code: str, events_path: Path, tmp: Path):
+    """Run a small Python program of the test under the same hook (as data in a file of the test)."""
+    hook = BOOT.split("if os.environ.get(")[0]
+    script = tmp / "child.py"
+    script.write_text(hook + "\n" + code, encoding="utf-8")
+    run = subprocess.run([sys.executable, "-I", "-B", str(script), str(events_path), json.dumps(WATCHED)],
+                         cwd=str(tmp), capture_output=True, text=True, timeout=START_SECONDS)
+    return run
+
+
 class JudgeTests(unittest.TestCase):
     """The judge is itself held: each kind of reach it must refuse is refused."""
 
     def test_the_judge_refuses_each_kind_of_reach(self):
         tmp = Path(tempfile.gettempdir()) / "judge-only-never-made"
+        standin = str(tmp / "bin" / "systemctl")
         cases = (["socket.getaddrinfo", ["example.org", 443]],
                  ["socket.gethostbyaddr", ["127.0.0.1"]],
                  ["socket.connect", [{"socket_family": 2}, ["192.0.2.7", 443]]],
                  ["socket.connect", [{"socket_family": 1}, "/run/elsewhere/door"]],
                  ["socket.bind", [{"socket_family": 2}, ["0.0.0.0", 80]]],
                  ["socket.__new__", [{"socket_family": 10}, 10, 1]],
+                 ["socket.__new__", [{"socket_family": -1}, -1, -1]],
                  ["subprocess.Popen", ["curl", ["curl", "x"]]],
+                 ["subprocess.Popen", [None, ["systemctl", "--user"], None, {"PATH": "/usr/bin"}]],
+                 ["subprocess.Popen", [None, ["systemctl"], None, {"PATH": str(tmp / "bin") + ":/usr/bin"}]],
+                 ["subprocess.Popen", ["/usr/bin/systemctl", ["systemctl"], None, {"PATH": str(tmp / "bin")}]],
+                 ["ctypes.dlopen", [None]],
+                 ["ctypes.call_function", [1234, []]],
                  ["os.system", ["curl x"]],
                  ["urllib.Request", ["https://example.org", None]])
         for event in cases:
-            with self.subTest(event=event[0]):
-                self.assertTrue(judge([event], tmp=tmp), event)
+            with self.subTest(event=event):
+                self.assertTrue(judge([event], tmp=tmp, allowed_programs=(standin,)), event)
         self.assertEqual(judge([["socket.connect", [{}, str(tmp / "control.sock")]],
-                                ["socket.bind", [{}, ["127.0.0.1", 0]]]], tmp=tmp), [])
+                                ["socket.bind", [{}, ["127.0.0.1", 0]]],
+                                ["subprocess.Popen", [None, ["systemctl", "--user"], None, {"PATH": str(tmp / "bin")}]],
+                                ["subprocess.Popen", [standin, ["systemctl"], None, {"PATH": "/usr/bin"}]]],
+                               tmp=tmp, allowed_programs=(standin,)), [])
+
+    def test_the_routes_past_the_hook_are_seen_or_refused(self):
+        # Each route runs for real in a small Python program of the test, under the same hook; nothing in it
+        # reaches beyond this machine (a socket pair, a call of the C library's getpid, a program by path).
+        with tempfile.TemporaryDirectory(prefix="rc-proof-") as name:
+            tmp = Path(name)
+            bins = _stand_in_bin(tmp)
+            other = tmp / "elsewhere"
+            other.mkdir()
+            (other / "systemctl").write_text("#!/bin/sh\nexit 0\n")
+            (other / "systemctl").chmod(0o700)
+            routes = {
+                "a foreign-function call": "import ctypes\nctypes.CDLL(None).getpid()\n",
+                "a socket made from a descriptor": "import socket\na, b = socket.socketpair()\n"
+                                                   "s = socket.socket(fileno=a.detach())\ns.close(); b.close()\n",
+                "a program named like a stand-in, from another folder": (
+                    "import subprocess\nsubprocess.run([%r, '--user'], env={'PATH': %r}, timeout=10)\n"
+                    % (str(other / "systemctl"), str(other))),
+                "a child Python process": "import subprocess, sys\n"
+                                          "subprocess.run([sys.executable, '-I', '-c', 'pass'], timeout=10)\n",
+                "a program that is not Python, by its bare name": (
+                    "import subprocess\nsubprocess.run(['systemctl', '--user'], env={'PATH': %r}, timeout=10)\n"
+                    % str(other)),
+            }
+            allowed = (str(bins / "systemctl"), str(bins / "loginctl"))
+            for route, code in routes.items():
+                with self.subTest(route=route):
+                    events_path = tmp / ("events-%d.jsonl" % len(route))
+                    run = _hooked_child(code, events_path, tmp)
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    events = read_events(events_path)
+                    self.assertTrue(events, route)  # the hook saw the route
+                    self.assertTrue(judge(events, tmp=tmp, allowed_programs=allowed), (route, events))
+            # The control: the stand-in itself, by name under its own folder, passes.
+            events_path = tmp / "events-control.jsonl"
+            run = _hooked_child("import subprocess\nsubprocess.run(['systemctl', '--user'], env={'PATH': %r}, "
+                                "timeout=10)\n" % str(bins), events_path, tmp)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(judge(read_events(events_path), tmp=tmp, allowed_programs=allowed), [])
 
 
 class SuiteHookTests(unittest.TestCase):
@@ -178,12 +296,12 @@ class SuiteHookTests(unittest.TestCase):
         cls.audit = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.audit)
 
-    def _run(self, code):
+    def _run(self, code, *extra):
         import contextlib
         import io
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            status = self.audit.main(["--", sys.executable, "-B", "-c", code])
+            status = self.audit.main([*extra, "--", sys.executable, "-B", "-c", code])
         return status, out.getvalue()
 
     def test_a_local_door_passes(self):
@@ -198,18 +316,35 @@ class SuiteHookTests(unittest.TestCase):
         for code in ("import sys; sys.audit('socket.getaddrinfo', 'reports.example.com', 443, 0, 0, 0)",
                      "import sys; sys.audit('socket.connect', None, ('192.0.2.7', 443))",
                      "import sys; sys.audit('urllib.Request', 'https://reports.example.com/', None, {}, 'GET')",
-                     "import sys; sys.audit('http.client.connect', None, 'reports.example.com', 443)"):
+                     "import sys; sys.audit('http.client.connect', None, 'reports.example.com', 443)",
+                     "import sys; sys.audit('ctypes.dlopen', None)",
+                     "import sys; sys.audit('subprocess.Popen', None, ['curl', '-s', 'x'], None, None)"):
             with self.subTest(code=code):
                 status, out = self._run(code)
                 self.assertEqual(status, 1, out)
                 self.assertIn("NOT PROVEN", out)
 
+    def test_a_program_that_is_not_python_is_named_and_refused_unless_allowed(self):
+        code = "import sys; sys.audit('subprocess.Popen', None, ['bash', '-c', 'true'], None, None)"
+        status, out = self._run(code)
+        self.assertEqual(status, 1, out)
+        self.assertIn("bash", out)
+        self.assertIn("not watched", out)
+        status, out = self._run(code, "--allow-program", "bash")
+        self.assertEqual(status, 0, out)
+        self.assertIn("bash", out)  # an allowed program is still named, with what is not watched
+
     def test_a_hook_that_saw_nothing_is_refused(self):
-        status, out = self.audit.main(["--", sys.executable, "-I", "-c", "pass"]), None
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = self.audit.main(["--", sys.executable, "-I", "-c", "pass"])
         self.assertEqual(status, 1)
+        self.assertIn("NOT PROVEN", out.getvalue())
 
 
-@unittest.skipUnless(REAL_DAEMON, "the daemon runs only on Linux free-threaded CPython 3.14")
+@unittest.skipUnless(DAEMON_RUNS_HERE, "the daemon runs only on Linux CPython")
 class IdleDaemonTests(unittest.TestCase):
     def test_the_idle_daemon_reaches_no_address_and_looks_up_no_name(self):
         from recursion_core.control.client import SocketAPI
@@ -218,6 +353,7 @@ class IdleDaemonTests(unittest.TestCase):
             tmp = Path(name)
             os.chmod(tmp, 0o700)
             bins = _stand_in_bin(tmp)
+            before = _digest(bins)
             runtime = tmp / "runtime"
             runtime.mkdir(mode=0o700)
             (tmp / "config" / "recursion").mkdir(parents=True)  # the person's settings: no engine named
@@ -225,11 +361,15 @@ class IdleDaemonTests(unittest.TestCase):
             env = {"PATH": str(bins), "HOME": str(tmp), "XDG_RUNTIME_DIR": str(runtime),
                    "XDG_STATE_HOME": str(tmp / "state"), "XDG_CONFIG_HOME": str(tmp / "config"),
                    "TMPDIR": str(tmp), "PYTHONPATH": str(CORE), "PYTHONDONTWRITEBYTECODE": "1", "LANG": "C.UTF-8"}
+            if not FREE_THREADED_314:
+                env["RECURSION_PROOF_STAND_IN_INTERPRETER_CHECK"] = "1"
             log_path = tmp / "daemon.log"
             with log_path.open("w") as log:
+                # close_fds (the default) and no pass_fds: the daemon is handed no descriptor but 0, 1 and 2.
                 child = subprocess.Popen([sys.executable, "-X", "gil=0", "-B", "-c", BOOT, str(events_path),
                                           json.dumps(WATCHED), "--gui-port", "0", "--sweep-seconds", "0.05"],
-                                         env=env, stdout=log, stderr=subprocess.STDOUT, cwd=str(tmp))
+                                         env=env, stdout=log, stderr=subprocess.STDOUT, cwd=str(tmp),
+                                         close_fds=True)
                 try:
                     api = SocketAPI(str(runtime / "recursion" / "control.sock"), timeout_s=1)
                     deadline = time.monotonic() + START_SECONDS
@@ -256,8 +396,9 @@ class IdleDaemonTests(unittest.TestCase):
             self.assertIn("socket.bind", names, events[:20])
             self.assertTrue(any(e == "socket.bind" and isinstance(a[1], str) and a[1].endswith("control.sock")
                                 for e, a in events), events[:20])
-            problems = judge(events, tmp=tmp, allowed_programs=("systemctl", "loginctl"))
+            problems = judge(events, tmp=tmp, allowed_programs=(str(bins / "systemctl"), str(bins / "loginctl")))
             self.assertEqual(problems, [], "\n".join(problems))
+            self.assertEqual(_digest(bins), before)  # the stand-ins that ran are the test's own, unchanged
 
 
 class ConfiguredEngineTests(unittest.TestCase):
@@ -314,5 +455,20 @@ class ConfiguredEngineTests(unittest.TestCase):
             self.assertTrue(any(e == "subprocess.Popen" for e, _ in events), events)
 
 
+def _report(result):
+    """The words a person reads after a run of this file: what was proven, and what was not."""
+    print()
+    if result.wasSuccessful() and not any("IdleDaemon" in str(t) for t, _ in result.skipped):
+        print("PROVEN (run-time): the idle daemon reached no address and looked up no name; the configured "
+              "engine reached only the address the person configured.")
+    else:
+        print("NOT PROVEN (run-time): a test failed or the idle daemon test did not run here; read above.")
+    print("Not covered by this proof:")
+    for line in NOT_COVERED:
+        print(f"  - {line}")
+
+
 if __name__ == "__main__":
-    unittest.main()
+    program = unittest.main(exit=False)
+    _report(program.result)
+    raise SystemExit(0 if program.result.wasSuccessful() else 1)

@@ -72,13 +72,14 @@ Losing it means making new permissions; it is not recoverable." The key is never
 answered, and no copy is made anywhere. The line is printed only at the end of a step that ended made,
 so it is said only for a key that is kept. A step (`install` or `upgrade`) that fails after it began to make
 the stores removes what it made, newest first: the stores, the folders made for them, the custody root, and
-a key made now together with the ledger made for it. The key is recorded when it is written: its folder is
-opened, never through a link at its own name, and held until the answer, and the key is recorded by its
-identity once the file at its name in that folder is the file at the key's path holding the bytes this step
-made. Each file is removed through the folder it was made in, and only while its name holds the very file
-made: it is renamed to a fresh name of the run in that folder, compared with the identity recorded, and only
-then unlinked (another program's file found so is put back at its name and kept), wherever the folder's path
-leads by then. A path the step could not remove is named in one more sentence of the same line, and a key no
+a key made now together with the ledger made for it. Each file is removed through the folder it was made in,
+and only while its name holds the very file made: it is renamed to a fresh name of the run in that folder,
+compared with the identity recorded when it was linked, and only then unlinked (another program's file found
+so is put back at its name and kept), wherever the folder's path leads by then. The key's folder is opened,
+never through a link at its own name, before the key is written and again after, and held until the answer:
+the key is removed at its path while the path still names the file read and that file holds the bytes this
+step made (which no other caller holds), and, in each of those folders that its path no longer leads to, so
+is every file named as the key or as a temporary file of it that holds those bytes. A path the step could not remove is named in one more sentence of the same line, and a key no
 longer at its name (moved or replaced while the command ran) in another, which says that what is at the path
 now is left as it is. A key of the person, found with its ledger, is never removed. The folders made by path
 for the key and the unit are left. Only a process ended between the key and the ledger (a power cut, a kill)

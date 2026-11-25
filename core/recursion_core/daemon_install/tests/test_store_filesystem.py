@@ -946,6 +946,15 @@ class TheReadmeSaysWhatTheInstallerDoesTests(unittest.TestCase):
             self.assertIn(new, text)
 
 
+    def test_the_readme_says_how_a_failed_step_finds_the_key_it_made(self):
+        with open(os.path.join(os.path.dirname(INSTALL.__file__), "README.md"), encoding="utf-8") as handle:
+            text = " ".join(handle.read().split())
+        self.assertNotIn("the key is recorded by its identity once the file at its name", text)
+        self.assertIn("The key's folder is opened, never through a link at its own name, before the key is written "
+                      "and again after, and held until the answer", text)
+        self.assertIn("every file named as the key or as a temporary file of it that holds those bytes", text)
+
+
 class OneReadingOfTheGroundTests(unittest.TestCase):
     """Every caller reads the disk through ``store_ground``; none reads the mount table or judges a path by text."""
 

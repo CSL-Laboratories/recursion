@@ -284,6 +284,8 @@ class GitInstallTests(GitCase):
         }])
         if backend_available():
             from recursion_core.daemon.plugins import PluginHost
+            from recursion_core.daemon.tests.plugin_fixture import ensure_revocation_store
+            ensure_revocation_store(self.state)
             host = PluginHost(self.config, self.state, gil_probe=FakeGilProbe())
             self.addCleanup(host.close)
             self.assertEqual(host.records[0]["state"], "loaded")
@@ -371,6 +373,8 @@ class EnableDisableRollbackTests(GitCase):
             "enabled": False,
         }])
         from recursion_core.daemon.plugins import PluginHost
+        from recursion_core.daemon.tests.plugin_fixture import ensure_revocation_store
+        ensure_revocation_store(self.state)
         host = PluginHost(self.config, self.state, gil_probe=FakeGilProbe())
         self.addCleanup(host.close)
         self.assertEqual(host.records, [])
@@ -381,6 +385,8 @@ class EnableDisableRollbackTests(GitCase):
         self.assertEqual(self.listed()["plugins"][0]["registry_label"], "non_verified")
         self.assertNotIn("enabled", self.listed()["plugins"][0])
         if backend_available():
+            from recursion_core.daemon.tests.plugin_fixture import ensure_revocation_store
+            ensure_revocation_store(self.state)
             host = PluginHost(self.config, self.state, gil_probe=FakeGilProbe())
             self.addCleanup(host.close)
             self.assertEqual(host.records[0]["state"], "loaded")

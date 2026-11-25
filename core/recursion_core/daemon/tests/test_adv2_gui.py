@@ -103,6 +103,7 @@ class Adv2HungPluginTests(GuiCase):
         config = self.tmp / 'config' / 'recursion'
         fx.write_install(config, grants=[fx.grant_for(HUNG_SOURCE)])
         fx.write_plugin(config / 'plugins' / 'hung', HUNG_SOURCE)
+        fx.ensure_revocation_store(self.tmp / 'state')
         self.host = plugins.PluginHost(config, self.tmp / 'state', gil_probe=FakeGilProbe(),
                                        verification_available=lambda: True)
         self.addCleanup(self.host.close)
@@ -155,6 +156,7 @@ class Adv2HungPluginTests(GuiCase):
         self.assertEqual([answer[0] for answer in first_answers], [200])
 
     def test_a_timed_out_call_answers_504_marks_the_plugin_degraded_and_no_second_call_is_made(self):
+        fx.ensure_revocation_store(self.tmp / 'state')
         host = plugins.PluginHost(self.tmp / 'config' / 'recursion', self.tmp / 'state', gil_probe=FakeGilProbe(),
                                   verification_available=lambda: True, operator_deadline_s=0.3)
         self.addCleanup(host.close)

@@ -103,6 +103,7 @@ class LabelLoadTests(unittest.TestCase):
         self.source = fx.OPERATOR_SOURCE
 
     def host(self):
+        fx.ensure_revocation_store(self.state)
         host = plugins.PluginHost(self.config, self.state, gil_probe=FakeGilProbe())
         self.addCleanup(host.close)
         return host
@@ -187,6 +188,7 @@ class LabelLoadTests(unittest.TestCase):
         omitted.close()
         fx.write_install(self.config, grants=[fx.grant_for(self.source, plugin_id='label.plain', permissions=PERMS)],
                          registry_labels={})
+        fx.ensure_revocation_store(self.tmp / 'state-empty')
         empty = plugins.PluginHost(self.config, self.tmp / 'state-empty', gil_probe=FakeGilProbe())
         self.addCleanup(empty.close)
         again = empty.records[0]
@@ -248,6 +250,7 @@ class LabelLoadTests(unittest.TestCase):
                 grants = [fx.grant_for(self.source, plugin_id=pid, permissions=PERMS)
                           for pid in ('label.x', 'label.lone')]
                 fx.write_install(config, grants=grants, registry_labels={_digest(manifest): 'verified'})
+                fx.ensure_revocation_store(state)
                 with self.assertLogs('recursion_core.daemon.plugins', 'ERROR'):
                     host = plugins.PluginHost(config, state, gil_probe=FakeGilProbe())
                 self.addCleanup(host.close)
@@ -291,6 +294,7 @@ class RunningDaemonLabelTests(unittest.TestCase):
                 expected[plugin_id] = label or 'unlisted'
             grants = [fx.grant_for(source, plugin_id=plugin_id, permissions=PERMS) for plugin_id in expected]
             fx.write_install(config, grants=grants, registry_labels=labels)
+            fx.ensure_revocation_store(case.state)
             _, composed = case.boot(plugin_options={'gil_probe': FakeGilProbe()})
             api = case.api(composed)
             listed = {row['plugin_id']: row for row in api.call('plugin.list')['plugins']}

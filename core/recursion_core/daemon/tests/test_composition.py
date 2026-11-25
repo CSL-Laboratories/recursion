@@ -760,6 +760,7 @@ class ComposedDaemonTest(unittest.TestCase):
         config = Path(self.environ['XDG_CONFIG_HOME']) / 'recursion'
         fx.write_install(config, trusted={'dev': key.public}, grants=[fx.grant_for(source, key=key)])
         fx.write_plugin(config / 'plugins' / 'fixture', source, key=key)
+        fx.ensure_revocation_store(self.state)
         return config / 'plugins' / 'fixture'
 
     def test_route_and_plugin_inventory_are_reads_of_the_running_daemon(self):

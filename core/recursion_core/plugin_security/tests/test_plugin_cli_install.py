@@ -401,6 +401,8 @@ class InstallCommandTests(ProfileCase):
         self.assertEqual(previous.read_bytes(), source)
         self.assertFalse((self.config / "plugins" / "fixture.unsigned").exists())
         from recursion_core.daemon.plugins import PluginHost
+        from recursion_core.daemon.tests.plugin_fixture import ensure_revocation_store
+        ensure_revocation_store(self.state)
         host = PluginHost(self.config, self.state, gil_probe=FakeGilProbe())
         self.addCleanup(host.close)
         self.assertEqual(host.records, [])
@@ -412,6 +414,8 @@ class InstallCommandTests(ProfileCase):
         self.install()
         from recursion_core.daemon import plugins
         from recursion_core.daemon import control_adapter as adapter
+        from recursion_core.daemon.tests.plugin_fixture import ensure_revocation_store
+        ensure_revocation_store(self.state)
         host = plugins.PluginHost(self.config, self.state, gil_probe=FakeGilProbe())
         self.addCleanup(host.close)
         self.assertEqual(host.records[0]["state"], "loaded")

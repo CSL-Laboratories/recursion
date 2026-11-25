@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 
 from recursion_core.plugin_security import canonical
 from recursion_core.plugin_security.signing import key_id
@@ -96,6 +97,38 @@ def write_install(config_dir, *, trusted=None, grants=(), **extra):
     path.write_text(json.dumps({'trusted_keys': dict(trusted or {}), 'grants': list(grants), **extra}))
     os.chmod(path, 0o600)
     return plugins
+
+
+def ensure_revocation_store(state_dir):
+    """Create the installer's revocation store when this test has not prepared one.
+
+    The daemon refuses ``revocation_store_missing`` rather than creating the file.
+    A directory the test already made unusable is left alone, so that test still
+    sees the daemon's own refusal. Returns the store path, or None when left alone.
+    """
+    from recursion_core.daemon.breaker import STORE_DIR
+    from recursion_core.daemon.plugins import REVOCATION_FILE
+    from recursion_core.plugin_security import create_revocation_store
+
+    directory = Path(state_dir) / STORE_DIR
+    path = directory / REVOCATION_FILE
+    try:
+        # A mode 000 folder raises on 3.12 while stating the file inside it.
+        # Leave that folder for the daemon's own refusal.
+        if path.is_symlink() or path.exists():
+            return str(path)
+        if directory.exists():
+            if directory.is_symlink() or not directory.is_dir():
+                return None
+            info = directory.stat()
+            if stat.S_IMODE(info.st_mode) & 0o077 or not os.access(directory, os.W_OK | os.X_OK):
+                return None
+    except OSError:
+        return None
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    create_revocation_store(str(path))
+    return str(path)
 
 
 def grant_for(source, *, key=None, plugin_id='fixture.operator', permissions=('read', 'panel'), **extra):

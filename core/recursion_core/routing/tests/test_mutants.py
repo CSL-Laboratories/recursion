@@ -605,7 +605,7 @@ MUTANTS = {
         "        elif done:  # the route was chosen or refused before this rule: routing never looked at its conditions\n"
         '            row.update(outcome="not_reached", reason=None)\n',
         "",
-        {"test_f2_rules_after_a_chosen_rule_are_not_reached",
+        {"test_rules_after_a_chosen_rule_are_not_reached",
          "test_rules_after_a_refused_rule_are_not_reached_whatever_their_conditions"}),
     # Each member's presence is asked from one walk of the decision and of its connection.
     "M114 every member's presence asked before any value is read": (

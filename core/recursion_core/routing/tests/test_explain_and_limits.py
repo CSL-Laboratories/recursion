@@ -255,7 +255,7 @@ class _ReadCounting(Mapping):
         return 1
 
 
-class ReviewRegressionTests(unittest.TestCase):
+class AnswerEdgeCaseTests(unittest.TestCase):
     """Edge cases of the answers: a wait on the breaker's retry time, a primary never offered again, a route with no
     model anywhere, refusal details that are code words, a task read once, and a snapshot that cannot be walked."""
 
@@ -369,7 +369,7 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual((d["ok"], d["model"]), (True, "explicit-model"))
 
 
-class ReviewTwoRegressionTests(unittest.TestCase):
+class NullAndUnreadableInputTests(unittest.TestCase):
     """A null hand pick, a null attempts list, an invalid limits block, an exhausted fallback list and anything that
     cannot be read is refused or answered with a typed word, never raised."""
 
@@ -491,7 +491,7 @@ class _Unreadable(Mapping):
         return 1
 
 
-class ReviewThreeRegressionTests(unittest.TestCase):
+class UnreadableDetectionParamsAndDecisionTests(unittest.TestCase):
     """A detection object, params, a decision or a limit result that cannot be read gives a typed refusal or no
     decision, never an exception."""
 
@@ -553,7 +553,7 @@ class ReviewThreeRegressionTests(unittest.TestCase):
                          "switch")
 
 
-class ReviewFourRegressionTests(unittest.TestCase):
+class WrongTypedDecisionAndMissingSnapshotTests(unittest.TestCase):
     """A decision that cannot be read or has a wrong-typed member is no decision; a missing snapshot is
     detection_unavailable; an attempt with a structured connection counts as tried."""
 
@@ -603,7 +603,7 @@ class ReviewFourRegressionTests(unittest.TestCase):
         self.assertEqual((out["action"], out["reason"], out["skipped"][0]["skipped"]), ("ask", "fallback_exhausted", "already_tried"))
 
 
-class ReviewFiveRegressionTests(unittest.TestCase):
+class DecisionMembersAndAttemptShapeTests(unittest.TestCase):
     """Each member of a decision is read inside the guard and has the type decide gives it; a bare connection word in
     attempts counts as tried; a wait time is a time or the retry time; ok is exactly True or False; attempts that are
     not a list name no attempt."""
@@ -732,7 +732,7 @@ class _EvilFloatInt(int):
         raise RuntimeError("float")
 
 
-class ReviewSixRegressionTests(unittest.TestCase):
+class UncomparableValuesAndFiniteWaitTests(unittest.TestCase):
     """Values that cannot be compared or formatted, and words that are str subclasses, give no decision and no
     attempt; an unreadable attempts entry is dropped without the limit; a wait time is finite; a published
     connection has its kind and id."""
@@ -870,7 +870,7 @@ class _LikeAMapping:
         return self.word
 
 
-class ReviewSevenRegressionTests(unittest.TestCase):
+class StrSubclassWordsAndJsonOnlyOutputTests(unittest.TestCase):
     """Words of the task and of the detection that are str subclasses are read as their text; tags that cannot be
     read are refused; route_decision publishes only what JSON takes; a mapping or a set of attempts names no
     attempt."""
@@ -1032,7 +1032,7 @@ class _Engines(Mapping):
         return list(self.pairs)
 
 
-class ReviewEightRegressionTests(unittest.TestCase):
+class RaisingTaskAndDuplicateEngineKeyTests(unittest.TestCase):
     """A task whose reading raises is refused even for an absent member, and two snapshot keys that read as one
     engine make the snapshot unusable."""
 
@@ -1113,7 +1113,7 @@ class DisappearingMemberTests(unittest.TestCase):
                 self.assertEqual(router.next_after_limit(cfg, {**d, "connection": connection}, LIMIT), control)
 
 
-class RequiredRegressionTests(unittest.TestCase):
+class StrSubclassConnectionIdAndUnknownReasonTests(unittest.TestCase):
     """route_decision refuses a connection id that is a str subclass; next_after_limit refuses a reason decide
     never gives."""
 
@@ -1131,10 +1131,10 @@ class RequiredRegressionTests(unittest.TestCase):
                          {"action": "none", "reason": "no_decision"})
 
 
-class SweepRegressionTests(unittest.TestCase):
+class RulesAfterAChosenOrRefusedRuleTests(unittest.TestCase):
     """Rules after a chosen or refused rule are not reached, whatever their conditions."""
 
-    def test_f2_rules_after_a_chosen_rule_are_not_reached(self) -> None:
+    def test_rules_after_a_chosen_rule_are_not_reached(self) -> None:
         out = router.explain(config(), SENTRY, {"task_kind": "review"})
         self.assertEqual(out["decision"]["engine"], "codex")
         self.assertEqual([row["outcome"] for row in out["rules"]], ["chosen", "not_reached", "not_reached"])
@@ -1161,7 +1161,7 @@ class _AskingDeletes(dict):
         return super().__contains__(key)
 
 
-class DeepSeekNineRegressionTests(unittest.TestCase):
+class NonMappingConnectionAndSingleWalkTests(unittest.TestCase):
     """A connection that is not a mapping is never walked, and each member's value is read from one walk of the
     decision and of its connection."""
 
@@ -1195,7 +1195,7 @@ class DeepSeekNineRegressionTests(unittest.TestCase):
         self.assertEqual(router.next_after_limit(self.cfg, {**self.d, "connection": connection}, LIMIT), self.control)
 
 
-class GrokTenRegressionTests(unittest.TestCase):
+class DaemonRefusedRouteIsPassedOverTests(unittest.TestCase):
     """A listed route the daemon refuses before launch is passed over for the next one."""
 
     def setUp(self) -> None:

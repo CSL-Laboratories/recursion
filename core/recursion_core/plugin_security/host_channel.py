@@ -37,8 +37,13 @@ later work):
   ``hello``; whether a program above an end takes a message that comes before it is that program's own rule.
 * Threads: one end may be used from several threads at once. What an end keeps (the next call id,
   the table of open calls, whether a ``hello`` or a ``bye`` came) is under ONE lock of that end, in
-  ``call``, ``load`` and ``receive``. No plugin function and no core request runs while the lock is
-  held, so a handler that calls on its own end never waits on it.
+  ``call``, ``load`` and ``receive``, held only around those values: no plugin function, no core
+  request, no refusal's words and nothing a caller handed in runs while it is held, so a handler that
+  calls on its own end never waits on it. What the interpreter itself may run between two lines (a
+  trace or profile function, a signal handler, a finalizer) can still run while the lock is held; a
+  request such code makes on the same end from that same thread is refused at once with
+  ``ChannelReentered`` (code ``end_reentered``) and never waits: nothing is taken or sent, and the
+  request the end was busy with goes on and gets its answer.
 * ``receive`` keeps the message it is handed, without a copy: the caller hands the message over and
   does not change it afterwards. ``decode`` makes a new object for every frame it reads.
 * Frame size: a ``load`` frame (daemon to host only) may be as large as the daemon's largest package
@@ -66,8 +71,8 @@ from .protocol import HOST
 __all__ = [
     "CALL_NAMES", "CHANNEL", "INVENTORY", "MAX_FRAME_BYTES", "MAX_LOAD_FRAME_BYTES", "MESSAGE_TYPES",
     "RESERVED_CALL_NAMES", "RESERVED_MESSAGE_TYPES", "RESERVED_RUN_ORIGINS", "RESERVED_TEXT", "REFUSAL_CODES",
-    "ChannelRefusal", "DaemonEnd", "HostEnd", "answer_call", "check_message", "decode", "encode", "frame_limit",
-    "refusal",
+    "ChannelReentered", "ChannelRefusal", "DaemonEnd", "HostEnd", "answer_call", "check_message", "decode", "encode",
+    "frame_limit", "refusal",
 ]
 
 CHANNEL = "csl-plugin-host/1"
@@ -128,6 +133,10 @@ _ENDED_SEND = "the channel ended with a bye: nothing more is sent on it; open a 
 _SECOND_HELLO = "hello: this channel's hello came already; each side sends one hello, first"
 _IDS_USED = (f"every call id up to {MAX_ID} is used on this channel, so no call is made; "
              "open a new channel to call again")
+_REENTERED = ("this end of the channel was entered again by the thread that is inside it already: a trace or "
+              "profile function, a signal handler or a finalizer ran while the end held its lock and made a request "
+              "on it. The request is refused at once and nothing was taken or sent; the request the end was busy "
+              "with goes on. Make this request after that code has returned, or hand it to another thread.")
 _SYSTEM_EXIT = ("SystemExit: the plugin's function tried to end the host process; the call is refused and the "
                 "host goes on. A plugin's function returns a value or raises an exception; it never ends the process.")
 
@@ -159,6 +168,21 @@ class ChannelRefusal(Exception):
                              "REFUSAL_CODES (host.v1.json x-refusal-codes)")
         super().__init__(f"{code}: {detail}" if detail else code)
         self.code, self.detail = code, detail
+
+
+class ChannelReentered(RuntimeError):
+    """A request on an end from the thread that is inside that end already, refused at once (module header).
+
+    ``code`` is ``end_reentered``. It is never a message on the channel and is not one of ``REFUSAL_CODES``:
+    nothing is taken and nothing is sent, so the peer never learns of it; the request the end was busy with
+    goes on and gets its answer. It is raised by ``call``, ``load`` and ``receive`` alike.
+    """
+
+    code = "end_reentered"
+
+    def __init__(self) -> None:
+        super().__init__(f"{self.code}: {_REENTERED}")
+        self.detail = _REENTERED
 
 
 def frame_limit(sender: str) -> int:
@@ -370,37 +394,66 @@ def answer_call(message: dict, handlers: Mapping[str, Callable[..., Any]]) -> di
     return {"type": "result", "id": message["id"], "value": value}
 
 
+# What stopped a request inside an end's lock: the words are made, and the exception raised, after it is let go.
+_STOP_ENDED, _STOP_FORM, _STOP_SECOND_HELLO, _STOP_SETTLE = 1, 2, 3, 4
+
+
 class _Order:
-    """What both ends hold alike: the channel's order and the one lock of an end (module header)."""
+    """What both ends hold alike: the channel's order and the one lock of an end (module header).
+
+    The lock is re-entrant only so that a request from the thread inside it never waits: every section under
+    it reads ``_depth`` first, and a section that finds it set changes nothing and is refused with
+    ``ChannelReentered`` once the lock is let go. Under the lock only the end's own plain values are read and
+    written (ints, flags, the set of open ids, the dict of answers); every refusal is made after it.
+    """
 
     def __init__(self, receiver: str) -> None:
-        self._receiver, self._lock, self._hello, self._ended = receiver, threading.Lock(), False, False
+        self._receiver, self._lock, self._depth = receiver, threading.RLock(), 0
+        self._hello, self._ended = False, False
 
-    def _take(self, message: object, settle: Callable[[dict], None] | None = None) -> dict | None:
+    def _take(self, message: object, settle: Callable[[dict], bool] | None = None) -> dict | None:
         """``message`` checked and taken in the channel's order, or ``ChannelRefusal``.
 
         ``None`` for a ``hello`` or a ``bye`` (nothing to answer). After a ``bye`` every message is refused,
-        whatever its form. ``settle(checked)`` runs under the end's lock for every other message.
+        whatever its form. ``settle(checked)`` runs under the end's lock for every other message and returns
+        True when the message is refused (it then changed nothing). From the thread inside this end already:
+        ``ChannelReentered``, and nothing is taken.
         """
         try:
             checked, form = check_message(message, receiver=self._receiver), None
         except ChannelRefusal as exc:
             checked, form = None, exc
+        stop = 0
         with self._lock:
-            if self._ended:
-                raise ChannelRefusal("message_invalid", _ENDED)
-            if form is not None:
-                raise form
-            if checked["type"] == "bye":
-                self._ended = True
-                return None
-            if checked["type"] == "hello":
-                if self._hello:
-                    raise ChannelRefusal("message_invalid", _SECOND_HELLO)
-                self._hello = True
-                return None
-            if settle is not None:
-                settle(checked)
+            busy = self._depth
+            if not busy:
+                try:
+                    self._depth = 1
+                    if self._ended:
+                        stop = _STOP_ENDED
+                    elif form is not None:
+                        stop = _STOP_FORM
+                    elif checked["type"] == "bye":
+                        self._ended, checked = True, None
+                    elif checked["type"] == "hello":
+                        if self._hello:
+                            stop = _STOP_SECOND_HELLO
+                        else:
+                            self._hello, checked = True, None
+                    elif settle is not None and settle(checked):
+                        stop = _STOP_SETTLE
+                finally:
+                    self._depth = 0
+        if busy:
+            raise ChannelReentered()
+        if stop == _STOP_ENDED:
+            raise ChannelRefusal("message_invalid", _ENDED)
+        if stop == _STOP_FORM:
+            raise form
+        if stop == _STOP_SECOND_HELLO:
+            raise ChannelRefusal("message_invalid", _SECOND_HELLO)
+        if stop == _STOP_SETTLE:
+            raise ChannelRefusal("message_invalid", f"result: id {checked['id']} answers no call this host sent")
         return checked
 
 
@@ -432,9 +485,19 @@ class DaemonEnd(_Order):
         package that does not fit one load frame. After a ``bye`` nothing is sent (``ValueError``)."""
         if plugin_id != self.plugin_id:
             raise ValueError("one channel per loaded plugin: a load names the plugin the channel was opened for")
+        ended = False
         with self._lock:
-            if self._ended:
-                raise ValueError(_ENDED_SEND)
+            busy = self._depth
+            if not busy:
+                try:
+                    self._depth = 1
+                    ended = self._ended
+                finally:
+                    self._depth = 0
+        if busy:
+            raise ChannelReentered()
+        if ended:
+            raise ValueError(_ENDED_SEND)
         if len(manifest) > MAX_MANIFEST_BYTES:
             raise ChannelRefusal("load_too_large", f"the manifest holds {len(manifest)} bytes; a manifest holds at most "
                                  f"{MAX_MANIFEST_BYTES} (MAX_MANIFEST_BYTES), so no load is sent")
@@ -483,26 +546,51 @@ class HostEnd(_Order):
     def __init__(self, handlers: Mapping[str, Callable[..., Any]]) -> None:
         super().__init__("host")
         self._handlers, self._open, self._next_id = handlers, set(), 0
-        self.answers: dict[int, dict] = {}
+        self._answers: dict[int, dict] = {}
+
+    @property
+    def answers(self) -> dict[int, dict]:
+        """What each open call got back (its ``result`` or ``refusal``), under its id. The end's own dict: read
+        it, never replace it (only the end writes it, under its lock)."""
+        return self._answers
 
     def call(self, name: str, args: Mapping[str, Any] | None = None) -> dict:
+        """One call the host sends, with the next id, kept open; ``ValueError`` after a ``bye`` or past
+        ``MAX_ID``; ``ChannelReentered`` from the thread inside this end already (no id is used)."""
+        stop, id_ = None, None
         with self._lock:
-            if self._ended:
-                raise ValueError(_ENDED_SEND)
-            if self._next_id > MAX_ID:
-                raise ValueError(_IDS_USED)
-            id_ = self._next_id
-            self._next_id += 1
-            self._open.add(id_)
+            busy = self._depth
+            if not busy:
+                try:
+                    self._depth = 1
+                    if self._ended:
+                        stop = _ENDED_SEND
+                    elif self._next_id > MAX_ID:
+                        stop = _IDS_USED
+                    else:
+                        id_ = self._next_id
+                        self._next_id = id_ + 1
+                        self._open.add(id_)
+                finally:
+                    self._depth = 0
+        if busy:
+            raise ChannelReentered()
+        if stop is not None:
+            raise ValueError(stop)
         return {"type": "call", "id": id_, "name": name, "args": dict(args or {})}
 
-    def _settle(self, checked: dict) -> None:
-        """Under the end's lock: a result or a refusal for an open call is taken, and only once."""
-        if checked["type"] == "result" and checked["id"] not in self._open:
-            raise ChannelRefusal("message_invalid", f"result: id {checked['id']} answers no call this host sent")
-        if checked["type"] in ("result", "refusal") and checked["id"] in self._open:
-            self._open.discard(checked["id"])
-            self.answers[checked["id"]] = checked
+    def _settle(self, checked: dict) -> bool:
+        """Under the end's lock: a result or a refusal for an open call is taken, and only once. True when a
+        result answers no open call (it is refused, after the lock, and nothing is taken)."""
+        kind = checked["type"]
+        if kind != "result" and kind != "refusal":
+            return False
+        id_ = checked["id"]
+        if id_ in self._open:
+            self._open.discard(id_)
+            self._answers[id_] = checked
+            return False
+        return kind == "result"
 
     def receive(self, message: object) -> dict | None:
         """The answer to one message from the daemon, or ``None``. The caller hands ``message`` over: it is

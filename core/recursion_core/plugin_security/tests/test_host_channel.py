@@ -11,6 +11,8 @@ import ast
 import base64
 import datetime
 import json
+import os
+import subprocess
 import sys
 import threading
 import unittest
@@ -1052,6 +1054,295 @@ class SchemaRootTests(unittest.TestCase):
         for value in self.BAD:
             with self.subTest(value=value):
                 self.assertFalse(validator.is_valid(value))
+
+
+# The re-entry probe runs in a process of its own, so that an end that waits on its own lock hangs only that
+# process, which the test ends at its bound. One line of JSON per scenario. argv[1] is the route: "trace" (a
+# trace function makes the request) or "signal" (a signal handler, raised by a trace function, makes it).
+REENTRY_PROBE = r'''
+import json, signal, sys
+from recursion_core.plugin_security import host_channel as hc
+
+route = sys.argv[1]
+FILE = hc.HostEnd.receive.__code__.co_filename
+
+
+class Core:
+    def client_for(self, caller):
+        return lambda request: b'{"ok":true}'
+
+
+def held(end):
+    owned = getattr(end._lock, "_is_owned", None)
+    return owned() if owned is not None else end._lock.locked()
+
+
+def probe(name, end, outer, inner, after):
+    seen, state = {}, {"fired": False}
+
+    def inside():
+        seen["held"] = held(end)
+        try:
+            seen["inner"] = repr(inner())
+        except BaseException as exc:
+            seen.update(error=type(exc).__name__, code=getattr(exc, "code", None), words=str(exc))
+
+    def tick():
+        return None
+
+    def tracer(frame, event, arg):
+        if not state["fired"] and frame.f_code.co_filename == FILE and held(end) and getattr(end, "_depth", True):
+            state["fired"] = True
+            if route == "trace":
+                inside()
+            else:
+                signal.raise_signal(signal.SIGINT)
+                tick()
+        return tracer
+
+    signal.signal(signal.SIGINT, lambda signum, frame: inside())
+    sys.settrace(tracer)
+    try:
+        answer = outer()
+    finally:
+        sys.settrace(None)
+    print(json.dumps(dict(seen, name=name, answer=answer, after=after())), flush=True)
+
+
+def result(id_):
+    return {"type": "result", "id": id_, "value": 1}
+
+
+def core(id_):
+    return {"type": "core", "id": id_, "bytes_b64": "e30="}
+
+
+host = hc.HostEnd({})
+probe("host-call-call", host, lambda: host.call("registry"), lambda: host.call("registry"),
+      lambda: {"next_id": host._next_id, "open": sorted(host._open)})
+host = hc.HostEnd({})
+first = host.call("registry")["id"]
+probe("host-receive-call", host, lambda: host.receive(result(first)), lambda: host.call("registry"),
+      lambda: {"next_id": host._next_id, "open": sorted(host._open), "answers": sorted(host.answers)})
+host = hc.HostEnd({})
+first, second = host.call("registry")["id"], host.call("registry")["id"]
+probe("host-receive-receive", host, lambda: host.receive(result(first)), lambda: host.receive(result(second)),
+      lambda: {"next_id": host._next_id, "open": sorted(host._open), "answers": sorted(host.answers)})
+daemon = hc.DaemonEnd("demo.plugin", Core())
+probe("daemon-receive-load", daemon, lambda: daemon.receive(core(3)),
+      lambda: daemon.load("demo.plugin", b"{}", {hc.ARTIFACT: b"x"}), lambda: {"ended": daemon._ended})
+daemon = hc.DaemonEnd("demo.plugin", Core())
+probe("daemon-receive-receive", daemon, lambda: daemon.receive(core(3)), lambda: daemon.receive(core(4)),
+      lambda: {"ended": daemon._ended})
+'''
+
+
+def lock_held(end):
+    """The end's lock is held by this thread (an RLock says so itself; a plain Lock held at all, in one thread)."""
+    owned = getattr(end._lock, "_is_owned", None)
+    return owned() if owned is not None else end._lock.locked()
+
+
+def run_reentry_probe(test, route, bound):
+    env = dict(os.environ)
+    core_dir = str(Path(hc.__file__).resolve().parents[2])
+    env["PYTHONPATH"] = core_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    try:
+        done = subprocess.run([sys.executable, "-c", REENTRY_PROBE, route], env=env, capture_output=True, text=True,
+                              timeout=bound)
+    except subprocess.TimeoutExpired as exc:
+        test.fail(f"{route}: a request from inside an end waited on that end's lock past {bound} s "
+                  f"(the probe process was ended); it had reported: {exc.stdout!r}")
+    test.assertEqual(done.returncode, 0, done.stderr[-2000:])
+    return {line["name"]: line for line in map(json.loads, done.stdout.splitlines())}
+
+
+class ReentryTests(unittest.TestCase):
+    """A request made on an end by the thread that is inside it already is refused at once, never waited for."""
+
+    BOUND = 60  # seconds for one probe process: a test's own bound, not a setting
+
+    AFTER = {  # what each end holds after the outer request: the inner one took nothing
+        "host-call-call": {"next_id": 1, "open": [0]},
+        "host-receive-call": {"next_id": 1, "open": [], "answers": [0]},
+        "host-receive-receive": {"next_id": 2, "open": [1], "answers": [0]},
+        "daemon-receive-load": {"ended": False},
+        "daemon-receive-receive": {"ended": False},
+    }
+    ANSWER = {
+        "host-call-call": {"type": "call", "id": 0, "name": "registry", "args": {}},
+        "host-receive-call": None,
+        "host-receive-receive": None,
+        "daemon-receive-load": {"type": "core", "id": 3, "bytes_b64": "eyJvayI6dHJ1ZX0="},
+        "daemon-receive-receive": {"type": "core", "id": 3, "bytes_b64": "eyJvayI6dHJ1ZX0="},
+    }
+
+    def check_route(self, route):
+        lines = run_reentry_probe(self, route, self.BOUND)
+        self.assertEqual(sorted(lines), sorted(self.AFTER))
+        for name, line in lines.items():
+            with self.subTest(route=route, scenario=name):
+                self.assertTrue(line.get("held"), "the inner request ran while the end held its lock")
+                self.assertEqual(line.get("error"), "ChannelReentered", line)
+                self.assertEqual(line.get("code"), "end_reentered")
+                self.assertIn("entered again by the thread that is inside it already", line["words"])
+                self.assertIn("nothing was taken or sent", line["words"])
+                self.assertIn("Make this request after that code has returned, or hand it to another thread",
+                              line["words"])
+                self.assertEqual(line["answer"], self.ANSWER[name])
+                self.assertEqual(line["after"], self.AFTER[name])
+
+    def test_a_trace_function_that_makes_a_request_on_the_end_it_is_inside_is_refused_at_once(self):
+        self.check_route("trace")
+
+    def test_a_signal_handler_that_makes_a_request_on_the_end_it_is_inside_is_refused_at_once(self):
+        self.check_route("signal")
+
+    def test_the_refusal_of_a_reentry_has_its_own_code_and_is_never_a_message_on_the_channel(self):
+        exc = hc.ChannelReentered()
+        self.assertIsInstance(exc, RuntimeError)
+        self.assertNotIsInstance(exc, hc.ChannelRefusal)
+        self.assertEqual(exc.code, "end_reentered")
+        self.assertNotIn(exc.code, hc.REFUSAL_CODES)
+        self.assertNotIn(exc.code, schema()["x-refusal-codes"])
+        self.assertIn("ChannelReentered", hc.__all__)
+        self.assertTrue(str(exc).startswith("end_reentered: "))
+        header = " ".join(hc.__doc__.split())
+        self.assertIn("is refused at once with ``ChannelReentered`` (code ``end_reentered``) and never waits", header)
+        self.assertNotIn("No plugin function and no core request runs while the lock is held", header)
+
+    def test_another_thread_waits_for_the_lock_and_is_never_refused(self):
+        host, inside, go, got, errors = hc.HostEnd({}), threading.Event(), threading.Event(), {}, []
+
+        def tracer(frame, event, arg):
+            if not inside.is_set() and frame.f_code is hc.HostEnd.call.__code__ and lock_held(host):
+                inside.set()
+                go.wait(self.BOUND)
+            return tracer
+
+        def first():
+            sys.settrace(tracer)
+            try:
+                got["first"] = host.call("registry")
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+            finally:
+                sys.settrace(None)
+
+        def second():
+            try:
+                got["second"] = host.call("registry")
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+        a = threading.Thread(target=first, daemon=True)
+        a.start()
+        self.assertTrue(inside.wait(self.BOUND))
+        b = threading.Thread(target=second, daemon=True)
+        b.start()
+        go.set()
+        a.join(self.BOUND)
+        b.join(self.BOUND)
+        self.assertFalse(a.is_alive() or b.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted([got["first"]["id"], got["second"]["id"]]), [0, 1])
+
+
+class LockWalkTests(unittest.TestCase):
+    """Every line run under an end's lock touches only the end's own plain values: nothing a caller gave runs there."""
+
+    ALLOWED_CALLS = {"self._open.add", "self._open.discard", "settle"}
+
+    def locked_statements(self):
+        tree = ast.parse(Path(hc.__file__).read_text(encoding="utf-8"))
+        found = {}
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            bodies = [node.body for node in ast.walk(fn) if isinstance(node, ast.With)
+                      and any(ast.unparse(item.context_expr) == "self._lock" for item in node.items)]
+            if fn.name == "_settle":
+                bodies.append(fn.body[1:] if isinstance(fn.body[0], ast.Expr) else fn.body)
+            for body in bodies:
+                for stmt in body:
+                    found.setdefault(fn.name, []).extend(node for node in ast.walk(stmt) if isinstance(node, ast.stmt))
+        return found
+
+    def test_every_statement_under_the_lock_calls_only_the_ends_own_set_and_makes_no_words(self):
+        found = self.locked_statements()
+        self.assertEqual(sorted(found), ["_settle", "_take", "call", "load"])
+        for name, stmts in found.items():
+            for stmt in stmts:
+                for node in ast.walk(stmt):
+                    with self.subTest(function=name, line=stmt.lineno):
+                        self.assertNotIsInstance(node, (ast.Raise, ast.JoinedStr, ast.Lambda, ast.Await, ast.Yield,
+                                                        ast.YieldFrom, ast.Assert, ast.Delete, ast.Import))
+                        if isinstance(node, ast.Call):
+                            self.assertIn(ast.unparse(node.func), self.ALLOWED_CALLS)
+
+    def test_every_line_run_under_the_lock_reaches_no_code_but_the_ends_own(self):
+        found = self.locked_statements()
+        want = {(name, stmt.lineno) for name, stmts in found.items() for stmt in stmts if not isinstance(stmt, ast.Try)}
+        filename = hc.HostEnd.receive.__code__.co_filename
+
+        class Core:
+            def client_for(self, caller):
+                return lambda request: b'{"ok":true}'
+        host = hc.HostEnd({"registry": lambda: {"r": 1}})
+        daemon = hc.DaemonEnd("demo.plugin", Core())
+        ends = (host, daemon)
+        load = hc.decode(daemon.load("demo.plugin", b"{}", {ARTIFACT: b"x"})[4:], sender="daemon")
+        lines, frames, c_calls = set(), [], []
+
+        def held():
+            return any(lock_held(end) for end in ends)
+
+        def tracer(frame, event, arg):
+            if event == "line" and frame.f_code.co_filename == filename and held():
+                lines.add((frame.f_code.co_name, frame.f_lineno))
+            return tracer
+
+        def profiler(frame, event, arg):
+            if held():
+                if event == "call":
+                    frames.append(frame.f_code)
+                elif event == "c_call":
+                    c_calls.append(arg)
+
+        def scenario():
+            hello = {"type": "hello", "channel": hc.CHANNEL}
+            host.receive(hello)
+            host.receive(hello)
+            first, second = host.call("registry")["id"], host.call("registry")["id"]
+            host.receive({"type": "result", "id": first, "value": 1})
+            host.receive({"type": "refusal", "id": second, "code": "call_failed", "detail": ""})
+            host.receive({"type": "result", "id": 999, "value": 1})
+            host.receive({"type": "refusal", "id": None, "code": "message_invalid", "detail": ""})
+            host.receive(call("registry"))
+            host.receive({"type": "nope"})
+            host.receive(load)
+            host._next_id = hc.MAX_ID + 1
+            with self.assertRaises(ValueError):
+                host.call("registry")
+            daemon.receive({"type": "core", "id": 3, "bytes_b64": "e30="})
+            host.receive({"type": "bye", "reason": "done"})
+            host.receive({"type": "result", "id": first, "value": 1})
+            with self.assertRaises(ValueError):
+                host.call("registry")
+            daemon.receive({"type": "bye", "reason": "done"})
+            with self.assertRaises(ValueError):
+                daemon.load("demo.plugin", b"{}", {ARTIFACT: b"x"})
+        sys.settrace(tracer)
+        sys.setprofile(profiler)
+        try:
+            scenario()
+        finally:
+            sys.setprofile(None)
+            sys.settrace(None)
+        self.assertEqual(want - lines, set(), "every line under the lock was run by the walk")
+        self.assertEqual({code.co_name for code in frames}, {"_settle"})
+        self.assertTrue(all(code is hc.HostEnd._settle.__code__ for code in frames))
+        own = [id(end._lock) for end in ends] + [id(host._open)]
+        self.assertEqual([repr(fn) for fn in c_calls if id(getattr(fn, "__self__", None)) not in own], [])
 
 
 if __name__ == "__main__":

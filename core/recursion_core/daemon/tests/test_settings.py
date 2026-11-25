@@ -1918,7 +1918,7 @@ class AKeyIsCappedAndACutKeyCarriesItsDigest(_Folder):
         self.assertIn(f"digest {_sha(big)})", detail)
 
     def test_the_digest_length_is_the_row_status_digest_chars(self) -> None:
-        key = "k" * 99 + "a"
+        key = "k" * 199 + "a"  # long enough to be cut under a cap of 160, which leaves room for 64 hex characters
         self.put(f"version = 1\n{key} = 1\n")
         loaded = settings.load(self.environ)
         self.assertIn("status.digest_chars = 8 (default 8; source: default; advised: at most 64)",
@@ -1926,7 +1926,7 @@ class AKeyIsCappedAndACutKeyCarriesItsDigest(_Folder):
         self.assertIn(f"digest {_sha(key)})", loaded.notes[0].detail)
         for chars, shown in ((6, 6), (12, 12), (64, 64), (65, 64), (1000, 64)):
             with self.subTest(chars=chars):
-                self.put(f"version = 1\n{key} = 1\n[status]\ndigest_chars = {chars}\n")
+                self.put(f"version = 1\n{key} = 1\n[status]\ndigest_chars = {chars}\nvalue_max_chars = 160\n")
                 loaded = settings.load(self.environ)
                 self.assertEqual(chars, loaded["status.digest_chars"])
                 self.assertRegex(loaded.notes[0].detail, r"digest " + _sha(key, shown) + r"\)")
@@ -1958,6 +1958,95 @@ class AKeyIsCappedAndACutKeyCarriesItsDigest(_Folder):
         for detail in hidden:
             for piece in (short, long_, "ghp_", "A1b2", "C3d4", str(len(short)), str(len(long_)), "digest"):
                 self.assertNotIn(piece, detail)
+
+    def test_the_digest_of_a_cut_key_is_made_without_the_sign_in_of_an_address(self) -> None:
+        # Two keys that differ only in the password of an address show the same line, and the digest is that of
+        # the text with the sign-in taken out (the same removal the shown form uses): no trace of the password.
+        for head, tail in (("https://admin:", "@dbhost/" + "p" * 100), ("p" * 100 + " admin:", "@dbhost")):
+            with self.subTest(scheme=head.startswith("https")):
+                keys = [head + word + tail for word in ("S3cretpass", "Hunter2pass")]
+                details = []
+                for key in keys:
+                    self.put(f'version = 1\n"{key}" = 1\n')
+                    details.append(settings.load(self.environ).notes[0].detail)
+                self.assertEqual(details[0], details[1])
+                free = keys[0].replace("admin:S3cretpass", "<sign-in hidden>")
+                self.assertIn(f" more, digest {_sha(free)})", details[0])
+                for key, word in zip(keys, ("S3cretpass", "Hunter2pass")):
+                    self.assertNotIn(_sha(key), details[0])
+                    self.assertNotIn(word, details[0])
+
+    def test_a_key_like_password_inside_the_sign_in_never_enters_the_digest(self) -> None:
+        # The raw text holds a run that looks like a key, but only inside the sign-in: the name is shown cut,
+        # and its digest is made of the text without that sign-in.
+        word = "A1b2" * 6
+        key = "https://admin:" + word + "@dbhost/" + "p" * 100
+        self.put(f'version = 1\n"{key}" = 1\n')
+        detail = settings.load(self.environ).notes[0].detail
+        self.assertIn(f" more, digest {_sha(key.replace('admin:' + word, '<sign-in hidden>'))})", detail)
+        self.assertNotIn(_sha(key), detail)
+        self.assertNotIn("A1b2", detail)
+
+    def test_a_long_name_whose_tail_looks_like_a_key_is_hidden_whole_with_no_digest(self) -> None:
+        # What the look-alike rule hides is never hashed: the whole name is hidden and carries its ordinal only,
+        # also where the part that looks like a key stands past the cap.
+        for tail in ("A1b2" * 6, " password hunter2pass"):
+            with self.subTest(tail=tail[:5]):
+                key = "a" * 100 + tail
+                self.put(f'version = 1\n"{key}" = 1\n')
+                detail = settings.load(self.environ).notes[0].detail
+                self.assertTrue(detail.startswith("<hidden key-like name 1 of this file> "), detail)
+                for piece in ("digest", "aaaa", tail.strip()[:4], str(len(key))):
+                    self.assertNotIn(piece, detail)
+
+    def test_a_value_under_any_name_never_enters_the_digest_of_its_key(self) -> None:
+        # The words of status.hidden_names hide values, never names: an unknown key that holds such a word is
+        # shown cut with the digest of the key alone, and its value is neither shown nor hashed.
+        key, secret = "a" * 100 + "_password", "s3cretvalue1"
+        self.put(f'version = 1\n{key} = "{secret}"\n')
+        detail = settings.load(self.environ).notes[0].detail
+        self.assertIn(f" more, digest {_sha(key)})", detail)
+        self.assertNotIn(secret, detail)
+        self.assertNotIn(_sha(f"{key} = {secret}"), detail)
+
+    def test_a_cut_key_holds_the_cap_and_part_of_the_key_for_every_pair_of_cap_and_digest_length(self) -> None:
+        # The case of the read: caps 40 and 80, digest lengths 16, 32 and 64, keys of 100 and 60000.
+        for size in (100, 60000):
+            key = "k" * (size - 1) + "a"
+            for cap in (40, 80):
+                for chars in (16, 32, 64):
+                    with self.subTest(size=size, cap=cap, chars=chars):
+                        self.put(f"version = 1\n{key} = 1\n[status]\nvalue_max_chars = {cap}\n"
+                                 f"digest_chars = {chars}\n")
+                        detail = settings.load(self.environ).notes[0].detail
+                        head = detail[:-len(UNKNOWN_WORDS)]
+                        self.assertTrue(detail.endswith(UNKNOWN_WORDS), detail)
+                        self.assertLessEqual(len(head), cap)
+                        self.assertTrue(head.startswith("'kkkkkkkk"), head)
+        # Every pair the two rows allow, walked: each cap from its least 40 to 200, each digest length from its
+        # least 6 to past the whole digest; keys of either side of the cap, long, and of the file's most bytes.
+        pattern = re.compile(r"^(.*)\.\.\. \((\d+) more, digest ([0-9a-f]+)\)$")
+        for cap in range(40, 201):
+            for chars in (*range(6, 73), 10 ** 18):
+                sizes = (cap - 3, cap - 2, cap - 1, cap + 40, 1000)
+                if chars in (6, 8, 16, 64, 10 ** 18):
+                    sizes += (60000, settings.MAX_BYTES)
+                for size in sizes:
+                    key = "k" * (size - 1) + "a"
+                    shown = settings._shown(key, cap, key=chars)
+                    if len(repr(key)) <= cap:
+                        self.assertEqual(repr(key), shown)
+                        continue
+                    found = pattern.match(shown)
+                    self.assertIsNotNone(found, (cap, chars, size, shown))
+                    kept, more, digest = found.group(1), int(found.group(2)), found.group(3)
+                    self.assertLessEqual(len(shown), cap, (cap, chars, size))
+                    self.assertTrue(kept.startswith("'kkkkkkkk"), (cap, chars, size, shown))
+                    self.assertEqual(len(repr(key)), len(kept) + more, (cap, chars, size))
+                    self.assertGreaterEqual(len(digest), 6)
+                    self.assertEqual(_sha(key, len(digest)), digest)
+                    if len(digest) < min(chars, 64):  # shortened only where the cap leaves no more room
+                        self.assertLessEqual(len(kept), 10, (cap, chars, size, shown))
 
     def test_a_second_start_in_one_process_with_no_earlier_handler_writes_each_start_line_once(self) -> None:
         self.put(OFF)

@@ -65,7 +65,7 @@
           "type": "integer",
           "minimum": 6,
           "default": 8,
-          "description": "How many hex characters of the SHA-256 digest of a key's whole text a key cut at the cap carries in a note, so two long keys that differ only past the cap read apart; a key that fits the cap carries none. The least is 6, since below it two keys read the same too often; past 64, the whole digest, nothing more is shown, so 64 is the advised most."
+          "description": "How many hex characters of the SHA-256 digest of a key's text, with the sign-in of any address in it taken out, a key cut at the cap carries in a note, so two long keys that differ only past the cap read apart; a key that fits the cap carries none. The least is 6, since below it two keys read the same too often; past 64, the whole digest, nothing more is shown, so 64 is the advised most. A cut key carries only as many as fit the cap beside its first 8 characters, and never fewer than 6."
         }
       },
       "additionalProperties": true

@@ -37,8 +37,9 @@ The rules this module keeps:
   return goes through the cap of the row ``status.value_max_chars`` (80 characters as shipped, 40 at least;
   ``"none"`` shows every value whole): a text past it is cut and the characters not shown are counted, and
   a list keeps the names that fit whole and counts the rest. A key of the file is capped the same way; a key
-  that is cut carries the first characters of the SHA-256 of its whole text, said to be a digest (the row
-  ``status.digest_chars``, 8 as shipped), so two keys never read the same; a key that fits is shown whole.
+  that is cut carries the first characters of the SHA-256 of its text with the sign-in of any address taken
+  out, said to be a digest (the row ``status.digest_chars``, 8 as shipped, as many as fit the cap beside the
+  key's first 8 characters, 6 at least), so two keys never read the same; a key that fits is shown whole.
 * NEVER SHOWN, under any cap and under ``"none"``, not in part and not by its length: the value of a
   setting whose name holds a word of the row ``status.hidden_names`` (the first net: by name, whatever the
   value looks like); the sign-in of a web address, what stands between the scheme and the host, also
@@ -109,6 +110,9 @@ _HIDDEN_SIGN_IN = "<sign-in hidden>"
 # A key of the file that looks like a key or a password: its ordinal among such keys by the file's order, equal
 # between two starts of the same file; no digest, no length and no character of its text.
 _HIDDEN_KEY_NAME = "<hidden key-like name {} of this file>"
+# A cut key keeps this many characters of its shown text (the opening quote and 8 of the key) before its digest;
+# the digest takes what is left of the cap, never less than the least of status.digest_chars. To become a row.
+_KEY_KEPT = 9
 # A text is never shown when it holds a run of this many letters and digits of two kinds or more, a known
 # key prefix or a password label followed by this many more characters, or a PEM block. Each figure is to
 # become a row of the settings file.
@@ -170,10 +174,11 @@ _SHOWN_NAMES_ROW = Setting(
     "sign-in of an address stay hidden in such a value.")
 _DIGEST_CHARS_ROW = Setting(
     DIGEST_CHARS, int, 8,
-    "How many hex characters of the SHA-256 digest of a key's whole text a key cut at the cap carries in "
-    "a note, so two long keys that differ only past the cap read apart; a key that fits the cap carries n"
-    "one. The least is 6, since below it two keys read the same too often; past 64, the whole digest, not"
-    "hing more is shown, so 64 is the advised most.",
+    "How many hex characters of the SHA-256 digest of a key's text, with the sign-in of any address in it "
+    "taken out, a key cut at the cap carries in a note, so two long keys that differ only past the cap read "
+    "apart; a key that fits the cap carries none. The least is 6, since below it two keys read the same too "
+    "often; past 64, the whole digest, nothing more is shown, so 64 is the advised most. A cut key carries "
+    "only as many as fit the cap beside its first 8 characters, and never fewer than 6.",
     floor=6, advice=(None, 64))
 SETTINGS: tuple[Setting, ...] = (
     Setting("plugin_host.gil_check", bool, True,
@@ -334,8 +339,8 @@ def _piece(value: object) -> str:
 
 
 def _digest(text: str, chars: int) -> str:
-    """The first ``chars`` hex characters of the SHA-256 of the whole ``text`` as the file holds it (UTF-8), so
-    that two keys cut at the same place never read the same."""
+    """The first ``chars`` hex characters of the SHA-256 of ``text`` (UTF-8), so that two keys cut at the same
+    place never read the same. ``_shown`` gives it the key's text with the sign-in of any address taken out."""
 
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:chars]
 
@@ -351,6 +356,9 @@ def _cut(text: str, cap: object, rest: int, names: bool, digest: str = "") -> st
             return f"... ({more} more, digest {digest})"
         return f"... ({more} more character{'' if more == 1 else 's'} not shown)"
 
+    if digest:  # as many digest characters as fit beside the key's first characters, never fewer than the least
+        room = cap - len(f"... ({len(text)} more, digest )") - _KEY_KEPT
+        digest = digest[:max(_DIGEST_CHARS_ROW.floor, room)]  # at the least cap every key of MAX_BYTES keeps 8
     keep = max(0, cap - len(said(len(text))))  # the count fits inside the cap
     return f"{text[:keep]}{said(len(text) - keep)}"
 
@@ -364,9 +372,11 @@ def _shown(value: object, cap: object = None, hidden: bool = False, key: bool | 
     whole, never cut inside a name, and counts the rest. With ``hidden`` (the setting's name holds a word of
     ``status.hidden_names``) the value is never shown; the sign-in of an address and a text that looks like a
     key or a password are never shown either (``_piece``): the look-alike rule is only a second net. With
-    ``key`` (the value is a key of the file) a cut text carries a short digest of the whole key, so that two
-    keys cut at the same place never read the same; a key that fits the cap is shown whole. The digest has as
-    many hex characters as ``key`` says (the row ``status.digest_chars``), its shipped value when True."""
+    ``key`` (the value is a key of the file) a cut text carries a short digest of the key's text with the
+    sign-in of any address taken out, so that two keys cut at the same place never read the same and nothing
+    of a sign-in enters the hash; a key that fits the cap is shown whole. The digest has as many hex characters
+    as ``key`` says (the row ``status.digest_chars``), its shipped value when True, or as fit the cap beside the
+    key's first characters, never fewer than the row's least."""
 
     cap = _VALUE_MAX_CHARS_ROW.default if cap is None else cap
     text, names, rest = (_HIDDEN_NAME if hidden else _piece(value)), [], 0
@@ -382,7 +392,8 @@ def _shown(value: object, cap: object = None, hidden: bool = False, key: bool | 
         rest = len(value) - len(names)
         text = "[" + ", ".join(names) + "]"
     chars = _DIGEST_CHARS_ROW.default if key is True else key
-    return _cut(text, cap, rest, bool(names), _digest(str.__str__(value), chars) if key and isinstance(value, str) else "")
+    digest = _digest(_without_sign_in(str.__str__(value)), chars) if key and isinstance(value, str) else ""
+    return _cut(text, cap, rest, bool(names), digest)
 
 
 def _allows_no_limit(row: Setting) -> bool:

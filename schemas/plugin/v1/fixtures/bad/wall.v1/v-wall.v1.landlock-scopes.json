@@ -1,0 +1,34 @@
+{
+  "reads_outside": true,
+  "home_canary": true,
+  "program_start": true,
+  "new_socket": true,
+  "signal_other": true,
+  "signal_other_ways": true,
+  "metadata_change": true,
+  "kernel_surface": true,
+  "writes": {
+    "open_for_write": "refused_by_landlock",
+    "truncate": "refused_by_landlock",
+    "create_file": "refused_by_landlock",
+    "create_folder": "refused_by_landlock",
+    "make_fifo": "refused_by_landlock",
+    "make_symlink": "refused_by_landlock",
+    "make_link": "refused_by_landlock",
+    "make_char_device": "refused_by_landlock",
+    "make_block_device": "refused_by_landlock",
+    "remove_file": "refused_by_landlock",
+    "remove_folder": "refused_by_landlock"
+  },
+  "writes_not_tried": {
+    "make_socket_node": "a socket file is made only by binding a new socket, and the wall refuses every new socket first (new_socket)",
+    "device_ioctl": "a device's own commands need a device opened, and the wall lets nothing be opened outside the install, where no device lies (reads_outside)",
+    "move_between_folders": "a move or a link into another folder also makes a name there, which the make kinds show refused"
+  },
+  "landlock_abi": 3,
+  "landlock_scopes": [
+    "network"
+  ],
+  "arch": "x86_64",
+  "proven": true
+}

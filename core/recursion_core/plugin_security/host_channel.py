@@ -68,7 +68,7 @@ MESSAGE_TYPES: dict[str, tuple[frozenset, frozenset]] = {
     "bye": (frozenset({"daemon", "host"}), frozenset({"type", "reason"})),
 }
 # (message type, sender) -> fields that sender may add. host.v1.json x-message-types.optional_from.
-OPTIONAL_MESSAGE_FIELDS = {("hello", "daemon"): frozenset({"gil_check"})}
+OPTIONAL_MESSAGE_FIELDS = {("hello", "daemon"): frozenset({"gil_check"}), ("hello", "host"): frozenset({"wall"})}
 
 # The ONE append-only list of call names, each with the arguments it takes, in order. host.v1.json
 # x-call-names. A later surface kind is a new name here, never a new message type.
@@ -94,7 +94,7 @@ INVENTORY: dict[str, tuple[str, str | None]] = {
 }
 REFUSAL_CODES = ("message_invalid", "message_unknown", "message_reserved", "message_wrong_side", "caller_forged",
                  "call_unknown", "call_reserved", "call_args_invalid", "call_not_offered", "call_failed",
-                 "host_gil_enabled", "host_start_refused", "load_too_large")
+                 "host_gil_enabled", "host_start_refused", "plugin_wall_unproven", "load_too_large")
 
 SIDES = ("daemon", "host")
 MAX_ID = 2 ** 53 - 1
@@ -197,6 +197,8 @@ def _check_fields(kind: str, message: dict) -> None:
             raise bad("channel")
         if "gil_check" in message and message["gil_check"] not in ("on", "off"):
             raise bad("gil_check")
+        if "wall" in message and type(message["wall"]) is not dict:
+            raise bad("wall")
     elif kind == "load":
         plugin_id = message["plugin_id"]
         if type(plugin_id) is not str or not _PLUGIN_ID.fullmatch(plugin_id) or plugin_id == HOST:

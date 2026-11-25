@@ -8,8 +8,20 @@ core requests only from the plugin's own thread) keep an honest plugin in order;
 boundary. The boundary is on the daemon's side, which must check every request that arrives on the
 channel against that plugin's grant and must take no result on trust (the daemon's reader of this
 channel is a later draft and that rule is its first requirement), and the wall around the process,
-which limits what the process can do to the machine. With this draft alone, do not run a plugin you
-do not trust.
+which limits what the process can do to the machine.
+
+The wall. Before it reads its first load, the host walls itself in (``wall_linux.apply_wall``, with the
+Python install as the only path it may read) and proves that wall from inside (``wall_linux.probe_wall``,
+with a canary file it writes in its own working folder just before the wall and its starter as the other
+process); its hello carries the record (``wall.v1``). The probe also tries each kind of write on that canary and in a
+write folder made beside it for the purpose; both are gone again before any plugin byte runs, and a host that finds
+either still there after its helper ended refuses every load.
+A host whose record is not proven, or whose wall was refused, answers every load with
+``plugin_wall_unproven`` naming what is missing, loads nothing and runs no plugin byte. Nothing on
+the channel, in a manifest, in a file or in a setting reaches that step: it runs once, before the host
+reads any message, and nothing here offers a way around it. Outside Linux there is no wall, so no load
+is ever taken there. Until the daemon's reader of this channel exists, do not run a plugin you do not
+trust.
 """
 
 from __future__ import annotations
@@ -17,6 +29,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import shutil
 import sys
 import types
 from collections import deque
@@ -29,6 +42,8 @@ from recursion_core.control_transport.framing import HEADER
 from recursion_core.plugin_security import host_channel as hc
 from recursion_core.plugin_security.limits import ARTIFACT
 from recursion_core.plugin_security.runtime import GilProbe
+
+from . import wall_linux
 
 # This becomes a setting in the person's own settings file. The daemon alone passes it.
 DEFAULT_GIL_CHECK = "on"
@@ -61,6 +76,144 @@ RESTARTED = "--restarted-once"
 START_REFUSED = "host_start_refused"
 EXIT_RESTART_FAILED = 71
 EXIT_ENVIRONMENT_NOT_CLEAN = 78
+
+# A host whose own wall is not proven answers every load with this refusal and runs no plugin byte.
+WALL_UNPROVEN = "plugin_wall_unproven"
+
+
+def _install_paths():
+    """The Python install this host runs from: the only paths its wall lets it read (the environment's
+    own folder and the install it was made from; one folder when they are the same)."""
+    return sorted({sys.prefix, sys.base_prefix})
+
+
+# The probe's canary: a regular file this host writes in its own working folder just before the wall, named
+# for this process. The probe must find it unreadable behind the wall, so a wall that leaves file reads open
+# is never proven (a folder alone would not show that). It holds nothing of anyone's: one line of its own.
+# Beside it, the write folder (the same name with WRITE_FOLDER_SUFFIX) is made for the probe's write kinds;
+# the probe also tries the writes on the canary itself.
+CANARY_PREFIX = ".csl-plugin-host-canary-"
+WRITE_FOLDER_SUFFIX = ".d"
+
+
+def _canary():
+    """(the canary's path, the write folder's path, a call that removes both), or ('', '', None) when they
+    cannot be made, which proves nothing.
+
+    A walled host can remove no file, so a helper process, forked before the wall and holding only its end
+    of a pipe, removes the canary and the write folder (with whatever a weak wall let the probe make in it)
+    when the host shuts that pipe after the probe (or when the host ends), and the host waits for it. The
+    call then answers the names still there (allowed behind the wall: it only looks), so a host whose helper
+    was killed or could not remove them knows it: a plugin must find its working folder as it was."""
+    try:
+        path = os.path.join(os.getcwd(), CANARY_PREFIX + str(os.getpid()))
+        made = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return "", "", None
+    folder = path + WRITE_FOLDER_SUFFIX
+    folder_made = False
+    try:
+        try:
+            os.write(made, b"canary\n")
+        finally:
+            os.close(made)
+        os.mkdir(folder, 0o700)
+        folder_made = True
+        wall_linux.prepare_write_folder(folder)
+        read_end, write_end = os.pipe()
+    except (OSError, ValueError):
+        # A name already there by the write folder's name (a folder with what it holds, a file or a link) is not
+        # this call's: it stays as it was, and only what this call made is removed.
+        _remove_probe_files(path, folder if folder_made else None)
+        return "", "", None
+    try:
+        helper = os.fork()
+    except OSError:
+        os.close(read_end)
+        os.close(write_end)
+        _remove_probe_files(path, folder)
+        return "", "", None
+    if helper == 0:
+        try:
+            os.close(write_end)
+            os.read(read_end, 1)  # the host shuts its end after the probe, or ends
+            _remove_probe_files(path, folder)
+        finally:
+            os._exit(0)
+    os.close(read_end)
+
+    def remove():
+        os.close(write_end)
+        os.waitpid(helper, 0)
+        return [os.path.basename(name) for name in (path, folder) if os.path.lexists(name)]
+    return path, folder, remove
+
+
+def _remove_probe_files(path, folder):
+    """The canary and the write folder with all it holds (no folder when ``folder`` is None); run by the helper,
+    which the wall does not reach, and before the wall when a step of the setup fails."""
+    _remove_quietly(path)
+    if folder is not None:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def _remove_quietly(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _wall():
+    """Wall this process in, then probe the wall from inside: (the wall.v1 record or None, the refusal).
+
+    Runs once, before the host reads any message. The refusal is the code of ``apply_wall``'s refusal, or
+    the name of what it raised, or '' when the wall applied. The probe runs either way: its checks are
+    harmless where they are allowed, and a record that shows them allowed is not proven. Where the probe
+    cannot run at all (not Linux), the record is None. The canary is made only where the wall can be (on
+    Linux; elsewhere the wall refuses before any change) and is removed once the probe has run."""
+    canary, folder, remove = _canary() if sys.platform.startswith("linux") else ("", "", None)
+    refused, left = "", []
+    try:
+        try:
+            wall_linux.apply_wall(_install_paths())
+        except wall_linux.WallRefused as exc:
+            refused = exc.code
+        except Exception as exc:  # a path that cannot be opened, or any other failure: no wall is in place
+            refused = "apply_wall_" + type(exc).__name__
+        try:
+            record = wall_linux.probe_wall(canary, os.getppid(), write_file=canary or None,
+                                           write_folder=folder or None)
+        except Exception:  # wall_system_unsupported, or a probe that cannot run: nothing is proven
+            record = None
+    finally:
+        if remove is not None:
+            try:
+                left = remove()
+            except OSError:
+                left = ["unknown"]
+    if left:  # the canary or the write folder is still there: a plugin would not find its folder as it was
+        refused = ", ".join(filter(None, [refused, CANARY_LEFT]))
+    return record, refused
+
+
+# The refusal named when the canary or the write folder is still there after the helper ended.
+CANARY_LEFT = "canary_left"
+
+
+def _wall_missing(record, refused):
+    """What keeps the wall from being proven: the refusal, then each check of the record that the kernel
+    did not refuse, then 'proven' when the record still does not say so. Empty only for a proven wall."""
+    missing = [refused] if refused else []
+    if type(record) is not dict:
+        return missing + ["no_record"]
+    missing += [name for name in wall_linux.RECORD_CHECKS if record.get(name) is not True]
+    writes = record.get("writes") if isinstance(record.get("writes"), dict) else {}
+    missing += ["writes." + kind for kind in wall_linux.WRITE_KINDS
+                if writes.get(kind) not in wall_linux.WRITE_OUTCOMES[:2]]
+    if record.get("proven") is not True:
+        missing.append("proven")
+    return missing
 
 
 def _environment_is_clean():
@@ -227,8 +380,10 @@ def _check_json(value):
 
 
 class _Program:
-    def __init__(self, channel, probe):
+    def __init__(self, channel, probe, wall=(None, "wall_not_applied")):
         self._channel, self._probe = channel, probe
+        self._wall_record, refused = wall
+        self._wall_missing = _wall_missing(self._wall_record, refused)
         self._handlers = {}
         self._end = hc.HostEnd(self._handlers)
         self._deferred = deque()
@@ -243,7 +398,10 @@ class _Program:
         return {"gil_check": self._gil_check, "gil": self._gil, "accepting_work": not self._gil_latched}
 
     def serve(self):
-        self._channel.send({"type": "hello", "channel": hc.CHANNEL})
+        hello = {"type": "hello", "channel": hc.CHANNEL}
+        if type(self._wall_record) is dict:
+            hello["wall"] = self._wall_record
+        self._channel.send(hello)
         while not self._closed:
             message = self._deferred.popleft() if self._deferred else self._read_peer()
             if message is not None:
@@ -287,6 +445,9 @@ class _Program:
             self._channel.send(answer)
 
     def _work(self, message):
+        if message["type"] == "load" and self._wall_missing:
+            self._channel.send(self._wall_refusal(message))
+            return
         if self._gil_latched:
             self._channel.send(self._gil_refusal(message))
             return
@@ -311,6 +472,10 @@ class _Program:
                 self._channel.send(answer)
             except (FrameError, RecursionError, TypeError, ValueError) as exc:
                 self._channel.send(self._failed(message, exc))
+
+    def _wall_refusal(self, message):
+        return hc.refusal(message, hc.ChannelRefusal(WALL_UNPROVEN, _unproven_detail(self._wall_record,
+                                                                                      self._wall_missing)))
 
     @staticmethod
     def _gil_refusal(message):
@@ -364,6 +529,33 @@ class _Program:
         raise EOFError("plugin channel ended")
 
 
+# The longest detail of a refusal (host.v1.json, the refusal's detail): part of the channel's format.
+_DETAIL_MAX = 1000
+
+
+def _unproven_detail(record, missing):
+    """The detail of a load refused for the wall: the sentences a person reads (wall_linux.WORDS), as many as
+    fit, then the names of what is missing, which always fit and come last."""
+    if type(record) is not dict:  # no record at all (no Linux, or a probe that could not run): the short form
+        return ("the wall around this host is not proven, so it loads nothing and runs no plugin code; "
+                "missing: " + ", ".join(missing))
+    words = wall_linux.why_not_proven(record) or [wall_linux.WORDS["not_loaded"]]
+    if CANARY_LEFT in ", ".join(missing):
+        words.insert(1, wall_linux.WORDS["canary_left"])
+    tail = " Missing: " + ", ".join(missing)
+    room = _DETAIL_MAX - len(tail)
+    kept = []
+    for i, line in enumerate(words):
+        rest = len(words) - i - 1
+        cost = len(" ".join(kept + [line]))
+        if cost + (len(" " + wall_linux.WORDS["more"]) if rest else 0) > room:
+            kept.append(wall_linux.WORDS["more"])
+            break
+        kept.append(line)
+    text = " ".join(kept)
+    return (text[:room] + tail)[-_DETAIL_MAX:] if len(text) > room else text + tail
+
+
 def main(*, gil_probe: GilProbe | None = None) -> dict:
     """Start the stdio host and return its final status to the local caller."""
     _restart_with_clean_environment()
@@ -372,6 +564,9 @@ def main(*, gil_probe: GilProbe | None = None) -> dict:
     os.environ.clear()
     os.environ.update(keep)
     with _Channel.from_stdio() as channel:
-        program = _Program(channel, GilProbe() if gil_probe is None else gil_probe)
+        # The wall comes after the inherited descriptors are shut and the standard ones point at the null
+        # device, and before the first message is read or sent: nothing the daemon sends reaches it.
+        wall = _wall()
+        program = _Program(channel, GilProbe() if gil_probe is None else gil_probe, wall)
         program.serve()
     return program.status()

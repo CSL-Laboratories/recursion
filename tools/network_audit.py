@@ -62,6 +62,12 @@ if _dir:
                 "subprocess.Popen", "urllib.Request", "http.client.connect", "os.system", "os.posix_spawn",
                 "os.exec")
     _MAX_ARGS = int(os.environ.get("RECURSION_AUDIT_MAX_ARGS", "64"))
+    _launchers = set(filter(None, os.environ.get("RECURSION_AUDIT_LAUNCHERS", "").split(",")))
+    def _launcher(exe):
+        try:
+            return os.path.basename(os.fsdecode(exe)) in _launchers
+        except Exception:
+            return True
     _seen_files = {}
     _this = os.path.realpath(sys.executable)
     def _py(name, path, cwd):
@@ -126,7 +132,8 @@ if _dir:
                 plain.append({"PATH": path,
                               "audit": (env.get("RECURSION_AUDIT_DIR") is not None) if hasattr(env, "get") else True,
                               "py_prog": _py(exe, path, cwd),
-                              "py_args": [k for k in range(1, min(len(argv), _MAX_ARGS)) if _py(argv[k], path, cwd)]})
+                              "py_args": [k for k in range(1, min(len(argv), _MAX_ARGS)) if _py(argv[k], path, cwd)]
+                                          if _launcher(exe) else []})
             line = json.dumps([event, plain])
         except Exception:
             line = json.dumps([event, ["unrecorded"]])
@@ -413,6 +420,7 @@ def main(argv=None):
         events_dir.mkdir()
         env = dict(os.environ)
         env["RECURSION_AUDIT_DIR"] = str(events_dir)
+        env["RECURSION_AUDIT_LAUNCHERS"] = ",".join(sorted(load_launchers(ROOT)))
         env["PYTHONPATH"] = os.pathsep.join([str(hook_dir), str(ROOT / "core")] +
                                             ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
         done = subprocess.run(command, cwd=str(ROOT), env=env)

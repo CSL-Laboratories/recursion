@@ -43,7 +43,9 @@ Run the proof on your own machine:
   anything outside the package; a call that could reach a network and has no row, or whose text is
   not the text its row holds; a use of a guarded place from a place its row does not name; a
   symbolic link under `core/`, or a compiled file the interpreter would run instead of its source;
-  a file it cannot read.
+  a file it cannot read; a coding declaration other than utf-8; a Python file under `core/` outside
+  the package, or one named like a standard module; a change of a file it cannot parse (its row
+  holds the file's digest).
 - `python3 core/tests/test_no_call_home_runtime.py` (Linux, CPython 3.12 or later) starts a daemon
   of its own in a temporary folder, leaves it idle, asks its status and stops it, while the
   interpreter's audit hook watches that it reaches no address and looks up no name; then it starts
@@ -83,10 +85,7 @@ What is proven, and what is not:
     (`len.__self__`); a module of the package used as a path to what that module imports (`from
     recursion_core.daemon.gui import socket`); a network method taken as a value (`c = s.connect`);
     a guarded place reached through an object of its class, or a place that takes its program from
-    its caller; a coding declaration that makes the interpreter run what the scan reads as a
-    comment; a file beside the package that replaces a standard module (`core/calendar.py`); a
-    change of a shipped file the scan cannot parse (a shell file); and a name a module row allows is
-    allowed in every file.
+    its caller; and a name a module row allows is allowed in every file.
   - past both: a file the code writes that the interpreter runs at a later start (a `.pth` file, a
     `sitecustomize`); the name-service lookups of pwd and getpass; a file path that reaches a
     network by itself (an automount such as `/net` on macOS, or a Windows network path).

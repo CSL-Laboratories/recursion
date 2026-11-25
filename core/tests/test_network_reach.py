@@ -353,6 +353,34 @@ class StaticProofTests(unittest.TestCase):
                 self.assertIn("NOT PROVEN", run.stdout)
                 self.assertIn("cannot be read", run.stdout)
 
+    def test_a_file_the_interpreter_reads_unlike_the_scan_is_refused(self):
+        def coding(root):
+            (root / nr.PACKAGE / "daemon" / "planted.py").write_bytes(
+                b"# -*- coding: unicode_escape -*-\n#\\n    import socket\\n    socket.create_connection\n")
+            return "core/recursion_core/daemon/planted.py", "coding declaration"
+
+        def beside(root):
+            (root / "core" / "calendar.py").write_text("x = 1\n", encoding="utf-8")
+            return "core/calendar.py", "beside the package"
+
+        def named(root):
+            (root / "core" / "tests").mkdir(exist_ok=True)
+            (root / "core" / "tests" / "socket.py").write_text("x = 1\n", encoding="utf-8")
+            return "core/tests/socket.py", "beside the package"
+
+        def shell(root):
+            with open(root / nr.PACKAGE / "daemon" / "evidence_ns.sh", "a", encoding="utf-8") as fh:
+                fh.write('curl -s "$URL"\n')
+            return "refused (changed-call)", "changed-call"  # the copy is clean: the one changed call is it
+
+        for plant in (coding, beside, named, shell):
+            with self.subTest(plant=plant.__name__), tempfile.TemporaryDirectory() as tmp:
+                root = _copy_package(Path(tmp))
+                self.assertEqual(nr.check(nr.scan(root), self.listing), [])  # the copy itself is clean
+                where, why = plant(root)
+                problems = nr.check(nr.scan(root), self.listing)
+                self.assertTrue(any(where in p and why in p for p in problems), problems)
+
     def test_a_green_scan_says_of_what_it_is_proven(self):
         import contextlib
         import io

@@ -36,27 +36,6 @@ example = "LeafRun.__new__(LeafRun)._spawn(argv); Harness.run(h, ['prog']) from 
 reason = "The callers of a guarded place are pinned when the place is named by its class or module, not when it is called through an object; a row whose program comes from its arguments is not guarded when its supplier is 'local'. Part can be built (a private name through an object, the 'local' rows guarded); a public method called through an object of any class cannot be followed by reading names alone."
 
 [[gap]]
-id = "G05"
-proof = "static"
-words = "a coding declaration that makes the interpreter run what the scan reads as a comment"
-example = "a first line '# -*- coding: unicode_escape -*-' with code hidden in a comment"
-reason = "The scan reads each file as UTF-8 text; the interpreter honours the declaration first. It can be built: a declaration other than utf-8 refused."
-
-[[gap]]
-id = "G06"
-proof = "static"
-words = "a file beside the package that replaces a standard module"
-example = "core/calendar.py, imported in place of the standard calendar module"
-reason = "The scan reads the package under core/recursion_core; core/ itself is on the import path of the run-time test, the evidence harness and a run from a checkout. It can be built: a Python file in core/ outside the package refused."
-
-[[gap]]
-id = "G07"
-proof = "static"
-words = "a change of a shipped file the scan cannot parse"
-example = "a line that fetches an address added to core/recursion_core/daemon/evidence_ns.sh"
-reason = "The row of such a file holds no text and no digest, so any change of it passes. It can be built: the row holds the file's digest."
-
-[[gap]]
 id = "G08"
 proof = "both"
 words = "a file the code writes that the interpreter runs at a later start"

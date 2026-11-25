@@ -30,6 +30,7 @@ syntax tree. It is a list of the ONLY things allowed, not a list of bad things i
 from __future__ import annotations
 
 import ast
+import hashlib
 import builtins
 import importlib
 import importlib.util
@@ -726,6 +727,11 @@ def _unseen(root: Path):
             rel = path.relative_to(root).as_posix()
             if path.is_symlink():
                 out.append(Finding("reach", rel, "<file>", "a symbolic link the scan does not follow", "undecidable", 0))
+            elif (name in files and name.endswith(".py") and (Path(here) == top or name[:-3] in
+                                                                sys.stdlib_module_names)) or \
+                    (name in dirs and Path(here) == top and name in sys.stdlib_module_names):
+                out.append(Finding("reach", rel, "<file>", "a Python file beside the package that the interpreter "
+                                   "may import in place of a module", "undecidable", 0))
             elif Path(here).name == "__pycache__" and name in files:
                 why = _compiled_file(path)
                 if why:
@@ -790,9 +796,40 @@ def _parse(path, rel):
         raise UnreadableFile(rel, exc) from exc
 
 
+# The source encoding declaration of PEP 263, in the first two lines of a file.
+CODING = re.compile(rb"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+UTF8_NAMES = {"utf-8", "utf8", "utf_8", "utf-8-sig"}
+
+
+def _coding(path: Path):
+    """The encoding a file declares that is not utf-8 (the interpreter would then read it unlike the scan),
+    or None."""
+    with open(path, "rb") as fh:
+        head = [fh.readline(), fh.readline()]
+    for line in head:
+        m = CODING.match(line)
+        if m:
+            name = m.group(1).decode("ascii", "replace").lower()
+            return None if name in UTF8_NAMES else name
+        if line.strip() and not line.lstrip().startswith(b"#"):
+            return None  # the declaration counts only before the first line of code
+    return None
+
+
+def _digest(path: Path):
+    """The SHA-256 of a file the scan cannot parse, with line ends made plain: its row holds it, so a change
+    of the file is a changed call."""
+    return "sha256:" + hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def scan(root: Path = ROOT):
     findings: list[Finding] = []
     for path, rel in shipped_files(root):
+        if path.suffix == ".py" and _coding(path):
+            findings.append(Finding("reach", rel, "<file>", f"a coding declaration other than utf-8 "
+                                    f"({_coding(path)}): the interpreter would read the file unlike the scan",
+                                    "undecidable", 0))
+            continue
         if path.suffix == ".py":
             tree = _parse(path, rel)
             docs = _docstring_nodes(tree)
@@ -804,7 +841,7 @@ def scan(root: Path = ROOT):
                 findings.append(f)
         elif path.suffix not in DATA_SUFFIXES:
             findings.append(Finding("reach", rel, "<file>", f"a {path.suffix or 'plain'} file the scan cannot read",
-                                    "undecidable", 0))
+                                    "undecidable", 0, _digest(path)))
         else:
             text = path.read_text(encoding="utf-8", errors="replace")
             for m in LITERAL.finditer(text):

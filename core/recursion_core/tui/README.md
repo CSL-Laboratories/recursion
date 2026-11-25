@@ -66,10 +66,16 @@ OpenCode's TUI is an HTTP client of its own server. It takes an injected `api` w
 
 - Opening reads `run.list`. Attaching (`a`/Enter, or `status RUN`) reads `run.status`. Neither starts
   anything. Closing (`q`, Ctrl-C, or the terminal ending input) sends no new request and exits 0: a
-  request still queued and not begun is not sent, except a Stop you confirmed, which is always sent. When `q`
-  comes while a confirmed Stop has no answer yet, the TUI waits for that answer (at most the loop's join bound,
-  5 s as shipped; Ctrl-C while it waits closes at once) so the transcript shows it. The close line names every request not
-  sent and any Stop whose answer did not come; other runs keep going, and reopening reattaches. An API client that cannot be built is `control_api_unavailable` on
+  request still queued and not begun is not sent, except a Stop you confirmed, which is sent while the close's
+  bound lasts. When `q` or Ctrl-C comes while a confirmed Stop has no answer yet, the TUI waits for that answer so
+  the transcript shows it; any other key while it waits says so again, once, and a second Ctrl-C closes at once.
+  The whole close, the wait and the end of the TUI's threads together, ends within ONE bound (`CLOSE_BOUND_S` in
+  `app.py`, 5 s as shipped; it is to become a row of the settings file). The close line says what became of each
+  Stop: answered and confirmed; answered and NOT confirmed (a failed call, `pending`, or an answer for another run:
+  the run may still be running); sent with no answer yet; or not begun, which is sent only if the Stop ahead of it
+  ends within what is left of the bound, and else is not sent. Each run whose Stop is not confirmed is named with
+  `run status` as what to do. In full screen the close line is printed again after the screen is left. It also
+  names every other request not sent; other runs keep going, and reopening reattaches. An API client that cannot be built is `control_api_unavailable` on
   stderr with exit 1, as in the CLI.
 - Keys (all from the keymap, so a binding file can change them; `?` lists the ones in force, and the
   prompt row's hints follow the keymap):

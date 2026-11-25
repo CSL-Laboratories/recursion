@@ -3,9 +3,9 @@
 ``TuiApp`` holds view state only: the last answers it was given, which run is selected, a bounded
 copy of engine output and one ordered event log (``events.EventLog``). It owns no session, run,
 approval or plugin state. Opening reads ``run.list``; attaching reads ``run.status``; closing sends
-no new request, and a Stop the person confirmed is always sent. Every request goes through the injected
-``api.call(method, params)``, the same surface the CLI uses; ``run.list`` follows ``next_after`` to the
-last page as the CLI does (``protocol.list_all_runs``).
+no new request, and a Stop the person confirmed is sent while the close's bound lasts. Every request goes
+through the injected ``api.call(method, params)``, the same surface the CLI uses; ``run.list`` follows
+``next_after`` to the last page as the CLI does (``protocol.list_all_runs``).
 
 Every request, answer, condition edge, engine output chunk, notice and error is appended to the log
 before anything shows it. The full-screen frame, the inline painter and the linear (screen-reader)
@@ -40,9 +40,17 @@ PARTIAL_CAP = 8192  # unfinished line with no newline; older cells are marked, n
 RUN_ROWS = 5
 HELP_ROWS = 3  # entries the open keys show at least; they take rows from the run list for them
 CONDITION_ROWS = 4
+# The whole close (the wait for a confirmed Stop's answer, then the join of the Loop's threads) ends within this many
+# seconds. It is to become the row ``tui.close_bound_s`` of the person's settings file, default 5.0 (the value the
+# Loop's join has always used); until then a Loop takes it from here, and ``Loop.join_timeout_s`` changes it.
+CLOSE_BOUND_S = 5.0
 _TRUNCATED = "⟦truncated⟧"
 _CURSOR = "▏"  # where the command line's cursor is, drawn only when it is not at the end
 SESSION_LIST = object()  # ``TuiApp.pane`` when the output pane shows the session list (review 1 of #405, Sol R1)
+
+
+def _runs(runs) -> str:
+    return ", ".join(field(r) for r in runs)
 
 
 def _fmt(params: Mapping) -> str:
@@ -207,8 +215,8 @@ class TuiApp:
         self._asked = 0  # requests asked so far, in order: a read asked before a confirmed Stop is known by it
         self._stopped: dict[str, int] = {}  # run id -> requests asked when its Stop was first confirmed (T2)
         # Requests handed to the dispatch that no lane has begun yet, by number: (method, params). A confirmed Stop is
-        # sent whatever happens; any other request still here when the TUI closes is not sent, and the close line
-        # names it.
+        # sent while the close's bound lasts; any other request still here when the TUI closes is not sent, and the
+        # close line names it.
         self._queued: dict[int, tuple[str, dict]] = {}
         self._lane_begins = False  # set by a Loop, whose lanes call begin(): only then is a queued request known
         self._stops_out: dict[int, str] = {}  # confirmed Stops asked and not yet answered: number -> run id
@@ -219,6 +227,13 @@ class TuiApp:
         self.awaiting_stop = False  # q was pressed while a confirmed Stop had no answer yet: the TUI waits for it
         self._ending = False  # the Loop ended (end_wait): an answer taken now comes after the screen's last frame
         self._answered_at_close: list[str] = []  # runs whose Stop was answered while closing or after the Loop ended
+        # Runs whose Stop was answered while closing with an answer that does not confirm it: run id -> what it said
+        self._unconfirmed_at_close: dict[str, str] = {}
+        # Set by a Loop: the seconds left of the close's one bound, and that bound (CLOSE_BOUND_S)
+        self.close_left: Callable[[], float] | None = None
+        self.close_bound_s: float | None = None
+        self._wait_said = False  # a key while the close waits has had the notice said again (once)
+        self.end_line = ""  # the close line once written; the full-screen mode prints it again after the screen
         self.errors: list[str] = []
         self.last_error: Event | None = None  # kept here too, so a bounded log cannot drop it
         self.mode, self.line, self.stop_target = "keys", "", None
@@ -316,9 +331,10 @@ class TuiApp:
 
     def close(self) -> None:
         """Closing sends no new request, and a request still queued and not begun is not sent, except a Stop the
-        person confirmed: that one is always sent. Under a Loop, a close while a confirmed Stop has no answer yet
-        first waits for that answer (at most ``stop_wait_s``; Ctrl-C, or a second close, ends the wait), so the
-        transcript records it. The close line names what was not sent and any Stop whose answer did not come.
+        person confirmed: a Loop sends it while the close's bound lasts. Under a Loop, a close while a confirmed
+        Stop has no answer yet first waits for that answer (within ``stop_wait_s``, the close's one bound; Ctrl-C,
+        or a second close, ends the wait), so the transcript records it. The close line says what became of each
+        Stop and names what was not sent.
         After it the app takes no key, answer or output: nothing is logged, sent or changed, so a thread that is
         still busy cannot add to the log or send a request."""
 
@@ -327,30 +343,71 @@ class TuiApp:
                 return  # a second call changes nothing
             if not self.awaiting_stop and self.stop_wait_s is not None and self._stops_out:
                 self.awaiting_stop = True
-                runs = ", ".join(field(r) for r in dict.fromkeys(self._stops_out.values()))
-                self._notice(f"closing: the Stop of {runs} is sent; the TUI closes when its answer comes, within "
+                self._notice(f"closing: {self._stops_said()}; the TUI closes when {self._answers_come()}, within "
                              f"{self.stop_wait_s:g} s; Ctrl-C closes now")
                 return
             self.closed = True  # the sealed log refuses any later event
-            self._emit("close", "operator", self._end_line())
+            self.end_line = self._end_line()
+            self._emit("close", "operator", self.end_line)
+
+    def _stops_begun(self) -> tuple[list[str], list[str]]:
+        """The runs of the confirmed Stops with no answer yet: those a lane has begun, and those still queued."""
+
+        begun = list(dict.fromkeys(r for n, r in self._stops_out.items() if n not in self._queued))
+        return begun, [r for r in dict.fromkeys(self._stops_out.values()) if r not in begun]
+
+    def _stops_said(self) -> str:
+        begun, queued = self._stops_begun()
+        parts = [f"the Stop of {_runs(begun)} is sent"] if begun else []
+        if queued:
+            behind = f" (it waits behind the Stop of {_runs(begun)})" if begun else ""
+            parts.append(f"the Stop of {_runs(queued)} is not yet begun{behind}")
+        return " and ".join(parts)
+
+    def _answers_come(self) -> str:
+        return "its answer comes" if len(self._stops_out) == 1 else "their answers come"
+
+    def _waiting_again(self) -> None:
+        """A key while the close waits: the notice is said again, once, so a second q is not met with silence."""
+
+        if self._wait_said:
+            return
+        self._wait_said = True
+        left = self.close_left() if self.close_left is not None else self.stop_wait_s
+        within = f", at most {left:.1f} s from now" if left is not None else ""
+        self._notice(f"still waiting: {self._stops_said()}; the TUI closes when {self._answers_come()}{within}; "
+                     f"other keys do nothing while it waits; Ctrl-C closes now")
 
     def _end_line(self) -> str:
-        """The final line: true at the moment it is written. A Stop answered while closing is said with its answer
-        above; a confirmed Stop with no answer yet is said as begun (sent) or still queued (it is still sent after
-        the close, while the TUI's process runs); every other request not begun is named as not sent."""
+        """The final line: true at the moment it is written, and no more than is known. Each Stop is said as it
+        stands: answered and confirmed (its answer above); answered without being confirmed (the run may still be
+        running); sent with no answer yet; or not begun, which is sent only if it begins within what is left of the
+        close's one bound and else not at all. Every other request not begun is named as not sent. Each run whose
+        Stop is not confirmed is named with what to do; every other run keeps going."""
 
         parts = []
         out = list(dict.fromkeys(self._stops_out.values()))
         answered = [r for r in dict.fromkeys(self._answered_at_close) if r not in out]
+        unconfirmed = {r: c for r, c in self._unconfirmed_at_close.items() if r not in out and r not in answered}
         if answered:
-            parts.append(f"the Stop of {', '.join(field(r) for r in answered)} was sent and answered (above)")
-        begun = list(dict.fromkeys(r for n, r in self._stops_out.items() if n not in self._queued))
-        queued = [r for r in out if r not in begun]
+            parts.append(f"the Stop of {_runs(answered)} was sent and answered (above)")
+        for run, said in unconfirmed.items():
+            parts.append(f"the Stop of {field(run)} was not confirmed ({said}, above); {field(run)} may still be "
+                         f"running")
+        begun, queued = self._stops_begun()
         if begun:
-            parts.append(f"the Stop of {', '.join(field(r) for r in begun)} was sent and its answer had not come")
+            parts.append(f"the Stop of {_runs(begun)} was sent and its answer had not come")
         if queued:
-            parts.append(f"the Stop of {', '.join(field(r) for r in queued)} was not yet begun; it is still "
-                         f"sent after this, while the TUI's process runs")
+            behind = f" (it waits behind the Stop of {_runs(begun)})" if begun else ""
+            left = self.close_left() if self.close_left is not None else 0.0
+            if left > 0:
+                ahead = f"the Stop of {_runs(begun)} ends" if begun else "it begins"
+                parts.append(f"the Stop of {_runs(queued)} was not begun{behind}; it is sent only if {ahead} within "
+                             f"{left:.2f} s, else it is not sent")
+            else:
+                bound = f"{self.close_bound_s:g} s " if self.close_bound_s is not None else ""
+                parts.append(f"the Stop of {_runs(queued)} was not begun{behind} and is not sent: the {bound}bound "
+                             f"has run out")
         not_sent = self._not_sent + [f"{m} {_fmt(pa)}".rstrip() for m, pa in self._queued.values()
                                      if m != "run.stop"]
         if not_sent:
@@ -358,13 +415,14 @@ class TuiApp:
                          f"({'; '.join(not_sent)})")
         if not parts:
             return "closed: no request sent; runs keep going and can be reattached"
-        if answered and not (begun or queued or not_sent):
+        if answered and not (unconfirmed or begun or queued or not_sent):
             parts.append("nothing else is sent at close")
-        stops = answered or out
+        stops = answered or unconfirmed or out
         tail = ("every other run keeps going and can be reattached" if stops
                 else "runs keep going and can be reattached")
-        if stops and (begun or queued):
-            tail = "look with run status before you trust that the run stopped; " + tail
+        doubtful = list(dict.fromkeys([*unconfirmed, *begun, *queued]))
+        if doubtful:
+            tail = f"look with run status before you trust that {_runs(doubtful)} stopped; " + tail
         return "closed: " + "; ".join(parts) + "; " + tail
 
     def begin(self, asked: int | None, method: str, params: dict, *, ending: bool = False) -> bool:
@@ -432,7 +490,14 @@ class TuiApp:
             if asked is not None:
                 self._queued.pop(asked, None)
                 if self._stops_out.pop(asked, None) is not None and (self.awaiting_stop or self._ending):
-                    self._answered_at_close.append(str(params.get("run_id")))
+                    run = str(params.get("run_id"))
+                    # Only a "stopped" for this very run confirms its Stop: a failed call, a pending answer or an
+                    # answer naming another run is said as not confirmed, with what it said.
+                    if code == "stopped" and kept.get("run_id") == params.get("run_id"):
+                        self._answered_at_close.append(run)
+                    else:
+                        self._unconfirmed_at_close[run] = (f"{field(str(code))} for another run" if code == "stopped"
+                                                           else field(str(code)))
             try:
                 self._apply_answer(method, params, answer, code, kept, asked)
             except Exception as exc:  # noqa: BLE001 - one answer that cannot be read must not end the loop
@@ -775,6 +840,7 @@ class TuiApp:
             self.close()  # while the TUI waits for a confirmed Stop's answer, this ends the wait: it closes now
             return
         if self.awaiting_stop:  # waiting for a confirmed Stop's answer: only Ctrl-C acts
+            self._waiting_again()
             return
         if self.mode == "confirm_stop":
             target, self.mode, self.stop_target = self.stop_target, "keys", None
@@ -1519,12 +1585,15 @@ class Loop:
         self._wake = threading.Event()
         self._halt = threading.Event()
         self._paint_lock = threading.Lock()  # a paint and shutdown() never overlap; none starts after it
-        # How long shutdown() waits for each thread, and how long a close waits for a confirmed Stop's answer. Not a
-        # new figure: the value shutdown() has always used; it is to become a row of the person's settings file.
-        self.join_timeout_s = 5.0
-        self._wait_since: float | None = None
+        # The close's one bound (CLOSE_BOUND_S): a close's wait for a confirmed Stop's answer and shutdown()'s join of
+        # the threads together end within it, counted from the moment the close begins (``_close_deadline``).
+        self.join_timeout_s = CLOSE_BOUND_S
+        self._deadline: float | None = None
+        self._deadline_lock = threading.Lock()
+        app.close_left = self._left
         self._lanes = {"stop": queue.SimpleQueue(), "other": queue.SimpleQueue()}
         self._threads: list[threading.Thread] = []
+        self._runner: threading.Thread | None = None  # the thread of run(), once start() made it
         self.frame: list[Row] = []
         self.frames = 0
         app.dispatch = self._dispatch
@@ -1537,6 +1606,7 @@ class Loop:
     @join_timeout_s.setter
     def join_timeout_s(self, value: float) -> None:
         self._join_timeout_s = value
+        self.app.close_bound_s = value
         if not self._halt.is_set():
             self.app.stop_wait_s = value
 
@@ -1552,6 +1622,18 @@ class Loop:
                 self.dropped_events += 1
             self._events.append(event)
 
+    def _close_deadline(self) -> float:
+        """When the close's one bound runs out: set the first time the close needs it (its wait begins, its line
+        asks, or shutdown() begins), and the same from then on."""
+
+        with self._deadline_lock:
+            if self._deadline is None:
+                self._deadline = time.monotonic() + self._join_timeout_s
+            return self._deadline
+
+    def _left(self) -> float:
+        return max(0.0, self._close_deadline() - time.monotonic())
+
     def _dispatch(self, method: str, params: dict, done) -> None:
         self._lanes["stop" if method == "run.stop" else "other"].put((method, params, done))
 
@@ -1562,7 +1644,10 @@ class Loop:
                 return
             method, params, done = item
             # A request not begun when the TUI closes, or the Loop ends, is not sent, except a confirmed Stop: that
-            # one is always sent. One begun before may end after it.
+            # one is sent while the close's bound lasts. One begun before may end after it. A Stop still queued when
+            # the bound has run out is not begun: the close line has said so (it stays queued in the app).
+            if method == "run.stop" and self._deadline is not None and time.monotonic() >= self._deadline:
+                continue
             if not self.app.begin(getattr(done, "asked", None), method, params, ending=self._halt.is_set()):
                 continue
             try:
@@ -1580,6 +1665,7 @@ class Loop:
         t = threading.Thread(target=self.run, daemon=True)
         t.start()
         self._threads.append(t)
+        self._runner = t
 
     def shutdown(self) -> bool:
         """Stop painting at once, then stop the threads. When this returns no paint is under way and
@@ -1589,10 +1675,15 @@ class Loop:
             self._halt.set()
         self.app.end_wait()
         self._wake.set()
+        deadline = self._close_deadline()  # what is left of the close's one bound, shared by every thread
+        # The tick under way may still ask a confirmed Stop (a y read just before the end of input): it ends first,
+        # so the Stop is queued before the lanes are told to end and is sent.
+        if self._runner is not None:
+            self._runner.join(timeout=max(0.0, deadline - time.monotonic()))
         for lane in self._lanes.values():
             lane.put(None)
         for t in self._threads:
-            t.join(timeout=self.join_timeout_s)
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
         # A Stop the lanes sent before they ended has its answer recorded before the app's close line.
         self._take_answers()
         return not any(t.is_alive() for t in self._threads)
@@ -1622,10 +1713,7 @@ class Loop:
             app.press(key, burst=burst)
         self._take_answers()  # 2. API answers
         if app.awaiting_stop and not app.closed:  # a close waits for a confirmed Stop's answer, within its bound
-            now = time.monotonic()
-            if self._wait_since is None:
-                self._wait_since = now
-            elif now - self._wait_since >= self.join_timeout_s:
+            if time.monotonic() >= self._close_deadline():
                 app.close()
         deadline = time.monotonic() + self.drain_budget_s  # 3. engine output, time-sliced
         while time.monotonic() < deadline:

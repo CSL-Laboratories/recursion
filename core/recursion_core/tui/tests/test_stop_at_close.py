@@ -201,13 +201,15 @@ class ConfirmedStopAtCloseTest(unittest.TestCase):
             tick_until(loop, lambda: app.closed)
             self.assertLess(time.monotonic() - began, WAIT_S)
             self.assertEqual(close_line(app), (
-                "closed: the Stop of r was sent and its answer had not come; the Stop of r2 was not yet begun; it "
-                "is still sent after this, while the TUI's process runs; look with run status before you trust "
-                "that the run stopped; every other run keeps going and can be reattached"))
-            loop.join_timeout_s = WAIT_S
+                "closed: the Stop of r was sent and its answer had not come; the Stop of r2 was not begun (it waits "
+                "behind the Stop of r) and is not sent: the 0.05 s bound has run out; look with run status "
+                "before you trust that r, r2 stopped; every other run keeps going and can be reattached"))
             api.release.set()
-            self.assertTrue(loop.shutdown())
-            self.assertEqual(api.sent("run.stop"), [{"run_id": "r"}, {"run_id": "r2"}])
+            loop.shutdown()
+            for thread in loop._threads:
+                thread.join(WAIT_S)
+            self.assertFalse(any(t.is_alive() for t in loop._threads))
+            self.assertEqual(api.sent("run.stop"), [{"run_id": "r"}], "the close line said the Stop of r2 is not sent")
         finally:
             api.release.set()
             app.close()

@@ -1,0 +1,208 @@
+# The list of packages that may stand under core/recursion_core/, one row each.
+#
+# core/tests/test_core_list.py reads this file. It is red when a package stands under the core with no row,
+# when a row has no package, when something under the core is skipped by a rule below that does not hold, and
+# when the count of packages that wait for the owner differs from for_owner_max. The scan reads the entries
+# directly under core/recursion_core/ only; what stands inside a package is that package's own.
+#
+# A row is keyed by name, the folder or module name directly under core/recursion_core/. Any other reader of this
+# file (an import guard, for one) may rely on that key and on the sections.
+#
+# Sections:
+#   core        a line of the pinned product contract, or a decision cited by role and date, places the package
+#               in the core.
+#   for_owner   the list does not place the package: no cited line is taken as placing it. builds_it names the
+#               lane or section that builds it. The owner decides: core, separate package or plugin.
+#   leaving     a placing decision moves the package out; moves_to and leave_by (YYYY-MM-DD) are required.
+#   expected    a name the hooks seam (control/hooks.py REGISTRANTS) already presumes whose package does not
+#               stand yet. A row whose package stands is red: give it its real section.
+#
+# A cite is one of:
+#   a lane      the row of section 7 of the pinned contract that begins with the lane id, such as F3;
+#   a section   ONE line inside the numbered section, such as 3.3, that places the package (never the heading);
+#   a decision  given by role and date only, such as 'the owner, 2026-11-24'.
+# The pinned contract is named by contract/PRODUCT.pin.json; it lives in a private research repository, and this
+# file copies none of its words and holds no digest of any of its lines. The digests that name each cited line
+# are kept in a file outside this repository; the test reads them, with the pinned bytes, only where a local clone
+# and that file are given (CSL_RESEARCH_VAULT and CSL_CORE_LIST_DIGESTS), and says on every run when they were not.
+
+[summary]
+# The number of for_owner rows. The test is red when it differs from the count of those rows, so the number
+# always equals the count and a new waiting package shows as a raised number in the change.
+for_owner_max = 6
+# What a passed leave_by does: "red" (the test is red) or "print" (the printed state line names the row and its date).
+leave_by_passed = "red"
+
+[rules]
+# What under core/recursion_core/ is not a package. Everything else must have a row, or the test is red.
+# A rule entry that matches nothing under the core is red.
+# Folders the scan skips because they hold no module; one that holds a module is red. __pycache__ only today.
+ignored_folders = ["__pycache__"]
+# Folders that hold tests only: an __init__.py with at most a docstring, and test_*.py modules whose top level
+# holds only imports, assignments, test case classes, test functions and the __main__ guard. Anything else is red.
+test_folders = []
+# Files directly under the core that are neither modules nor folders. A module named here is red.
+other_files = []
+
+[sweep]
+# Where the contract is given (CSL_RESEARCH_VAULT), the test reads the files named in scan and is red on a heading of
+# the contract, or a run of run_words words of it (words made of letters only; links and numbers left out), standing in
+# any of them. A message names the file, the line and a count, and none of the words.
+run_words = 6
+# Files or folders, as paths from the repository root; "." is the whole tree. One entry that matches nothing is red.
+scan = ["core/CORE-PACKAGES.toml", "core/tests"]
+# Files or folders of the scan that it leaves out. None today.
+leave_out = []
+
+[[package]]
+name = "cgroup_leaf"
+section = "core"
+what = "Same-user cgroup v2 leaf launch with a kill of the whole tree on every exit path."
+placed_by = [
+  { kind = "lane", ref = "F3", contract = "pinned" },
+]
+
+[[package]]
+name = "control"
+section = "core"
+what = "The control API, the command line, the control tool descriptors, a truthful Stop and the hooks seam."
+placed_by = [
+  { kind = "lane", ref = "D3", contract = "pinned" },
+  { kind = "section", ref = "3.5", contract = "pinned" },
+]
+
+[[package]]
+name = "plugin_security"
+section = "core"
+what = "The plugin loader, the approval gate, the connection breaker, authority profiles and signing."
+placed_by = [
+  { kind = "lane", ref = "F2", contract = "pinned" },
+  { kind = "lane", ref = "K3", contract = "pinned" },
+]
+
+[[package]]
+name = "routes"
+section = "core"
+what = "The route contract, the engine adapters and the engine table."
+placed_by = [
+  { kind = "section", ref = "3.3", contract = "pinned" },
+]
+builds_it = [
+  { kind = "lane", ref = "F4", contract = "pinned" },
+]
+
+[[package]]
+name = "routing"
+section = "core"
+what = "The default engine, the routing configuration and the per-task hand pick."
+placed_by = [
+  { kind = "lane", ref = "F13", contract = "pinned" },
+  { kind = "section", ref = "12", contract = "pinned" },
+]
+
+[[package]]
+name = "subscription_routes"
+section = "core"
+what = "The limits on a route that runs on a subscription login, in the loop the core runs itself."
+placed_by = [
+  { kind = "section", ref = "3.3", contract = "pinned" },
+]
+
+[[package]]
+name = "child_env"
+section = "for_owner"
+what = "The environment of an engine child process: which names reach it."
+builds_it = [
+  { kind = "lane", ref = "F5", contract = "pinned" },
+]
+
+[[package]]
+name = "control_transport"
+section = "for_owner"
+what = "The local control socket (Unix, peer credentials) with no network listener."
+builds_it = [
+  { kind = "lane", ref = "D1", contract = "pinned" },
+  { kind = "lane", ref = "D3", contract = "pinned" },
+]
+
+[[package]]
+name = "daemon"
+section = "for_owner"
+what = "The per-user daemon: durable intent, reconciliation, the breaker and engine launch."
+builds_it = [
+  { kind = "lane", ref = "D1", contract = "pinned" },
+  { kind = "section", ref = "3.1", contract = "pinned" },
+]
+
+[[package]]
+name = "events"
+section = "for_owner"
+what = "The one SQLite event store and its transaction helper."
+builds_it = [
+  { kind = "lane", ref = "F7", contract = "pinned" },
+]
+
+[[package]]
+name = "gui"
+section = "for_owner"
+what = "The operator GUI served by the daemon over the control client."
+builds_it = [
+  { kind = "lane", ref = "G1", contract = "pinned" },
+  { kind = "lane", ref = "G6", contract = "pinned" },
+]
+
+[[package]]
+name = "tui"
+section = "for_owner"
+what = "A terminal client that fills the screen and talks to the control API."
+builds_it = [
+  { kind = "lane", ref = "G8", contract = "pinned" },
+]
+
+[[package]]
+name = "keys"
+section = "expected"
+what = "Key custody, named by the hooks seam."
+
+[[package]]
+name = "workspace"
+section = "expected"
+what = "The workspace lane, named by the hooks seam."
+
+[[package]]
+name = "approvals"
+section = "expected"
+what = "Approval records and verbs, named by the hooks seam."
+
+[[package]]
+name = "launch_check"
+section = "expected"
+what = "The launch check, named by the hooks seam."
+
+[[package]]
+name = "setup"
+section = "expected"
+what = "Setup and agent install, named by the hooks seam."
+
+[[package]]
+name = "remote"
+section = "expected"
+what = "Remote control over a person's own login, named by the hooks seam."
+
+[[package]]
+name = "quota"
+section = "expected"
+what = "Route admission and the spend ledger, named by the hooks seam."
+decided_out = true
+placed_by = [
+  { kind = "decision", ref = "the owner, 2026-11-24" },
+]
+
+[[package]]
+name = "sessions"
+section = "expected"
+what = "Session records and session commands, named by the hooks seam."
+decided_out = true
+placed_by = [
+  { kind = "decision", ref = "the owner, 2026-11-24" },
+]

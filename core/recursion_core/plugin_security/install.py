@@ -313,7 +313,11 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
                    version: str | None = None, state: os.PathLike | str | None = None, wait: bool = True,
                    git_repository: str | None = None, report_kept=None, confirm=None,
                    write_grant: bool | None = None, confirm_grant=None) -> dict:
-    """Check ``registry_root``, then write the release as the next generation.
+    """Check the id and the version, then ``registry_root``, then write the release as the next generation.
+
+    The id and the version are checked from the arguments alone, before any byte of the registry or of a
+    git source is read: a reserved or malformed id, or a version that is not text, is refused with no
+    read of what it never needed, and a broken registry cannot hide that reason.
 
     ``git_repository`` is a local bare path. The fetch, and every refusal of
     that fetch, finishes before the profile lock. A refusal does not fall
@@ -334,6 +338,16 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
     if confirm_grant is not None and not callable(confirm_grant):
         raise InstallRefused("grant_flag")
     config_path = Path(config)
+    # From the arguments alone, before the registry or a git source is read.
+    if type(plugin_id) is str and plugin_id in _STORE_RESERVED_IDS:
+        raise InstallRefused("plugin_id_reserved",
+                             detail=f"The name {plugin_id} is kept for the install's own files and is never a "
+                                    f"plugin id. Pick another plugin id.", show_detail=True)
+    # Unreachable for a text id while _PROFILE_NAMES equals _STORE_RESERVED_IDS; kept as the profile's own guard.
+    if not _plugin_id_ok(plugin_id) or plugin_id in _PROFILE_NAMES:
+        raise InstallRefused("plugin_not_in_registry")
+    if version is not None and type(version) is not str:
+        raise InstallRefused("release_not_in_registry")
     report = check_registry(registry_root)
     codes = report.codes()
     if codes:
@@ -342,12 +356,6 @@ def install_plugin(config: os.PathLike | str, registry_root: os.PathLike | str, 
     # whole install. Unknown must not read as valid, and nothing is written.
     if any(item.code == "signature_unchecked" for item in report.notes):
         raise InstallRefused("signature_backend_unavailable")
-    if type(plugin_id) is str and plugin_id in _STORE_RESERVED_IDS:
-        raise InstallRefused("plugin_id_reserved")
-    if not _plugin_id_ok(plugin_id) or plugin_id in _PROFILE_NAMES:
-        raise InstallRefused("plugin_not_in_registry")
-    if version is not None and type(version) is not str:
-        raise InstallRefused("release_not_in_registry")
     chosen = _select(report, plugin_id, version)
     artifact = chosen.artifact
     fetched = False

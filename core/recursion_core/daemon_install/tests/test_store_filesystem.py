@@ -468,11 +468,12 @@ class GroundAsTheKernelResolvesItTests(unittest.TestCase):
         with mock.patch.object(stores, "create_breaker_store", swapped_then_made):
             detail = self.refused("store_ground_changed", install, Roots(home=self.home), EXEC)
         made = os.path.join(self.home, ".local", "state", "recursion", "plugin-security", "breaker.sqlite3")
-        self.assertTrue(os.path.isfile(os.path.join(other, ".local", "state", "recursion", "plugin-security",
-                                                    "breaker.sqlite3")))
-        self.assertTrue(detail.startswith(f"{made} was made, but not in {self.home}, the folder whose disk was read "
-                                          "(ext4): "), detail)
-        self.assertIn(f"remove {made}, then run the command again", detail)
+        self.assertFalse(os.path.lexists(os.path.join(other, ".local", "state", "recursion", "plugin-security",
+                                                      "breaker.sqlite3")))  # nothing made on the refused disk
+        self.assertTrue(detail.startswith(f"{made} does not lead to the store in {self.home}, the folder whose disk "
+                                          "was read (ext4): "), detail)
+        self.assertIn("so Recursion removes what this run made", detail)
+        self.assertEqual(_tree(self.home + ".judged"), {})  # and nothing of it left where it was made
 
     def test_a_folder_swapped_at_any_moment_never_leaves_a_store_on_another_disk_unsaid(self):
         """SWAP_ROUNDS installs; in each, a thread swaps the home for a link into a refused disk once, at a moment
@@ -526,6 +527,125 @@ class GroundAsTheKernelResolvesItTests(unittest.TestCase):
               + ", ".join(f"{k}{' swapped' if s else ''} {v}" for (k, s), v in sorted(tally.items()))
               + f"; unsaid {len(unsaid)}; a store on the refused stand-in under another refusal: {other_refusal}")
         self.assertEqual(unsaid, [])
+        self.assertEqual(other_refusal, 0)
+
+    def _holding_stores(self):
+        """The refused place already holds stores, made while its disk was not yet listed refused (no unit)."""
+
+        nfs = self.folder("nfs")
+        other = self.folder("nfs", "home")
+        self.folder("nfs", "home", ".config", "systemd", "user")
+        install(Roots(home=other), EXEC)
+        os.unlink(owned_paths(Roots(home=other)).unit)
+        self.mounts([("/", "ext4"), (nfs, "nfs4")])
+        return nfs, other
+
+    def _swapped_at(self, moment):
+        """The fixed order: the home swapped for a link into a refused place that holds stores, just after the
+        folders read are held to the folders opened (``_still_on_ground``) or just before the stores are proven
+        (``_made_on_ground``). The install is refused, leaves the refused place as it was, and leaves nothing of its
+        own in the folder it judged."""
+
+        nfs, other = self._holding_stores()
+        before = _tree(nfs)
+        real = getattr(INSTALL, moment)
+
+        def swapped(*args, **kwargs):
+            if moment == "_still_on_ground":
+                answer = real(*args, **kwargs)
+                self._swap(self.home, other)
+                return answer
+            self._swap(self.home, other)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(INSTALL, moment, swapped):
+            detail = self.refused("store_ground_changed", install, Roots(home=self.home), EXEC)
+        self.assertEqual(_tree(nfs), before)  # nothing made on the refused disk, the stores there untouched
+        self.assertEqual(_tree(self.home + ".judged"), {})  # nothing of this run left in the folder judged
+        self.assertEqual(len(detail.splitlines()), 1, detail)
+
+    def test_a_swap_into_a_place_that_holds_stores_after_the_check_is_refused_and_leaves_nothing(self):
+        self._swapped_at("_still_on_ground")
+
+    def test_a_swap_into_a_place_that_holds_stores_before_the_proof_is_refused_and_leaves_nothing(self):
+        self._swapped_at("_made_on_ground")
+
+    def _failing_unit(self, also=None):
+        unit = owned_paths(Roots(home=self.home)).unit
+        real = INSTALL.write_exclusive
+
+        def failing(path, *args, **kwargs):
+            if path == unit:
+                if also is not None:
+                    also()
+                raise OSError(28, "No space left on device")
+            return real(path, *args, **kwargs)
+
+        return mock.patch.object(INSTALL, "write_exclusive", failing)
+
+    def test_a_failure_after_the_stores_are_made_leaves_nothing_this_run_made_in_the_state_folder(self):
+        with self._failing_unit():
+            with self.assertRaises(OSError):
+                install(Roots(home=self.home), EXEC)
+        self.assertFalse(os.path.lexists(os.path.join(self.home, ".local")), _tree(self.home))
+
+    @unittest.skipUnless(backend_available(), "needs the cryptography package")
+    def test_a_failure_after_the_ledger_is_made_removes_the_key_made_with_it(self):
+        told = []
+        paths = owned_paths(Roots(home=self.home))
+        with self._failing_unit():
+            with self.assertRaises(OSError):
+                install(Roots(home=self.home), EXEC, make_anchor=True, on_anchor_made=told.append)
+        self.assertFalse(os.path.lexists(paths.ledger))
+        self.assertFalse(os.path.lexists(paths.anchor_key))
+        self.assertEqual(told, [])  # no key is said to be kept: none is
+        install(Roots(home=self.home), EXEC, make_anchor=True, on_anchor_made=told.append)  # a fresh start again
+        self.assertEqual(told, [paths.anchor_key])
+
+    def test_a_store_folder_another_caller_makes_first_is_used(self):
+        real = INSTALL._mkdir
+
+        def the_other_caller_first(name, mode=0o777, **kwargs):
+            if "dir_fd" in kwargs:  # a folder made through the folder judged
+                real(name, 0o700, **kwargs)
+            return real(name, mode, **kwargs)
+
+        with mock.patch.object(INSTALL, "_mkdir", the_other_caller_first):
+            plan = install(Roots(home=self.home), EXEC)
+        self.assertTrue(plan.changed)
+        self.assertTrue(os.path.isfile(owned_paths(Roots(home=self.home)).breaker_store))
+
+    def test_what_a_failure_could_not_remove_is_named_in_one_line(self):
+        paths = owned_paths(Roots(home=self.home))
+
+        def another_file():
+            open(os.path.join(paths.store_dir, "kept.txt"), "w").close()  # put there by another, so kept
+
+        with self._failing_unit(another_file):
+            with self.assertRaises(OSError) as caught:
+                install(Roots(home=self.home), EXEC)
+        note = " ".join(getattr(caught.exception, "__notes__", ()))
+        self.assertTrue(note.startswith(f"This run could not remove what it made at {paths.store_dir}, "), note)
+        self.assertIn("then run the command again.", note)
+        self.assertEqual(len(note.splitlines()), 1)
+        self.assertFalse(os.path.lexists(paths.breaker_store))
+        self.assertTrue(os.path.isfile(os.path.join(paths.store_dir, "kept.txt")))
+
+    def test_a_store_put_at_its_name_meanwhile_is_not_taken_for_the_one_made(self):
+        paths = owned_paths(Roots(home=self.home))
+        real = stores.create_breaker_store
+
+        def another_first(path):
+            real(path)
+            with open(paths.breaker_store, "wb") as other:  # another's file at the store's name, after the look
+                other.write(b"another's")
+
+        with mock.patch.object(stores, "create_breaker_store", another_first):
+            self.refused("breaker_store_exists", install, Roots(home=self.home), EXEC)
+        with open(paths.breaker_store, "rb") as kept:
+            self.assertEqual(kept.read(), b"another's")  # left as it is, never taken for the store made
+        self.assertFalse(os.path.lexists(paths.revocation_store))
+
 
 class OneReadingOfTheGroundTests(unittest.TestCase):
     """Every caller reads the disk through ``store_ground``; none reads the mount table or judges a path by text."""

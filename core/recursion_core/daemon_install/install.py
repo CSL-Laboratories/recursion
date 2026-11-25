@@ -16,8 +16,9 @@ Before any store is made, ``install`` and ``upgrade`` read the file-system type 
 go in from the kernel's mount table (``filesystem_type``) and refuse 9p, overlay and network disks
 (``store_filesystem_unsupported``, ``check_store_ground``), where SQLite's write-ahead log can damage a
 database; a table that cannot be read refuses nothing and the plan says the type was not read. The folder
-is read as the kernel resolves it, from opened folders (``store_ground``), and each store made is held to
-the folder opened when its disk was read (``store_ground_changed``).
+is read as the kernel resolves it, from opened folders (``store_ground``); every store is made through the
+folder opened when its disk was read, by its descriptor, and every store made or found is held to that folder
+(``store_ground_changed``). A step that fails after it began to make the stores removes what it made.
 
 Each returns a ``Plan`` with the ``systemctl --user`` commands that apply the change. This module
 runs none of them: it starts no process, opens no socket and touches no system unit.
@@ -26,12 +27,16 @@ runs none of them: it starts no process, opens no socket and touches no system u
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import errno
 import os
 import re
+import secrets
 import shlex
+import shutil
 import sqlite3
 import stat
+import tempfile
 from dataclasses import dataclass
 
 from .errors import InstallRefused
@@ -39,7 +44,7 @@ from .layout import (BREAKER_FILE, LEDGER_FILE, REVOCATION_FILE, STATE_FOLDER, S
                      check_dirs, check_private_dir, check_state_root, default_state_home, ensure_dir,
                      ensure_state_root, file_untrusted, held_regular, owned_paths, read_regular_and_stat,
                      replace_regular, still_holds, still_names, unlink_regular, write_exclusive)
-from .layout import _MAX_LINKS, _fsync_dir
+from .layout import _MAX_LINKS, _existing_folder, _folders_below, _fsync_dir, _nearest_trusted
 from .unit import MARKER, UNIT_NAME, render_unit, state_elsewhere
 
 _UNIT_MODE = 0o644
@@ -83,9 +88,10 @@ _UNDECIDED = ("Recursion cannot tell which disk {folder} is on, so it creates no
 _CHANGED_BEFORE = ("{where} was moved or replaced after its disk was read and before the stores were made, so "
                    "Recursion made nothing. Leave the folders on the way to it as they are while the command "
                    "runs, and run it again.")
-_CHANGED_AFTER = ("{path} was made, but not in {where}, the folder whose disk was read ({kind}): a folder on "
-                  "the way was moved or replaced while the stores were made. Check its disk with: findmnt -no "
-                  "FSTYPE -T {quoted}; if it is not a local disk, remove {path}, then run the command again.")
+_CHANGED_AFTER = ("{path} does not lead to the store in {where}, the folder whose disk was read ({kind}): a "
+                  "folder on the way was moved or replaced while the stores were made, so Recursion removes "
+                  "what this run made. Leave the folders on the way to it as they are while the command runs, "
+                  "and run it again. See where it leads now with: findmnt -no FSTYPE -T {quoted}")
 
 
 @dataclass(frozen=True)
@@ -415,51 +421,322 @@ def _still_on_ground(grounds: tuple[Ground, ...]) -> None:
             raise InstallRefused("store_ground_changed", _CHANGED_BEFORE.format(where=_shown(ground.where)))
 
 
-def _made_on_ground(grounds: tuple[Ground, ...], made: tuple[str, ...]) -> None:
-    """After the stores are made: each store made now is in the folder opened when its disk was read.
-
-    From the opened folder (``Ground.fd``) the names below it are opened one by one, never through a link, each
-    on the opened folder's device; the store's own entry there must be the file at its path. A store made
-    elsewhere (a folder on the way moved or replaced meanwhile) is ``store_ground_changed``, naming it."""
-
-    by_folder = {ground.folder: ground for ground in grounds}
-    for path in made:
-        ground = by_folder.get(os.path.dirname(path))
-        if ground is None or ground.fd < 0:
-            continue
-        opened, fd, same = [], ground.fd, True
-        try:
-            for name in ground.below:
-                fd = os.open(name, _FOLDER_OPEN, dir_fd=fd)
-                opened.append(fd)
-                if os.fstat(fd).st_dev != ground.device:
-                    same = False
-                    break
-            if same:
-                entry = os.stat(os.path.basename(path), dir_fd=fd, follow_symlinks=False)
-                there = os.stat(path, follow_symlinks=False)
-                same = (entry.st_dev, entry.st_ino) == (there.st_dev, there.st_ino) and entry.st_dev == ground.device
-        except OSError:
-            same = False
-        finally:
-            for each in opened:
-                os.close(each)
-        if not same:
-            raise InstallRefused("store_ground_changed", _CHANGED_AFTER.format(
-                path=_shown(path), where=_shown(ground.where), kind=ground.kind or "a type that was not read",
-                quoted=_quoted(os.path.dirname(path))))
-
-
 def _store_folders(paths: Owned) -> tuple[str, ...]:
     """The folders of every store the step makes: the breaker and revocation stores' and the ledger's."""
 
     return (os.path.dirname(paths.breaker_store), os.path.dirname(paths.revocation_store), os.path.dirname(paths.ledger))
 
 
-def _made_now(made: tuple[tuple[str, str, bool], ...], ledger: tuple[str, bool, str]) -> tuple[str, ...]:
-    """The paths of the stores made by this step: ``ensure_stores``' made now, and the ledger when it was made."""
+def _made_on_ground(grounds: tuple[Ground, ...], run: "_Run") -> None:
+    """After the stores are made: every store this step made or found is in the folder opened when its disk was read.
 
-    return tuple(path for _, path, created in made if created) + ((ledger[0],) if ledger[1] else ())
+    Each store's entry, opened from that folder's descriptor one name at a time and never through a link, must be
+    on the opened folder's device and be the very file at the store's path, and a store made now must still be the
+    file this step made and holds open (``_Run.proven``). A store elsewhere (a folder on the way moved or replaced
+    meanwhile) is ``store_ground_changed``, naming it, and the step removes what it made (``_Run.undo``)."""
+
+    for path, fd, name, mine in run.stores:
+        run.proven(path, fd, name, mine)
+
+
+# The step (install or upgrade) whose stores are being made: ``ensure_stores`` and ``ensure_ledger`` called inside
+# it make and find the stores through the folders it judged (``_Run``).
+_RUN: contextvars.ContextVar = contextvars.ContextVar("recursion_install_run", default=None)
+# The folders of a step (those made through an opened folder, and the private folder a store is built in) are
+# made by this one call, bound when the module is loaded.
+_mkdir = os.mkdir
+# The sentence added to a failure after which this step could not remove all it made.
+_NOT_CLEANED = (" This run could not remove what it made at {paths}: remove {it} once nothing uses {it}, then run "
+                "the command again.")
+
+
+def _remove_entry(fd: int, name: str, mine: tuple[int, int]) -> None:
+    """Remove ``name`` in the opened folder ``fd`` while it is the file ``mine``; anything else there is kept."""
+
+    with contextlib.suppress(OSError):
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) == mine:
+            os.unlink(name, dir_fd=fd)
+
+
+def _open_store(path: str, magic: str, *, check_only: bool = False) -> None:
+    """``plugin_security.stores``' own check (``check_store``) or open (``open_store``) of a store, its refusal
+    kept as the installer's."""
+
+    from recursion_core.plugin_security import Refused, stores
+
+    try:
+        if check_only:
+            stores.check_store(path, magic)
+        else:
+            stores.open_store(path, magic).close()
+    except Refused as refusal:
+        raise InstallRefused(refusal.code, f"{path}: {refusal.detail}") from None
+    except (OSError, sqlite3.Error) as exc:
+        raise InstallRefused("store_not_created", f"{path}: {type(exc).__name__}: {exc}") from None
+
+
+def _built(path: str, create) -> bytes:
+    """A new store's bytes: ``create`` (``plugin_security.stores``' own create, which builds, checks and links it)
+    run in a private temporary folder of this process, read back, and that folder removed."""
+
+    from recursion_core.plugin_security import Refused
+
+    build = os.path.join(tempfile.gettempdir(), f".recursion-store-{secrets.token_hex(8)}")
+    try:
+        _mkdir(build, 0o700)
+    except OSError as exc:
+        raise InstallRefused("store_not_created", f"{path}: no private folder to build it in: {type(exc).__name__}: "
+                             f"{exc}") from None
+    try:
+        built = os.path.join(build, os.path.basename(path))
+        try:
+            create(built)
+        except Refused as refusal:
+            if refusal.code.endswith("_invalid"):
+                # The helper's refusal of a new store it could not build or put in place: a store not made.
+                raise InstallRefused("store_not_created", f"{path}: {refusal.code}: {refusal.detail}") from None
+            raise InstallRefused(refusal.code, f"{path}: {refusal.detail}") from None
+        except (OSError, sqlite3.Error) as exc:
+            raise InstallRefused("store_not_created", f"{path}: {type(exc).__name__}: {exc}") from None
+        with open(built, "rb") as source:
+            return source.read()
+    finally:
+        shutil.rmtree(build, ignore_errors=True)
+
+
+def _checked_way(paths: Owned) -> None:
+    """The rule ``ensure_state_root`` and ``ensure_dir`` hold a folder that is there to (a link, a file, or a folder
+    another user owns or can write is refused instead of being used), for each folder from the state root to the
+    store folder that is there, read only: the folders that are not there are made by ``_Run.folder``."""
+
+    root = _nearest_trusted(paths.state_root) if paths.chosen else paths.state_root
+    for current in _folders_below(root, paths.store_dir):
+        if not _existing_folder(current):
+            return
+
+
+class _Run:
+    """What one step makes of the stores, through the folders it judged (``store_ground``), and how it is undone.
+
+    A folder below a judged folder is opened from the judged folder's descriptor, one name at a time and never
+    through a link, and made there (0700) when it is not there. A new store is built by ``plugin_security.stores``
+    in a private temporary folder (``_built``); its bytes are written through the opened store folder under a
+    temporary name (``O_EXCL``, ``O_NOFOLLOW``, held open until the answer) and linked to the store's name
+    exclusively, so a store already at that name is never taken for the one just made. Every store, made or found,
+    is held to the opened folder by the kernel's identity of the file (``proven``). ``undo`` removes what the step
+    made, newest first, each only while its name still holds the file or folder made, and the key made now with
+    the ledger, and returns the paths it could not remove."""
+
+    def __init__(self, grounds: tuple[Ground, ...], held: contextlib.ExitStack) -> None:
+        self.grounds = grounds
+        self.by_folder = {ground.folder: ground for ground in grounds}
+        self.held = held
+        self.folders: dict[str, tuple[int, Ground]] = {}
+        # (what, opened folder or -1, name or path, (device, inode), path), in the order made
+        self.made: list[tuple[str, int, str, tuple[int, int], str]] = []
+        self.stores: list[tuple[str, int, str, tuple[int, int]]] = []
+        self.key: tuple[str, bytes] | None = None
+
+    def covers(self, paths: Owned) -> bool:
+        return all(folder in self.by_folder for folder in _store_folders(paths))
+
+    def folder(self, folder: str) -> int:
+        """The store folder ``folder``, opened (and the folders below its judged folder made) from the judged
+        folder's descriptor; held open until the answer."""
+
+        if folder in self.folders:
+            return self.folders[folder][0]
+        ground = self.by_folder[folder]
+        changed = InstallRefused("store_ground_changed", _CHANGED_BEFORE.format(where=_shown(ground.where)))
+        if ground.fd < 0:
+            raise changed
+        fd, path = ground.fd, ground.where
+        for name in ground.below:
+            path = os.path.join(path, name)
+            made = False
+            try:
+                try:
+                    below = os.open(name, _FOLDER_OPEN, dir_fd=fd)
+                except FileNotFoundError:
+                    try:
+                        _mkdir(name, _DIR_MODE, dir_fd=fd)
+                        made = True
+                    except FileExistsError:
+                        pass  # another caller made it since the look: held to the same rules below
+                    below = os.open(name, _FOLDER_OPEN, dir_fd=fd)
+            except OSError:
+                raise changed from None
+            self.held.callback(os.close, below)
+            info = os.fstat(below)
+            if made:
+                self.made.append(("folder", fd, name, (info.st_dev, info.st_ino), path))
+            if info.st_dev != ground.device:
+                raise changed
+            if os.name == "posix" and (info.st_uid != os.geteuid() or info.st_mode & 0o022):
+                raise InstallRefused("folder_untrusted", f"{_shown(path)} is another user's or writable by others, so "
+                                     "no store is made in it: `chmod 700` it, or remove it, then run the command again")
+            fd = below
+        self.folders[folder] = (fd, ground)
+        return fd
+
+    def there(self, path: str) -> bool:
+        fd = self.folder(os.path.dirname(path))
+        try:
+            os.stat(os.path.basename(path), dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise InstallRefused("store_not_created", f"{path}: {type(exc).__name__}: {exc}") from None
+        return True
+
+    def store(self, path: str, magic: str, create) -> bool:
+        """Find the store at ``path`` in its judged folder, or make it there with ``create``. True when made now."""
+
+        from recursion_core.plugin_security import stores
+
+        prefix = stores.KINDS[magic]
+        fd, name = self.folder(os.path.dirname(path)), os.path.basename(path)
+        if self.there(path):
+            self.proven(path, fd, name, None)  # before any open: the path leads into the folder judged
+            _open_store(path, magic)
+            self.stores.append((path, fd, name, self.proven(path, fd, name, None)))
+            return False
+        if create is None:
+            raise InstallRefused(f"{prefix}_missing", f"{path}: {name}")
+        for suffix in ("-wal", "-shm", "-journal"):  # a leftover side file would be replayed into the new store
+            try:
+                os.stat(name + suffix, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise InstallRefused(f"{prefix}_exists", f"{path}: {name}{suffix}")
+        data = _built(path, create)
+        part = f".{name}.{secrets.token_hex(8)}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            out = os.open(part, flags, 0o600, dir_fd=fd)
+        except OSError as exc:
+            raise InstallRefused("store_not_created", f"{path}: {type(exc).__name__}: {exc}") from None
+        self.held.callback(os.close, out)  # the file made stays open until the answer: its identity is not reused
+        info = os.fstat(out)
+        mine = (info.st_dev, info.st_ino)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(out, view):]
+            os.fsync(out)
+            try:
+                os.link(part, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+            except FileExistsError:
+                raise InstallRefused(f"{prefix}_exists", f"{path}: {name}") from None
+            except OSError as exc:
+                raise InstallRefused("store_not_created", f"{path}: cannot link the new store: {type(exc).__name__}: "
+                                     f"{exc}") from None
+            self.made.append(("file", fd, name, mine, path))
+            os.fsync(fd)
+        except OSError as exc:
+            raise InstallRefused("store_not_created", f"{path}: {type(exc).__name__}: {exc}") from None
+        finally:
+            _remove_entry(fd, part, mine)
+        self.proven(path, fd, name, mine)
+        _open_store(path, magic, check_only=True)  # the store and the folders above it, by the stores' own rules
+        self.stores.append((path, fd, name, mine))
+        return True
+
+    def proven(self, path: str, fd: int, name: str, mine: tuple[int, int] | None) -> tuple[int, int]:
+        """The store's entry in its opened folder is on that folder's device, is the file at ``path``, and, made now
+        or seen before (``mine``), is that same file; else ``store_ground_changed``."""
+
+        ground = self.folders[os.path.dirname(path)][1]
+        try:
+            entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            there = os.stat(path, follow_symlinks=False)
+            same = ((entry.st_dev, entry.st_ino) == (there.st_dev, there.st_ino) and entry.st_dev == ground.device
+                    and (mine is None or (entry.st_dev, entry.st_ino) == mine))
+        except OSError:
+            same = False
+        if not same:
+            raise InstallRefused("store_ground_changed", _CHANGED_AFTER.format(
+                path=_shown(path), where=_shown(ground.where), kind=ground.kind or "a type that was not read",
+                quoted=_quoted(os.path.dirname(path))))
+        return (entry.st_dev, entry.st_ino)
+
+    def made_at(self, path: str) -> None:
+        """A folder made by path in this step (``ensure_dir``): removed by ``undo`` while it is that folder."""
+
+        with contextlib.suppress(OSError):
+            info = os.stat(path, follow_symlinks=False)
+            self.made.append(("path", -1, path, (info.st_dev, info.st_ino), path))
+
+    def undo(self) -> list[str]:
+        """Remove what this step made, newest first; the paths it could not remove."""
+
+        left = []
+        for what, fd, name, mine, path in reversed(self.made):
+            try:
+                info = os.stat(name, dir_fd=fd if fd >= 0 else None, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                left.append(path)
+                continue
+            if (info.st_dev, info.st_ino) != mine:
+                continue  # another file or folder at the name now: not this step's, left as it is
+            try:
+                if what == "file":
+                    os.unlink(name, dir_fd=fd)
+                else:
+                    os.rmdir(name, dir_fd=fd if fd >= 0 else None)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                left.append(path)
+        if self.key is not None:
+            key, pem = self.key
+            _remove_key_made(key, pem)
+            with contextlib.suppress(OSError, InstallRefused):
+                with held_regular(key) as (data, _):
+                    if data == pem:
+                        left.append(key)
+        return left
+
+    def undone(self, exc: BaseException) -> BaseException:
+        """``exc`` after ``undo``: an ``InstallRefused`` with one sentence naming what could not be removed."""
+
+        left = self.undo()
+        if not left:
+            return exc
+        words = _NOT_CLEANED.format(paths=", ".join(_shown(path) for path in left), it="it" if len(left) == 1 else "them")
+        if isinstance(exc, InstallRefused):
+            return InstallRefused(exc.kind, exc.detail + words)
+        if hasattr(exc, "add_note"):
+            exc.add_note(words.strip())
+        return exc
+
+
+@contextlib.contextmanager
+def _in_run(paths: Owned):
+    """The step ``ensure_stores`` and ``ensure_ledger`` make the stores in: the caller's (install, upgrade), or,
+    called on their own, one of their own over the store folders (each judged, ``accept_risk``: they refuse no kind
+    of disk themselves), whose stores are proven at its end and undone on a failure."""
+
+    run = _RUN.get()
+    if run is not None and run.covers(paths):
+        yield run
+        return
+    with contextlib.ExitStack() as held:
+        run = _Run(_judge(_store_folders(paths), "accept_risk", held)[1], held)
+        token = _RUN.set(run)
+        try:
+            yield run
+            _made_on_ground(run.grounds, run)
+        except BaseException as exc:
+            refusal = run.undone(exc)
+            if refusal is exc:
+                raise
+            raise refusal from None
+        finally:
+            _RUN.reset(token)
 
 
 def ensure_stores(paths: Owned) -> tuple[tuple[str, str, bool], ...]:
@@ -473,34 +750,22 @@ def ensure_stores(paths: Owned) -> tuple[tuple[str, str, bool], ...]:
     a umask that takes the owner's own write bit, an I/O error at the final link: the helper's
     ``<store>_invalid`` for a new store, its code kept in the detail) is ``store_not_created``. Returns
     ``(kind, path, created now)`` for each. The ledger is not one of these: ``ensure_ledger`` is the
-    step that would create it, and it has no anchor key unless the caller passes one.
+    step that would create it, and it has no anchor key unless the caller passes one. Each store is found or
+    made through the folder its disk was read for (``_Run``: inside ``install`` or ``upgrade``, theirs; called
+    on its own, one of its own that refuses no kind of disk), and a failure removes what was made.
     """
 
     # Imported here, not with this module: ``recursiond --help`` builds its parser from this package.
-    from recursion_core.plugin_security import Refused, stores
+    from recursion_core.plugin_security import stores
 
     if type(paths) is not Owned:
         raise InstallRefused("paths", "ensure_stores takes owned_paths(roots)")
-    ensure_state_root(paths)
-    ensure_dir(paths.state_root, paths.store_dir, mode=_DIR_MODE)
-    done = []
-    for path, magic, create in ((paths.breaker_store, stores.BREAKER_MAGIC, stores.create_breaker_store),
-                                (paths.revocation_store, stores.REVOCATION_MAGIC, stores.create_revocation_store)):
-        exists = os.path.lexists(path)
-        try:
-            if exists:
-                stores.open_store(path, magic).close()
-            else:
-                create(path)
-        except Refused as refusal:
-            if not exists and refusal.code.endswith("_invalid"):
-                # The helper's refusal of a new store it could not build or put in place (an I/O error at
-                # its final link included): not a store found wrong, a store not made.
-                raise InstallRefused("store_not_created", f"{path}: {refusal.code}: {refusal.detail}") from None
-            raise InstallRefused(refusal.code, f"{path}: {refusal.detail}") from None
-        except (OSError, sqlite3.Error) as exc:
-            raise InstallRefused("store_not_created", f"{path}: {type(exc).__name__}: {exc}") from None
-        done.append((stores.KINDS[magic], path, not exists))
+    with _in_run(paths) as run:
+        _checked_way(paths)
+        done = []
+        for path, magic, create in ((paths.breaker_store, stores.BREAKER_MAGIC, stores.create_breaker_store),
+                                    (paths.revocation_store, stores.REVOCATION_MAGIC, stores.create_revocation_store)):
+            done.append((stores.KINDS[magic], path, run.store(path, magic, create)))
     return tuple(done)
 
 
@@ -529,29 +794,18 @@ def _ensure_ledger(paths: Owned, anchor_public_key: str | None, *, create: bool)
         raise InstallRefused("paths", "ensure_ledger takes owned_paths(roots)")
     if anchor_public_key is not None and type(anchor_public_key) is not str:
         raise InstallRefused("anchor_public_key", "the anchor is the installer's public key, or absent")
-    ensure_state_root(paths)
-    ensure_dir(paths.state_root, paths.store_dir, mode=_DIR_MODE)
-    path = paths.ledger
-    exists = os.path.lexists(path)
-    if not anchor_public_key:
-        if not exists:
-            return (path, False, NEEDS_ANCHOR)
-        _open_ledger(path)
+    with _in_run(paths) as run:  # found or made through the folder its disk was read for
+        _checked_way(paths)
+        path = paths.ledger
+        if not run.there(path):
+            if not anchor_public_key:
+                return (path, False, NEEDS_ANCHOR)
+            if not create:
+                raise InstallRefused("authority_anchor_disagrees", _ledger_gone_detail(paths))
+            run.store(path, stores.LEDGER_MAGIC, lambda built: stores.create_ledger(built, anchor_public_key))
+            return (path, True, "")
+        run.store(path, stores.LEDGER_MAGIC, None)
         return (path, False, "")
-    if exists:
-        _open_ledger(path)
-        return (path, False, "")
-    if not create:
-        raise InstallRefused("authority_anchor_disagrees", _ledger_gone_detail(paths))
-    try:
-        stores.create_ledger(path, anchor_public_key)
-    except Refused as refusal:
-        if not exists and refusal.code.endswith("_invalid"):
-            raise InstallRefused("store_not_created", f"{path}: {refusal.code}: {refusal.detail}") from None
-        raise InstallRefused(refusal.code, f"{path}: {refusal.detail}") from None
-    except (OSError, sqlite3.Error) as exc:
-        raise InstallRefused("store_not_created", f"{path}: {type(exc).__name__}: {exc}") from None
-    return (path, True, "")
 
 
 def _open_ledger(path: str) -> None:
@@ -828,6 +1082,10 @@ def _anchor_and_ledger(paths: Owned, anchor_public_key: str | None, found: _Foun
     if found.public is not None:  # found with its ledger: a ledger gone since the look is refused, never made anew
         return _ensure_ledger(paths, found.public, create=False), (paths.anchor_key, False)
     public, pem = _make_key(paths, found)
+    run = _RUN.get()
+    if run is not None and run.covers(paths):  # the step removes the key with the ledger on a failure
+        run.key = (paths.anchor_key, pem)
+        return ensure_ledger(paths, public), (paths.anchor_key, True)
     try:
         ledger = ensure_ledger(paths, public)
     except BaseException:
@@ -850,16 +1108,17 @@ def install(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
     refused before anything is made; the root as made (or as another caller made it meanwhile) is held
     to the same rule before the unit is written. A unit found is held open until the answer and checked against
     its bytes and then its path last (``still_holds``, then ``still_names``): one removed, replaced or rewritten
-    in place meanwhile is ``unit_missing`` or ``unit_changed``. A refusal
-    after the stores are begun (that, or a store refused after the other was made) leaves what was
-    made; each store made is a whole, valid store, and the command run again finds it. ``anchor_public_key``
+    in place meanwhile is ``unit_missing`` or ``unit_changed``. A failure
+    after the stores are begun (that, or a store refused after the other was made) removes what this run
+    made (the stores, the folders made for them, a key made now) and names any path it could not remove;
+    the stores found are left as they are. ``anchor_public_key``
     is passed to ``ensure_ledger``; the default None is the command, which has no key. A platform
     with no ``os.geteuid`` is refused ``platform_unsupported`` (one line naming the platform) before
     any path is read or written. With ``make_anchor`` (``recursiond install``) the ledger is bound to the
     install's own key, made on a fresh profile (``find_anchor``, ``make_anchor_key``); key, ledger and
     ``install.json``'s ``authority_anchor`` that disagree are refused before anything is made.
-    ``on_anchor_made(path)``, if given, is called once when a key made now is kept, also when a later step
-    then fails."""
+    ``on_anchor_made(path)``, if given, is called once when a key made now is kept: when the install ends
+    made."""
 
     paths = owned_paths(roots)
     unit = render_unit(exec_args, paths.state_home if paths.chosen else None).encode()
@@ -880,17 +1139,30 @@ def install(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
         ground, grounds = _judge(_store_folders(paths), held=held)
         found = _found(paths, anchor_public_key, make_anchor)  # before anything is made
         _still_on_ground(grounds)  # the folders read still name the folders opened: nothing swapped since
-        made = ensure_stores(paths)  # first: a unit is never left naming a daemon whose stores are missing
-        ledger, anchor = _anchor_and_ledger(paths, anchor_public_key, found, make_anchor, on_anchor_made)
-        _made_on_ground(grounds, _made_now(made, ledger))  # each store made now is where its disk was read
-        homes = ensure_dir(paths.state_root, paths.homes, mode=_DIR_MODE)
-        check_private_dir(paths.state_root, paths.homes, required=True)  # as made, or as another caller made it
-        if present:
-            still_holds(paths.unit, read)  # the bytes read, first: an in-place rewrite shows here
-            still_names(paths.unit, info)  # last: the path still names the file that was read
-        else:
-            ensure_dir(paths.home, paths.unit_dir, mode=_DIR_MODE)
-            write_exclusive(paths.unit, unit, _UNIT_MODE)
+        run = _Run(grounds, held)  # the stores made through the folders opened, and undone on a failure
+        token = _RUN.set(run)
+        try:
+            made = ensure_stores(paths)  # first: a unit is never left naming a daemon whose stores are missing
+            ledger, anchor = _anchor_and_ledger(paths, anchor_public_key, found, make_anchor, on_anchor_made)
+            _made_on_ground(grounds, run)  # each store made or found is in the folder whose disk was read
+            homes = ensure_dir(paths.state_root, paths.homes, mode=_DIR_MODE)
+            if homes:
+                run.made_at(paths.homes)
+            check_private_dir(paths.state_root, paths.homes, required=True)  # as made, or as another caller made it
+            if present:
+                still_holds(paths.unit, read)  # the bytes read, first: an in-place rewrite shows here
+                still_names(paths.unit, info)  # last: the path still names the file that was read
+            else:
+                ensure_dir(paths.home, paths.unit_dir, mode=_DIR_MODE)
+                write_exclusive(paths.unit, unit, _UNIT_MODE)
+        except BaseException as exc:
+            refusal = run.undone(exc)  # nothing this run made is left; what could not be removed is named
+            if refusal is exc:
+                raise
+            raise refusal from None
+        finally:
+            _RUN.reset(token)
+        _kept(paths, anchor, on_anchor_made)
         return _plan("install", not present or _any_created(made) or homes or ledger[1], paths, made, ledger, anchor,
                      ground)
 
@@ -929,16 +1201,29 @@ def upgrade(roots: Roots, exec_args: tuple[str, ...], *, anchor_public_key: str 
         ground, grounds = _judge(_store_folders(paths), held=held)
         found = _found(paths, anchor_public_key, make_anchor)  # before anything is made
         _still_on_ground(grounds)  # the folders read still name the folders opened: nothing swapped since
-        made = ensure_stores(paths)
-        ledger, anchor = _anchor_and_ledger(paths, anchor_public_key, found, make_anchor, on_anchor_made)
-        _made_on_ground(grounds, _made_now(made, ledger))  # each store made now is where its disk was read
-        homes = ensure_dir(paths.state_root, paths.homes, mode=_DIR_MODE)
-        check_private_dir(paths.state_root, paths.homes, required=True)  # as made, or as another caller made it
-        if current:
-            still_holds(paths.unit, read)  # the bytes read, first: an in-place rewrite shows here
-            still_names(paths.unit, info)  # last: the path still names the file that was read
-        else:
-            replace_regular(paths.unit, unit, _UNIT_MODE)
+        run = _Run(grounds, held)  # the stores made through the folders opened, and undone on a failure
+        token = _RUN.set(run)
+        try:
+            made = ensure_stores(paths)
+            ledger, anchor = _anchor_and_ledger(paths, anchor_public_key, found, make_anchor, on_anchor_made)
+            _made_on_ground(grounds, run)  # each store made or found is in the folder whose disk was read
+            homes = ensure_dir(paths.state_root, paths.homes, mode=_DIR_MODE)
+            if homes:
+                run.made_at(paths.homes)
+            check_private_dir(paths.state_root, paths.homes, required=True)  # as made, or as another caller made it
+            if current:
+                still_holds(paths.unit, read)  # the bytes read, first: an in-place rewrite shows here
+                still_names(paths.unit, info)  # last: the path still names the file that was read
+            else:
+                replace_regular(paths.unit, unit, _UNIT_MODE)
+        except BaseException as exc:
+            refusal = run.undone(exc)  # nothing this run made is left; what could not be removed is named
+            if refusal is exc:
+                raise
+            raise refusal from None
+        finally:
+            _RUN.reset(token)
+        _kept(paths, anchor, on_anchor_made)
         return _plan("upgrade", not current or _any_created(made) or homes or ledger[1], paths, made, ledger, anchor,
                      ground)
 
@@ -999,6 +1284,13 @@ def leftovers(roots: Roots) -> tuple[str, ...]:
 
     paths = owned_paths(roots)
     return tuple(path for path in (paths.unit,) if os.path.lexists(path))
+
+
+def _kept(paths: Owned, anchor: tuple[str, bool] | None, on_anchor_made) -> None:
+    """At the end of a step that ended made: ``on_anchor_made`` for a key made now, which is kept."""
+
+    if anchor is not None and anchor[1] and on_anchor_made is not None:
+        on_anchor_made(paths.anchor_key)
 
 
 def _any_created(made: tuple[tuple[str, str, bool], ...]) -> bool:

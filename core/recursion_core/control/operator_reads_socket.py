@@ -39,6 +39,7 @@ connects to nothing and answers ``control_api_unavailable``, ``delivered`` ``Fal
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import stat
@@ -234,11 +235,17 @@ class OperatorReadsServer:
             raise TypeError("this socket serves an OperatorReads and nothing else")
         if max_connections < 1 or read_deadline_s <= 0:
             raise ValueError("max_connections and read_deadline_s must be positive")
+        deadline = float(read_deadline_s)
+        # NaN and infinity are not <= 0. settimeout then raises and the request is dropped with no answer.
+        if not math.isfinite(deadline):
+            raise ValueError("max_connections and read_deadline_s must be positive")
         self._reads, self._path = reads, path
-        self._deadline, self._max = float(read_deadline_s), int(max_connections)
+        self._deadline, self._max = deadline, int(max_connections)
         self._peer_uid = peer_uid or _peer_uid
         self._slots = threading.BoundedSemaphore(self._max)
         self._lock = threading.Lock()
+        # start and close share this. close must not decide the listener is absent while start can still publish.
+        self._gate = threading.Lock()
         self._conns: set[socket.socket] = set()
         self._workers: list[threading.Thread] = []
         self._stop = threading.Event()
@@ -253,6 +260,10 @@ class OperatorReadsServer:
         return self._path
 
     def start(self) -> OperatorReadsServer:
+        with self._gate:
+            return self._start_locked()
+
+    def _start_locked(self) -> OperatorReadsServer:
         if self._listener is not None or self._stop.is_set():
             raise RuntimeError("the server was already started")
         if _AF_UNIX is None or _SO_PEERCRED is None or fcntl is None:
@@ -315,31 +326,40 @@ class OperatorReadsServer:
     def close(self) -> None:
         """Stop serving and remove this server's own socket file (never another file at the path)."""
 
-        self._stop.set()
-        listener, self._listener = self._listener, None
-        if listener is None:
-            return
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-        listener.close()
-        with self._lock:
-            conns, workers = list(self._conns), list(self._workers)
-        for conn in conns:
+        with self._gate:
+            self._stop.set()
+            # Start holds this lock until it has published or rolled back, so a missing listener
+            # here is not published afterwards. A later call finishes cleanup the first one did not,
+            # and does nothing once the socket lock is gone and no source call is still running.
+            if (self._listener is None and self._start_lock is None
+                    and not any(worker.is_alive() for worker in self._workers)):
+                return
+            if self._thread is not None:
+                self._thread.join(timeout=5.0)
+            listener, self._listener = self._listener, None
+            if listener is not None:
+                listener.close()
+            with self._lock:
+                conns, workers = list(self._conns), list(self._workers)
+            for conn in conns:
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            for worker in workers:
+                # A timed join used to return while the source call could still write. Wait it out.
+                worker.join(timeout=5.0)
+                while worker.is_alive():
+                    worker.join(timeout=5.0)
             try:
-                conn.shutdown(socket.SHUT_RDWR)
+                st = os.lstat(self._path)
+                if (st.st_dev, st.st_ino) == self._identity:
+                    os.unlink(self._path)
             except OSError:
                 pass
-        for worker in workers:
-            worker.join(timeout=5.0)
-        try:
-            st = os.lstat(self._path)
-            if (st.st_dev, st.st_ino) == self._identity:
-                os.unlink(self._path)
-        except OSError:
-            pass
-        held, self._start_lock = self._start_lock, None
-        if held is not None:  # after the socket is gone, so the next server finds nothing live
-            _release_start_lock(self._path + _LOCK_SUFFIX, held)
+            held, self._start_lock = self._start_lock, None
+            if held is not None:  # after the socket is gone, so the next server finds nothing live
+                _release_start_lock(self._path + _LOCK_SUFFIX, held)
 
     def __enter__(self) -> OperatorReadsServer:
         return self.start()
@@ -376,8 +396,11 @@ class OperatorReadsServer:
             try:
                 worker.start()
             except RuntimeError:
+                # An unstarted thread cannot be joined. Leaving it tracked makes close raise
+                # before the socket path is removed, and the slot must be given back.
                 with self._lock:
                     self._conns.discard(conn)
+                    self._workers = [w for w in self._workers if w is not worker]
                 self._slots.release()
                 self._reject(conn, BUSY)
 

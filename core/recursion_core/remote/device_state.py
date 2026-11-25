@@ -19,8 +19,23 @@ the phone door of this lane's later slices keep, so that they are tested before 
   earlier answer.
 * After that ``disconnect`` the book keeps the record for ``revoked_connection_keep_s`` seconds on its
   clock, and the same holds while it is kept. ``None`` (the first value, ``REVOKED_CONNECTION_KEEP_S``)
-  never forgets: that id is never admitted again in the book's life, nor, with a store, after a restart.
-  ``0`` drops it at the disconnect, and the id is then admitted as any new one.
+  never forgets: that id is never admitted again in the book's life, nor, with a store, after a restart,
+  unless the bound below makes room. ``0`` drops it at the disconnect, and the id is then admitted as any new
+  one. Every ``revoke`` and ``disconnect``, and the load at the start, drop the records whose keep time has
+  passed, without waiting for their id to be looked at, and the store forgets them too.
+* THE BOUND. At most ``revoked_connection_keep_max`` records are kept (``None``: no bound). When a revoke or
+  a disconnect would pass it, the book forgets, in this order: first every record whose keep time has
+  passed; then the records whose disconnect has come, oldest release first. A record whose disconnect has
+  not come (a connection the door may still present) is NEVER forgotten, so a revoke never admits an id the
+  door still holds: if those alone pass the bound, the book keeps them and ``status`` says that the bound is
+  passed and by how many. Forgetting a record makes its id free for another device; for ids the book makes
+  itself (``new_connection_id``) that costs nothing, since none of them is ever made twice.
+* A device holds at most ``connections_max`` live connections (``None``: no cap); ``connect`` refuses one
+  more with ``connections_full``, so one paired device cannot make the record grow without end at a revoke.
+* ``new_connection_id`` makes connection ids that are never reused: a boot id drawn at each start (with a
+  store, written in it, and never the prefix of a held id) and a counter. A door that takes its ids from the
+  book never meets a held id, so the keep time and the bound cost it nothing. Ids a door brings itself are
+  still taken as before.
 * With a store, ``revoke`` returns only when the device's revocation and every connection it named are
   written and synced, and ``disconnect`` writes the release of such a connection the same way. A book built
   on the same store after a restart refuses as the book before it did. Each record carries the wall-clock
@@ -52,8 +67,10 @@ the unused bound.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import math
+import secrets
 import threading
 import time
 from collections.abc import Callable, Hashable
@@ -70,6 +87,21 @@ from .revocation_store import RevocationStore, RevocationStoreError, Revocations
 # named: it becomes the row remote.device.revoked_connection_keep_s of the person's settings file when that
 # file is in this tree, an argument of DeviceBook still winning.
 REVOKED_CONNECTION_KEEP_S: float | None = None
+
+# The row remote.device.revoked_connection_keep_max: the most records of revoked connections the daemon
+# keeps; when it is reached, the records of connections already closed are forgotten oldest first and their
+# ids may then be given to another device; a connection still open is never forgotten. none: no bound. The
+# first value, about 13 MB at some 130 bytes a record; the one place it is named, an argument of DeviceBook
+# still winning, until the settings file is in this tree.
+REVOKED_CONNECTION_KEEP_MAX: int | None = 100_000
+
+# The row remote.device.connections_max: the most open connections one paired device may hold at once; one
+# more is refused. none: no cap. The first value; the one place it is named, an argument of DeviceBook still
+# winning, until the settings file is in this tree.
+CONNECTIONS_MAX: int | None = 64
+
+# The length of the boot id, in random bytes: a figure of the id's form, not a setting.
+_BOOT_BYTES = 16
 
 
 @dataclass(frozen=True)
@@ -90,6 +122,12 @@ def unreadable_detail(reason: str) -> str:
     """The words of ``revocations_unreadable``: what, why, and the step."""
     return ("the record of revoked phones could not be read, so no phone is let in until it can be: that way no "
             f"revoked phone is let in by mistake. {reason}")
+
+
+def connections_full_detail(held: int) -> str:
+    """The words of ``connections_full``."""
+    return (f"this device already holds {held} open connections, the most allowed (remote.device.connections_max): "
+            "end one of them first")
 
 
 class RevocationNotWritten(PairingRefused):
@@ -143,6 +181,12 @@ def _key(conn_id: object) -> bool:
     return True
 
 
+def _count_setting(name: str, value: object, words: str) -> None:
+    if value is not None and (type(value) is not int or value < 1):
+        raise PairingRefused("setting_invalid", f"remote.device.{name} is none ({words}) or a whole number, "
+                             "1 or more")
+
+
 @dataclass
 class DeviceBook:
     """Paired devices and their live connections, in memory, under one lock. ``clock`` is monotonic; ``wall``
@@ -150,6 +194,8 @@ class DeviceBook:
 
     ``revoked_connection_keep_s``: how long the record of a revoked device's connection is kept after the
     door's disconnect of it (``None``: never forgotten; ``0``: dropped at the disconnect).
+    ``revoked_connection_keep_max``: the most such records kept (``None``: no bound); see the module text.
+    ``connections_max``: the most live connections one device holds (``None``: no cap).
     ``store``: where revocations are kept across a restart (``None``: in memory only).
     """
 
@@ -157,14 +203,21 @@ class DeviceBook:
     revoked_connection_keep_s: float | None = REVOKED_CONNECTION_KEEP_S
     store: RevocationStore | None = None
     wall: Callable[[], float] = time.time
+    revoked_connection_keep_max: int | None = REVOKED_CONNECTION_KEEP_MAX
+    connections_max: int | None = CONNECTIONS_MAX
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _write_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _devices: dict[str, DeviceRecord] = field(default_factory=dict, init=False, repr=False)
     _connections: dict[Hashable, str] = field(default_factory=dict, init=False, repr=False)
+    _by_device: dict[str, dict] = field(default_factory=dict, init=False, repr=False)
     _revoked: dict[Hashable, _RevokedConnection] = field(default_factory=dict, init=False, repr=False)
+    # The released records, oldest release first: the order of the sweep and of the bound.
+    _released: collections.OrderedDict = field(default_factory=collections.OrderedDict, init=False, repr=False)
     _revoked_devices: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _unwritten: set = field(default_factory=set, init=False, repr=False)
     _unreadable: str | None = field(default=None, init=False, repr=False)
+    _boot: str = field(default="", init=False, repr=False)
+    _counter: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         keep = self.revoked_connection_keep_s
@@ -172,24 +225,30 @@ class DeviceBook:
                                  or math.isnan(keep) or keep < 0):
             raise PairingRefused("setting_invalid", "revoked_connection_keep_s is None (never forget) or a "
                                  "number of seconds, 0 or more")
-        if self.store is not None:
-            with self._write_lock:
-                with self._lock:
-                    change = self._load()
-                self._write(change)
+        _count_setting("revoked_connection_keep_max", self.revoked_connection_keep_max, "no bound")
+        _count_setting("connections_max", self.connections_max, "no cap")
+        with self._write_lock:
+            with self._lock:
+                change, forget = self._load() if self.store is not None else (None, ())
+                self._draw_boot()
+                if self.store is not None and self._unreadable is None:
+                    change = Revocations(change.devices if change else {}, change.connections if change else {},
+                                         self._boot)
+            self._write(change, forget)
 
     # -- the store --------------------------------------------------------------------------------
-    def _load(self) -> Revocations | None:
-        """Called with both locks held: memory takes what the store holds. Returns the releases to write."""
+    def _load(self) -> tuple[Revocations | None, tuple]:
+        """Called with the book's lock held: memory takes what the store holds. Returns the releases to write and
+        the records to forget."""
         try:
             held = self.store.load()  # type: ignore[union-attr]
         except RevocationStoreError as exc:
             self._unreadable = unreadable_detail(str(exc))
-            return None
+            return None, ()
         self._unreadable = None
         now, wall = self.clock(), self.wall()
         self._revoked_devices.update(held.devices)
-        released = {}
+        earlier, released = [], {}
         for conn_id, stored in held.connections.items():
             if stored.released_wall is None:
                 # Not released when the daemon stopped: the door's connections ended with it.
@@ -199,18 +258,33 @@ class DeviceBook:
                 # A wall clock that moved back is read as no time passed (kept longer, the safe side).
                 gone = max(0.0, wall - stored.released_wall)
                 record = _RevokedConnection(stored.device_id, now - gone, stored.released_wall)
+            earlier.append((record.released_at, conn_id, record))
+        earlier.sort(key=lambda item: item[0])
+        for _, conn_id, record in earlier:
             self._revoked[conn_id] = record
+            self._released[conn_id] = None
+        forget = self._forgetting()
+        released = {c: r for c, r in released.items() if c in self._revoked}
         if not released:
-            return None
+            return None, forget
         devices = {r.device_id: self._revoked_devices[r.device_id] for r in released.values()}
-        return Revocations(devices, released)
+        return Revocations(devices, released), forget
+
+    def _draw_boot(self) -> None:
+        """Called with the book's lock held: a boot id no held id begins with, and never the stored one."""
+        while True:
+            boot = secrets.token_hex(_BOOT_BYTES)
+            prefix = boot + "."
+            if not any(type(c) is str and c.startswith(prefix) for c in self._revoked):
+                self._boot, self._counter = boot, 0
+                return
 
     def _write(self, change: Revocations | None, forget: tuple = ()) -> str | None:
         """Called with the write lock held and the book's lock free. Returns why it failed, else None."""
         if self.store is None:
             return None
         try:
-            if change is not None and (change.devices or change.connections):
+            if change is not None and (change.devices or change.connections or change.boot is not None):
                 self.store.put(change)
             if forget:
                 self.store.forget(forget)
@@ -220,8 +294,8 @@ class DeviceBook:
 
     def _readable(self) -> str | None:
         """Called with the book's lock held: ``None`` when the store was read, else the refusal's words. An
-        unreadable store is read again here; what it then holds is taken; the releases it finds stay unwritten until a
-        revoke of their device writes them (on disk they are kept longer, the safe side)."""
+        unreadable store is read again here; what it then holds is taken; the releases it finds stay unwritten
+        until a revoke of their device writes them (on disk they are kept longer, the safe side)."""
         if self._unreadable is not None:
             self._load()
         return self._unreadable
@@ -232,6 +306,31 @@ class DeviceBook:
         connections = {c: StoredConnection(r.device_id, r.released_wall)
                        for c, r in self._revoked.items() if r.device_id in devices}
         return Revocations(devices, connections)
+
+    def _drop(self, conn_id: Hashable) -> None:
+        del self._revoked[conn_id]
+        self._released.pop(conn_id, None)
+
+    def _forgetting(self) -> tuple:
+        """Called with the book's lock held, at every revoke, disconnect and load: drop the records whose keep time
+        has passed, then, past the bound, the released records oldest release first. Never an unreleased one.
+        Returns the ids forgotten, for the store."""
+        gone = []
+        keep = self.revoked_connection_keep_s
+        if keep is not None and self._released:
+            now = self.clock()
+            while self._released:
+                conn_id = next(iter(self._released))
+                if now < self._revoked[conn_id].released_at + keep:
+                    break
+                self._drop(conn_id)
+                gone.append(conn_id)
+        bound = self.revoked_connection_keep_max
+        while bound is not None and len(self._revoked) > bound and self._released:
+            conn_id = next(iter(self._released))
+            self._drop(conn_id)
+            gone.append(conn_id)
+        return tuple(gone)
 
     # -- devices ----------------------------------------------------------------------------------
     def add(self, grant: PairingGrant, *, expires_at: float) -> DeviceRecord:
@@ -264,6 +363,15 @@ class DeviceBook:
         with self._lock:
             return self._accepted(device_id, scope)
 
+    def new_connection_id(self) -> str:
+        """A connection id never made before, here or before a restart on the same store: ``<boot>.<n>``."""
+        with self._lock:
+            while True:
+                self._counter += 1
+                conn_id = f"{self._boot}.{self._counter}"
+                if conn_id not in self._connections and conn_id not in self._revoked:
+                    return conn_id
+
     def connect(self, device_id: object, conn_id: Hashable, *, scope: str = "read") -> Admission:
         """Admit a new live connection for ``scope`` and remember it, so that a revocation can name it."""
         if not _key(conn_id):
@@ -282,6 +390,10 @@ class DeviceBook:
                     return Admission(False, "connection_exists")
                 if self._held(conn_id):
                     return Admission(False, "connection_exists", REVOKED_CONNECTION_HELD)
+                live = self._by_device.setdefault(device_id, {})  # type: ignore[arg-type]
+                if self.connections_max is not None and len(live) >= self.connections_max:
+                    return Admission(False, "connections_full", connections_full_detail(len(live)))
+                live[conn_id] = None
                 self._connections[conn_id] = device_id  # type: ignore[assignment]
                 self._note(record, now)
             return decision
@@ -306,17 +418,27 @@ class DeviceBook:
         with self._write_lock:
             change, forget = None, ()
             with self._lock:
-                self._connections.pop(conn_id, None)
+                owner = self._connections.pop(conn_id, None)
+                if owner is not None:
+                    live = self._by_device.get(owner)
+                    if live is not None:
+                        live.pop(conn_id, None)
+                        if not live:
+                            del self._by_device[owner]
                 revoked = self._revoked.get(conn_id)
                 if revoked is not None and revoked.released_at is None:
                     if self.revoked_connection_keep_s == 0:
-                        del self._revoked[conn_id]
+                        self._drop(conn_id)
                         forget = (conn_id,)
                     else:
                         record = dataclasses.replace(revoked, released_at=self.clock(), released_wall=self.wall())
                         self._revoked[conn_id] = record
+                        self._released[conn_id] = None
                         change = Revocations({record.device_id: self._revoked_devices[record.device_id]},
                                              {conn_id: StoredConnection(record.device_id, record.released_wall)})
+                forget = forget + self._forgetting()
+                if change is not None and conn_id not in self._revoked:
+                    change = None
             self._write(change, forget)
 
     def revoke(self, device_id: str) -> tuple[Hashable, ...]:
@@ -330,12 +452,13 @@ class DeviceBook:
                 if record.revoked_at is None:
                     self._devices[device_id] = dataclasses.replace(record, revoked_at=self.clock())
                     self._revoked_devices[device_id] = self.wall()
-                closing = tuple(conn for conn, owner in self._connections.items() if owner == device_id)
+                closing = tuple(self._by_device.pop(device_id, {}))
                 for conn in closing:
                     del self._connections[conn]
                     self._revoked[conn] = _RevokedConnection(device_id)
+                forget = self._forgetting()
                 change = self._change_of(self._unwritten | {device_id}) if self.store is not None else None
-            failed = self._write(change)
+            failed = self._write(change, forget)
             with self._lock:
                 if failed is None:
                     self._unwritten.difference_update(change.devices if change is not None else ())
@@ -350,6 +473,19 @@ class DeviceBook:
             now = self.clock()
             return [record.public(now) for record in self._devices.values()]
 
+    def status(self) -> dict:
+        """What the person at the machine reads about the record of revoked connections."""
+        with self._lock:
+            kept, bound = len(self._revoked), self.revoked_connection_keep_max
+            open_ = kept - len(self._released)
+            passed = max(0, kept - bound) if bound is not None else 0
+            words = (f"the bound of {bound} records is passed by {passed}: those are connections still open, which "
+                     "are never forgotten" if passed else "")
+            return {"revoked_connections_kept": kept, "revoked_connections_open": open_,
+                    "revoked_connection_keep_max": bound, "bound_passed_by": passed, "bound_words": words,
+                    "revocations_readable": self._unreadable is None, "revocations_unreadable": self._unreadable or "",
+                    "revocations_unwritten": sorted(self._unwritten)}
+
     def _held(self, conn_id: Hashable) -> bool:
         """Called with the lock held: whether ``conn_id`` is a revoked device's connection the book still keeps.
         The clock is read only for a record whose disconnect came and whose keeping ends."""
@@ -359,7 +495,7 @@ class DeviceBook:
         keep = self.revoked_connection_keep_s
         if revoked.released_at is None or keep is None or self.clock() < revoked.released_at + keep:
             return True
-        del self._revoked[conn_id]
+        self._drop(conn_id)
         return False
 
     def _accepted(self, device_id: object, scope: str) -> Admission:

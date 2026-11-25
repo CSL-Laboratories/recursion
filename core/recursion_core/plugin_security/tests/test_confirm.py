@@ -989,5 +989,135 @@ class AnAllowOnlyByAYesTests(unittest.TestCase):
         self.assertEqual(person.check(), "origin person")
 
 
+
+class _OddText(str):
+    """A text subclass with its own equality: it says it equals every value."""
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    __hash__ = str.__hash__
+
+
+def _not_ids(text: str) -> dict:
+    """Values that are not ids, each beside the text id it could be taken for: the number one
+    and the truth value, zero and the false value, a float equal to an integer, bytes equal in
+    text, a text subclass with its own equality, None and the empty text."""
+    return {"one": 1, "true": True, "zero": 0, "false": False, "float one": 1.0, "bytes": text.encode(),
+            "odd text": _OddText(text), "none": None, "empty": ""}
+
+
+_ID_NAMES = {"plugin_id": "plugin id", "run_id": "run id", "connection": "connection id"}
+_GOOD_IDS = {"plugin_id": "demo.plugin", "run_id": "run-1", "connection": "conn-a"}
+
+
+class AnIdIsTextTests(unittest.TestCase):
+    """An id is a non-empty text string, or the request is refused before any lookup: no
+    lookup of the gate or of the record ever finds two ids of different types equal."""
+
+    def _not_text(self, name: str, call, code: str = "id_not_text") -> None:
+        with self.assertRaises(Refused) as caught:
+            call()
+        self.assertEqual(caught.exception.code, code)
+        self.assertTrue(caught.exception.detail.startswith(f"the {name} is not a non-empty text string"))
+        self.assertIn(f"nothing was asked, kept or done: pass the {name} as text", caught.exception.detail)
+
+    def test_a_go_answer_for_run_one_never_lets_the_refused_use_of_run_true_go(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        self.assertEqual(_net(area, first_uses, "run-0"), "approved by the person")
+        ask = lambda run_id: decide("model", "network", _NET, first_uses=first_uses, plugin_id="demo.plugin",
+                                    run_id=run_id, connection="conn-a")
+        first = ask(1)
+        # The person refuses the same use named with run True (1 == True as a key).
+        twin = area.gate.request(confirmation_effect("network", _NET, plugin_id="demo.plugin", run_id=True,
+                                                     connection="conn-a"))
+        area.gate.decide(twin[0], twin[1], _OPERATOR, False)
+        self.assertEqual(first, ASK)
+        self.assertEqual(ask(True), ASK)
+        drawn = len(area.drawn)
+        self._not_text("run id", lambda: _net(area, first_uses, True))
+        self.assertEqual(len(area.drawn), drawn)
+
+    def test_a_yes_never_keeps_an_allow_for_a_plugin_id_that_is_not_text(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        self._not_text("plugin id", lambda: _net(area, first_uses, "run-1", plugin_id=1))
+        self.assertEqual((len(area.drawn), area.waited), (0, 0))
+        for plugin_id in (1, True):
+            with self.subTest(plugin_id=plugin_id):
+                self.assertEqual(decide("model", "network", _NET, first_uses=first_uses, plugin_id=plugin_id,
+                                        run_id="run-1", connection="conn-a"), ASK)
+                self.assertNotIn((plugin_id, _NET), first_uses)
+        self.assertNotIn(_NET, first_uses)
+
+    def test_every_id_of_a_use_that_is_not_text_asks_and_is_refused_before_anything_is_drawn(self) -> None:
+        for position, name in _ID_NAMES.items():
+            for label, value in _not_ids(_GOOD_IDS[position]).items():
+                with self.subTest(position=position, value=label):
+                    area, first_uses = _Area(), NetworkFirstUses()
+                    self.assertEqual(_net(area, first_uses, "run-0"), "approved by the person")
+                    ids = dict(_GOOD_IDS, **{position: value})
+                    for _ in range(2):
+                        self.assertEqual(decide("model", "network", _NET, first_uses=first_uses, **ids), ASK)
+                    drawn, waited = len(area.drawn), area.waited
+                    for handle in ("network", "credential", "process"):
+                        self._not_text(name, lambda: confirm(area.gate, area.wait, origin="model", handle=handle,
+                                                             target=_TARGETS[handle], first_uses=first_uses,
+                                                             **ids))
+                    self.assertEqual((len(area.drawn), area.waited), (drawn, waited))
+                    self.assertEqual(decide("model", "network", _NET, first_uses=first_uses, **_GOOD_IDS), GO)
+
+    def test_the_gate_refuses_an_id_that_is_not_text_before_any_lookup(self) -> None:
+        area, first_uses = _Area(), NetworkFirstUses()
+        gate, key = area.gate, first_uses._key("demo.plugin", _NET)
+        effect = confirmation_effect("network", _NET, plugin_id="demo.plugin", run_id="run-1", connection="conn-a")
+        approval_id, digest = gate.request(effect, keep=key)
+        gate.decide(approval_id, digest, _OPERATOR, True)
+        pending, pending_digest = gate.request(effect)
+        drawn = len(area.drawn)
+        for label, bad in _not_ids(approval_id).items():
+            with self.subTest(call="take", value=label):
+                self._not_text("approval id", lambda: gate.take(bad, effect), "approval_required")
+            with self.subTest(call="keep", value=label):
+                self._not_text("approval id", lambda: gate.keep(bad, effect, key), "approval_required")
+            with self.subTest(call="decide", value=label):
+                self._not_text("approval id", lambda: gate.decide(bad, pending_digest, _OPERATOR, True),
+                               "approval_unknown")
+        for label, bad in _not_ids(pending_digest).items():
+            with self.subTest(call="decide digest", value=label):
+                self._not_text("digest", lambda: gate.decide(pending, bad, _OPERATOR, True),
+                               "approval_digest_mismatch")
+            with self.subTest(call="is_vetoed", value=label):
+                self._not_text("digest", lambda: gate.is_vetoed(bad))
+        for label, bad in _not_ids("demo.plugin").items():
+            for part, entry in enumerate(((bad, _NET), ("demo.plugin", bad))):
+                with self.subTest(call="request keep", value=label, part=part):
+                    self._not_text("id in the allow's key", lambda: gate.request(effect, keep=(key[0], entry)))
+                with self.subTest(call="standing", value=label, part=part):
+                    self._not_text("id in the allow's key", lambda: gate.standing((key[0], entry)))
+            for part, use in enumerate(((bad, "conn-a"), ("run-1", bad))):
+                with self.subTest(call="standing use", value=label, part=part):
+                    self._not_text("id in the use's key", lambda: gate.standing(key, use, lambda: effect))
+        with self.assertRaises(TypeError):
+            gate.request(effect, keep=("a book", ("demo.plugin", _NET)))
+        self.assertEqual(len(area.drawn), drawn)
+        # Nothing was looked up or changed: the approved yes is still there to be taken, once.
+        self.assertEqual(gate.decide(pending, pending_digest, _OPERATOR, True), "approved")
+        self.assertFalse(gate.standing(key))
+        self.assertEqual(gate.take(approval_id, effect), digest)
+        self.assertTrue(gate.standing(key))
+        first_uses._bind(gate)
+        self.assertIn(("demo.plugin", _NET), first_uses)
+        for label, bad in _not_ids("demo.plugin").items():
+            with self.subTest(contains="plugin", value=label):
+                self.assertNotIn((bad, _NET), first_uses)
+        for label, bad in _not_ids(_NET).items():
+            with self.subTest(contains="destination", value=label):
+                self.assertNotIn(bad, first_uses)
+                self.assertNotIn(("demo.plugin", bad), first_uses)
+
+
 if __name__ == "__main__":
     unittest.main()

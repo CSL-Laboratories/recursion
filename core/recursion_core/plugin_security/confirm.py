@@ -52,7 +52,11 @@ use (``ApprovalGate.standing``, the same critical section); otherwise it asks, a
 gate refuses a vetoed use without drawing it. The digest of each use asked about is
 computed once and kept beside the allow. A record answers for one gate only. It lives in
 memory only: the daemon makes a new, empty one at each start, so a restart asks again.
-The plugin and the destination are compared exactly as given.
+The plugin, the run, the connection and the destination are compared exactly as given and
+only as non-empty text strings: ``decide`` asks for an id of any other type, and
+``confirm`` refuses it with ``id_not_text`` and words before anything is looked up or
+drawn, so a number, a truth value, bytes or a ``str`` subclass never meets an id of
+another type as equal.
 
 A use let go before a refusal is not withdrawn by it, however long the caller holds the
 go answer before it acts, unless the caller makes the last check: ``confirm_use`` hands
@@ -66,7 +70,7 @@ import threading
 from collections.abc import Callable, Container
 from urllib.parse import parse_qsl, urlsplit
 
-from .approval import ApprovalGate, EFFECT_SCHEMA, SCOPE_FIELDS
+from .approval import ApprovalGate, EFFECT_SCHEMA, SCOPE_FIELDS, _check_id, _is_id
 from .canonical import canonical, parse
 from .errors import Refused
 
@@ -185,7 +189,12 @@ class NetworkFirstUses:
         if gate is None:
             return False
         if type(key) is tuple:
+            # Only a pair of ids can name an allow: any other key is not in the record.
+            if len(key) != 2 or not (_is_id(key[0]) and _is_id(key[1])):
+                return False
             return gate.standing((self._book, key))
+        if not _is_id(key):
+            return False
         return gate.standing_any(self._book, lambda entry: entry[1] == key)
 
 
@@ -222,15 +231,16 @@ def decide(origin: str | None, handle: str, target: str, *, lifted: bool = False
            connection: str | None = None) -> str:
     """Answer ``"ask"`` or ``"go"`` for one use by the plugin ``plugin_id``. It changes nothing.
 
-    A network use goes only when it names the plugin, the run and the connection and the
-    ``NetworkFirstUses`` record says an allow stands for it with no veto covering it.
+    A network use goes only when it names the plugin, the run and the connection, each as a
+    non-empty text string, and the ``NetworkFirstUses`` record says an allow stands for it
+    with no veto covering it; any other id asks.
     """
     origin = _check(origin, handle, target, lifted)
     if origin == "person":
         return GO
     if lifted:
         return GO
-    if handle == "network" and plugin_id is not None and run_id is not None and connection is not None \
+    if handle == "network" and _is_id(plugin_id) and _is_id(run_id) and _is_id(connection) \
             and isinstance(first_uses, NetworkFirstUses) \
             and first_uses.stands(plugin_id, target, run_id=run_id, connection=connection):
         return GO
@@ -277,6 +287,10 @@ def confirm_use(gate: ApprovalGate, wait: Callable[[str, str], None], *, origin:
     Raises as ``confirm`` does. The caller calls the ``Use``'s ``check()`` just before it acts.
     """
     origin = _check(origin, handle, target, lifted)
+    # Before any lookup or draw: an id that is not text is refused, never compared.
+    _check_id("plugin id", plugin_id)
+    _check_id("run id", run_id)
+    _check_id("connection id", connection)
     if handle == "network":
         _check_destination(target)
         first_uses._bind(gate)
@@ -315,7 +329,9 @@ def confirm(gate: ApprovalGate, wait: Callable[[str, str], None], *, origin: str
     Returns why the use may go: ``"origin person"``, ``"lifted by the person"``,
     ``"destination approved since the daemon started"`` or ``"approved by the person"``.
     Raises ``target_holds_secret`` for a network target that looks like it carries a
-    secret, before anything is drawn; the gate's ``Refused`` when the approval is refused,
+    secret, before anything is drawn; ``id_not_text`` with words for a plugin, run or
+    connection id that is not a non-empty text string, before anything is looked up or
+    drawn; the gate's ``Refused`` when the approval is refused,
     timed out or not given; and ``approval_vetoed`` when the person refused this same use,
     before this call or during it: then no allow stands for it.
     """

@@ -2062,7 +2062,8 @@ def why_not_proven(record: dict) -> list:
         lines.append(WORDS["other_arch"].format(arch=str(record.get("arch") or "unknown")[:32]))
     if len(lines) == 1:  # every part held, yet not proven: a step of the wall failed
         lines.append(WORDS["partial"])
-    lines.append(WORDS["what_to_do"])
+    if record.get("proven_over") != "widened_list":  # over a widened list every part held: the list is the cause,
+        lines.append(WORDS["what_to_do"])           # and its own words say what to do
     return lines
 
 

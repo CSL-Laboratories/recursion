@@ -23,6 +23,12 @@ then one line with the commands that go on, and returns 0.
 question, as unpin does, and installs the held release only on ``yes``;
 ``quarantine drop <id>`` moves the held release into a kept place and names it.
 
+``install <plugin_id> --registry <address>@<full commit>`` reads the registry's tree at that commit
+(a local bare repository, its ``file://`` address, or an ``https://`` address) and installs from it
+with the same checks; ``--registry <folder>`` reads a registry folder on disk. The id may be given as
+the one word after ``install`` or with ``--plugin``. With no registry named the install refuses
+``registry_not_named`` and says how to name one.
+
 ``install --yes`` writes one grant for the requested permissions except
 ``order``. ``install --no-grant`` writes none. With neither flag, a terminal
 is asked once and only the answer ``y`` or ``yes`` grants; any other answer,
@@ -41,6 +47,7 @@ from pathlib import Path
 from .install import (InstallRefused, NothingChanged, disable_plugin, enable_plugin, install_plugin,
                       list_plugins, quarantine_accept, quarantine_drop, quarantine_list, remove_plugin,
                       rollback_generation, unpin_plugin)
+from .registry_source import install_from_registry, split_registry
 
 __all__ = ["main"]
 
@@ -79,8 +86,9 @@ def _parser() -> argparse.ArgumentParser:
 
     install = commands.add_parser("install")
     install.error = _error  # type: ignore[method-assign]
-    install.add_argument("--registry", required=True)
-    install.add_argument("--plugin", required=True)
+    install.add_argument("plugin_id", nargs="?")
+    install.add_argument("--registry", help="<address>@<full commit>, or a registry folder")
+    install.add_argument("--plugin")
     install.add_argument("--version")
     install.add_argument("--git", help="local bare repository")
     install.add_argument("--config")
@@ -202,16 +210,26 @@ def main(argv: list[str] | None = None, out=None, err=None, inp=None, stdin=None
             if args.yes and args.no_grant:
                 err.write("usage: recursion plugin install (--yes and --no-grant)\n")
                 return 2
+            if args.plugin_id is not None and args.plugin is not None and args.plugin_id != args.plugin:
+                err.write("usage: recursion plugin install <plugin_id> (two different ids given)\n")
+                return 2
+            plugin_id = args.plugin_id if args.plugin_id is not None else args.plugin
+            if plugin_id is None:
+                err.write("usage: recursion plugin install <plugin_id> [--registry <address>@<full commit>]\n")
+                return 2
             if args.no_grant:
                 write_grant, confirm = False, None
             elif args.yes:
                 write_grant, confirm = True, None
             else:
                 write_grant, confirm = None, _confirm_grant(stdin, err)
-            result = install_plugin(_config_dir(args.config), args.registry, args.plugin,
-                                    version=args.version, state=_state_dir(args.state), report_kept=report,
-                                    confirm=ask, git_repository=args.git, write_grant=write_grant,
-                                    confirm_grant=confirm)
+            options = dict(version=args.version, state=_state_dir(args.state), report_kept=report,
+                           confirm=ask, git_repository=args.git, write_grant=write_grant, confirm_grant=confirm)
+            if args.registry is not None and split_registry(args.registry)[0] == "folder":
+                result = install_plugin(_config_dir(args.config), args.registry, plugin_id, **options)
+            else:
+                result = install_from_registry(_config_dir(args.config), plugin_id, registry=args.registry,
+                                               **options)
         elif args.command == "list":
             result = list_plugins(_config_dir(args.config), state=_state_dir(args.state))
         elif args.command == "enable":

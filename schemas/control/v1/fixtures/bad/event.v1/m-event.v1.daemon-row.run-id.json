@@ -1,0 +1,27 @@
+{
+  "seq": 30,
+  "session_id": "ses-7f3a9c2e51d04b6a",
+  "run_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+  "turn_id": null,
+  "time": "2026-11-13T07:34:30.110Z",
+  "type": "state.changed",
+  "source": "core",
+  "trust": "trusted",
+  "payload": {
+    "entity": "run",
+    "entity_id": "run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7",
+    "post_image": {
+      "daemon_row": {
+        "unit": "recursion-run-run-5b1f0c2d9a7e4f36b8c1d2e3f4a5b6c7.service",
+        "stop": false,
+        "state": "terminated",
+        "boot_id": "6f1c2d3e-4a5b-4c6d-8e7f-90a1b2c3d4e5",
+        "detail": ""
+      },
+      "control_record": null
+    },
+    "post_image_sha256": "c4a0f639e8f212407f0be5bb9b1f0819f5d5cc879513fa77b36b0327e227ba85",
+    "reason": "reconcile",
+    "coalesced": null
+  }
+}

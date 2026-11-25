@@ -9,14 +9,31 @@
     {"name": "stop via command", "tui": {"command": "stop run-1"}, "cli": ["stop", "run-1"], "request": {"method": "run.stop", "params": {"run_id": "run-1"}}},
     {"name": "stop key then confirm", "tui": {"keys": ["s", "y"]}, "cli": ["stop", "run-1"], "request": {"method": "run.stop", "params": {"run_id": "run-1"}}},
     {"name": "start", "tui": {"command": "start --tenant t1 --engine codex --prompt hi"}, "cli": ["start", "--tenant", "t1", "--engine", "codex", "--prompt", "hi"], "request": {"method": "run.start", "params": {"tenant": "t1", "engine": "codex", "prompt": "hi"}}},
-    {"name": "start with client key", "tui": {"command": "start --tenant t1 --engine codex --prompt 'two words' --client-key k1"}, "cli": ["start", "--tenant", "t1", "--engine", "codex", "--prompt", "two words", "--client-key", "k1"], "request": {"method": "run.start", "params": {"tenant": "t1", "engine": "codex", "prompt": "two words", "client_key": "k1"}}}
+    {"name": "start with client key", "tui": {"command": "start --tenant t1 --engine codex --prompt 'two words' --client-key k1"}, "cli": ["start", "--tenant", "t1", "--engine", "codex", "--prompt", "two words", "--client-key", "k1"], "request": {"method": "run.start", "params": {"tenant": "t1", "engine": "codex", "prompt": "two words", "client_key": "k1"}}},
+    {"name": "leader stop then confirm", "tui": {"keys": ["ctrl+x", "k", "y"]}, "cli": ["stop", "run-1"], "request": {"method": "run.stop", "params": {"run_id": "run-1"}}},
+    {"name": "leader refresh", "tui": {"keys": ["ctrl+x", "r"]}, "cli": ["list"], "request": {"method": "run.list", "params": {}}},
+    {"name": "leader start line", "tui": {"keys": ["ctrl+x", "n", "-", "-", "t", "e", "n", "a", "n", "t", " ", "t", "1", " ", "-", "-", "e", "n", "g", "i", "n", "e", " ", "c", "o", "d", "e", "x", " ", "-", "-", "p", "r", "o", "m", "p", "t", " ", "h", "i", "enter"]}, "cli": ["start", "--tenant", "t1", "--engine", "codex", "--prompt", "hi"], "request": {"method": "run.start", "params": {"tenant": "t1", "engine": "codex", "prompt": "hi"}}},
+    {"name": "slash key then stop", "tui": {"keys": ["/", "s", "t", "o", "p", " ", "r", "u", "n", "-", "1", "enter"]}, "cli": ["stop", "run-1"], "request": {"method": "run.stop", "params": {"run_id": "run-1"}}},
+    {"name": "slash stop", "tui": {"command": "/stop run-1"}, "cli": ["stop", "run-1"], "request": {"method": "run.stop", "params": {"run_id": "run-1"}}},
+    {"name": "slash status", "tui": {"command": "/status run-1"}, "cli": ["status", "run-1"], "request": {"method": "run.status", "params": {"run_id": "run-1"}}},
+    {"name": "slash runs is list", "tui": {"command": "/runs"}, "cli": ["list"], "request": {"method": "run.list", "params": {}}}
   ],
   "no_request": [
     {"name": "stop key cancelled", "tui": {"keys": ["s", "n"]}},
     {"name": "selection only", "tui": {"keys": ["j", "k", "down", "up"]}},
     {"name": "usage error", "tui": {"command": "stop"}},
     {"name": "unknown verb", "tui": {"command": "approve run-1"}},
-    {"name": "close", "tui": {"keys": ["q"]}}
+    {"name": "close", "tui": {"keys": ["q"]}},
+    {"name": "close with ctrl+d twice", "tui": {"keys": ["ctrl+d", "ctrl+d"]}},
+    {"name": "leader close", "tui": {"keys": ["ctrl+x", "q"]}},
+    {"name": "help key", "tui": {"keys": ["?", "esc"]}},
+    {"name": "help command", "tui": {"command": "/help"}},
+    {"name": "leader unbound", "tui": {"keys": ["ctrl+x", "z"]}},
+    {"name": "leader cancelled", "tui": {"keys": ["ctrl+x", "esc"]}},
+    {"name": "leader stop cancelled", "tui": {"keys": ["ctrl+x", "k", "n"]}},
+    {"name": "esc on the run list", "tui": {"keys": ["esc"]}},
+    {"name": "output pager", "tui": {"keys": ["tab", "k", "ctrl+u", "ctrl+d", "g", "g", "G", "n", "N", "esc"]}},
+    {"name": "leader conditions", "tui": {"keys": ["ctrl+x", "c"]}}
   ],
   "reads_current_conditions": [
     {"name": "conditions", "about": "Same command on both surfaces, no new control API method. The TUI already holds its view state, so it sends nothing; the one-shot CLI holds none, so it reads run.list first.", "tui": {"command": "conditions"}, "cli": ["conditions"], "tui_requests": [], "cli_requests": [{"method": "run.list", "params": {}}]}

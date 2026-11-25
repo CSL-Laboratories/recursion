@@ -1,0 +1,10 @@
+{
+  "answer": {
+    "code": "method_unknown",
+    "run_id": "run-none"
+  },
+  "method": "run.stop",
+  "params": {
+    "run_id": "run-none"
+  }
+}

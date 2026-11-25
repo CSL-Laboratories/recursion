@@ -21,7 +21,10 @@ refusal carries a path.
   moved aside (never deleted) and this store answers ``memory_unreadable``; other plugins' stores are other
   files and go on. Any other error at open (the file busy or locked by another connection, read-only, a
   full disk) moves nothing: the file stays where it is, the store answers ``memory_unavailable`` and tries
-  to open it again at the next call.
+  to open it again at the next call. The words tell a read-only file from a read-only folder and name the
+  act for each. A file another program holds, or that cannot be written, AFTER the store opened ends that one
+  call in ``memory_unavailable`` too, in words, after the call's wait ``CALL_WAIT_S``: the call's transaction
+  is rolled back, so the write did not happen, and nothing is moved.
 * THE RECORD. One row per write, delete and set-aside goes to ``record`` (the daemon's sink for its event
   log): time, plugin, identity, call, the key's SHA-256 and length (its text only when
   ``plugin_memory.record_key_text`` is true), the store's bytes before and after, the revision and the result
@@ -70,6 +73,10 @@ PACE_WINDOW_S = 60.0  # "per minute" is the row's own meaning, not a figure a pe
 # How long an open waits for a store file another connection holds, in seconds. It becomes the settings row
 # plugin_memory.open_wait_seconds; until that row exists it is this one named value.
 OPEN_WAIT_S = 5.0
+# How long each call after the open waits for a store file another connection holds, in seconds, before it is
+# answered memory_unavailable. It becomes the settings row plugin_memory.call_wait_seconds; until that row
+# exists it is this one named value.
+CALL_WAIT_S = 5.0
 _KEY_ID = re.compile(r"[a-z0-9]{1,16}:[0-9a-f]{1,64}")
 _PLUGIN_ID = re.compile(r"[a-z][a-z0-9_.-]{1,63}")
 _SQLITE_FULL, _SQLITE_CORRUPT, _SQLITE_NOTADB = 13, 11, 26
@@ -170,13 +177,35 @@ def _code(exc: BaseException) -> int | None:
     return value & 0xFF if type(value) is int else None
 
 
-def _not_open(exc: BaseException) -> dict:
-    """The words' fill for a store file that could not be opened now and was left in place."""
+def _read_only(path: Path) -> dict:
+    """The words' fill for a store file that could not be written: the file, its folder, or both, as they are now."""
+    names = [f"{path}{suffix}" for suffix in ("", "-wal", "-shm") if os.path.lexists(f"{path}{suffix}")]
+    file = any(not os.access(name, os.W_OK) for name in names)
+    folder = not os.access(path.parent, os.W_OK | os.X_OK)
+    if file and folder:
+        return {"cause": "the file and the folder that holds it are read-only",
+                "act": "make the folder that holds the plugin's saved data in Recursion's state folder writable "
+                       "again, and the files in it"}
+    if folder:
+        return {"cause": "the folder that holds it is read-only",
+                "act": "make the folder that holds the plugin's saved data in Recursion's state folder writable "
+                       "again; the file itself is writable"}
+    if file:
+        return {"cause": "the file is read-only",
+                "act": "make the plugin's saved-data file in Recursion's state folder writable again, with the "
+                       "files beside it that begin with its name; the folder itself is writable"}
+    return {"cause": "it could not be written",
+            "act": "check that the folder that holds the plugin's saved data in Recursion's state folder, and the "
+                   "files in it, can be written"}
+
+
+def _not_open(exc: BaseException, path: Path) -> dict:
+    """The words' fill for a store file that could not be opened or used now and was left in place."""
     code = _code(exc)
     if code in (_SQLITE_BUSY, _SQLITE_LOCKED):
         return {"cause": "another program was using it", "act": "end the other program that holds it"}
     if code == _SQLITE_READONLY:
-        return {"cause": "it could not be written", "act": "make Recursion's state folder writable again"}
+        return _read_only(path)
     if code == _SQLITE_FULL:
         return {"cause": "your disk is full", "act": "free some space on your disk"}
     return {"cause": "SQLite could not open it", "act": "restart Recursion"}
@@ -253,13 +282,14 @@ class PluginMemory:
                 raise sqlite3.OperationalError("not in WAL mode")
             db.execute(f"PRAGMA synchronous={self.sync}")
             db.executescript(_SCHEMA)
+            db.execute(f"PRAGMA busy_timeout = {int(CALL_WAIT_S * 1000)}")
         except sqlite3.DatabaseError as exc:
             if db is not None:
                 db.close()
             if _code(exc) in (_SQLITE_CORRUPT, _SQLITE_NOTADB):
                 self._set_aside_damaged()
             else:
-                self.unavailable = _not_open(exc)
+                self.unavailable = _not_open(exc, self._path)
             return
         except BaseException:
             if db is not None:
@@ -348,6 +378,9 @@ class PluginMemory:
                     elif _code(exc) in (_SQLITE_CORRUPT, _SQLITE_NOTADB):
                         self._set_aside_damaged()
                         return self._refused("memory_unreadable")
+                    elif _code(exc) in (_SQLITE_BUSY, _SQLITE_LOCKED, _SQLITE_READONLY):
+                        # held or not writable after the open: the transaction is rolled back, nothing moved
+                        answer = self._refused("memory_unavailable_call", **_not_open(exc, self._path))
                     else:
                         raise
             if writes and not answer["ok"]:
@@ -491,5 +524,5 @@ class PluginMemory:
                 self._db = None
 
 
-__all__ = ["MAX_VALUE_BYTES", "OPEN_WAIT_S", "PluginMemory", "ROWS", "STORE_DIR", "STORE_FILE", "for_plugin",
+__all__ = ["CALL_WAIT_S", "MAX_VALUE_BYTES", "OPEN_WAIT_S", "PluginMemory", "ROWS", "STORE_DIR", "STORE_FILE", "for_plugin",
            "identity_for", "memory_key_ok", "set_aside"]

@@ -96,12 +96,19 @@ WORDS: dict[str, tuple[str, str, str, str]] = {
         "The item is at revision SIZE, the largest number a message between Recursion and a plugin carries.",
         "The plugin can delete the item and save it anew, which starts it again at revision 1.",
         "No: nothing of this write was saved."),
+    # Appended in the round on 48cfc2d3: the file was opened, then held or not writable at this call.
+    "memory_unavailable_call": (
+        "PLUGIN's saved data could not be reached just now.",
+        "Recursion could not use its file because CAUSE; the file is not damaged as far as Recursion can tell.",
+        "The plugin can ask again; if this goes on, ACT.",
+        "No: this call wrote nothing, and nothing was moved or deleted: the file and its data stay where they were."),
 }
 
 # Which refusal code each entry answers with on the channel (the grant entries are call_not_offered).
 CODE_OF = {name: ("memory_full" if name in ("memory_full", "memory_full_disk", "memory_full_revision")
                   else "memory_item_too_large" if name.startswith("memory_item_too_large")
-                  else "call_not_offered" if name.startswith("not_granted") else name)
+                  else "call_not_offered" if name.startswith("not_granted")
+                  else "memory_unavailable" if name.startswith("memory_unavailable") else name)
            for name in WORDS}
 
 

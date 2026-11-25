@@ -2,17 +2,24 @@
 
 Evidence classes: every test runs the channel's two ends and the store in-process, over SQLite files in a
 temporary folder the test made; no plugin host process and no real daemon start exists in these tests (the
-daemon-side reader that builds a store for a real host is later work). No test starts a thread or a process.
+daemon-side reader that builds a store for a real host is later work). No test starts a thread. ONE helper,
+``held_by_a_child``, starts a child process of the test's own that holds a store file's write lock after the
+store opened: it is released on every path (its input is closed, it is waited for, killed after a timeout) and
+it ends by itself after HOLDER_LIMIT_S whatever the test does; it gets HOME and TMPDIR inside the test's folder.
 """
 
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -37,6 +44,43 @@ DIR_A, DIR_B = "ed25519-" + "a" * 32, "ed25519-" + "b" * 32
 
 def b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
+
+
+# The child that holds a store file's write lock until its input closes; it ends by itself after HOLDER_LIMIT_S.
+HOLDER_LIMIT_S = 60
+HOLDER = f"""
+import signal, sqlite3, sys
+signal.alarm({HOLDER_LIMIT_S})
+db = sqlite3.connect(sys.argv[1], isolation_level=None)
+db.execute("BEGIN IMMEDIATE")
+db.execute("UPDATE totals SET items = items WHERE one = 1")
+print("held", flush=True)
+sys.stdin.readline()
+db.execute("ROLLBACK")
+db.close()
+"""
+
+
+class Refusing:
+    """A stand-in connection: a statement that begins with ``match`` raises SQLite's error ``code``; every other
+    statement and attribute is the real connection's."""
+
+    def __init__(self, db, code, match):
+        self._db, self._code, self._match = db, code, match
+
+    def execute(self, sql, *args):
+        if sql.lstrip().upper().startswith(self._match):
+            exc = sqlite3.OperationalError("stood in")
+            exc.sqlite_errorcode = self._code
+            raise exc
+        return self._db.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+
+def parts(answer):
+    return {key: answer.get(key) for key in ("code", "what", "why", "next", "changed")}
 
 
 class Rows:
@@ -641,6 +685,148 @@ class SavedData(unittest.TestCase):
                                  "and a plugin carries.",
                           "next": "The plugin can delete the item and save it anew, which starts it again at revision 1.",
                           "changed": "No: nothing of this write was saved."})
+
+    # Round on 48cfc2d3: a child of this test holds the store file's write lock, released on every path
+    @contextlib.contextmanager
+    def held_by_a_child(self, path):
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home), "TMPDIR": str(self.root)}
+        child = subprocess.Popen([sys.executable, "-I", "-c", HOLDER, str(path)], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=str(self.root),
+                                 text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "held")
+            yield
+        finally:
+            child.stdin.close()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=10)
+            child.stdout.close()
+
+    def read_only_store(self, files, folder):
+        """A healthy store, closed, then opened again with its file, its folder or both read-only."""
+        if os.geteuid() == 0:
+            self.skipTest("the owner of every file can write it as root")
+        first = self.store()
+        self.put(self.end(memory=first), "k", b"healthy")
+        path = first._path
+        first.close()
+        names = [f"{path}{suffix}" for suffix in ("", "-wal", "-shm") if os.path.lexists(f"{path}{suffix}")]
+        self.addCleanup(lambda: [os.chmod(path.parent / name, 0o600) for name in os.listdir(path.parent)
+                                 if name.startswith(path.name)])
+        self.addCleanup(os.chmod, path.parent, 0o700)
+        for name in names if files else ():
+            os.chmod(name, 0o400)
+        if folder:
+            os.chmod(path.parent, 0o500)
+        memory = self.store()
+        return memory, self.end(memory=memory), path, names
+
+    # Round on 48cfc2d3. N1: a write that meets a file another program holds AFTER the open is refused in words
+    def test_a_file_held_after_the_open_is_refused_in_words_and_nothing_is_written(self):
+        with mock.patch.object(ms, "OPEN_WAIT_S", 0.01), mock.patch.object(ms, "CALL_WAIT_S", 0.4, create=True):
+            memory = self.store()
+        end = self.end(memory=memory)
+        self.assertTrue(self.value(self.put(end, "k", b"healthy"))["ok"])
+        with self.held_by_a_child(memory._path):
+            began = time.monotonic()
+            answer = self.value(self.put(end, "k2", b"new"))
+            waited = time.monotonic() - began
+            got = self.value(self.ask(end, "memory.get", key="k"))
+        self.assertEqual(parts(answer), {
+            "code": "memory_unavailable", "what": "demo.notes's saved data could not be reached just now.",
+            "why": "Recursion could not use its file because another program was using it; the file is not damaged "
+                   "as far as Recursion can tell.",
+            "next": "The plugin can ask again; if this goes on, end the other program that holds it.",
+            "changed": "No: this call wrote nothing, and nothing was moved or deleted: the file and its data stay "
+                       "where they were."})
+        self.assertGreaterEqual(waited, 0.35)  # the call's own wait, CALL_WAIT_S, not the open's
+        self.assertEqual((got["ok"], base64.b64decode(got["value_b64"])), (True, b"healthy"))
+        self.assertEqual((self.rows[-1]["call"], self.rows[-1]["result"]), ("memory.put", "memory_unavailable"))
+        self.assertTrue(memory._path.is_file())
+        self.assertEqual(ms.set_aside(self.state, "demo.notes", KEY_A), [])
+        self.assertFalse(memory.unreadable)
+        self.assertTrue(self.value(self.put(end, "k2", b"new"))["ok"])
+        self.assertEqual(self.value(self.ask(end, "memory.list", prefix="", after=None, limit=None))["keys"],
+                         ["k", "k2"])
+
+    # N1: a read that meets a held file, and a write that meets a read-only file, after the open (stood in)
+    def test_a_read_or_a_write_after_the_open_that_meets_a_held_or_read_only_file_says_so(self):
+        if os.geteuid() == 0:
+            self.skipTest("the owner of every file can write it as root")
+        memory = self.store()
+        end = self.end(memory=memory)
+        self.assertTrue(self.value(self.put(end, "k", b"healthy"))["ok"])
+        real = memory._db
+        for code in (5, 6):
+            memory._db = Refusing(real, code, "SELECT VALUE")
+            answer = self.value(self.ask(end, "memory.get", key="k"))
+            self.assertEqual((answer["code"], answer["why"], answer["next"]), (
+                "memory_unavailable",
+                "Recursion could not use its file because another program was using it; the file is not damaged "
+                "as far as Recursion can tell.",
+                "The plugin can ask again; if this goes on, end the other program that holds it."))
+        os.chmod(memory._path, 0o400)
+        self.addCleanup(os.chmod, memory._path, 0o600)
+        memory._db = Refusing(real, 8, "INSERT")
+        answer = self.value(self.put(end, "k2", b"new"))
+        memory._db = real
+        self.assertEqual((answer["code"], answer["why"]), (
+            "memory_unavailable", "Recursion could not use its file because the file is read-only; the file is not "
+                                  "damaged as far as Recursion can tell."))
+        self.assertIn("make the plugin's saved-data file in Recursion's state folder writable again", answer["next"])
+        self.assertFalse(real.in_transaction)
+        self.assertEqual(self.value(self.ask(end, "memory.list", prefix="", after=None, limit=None))["keys"], ["k"])
+        self.assertEqual((self.rows[-1]["call"], self.rows[-1]["result"]), ("memory.put", "memory_unavailable"))
+
+    # N2: a read-only FILE in a writable folder names the file, never the folder
+    def test_a_read_only_file_names_the_file_and_the_folder_is_writable(self):
+        memory, end, path, names = self.read_only_store(files=True, folder=False)
+        answer = self.value(self.ask(end, "memory.get", key="k"))
+        self.assertEqual(parts(answer), {
+            "code": "memory_unavailable", "what": "demo.notes's saved data could not be opened just now.",
+            "why": "Recursion could not open its file because the file is read-only; the file is not damaged as far "
+                   "as Recursion can tell.",
+            "next": "Recursion tries again at the plugin's next call; if this goes on, make the plugin's saved-data "
+                    "file in Recursion's state folder writable again, with the files beside it that begin with its "
+                    "name; the folder itself is writable.",
+            "changed": "Nothing was moved or deleted: the file and its data stay where they were."})
+        # the act the words name: the file and the files beside it that begin with its name (SQLite gives a
+        # write-ahead file it makes the mode of the store file, so one may have come since)
+        for name in sorted(os.listdir(path.parent)):
+            if name.startswith(path.name):
+                os.chmod(path.parent / name, 0o600)
+        got = self.value(self.ask(end, "memory.get", key="k"))
+        self.assertEqual((got["ok"], base64.b64decode(got["value_b64"])), (True, b"healthy"))
+        self.assertEqual(ms.set_aside(self.state, "demo.notes", KEY_A), [])
+
+    # N2: a read-only FOLDER names the folder, and says the file itself is writable
+    def test_a_read_only_folder_names_the_folder_and_the_file_is_writable(self):
+        memory, end, path, names = self.read_only_store(files=False, folder=True)
+        answer = self.value(self.ask(end, "memory.get", key="k"))
+        self.assertEqual((answer["code"], answer["why"], answer["next"]), (
+            "memory_unavailable",
+            "Recursion could not open its file because the folder that holds it is read-only; the file is not "
+            "damaged as far as Recursion can tell.",
+            "Recursion tries again at the plugin's next call; if this goes on, make the folder that holds the "
+            "plugin's saved data in Recursion's state folder writable again; the file itself is writable."))
+        os.chmod(path.parent, 0o700)
+        got = self.value(self.ask(end, "memory.get", key="k"))
+        self.assertEqual((got["ok"], base64.b64decode(got["value_b64"])), (True, b"healthy"))
+        self.assertTrue(path.is_file())
+
+    # N2: both read-only name both
+    def test_a_read_only_file_in_a_read_only_folder_names_both(self):
+        memory, end, path, names = self.read_only_store(files=True, folder=True)
+        answer = self.value(self.ask(end, "memory.get", key="k"))
+        self.assertEqual((answer["code"], answer["why"], answer["next"]), (
+            "memory_unavailable",
+            "Recursion could not open its file because the file and the folder that holds it are read-only; the "
+            "file is not damaged as far as Recursion can tell.",
+            "Recursion tries again at the plugin's next call; if this goes on, make the folder that holds the "
+            "plugin's saved data in Recursion's state folder writable again, and the files in it."))
 
     # The settings rows: declared once, each with its shipped default; the grant row's sentence as written
     def test_the_rows_are_settings_with_their_defaults(self):

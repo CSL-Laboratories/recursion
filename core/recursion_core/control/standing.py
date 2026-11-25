@@ -40,6 +40,7 @@ what stands never makes Stop wait. Every sentence a person reads is in ``TEXT``.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -83,15 +84,15 @@ TEXT = {
     'plugin_host': 'Plugin {id} is loaded. It runs only when the daemon asks it; Stop leaves it loaded.',
     'plugin_host_busy': 'Plugin {id} is loaded and a read of it passed its deadline and still runs. '
                         'Only a restart of the daemon ends that read.',
-    'approval': 'Approval {id} waits for an answer, for {left} more seconds; then it expires by itself. Nothing '
+    'approval': 'Approval {id} waits for an answer, for {left}; then it expires by itself. Nothing '
                 'it asks for runs until it is answered, and this release has no place to answer it.',
-    'approval_granted': 'Approval {id} was granted and waits to be used, for {left} more seconds at most.',
+    'approval_granted': 'Approval {id} was granted and waits to be used, for {left} at most.',
     'budget': 'Budget {id} has {spent} spent against it, in the smallest unit of its currency (cents, for one). '
               'Its limit is in its signed profile; Stop does not change it.',
     'row_kind_unknown': 'The {store} store holds a kind of standing work this release does not show yet. '
                         'It is counted here and not hidden; a newer release of Recursion shows it.',
     'store_failed': 'The {store} store could not be read, so what it holds is not shown. Ask again.',
-    'store_no_answer': 'The {store} store did not answer within {wait:g} seconds, so what it holds is not shown. '
+    'store_no_answer': 'The {store} store did not answer within {wait}, so what it holds is not shown. '
                        'Ask again.',
     'store_still_reading': 'The {store} store has not answered an earlier ask yet, so what it holds is not shown. '
                            'Ask again.',
@@ -110,13 +111,17 @@ TEXT = {
     'stop_stays': 'Still standing, which Stop does not end: {parts}.',
     'stop_stays_unread': 'The {store} store was busy, so what still stands in it is not said here; '
                          'look at everything standing.',
+    'stop_stays_failed': 'The {store} store could not be read, so what still stands in it is not said here; '
+                         'look at everything standing.',
+    'stop_stays_no_answer': 'The {store} store did not answer within {wait}, so what still stands in it is not '
+                            'said here; look at everything standing.',
     'stop_run_pending': 'run {id}, whose processes may still be running',
     'stop_run_gone': 'run {id}, which was already gone',
     'stop_run_no_answer': 'run {id}, whose Stop the daemon did not answer',
     'stop_run_refused': 'run {id}, whose Stop was refused',
     'stop_plugin_busy': 'plugin {id}, a read of which passed its deadline and still runs inside the daemon',
     'stop_store_failed': 'the {store} store, whose Stop failed',
-    'stop_store_no_answer': 'the {store} store, which did not answer within {wait:g} seconds',
+    'stop_store_no_answer': 'the {store} store, which did not answer within {wait}',
     'nothing': 'nothing',
 }
 # How a run's record state is said in a sentence.
@@ -128,13 +133,25 @@ KIND_WORDS = {'run': ('run', 'runs'), 'plugin_host': ('plugin host', 'plugin hos
 STAYS_WORDS = {'plugin_host': ('plugin host stays loaded', 'plugin hosts stay loaded'),
                'approval': ('approval still waits', 'approvals still wait'),
                'budget': ('budget keeps the spend recorded against it', 'budgets keep the spend recorded against them')}
+# How a number of seconds is said, by the placeholder that holds it: (one, many, whole). A whole count is
+# rounded up, so a time that still runs is never said as none.
+SECONDS_WORDS = {'left': ('more second', 'more seconds', True), 'wait': ('second', 'seconds', False)}
 
 
 class StoreBusy(Exception):
     """A reader asked with ``wait=False`` found its store busy: it did not wait, and read nothing."""
 
 
+def _seconds(value, one, many, whole):
+    n = math.ceil(value) if whole else value
+    return f'{n:g} {one if n == 1 else many}'
+
+
 def _text(key, **fields):
+    for name, (one, many, whole) in SECONDS_WORDS.items():
+        value = fields.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            fields[name] = _seconds(value, one, many, whole)
     return TEXT[key].format(**fields)
 
 
@@ -504,11 +521,19 @@ def stop_all(control, *, stores=STORES, wait_s=None):
                 left.append({'store': store.name, 'outcome': 'no_answer',
                              'text': _text('stop_store_no_answer', store=store.name, wait=wait_s)})
             else:
-                unread.append({'store': store.name, 'text': _text('stop_stays_unread', store=store.name)})
+                unread.append({'store': store.name,
+                               'text': _text('stop_stays_no_answer', store=store.name, wait=wait_s)})
             continue
         if 'error' in box:
             if not holds_work:
-                unread.append({'store': store.name, 'text': _text('stop_stays_unread', store=store.name)})
+                # busy only for a store that said it was busy; any other error is said as a store not read
+                if isinstance(box['error'], StoreBusy):
+                    key = 'stop_stays_unread'
+                else:
+                    log.error('standing stop: the %s store could not be read (%s)', store.name,
+                              type(box['error']).__name__)
+                    key = 'stop_stays_failed'
+                unread.append({'store': store.name, 'text': _text(key, store=store.name)})
                 continue
             log.error('standing stop: the %s store failed (%s)', store.name, type(box['error']).__name__)
             left.append({'store': store.name, 'outcome': 'failed',

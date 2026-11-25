@@ -323,6 +323,28 @@ class TheApprovalsRow(unittest.TestCase):
         self.assertEqual((answer['rows'], answer['text']), ([], standing.TEXT['view_nothing']),
                          'an expired approval shown as waiting')
 
+    def test_an_approval_says_one_more_second_for_one_and_whole_seconds_otherwise(self):
+        clock = _Clock()
+        gate = _gate(clock)
+        waiting, _ = gate.request(_effect('run-1'))
+        granted, granted_digest = gate.request(_effect('run-2'))
+        gate.decide(granted, granted_digest, 'op', True)
+        control, _ = _control(self, plugins=_Plugins(gate=gate))
+        start = clock.now
+
+        def texts():
+            return {row['id']: row['text'] for row in control.call('standing.list')['rows']}
+
+        clock.now = start + TTL - 1
+        self.assertIn('for 1 more second; then', texts()[waiting])
+        self.assertTrue(texts()[granted].endswith('for 1 more second at most.'))
+        clock.now = start + TTL - 1.5
+        self.assertIn('for 2 more seconds; then', texts()[waiting])
+        clock.now = start + TTL - 0.25
+        self.assertTrue(texts()[granted].endswith('for 1 more second at most.'))
+        clock.now = start + 0.5
+        self.assertIn('for 300 more seconds; then', texts()[waiting])
+
     def test_the_readers_of_a_store_that_holds_no_work_never_wait_for_its_lock(self):
         gate = _gate(_Clock())
         gate.request(_effect('run-1'))
@@ -556,7 +578,32 @@ class OneStop(unittest.TestCase):
                          [('failing', 'failed'), ('hanging', 'no_answer')])
         self.assertEqual(answer['code'], 'pending')
         self.assertEqual(waits, [False], 'Stop asked a reader that may wait')
-        self.assertIn(standing._text('stop_stays_unread', store='quiet'), answer['text'])
+        self.assertIn(standing._text('stop_stays_no_answer', store='quiet', wait=1.0), answer['text'])
+
+    def test_a_store_that_holds_no_work_and_cannot_be_read_or_does_not_answer_is_never_said_busy(self):
+        control, _ = _control(self, plugins=_Plugins())
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+
+        def read_raises(c, wait=True):
+            raise OSError('store down')
+
+        def read_hangs(c, wait=True):
+            gate.wait(10)
+            return []
+
+        stores = (*standing.STORES, standing.Store('broken', 'approval', read_raises, standing.HOLDS_NO_WORK),
+                  standing.Store('slow', 'budget', read_hangs, standing.HOLDS_NO_WORK))
+        answer = standing.stop_all(control, stores=stores, wait_s=1.0)
+        failed = ('The broken store could not be read, so what still stands in it is not said here; '
+                  'look at everything standing.')
+        slow = ('The slow store did not answer within 1 second, so what still stands in it is not said here; '
+                'look at everything standing.')
+        self.assertIn({'store': 'broken', 'text': failed}, answer['still_standing'])
+        self.assertIn({'store': 'slow', 'text': slow}, answer['still_standing'])
+        self.assertIn(failed, answer['text'])
+        self.assertIn(slow, answer['text'])
+        self.assertNotIn('busy', answer['text'], 'a store that failed or did not answer was said busy')
 
     def test_stop_never_waits_for_a_busy_store_to_say_what_still_stands(self):
         control, api, _ = _everything(self, kill=FakeKillTree(answers=(EMPTY,)))

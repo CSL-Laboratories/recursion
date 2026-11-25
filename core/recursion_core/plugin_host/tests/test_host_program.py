@@ -29,6 +29,8 @@ MARKER = "CSL_PLUGIN_HOST_CLEAN"
 CANARY_NAME = "CSL_HOST_TEST_CANARY"
 CANARY = "canary-value-7d3f19"
 RESTARTED = "--restarted-once"
+# The bytes of a stand-in file already in the host's working folder before it starts.
+KEPT = b"a person's file, stand-in\n"
 # The named exit statuses of a host that refuses to start (sysexits EX_OSERR and EX_CONFIG).
 EXIT_RESTART_FAILED = 71
 EXIT_ENVIRONMENT_NOT_CLEAN = 78
@@ -224,6 +226,46 @@ class HostTestHelperTests(unittest.TestCase):
             self.assertEqual(reason, "requires /proc/self/cmdline")
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "the canary is made only where the wall can be (Linux)")
+class CanarySetupTests(unittest.TestCase):
+    """The host's setup before its wall removes only what it made: a name already there stays as it was."""
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(scratch.name)
+        self.cwd = Path(scratch.name)
+        from recursion_core import plugin_host
+
+        self.host = plugin_host
+        self.folder = self.cwd / (plugin_host.CANARY_PREFIX + str(os.getpid()) + plugin_host.WRITE_FOLDER_SUFFIX)
+        self.folder.mkdir()
+        (self.folder / "kept.txt").write_bytes(KEPT)
+
+    def assert_left_as_it_was(self):
+        self.assertEqual(os.listdir(self.cwd), [self.folder.name], "the canary is gone, the folder is still there")
+        self.assertEqual(os.listdir(self.folder), ["kept.txt"])
+        self.assertEqual((self.folder / "kept.txt").read_bytes(), KEPT)
+
+    def test_c1_a_folder_already_there_by_the_write_folders_name_stays_whole(self):
+        self.assertEqual(self.host._canary(), ("", "", None))
+        self.assert_left_as_it_was()
+
+    def test_c2_when_the_canary_cannot_be_written_a_folder_already_there_stays_whole(self):
+        with unittest.mock.patch.object(self.host.os, "write", side_effect=OSError(28, "no space left")):
+            self.assertEqual(self.host._canary(), ("", "", None))
+        self.assert_left_as_it_was()
+
+    def test_c3_a_write_folder_this_call_made_is_removed_when_a_later_step_fails(self):
+        (self.folder / "kept.txt").unlink()
+        self.folder.rmdir()
+        with unittest.mock.patch.object(self.host.wall_linux, "prepare_write_folder",
+                                        side_effect=ValueError("stand-in")):
+            self.assertEqual(self.host._canary(), ("", "", None))
+        self.assertEqual(os.listdir(self.cwd), [], "the canary and the folder this call made are both gone")
+
+
 class HostProgramTests(unittest.TestCase):
     counter = __import__("itertools").count()
 
@@ -353,6 +395,11 @@ class HostProgramTests(unittest.TestCase):
             report = report.read_text() if report.exists() else None
             self.canaries_left = sorted(
                 name for name in os.listdir(cwd) if name.startswith(".csl-plugin-host-canary"))
+            # What each folder among them holds: a file's bytes, or None for anything else.
+            self.left_inside = {
+                name: {child: Path(cwd, name, child).read_bytes() if Path(cwd, name, child).is_file() else None
+                       for child in sorted(os.listdir(Path(cwd, name)))}
+                for name in self.canaries_left if Path(cwd, name).is_dir() and not Path(cwd, name).is_symlink()}
         self.stderr = stderr
         self.starts = len(starts.read_text()) if starts.exists() else 0
         self.assertEqual(process.returncode, code, stderr.decode(errors="replace"))
@@ -360,7 +407,8 @@ class HostProgramTests(unittest.TestCase):
         self.assertTrue(replies, stderr.decode(errors="replace"))
         self.hello = replies.pop(0)
         self.assertEqual({key: value for key, value in self.hello.items() if key != "wall"}, HELLO)
-        if code != 0 or wall in ("real", "noreadfile", "nowrite", "notruncate", "keepcanary"):
+        if code != 0 or wall in ("real", "noreadfile", "nowrite", "notruncate", "keepcanary",
+                                  "folderthere"):
             return replies, None, None, None
         self.assertIsNotNone(report, "the host wrote no status")
         status, reads, identity = json.loads(report)
@@ -1045,6 +1093,21 @@ class HostProgramTests(unittest.TestCase):
         self.assertIn(wall_linux.WORDS["canary_left"], replies[0]["detail"])
         self.assertEqual(len(self.canaries_left), 2, "the canary and the write folder, both named")
 
+    def test_w8_a_folder_already_there_by_the_write_folders_name_stays_whole_and_every_load_is_refused(self):
+        why = _why_no_wall()
+        if why:
+            self.skipTest(why)
+        replies, _, _, _ = self.exchange(HELLO, load(WALL_SOURCE), BYE, wall="folderthere")
+        self.assertEqual([(reply["type"], reply.get("code")) for reply in replies],
+                         [("refusal", "plugin_wall_unproven")], replies)
+        record = self.hello["wall"]
+        self.assertIs(record["home_canary"], False)
+        self.assertIs(record["proven"], False)
+        self.assertEqual(len(self.canaries_left), 1, self.canaries_left)
+        name = self.canaries_left[0]
+        self.assertTrue(name.endswith(".d"), name)
+        self.assertEqual(self.left_inside, {name: {"kept.txt": KEPT}}, "the folder and its file, as they were")
+
 
 # The plugin of the write test: at load it cuts a file outside its folder to nothing (VICTIM is its path).
 WRITE_SOURCE = textwrap.dedent("""
@@ -1122,4 +1185,10 @@ WALL_SHIMS = {
                    "_wall_linux._FS_LATER = {2: 1 << 13, 5: 1 << 15}\n"),
     # "keepcanary": the real wall, and a helper that leaves the canary and the write folder behind.
     "keepcanary": "plugin_host._remove_probe_files = lambda path, folder: None\n",
+    # "folderthere": the real wall, and a folder already in the working folder by the name of the host's write
+    # folder (made here, before main, for the host's own process id), holding a file.
+    "folderthere": ("_there = plugin_host.CANARY_PREFIX + str(os.getpid()) + plugin_host.WRITE_FOLDER_SUFFIX\n"
+                    "if not os.path.lexists(_there):\n"
+                    "    os.mkdir(_there)\n"
+                    f"    open(os.path.join(_there, 'kept.txt'), 'wb').write({KEPT!r})\n"),
 }

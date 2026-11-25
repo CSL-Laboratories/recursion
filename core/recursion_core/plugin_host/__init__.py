@@ -111,16 +111,20 @@ def _canary():
     except OSError:
         return "", "", None
     folder = path + WRITE_FOLDER_SUFFIX
+    folder_made = False
     try:
         try:
             os.write(made, b"canary\n")
         finally:
             os.close(made)
         os.mkdir(folder, 0o700)
+        folder_made = True
         wall_linux.prepare_write_folder(folder)
         read_end, write_end = os.pipe()
     except (OSError, ValueError):
-        _remove_probe_files(path, folder)
+        # A name already there by the write folder's name (a folder with what it holds, a file or a link) is not
+        # this call's: it stays as it was, and only what this call made is removed.
+        _remove_probe_files(path, folder if folder_made else None)
         return "", "", None
     try:
         helper = os.fork()
@@ -146,9 +150,11 @@ def _canary():
 
 
 def _remove_probe_files(path, folder):
-    """The canary and the write folder with all it holds; run by the helper, which the wall does not reach."""
+    """The canary and the write folder with all it holds (no folder when ``folder`` is None); run by the helper,
+    which the wall does not reach, and before the wall when a step of the setup fails."""
     _remove_quietly(path)
-    shutil.rmtree(folder, ignore_errors=True)
+    if folder is not None:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def _remove_quietly(path):

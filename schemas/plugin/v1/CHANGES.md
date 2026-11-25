@@ -17,6 +17,7 @@ probe cannot try harmlessly, each with the check that shows it refused instead. 
 without the two fields, so a host built on draft 3 reads as not proven and loads nothing until it hands the
 probe a file and a folder. Every wall fixture carries both fields; 4 good fixtures (`h08` to `h11`) and
 21 bad ones hold them.
+
 ## `host.v1.json` is `1.0-draft.4` (2026-11-23)
 
 The host's own `hello` may carry `wall`, the `wall.v1` record of the wall the host applied to itself

@@ -45,6 +45,29 @@ apart from the tombstones, so a burst of other approvals cannot evict a veto and
 its finality. Each entry is one SHA-256 hex digest (no effect bytes), and the set grows
 only by one per distinct digest the operator vetoes: only the ``operator_ui`` principal
 can add to it, never a plugin request.
+
+An allow that outlives one use (what the person approved, kept for the later uses it
+covers) is part of the gate, and the gate keeps one only as the effect of the person's
+yes to one approval. ``request(effect, keep=key)`` names where the allow of that
+approval goes; ``take`` consumes the approved approval and keeps its allow in the same
+critical section, after the veto check, so a veto lands before it (and the take
+refuses) or after it (and ``standing`` answers no), and nothing the gate retires can
+come between the take and the store. ``keep`` keeps the allow of an approval taken
+earlier, once per approval: a second keep of the same yes is refused
+(``approval_replayed``). ``standing`` counts only the allows the gate kept itself,
+never a list a caller holds, and reads the veto of the use asked about in the same
+section. The digest of that use is computed once per use and kept beside the allow, so
+the go path does not check and hash the effect again on every use. The allows live in
+memory only, like the vetoes: a restart forgets them and asks again.
+
+Every id the gate looks up (an approval id, a digest, each part of an allow's key and of
+a use's key) is an exact, non-empty ``str``, or the call is refused with words before any
+lookup: an approval id or a digest with the code the gate gives for one it does not know
+(``approval_required`` from ``take`` and ``keep``, ``approval_unknown`` and
+``approval_digest_mismatch`` from ``decide``), any other id with ``id_not_text``; the book of an allow's key is a plain ``object()``, equal
+only to itself. So no lookup of the gate ever finds two ids of different types equal: the
+number one and the truth value, a float and an integer, bytes and text, or a ``str``
+subclass with its own equality.
 """
 
 from __future__ import annotations
@@ -56,7 +79,7 @@ import secrets
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Iterable
 
 from .canonical import canonical, parse
 from .errors import Refused
@@ -101,12 +124,62 @@ def effect_digest(effect: object) -> str:
     return hashlib.sha256(check_effect(effect)).hexdigest()
 
 
+def _is_id(value: object) -> bool:
+    """Whether ``value`` is an id: an exact, non-empty ``str`` (never a subclass)."""
+    return type(value) is str and value != ""
+
+
+def _check_id(name: str, value: object, code: str = "id_not_text") -> None:
+    """Refuse, with ``code`` and words, an id that is not an exact, non-empty ``str``, before any lookup."""
+    if not _is_id(value):
+        given = "an empty text" if type(value) is str else type(value).__name__
+        raise Refused(code, f"the {name} is not a non-empty text string ({given} given); "
+                            f"nothing was asked, kept or done: pass the {name} as text")
+
+
+def _ids(parts: object) -> bool:
+    """Whether ``parts`` is a non-empty tuple of ids."""
+    if type(parts) is not tuple or not parts:
+        return False
+    for part in parts:
+        if type(part) is not str or part == "":
+            return False
+    return True
+
+
+def _check_parts(parts: object, name: str) -> None:
+    """Refuse a key that is not a non-empty tuple of ids, before any lookup."""
+    if _ids(parts):
+        return
+    if type(parts) is not tuple or not parts:
+        raise TypeError(f"the {name} must be a non-empty tuple of ids")
+    for part in parts:
+        _check_id(f"id in the {name}", part)
+
+
+def _check_book(book: object) -> None:
+    if type(book) is not object:
+        raise TypeError("the book of an allow's key must be a plain object(), equal only to itself")
+
+
+def _check_key(key: object, shape: str) -> None:
+    """Refuse an allow's key that is not ``(book, entry)``: a plain ``object()`` and a tuple of ids."""
+    if type(key) is tuple and len(key) == 2 and type(key[0]) is object and _ids(key[1]):
+        return
+    if type(key) is not tuple or len(key) != 2:
+        raise TypeError(shape)
+    _check_book(key[0])
+    _check_parts(key[1], "allow's key")
+
+
 @dataclass
 class _Approval:
     digest: str
     raw: bytes | None  # None once terminal: a tombstone keeps no effect bytes
     expires_at: int
     state: str = "pending"  # pending -> approved | vetoed | expired; approved -> used | expired
+    keep: object = None  # where the allow of this approval goes once its yes is taken
+    kept: bool = False  # True once its allow was kept: one yes keeps one allow
 
 _TERMINAL = frozenset({"used", "vetoed", "expired"})
 
@@ -137,6 +210,13 @@ class ApprovalGate:
         # is bounded by operator veto decisions (operator_ui principal only), not by
         # plugin requests. In memory only: a restart forgets every veto.
         self._vetoed: set[str] = set()
+        # The allows the gate kept, each only as the effect of a yes: book -> entry -> the
+        # digests of the approvals behind it. Written only by take and keep, under the lock.
+        self._allows: dict[object, dict[object, set[str]]] = {}
+        # The digest of each use the go path asked about, per book: (entry, use) -> digest.
+        # Filled under the lock and only while an allow stands for that entry, so it grows
+        # with the allows and the uses they let go; a pure memo of effect_digest.
+        self._uses: dict[object, dict[object, str]] = {}
 
     def _retire(self, approval_id: str, item: _Approval, state: str) -> None:
         """Make an entry terminal: drop its bytes, keep a bounded tombstone. Lock held."""
@@ -179,7 +259,11 @@ class ApprovalGate:
             if item is not None and item.state not in _TERMINAL:
                 self._retire(approval_id, item, "expired")
 
-    def request(self, effect: dict) -> tuple[str, str]:
+    def request(self, effect: dict, *, keep: tuple[object, object] | None = None) -> tuple[str, str]:
+        """Draw one approval for ``effect``. ``keep``, a ``(book, entry)`` pair, names where the
+        allow of this approval goes when its yes is taken; without it nothing outlives the use."""
+        if keep is not None:
+            _check_key(keep, "keep must be a (book, entry) pair or None")
         raw = check_effect(effect)
         digest = hashlib.sha256(raw).hexdigest()
         with self._lock:
@@ -189,7 +273,7 @@ class ApprovalGate:
             approval_id = "apr_" + secrets.token_hex(16)
             now = self._clock()
             self._sweep(now)
-            self._approvals[approval_id] = _Approval(digest, raw, now + self._ttl)
+            self._approvals[approval_id] = _Approval(digest, raw, now + self._ttl, keep=keep)
             self._live += 1
             heapq.heappush(self._expiry, (now + self._ttl, approval_id))
         # Drawn from the stored bytes, after storage: the caller cannot alter either.
@@ -202,6 +286,8 @@ class ApprovalGate:
             raise Refused("approval_requires_operator")
         if type(approve) is not bool:
             raise Refused("decision_invalid")
+        _check_id("approval id", approval_id, "approval_unknown")
+        _check_id("digest", digest, "approval_digest_mismatch")
         with self._lock:
             item = self._approvals.get(approval_id)
             if item is None:
@@ -228,6 +314,7 @@ class ApprovalGate:
 
     def take(self, approval_id: str, effect: dict) -> str:
         """Consume the approval for exactly this effect. One use only."""
+        _check_id("approval id", approval_id, "approval_required")
         raw = check_effect(effect)
         digest = hashlib.sha256(raw).hexdigest()
         with self._lock:
@@ -249,10 +336,100 @@ class ApprovalGate:
             if item.digest in self._vetoed:
                 raise Refused("approval_vetoed")
             self._retire(approval_id, item, "used")
+            if item.keep is not None:
+                # The person's yes to this approval, taken here: its allow is kept in the
+                # same critical section as the veto check above.
+                item.kept = True
+                self._store(item.keep, digest)
             return digest
 
     def is_vetoed(self, digest: str) -> bool:
         """Whether the operator vetoed this digest. The core's commit section asks it again
         after ``take``, so a veto acknowledged before the commit refuses it (R4-1)."""
+        _check_id("digest", digest)
         with self._lock:
             return digest in self._vetoed
+
+    def keep(self, approval_id: str, effect: dict, key: tuple[object, object]) -> str:
+        """Keep the allow of one approval taken earlier, in the same critical section as the veto check.
+
+        The allow is kept under ``key`` (a ``(book, entry)`` pair) only when ``approval_id``
+        was given by this gate for exactly this effect, was taken (``used``), its digest is
+        not vetoed and its allow was not kept before; otherwise nothing is kept and the call
+        refuses (``approval_required``, ``approval_digest_mismatch``, ``approval_vetoed``,
+        ``approval_not_taken`` with the approval's state, or ``approval_replayed``).
+        """
+        _check_key(key, "key must be a (book, entry) pair")
+        _check_id("approval id", approval_id, "approval_required")
+        raw = check_effect(effect)
+        digest = hashlib.sha256(raw).hexdigest()
+        with self._lock:
+            item = self._approvals.get(approval_id)
+            if item is None:
+                raise Refused("approval_required")
+            if item.digest != digest:
+                raise Refused("approval_digest_mismatch")
+            if digest in self._vetoed:
+                raise Refused("approval_vetoed")
+            if item.state != "used":
+                raise Refused("approval_not_taken", item.state)
+            if item.kept:
+                # One yes keeps one allow: a second keep of it is a replay.
+                raise Refused("approval_replayed")
+            item.kept = True
+            self._store(key, digest)
+            return digest
+
+    def _store(self, key: tuple[object, object], digest: str) -> None:
+        """Keep the allow of one taken yes. Lock held; the one writer of the allows."""
+        book, entry = key
+        self._allows.setdefault(book, {}).setdefault(entry, set()).add(digest)
+
+    def _use_digest(self, key: tuple[object, object], use: object,
+                    effect: Callable[[], dict]) -> tuple[str, bool]:
+        """The digest of one use, from the memo when it is there (then False) or computed (True)."""
+        book, entry = key
+        uses = self._uses.get(book)
+        digest = None if uses is None else uses.get((entry, use))
+        if digest is not None:
+            return digest, False
+        return effect_digest(effect()), True
+
+    def standing(self, key: tuple[object, object], use: object = None,
+                 effect: Callable[[], dict] | None = None) -> bool:
+        """Whether an allow this gate kept stands for ``key``, in the same critical section as the veto check.
+
+        Only allows the gate kept itself, each as the effect of a yes, count. True when at
+        least one digest kept for ``key`` is not vetoed and, when ``effect`` is given, the
+        digest of the use it builds is not vetoed either: a veto of the use asked about, or
+        of every approval behind the allow, makes it stand no more. The use's digest is
+        computed once per ``use`` and kept beside the allow, so ``use`` must name every
+        field of the effect that ``key`` does not; it is a tuple of ids, like the entry of ``key``.
+        """
+        _check_key(key, "key must be a (book, entry) pair")
+        if effect is not None:
+            _check_parts(use, "use's key")
+        book, entry = key
+        digest, fresh = (None, False) if effect is None else self._use_digest(key, use, effect)
+        with self._lock:
+            if digest is not None and digest in self._vetoed:
+                return False
+            stands = any(source not in self._vetoed for source in self._allows.get(book, {}).get(entry, ()))
+            if stands and fresh:
+                self._uses.setdefault(book, {})[(entry, use)] = digest
+            return stands
+
+    def standing_any(self, book: object, match: Callable[[object], bool]) -> bool:
+        """Whether an allow this gate kept stands for any entry of ``book`` that ``match`` accepts.
+        ``match`` runs under the gate's lock and must not call back into the gate."""
+        _check_book(book)
+        with self._lock:
+            return any(source not in self._vetoed
+                       for entry, digests in self._allows.get(book, {}).items() if match(entry)
+                       for source in digests)
+
+    def _kept_copy(self, book: object) -> dict[object, set[str]]:
+        """A copy of the allows kept for ``book``, entry -> digests, for status and tests.
+        Read without the lock (so it may be called under it); it lets nothing go."""
+        _check_book(book)
+        return {entry: set.copy(digests) for entry, digests in dict.items(self._allows.get(book, {}))}

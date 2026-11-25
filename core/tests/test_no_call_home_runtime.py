@@ -551,7 +551,7 @@ class ReadmeWordsTests(unittest.TestCase):
                       "what the operating system does by itself", "made from a descriptor",
                       "foreign-function module", "not part of the hosted gate", "Windows",
                       "a later change of a kind those tests plant", "a way the scan cannot see is not caught",
-                      "is judged by the program it starts", "only a real interpreter is taken for Python",
+                      "is judged by the program it starts", "is taken for Python by its name",
                       "a Python process that does not load the hook",
                       "code that hides from the hook", "sees only what Python code reports to it",
                       "holds only together with the static proof", "a file path that reaches a network by itself"):

@@ -73,9 +73,9 @@ reason = "The audit does not look at which file of an allowed name ran; the test
 [[gap]]
 id = "G16"
 proof = "run-time"
-words = "a child that switches the hook off or writes its own events file"
-example = "sitecustomize._watched set to nothing; an empty events file written for the child's own number"
-reason = "The hook is Python code inside the child, so code that runs there can undo it. This is code that hides from the hook by its nature: only the static proof, where it reads that code, or a net outside the process can see it."
+words = "a process of the run (the command itself or a child) that switches the hook off or writes its own events file"
+example = "sitecustomize._watched set to nothing in a child; the command's own process pointing sitecustomize._out at nothing before it connects; an empty events file written for the child's own number"
+reason = "The hook is Python code inside each process of the run, the command's own process included, so code that runs there can undo it. This is code that hides from the hook by its nature: only the static proof, where it reads that code, or a net outside the process can see it."
 
 [[gap]]
 id = "G17"
@@ -90,6 +90,20 @@ proof = "run-time"
 words = "the program row claude allows the name of a real engine program"
 example = "a test that runs the real engine program by that name"
 reason = "The row is safe only while the tests' PATH holds a stand-in of that name; allowing the stand-in by its full path is a candidate."
+
+[[gap]]
+id = "G19"
+proof = "run-time"
+words = "an interpreter started by a program that is neither Python nor a launcher"
+example = "the system's program loader (ld-linux) copied as sleep, running /usr/bin/python3.12 -I -c '...'; systemd-run starting an interpreter"
+reason = "The hook looks at the files of a start's arguments only when a launcher starts: looking at every argument of every start along PATH cost about 75 ms a look on a host whose PATH holds many slow folders, and turned a product test red. Such a program is judged by its name, so an allowed name lets the interpreter it runs go unseen. It can be built: the hook looks at each argument that names a file by its path (no PATH search) for every start, or a program row allows a file and not a name."
+
+[[gap]]
+id = "G20"
+proof = "run-time"
+words = "a process that was running before the run began, or outside the run's processes, that the run asks to act"
+example = "a Python program started before the audit, which a test asks through a file to open a connection"
+reason = "The hook is in the processes the run starts; a process outside them is not watched, and asking it to act through a file or a socket of this machine is not a reach of the run. No hook can see it by its nature: only a net outside the processes, such as a run inside a network namespace with no route out, can."
 
 [[claim]]
 text = "a later change that adds a call home, a module or a refused construct goes red"
@@ -122,3 +136,7 @@ reason = "Once said; more ways were found after it."
 [[claim]]
 text = "prints PROVEN on a clean checkout"
 reason = "The whole-suite run prints NOT PROVEN on a clean checkout today."
+
+[[claim]]
+text = "only a real interpreter is taken for Python"
+reason = "Once said; an interpreter started by a program that is neither Python nor a launcher is not seen (row G19)."

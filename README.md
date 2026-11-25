@@ -75,8 +75,8 @@ What is proven, and what is not:
   names what it could not watch. It names a program that is not Python and refuses one that is not
   listed in `tools/network_audit.toml`. A program started through another program (`env`,
   `unshare`) is judged by the program it starts (a split-string option of `env`, also inside a group
-  such as `-iS`, is refused), only a real interpreter is taken for Python (by its name, or by its file
-  whatever its name, looked at when it starts), a Python process that does not load the hook
+  such as `-iS`, is refused), a program is taken for Python by its name (`python3`, `python3.N`), or
+  by its file whatever its name, looked at when it starts, a Python process that does not load the hook
   (started with `-I`, `-S` or `-E`, or with a cleared environment) is refused, and a hooked process
   still running when the command ends makes the run NOT PROVEN, except in the run-time ways of the
   list below. Not watched: code that
@@ -91,8 +91,11 @@ What is proven, and what is not:
     `sitecustomize`); the name-service lookups of pwd and getpass; a file path that reaches a
     network by itself (an automount such as `/net` on macOS, or a Windows network path).
   - past the whole-suite run: a program row allows a name, not a file (a test's script named
-    `sleep`); a child that switches the hook off or writes its own events file; what a unit started
-    by systemd-run runs; the program row claude allows the name of a real engine program.
+    `sleep`); a process of the run (the command itself or a child) that switches the hook off or
+    writes its own events file; what a unit started by systemd-run runs; the program row claude
+    allows the name of a real engine program; an interpreter started by a program that is neither
+    Python nor a launcher (the system's program loader copied under an allowed name); a process that
+    was running before the run began, or outside the run's processes, that the run asks to act.
 - Not proven: the engines' own traffic to the addresses you configured, and anything else an
   engine program reaches by itself; what a plugin does under a grant you gave (the plugin checks'
   proof); what the operating system does by itself (its own name lookups and services); what any

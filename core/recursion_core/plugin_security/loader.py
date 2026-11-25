@@ -182,17 +182,43 @@ def _code_name(package_name: str, plugin_id: str, path: str | None = None) -> st
     return "<plugin %s #%s%s>" % (plugin_id, package_name.rpartition("_")[2], "" if path is None else ": " + path)
 
 
-def _remember_lines(code_name: str, source: bytes) -> None:
-    """Put the verified lines in the line cache under ``code_name``, so that an error report shows
-    the lines that were checked. The entry has no time, so the cache never compares it with a file."""
+def _verified_lines(source: bytes) -> list[str] | None:
+    """The lines of verified bytes, or None when they do not decode (compile() refuses them too)."""
     try:
         text = importlib.util.decode_source(source)
     except (SyntaxError, UnicodeError, LookupError):
-        return  # compile() refuses these bytes too
+        return None
     lines = io.StringIO(text).readlines()  # split as the tokenizer counts lines: at a newline only
     if lines and not lines[-1].endswith("\n"):
         lines[-1] += "\n"
-    linecache.cache[code_name] = (len(source), None, lines, code_name)
+    return lines
+
+
+def _remember_lines(code_name: str, source: bytes) -> None:
+    """Put the verified lines in the line cache under ``code_name``, so that an error report shows
+    the lines that were checked. The entry has no time, so the cache never compares it with a file."""
+    lines = _verified_lines(source)
+    if lines is not None:
+        linecache.cache[code_name] = (len(source), None, lines, code_name)
+
+
+def _compile_verified(source: bytes, code_name: str):
+    """compile() of verified bytes under ``code_name``. When they do not compile (a syntax or an
+    indentation error, a null byte, an encoding line, bytes that do not decode), the interpreter
+    may have read the error's line from a file of that name in the working folder: the line the
+    error shows is replaced by the line of the verified bytes, or left empty, never a file's text."""
+    try:
+        return compile(source, code_name, "exec", dont_inherit=True)
+    except SyntaxError as exc:  # IndentationError and TabError too
+        lines = _verified_lines(source)
+        number = exc.lineno
+        text = lines[number - 1] if lines and isinstance(number, int) and 1 <= number <= len(lines) else None
+        if len(exc.args) == 2 and isinstance(exc.args[1], tuple) and len(exc.args[1]) >= 4:
+            details = list(exc.args[1])
+            details[3] = text
+            exc.args = (exc.args[0], tuple(details))
+        exc.text = text
+        raise
 
 
 class _PackageImports:
@@ -247,7 +273,7 @@ class _PackageImports:
         source = self.files[path]
         with self._lock:
             self.served[path] = hashlib.sha256(source).hexdigest()
-        exec(compile(source, self.code_name(path), "exec", dont_inherit=True), module.__dict__)
+        exec(_compile_verified(source, self.code_name(path)), module.__dict__)
 
     def is_package(self, fullname: str) -> bool:
         where = None if fullname == self.name else self.locate(fullname)
@@ -548,7 +574,7 @@ class PluginLoader:
                 if manifest.plugin_id in self._active:
                     raise Refused("plugin_already_active", manifest.plugin_id)
                 name = _FINDER.new_name(manifest.plugin_id)
-                code = compile(artifact, _code_name(name, manifest.plugin_id), "exec", dont_inherit=True)
+                code = _compile_verified(artifact, _code_name(name, manifest.plugin_id))
                 findings.append(_finding("stage", "compiled", "info"))
             except (Refused, SyntaxError, ValueError, RecursionError, MemoryError) as exc:
                 # No plugin code ran, but the rule is a GIL read after every load attempt.

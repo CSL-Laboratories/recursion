@@ -14,7 +14,8 @@ check that nothing it writes is ever run or called signed:
 * the record names the digest of the bytes loaded, equal to the digest verified, and says that a
   file the plugin opens by its path is not covered;
 * an error report, a warning and a source lookup of the plugin's code show the verified lines,
-  never a file planted in the working folder or a sys.path folder under its code's name.
+  never a file planted in the working folder or a sys.path folder under its code's name; a listed
+  module that does not compile shows the line of its verified bytes, or no line.
 
 The stress test runs a swapper thread against many thousands of verify-and-load rounds.
 """
@@ -557,6 +558,11 @@ def entry_boom():
 def warn():
     from .lib import boom as module
     return module.warn()
+
+
+def load_bad(kind):
+    import importlib
+    return importlib.import_module(".lib.bad_" + kind, __package__)
 """
 
 BOOM_MODULE = b"""import warnings
@@ -571,9 +577,22 @@ def warn():
 """
 
 # What a stranger plants under a code name: a line for every line number the plugin's code has.
-PLANTED = b"".join(b"PLANTED_BY_A_STRANGER = %d\n" % number for number in range(1, 41))
+PLANTED = b"".join(b"PLANTED_BY_A_STRANGER = %d\n" % number for number in range(1, 61))
 # The name a served module's code had before: a relative path, opened by the line cache.
 OLD_MODULE_NAME = "<plugin %s>/lib/boom.py" % PLUGIN_ID
+
+# Listed modules that do not compile, one for every kind of error compile() raises for bytes, and
+# the line each error must show: the line of the verified bytes, or None where they have none.
+BAD_MODULES = {
+    "syntax": (b"A = 1\nB = (\n", "B = (\n"),
+    "indent": (b"A = 1\ndef f():\nreturn 1\n", "return 1\n"),
+    "tab": (b"if 1:\n\tA = 1\n        B = 2\n", "        B = 2\n"),
+    "null": (b"A = 1\nB = '\x00'\n", None),
+    "encoding": (b"# -*- coding: no-such-codec -*-\nA = 1\n", None),
+    "decode": (b"A = 1\nB = '\xff\xfe'\n", None),
+}
+BAD_FILES = {"lib/bad_%s.py" % kind: source for kind, (source, _) in BAD_MODULES.items()}
+BAD_ERRORS = {"indent": IndentationError, "tab": TabError}
 
 
 @unittest.skipUnless(LINUX, "the plugin install path checks ownership by uid")
@@ -591,7 +610,7 @@ class ErrorReportsShowTheVerifiedLinesTests(unittest.TestCase):
         sys.path.insert(0, str(self.on_path))
         self.addCleanup(sys.path.remove, str(self.on_path))
         self.files = dict(GOOD, **{ENTRY_FILE: BOOM_ENTRY, "lib/later.py": b"LATER = 'verified'\n",
-                                   "lib/boom.py": BOOM_MODULE})
+                                   "lib/boom.py": BOOM_MODULE}, **BAD_FILES)
         _sign_listed(self, key, self.root, self.files)
         self.host = _host(self, self.root)
         self.record, = self.host.records
@@ -678,6 +697,46 @@ class ErrorReportsShowTheVerifiedLinesTests(unittest.TestCase):
                                        (">", ": second.py>", ": lib/__init__.py>", ": lib/late.py>", ": lib/boom.py>")))
         self.host.loader.close()
         self.assertEqual([name for name in linecache.cache if str(name).startswith(prefix)], [])
+
+    def compile_error(self, kind: str) -> SyntaxError:
+        """The error of importing the listed module lib/bad_KIND.py, which does not compile, after a
+        stranger's file is planted under that module's code name. The interpreter may read the
+        error's line from such a file; neither the report nor the error may hold that text."""
+        name = "<plugin %s #%s: lib/bad_%s.py>" % (PLUGIN_ID, self.module.__name__.rpartition("_")[2], kind)
+        self.plant(name)
+        try:
+            self.module.load_bad(kind)
+        except SyntaxError as exc:
+            error = exc
+        else:
+            self.fail("lib/bad_%s.py compiled" % kind)
+        self.assertIsInstance(error, BAD_ERRORS.get(kind, SyntaxError))
+        linecache.checkcache()
+        report = "".join(traceback.format_exception(error))
+        self.assertNotIn("PLANTED_BY_A_STRANGER", report + repr(error.args) + repr(error.text))
+        verified = BAD_MODULES[kind][1]
+        self.assertEqual(error.text, verified)
+        if verified is not None:
+            self.assertIn(verified.strip(), "".join(traceback.format_exception_only(error)))
+        return error
+
+    def test_a_syntax_error_in_a_listed_module_shows_its_verified_line_not_a_planted_file(self):
+        self.compile_error("syntax")
+
+    def test_an_indentation_error_shows_its_verified_line_not_a_planted_file(self):
+        self.compile_error("indent")
+
+    def test_a_tab_error_shows_its_verified_line_not_a_planted_file(self):
+        self.compile_error("tab")
+
+    def test_a_null_byte_shows_no_line_and_no_planted_file(self):
+        self.compile_error("null")
+
+    def test_an_encoding_line_naming_no_codec_shows_no_line_and_no_planted_file(self):
+        self.compile_error("encoding")
+
+    def test_bytes_that_do_not_decode_show_no_line_and_no_planted_file(self):
+        self.compile_error("decode")
 
 
 STRESS_ENTRY = b"""try:

@@ -92,6 +92,7 @@ import tempfile
 import threading
 import time
 import weakref
+from types import MappingProxyType
 from typing import Callable, NamedTuple
 
 try:
@@ -155,8 +156,11 @@ class StoreError(RuntimeError):
 # history), and the row's reason says which page and what it says; the loader refuses a row without a reason. The
 # table is read per line: a repaired patch passes only inside its own (major, minor) line, never across lines, since
 # 3.45.0 to 3.50.6 and 3.51.0 to 3.51.2 sit above repaired numbers of other lines and are not repaired; inside its
-# line, every patch from the first repaired one passes. The refusal's list of what will do is built from the same
-# rows (``sqlite_wal_will_do``), so the words cannot name a line the rule lacks, or lack one the rule has.
+# line, every patch from the first repaired one passes. The loader refuses a row the rule would never read: one that
+# starts below the first release with WAL or at or past the release from which every release is repaired. The rule
+# and the refusal's list of what will do (``sqlite_wal_will_do``) read ONE object, the read-only mapping
+# ``SQLITE_WAL_RESET_REPAIRED`` built from the rows, so the words cannot name a line the rule lacks, or lack one the
+# rule has, and neither can be changed alone.
 
 SQLITE_WAL_BUG = 'store_sqlite_wal_bug'     # the typed refusal of every store
 SQLITE_WAL_BUG_UNKNOWN_CHOICE = 'store_sqlite_wal_bug_unknown_choice'  # a choice that is neither of the two
@@ -170,13 +174,18 @@ _SQLITE_WAL_VERSION_TEXT = re.compile(r'([0-9]+)\.([0-9]+)\.([0-9]+)')
 _SQLITE_WAL_LINE_TEXT = re.compile(r'([0-9]+)\.([0-9]+)')
 
 
+def _dotted(version: tuple[int, ...]) -> str:
+    return '.'.join(str(part) for part in version)
+
+
 def load_sqlite_wal_table(path: Path = SQLITE_WAL_TABLE_FILE) -> dict:
     """The table of SQLite releases that carry the WAL-reset repair, read from ``path`` and checked whole.
 
     Returns ``first`` and ``repaired_from`` as (major, minor, patch) and ``rows`` as a tuple of
     ((major, minor), first repaired patch, reason) in the file's order, the order in which the refusal names them.
     A file of another shape, a key the shape does not have, a row or an end without its reason, a line given twice,
-    or a number that is not a whole number raises ValueError with words that name the file, the place and what to
+    a row that starts below ``first`` or at or past ``repaired_from`` (the rule never reads it), or a number that is
+    not a whole number raises ValueError with words that name the file, the place and what to
     write."""
     def refuse(where: str, problem: str) -> ValueError:
         return ValueError(
@@ -234,6 +243,13 @@ def load_sqlite_wal_table(path: Path = SQLITE_WAL_TABLE_FILE) -> dict:
         patch = row.get('first_repaired_patch')
         if type(patch) is not int or patch < 0:
             raise refuse(where, f'gives the first repaired patch {patch!r}, not a whole number of 0 or more')
+        start = (*line, patch)
+        if start < first:
+            raise refuse(where, f'starts at {_dotted(start)}, below "first" {raw["first"]}: no release there has '
+                                'WAL, so the rule never reads this row; remove the row')
+        if start >= repaired_from:
+            raise refuse(where, f'starts at {_dotted(start)}, at or past "repaired_from" {raw["repaired_from"]}: every '
+                                'release from there is repaired, so the rule never reads this row; remove the row')
         seen.add(line)
         rows.append((line, patch, reason(where, row.get('reason'))))
     return {'first': first, 'repaired_from': repaired_from, 'rows': tuple(rows)}
@@ -243,32 +259,38 @@ SQLITE_WAL_TABLE = load_sqlite_wal_table()  # read once, when the module is load
 SQLITE_WAL_FIRST = SQLITE_WAL_TABLE['first']                  # WAL, and the bug with it, begins here
 SQLITE_WAL_REPAIRED_FROM = SQLITE_WAL_TABLE['repaired_from']  # every release from here carries the repair
 # (major, minor) -> the first patch release of that line that carries the repair; a line not in the table has none.
-SQLITE_WAL_RESET_REPAIRED = {line: patch for line, patch, _reason in SQLITE_WAL_TABLE['rows']}
+# Read-only: the rule and the words read this one object, so neither can be changed without the other.
+SQLITE_WAL_RESET_REPAIRED = MappingProxyType({line: patch for line, patch, _reason in SQLITE_WAL_TABLE['rows']})
 
 
 def sqlite_wal_will_do(table: dict | None = None) -> str:
-    """The sentence of the refusal that names every SQLite that will do, built from ``table`` (by default the loaded
-    one) in its order: the first release from which every release is repaired, then each line from its first
-    repaired patch. The words and the rule are read from the same rows."""
-    table = SQLITE_WAL_TABLE if table is None else table
+    """The sentence of the refusal that names every SQLite that will do, in the order of the rows: the first release
+    from which every release is repaired, then each line from its first repaired patch.
 
-    def text(version: tuple[int, ...]) -> str:
-        return '.'.join(str(part) for part in version)
-
-    lines = [f'{text((*line, patch))} or later on the {text(line)} line' for line, patch, _reason in table['rows']]
-    words = f'Use a Python whose SQLite is {text(table["repaired_from"])} or later'
-    if lines:
-        words += ', or ' + (lines[0] if len(lines) == 1 else ', '.join(lines[:-1]) + ', or ' + lines[-1])
+    By default it reads, at the moment of the call, the very objects the rule reads (``SQLITE_WAL_REPAIRED_FROM`` and
+    ``SQLITE_WAL_RESET_REPAIRED``). A stand-in ``table``, as ``load_sqlite_wal_table`` returns it, is for tests."""
+    if table is None:
+        repaired_from, lines = SQLITE_WAL_REPAIRED_FROM, tuple(SQLITE_WAL_RESET_REPAIRED.items())
+    else:
+        repaired_from = table['repaired_from']
+        lines = tuple((line, patch) for line, patch, _reason in table['rows'])
+    named = [f'{_dotted((*line, patch))} or later on the {_dotted(line)} line' for line, patch in lines]
+    words = f'Use a Python whose SQLite is {_dotted(repaired_from)} or later'
+    if named:
+        words += ', or ' + (named[0] if len(named) == 1 else ', '.join(named[:-1]) + ', or ' + named[-1])
     return words + '.'
 
 
-_SQLITE_WAL_REST = ('Recursion does not open its stores with it. ' + sqlite_wal_will_do() + ' '
-                    "Check the daemon's interpreter with: "
-                    '~/.local/lib/recursion/venv/bin/python3.14t -c "import sqlite3; print(sqlite3.sqlite_version)" '
-                    '(a program that calls a store itself checks the interpreter it runs). To accept the risk and '
-                    'go on, set stores.sqlite_wal_bug = "accept_risk" in $XDG_CONFIG_HOME/recursion/settings.toml '
-                    "for the daemon's own stores, or pass "
-                    'sqlite_wal_bug="accept_risk" from a program that calls a store itself.')
+def _sqlite_wal_rest() -> str:
+    return ('Recursion does not open its stores with it. ' + sqlite_wal_will_do() + ' '
+            "Check the daemon's interpreter with: "
+            '~/.local/lib/recursion/venv/bin/python3.14t -c "import sqlite3; print(sqlite3.sqlite_version)" '
+            '(a program that calls a store itself checks the interpreter it runs). To accept the risk and '
+            'go on, set stores.sqlite_wal_bug = "accept_risk" in $XDG_CONFIG_HOME/recursion/settings.toml '
+            "for the daemon's own stores, or pass "
+            'sqlite_wal_bug="accept_risk" from a program that calls a store itself.')
+
+
 _SQLITE_WAL_HAS_THE_BUG = 'This Python uses SQLite {found}, which has a known bug that can damage a database in WAL mode. '
 
 
@@ -322,7 +344,7 @@ def sqlite_wal_refusal(choice: str = 'refuse') -> str | None:
     found = sqlite3.sqlite_version
     if choice == 'accept_risk' or not sqlite_wal_affected(found):
         return None
-    return _SQLITE_WAL_HAS_THE_BUG.format(found=found) + _SQLITE_WAL_REST
+    return _SQLITE_WAL_HAS_THE_BUG.format(found=found) + _sqlite_wal_rest()
 
 
 def sqlite_wal_accepted(choice: str) -> None:

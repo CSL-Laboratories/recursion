@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import sqlite3
 import tempfile
+from types import MappingProxyType
 import unittest
 from unittest import mock
 
@@ -78,7 +79,8 @@ class TheTableIsPinnedVersionByVersion(unittest.TestCase):
 
     def test_a_stand_in_table_that_refuses_3_52_1_is_caught_by_the_pins(self) -> None:
         self.assertEqual([], mismatches())
-        with mock.patch.dict(D.SQLITE_WAL_RESET_REPAIRED, {(3, 52): 2}):
+        refusing = MappingProxyType({**D.SQLITE_WAL_RESET_REPAIRED, (3, 52): 2})
+        with mock.patch.object(D, "SQLITE_WAL_RESET_REPAIRED", refusing):
             self.assertEqual(["3.52.0", "3.52.1"], mismatches())
 
 
@@ -122,6 +124,37 @@ class TheRefusalIsBuiltFromTheTable(unittest.TestCase):
                          "or later on the 3.9 line.",
                          D.sqlite_wal_will_do(table((((4, 1), 2, "a"), ((3, 9), 0, "b")))))
         self.assertEqual(WILL_DO, D.sqlite_wal_will_do())
+
+
+class TheRuleAndTheWordsReadOneReadOnlyObject(unittest.TestCase):
+    def test_the_mapping_is_read_only_and_is_the_tables_rows(self) -> None:
+        mapping = D.SQLITE_WAL_RESET_REPAIRED
+        self.assertIsInstance(mapping, MappingProxyType)
+        self.assertEqual({line: patch for line, patch, _reason in D.SQLITE_WAL_TABLE["rows"]}, dict(mapping))
+        with self.assertRaises(TypeError):
+            mapping[(3, 52)] = 5
+        with self.assertRaises(TypeError):
+            mapping[(3, 99)] = 0
+        with self.assertRaises(TypeError):
+            del mapping[(3, 52)]
+        self.assertEqual(0, mapping[(3, 52)])
+        self.assertNotIn((3, 99), mapping)
+
+    def test_one_change_of_the_object_moves_the_rule_and_the_words_together(self) -> None:
+        stand_in = MappingProxyType({(3, 52): 2, (3, 51): 3})
+        with mock.patch.object(D, "SQLITE_WAL_RESET_REPAIRED", stand_in):
+            self.assertTrue(D.sqlite_wal_affected("3.52.1"))
+            self.assertFalse(D.sqlite_wal_affected("3.52.2"))
+            self.assertTrue(D.sqlite_wal_affected("3.50.7"))
+            with stub("3.45.1"):
+                message = D.sqlite_wal_refusal()
+            self.assertIn("3.53.0 or later, or 3.52.2 or later on the 3.52 line, or 3.51.3 or later on the 3.51 line.",
+                          message)
+            self.assertNotIn("3.50.7", message)
+            self.assertNotIn("3.44.6", message)
+        with stub("3.45.1"):
+            self.assertIn(WILL_DO, D.sqlite_wal_refusal())      # put back: the shipped words again
+        self.assertFalse(D.sqlite_wal_affected("3.52.1"))
 
 
 class TheTableIsADataFileWithAReasonOnEveryRow(unittest.TestCase):
@@ -172,6 +205,15 @@ class TheTableIsADataFileWithAReasonOnEveryRow(unittest.TestCase):
         def twice(table):
             table["lines"].append(copy.deepcopy(table["lines"][1]))
 
+        def add(line, patch):
+            def change(table):
+                table["lines"].append({"line": line, "first_repaired_patch": patch, "reason": "a stand-in"})
+            return change
+
+        def below_first(table):
+            table["first"] = "3.7.4"
+            add("3.7", 2)(table)
+
         cases = {
             "a row without its reason": (row(1, "reason", None), "the row of line 3.51 has no reason"),
             "a row with an empty reason": (row(1, "reason", "  "), "the row of line 3.51 has no reason"),
@@ -187,6 +229,11 @@ class TheTableIsADataFileWithAReasonOnEveryRow(unittest.TestCase):
             "a negative patch": (row(1, "first_repaired_patch", -1), "not a whole number of 0 or more"),
             "a line that is a version": (row(0, "line", "3.52.0"), 'not a line such as "3.52"'),
             "a line outside the range": (row(0, "line", "3.60"), "lies outside the lines from 3.7.0 to 3.53.0"),
+            "a row at the repaired end": (add("3.53", 0), 'the row of line 3.53 starts at 3.53.0, at or past '
+                                          '"repaired_from" 3.53.0'),
+            "a row past the repaired end": (add("3.53", 2), 'the row of line 3.53 starts at 3.53.2, at or past '
+                                            '"repaired_from" 3.53.0'),
+            "a row below the first release": (below_first, 'the row of line 3.7 starts at 3.7.2, below "first" 3.7.4'),
             "a first release that is not a version": (top("first", "3.7"), 'not a version such as "3.53.0"'),
         }
         with tempfile.TemporaryDirectory() as folder:
@@ -210,6 +257,17 @@ class TheTableIsADataFileWithAReasonOnEveryRow(unittest.TestCase):
                     D.load_sqlite_wal_table(path)
                 self.assertIn("is not a JSON file that can be read", str(caught.exception))
                 self.assertIn(PUT_BACK, str(caught.exception))
+
+    def test_the_loader_takes_a_row_just_inside_both_bounds(self) -> None:
+        table = self.raw()
+        table["first"], table["repaired_from"] = "3.7.4", "3.53.2"
+        table["lines"] += [{"line": "3.53", "first_repaired_patch": 1, "reason": "a stand-in"},
+                           {"line": "3.7", "first_repaired_patch": 4, "reason": "a stand-in"}]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "sqlite_wal_repaired.json"
+            path.write_text(json.dumps(table), encoding="utf-8")
+            loaded = D.load_sqlite_wal_table(path)
+        self.assertEqual([((3, 53), 1), ((3, 7), 4)], [(line, patch) for line, patch, _ in loaded["rows"]][-2:])
 
 
 if __name__ == "__main__":

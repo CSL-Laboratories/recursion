@@ -9,6 +9,7 @@ import dataclasses
 import threading
 import unittest
 
+from recursion_core.remote import device_state
 from recursion_core.remote.device_state import DeviceBook
 from recursion_core.remote.pairing import PairingGrant, PairingRefused
 from recursion_core.remote.tests import support
@@ -221,6 +222,125 @@ class DeviceTests(unittest.TestCase):
             thread.join(support.WATCHDOG_S)
         self.assertLessEqual(set(admitted), closing)
         self.assertEqual(self.book.connect("dev_one", "late").code, "device_revoked")
+
+
+# A test figure: rounds of the race between a revocation and another device's connects on the same ids.
+RACE_ROUNDS = 200
+RACE_IDS = 8
+
+
+class RevokedConnectionTests(unittest.TestCase):
+    """A revoked device's connection stays refused as revoked while the door can still present it."""
+
+    def book(self, **options) -> DeviceBook:
+        self.clock = support.FakeClock()
+        book = DeviceBook(clock=self.clock, **options)
+        book.add(grant(), expires_at=self.clock.now + 3600)
+        book.add(grant("dev_two"), expires_at=self.clock.now + 3600)
+        return book
+
+    def test_a_revoked_connection_is_refused_as_revoked_and_its_id_admits_no_other_device(self) -> None:
+        book = self.book()
+        self.assertTrue(book.connect("dev_one", "c").ok)
+        self.assertEqual(book.revoke("dev_one"), ("c",))
+        for _ in range(2):
+            self.assertEqual(book.check_connection("c", "read").code, "device_revoked")
+            self.assertEqual(book.check_connection("c", "run.stop").code, "device_revoked")
+            decision = book.connect("dev_two", "c")
+            self.assertEqual((decision.ok, decision.code), (False, "connection_exists"))
+            self.assertEqual(decision.detail, device_state.REVOKED_CONNECTION_HELD)
+        self.assertEqual(book.revoke("dev_one"), ())
+        self.assertEqual(book.connect("dev_one", "c").code, "device_revoked")
+        self.assertTrue(book.connect("dev_two", "c2").ok)
+
+    def test_revoke_names_each_live_connection_once(self) -> None:
+        book = self.book()
+        for conn in ("a", "b"):
+            self.assertTrue(book.connect("dev_one", conn).ok)
+        self.assertTrue(book.connect("dev_two", "z").ok)
+        self.assertEqual(sorted(book.revoke("dev_one")), ["a", "b"])
+        self.assertEqual(book.revoke("dev_one"), ())
+        self.assertTrue(book.check_connection("z", "read").ok)
+
+    def test_at_a_keep_of_0_the_disconnect_drops_it_and_the_id_is_admitted_as_a_new_one(self) -> None:
+        book = self.book(revoked_connection_keep_s=0)
+        self.assertTrue(book.connect("dev_one", "c").ok)
+        book.revoke("dev_one")
+        self.assertEqual(book.connect("dev_two", "c").code, "connection_exists")
+        book.disconnect("c")
+        self.assertEqual(book._revoked, {})  # the book holds nothing for it after the disconnect
+        self.assertEqual(book.check_connection("c", "read").code, "connection_unknown")
+        self.assertTrue(book.connect("dev_two", "c").ok)
+        self.assertTrue(book.check_connection("c", "read").ok)
+        book.disconnect("c")
+        self.assertEqual(book.check_connection("c", "read").code, "connection_unknown")
+
+    def test_the_first_value_never_forgets_a_revoked_connection(self) -> None:
+        self.assertIsNone(device_state.REVOKED_CONNECTION_KEEP_S)
+        book = self.book()
+        self.assertIsNone(book.revoked_connection_keep_s)
+        self.assertTrue(book.connect("dev_one", "c").ok)
+        book.revoke("dev_one")
+        book.disconnect("c")
+        self.clock.now += 3000.0  # long after the disconnect, short of the devices' own expiry
+        self.assertEqual(book.check_connection("c", "read").code, "device_revoked")
+        self.assertEqual(book.connect("dev_two", "c").code, "connection_exists")
+        book.disconnect("c")
+        self.assertEqual(book.connect("dev_two", "c").code, "connection_exists")
+
+    def test_a_keep_of_some_seconds_ends_on_the_books_clock_after_the_disconnect(self) -> None:
+        book = self.book(revoked_connection_keep_s=30)
+        self.assertTrue(book.connect("dev_one", "c").ok)
+        book.revoke("dev_one")
+        self.clock.now += 100  # before the disconnect the record is kept whatever the time
+        self.assertEqual(book.connect("dev_two", "c").code, "connection_exists")
+        book.disconnect("c")
+        self.clock.now += 29.5
+        self.assertEqual(book.check_connection("c", "read").code, "device_revoked")
+        self.assertEqual(book.connect("dev_two", "c").code, "connection_exists")
+        self.clock.now += 0.5
+        self.assertTrue(book.connect("dev_two", "c").ok)
+        self.assertTrue(book.check_connection("c", "read").ok)
+
+    def test_a_keep_that_is_not_a_value_is_refused(self) -> None:
+        for keep in (-1, -0.5, float("nan"), "30", True, [30]):
+            with self.subTest(keep=keep), self.assertRaises(PairingRefused) as caught:
+                DeviceBook(revoked_connection_keep_s=keep)  # type: ignore[arg-type]
+            self.assertEqual(caught.exception.code, "setting_invalid")
+        for keep in (None, 0, 0.5, 30, float("inf")):
+            with self.subTest(keep=keep):
+                self.assertEqual(DeviceBook(revoked_connection_keep_s=keep).revoked_connection_keep_s, keep)
+
+    def test_a_revocation_racing_another_devices_connects_never_hands_it_a_named_connection(self) -> None:
+        for round_ in range(RACE_ROUNDS):
+            book = self.book()
+            ids = [f"c{round_}-{n}" for n in range(RACE_IDS)]
+            for conn in ids:
+                self.assertTrue(book.connect("dev_one", conn).ok)
+            barrier = threading.Barrier(2)
+            named, admitted = [], []
+
+            def revoke() -> None:
+                barrier.wait(support.WATCHDOG_S)
+                named.extend(book.revoke("dev_one"))
+
+            def connect() -> None:
+                barrier.wait(support.WATCHDOG_S)
+                for _ in range(3):
+                    for conn in ids:
+                        if book.connect("dev_two", conn).ok:
+                            admitted.append(conn)
+
+            threads = [threading.Thread(target=revoke), threading.Thread(target=connect)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(support.WATCHDOG_S)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(sorted(named), sorted(ids))
+            self.assertEqual(admitted, [], f"round {round_}")
+            for conn in ids:
+                self.assertEqual(book.check_connection(conn, "read").code, "device_revoked")
 
 
 if __name__ == "__main__":

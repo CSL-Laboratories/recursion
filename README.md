@@ -17,6 +17,27 @@ Start here:
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute
 - [ANCHOR.md](ANCHOR.md) — why the work exists; [CONTROL_PLANE.md](CONTROL_PLANE.md) — who decides
 
+## What Recursion connects to
+
+Only what you configure. Recursion sends nothing to its makers: no usage counts, no crash
+reports, no update check, and it makes no install or machine identifier. The daemon opens two
+doors, both on your own machine: the control door, a Unix socket in your runtime folder, and the
+browser view on the loopback address `127.0.0.1`. It starts the engine programs you configured,
+with only the addresses you configured; what an engine program reaches on its own is that
+program's setting (Codex is started with its update check turned off). A plugin reaches a network
+only under a grant you gave; that proof belongs to the plugin checks in
+`core/recursion_core/plugin_security/`, not to this list. Every place in the shipped code that
+could reach a network is written down, with who supplies its address, in `tools/network_reach.toml`.
+
+Run the proof on your own machine:
+
+- `python3 tools/network_reach.py` reads every shipped file by its syntax tree and fails on any
+  call that could reach a network and has no row in the list, or whose address would come from
+  the code itself.
+- `python3.14t -X gil=0 core/tests/test_no_call_home_runtime.py` starts a daemon of its own in a
+  temporary folder, leaves it idle, asks its status and stops it, while the interpreter's audit
+  hook watches that it reaches no address and looks up no name.
+
 > Governance note: `CONTROL_PLANE.md` and `ANCHOR.md` are the operative authority and scope
 > records. They already describe Recursion v3 (D-017, 2026-09-28); the older claim that they
 > "still describe the pre-v3 control plane" was stale. Neither file is edited in the

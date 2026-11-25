@@ -107,7 +107,7 @@
     {"call": "set_tid_address", "x86_64": 218, "aarch64": 96, "reason": "a thread or child of the process's own and its end: the child inherits the whole wall", "recorded": [], "beyond_recording": "not made by the wall's tests here; a thread or child of the process's own, which inherits the whole wall, or the start of a thread by the C library"},
     {"call": "set_robust_list", "x86_64": 273, "aarch64": 99, "reason": "a thread or child of the process's own and its end: the child inherits the whole wall", "recorded": ["cpython-3.12-x86_64", "cpython-3.14t-x86_64"]},
     {"call": "rseq", "x86_64": 334, "aarch64": 293, "reason": "a thread or child of the process's own and its end: the child inherits the whole wall", "recorded": ["cpython-3.12-x86_64", "cpython-3.14t-x86_64"]},
-    {"call": "futex", "x86_64": 202, "aarch64": 98, "reason": "a thread or child of the process's own and its end: the child inherits the whole wall", "recorded": ["cpython-3.12-x86_64", "cpython-3.14t-x86_64"]},
+    {"call": "futex", "x86_64": 202, "aarch64": 98, "reason": "allowed only in the forms of futex_operations, each with its reason: the private ones, keyed by the process's own memory, which reach its own threads only, and the one wait that is not private which the C library's thread join makes; every wake and every move that is not private is refused, since it is keyed by a file's page and reaches any process that maps the same file, one started before the wall among them", "recorded": ["cpython-3.12-x86_64", "cpython-3.14t-x86_64"], "check": "futex_private"},
     {"call": "sched_yield", "x86_64": 24, "aarch64": 124, "reason": "a thread or child of the process's own and its end: the child inherits the whole wall", "recorded": ["cpython-3.14t-x86_64"]},
     {"call": "arch_prctl", "x86_64": 158, "aarch64": null, "reason": "a thread or child of the process's own and its end: the child inherits the whole wall", "recorded": [], "beyond_recording": "not made by the wall's tests here; a thread or child of the process's own, which inherits the whole wall, or the start of a thread by the C library"},
     {"call": "getpid", "x86_64": 39, "aarch64": 172, "reason": "a fact about the process itself or the machine, read only, or a setting of the process's own that reaches no other process and cannot lift the wall (no_new_privs cannot be unset, a filter only added)", "recorded": ["cpython-3.12-x86_64", "cpython-3.14t-x86_64"]},
@@ -203,5 +203,25 @@
     {"option": 39, "name": "PR_GET_NO_NEW_PRIVS", "reason": "read only: a fact about the process itself"},
     {"option": 40, "name": "PR_GET_TID_ADDRESS", "reason": "read only: a fact about the process itself"},
     {"option": 42, "name": "PR_GET_THP_DISABLE", "reason": "read only: a fact about the process itself"}
+  ],
+  "futex_operations": [
+    {"operation": 128, "name": "FUTEX_WAIT_PRIVATE", "reason": "private: a lock or a condition of the process's own threads waits; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 384, "name": "FUTEX_WAIT_PRIVATE|FUTEX_CLOCK_REALTIME", "reason": "private, on the wall clock: a lock or a condition of the process's own threads waits; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 129, "name": "FUTEX_WAKE_PRIVATE", "reason": "private: a lock or a condition of the process's own threads wakes; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 131, "name": "FUTEX_REQUEUE_PRIVATE", "reason": "private: the C library's older condition variables move waiters between two words of the process's own; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 132, "name": "FUTEX_CMP_REQUEUE_PRIVATE", "reason": "private: the C library's condition variables move waiters between two words of the process's own; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 133, "name": "FUTEX_WAKE_OP_PRIVATE", "reason": "private: the C library wakes the waiters of two words of the process's own at once; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 134, "name": "FUTEX_LOCK_PI_PRIVATE", "reason": "private: a lock of the process's own that passes priority to its holder; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 135, "name": "FUTEX_UNLOCK_PI_PRIVATE", "reason": "private: the same lock, let go; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 136, "name": "FUTEX_TRYLOCK_PI_PRIVATE", "reason": "private: the same lock, tried without waiting; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 137, "name": "FUTEX_WAIT_BITSET_PRIVATE", "reason": "private: the C library's waits with a deadline (threads, semaphores, conditions); keyed by the process's own memory, it reaches no other process"},
+    {"operation": 393, "name": "FUTEX_WAIT_BITSET_PRIVATE|FUTEX_CLOCK_REALTIME", "reason": "private, on the wall clock: the C library's waits with a deadline (threads, semaphores, conditions); keyed by the process's own memory, it reaches no other process"},
+    {"operation": 265, "name": "FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME (not private)", "reason": "the C library's thread join waits so on the id of a thread of the process's own, which the kernel wakes in the form that is not private when the thread ends (the free-threaded interpreter joins its threads so); a wait wakes no process, but a process that maps the same page of a file can learn whether the walled one waits there, which the record states"},
+    {"operation": 138, "name": "FUTEX_WAKE_BITSET_PRIVATE", "reason": "private: the C library's wakes of those waits; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 139, "name": "FUTEX_WAIT_REQUEUE_PI_PRIVATE", "reason": "private: a condition of the process's own over a priority lock, waited on; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 395, "name": "FUTEX_WAIT_REQUEUE_PI_PRIVATE|FUTEX_CLOCK_REALTIME", "reason": "private, on the wall clock: a condition of the process's own over a priority lock, waited on; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 140, "name": "FUTEX_CMP_REQUEUE_PI_PRIVATE", "reason": "private: the same condition, its waiters moved to the lock; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 141, "name": "FUTEX_LOCK_PI2_PRIVATE", "reason": "private: a priority lock of the process's own on a chosen clock; keyed by the process's own memory, it reaches no other process"},
+    {"operation": 397, "name": "FUTEX_LOCK_PI2_PRIVATE|FUTEX_CLOCK_REALTIME", "reason": "private, on the wall clock: a priority lock of the process's own on a chosen clock; keyed by the process's own memory, it reaches no other process"}
   ]
 }

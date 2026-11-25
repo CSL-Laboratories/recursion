@@ -29,7 +29,8 @@ def _digests(data) -> dict:
     spaces and ASCII only (prctl's row with the list's prctl options in it), SHA-256, its first 32 hex digits."""
     out = {}
     for row in data["rows"]:
-        body = dict(row, prctl_options=data.get("prctl_options", [])) if row["call"] == "prctl" else row
+        body = (dict(row, prctl_options=data.get("prctl_options", [])) if row["call"] == "prctl"
+                else dict(row, futex_operations=data.get("futex_operations", [])) if row["call"] == "futex" else row)
         text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         out[row["call"]] = hashlib.sha256(text.encode("ascii")).hexdigest()[:32]
     return out

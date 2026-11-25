@@ -62,7 +62,13 @@ and to everything it starts later, and neither can be lifted again from inside:
    ``prctl`` is let through only with an option the allow list names (``prctl_options``, each with its reason);
    ``DENIED_PRCTL_OPTIONS`` (the dumpable state, the process's name, its memory map's fields, the process allowed to
    trace it) are refused by name, and the wall sets the process not dumpable as it loads the filter, so no process
-   started before the wall and no longer this one's child reads or writes its memory or its name. What such a
+   started before the wall and no longer this one's child reads or writes its memory or its name. ``futex`` is let
+   through only in the forms the allow list names (``futex_operations``, each with its reason): its private forms,
+   and the one wait that is not private which the C library's thread join makes on a thread's id (the kernel wakes
+   it so when the thread ends). Every wake and move that is not private is refused: it is keyed by a file's page, so
+   it would reach a process that maps the same file, one started before the wall among them, with no map or
+   descriptor the wall could see. A wait wakes no process; what such a process can still learn from it (whether the
+   walled one waits on a page of a file both map) is a limit the record states. What such a
    process can still read of the walled one (the command line, which lives in the walled process's own memory, and
    its times) is not seen by the probe: the host must start no process before the wall.
    The filter is an ALLOW LIST: after the refusals above it lets through only the calls named in the list
@@ -242,6 +248,11 @@ ALLOW_LIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wall
 _ALLOW_FORMAT = "wall-allow-list.v1"
 _ALLOW_ROW_KEYS = ("call", "x86_64", "aarch64", "check", "reason", "recorded", "beyond_recording")
 _ALLOW_OPTION_KEYS = ("option", "name", "reason")
+_ALLOW_FUTEX_KEYS = ("operation", "name", "reason")
+_ALLOW_FUTEX: dict = {}  # the futex operations of each list read, by its path
+_FUTEX_PRIVATE_FLAG = 128  # include/uapi/linux/futex.h: the kernel's interface
+_FUTEX_CLOCK_REALTIME = 256
+_FUTEX_WAITS = (0, 9)  # FUTEX_WAIT, FUTEX_WAIT_BITSET: the only operations that wake no process
 _ALLOW_OPTIONS: dict = {}  # the prctl options of each list read, by its path
 _ALLOW_DIGESTS: dict = {}  # the digest of each row of each list read (see _row_digest), by its path and the row's call
 _ALLOW_CHUNK = 250  # allow rows per run of comparisons: a classic BPF jump reaches 255 rows forward at most
@@ -292,7 +303,7 @@ _NR_MORE = {
         "prlimit64": 302, "sched_setaffinity": 203, "sched_setscheduler": 144, "sched_setparam": 142,
         "sched_setattr": 314, "migrate_pages": 256, "move_pages": 279, "setpriority": 141, "ioprio_set": 251,
         "fcntl": 72, "ioctl": 16, "clone": 56, "clone3": 435, "sendto": 44, "close_range": 436,
-        "truncate": 76, "ftruncate": 77, "openat2": 437, "open": 2, "openat": 257, "personality": 135, "prctl": 157,
+        "truncate": 76, "ftruncate": 77, "openat2": 437, "open": 2, "openat": 257, "personality": 135, "prctl": 157, "futex": 202,
     },
     "aarch64": {
         "fchmod": 52, "fchmodat": 53, "fchmodat2": 452, "fchown": 55, "fchownat": 54, "utimensat": 88,
@@ -305,7 +316,7 @@ _NR_MORE = {
         "prlimit64": 261, "sched_setaffinity": 122, "sched_setscheduler": 119, "sched_setparam": 118,
         "sched_setattr": 274, "migrate_pages": 238, "move_pages": 239, "setpriority": 140, "ioprio_set": 30,
         "fcntl": 25, "ioctl": 29, "clone": 220, "clone3": 435, "sendto": 206, "close_range": 436,
-        "truncate": 45, "ftruncate": 46, "openat2": 437, "openat": 56, "personality": 92, "prctl": 167,
+        "truncate": 45, "ftruncate": 46, "openat2": 437, "openat": 56, "personality": 92, "prctl": 167, "futex": 98,
     },
 }
 _AUDIT_ARCH = {"x86_64": 0xC000003E, "aarch64": 0xC00000B7}
@@ -706,6 +717,8 @@ def _required_check(call: str):
         return call
     if call == "prctl":
         return "prctl_option"
+    if call == "futex":
+        return "futex_private"
     if call in OLD_LANDLOCK_DENIED_CALLS or call in ("open", "openat"):
         return "landlock_truncate"
     return None
@@ -797,16 +810,39 @@ def _read_allow_list(path: str) -> tuple:
         if option in seen_options:
             refuse(f"{where} names an option an entry above names already")
         seen_options.add(option)
+    operations = data.get("futex_operations", [])
+    if not isinstance(operations, list):
+        refuse("its futex operations are not a list")
+    seen_operations = set()
+    for index, entry in enumerate(operations, 1):
+        where = f"futex operation {index}"
+        if not isinstance(entry, dict) or set(entry) != set(_ALLOW_FUTEX_KEYS):
+            refuse(f"{where} is not an operation of the wall's form (its keys: {', '.join(_ALLOW_FUTEX_KEYS)})")
+        operation = entry["operation"]
+        if not isinstance(operation, int) or isinstance(operation, bool) or not 0 <= operation <= 0xFFFFFFFF:
+            refuse(f"{where} gives no operation number")
+        if not isinstance(entry["reason"], str) or not entry["reason"].strip():
+            refuse(f"{where} ({entry.get('name')}) carries no reason")
+        if (not operation & _FUTEX_PRIVATE_FLAG
+                and operation & ~(_FUTEX_PRIVATE_FLAG | _FUTEX_CLOCK_REALTIME) not in _FUTEX_WAITS):
+            refuse(f"{where} ({entry.get('name')}) is not a private form and not a wait: a wake or a move that is not "
+                   "private is keyed by a file's page and reaches a process outside the wall that maps the same file, "
+                   "which no row can allow")
+        if operation in seen_operations:
+            refuse(f"{where} names an operation an entry above names already")
+        seen_operations.add(operation)
     _ALLOW_OPTIONS[path] = tuple(entry["option"] for entry in options)
-    _ALLOW_DIGESTS[path] = {row["call"]: _row_digest(row, options) for row in data["rows"]}
+    _ALLOW_FUTEX[path] = tuple(entry["operation"] for entry in operations)
+    _ALLOW_DIGESTS[path] = {row["call"]: _row_digest(row, options, operations) for row in data["rows"]}
     return tuple(data["rows"])
 
 
-def _row_digest(row: dict, options=()) -> str:
+def _row_digest(row: dict, options=(), operations=()) -> str:
     """The digest of one row of an allow list: its JSON with the keys sorted, no spaces and ASCII only (prctl's row
-    with the list's prctl options in it, since they are part of what it lets through), SHA-256, the first 32 hex
-    digits. A row changed in any part, its reason too, has another digest."""
-    body = dict(row, prctl_options=list(options)) if row.get("call") == "prctl" else row
+    with the list's prctl options in it, futex's row with its futex operations, since they are part of what it lets
+    through), SHA-256, the first 32 hex digits. A row changed in any part, its reason too, has another digest."""
+    body = (dict(row, prctl_options=list(options)) if row.get("call") == "prctl"
+            else dict(row, futex_operations=list(operations)) if row.get("call") == "futex" else row)
     text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(text.encode("ascii")).hexdigest()[:32]
 
@@ -831,7 +867,9 @@ def load_allow_list(path=None) -> dict:
     options, digests = _ALLOW_OPTIONS[file], _ALLOW_DIGESTS[file]
     added = sorted(call for call, digest in digests.items() if _SHIPPED_ALLOW_ROWS.get(call) != digest)
     removed = sorted(call for call in _SHIPPED_ALLOW_ROWS if call not in digests)
-    rows = tuple(dict(row, options=options) if row["call"] == "prctl" else row for row in rows)
+    operations = _ALLOW_FUTEX[file]
+    rows = tuple(dict(row, options=options) if row["call"] == "prctl"
+                 else dict(row, operations=operations) if row["call"] == "futex" else row for row in rows)
     return {"file": file, "rows": rows, "shipped": not added and not removed, "added": added, "removed": removed,
             "digest": _list_digest(digests)}
 
@@ -860,7 +898,7 @@ def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI, allow_rows=None) -
     rows += [(_BPF_JEQ_K, "caller", 0, numbers[name]) for name in CALLER_ONLY_CALLS if name in listed]
     rows += [(_BPF_JEQ_K, label, 0, numbers[name]) for name, label in
              (("setpriority", "prio"), ("ioprio_set", "ioprio"), ("fcntl", "fcntl"), ("ioctl", "ioctl"),
-              ("clone", "clone"), ("sendto", "sendto"), ("prctl", "prctl")) if name in listed]
+              ("clone", "clone"), ("sendto", "sendto"), ("prctl", "prctl"), ("futex", "futex")) if name in listed]
     rows.append((_BPF_JEQ_K, "enosys", 0, numbers["clone3"]))
     rows.append((_BPF_JGE_K, "listed", "listed", 0))  # always taken: on to the allow list, past the checks below
     labels: dict[str, int] = {}
@@ -893,6 +931,11 @@ def _filter(arch: str, landlock_abi: int = _MIN_LANDLOCK_ABI, allow_rows=None) -
     prctl_options = listed["prctl"].get("options", ()) if "prctl" in listed else ()
     block("prctl", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[0]),
           *[(_BPF_JEQ_K, "allow", 0, option) for option in prctl_options], (_BPF_RET_K, 0, 0, _RET_EPERM))
+    # futex: only the operations the allow list names, each a private form (the private flag in the low word of its
+    # second argument, which is all the kernel reads); a wait or wake keyed by a file's page is answered EPERM
+    futex_operations = listed["futex"].get("operations", ()) if "futex" in listed else ()
+    block("futex", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]),
+          *[(_BPF_JEQ_K, "allow", 0, operation) for operation in futex_operations], (_BPF_RET_K, 0, 0, _RET_EPERM))
     block("trunc1", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[1]), (_BPF_JSET_K, "deny", "allow", _O_TRUNC))
     block("trunc2", (_BPF_LD_W_ABS, 0, 0, _OFF_ARG_LOW[2]), (_BPF_JSET_K, "deny", "allow", _O_TRUNC))
     block("enosys", (_BPF_RET_K, 0, 0, _RET_ENOSYS))
@@ -1467,9 +1510,12 @@ def _kernel_surface() -> None:
     mq_getsetattr of the descriptor -1, signal 0 to this process itself by its own pid, and a lease on a
     pipe, open_tree of the root folder (the newer mount calls), a call number the kernel will never give a call
     (the filter refuses every number above the newest one its tables name), and personality asked only to read
-    (a call the kernel has and the allow list does not name); then clone3, which this wall answers ENOSYS (the kernel's own answer to these arguments is EINVAL)."""
+    (a call the kernel has and the allow list does not name), the three prctl options refused by name, and a futex
+    wake that is not private (keyed by a file's page where the word is a file's: the filter lets only the private
+    forms through); then clone3, which this wall answers ENOSYS (the kernel's own answer to these arguments is EINVAL)."""
     libc, arch = _libc(), _arch()
     address = ctypes.create_string_buffer(16)  # a destination address of zeros, never sent: the descriptor is -1
+    word = ctypes.c_int(0)  # a word of the probe's own: a wake that is not private of it wakes no one where allowed
     attempts = [lambda: _sys(libc, "io_uring_setup", 0, 0),
                 lambda: _sys(libc, "io_uring_enter", -1, 0, 0, 0, 0, 0),     # no ring: EBADF if allowed
                 lambda: _sys(libc, "io_uring_register", -1, 0, 0, 0),        # no ring: EBADF if allowed
@@ -1487,7 +1533,8 @@ def _kernel_surface() -> None:
                 lambda: _sys(libc, "personality", 0xFFFFFFFF),
                 lambda: _prctl_same_name(libc),
                 lambda: _sys(libc, "prctl", DENIED_PRCTL_OPTIONS["PR_SET_PTRACER"], 0, 0, 0, 0),  # no tracer
-                lambda: _sys(libc, "prctl", DENIED_PRCTL_OPTIONS["PR_SET_DUMPABLE"], 0, 0, 0, 0)]  # stays 0  # off the allow list: reads the persona if allowed
+                lambda: _sys(libc, "prctl", DENIED_PRCTL_OPTIONS["PR_SET_DUMPABLE"], 0, 0, 0, 0),
+                lambda: _sys(libc, "futex", ctypes.addressof(word), 1, 1, 0, 0, 0)]  # a shared wake of its own word  # stays 0  # off the allow list: reads the persona if allowed
     if arch == "x86_64":
         attempts.append(lambda: _kernel("x32 getpid", *_call(libc, _X32_SYSCALL_BIT | 39)))
     try:
@@ -2112,7 +2159,7 @@ _SHIPPED_ALLOW_ROWS = {
     "set_tid_address": "92b56e045b3b0828097b5af3d202e05f",
     "set_robust_list": "d8f14e61f6f76b811d31d06ee7864711",
     "rseq": "1394934400097497932b119ad41d40ee",
-    "futex": "e06220d7c9056bf137966cb1d0cc9cd5",
+    "futex": "acb8306830a95aeff1bc2930c7ad762d",
     "sched_yield": "81863b21f349df5131e5e9400f45378e",
     "arch_prctl": "3e898cf59d8a5f3e7f6e6f97e08fc69f",
     "getpid": "f7c21d36ae3649870b3f19ca7a7a5472",

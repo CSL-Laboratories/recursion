@@ -510,7 +510,7 @@ says = "A stand-in engine for the evidence harness: it starts a local sleeping c
 [[reach]]
 file = "core/recursion_core/daemon/gui.py"
 function = "<module>"
-names = ["import socket", "import socketserver.ThreadingMixIn", "import wsgiref.simple_server.WSGIRequestHandler", "import wsgiref.simple_server.WSGIServer"]
+names = ["import socket", "import socketserver.TCPServer", "import socketserver.ThreadingMixIn", "import wsgiref.simple_server.WSGIRequestHandler", "import wsgiref.simple_server.WSGIServer"]
 who = "local"
 address = "the loopback address 127.0.0.1 and the port of --gui-port"
 says = "The browser view listens on the loopback address of this machine only, on the port you give with --gui-port."
@@ -527,6 +527,14 @@ says = "The browser view listens on the loopback address of this machine only, o
 file = "core/recursion_core/daemon/gui.py"
 function = "_Server"
 names = ["socketserver.ThreadingMixIn", "wsgiref.simple_server.WSGIServer"]
+who = "local"
+address = "the loopback address 127.0.0.1 and the port of --gui-port"
+says = "The browser view listens on the loopback address of this machine only, on the port you give with --gui-port."
+
+[[reach]]
+file = "core/recursion_core/daemon/gui.py"
+function = "_Server.server_bind"
+names = ["socketserver.TCPServer.server_bind"]
 who = "local"
 address = "the loopback address 127.0.0.1 and the port of --gui-port"
 says = "The browser view listens on the loopback address of this machine only, on the port you give with --gui-port."

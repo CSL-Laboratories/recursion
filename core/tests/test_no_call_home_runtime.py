@@ -24,14 +24,23 @@ is refused here, and the static proof refuses the modules); what the operating s
 Nothing leaves this machine: every address in this file is a loopback address or a path inside a
 temporary folder the test made. The idle time is a setting: RECURSION_PROOF_IDLE_SECONDS (shipped
 first value below). Run by itself: python3 core/tests/test_no_call_home_runtime.py
+Run so, it runs nothing when the static scan finds a file or folder under core/ that the interpreter may
+import in place of a module (it prints NOT PROVEN and names it): the tests folder is not scanned, and the
+interpreter puts it first on the import path of a script, so it is taken off that path before anything
+else is imported.
 """
+import os
+import sys
+
+if __name__ == "__main__" and not sys.flags.safe_path and sys.path and \
+        os.path.realpath(sys.path[0] or os.curdir) == os.path.dirname(os.path.realpath(__file__)):
+    del sys.path[0]  # os and sys are the interpreter's own (frozen and built in): nothing of this folder ran
+
 import hashlib
 import json
-import os
 from pathlib import Path
 import socket
 import subprocess
-import sys
 import sysconfig
 import tempfile
 import threading
@@ -634,7 +643,9 @@ class ReadmeWordsTests(unittest.TestCase):
                       "is judged by the program it starts", "is taken for Python by its name",
                       "a Python process that does not load the hook",
                       "code that hides from the hook", "sees only what Python code reports to it",
-                      "holds only together with the static proof", "a file path that reaches a network by itself"):
+                      "holds only together with the static proof", "a file path that reaches a network by itself",
+                      "or a folder outside the package, named like a standard module",
+                      "It runs nothing while the scan finds such a file or folder"):
             with self.subTest(words=words):
                 self.assertIn(words, " ".join(section.split()))
 
@@ -689,6 +700,35 @@ class ReadmeWordsTests(unittest.TestCase):
                       "a child forked without a new start is such a process"):
             with self.subTest(words=words):
                 self.assertIn(words, section)
+
+    def test_the_second_command_runs_nothing_the_scan_did_not_judge(self):
+        # A package folder named like a standard module in the tests folder was imported by this file run
+        # as a script (its folder is first on the import path) while it printed PROVEN. In a scratch copy:
+        # the plant reaches the test's own loopback listener if it runs.
+        import shutil
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))  # the loopback address only: nothing leaves this machine
+        listener.listen(4)
+        port = listener.getsockname()[1]
+        with tempfile.TemporaryDirectory(prefix="rc-proof-") as name:
+            root = Path(name)
+            (root / "core" / "tests" / "tempfile").mkdir(parents=True)
+            (root / "tools").mkdir()
+            for rel in ("core/tests/test_no_call_home_runtime.py", "tools/network_reach.py", "tools/network_reach.toml"):
+                shutil.copy2(ROOT / rel, root / rel)
+            (root / "core" / "tests" / "tempfile" / "__init__.py").write_text(
+                "import socket\nsocket.create_connection(('127.0.0.1', %d)).close()\n" % port, encoding="utf-8")
+            run = subprocess.run([sys.executable, "-B", str(root / "core" / "tests" / "test_no_call_home_runtime.py"),
+                                  "JudgeTests"], capture_output=True, text=True, timeout=START_SECONDS * 4, cwd=str(root))
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("NOT PROVEN (run-time): nothing was run", run.stdout)
+        self.assertIn("core/tests/tempfile", run.stdout)
+        self.assertNotIn("PROVEN (run-time): the idle daemon", run.stdout)
+        listener.setblocking(False)
+        with self.assertRaises(BlockingIOError):
+            listener.accept()  # the plant never ran
+        self.assertEqual(_not_judged(), [])  # and the checkout itself holds no such place
 
     def test_a_green_run_prints_no_refusal_meant_for_a_planted_case(self):
         # The second command's own planted cases keep their words to themselves: on a green run the
@@ -767,7 +807,29 @@ def _report(result):
         print(f"  - {line}")
 
 
+def _not_judged(root=ROOT):
+    """What the static scan refuses as a place the interpreter may import in place of a module (or cannot
+    see into) under core/: this file runs nothing while one is there."""
+    import importlib.util
+    try:
+        spec = importlib.util.spec_from_file_location("network_reach", root / "tools" / "network_reach.py")
+        nr = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("network_reach", nr)
+        spec.loader.exec_module(nr)
+        return [f"{f.file}: {f.text}" for f in nr._unseen(root)]
+    except Exception as exc:  # the scan cannot be read: nothing is judged
+        return [f"tools/network_reach.py could not be loaded ({type(exc).__name__}: {exc})"]
+
+
 if __name__ == "__main__":
+    refused = _not_judged()
+    if refused:
+        print("NOT PROVEN (run-time): nothing was run. Under core/ the static scan (tools/network_reach.py) "
+              "refuses what it cannot judge, and this run would import it:")
+        for line in refused:
+            print(f"  - {line}")
+        print("Take each of these out (or run python3 tools/network_reach.py to read why), then run again.")
+        raise SystemExit(1)
     program = unittest.main(exit=False)
     _report(program.result)
     raise SystemExit(0 if program.result.wasSuccessful() else 1)

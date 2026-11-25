@@ -712,8 +712,11 @@ def shipped_files(root: Path):
 
 def _unseen(root: Path):
     """Places the walk of the package cannot see into, refused: a symbolic link anywhere under core/ (the
-    interpreter follows it, the walk does not), and a compiled file in a __pycache__ folder that the
-    interpreter would run instead of its source. A compiled file for this interpreter is compared with its
+    interpreter follows it, the walk does not), a Python file or a folder the interpreter may import in place
+    of a module (a Python file directly under core/; one named like a standard module anywhere under core/;
+    a folder outside the package, or a Python file there, named like a standard module or like the top name
+    of a [[module]] row: the tests folder is on the import path of the tests and is not scanned), and a
+    compiled file in a __pycache__ folder that the interpreter would run instead of its source. A compiled file for this interpreter is compared with its
     source; one the interpreter would not use (stale) is harmless; one for another interpreter is judged by
     the run of the scan under that interpreter, and an unchecked one is refused under any interpreter."""
     import os
@@ -721,17 +724,26 @@ def _unseen(root: Path):
     top = root / PACKAGE.parent
     if not top.is_dir():
         return out
+    package = root / PACKAGE
+    try:
+        rows = load_list(root if (root / LIST_FILE).is_file() else ROOT).get("module", [])
+    except (OSError, ValueError):
+        rows = []
+    listed = {str(row.get("name", "")).split(".")[0] for row in rows} - {"", OWN_PACKAGE}
     for here, dirs, files in os.walk(top, followlinks=False):
+        outside = Path(here) != package and package not in Path(here).parents
         for name in sorted(dirs + files):
             path = Path(here) / name
             rel = path.relative_to(root).as_posix()
             if path.is_symlink():
                 out.append(Finding("reach", rel, "<file>", "a symbolic link the scan does not follow", "undecidable", 0))
-            elif (name in files and name.endswith(".py") and (Path(here) == top or name[:-3] in
-                                                                sys.stdlib_module_names)) or \
-                    (name in dirs and Path(here) == top and name in sys.stdlib_module_names):
+            elif name in files and name.endswith(".py") and (Path(here) == top or name[:-3] in
+                                                             sys.stdlib_module_names or (outside and name[:-3] in listed)):
                 out.append(Finding("reach", rel, "<file>", "a Python file beside the package that the interpreter "
                                    "may import in place of a module", "undecidable", 0))
+            elif name in dirs and outside and path != package and (name in sys.stdlib_module_names or name in listed):
+                out.append(Finding("reach", rel, "<file>", "a folder beside the package named like a module, which "
+                                   "the interpreter may import in place of that module", "undecidable", 0))
             elif Path(here).name == "__pycache__" and name in files:
                 why = _compiled_file(path)
                 if why:

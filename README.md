@@ -43,14 +43,16 @@ Run the proof on your own machine:
   anything outside the package; a call that could reach a network and has no row, or whose text is
   not the text its row holds; a use of a guarded place from a place its row does not name; a
   symbolic link under `core/`, or a compiled file the interpreter would run instead of its source;
-  a file it cannot read; a coding declaration other than utf-8; a Python file under `core/` outside
-  the package, or one named like a standard module; a change of a file it cannot parse (its row
-  holds the file's digest).
+  a file it cannot read; a coding declaration other than utf-8; a Python file directly under
+  `core/`, one named like a standard module anywhere under `core/`, or a folder outside the package,
+  named like a standard module or a listed module (the interpreter may import it in place of that
+  module); a change of a file it cannot parse (its row holds the file's digest).
 - `python3 core/tests/test_no_call_home_runtime.py` (Linux, CPython 3.12 or later) starts a daemon
   of its own in a temporary folder, leaves it idle, asks its status and stops it, while the
   interpreter's audit hook watches that it reaches no address and looks up no name; then it starts
   a stand-in engine at an address it configured and checks that only that address is reached. It
-  prints PROVEN (run-time) or NOT PROVEN, and the list of what it does not cover. The daemon itself
+  prints PROVEN (run-time) or NOT PROVEN, and the list of what it does not cover. It runs nothing
+  while the scan finds such a file or folder under `core/` (it prints NOT PROVEN and names it). The daemon itself
   runs only on free-threaded CPython 3.14t; on another interpreter the test stands in for that one
   check, and the rest of the daemon runs as shipped.
 

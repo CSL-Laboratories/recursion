@@ -368,12 +368,24 @@ class StaticProofTests(unittest.TestCase):
             (root / "core" / "tests" / "socket.py").write_text("x = 1\n", encoding="utf-8")
             return "core/tests/socket.py", "beside the package"
 
+        def folder(root):
+            # A package folder named like a standard module in the tests folder: the second command of the
+            # README ran it while printing PROVEN (the script's own folder is first on its import path).
+            (root / "core" / "tests" / "tempfile").mkdir(parents=True)
+            (root / "core" / "tests" / "tempfile" / "__init__.py").write_text("x = 1\n", encoding="utf-8")
+            return "core/tests/tempfile", "beside the package"
+
+        def top_folder(root):
+            (root / "core" / "calendar").mkdir()
+            (root / "core" / "calendar" / "__init__.py").write_text("x = 1\n", encoding="utf-8")
+            return "core/calendar", "beside the package"
+
         def shell(root):
             with open(root / nr.PACKAGE / "daemon" / "evidence_ns.sh", "a", encoding="utf-8") as fh:
                 fh.write('curl -s "$URL"\n')
             return "refused (changed-call)", "changed-call"  # the copy is clean: the one changed call is it
 
-        for plant in (coding, beside, named, shell):
+        for plant in (coding, beside, named, folder, top_folder, shell):
             with self.subTest(plant=plant.__name__), tempfile.TemporaryDirectory() as tmp:
                 root = _copy_package(Path(tmp))
                 self.assertEqual(nr.check(nr.scan(root), self.listing), [])  # the copy itself is clean

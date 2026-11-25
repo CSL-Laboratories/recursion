@@ -2379,6 +2379,15 @@
         "keyword": "enum",
         "at": "/descriptors_counted_by"
       }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.limits-of-proven.process-times.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall names the limit process times.",
+      "expect": {
+        "keyword": "required",
+        "at": "/limits_of_proven"
+      }
     }
   ]
 }

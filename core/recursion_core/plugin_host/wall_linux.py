@@ -68,11 +68,12 @@ and to everything it starts later, and neither can be lifted again from inside:
    and the one wait that is not private which the C library's thread join makes on a thread's id (the kernel wakes
    it so when the thread ends). Every wake and move that is not private is refused: it is keyed by a file's page, so
    it would reach a process that maps the same file, one started before the wall among them, with no map or
-   descriptor the wall could see. A wait wakes no process; what another process can still learn from it (whether the
-   walled one waits on a page of a file both map) is a limit the record names, with the forms in force
-   (``shared_waits_allowed``, ``limits_of_proven``). What a process started before the wall and no longer this one's
+   descriptor the wall could see. A wait wakes no process, but it is a channel both ways with another process that
+   maps the same page of a file (its wakes tell it when the walled one waits there, and end those waits): the record
+   names it, with the forms in force (``shared_waits_allowed``, ``limits_of_proven``). What a process started before the wall and no longer this one's
    child can still read of the walled one (the command line, which lives in the walled process's own memory, its times
-   and state), and which pages of a file the walled one brought into memory, are not seen by the probe either: the
+   and state, through which the walled one can signal it), and which pages of a file the walled one brought into
+   memory (a channel to any process that maps the file), are not seen by the probe either: the
    record names each in ``limits_of_proven`` (``LIMITS_OF_PROVEN``), ``what_proven_does_not_cover(record)`` gives the
    words a person reads beside the word proven, and the host must start no process before the wall.
    The filter is an ALLOW LIST: after the refusals above it lets through only the calls named in the list
@@ -426,17 +427,24 @@ HELD_NOT_TRIED = {
 # forms). The wall's own definition, not a setting.
 LIMITS_OF_PROVEN = {
     "shared_futex_wait": "the filter lets through {forms}, a wait that is not private, because the C library's thread "
-                         "join makes it on a thread's id (the kernel wakes that word in its form that is not private "
-                         "when the thread ends, and refusing it ends the free-threaded interpreter at its first join): "
-                         "another process that maps the same page of a file, a helper started before the wall among "
-                         "them, can learn through it whether this process waits there, one bit at a time; the wait "
-                         "wakes no process, and every wake that is not private is refused",
+                         "join makes it on a thread's id (refusing it ends the free-threaded interpreter at its first "
+                         "join): it is a channel both ways with any other process on the same machine that maps the "
+                         "same page of a file, a helper started before the wall among them, which learns by waking that "
+                         "page whether this process waits there, and whose wakes end this process's waits there (one "
+                         "run on a test host passed 400 of 400 bits out at 2000 bits a second: a measurement of that "
+                         "run, not a bound); it reaches none of the C library's own joins, which lie in this process's "
+                         "own memory, and every wake that is not private is refused",
+    "process_times": "a process started before the wall and no longer this one's child reads this process's times and "
+                     "state in /proc, which change as this process runs or sleeps: a channel out that no call of this "
+                     "process needs and no list of the kernel names (one run on a test host passed 16 of 16 bits at 20 "
+                     "bits a second: a measurement, not a bound)",
+    "page_cache_residency": "any other process on the same machine that maps a file this one can read learns from the "
+                            "kernel's page cache which of its pages this process brought into memory: a channel out "
+                            "through reading alone, which no row of the allow list shuts (one run on a test host passed "
+                            "64 of 64 bits in 0.4 seconds on the free-threaded interpreter: a measurement, not a bound)",
     "what_the_process_shows": "a process started before the wall and no longer this one's child is not seen by the "
                               "probe: it can read this process's command line, which lives in this process's own "
-                              "memory, and its times and state in /proc, which no call of this process changes; the "
-                              "host must start no process before the wall",
-    "page_cache_residency": "another process that maps a file this one reads can learn from the kernel's page cache "
-                            "which pages of the file this process brought into memory, one page at a time",
+                              "memory; the host must start no process before the wall",
 }
 _FUTEX_FORM_NAMES = {0: "FUTEX_WAIT", 9: "FUTEX_WAIT_BITSET"}  # the kernel's names of its two waits
 _RING_OFF = ("the kernel made no ring of kernel calls for this process before the wall (rings turned off), so there "
@@ -583,20 +591,27 @@ WORDS = {
     "held_signal_owner": "a pipe set before to signal a process on every change",
     "held_shared_map": "a file mapped shared and writable",
     "held_namespace": "a namespace entered before",
-    "limits_intro": "The plugin host is shown to be shut in, with limits that the test cannot rule out:",
-    "limit_shared_futex_wait": "The sandbox lets through one kind of wait of the kernel that another process can see "
-                               "({forms}), because the system's own threads need it to finish: another process that "
-                               "opens the same file, one started before the plugin host shut itself in among them, can "
-                               "learn whether the host waits there, one bit at a time. It cannot wake the host, and "
-                               "the host cannot wake it.",
+    "limits_intro": "The plugin host is shut in as the test shows: a plugin cannot write your files, reach the "
+                    "network or make the kernel calls the sandbox refuses. The sandbox does NOT stop a plugin from "
+                    "signalling a cooperating process on the same machine in the ways below, and the word proven is "
+                    "said only of what the record lists as tested:",
+    "limit_shared_futex_wait": "A kind of wait of the kernel that another process can see is let through ({forms}), "
+                               "because the system's own threads need it to finish: through it a plugin can pass bits "
+                               "both ways with any process on the same machine that opens the same file, one started "
+                               "before the plugin host among them (on one test machine 400 of 400 bits passed out at "
+                               "2000 bits a second; a measurement of that run, not a bound).",
+    "limit_process_times": "A process started before the plugin host shut itself in can read how long the host runs "
+                           "and sleeps, and so read bits a plugin chooses to send (on one test machine 16 of 16 at 20 "
+                           "bits a second).",
+    "limit_page_cache_residency": "Any process on the same machine that opens a file the plugin host can read can learn "
+                                  "which parts of it the host read, and so read bits a plugin chooses to send (on one "
+                                  "test machine 64 of 64 in under half a second).",
     "limit_what_the_process_shows": "A process started before the plugin host shut itself in, and no longer its child, "
-                                    "is not seen by the test: it can still read the host's command line, its times "
-                                    "and its state.",
-    "limit_page_cache_residency": "Another process that opens a file the plugin host reads can learn which parts of "
-                                  "the file the host read.",
+                                    "is not seen by the test: it can still read the host's command line.",
     "limit_unknown": "The record names a limit that this sandbox does not know ({name}); it is not shown to hold.",
     "limits_what_to_do": "What you can do: let no process start before the plugin host shuts itself in, as the daemon "
-                         "does.",
+                         "does. A process started later on the same machine can still use the shared wait and the file "
+                         "pages, so load only plugins you would let speak to the other programs on this machine.",
     "regular_file": "file",
     "block_device": "disk or other block device",
     "character_device": "terminal or other character device",
@@ -2273,7 +2288,7 @@ _SHIPPED_ALLOW_ROWS = {
     "set_tid_address": "92b56e045b3b0828097b5af3d202e05f",
     "set_robust_list": "d8f14e61f6f76b811d31d06ee7864711",
     "rseq": "1394934400097497932b119ad41d40ee",
-    "futex": "acb8306830a95aeff1bc2930c7ad762d",
+    "futex": "96c70e88f918ac0110ac511ced3b5d1a",
     "sched_yield": "81863b21f349df5131e5e9400f45378e",
     "arch_prctl": "3e898cf59d8a5f3e7f6e6f97e08fc69f",
     "getpid": "f7c21d36ae3649870b3f19ca7a7a5472",

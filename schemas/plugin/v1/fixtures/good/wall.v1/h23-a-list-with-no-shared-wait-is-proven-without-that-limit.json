@@ -79,8 +79,9 @@
   },
   "shared_waits_allowed": [],
   "limits_of_proven": {
-    "what_the_process_shows": "a process started before the wall and no longer this one's child is not seen by the probe: it can read this process's command line, which lives in this process's own memory, and its times and state in /proc, which no call of this process changes; the host must start no process before the wall",
-    "page_cache_residency": "another process that maps a file this one reads can learn from the kernel's page cache which pages of the file this process brought into memory, one page at a time"
+    "process_times": "a process started before the wall and no longer this one's child reads this process's times and state in /proc, which change as this process runs or sleeps: a channel out that no call of this process needs and no list of the kernel names (one run on a test host passed 16 of 16 bits at 20 bits a second: a measurement, not a bound)",
+    "page_cache_residency": "any other process on the same machine that maps a file this one can read learns from the kernel's page cache which of its pages this process brought into memory: a channel out through reading alone, which no row of the allow list shuts (one run on a test host passed 64 of 64 bits in 0.4 seconds on the free-threaded interpreter: a measurement, not a bound)",
+    "what_the_process_shows": "a process started before the wall and no longer this one's child is not seen by the probe: it can read this process's command line, which lives in this process's own memory; the host must start no process before the wall"
   },
   "landlock_abi": 3,
   "landlock_scopes": [],

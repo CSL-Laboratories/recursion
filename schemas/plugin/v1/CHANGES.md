@@ -4,6 +4,15 @@ Each schema carries its own version in `x-version`. While a schema is `1.0-draft
 `N` and is listed here with what it breaks. A schema becomes `1.0` when every consumer lane named for
 it in `README.md` has a passing fixture in `fixtures/`.
 
+## `wall.v1.json` is `1.0-draft.12` (Nov 25, 2026)
+
+`limits_of_proven` gains `process_times` (a process started before the wall reads the host's times and state in
+/proc, a channel out), required of a proven record, and its description and that of `shared_waits_allowed` say what
+each limit is: a way a walled plugin can still signal a cooperating process on the same machine. The shared wait is a
+channel both ways with any process that maps the same page of a file, not one bit. A rate named in a reason is a
+measurement of one run, not a bound. What it breaks: a draft 11 record that says proven does not validate at draft
+12. 1 bad fixture is added; every fixture with limits gains the new one and the reasons of the head.
+
 ## `wall.v1.json` is `1.0-draft.11` (Nov 25, 2026)
 
 An additive step: every field and value of draft 10 keeps its meaning, and a record that is not proven still

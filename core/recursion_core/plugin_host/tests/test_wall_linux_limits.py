@@ -72,5 +72,32 @@ class AProvenRecordNamesItsLimitsTests(unittest.TestCase):
         self.assertEqual(len(result["limits"]), len(wall_linux.LIMITS_OF_PROVEN) + 2, "a sentence for every limit")
 
 
+CHANNELS = ("shared_futex_wait", "process_times", "page_cache_residency", "what_the_process_shows")
+
+
+class EachChannelStandsInTheRecordTests(unittest.TestCase):
+
+    def test_each_channel_to_another_process_is_named_with_its_reason_and_its_words(self):
+        shared = _shared_waits()
+        limits = wall_linux._limits_of_proven(shared)
+        self.assertEqual(tuple(limits), CHANNELS)
+        for name in CHANNELS[:3]:
+            self.assertIn("a measurement", limits[name], name)
+            self.assertIn("channel", limits[name], name)
+        self.assertIn("both ways", limits["shared_futex_wait"])
+        self.assertIn("end this process's waits", limits["shared_futex_wait"])
+        lines = wall_linux.what_proven_does_not_cover({"proven": True, "shared_waits_allowed": shared,
+                                                       "limits_of_proven": limits})
+        self.assertIn("does NOT stop a plugin from signalling a cooperating process", lines[0])
+        self.assertEqual(lines[1:-1], [wall_linux.WORDS["limit_shared_futex_wait"].format(
+            forms=wall_linux._futex_forms(shared))] + [wall_linux.WORDS["limit_" + name] for name in CHANNELS[1:]])
+
+    def test_the_shipped_list_says_the_record_names_the_shared_wait(self):
+        with open(wall_linux.ALLOW_LIST_FILE, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertNotIn("which the record states", text)
+        self.assertIn("which the record names (limits_of_proven)", text)
+
+
 if __name__ == "__main__":
     unittest.main()

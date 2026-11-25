@@ -1,0 +1,30 @@
+{
+  "shape": 1,
+  "about": "The SQLite releases that carry the repair of the WAL-reset bug, read by events/db.py (load_sqlite_wal_table). Inside a line, every patch from its first_repaired_patch is repaired; every release from repaired_from is repaired; a line without a row is not; nothing before first has WAL. A row is added, or a line's first repaired patch is lowered, only on SQLite's own pages (wal.html section 11, its news page or its release history), and its reason says which page and what it says. The refusal names the lines in the order of this list. shape is the shape of this file; a new shape is a new number.",
+  "first": "3.7.0",
+  "first_reason": "wal.html section 11: the bug is likely present in every version from 3.7.0 (2010-07-21), the first release with WAL, through 3.51.2.",
+  "repaired_from": "3.53.0",
+  "repaired_from_reason": "SQLite's news page: its 3.53.0 item calls 3.53.0 the first major release with the repair unless 3.52.0 is counted; every release from it carries the repair.",
+  "lines": [
+    {
+      "line": "3.52",
+      "first_repaired_patch": 0,
+      "reason": "3.52.0 (2026-03-06) was withdrawn for features that were not fully compatible, not for this bug. SQLite's news page says it holds the repair: its 3.52.0 item says the corruption bug found days before is repaired in it, and its 3.53.0 item calls 3.53.0 the first major release with the repair unless 3.52.0 is counted. SQLite's release history agrees: the repair check-in of 2026-03-03 is an ancestor of the 3.52.0 release check-in, and 3.51.3 ships the same change. So the 3.52 line passes from its patch 0."
+    },
+    {
+      "line": "3.51",
+      "first_repaired_patch": 3,
+      "reason": "wal.html section 11: the bug is repaired in version 3.51.3 (2026-03-13) and later."
+    },
+    {
+      "line": "3.50",
+      "first_repaired_patch": 7,
+      "reason": "wal.html section 11 names 3.50.7 among the backports of the repair."
+    },
+    {
+      "line": "3.44",
+      "first_repaired_patch": 6,
+      "reason": "wal.html section 11 names 3.44.6 among the backports of the repair."
+    }
+  ]
+}

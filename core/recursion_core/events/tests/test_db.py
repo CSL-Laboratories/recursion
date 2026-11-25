@@ -1324,7 +1324,7 @@ class ModuleTest(unittest.TestCase):
                 imported.add(node.module)
         self.assertEqual(imported, {'__future__', 'collections', 'contextlib', 'hashlib', 'json', 'logging', 'os', 're',
                                     'shutil', 'sqlite3', 'stat', 'tempfile', 'threading', 'time', 'weakref', 'typing',
-                                    'fcntl'})
+                                    'fcntl', 'pathlib', 'types'})
 
     def test_each_decision_of_a_declarations_rules_on_its_own(self) -> None:
         """SQLite does not ask about every object a statement touches, so each rule is held here directly too."""

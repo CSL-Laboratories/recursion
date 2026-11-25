@@ -82,8 +82,12 @@ store's code as its detail (``routine_unknown``, ``routine_lease_ended``, ``rout
 sentence of the one table of words (``text``), or it is charged to the record's budget and goes on. A
 retried start (the same key) is answered as before and charged nothing. A charge is for a run that
 exists: the charge is held with the run id until the launch record is stored (``recorded``); when that
-record cannot be stored (the put raises or meets a newer generation) the charge is given back before the
-answer (``give_back``), which says the run was not started and nothing was charged; a same-key start sent
+record is not stored (the put meets a newer generation, or raises and the record read back is not there)
+the charge is given back before the answer (``give_back``), which says the run was not started and nothing
+was charged. A put that raises may have stored the record all the same, so the record is read back: a
+record that is there is the start made, and its charge stands; when the read fails too, the charge stays
+held and the answer says so (``start_record_unknown``), since a charge that may be one too many is given
+back at the daemon's next start while a run for nothing could not be taken back. A same-key start sent
 while the charge is still held takes it; and when the API is built over the store, a charge whose run the
 registry does not hold is given back (``settle``, ``control/routines.py``). With no routine store there is
 no record to run from, so a trigger start is refused ``request_invalid`` / ``routine_store_absent`` before
@@ -371,12 +375,22 @@ class ControlAPI:
                 if not charged:
                     raise
                 failure = str(err)
+                # A put that raised may have stored the record all the same: only a record proven absent
+                # gives its charge back (module text).
+                try:
+                    stored = self._reg("get", run_id)
+                except _RegistryError as unread:
+                    return self._unknown(run_id, f"{failure}, {unread}")
+                if stored is not None:  # it is there: the start is made and its charge stands
+                    rec.clear()
+                    rec.update(stored)
+                    failure = None
             if failure is not None:
                 if charged:
                     return self._unrecorded(origin, held, run_id, failure)
                 raise _RegistryError(failure)
-            if charged:
-                self._routines.recorded(origin, run_id)  # the record is stored: the charge stands for it
+            if held:  # the record is stored: the charge stands for it (a relaunch drops a row it left too)
+                self._routines.recorded(origin, run_id)
             self._failed.discard(run_id)
         try:
             handle = self._starter({**params, "run_id": run_id})
@@ -420,6 +434,15 @@ class ControlAPI:
             held.remove(run_id)  # its hold went with the charge
         words = WORDS["start_unrecorded" if given else "start_unrecorded_held"].format(detail=detail)
         return {"code": REGISTRY_UNAVAILABLE, "detail": detail, "charged": not given, "text": words}
+
+    def _unknown(self, run_id: str, detail: str) -> dict:
+        """The put of a start charged here raised and its record cannot be read back: the charge stays held.
+
+        Nothing launched the run, so a same-key retry launches it, under the same run id if the record is
+        there and taking the held charge if it is not: once, and charged nothing more."""
+        self._failed.add(run_id)
+        return {"code": REGISTRY_UNAVAILABLE, "detail": detail, "charged": True,
+                "text": WORDS["start_record_unknown"].format(detail=detail)}
 
     def _retry(self, prior: dict) -> dict | None:
         """Answer a same-key retry from the existing record, or None to relaunch it. Caller holds the run lock.

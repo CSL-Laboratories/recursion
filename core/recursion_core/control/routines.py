@@ -32,10 +32,13 @@ the run id the start is launched under, made in the transaction that charges it 
 ``launching``), with the tenant and client key the start was sent with. The row is the charge: ``used``
 moves only with it, one up when it is made and one down when it is given back. The API stores the run's
 launch record and then drops the row (``recorded``): the charge stands for a run that is in the run list.
-When the launch record cannot be stored, the API gives the charge back in one transaction with its row
-(``give_back``) before it answers, so nothing was charged and ``last_refusal`` is not touched. A start sent
-again with the same client key while a row of its key is held (the give-back could not be written, or the
-process ended between the charge and the record) takes that row and its run id and is not charged again,
+When the launch record is known not to be stored (the put met a newer generation, or it raised and the
+record read back is not there), the API gives the charge back in one transaction with its row
+(``give_back``) before it answers, so nothing was charged and ``last_refusal`` is not touched; a put that
+raised and whose record is there is the start made. A start sent again with the same client key while a
+row of its key is held (the give-back could not be written, the record could not be read back after its
+put raised, or the process ended between the charge and the record) takes that row and its run id and is
+not charged again,
 the budget not read a second time. When the API is built over the store (the daemon starts), every row
 whose run id the run list does not hold is given back (``settle``), with one warning line that names the
 routine and the run id; a row whose run is in the list is dropped and its charge stands. A new admission
@@ -191,6 +194,11 @@ TEXT = {
                              "charge is held for this start: send the start again with the same key and it is "
                              "charged once; if no run is recorded for it, it is given back when the daemon "
                              "starts again.",
+    "start_record_unknown": "The daemon could not tell whether the run was recorded: its run list failed while "
+                            "writing it and could not be read back ({detail}). The charge is kept for this "
+                            "start, so the routine may count one run more than it ran until the daemon starts "
+                            "again; send the start again with the same key and it runs once, charged nothing "
+                            "more.",
     "charge_given_back": "A charge for run {run_id}, which was never recorded, was given back to the routine "
                          "{record_id}. No run was started for it, so there is nothing for you to do.",
     "routine_changed": "This routine changed while a run was being started from it, or was changed in its "

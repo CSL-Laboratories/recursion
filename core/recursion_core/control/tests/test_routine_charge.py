@@ -253,5 +253,102 @@ class TheHoldOfAFailedLaunchTest(ChargeCase):
         self.assertEqual(self.used(store), 1)
 
 
+class WritesThenRaises(InMemoryRunRegistry):
+    """The in-memory registry whose first put raises, after storing the record when ``writes``; the next
+    ``unreadable`` reads after that put raise too."""
+
+    def __init__(self, writes=True, unreadable=0):
+        super().__init__()
+        self.fail, self.writes, self.unreadable, self.blind = 1, writes, unreadable, 0
+
+    def put(self, rec):
+        if self.fail > 0:
+            self.fail -= 1
+            if self.writes:
+                super().put(rec)
+            self.blind = self.unreadable
+            raise OSError("written, answer lost" if self.writes else "registry down")
+        return super().put(rec)
+
+    def get(self, run_id):
+        if self.blind > 0:
+            self.blind -= 1
+            raise OSError("registry down")
+        return super().get(run_id)
+
+
+def reconcile(registry):
+    """What the daemon's reconcile does to a starting record with no unit (DaemonControl._reconcile_one)."""
+    for rec in registry.list():
+        if rec.get("state") == "starting" and not rec.get("cgroup"):
+            rec["state"] = "start_failed"
+            registry.put(rec)
+
+
+class APutThatRaisesTest(ChargeCase):
+    """The put of the launch record raises; only a record proven absent gives its charge back."""
+
+    def budget_of_one(self, registry):
+        self.registry = registry
+        store = self.store()
+        store.admit(OWNER, a_record(budget={"unit": "runs", "limit": 1}))
+        return store, self.api(store)
+
+    def and_then(self, store, api, first):
+        """The same-key retry, the daemon's reconcile, the retry again, then a start with another key."""
+        answers = [first, self.start(api)]
+        reconcile(self.registry)
+        answers.append(self.start(api))
+        other = self.start(api, key="k2")
+        self.assertEqual((other["code"], other["detail"]), ("request_invalid", "routine_budget_spent"), answers)
+        self.assertEqual((self.used(store), len(self.registry.list()), len(self.starter.calls)), (1, 1, 1), answers)
+        self.assertEqual(self.rows(), [])
+        return answers
+
+    def test_a_record_that_is_there_is_the_start_made_and_keeps_its_charge(self):
+        store, api = self.budget_of_one(WritesThenRaises())
+        first = self.start(api)
+        self.assertEqual((first["code"], self.used(store)), ("started", 1), first)
+        answers = self.and_then(store, api, first)
+        self.assertEqual([(a["code"], a["duplicate"]) for a in answers[1:]], [("started", True)] * 2)
+
+    def test_a_record_that_is_not_there_gives_the_charge_back(self):
+        store, api = self.budget_of_one(WritesThenRaises(writes=False))
+        first = self.start(api)
+        self.assertEqual((first["code"], first["charged"], self.used(store)), ("registry_unavailable", False, 0))
+        self.assertEqual(first["text"], r.TEXT["start_unrecorded"].format(detail="put:OSError"))
+        self.assertEqual(self.and_then(store, api, first)[1]["code"], "started")
+
+    def unknown(self, writes):
+        store, api = self.budget_of_one(WritesThenRaises(writes=writes, unreadable=1))
+        first = self.start(api)
+        self.assertEqual((first["code"], first["charged"], self.used(store)), ("registry_unavailable", True, 1))
+        self.assertEqual(first["text"], r.TEXT["start_record_unknown"].format(detail="put:OSError, get:OSError"))
+        self.assertEqual(self.and_then(store, api, first)[1]["code"], "started")  # launched once, charged once
+
+    def test_a_record_written_that_cannot_be_read_back_keeps_the_charge_and_says_so(self):
+        self.unknown(writes=True)
+
+    def test_a_record_not_written_that_cannot_be_read_back_keeps_the_charge_and_says_so(self):
+        self.unknown(writes=False)
+
+    def test_a_record_that_cannot_be_read_back_is_given_back_at_the_next_start_when_it_is_not_there(self):
+        store, api = self.budget_of_one(WritesThenRaises(writes=False, unreadable=1))
+        self.assertEqual(self.start(api)["charged"], True)
+        self.api(self.store())  # the daemon starts again: the run list does not hold the run
+        self.assertEqual((self.used(store), self.rows()), (0, []))
+
+    def test_two_runs_on_a_budget_of_one(self):
+        """A put that wrote and raised; the retry; the reconcile; the retry; another key (budget one)."""
+        store, api = self.budget_of_one(WritesThenRaises())
+        self.start(api)
+        self.start(api)
+        reconcile(self.registry)
+        self.start(api)
+        self.start(api, key="k2")
+        self.assertEqual(len(self.starter.calls), 1)
+        self.assertEqual(self.used(store), len(self.registry.list()))
+
+
 if __name__ == "__main__":
     unittest.main()

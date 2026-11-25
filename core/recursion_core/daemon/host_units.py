@@ -483,6 +483,8 @@ class PluginHostUnits:
                     if exc.reason == NOT_STARTED:  # no answer by the call's deadline: degraded, whatever the cause
                         with self._lock:
                             self.degraded[plugin_id] = self.degraded.get(plugin_id, 0) + 1
+                    if exc.reason == REPLACED:  # every replaced end of a call says it may be sent again
+                        raise HostUnavailable(plugin_id, REPLACED, REPLACED_DETAIL) from None
                     raise
             try:
                 answer = self._exchange(host, message, frame, deadline)

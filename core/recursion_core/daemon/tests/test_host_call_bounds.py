@@ -16,6 +16,7 @@ from recursion_core.plugin_security import host_channel as hc
 CORE_S = 0.2     # the daemon's own time on one core request of the tests (a test figure)
 MOST_S = 0.6     # the bound on the daemon's time in those tests (a test figure)
 SETTLE_S = 0.3   # how long a test lets a thread reach the turn it waits on (a test figure)
+POLL_S = 0.01    # how often a test looks again at what a thread has reached (a test figure)
 JOIN_S = hs.JOIN_S
 
 
@@ -162,6 +163,32 @@ class TheDaemonsTimeInOneCallHasABound(tc._Units):
                 units.call('stand.in', 'operator', {'command': 'x'})
         self.assertEqual(caught.exception.reason, 'timed_out')
         self.assertIn("by the call's deadline of 0.3 s (plugin_host.call_deadline_s)", caught.exception.detail)
+
+
+@unittest.skipUnless(hs.LINUX, 'plugin host units are Linux only')
+class ACallReplacedWhileItsOwnStartIsUnderWay(tc._Units):
+    def test_it_ends_replaced_with_the_words_that_say_the_call_may_be_sent_again(self):
+        hosts = tc.Hosts(self, ['answers', 'silent', 'answers'])
+        units = self.units(hosts, call_deadline_s=None, start_deadline_s=None)
+        first = units.start('stand.in', *hs.package(hs.POLITE))
+        hosts.kill_cgroup('', first.unit)  # the host ends by itself
+        with self.assertLogs(host_units.log, 'ERROR'):
+            with self.assertRaises(host_units.HostUnavailable) as ended:
+                units.call('stand.in', 'operator', {'command': 'x'})
+        self.assertEqual(ended.exception.reason, 'ended')
+        thread, box = hs.in_thread(lambda: units.call('stand.in', 'operator', {'command': 'y'}))
+        deadline = time.monotonic() + JOIN_S
+        while 'stand.in' not in units._starting and time.monotonic() < deadline:  # the call starts its own host
+            time.sleep(POLL_S)
+        self.assertEqual(len(hosts.started), 2)
+        units.start('stand.in', *hs.package(hs.POLITE))  # replaces the host the call is starting
+        thread.join(JOIN_S)
+        self.assertFalse(thread.is_alive())
+        error = box.get('error')
+        self.assertIsInstance(error, host_units.HostUnavailable, box)
+        self.assertEqual((error.reason, error.detail), ('replaced', host_units.REPLACED_DETAIL))
+        self.assertIn('the call was not answered and may be sent again', str(error))
+        self.answered_by(units, hosts, 3)
 
 
 if __name__ == '__main__':

@@ -207,6 +207,15 @@ class CoreService:
         run = self._breaker.check(effect["run_id"], effect["connection"], caller)
         return permission, run
 
+    @contextlib.contextmanager
+    def permission_held(self, plugin_id: str, permission: str) -> Iterator[bool]:
+        """Whether ``plugin_id`` holds ``permission`` now, with every change of the grants held off until the
+        block ends (``PluginLoader.permissions_held``). A step taken inside the block is taken in one step
+        with this answer: a revocation or a poison that returned before it is seen, and one that comes
+        later lands after the step. For the daemon's own in-process steps (a start a plugin asked for)."""
+        with self._loader.permissions_held(plugin_id) as permissions:
+            yield permission in permissions
+
     def _op_plugin_permissions(self, caller: str, plugin_id: str) -> dict:
         return {"permissions": list(self._loader.permissions(plugin_id))}
 

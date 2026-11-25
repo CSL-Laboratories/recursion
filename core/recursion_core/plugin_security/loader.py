@@ -29,7 +29,9 @@ import importlib.machinery
 import sys
 import threading
 import types
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from typing import Iterator
 
 from .errors import Refused
 from .manifest import Grant, Manifest, ReservedEffects, TrustStore, effective_permissions, parse_manifest
@@ -53,6 +55,12 @@ class CoreHealth:
     @property
     def poisoned(self) -> str | None:
         return self._reason
+
+    @contextmanager
+    def held(self) -> Iterator[str | None]:
+        """The poison reason (None while healthy), with ``poison`` held off until the block ends."""
+        with self._lock:
+            yield self._reason
 
     def require_healthy(self) -> None:
         if self._reason is not None:
@@ -85,12 +93,28 @@ class PluginLoader:
         self._health = health
         self._gil = gil_probe if gil_probe is not None else GilProbe()
         self._lock = threading.Lock()
+        # Every write of ``_active`` holds this lock, so a reader holding it (``permissions_held``) sees the
+        # grants as no write can change them until it lets go. It is held only for the write itself, never
+        # while plugin code runs; it is taken after ``_lock`` and before the core health's lock.
+        self._grants_lock = threading.Lock()
         self._active: dict[str, LoadedPlugin] = {}
         self.last_findings: tuple = ()
 
     def permissions(self, plugin_id: str) -> tuple:
         plugin = self._active.get(plugin_id)
         return () if plugin is None or self._health.poisoned else plugin.permissions
+
+    @contextmanager
+    def permissions_held(self, plugin_id: str) -> Iterator[tuple]:
+        """The permissions ``plugin_id`` holds now, with every change of them held off until the block ends.
+
+        A revocation (``revoke_key``), a poison and a load wait for the block, so a step taken inside it is
+        taken under exactly these permissions: a change that returned before the block began is seen, and
+        one that begins inside it lands after the step. Keep the block short: it holds every grant change.
+        """
+        with self._grants_lock, self._health.held() as poisoned:
+            plugin = self._active.get(plugin_id)
+            yield () if plugin is None or poisoned else plugin.permissions
 
     def revoke_key(self, kid: str) -> list[str]:
         """Revoke a developer key now (PRODUCT.md 4.4) and return the plugin ids it turned off.
@@ -112,7 +136,8 @@ class PluginLoader:
         if type(kid) is not str or not kid.startswith("ed25519:"):
             raise Refused("invalid_key_id")
         with self._lock:
-            turned_off = self._order_off(kid)
+            with self._grants_lock:
+                turned_off = self._order_off(kid)
             self._trust.revoke(kid)
             return turned_off
 
@@ -208,8 +233,9 @@ class PluginLoader:
         """Read the GIL; if it is on, poison the core and drop every active plugin."""
         if not self._gil.gil_enabled():
             return False
-        self._health.poison("gil_enabled_after_load:" + name)
-        self._active.clear()
+        with self._grants_lock:
+            self._health.poison("gil_enabled_after_load:" + name)
+            self._active.clear()
         findings.append(_finding("active", "gil_enabled_after_load", "refuse"))
         self.last_findings = tuple(findings)
         return True
@@ -238,6 +264,7 @@ class PluginLoader:
         findings.append(_finding("active", "active", "info", "in_process_not_contained"))
         loaded = LoadedPlugin(manifest.plugin_id, manifest.artifact_sha256, trust, kid, label,
                               perms, module, tuple(findings), key_id(manifest.developer_key))
-        self._active[manifest.plugin_id] = loaded
+        with self._grants_lock:
+            self._active[manifest.plugin_id] = loaded
         self.last_findings = loaded.findings
         return loaded

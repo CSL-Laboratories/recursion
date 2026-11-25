@@ -820,14 +820,15 @@ class DaemonControl:
         self._starts_in_flight = 0  # run.start calls of this process that have not answered yet
 
     # -- calls ---------------------------------------------------------------------------------
-    def call(self, method, params=None, *, origin=None):
-        """One method for a surface. ``origin`` is the daemon's own, for ``run.start`` only (a plugin host's
-        ``run.request``): it takes the same start path and adds ``origin`` to the run record."""
-        if origin is not None and method != 'run.start':
-            raise ValueError('origin is given only with run.start')
-        return self._answer(method, params, 0, origin=origin)
+    def call(self, method, params=None, *, origin=None, admit=None):
+        """One method for a surface. ``origin`` and ``admit`` are the daemon's own, for ``run.start`` only (a
+        plugin host's ``run.request``): it takes the same start path, adds ``origin`` to the run record, and
+        ``admit`` is the API's check taken in one step with the start (``ControlAPI`` module text)."""
+        if (origin is not None or admit is not None) and method != 'run.start':
+            raise ValueError('origin and admit are given only with run.start')
+        return self._answer(method, params, 0, origin=origin, admit=admit)
 
-    def _answer(self, method, params, reserved_bytes, *, origin=None):
+    def _answer(self, method, params, reserved_bytes, *, origin=None, admit=None):
         if method == 'run.list':
             return self._list(params, reserved_bytes)
         if method == 'route.list':
@@ -844,10 +845,8 @@ class DaemonControl:
             with self._starts_lock:
                 self._starts_in_flight += 1
             try:
-                if origin is None:
-                    answer = self.api.call(method, dict(params or {}))
-                else:
-                    answer = self.api.call(method, dict(params or {}), origin=origin)
+                given = {name: value for name, value in (('origin', origin), ('admit', admit)) if value is not None}
+                answer = self.api.call(method, dict(params or {}), **given)
             finally:
                 with self._starts_lock:
                     self._starts_in_flight -= 1

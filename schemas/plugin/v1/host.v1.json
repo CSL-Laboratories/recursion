@@ -26,8 +26,8 @@
     "args": {
       "record_kind": {"description": "One of record_kinds.", "type": "string"},
       "record_id": {"description": "The record's id in the plugin's own store.", "type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$", "not": {"pattern": "[\\r\\n]"}},
-      "revision": {"description": "The record's revision, counted from 1.", "type": "integer", "minimum": 1},
-      "occurrence": {"description": "The time the run is for: an RFC 3339 UTC time ending in Z, in whole seconds, a real instant.", "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", "not": {"pattern": "[\\r\\n]"}},
+      "revision": {"description": "The record's revision, counted from 1, written as a whole number without a fraction (1, never 1.0). A JSON Schema validator counts 1.0 as an integer, so this schema cannot decide it: the daemon does, and refuses 1.0 call_args_invalid.", "type": "integer", "minimum": 1},
+      "occurrence": {"description": "The time the run is for: an RFC 3339 UTC time ending in Z, in whole seconds, a real instant. The pattern cannot say which dates are real, so the daemon also checks the calendar and refuses a day or an hour that does not exist (2026-02-30, 24:00:00) call_args_invalid. A leap second (second 60) is refused on purpose, though RFC 3339 allows it: the daemon's clock cannot hold that instant; ask for the second after it.", "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", "not": {"pattern": "[\\r\\n]"}},
       "tenant": {"description": "As run.start takes it: a non-empty string.", "type": "string", "minLength": 1},
       "engine": {"description": "As run.start takes it: a non-empty string.", "type": "string", "minLength": 1},
       "prompt": {"description": "As run.start takes it: a non-empty string of strict UTF-8.", "type": "string", "minLength": 1}

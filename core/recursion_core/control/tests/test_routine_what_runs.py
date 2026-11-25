@@ -231,8 +231,12 @@ class EveryWayToTheLaunchTest(WhatRunsCase):
 
 class TheKeptRefusalTest(WhatRunsCase):
     def test_a_refusal_is_kept_with_a_plugin_and_an_occurrence_only_when_each_is_in_its_form(self):
+        d = self.daemon()
+        d.store.admit(OWNER, a_record())
+        answer = d.api.call("run.start", {"client_key": "k0"}, origin=trigger(occurrence=None))
+        self.assertEqual(answer["detail"], "origin_not_admitted")  # a trigger origin lacking a key is not admitted
+        self.assertIsNone(d.store.get("morning-digest")["last_refusal"])
         for label, origin, absent in (("an empty occurrence", trigger(occurrence=""), "occurrence"),
-                                      ("no occurrence", trigger(occurrence=None), "occurrence"),
                                       ("an occurrence that is not an instant", trigger(occurrence="1"), "occurrence")):
             with self.subTest(origin=label):
                 self.setUp()
@@ -246,7 +250,7 @@ class TheKeptRefusalTest(WhatRunsCase):
                 self.assertNotIn(absent, kept)
         d = self.daemon()
         d.store.admit(OWNER, a_record())
-        self.assertEqual(d.api.call("run.start", {"client_key": "k2"}, origin=trigger(plugin=None))["detail"],
+        self.assertEqual(d.api.call("run.start", {"client_key": "k2"}, origin=trigger(plugin=""))["detail"],
                          "routine_unknown")
         kept = d.store.get("morning-digest")["last_refusal"]
         self.assertEqual((kept["code"], kept["occurrence"]), ("routine_unknown", "2026-11-24T00:01:00Z"))
@@ -270,11 +274,11 @@ class TheKeptRefusalTest(WhatRunsCase):
     def test_a_wrong_or_missing_record_kind_is_not_kept_and_the_module_text_says_which_are(self):
         d = self.daemon()
         d.store.admit(OWNER, a_record())
-        for label, origin in (("routine.v2", trigger(record_kind="routine.v2")),
-                              ("no kind", trigger(record_kind=None))):
+        for label, origin, detail in (("routine.v2", trigger(record_kind="routine.v2"), "routine_unknown"),
+                                      ("no kind", trigger(record_kind=None), "origin_not_admitted")):
             with self.subTest(origin=label):
                 answer = d.api.call("run.start", {"client_key": f"k-{label}"}, origin=origin)
-                self.assertEqual(answer["detail"], "routine_unknown")
+                self.assertEqual(answer["detail"], detail)
         self.assertEqual((d.store.get("morning-digest")["last_refusal"], d.store.get("morning-digest")["used"]),
                          (None, 0))
         kept_paragraph = next(p for p in r.__doc__.split("\n\n") if p.startswith("Which refusals are kept"))

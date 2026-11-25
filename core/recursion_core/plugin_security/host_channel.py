@@ -27,7 +27,10 @@ later work):
   core's. ``DaemonEnd.load`` sends a load only for that plugin.
 * ``run.request`` (a plugin asks for a run from one of its records): answered at the daemon's end only
   when the channel was given the daemon's start path (``runs``) and the core says the channel's plugin
-  holds the ``schedule`` permission; otherwise ``call_not_offered``. Its seven arguments are checked
+  holds the ``schedule`` permission; otherwise ``call_not_offered``. The permission is read again in one
+  step with the start (``run.start``'s ``admit``), so a revocation that returned before the start is
+  recorded means no start (``call_not_offered``); one that lands later stops nothing already started (Stop
+  is the way to end that run). Its seven arguments are checked
   before anything starts (``call_args_invalid``); ``tenant``, ``engine`` and ``prompt`` exactly as
   ``run.start`` checks them. The run is started by ``runs.call("run.start", ..., origin=...)``: the one
   admission path of ``run.start``, with the start key derived here from the plugin, the record, its
@@ -54,12 +57,13 @@ import binascii
 import datetime
 import json
 import re
-from typing import Any, Callable, Mapping
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, Mapping
 
 from recursion_core.control_transport.errors import FrameError
 from recursion_core.control_transport.framing import MAX_FRAME_BYTES, decode_body, encode_frame
 
-from recursion_core.control.api import start_params_problem
+from recursion_core.control.api import START_REFUSED, start_params_problem
 
 from .canonical import canonical, parse
 from .limits import ARTIFACT, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES
@@ -354,6 +358,8 @@ def answer_call(message: dict, handlers: Mapping[str, Callable[..., Any]]) -> di
             raise ChannelRefusal("call_not_offered", name)
         try:
             value = handler(*(args[arg] for arg in CALL_NAMES[name]))
+        except _NotOffered:  # the daemon's own handler found the call not offered at its start
+            raise ChannelRefusal("call_not_offered", name) from None
         except Exception as exc:  # noqa: BLE001 - the plugin's failure is answered typed, never guessed around
             raise ChannelRefusal("call_failed", type(exc).__name__) from None
     except ChannelRefusal as exc:
@@ -372,7 +378,13 @@ class DaemonEnd:
     when ``runs`` (the daemon's start path: an object whose ``call(method, params, *, origin=...)`` is
     ``DaemonControl.call`` or ``ControlAPI.call``) was given and the core answers that this channel's
     plugin holds ``schedule`` (the ``plugin.permissions`` op, asked at each call, so a revocation counts);
-    otherwise it is ``call_not_offered``. Every other host call is ``call_reserved``, ``call_unknown`` or
+    otherwise it is ``call_not_offered``. The start reads the permission again in one step with itself
+    (``run.start``'s ``admit``): from the core's ``permission_held`` when the core has one (the real
+    ``CoreService``: under the lock every grant change takes, so no revocation can land between that read
+    and the record), else by asking ``plugin.permissions`` again inside the start's locks; a no there is
+    ``call_not_offered`` too, nothing is recorded and the starter is not called. A revocation that lands
+    after the start is recorded stops nothing already started: Stop is the way to end that run. Every
+    other host call is ``call_reserved``, ``call_unknown`` or
     ``call_not_offered``, and nothing runs. This end sends no call, so every ``result`` is for an id it
     never called and is refused ``message_invalid``, as at a host.
     """
@@ -382,6 +394,8 @@ class DaemonEnd:
             raise ValueError("a plugin host's channel is opened for one plugin id, never for the host")
         self.plugin_id = plugin_id
         self._core = core.client_for(plugin_id)
+        held = getattr(core, "permission_held", None)
+        self._held = held if callable(held) else None
         self._runs = runs
 
     def load(self, plugin_id: str, manifest: bytes, files: Mapping[str, bytes]) -> bytes:
@@ -420,20 +434,43 @@ class DaemonEnd:
         granted = result.get("permissions") if type(result) is dict else None
         return type(granted) is list and permission in granted
 
+    @contextmanager
+    def _holding(self, permission: str) -> Iterator[bool]:
+        """Whether this channel's plugin holds ``permission``, read for a step taken inside the block: under
+        the core's ``permission_held`` when it has one, else asked of the core again here."""
+        if self._held is None:
+            yield self._granted(permission)
+            return
+        with self._held(self.plugin_id, permission) as granted:
+            yield granted is True
+
     def _run_request(self, record_kind: str, record_id: str, revision: int, occurrence: str, tenant: str,
                      engine: str, prompt: str) -> dict:
         """Start one run from a record through ``run.start``'s path. The caller is this channel's plugin; the
         start key is derived here, so the same plugin, record, revision and occurrence
-        start at most one run for one tenant; the same occurrence for another tenant is another run."""
+        start at most one run for one tenant; the same occurrence for another tenant is another run.
+
+        ``schedule`` is read again in one step with the start (``admit``): a revocation that returned before
+        the start is recorded means no start, answered ``call_not_offered``; one that lands after it stops
+        nothing already started (Stop is the way to end that run)."""
         origin = {"kind": RUN_ORIGIN_KIND, "plugin": self.plugin_id, "record_kind": record_kind,
                   "record_id": record_id, "revision": revision, "occurrence": occurrence}
         key = f"{RUN_ORIGIN_KIND}/{self.plugin_id}/{record_kind}/{record_id}/{revision}/{occurrence}"
         params = {"tenant": tenant, "engine": engine, "prompt": prompt, "client_key": key}
-        return self._runs.call("run.start", params, origin=origin)
+        answer = self._runs.call("run.start", params, origin=origin,
+                                 admit=lambda: self._holding(RUN_REQUEST_PERMISSION))
+        if type(answer) is dict and answer.get("code") == START_REFUSED:
+            raise _NotOffered()
+        return answer
+
+
+class _NotOffered(Exception):
+    """Raised by the daemon's own handler when its call is found not offered at the step itself."""
 
 
 class _DaemonOffers:
-    """The daemon end's call table, looked up by ``answer_call`` only once a call's arguments are in form."""
+    """The daemon end's call table, looked up by ``answer_call`` only once a call's arguments are in form.
+    Its ask of ``schedule`` decides only whether the call is offered; the start reads it again itself."""
 
     def __init__(self, end: DaemonEnd) -> None:
         self._end = end

@@ -71,7 +71,28 @@ carries an ``origin`` key is answered as today (the key is ignored and never sto
 record carries another origin than the one asked with (a client's start against a key the daemon derived,
 or the other way round) is ``request_invalid`` / ``client_key_reused``, as any reuse of a key for another
 request. ``start_params_problem`` is the check of ``tenant``, ``engine`` and ``prompt`` that ``run.start``
-makes, for a caller that must refuse the same values before it starts anything.
+makes, for a caller that must refuse the same values before it starts anything. ``start`` refuses an
+origin that is not a mapping with a ``ValueError``. An origin whose ``kind`` is not in
+``RUN_ORIGIN_KEYS`` and on the allow-list below, or whose keys are not exactly that kind's, is refused
+``request_invalid`` / ``origin_not_admitted`` with its sentence before anything is written or charged,
+so the refusal crosses a channel as an answer with words. ``trigger`` is the one kind written today.
+
+A check taken in one step with the start (``admit``). ``call("run.start", params, origin=..., admit=...)``
+takes ``admit``, a callable that returns a context manager whose value says whether the start may go on
+(the daemon's end of a plugin host's channel gives one that reads the plugin's ``schedule`` permission).
+It is entered under the start's own locks, after the key lookup, and held until the launch intent is
+written, so whatever it reads cannot change between its answer and the record. A ``False`` answer is
+``start_refused`` / ``not_admitted``: nothing is written, the starter is not called, a keyed retry of a
+run already recorded is refused the same way, and nothing is counted. A change that lands after the
+launch intent is written stops nothing already started: Stop is the way to end that run.
+
+The hold first, the charge inside it. With the routine store a fresh start from a record is charged
+(``admit_start`` with ``reread``, which rereads the record's values and charges in one transaction)
+only once ``admit`` has answered yes, and inside that same hold, before the launch intent is written:
+a start refused ``not_admitted`` is charged nothing. The run id of such a start is made in that
+charging transaction (or is the one of a charge its key still holds) and its run lock is taken after
+it, since no other call knows a new run id; a relaunch of a run already recorded takes its run lock
+before the hold.
 
 Which origins are admitted. ``ADMITTED_RUN_ORIGINS`` is an allow-list of origin kinds: a start whose
 origin's ``kind`` is not on it is refused ``request_invalid`` / ``origin_not_admitted`` before anything is
@@ -126,7 +147,7 @@ import hashlib
 import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 
 from recursion_core.control.routines import RUN_VALUES
 from recursion_core.control.routines import TEXT as WORDS
@@ -138,8 +159,14 @@ STARTED, OK, STOPPED, PENDING = "started", "ok", "stopped", "pending"
 RUN_UNKNOWN, REQUEST_INVALID, START_FAILED, METHOD_UNKNOWN = (
     "run_unknown", "request_invalid", "start_failed", "method_unknown")
 START_UNCONFIRMED, REGISTRY_UNAVAILABLE = "start_unconfirmed", "registry_unavailable"
+START_REFUSED = "start_refused"  # the start's own ``admit`` check answered no; nothing was written
 CODES = frozenset({STARTED, OK, STOPPED, PENDING, RUN_UNKNOWN, REQUEST_INVALID, START_FAILED, METHOD_UNKNOWN,
-                   START_UNCONFIRMED, REGISTRY_UNAVAILABLE})
+                   START_UNCONFIRMED, REGISTRY_UNAVAILABLE, START_REFUSED})
+# The origin kinds a start may be recorded with, each with exactly its keys (host.v1.json x-run-request
+# origin). Part of the run record's format, not a setting.
+RUN_ORIGIN_KEYS = {"trigger": frozenset({"kind", "plugin", "record_kind", "record_id", "revision", "occurrence"})}
+# admit() -> a context manager whose value is True when the start may go on (see the module text).
+Admit = Callable[[], AbstractContextManager]
 SUCCESS_CODES = frozenset({STARTED, OK, STOPPED})
 _PENDING_REASON = {POPULATED: "cgroup_populated", TIMEOUT: "confirm_timeout"}
 LIST_LIMIT_MAX = 1000  # the most runs one run.list page may ask for
@@ -215,13 +242,14 @@ class ControlAPI:
     def _run_recorded(self, run_id: str) -> bool:
         return self._registry.get(run_id) is not None
 
-    def call(self, method: str, params: Mapping | None = None, *, origin: Mapping | None = None) -> dict:
-        """One method. ``origin`` is for an in-process ``run.start`` only (see the module text); a surface's
-        request never reaches it."""
-        if origin is not None and method != "run.start":
-            raise ValueError("origin is given only with run.start")
+    def call(self, method: str, params: Mapping | None = None, *, origin: Mapping | None = None,
+             admit: Admit | None = None) -> dict:
+        """One method. ``origin`` and ``admit`` are for an in-process ``run.start`` only (see the module
+        text); a surface's request never reaches them."""
+        if (origin is not None or admit is not None) and method != "run.start":
+            raise ValueError("origin and admit are given only with run.start")
         try:
-            return self._call(method, dict(params or {}), origin)
+            return self._call(method, dict(params or {}), origin, admit)
         except _RegistryError as err:  # every method answers with a typed code (red-team r2 finding 1)
             return {"code": REGISTRY_UNAVAILABLE, "detail": str(err)}
 
@@ -231,11 +259,11 @@ class ControlAPI:
         except Exception as err:
             raise _RegistryError(f"{op}:{type(err).__name__}") from err
 
-    def _call(self, method: str, params: dict, origin: Mapping | None = None) -> dict:
+    def _call(self, method: str, params: dict, origin: Mapping | None = None, admit: Admit | None = None) -> dict:
         if method == "run.list":
             return self.list_runs(params)
         if method == "run.start":
-            return self.start(params, origin=origin)
+            return self.start(params, origin=origin, admit=admit)
         handler = {"run.status": self.status, "run.stop": self.stop}.get(method)
         if handler is None:
             return {"code": METHOD_UNKNOWN, "detail": str(method)}
@@ -270,8 +298,16 @@ class ControlAPI:
         return {"code": OK, "runs": runs}
 
     # -- start --------------------------------------------------------------------------------
-    def start(self, params: Mapping, *, origin: Mapping | None = None) -> dict:
+    def start(self, params: Mapping, *, origin: Mapping | None = None, admit: Admit | None = None) -> dict:
+        if origin is not None and not isinstance(origin, Mapping):
+            raise ValueError("origin: a mapping with exactly the keys of its kind")
+        if admit is not None and not callable(admit):
+            raise ValueError("admit: a callable that returns a context manager")
         origin = dict(origin) if origin is not None else None
+        # An origin is admitted only when its kind is on the allow-list and it has exactly that kind's keys.
+        kind = origin.get("kind") if origin is not None else None
+        admitted_origin = (origin is None or (type(kind) is str and kind in ADMITTED_RUN_ORIGINS
+                                              and set(origin) == RUN_ORIGIN_KEYS.get(kind)))
         if origin is not None and origin.get("kind") in ADMITTED_RUN_ORIGINS and self._routines is None:
             # No routine store: there is no record to run from, so nothing a plugin sends is run (module text).
             return {"code": REQUEST_INVALID, "detail": ROUTINE_STORE_ABSENT, "text": WORDS[ROUTINE_STORE_ABSENT]}
@@ -282,7 +318,7 @@ class ControlAPI:
         problem = start_params_problem({"tenant": "t", "engine": "e", "prompt": "p", **sent} if from_record else params)
         if problem is not None:
             return {"code": REQUEST_INVALID, "detail": problem}
-        if origin is not None and origin.get("kind") not in ADMITTED_RUN_ORIGINS:
+        if not admitted_origin:
             return {"code": REQUEST_INVALID, "detail": ORIGIN_NOT_ADMITTED, "text": WORDS[ORIGIN_NOT_ADMITTED]}
         if from_record and set(params) - set(RECORD_START_KEYS):  # what the record does not bind does not travel
             return {"code": REQUEST_INVALID, "detail": ROUTINE_UNBOUND_VALUES, "text": WORDS[ROUTINE_UNBOUND_VALUES]}
@@ -296,7 +332,7 @@ class ControlAPI:
         self._enter_owner()
         try:
             if not isinstance(key, str):
-                return self._start(params, origin, held)  # no key: a fresh run id, nothing to dedupe
+                return self._start(params, origin, held, admit)  # no key: a fresh run id, nothing to dedupe
             slot_key = (params["tenant"], key)
             with self._locks_lock:
                 slot = self._start_locks.get(slot_key)
@@ -307,7 +343,7 @@ class ControlAPI:
             lock_key = _start_lock_key(slot_key)
             self._locks.acquire(self._local.owner, [lock_key])
             try:
-                return self._start(params, origin, held)
+                return self._start(params, origin, held, admit)
             finally:
                 self._let_go(origin, held)  # before the start lock: a same-key retry is held after this (module text)
                 self._locks.release(self._local.owner, [lock_key])
@@ -323,7 +359,8 @@ class ControlAPI:
         while held:  # this start has answered: its launch call returned or never came
             self._routines.launched(origin, held.pop())
 
-    def _start(self, params: Mapping, origin: dict | None = None, held: list | None = None) -> dict:
+    def _start(self, params: Mapping, origin: dict | None = None, held: list | None = None,
+               admit: Admit | None = None) -> dict:
         held = [] if held is None else held
         key = params.get("client_key")
         start_key = None
@@ -333,21 +370,32 @@ class ControlAPI:
         prior = self._reg("find_start", params["tenant"], key) if start_key is not None else None
         if prior is not None and (prior.get("start_key") != start_key or prior.get("origin") != origin):
             return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
-        if prior is None and origin is not None and self._routines is not None:
-            # The record as it is now, in the transaction that charges it: still the values read above.
-            # Its run id is made in that transaction and held there until this start answers.
-            refusal = self._routines.admit_start(origin, {name: params[name] for name in RUN_VALUES}, reread=True,
-                                                 launching=self._new_run_id,
-                                                 key=(params["tenant"], key) if isinstance(key, str) else None)
-            if refusal["code"] != OK:
-                return {"code": REQUEST_INVALID, "detail": refusal["code"], "text": refusal["text"]}
-            held.append(refusal["run_id"])
-        run_id = prior["run_id"] if prior is not None else held[0] if held else self._new_run_id()
-        rec = {"run_id": run_id, "tenant": params["tenant"], "engine": params["engine"], "state": "starting",
-               "cgroup": None, "started_at": self._clock(), "stop": None, "start_key": start_key}
-        if origin is not None:
-            rec["origin"] = origin
-        with self._run_lock(run_id):
+        # ``admit`` is entered after the key lookup and held until the launch intent is written: what it
+        # reads cannot change between its answer and the record (the module text). The permission is held
+        # FIRST and the routine's charge is made inside that hold, so a start refused there is never charged.
+        with ExitStack() as hold:
+            run_id = prior["run_id"] if prior is not None else None
+            if run_id is not None:  # a run already recorded: its run lock first, then the hold
+                hold.enter_context(self._run_lock(run_id))
+            admitted = hold.enter_context(nullcontext(True) if admit is None else admit())
+            if admitted is not True:
+                return {"code": START_REFUSED, "detail": "not_admitted"}
+            if prior is None and origin is not None and self._routines is not None:
+                # The record as it is now, in the transaction that charges it: still the values read above.
+                # Its run id is made in that transaction and held there until this start answers.
+                refusal = self._routines.admit_start(origin, {name: params[name] for name in RUN_VALUES}, reread=True,
+                                                     launching=self._new_run_id,
+                                                     key=(params["tenant"], key) if isinstance(key, str) else None)
+                if refusal["code"] != OK:
+                    return {"code": REQUEST_INVALID, "detail": refusal["code"], "text": refusal["text"]}
+                held.append(refusal["run_id"])
+            if run_id is None:  # a new run id: no other call knows it yet, so its run lock never waits
+                run_id = held[0] if held else self._new_run_id()
+                hold.enter_context(self._run_lock(run_id))
+            rec = {"run_id": run_id, "tenant": params["tenant"], "engine": params["engine"], "state": "starting",
+                   "cgroup": None, "started_at": self._clock(), "stop": None, "start_key": start_key}
+            if origin is not None:
+                rec["origin"] = origin
             if prior is not None:  # a retried start is not run twice, across restarts too (11.3, 11.8)
                 answer = self._retry(self._current(prior))
                 if answer is not None:

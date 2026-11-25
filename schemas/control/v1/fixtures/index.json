@@ -14180,30 +14180,67 @@
       }
     },
     {
-      "file": "bad/routine.record.v1/m-routine.record.v1.refusal.plugin.json",
-      "schema": "routine.record.v1.json",
-      "rule": "The object described at routine.record.v1.json#/$defs/refusal always carries 'plugin'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/last_refusal"
-      }
-    },
-    {
-      "file": "bad/routine.record.v1/m-routine.record.v1.refusal.occurrence.json",
-      "schema": "routine.record.v1.json",
-      "rule": "The object described at routine.record.v1.json#/$defs/refusal always carries 'occurrence'.",
-      "expect": {
-        "keyword": "required",
-        "at": "/last_refusal"
-      }
-    },
-    {
       "file": "bad/routine.record.v1/f-routine.record.v1.kind.json",
       "schema": "routine.record.v1.json",
       "rule": "The value at /kind is fixed by routine.record.v1.json#/properties/kind.",
       "expect": {
         "keyword": "const",
         "at": "/kind"
+      }
+    },
+    {
+      "file": "good/routine.record.v1/h07-a-refusal-asked-with-no-plugin-or-occurrence-in-its-form.json",
+      "schema": "routine.record.v1.json",
+      "shows": "A refusal kept for a start asked with no plugin and no occurrence in their forms: both fields are absent, never an empty or a made-up value."
+    },
+    {
+      "file": "good/routine.record.v1/h08-a-run-asked-with-another-engine-and-prompt.json",
+      "schema": "routine.record.v1.json",
+      "shows": "A refusal kept for a start that sent another engine and prompt than the record's: it names which values differ, never the prompt's text."
+    },
+    {
+      "file": "bad/routine.record.v1/m-routine.record.v1.prompt-sha256.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The object described at routine.record.v1.json#/ always carries 'prompt_sha256'.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/b09-a-prompt-digest-that-is-not-hex.json",
+      "schema": "routine.record.v1.json",
+      "rule": "prompt_sha256 is sixty-four lowercase hex digits.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/prompt_sha256"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/v-routine.record.v1.refusal.differs.json",
+      "schema": "routine.record.v1.json",
+      "rule": "The values at /last_refusal/differs are only tenant, engine and prompt.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/last_refusal/differs/0"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/b10-a-refusal-with-an-empty-occurrence.json",
+      "schema": "routine.record.v1.json",
+      "rule": "A kept occurrence is a UTC instant to the second; an empty one is never kept.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/last_refusal/occurrence"
+      }
+    },
+    {
+      "file": "bad/routine.record.v1/b11-a-refusal-with-a-made-up-plugin.json",
+      "schema": "routine.record.v1.json",
+      "rule": "A kept plugin is a plugin id; the text 'None' is never kept.",
+      "expect": {
+        "keyword": "pattern",
+        "at": "/last_refusal/plugin"
       }
     }
   ]

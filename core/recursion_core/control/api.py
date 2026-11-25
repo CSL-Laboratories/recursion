@@ -83,6 +83,15 @@ sentence of the one table of words (``text``), or it is charged to the record's 
 retried start (the same key) is answered as before and charged nothing. With no routine store a trigger
 start is admitted as before.
 
+What a trigger start runs, when the API is given the routine store: what the record says, never what the
+caller sends. Before the start lock is taken, the store is asked (charging nothing) for the record's
+``tenant``, ``engine`` and ``prompt``; the caller may leave any of them out, each one it sends must be the
+record's (``request_invalid`` / ``routine_differs`` otherwise, its sentence naming which differs), and the
+start goes on with the record's three values. Every way to the one launch call reads them again from the
+record inside the start lock: a fresh start in the transaction that charges it, and the relaunch of a
+same-key start whose launch failed (charged once already) in a check that charges nothing. A same-key
+retry answered from the run it already has launches nothing.
+
 Stop decisions and launch records are serialised per run, so a slow or hung cleanup on one run never
 queues another run's Stop (11.3, D2-55 / B-19), and a launch never overwrites a Stop that landed during it.
 The registry write is a compare-and-swap on the record's generation, so a stop is also not overwritten by
@@ -100,6 +109,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 
+from recursion_core.control.routines import RUN_VALUES
 from recursion_core.control.routines import TEXT as WORDS
 from recursion_core.control.registry import (
     EMPTY, POPULATED, TIMEOUT, KillTree, OwnerLockTable, RunRegistry, StaleGeneration,
@@ -233,12 +243,21 @@ class ControlAPI:
 
     # -- start --------------------------------------------------------------------------------
     def start(self, params: Mapping, *, origin: Mapping | None = None) -> dict:
-        problem = start_params_problem(params)
+        origin = dict(origin) if origin is not None else None
+        # A trigger start with the routine store runs the record's values: the caller may leave them out.
+        from_record = (origin is not None and self._routines is not None
+                       and origin.get("kind") in ADMITTED_RUN_ORIGINS)
+        sent = {name: params[name] for name in RUN_VALUES if name in params}
+        problem = start_params_problem({"tenant": "t", "engine": "e", "prompt": "p", **sent} if from_record else params)
         if problem is not None:
             return {"code": REQUEST_INVALID, "detail": problem}
-        origin = dict(origin) if origin is not None else None
         if origin is not None and origin.get("kind") not in ADMITTED_RUN_ORIGINS:
             return {"code": REQUEST_INVALID, "detail": ORIGIN_NOT_ADMITTED, "text": WORDS[ORIGIN_NOT_ADMITTED]}
+        if from_record:  # what the record says, read before the start lock (its tenant names the lock)
+            read = self._routines.admit_start(origin, sent, charge=False)
+            if read["code"] != OK:
+                return {"code": REQUEST_INVALID, "detail": read["code"], "text": read["text"]}
+            params = {**params, **read["start"]}
         key = params.get("client_key")
         self._enter_owner()
         try:
@@ -274,8 +293,9 @@ class ControlAPI:
         if prior is not None and (prior.get("start_key") != start_key or prior.get("origin") != origin):
             return {"code": REQUEST_INVALID, "detail": "client_key_reused"}
         if prior is None and origin is not None and self._routines is not None:
-            refusal = self._routines.admit_start(origin)  # the record as it is now; charged when it goes on
-            if refusal is not None:
+            # The record as it is now, in the transaction that charges it: still the values read above.
+            refusal = self._routines.admit_start(origin, {name: params[name] for name in RUN_VALUES}, reread=True)
+            if refusal["code"] != OK:
                 return {"code": REQUEST_INVALID, "detail": refusal["code"], "text": refusal["text"]}
         run_id = prior["run_id"] if prior is not None else self._new_run_id()
         rec = {"run_id": run_id, "tenant": params["tenant"], "engine": params["engine"], "state": "starting",
@@ -287,6 +307,12 @@ class ControlAPI:
                 answer = self._retry(self._current(prior))
                 if answer is not None:
                     return answer
+                if origin is not None and self._routines is not None:
+                    # A relaunch runs again: the record must still say what it runs (charged once already).
+                    refusal = self._routines.admit_start(origin, {name: params[name] for name in RUN_VALUES},
+                                                         charge=False, reread=True)
+                    if refusal["code"] != OK:
+                        return {"code": REQUEST_INVALID, "detail": refusal["code"], "text": refusal["text"]}
                 # The run already has a generation. A relaunch has to CAS that generation; a blind put
                 # would be a stale write and is refused.
                 current = self._current(prior)

@@ -5,6 +5,7 @@
   "plugin": "demo.schedule",
   "tenant": "default",
   "engine": "claude_code",
+  "prompt_sha256": "6d3d4defee80dacff8ea4658b7689d0769706de5c7b62a7574590aacc9511766",
   "lease_seconds": 2592000,
   "budget": {
     "unit": "runs",

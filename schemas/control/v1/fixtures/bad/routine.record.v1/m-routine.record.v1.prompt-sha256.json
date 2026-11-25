@@ -23,9 +23,5 @@
     "ends": 2592000
   },
   "used": 0,
-  "last_refusal": {
-    "code": "routine_lease_ended",
-    "at": "2026-12-23T20:00:01.000Z",
-    "occurrence": "2026-12-23T20:00:00Z"
-  }
+  "last_refusal": null
 }

@@ -26,7 +26,24 @@ Nothing is frozen yet.
 | `transcript.line.v1.json` | 1.0-draft.3 |
 | `methods.v1.json` and `methods.table.v1.json` | 1.0-draft.10 |
 | `session.token.v1.json` | 1.0-draft.1 |
-| `routine.record.v1.json` | 1.0-draft.2 |
+| `routine.record.v1.json` | 1.0-draft.3 |
+
+## A start from a routine record runs what the record says (Nov 24, 2026)
+
+`routine.record` draft 3; every other schema keeps its draft. A run asked from a record (origin kind
+`trigger`, with the core's routine store given to `run.start`'s one admission path) runs the record's
+`tenant`, `engine` and `prompt`, never the caller's. The caller may leave them out; a value it sends that is
+not the record's is refused `request_invalid` with the detail `routine_differs`, whose sentence names which
+of the three differs and never the prompt's text. The record keeps `prompt_sha256` beside its prompt; a
+prompt in the store that no longer matches it is refused `routine_changed`. Neither is charged to the
+budget; both are kept in `last_refusal`, which names the values that differed (`differs`). A kept refusal
+carries `plugin` and `occurrence` only when each is a value in its form; otherwise the field is absent.
+
+| What changed | What it breaks |
+|---|---|
+| Field `prompt_sha256`, required | A draft 2 record: it has no digest |
+| `last_refusal`: codes `routine_changed` and `routine_differs`; field `differs`; `plugin` and `occurrence` no longer required, each held to its form | A draft 2 refusal with an empty or a made-up plugin or occurrence |
+| Fixtures: every whole record carries its digest; the two that removed `plugin` and `occurrence` from a refusal are gone (each is now a good record), and seven are new | |
 
 ## A routine record ends with its lease and its budget (Nov 23, 2026)
 

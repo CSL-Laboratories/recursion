@@ -50,6 +50,26 @@ lease ends there no later than the wall clock's forward count says, across a res
 open on the file and after a clock set back or a far-future reading, and the record's ``lease`` names the
 clock that ends it whenever it is read: ``get`` moves it and writes it as ``list`` does.
 
+What a start from a record runs. The person admits a plugin to start ONE routine: what is run, as whom,
+on which engine. So a start from a record runs what the record says, never what the caller sends:
+``admit_start`` answers with the record's ``tenant``, ``engine`` and ``prompt`` (``RUN_VALUES``), and the
+API starts those. A caller may leave the three out; each one it does send must be the record's, else the
+start is refused ``routine_differs``, whose sentence names which of the three differs (never the prompt's
+text). The record keeps its prompt by a digest as well as in text (``prompt_sha256``, the SHA-256 of its
+UTF-8 bytes, written by ``admit`` and by every ``change`` of the prompt); a prompt in the store that no
+longer matches its digest, a tenant, engine or prompt that is no longer in its form, or a record that
+changed between the start's first read of it and the read that charges or relaunches it, is refused
+``routine_changed``. Neither refusal is charged to the budget, and both are kept on the record.
+
+Which refusals are kept on the record (``START_REFUSALS``): every refusal of a start that names this
+record: another plugin's ask (``routine_unknown``), ``routine_changed``, ``routine_differs``,
+``routine_lease_ended`` and ``routine_budget_spent``. Two refusals are not kept: a record id the store does
+not hold (there is no record to keep it on) and an origin whose ``record_kind`` is not ``routine.v1`` or is
+missing (it names a record of another kind, not this one, so it is not shown as an ask of this routine).
+A kept refusal carries the plugin and the occurrence it was asked with only when each is a value in its
+form (a plugin id; an occurrence as ``run.request`` takes it, a UTC instant to the second); otherwise the
+field is absent, never an empty or a made-up value.
+
 What runs today. No daemon composes this store yet: no command of a person reaches it from outside the
 process, and a running daemon starts its runs as before.
 
@@ -63,19 +83,23 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import hashlib
 import json
 import re
 import sqlite3
 import time
 from typing import Callable, Iterator, Mapping
 
-__all__ = ["BUDGET_UNITS", "LEASE_CLOCKS", "RECORD_KIND", "TEXT", "WRITER_KINDS", "RoutineStore", "bounds_of"]
+__all__ = ["BUDGET_UNITS", "LEASE_CLOCKS", "RECORD_KIND", "RUN_VALUES", "START_REFUSALS", "TEXT", "WRITER_KINDS",
+           "RoutineStore", "bounds_of", "prompt_digest"]
 
 RECORD_KIND = "routine.v1"
 # The principal kinds that stand for the person (common.v1.json $defs/principal). Only these write.
 WRITER_KINDS = ("owner", "device")
 LEASE_CLOCKS = ("counted", "wall")
 BUDGET_UNITS = ("runs",)
+# What a start from a record runs; each is read from the record, never from the caller (module text).
+RUN_VALUES = ("tenant", "engine", "prompt")
 
 # Figures. Each value below becomes a row of the person's settings file, with this value as its shipped
 # default, once that file's one reader is in this code; until then the composition (or a test) may give
@@ -113,13 +137,28 @@ TEXT = {
                             "Write the routine again to give it a new budget.",
     "origin_not_admitted": "This kind of run is reserved and not available in this release, so no run was "
                            "started. There is nothing for you to do.",
+    "routine_differs": "The plugin asked this routine for a run with another {what} than the routine you "
+                       "admitted, so no run was started and nothing was charged. The request is kept on the "
+                       "routine; if you want that run, write the routine again with it.",
+    "routine_changed": "This routine changed while a run was being started from it, or was changed in its "
+                       "store by something other than your own commands, so no run was started and nothing "
+                       "was charged. Read the routine, and write it again if it does not say what you want.",
 }
-# The refusals of a start that are kept on the record, for the person to read.
-START_REFUSALS = ("routine_unknown", "routine_lease_ended", "routine_budget_spent")
+# The refusals of a start that are kept on the record, for the person to read (module text: which are not).
+START_REFUSALS = ("routine_unknown", "routine_changed", "routine_differs", "routine_lease_ended",
+                  "routine_budget_spent")
 
 
-def _refused(code: str, detail: str = "") -> dict:
+def _refused(code: str, detail: str = "", differs: tuple = ()) -> dict:
+    if code == "routine_differs":  # the sentence names which values differ: "tenant", "engine and prompt"
+        what = differs[0] if len(differs) == 1 else ", ".join(differs[:-1]) + " and " + differs[-1]
+        return {"code": code, "detail": detail, "differs": list(differs), "text": TEXT[code].format(what=what)}
     return {"code": code, "detail": detail, "text": TEXT[code]}
+
+
+def prompt_digest(prompt: str) -> str:
+    """The SHA-256 of the prompt's UTF-8 bytes, as hex: the digest a record keeps beside its prompt."""
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
 
 def _instant(seconds: float) -> str:
@@ -307,7 +346,7 @@ class RoutineStore:
             now = self._clocks(db)
             prior = self._get(db, record["record_id"])
             stored = {"kind": RECORD_KIND, **{name: record[name] for name in REQUIRED_PERSON_FIELDS},
-                      "lease_seconds": seconds, "budget": dict(record.get("budget", self._default_budget)),
+                      "prompt_sha256": prompt_digest(record["prompt"]), "lease_seconds": seconds, "budget": dict(record.get("budget", self._default_budget)),
                       "revision": 1 if prior is None else prior["revision"] + 1,
                       "lease": self._lease(now, seconds, self._lease_clock()), "used": 0, "last_refusal": None}
             self._stamp(stored, writer)
@@ -341,6 +380,8 @@ class RoutineStore:
             if widened is not None:
                 return _refused("widen_needs_admission", widened)
             stored = {**prior, **{name: changes[name] for name in changes}, "revision": prior["revision"] + 1}
+            if "prompt" in changes:  # the person's own change of the prompt is digested as an admission's is
+                stored["prompt_sha256"] = prompt_digest(changes["prompt"])
             if "lease_seconds" in changes:  # a shorter lease from the same start, or a first one from now
                 kept = prior["lease"]
                 stored["lease"] = (self._lease(now, changes["lease_seconds"], self._lease_clock()) if kept is None else
@@ -392,33 +433,96 @@ class RoutineStore:
             return record
 
     # -- the core's check, before a run is started from a record ----------------------------------
-    def admit_start(self, origin: Mapping) -> dict | None:
-        """None when a start from ``origin``'s record may go on (and it is charged), else the refusal.
+    def admit_start(self, origin: Mapping, asked: Mapping | None = None, *, charge: bool = True,
+                    reread: bool = False) -> dict:
+        """Whether a start from ``origin``'s record may go on, and what it runs: ``{"code": "ok", "start":
+        {...}}`` with the record's ``tenant``, ``engine`` and ``prompt``, else the refusal.
 
         Read in one transaction with the charge: the record as it is now (never an older copy), its
-        plugin, its leases (the earliest end ends it) and its budgets (each must have room). A refusal is
-        kept on the record as ``last_refusal``.
+        plugin, its prompt against its digest, each value of ``asked`` (what the caller sent of
+        ``RUN_VALUES``: any of them, or none) against the record's, then its leases (the earliest end ends
+        it) and its budgets (each must have room). With ``charge`` (a fresh start) the start is charged;
+        without it (the API's check before it takes the start lock, or the relaunch of a run already
+        charged) nothing is charged and the lease and budget are not read. With ``reread``, ``asked`` holds
+        the values this start read from the record a moment before, so a value that differs now means the
+        record changed in between: ``routine_changed``, not the caller's ``routine_differs``. Which refusals
+        are kept on the record as ``last_refusal``, and why two are not, is in the module text.
         """
+        asked = {} if asked is None else asked
         record_id = origin.get("record_id")
         with self._write() as db:
             now = self._clocks(db)
             record = self._get(db, record_id) if type(record_id) is str else None
             if record is None or origin.get("record_kind") != RECORD_KIND:
-                return _refused("routine_unknown", str(record_id)[:64])
+                return _refused("routine_unknown", str(record_id)[:64])  # not kept: module text
             self._measured(record, now)  # written below on every path: refused or charged
-            code = None
+            code, differs = None, ()
             leases, budgets = bounds_of(record)
             if origin.get("plugin") != record["plugin"]:
                 code = "routine_unknown"
-            elif any(now[lease["clock"]] >= lease["ends"] for lease in leases):
+            elif _changed(record):
+                code = "routine_changed"
+            elif _differs(record, asked):
+                code, differs = ("routine_changed", ()) if reread else ("routine_differs", _differs(record, asked))
+            elif charge and any(now[lease["clock"]] >= lease["ends"] for lease in leases):
                 code = "routine_lease_ended"
-            elif any(budget["used"] >= budget["limit"] for budget in budgets):
+            elif charge and any(budget["used"] >= budget["limit"] for budget in budgets):
                 code = "routine_budget_spent"
             if code is not None:
-                record["last_refusal"] = {"code": code, "at": _instant(self._wall()),
-                                          "plugin": str(origin.get("plugin")), "occurrence": str(origin.get("occurrence"))}
+                record["last_refusal"] = _kept_refusal(code, _instant(self._wall()), origin, differs)
                 self._put(db, record)
-                return _refused(code, record_id)
-            record["used"] += 1
+                return _refused(code, record_id, differs)
+            if charge:
+                record["used"] += 1
             self._put(db, record)
-        return None
+        return {"code": OK, "start": {name: record[name] for name in RUN_VALUES}}
+
+
+def _changed(record: Mapping) -> bool:
+    """True when the record's tenant, engine or prompt is no longer in its form, or its prompt no longer
+    matches the digest kept beside it: the record was changed in the store, not by the person's commands."""
+    from recursion_core.control.api import start_params_problem  # api.py imports this module
+
+    if start_params_problem({name: record.get(name) for name in RUN_VALUES}) is not None:
+        return True
+    return record.get("prompt_sha256") != prompt_digest(record["prompt"])
+
+
+def _differs(record: Mapping, asked: Mapping) -> tuple:
+    """The names of ``RUN_VALUES`` the caller sent with a value that is not the record's, in their order.
+    The prompt is compared by its digest, so neither it nor the record's is ever repeated."""
+    differs = []
+    for name in RUN_VALUES:
+        if name not in asked:
+            continue
+        if name == "prompt":
+            value = asked[name]
+            same = type(value) is str and _encodes(value) and prompt_digest(value) == record["prompt_sha256"]
+        else:
+            same = asked[name] == record[name]
+        if not same:
+            differs.append(name)
+    return tuple(differs)
+
+
+def _encodes(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _kept_refusal(code: str, at: str, origin: Mapping, differs: tuple) -> dict:
+    """The ``last_refusal`` kept for the person: the plugin and the occurrence only when each is in its form."""
+    from recursion_core.plugin_security.host_channel import _occurrence_ok  # the form run.request takes
+
+    kept = {"code": code, "at": at}
+    plugin = origin.get("plugin")
+    if type(plugin) is str and _PLUGIN.fullmatch(plugin) and plugin != "host":
+        kept["plugin"] = plugin
+    if _occurrence_ok(origin.get("occurrence")):
+        kept["occurrence"] = origin["occurrence"]
+    if differs:
+        kept["differs"] = list(differs)
+    return kept

@@ -298,7 +298,8 @@ def _record(writes: dict) -> dict:
 
 # The process alone, holding nothing open for writing: stand-ins, for the probes run in this process (the runner's own
 # threads and log files are not the record's to judge).
-ALONE = {"_threads_now": lambda: 1, "_descriptors_open_for_write": lambda: [], "_maps_open_for_write": lambda: []}
+ALONE = {"_threads_now": lambda: 1, "_descriptors_open_for_write": lambda: [], "_maps_open_for_write": lambda: [],
+         "_walled_here": lambda: True, "_descriptors_unaccounted": lambda: []}  # as if apply_wall ran here
 
 
 def _refuse(*_args, **_kwargs):

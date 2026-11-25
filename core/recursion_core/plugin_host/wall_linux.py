@@ -17,7 +17,10 @@ and to everything it starts later, and neither can be lifted again from inside:
    mapped shared and writable. ``apply_wall`` opens the kernel's own list of the process's descriptors
    (``/proc/self/fd``) and of its maps (``/proc/self/maps``) for reading BEFORE the wall, reads both AFTER it,
    and closes both before it returns, so that no plugin code holds either; the record is built from what it
-   read there.
+   read there. ``probe_wall`` then names every descriptor the process holds at the probe's own moment (found by
+   number, up to the kernel's own count of them where the kernel gives one): a descriptor that the kernel's list
+   did not hold after the wall (one handed in over a connection held from before it) is named, by kind, and
+   keeps the record from proven, as does a record made in a process where ``apply_wall`` did not run.
 2. ONE seccomp filter, loaded with ``SECCOMP_FILTER_FLAG_TSYNC`` so that it reaches every thread of the
    process. It checks the audit arch first (x86_64 and aarch64; a call made under another arch, or the
    x32 range of x86_64, is answered EPERM), then answers EPERM to:
@@ -301,6 +304,11 @@ _READ_CHUNK = 1 << 16  # how much of a kernel list one read takes: a buffer size
 # The kinds of file that a descriptor open for writing makes the record not proven for (the record's field
 # ``descriptors_open_for_write``): through either, a write reaches what the wall is there to keep.
 _DESCRIPTOR_KINDS = {stat.S_IFREG: "regular_file", stat.S_IFBLK: "block_device"}
+# The kind of every descriptor, by the file type the kernel gives it (the record's field ``descriptors_unaccounted``);
+# a descriptor of no file type (an eventfd, a ring of kernel calls, a timer) is "other". Names, not figures.
+_FILE_KINDS = {**_DESCRIPTOR_KINDS, stat.S_IFCHR: "character_device", stat.S_IFIFO: "pipe",
+               stat.S_IFSOCK: "socket", stat.S_IFDIR: "folder", stat.S_IFLNK: "link"}
+_OTHER_KIND = "other"
 # The names the probe uses in the write folder: the two that prepare_write_folder makes for the removals, and the
 # ones the make kinds try to create (absent before the probe; whatever a weak wall let it make stays there for the
 # caller to remove). File names, not figures.
@@ -364,8 +372,22 @@ WORDS = {
                 "host must unmap every such file before it shuts itself in.",
     "maps_unknown": "The plugin host could not read the list of its memory maps, so it could not show that no file "
                     "was mapped for writing.",
+    "descriptor_after_wall": "A {kind} reached the plugin host after it shut itself in and before it tested "
+                             "itself (handed in over a connection it held). The sandbox checks a file only when it "
+                             "is opened, and this one was opened outside it, so the test cannot show what it "
+                             "reaches. What you can do: let the host receive nothing between shutting itself in "
+                             "and testing itself.",
+    "no_wall_here": "The plugin host did not shut itself in within this process, so this test shows nothing of a "
+                    "sandbox of its own, and nothing was loaded. What you can do: start the plugin host as its own "
+                    "program, as the daemon does, so that it shuts itself in before it tests itself.",
     "regular_file": "file",
     "block_device": "disk or other block device",
+    "character_device": "terminal or other character device",
+    "pipe": "pipe",
+    "socket": "network or local connection",
+    "folder": "folder",
+    "link": "link",
+    "other": "kernel object that is not a file (a queue of kernel calls, a timer, an event counter)",
     "what_to_do": "What you can do: run the plugin host on Linux 5.13 or newer with Landlock turned on (most "
                   "distributions turn it on; otherwise add landlock to the kernel's lsm= boot setting), outside "
                   "any container or security tool that changes what a process may do with files, and start it "
@@ -675,7 +697,7 @@ def _read_kernel_lists(lists: dict) -> dict:
     """What the two lists say now, read through the descriptors opened before the wall: the descriptors open for
     writing (named as ``_named_for_write`` names them) and the maps shared and writable of a file; None for a list
     that could not be read. The two descriptors of the lists themselves are not counted."""
-    seen = {"descriptors": None, "maps": None}
+    seen = {"descriptors": None, "maps": None, "numbers": None}
     if lists.get("descriptors") is not None:
         try:
             numbers = sorted(int(name) for name in os.listdir(lists["descriptors"]))
@@ -683,7 +705,8 @@ def _read_kernel_lists(lists: dict) -> dict:
             numbers = None
         if numbers is not None:
             ours = {fd for fd in lists.values() if fd is not None}
-            seen["descriptors"] = _named_for_write(number for number in numbers if number not in ours)
+            seen["numbers"] = [number for number in numbers if number not in ours]
+            seen["descriptors"] = _named_for_write(seen["numbers"])
     if lists.get("maps") is not None:
         try:
             os.lseek(lists["maps"], 0, os.SEEK_SET)
@@ -1050,13 +1073,39 @@ def _write_outcomes(write_file, write_folder) -> dict:
 
 def _descriptors_open_for_write():
     """Each descriptor of this process open for writing on a regular file or a block device, as
-    ``{"descriptor": n, "kind": ...}`` in its order, or None when not every descriptor could be seen.
+    ``{"descriptor": n, "kind": ...}`` in its order, or None when not every descriptor could be seen: those held
+    now, and, where apply_wall ran in this process, every one the kernel's list held after the wall."""
+    numbers, seen = _descriptors_now(), _STATE.get("seen_at_wall")
+    at_wall = seen.get("numbers") if seen else []
+    if numbers is None or at_wall is None:
+        return None
+    return _named_for_write(sorted(set(numbers) | set(at_wall)))
+
+
+def _walled_here() -> bool:
+    """Whether apply_wall put the wall on in THIS process and read the kernel's lists after it."""
+    return bool(_STATE.get("seen_at_wall"))
+
+
+def _descriptors_unaccounted():
+    """Each descriptor held now that the kernel's list read after the wall did not hold (one handed in since), as
+    ``_named_kinds`` names it; None where apply_wall did not run in this process or not every one could be seen."""
+    seen = _STATE.get("seen_at_wall")
+    at_wall = seen.get("numbers") if seen else None
+    numbers = None if at_wall is None else _descriptors_now()
+    if numbers is None:
+        return None
+    return _named_kinds(number for number in numbers if number not in set(at_wall))
+
+
+def _descriptors_now():
+    """The numbers of every descriptor this process holds now, in order, or None when not every one could be seen.
 
     The list of descriptors (/proc/self/fd) is outside what the wall lets the process read, so they are found by
     number with ``fstat`` and ``fcntl(F_GETFL)``, which the wall does not refuse: up to the count the kernel
     gives as the size of /proc/self/fd (a stat, from Linux 6.2), or, where that size is 0, up to the hard limit
-    of open files (a descriptor numbered above a hard limit lowered after it was opened is then not seen).
-    The kind of file is named, never its name or its contents."""
+    of open files (a descriptor numbered above a hard limit lowered after it was opened is then not seen; the
+    probe adds the kernel's own list read after the wall for every descriptor held then)."""
     import fcntl
     import resource
     try:
@@ -1079,7 +1128,20 @@ def _descriptors_open_for_write():
         number += 1
     if expected > 0 and found != expected:
         return None
-    return _named_for_write(open_numbers)
+    return open_numbers
+
+
+def _named_kinds(numbers) -> list:
+    """Each of the descriptors ``numbers`` that is still open, as ``{"descriptor": n, "kind": ...}`` in order, its
+    kind by the file type the kernel gives it (``_FILE_KINDS``, else ``other``); never its name or contents."""
+    named = []
+    for number in numbers:
+        try:
+            kind = stat.S_IFMT(os.fstat(number).st_mode)
+        except OSError:
+            continue
+        named.append({"descriptor": number, "kind": _FILE_KINDS.get(kind, _OTHER_KIND)})
+    return named
 
 
 def _named_for_write(numbers) -> list:
@@ -1119,6 +1181,16 @@ def why_not_proven(record: dict) -> list:
                 kind = entry.get("kind") if isinstance(entry, dict) else None
                 lines.append(WORDS["descriptor_open"].format(
                     kind=WORDS[kind] if kind in _DESCRIPTOR_KINDS.values() else WORDS["regular_file"]))
+    if record.get("descriptors_seen_by") == "scan_by_number":
+        lines.append(WORDS["no_wall_here"])
+    if isinstance(record.get("descriptors_unaccounted"), list):
+        for entry in record["descriptors_unaccounted"]:
+            kind = entry.get("kind") if isinstance(entry, dict) else None
+            known = kind in _FILE_KINDS.values() or kind == _OTHER_KIND
+            lines.append(WORDS["descriptor_after_wall"].format(kind=WORDS[kind] if known else WORDS[_OTHER_KIND]))
+    elif ("descriptors_unaccounted" in record and record.get("descriptors_seen_by") != "scan_by_number"
+          and isinstance(record.get("descriptors_open_for_write"), list)):
+        lines.append(WORDS["descriptors_unknown"])
     if "memory_maps_open_for_write" in record:
         maps = record["memory_maps_open_for_write"]
         if not isinstance(maps, list):
@@ -1148,14 +1220,18 @@ def why_not_proven(record: dict) -> list:
 def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> dict:
     """The record ``wall.v1``: a check the host's own code makes on itself, from inside this process.
 
-    First the threads of the process are counted (``threads``) and its descriptors open for writing on a
-    regular file or a block device are named (``descriptors_open_for_write``; None when not every descriptor
-    could be seen), before the probe opens anything of its own. Eight checks are tried; each field is True only
+    First the threads of the process are counted (``threads``) and every descriptor it holds is found, before the
+    probe opens anything of its own: those open for writing on a regular file or a block device are named
+    (``descriptors_open_for_write``; None when not every descriptor could be seen), and so is every descriptor
+    that the kernel's list read after the wall did not hold (``descriptors_unaccounted``, by kind; None where no
+    wall was applied in this process or not every descriptor could be seen). Eight checks are tried; each field is True only
     when the kernel refused it. Then each kind of
     ``WRITE_KINDS`` is tried on the probe's own file and in ``write_folder`` (a folder the caller made and gave to
     ``prepare_write_folder`` before the wall); ``writes`` holds the outcome of each, and ``writes_not_tried``
     names every kind the probe does not try, with its reason: ``proven`` covers the kinds in ``writes`` only.
-    ``proven`` is True only when the process has one thread, no descriptor open for writing, all eight checks
+    ``proven`` is True only when ``apply_wall`` ran in this process (``descriptors_seen_by`` is
+    ``kernel_list_after_wall``), no descriptor is held that the wall's list did not hold, the process has one
+    thread, no descriptor open for writing, all eight checks
     are refused, every write kind is refused by the part of the wall that holds it, on a supported arch with
     Landlock ABI 1 or above, and no step of ``apply_wall`` failed in this process; without a write file and
     folder it is never True. ``landlock_scopes`` names the Landlock scopes ``apply_wall`` put in force (none
@@ -1167,16 +1243,17 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
     libc = _libc()
     canary = os.fspath(canary_path)
     threads = _threads_now()  # before the probe opens anything of its own
-    seen = _STATE.get("seen_at_wall")
-    if seen:  # apply_wall ran in this process: the kernel's own lists, read after the wall
-        held, maps, seen_by = seen["descriptors"], seen["maps"], "kernel_list_after_wall"
-    else:
-        held, maps, seen_by = _descriptors_open_for_write(), _maps_open_for_write(), "scan_by_number"
+    # every descriptor held at the probe's own moment, before it opens anything: the ones the kernel's list after the
+    # wall did not hold (handed in since), and the ones open for writing, now or at the wall
+    unaccounted, held, seen = _descriptors_unaccounted(), _descriptors_open_for_write(), _STATE.get("seen_at_wall")
+    seen_by = "kernel_list_after_wall" if _walled_here() else "scan_by_number"
+    maps = seen["maps"] if seen else _maps_open_for_write()
     record = {
         "threads": threads,
         "descriptors_open_for_write": held,
         "memory_maps_open_for_write": maps,
         "descriptors_seen_by": seen_by,
+        "descriptors_unaccounted": unaccounted,
         "reads_outside": _refused(_read_root),
         "home_canary": _refused(lambda: _read_canary(canary)),
         "program_start": _refused(_start_program),
@@ -1191,7 +1268,8 @@ def probe_wall(canary_path, daemon_pid, write_file=None, write_folder=None) -> d
         "landlock_scopes": list(_STATE["scopes"]),
         "arch": platform.machine() or "unknown",
     }
-    record["proven"] = (threads == 1 and held == [] and maps == []
+    record["proven"] = (seen_by == "kernel_list_after_wall" and unaccounted == []
+                        and threads == 1 and held == [] and maps == []
                         and all(record[name] for name in RECORD_CHECKS) and record["landlock_abi"] >= _MIN_LANDLOCK_ABI
                         and all(record["writes"][kind] in _WRITE_REFUSED for kind in WRITE_KINDS)
                         and record["arch"] in _NR and _STATE["failed"] is None)

@@ -2,6 +2,8 @@
   "threads": 1,
   "descriptors_open_for_write": [],
   "memory_maps_open_for_write": [],
+  "descriptors_seen_by": "kernel_list_after_wall",
+  "descriptors_unaccounted": [],
   "reads_outside": true,
   "home_canary": false,
   "program_start": true,

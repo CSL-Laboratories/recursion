@@ -1051,8 +1051,8 @@ class LandlockScopeTests(unittest.TestCase):
             stand_ins = dict({fn: _refuse for fn in CHECK_FUNCTIONS.values()}, _write_outcomes=_writes_refused)
             with self.subTest(abi=abi), mock.patch.multiple(
                     wall_linux, _call=fake_call, _landlock_abi=lambda libc: abi, _thread_count=lambda: 1,
-                    _threads_now=lambda: 1, _descriptors_open_for_write=lambda: [],
-                    _read_kernel_lists=lambda lists: {"descriptors": [], "maps": []},
+                    _threads_now=lambda: 1, _descriptors_open_for_write=lambda: [], _descriptors_unaccounted=lambda: [],
+                    _read_kernel_lists=lambda lists: {"descriptors": [], "maps": [], "numbers": []},
                     _no_new_privs=lambda libc: None, _load_seccomp_filter=lambda *a, **k: None,
                     _STATE={"applied": [], "failed": None, "scopes": []}, **stand_ins):
                 wall_linux.apply_wall([sys.prefix])
@@ -1140,7 +1140,8 @@ class ProvenNeedsEveryCheckTests(unittest.TestCase):
         stand_ins = {fn: (_let_through if name == let_through else _refuse) for name, fn in CHECK_FUNCTIONS.items()}
         stand_ins["_write_outcomes"] = _writes_refused
         stand_ins.update(_threads_now=lambda: 1, _descriptors_open_for_write=lambda: [],
-                         _maps_open_for_write=lambda: [])  # the runner's own are not judged
+                         _maps_open_for_write=lambda: [], _walled_here=lambda: True,
+                         _descriptors_unaccounted=lambda: [])  # the runner's own are not judged; as if walled here
         with mock.patch.multiple(wall_linux, create=True, **stand_ins, **patches):
             return wall_linux.probe_wall("/nonexistent/canary", 1)
 

@@ -1535,6 +1535,16 @@
       "shows": "Draft 5 is additive: a draft 4 record that is not proven (no threads, no descriptors, the socket kind named as not tried) still validates and still reads as not proven."
     },
     {
+      "file": "good/wall.v1/h16-a-descriptor-handed-in-after-the-wall-is-not-a-wall.json",
+      "schema": "wall.v1.json",
+      "shows": "A descriptor reached the host after the wall and before the probe (handed in over a held connection): it is named by number and kind, and the record is not proven."
+    },
+    {
+      "file": "good/wall.v1/h17-no-wall-in-the-host-s-own-process-is-not-proven.json",
+      "schema": "wall.v1.json",
+      "shows": "The probe ran in a process where no wall was applied: it looked for the descriptors itself, nothing can be accounted against the wall's list, and the record is not proven."
+    },
+    {
       "file": "bad/wall.v1/m-wall.v1.then.threads.json",
       "schema": "wall.v1.json",
       "rule": "A proven wall names its threads.",
@@ -1757,6 +1767,87 @@
       "expect": {
         "keyword": "enum",
         "at": "/descriptors_seen_by"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b14-proven-with-a-descriptor-handed-in-after-the-wall.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall held no descriptor that its list after the wall did not hold.",
+      "expect": {
+        "keyword": "maxItems",
+        "at": "/descriptors_unaccounted"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b15-proven-when-not-every-descriptor-could-be-accounted-for.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall accounted for every descriptor it held.",
+      "expect": {
+        "keyword": "type",
+        "at": "/descriptors_unaccounted"
+      }
+    },
+    {
+      "file": "bad/wall.v1/b16-proven-with-no-wall-in-its-own-process.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven record was made in the process the wall was applied to.",
+      "expect": {
+        "keyword": "const",
+        "at": "/descriptors_seen_by"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.descriptors-unaccounted.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall says which descriptors it could not account for.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.then.descriptors-seen-by.json",
+      "schema": "wall.v1.json",
+      "rule": "A proven wall says how its descriptors were found.",
+      "expect": {
+        "keyword": "required",
+        "at": ""
+      }
+    },
+    {
+      "file": "bad/wall.v1/u-wall.v1.descriptors-unaccounted.0.json",
+      "schema": "wall.v1.json",
+      "rule": "An unaccounted descriptor entry is closed: a field nobody defined (a file's name, say) is refused.",
+      "expect": {
+        "keyword": "additionalProperties",
+        "at": "/descriptors_unaccounted/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.descriptors-unaccounted.0.descriptor.json",
+      "schema": "wall.v1.json",
+      "rule": "An unaccounted descriptor entry names its number.",
+      "expect": {
+        "keyword": "required",
+        "at": "/descriptors_unaccounted/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/m-wall.v1.descriptors-unaccounted.0.kind.json",
+      "schema": "wall.v1.json",
+      "rule": "An unaccounted descriptor entry names its kind.",
+      "expect": {
+        "keyword": "required",
+        "at": "/descriptors_unaccounted/0"
+      }
+    },
+    {
+      "file": "bad/wall.v1/v-wall.v1.descriptors-unaccounted.0.kind.json",
+      "schema": "wall.v1.json",
+      "rule": "An unaccounted descriptor's kind is one the kernel gives.",
+      "expect": {
+        "keyword": "enum",
+        "at": "/descriptors_unaccounted/0/kind"
       }
     }
   ]
